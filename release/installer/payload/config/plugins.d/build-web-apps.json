@@ -1,0 +1,7 @@
+{
+  "id": "build-web-apps",
+  "displayName": "Build Web Apps",
+  "type": "plugin",
+  "enabled": true,
+  "description": "Optional plugin bundle for web app related skills."
+}

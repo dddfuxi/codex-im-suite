@@ -1,0 +1,31 @@
+# Node / TS
+node_modules/
+dist/
+*.tsbuildinfo
+
+# .NET
+bin/
+obj/
+
+# Runtime / logs
+.claude-to-im/
+logs/
+runtime/
+
+# Temp / IDE
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+.vscode/
+
+# Local MCP caches
+.picture-memory/
+.unity-prefab-memory/
+input/
+output/
+
+# Release working dirs
+release/artifacts/
+release/portable/packages/*/dist/
+

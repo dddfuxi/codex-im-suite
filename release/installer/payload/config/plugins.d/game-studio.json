@@ -1,0 +1,7 @@
+{
+  "id": "game-studio",
+  "displayName": "Game Studio",
+  "type": "plugin",
+  "enabled": true,
+  "description": "Optional plugin bundle for game and playtest workflows."
+}

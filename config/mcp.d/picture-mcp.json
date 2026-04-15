@@ -1,0 +1,13 @@
+{
+  "id": "pictureMCP",
+  "displayName": "Picture MCP",
+  "type": "stdio",
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-picture-mcp.ps1",
+  "cwd": "${SUITE_ROOT}\\..\\MCP-for-Picture",
+  "registerName": "pictureMCP",
+  "healthCheck": {
+    "kind": "codex-mcp-list"
+  },
+  "description": "Picture annotation and layout memory MCP"
+}

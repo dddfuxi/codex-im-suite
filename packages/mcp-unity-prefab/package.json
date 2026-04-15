@@ -1,0 +1,23 @@
+{
+  "name": "mcp-for-unity-prefab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Unity prefab folder scanner and preview annotator powered by an existing unity-mcp server",
+  "scripts": {
+    "mcp": "tsx src/mcp-stdio.ts",
+    "cli": "tsx src/cli.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "sharp": "^0.34.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

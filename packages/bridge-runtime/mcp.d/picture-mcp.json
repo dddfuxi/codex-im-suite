@@ -1,0 +1,13 @@
+{
+  "id": "pictureMCP",
+  "displayName": "Picture MCP",
+  "type": "stdio",
+  "enabled": true,
+  "launcher": "scripts/launch-picture-mcp.ps1",
+  "cwd": "C:\\Users\\admin\\Documents\\New project\\MCP-for-Picture",
+  "registerName": "pictureMCP",
+  "healthCheck": {
+    "kind": "codex-mcp-list"
+  },
+  "description": "Image annotation, subject labeling, and layout memory tools"
+}

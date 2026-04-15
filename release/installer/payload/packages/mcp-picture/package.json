@@ -1,0 +1,30 @@
+{
+  "name": "mcp-for-picture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal HTTP service: image -> agent-ready text (multi-provider)",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "mcp": "tsx src/mcp-stdio.ts",
+    "cli": "tsx src/cli.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "@openai/codex-sdk": "^0.110.0",
+    "express": "^4.21.0",
+    "openai": "^5.12.2",
+    "sharp": "^0.34.4"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

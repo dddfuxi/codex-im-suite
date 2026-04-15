@@ -1,0 +1,18 @@
+{
+  "id": "unityPrefabMCP",
+  "displayName": "Unity Prefab MCP",
+  "type": "stdio",
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-prefab-mcp.ps1",
+  "cwd": "${SUITE_ROOT}\\..\\MCP-for-Unity-Prefab",
+  "registerName": "unityPrefabMCP",
+  "env": {
+    "UNITY_MCP_HOST": "127.0.0.1",
+    "UNITY_MCP_HTTP_PORT": "8081",
+    "UNITY_MCP_TIMEOUT_MS": "30000"
+  },
+  "healthCheck": {
+    "kind": "codex-mcp-list"
+  },
+  "description": "Unity prefab folder MCP"
+}
