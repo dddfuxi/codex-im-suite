@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $suiteRoot = Split-Path -Parent $scriptDir
 
+& (Join-Path $scriptDir 'sync-live-skill.ps1')
 & (Join-Path $scriptDir 'package-release.ps1')
 
 Push-Location $suiteRoot

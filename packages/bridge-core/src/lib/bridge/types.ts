@@ -24,6 +24,7 @@ export interface ChannelAddress {
   chatId: string;        // Platform-specific chat/channel identifier
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
+  chatType?: string;     // Platform-specific chat type (group / p2p / etc.)
 }
 
 /** Composite key for routing: channelType + chatId */
@@ -91,6 +92,8 @@ export interface ChannelBinding {
   id: string;
   channelType: ChannelType;
   chatId: string;
+  displayName?: string;
+  chatType?: string;
   /** CodePilot session ID this chat is bound to */
   codepilotSessionId: string;
   /** SDK session ID for resume (cached from last conversation) */
@@ -101,6 +104,10 @@ export interface ChannelBinding {
   model: string;
   /** Chat mode */
   mode: 'code' | 'plan' | 'ask';
+  /** Fingerprint of bridge/session-management code last applied to this binding. */
+  bridgeFingerprint?: string;
+  /** Fingerprint of tooling/MCP registration last applied to this binding. */
+  toolingFingerprint?: string;
   /** Whether this binding is currently active */
   active: boolean;
   createdAt: string;

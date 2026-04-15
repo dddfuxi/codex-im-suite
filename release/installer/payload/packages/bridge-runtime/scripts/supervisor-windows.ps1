@@ -28,7 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ── Paths ──
-$DefaultCtiHome = 'E:\cli-md'
+$DefaultCtiHome = Join-Path $HOME '.claude-to-im'
 if (-not $env:CTI_HOME) {
     $env:CTI_HOME = $DefaultCtiHome
 }

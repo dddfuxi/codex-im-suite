@@ -263,6 +263,29 @@ function truncateText(text: string, maxLen: number): string {
   return normalized.length > maxLen ? `${normalized.slice(0, maxLen - 3)}...` : normalized;
 }
 
+function getReplyStyleHint(): string {
+  return (process.env.CTI_REPLY_STYLE_HINT || '').trim();
+}
+
+function buildBridgeReplyGuardrails(): string {
+  const lines = [
+    'Bridge reply contract:',
+    '- User-facing reply must be concise and outcome-first.',
+    '- Do not expose hidden reasoning, long planning narration, or step-by-step internal thought.',
+    '- Execution details, troubleshooting steps, and intermediate progress belong to bridge logs/panel, not the final chat reply.',
+    '- Prefer a short natural Chinese reply that states: what was done, the key result, and at most one next step if needed.',
+    '- Keep only the essential result unless the user explicitly asks for a detailed walkthrough.',
+    '- If the task is unfinished or blocked, state the exact blocker briefly instead of narrating your whole investigation.',
+    '- Tone should be natural and light, similar to: 这个我做好啦…… / 这个已经处理完了……, but avoid repetitive filler.',
+    '- If future style or memory hints are provided, follow them as long as they do not conflict with the rules above.',
+  ];
+  const styleHint = getReplyStyleHint();
+  if (styleHint) {
+    lines.push(`- Additional reply style hint: ${styleHint}`);
+  }
+  return lines.join('\n');
+}
+
 function summarizeToolBlocks(rawContent: string): string {
   try {
     const blocks = JSON.parse(rawContent) as Array<Record<string, unknown>>;
@@ -347,6 +370,7 @@ function buildTurnPrompt(params: StreamChatParams): string {
   if (systemPrompt) {
     sections.push(`System instructions:\n${systemPrompt}`);
   }
+  sections.push(`Bridge reply style:\n${buildBridgeReplyGuardrails()}`);
   if (historyEntries.length > 0) {
     sections.push(`Conversation context:\n${historyEntries.join('\n')}`);
   }

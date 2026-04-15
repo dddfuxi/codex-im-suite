@@ -80,6 +80,67 @@ export interface BridgeMessage {
   content: string;
 }
 
+export interface MemoryRetrievalQuery {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  workingDirectory?: string;
+  query: string;
+  recentHistoryLimit?: number;
+}
+
+export interface RetrievedMemoryHit {
+  sessionId: string;
+  channelType?: string;
+  chatId?: string;
+  workingDirectory?: string;
+  role: 'user' | 'assistant';
+  source: 'summary' | 'message';
+  score: number;
+  content: string;
+}
+
+export interface RetrievedMemoryContext {
+  summary: string;
+  hits: RetrievedMemoryHit[];
+}
+
+export interface FeishuHistoryIndexedMessage {
+  messageId: string;
+  chatId: string;
+  createTime: string;
+  msgType: string;
+  senderId?: string;
+  senderType?: string;
+  senderName?: string;
+  text: string;
+}
+
+export interface FeishuHistorySyncStatus {
+  chatId: string;
+  displayName?: string;
+  chatType?: string;
+  messageCount: number;
+  latestMessageTime?: string;
+  oldestMessageTime?: string;
+  lastSyncAt?: string;
+}
+
+export interface FeishuHistoryQuery {
+  chatId: string;
+  query: string;
+  limit: number;
+  startTimeMs?: number;
+  endTimeMs?: number;
+  targetSpeakerNames?: string[];
+}
+
+export interface RetrievedFeishuHistoryContext {
+  summary: string;
+  items: FeishuHistoryIndexedMessage[];
+  syncStatus?: FeishuHistorySyncStatus;
+}
+
 // ── Host Interface: Settings ─────────────────────────────────
 
 export interface SettingsProvider {
@@ -129,11 +190,15 @@ export interface OutboundRefInput {
 export interface UpsertChannelBindingInput {
   channelType: string;
   chatId: string;
+  displayName?: string;
+  chatType?: string;
   codepilotSessionId: string;
   sdkSessionId?: string;
   workingDirectory: string;
   model: string;
   mode?: string;
+  bridgeFingerprint?: string;
+  toolingFingerprint?: string;
 }
 
 /**
@@ -164,6 +229,23 @@ export interface BridgeStore {
   // ── Messages ──
   addMessage(sessionId: string, role: string, content: string, usage?: string | null): void;
   getMessages(sessionId: string, opts?: { limit?: number }): { messages: BridgeMessage[] };
+  retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null;
+  retrieveRelevantFeishuHistory?(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null;
+  upsertFeishuHistoryMessages?(data: {
+    chatId: string;
+    displayName?: string;
+    chatType?: string;
+    messages: FeishuHistoryIndexedMessage[];
+    syncedAt?: string;
+  }): FeishuHistorySyncStatus | null;
+  getFeishuHistorySyncStatus?(chatId?: string): FeishuHistorySyncStatus[];
+  upsertFeishuChatIndex?(data: {
+    chatId: string;
+    chatType?: string;
+    displayName?: string;
+    lastMessageAt?: string;
+    lastSenderId?: string;
+  }): void;
 
   // ── Session locking ──
   acquireSessionLock(sessionId: string, lockId: string, owner: string, ttlSecs: number): boolean;
@@ -206,9 +288,11 @@ export interface StreamChatParams {
   prompt: string;
   sessionId: string;
   sdkSessionId?: string;
+  forceFreshThread?: boolean;
   model?: string;
   systemPrompt?: string;
   workingDirectory?: string;
+  additionalDirectories?: string[];
   abortController?: AbortController;
   permissionMode?: string;
   provider?: BridgeApiProvider;

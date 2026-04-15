@@ -46,6 +46,14 @@ export abstract class BaseChannelAdapter {
   abstract send(message: OutboundMessage): Promise<SendResult>;
 
   /**
+   * Send a local image file to the channel when the adapter supports outbound media.
+   * Default implementation is unsupported.
+   */
+  async sendLocalImage(_chatId: string, _filePath: string, _replyToMessageId?: string): Promise<SendResult> {
+    return { ok: false, error: 'Local image sending is not supported by this adapter' };
+  }
+
+  /**
    * Answer a callback query (e.g. Telegram inline button press).
    * Not all platforms support this — default implementation is a no-op.
    */
