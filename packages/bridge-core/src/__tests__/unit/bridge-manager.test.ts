@@ -133,6 +133,21 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager policy helpers', () => {
+  it('detects generated document list requests without needing full history', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.equal(_testOnly.isFeishuDocumentListRequest('之前生成过哪些飞书文档'), true);
+    assert.equal(_testOnly.isFeishuDocumentListRequest('帮我截一张图'), false);
+  });
+
+  it('classifies dangerous Feishu requests that require owner identity', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.equal(_testOnly.isDangerousUserRequest('删掉刚才创建的飞书文档'), true);
+    assert.equal(_testOnly.isDangerousUserRequest('git pull 拉到最新'), true);
+    assert.equal(_testOnly.isDangerousUserRequest('截一张场景图'), false);
+  });
+});
+
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
   return {
     getSetting: (key: string) => settings[key] ?? null,
@@ -145,6 +160,7 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     updateSessionProviderId: () => {},
     addMessage: () => {},
     getMessages: () => ({ messages: [] }),
+    retrieveRelevantMemory: () => null,
     acquireSessionLock: () => true,
     renewSessionLock: () => {},
     releaseSessionLock: () => {},

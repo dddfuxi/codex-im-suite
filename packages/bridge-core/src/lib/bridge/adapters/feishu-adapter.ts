@@ -16,8 +16,7 @@
  */
 
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
 import * as lark from '@larksuiteoapi/node-sdk';
 import type {
   ChannelType,
@@ -65,7 +64,6 @@ interface FeishuCardState {
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
-const OUTBOUND_IMAGE_MARKER_RE = /\[\[CTI_IMAGE:(.+?)\]\]/g;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -103,6 +101,49 @@ const MIME_BY_TYPE: Record<string, string> = {
   media: 'application/octet-stream',
 };
 
+interface FeishuHistoryIntent {
+  originalPrompt: string;
+  taskPrompt: string;
+  limit: number;
+  startTimeMs?: number;
+  endTimeMs?: number;
+  scopeText: string;
+  responseMode: 'chat' | 'doc';
+  docTitle?: string;
+  purpose?: 'summary' | 'reference';
+  targetSpeakerNames?: string[];
+}
+
+interface FeishuMessageListItem {
+  message_id: string;
+  chat_id: string;
+  create_time: string;
+  deleted?: boolean;
+  msg_type: string;
+  body?: { content?: string };
+  sender?: {
+    id?: string;
+    id_type?: string;
+    sender_type?: string;
+  };
+}
+
+interface FeishuChatMemberItem {
+  member_id?: string;
+  member_id_type?: string;
+  name?: string;
+}
+
+export interface FeishuDocRequest {
+  title: string;
+  scopeText: string;
+}
+
+interface FeishuDocumentOptions {
+  title?: string;
+  ownerUserId?: string;
+}
+
 export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
 
@@ -123,6 +164,78 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
+
+  private isStreamingCardEnabled(): boolean {
+    const raw =
+      getBridgeContext().store.getSetting('bridge_feishu_streaming_card_enabled')
+      || process.env.CTI_FEISHU_STREAMING_CARD_ENABLED
+      || 'false';
+    return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+  }
+
+  private async resolveChatDisplayName(chatId: string, fallbackChatType?: string): Promise<string> {
+    const cached = this.chatMetaCache.get(chatId);
+    if (cached && Date.now() - cached.cachedAt < 10 * 60 * 1000) {
+      return cached.displayName;
+    }
+
+    try {
+      const { appId, appSecret, baseUrl } = this.getAuthContext();
+      const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+      const response = await fetch(`${baseUrl}/open-apis/im/v1/chats/${chatId}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = await response.json() as {
+        code?: number;
+        msg?: string;
+        data?: { chat?: { name?: string; chat_type?: string } };
+      };
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(payload.msg || response.statusText);
+      }
+
+      const displayName = payload.data?.chat?.name?.trim() || chatId;
+      this.chatMetaCache.set(chatId, {
+        displayName,
+        chatType: payload.data?.chat?.chat_type || fallbackChatType,
+        cachedAt: Date.now(),
+      });
+      return displayName;
+    } catch (err) {
+      console.warn('[feishu-adapter] resolveChatDisplayName failed:', err instanceof Error ? err.message : err);
+      return cached?.displayName || chatId;
+    }
+  }
+
+  private persistChatIndex(
+    chatId: string,
+    chatType: string,
+    displayName: string,
+    sender: FeishuMessageEventData['sender'],
+    createTime: string,
+  ): void {
+    const store = getBridgeContext().store as {
+      upsertFeishuChatIndex?: (data: {
+        chatId: string;
+        chatType?: string;
+        displayName?: string;
+        lastMessageAt?: string;
+        lastSenderId?: string;
+      }) => void;
+    };
+    store.upsertFeishuChatIndex?.({
+      chatId,
+      chatType,
+      displayName,
+      lastMessageAt: createTime,
+      lastSenderId: sender.sender_id?.open_id || sender.sender_id?.user_id || sender.sender_id?.union_id || '',
+    });
+  }
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -270,7 +383,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const messageId = this.lastIncomingMessageId.get(chatId);
 
     // Create streaming card (fire-and-forget — fallback to traditional if fails)
-    if (messageId) {
+    if (messageId && this.isStreamingCardEnabled()) {
       this.createStreamingCard(chatId, messageId).catch(() => {});
     }
 
@@ -607,6 +720,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Creates streaming card on first call, then updates content.
    */
   onStreamText(chatId: string, fullText: string): void {
+    if (!this.isStreamingCardEnabled()) return;
     if (!this.activeCards.has(chatId)) {
       // Card should have been created by onMessageStart, but create lazily if not
       const messageId = this.lastIncomingMessageId.get(chatId);
@@ -619,10 +733,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
+    if (!this.isStreamingCardEnabled()) return;
     this.updateToolProgress(chatId, tools);
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
+    if (!this.isStreamingCardEnabled()) return false;
     return this.finalizeCard(chatId, status, responseText);
   }
 
@@ -634,8 +750,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     let text = message.text;
-    const imagePaths = this.extractOutboundImagePaths(text);
-    text = this.stripOutboundImageMarkers(text);
 
     // Convert HTML to markdown for Feishu rendering (e.g. command responses)
     if (message.parseMode === 'HTML') {
@@ -647,31 +761,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text = preprocessFeishuMarkdown(text);
     }
 
-    let primaryResult: SendResult = { ok: true };
-
     // If there are inline buttons (permission prompts), send card with action buttons
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      primaryResult = await this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
-      if (!primaryResult.ok) return primaryResult;
-    } else if (text.trim()) {
-      // Rendering strategy (aligned with Openclaw):
-      // - Code blocks / tables → interactive card (schema 2.0 markdown)
-      // - Other text → post (md tag)
-      if (hasComplexMarkdown(text)) {
-        primaryResult = await this.sendAsCard(message.address.chatId, text);
-      } else {
-        primaryResult = await this.sendAsPost(message.address.chatId, text);
-      }
-      if (!primaryResult.ok) return primaryResult;
+      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
-    for (const imagePath of imagePaths) {
-      const imageResult = await this.sendLocalImage(message.address.chatId, imagePath);
-      if (!imageResult.ok) return imageResult;
-      primaryResult = imageResult.messageId ? imageResult : primaryResult;
+    // Rendering strategy (aligned with Openclaw):
+    // - Code blocks / tables → interactive card (schema 2.0 markdown)
+    // - Other text → post (md tag)
+    if (hasComplexMarkdown(text)) {
+      return this.sendAsCard(message.address.chatId, text);
     }
-
-    return primaryResult;
+    return this.sendAsPost(message.address.chatId, text);
   }
 
   /**
@@ -745,90 +846,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
     }
-  }
-
-  private extractOutboundImagePaths(text: string): string[] {
-    const paths: string[] = [];
-    for (const match of text.matchAll(OUTBOUND_IMAGE_MARKER_RE)) {
-      const raw = match[1]?.trim();
-      if (!raw) continue;
-      paths.push(raw);
-    }
-    return paths;
-  }
-
-  private stripOutboundImageMarkers(text: string): string {
-    return text
-      .replace(OUTBOUND_IMAGE_MARKER_RE, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-  }
-
-  private async sendLocalImage(chatId: string, localPath: string): Promise<SendResult> {
-    try {
-      const resolvedPath = path.resolve(localPath);
-      if (!fs.existsSync(resolvedPath)) {
-        return { ok: false, error: `Image file not found: ${resolvedPath}` };
-      }
-
-      const imageKey = await this.uploadImage(resolvedPath);
-      if (!imageKey) {
-        return { ok: false, error: `Failed to upload image: ${resolvedPath}` };
-      }
-
-      const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'image',
-          content: JSON.stringify({ image_key: imageKey }),
-        },
-      });
-
-      if (res?.data?.message_id) {
-        return { ok: true, messageId: res.data.message_id };
-      }
-      return { ok: false, error: `Feishu image send failed for ${resolvedPath}` };
-    } catch (err) {
-      return {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }
-
-  private async uploadImage(localPath: string): Promise<string | null> {
-    const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
-    const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret') || '';
-    const domainSetting = getBridgeContext().store.getSetting('bridge_feishu_domain') || 'feishu';
-    const baseUrl = domainSetting === 'lark'
-      ? 'https://open.larksuite.com'
-      : 'https://open.feishu.cn';
-
-    if (!appId || !appSecret) return null;
-
-    const tokenRes = await fetch(`${baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const tokenData = await tokenRes.json() as { tenant_access_token?: string };
-    if (!tokenData.tenant_access_token) return null;
-
-    const form = new FormData();
-    form.set('image_type', 'message');
-    const buffer = fs.readFileSync(localPath);
-    form.set('image', new Blob([buffer]), path.basename(localPath));
-
-    const uploadRes = await fetch(`${baseUrl}/open-apis/im/v1/images`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
-      body: form,
-      signal: AbortSignal.timeout(20_000),
-    });
-    const uploadData = await uploadRes.json() as { data?: { image_key?: string } };
-    return uploadData.data?.image_key || null;
   }
 
   // ── Permission card (with real action buttons) ─────────────
@@ -1153,14 +1170,65 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Strip @mention markers from text
     text = this.stripMentionMarkers(text);
 
-    if (!text.trim() && attachments.length === 0) return;
-
     const timestamp = parseInt(msg.create_time, 10) || Date.now();
+    const displayName = await this.resolveChatDisplayName(chatId, msg.chat_type);
+    this.persistChatIndex(chatId, msg.chat_type, displayName, sender, msg.create_time);
+    try {
+      await this.syncIndexedChatHistory(chatId, msg.chat_type, displayName, false);
+    } catch (err) {
+      console.warn('[feishu-adapter] incremental history sync failed:', err instanceof Error ? err.message : err);
+    }
     const address = {
       channelType: 'feishu' as const,
       chatId,
       userId,
+      displayName,
+      chatType: msg.chat_type,
     };
+    let rawMetadata: Record<string, unknown> | undefined = {
+      feishuSender: {
+        openId: sender.sender_id?.open_id,
+        userId: sender.sender_id?.user_id,
+        unionId: sender.sender_id?.union_id,
+        chatType: msg.chat_type,
+      },
+    };
+
+    const trimmedUserText = text.trim();
+    if (isGroup && trimmedUserText) {
+      const historyIntent = this.parseHistoryIntentV2(trimmedUserText);
+      if (historyIntent) {
+        try {
+          text = await this.buildHistoryAugmentedPromptV2(chatId, msg.message_id, historyIntent);
+          if (historyIntent.responseMode === 'doc' && historyIntent.docTitle) {
+            rawMetadata = {
+              ...(rawMetadata || {}),
+              feishuDocRequest: {
+                title: historyIntent.docTitle,
+                scopeText: historyIntent.scopeText,
+              } satisfies FeishuDocRequest,
+            };
+          }
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          console.warn('[feishu-adapter] Failed to augment prompt with chat history:', errorMessage);
+
+          const inbound: InboundMessage = {
+            messageId: msg.message_id,
+            address,
+            text: '',
+            timestamp,
+            raw: {
+              userVisibleError: this.toHistoryReadErrorMessage(errorMessage),
+            },
+          };
+          this.enqueue(inbound);
+          return;
+        }
+      }
+    }
+
+    if (!text.trim() && attachments.length === 0) return;
 
     // [P1] Check for /perm text command (permission approval fallback)
     const trimmedText = text.trim();
@@ -1189,6 +1257,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       address,
       text: text.trim(),
       timestamp,
+      raw: rawMetadata,
       attachments: attachments.length > 0 ? attachments : undefined,
     };
 
@@ -1271,6 +1340,1057 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return { extractedText: textParts.join('').trim(), imageKeys };
+  }
+
+  private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
+    const normalized = text.replace(/\s+/g, '');
+    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6)/.test(normalized);
+    const mentionsHistory = /(\u7fa4\u804a|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized);
+    const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized);
+    const wantsDoc = /(\u98de\u4e66\u6587\u6863|\u6587\u6863\u94fe\u63a5|\u751f\u6210.*\u6587\u6863|\u6574\u7406\u6210.*\u6587\u6863|\u8f93\u51fa\u5230.*\u6587\u6863|\u53d1\u94fe\u63a5|\u56de\u94fe\u63a5)/.test(normalized);
+    const actionVerbMatched = /(\u6807\u6ce8|\u91cd\u6807|\u6539\u6807|\u5224\u65ad|\u4fee\u6539|\u7ea0\u6b63|\u6838\u5bf9|\u6821\u5bf9|\u547d\u540d|\u5bf9\u7167)/.test(normalized);
+    const targetSpeakerNames = this.extractTargetSpeakerNamesV2(text);
+    const wantsReferenceAction = (
+      /(\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408).*(\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd)/.test(normalized)
+      || (/(\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408).*(\u8bf4\u7684|\u63d0\u5230\u7684|\u804a\u8fc7\u7684)/.test(normalized) && targetSpeakerNames.length > 0)
+    ) && actionVerbMatched;
+
+    if ((!wantsSummary && !wantsDoc && !wantsReferenceAction) || (!mentionsHistory && !mentionsTime && !wantsDoc && !wantsReferenceAction)) {
+      return null;
+    }
+
+    const countMatch = text.match(/(\d{1,3})\s*(\u6761|\u5219|\u6bb5|\u4e2a)?/);
+    const requestedCount = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
+    const now = new Date();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfTomorrow = new Date(startOfToday);
+    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+    const startOfYesterday = new Date(startOfToday);
+    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+    const startOfDayBeforeYesterday = new Date(startOfToday);
+    startOfDayBeforeYesterday.setDate(startOfDayBeforeYesterday.getDate() - 2);
+
+    let startTimeMs: number | undefined;
+    let endTimeMs: number | undefined;
+    let scopeText = '\u672c\u7fa4\u6700\u8fd1\u6d88\u606f';
+
+    if (/(\u6628\u5929|\u6628\u65e5)/.test(normalized)) {
+      startTimeMs = startOfYesterday.getTime();
+      endTimeMs = startOfToday.getTime();
+      scopeText = '\u672c\u7fa4\u6628\u5929\u7684\u804a\u5929\u8bb0\u5f55';
+    } else if (/\u524d\u5929/.test(normalized)) {
+      startTimeMs = startOfDayBeforeYesterday.getTime();
+      endTimeMs = startOfYesterday.getTime();
+      scopeText = '\u672c\u7fa4\u524d\u5929\u7684\u804a\u5929\u8bb0\u5f55';
+    } else if (/(\u4eca\u5929|\u4eca\u65e5)/.test(normalized)) {
+      startTimeMs = startOfToday.getTime();
+      endTimeMs = startOfTomorrow.getTime();
+      scopeText = '\u672c\u7fa4\u4eca\u5929\u7684\u804a\u5929\u8bb0\u5f55';
+    }
+
+    if (startTimeMs !== undefined && /(\u4e0a\u5348|\u65e9\u4e0a|\u6e05\u6668)/.test(normalized)) {
+      const end = new Date(startTimeMs);
+      end.setHours(12, 0, 0, 0);
+      endTimeMs = end.getTime();
+      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u4e0a\u5348\u804a\u5929\u8bb0\u5f55');
+    } else if (startTimeMs !== undefined && /\u4e0b\u5348/.test(normalized)) {
+      const start = new Date(startTimeMs);
+      start.setHours(12, 0, 0, 0);
+      startTimeMs = start.getTime();
+      const end = new Date(start);
+      end.setHours(18, 0, 0, 0);
+      endTimeMs = end.getTime();
+      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u4e0b\u5348\u804a\u5929\u8bb0\u5f55');
+    } else if (startTimeMs !== undefined && /(\u665a\u4e0a|\u665a\u95f4)/.test(normalized)) {
+      const start = new Date(startTimeMs);
+      start.setHours(18, 0, 0, 0);
+      startTimeMs = start.getTime();
+      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u665a\u95f4\u804a\u5929\u8bb0\u5f55');
+    }
+
+    const wantsFull = /(\u5b8c\u6574|\u5168\u90e8|\u6240\u6709)/.test(normalized);
+    const defaultLimit = wantsReferenceAction ? 50 : (startTimeMs !== undefined ? 100 : 30);
+    const limit = Math.max(5, Math.min(requestedCount ?? (wantsFull ? 100 : defaultLimit), 100));
+    const responseMode: 'chat' | 'doc' = wantsDoc ? 'doc' : 'chat';
+    const docTitle = undefined;
+
+    return {
+      originalPrompt: text,
+      taskPrompt: text,
+      limit,
+      startTimeMs,
+      endTimeMs,
+      scopeText,
+      responseMode,
+      docTitle,
+      purpose: wantsReferenceAction ? 'reference' : 'summary',
+      targetSpeakerNames,
+    };
+  }
+
+  private extractTargetSpeakerNamesV2(text: string): string[] {
+    const names = new Set<string>();
+    const patterns = [
+      /(?:\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408)([^\uFF0C\u3002\uFF1B\uFF1A\s]{1,12}?)(?:\u7684)?(?:\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd)/g,
+      /(?:\u53c2\u8003|\u6309)([^\uFF0C\u3002\uFF1B\uFF1A\s]{1,12}?)(?:\u8bf4\u7684|\u63d0\u5230\u7684|\u804a\u8fc7\u7684)/g,
+      /@([^\s\uFF0C\u3002\uFF1B\uFF1A]{1,24})/g,
+    ];
+
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        const raw = (match[1] || '').trim();
+        const cleaned = raw
+          .replace(/^(\u7fa4\u91cc|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u7fa4\u804a|\u804a\u5929)/, '')
+          .replace(/(\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd|\u8bf4\u7684|\u63d0\u5230\u7684)$/g, '')
+          .trim();
+        if (cleaned.length >= 2 && cleaned.length <= 12) {
+          names.add(cleaned);
+        }
+      }
+    }
+
+    return [...names];
+  }
+
+  private getExtendedStore(): {
+    upsertFeishuHistoryMessages?: (data: {
+      chatId: string;
+      displayName?: string;
+      chatType?: string;
+      messages: Array<{
+        messageId: string;
+        chatId: string;
+        createTime: string;
+        msgType: string;
+        senderId?: string;
+        senderType?: string;
+        senderName?: string;
+        text: string;
+      }>;
+      syncedAt?: string;
+    }) => unknown;
+    getFeishuHistorySyncStatus?: (chatId?: string) => Array<{ latestMessageTime?: string }>;
+    retrieveRelevantFeishuHistory?: (query: {
+      chatId: string;
+      query: string;
+      limit: number;
+      startTimeMs?: number;
+      endTimeMs?: number;
+      targetSpeakerNames?: string[];
+    }) => { summary: string; items: Array<{ messageId: string }>; syncStatus?: { lastSyncAt?: string; messageCount?: number } } | null;
+  } {
+    return getBridgeContext().store as unknown as ReturnType<FeishuAdapter['getExtendedStore']>;
+  }
+
+  private async syncIndexedChatHistory(chatId: string, chatType: string, displayName: string, full = false): Promise<void> {
+    const store = this.getExtendedStore();
+    if (!store.upsertFeishuHistoryMessages) return;
+
+    const latestKnownTime = full
+      ? 0
+      : Number.parseInt(store.getFeishuHistorySyncStatus?.(chatId)?.[0]?.latestMessageTime || '0', 10) || 0;
+    const memberNames = await this.fetchChatMemberNames(chatId);
+    const collected: FeishuMessageListItem[] = [];
+    let pageToken = '';
+
+    while (true) {
+      const { items, nextPageToken, hasMore } = await this.fetchMessagePage(chatId, pageToken, 50);
+      if (items.length === 0) break;
+      collected.push(...items);
+
+      if (!full) {
+        const pageHasNewer = items.some((item) => (Number.parseInt(item.create_time, 10) || 0) > latestKnownTime);
+        if (!pageHasNewer) break;
+      }
+
+      if (!hasMore || !nextPageToken) break;
+      pageToken = nextPageToken;
+    }
+
+    const prepared = collected
+      .filter((item) => !item.deleted)
+      .filter((item) => item.msg_type !== 'system')
+      .map((item) => {
+        const senderId = item.sender?.id?.trim() || '';
+        const senderName = senderId ? memberNames.get(senderId)?.trim() || '' : '';
+        return {
+          messageId: item.message_id,
+          chatId,
+          createTime: item.create_time,
+          msgType: item.msg_type,
+          senderId,
+          senderType: item.sender?.sender_type,
+          senderName,
+          text: this.extractHistoryText(item),
+        };
+      })
+      .filter((item) => item.text);
+
+    if (prepared.length === 0 && !full) return;
+    store.upsertFeishuHistoryMessages({
+      chatId,
+      displayName,
+      chatType,
+      messages: prepared,
+      syncedAt: new Date().toISOString(),
+    });
+  }
+
+  private async buildHistoryAugmentedPromptV2(
+    chatId: string,
+    currentMessageId: string,
+    intent: FeishuHistoryIntent,
+  ): Promise<string> {
+    const displayName = await this.resolveChatDisplayName(chatId);
+    await this.syncIndexedChatHistory(chatId, 'group', displayName, false);
+    const retrieved = this.getExtendedStore().retrieveRelevantFeishuHistory?.({
+      chatId,
+      query: intent.taskPrompt,
+      limit: intent.limit,
+      startTimeMs: intent.startTimeMs,
+      endTimeMs: intent.endTimeMs,
+      targetSpeakerNames: intent.targetSpeakerNames,
+    });
+
+    const formattedHistory = retrieved?.summary || '';
+
+    if (!formattedHistory) {
+      return [
+        `\u7528\u6237\u5f53\u524d\u8bf7\u6c42\uff1a${intent.taskPrompt}`,
+        '',
+        (intent.targetSpeakerNames ?? []).length > 0
+          ? `\u8bf4\u660e\uff1a\u672c\u5730\u5386\u53f2\u7d22\u5f15\u91cc\u6ca1\u6709\u7b5b\u5230\u4e0e ${(intent.targetSpeakerNames ?? []).join('\u3001')} \u76f8\u5173\u7684\u6709\u6548\u6d88\u606f\u3002\u8bf7\u76f4\u63a5\u8bf4\u660e\u8fd9\u4e00\u70b9\uff0c\u5e76\u7ed9\u51fa\u6700\u77ed\u4e0b\u4e00\u6b65\u5efa\u8bae\u3002`
+          : '\u8bf4\u660e\uff1a\u6211\u5df2\u5c1d\u8bd5\u8bfb\u53d6\u7fa4\u804a\u5386\u53f2\uff0c\u4f46\u5f53\u524d\u6ca1\u6709\u62ff\u5230\u53ef\u7528\u4e8e\u56de\u7b54\u7684\u6709\u6548\u6d88\u606f\u3002\u8bf7\u76f4\u63a5\u8bf4\u660e\u8fd9\u6b21\u6ca1\u8bfb\u5230\u5185\u5bb9\uff0c\u5e76\u7ed9\u51fa\u6700\u77ed\u4e0b\u4e00\u6b65\u5efa\u8bae\u3002',
+      ].join('\n');
+    }
+
+    const selectedCount = retrieved?.items.length ?? 0;
+    const targetSpeakerNames = intent.targetSpeakerNames ?? [];
+    const speakerScope = targetSpeakerNames.length > 0
+      ? `\u4e0e ${targetSpeakerNames.join('\u3001')} \u76f8\u5173\u7684`
+      : '';
+    const syncInfo = retrieved?.syncStatus?.messageCount ? `\uFF08\u672C\u5730\u7D22\u5F15\u5DF2\u540C\u6B65 ${retrieved.syncStatus.messageCount} \u6761\uFF09` : '';
+    const scopeText = `${intent.scopeText}\u4E2D\u7D22\u5F15\u547D\u4E2D\u7684${speakerScope}${selectedCount}\u6761\u76F8\u5173\u6D88\u606F${syncInfo}`;
+
+    if (intent.responseMode === 'doc') {
+      return [
+        `\u8bf7\u57fa\u4e8e\u4e0b\u9762\u63d0\u4f9b\u7684 ${scopeText}\uff0c\u751f\u6210\u4e00\u4efd\u9002\u5408\u76f4\u63a5\u5199\u5165\u98de\u4e66\u6587\u6863\u7684 Markdown \u6b63\u6587\u3002`,
+        '\u8981\u6c42\uff1a',
+        '1. \u7b2c\u4e00\u884c\u5fc5\u987b\u662f\u4e00\u7ea7\u6807\u9898\u3002',
+        '2. \u6b63\u6587\u9ed8\u8ba4\u5305\u542b\u201c\u7ed3\u8bba\u6458\u8981\u201d\u201c\u91cd\u70b9\u4fe1\u606f\u201d\u201c\u5f85\u529e\u4e8b\u9879\u201d\u4e09\u4e2a\u90e8\u5206\uff1b\u5982\u679c\u67d0\u90e8\u5206\u786e\u5b9e\u4e3a\u7a7a\uff0c\u4e5f\u8981\u5982\u5b9e\u5199\u660e\u3002',
+        '3. \u53ea\u8f93\u51fa\u6587\u6863\u6b63\u6587\u672c\u8eab\uff0c\u4e0d\u8981\u5199\u201c\u4e0b\u9762\u662f\u201d\u201c\u5df2\u4e3a\u4f60\u751f\u6210\u201d\u201c\u8bf7\u67e5\u6536\u201d\u7b49\u5ba2\u5957\u53e5\u3002',
+        '4. \u4e0d\u8981\u8f93\u51fa\u4ee3\u7801\u5757\uff0c\u4e0d\u8981\u7f16\u9020\u7fa4\u91cc\u6ca1\u6709\u51fa\u73b0\u7684\u4fe1\u606f\u3002',
+        '',
+        '=== \u7fa4\u804a\u5386\u53f2\u5f00\u59cb ===',
+        formattedHistory,
+        '=== \u7fa4\u804a\u5386\u53f2\u7ed3\u675f ===',
+        '',
+        `\u7528\u6237\u5f53\u524d\u8bf7\u6c42\uff1a${intent.taskPrompt}`,
+      ].join('\n');
+    }
+
+    if (intent.purpose === 'reference' && targetSpeakerNames.length > 0) {
+      return [
+        `\u8bf7\u4f18\u5148\u4f9d\u636e\u4e0b\u9762\u63d0\u4f9b\u7684 ${scopeText} \u6765\u5b8c\u6210\u7528\u6237\u8bf7\u6c42\u3002`,
+        '\u8981\u6c42\uff1a\u76f4\u63a5\u7ed9\u51fa\u7ed3\u8bba\u6216\u4fee\u6539\u7ed3\u679c\uff0c\u4e0d\u8981\u5148\u8bf4\u201c\u6211\u53bb\u627e\u8bb0\u5f55\u201d\u6216\u201c\u6211\u6ca1\u770b\u5230\u804a\u5929\u8bb0\u5f55\u201d\u3002',
+        `\u5982\u679c\u8fd9\u4e9b\u8bb0\u5f55\u4e0d\u8db3\u4ee5\u652f\u6491\u6700\u7ec8\u5224\u65ad\uff0c\u518d\u7528\u4e00\u53e5\u8bdd\u8bf4\u660e\u201c\u5f53\u524d\u53ea\u8bfb\u5230\u4e86 ${targetSpeakerNames.join('\u3001')} \u7684\u8fd9\u4e9b\u76f8\u5173\u8bb0\u5f55\uff0c\u4ecd\u7f3a\u5c11\u54ea\u7c7b\u4fe1\u606f\u201d\u3002`,
+        '\u4e0d\u8981\u628a\u672c\u5730\u6587\u4ef6\u641c\u7d22\u7ed3\u679c\u8bef\u5f53\u6210\u7fa4\u804a\u8bb0\u5f55\uff0c\u4e0d\u8981\u7f16\u9020\u804a\u5929\u5185\u5bb9\u3002',
+        '\u5982\u679c\u7fa4\u804a\u5386\u53f2\u4e2d\u5df2\u7ecf\u51fa\u73b0\u4e86\u660e\u786e\u7684\u82f1\u6587\u6807\u8bc6\u3001\u8d44\u6e90\u540d\u3001\u914d\u7f6e\u540d\u3001ID\u3001token \u6216\u4ee3\u7801\u98ce\u683c\u547d\u540d\uff0c\u5fc5\u987b\u4f18\u5148\u539f\u6837\u4fdd\u7559\uff0c\u4e0d\u8981\u81ea\u5df1\u6539\u5199\u6210\u53e6\u4e00\u79cd\u683c\u5f0f\u3002',
+        '',
+        '=== \u76f8\u5173\u7fa4\u804a\u8bb0\u5f55\u5f00\u59cb ===',
+        formattedHistory,
+        '=== \u76f8\u5173\u7fa4\u804a\u8bb0\u5f55\u7ed3\u675f ===',
+        '',
+        `\u7528\u6237\u5f53\u524d\u8bf7\u6c42\uff1a${intent.taskPrompt}`,
+      ].join('\n');
+    }
+
+    return [
+      `\u8bf7\u57fa\u4e8e\u4e0b\u9762\u63d0\u4f9b\u7684 ${scopeText} \u56de\u7b54\u7528\u6237\u8bf7\u6c42\u3002`,
+      '\u8981\u6c42\uff1a\u76f4\u63a5\u7ed9\u51fa\u7ed3\u8bba\u548c\u6458\u8981\uff0c\u5c11\u8bb2\u8fc7\u7a0b\uff0c\u4e0d\u8981\u8ba9\u7528\u6237\u91cd\u590d\u8d34\u8bb0\u5f55\u3002',
+      '\u5982\u679c\u4fe1\u606f\u4e0d\u5b8c\u6574\uff0c\u53ef\u4ee5\u5728\u7ed3\u5c3e\u7528\u4e00\u53e5\u8bdd\u7b80\u77ed\u8bf4\u660e\u8fb9\u754c\uff0c\u4f46\u4e0d\u8981\u628a\u6574\u6bb5\u56de\u7b54\u5199\u6210\u62d2\u7b54\u6216\u514d\u8d23\u58f0\u660e\u3002',
+      '\u4e0d\u8981\u7f16\u9020\u672a\u51fa\u73b0\u7684\u5185\u5bb9\uff0c\u4e5f\u4e0d\u8981\u8bf4\u201c\u6211\u73b0\u5728\u770b\u4e0d\u5230\u672c\u7fa4\u8bb0\u5f55\u201d\u4e4b\u7c7b\u7684\u6cdb\u5316\u5e9f\u8bdd\uff1b\u4f60\u73b0\u5728\u770b\u5230\u7684\u5c31\u662f\u4e0b\u9762\u8fd9\u6bb5\u5386\u53f2\u3002',
+      '',
+      '=== \u7fa4\u804a\u5386\u53f2\u5f00\u59cb ===',
+      formattedHistory,
+      '=== \u7fa4\u804a\u5386\u53f2\u7ed3\u675f ===',
+      '',
+      `\u7528\u6237\u5f53\u524d\u8bf7\u6c42\uff1a${intent.taskPrompt}`,
+    ].join('\n');
+  }
+
+  private matchesHistorySpeakerV2(
+    item: FeishuMessageListItem,
+    memberNames: Map<string, string>,
+    targetSpeakerNames: string[],
+  ): boolean {
+    const senderId = item.sender?.id?.trim() || '';
+    const senderName = (senderId && memberNames.get(senderId)?.trim()) || '';
+    const speakerCandidates = [senderName, senderId].filter(Boolean);
+    return targetSpeakerNames.some((target) =>
+      speakerCandidates.some((candidate) => candidate === target || candidate.includes(target) || target.includes(candidate)),
+    );
+  }
+
+  private isNamingContextItemV2(item: FeishuMessageListItem): boolean {
+    const content = item.body?.content || '';
+    const namingHints = /(\u82f1\u6587\u540d|\u547d\u540d|\u8d77\u540d|\u683c\u5f0f|\u6807\u8bc6|\u914d\u7f6e\u540d|\u8d44\u6e90\u540d|token|id)/i.test(content);
+    const codeLikeTokens = this.extractCodeLikeTokensV2(content);
+    return namingHints || codeLikeTokens.length > 0;
+  }
+
+  private extractCodeLikeTokensV2(text: string): string[] {
+    const tokens = new Set<string>();
+    const patterns = [
+      /\b[A-Za-z]+(?:_[A-Za-z0-9]+){1,}\b/g,
+      /\b[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+){1,}\b/g,
+      /\b[a-z]+(?:[A-Z][A-Za-z0-9]+){1,}\b/g,
+      /`([^`\r\n]{2,80})`/g,
+    ];
+
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        const token = (match[1] || match[0] || '').trim();
+        if (token.length >= 3 && token.length <= 80) {
+          tokens.add(token);
+        }
+      }
+    }
+
+    return [...tokens];
+  }
+
+  private mergeHistoryItemsV2(
+    primary: FeishuMessageListItem[],
+    secondary: FeishuMessageListItem[],
+  ): FeishuMessageListItem[] {
+    const merged = new Map<string, FeishuMessageListItem>();
+    for (const item of [...primary, ...secondary]) {
+      merged.set(item.message_id, item);
+    }
+    return [...merged.values()].sort((a, b) => Number.parseInt(a.create_time, 10) - Number.parseInt(b.create_time, 10));
+  }
+
+  private parseHistoryIntent(text: string): FeishuHistoryIntent | null {
+    const normalized = text.replace(/\s+/g, '');
+    const wantsSummary = /(总结|汇总|整理|梳理|概括|归纳|回顾|提炼|提取)/.test(normalized);
+    const mentionsHistory = /(群聊|聊天|对话|消息|记录|讨论|内容)/.test(normalized);
+    const timeScoped = /(最近|近\d+条|近\d+则|今天|今日|昨天|昨日|前天|上午|下午|晚上|完整|全部)/.test(normalized);
+    const wantsDoc = /(飞书文档|文档链接|生成.*文档|整理成.*文档|输出到.*文档|发链接|回链接)/.test(normalized);
+
+    if ((!wantsSummary && !wantsDoc) || (!mentionsHistory && !timeScoped && !wantsDoc)) {
+      return null;
+    }
+
+    const countMatch = text.match(/(\d{1,3})\s*(条|则|段|个)/);
+    const requestedCount = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
+    const now = new Date();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfTomorrow = new Date(startOfToday);
+    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
+    const startOfYesterday = new Date(startOfToday);
+    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+    const startOfDayBeforeYesterday = new Date(startOfToday);
+    startOfDayBeforeYesterday.setDate(startOfDayBeforeYesterday.getDate() - 2);
+
+    let startTimeMs: number | undefined;
+    let endTimeMs: number | undefined;
+    let scopeText = '本群最近消息';
+
+    if (/(昨天|昨日)/.test(normalized)) {
+      startTimeMs = startOfYesterday.getTime();
+      endTimeMs = startOfToday.getTime();
+      scopeText = '本群昨天的聊天记录';
+    } else if (/前天/.test(normalized)) {
+      startTimeMs = startOfDayBeforeYesterday.getTime();
+      endTimeMs = startOfYesterday.getTime();
+      scopeText = '本群前天的聊天记录';
+    } else if (/(今天|今日)/.test(normalized)) {
+      startTimeMs = startOfToday.getTime();
+      endTimeMs = startOfTomorrow.getTime();
+      scopeText = '本群今天的聊天记录';
+    }
+
+    if (startTimeMs !== undefined && /(上午|早上|清晨)/.test(normalized)) {
+      const end = new Date(startTimeMs);
+      end.setHours(12, 0, 0, 0);
+      endTimeMs = end.getTime();
+      scopeText = scopeText.replace('聊天记录', '上午聊天记录');
+    } else if (startTimeMs !== undefined && /(下午)/.test(normalized)) {
+      const start = new Date(startTimeMs);
+      start.setHours(12, 0, 0, 0);
+      startTimeMs = start.getTime();
+      const end = new Date(start);
+      end.setHours(18, 0, 0, 0);
+      endTimeMs = end.getTime();
+      scopeText = scopeText.replace('聊天记录', '下午聊天记录');
+    } else if (startTimeMs !== undefined && /(晚上|晚间)/.test(normalized)) {
+      const start = new Date(startTimeMs);
+      start.setHours(18, 0, 0, 0);
+      startTimeMs = start.getTime();
+      scopeText = scopeText.replace('聊天记录', '晚上聊天记录');
+    }
+
+    const wantsFull = /(完整|全部|所有)/.test(normalized);
+    const defaultLimit = startTimeMs !== undefined ? 100 : 30;
+    const limit = Math.max(5, Math.min(requestedCount ?? (wantsFull ? 100 : defaultLimit), 100));
+    const responseMode: 'chat' | 'doc' = wantsDoc ? 'doc' : 'chat';
+    const docTitle = undefined;
+
+    return {
+      originalPrompt: text,
+      taskPrompt: text,
+      limit,
+      startTimeMs,
+      endTimeMs,
+      scopeText,
+      responseMode,
+      docTitle,
+    };
+  }
+
+  private async buildHistoryAugmentedPrompt(
+    chatId: string,
+    currentMessageId: string,
+    intent: FeishuHistoryIntent,
+  ): Promise<string> {
+    const [recentMessages, memberNames] = await Promise.all([
+      this.fetchRecentMessages(chatId, 100),
+      this.fetchChatMemberNames(chatId),
+    ]);
+
+    const historyItems = recentMessages
+      .filter((item) => !item.deleted)
+      .filter((item) => item.msg_type !== 'system')
+      .filter((item) => item.sender?.sender_type !== 'app')
+      .filter((item) => item.message_id !== currentMessageId)
+      .filter((item) => {
+        const ts = Number.parseInt(item.create_time, 10);
+        if (intent.startTimeMs !== undefined && ts < intent.startTimeMs) return false;
+        if (intent.endTimeMs !== undefined && ts >= intent.endTimeMs) return false;
+        return true;
+      })
+      .slice(0, intent.limit)
+      .reverse();
+
+    const formattedHistory = historyItems
+      .map((item) => this.formatHistoryItem(item, memberNames))
+      .filter(Boolean)
+      .join('\n');
+
+    if (!formattedHistory) {
+      return [
+        `用户当前请求：${intent.taskPrompt}`,
+        '',
+        '说明：我已尝试读取群聊历史，但当前没有拿到可用于总结的有效消息。请直接告诉用户这次没读到内容，并给出最短下一步建议。',
+      ].join('\n');
+    }
+
+    const scopeText = `${intent.scopeText}中最近筛出的 ${historyItems.length} 条可读消息`;
+
+    if (intent.responseMode === 'doc') {
+      return [
+        `请基于下面提供的 ${scopeText}，生成一份适合直接写入飞书文档的 Markdown 正文。`,
+        '要求：',
+        '1. 第一行必须是一级标题。',
+        '2. 正文默认包含“结论摘要”“关键事实”“执行结果”“问题与风险”“后续待办”五个部分；如果某部分确实为空，也要如实写明。',
+        '3. 这是飞书文档正文，不是聊天记录导出。不要按时间线逐条复述，不要保留“用户A：...”这种原始聊天流水，除非它是必要证据。',
+        '4. 如果历史里出现失败、空白截图、错误替代方案或未完成事项，必须写入“问题与风险”，不能包装成成功。',
+        '5. 只输出文档正文本身，不要写“下面是”“已为你生成”“请查收”等客套句。',
+        '6. 不要输出代码块，不要编造群里没有出现的信息。',
+        '',
+        '=== 群聊历史开始 ===',
+        formattedHistory,
+        '=== 群聊历史结束 ===',
+        '',
+        `用户当前请求：${intent.taskPrompt}`,
+      ].join('\n');
+    }
+
+    return [
+      `请基于下面提供的 ${scopeText} 回答用户请求。`,
+      '要求：直接给出结论和摘要，少讲过程，不要让用户重复贴记录。',
+      '如果信息不完整，可以在结尾用一句话简短说明边界，但不要把整段回答写成拒答或免责声明。',
+      '不要编造未出现的内容，也不要说“我现在看不到本群记录”之类的泛化废话；你现在看到的就是下面这段历史。',
+      '',
+      '=== 群聊历史开始 ===',
+      formattedHistory,
+      '=== 群聊历史结束 ===',
+      '',
+      `用户当前请求：${intent.taskPrompt}`,
+    ].join('\n');
+  }
+
+  private buildHistoryDocumentTitle(scopeText: string, now: Date): string {
+    const timeLabel = new Intl.DateTimeFormat('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(now).replace(/[/:]/g, '-');
+    const scopeLabel = scopeText.replace(/^本群/, '').replace(/的聊天记录$/, '').replace(/最近消息$/, '最近消息');
+    return `群聊总结-${scopeLabel}-${timeLabel}`;
+  }
+
+  private async fetchRecentMessages(chatId: string, limit: number): Promise<FeishuMessageListItem[]> {
+    const allItems: FeishuMessageListItem[] = [];
+    let pageToken = '';
+
+    while (allItems.length < limit) {
+      const { items, hasMore, nextPageToken } = await this.fetchMessagePage(
+        chatId,
+        pageToken,
+        Math.max(1, Math.min(limit - allItems.length, 50)),
+      );
+      allItems.push(...items);
+      if (!hasMore || !nextPageToken || items.length === 0) {
+        break;
+      }
+      pageToken = nextPageToken;
+    }
+
+    return allItems.slice(0, limit);
+  }
+
+  private async fetchMessagePage(
+    chatId: string,
+    pageToken: string,
+    pageSize: number,
+  ): Promise<{ items: FeishuMessageListItem[]; hasMore: boolean; nextPageToken: string }> {
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+    const url = new URL('/open-apis/im/v1/messages', baseUrl);
+    url.searchParams.set('container_id_type', 'chat');
+    url.searchParams.set('container_id', chatId);
+    url.searchParams.set('page_size', String(Math.max(1, Math.min(pageSize, 50))));
+    url.searchParams.set('sort_type', 'ByCreateTimeDesc');
+    if (pageToken) url.searchParams.set('page_token', pageToken);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${tenantAccessToken}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const payload = await response.json() as {
+      code?: number;
+      msg?: string;
+      data?: {
+        items?: FeishuMessageListItem[];
+        has_more?: boolean;
+        page_token?: string;
+      };
+    };
+
+    if (!response.ok || payload.code !== 0) {
+      throw new Error(`Feishu message.list failed [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
+    }
+
+    return {
+      items: payload.data?.items ?? [],
+      hasMore: !!payload.data?.has_more,
+      nextPageToken: payload.data?.page_token || '',
+    };
+  }
+
+  private async fetchChatMemberNames(chatId: string): Promise<Map<string, string>> {
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+    const names = new Map<string, string>();
+    let pageToken = '';
+
+    while (true) {
+      const url = new URL(`/open-apis/im/v1/chats/${chatId}/members`, baseUrl);
+      url.searchParams.set('member_id_type', 'open_id');
+      url.searchParams.set('page_size', '50');
+      if (pageToken) {
+        url.searchParams.set('page_token', pageToken);
+      }
+
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      const payload = await response.json() as {
+        code?: number;
+        msg?: string;
+        data?: {
+          items?: FeishuChatMemberItem[];
+          has_more?: boolean;
+          page_token?: string;
+        };
+      };
+
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(`Feishu chats.members failed [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
+      }
+
+      for (const item of payload.data?.items ?? []) {
+        const memberId = item.member_id?.trim();
+        const memberName = item.name?.trim();
+        if (memberId && memberName) {
+          names.set(memberId, memberName);
+        }
+      }
+
+      if (!payload.data?.has_more || !payload.data.page_token) {
+        break;
+      }
+      pageToken = payload.data.page_token;
+    }
+
+    return names;
+  }
+
+  private getAuthContext(): { appId: string; appSecret: string; baseUrl: string } {
+    const store = getBridgeContext().store;
+    const appId = store.getSetting('bridge_feishu_app_id') || '';
+    const appSecret = store.getSetting('bridge_feishu_app_secret') || '';
+    const domainSetting = store.getSetting('bridge_feishu_domain') || 'https://open.feishu.cn';
+    const baseUrl = domainSetting.includes('larksuite')
+      ? 'https://open.larksuite.com'
+      : 'https://open.feishu.cn';
+
+    if (!appId || !appSecret) {
+      throw new Error('Feishu app credentials are not configured');
+    }
+
+    return { appId, appSecret, baseUrl };
+  }
+
+  private async fetchTenantAccessToken(appId: string, appSecret: string, baseUrl: string): Promise<string> {
+    const tokenRes = await fetch(`${baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const tokenData = await tokenRes.json() as {
+      code?: number;
+      msg?: string;
+      tenant_access_token?: string;
+    };
+
+    if (!tokenRes.ok || !tokenData.tenant_access_token) {
+      throw new Error(`Failed to get tenant access token: ${tokenData.msg || tokenRes.statusText}`);
+    }
+
+    return tokenData.tenant_access_token;
+  }
+
+  async createDocumentFromMarkdown(
+    markdown: string,
+    options?: FeishuDocumentOptions,
+  ): Promise<{ documentId: string; title: string; url: string }> {
+    const normalizedMarkdown = markdown.trim();
+    if (!normalizedMarkdown) {
+      throw new Error('没有可写入飞书文档的正文内容');
+    }
+    this.assertDocumentTextEncodingSafe(normalizedMarkdown);
+
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+    const title = options?.title?.trim() || this.deriveDocumentTitleFromMarkdown(normalizedMarkdown);
+
+    const createResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tenantAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const createPayload = await createResponse.json() as {
+      code?: number;
+      msg?: string;
+      data?: { document?: { document_id?: string; title?: string } };
+    };
+
+    const documentId = createPayload.data?.document?.document_id;
+    if (!createResponse.ok || createPayload.code !== 0 || !documentId) {
+      throw new Error(`Feishu docx.document.create failed [${createPayload.code ?? createResponse.status}]: ${createPayload.msg || createResponse.statusText}`);
+    }
+
+    const children = this.markdownToDocumentBlocks(normalizedMarkdown);
+    const chunkSize = 20;
+    for (let index = 0; index < children.length; index += chunkSize) {
+      const chunk = children.slice(index, index + chunkSize);
+      const blockResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ children: chunk }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      const blockPayload = await blockResponse.json() as {
+        code?: number;
+        msg?: string;
+      };
+
+      if (!blockResponse.ok || blockPayload.code !== 0) {
+        throw new Error(`Feishu docx.document.block.children.create failed [${blockPayload.code ?? blockResponse.status}]: ${blockPayload.msg || blockResponse.statusText}`);
+      }
+    }
+
+    const url = baseUrl.includes('larksuite')
+      ? `https://www.larksuite.com/docx/${documentId}`
+      : `https://www.feishu.cn/docx/${documentId}`;
+
+    if (options?.ownerUserId) {
+      await this.grantDocumentEditPermissionBestEffort(documentId, options.ownerUserId, tenantAccessToken, baseUrl);
+    }
+
+    return {
+      documentId,
+      title: createPayload.data?.document?.title || title,
+      url,
+    };
+  }
+
+  async replaceDocumentFromMarkdown(
+    documentId: string,
+    markdown: string,
+    options?: FeishuDocumentOptions,
+  ): Promise<{ documentId: string; title: string; url: string }> {
+    const normalizedMarkdown = markdown.trim();
+    if (!documentId.trim()) {
+      throw new Error('Missing Feishu document ID');
+    }
+    if (!normalizedMarkdown) {
+      throw new Error('没有可写入飞书文档的正文内容');
+    }
+    this.assertDocumentTextEncodingSafe(normalizedMarkdown);
+
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+
+    const listResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents/${documentId}/blocks`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${tenantAccessToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const listPayload = await listResponse.json() as {
+      code?: number;
+      msg?: string;
+      data?: { items?: Array<{ block_id?: string; children?: string[] }> };
+    };
+    if (!listResponse.ok || listPayload.code !== 0) {
+      throw new Error(`Feishu docx.document.blocks.list failed [${listPayload.code ?? listResponse.status}]: ${listPayload.msg || listResponse.statusText}`);
+    }
+
+    const rootBlock = (listPayload.data?.items || []).find((item) => item.block_id === documentId)
+      || listPayload.data?.items?.[0];
+    const childCount = rootBlock?.children?.length || 0;
+    if (childCount > 0) {
+      const deleteResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children/batch_delete`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ start_index: 0, end_index: childCount }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const deletePayload = await deleteResponse.json() as { code?: number; msg?: string };
+      if (!deleteResponse.ok || deletePayload.code !== 0) {
+        throw new Error(`Feishu docx.document.block.children.batch_delete failed [${deletePayload.code ?? deleteResponse.status}]: ${deletePayload.msg || deleteResponse.statusText}`);
+      }
+    }
+
+    const children = this.markdownToDocumentBlocks(normalizedMarkdown);
+    const chunkSize = 20;
+    for (let index = 0; index < children.length; index += chunkSize) {
+      const chunk = children.slice(index, index + chunkSize);
+      const blockResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ children: chunk }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const blockPayload = await blockResponse.json() as { code?: number; msg?: string };
+      if (!blockResponse.ok || blockPayload.code !== 0) {
+        throw new Error(`Feishu docx.document.block.children.create failed [${blockPayload.code ?? blockResponse.status}]: ${blockPayload.msg || blockResponse.statusText}`);
+      }
+    }
+
+    if (options?.ownerUserId) {
+      await this.grantDocumentEditPermissionBestEffort(documentId, options.ownerUserId, tenantAccessToken, baseUrl);
+    }
+
+    const title = options?.title?.trim() || this.deriveDocumentTitleFromMarkdown(normalizedMarkdown);
+    const url = baseUrl.includes('larksuite')
+      ? `https://www.larksuite.com/docx/${documentId}`
+      : `https://www.feishu.cn/docx/${documentId}`;
+    return { documentId, title, url };
+  }
+
+  private deriveDocumentTitleFromMarkdown(markdown: string): string {
+    const heading = markdown
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /^#\s+/.test(line));
+    if (heading) {
+      return heading.replace(/^#\s+/, '').slice(0, 80);
+    }
+    const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    return `群聊总结 ${now}`;
+  }
+
+  private async grantDocumentEditPermissionBestEffort(
+    documentId: string,
+    ownerUserId: string,
+    tenantAccessToken: string,
+    baseUrl: string,
+  ): Promise<void> {
+    const memberId = ownerUserId.trim();
+    if (!memberId) return;
+
+    try {
+      const response = await fetch(`${baseUrl}/open-apis/drive/v1/permissions/${documentId}/members?type=docx`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          member_type: 'openid',
+          member_id: memberId,
+          perm: 'edit',
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = await response.json() as { code?: number; msg?: string };
+      if (!response.ok || payload.code !== 0) {
+        console.warn(`[feishu-adapter] Document permission grant skipped [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
+      }
+    } catch (err) {
+      console.warn('[feishu-adapter] Document permission grant skipped:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private markdownToDocumentBlocks(markdown: string): Array<Record<string, unknown>> {
+    const lines = markdown
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((line) => line.trimEnd());
+    const blocks: Array<Record<string, unknown>> = [];
+    let paragraphBuffer: string[] = [];
+
+    const flushParagraph = () => {
+      const merged = paragraphBuffer
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(' ');
+      paragraphBuffer = [];
+      if (!merged) return;
+      blocks.push(this.buildDocumentTextBlock(this.normalizeDocumentText(merged)));
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        flushParagraph();
+        continue;
+      }
+
+      const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+      if (headingMatch) {
+        flushParagraph();
+        const level = headingMatch[1].length;
+        const content = this.normalizeDocumentText(headingMatch[2]);
+        blocks.push(this.buildDocumentHeadingBlock(level, content));
+        continue;
+      }
+
+      const bulletMatch = line.match(/^[-*]\s+(.*)$/);
+      if (bulletMatch) {
+        flushParagraph();
+        blocks.push(this.buildDocumentTextBlock(`• ${this.normalizeDocumentText(bulletMatch[1])}`));
+        continue;
+      }
+
+      const orderedMatch = line.match(/^(\d+)\.\s+(.*)$/);
+      if (orderedMatch) {
+        flushParagraph();
+        blocks.push(this.buildDocumentTextBlock(`${orderedMatch[1]}. ${this.normalizeDocumentText(orderedMatch[2])}`));
+        continue;
+      }
+
+      paragraphBuffer.push(line);
+    }
+
+    flushParagraph();
+
+    if (blocks.length === 0) {
+      blocks.push(this.buildDocumentTextBlock(this.normalizeDocumentText(markdown)));
+    }
+
+    return blocks;
+  }
+
+  private buildDocumentHeadingBlock(level: number, content: string): Record<string, unknown> {
+    const normalizedLevel = Math.max(1, Math.min(level, 3));
+    const blockKey = normalizedLevel === 1 ? 'heading1' : normalizedLevel === 2 ? 'heading2' : 'heading3';
+    const blockType = normalizedLevel === 1 ? 3 : normalizedLevel === 2 ? 4 : 5;
+    return {
+      block_type: blockType,
+      [blockKey]: {
+        elements: [
+          {
+            text_run: {
+              content,
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  private buildDocumentTextBlock(content: string): Record<string, unknown> {
+    return {
+      block_type: 2,
+      text: {
+        elements: [
+          {
+            text_run: {
+              content,
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  private normalizeDocumentText(text: string): string {
+    return text
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1 ($2)')
+      .replace(/[`*_~>#]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private assertDocumentTextEncodingSafe(text: string): void {
+    const hasQuestionReplacementRun = /\?{4,}/.test(text);
+    const hasMojibakeRun = /(?:鈥|鉁|涓|竴|缇|鎬|妗|鍐|櫒|鐢|鏈|棿|啓|涔|堕){2,}/.test(text);
+
+    if (hasQuestionReplacementRun || hasMojibakeRun) {
+      throw new Error(
+        '飞书文档正文疑似已发生编码损坏。请使用 UTF-8 文件或 Buffer 输入，不要把中文 JSON 通过 PowerShell 命令字符串或 stdin 传入。',
+      );
+    }
+  }
+
+  private formatHistoryItem(item: FeishuMessageListItem, memberNames?: Map<string, string>): string {
+    const timestamp = Number.parseInt(item.create_time, 10);
+    const timeLabel = Number.isFinite(timestamp)
+      ? new Date(timestamp).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      : '未知时间';
+    const senderType = item.sender?.sender_type || 'unknown';
+    const senderId = item.sender?.id || '';
+    const resolvedSenderName = senderId ? memberNames?.get(senderId) : '';
+    const senderLabel = senderType === 'app'
+      ? '机器人'
+      : `用户(${senderId.slice(-6) || 'unknown'})`;
+    const resolvedSenderLabel = senderType === 'app'
+      ? '机器人'
+      : (resolvedSenderName || senderLabel);
+    const messageText = this.extractHistoryText(item);
+
+    if (!messageText) {
+      return '';
+    }
+
+    return `[${timeLabel}] ${resolvedSenderLabel}: ${messageText}`;
+  }
+
+  private extractHistoryText(item: FeishuMessageListItem): string {
+    const content = item.body?.content || '';
+    switch (item.msg_type) {
+      case 'text':
+        return this.parseTextContent(content).replace(/\s+/g, ' ').trim();
+      case 'post':
+        return this.parsePostContent(content).extractedText.replace(/\s+/g, ' ').trim();
+      case 'image':
+        return '[图片]';
+      case 'file':
+        return '[文件]';
+      case 'audio':
+        return '[语音]';
+      case 'video':
+      case 'media':
+        return '[视频]';
+      case 'interactive':
+        return '[卡片消息]';
+      default:
+        return `[${item.msg_type}]`;
+    }
+  }
+
+  async sendLocalImage(chatId: string, filePath: string, _replyToMessageId?: string): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    try {
+      if (!fs.existsSync(filePath)) {
+        return { ok: false, error: `Image file not found: ${filePath}` };
+      }
+
+      const uploadRes = await this.restClient.im.image.create({
+        data: {
+          image_type: 'message',
+          image: fs.createReadStream(filePath),
+        },
+      });
+
+      const imageKey = uploadRes?.image_key;
+      if (!imageKey) {
+        return { ok: false, error: 'Feishu image upload did not return image_key' };
+      }
+
+      const sendRes = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'image',
+          content: JSON.stringify({ image_key: imageKey }),
+        },
+      });
+
+      if (sendRes?.data?.message_id) {
+        return { ok: true, messageId: sendRes.data.message_id };
+      }
+      return { ok: false, error: `Feishu image send failed: ${sendRes?.msg || 'unknown error'}` };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  private toHistoryReadErrorMessage(errorMessage: string): string {
+    if (errorMessage.includes('im:message.group_msg')) {
+      return '读取本群历史失败：缺少飞书权限 `im:message.group_msg`。请在应用权限里添加该 scope，并重新发布审核通过后再试。';
+    }
+    return `读取本群历史失败：${errorMessage}`;
   }
 
   // ── Bot identity ────────────────────────────────────────────

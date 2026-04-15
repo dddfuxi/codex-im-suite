@@ -28,7 +28,7 @@ const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
 const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(MODULE_DIR, '..');
-const CORE_ROOT = path.resolve(SKILL_ROOT, '..', 'bridge-core');
+const CORE_ROOT = path.resolve(SKILL_ROOT, '..', 'claude-to-im-core');
 
 function collectTsFiles(rootDir: string): string[] {
   if (!fs.existsSync(rootDir)) return [];

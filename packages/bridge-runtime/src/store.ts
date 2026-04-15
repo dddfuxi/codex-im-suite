@@ -16,6 +16,10 @@ import type {
   MemoryRetrievalQuery,
   RetrievedMemoryContext,
   RetrievedMemoryHit,
+  FeishuHistoryIndexedMessage,
+  FeishuHistoryQuery,
+  RetrievedFeishuHistoryContext,
+  FeishuHistorySyncStatus,
   AuditLogInput,
   PermissionLinkInput,
   PermissionLinkRecord,
@@ -28,6 +32,9 @@ import { CTI_HOME } from './config.js';
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
+const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
+const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
+const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
 const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '80', 10) || 80);
 const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '32000', 10) || 32000);
@@ -80,6 +87,17 @@ interface LockEntry {
   expiresAt: number;
 }
 
+interface FeishuChatIndexRecord {
+  chatId: string;
+  chatType?: string;
+  displayName?: string;
+  lastMessageAt?: string;
+  lastSenderId?: string;
+  updatedAt: string;
+}
+
+interface FeishuHistoryIndexRecord extends FeishuHistorySyncStatus {}
+
 // Store
 
 export class JsonFileStore implements BridgeStore {
@@ -91,6 +109,8 @@ export class JsonFileStore implements BridgeStore {
   private offsets = new Map<string, string>();
   private dedupKeys = new Map<string, number>();
   private locks = new Map<string, LockEntry>();
+  private feishuChatIndex = new Map<string, FeishuChatIndexRecord>();
+  private feishuHistoryIndex = new Map<string, FeishuHistoryIndexRecord>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
   constructor(settingsMap: Map<string, string>) {
@@ -98,6 +118,7 @@ export class JsonFileStore implements BridgeStore {
     ensureDir(DATA_DIR);
     ensureDir(MESSAGES_DIR);
     ensureDir(MESSAGE_ARCHIVES_DIR);
+    ensureDir(FEISHU_HISTORY_DIR);
     this.loadAll();
   }
 
@@ -149,6 +170,22 @@ export class JsonFileStore implements BridgeStore {
       this.dedupKeys.set(k, v);
     }
 
+    const feishuChatIndex = readJson<Record<string, FeishuChatIndexRecord>>(
+      FEISHU_CHAT_INDEX_PATH,
+      {},
+    );
+    for (const [key, value] of Object.entries(feishuChatIndex)) {
+      this.feishuChatIndex.set(key, value);
+    }
+
+    const feishuHistoryIndex = readJson<Record<string, FeishuHistoryIndexRecord>>(
+      FEISHU_HISTORY_INDEX_PATH,
+      {},
+    );
+    for (const [key, value] of Object.entries(feishuHistoryIndex)) {
+      this.feishuHistoryIndex.set(key, value);
+    }
+
     // Audit
     this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
   }
@@ -186,6 +223,32 @@ export class JsonFileStore implements BridgeStore {
       path.join(DATA_DIR, 'dedup.json'),
       Object.fromEntries(this.dedupKeys),
     );
+  }
+
+  private persistFeishuChatIndex(): void {
+    writeJson(
+      FEISHU_CHAT_INDEX_PATH,
+      Object.fromEntries(this.feishuChatIndex),
+    );
+  }
+
+  private persistFeishuHistoryIndex(): void {
+    writeJson(
+      FEISHU_HISTORY_INDEX_PATH,
+      Object.fromEntries(this.feishuHistoryIndex),
+    );
+  }
+
+  private getFeishuHistoryPath(chatId: string): string {
+    return path.join(FEISHU_HISTORY_DIR, `${chatId}.json`);
+  }
+
+  private loadFeishuHistoryMessages(chatId: string): FeishuHistoryIndexedMessage[] {
+    return readJson<FeishuHistoryIndexedMessage[]>(this.getFeishuHistoryPath(chatId), []);
+  }
+
+  private persistFeishuHistoryMessages(chatId: string, messages: FeishuHistoryIndexedMessage[]): void {
+    writeJson(this.getFeishuHistoryPath(chatId), messages);
   }
 
   private persistAudit(): void {
@@ -650,6 +713,8 @@ export class JsonFileStore implements BridgeStore {
     if (existing) {
       const updated: ChannelBinding = {
         ...existing,
+        displayName: data.displayName ?? existing.displayName,
+        chatType: data.chatType ?? existing.chatType,
         codepilotSessionId: data.codepilotSessionId,
         sdkSessionId: data.sdkSessionId ?? existing.sdkSessionId,
         workingDirectory: data.workingDirectory,
@@ -667,6 +732,8 @@ export class JsonFileStore implements BridgeStore {
       id: uuid(),
       channelType: data.channelType,
       chatId: data.chatId,
+      displayName: data.displayName,
+      chatType: data.chatType,
       codepilotSessionId: data.codepilotSessionId,
       sdkSessionId: data.sdkSessionId || '',
       workingDirectory: data.workingDirectory,
@@ -697,6 +764,146 @@ export class JsonFileStore implements BridgeStore {
     const all = Array.from(this.bindings.values());
     if (!channelType) return all;
     return all.filter((b) => b.channelType === channelType);
+  }
+
+  upsertFeishuChatIndex(data: {
+    chatId: string;
+    chatType?: string;
+    displayName?: string;
+    lastMessageAt?: string;
+    lastSenderId?: string;
+  }): void {
+    const chatId = data.chatId.trim();
+    if (!chatId) return;
+    const existing = this.feishuChatIndex.get(chatId);
+    const record: FeishuChatIndexRecord = {
+      chatId,
+      chatType: data.chatType ?? existing?.chatType,
+      displayName: data.displayName ?? existing?.displayName ?? chatId,
+      lastMessageAt: data.lastMessageAt ?? existing?.lastMessageAt,
+      lastSenderId: data.lastSenderId ?? existing?.lastSenderId,
+      updatedAt: now(),
+    };
+    this.feishuChatIndex.set(chatId, record);
+    this.persistFeishuChatIndex();
+  }
+
+  upsertFeishuHistoryMessages(data: {
+    chatId: string;
+    displayName?: string;
+    chatType?: string;
+    messages: FeishuHistoryIndexedMessage[];
+    syncedAt?: string;
+  }): FeishuHistorySyncStatus | null {
+    const chatId = data.chatId.trim();
+    if (!chatId) return null;
+
+    const existing = this.loadFeishuHistoryMessages(chatId);
+    const merged = new Map<string, FeishuHistoryIndexedMessage>();
+    for (const item of existing) merged.set(item.messageId, item);
+    for (const item of data.messages) {
+      if (!item.messageId?.trim()) continue;
+      merged.set(item.messageId, {
+        ...item,
+        chatId,
+        text: item.text || '',
+      });
+    }
+
+    const nextMessages = [...merged.values()]
+      .sort((left, right) => Number.parseInt(left.createTime || '0', 10) - Number.parseInt(right.createTime || '0', 10));
+    this.persistFeishuHistoryMessages(chatId, nextMessages);
+
+    const status: FeishuHistoryIndexRecord = {
+      chatId,
+      displayName: data.displayName || this.feishuChatIndex.get(chatId)?.displayName || chatId,
+      chatType: data.chatType || this.feishuChatIndex.get(chatId)?.chatType,
+      messageCount: nextMessages.length,
+      oldestMessageTime: nextMessages[0]?.createTime,
+      latestMessageTime: nextMessages[nextMessages.length - 1]?.createTime,
+      lastSyncAt: data.syncedAt || now(),
+    };
+    this.feishuHistoryIndex.set(chatId, status);
+    this.persistFeishuHistoryIndex();
+    this.upsertFeishuChatIndex({
+      chatId,
+      chatType: status.chatType,
+      displayName: status.displayName,
+      lastMessageAt: status.latestMessageTime,
+    });
+    return status;
+  }
+
+  getFeishuHistorySyncStatus(chatId?: string): FeishuHistorySyncStatus[] {
+    const all = [...this.feishuHistoryIndex.values()].sort((left, right) =>
+      Date.parse(right.lastSyncAt || right.latestMessageTime || '') - Date.parse(left.lastSyncAt || left.latestMessageTime || '')
+    );
+    if (!chatId) return all;
+    return all.filter((item) => item.chatId === chatId);
+  }
+
+  retrieveRelevantFeishuHistory(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null {
+    const chatId = query.chatId.trim();
+    if (!chatId) return null;
+    const allMessages = this.loadFeishuHistoryMessages(chatId);
+    if (allMessages.length === 0) return null;
+
+    const tokens = this.extractMemoryTokens(query.query);
+    const targetSpeakerNames = (query.targetSpeakerNames || []).map((name) => name.trim()).filter(Boolean);
+    const filtered = allMessages.filter((item) => {
+      const ts = Number.parseInt(item.createTime || '0', 10);
+      if (query.startTimeMs !== undefined && ts < query.startTimeMs) return false;
+      if (query.endTimeMs !== undefined && ts >= query.endTimeMs) return false;
+      if (targetSpeakerNames.length === 0) return true;
+      const speakerHaystack = `${item.senderName || ''} ${item.senderId || ''}`.trim();
+      return targetSpeakerNames.some((target) =>
+        speakerHaystack.includes(target)
+        || target.includes(item.senderName || '')
+        || (item.text || '').includes(target)
+      );
+    });
+    if (filtered.length === 0) return null;
+
+    const scored = filtered.map((item) => {
+      const haystack = `${item.senderName || ''} ${item.senderId || ''} ${item.text || ''}`;
+      let score = 0;
+      for (const token of tokens) {
+        const needle = /[a-z]/i.test(token) ? token.toLowerCase() : token;
+        const source = /[a-z]/i.test(token) ? haystack.toLowerCase() : haystack;
+        if (source.includes(needle)) {
+          score += /[a-z]/i.test(token)
+            ? Math.min(5, Math.max(2, token.length / 2))
+            : Math.min(4, Math.max(1.5, token.length));
+        }
+      }
+      if (targetSpeakerNames.length > 0) score += 4;
+      return { item, score };
+    });
+
+    const selected = scored
+      .sort((left, right) => right.score - left.score)
+      .slice(0, Math.max(1, query.limit))
+      .map((entry) => entry.item)
+      .sort((left, right) => Number.parseInt(left.createTime || '0', 10) - Number.parseInt(right.createTime || '0', 10));
+
+    const formattedHistory = selected
+      .map((item) => {
+        const date = Number.parseInt(item.createTime || '0', 10);
+        const label = Number.isFinite(date) && date > 0
+          ? new Date(date).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : '未知时间';
+        const speaker = item.senderName || item.senderId || (item.senderType === 'app' ? '机器人' : '用户');
+        return `[${label}] ${speaker}: ${item.text}`;
+      })
+      .join('\n');
+
+    if (!formattedHistory) return null;
+    const syncStatus = this.feishuHistoryIndex.get(chatId);
+    return {
+      summary: formattedHistory,
+      items: selected,
+      syncStatus,
+    };
   }
 
   // Sessions
@@ -753,7 +960,9 @@ export class JsonFileStore implements BridgeStore {
     if (tokens.length === 0) return null;
 
     const metaBySession = this.buildMemorySessionMeta();
-    const hits: RetrievedMemoryHit[] = [];
+    const sameChatHits: RetrievedMemoryHit[] = [];
+    const currentSessionHits: RetrievedMemoryHit[] = [];
+    const sameWorkdirHits: RetrievedMemoryHit[] = [];
     const dedup = new Set<string>();
     const recentHistoryLimit = Math.max(0, query.recentHistoryLimit || 0);
 
@@ -794,7 +1003,7 @@ export class JsonFileStore implements BridgeStore {
         if (score < MEMORY_MIN_SCORE) continue;
 
         dedup.add(contentKey);
-        hits.push({
+        const hit: RetrievedMemoryHit = {
           sessionId,
           channelType: meta.channelType,
           chatId: meta.chatId,
@@ -803,9 +1012,18 @@ export class JsonFileStore implements BridgeStore {
           source: summarized.source,
           score,
           content: this.buildMatchedMemoryExcerpt(summarized.searchText, tokens),
-        });
+        };
+        if (sameChat) sameChatHits.push(hit);
+        else if (isCurrentSession) currentSessionHits.push(hit);
+        else sameWorkdirHits.push(hit);
       }
     }
+
+    const hits = sameChatHits.length > 0
+      ? sameChatHits
+      : currentSessionHits.length > 0
+        ? currentSessionHits
+        : sameWorkdirHits;
 
     const selected: RetrievedMemoryHit[] = [];
     let usedChars = 0;

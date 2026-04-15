@@ -26,6 +26,8 @@ import type {
   StreamChatParams,
   BridgeSession,
   BridgeMessage,
+  MemoryRetrievalQuery,
+  RetrievedMemoryContext,
 } from '../host.js';
 import type { ChannelBinding, ChannelType } from '../types.js';
 
@@ -88,6 +90,7 @@ class InMemoryStore implements BridgeStore {
     this.messages.set(sessionId, msgs);
   }
   getMessages(sessionId: string) { return { messages: this.messages.get(sessionId) || [] }; }
+  retrieveRelevantMemory(_query: MemoryRetrievalQuery): RetrievedMemoryContext | null { return null; }
   acquireSessionLock() { return true; }
   renewSessionLock() {}
   releaseSessionLock() {}

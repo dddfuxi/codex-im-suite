@@ -29,6 +29,7 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
     sessions,
     getSetting(key: string) {
       if (key === 'bridge_default_work_dir') return '/tmp/test';
+      if (key === 'bridge_allowed_workspace_roots') return '/tmp/test';
       if (key === 'bridge_default_model') return 'claude-3';
       if (key === 'bridge_default_provider_id') return '';
       return null;
@@ -76,6 +77,7 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
     updateSessionProviderId() {},
     addMessage() {},
     getMessages() { return { messages: [] }; },
+    retrieveRelevantMemory() { return null; },
     acquireSessionLock() { return true; },
     renewSessionLock() {},
     releaseSessionLock() {},
@@ -156,6 +158,23 @@ describe('channel-router', () => {
 
     const second = router.resolve({ channelType: 'telegram', chatId: '123' });
     assert.notEqual(first.codepilotSessionId, second.codepilotSessionId);
+  });
+
+  it('resolve() refreshes bindings whose cwd is outside the allowed workspace roots', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: '123' });
+    const session = store.sessions.get(first.codepilotSessionId);
+    assert.ok(session);
+    if (session) {
+      session.working_directory = '/legacy/outside';
+    }
+    store.bindings.set('telegram:123', {
+      ...first,
+      workingDirectory: '/legacy/outside',
+    });
+
+    const second = router.resolve({ channelType: 'telegram', chatId: '123' });
+    assert.notEqual(first.codepilotSessionId, second.codepilotSessionId);
+    assert.equal(second.workingDirectory, '/tmp/test');
   });
 
   it('createBinding() uses custom working directory', () => {

@@ -13,6 +13,7 @@ const MAX_INPUT_LENGTH = 32_000; // Claude's effective context limit
 const MAX_PATH_LENGTH = 1024;
 const SESSION_ID_PATTERN = /^[0-9a-f-]{32,64}$/i;
 const VALID_MODES = ['plan', 'code', 'ask'] as const;
+const WORKSPACE_LIST_SEPARATOR = /[,\n;|]/;
 
 /**
  * Patterns that indicate shell injection or dangerous input.
@@ -35,7 +36,7 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
  * Must be an absolute path without traversal or shell metacharacters.
  * Returns sanitized path or null if invalid.
  */
-export function validateWorkingDirectory(rawPath: string): string | null {
+function normalizeAbsoluteDirectory(rawPath: string): string | null {
   if (!rawPath || !rawPath.trim()) return null;
 
   const trimmed = rawPath.trim();
@@ -58,6 +59,45 @@ export function validateWorkingDirectory(rawPath: string): string | null {
 
   // Normalize the path (resolves redundant slashes, etc.)
   return path.normalize(trimmed);
+}
+
+export function splitWorkspacePathList(rawValue?: string | null): string[] {
+  if (!rawValue) return [];
+
+  const seen = new Set<string>();
+  const roots: string[] = [];
+  for (const entry of rawValue.split(WORKSPACE_LIST_SEPARATOR)) {
+    const normalized = normalizeAbsoluteDirectory(entry);
+    if (!normalized) continue;
+    const dedupeKey = path.resolve(normalized).toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    roots.push(normalized);
+  }
+  return roots;
+}
+
+export function isPathWithinAllowedRoots(candidatePath: string, allowedRoots: string[] = []): boolean {
+  if (allowedRoots.length === 0) return true;
+
+  const candidate = normalizeAbsoluteDirectory(candidatePath);
+  if (!candidate) return false;
+
+  const candidateResolved = path.resolve(candidate);
+  return allowedRoots.some((root) => {
+    const normalizedRoot = normalizeAbsoluteDirectory(root);
+    if (!normalizedRoot) return false;
+    const rootResolved = path.resolve(normalizedRoot);
+    const relative = path.relative(rootResolved, candidateResolved);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  });
+}
+
+export function validateWorkingDirectory(rawPath: string, allowedRoots: string[] = []): string | null {
+  const normalized = normalizeAbsoluteDirectory(rawPath);
+  if (!normalized) return null;
+  if (!isPathWithinAllowedRoots(normalized, allowedRoots)) return null;
+  return normalized;
 }
 
 /**
