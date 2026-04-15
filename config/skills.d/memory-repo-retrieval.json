@@ -1,0 +1,8 @@
+{
+  "id": "memory-repo-retrieval",
+  "displayName": "Memory Repo Retrieval",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\memory-repo-retrieval",
+  "type": "skill",
+  "enabled": true,
+  "description": "Retrieve only relevant history from memory repo to avoid token blow-up."
+}

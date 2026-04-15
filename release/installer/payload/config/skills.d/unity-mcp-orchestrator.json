@@ -1,0 +1,8 @@
+{
+  "id": "unity-mcp-orchestrator",
+  "displayName": "Unity MCP Orchestrator",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\unity-mcp-orchestrator",
+  "type": "skill",
+  "enabled": true,
+  "description": "Unity Editor orchestration guidance and workflow rules for MCP-driven operations."
+}

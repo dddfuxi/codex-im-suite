@@ -1,0 +1,8 @@
+{
+  "id": "feishu-document-generation",
+  "displayName": "Feishu Document Generation",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\feishu-document-generation",
+  "type": "skill",
+  "enabled": true,
+  "description": "Generate or update Feishu docs from bridge output, summaries, and screenshots."
+}

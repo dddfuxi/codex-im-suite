@@ -1,0 +1,59 @@
+{
+  "name": "codex-im-suite",
+  "displayName": "Feishu CLI / Codex / MCP Suite",
+  "version": "0.1.0",
+  "platform": "windows",
+  "packages": {
+    "bridge-core": {
+      "path": "./packages/bridge-core",
+      "role": "core-library",
+      "buildScript": "npm run build"
+    },
+    "bridge-runtime": {
+      "path": "./packages/bridge-runtime",
+      "role": "runtime-shell",
+      "buildScript": "npm run build"
+    },
+    "mcp-picture": {
+      "path": "./packages/mcp-picture",
+      "role": "external-mcp",
+      "buildScript": "npm run build"
+    },
+    "mcp-unity-prefab": {
+      "path": "./packages/mcp-unity-prefab",
+      "role": "external-mcp",
+      "buildScript": "npm run build"
+    }
+  },
+  "apps": {
+    "control-panel": {
+      "path": "./apps/control-panel",
+      "role": "desktop-orchestrator"
+    },
+    "installer": {
+      "path": "./apps/installer",
+      "role": "windows-installer"
+    }
+  },
+  "config": {
+    "mcpManifestDir": "./config/mcp.d",
+    "skillManifestDir": "./config/skills.d",
+    "pluginManifestDir": "./config/plugins.d"
+  },
+  "extensions": {
+    "skills": {
+      "manifestDir": "./config/skills.d"
+    },
+    "plugins": {
+      "manifestDir": "./config/plugins.d"
+    },
+    "mcps": {
+      "manifestDir": "./config/mcp.d"
+    }
+  },
+  "release": {
+    "portableDir": "./release/portable",
+    "installerDir": "./release/installer",
+    "artifactsDir": "./release/artifacts"
+  }
+}

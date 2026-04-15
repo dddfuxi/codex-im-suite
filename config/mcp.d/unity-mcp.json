@@ -1,0 +1,17 @@
+{
+  "id": "unityMCP",
+  "displayName": "Unity MCP",
+  "type": "http",
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-mcp.ps1",
+  "cwd": "${CTI_UNITY_PROJECT_PATH}",
+  "env": {
+    "CTI_UNITY_PROJECT_PATH": "${CTI_UNITY_PROJECT_PATH}",
+    "CTI_UNITY_MCP_ENDPOINT": "http://127.0.0.1:8081/mcp"
+  },
+  "healthCheck": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8081/mcp"
+  },
+  "description": "Unity Editor HTTP MCP endpoint"
+}
