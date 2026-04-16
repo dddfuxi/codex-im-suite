@@ -79,8 +79,10 @@ foreach ($name in $coreFiles) {
 
 $liveControlPanelProgram = Join-Path $liveRuntime 'tools\ControlPanel\Program.cs'
 $suiteControlPanelProgram = Join-Path $suiteControlPanel 'Program.cs'
-if (Test-Path -LiteralPath $liveControlPanelProgram) {
-    Copy-Item -LiteralPath $liveControlPanelProgram -Destination $suiteControlPanelProgram -Force
+
+if (Test-Path -LiteralPath $suiteControlPanelProgram) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $liveControlPanelProgram) | Out-Null
+    Copy-Item -LiteralPath $suiteControlPanelProgram -Destination $liveControlPanelProgram -Force
 }
 
 Write-Host "sync complete"

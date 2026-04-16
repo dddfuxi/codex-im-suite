@@ -1,0 +1,14 @@
+{
+  "id": "blenderMCP",
+  "displayName": "Blender MCP",
+  "type": "stdio",
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-blender-mcp.ps1",
+  "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-blender-mcp.ps1",
+  "cwd": "${SUITE_ROOT}",
+  "registerName": "blenderMCP",
+  "healthCheck": {
+    "kind": "codex-mcp-list"
+  },
+  "description": "Blender MCP via uvx blender-mcp"
+}
