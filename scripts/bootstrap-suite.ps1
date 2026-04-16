@@ -27,4 +27,10 @@ foreach ($pkgName in $manifest.packages.PSObject.Properties.Name) {
 
 dotnet restore (Join-Path $suiteRoot 'apps\control-panel\CodexImSuite.ControlPanel.csproj') | Out-Host
 dotnet restore (Join-Path $suiteRoot 'apps\installer\CodexImSuite.Installer.csproj') | Out-Host
+
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+if (-not $uv) {
+    Write-Warning "uv not found. Blender MCP bootstrap will be unavailable until uv is installed."
+}
+
 Write-Host "suite bootstrap complete"

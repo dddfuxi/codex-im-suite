@@ -4,6 +4,7 @@
   "type": "http",
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-mcp.ps1",
+  "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-unity-mcp.ps1",
   "cwd": "${CTI_UNITY_PROJECT_PATH}",
   "env": {
     "CTI_UNITY_PROJECT_PATH": "${CTI_UNITY_PROJECT_PATH}",

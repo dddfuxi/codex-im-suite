@@ -82,6 +82,47 @@ function appendReplyEndMarker(text: string): string {
   return `${trimmed}\n\n${marker}`;
 }
 
+function isProcessNarrationLine(line: string): boolean {
+  const normalized = line.trim();
+  if (!normalized) return false;
+  return /^(我先|我会|我正在|我继续|我再|我开始|我已经找到|我确认到|下一步|接下来|现在我|当前我|先看|先查|我改用|我准备|我补查|我切到|我定位到|启动尝试|直连服务|刚确认|刚才|随后|Then |Next )/i.test(normalized);
+}
+
+function isOutcomeLine(line: string): boolean {
+  const normalized = line.trim();
+  if (!normalized) return false;
+  return /(已完成|已处理|已修复|已生成|已同步|已发送|已重启|已更新|运行中|成功|失败|报错|错误|文件在|图片在|文档在|链接|PID|channel|当前状态|结论|原因|结果|可用|不可用|命中|同步完成|请直接|你现在可以)/i.test(normalized);
+}
+
+function compactBridgeReplyForDelivery(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+
+  const normalized = trimmed.replace(/\r\n/g, '\n');
+  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean);
+
+  const strongBlocks = blocks.filter((block) => isOutcomeLine(block) && !isProcessNarrationLine(block));
+  if (strongBlocks.length > 0) {
+    const compact = strongBlocks.slice(-3).join('\n\n').trim();
+    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
+  }
+
+  const strongLines = lines.filter((line) => isOutcomeLine(line) && !isProcessNarrationLine(line));
+  if (strongLines.length > 0) {
+    const compact = strongLines.slice(-4).join('\n').trim();
+    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
+  }
+
+  if (blocks.length >= 3 || lines.length >= 8) {
+    const filtered = lines.filter((line) => !isProcessNarrationLine(line));
+    const compact = (filtered.length > 0 ? filtered.slice(-4) : lines.slice(-3)).join('\n').trim();
+    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
+  }
+
+  return trimmed.length > 420 ? `${trimmed.slice(0, 417)}...` : trimmed;
+}
+
 /** Default stream config per channel type. */
 const STREAM_DEFAULTS: Record<string, StreamConfig> = {
   telegram: { intervalMs: 700, minDeltaChars: 20, maxChars: 3900 },
@@ -312,7 +353,7 @@ async function deliverResponse(
   sessionId: string,
   replyToMessageId?: string,
 ): Promise<SendResult> {
-  const finalText = appendReplyEndMarker(responseText);
+  const finalText = appendReplyEndMarker(compactBridgeReplyForDelivery(responseText));
   if (adapter.channelType === 'telegram') {
     const chunks = markdownToTelegramChunks(finalText, 4096);
     if (chunks.length > 0) {
@@ -468,16 +509,25 @@ function collectRecentAssistantImagePaths(
 ): string[] {
   const { store } = getBridgeContext();
   const recent = store.getMessages(sessionId, { limit: 4 }).messages;
-  const found = new Set<string>();
-
-  for (const message of recent) {
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const message = recent[index];
     if (message.role !== 'assistant' || !message.content) continue;
-    for (const imagePath of extractLocalImagePaths(message.content, workingDirectory, additionalDirectories)) {
-      found.add(imagePath);
+    const imagePaths = extractLocalImagePaths(message.content, workingDirectory, additionalDirectories);
+    if (imagePaths.length > 0) {
+      return Array.from(new Set(imagePaths));
     }
   }
+  return [];
+}
 
-  return Array.from(found);
+function getAutoReplyImageLimit(): number {
+  const { store } = getBridgeContext();
+  const raw = store.getSetting('bridge_auto_reply_image_limit')
+    || process.env.CTI_AUTO_REPLY_IMAGE_LIMIT
+    || '1';
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 1;
+  return Math.min(parsed, 4);
 }
 
 interface WorkspaceCatalogEntry {
@@ -864,9 +914,10 @@ function buildUnityQuickActionSystemInstructions(): string {
     '9. For screenshot requests, the requested source is binding: if the user specifies a scene, camera, Game view, or PreviewCamera, do not substitute a Scene View/window crop as success. If exact capture fails, keep repairing via MCP/CLI/UI automation or report the exact failure.',
     '10. After any screenshot capture, verify the actual image content before declaring success. If the image is blank, black, transparent, mostly one color, or clearly the wrong viewport/camera, treat it as failure and continue repair.',
     '11. For a requested camera such as PreviewCamera, success requires: requested scene loaded, target camera found/enabled, output rendered from that camera or Game view, and non-blank image verified.',
-    '12. Send progress only when a real checkpoint is completed (for example: MCP connected, scene loaded, target camera found, screenshot saved and verified). Do not send repeated empty "still working" messages.',
-    '13. If that direct path fails, do at most one narrow fallback to locate the exact menu/script/window.',
-    '14. Keep the reply short and result-first. Do not narrate a long step-by-step thought chain.',
+    '12. If multiple Unity projects are open, operate only on the project bound to this turn. Do not switch to another open Unity window/project unless the owner explicitly requested that exact path.',
+    '13. Send progress only when a real checkpoint is completed (for example: MCP connected, scene loaded, target camera found, screenshot saved and verified). Do not send repeated empty "still working" messages.',
+    '14. If that direct path fails, do at most one narrow fallback to locate the exact menu/script/window.',
+    '15. Keep the reply short and result-first. Do not narrate a long step-by-step thought chain.',
   ].join('\n');
 }
 
@@ -888,6 +939,7 @@ function buildUnityMenuActionSystemInstructions(menuPath: string): string {
 
 function buildUnityScreenshotPolicyInstructions(text: string): string {
   const wantsOverview = /(全览图|横屏|整体布局|全景|overview|panorama|landscape|16:9)/i.test(text);
+  const wantsRunGame = /(运行游戏|跑游戏|进入游戏|play mode|game view|运行一下)/i.test(text);
   const defaultProjectPath = getSt3UnityProjectPath();
   return [
     'ST3 screenshot policy:',
@@ -895,9 +947,13 @@ function buildUnityScreenshotPolicyInstructions(text: string): string {
     wantsOverview
       ? '2. The user requested an overview/landscape shot. Use a landscape 16:9 capture and adjust the camera/viewpoint to show the whole requested scene.'
       : '2. The user did not explicitly request an overview. Prefer Game view or the requested camera in portrait orientation.',
-    '3. If the request names PreviewCamera, Game view, or a scene camera, that source is binding. A Scene View crop or random editor viewport is not a valid success.',
-    '4. For Timeline scenes, set the PlayableDirector to the requested time, default to time=0 for first frame, call Evaluate(), then render the camera.',
-    '5. Verify the screenshot is not blank, not mostly one color, and has the requested orientation before reporting completion.',
+    wantsRunGame
+      ? '3. "运行游戏" means entering the playable game entry flow, not opening an art-only preview scene. In ST3, default to the configured game entry scene such as FirstScene/build settings entry unless the user explicitly names another runtime scene.'
+      : '3. If the request names PreviewCamera, Game view, or a scene camera, that source is binding. A Scene View crop or random editor viewport is not a valid success.',
+    '4. Never capture from another already-open Unity project/window as a fallback. If the bound ST3 project is not the active Unity window, switch to the correct project or report the exact blocker.',
+    '5. For Timeline scenes, set the PlayableDirector to the requested time, default to time=0 for first frame, call Evaluate(), then render the camera.',
+    '6. Default deliverable is one verified screenshot. Only send multiple screenshots when the user explicitly asks for several, or one image cannot satisfy the requested comparison/coverage.',
+    '7. Verify the screenshot is not blank, not mostly one color, and has the requested orientation before reporting completion.',
   ].join('\n');
 }
 
@@ -1877,7 +1933,11 @@ async function handleMessage(
     if (hasStreamingCards && adapter.onStreamEnd) {
       try {
         const status = result.hasError ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
+        cardFinalized = await adapter.onStreamEnd(
+          msg.address.chatId,
+          status,
+          compactBridgeReplyForDelivery(result.responseText),
+        );
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
       }
@@ -1963,7 +2023,7 @@ async function handleMessage(
         ),
       ]));
       if (localImagePaths.length > 0 && typeof adapter.sendLocalImage === 'function') {
-        for (const imagePath of localImagePaths.slice(0, 4)) {
+        for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
           const imageSend = await adapter.sendLocalImage(msg.address.chatId, imagePath, msg.messageId);
           if (!imageSend.ok) {
             console.warn(`[bridge-manager] Failed to send local image: ${imagePath}`, imageSend.error);

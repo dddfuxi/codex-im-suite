@@ -32,9 +32,13 @@ internal sealed class MainForm : Form
     private readonly string _dataDir;
     private readonly string _messagesDir;
     private readonly string _statusJsonPath;
+    private readonly string _mcpServiceStatePath;
     private readonly string _feishuChatIndexPath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
+    private FileSystemWatcher? _manifestWatcher;
+    private System.Windows.Forms.Timer? _manifestReloadTimer;
+    private string _pendingManifestReloadReason = "初始化";
 
     private readonly TextBox _workdir = new();
     private readonly TextBox _allowedRoots = new();
@@ -47,8 +51,16 @@ internal sealed class MainForm : Form
     private readonly TextBox _mcpStatus = CreateStatusBox();
     private readonly TextBox _buildStatus = CreateStatusBox();
     private readonly ListBox _mcpList = new();
+    private readonly TextBox _mcpRuntimeStatus = new();
     private readonly TextBox _mcpDetails = new();
     private readonly TextBox _log = new();
+    private readonly TextBox _historySyncStatus = new();
+    private readonly TextBox _historySearchChat = new();
+    private readonly TextBox _historySearchKeyword = new();
+    private readonly TextBox _historySearchSpeaker = new();
+    private readonly TextBox _historySearchStart = new();
+    private readonly TextBox _historySearchEnd = new();
+    private readonly TextBox _historySearchResults = new();
 
     private Dictionary<string, string> _config = new(StringComparer.OrdinalIgnoreCase);
     private List<McpManifest> _manifests = [];
@@ -56,46 +68,50 @@ internal sealed class MainForm : Form
     public MainForm()
     {
         _skillDir = FindSkillDir();
+        _suiteRoot = FindSuiteRoot(_skillDir);
         _ctiHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude-to-im");
         _configPath = Path.Combine(_ctiHome, "config.env");
         _daemonScript = Path.Combine(_skillDir, "scripts", "daemon.ps1");
-        _registerMcpScript = Path.Combine(_skillDir, "scripts", "register-external-mcps.ps1");
-        _manifestDir = Path.Combine(_skillDir, "mcp.d");
-        _suiteRoot = FindSuiteRoot(_skillDir);
+        _registerMcpScript = string.IsNullOrWhiteSpace(_suiteRoot)
+            ? Path.Combine(_skillDir, "scripts", "register-external-mcps.ps1")
+            : Path.Combine(_suiteRoot, "scripts", "register-external-mcps.ps1");
+        _manifestDir = string.IsNullOrWhiteSpace(_suiteRoot)
+            ? Path.Combine(_skillDir, "mcp.d")
+            : Path.Combine(_suiteRoot, "config", "mcp.d");
         _publishBackupScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "publish-backup.ps1");
         _dataDir = Path.Combine(_ctiHome, "data");
         _messagesDir = Path.Combine(_dataDir, "messages");
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
+        _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
 
         Text = "飞书 / Codex / MCP 中控面板";
         StartPosition = FormStartPosition.CenterScreen;
-        Width = 1260;
-        Height = 860;
-        MinimumSize = new Size(1120, 760);
+        Width = 1380;
+        Height = 1080;
+        MinimumSize = new Size(1240, 920);
         Font = new Font("Microsoft YaHei UI", 9F);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(12) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(12) };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 290));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
 
-        root.Controls.Add(BuildStatusPanel(), 0, 0);
-        root.Controls.Add(BuildConfigPanel(), 0, 1);
-        root.Controls.Add(BuildActionPanel(), 0, 2);
-        root.Controls.Add(BuildMcpPanel(), 0, 3);
-        root.Controls.Add(BuildLogPanel(), 0, 4);
+        root.Controls.Add(BuildToolbarPanel(), 0, 0);
+        root.Controls.Add(BuildStatusPanel(), 0, 1);
+        root.Controls.Add(BuildConfigPanel(), 0, 2);
+        root.Controls.Add(BuildWorkspacePanel(), 0, 3);
 
         Load += async (_, _) =>
         {
             LoadConfig();
             LoadManifests();
             RenderMcpList();
+            InitializeManifestWatcher();
             await RefreshAllAsync();
         };
     }
@@ -139,28 +155,157 @@ internal sealed class MainForm : Form
         return group;
     }
 
-    private Control BuildActionPanel()
+    private Control BuildToolbarPanel()
     {
-        var group = new GroupBox { Text = "基础操作", Dock = DockStyle.Fill };
-        var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(8), WrapContents = true };
+        var host = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0) };
+        var strip = new ToolStrip
+        {
+            Dock = DockStyle.Fill,
+            GripStyle = ToolStripGripStyle.Hidden,
+            RenderMode = ToolStripRenderMode.System,
+            Padding = new Padding(4, 2, 4, 2),
+            CanOverflow = true,
+            Stretch = true,
+        };
+        host.Controls.Add(strip);
+
+        AddToolAction(strip, "刷新状态", async () => await RefreshAllAsync());
+        AddToolAction(strip, "启动飞书", async () => await RunDaemonAsync("start"));
+        AddToolAction(strip, "停止飞书", async () => await RunDaemonAsync("stop"));
+        AddToolAction(strip, "重启飞书", async () => { await RunDaemonAsync("stop"); await RunDaemonAsync("start"); });
+        AddToolAction(strip, "查看日志", async () => await RunDaemonAsync("logs 120"));
+        AddToolAction(strip, "检查 Codex", async () => await CheckCodexAsync());
+        AddToolAction(strip, "注册全部 MCP", async () => await RegisterAllMcpsAsync());
+        AddToolAction(strip, "一键发布", async () => await PublishSuiteAsync());
+        AddToolAction(strip, "查看会话", async () => await ShowConversationViewerAsync());
+        AddToolAction(strip, "同步全部历史", async () => await SyncAllFeishuHistoryAsync());
+        AddToolAction(strip, "查看同步状态", ShowFeishuHistorySyncStatus);
+        AddToolAction(strip, "帮助", ShowHelp);
+        strip.Items.Add(new ToolStripSeparator());
+        AddToolAction(strip, "打开配置", () => OpenPath(_configPath));
+        AddToolAction(strip, "打开 mcp.d", () => OpenPath(_manifestDir));
+        AddToolAction(strip, "打开记忆仓库", () => OpenPath(_memoryRepo.Text));
+        if (!string.IsNullOrWhiteSpace(_suiteRoot))
+        {
+            AddToolAction(strip, "打开最近发布摘要", OpenLatestPublishSummary);
+            AddToolAction(strip, "打开发布历史", OpenReleaseNotes);
+            AddToolAction(strip, "打开 Suite", () => OpenPath(_suiteRoot));
+        }
+        return host;
+    }
+
+    private Control BuildWorkspacePanel()
+    {
+        var outer = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterWidth = 8,
+            FixedPanel = FixedPanel.None,
+        };
+        outer.Panel1.Controls.Add(BuildHistoryPanel());
+
+        var lower = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Horizontal,
+            SplitterWidth = 8,
+            FixedPanel = FixedPanel.None,
+        };
+        lower.Panel1.Controls.Add(BuildMcpPanel());
+        lower.Panel2.Controls.Add(BuildLogPanel());
+        outer.Panel2.Controls.Add(lower);
+
+        return outer;
+    }
+
+    private Control BuildHistoryPanel()
+    {
+        var group = new GroupBox { Text = "历史索引", Dock = DockStyle.Fill };
+        var container = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(8) };
+        container.RowStyles.Add(new RowStyle(SizeType.Percent, 32));
+        container.RowStyles.Add(new RowStyle(SizeType.Percent, 68));
+        group.Controls.Add(container);
+
+        var syncGroup = new GroupBox { Text = "历史同步状态", Dock = DockStyle.Fill };
+        _historySyncStatus.Dock = DockStyle.Fill;
+        _historySyncStatus.Multiline = true;
+        _historySyncStatus.ReadOnly = true;
+        _historySyncStatus.ScrollBars = ScrollBars.Both;
+        _historySyncStatus.WordWrap = false;
+        _historySyncStatus.Font = new Font("Consolas", 9F);
+        syncGroup.Controls.Add(_historySyncStatus);
+        container.Controls.Add(syncGroup, 0, 0);
+
+        container.Controls.Add(BuildHistorySearchPanel(), 0, 1);
+        return group;
+    }
+
+    private Control BuildHistorySearchPanel()
+    {
+        var group = new GroupBox { Text = "本地历史检索", Dock = DockStyle.Fill };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 4, Padding = new Padding(6) };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         group.Controls.Add(layout);
 
-        AddAction(layout, "刷新状态", async () => await RefreshAllAsync());
-        AddAction(layout, "启动飞书", async () => await RunDaemonAsync("start"));
-        AddAction(layout, "停止飞书", async () => await RunDaemonAsync("stop"));
-        AddAction(layout, "重启飞书", async () => { await RunDaemonAsync("stop"); await RunDaemonAsync("start"); });
-        AddAction(layout, "查看日志", async () => await RunDaemonAsync("logs 120"));
-        AddAction(layout, "检查 Codex", async () => await CheckCodexAsync());
-        AddAction(layout, "注册全部 MCP", async () => await RegisterAllMcpsAsync());
-        AddAction(layout, "一键发布", async () => await PublishSuiteAsync());
-        AddAction(layout, "查看会话", async () => await ShowConversationViewerAsync());
-        AddAction(layout, "同步全部历史", async () => await SyncAllFeishuHistoryAsync());
-        AddAction(layout, "查看同步状态", ShowFeishuHistorySyncStatus);
-        AddAction(layout, "帮助", ShowHelp);
-        AddAction(layout, "打开配置", () => OpenPath(_configPath));
-        AddAction(layout, "打开 mcp.d", () => OpenPath(_manifestDir));
-        AddAction(layout, "打开记忆仓库", () => OpenPath(_memoryRepo.Text));
-        if (!string.IsNullOrWhiteSpace(_suiteRoot)) AddAction(layout, "打开 Suite", () => OpenPath(_suiteRoot));
+        layout.Controls.Add(new Label { Text = "群名/Chat", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 0);
+        _historySearchChat.Dock = DockStyle.Fill;
+        layout.Controls.Add(_historySearchChat, 1, 0);
+
+        layout.Controls.Add(new Label { Text = "关键词", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 0);
+        _historySearchKeyword.Dock = DockStyle.Fill;
+        layout.Controls.Add(_historySearchKeyword, 3, 0);
+
+        layout.Controls.Add(new Label { Text = "发言人", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 4, 0);
+        _historySearchSpeaker.Dock = DockStyle.Fill;
+        layout.Controls.Add(_historySearchSpeaker, 5, 0);
+
+        layout.Controls.Add(new Label { Text = "开始时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 1);
+        _historySearchStart.Dock = DockStyle.Fill;
+        _historySearchStart.PlaceholderText = "2026-04-15 09:00";
+        layout.Controls.Add(_historySearchStart, 1, 1);
+
+        layout.Controls.Add(new Label { Text = "结束时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 1);
+        _historySearchEnd.Dock = DockStyle.Fill;
+        _historySearchEnd.PlaceholderText = "2026-04-15 18:00";
+        layout.Controls.Add(_historySearchEnd, 3, 1);
+
+        var buttonPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoSize = true };
+        var searchButton = new Button { Text = "检索历史", Width = 96, Height = 28 };
+        searchButton.Click += (_, _) => RunHistorySearch();
+        var clearButton = new Button { Text = "清空条件", Width = 96, Height = 28 };
+        clearButton.Click += (_, _) =>
+        {
+            _historySearchChat.Clear();
+            _historySearchKeyword.Clear();
+            _historySearchSpeaker.Clear();
+            _historySearchStart.Clear();
+            _historySearchEnd.Clear();
+            _historySearchResults.Clear();
+        };
+        buttonPanel.Controls.Add(searchButton);
+        buttonPanel.Controls.Add(clearButton);
+        layout.SetColumnSpan(buttonPanel, 3);
+        layout.Controls.Add(buttonPanel, 3, 2);
+
+        _historySearchResults.Dock = DockStyle.Fill;
+        _historySearchResults.Multiline = true;
+        _historySearchResults.ReadOnly = true;
+        _historySearchResults.ScrollBars = ScrollBars.Both;
+        _historySearchResults.WordWrap = false;
+        _historySearchResults.Font = new Font("Consolas", 9F);
+        layout.SetColumnSpan(_historySearchResults, 6);
+        layout.Controls.Add(_historySearchResults, 0, 3);
+
         return group;
     }
     private Control BuildMcpPanel()
@@ -173,15 +318,36 @@ internal sealed class MainForm : Form
 
         _mcpList.Dock = DockStyle.Fill;
         _mcpList.HorizontalScrollbar = true;
-        _mcpList.SelectedIndexChanged += (_, _) => RenderSelectedMcp();
+        _mcpList.SelectedIndexChanged += async (_, _) => await RenderSelectedMcpAsync();
         layout.Controls.Add(_mcpList, 0, 0);
+
+        var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(right, 1, 0);
+
+        var buttonBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoScroll = true };
+        AddAction(buttonBar, "启动", async () => await StartSelectedMcpAsync());
+        AddAction(buttonBar, "停止", async () => await StopSelectedMcpAsync());
+        AddAction(buttonBar, "检查", async () => await CheckSelectedMcpAsync());
+        AddAction(buttonBar, "注册", async () => await RegisterSelectedMcpAsync());
+        AddAction(buttonBar, "打开目录", OpenSelectedMcpPath);
+        right.Controls.Add(buttonBar, 0, 0);
+
+        _mcpRuntimeStatus.Dock = DockStyle.Fill;
+        _mcpRuntimeStatus.Multiline = true;
+        _mcpRuntimeStatus.ReadOnly = true;
+        _mcpRuntimeStatus.ScrollBars = ScrollBars.Vertical;
+        _mcpRuntimeStatus.Font = new Font("Consolas", 9F);
+        right.Controls.Add(_mcpRuntimeStatus, 0, 1);
 
         _mcpDetails.Dock = DockStyle.Fill;
         _mcpDetails.Multiline = true;
         _mcpDetails.ReadOnly = true;
         _mcpDetails.ScrollBars = ScrollBars.Vertical;
         _mcpDetails.Font = new Font("Consolas", 9F);
-        layout.Controls.Add(_mcpDetails, 1, 0);
+        right.Controls.Add(_mcpDetails, 0, 2);
         return group;
     }
 
@@ -254,6 +420,25 @@ internal sealed class MainForm : Form
     private static void AddAction(FlowLayoutPanel layout, string text, Action action)
         => AddAction(layout, text, () => { action(); return Task.CompletedTask; });
 
+    private static void AddToolAction(ToolStrip strip, string text, Func<Task> action)
+    {
+        var button = new ToolStripButton(text)
+        {
+            DisplayStyle = ToolStripItemDisplayStyle.Text,
+            AutoSize = true,
+        };
+        button.Click += async (_, _) =>
+        {
+            button.Enabled = false;
+            try { await action(); }
+            finally { button.Enabled = true; }
+        };
+        strip.Items.Add(button);
+    }
+
+    private static void AddToolAction(ToolStrip strip, string text, Action action)
+        => AddToolAction(strip, text, () => { action(); return Task.CompletedTask; });
+
     private void LoadConfig()
     {
         _config = ReadEnvFile(_configPath);
@@ -278,6 +463,7 @@ internal sealed class MainForm : Form
                 manifest.Id ??= Path.GetFileNameWithoutExtension(file);
                 manifest.DisplayName ??= manifest.Id;
                 manifest.ManifestPath = file;
+                manifest.ServiceStatePath = _mcpServiceStatePath;
                 _manifests.Add(manifest);
             }
             catch (Exception ex)
@@ -285,24 +471,105 @@ internal sealed class MainForm : Form
                 AppendLog($"MCP 清单读取失败：{file} {ex.Message}");
             }
         }
-        _mcpStatus.Text = $"发现 {_manifests.Count} 个清单{Environment.NewLine}启用 {_manifests.Count(m => m.Enabled != false)} 个";
+        var states = LoadMcpServiceStates();
+        var running = _manifests.Count(m => TryGetRunningServiceState(m, states, out _));
+        _mcpStatus.Text = $"发现 {_manifests.Count} 个清单{Environment.NewLine}启用 {_manifests.Count(m => m.Enabled != false)} 个{Environment.NewLine}运行 {running} 个";
     }
 
     private void RenderMcpList()
     {
+        var selectedId = (_mcpList.SelectedItem as McpManifest)?.Id;
         _mcpList.BeginUpdate();
         _mcpList.Items.Clear();
         foreach (var manifest in _manifests) _mcpList.Items.Add(manifest);
         _mcpList.EndUpdate();
-        if (_mcpList.Items.Count > 0) _mcpList.SelectedIndex = 0;
-        else _mcpDetails.Text = "暂无 MCP 清单。";
+        if (_mcpList.Items.Count == 0)
+        {
+            _mcpDetails.Text = "暂无 MCP 清单。";
+            _mcpRuntimeStatus.Text = "未选择 MCP。";
+            return;
+        }
+
+        var selectedIndex = 0;
+        if (!string.IsNullOrWhiteSpace(selectedId))
+        {
+            for (var i = 0; i < _mcpList.Items.Count; i++)
+            {
+                if (_mcpList.Items[i] is McpManifest item && string.Equals(item.Id, selectedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+        }
+        _mcpList.SelectedIndex = selectedIndex;
     }
 
-    private void RenderSelectedMcp()
+    private void InitializeManifestWatcher()
+    {
+        _manifestReloadTimer?.Stop();
+        _manifestReloadTimer?.Dispose();
+        _manifestWatcher?.Dispose();
+
+        Directory.CreateDirectory(_manifestDir);
+
+        _manifestReloadTimer = new System.Windows.Forms.Timer { Interval = 600 };
+        _manifestReloadTimer.Tick += (_, _) =>
+        {
+            _manifestReloadTimer?.Stop();
+            ReloadManifestList();
+        };
+
+        _manifestWatcher = new FileSystemWatcher(_manifestDir, "*.json")
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size,
+            IncludeSubdirectories = false,
+            EnableRaisingEvents = true,
+        };
+
+        _manifestWatcher.Created += (_, e) => QueueManifestReload($"新增: {Path.GetFileName(e.FullPath)}");
+        _manifestWatcher.Changed += (_, e) => QueueManifestReload($"更新: {Path.GetFileName(e.FullPath)}");
+        _manifestWatcher.Deleted += (_, e) => QueueManifestReload($"删除: {Path.GetFileName(e.FullPath)}");
+        _manifestWatcher.Renamed += (_, e) => QueueManifestReload($"重命名: {Path.GetFileName(e.OldFullPath)} -> {Path.GetFileName(e.FullPath)}");
+
+        AppendLog($"已监听 MCP 清单目录：{_manifestDir}");
+    }
+
+    private void QueueManifestReload(string reason)
+    {
+        if (IsDisposed) return;
+
+        void Schedule()
+        {
+            _pendingManifestReloadReason = reason;
+            _manifestReloadTimer?.Stop();
+            _manifestReloadTimer?.Start();
+        }
+
+        if (InvokeRequired) BeginInvoke((Action)Schedule);
+        else Schedule();
+    }
+
+    private void ReloadManifestList()
+    {
+        try
+        {
+            LoadManifests();
+            RenderMcpList();
+            AppendLog($"自动导入 MCP 清单完成：{_pendingManifestReloadReason}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"自动导入 MCP 清单失败：{ex.Message}");
+        }
+    }
+
+    private async Task RenderSelectedMcpAsync()
     {
         if (_mcpList.SelectedItem is not McpManifest manifest)
         {
             _mcpDetails.Text = "未选择 MCP。";
+            _mcpRuntimeStatus.Text = "未选择 MCP。";
             return;
         }
         _mcpDetails.Text = string.Join(Environment.NewLine, new[]
@@ -311,13 +578,15 @@ internal sealed class MainForm : Form
             $"ID: {manifest.Id}",
             $"类型: {manifest.Type}",
             $"启用: {manifest.Enabled != false}",
-            $"Launcher: {manifest.Launcher}",
-            $"CWD: {manifest.Cwd}",
+            $"Launcher: {ResolveManifestPath(manifest.Launcher, manifest)}",
+            $"StopLauncher: {ResolveManifestPath(manifest.StopLauncher, manifest)}",
+            $"CWD: {ResolveManifestDirectory(manifest.Cwd, manifest)}",
             $"RegisterName: {manifest.RegisterName}",
             $"Manifest: {manifest.ManifestPath}",
             "",
             manifest.Description ?? "",
         });
+        await RefreshSelectedMcpRuntimeStatusAsync(manifest);
     }
     private string GetConfig(string key, string fallback)
         => _config.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
@@ -347,10 +616,13 @@ internal sealed class MainForm : Form
     {
         LoadConfig();
         LoadManifests();
+        await UpdateMcpManifestStatesAsync();
         RenderMcpList();
         await CheckBridgeAsync();
         await CheckCodexAsync(true);
         await RefreshBuildInfoAsync();
+        RefreshFeishuHistorySyncStatusPanel();
+        if (_mcpList.SelectedItem is McpManifest selected) await RefreshSelectedMcpRuntimeStatusAsync(selected);
     }
 
     private async Task CheckBridgeAsync()
@@ -388,7 +660,11 @@ internal sealed class MainForm : Form
 
     private async Task RefreshBuildInfoAsync()
     {
-        var exePath = Assembly.GetExecutingAssembly().Location;
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            exePath = Path.Combine(AppContext.BaseDirectory, "ClaudeToImControlPanel.exe");
+        }
         var buildTime = File.Exists(exePath) ? File.GetLastWriteTime(exePath).ToString("yyyy-MM-dd HH:mm:ss") : "unknown";
         var branch = await RunGitTextAsync("branch --show-current");
         var commit = await RunGitTextAsync("rev-parse --short HEAD");
@@ -406,6 +682,432 @@ internal sealed class MainForm : Form
     {
         var result = await RunPowerShellFileAsync(_registerMcpScript, "", _skillDir, 120000);
         AppendCommand("注册全部 MCP", result);
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+        RenderMcpList();
+        if (_mcpList.SelectedItem is McpManifest selected) await RefreshSelectedMcpRuntimeStatusAsync(selected);
+    }
+
+    private async Task RegisterSelectedMcpAsync()
+    {
+        await RegisterAllMcpsAsync();
+    }
+
+    private void OpenSelectedMcpPath()
+    {
+        if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        var cwd = ResolveManifestDirectory(manifest.Cwd, manifest);
+        var launcher = ResolveManifestPath(manifest.Launcher, manifest);
+        if (!string.IsNullOrWhiteSpace(cwd) && Directory.Exists(cwd))
+        {
+            OpenPath(cwd);
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(launcher))
+        {
+            OpenPath(Path.GetDirectoryName(launcher) ?? launcher);
+        }
+    }
+
+    private void OpenLatestPublishSummary()
+    {
+        if (string.IsNullOrWhiteSpace(_suiteRoot)) return;
+        var path = Path.Combine(_suiteRoot, "publish-summary.md");
+        if (File.Exists(path))
+        {
+            OpenPath(path);
+            return;
+        }
+        MessageBox.Show(this, "还没有生成 publish-summary.md。请先执行一次一键发布。", "暂无发布摘要", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void OpenReleaseNotes()
+    {
+        if (string.IsNullOrWhiteSpace(_suiteRoot)) return;
+        var path = Path.Combine(_suiteRoot, "release-notes.md");
+        if (File.Exists(path))
+        {
+            OpenPath(path);
+            return;
+        }
+        MessageBox.Show(this, "还没有生成 release-notes.md。请先执行一次一键发布。", "暂无发布历史", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private async Task StartSelectedMcpAsync()
+    {
+        if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        if (manifest.Enabled == false)
+        {
+            AppendLog($"MCP 未启用，跳过启动：{manifest.DisplayName}");
+            return;
+        }
+
+        var states = LoadMcpServiceStates();
+        if (TryGetRunningServiceState(manifest, states, out var running))
+        {
+            AppendLog($"MCP 已在运行：{manifest.DisplayName} PID={running!.ProcessId}");
+            await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+            return;
+        }
+
+        var launcher = ResolveManifestPath(manifest.Launcher, manifest);
+        if (string.IsNullOrWhiteSpace(launcher) || !File.Exists(launcher))
+        {
+            AppendLog($"MCP 启动失败，launcher 不存在：{manifest.DisplayName} -> {launcher}");
+            await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+            return;
+        }
+
+        var cwd = ResolveManifestDirectory(manifest.Cwd, manifest);
+        if (string.IsNullOrWhiteSpace(cwd) || !Directory.Exists(cwd))
+        {
+            cwd = !string.IsNullOrWhiteSpace(_suiteRoot) && Directory.Exists(_suiteRoot) ? _suiteRoot : _skillDir;
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{launcher.Replace("\"", "\"\"")}\"",
+            WorkingDirectory = cwd,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var pair in BuildManifestEnvironment(manifest))
+        {
+            startInfo.Environment[pair.Key] = pair.Value ?? "";
+        }
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            AppendLog($"MCP 启动失败：{manifest.DisplayName}");
+            return;
+        }
+
+        await Task.Delay(1200);
+        if (process.HasExited)
+        {
+            await UpdateMcpManifestStatesAsync();
+            var healthAfterExit = await RunManifestHealthCheckAsync(manifest);
+            if (IsHostManagedMcp(manifest) && healthAfterExit.Success)
+            {
+                AppendLog($"MCP 启动检查完成：{manifest.DisplayName} | 宿主服务已在线");
+            }
+            else
+            {
+                AppendLog($"MCP 启动后立即退出：{manifest.DisplayName} exit={process.ExitCode}");
+            }
+        }
+        else
+        {
+            states[manifest.Id ?? manifest.DisplayName ?? Guid.NewGuid().ToString("N")] = new McpServiceState
+            {
+                Id = manifest.Id,
+                DisplayName = manifest.DisplayName,
+                ProcessId = process.Id,
+                Launcher = launcher,
+                WorkingDirectory = cwd,
+                StartedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            };
+            SaveMcpServiceStates(states);
+            AppendLog($"MCP 已启动：{manifest.DisplayName} PID={process.Id}");
+        }
+
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+        RenderMcpList();
+        await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+    }
+
+    private async Task StopSelectedMcpAsync()
+    {
+        if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        var states = LoadMcpServiceStates();
+        var key = manifest.Id ?? manifest.DisplayName ?? "";
+
+        if (TryGetRunningServiceState(manifest, states, out var running))
+        {
+            try
+            {
+                var process = Process.GetProcessById(running!.ProcessId);
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(5000);
+                AppendLog($"MCP 已停止：{manifest.DisplayName} PID={running.ProcessId}");
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"MCP 停止失败：{manifest.DisplayName} {ex.Message}");
+            }
+            states.Remove(key);
+            SaveMcpServiceStates(states);
+            LoadManifests();
+            await UpdateMcpManifestStatesAsync();
+            RenderMcpList();
+            await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+            return;
+        }
+
+        var stopLauncher = ResolveManifestPath(manifest.StopLauncher, manifest);
+        if (!string.IsNullOrWhiteSpace(stopLauncher) && File.Exists(stopLauncher))
+        {
+            var result = await RunPowerShellFileAsync(stopLauncher, "", ResolveManifestDirectory(manifest.Cwd, manifest), 120000, BuildManifestEnvironment(manifest));
+            AppendCommand($"停止 MCP {manifest.DisplayName}", result);
+        }
+        else
+        {
+            AppendLog($"MCP 没有可停止的托管进程：{manifest.DisplayName}");
+        }
+
+        states.Remove(key);
+        SaveMcpServiceStates(states);
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+        RenderMcpList();
+        await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+    }
+
+    private async Task CheckSelectedMcpAsync()
+    {
+        if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        await RefreshSelectedMcpRuntimeStatusAsync(manifest, appendLog: true);
+        RenderMcpList();
+    }
+
+    private async Task RefreshSelectedMcpRuntimeStatusAsync(McpManifest manifest, bool appendLog = false)
+    {
+        var lines = new List<string>();
+        var states = LoadMcpServiceStates();
+        var tracked = TryGetRunningServiceState(manifest, states, out var state);
+        manifest.IsRunning = tracked;
+        var hostManaged = IsHostManagedMcp(manifest);
+        lines.Add(hostManaged
+            ? $"宿主服务: {(tracked ? "托管进程运行中" : "依赖外部宿主")}"
+            : $"托管进程: {(tracked ? "运行中" : "未运行")}");
+
+        if (tracked && state is not null)
+        {
+            lines.Add($"PID: {state.ProcessId}");
+            lines.Add($"Started: {state.StartedAt}");
+        }
+
+        var health = await RunManifestHealthCheckAsync(manifest);
+        manifest.HealthOk = health.Success;
+        manifest.HealthSummary = health.Message;
+        lines.Add($"检查结果: {(health.Success ? "通过" : "失败")}");
+        lines.Add(health.Message);
+        manifest.StatusBadge = BuildManifestStatusBadge(manifest);
+
+        _mcpRuntimeStatus.Text = string.Join(Environment.NewLine, lines);
+        if (appendLog)
+        {
+            AppendLog($"MCP 检查：{manifest.DisplayName} -> {(health.Success ? "通过" : "失败")} | {health.Message}");
+        }
+    }
+
+    private async Task UpdateMcpManifestStatesAsync()
+    {
+        var states = LoadMcpServiceStates();
+        HashSet<string> registered = new(StringComparer.OrdinalIgnoreCase);
+
+        var codexList = await RunProcessAsync("powershell.exe", "-NoLogo -NoProfile -Command \"codex mcp list\"", _skillDir);
+        if (codexList.ExitCode == 0)
+        {
+            foreach (var line in codexList.Stdout.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries))
+            {
+                var name = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    registered.Add(name.Trim());
+                }
+            }
+        }
+
+        foreach (var manifest in _manifests)
+        {
+            manifest.IsRunning = TryGetRunningServiceState(manifest, states, out _);
+            var registerName = !string.IsNullOrWhiteSpace(manifest.RegisterName) ? manifest.RegisterName! : manifest.Id ?? "";
+            manifest.IsRegistered = !string.IsNullOrWhiteSpace(registerName) && registered.Contains(registerName);
+            var health = await RunManifestHealthCheckAsync(manifest);
+            manifest.HealthOk = health.Success;
+            manifest.HealthSummary = health.Message;
+            manifest.StatusBadge = BuildManifestStatusBadge(manifest);
+        }
+    }
+
+    private static string BuildManifestStatusBadge(McpManifest manifest)
+    {
+        var parts = new List<string>();
+        if (IsHostManagedMcp(manifest))
+        {
+            parts.Add(manifest.HealthOk == true ? "[宿主在线]" : "[宿主离线]");
+        }
+        else
+        {
+            parts.Add(manifest.IsRunning ? "[运行中]" : "[未运行]");
+        }
+        if (!string.IsNullOrWhiteSpace(manifest.RegisterName))
+        {
+            parts.Add(manifest.IsRegistered ? "[已注册]" : "[未注册]");
+        }
+        if (manifest.HealthOk.HasValue)
+        {
+            parts.Add(manifest.HealthOk.Value ? "[检查通过]" : "[检查失败]");
+        }
+        return string.Join("", parts);
+    }
+
+    private static bool IsHostManagedMcp(McpManifest manifest)
+        => string.Equals(manifest.Type, "http", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<(bool Success, string Message)> RunManifestHealthCheckAsync(McpManifest manifest)
+    {
+        if (manifest.HealthCheck is null || string.IsNullOrWhiteSpace(manifest.HealthCheck.Kind))
+        {
+            return (false, "未配置 healthCheck");
+        }
+
+        var kind = manifest.HealthCheck.Kind.Trim().ToLowerInvariant();
+        if (kind == "http")
+        {
+            var url = ExpandManifestValue(manifest.HealthCheck.Url);
+            if (string.IsNullOrWhiteSpace(url)) return (false, "healthCheck.url 为空");
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                using var response = await client.GetAsync(url);
+                var code = (int)response.StatusCode;
+                var online = code is >= 200 and < 300 or 400 or 401 or 403 or 404 or 405 or 406;
+                var statusLabel = online ? "HTTP 在线" : "HTTP 异常";
+                return (online, $"{statusLabel} {(int)response.StatusCode} {response.ReasonPhrase} | {url}");
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+            {
+                var code = (int)ex.StatusCode.Value;
+                var online = code is 400 or 401 or 403 or 404 or 405 or 406;
+                var statusLabel = online ? "HTTP 在线" : "HTTP 异常";
+                return (online, $"{statusLabel} {code} | {url} | {ex.Message}");
+            }
+            catch (TaskCanceledException ex)
+            {
+                return (false, $"HTTP 超时 | {url} | {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return (false, $"HTTP 连接失败 | {url} | {ex.Message}");
+            }
+        }
+
+        if (kind == "codex-mcp-list")
+        {
+            var name = !string.IsNullOrWhiteSpace(manifest.RegisterName) ? manifest.RegisterName! : manifest.Id ?? "";
+            var result = await RunProcessAsync("powershell.exe", "-NoLogo -NoProfile -Command \"codex mcp list\"", _skillDir);
+            var found = result.ExitCode == 0 && Regex.IsMatch(result.Stdout, $"(?m)^{Regex.Escape(name)}\\s");
+            return found
+                ? (true, $"已注册到 Codex: {name}")
+                : (false, $"未在 Codex MCP 列表中发现: {name}");
+        }
+
+        return (false, $"未知 healthCheck.kind: {manifest.HealthCheck.Kind}");
+    }
+
+    private bool TryGetRunningServiceState(McpManifest manifest, Dictionary<string, McpServiceState> states, out McpServiceState? state)
+    {
+        state = null;
+        var key = manifest.Id ?? manifest.DisplayName ?? "";
+        if (!states.TryGetValue(key, out var candidate))
+        {
+            return false;
+        }
+
+        try
+        {
+            var process = Process.GetProcessById(candidate.ProcessId);
+            if (process.HasExited)
+            {
+                states.Remove(key);
+                SaveMcpServiceStates(states);
+                return false;
+            }
+            state = candidate;
+            return true;
+        }
+        catch
+        {
+            states.Remove(key);
+            SaveMcpServiceStates(states);
+            return false;
+        }
+    }
+
+    private Dictionary<string, McpServiceState> LoadMcpServiceStates()
+    {
+        try
+        {
+            if (!File.Exists(_mcpServiceStatePath))
+            {
+                return new Dictionary<string, McpServiceState>(StringComparer.OrdinalIgnoreCase);
+            }
+            var raw = File.ReadAllText(_mcpServiceStatePath, Encoding.UTF8);
+            return JsonSerializer.Deserialize<Dictionary<string, McpServiceState>>(raw, JsonOptions)
+                   ?? new Dictionary<string, McpServiceState>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new Dictionary<string, McpServiceState>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private void SaveMcpServiceStates(Dictionary<string, McpServiceState> states)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_mcpServiceStatePath)!);
+        File.WriteAllText(_mcpServiceStatePath, JsonSerializer.Serialize(states, JsonOptions), new UTF8Encoding(false));
+    }
+
+    private Dictionary<string, string?> BuildManifestEnvironment(McpManifest manifest)
+    {
+        var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        if (manifest.Env is null) return env;
+        foreach (var pair in manifest.Env)
+        {
+            env[pair.Key] = ExpandManifestValue(pair.Value);
+        }
+        return env;
+    }
+
+    private string ExpandManifestValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        var expanded = value
+            .Replace("${SUITE_ROOT}", _suiteRoot ?? "")
+            .Replace("${CTI_HOME}", _ctiHome)
+            .Replace("${USERPROFILE}", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+
+        foreach (var pair in _config)
+        {
+            expanded = expanded.Replace("${" + pair.Key + "}", pair.Value ?? "");
+        }
+
+        return Environment.ExpandEnvironmentVariables(expanded);
+    }
+
+    private string ResolveManifestPath(string? value, McpManifest manifest)
+    {
+        var expanded = ExpandManifestValue(value);
+        if (string.IsNullOrWhiteSpace(expanded)) return "";
+        if (Uri.TryCreate(expanded, UriKind.Absolute, out var uri) && (uri.Scheme == "http" || uri.Scheme == "https")) return expanded;
+        if (Path.IsPathRooted(expanded)) return Path.GetFullPath(expanded);
+        var baseDir = manifest.ManifestPath is not null ? Path.GetDirectoryName(manifest.ManifestPath)! : (!string.IsNullOrWhiteSpace(_suiteRoot) ? _suiteRoot : _skillDir);
+        return Path.GetFullPath(Path.Combine(baseDir, expanded));
+    }
+
+    private string ResolveManifestDirectory(string? value, McpManifest manifest)
+    {
+        var expanded = ExpandManifestValue(value);
+        if (string.IsNullOrWhiteSpace(expanded)) return "";
+        if (Path.IsPathRooted(expanded)) return Path.GetFullPath(expanded);
+        var baseDir = manifest.ManifestPath is not null ? Path.GetDirectoryName(manifest.ManifestPath)! : (!string.IsNullOrWhiteSpace(_suiteRoot) ? _suiteRoot : _skillDir);
+        return Path.GetFullPath(Path.Combine(baseDir, expanded));
     }
 
     private async Task PublishSuiteAsync()
@@ -415,9 +1117,105 @@ internal sealed class MainForm : Form
             AppendLog("未找到 publish-backup.ps1。");
             return;
         }
+
+        var preflight = await ValidatePowerShellScriptAsync(_publishBackupScript);
+        if (!preflight.Success)
+        {
+            AppendLog($"发布前语法预检失败：{preflight.Message}");
+            MessageBox.Show(
+                this,
+                $"发布前语法预检失败，已阻止继续发布。\n\n{preflight.Message}",
+                "发布预检失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return;
+        }
+        AppendLog("发布前语法预检通过：PARSE_OK");
+
+        var preview = await BuildPublishPreviewAsync();
+        var confirm = MessageBox.Show(
+            this,
+            preview,
+            "一键发布预览",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information);
+        if (confirm != DialogResult.OK)
+        {
+            AppendLog("已取消一键发布。");
+            return;
+        }
+
         var result = await RunPowerShellFileAsync(_publishBackupScript, "", _suiteRoot, 900000);
         AppendCommand("一键发布", result);
         await RefreshBuildInfoAsync();
+    }
+
+    private async Task<(bool Success, string Message)> ValidatePowerShellScriptAsync(string scriptPath)
+    {
+        var escaped = scriptPath.Replace("'", "''");
+        var command = "$tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile('" + escaped + "', [ref]$tokens, [ref]$errors) | Out-Null; if ($errors.Count -eq 0) { 'PARSE_OK'; exit 0 } else { $errors | Select-Object -First 8 | ForEach-Object { $_.Message }; exit 1 }";
+        var result = await RunProcessAsync("powershell.exe", $"-NoLogo -NoProfile -Command \"{command}\"", _suiteRoot);
+        if (result.ExitCode == 0)
+        {
+            return (true, "PARSE_OK");
+        }
+
+        var details = FirstNonEmptyLine(result.Stdout)
+            ?? FirstNonEmptyLine(result.Stderr)
+            ?? "Unknown PowerShell parse error.";
+        return (false, details);
+    }
+
+    private async Task<string> BuildPublishPreviewAsync()
+    {
+        var cwd = string.IsNullOrWhiteSpace(_suiteRoot) ? _skillDir : _suiteRoot;
+        var result = await RunProcessAsync("powershell.exe", "-NoLogo -NoProfile -Command \"git status --short\"", cwd);
+        var lines = result.ExitCode == 0
+            ? result.Stdout.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries)
+            : Array.Empty<string>();
+
+        if (lines.Length == 0)
+        {
+            return "当前没有待发布改动。继续执行会只触发同步和打包，不会生成新的 git 提交。";
+        }
+
+        var mcpLines = lines.Where(line => Regex.IsMatch(line, @"config[\\/]+mcp\.d[\\/].+\.json|scripts[\\/]+(launch|stop)-.+-mcp\.ps1|extensions[\\/]+blender|packages[\\/]+mcp-")).ToList();
+        var panelLines = lines.Where(line => Regex.IsMatch(line, @"apps[\\/]+control-panel[\\/]|packages[\\/]+bridge-runtime[\\/]+scripts[\\/]+build-control-panel\.ps1|scripts[\\/]+sync-live-skill\.ps1")).ToList();
+        var otherLines = lines.Where(line => !mcpLines.Contains(line) && !panelLines.Contains(line)).ToList();
+
+        var builder = new StringBuilder();
+        builder.AppendLine("发布前摘要");
+        builder.AppendLine();
+
+        builder.AppendLine("MCP 相关改动：");
+        if (mcpLines.Count == 0) builder.AppendLine("- 无");
+        else
+        {
+            foreach (var line in mcpLines.Take(12)) builder.AppendLine("- " + line.Trim());
+            if (mcpLines.Count > 12) builder.AppendLine($"- ... 其余 {mcpLines.Count - 12} 条");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("面板相关改动：");
+        if (panelLines.Count == 0) builder.AppendLine("- 无");
+        else
+        {
+            foreach (var line in panelLines.Take(10)) builder.AppendLine("- " + line.Trim());
+            if (panelLines.Count > 10) builder.AppendLine($"- ... 其余 {panelLines.Count - 10} 条");
+        }
+
+        if (otherLines.Count > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("其他改动：");
+            foreach (var line in otherLines.Take(10)) builder.AppendLine("- " + line.Trim());
+            if (otherLines.Count > 10) builder.AppendLine($"- ... 其余 {otherLines.Count - 10} 条");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("确认后将执行：同步 -> 打包 -> git add/commit -> git push");
+        builder.AppendLine("git 提交信息会自动整理包含 MCP/面板更新摘要。");
+        return builder.ToString().TrimEnd();
     }
 
     private void ShowHelp()
@@ -602,11 +1400,11 @@ internal sealed class MainForm : Form
             return entry;
         }
 
-        var indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 120);
+        var indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 400);
         if (indexedMessages.Count == 0)
         {
             await SyncFeishuChatHistoryAsync(entry.ChatId, entry.DisplayName, entry.ChatType, false);
-            indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 120);
+            indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 400);
         }
         entry.Messages = indexedMessages;
         entry.Summary = BuildConversationSummary(indexedMessages);
@@ -803,6 +1601,7 @@ internal sealed class MainForm : Form
             AppendLog($"已同步飞书历史：{chat.DisplayName} ({chat.ChatId})");
         }
         AppendLog($"飞书全历史同步完成，共 {synced} 个会话。");
+        RefreshFeishuHistorySyncStatusPanel();
     }
 
     private async Task SyncFeishuChatHistoryAsync(string chatId, string? displayName, string? chatType, bool full)
@@ -858,6 +1657,7 @@ internal sealed class MainForm : Form
             LastSyncAt = DateTime.UtcNow.ToString("o"),
         };
         SaveFeishuHistoryIndex(index);
+        RefreshFeishuHistorySyncStatusPanel();
     }
 
     private async Task<Dictionary<string, string>> FetchFeishuChatMemberNamesAsync(string chatId)
@@ -934,9 +1734,127 @@ internal sealed class MainForm : Form
         }).ToList();
     }
 
+    private void RefreshFeishuHistorySyncStatusPanel()
+    {
+        var index = LoadFeishuHistoryIndex()
+            .Values
+            .OrderByDescending(item => ParseUnixMsOrIso(item.LastSyncAt) ?? DateTime.MinValue)
+            .ThenBy(item => item.DisplayName ?? item.ChatId)
+            .ToList();
+
+        if (index.Count == 0)
+        {
+            _historySyncStatus.Text = "暂无本地飞书历史索引。";
+            return;
+        }
+
+        var lines = new List<string>
+        {
+            $"已同步会话: {index.Count}",
+            $"累计消息: {index.Sum(item => item.MessageCount)}",
+            "",
+        };
+        foreach (var item in index.Take(8))
+        {
+            var latest = ParseUnixMsOrIso(item.LatestMessageTime)?.ToString("yyyy-MM-dd HH:mm:ss") ?? "-";
+            var syncedAt = ParseUnixMsOrIso(item.LastSyncAt)?.ToString("yyyy-MM-dd HH:mm:ss") ?? item.LastSyncAt ?? "-";
+            lines.Add($"{item.DisplayName ?? item.ChatId} | {item.MessageCount} 条 | 最新 {latest} | 同步 {syncedAt}");
+        }
+        if (index.Count > 8) lines.Add($"... 其余 {index.Count - 8} 个会话请点“查看同步状态”");
+        _historySyncStatus.Text = string.Join(Environment.NewLine, lines);
+    }
+
+    private void RunHistorySearch()
+    {
+        var chatFilter = _historySearchChat.Text.Trim();
+        var keywordFilter = _historySearchKeyword.Text.Trim();
+        var speakerFilter = _historySearchSpeaker.Text.Trim();
+        var startAt = ParseDateTime(_historySearchStart.Text.Trim());
+        var endAt = ParseDateTime(_historySearchEnd.Text.Trim());
+
+        var keywordTokens = Regex.Split(keywordFilter, @"\s+")
+            .Select(token => token.Trim())
+            .Where(token => !string.IsNullOrWhiteSpace(token))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var candidates = LoadFeishuHistoryIndex()
+            .Values
+            .Where(item =>
+                string.IsNullOrWhiteSpace(chatFilter)
+                || (item.ChatId?.Contains(chatFilter, StringComparison.OrdinalIgnoreCase) ?? false)
+                || (item.DisplayName?.Contains(chatFilter, StringComparison.OrdinalIgnoreCase) ?? false))
+            .ToList();
+
+        var hits = new List<HistorySearchHit>();
+        foreach (var chat in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(chat.ChatId)) continue;
+            foreach (var item in LoadIndexedFeishuHistoryRaw(chat.ChatId))
+            {
+                var createdAt = ParseUnixMsOrIso(item.CreateTime);
+                if (startAt.HasValue && (!createdAt.HasValue || createdAt.Value < startAt.Value)) continue;
+                if (endAt.HasValue && (!createdAt.HasValue || createdAt.Value > endAt.Value)) continue;
+
+                var speakerText = $"{item.SenderName} {item.SenderId}".Trim();
+                if (!string.IsNullOrWhiteSpace(speakerFilter)
+                    && !speakerText.Contains(speakerFilter, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var haystack = $"{item.Text}\n{speakerText}";
+                var score = 0;
+                foreach (var token in keywordTokens)
+                {
+                    if (haystack.Contains(token, StringComparison.OrdinalIgnoreCase)) score += 10;
+                }
+
+                if (keywordTokens.Length > 0 && score == 0) continue;
+                if (keywordTokens.Length == 0 && string.IsNullOrWhiteSpace(speakerFilter) && !startAt.HasValue && !endAt.HasValue) score = 1;
+
+                hits.Add(new HistorySearchHit
+                {
+                    ChatId = chat.ChatId,
+                    DisplayName = chat.DisplayName ?? chat.ChatId,
+                    CreatedAt = createdAt,
+                    SenderName = item.SenderName,
+                    SenderId = item.SenderId,
+                    Text = item.Text,
+                    Score = score,
+                });
+            }
+        }
+
+        var ordered = hits
+            .OrderByDescending(item => item.Score)
+            .ThenByDescending(item => item.CreatedAt ?? DateTime.MinValue)
+            .Take(60)
+            .ToList();
+
+        if (ordered.Count == 0)
+        {
+            _historySearchResults.Text = "没有命中本地历史索引。";
+            return;
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"命中 {ordered.Count} 条");
+        builder.AppendLine();
+        for (var index = 0; index < ordered.Count; index++)
+        {
+            var hit = ordered[index];
+            builder.AppendLine($"[{index + 1}] {hit.DisplayName} | {hit.CreatedAt:yyyy-MM-dd HH:mm:ss} | {hit.SenderName ?? hit.SenderId ?? "-"} | score={hit.Score}");
+            builder.AppendLine(TrimForSummary(hit.Text, 280));
+            builder.AppendLine();
+        }
+        _historySearchResults.Text = builder.ToString().TrimEnd();
+    }
+
     private void ShowFeishuHistorySyncStatus()
     {
         var index = LoadFeishuHistoryIndex();
+        RefreshFeishuHistorySyncStatusPanel();
         if (index.Count == 0)
         {
             AppendLog("飞书历史索引为空。");
@@ -1195,6 +2113,9 @@ internal sealed class MainForm : Form
     private static string FirstLine(string text)
         => text.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? "可用";
 
+    private static string? FirstNonEmptyLine(string text)
+        => text.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(line => !string.IsNullOrWhiteSpace(line))?.Trim();
+
     private static void OpenPath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
@@ -1233,11 +2154,37 @@ internal sealed class McpManifest
     public string? Type { get; set; }
     public bool? Enabled { get; set; }
     public string? Launcher { get; set; }
+    public string? StopLauncher { get; set; }
     public string? Cwd { get; set; }
     public string? RegisterName { get; set; }
+    public Dictionary<string, string>? Env { get; set; }
+    public McpHealthCheck? HealthCheck { get; set; }
     public string? Description { get; set; }
     public string? ManifestPath { get; set; }
-    public override string ToString() => $"{DisplayName ?? Id} [{Type}] {(Enabled == false ? "disabled" : "enabled")}";
+    public string? ServiceStatePath { get; set; }
+    public string? StatusBadge { get; set; }
+    public bool IsRegistered { get; set; }
+    public bool IsRunning { get; set; }
+    public bool? HealthOk { get; set; }
+    public string? HealthSummary { get; set; }
+    public override string ToString()
+        => $"{StatusBadge ?? ""} {(DisplayName ?? Id)} [{Type}] {(Enabled == false ? "disabled" : "enabled")}".Trim();
+}
+
+internal sealed class McpHealthCheck
+{
+    public string? Kind { get; set; }
+    public string? Url { get; set; }
+}
+
+internal sealed class McpServiceState
+{
+    public string? Id { get; set; }
+    public string? DisplayName { get; set; }
+    public int ProcessId { get; set; }
+    public string? Launcher { get; set; }
+    public string? WorkingDirectory { get; set; }
+    public string? StartedAt { get; set; }
 }
 
 internal sealed class BridgeRuntimeStatus
@@ -1277,6 +2224,17 @@ internal sealed class FeishuHistorySyncRecord
     public string? OldestMessageTime { get; set; }
     public string? LatestMessageTime { get; set; }
     public string? LastSyncAt { get; set; }
+}
+
+internal sealed class HistorySearchHit
+{
+    public string ChatId { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public DateTime? CreatedAt { get; set; }
+    public string? SenderName { get; set; }
+    public string? SenderId { get; set; }
+    public string Text { get; set; } = "";
+    public int Score { get; set; }
 }
 
 internal sealed class SessionRecord

@@ -1,8 +1,15 @@
 $ErrorActionPreference = 'Stop'
 
 $SkillDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$SuiteRoot = Join-Path (Join-Path $env:USERPROFILE 'Documents\New project') 'codex-im-suite'
 $ProjectDir = Join-Path $SkillDir 'tools\ControlPanel'
 $PublishDir = Join-Path $SkillDir 'dist\control-panel'
+
+$SuiteProgram = Join-Path $SuiteRoot 'apps\control-panel\Program.cs'
+$LiveProgram = Join-Path $ProjectDir 'Program.cs'
+if (Test-Path -LiteralPath $SuiteProgram) {
+  Copy-Item -LiteralPath $SuiteProgram -Destination $LiveProgram -Force
+}
 
 dotnet publish $ProjectDir `
   -c Release `
