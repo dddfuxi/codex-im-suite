@@ -29,10 +29,15 @@ internal sealed class MainForm : Form
     private readonly string _manifestDir;
     private readonly string _suiteRoot;
     private readonly string _publishBackupScript;
+    private readonly string _localLlmStartScript;
+    private readonly string _localLlmStopScript;
+    private readonly string _localLlmHealthcheckScript;
+    private readonly string _localLlmReadmePath;
     private readonly string _dataDir;
     private readonly string _messagesDir;
     private readonly string _statusJsonPath;
     private readonly string _mcpServiceStatePath;
+    private readonly string _localLlmStatusPath;
     private readonly string _feishuChatIndexPath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
@@ -49,6 +54,7 @@ internal sealed class MainForm : Form
     private readonly TextBox _bridgeStatus = CreateStatusBox();
     private readonly TextBox _codexStatus = CreateStatusBox();
     private readonly TextBox _mcpStatus = CreateStatusBox();
+    private readonly TextBox _localLlmStatus = CreateStatusBox();
     private readonly TextBox _buildStatus = CreateStatusBox();
     private readonly ListBox _mcpList = new();
     private readonly TextBox _mcpRuntimeStatus = new();
@@ -79,10 +85,18 @@ internal sealed class MainForm : Form
             ? Path.Combine(_skillDir, "mcp.d")
             : Path.Combine(_suiteRoot, "config", "mcp.d");
         _publishBackupScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "publish-backup.ps1");
+        var localLlmScriptRoot = string.IsNullOrWhiteSpace(_suiteRoot)
+            ? Path.Combine(_skillDir, "scripts", "local-llm")
+            : Path.Combine(_suiteRoot, "scripts", "local-llm");
+        _localLlmStartScript = Path.Combine(localLlmScriptRoot, "start-local-llm.ps1");
+        _localLlmStopScript = Path.Combine(localLlmScriptRoot, "stop-local-llm.ps1");
+        _localLlmHealthcheckScript = Path.Combine(localLlmScriptRoot, "healthcheck-local-llm.ps1");
+        _localLlmReadmePath = Path.Combine(localLlmScriptRoot, "README.md");
         _dataDir = Path.Combine(_ctiHome, "data");
         _messagesDir = Path.Combine(_dataDir, "messages");
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
         _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
+        _localLlmStatusPath = Path.Combine(_ctiHome, "runtime", "local-llm-status.json");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
@@ -119,13 +133,14 @@ internal sealed class MainForm : Form
     private Control BuildStatusPanel()
     {
         var group = new GroupBox { Text = "服务总览", Dock = DockStyle.Fill };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, Padding = new Padding(8) };
-        for (var i = 0; i < 4; i++) layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, Padding = new Padding(8) };
+        for (var i = 0; i < 5; i++) layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20F));
         group.Controls.Add(layout);
         AddStatusCard(layout, "飞书桥接", _bridgeStatus, 0);
         AddStatusCard(layout, "Codex CLI", _codexStatus, 1);
         AddStatusCard(layout, "MCP 清单", _mcpStatus, 2);
-        AddStatusCard(layout, "版本信息", _buildStatus, 3);
+        AddStatusCard(layout, "本地模型", _localLlmStatus, 3);
+        AddStatusCard(layout, "版本信息", _buildStatus, 4);
         return group;
     }
 
@@ -175,6 +190,9 @@ internal sealed class MainForm : Form
         AddToolAction(strip, "重启飞书", async () => { await RunDaemonAsync("stop"); await RunDaemonAsync("start"); });
         AddToolAction(strip, "查看日志", async () => await RunDaemonAsync("logs 120"));
         AddToolAction(strip, "检查 Codex", async () => await CheckCodexAsync());
+        AddToolAction(strip, "启动本地模型", async () => await StartLocalLlmAsync());
+        AddToolAction(strip, "停止本地模型", async () => await StopLocalLlmAsync());
+        AddToolAction(strip, "检查本地模型", async () => await CheckLocalLlmAsync());
         AddToolAction(strip, "注册全部 MCP", async () => await RegisterAllMcpsAsync());
         AddToolAction(strip, "一键发布", async () => await PublishSuiteAsync());
         AddToolAction(strip, "查看会话", async () => await ShowConversationViewerAsync());
@@ -184,6 +202,7 @@ internal sealed class MainForm : Form
         strip.Items.Add(new ToolStripSeparator());
         AddToolAction(strip, "打开配置", () => OpenPath(_configPath));
         AddToolAction(strip, "打开 mcp.d", () => OpenPath(_manifestDir));
+        AddToolAction(strip, "打开本地模型说明", OpenLocalLlmDocs);
         AddToolAction(strip, "打开记忆仓库", () => OpenPath(_memoryRepo.Text));
         if (!string.IsNullOrWhiteSpace(_suiteRoot))
         {
@@ -620,6 +639,7 @@ internal sealed class MainForm : Form
         RenderMcpList();
         await CheckBridgeAsync();
         await CheckCodexAsync(true);
+        await CheckLocalLlmAsync(true);
         await RefreshBuildInfoAsync();
         RefreshFeishuHistorySyncStatusPanel();
         if (_mcpList.SelectedItem is McpManifest selected) await RefreshSelectedMcpRuntimeStatusAsync(selected);
@@ -658,6 +678,36 @@ internal sealed class MainForm : Form
         if (!updateOnly) AppendCommand("codex version", result);
     }
 
+    private async Task CheckLocalLlmAsync(bool updateOnly = false)
+    {
+        var enabled = !string.Equals(GetConfig("CTI_LOCAL_LLM_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var autoRoute = !string.Equals(GetConfig("CTI_LOCAL_LLM_AUTO_ROUTE", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
+        var model = GetConfig("CTI_LOCAL_LLM_MODEL", "qwen2.5-coder-7b-instruct");
+
+        if (!enabled)
+        {
+            _localLlmStatus.Text = $"未启用{Environment.NewLine}{model}";
+            if (!updateOnly) AppendLog("本地模型未启用。");
+            return;
+        }
+
+        var (ok, message) = await ProbeLocalLlmAsync(baseUrl);
+        var stats = ReadLocalLlmStatus();
+        _localLlmStatus.Text = string.Join(Environment.NewLine, new[]
+        {
+            ok ? "在线" : "离线",
+            model,
+            $"命中 {stats.RouteHits} / 回退 {stats.FallbackCount}",
+            string.IsNullOrWhiteSpace(stats.LastFallbackReason) ? (autoRoute ? "自动分流开启" : "自动分流关闭") : TrimForStatus(stats.LastFallbackReason, 36),
+        });
+
+        if (!updateOnly)
+        {
+            AppendLog($"本地模型检查：{(ok ? "通过" : "失败")} | {message}");
+        }
+    }
+
     private async Task RefreshBuildInfoAsync()
     {
         var exePath = Environment.ProcessPath;
@@ -669,6 +719,52 @@ internal sealed class MainForm : Form
         var branch = await RunGitTextAsync("branch --show-current");
         var commit = await RunGitTextAsync("rev-parse --short HEAD");
         _buildStatus.Text = $"构建时间: {buildTime}{Environment.NewLine}分支: {branch}{Environment.NewLine}Commit: {commit}";
+    }
+
+    private LocalLlmStatusRecord ReadLocalLlmStatus()
+    {
+        try
+        {
+            if (!File.Exists(_localLlmStatusPath)) return new LocalLlmStatusRecord();
+            var raw = File.ReadAllText(_localLlmStatusPath, Encoding.UTF8);
+            return string.IsNullOrWhiteSpace(raw)
+                ? new LocalLlmStatusRecord()
+                : JsonSerializer.Deserialize<LocalLlmStatusRecord>(raw, JsonOptions) ?? new LocalLlmStatusRecord();
+        }
+        catch
+        {
+            return new LocalLlmStatusRecord();
+        }
+    }
+
+    private async Task<(bool Ok, string Message)> ProbeLocalLlmAsync(string baseUrl)
+    {
+        var targets = new[]
+        {
+            $"{baseUrl.TrimEnd('/')}/health",
+            $"{baseUrl.TrimEnd('/')}/v1/models",
+            baseUrl,
+        };
+
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        foreach (var target in targets)
+        {
+            try
+            {
+                using var response = await client.GetAsync(target);
+                var code = (int)response.StatusCode;
+                if (response.IsSuccessStatusCode || code is 400 or 401 or 403 or 404 or 405 or 406)
+                {
+                    return (true, $"在线 {code} | {target}");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (target == targets[^1]) return (false, $"{target} | {ex.Message}");
+            }
+        }
+
+        return (false, $"{baseUrl} | 无有效响应");
     }
 
     private async Task<string> RunGitTextAsync(string args)
@@ -691,6 +787,35 @@ internal sealed class MainForm : Form
     private async Task RegisterSelectedMcpAsync()
     {
         await RegisterAllMcpsAsync();
+    }
+
+    private async Task StartLocalLlmAsync()
+    {
+        if (!File.Exists(_localLlmStartScript))
+        {
+            AppendLog($"本地模型启动脚本不存在：{_localLlmStartScript}");
+            return;
+        }
+        var result = await RunPowerShellFileAsync(_localLlmStartScript, "", _suiteRoot, 120000);
+        AppendCommand("启动本地模型", result);
+        await CheckLocalLlmAsync(true);
+    }
+
+    private async Task StopLocalLlmAsync()
+    {
+        if (!File.Exists(_localLlmStopScript))
+        {
+            AppendLog($"本地模型停止脚本不存在：{_localLlmStopScript}");
+            return;
+        }
+        var result = await RunPowerShellFileAsync(_localLlmStopScript, "", _suiteRoot, 120000);
+        AppendCommand("停止本地模型", result);
+        await CheckLocalLlmAsync(true);
+    }
+
+    private void OpenLocalLlmDocs()
+    {
+        if (File.Exists(_localLlmReadmePath)) OpenPath(_localLlmReadmePath);
     }
 
     private void OpenSelectedMcpPath()
@@ -2116,6 +2241,12 @@ internal sealed class MainForm : Form
     private static string? FirstNonEmptyLine(string text)
         => text.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(line => !string.IsNullOrWhiteSpace(line))?.Trim();
 
+    private static string TrimForStatus(string text, int maxLen)
+    {
+        var value = text.Trim();
+        return value.Length > maxLen ? value[..(maxLen - 3)] + "..." : value;
+    }
+
     private static void OpenPath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
@@ -2192,6 +2323,25 @@ internal sealed class BridgeRuntimeStatus
     public bool Running { get; set; }
     public int Pid { get; set; }
     public string[]? Channels { get; set; }
+}
+
+internal sealed class LocalLlmStatusRecord
+{
+    public bool Enabled { get; set; }
+    public bool AutoRoute { get; set; }
+    public string? BaseUrl { get; set; }
+    public string? Model { get; set; }
+    public int RouteHits { get; set; }
+    public int RouteMisses { get; set; }
+    public int FallbackCount { get; set; }
+    public bool? ServerReachable { get; set; }
+    public string? LastCheckAt { get; set; }
+    public string? LastRouteReason { get; set; }
+    public string? LastFallbackReason { get; set; }
+    public string? LastProvider { get; set; }
+    public string? LastRequestKind { get; set; }
+    public string? LastError { get; set; }
+    public string? UpdatedAt { get; set; }
 }
 
 internal sealed class ChannelBindingRecord

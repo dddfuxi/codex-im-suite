@@ -15,6 +15,14 @@ export interface Config {
   memoryPromptMaxChars?: number;
   unityMcpEndpoints?: string;
   unityMcpStartCommand?: string;
+  localLlmEnabled?: boolean;
+  localLlmBaseUrl?: string;
+  localLlmModel?: string;
+  localLlmTimeoutMs?: number;
+  localLlmAutoRoute?: boolean;
+  localLlmMaxInputChars?: number;
+  localLlmMaxOutputTokens?: number;
+  localLlmComplexityMode?: string;
   defaultModel?: string;
   defaultMode: string;
   // Telegram
@@ -135,6 +143,15 @@ export function loadConfig(): Config {
   const memoryPromptMaxChars = env.get("CTI_MEMORY_PROMPT_MAX_CHARS")
     ? Number(env.get("CTI_MEMORY_PROMPT_MAX_CHARS"))
     : undefined;
+  const localLlmTimeoutMs = env.get("CTI_LOCAL_LLM_TIMEOUT_MS")
+    ? Number(env.get("CTI_LOCAL_LLM_TIMEOUT_MS"))
+    : undefined;
+  const localLlmMaxInputChars = env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS")
+    ? Number(env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS"))
+    : undefined;
+  const localLlmMaxOutputTokens = env.get("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS")
+    ? Number(env.get("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS"))
+    : undefined;
   const allowedWorkspaceRoots = mergeWorkspaceRoots(
     defaultWorkDir,
     splitPathList(env.get("CTI_ALLOWED_WORKSPACE_ROOTS")),
@@ -154,6 +171,18 @@ export function loadConfig(): Config {
     memoryPromptMaxChars,
     unityMcpEndpoints: env.get("CTI_UNITY_MCP_ENDPOINTS") || undefined,
     unityMcpStartCommand: env.get("CTI_UNITY_MCP_START_COMMAND") || undefined,
+    localLlmEnabled: env.has("CTI_LOCAL_LLM_ENABLED")
+      ? env.get("CTI_LOCAL_LLM_ENABLED") === "true"
+      : true,
+    localLlmBaseUrl: env.get("CTI_LOCAL_LLM_BASE_URL") || "http://127.0.0.1:8080",
+    localLlmModel: env.get("CTI_LOCAL_LLM_MODEL") || "qwen2.5-coder-7b-instruct",
+    localLlmTimeoutMs: localLlmTimeoutMs ?? 45000,
+    localLlmAutoRoute: env.has("CTI_LOCAL_LLM_AUTO_ROUTE")
+      ? env.get("CTI_LOCAL_LLM_AUTO_ROUTE") === "true"
+      : true,
+    localLlmMaxInputChars: localLlmMaxInputChars ?? 6000,
+    localLlmMaxOutputTokens: localLlmMaxOutputTokens ?? 768,
+    localLlmComplexityMode: env.get("CTI_LOCAL_LLM_COMPLEXITY_MODE") || "conservative",
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
@@ -217,6 +246,19 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_MEMORY_PROMPT_MAX_CHARS", String(config.memoryPromptMaxChars));
   out += formatEnvLine("CTI_UNITY_MCP_ENDPOINTS", config.unityMcpEndpoints);
   out += formatEnvLine("CTI_UNITY_MCP_START_COMMAND", config.unityMcpStartCommand);
+  if (config.localLlmEnabled !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_ENABLED", String(config.localLlmEnabled));
+  out += formatEnvLine("CTI_LOCAL_LLM_BASE_URL", config.localLlmBaseUrl);
+  out += formatEnvLine("CTI_LOCAL_LLM_MODEL", config.localLlmModel);
+  if (config.localLlmTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_TIMEOUT_MS", String(config.localLlmTimeoutMs));
+  if (config.localLlmAutoRoute !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_AUTO_ROUTE", String(config.localLlmAutoRoute));
+  if (config.localLlmMaxInputChars !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_MAX_INPUT_CHARS", String(config.localLlmMaxInputChars));
+  if (config.localLlmMaxOutputTokens !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS", String(config.localLlmMaxOutputTokens));
+  out += formatEnvLine("CTI_LOCAL_LLM_COMPLEXITY_MODE", config.localLlmComplexityMode);
   if (config.defaultModel) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
   out += formatEnvLine("CTI_TG_BOT_TOKEN", config.tgBotToken);
@@ -394,6 +436,30 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (config.unityMcpStartCommand) {
     m.set("bridge_unity_mcp_start_command", config.unityMcpStartCommand);
+  }
+  if (config.localLlmEnabled !== undefined) {
+    m.set("bridge_local_llm_enabled", String(config.localLlmEnabled));
+  }
+  if (config.localLlmBaseUrl) {
+    m.set("bridge_local_llm_base_url", config.localLlmBaseUrl);
+  }
+  if (config.localLlmModel) {
+    m.set("bridge_local_llm_model", config.localLlmModel);
+  }
+  if (typeof config.localLlmTimeoutMs === "number" && Number.isFinite(config.localLlmTimeoutMs)) {
+    m.set("bridge_local_llm_timeout_ms", String(Math.max(1000, Math.floor(config.localLlmTimeoutMs))));
+  }
+  if (config.localLlmAutoRoute !== undefined) {
+    m.set("bridge_local_llm_auto_route", String(config.localLlmAutoRoute));
+  }
+  if (typeof config.localLlmMaxInputChars === "number" && Number.isFinite(config.localLlmMaxInputChars)) {
+    m.set("bridge_local_llm_max_input_chars", String(Math.max(1200, Math.floor(config.localLlmMaxInputChars))));
+  }
+  if (typeof config.localLlmMaxOutputTokens === "number" && Number.isFinite(config.localLlmMaxOutputTokens)) {
+    m.set("bridge_local_llm_max_output_tokens", String(Math.max(128, Math.floor(config.localLlmMaxOutputTokens))));
+  }
+  if (config.localLlmComplexityMode) {
+    m.set("bridge_local_llm_complexity_mode", config.localLlmComplexityMode);
   }
   if (config.defaultModel) {
     m.set("bridge_default_model", config.defaultModel);
