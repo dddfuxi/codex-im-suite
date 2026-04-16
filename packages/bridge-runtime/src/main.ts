@@ -22,6 +22,10 @@ import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
+import { LocalLlamaProvider } from './local-llm-provider.js';
+import { decideLocalRoute } from './local-llm-router.js';
+import { readLocalLlmStatus, updateLocalLlmStatus } from './local-llm-status.js';
+import { sseEvent } from './sse-utils.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
@@ -29,6 +33,77 @@ const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(MODULE_DIR, '..');
 const CORE_ROOT = path.resolve(SKILL_ROOT, '..', 'claude-to-im-core');
+
+class RoutedLlmProvider implements LLMProvider {
+  constructor(
+    private readonly config: Config,
+    private readonly localProvider: LocalLlamaProvider,
+    private readonly fallbackProvider: LLMProvider,
+  ) {}
+
+  streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
+    const decision = decideLocalRoute(params, this.config);
+    if (!decision.useLocal) {
+      const current = readLocalLlmStatus(this.config);
+      updateLocalLlmStatus(this.config, {
+        routeMisses: current.routeMisses + 1,
+        lastProvider: 'codex',
+        lastRequestKind: decision.requestKind,
+        lastRouteReason: decision.reason,
+      });
+      return this.fallbackProvider.streamChat(params);
+    }
+
+    return new ReadableStream<string>({
+      start: async (controller) => {
+        try {
+          const current = readLocalLlmStatus(this.config);
+          updateLocalLlmStatus(this.config, {
+            routeHits: current.routeHits + 1,
+            lastProvider: 'local',
+            lastRequestKind: decision.requestKind,
+            lastRouteReason: decision.reason,
+            serverReachable: true,
+            lastCheckAt: new Date().toISOString(),
+            lastError: '',
+          });
+          const result = await this.localProvider.run(params);
+          controller.enqueue(sseEvent('status', { provider: 'local-llama', routeReason: decision.reason }));
+          controller.enqueue(sseEvent('text', result.text));
+          controller.enqueue(sseEvent('result', {
+            subtype: 'success',
+            is_error: false,
+            session_id: params.sessionId,
+            usage: result.usage || {},
+          }));
+          controller.close();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const current = readLocalLlmStatus(this.config);
+          updateLocalLlmStatus(this.config, {
+            fallbackCount: current.fallbackCount + 1,
+            lastProvider: 'codex',
+            lastRequestKind: decision.requestKind,
+            lastRouteReason: decision.reason,
+            lastFallbackReason: message,
+            lastError: message,
+            serverReachable: false,
+            lastCheckAt: new Date().toISOString(),
+          });
+          controller.enqueue(sseEvent('status', { provider: 'codex', fallbackFrom: 'local-llama', reason: message }));
+          const stream = this.fallbackProvider.streamChat(params);
+          const reader = stream.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+          controller.close();
+        }
+      },
+    });
+  }
+}
 
 function collectTsFiles(rootDir: string): string[] {
   if (!fs.existsSync(rootDir)) return [];
@@ -81,11 +156,16 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
  * - 'auto': tries Claude first, falls back to Codex
  */
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions): Promise<LLMProvider> {
+  const wrapWithLocalRoute = (provider: LLMProvider): LLMProvider => {
+    if (config.localLlmEnabled !== true) return provider;
+    return new RoutedLlmProvider(config, new LocalLlamaProvider(config), provider);
+  };
+
   const runtime = config.runtime;
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    return new CodexProvider(pendingPerms);
+    return wrapWithLocalRoute(new CodexProvider(pendingPerms));
   }
 
   if (runtime === 'auto') {
@@ -106,7 +186,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions)
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    return new CodexProvider(pendingPerms);
+    return wrapWithLocalRoute(new CodexProvider(pendingPerms));
   }
 
   // Default: claude
@@ -166,6 +246,7 @@ function writeStatus(info: StatusInfo): void {
 async function main(): Promise<void> {
   const config = loadConfig();
   setupLogger();
+  updateLocalLlmStatus(config, {});
 
   const runId = crypto.randomUUID();
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);

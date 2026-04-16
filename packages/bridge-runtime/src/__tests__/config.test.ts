@@ -188,6 +188,28 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_self_optimize_on_failure'), 'true');
   });
 
+  it('maps local llama routing config', () => {
+    const m = configToSettings({
+      ...base,
+      localLlmEnabled: true,
+      localLlmBaseUrl: 'http://127.0.0.1:8080',
+      localLlmModel: 'qwen2.5-coder-7b-instruct',
+      localLlmTimeoutMs: 45000,
+      localLlmAutoRoute: true,
+      localLlmMaxInputChars: 5000,
+      localLlmMaxOutputTokens: 768,
+      localLlmComplexityMode: 'conservative',
+    });
+    assert.equal(m.get('bridge_local_llm_enabled'), 'true');
+    assert.equal(m.get('bridge_local_llm_base_url'), 'http://127.0.0.1:8080');
+    assert.equal(m.get('bridge_local_llm_model'), 'qwen2.5-coder-7b-instruct');
+    assert.equal(m.get('bridge_local_llm_timeout_ms'), '45000');
+    assert.equal(m.get('bridge_local_llm_auto_route'), 'true');
+    assert.equal(m.get('bridge_local_llm_max_input_chars'), '5000');
+    assert.equal(m.get('bridge_local_llm_max_output_tokens'), '768');
+    assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
+  });
+
   it('omits optional fields when not set', () => {
     const m = configToSettings(base);
     assert.equal(m.has('telegram_bot_token'), false);
