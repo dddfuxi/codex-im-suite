@@ -196,6 +196,13 @@ describe('configToSettings', () => {
       localLlmModel: 'qwen2.5-coder-7b-instruct',
       localLlmTimeoutMs: 45000,
       localLlmAutoRoute: true,
+      localLlmFallbackToCodex: true,
+      localLlmRouterEnabled: true,
+      localLlmRouterMode: 'hybrid',
+      localLlmForceHub: true,
+      localLlmRouterMaxInputChars: 5200,
+      localLlmRouterMaxHistoryItems: 6,
+      localLlmRouterTimeoutMs: 12000,
       localLlmMaxInputChars: 5000,
       localLlmMaxOutputTokens: 768,
       localLlmComplexityMode: 'conservative',
@@ -205,6 +212,13 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_local_llm_model'), 'qwen2.5-coder-7b-instruct');
     assert.equal(m.get('bridge_local_llm_timeout_ms'), '45000');
     assert.equal(m.get('bridge_local_llm_auto_route'), 'true');
+    assert.equal(m.get('bridge_local_llm_fallback_to_codex'), 'true');
+    assert.equal(m.get('bridge_local_llm_router_enabled'), 'true');
+    assert.equal(m.get('bridge_local_llm_router_mode'), 'hybrid');
+    assert.equal(m.get('bridge_local_llm_force_hub'), 'true');
+    assert.equal(m.get('bridge_local_llm_router_max_input_chars'), '5200');
+    assert.equal(m.get('bridge_local_llm_router_max_history_items'), '6');
+    assert.equal(m.get('bridge_local_llm_router_timeout_ms'), '12000');
     assert.equal(m.get('bridge_local_llm_max_input_chars'), '5000');
     assert.equal(m.get('bridge_local_llm_max_output_tokens'), '768');
     assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
