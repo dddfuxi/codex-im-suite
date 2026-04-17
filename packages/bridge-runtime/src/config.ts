@@ -20,6 +20,13 @@ export interface Config {
   localLlmModel?: string;
   localLlmTimeoutMs?: number;
   localLlmAutoRoute?: boolean;
+  localLlmFallbackToCodex?: boolean;
+  localLlmRouterEnabled?: boolean;
+  localLlmRouterMode?: 'hybrid' | 'local_only' | 'codex_only';
+  localLlmForceHub?: boolean;
+  localLlmRouterMaxInputChars?: number;
+  localLlmRouterMaxHistoryItems?: number;
+  localLlmRouterTimeoutMs?: number;
   localLlmMaxInputChars?: number;
   localLlmMaxOutputTokens?: number;
   localLlmComplexityMode?: string;
@@ -146,6 +153,15 @@ export function loadConfig(): Config {
   const localLlmTimeoutMs = env.get("CTI_LOCAL_LLM_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_LLM_TIMEOUT_MS"))
     : undefined;
+  const localLlmRouterMaxInputChars = env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS")
+    ? Number(env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS"))
+    : undefined;
+  const localLlmRouterMaxHistoryItems = env.get("CTI_LOCAL_LLM_ROUTER_MAX_HISTORY_ITEMS")
+    ? Number(env.get("CTI_LOCAL_LLM_ROUTER_MAX_HISTORY_ITEMS"))
+    : undefined;
+  const localLlmRouterTimeoutMs = env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS")
+    ? Number(env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS"))
+    : undefined;
   const localLlmMaxInputChars = env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS")
     ? Number(env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS"))
     : undefined;
@@ -180,6 +196,19 @@ export function loadConfig(): Config {
     localLlmAutoRoute: env.has("CTI_LOCAL_LLM_AUTO_ROUTE")
       ? env.get("CTI_LOCAL_LLM_AUTO_ROUTE") === "true"
       : true,
+    localLlmFallbackToCodex: env.has("CTI_LOCAL_LLM_FALLBACK_TO_CODEX")
+      ? env.get("CTI_LOCAL_LLM_FALLBACK_TO_CODEX") === "true"
+      : true,
+    localLlmRouterEnabled: env.has("CTI_LOCAL_LLM_ROUTER_ENABLED")
+      ? env.get("CTI_LOCAL_LLM_ROUTER_ENABLED") === "true"
+      : true,
+    localLlmRouterMode: ((env.get("CTI_LOCAL_LLM_ROUTER_MODE") || "hybrid").trim().toLowerCase() as Config["localLlmRouterMode"]) || "hybrid",
+    localLlmForceHub: env.has("CTI_LOCAL_LLM_FORCE_HUB")
+      ? env.get("CTI_LOCAL_LLM_FORCE_HUB") === "true"
+      : true,
+    localLlmRouterMaxInputChars: localLlmRouterMaxInputChars ?? (localLlmMaxInputChars ?? 6000),
+    localLlmRouterMaxHistoryItems: localLlmRouterMaxHistoryItems ?? 6,
+    localLlmRouterTimeoutMs: localLlmRouterTimeoutMs ?? 30000,
     localLlmMaxInputChars: localLlmMaxInputChars ?? 6000,
     localLlmMaxOutputTokens: localLlmMaxOutputTokens ?? 768,
     localLlmComplexityMode: env.get("CTI_LOCAL_LLM_COMPLEXITY_MODE") || "conservative",
@@ -254,6 +283,19 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_LOCAL_LLM_TIMEOUT_MS", String(config.localLlmTimeoutMs));
   if (config.localLlmAutoRoute !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_AUTO_ROUTE", String(config.localLlmAutoRoute));
+  if (config.localLlmFallbackToCodex !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_FALLBACK_TO_CODEX", String(config.localLlmFallbackToCodex));
+  if (config.localLlmRouterEnabled !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_ENABLED", String(config.localLlmRouterEnabled));
+  out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_MODE", config.localLlmRouterMode);
+  if (config.localLlmForceHub !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_FORCE_HUB", String(config.localLlmForceHub));
+  if (config.localLlmRouterMaxInputChars !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS", String(config.localLlmRouterMaxInputChars));
+  if (config.localLlmRouterMaxHistoryItems !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_MAX_HISTORY_ITEMS", String(config.localLlmRouterMaxHistoryItems));
+  if (config.localLlmRouterTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS", String(config.localLlmRouterTimeoutMs));
   if (config.localLlmMaxInputChars !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_MAX_INPUT_CHARS", String(config.localLlmMaxInputChars));
   if (config.localLlmMaxOutputTokens !== undefined)
@@ -451,6 +493,27 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (config.localLlmAutoRoute !== undefined) {
     m.set("bridge_local_llm_auto_route", String(config.localLlmAutoRoute));
+  }
+  if (config.localLlmFallbackToCodex !== undefined) {
+    m.set("bridge_local_llm_fallback_to_codex", String(config.localLlmFallbackToCodex));
+  }
+  if (config.localLlmRouterEnabled !== undefined) {
+    m.set("bridge_local_llm_router_enabled", String(config.localLlmRouterEnabled));
+  }
+  if (config.localLlmRouterMode) {
+    m.set("bridge_local_llm_router_mode", config.localLlmRouterMode);
+  }
+  if (config.localLlmForceHub !== undefined) {
+    m.set("bridge_local_llm_force_hub", String(config.localLlmForceHub));
+  }
+  if (typeof config.localLlmRouterMaxInputChars === "number" && Number.isFinite(config.localLlmRouterMaxInputChars)) {
+    m.set("bridge_local_llm_router_max_input_chars", String(Math.max(1200, Math.floor(config.localLlmRouterMaxInputChars))));
+  }
+  if (typeof config.localLlmRouterMaxHistoryItems === "number" && Number.isFinite(config.localLlmRouterMaxHistoryItems)) {
+    m.set("bridge_local_llm_router_max_history_items", String(Math.max(2, Math.floor(config.localLlmRouterMaxHistoryItems))));
+  }
+  if (typeof config.localLlmRouterTimeoutMs === "number" && Number.isFinite(config.localLlmRouterTimeoutMs)) {
+    m.set("bridge_local_llm_router_timeout_ms", String(Math.max(1000, Math.floor(config.localLlmRouterTimeoutMs))));
   }
   if (typeof config.localLlmMaxInputChars === "number" && Number.isFinite(config.localLlmMaxInputChars)) {
     m.set("bridge_local_llm_max_input_chars", String(Math.max(1200, Math.floor(config.localLlmMaxInputChars))));

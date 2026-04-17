@@ -110,7 +110,7 @@ internal sealed class MainForm : Form
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(12) };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 282));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 290));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
@@ -136,10 +136,26 @@ internal sealed class MainForm : Form
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, Padding = new Padding(8) };
         for (var i = 0; i < 5; i++) layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20F));
         group.Controls.Add(layout);
-        AddStatusCard(layout, "飞书桥接", _bridgeStatus, 0);
-        AddStatusCard(layout, "Codex CLI", _codexStatus, 1);
-        AddStatusCard(layout, "MCP 清单", _mcpStatus, 2);
-        AddStatusCard(layout, "本地模型", _localLlmStatus, 3);
+        AddStatusCard(layout, "飞书桥接", _bridgeStatus, 0,
+            CreateCardButton("启动", async () => await RunDaemonAsync("start")),
+            CreateCardButton("停止", async () => await RunDaemonAsync("stop")),
+            CreateCardButton("重启", async () => await RestartBridgeAsync()),
+            CreateCardButton("日志", async () => await RunDaemonAsync("logs 120")));
+        AddStatusCard(layout, "Codex CLI", _codexStatus, 1,
+            CreateCardButton("检查", async () => await CheckCodexAsync()),
+            CreateCardButton("混合模式", async () => await SetRouterModeAsync("hybrid")),
+            CreateCardButton("仅本地", async () => await SetRouterModeAsync("local_only")),
+            CreateCardButton("仅 Codex", async () => await SetRouterModeAsync("codex_only")),
+            CreateCardButton("路由摘要", ShowLocalRouterSummary));
+        AddStatusCard(layout, "MCP 清单", _mcpStatus, 2,
+            CreateCardButton("注册全部", async () => await RegisterAllMcpsAsync()),
+            CreateCardButton("刷新", async () => await RefreshAllAsync()));
+        AddStatusCard(layout, "本地辅助执行器", _localLlmStatus, 3,
+            CreateCardButton("启动", async () => await StartLocalLlmAsync()),
+            CreateCardButton("停止", async () => await StopLocalLlmAsync()),
+            CreateCardButton("检查", async () => await CheckLocalLlmAsync()),
+            CreateCardButton("说明", OpenLocalLlmDocs),
+            CreateCardButton("路由摘要", ShowLocalRouterSummary));
         AddStatusCard(layout, "版本信息", _buildStatus, 4);
         return group;
     }
@@ -185,15 +201,6 @@ internal sealed class MainForm : Form
         host.Controls.Add(strip);
 
         AddToolAction(strip, "刷新状态", async () => await RefreshAllAsync());
-        AddToolAction(strip, "启动飞书", async () => await RunDaemonAsync("start"));
-        AddToolAction(strip, "停止飞书", async () => await RunDaemonAsync("stop"));
-        AddToolAction(strip, "重启飞书", async () => { await RunDaemonAsync("stop"); await RunDaemonAsync("start"); });
-        AddToolAction(strip, "查看日志", async () => await RunDaemonAsync("logs 120"));
-        AddToolAction(strip, "检查 Codex", async () => await CheckCodexAsync());
-        AddToolAction(strip, "启动本地模型", async () => await StartLocalLlmAsync());
-        AddToolAction(strip, "停止本地模型", async () => await StopLocalLlmAsync());
-        AddToolAction(strip, "检查本地模型", async () => await CheckLocalLlmAsync());
-        AddToolAction(strip, "注册全部 MCP", async () => await RegisterAllMcpsAsync());
         AddToolAction(strip, "一键发布", async () => await PublishSuiteAsync());
         AddToolAction(strip, "查看会话", async () => await ShowConversationViewerAsync());
         AddToolAction(strip, "同步全部历史", async () => await SyncAllFeishuHistoryAsync());
@@ -202,7 +209,6 @@ internal sealed class MainForm : Form
         strip.Items.Add(new ToolStripSeparator());
         AddToolAction(strip, "打开配置", () => OpenPath(_configPath));
         AddToolAction(strip, "打开 mcp.d", () => OpenPath(_manifestDir));
-        AddToolAction(strip, "打开本地模型说明", OpenLocalLlmDocs);
         AddToolAction(strip, "打开记忆仓库", () => OpenPath(_memoryRepo.Text));
         if (!string.IsNullOrWhiteSpace(_suiteRoot))
         {
@@ -394,14 +400,44 @@ internal sealed class MainForm : Form
         Text = "未检测",
     };
 
-    private static void AddStatusCard(TableLayoutPanel parent, string title, TextBox value, int col)
+    private static void AddStatusCard(TableLayoutPanel parent, string title, TextBox value, int col, params Button[] actions)
     {
         var panel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(8), BackColor = Color.WhiteSmoke };
-        var titleLabel = new Label { Text = title, Dock = DockStyle.Top, Height = 24, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold) };
+        var titleLabel = new Label { Text = title, Dock = DockStyle.Top, Height = 24, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft };
         value.Dock = DockStyle.Fill;
         panel.Controls.Add(value);
+        if (actions.Length > 0)
+        {
+            var actionPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                WrapContents = true,
+                AutoScroll = false,
+                AutoSize = false,
+                Height = 86,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                FlowDirection = FlowDirection.LeftToRight,
+            };
+            foreach (var button in actions) actionPanel.Controls.Add(button);
+            panel.Controls.Add(actionPanel);
+        }
         panel.Controls.Add(titleLabel);
         parent.Controls.Add(panel, col, 0);
+    }
+
+    private static Button CreateCardButton(string text, Action action)
+    {
+        var button = new Button { Text = text, AutoSize = true, Height = 26, Margin = new Padding(0, 0, 6, 0) };
+        button.Click += (_, _) => action();
+        return button;
+    }
+
+    private static Button CreateCardButton(string text, Func<Task> action)
+    {
+        var button = new Button { Text = text, AutoSize = true, Height = 26, Margin = new Padding(0, 0, 6, 0) };
+        button.Click += async (_, _) => await action();
+        return button;
     }
 
     private static void AddPathRow(TableLayoutPanel layout, int row, string label, TextBox box, bool browseFolder)
@@ -671,17 +707,40 @@ internal sealed class MainForm : Form
         await CheckBridgeAsync();
     }
 
+    private async Task RestartBridgeAsync()
+    {
+        await RunDaemonAsync("stop");
+        await RunDaemonAsync("start");
+        await CheckCodexAsync(true);
+        await CheckLocalLlmAsync(true);
+    }
+
     private async Task CheckCodexAsync(bool updateOnly = false)
     {
+        var routerMode = GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid");
         var result = await RunProcessAsync("powershell.exe", "-NoLogo -NoProfile -Command \"codex --version\"", _skillDir);
-        _codexStatus.Text = result.ExitCode == 0 ? FirstLine(result.Stdout) : "不可用";
+        var version = result.ExitCode == 0 ? FirstLine(result.Stdout) : "不可用";
+        var codexPrimary = routerMode != "local_only";
+        var stats = ReadLocalLlmStatus();
+        var degradation = result.ExitCode == 0
+            ? "降级: 正常"
+            : (routerMode == "local_only" ? "降级: 已固定仅本地" : "降级: Codex 不可用，将回退本地");
+        _codexStatus.Text = string.Join(Environment.NewLine, new[]
+        {
+            version,
+            $"模式: {RouterModeToLabel(routerMode)}",
+            $"主脑: {(codexPrimary ? "Codex" : "本地")}",
+            $"最近一次请求: {FormatLastBrainStatus(stats)}",
+            routerMode == "local_only" ? "升级: 关闭" : "升级: 允许",
+            degradation,
+        });
         if (!updateOnly) AppendCommand("codex version", result);
     }
 
     private async Task CheckLocalLlmAsync(bool updateOnly = false)
     {
         var enabled = !string.Equals(GetConfig("CTI_LOCAL_LLM_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
-        var autoRoute = !string.Equals(GetConfig("CTI_LOCAL_LLM_AUTO_ROUTE", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var routerMode = GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid");
         var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
         var model = GetConfig("CTI_LOCAL_LLM_MODEL", "qwen2.5-coder-7b-instruct");
 
@@ -698,8 +757,15 @@ internal sealed class MainForm : Form
         {
             ok ? "在线" : "离线",
             model,
-            $"命中 {stats.RouteHits} / 回退 {stats.FallbackCount}",
-            string.IsNullOrWhiteSpace(stats.LastFallbackReason) ? (autoRoute ? "自动分流开启" : "自动分流关闭") : TrimForStatus(stats.LastFallbackReason, 36),
+            $"角色: {(routerMode == "local_only" ? "本地执行主力" : "辅助执行器")}",
+            $"模式 {RouterModeToLabel(stats.RouterMode ?? routerMode)}",
+            "范围: 仅显式小活",
+            $"本地 {stats.RouteHits} / 升级 {stats.EscalationCount}",
+            $"执行 {stats.ExecutionCount} / 失败 {stats.ExecutionFailures}",
+            $"兜底 {stats.LocalOnlyAnswers} / 拒答 {stats.LocalRefusals}",
+            string.IsNullOrWhiteSpace(stats.LastRefusalReason)
+                ? (string.IsNullOrWhiteSpace(stats.LastFallbackReason) ? TrimForStatus(stats.LastRouteReason ?? "暂无最近路由", 42) : TrimForStatus(stats.LastFallbackReason, 42))
+                : TrimForStatus(stats.LastRefusalReason, 42),
         });
 
         if (!updateOnly)
@@ -816,6 +882,96 @@ internal sealed class MainForm : Form
     private void OpenLocalLlmDocs()
     {
         if (File.Exists(_localLlmReadmePath)) OpenPath(_localLlmReadmePath);
+    }
+
+    private async Task SetRouterModeAsync(string mode)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+        var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
+        SetOrAppendEnv(lines, "CTI_LOCAL_LLM_ROUTER_ENABLED", "true");
+        SetOrAppendEnv(lines, "CTI_LOCAL_LLM_FORCE_HUB", "true");
+        SetOrAppendEnv(lines, "CTI_LOCAL_LLM_ROUTER_MODE", mode);
+        SetOrAppendEnv(lines, "CTI_LOCAL_LLM_FALLBACK_TO_CODEX", mode == "local_only" ? "false" : "true");
+        File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+        AppendLog($"已切换运行模式：{RouterModeToLabel(mode)}");
+        LoadConfig();
+        await CheckLocalLlmAsync(true);
+        await CheckCodexAsync(true);
+        await RestartBridgeAsync();
+    }
+
+    private void ShowLocalRouterSummary()
+    {
+        var status = ReadLocalLlmStatus();
+        var lines = new List<string>
+        {
+            $"当前模式: {RouterModeToLabel(status.RouterMode ?? GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid"))}",
+            $"最近本地命中: {status.RouteHits}",
+            $"最近升级 Codex: {status.EscalationCount}",
+            $"最近本地执行: {status.ExecutionCount}",
+            $"最近执行失败: {status.ExecutionFailures}",
+            $"最近本地兜底: {status.LocalOnlyAnswers}",
+            $"最近本地拒答: {status.LocalRefusals}",
+            "",
+            "最近路由摘要:",
+        };
+
+        var routes = status.RecentRoutes ?? [];
+        if (routes.Count == 0)
+        {
+            lines.Add("暂无路由记录。");
+        }
+        else
+        {
+            foreach (var route in routes.TakeLast(12).Reverse())
+            {
+                lines.Add($"[{route.Timestamp}] {FormatRouteLabel(route)} | {route.TaskKind}");
+                lines.Add($"  原因: {route.Reason}");
+                lines.Add($"  压缩: prompt={route.CompressedPromptChars}, history={route.CompressedHistoryChars}");
+                if (!string.IsNullOrWhiteSpace(route.FallbackReason))
+                {
+                    lines.Add($"  回退: {route.FallbackReason}");
+                }
+            }
+        }
+
+        lines.Add("");
+        lines.Add("最近本地执行摘要:");
+        var executions = status.RecentExecutions ?? [];
+        if (executions.Count == 0)
+        {
+            lines.Add("暂无执行记录。");
+        }
+        else
+        {
+            foreach (var execution in executions.TakeLast(12).Reverse())
+            {
+                lines.Add($"[{execution.Timestamp}] {(execution.Success ? "success" : "failed")} | {execution.Action} | steps={execution.StepCount}");
+                lines.Add($"  原因: {execution.Reason}");
+                lines.Add($"  摘要: {execution.Summary}");
+            }
+        }
+
+        using var dialog = new Form
+        {
+            Text = "最近路由摘要",
+            Width = 920,
+            Height = 620,
+            StartPosition = FormStartPosition.CenterParent,
+            Font = new Font("Microsoft YaHei UI", 9F),
+        };
+        var box = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Font = new Font("Consolas", 9F),
+            Text = string.Join(Environment.NewLine, lines),
+        };
+        dialog.Controls.Add(box);
+        dialog.ShowDialog(this);
     }
 
     private void OpenSelectedMcpPath()
@@ -2247,6 +2403,56 @@ internal sealed class MainForm : Form
         return value.Length > maxLen ? value[..(maxLen - 3)] + "..." : value;
     }
 
+    private static string RouterModeToLabel(string? mode)
+        => (mode ?? "").Trim().ToLowerInvariant() switch
+        {
+            "local_only" => "仅本地",
+            "codex_only" => "仅 Codex",
+            _ => "混合模式（Codex 主脑）",
+        };
+
+    private static string FormatLastBrainStatus(LocalLlmStatusRecord status)
+    {
+        var routeLabel = (status.LastRouteLabel ?? "").Trim().ToLowerInvariant();
+        if (routeLabel.Length > 0)
+        {
+            return routeLabel switch
+            {
+                "codex_primary" => "Codex 主脑",
+                "local_explicit_task" => "本地辅助执行",
+                "local_fallback_no_codex" => "本地兜底",
+                "local_refused_out_of_scope" => "本地拒绝（超范围）",
+                _ => "暂无记录",
+            };
+        }
+
+        var provider = (status.LastProvider ?? "").Trim().ToLowerInvariant();
+        return provider switch
+        {
+            "codex" or "codex_only" => "Codex 主脑",
+            "local" => "本地辅助执行",
+            "local_best_effort" => "本地兜底",
+            "refuse_local" => "本地拒绝（超范围）",
+            _ => "暂无记录",
+        };
+    }
+
+    private static string FormatRouteLabel(LocalLlmRouteSummaryRecord route)
+    {
+        var provider = (route.Provider ?? "").Trim().ToLowerInvariant();
+        var mode = (route.Mode ?? "").Trim().ToLowerInvariant();
+        return provider switch
+        {
+            "codex" => "codex_primary",
+            "local_best_effort" => "local_fallback_no_codex",
+            "refuse_local" => "local_refused_out_of_scope",
+            "local" when mode == "hybrid" => "local_explicit_task",
+            "local" when mode == "local_only" => "local_fallback_no_codex",
+            "codex_only" => "codex_primary",
+            _ => $"{provider}:{route.Decision}",
+        };
+    }
+
     private static void OpenPath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
@@ -2329,19 +2535,60 @@ internal sealed class LocalLlmStatusRecord
 {
     public bool Enabled { get; set; }
     public bool AutoRoute { get; set; }
+    public bool RouterEnabled { get; set; }
+    public string? RouterMode { get; set; }
+    public bool ForceHub { get; set; }
     public string? BaseUrl { get; set; }
     public string? Model { get; set; }
     public int RouteHits { get; set; }
     public int RouteMisses { get; set; }
+    public int RouteFailures { get; set; }
+    public int EscalationCount { get; set; }
+    public int LocalOnlyAnswers { get; set; }
+    public int LocalRefusals { get; set; }
+    public int ExecutionCount { get; set; }
+    public int ExecutionFailures { get; set; }
     public int FallbackCount { get; set; }
     public bool? ServerReachable { get; set; }
     public string? LastCheckAt { get; set; }
     public string? LastRouteReason { get; set; }
     public string? LastFallbackReason { get; set; }
+    public string? LastDecision { get; set; }
+    public string? LastRefusalReason { get; set; }
+    public int LastCompressedPromptChars { get; set; }
+    public int LastCompressedHistoryChars { get; set; }
     public string? LastProvider { get; set; }
+    public string? LastRouteLabel { get; set; }
+    public bool? LastCodexPrimary { get; set; }
     public string? LastRequestKind { get; set; }
     public string? LastError { get; set; }
     public string? UpdatedAt { get; set; }
+    public List<LocalLlmRouteSummaryRecord>? RecentRoutes { get; set; }
+    public List<LocalLlmExecutionSummaryRecord>? RecentExecutions { get; set; }
+}
+
+internal sealed class LocalLlmRouteSummaryRecord
+{
+    public string? Timestamp { get; set; }
+    public string? Mode { get; set; }
+    public string? TaskKind { get; set; }
+    public string? Decision { get; set; }
+    public string? Provider { get; set; }
+    public string? Reason { get; set; }
+    public int CompressedPromptChars { get; set; }
+    public int CompressedHistoryChars { get; set; }
+    public string? FallbackReason { get; set; }
+}
+
+internal sealed class LocalLlmExecutionSummaryRecord
+{
+    public string? Timestamp { get; set; }
+    public string? Action { get; set; }
+    public int StepCount { get; set; }
+    public bool Success { get; set; }
+    public string? Provider { get; set; }
+    public string? Reason { get; set; }
+    public string? Summary { get; set; }
 }
 
 internal sealed class ChannelBindingRecord
