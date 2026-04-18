@@ -1,0 +1,8 @@
+{
+  "id": "github-bmad-master",
+  "displayName": "GitHub BMAD Master",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\github-bmad-master",
+  "type": "skill",
+  "enabled": true,
+  "description": "Lightweight BMAD workflow orchestrator adapted from GitHub for project status and workflow routing."
+}

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Bridge Manager — singleton orchestrator for the multi-IM bridge system.
  *
  * Manages adapter lifecycles, routes inbound messages through the
@@ -7,9 +7,10 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
@@ -38,9 +39,24 @@ import {
   recordFeishuDocumentMemory,
   renderFeishuDocumentMemoryList,
 } from './feishu-document-memory.js';
+import {
+  completeBridgeRuntimeRequest,
+  failBridgeRuntimeRequest,
+  makeInboundSummary,
+  makeRequestSummary,
+  markBridgeRuntimeStage,
+  recordBridgeRuntimeInbound,
+  updateBridgeRuntimeActiveRequest,
+} from './runtime-audit.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
+const FINAL_REPLY_FENCE = 'cti-final';
+const FINAL_ENVELOPE_STATUS_PATH = path.join(
+  process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+  'runtime',
+  'final-envelope-status.json',
+);
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -80,6 +96,219 @@ function appendReplyEndMarker(text: string): string {
   if (!trimmed) return marker;
   if (trimmed.endsWith(marker)) return text;
   return `${trimmed}\n\n${marker}`;
+}
+
+type FinalReplyKind = 'text' | 'image' | 'file' | 'mixed';
+type FinalReplyMode = 'plain' | 'markdown' | 'html';
+
+interface FinalReplyEnvelope {
+  kind: FinalReplyKind;
+  text: string;
+  images: string[];
+  files: string[];
+  reply_mode: FinalReplyMode;
+  mentions?: OutboundMention[];
+  reply_to?: string;
+}
+
+interface FinalEnvelopeStatusRecord {
+  parsed: boolean;
+  kind?: FinalReplyKind | null;
+  usedRawFallback: boolean;
+  usedLegacyCompactor: boolean;
+  updatedAt: string;
+}
+
+interface PreparedBridgeReplyPayload {
+  text: string;
+  parseMode: 'plain' | 'Markdown' | 'HTML';
+  images: string[];
+  files: string[];
+  mentions?: OutboundMention[];
+  replyTo?: string;
+}
+
+function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' | 'HTML' {
+  switch ((mode || 'plain').trim().toLowerCase()) {
+    case 'markdown':
+      return 'Markdown';
+    case 'html':
+      return 'HTML';
+    default:
+      return 'plain';
+  }
+}
+
+function writeFinalEnvelopeStatus(status: FinalEnvelopeStatusRecord): void {
+  try {
+    fs.mkdirSync(path.dirname(FINAL_ENVELOPE_STATUS_PATH), { recursive: true });
+    fs.writeFileSync(FINAL_ENVELOPE_STATUS_PATH, JSON.stringify(status, null, 2), 'utf8');
+  } catch {
+    // best effort
+  }
+}
+
+function extractVisibleAssistantText(text: string): string {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+  const blockPattern = /\[\{"type":"text","text":"([\s\S]*?)"}(?:,[\s\S]*?)?\]/g;
+  const matches = Array.from(normalized.matchAll(blockPattern));
+  if (matches.length > 0) {
+    const last = matches[matches.length - 1]?.[1] || '';
+    return last
+      .replace(/\\"/g, '"')
+      .replace(/\\n/g, '\n')
+      .replace(/\\r/g, '')
+      .trim();
+  }
+  return normalized;
+}
+
+function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
+  if (!candidate || typeof candidate !== 'object') return null;
+  const raw = candidate as Record<string, unknown>;
+  const kind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() as FinalReplyKind : null;
+  const text = typeof raw.text === 'string' ? raw.text : '';
+  const images = Array.isArray(raw.images) ? raw.images.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+  const files = Array.isArray(raw.files) ? raw.files.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+  const replyMode = typeof raw.reply_mode === 'string' ? raw.reply_mode.trim().toLowerCase() as FinalReplyMode : null;
+  if (!kind || !['text', 'image', 'file', 'mixed'].includes(kind)) return null;
+  if (!replyMode || !['plain', 'markdown', 'html'].includes(replyMode)) return null;
+  if (!text.trim() && images.length === 0 && files.length === 0) return null;
+  return {
+    kind,
+    text,
+    images,
+    files,
+    reply_mode: replyMode,
+    mentions: Array.isArray(raw.mentions) ? raw.mentions as OutboundMention[] : undefined,
+    reply_to: typeof raw.reply_to === 'string' && raw.reply_to.trim() ? raw.reply_to.trim() : undefined,
+  };
+}
+
+function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | null {
+  const fencePattern = new RegExp(String.raw`(?:^|\n)\`\`\`${FINAL_REPLY_FENCE}\s*\n([\s\S]*?)\n\`\`\``, 'g');
+  let lastMatch: RegExpExecArray | null = null;
+  for (const match of text.matchAll(fencePattern)) {
+    lastMatch = match;
+  }
+  if (lastMatch) {
+    try {
+      return parseEnvelopeObject(JSON.parse(lastMatch[1].trim()));
+    } catch {
+      // continue to raw JSON fallback
+    }
+  }
+  const rawJsonPattern = /(\{[\s\S]*?"kind"\s*:\s*"(?:text|image|file|mixed)"[\s\S]*?"reply_mode"\s*:\s*"(?:plain|markdown|html)"[\s\S]*?\})/g;
+  let rawJsonMatch: RegExpExecArray | null = null;
+  for (const match of text.matchAll(rawJsonPattern)) {
+    rawJsonMatch = match;
+  }
+  if (!rawJsonMatch) return null;
+  try {
+    return parseEnvelopeObject(JSON.parse(rawJsonMatch[1].trim()));
+  } catch {
+    return null;
+  }
+}
+
+function resolveExplicitPaths(
+  items: string[],
+  workingDirectory: string,
+  additionalDirectories: string[] = [],
+): string[] {
+  const resolved = new Set<string>();
+  for (const item of items) {
+    if (!item || typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    if (path.isAbsolute(trimmed)) {
+      resolved.add(trimmed);
+      continue;
+    }
+    if (workingDirectory) {
+      resolved.add(path.resolve(workingDirectory, trimmed));
+    }
+    for (const dir of additionalDirectories) {
+      if (dir) resolved.add(path.resolve(dir, trimmed));
+    }
+  }
+  return Array.from(resolved);
+}
+
+async function prepareBridgeReplyPayload(
+  text: string,
+  workingDirectory: string,
+  additionalDirectories: string[] = [],
+): Promise<PreparedBridgeReplyPayload> {
+  const envelope = extractFinalReplyEnvelope(text);
+  if (envelope) {
+    writeFinalEnvelopeStatus({
+      parsed: true,
+      kind: envelope.kind,
+      usedRawFallback: false,
+      usedLegacyCompactor: false,
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      text: appendReplyEndMarker(envelope.text || ''),
+      parseMode: parseReplyMode(envelope.reply_mode),
+      images: resolveExplicitPaths(envelope.images, workingDirectory, additionalDirectories),
+      files: resolveExplicitPaths(envelope.files, workingDirectory, additionalDirectories),
+      mentions: envelope.mentions,
+      replyTo: envelope.reply_to,
+    };
+  }
+
+  const visible = extractVisibleAssistantText(text);
+  const visibleEnvelope = visible ? extractFinalReplyEnvelope(visible) : null;
+  if (visibleEnvelope) {
+    writeFinalEnvelopeStatus({
+      parsed: true,
+      kind: visibleEnvelope.kind,
+      usedRawFallback: false,
+      usedLegacyCompactor: false,
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      text: appendReplyEndMarker(visibleEnvelope.text || ''),
+      parseMode: parseReplyMode(visibleEnvelope.reply_mode),
+      images: resolveExplicitPaths(visibleEnvelope.images, workingDirectory, additionalDirectories),
+      files: resolveExplicitPaths(visibleEnvelope.files, workingDirectory, additionalDirectories),
+      mentions: visibleEnvelope.mentions,
+      replyTo: visibleEnvelope.reply_to,
+    };
+  }
+  if (visible) {
+    writeFinalEnvelopeStatus({
+      parsed: false,
+      kind: null,
+      usedRawFallback: true,
+      usedLegacyCompactor: false,
+      updatedAt: new Date().toISOString(),
+    });
+    return {
+      text: appendReplyEndMarker(visible),
+      parseMode: 'plain',
+      images: [],
+      files: [],
+    };
+  }
+
+  const compacted = compactBridgeReplyForDelivery(text);
+  writeFinalEnvelopeStatus({
+    parsed: false,
+    kind: null,
+    usedRawFallback: false,
+    usedLegacyCompactor: true,
+    updatedAt: new Date().toISOString(),
+  });
+  return {
+    text: appendReplyEndMarker(compacted),
+    parseMode: 'plain',
+    images: [],
+    files: [],
+  };
 }
 
 function isProcessNarrationLine(line: string): boolean {
@@ -352,8 +581,22 @@ async function deliverResponse(
   responseText: string,
   sessionId: string,
   replyToMessageId?: string,
+  alreadyPrepared = false,
+  parseModeOverride?: 'plain' | 'Markdown' | 'HTML',
+  mentions?: OutboundMention[],
 ): Promise<SendResult> {
-  const finalText = appendReplyEndMarker(compactBridgeReplyForDelivery(responseText));
+  const prepared = alreadyPrepared
+    ? {
+      text: responseText,
+      parseMode: parseModeOverride || 'plain',
+      mentions,
+    }
+    : {
+      text: appendReplyEndMarker(compactBridgeReplyForDelivery(responseText)),
+      parseMode: parseModeOverride || 'plain',
+      mentions,
+    };
+  const finalText = prepared.text;
   if (adapter.channelType === 'telegram') {
     const chunks = markdownToTelegramChunks(finalText, 4096);
     if (chunks.length > 0) {
@@ -368,8 +611,9 @@ async function deliverResponse(
       const result = await deliver(adapter, {
         address,
         text: chunks[i].text,
-        parseMode: 'Markdown',
+        parseMode: prepared.parseMode === 'HTML' ? 'Markdown' : prepared.parseMode,
         replyToMessageId,
+        mentions: prepared.mentions,
       }, { sessionId });
       if (!result.ok) return result;
     }
@@ -380,16 +624,18 @@ async function deliverResponse(
     return deliver(adapter, {
       address,
       text: finalText,
-      parseMode: 'Markdown',
+      parseMode: prepared.parseMode === 'plain' ? 'Markdown' : prepared.parseMode,
       replyToMessageId,
+      mentions: prepared.mentions,
     }, { sessionId });
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
   return deliver(adapter, {
     address,
     text: finalText,
-    parseMode: 'plain',
+    parseMode: prepared.parseMode,
     replyToMessageId,
+    mentions: prepared.mentions,
   }, { sessionId });
 }
 
@@ -1372,8 +1618,10 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
   (async () => {
     while (state.running && adapter.isRunning()) {
       try {
+        markBridgeRuntimeStage('adapter_waiting');
         const msg = await adapter.consumeOne();
         if (!msg) continue; // Adapter stopped
+        markBridgeRuntimeStage('message_received');
 
         // Callback queries, commands, and numeric permission shortcuts are
         // lightweight — process inline (outside session lock).
@@ -1403,6 +1651,7 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         if (abort.signal.aborted) break;
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error(`[bridge-manager] Error in ${adapter.channelType} loop:`, err);
+        failBridgeRuntimeRequest(err);
         // Track last error per adapter
         const meta = state.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
         meta.lastError = errMsg;
@@ -1430,6 +1679,23 @@ async function handleMessage(
   msg: InboundMessage,
 ): Promise<void> {
   const { store } = getBridgeContext();
+  recordBridgeRuntimeInbound(makeInboundSummary({
+    messageId: msg.messageId,
+    chatId: msg.address.chatId,
+    channelType: adapter.channelType,
+    displayName: msg.address.displayName || msg.address.userId || msg.address.chatId,
+    text: msg.text,
+    chatType: msg.address.chatType,
+  }));
+  let activeRequest = makeRequestSummary({
+    messageId: msg.messageId,
+    chatId: msg.address.chatId,
+    channelType: adapter.channelType,
+    displayName: msg.address.displayName || msg.address.userId || msg.address.chatId,
+    text: msg.text,
+    stage: 'message_received',
+  });
+  markBridgeRuntimeStage('message_received', { activeRequest });
   const rawData = msg.raw as {
     imageDownloadFailed?: boolean;
     attachmentDownloadFailed?: boolean;
@@ -1453,11 +1719,16 @@ async function handleMessage(
   const meta = adapterState.adapterMeta.get(adapter.channelType) || { lastMessageAt: null, lastError: null };
   meta.lastMessageAt = new Date().toISOString();
   adapterState.adapterMeta.set(adapter.channelType, meta);
+  let auditTerminalState: 'completed' | 'failed' | null = null;
 
   // Acknowledge the update offset after processing completes (or fails).
   // This ensures the adapter only advances its committed offset once the
   // message has been fully handled, preventing message loss on crash.
   const ack = () => {
+    if (auditTerminalState !== 'failed') {
+      completeBridgeRuntimeRequest(activeRequest);
+      auditTerminalState = 'completed';
+    }
     if (msg.updateId != null && adapter.acknowledgeUpdate) {
       adapter.acknowledgeUpdate(msg.updateId);
     }
@@ -1645,6 +1916,12 @@ async function handleMessage(
   const effectiveBinding = turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory
     ? { ...binding, workingDirectory: turnWorkspaceOverride, sdkSessionId: '' }
     : binding;
+  activeRequest = {
+    ...activeRequest,
+    chatId: msg.address.chatId,
+    displayName: msg.address.displayName || msg.address.userId || msg.address.chatId,
+  };
+  updateBridgeRuntimeActiveRequest(activeRequest, 'message_bound');
   const usesTransientWorkspaceOverride = effectiveBinding.workingDirectory !== binding.workingDirectory;
   const accessibleWorkspaceDirectories = getAccessibleWorkspaceDirectories(
     effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '',
@@ -1756,6 +2033,7 @@ async function handleMessage(
   const state = getState();
   state.activeTasks.set(effectiveBinding.codepilotSessionId, taskAbort);
   const progressPulse = await startProgressPulse(adapter, msg, effectiveBinding.codepilotSessionId);
+  updateBridgeRuntimeActiveRequest(activeRequest, 'engine_started');
   const directFeishuDocSourceMarkdown = directFeishuDocRequest
     ? extractAssistantMarkdown(
       [...store.getMessages(effectiveBinding.codepilotSessionId, { limit: 20 }).messages]
@@ -1910,6 +2188,11 @@ async function handleMessage(
     }
 
     const result = await engine.processMessage(effectiveBinding, basePromptText, async (perm) => {
+      updateBridgeRuntimeActiveRequest({
+        permissionRequestId: perm.permissionRequestId,
+        permissionType: perm.toolName,
+        permissionStartedAt: new Date().toISOString(),
+      }, 'permission_waiting');
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
@@ -1925,6 +2208,13 @@ async function handleMessage(
       historyLimit: fastPathOptions.historyLimit,
       extraSystemPrompt: fastPathOptions.extraSystemPrompt,
     });
+    updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
+    const resolvedWorkingDirectory =
+      effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
+    const preparedReply = result.responseText
+      ? await prepareBridgeReplyPayload(result.responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories)
+      : null;
+    const userFacingResponseText = preparedReply?.text || '';
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -1936,7 +2226,7 @@ async function handleMessage(
         cardFinalized = await adapter.onStreamEnd(
           msg.address.chatId,
           status,
-          compactBridgeReplyForDelivery(result.responseText),
+          userFacingResponseText,
         );
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
@@ -1951,10 +2241,10 @@ async function handleMessage(
         createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
       }).createDocumentFromMarkdown;
 
-      if (typeof createDoc === 'function') {
-        try {
-          const docInfo = await createDoc.call(adapter, result.responseText, {
-            title: feishuDocRequest.title && !isGenericFeishuDocumentTitle(feishuDocRequest.title)
+        if (typeof createDoc === 'function') {
+          try {
+            const docInfo = await createDoc.call(adapter, userFacingResponseText || result.responseText, {
+              title: feishuDocRequest.title && !isGenericFeishuDocumentTitle(feishuDocRequest.title)
               ? feishuDocRequest.title
               : undefined,
             ownerUserId: getConfiguredOwnerIds(adapter.channelType)[0],
@@ -1965,9 +2255,9 @@ async function handleMessage(
             documentId: docInfo.documentId,
             chatId: msg.address.chatId,
             requesterId: msg.address.userId,
-            workspace: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '',
+            workspace: resolvedWorkingDirectory,
             sourceText: rawText,
-            markdown: result.responseText,
+            markdown: userFacingResponseText || result.responseText,
           });
           const guideInfo = await syncFeishuDocumentGuideBestEffort(
             adapter,
@@ -2005,12 +2295,20 @@ async function handleMessage(
 
     if (result.responseText) {
       if (!cardFinalized && !handledAsDoc) {
-        await deliverResponse(adapter, msg.address, result.responseText, effectiveBinding.codepilotSessionId, msg.messageId);
+        updateBridgeRuntimeActiveRequest(activeRequest, 'reply_sending');
+        await deliverResponse(
+          adapter,
+          msg.address,
+          userFacingResponseText,
+          effectiveBinding.codepilotSessionId,
+          preparedReply?.replyTo || msg.messageId,
+          true,
+          preparedReply?.parseMode,
+          preparedReply?.mentions,
+        );
       }
-
-      const resolvedWorkingDirectory =
-        effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
       const localImagePaths = Array.from(new Set([
+        ...(preparedReply?.images || []),
         ...extractLocalImagePaths(
           result.responseText,
           resolvedWorkingDirectory,
@@ -2022,12 +2320,30 @@ async function handleMessage(
           accessibleWorkspaceDirectories,
         ),
       ]));
+      const localFilePaths = Array.from(new Set(preparedReply?.files || []));
       if (localImagePaths.length > 0 && typeof adapter.sendLocalImage === 'function') {
         for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
           const imageSend = await adapter.sendLocalImage(msg.address.chatId, imagePath, msg.messageId);
           if (!imageSend.ok) {
             console.warn(`[bridge-manager] Failed to send local image: ${imagePath}`, imageSend.error);
           }
+        }
+      }
+      if (localFilePaths.length > 0) {
+        if (typeof (adapter as BaseChannelAdapter & { sendLocalFile?: (chatId: string, filePath: string, replyToMessageId?: string) => Promise<SendResult>; }).sendLocalFile === 'function') {
+          for (const filePath of localFilePaths) {
+            const fileSend = await (adapter as BaseChannelAdapter & { sendLocalFile: (chatId: string, filePath: string, replyToMessageId?: string) => Promise<SendResult>; }).sendLocalFile(msg.address.chatId, filePath, msg.messageId);
+            if (!fileSend.ok) {
+              console.warn(`[bridge-manager] Failed to send local file: ${filePath}`, fileSend.error);
+            }
+          }
+        } else {
+          await deliver(adapter, {
+            address: msg.address,
+            text: appendReplyEndMarker(`文件输出：\n${localFilePaths.map((filePath) => `- ${filePath}`).join('\n')}`),
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+          }, { sessionId: effectiveBinding.codepilotSessionId });
         }
       }
     } else if (result.hasError) {
@@ -2055,6 +2371,11 @@ async function handleMessage(
         }
       } catch { /* best effort */ }
     }
+    auditTerminalState = 'completed';
+  } catch (err) {
+    auditTerminalState = 'failed';
+    failBridgeRuntimeRequest(err, activeRequest);
+    throw err;
   } finally {
     progressPulse?.stop();
 

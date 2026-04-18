@@ -38,6 +38,8 @@ internal sealed class MainForm : Form
     private readonly string _statusJsonPath;
     private readonly string _mcpServiceStatePath;
     private readonly string _localLlmStatusPath;
+    private readonly string _finalEnvelopeStatusPath;
+    private readonly string _bridgeRuntimeAuditPath;
     private readonly string _feishuChatIndexPath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
@@ -50,6 +52,9 @@ internal sealed class MainForm : Form
     private readonly TextBox _unityProject = new();
     private readonly TextBox _memoryRepo = new();
     private readonly TextBox _additionalDirs = new();
+    private readonly ComboBox _replyStylePreset = new();
+    private readonly TextBox _replyStyleRequest = new();
+    private readonly TextBox _replyStyleHint = new();
 
     private readonly TextBox _bridgeStatus = CreateStatusBox();
     private readonly TextBox _codexStatus = CreateStatusBox();
@@ -70,6 +75,14 @@ internal sealed class MainForm : Form
 
     private Dictionary<string, string> _config = new(StringComparer.OrdinalIgnoreCase);
     private List<McpManifest> _manifests = [];
+    private static readonly Dictionary<string, string> ReplyStylePresets = new(StringComparer.Ordinal)
+    {
+        ["专业简洁"] = "回复保持专业简洁，先说结果，再说一句必要影响，不展开思考过程。",
+        ["自然轻松"] = "语气自然轻松一点，像在直接回消息，但仍然先说结果，不要啰嗦。",
+        ["像助理汇报"] = "回复像项目助理汇报，先说结果，再说一句影响或下一步，不解释思考过程。",
+        ["更口语一点"] = "语气更口语一点，可以说“这个我处理好了”，但不要拖长，不要卖萌。",
+        ["严格短句"] = "尽量使用严格短句，只保留结果和必要结论，不加铺垫。",
+    };
 
     public MainForm()
     {
@@ -97,6 +110,8 @@ internal sealed class MainForm : Form
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
         _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
         _localLlmStatusPath = Path.Combine(_ctiHome, "runtime", "local-llm-status.json");
+        _finalEnvelopeStatusPath = Path.Combine(_ctiHome, "runtime", "final-envelope-status.json");
+        _bridgeRuntimeAuditPath = Path.Combine(_ctiHome, "runtime", "bridge-runtime-audit.json");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
@@ -111,7 +126,7 @@ internal sealed class MainForm : Form
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(12) };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 282));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 290));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 520));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
 
@@ -163,12 +178,15 @@ internal sealed class MainForm : Form
     private Control BuildConfigPanel()
     {
         var group = new GroupBox { Text = "路径 / 配置", Dock = DockStyle.Fill };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 6, Padding = new Padding(8) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 9, Padding = new Padding(8) };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 152));
         for (var i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         group.Controls.Add(layout);
 
         AddPathRow(layout, 0, "默认工作目录", _workdir, true);
@@ -177,12 +195,43 @@ internal sealed class MainForm : Form
         AddPathRow(layout, 3, "聊天记忆仓库", _memoryRepo, true);
         AddPathRow(layout, 4, "Codex 附加目录", _additionalDirs, false);
 
-        var hint = new Label { Text = "这里只保存非敏感路径配置。多个目录可用分号分隔，改完后点击“保存配置”，再重启飞书。", Dock = DockStyle.Fill, ForeColor = Color.DimGray, TextAlign = ContentAlignment.TopLeft };
-        layout.Controls.Add(hint, 1, 5);
+        layout.Controls.Add(new Label { Text = "回复风格预设", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 5);
+        _replyStylePreset.Dock = DockStyle.Fill;
+        _replyStylePreset.DropDownStyle = ComboBoxStyle.DropDownList;
+        _replyStylePreset.Items.Add("自定义");
+        foreach (var key in ReplyStylePresets.Keys) _replyStylePreset.Items.Add(key);
+        _replyStylePreset.SelectedIndexChanged += (_, _) =>
+        {
+            var selected = _replyStylePreset.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(selected) || selected == "自定义") return;
+            if (ReplyStylePresets.TryGetValue(selected, out var preset)) _replyStyleHint.Text = preset;
+        };
+        layout.Controls.Add(_replyStylePreset, 1, 5);
+
+        layout.Controls.Add(new Label { Text = "风格要求", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 6);
+        _replyStyleRequest.Dock = DockStyle.Fill;
+        _replyStyleRequest.Multiline = true;
+        _replyStyleRequest.ScrollBars = ScrollBars.Vertical;
+        _replyStyleRequest.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
+        layout.Controls.Add(_replyStyleRequest, 1, 6);
+
+        var summarizeStyle = new Button { Text = "本地AI整理", Dock = DockStyle.Fill };
+        summarizeStyle.Click += async (_, _) => await SummarizeReplyStyleWithLocalAiAsync();
+        layout.Controls.Add(summarizeStyle, 2, 6);
+
+        layout.Controls.Add(new Label { Text = "自定义风格", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 7);
+        _replyStyleHint.Dock = DockStyle.Fill;
+        _replyStyleHint.Multiline = true;
+        _replyStyleHint.ScrollBars = ScrollBars.Vertical;
+        _replyStyleHint.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
+        layout.Controls.Add(_replyStyleHint, 1, 7);
+
+        var hint = new Label { Text = "这里只保存非敏感路径和回复风格配置。多个目录可用分号分隔。改完后点击“保存配置”，再重启飞书桥接。", Dock = DockStyle.Fill, ForeColor = Color.DimGray, TextAlign = ContentAlignment.TopLeft };
+        layout.Controls.Add(hint, 1, 8);
 
         var save = new Button { Text = "保存配置", Dock = DockStyle.Fill };
         save.Click += (_, _) => SaveConfigFromUi();
-        layout.Controls.Add(save, 2, 5);
+        layout.Controls.Add(save, 2, 8);
         return group;
     }
 
@@ -502,6 +551,8 @@ internal sealed class MainForm : Form
         _unityProject.Text = GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game");
         _memoryRepo.Text = GetConfig("CTI_MEMORY_REPO_DIR", @"E:\cli-md");
         _additionalDirs.Text = GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", "");
+        _replyStyleHint.Text = GetConfig("CTI_REPLY_STYLE_HINT", "");
+        _replyStylePreset.SelectedItem = ResolveReplyStylePreset(_replyStyleHint.Text);
         AppendLog($"已读取配置：{_configPath}");
     }
 
@@ -655,9 +706,83 @@ internal sealed class MainForm : Form
         SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", _unityProject.Text.Trim());
         SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", _memoryRepo.Text.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", _additionalDirs.Text.Trim());
+        SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", _replyStyleHint.Text.Trim());
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
-        AppendLog("配置已保存。建议随后重启飞书桥接。");
+        AppendLog("配置已保存。回复风格将在重启飞书桥接后生效。");
         LoadConfig();
+    }
+
+    private async Task SummarizeReplyStyleWithLocalAiAsync()
+    {
+        var requestText = _replyStyleRequest.Text.Trim();
+        if (string.IsNullOrWhiteSpace(requestText))
+        {
+            MessageBox.Show(this, "先输入用户对机器人说话方式的要求。", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
+        var model = GetConfig("CTI_LOCAL_LLM_MODEL", "qwen2.5-coder-7b-instruct");
+        var probe = await ProbeLocalLlmAsync(baseUrl);
+        if (!probe.Ok)
+        {
+            AppendLog($"本地AI整理失败：本地模型不可用 | {probe.Message}");
+            MessageBox.Show(this, $"本地模型当前不可用：{probe.Message}", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            var payload = new
+            {
+                model,
+                temperature = 0.2,
+                max_tokens = 180,
+                messages = new object[]
+                {
+                    new
+                    {
+                        role = "system",
+                        content = "你负责把用户对机器人说话方式的原始要求，压缩成一段可直接写入配置的中文回复风格规则。输出要求：1. 只输出最终规则文本；2. 60字以内；3. 不要解释原因；4. 不要用项目符号；5. 重点约束语气、长度、是否暴露思考过程。"
+                    },
+                    new
+                    {
+                        role = "user",
+                        content = requestText
+                    }
+                }
+            };
+            using var response = await client.PostAsync(
+                $"{baseUrl.TrimEnd('/')}/v1/chat/completions",
+                new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+            var body = await response.Content.ReadAsStringAsync();
+            response.EnsureSuccessStatusCode();
+
+            var summarized = ExtractChatCompletionText(body).Trim();
+            if (string.IsNullOrWhiteSpace(summarized))
+            {
+                throw new InvalidOperationException("本地模型没有返回可用的风格摘要。");
+            }
+
+            _replyStyleHint.Text = summarized;
+            _replyStylePreset.SelectedItem = "自定义";
+            AppendLog($"本地AI已整理回复风格：{summarized}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"本地AI整理失败：{ex.Message}");
+            MessageBox.Show(this, $"本地AI整理失败：{ex.Message}", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private static string ResolveReplyStylePreset(string value)
+    {
+        foreach (var pair in ReplyStylePresets)
+        {
+            if (string.Equals(pair.Value, value, StringComparison.Ordinal)) return pair.Key;
+        }
+        return "自定义";
     }
 
     private static void SetOrAppendEnv(List<string> lines, string key, string value)
@@ -689,8 +814,34 @@ internal sealed class MainForm : Form
         {
             var raw = File.Exists(_statusJsonPath) ? File.ReadAllText(_statusJsonPath, Encoding.UTF8) : "";
             var status = string.IsNullOrWhiteSpace(raw) ? null : JsonSerializer.Deserialize<BridgeRuntimeStatus>(raw, JsonOptions);
+            var audit = ReadBridgeRuntimeAudit();
             var channels = status?.Channels is { Length: > 0 } ? string.Join(", ", status.Channels) : "(none)";
-            statusText = status?.Running == true ? $"运行中{Environment.NewLine}PID {status.Pid}{Environment.NewLine}Channels: {channels}" : "未运行";
+            var daemonSaysRunning = result.Stdout.Contains("Bridge status: running", StringComparison.OrdinalIgnoreCase);
+            var pidAlive = status is not null && status.Pid > 0 && IsProcessAlive(status.Pid);
+            statusText = (status?.Running == true && pidAlive && daemonSaysRunning)
+                ? $"运行中{Environment.NewLine}PID {status.Pid}{Environment.NewLine}Channels: {channels}"
+                : "未运行";
+            if (audit is not null)
+            {
+                var recentStage = string.IsNullOrWhiteSpace(audit.LastStage) ? "(none)" : audit.LastStage;
+                var wsState = string.IsNullOrWhiteSpace(audit.FeishuWs?.State) ? "(unknown)" : audit.FeishuWs?.State;
+                var p2pPoll = string.IsNullOrWhiteSpace(audit.FeishuP2pPoll?.State)
+                    ? "(unknown)"
+                    : audit.FeishuP2pPoll?.State;
+                var p2pRecovered = string.IsNullOrWhiteSpace(audit.FeishuP2pPoll?.LastRecoveredMessageId)
+                    ? ""
+                    : $" / {audit.FeishuP2pPoll?.LastRecoveredChatId} / {audit.FeishuP2pPoll?.LastRecoveredMessageId}";
+                var active = audit.LastActiveRequest is null
+                    ? "(none)"
+                    : $"{audit.LastActiveRequest.DisplayName} / {audit.LastActiveRequest.Stage}";
+                var exitReason = string.IsNullOrWhiteSpace(audit.LastExitReason) ? "(none)" : audit.LastExitReason;
+                statusText +=
+                    $"{Environment.NewLine}最近阶段: {recentStage}" +
+                    $"{Environment.NewLine}最近活跃请求: {active}" +
+                    $"{Environment.NewLine}最近 WS 状态: {wsState}" +
+                    $"{Environment.NewLine}私聊补捞状态: {p2pPoll}{p2pRecovered}" +
+                    $"{Environment.NewLine}最近退出原因: {exitReason}";
+            }
         }
         catch
         {
@@ -698,6 +849,22 @@ internal sealed class MainForm : Form
         }
         _bridgeStatus.Text = statusText;
         AppendCommand("bridge status", result);
+    }
+
+    private BridgeRuntimeAuditRecord? ReadBridgeRuntimeAudit()
+    {
+        try
+        {
+            if (!File.Exists(_bridgeRuntimeAuditPath)) return null;
+            var raw = File.ReadAllText(_bridgeRuntimeAuditPath, Encoding.UTF8);
+            return string.IsNullOrWhiteSpace(raw)
+                ? null
+                : JsonSerializer.Deserialize<BridgeRuntimeAuditRecord>(raw, JsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task RunDaemonAsync(string action)
@@ -715,6 +882,19 @@ internal sealed class MainForm : Form
         await CheckLocalLlmAsync(true);
     }
 
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private async Task CheckCodexAsync(bool updateOnly = false)
     {
         var routerMode = GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid");
@@ -722,6 +902,7 @@ internal sealed class MainForm : Form
         var version = result.ExitCode == 0 ? FirstLine(result.Stdout) : "不可用";
         var codexPrimary = routerMode != "local_only";
         var stats = ReadLocalLlmStatus();
+        var envelope = ReadFinalEnvelopeStatus();
         var degradation = result.ExitCode == 0
             ? "降级: 正常"
             : (routerMode == "local_only" ? "降级: 已固定仅本地" : "降级: Codex 不可用，将回退本地");
@@ -731,6 +912,7 @@ internal sealed class MainForm : Form
             $"模式: {RouterModeToLabel(routerMode)}",
             $"主脑: {(codexPrimary ? "Codex" : "本地")}",
             $"最近一次请求: {FormatLastBrainStatus(stats)}",
+            $"结果块: {FormatFinalEnvelopeStatus(envelope)}",
             routerMode == "local_only" ? "升级: 关闭" : "升级: 允许",
             degradation,
         });
@@ -803,6 +985,22 @@ internal sealed class MainForm : Form
         }
     }
 
+    private FinalEnvelopeStatusRecord ReadFinalEnvelopeStatus()
+    {
+        try
+        {
+            if (!File.Exists(_finalEnvelopeStatusPath)) return new FinalEnvelopeStatusRecord();
+            var raw = File.ReadAllText(_finalEnvelopeStatusPath, Encoding.UTF8);
+            return string.IsNullOrWhiteSpace(raw)
+                ? new FinalEnvelopeStatusRecord()
+                : JsonSerializer.Deserialize<FinalEnvelopeStatusRecord>(raw, JsonOptions) ?? new FinalEnvelopeStatusRecord();
+        }
+        catch
+        {
+            return new FinalEnvelopeStatusRecord();
+        }
+    }
+
     private async Task<(bool Ok, string Message)> ProbeLocalLlmAsync(string baseUrl)
     {
         var targets = new[]
@@ -831,6 +1029,30 @@ internal sealed class MainForm : Form
         }
 
         return (false, $"{baseUrl} | 无有效响应");
+    }
+
+    private static string ExtractChatCompletionText(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (!document.RootElement.TryGetProperty("choices", out var choices) || choices.ValueKind != JsonValueKind.Array || choices.GetArrayLength() == 0)
+        {
+            return "";
+        }
+
+        var first = choices[0];
+        if (!first.TryGetProperty("message", out var message) || !message.TryGetProperty("content", out var content))
+        {
+            return "";
+        }
+
+        return content.ValueKind switch
+        {
+            JsonValueKind.String => content.GetString() ?? "",
+            JsonValueKind.Array => string.Join("", content.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.Object && item.TryGetProperty("text", out _))
+                .Select(item => item.GetProperty("text").GetString() ?? "")),
+            _ => ""
+        };
     }
 
     private async Task<string> RunGitTextAsync(string args)
@@ -2437,6 +2659,24 @@ internal sealed class MainForm : Form
         };
     }
 
+    private static string FormatFinalEnvelopeStatus(FinalEnvelopeStatusRecord status)
+    {
+        var kind = string.IsNullOrWhiteSpace(status.Kind) ? "none" : status.Kind!.Trim().ToLowerInvariant();
+        if (status.Parsed)
+        {
+            return $"命中 {kind}";
+        }
+        if (status.UsedRawFallback)
+        {
+            return "原文兜底";
+        }
+        if (status.UsedLegacyCompactor)
+        {
+            return "旧裁剪兼容";
+        }
+        return "暂无记录";
+    }
+
     private static string FormatRouteLabel(LocalLlmRouteSummaryRecord route)
     {
         var provider = (route.Provider ?? "").Trim().ToLowerInvariant();
@@ -2531,6 +2771,54 @@ internal sealed class BridgeRuntimeStatus
     public string[]? Channels { get; set; }
 }
 
+internal sealed class BridgeRuntimeAuditRecord
+{
+    public string? RunId { get; set; }
+    public int Pid { get; set; }
+    public string? StartedAt { get; set; }
+    public string? LastHeartbeatAt { get; set; }
+    public string? LastStage { get; set; }
+    public string? LastStageAt { get; set; }
+    public BridgeRuntimeRequestRecord? LastActiveRequest { get; set; }
+    public BridgeRuntimeRequestRecord? LastCompletedRequest { get; set; }
+    public string? LastExitReason { get; set; }
+    public string? LastExitAt { get; set; }
+    public BridgeRuntimeFeishuWsRecord? FeishuWs { get; set; }
+    public BridgeRuntimeFeishuP2pPollRecord? FeishuP2pPoll { get; set; }
+}
+
+internal sealed class BridgeRuntimeRequestRecord
+{
+    public string? MessageId { get; set; }
+    public string? ChatId { get; set; }
+    public string? ChannelType { get; set; }
+    public string? DisplayName { get; set; }
+    public string? TextPreview { get; set; }
+    public string? StartedAt { get; set; }
+    public string? Stage { get; set; }
+    public string? StageUpdatedAt { get; set; }
+}
+
+internal sealed class BridgeRuntimeFeishuWsRecord
+{
+    public string? State { get; set; }
+    public string? UpdatedAt { get; set; }
+    public string? LastEventType { get; set; }
+    public string? LastEventAt { get; set; }
+    public string? LastError { get; set; }
+    public string? LastDisconnectReason { get; set; }
+}
+
+internal sealed class BridgeRuntimeFeishuP2pPollRecord
+{
+    public string? State { get; set; }
+    public string? UpdatedAt { get; set; }
+    public string? LastPollAt { get; set; }
+    public string? LastRecoveredMessageId { get; set; }
+    public string? LastRecoveredChatId { get; set; }
+    public string? LastError { get; set; }
+}
+
 internal sealed class LocalLlmStatusRecord
 {
     public bool Enabled { get; set; }
@@ -2565,6 +2853,15 @@ internal sealed class LocalLlmStatusRecord
     public string? UpdatedAt { get; set; }
     public List<LocalLlmRouteSummaryRecord>? RecentRoutes { get; set; }
     public List<LocalLlmExecutionSummaryRecord>? RecentExecutions { get; set; }
+}
+
+internal sealed class FinalEnvelopeStatusRecord
+{
+    public bool Parsed { get; set; }
+    public string? Kind { get; set; }
+    public bool UsedRawFallback { get; set; }
+    public bool UsedLegacyCompactor { get; set; }
+    public string? UpdatedAt { get; set; }
 }
 
 internal sealed class LocalLlmRouteSummaryRecord

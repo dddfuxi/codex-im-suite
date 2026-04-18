@@ -33,6 +33,7 @@ const DEFAULT_REASONING_EFFORT = 'low';
 const DEFAULT_CONTEXT_CHAR_BUDGET = 12000;
 const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
+const FINAL_REPLY_FENCE = 'cti-final';
 const SHARED_CODEX_HOME_PATHS = ['skills', 'plugins', 'vendor_imports', 'rules'];
 const STATE_DB_PATTERNS = [
   /^state_\d+\.sqlite(?:-shm|-wal)?$/i,
@@ -276,12 +277,31 @@ function buildBridgeReplyGuardrails(): string {
     '- Prefer a short natural Chinese reply that states: what was done, the key result, and at most one next step if needed.',
     '- Keep only the essential result unless the user explicitly asks for a detailed walkthrough.',
     '- If the task is unfinished or blocked, state the exact blocker briefly instead of narrating your whole investigation.',
+    '- Never start the user-facing reply with phrases like: 这次是…… / 我会…… / 我先…… / 我继续…… / 我已经确认…… . Start with the actual answer or result directly.',
+    '- If the user asked to send something again, repeat the concrete content directly instead of describing your retrieval process.',
+    '- If the answer is a mapping, checklist, or correspondence table, include the actual items. Do not stop at an intro sentence.',
+    '- If retrieved content contains exact identifiers, names, codes, keys, file names, scene names, or other structured labels, preserve those exact strings verbatim in the final answer.',
+    '- For replay / resend / correspondence requests, prefer the exact recovered mapping lines over a paraphrased summary. Do not collapse a structured mapping into only category words or loose Chinese summaries. If you only found partial items, say it is partial while still listing the exact recovered keys.',
     '- Tone should be natural and light, similar to: 这个我做好啦…… / 这个已经处理完了……, but avoid repetitive filler.',
-    '- If future style or memory hints are provided, follow them as long as they do not conflict with the rules above.',
+    '- If future style or memory hints are provided, treat them as an explicit persona/output requirement.',
+    '- When a custom reply style hint exists, you must visibly reflect it in the final wording, not just keep the default neutral tone.',
+    '- Keep the custom style while still staying concise and not exposing hidden reasoning.',
+    `- Emit exactly one final fenced result block labeled ${FINAL_REPLY_FENCE}.`,
+    `- The ${FINAL_REPLY_FENCE} block must contain strict JSON with keys: kind, text, images, files, reply_mode.`,
+    '- kind must be one of: text, image, file, mixed.',
+    '- Put all final user-visible content only inside that JSON block. Do not place the final answer outside the block.',
+    '- text must contain the complete final text to send. For mappings, lists, and tables, include all actual items in text.',
+    '- images and files must be arrays of local paths when applicable, otherwise use empty arrays.',
+    '- reply_mode must be one of: plain, markdown, html.',
+    '- Optional keys mentions and reply_to may be included when needed.',
+    '- Never output a naked JSON object outside the fenced result block.',
+    `- Example:\n\`\`\`${FINAL_REPLY_FENCE}\n{"kind":"text","text":"对应关系再发你一次：\\n| Key | Label |\\n|---|---|\\n| \`ITEM_A\` | 标签A |","images":[],"files":[],"reply_mode":"markdown"}\n\`\`\``,
   ];
   const styleHint = getReplyStyleHint();
   if (styleHint) {
-    lines.push(`- Additional reply style hint: ${styleHint}`);
+    lines.push(`- Required custom reply style: ${styleHint}`);
+    lines.push('- Apply the custom reply style in the very first sentence of the user-facing reply.');
+    lines.push('- If the custom reply style conflicts with safety or truthfulness, preserve safety/truthfulness and keep as much of the style as possible.');
   }
   return lines.join('\n');
 }

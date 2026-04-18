@@ -18,7 +18,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet('start','stop','status','logs','install-service','uninstall-service','help')]
+    [ValidateSet('start','stop','status','logs','install-service','uninstall-service','help','run-supervisor')]
     [string]$Command = 'help',
 
     [Parameter(Position=1)]
@@ -36,6 +36,8 @@ $CtiHome    = $env:CTI_HOME
 $SkillDir   = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $RuntimeDir = Join-Path $CtiHome 'runtime'
 $PidFile    = Join-Path $RuntimeDir 'bridge.pid'
+$SupervisorPidFile = Join-Path $RuntimeDir 'bridge-supervisor.pid'
+$StopFlagFile = Join-Path $RuntimeDir 'bridge.stop'
 $StatusFile = Join-Path $RuntimeDir 'status.json'
 $LogFile    = Join-Path (Join-Path $CtiHome 'logs') 'bridge.log'
 $ErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-error.log'
@@ -73,6 +75,17 @@ function Ensure-Built {
 
 function Read-Pid {
     if (Test-Path $PidFile) { return (Get-Content $PidFile -Raw).Trim() }
+    if (Test-Path $StatusFile) {
+        try {
+            $json = Get-Content $StatusFile -Raw | ConvertFrom-Json
+            if ($json.pid) { return [string]$json.pid }
+        } catch {}
+    }
+    return $null
+}
+
+function Read-SupervisorPid {
+    if (Test-Path $SupervisorPidFile) { return (Get-Content $SupervisorPidFile -Raw).Trim() }
     return $null
 }
 
@@ -85,8 +98,16 @@ function Test-PidAlive {
 
 function Test-StatusRunning {
     if (-not (Test-Path $StatusFile)) { return $false }
-    $json = Get-Content $StatusFile -Raw | ConvertFrom-Json
-    return $json.running -eq $true
+    try {
+        $json = Get-Content $StatusFile -Raw | ConvertFrom-Json
+        if ($json.running -ne $true) { return $false }
+        if ($json.pid) {
+            return Test-PidAlive ([string]$json.pid)
+        }
+        return $false
+    } catch {
+        return $false
+    }
 }
 
 function Show-LastExitReason {
@@ -216,28 +237,53 @@ function Install-NSSMService {
 # ── Fallback: Start-Process (no service manager) ──
 
 function Start-Fallback {
-    $nodePath = Get-NodePath
+    if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
+    $supervisorProc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $PSCommandPath,
+            '-Command', 'run-supervisor'
+        ) `
+        -WorkingDirectory $SkillDir `
+        -WindowStyle Hidden `
+        -PassThru
 
-    # Clean env
-    $envClone = [System.Collections.Hashtable]::new()
-    foreach ($key in [System.Environment]::GetEnvironmentVariables().Keys) {
-        $envClone[$key] = [System.Environment]::GetEnvironmentVariable($key)
-    }
-    # Remove CLAUDECODE
+    Set-Content -Path $SupervisorPidFile -Value $supervisorProc.Id
+    return $supervisorProc.Id
+}
+
+function Run-SupervisorLoop {
+    Ensure-Dirs
+    Ensure-Built
+    if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
+    Set-Content -Path $SupervisorPidFile -Value $PID
+
+    $nodePath = Get-NodePath
     [System.Environment]::SetEnvironmentVariable('CLAUDECODE', $null)
     [System.Environment]::SetEnvironmentVariable('CTI_HOME', $CtiHome)
 
-    $proc = Start-Process -FilePath $nodePath `
-        -ArgumentList $DaemonMjs `
-        -WorkingDirectory $SkillDir `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $LogFile `
-        -RedirectStandardError $ErrorLogFile `
-        -PassThru
+    while ($true) {
+        if (Test-Path $StopFlagFile) { break }
 
-    # Write initial PID (main.ts will overwrite with real PID)
-    Set-Content -Path $PidFile -Value $proc.Id
-    return $proc.Id
+        $proc = Start-Process -FilePath $nodePath `
+            -ArgumentList $DaemonMjs `
+            -WorkingDirectory $SkillDir `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $LogFile `
+            -RedirectStandardError $ErrorLogFile `
+            -PassThru
+
+        Set-Content -Path $PidFile -Value $proc.Id
+        Wait-Process -Id $proc.Id -ErrorAction SilentlyContinue
+
+        if (Test-Path $StopFlagFile) { break }
+        Start-Sleep -Seconds 3
+    }
+
+    if (Test-Path $SupervisorPidFile) { Remove-Item $SupervisorPidFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $PidFile) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
 }
 
 # ── Commands ──
@@ -248,8 +294,9 @@ switch ($Command) {
         Ensure-Built
 
         $existingPid = Read-Pid
-        if ($existingPid -and (Test-PidAlive $existingPid)) {
-            Write-Host "Bridge already running (PID: $existingPid)"
+        $existingSupervisorPid = Read-SupervisorPid
+        if (($existingPid -and (Test-PidAlive $existingPid)) -or ($existingSupervisorPid -and (Test-PidAlive $existingSupervisorPid))) {
+            Write-Host "Bridge already running"
             if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             exit 1
         }
@@ -272,18 +319,21 @@ switch ($Command) {
                 exit 1
             }
         } else {
-            Write-Host "Starting bridge (background process)..."
-            $bridgePid = Start-Fallback
-            Start-Sleep -Seconds 3
+            Write-Host "Starting bridge (background supervisor)..."
+            $supervisorPid = Start-Fallback
+            Start-Sleep -Seconds 5
 
             $newPid = Read-Pid
-            if ($newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
-                Write-Host "Bridge started (PID: $newPid)"
+            $newSupervisorPid = Read-SupervisorPid
+            if ($newSupervisorPid -and (Test-PidAlive $newSupervisorPid) -and $newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+                Write-Host "Bridge started (PID: $newPid, supervisor: $newSupervisorPid)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
                 Write-Host "Failed to start bridge."
-                if (-not $newPid -or -not (Test-PidAlive $newPid)) {
-                    Write-Host "  Process exited immediately."
+                if (-not $newSupervisorPid -or -not (Test-PidAlive $newSupervisorPid)) {
+                    Write-Host "  Supervisor exited immediately."
+                } elseif (-not $newPid -or -not (Test-PidAlive $newPid)) {
+                    Write-Host "  Bridge process exited immediately."
                 }
                 Show-LastExitReason
                 Show-FailureHelp
@@ -293,6 +343,7 @@ switch ($Command) {
     }
 
     'stop' {
+        Set-Content -Path $StopFlagFile -Value (Get-Date).ToString('o')
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -eq 'Running') {
             Write-Host "Stopping bridge via Windows Service..."
@@ -301,24 +352,35 @@ switch ($Command) {
             if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
         } else {
             $bridgePid = Read-Pid
-            if (-not $bridgePid) { Write-Host "No bridge running"; exit 0 }
+            $supervisorPid = Read-SupervisorPid
+            if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; exit 0 }
             if (Test-PidAlive $bridgePid) {
                 Stop-Process -Id ([int]$bridgePid) -Force
                 Write-Host "Bridge stopped"
             } else {
                 Write-Host "Bridge was not running (stale PID file)"
             }
+            if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
+                Stop-Process -Id ([int]$supervisorPid) -Force
+                Write-Host "Supervisor stopped"
+            }
             if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
+            if (Test-Path $SupervisorPidFile) { Remove-Item $SupervisorPidFile -Force }
+            if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
         }
     }
 
     'status' {
         $bridgePid = Read-Pid
+        $supervisorPid = Read-SupervisorPid
 
         # Check Windows Service
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($svc) {
             Write-Host "Windows Service '$ServiceName': $($svc.Status)"
+        }
+        if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
+            Write-Host "Supervisor process is running (PID: $supervisorPid)"
         }
 
         if ($bridgePid -and (Test-PidAlive $bridgePid)) {
@@ -405,5 +467,9 @@ switch ($Command) {
         Write-Host "  logs [N]          Show last N log lines (default 50)"
         Write-Host "  install-service   Install as Windows Service (requires WinSW or NSSM)"
         Write-Host "  uninstall-service Remove the Windows Service"
+    }
+
+    'run-supervisor' {
+        Run-SupervisorLoop
     }
 }

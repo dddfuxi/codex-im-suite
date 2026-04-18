@@ -1,0 +1,8 @@
+{
+  "id": "github-memory-protocol",
+  "displayName": "GitHub Memory Protocol",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\github-memory-protocol",
+  "type": "skill",
+  "enabled": true,
+  "description": "Local markdown memory protocol adapted from GitHub for durable preferences and reusable project constraints."
+}
