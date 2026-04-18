@@ -126,6 +126,14 @@ export interface FeishuHistorySyncStatus {
   lastSyncAt?: string;
 }
 
+export interface FeishuP2pUserAliasRecord {
+  userId: string;
+  latestChatId: string;
+  canonicalChatId?: string;
+  displayName?: string;
+  updatedAt: string;
+}
+
 export interface FeishuHistoryQuery {
   chatId: string;
   query: string;
@@ -246,6 +254,13 @@ export interface BridgeStore {
     lastMessageAt?: string;
     lastSenderId?: string;
   }): void;
+  getFeishuP2pUserAlias?(userId: string): FeishuP2pUserAliasRecord | null;
+  upsertFeishuP2pUserAlias?(data: {
+    userId: string;
+    latestChatId: string;
+    canonicalChatId?: string;
+    displayName?: string;
+  }): FeishuP2pUserAliasRecord | null;
 
   // ── Session locking ──
   acquireSessionLock(sessionId: string, lockId: string, owner: string, ttlSecs: number): boolean;

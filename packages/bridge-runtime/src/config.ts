@@ -6,6 +6,7 @@ export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
   enabledChannels: string[];
   defaultWorkDir: string;
+  bridgeProcessingTimeoutMs?: number;
   allowedWorkspaceRoots?: string[];
   codexAdditionalDirectories?: string[];
   memoryRepoDir?: string;
@@ -144,6 +145,9 @@ export function loadConfig(): Config {
   const contextHistoryMaxChars = env.get("CTI_CONTEXT_HISTORY_MAX_CHARS")
     ? Number(env.get("CTI_CONTEXT_HISTORY_MAX_CHARS"))
     : undefined;
+  const bridgeProcessingTimeoutMs = env.has("CTI_BRIDGE_PROCESSING_TIMEOUT_MS")
+    ? Number(env.get("CTI_BRIDGE_PROCESSING_TIMEOUT_MS"))
+    : undefined;
   const contextHistoryMessageMaxChars = env.get("CTI_CONTEXT_HISTORY_MESSAGE_MAX_CHARS")
     ? Number(env.get("CTI_CONTEXT_HISTORY_MESSAGE_MAX_CHARS"))
     : undefined;
@@ -178,6 +182,7 @@ export function loadConfig(): Config {
     runtime,
     enabledChannels: splitCsv(env.get("CTI_ENABLED_CHANNELS")) ?? [],
     defaultWorkDir,
+    bridgeProcessingTimeoutMs,
     allowedWorkspaceRoots,
     codexAdditionalDirectories,
     memoryRepoDir,
@@ -263,6 +268,8 @@ export function saveConfig(config: Config): void {
     config.enabledChannels.join(",")
   );
   out += formatEnvLine("CTI_DEFAULT_WORKDIR", config.defaultWorkDir);
+  if (config.bridgeProcessingTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_BRIDGE_PROCESSING_TIMEOUT_MS", String(config.bridgeProcessingTimeoutMs));
   out += formatEnvLine("CTI_ALLOWED_WORKSPACE_ROOTS", config.allowedWorkspaceRoots?.join(";"));
   out += formatEnvLine("CTI_CODEX_ADDITIONAL_DIRECTORIES", config.codexAdditionalDirectories?.join(";"));
   out += formatEnvLine("CTI_MEMORY_REPO_DIR", config.memoryRepoDir);
@@ -365,6 +372,9 @@ export function maskSecret(value: string): string {
 export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
   m.set("remote_bridge_enabled", "true");
+  if (config.bridgeProcessingTimeoutMs !== undefined) {
+    m.set("bridge_processing_timeout_ms", String(config.bridgeProcessingTimeoutMs));
+  }
 
   // ── Telegram ──
   // Upstream keys: telegram_bot_token, bridge_telegram_enabled,

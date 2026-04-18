@@ -57,6 +57,12 @@ export interface InboundMessage {
   attachments?: import('./host.js').FileAttachment[];
 }
 
+export interface OutboundMention {
+  userId?: string;
+  name?: string;
+  atAll?: boolean;
+}
+
 /** Outbound message to send to an IM channel */
 export interface OutboundMessage {
   /** Target address */
@@ -69,6 +75,8 @@ export interface OutboundMessage {
   inlineButtons?: InlineButton[][];
   /** If replying to a specific message */
   replyToMessageId?: string;
+  /** Optional mentions for channels that support native mention formatting */
+  mentions?: OutboundMention[];
 }
 
 /** Inline keyboard button for permission prompts */

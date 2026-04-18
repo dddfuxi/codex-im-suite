@@ -13,4 +13,10 @@ param(
 )
 
 $supervisorScript = Join-Path (Split-Path -Parent $PSCommandPath) 'supervisor-windows.ps1'
+if ($Command -eq 'restart') {
+    & $supervisorScript -Command stop -LogLines $LogLines
+    & $supervisorScript -Command start -LogLines $LogLines
+    exit $LASTEXITCODE
+}
+
 & $supervisorScript -Command $Command -LogLines $LogLines

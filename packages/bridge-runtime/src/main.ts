@@ -12,6 +12,11 @@ import { fileURLToPath } from 'node:url';
 import { initBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
 import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
 import 'claude-to-im/src/lib/bridge/adapters/index.js';
+import {
+  initializeBridgeRuntimeAudit,
+  recordBridgeRuntimeExit,
+  touchBridgeRuntimeHeartbeat,
+} from 'claude-to-im/src/lib/bridge/runtime-audit.js';
 import './adapters/weixin-adapter.js';
 
 import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
@@ -45,6 +50,62 @@ const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(MODULE_DIR, '..');
 const CORE_ROOT = path.resolve(SKILL_ROOT, '..', 'claude-to-im-core');
+
+interface ParsedBridgeSseEvent {
+  type: string;
+  data: unknown;
+}
+
+function tryParseJson<T>(value: string): T | null {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
+function parseBridgeSseEvents(chunk: string): ParsedBridgeSseEvent[] {
+  const events: ParsedBridgeSseEvent[] = [];
+  for (const rawLine of chunk.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payloadText = line.slice(5).trim();
+    if (!payloadText) continue;
+    const payload = tryParseJson<{ type?: unknown; data?: unknown }>(payloadText);
+    if (!payload || typeof payload.type !== 'string') continue;
+    let data: unknown = payload.data;
+    if (typeof data === 'string') {
+      const trimmed = data.trim();
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        data = tryParseJson(trimmed) ?? data;
+      }
+    }
+    events.push({ type: payload.type, data });
+  }
+  return events;
+}
+
+function extractCodexFatalStreamError(chunk: string): string | null {
+  const events = parseBridgeSseEvents(chunk);
+  for (const event of events) {
+    if (event.type === 'error') {
+      if (typeof event.data === 'string' && event.data.trim()) return event.data.trim();
+      return 'Codex 流返回错误事件';
+    }
+    if (event.type === 'result' && event.data && typeof event.data === 'object') {
+      const data = event.data as { is_error?: unknown; error?: unknown; message?: unknown };
+      if (data.is_error === true) {
+        if (typeof data.error === 'string' && data.error.trim()) return data.error.trim();
+        if (typeof data.message === 'string' && data.message.trim()) return data.message.trim();
+        return 'Codex 返回错误结果';
+      }
+    }
+  }
+  if (/Codex Exec exited with code \d+/i.test(chunk)) {
+    return chunk.trim();
+  }
+  return null;
+}
 
 class HubLlmProvider implements LLMProvider {
   constructor(
@@ -388,6 +449,10 @@ class HubLlmProvider implements LLMProvider {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        const fatalError = extractCodexFatalStreamError(value);
+        if (fatalError) {
+          throw new Error(fatalError);
+        }
         controller.enqueue(value);
       }
       controller.close();
@@ -573,6 +638,7 @@ async function main(): Promise<void> {
 
   const runId = crypto.randomUUID();
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);
+  initializeBridgeRuntimeAudit(runId, process.pid);
 
   const settings = configToSettings(config);
   if (!settings.get('bridge_unity_mcp_endpoint_list')) {
@@ -621,6 +687,9 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
+  const heartbeatTimer = setInterval(() => {
+    touchBridgeRuntimeHeartbeat();
+  }, 15_000);
 
   let shuttingDown = false;
   const shutdown = async (signal?: string) => {
@@ -630,6 +699,8 @@ async function main(): Promise<void> {
     console.log(`[claude-to-im] Shutting down (${reason})...`);
     pendingPerms.denyAll();
     await bridgeManager.stop();
+    clearInterval(heartbeatTimer);
+    recordBridgeRuntimeExit(reason);
     writeStatus({ running: false, lastExitReason: reason });
     process.exit(0);
   };
@@ -640,10 +711,13 @@ async function main(): Promise<void> {
 
   process.on('unhandledRejection', (reason) => {
     console.error('[claude-to-im] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
+    recordBridgeRuntimeExit(`unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`, reason);
     writeStatus({ running: false, lastExitReason: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}` });
   });
   process.on('uncaughtException', (err) => {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
+    clearInterval(heartbeatTimer);
+    recordBridgeRuntimeExit(`uncaughtException: ${err.message}`, err);
     writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
     process.exit(1);
   });
@@ -652,6 +726,7 @@ async function main(): Promise<void> {
   });
   process.on('exit', (code) => {
     console.log(`[claude-to-im] exit (code: ${code})`);
+    clearInterval(heartbeatTimer);
   });
 
   setInterval(() => { /* keepalive */ }, 45_000);
@@ -659,6 +734,7 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   console.error('[claude-to-im] Fatal error:', err instanceof Error ? err.stack || err.message : err);
+  try { recordBridgeRuntimeExit(`fatal: ${err instanceof Error ? err.message : String(err)}`, err); } catch { /* ignore */ }
   try { writeStatus({ running: false, lastExitReason: `fatal: ${err instanceof Error ? err.message : String(err)}` }); } catch { /* ignore */ }
   process.exit(1);
 });

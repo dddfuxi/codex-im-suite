@@ -20,6 +20,7 @@ import type {
   FeishuHistoryQuery,
   RetrievedFeishuHistoryContext,
   FeishuHistorySyncStatus,
+  FeishuP2pUserAliasRecord,
   AuditLogInput,
   PermissionLinkInput,
   PermissionLinkRecord,
@@ -33,6 +34,7 @@ const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
 const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
+const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
 const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
@@ -97,6 +99,7 @@ interface FeishuChatIndexRecord {
 }
 
 interface FeishuHistoryIndexRecord extends FeishuHistorySyncStatus {}
+interface FeishuP2pUserAliasIndexRecord extends FeishuP2pUserAliasRecord {}
 
 // Store
 
@@ -110,6 +113,7 @@ export class JsonFileStore implements BridgeStore {
   private dedupKeys = new Map<string, number>();
   private locks = new Map<string, LockEntry>();
   private feishuChatIndex = new Map<string, FeishuChatIndexRecord>();
+  private feishuP2pUserIndex = new Map<string, FeishuP2pUserAliasIndexRecord>();
   private feishuHistoryIndex = new Map<string, FeishuHistoryIndexRecord>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
@@ -178,6 +182,14 @@ export class JsonFileStore implements BridgeStore {
       this.feishuChatIndex.set(key, value);
     }
 
+    const feishuP2pUserIndex = readJson<Record<string, FeishuP2pUserAliasIndexRecord>>(
+      FEISHU_P2P_USER_INDEX_PATH,
+      {},
+    );
+    for (const [key, value] of Object.entries(feishuP2pUserIndex)) {
+      this.feishuP2pUserIndex.set(key, value);
+    }
+
     const feishuHistoryIndex = readJson<Record<string, FeishuHistoryIndexRecord>>(
       FEISHU_HISTORY_INDEX_PATH,
       {},
@@ -229,6 +241,13 @@ export class JsonFileStore implements BridgeStore {
     writeJson(
       FEISHU_CHAT_INDEX_PATH,
       Object.fromEntries(this.feishuChatIndex),
+    );
+  }
+
+  private persistFeishuP2pUserIndex(): void {
+    writeJson(
+      FEISHU_P2P_USER_INDEX_PATH,
+      Object.fromEntries(this.feishuP2pUserIndex),
     );
   }
 
@@ -786,6 +805,34 @@ export class JsonFileStore implements BridgeStore {
     };
     this.feishuChatIndex.set(chatId, record);
     this.persistFeishuChatIndex();
+  }
+
+  getFeishuP2pUserAlias(userId: string): FeishuP2pUserAliasRecord | null {
+    const key = userId.trim();
+    if (!key) return null;
+    return this.feishuP2pUserIndex.get(key) ?? null;
+  }
+
+  upsertFeishuP2pUserAlias(data: {
+    userId: string;
+    latestChatId: string;
+    canonicalChatId?: string;
+    displayName?: string;
+  }): FeishuP2pUserAliasRecord | null {
+    const userId = data.userId.trim();
+    const latestChatId = data.latestChatId.trim();
+    if (!userId || !latestChatId) return null;
+    const existing = this.feishuP2pUserIndex.get(userId);
+    const record: FeishuP2pUserAliasIndexRecord = {
+      userId,
+      latestChatId,
+      canonicalChatId: data.canonicalChatId?.trim() || existing?.canonicalChatId || latestChatId,
+      displayName: data.displayName ?? existing?.displayName,
+      updatedAt: now(),
+    };
+    this.feishuP2pUserIndex.set(userId, record);
+    this.persistFeishuP2pUserIndex();
+    return record;
   }
 
   upsertFeishuHistoryMessages(data: {

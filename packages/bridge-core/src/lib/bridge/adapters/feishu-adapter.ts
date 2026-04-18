@@ -17,10 +17,13 @@
 
 import crypto from 'crypto';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import type {
   ChannelType,
   InboundMessage,
+  OutboundMention,
   OutboundMessage,
   SendResult,
 } from '../types.js';
@@ -28,6 +31,7 @@ import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
+import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
   preprocessFeishuMarkdown,
@@ -64,6 +68,12 @@ interface FeishuCardState {
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
+const P2P_POLL_INTERVAL_MS = 15000;
+const FEISHU_CHAT_INDEX_PATH = path.join(
+  process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+  'data',
+  'feishu-chat-index.json',
+);
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -134,6 +144,15 @@ interface FeishuChatMemberItem {
   name?: string;
 }
 
+interface FeishuChatIndexRecord {
+  chatId: string;
+  chatType?: string;
+  displayName?: string;
+  lastMessageAt?: string;
+  lastSenderId?: string;
+  updatedAt?: string;
+}
+
 export interface FeishuDocRequest {
   title: string;
   scopeText: string;
@@ -165,6 +184,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
+  private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
+  private p2pPollInFlight = false;
 
   private isStreamingCardEnabled(): boolean {
     const raw =
@@ -237,6 +258,47 @@ export class FeishuAdapter extends BaseChannelAdapter {
     });
   }
 
+  private getPreferredPrivateUserId(sender: FeishuMessageEventData['sender']): string {
+    return (
+      sender.sender_id?.user_id
+      || sender.sender_id?.open_id
+      || sender.sender_id?.union_id
+      || ''
+    ).trim();
+  }
+
+  private reconcileP2pAliasBinding(chatId: string, userId: string, displayName: string): void {
+    if (!userId || !chatId) return;
+    const store = getBridgeContext().store;
+    const alias = store.getFeishuP2pUserAlias?.(userId);
+    const currentBinding = store.getChannelBinding('feishu', chatId);
+    const canonicalChatId = alias?.canonicalChatId?.trim() || alias?.latestChatId?.trim() || chatId;
+    const canonicalBinding = canonicalChatId ? store.getChannelBinding('feishu', canonicalChatId) : null;
+
+    if (!currentBinding && canonicalBinding && canonicalBinding.chatType === 'p2p' && canonicalBinding.chatId !== chatId) {
+      store.upsertChannelBinding({
+        channelType: 'feishu',
+        chatId,
+        displayName,
+        chatType: 'p2p',
+        codepilotSessionId: canonicalBinding.codepilotSessionId,
+        sdkSessionId: canonicalBinding.sdkSessionId || '',
+        workingDirectory: canonicalBinding.workingDirectory || store.getSession(canonicalBinding.codepilotSessionId)?.working_directory || '',
+        model: canonicalBinding.model || store.getSession(canonicalBinding.codepilotSessionId)?.model || '',
+        mode: canonicalBinding.mode,
+        bridgeFingerprint: canonicalBinding.bridgeFingerprint,
+        toolingFingerprint: canonicalBinding.toolingFingerprint,
+      });
+    }
+
+    store.upsertFeishuP2pUserAlias?.({
+      userId,
+      latestChatId: chatId,
+      canonicalChatId: canonicalBinding?.chatId || canonicalChatId,
+      displayName,
+    });
+  }
+
   // ── Lifecycle ───────────────────────────────────────────────
 
   async start(): Promise<void> {
@@ -247,6 +309,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Cannot start:', configError);
       return;
     }
+    updateFeishuWsAudit({ state: 'starting', lastError: '', lastDisconnectReason: '' });
 
     const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
     const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret') || '';
@@ -255,34 +318,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
       ? lark.Domain.Lark
       : lark.Domain.Feishu;
 
-    // Create REST client
-    this.restClient = new lark.Client({
-      appId,
-      appSecret,
-      domain,
-    });
+    try {
+      // Create REST client
+      this.restClient = new lark.Client({
+        appId,
+        appSecret,
+        domain,
+      });
 
-    // Resolve bot identity for @mention detection
-    await this.resolveBotIdentity(appId, appSecret, domain);
+      // Resolve bot identity for @mention detection
+      await this.resolveBotIdentity(appId, appSecret, domain);
 
-    this.running = true;
+      this.running = true;
 
-    // Create EventDispatcher and register event handlers.
-    const dispatcher = new lark.EventDispatcher({}).register({
-      'im.message.receive_v1': async (data) => {
-        await this.handleIncomingEvent(data as FeishuMessageEventData);
-      },
-      'card.action.trigger': (async (data: unknown) => {
-        return await this.handleCardAction(data);
-      }) as any,
-    });
+      // Create EventDispatcher and register event handlers.
+      const dispatcher = new lark.EventDispatcher({}).register({
+        'im.message.receive_v1': async (data) => {
+          await this.handleIncomingEvent(data as FeishuMessageEventData);
+        },
+        'card.action.trigger': (async (data: unknown) => {
+          return await this.handleCardAction(data);
+        }) as any,
+      });
 
-    // Create and start WSClient
-    this.wsClient = new lark.WSClient({
-      appId,
-      appSecret,
-      domain,
-    });
+      // Create and start WSClient
+      this.wsClient = new lark.WSClient({
+        appId,
+        appSecret,
+        domain,
+      });
 
     // Monkey-patch WSClient.handleEventData to support card action events (type: "card").
     // The SDK's WSClient only processes type="event" messages. Card action callbacks
@@ -306,14 +370,26 @@ export class FeishuAdapter extends BaseChannelAdapter {
       };
     }
 
-    this.wsClient.start({ eventDispatcher: dispatcher });
-
-    console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
+      this.wsClient.start({ eventDispatcher: dispatcher });
+      updateFeishuWsAudit({ state: 'connected' });
+      updateFeishuP2pPollAudit({ state: 'idle', lastError: '' });
+      this.startP2pPollFallback();
+      console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
+    } catch (err) {
+      updateFeishuWsAudit({
+        state: 'error',
+        lastError: err instanceof Error ? err.stack || err.message : String(err),
+      });
+      this.running = false;
+      throw err;
+    }
   }
 
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
+    updateFeishuWsAudit({ state: 'closed', lastDisconnectReason: 'adapter stop() called' });
+    updateFeishuP2pPollAudit({ state: 'idle' });
 
     // Close WebSocket connection (SDK exposes close())
     if (this.wsClient) {
@@ -325,6 +401,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       this.wsClient = null;
     }
     this.restClient = null;
+    if (this.p2pPollTimer) {
+      clearInterval(this.p2pPollTimer);
+      this.p2pPollTimer = null;
+    }
+    this.p2pPollInFlight = false;
 
     // Reject all waiting consumers
     for (const waiter of this.waiters) {
@@ -766,31 +847,51 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
-    // Rendering strategy (aligned with Openclaw):
-    // - Code blocks / tables → interactive card (schema 2.0 markdown)
-    // - Other text → post (md tag)
-    if (hasComplexMarkdown(text)) {
-      return this.sendAsCard(message.address.chatId, text);
+    if (message.parseMode === 'Markdown') {
+      const result = await this.sendAsCard(message.address.chatId, text, message.replyToMessageId);
+      if (result.ok) {
+        console.log('[feishu-adapter] Markdown send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
+      } else {
+        console.warn('[feishu-adapter] Markdown send failed:', JSON.stringify({ chatId: message.address.chatId, error: result.error }));
+      }
+      return result;
     }
-    return this.sendAsPost(message.address.chatId, text);
+
+    const result = await this.sendAsPlainText(
+      message.address.chatId,
+      text,
+      message.replyToMessageId,
+      message,
+    );
+    if (result.ok) {
+      console.log('[feishu-adapter] Plain text send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
+    } else {
+      console.warn('[feishu-adapter] Plain text send failed:', JSON.stringify({ chatId: message.address.chatId, error: result.error }));
+    }
+    return result;
   }
 
   /**
    * Send text as an interactive card (schema 2.0 markdown).
    * Used for code blocks and tables — card renders them properly.
    */
-  private async sendAsCard(chatId: string, text: string): Promise<SendResult> {
+  private async sendAsCard(chatId: string, text: string, replyToMessageId?: string): Promise<SendResult> {
     const cardContent = buildCardContent(text);
 
     try {
-      const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: cardContent,
-        },
-      });
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { msg_type: 'interactive', content: cardContent },
+        })
+        : await this.restClient!.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: cardContent,
+          },
+        });
 
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
@@ -801,25 +902,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Fallback to post
-    return this.sendAsPost(chatId, text);
+    return this.sendAsPost(chatId, text, replyToMessageId);
   }
 
   /**
    * Send text as a post message (msg_type: 'post') with md tag.
    * Used for simple text — renders bold, italic, inline code, links.
    */
-  private async sendAsPost(chatId: string, text: string): Promise<SendResult> {
+  private async sendAsPost(chatId: string, text: string, replyToMessageId?: string): Promise<SendResult> {
     const postContent = buildPostContent(text);
 
     try {
-      const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'post',
-          content: postContent,
-        },
-      });
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { msg_type: 'post', content: postContent },
+        })
+        : await this.restClient!.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'post',
+            content: postContent,
+          },
+        });
 
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
@@ -831,14 +937,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Final fallback: plain text
     try {
-      const res = await this.restClient!.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text }),
-        },
-      });
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { msg_type: 'text', content: JSON.stringify({ text }) },
+        })
+        : await this.restClient!.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'text',
+            content: JSON.stringify({ text }),
+          },
+        });
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
@@ -1023,9 +1134,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Incoming event handler ──────────────────────────────────
 
   private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
+    console.log('[feishu-adapter] inbound event:', data.message?.message_id || '(unknown)', data.message?.chat_id || '(unknown)');
+    updateFeishuWsAudit({
+      lastEventType: 'im.message.receive_v1',
+      lastEventAt: new Date().toISOString(),
+    });
     try {
       await this.processIncomingEvent(data);
     } catch (err) {
+      updateFeishuWsAudit({
+        state: 'error',
+        lastError: err instanceof Error ? err.stack || err.message : String(err),
+      });
       console.error(
         '[feishu-adapter] Unhandled error in event handler:',
         err instanceof Error ? err.stack || err.message : err,
@@ -1173,6 +1293,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const timestamp = parseInt(msg.create_time, 10) || Date.now();
     const displayName = await this.resolveChatDisplayName(chatId, msg.chat_type);
     this.persistChatIndex(chatId, msg.chat_type, displayName, sender, msg.create_time);
+    if (msg.chat_type === 'p2p') {
+      this.reconcileP2pAliasBinding(chatId, this.getPreferredPrivateUserId(sender), displayName);
+    }
     try {
       await this.syncIndexedChatHistory(chatId, msg.chat_type, displayName, false);
     } catch (err) {
@@ -1340,6 +1463,165 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return { extractedText: textParts.join('').trim(), imageKeys };
+  }
+
+  private startP2pPollFallback(): void {
+    if (this.p2pPollTimer) clearInterval(this.p2pPollTimer);
+    this.p2pPollTimer = setInterval(() => {
+      void this.pollP2pChatsForMissedMessages();
+    }, P2P_POLL_INTERVAL_MS);
+  }
+
+  private readIndexedP2pChats(): FeishuChatIndexRecord[] {
+    try {
+      const raw = fs.readFileSync(FEISHU_CHAT_INDEX_PATH, 'utf8');
+      const parsed = JSON.parse(raw) as Record<string, FeishuChatIndexRecord>;
+      return Object.values(parsed).filter((item) => item?.chatId && item.chatType === 'p2p');
+    } catch {
+      return [];
+    }
+  }
+
+  private async pollP2pChatsForMissedMessages(): Promise<void> {
+    if (!this.running || this.p2pPollInFlight) return;
+    this.p2pPollInFlight = true;
+    updateFeishuP2pPollAudit({
+      state: 'polling',
+      lastPollAt: new Date().toISOString(),
+      lastError: '',
+    });
+    try {
+      const chats = this.readIndexedP2pChats();
+      for (const chat of chats) {
+        await this.pollSingleP2pChat(chat);
+      }
+      updateFeishuP2pPollAudit({ state: 'idle' });
+    } catch (err) {
+      console.warn('[feishu-adapter] p2p poll fallback failed:', err instanceof Error ? err.message : err);
+      updateFeishuP2pPollAudit({
+        state: 'failed',
+        lastError: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.p2pPollInFlight = false;
+    }
+  }
+
+  private async pollSingleP2pChat(chat: FeishuChatIndexRecord): Promise<void> {
+    const latestKnownTime = Number.parseInt(chat.lastMessageAt || '0', 10) || 0;
+    const { items } = await this.fetchMessagePage(chat.chatId, '', 10);
+    const candidates = items
+      .filter((item) => !item.deleted)
+      .filter((item) => item.msg_type !== 'system')
+      .filter((item) => item.sender?.sender_type !== 'app')
+      .filter((item) => !this.seenMessageIds.has(item.message_id))
+      .filter((item) => (Number.parseInt(item.create_time, 10) || 0) > latestKnownTime)
+      .sort((a, b) => (Number.parseInt(a.create_time, 10) || 0) - (Number.parseInt(b.create_time, 10) || 0));
+
+    for (const item of candidates) {
+      console.log('[feishu-adapter] recovered p2p event via history poll:', item.message_id, chat.chatId);
+      updateFeishuP2pPollAudit({
+        state: 'recovered',
+        lastPollAt: new Date().toISOString(),
+        lastRecoveredMessageId: item.message_id,
+        lastRecoveredChatId: chat.chatId,
+        lastError: '',
+      });
+      await this.handleIncomingEvent({
+        sender: {
+          sender_type: item.sender?.sender_type || 'user',
+          sender_id: item.sender?.id
+            ? { [item.sender.id_type === 'user_id' ? 'user_id' : item.sender.id_type === 'union_id' ? 'union_id' : 'open_id']: item.sender.id }
+            : undefined,
+        },
+        message: {
+          message_id: item.message_id,
+          chat_id: item.chat_id,
+          chat_type: chat.chatType || 'p2p',
+          message_type: item.msg_type,
+          content: item.body?.content || '',
+          create_time: item.create_time,
+        },
+      });
+    }
+  }
+
+  private buildOutboundMentionTags(message?: OutboundMessage): string[] {
+    if (!message) return [];
+    if (/<at\s+user_id=/i.test(message.text)) return [];
+
+    const resolvedMentions: OutboundMention[] = [];
+    const seen = new Set<string>();
+    const pushMention = (mention?: OutboundMention | null) => {
+      if (!mention) return;
+      const key = mention.atAll ? '__all__' : (mention.userId || '').trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      resolvedMentions.push(mention);
+    };
+
+    for (const mention of message.mentions || []) {
+      pushMention(mention);
+    }
+
+    const isGroup = message.address.chatType === 'group';
+    if (isGroup && message.replyToMessageId && message.address.userId) {
+      pushMention({
+        userId: message.address.userId,
+        name: message.address.displayName,
+      });
+    }
+
+    return resolvedMentions.map((mention) => {
+      if (mention.atAll) {
+        return '<at user_id="all">所有人</at>';
+      }
+      const userId = (mention.userId || '').trim();
+      if (!userId) return '';
+      const name = (mention.name || '你').replace(/[<>"]/g, '').trim() || '你';
+      return `<at user_id="${userId}">${name}</at>`;
+    }).filter(Boolean);
+  }
+
+  private buildFeishuTextPayload(text: string, message?: OutboundMessage): string {
+    const mentionTags = this.buildOutboundMentionTags(message);
+    const body = mentionTags.length > 0
+      ? `${mentionTags.join(' ')}${text.trim() ? `\n${text}` : ''}`
+      : text;
+    return JSON.stringify({ text: body });
+  }
+
+  private async sendAsPlainText(
+    chatId: string,
+    text: string,
+    replyToMessageId?: string,
+    message?: OutboundMessage,
+  ): Promise<SendResult> {
+    try {
+      const content = this.buildFeishuTextPayload(text, message);
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+            path: { message_id: replyToMessageId },
+            data: {
+              msg_type: 'text',
+              content,
+            },
+          })
+        : await this.restClient!.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'text',
+              content,
+            },
+          });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      return { ok: false, error: res?.msg || 'Send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
   }
 
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
@@ -2343,7 +2625,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  async sendLocalImage(chatId: string, filePath: string, _replyToMessageId?: string): Promise<SendResult> {
+  async sendLocalImage(chatId: string, filePath: string, replyToMessageId?: string): Promise<SendResult> {
     if (!this.restClient) {
       return { ok: false, error: 'Feishu client not initialized' };
     }
@@ -2365,14 +2647,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
         return { ok: false, error: 'Feishu image upload did not return image_key' };
       }
 
-      const sendRes = await this.restClient.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: 'image',
-          content: JSON.stringify({ image_key: imageKey }),
-        },
-      });
+      const sendRes = replyToMessageId
+        ? await this.restClient.im.message.reply({
+            path: { message_id: replyToMessageId },
+            data: {
+              msg_type: 'image',
+              content: JSON.stringify({ image_key: imageKey }),
+            },
+          })
+        : await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'image',
+              content: JSON.stringify({ image_key: imageKey }),
+            },
+          });
 
       if (sendRes?.data?.message_id) {
         return { ok: true, messageId: sendRes.data.message_id };
