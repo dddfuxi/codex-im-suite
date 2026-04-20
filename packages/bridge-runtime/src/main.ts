@@ -19,7 +19,7 @@ import {
 } from 'claude-to-im/src/lib/bridge/runtime-audit.js';
 import './adapters/weixin-adapter.js';
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { BridgeStore, LLMProvider, RetrievedFeishuHistoryContext, RetrievedMemoryContext } from 'claude-to-im/src/lib/bridge/host.js';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
@@ -107,9 +107,70 @@ function extractCodexFatalStreamError(chunk: string): string | null {
   return null;
 }
 
+const MEMORY_RECALL_PATTERNS = [
+  /你还记得/u,
+  /还记得/u,
+  /之前(记录|说过|提到|让我记|让你记)/u,
+  /再发我一次/u,
+  /对应关系/u,
+  /映射/u,
+  /别名/u,
+  /上次(记录|说的|提到的)/u,
+  /历史/u,
+  /记忆/u,
+  /\bremember\b/i,
+  /\brecall\b/i,
+  /\bhistory\b/i,
+  /\bprevious\b/i,
+];
+
+function shouldAugmentWithMemory(prompt: string): boolean {
+  const normalized = prompt.trim();
+  if (!normalized) return false;
+  return MEMORY_RECALL_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function truncatePreview(text: string, maxChars = 220): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistory: RetrievedFeishuHistoryContext | null): string | undefined {
+  const lines: string[] = [];
+
+  if (memory?.summary) {
+    lines.push(`本地记忆摘要:\n${memory.summary.trim()}`);
+  }
+  if (memory?.hits?.length) {
+    const items = memory.hits
+      .slice(0, 4)
+      .map((hit) => `- [${hit.role}/${hit.source}] ${truncatePreview(hit.content, 180)}`);
+    if (items.length) {
+      lines.push(`本地记忆命中:\n${items.join('\n')}`);
+    }
+  }
+
+  if (feishuHistory?.summary) {
+    lines.push(`当前聊天历史摘要:\n${feishuHistory.summary.trim()}`);
+  }
+  if (feishuHistory?.items?.length) {
+    const items = feishuHistory.items
+      .slice(0, 4)
+      .map((item) => `- [${item.senderName || item.senderId || 'unknown'}] ${truncatePreview(item.text || '', 180)}`);
+    if (items.length) {
+      lines.push(`当前聊天历史命中:\n${items.join('\n')}`);
+    }
+  }
+
+  const merged = lines.filter(Boolean).join('\n\n').trim();
+  return merged || undefined;
+}
+
 class HubLlmProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
+    private readonly store: BridgeStore,
     private readonly localProvider: LocalLlamaProvider,
     private readonly localAgent: LocalAgentProvider,
     private readonly fallbackProvider: LLMProvider,
@@ -206,6 +267,42 @@ class HubLlmProvider implements LLMProvider {
     };
   }
 
+  private buildRecallContext(
+    params: Parameters<LLMProvider['streamChat']>[0],
+    taskKind?: string,
+  ): string | undefined {
+    if (!shouldAugmentWithMemory(params.prompt) && taskKind !== 'repo_query') {
+      return undefined;
+    }
+
+    const session = this.store.getSession(params.sessionId);
+    const binding = this.store
+      .listChannelBindings()
+      .find((item) => item.codepilotSessionId === params.sessionId);
+    const workingDirectory = params.workingDirectory || session?.working_directory;
+    const channelType = binding?.channelType || '';
+    const chatId = binding?.chatId || '';
+
+    const memory = this.store.retrieveRelevantMemory({
+      sessionId: params.sessionId,
+      channelType,
+      chatId,
+      workingDirectory,
+      query: params.prompt,
+      recentHistoryLimit: 6,
+    });
+
+    const feishuHistory = binding?.channelType === 'feishu' && binding.chatId && this.store.retrieveRelevantFeishuHistory
+      ? this.store.retrieveRelevantFeishuHistory({
+          chatId: binding.chatId,
+          query: params.prompt,
+          limit: 4,
+        })
+      : null;
+
+    return formatMemoryContext(memory, feishuHistory);
+  }
+
   private async dispatchAfterRouteFailure(
     controller: ReadableStreamDefaultController<string>,
     params: Parameters<LLMProvider['streamChat']>[0],
@@ -213,6 +310,7 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
     reason: string,
   ): Promise<void> {
+    const recallContext = this.buildRecallContext(params, conservative.requestKind);
     if (mode !== 'local_only') {
       await this.pipeCodexPrimaryWithFallback(controller, params, conservative, `本地辅助失败，升级 Codex：${reason}`);
       return;
@@ -245,8 +343,9 @@ class HubLlmProvider implements LLMProvider {
           limitReason: `本地路由失败，按保守规则直接本地回答：${conservative.reason}`,
           taskKind: conservative.requestKind,
           commandDraftOnly: conservative.readOnlyDraftOnly,
+          recallContext,
         })
-      : await this.localProvider.buildBestEffortAnswer(params, reason, conservative.requestKind);
+      : await this.localProvider.buildBestEffortAnswer(params, reason, conservative.requestKind, recallContext);
 
     this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
       mode,
@@ -269,6 +368,7 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
     conservative: ReturnType<typeof decideConservativeRoute>,
   ): Promise<void> {
+    const recallContext = this.buildRecallContext(params, route.taskKind);
     switch (route.decision) {
       case 'answer_local': {
         const executed = await this.localAgent.handleRoutedExecution(controller, params, {
@@ -290,7 +390,12 @@ class HubLlmProvider implements LLMProvider {
           });
           return;
         }
-        const result = await this.localProvider.answer(params, { route, mode, commandDraftOnly: route.taskKind === 'command_draft' });
+        const result = await this.localProvider.answer(params, {
+          route,
+          mode,
+          commandDraftOnly: route.taskKind === 'command_draft',
+          recallContext,
+        });
         this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
           mode,
           taskKind: route.taskKind,
@@ -312,6 +417,7 @@ class HubLlmProvider implements LLMProvider {
             limitReason: this.localProvider.buildLocalOnlyMessage(route.taskKind, route.reason, route.taskKind === 'command_draft'),
             taskKind: route.taskKind,
             commandDraftOnly: route.taskKind === 'command_draft',
+            recallContext,
           });
           this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
             mode,
@@ -361,6 +467,7 @@ class HubLlmProvider implements LLMProvider {
           limitReason: this.localProvider.buildLocalOnlyMessage(route.taskKind, route.reason, route.taskKind === 'command_draft'),
           taskKind: route.taskKind,
           commandDraftOnly: route.taskKind === 'command_draft',
+          recallContext,
         });
         this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
           mode,
@@ -381,6 +488,7 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
     reason: string,
   ): Promise<void> {
+    const recallContext = this.buildRecallContext(params, conservative.requestKind);
     try {
       await this.pipeFallbackStream(controller, params, {
         mode: 'hybrid',
@@ -401,10 +509,15 @@ class HubLlmProvider implements LLMProvider {
             limitReason: `Codex 不可用，改由本地兜底：${message}`,
             taskKind: conservative.requestKind,
             commandDraftOnly: conservative.readOnlyDraftOnly,
+            recallContext,
           })
         : await this.localProvider.buildBestEffortAnswer(params, `Codex 不可用，当前仅能本地兜底：${message}`, conservative.requestKind);
 
-      this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
+      const finalResult = !conservative.useLocal && recallContext
+        ? await this.localProvider.buildBestEffortAnswer(params, message, conservative.requestKind, recallContext)
+        : result;
+
+      this.emitLocalSuccess(controller, params.sessionId, finalResult.text, finalResult.usage, {
         mode: 'hybrid',
         taskKind: conservative.requestKind,
         decision: conservative.useLocal ? 'answer_local' : 'refuse_local',
@@ -549,11 +662,11 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
   };
 }
 
-async function resolveProvider(config: Config, pendingPerms: PendingPermissions): Promise<LLMProvider> {
+async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
   const wrapWithLocalHub = (provider: LLMProvider): LLMProvider => {
     if (config.localLlmEnabled !== true) return provider;
     const localProvider = new LocalLlamaProvider(config);
-    return new HubLlmProvider(config, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider);
+    return new HubLlmProvider(config, store, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider);
   };
 
   const runtime = config.runtime;
@@ -654,7 +767,7 @@ async function main(): Promise<void> {
 
   const store = new JsonFileStore(settings);
   const pendingPerms = new PendingPermissions();
-  const llm = await resolveProvider(config, pendingPerms);
+  const llm = await resolveProvider(config, pendingPerms, store);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
   const gateway = {

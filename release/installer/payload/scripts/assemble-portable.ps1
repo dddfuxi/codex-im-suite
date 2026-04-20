@@ -12,7 +12,10 @@ New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $artifactsDir 'control-panel\CodexImSuiteControlPanel.exe') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'suite.manifest.json') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'README.md') -Destination $portableDir -Force
+Copy-Item -LiteralPath (Join-Path $suiteRoot 'AGENTS.md') -Destination $portableDir -Force
+Copy-Item -LiteralPath (Join-Path $suiteRoot 'docs') -Destination (Join-Path $portableDir 'docs') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'config') -Destination (Join-Path $portableDir 'config') -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $suiteRoot 'extensions') -Destination (Join-Path $portableDir 'extensions') -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'scripts') -Destination (Join-Path $portableDir 'scripts') -Recurse -Force
 
 $packagesDir = Join-Path $portableDir 'packages'

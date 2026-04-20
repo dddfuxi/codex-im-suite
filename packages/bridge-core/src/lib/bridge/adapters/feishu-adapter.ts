@@ -68,7 +68,7 @@ interface FeishuCardState {
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
-const P2P_POLL_INTERVAL_MS = 15000;
+const P2P_POLL_INTERVAL_MS = 5000;
 const FEISHU_CHAT_INDEX_PATH = path.join(
   process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
   'data',
@@ -1467,6 +1467,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private startP2pPollFallback(): void {
     if (this.p2pPollTimer) clearInterval(this.p2pPollTimer);
+    void this.pollP2pChatsForMissedMessages();
     this.p2pPollTimer = setInterval(() => {
       void this.pollP2pChatsForMissedMessages();
     }, P2P_POLL_INTERVAL_MS);

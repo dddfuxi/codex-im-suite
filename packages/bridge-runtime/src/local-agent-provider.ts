@@ -153,6 +153,7 @@ export class LocalAgentProvider {
     const prompt = params.prompt.toLowerCase();
     const mentionsMcp = /(mcp|unity mcp|blender mcp|picture mcp|prefab mcp|unitymcp|blendermcp)/i.test(params.prompt);
     if (!mentionsMcp) return false;
+    if (/(截图|截一张|截图发我|game view|gameview|viewport|视口|相机|camera|拍一张|渲染|导入|生成模型|进入场景|运行游戏|play mode|playmode|场景里|打开unity|呼起unity并|连接mcp截)/i.test(prompt)) return false;
     return /(检查|状态|连通|在线|健康|启动|停止|重启|工具列表|列出.*工具|有哪些工具|调用.*工具|tool call|tools\/list)/i.test(prompt);
   }
 

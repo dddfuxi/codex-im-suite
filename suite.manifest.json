@@ -42,9 +42,11 @@
   },
   "extensions": {
     "skills": {
+      "sourceDir": "./extensions/skills",
       "manifestDir": "./config/skills.d"
     },
     "plugins": {
+      "sourceDir": "./extensions/plugins",
       "manifestDir": "./config/plugins.d"
     },
     "mcps": {

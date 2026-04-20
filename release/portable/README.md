@@ -1,116 +1,100 @@
 # codex-im-suite
 
-`codex-im-suite` 是飞书桥接、Codex 执行层、MCP、Skill、控制面板和打包流程的统一开发与发布目录。
+`codex-im-suite` 是飞书桥接、Codex 执行层、本地辅助模型、MCP、Skill、控制面板和 Windows 打包流程的统一开发与发布目录。
 
-现在这套目录的目标很明确：
+当前目标很明确：
 
-- 以后开发主要在这个目录下进行，不再依赖外部散落仓库作为唯一入口。
-- 当前运行版的重要源码已经备份进来。
-- 需要上传 GitHub 备份时，先打包，再提交，再推送。
+- 开发入口收口到本仓库，不再依赖散落在外部目录的历史副本。
+- 运行版 live skill 可以从本仓库同步生成。
+- 发布时先同步、构建、打包，再提交和推送，保证 GitHub 备份与可运行产物一致。
 
-## 当前结构
+## 快速入口
 
-### 1. packages
+- Agent 维护规则：[AGENTS.md](./AGENTS.md)
+- 架构说明：[docs/PROJECT-ARCHITECTURE.md](./docs/PROJECT-ARCHITECTURE.md)
+- 开发记录：[docs/DEVELOPMENT-LOG.md](./docs/DEVELOPMENT-LOG.md)
+- 架构文档检查：`scripts/update-architecture-docs.ps1`
+- 最近发布摘要：[publish-summary.md](./publish-summary.md)
+- 发布历史：[release-notes.md](./release-notes.md)
+- 套件清单：[suite.manifest.json](./suite.manifest.json)
 
-- `packages/bridge-core`
-  - 桥接核心库
-  - 来自原 `Claude-to-IM`
-- `packages/bridge-runtime`
-  - 当前运行版桥接壳层与脚本
-  - 来自当前运行中的 `C:\Users\admin\.codex\skills\claude-to-im`
-- `packages/mcp-picture`
-  - 图片标注 / 布局记忆 MCP
-- `packages/mcp-unity-prefab`
-  - Unity Prefab 扫描 MCP
+## 目录结构
 
-### 2. apps
+- `packages/bridge-core`：IM 桥接核心库，包含 Feishu 适配器、消息路由、权限、审计、发送收口。
+- `packages/bridge-runtime`：运行时壳层，包含配置、daemon、provider、Codex、本地模型、本地执行器、MCP 桥接。
+- `packages/mcp-picture`：图片能力 MCP。
+- `packages/mcp-unity-prefab`：Unity Prefab MCP。
+- `apps/control-panel`：Windows 中控面板。
+- `apps/installer`：Windows 安装器。
+- `config/mcp.d`：MCP manifest，面板和注册脚本都从这里发现 MCP。
+- `config/skills.d`：随项目备份的 skill manifest。
+- `config/plugins.d`：随项目备份的 plugin manifest。
+- `extensions/skills`：自定义 skill 的项目内副本。
+- `scripts`：启动、注册、构建、打包、发布、同步脚本。
+- `release`：portable、installer、zip 等发布产物。
 
-- `apps/control-panel`
-  - 中控面板源码
-- `apps/installer`
-  - Windows 安装器源码
+## 当前运行模型
 
-### 3. config
+默认是 `Codex 主脑 + 本地辅助执行器`：
 
-- `config/mcp.d`
-  - MCP 清单
-- `config/skills.d`
-  - Skill 清单
-- `config/plugins.d`
-  - Plugin 清单
+- 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
+- 本地模型只处理明确的小活，例如简单命令、git 状态、文件读取、MCP 状态检查。
+- Codex 不可用时，本地模型做兜底，并会先检索本地记忆后再回答记忆类问题。
+- 本地执行器不能伪造完成结果，不能绕过权限和工作区限制。
 
-### 4. extensions
+## 关键命令
 
-- `extensions/skills`
-  - 当前需要一起备份和迁移的自定义 skill 副本
+构建全部 package 和面板：
 
-### 5. scripts
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
+```
 
-- `bootstrap-suite.ps1`
-  - 新机器初始化依赖
-- `build-packages.ps1`
-  - 构建 suite 内所有 package 和面板
-- `assemble-portable.ps1`
-  - 组装便携版
-- `build-installer.ps1`
-  - 组装安装器
-- `package-release.ps1`
-  - 一键打包
-- `register-external-mcps.ps1`
-  - 读取 manifest 并注册 stdio MCP
-- `publish-backup.ps1`
-  - 先打包，再提交，再推送 GitHub
-
-## 开发规则
-
-以后如果修改开发版，优先改这里：
-
-- `packages/bridge-core`
-- `packages/bridge-runtime`
-- `packages/mcp-picture`
-- `packages/mcp-unity-prefab`
-- `apps/control-panel`
-
-不要再把外部历史目录当成主开发目录。
-
-## 打包规则
-
-执行：
+打包 portable 和 installer：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-会按顺序：
-
-1. 构建所有 package
-2. 构建中控面板
-3. 组装 portable
-4. 组装 installer
-
-输出目录：
-
-- `release/portable`
-- `release/installer`
-- `release/codex-im-suite-portable.zip`
-
-## 上传规则
-
-如果你要求“上传 GitHub 备份”，应该走：
+发布到 GitHub：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 ```
 
-这个脚本会：
+同步项目内 skills 到本机 Codex：
 
-1. 先重新打包，确保产物跟最新开发版一致
-2. `git add .`
-3. 自动提交
-4. 推送到当前配置的远端
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
+```
 
-也就是说，后续你改了开发版，再要求上传时，打包版会先自动更新到最新再推送。
+注册 MCP 到 Codex：
 
-## 当前仓库地址
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register-external-mcps.ps1
+```
 
-- GitHub: [dddfuxi/codex-im-suite](https://github.com/dddfuxi/codex-im-suite)
+检查架构文档是否需要同步：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
+```
+
+## 运行版同步
+
+当前 live skill 仍位于：
+
+- `C:\Users\admin\.codex\skills\claude-to-im`
+- `C:\Users\admin\.codex\skills\claude-to-im-core`
+
+仓库里的源码是主版本。需要更新 live 版本时，使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\sync-live-skill.ps1
+```
+
+发布脚本会自动执行同步和打包，避免“开发版”和“打包版”漂移。
+
+## GitHub
+
+仓库地址：[dddfuxi/codex-im-suite](https://github.com/dddfuxi/codex-im-suite)

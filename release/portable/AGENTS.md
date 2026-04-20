@@ -1,0 +1,127 @@
+# codex-im-suite Agent 维护规则
+
+本文件是本仓库的最高优先级本地维护规则。后续 agent 在 `codex-im-suite` 内工作时，必须先遵守这里的约定，再执行具体任务。
+
+## 1. 基本沟通
+
+- 始终使用中文回复。
+- 先确认当前修改对象是 `codex-im-suite` 开发版，还是本机 live skill。
+- 默认只修改开发版仓库：`C:\Users\admin\Documents\New project\codex-im-suite`。
+- 只有用户明确要求“同步运行版 / 修 live / 现在机器人立刻生效”时，才同步到：
+  - `C:\Users\admin\.codex\skills\claude-to-im`
+  - `C:\Users\admin\.codex\skills\claude-to-im-core`
+- 不要把外部仓库、Unity 工程、MCP 工程当成 bridge 主仓库直接改，除非用户明确要求。
+
+## 2. 项目边界
+
+- `packages/bridge-core`：桥接核心，负责 Feishu adapter、消息路由、权限、发送收口、审计。
+- `packages/bridge-runtime`：运行时壳层，负责配置、daemon、provider、Codex、本地模型、本地执行器、MCP bridge。
+- `apps/control-panel`：中控面板，只做服务编排、状态展示、配置入口，不放桥接业务逻辑。
+- `config/mcp.d`：MCP manifest 唯一来源，面板和注册脚本不能硬编码 MCP 名称。
+- `extensions/skills`：随项目备份的 skill 副本，不等同于本机 live skill。
+- `release`：打包产物目录，不作为源码维护入口。
+
+## 3. 文档收口规则
+
+当前文档只保留少数固定入口，禁止为每次小改动新建零散 Markdown。
+
+- `README.md`：只写项目入口、快速命令、关键链接，不写长篇历史。
+- `docs/PROJECT-ARCHITECTURE.md`：只写当前架构事实和模块边界，避免写流水账。
+- `docs/DEVELOPMENT-LOG.md`：记录阶段性开发记录、已知风险、后续 TODO。
+- `release-notes.md`：发布历史，由发布流程维护，不手动塞临时想法。
+- `publish-summary.md`：最近一次发布摘要，由发布流程生成或覆盖。
+- `AGENTS.md`：给 agent 的维护规则，不写成用户说明书。
+
+新增文档前必须先判断：
+
+- 能否补到 `README.md` 的一个链接或短段落。
+- 能否补到 `PROJECT-ARCHITECTURE.md` 的对应章节。
+- 能否补到 `DEVELOPMENT-LOG.md` 的一条记录。
+- 如果只是一次发布说明，应进入 `release-notes.md` 或 `publish-summary.md`。
+
+除非用户明确要求专题文档，否则不要新增新的 `docs/*.md`。
+
+## 4. 文档写法
+
+- 文档必须使用 UTF-8 编码，避免 PowerShell 默认编码造成中文乱码。
+- 标题要短，按“事实 / 当前状态 / 约束 / 操作入口”组织。
+- 不要把聊天过程、思考过程、工具日志写进文档。
+- 不要记录密钥、token、App Secret、私有 config 链接。
+- 路径使用 Windows 绝对路径时要明确是否为开发版、live 版、打包版。
+- 文档里涉及“当前状态”时，要写清日期或“截至本次记录”，避免过期信息被当成事实。
+
+## 5. 修改代码后的记录要求
+
+以下改动必须同步更新文档：
+
+- Feishu 入站、出站、reply、mention、card、图片、私聊补捞。
+- Codex / 本地模型 / 本地执行器路由策略。
+- MCP manifest 协议、启动、停止、健康检查、工作区校验。
+- 控制面板入口、服务卡片、发布按钮、状态展示。
+- 记忆仓库、历史同步、检索、会话绑定。
+- 打包、发布、GitHub 备份流程。
+- 默认工作区、安全边界、owner 权限、高危操作门禁。
+
+更新位置：
+
+- 架构或边界变化：更新 `docs/PROJECT-ARCHITECTURE.md`。
+- 阶段性修复或风险：更新 `docs/DEVELOPMENT-LOG.md`。
+- 用户入口或命令变化：更新 `README.md`。
+- agent 操作规则变化：更新本文件。
+
+## 5.1 架构文档同步规则
+
+本仓库已安装 `project-architecture-diagram` skill。遇到以下情况必须使用该 skill 检查并维护 `docs/PROJECT-ARCHITECTURE.md`：
+
+- 新增、删除或重命名 package、app、script、manifest 目录。
+- 修改 Feishu 入站/出站主链路、私聊补捞、reply、mention、card、图片发送。
+- 修改 Codex provider、本地模型、本地执行器、fallback、路由策略。
+- 修改 MCP manifest 协议、MCP 启停、健康检查、工作区校验。
+- 修改控制面板与 bridge/runtime 的职责边界。
+- 修改打包、安装、发布、一键 bootstrap、live skill 同步链路。
+- 修改记忆索引、历史同步、检索上下文、会话绑定。
+
+完成架构相关代码改动前，运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
+```
+
+如果脚本提示 `Architecture review: REQUIRED`，必须确认 `docs/PROJECT-ARCHITECTURE.md` 是否需要同步。若不需要，在最终回复中说明“不涉及架构文档更新”。
+
+## 6. 运行版同步规则
+
+- 开发版是主版本，live skill 是运行副本。
+- 修改开发版后，如果用户要求立即生效，运行同步脚本，而不是手工复制零散文件。
+- 发布前必须确认开发版、live skill、portable 打包版没有分叉。
+- 面板显示异常时，先看 exe 路径、构建时间、commit，再判断是不是旧版本。
+
+## 7. Feishu 回复收口规则
+
+- 飞书最终回复必须只发用户可见结果，不发思考过程、工具过程、检索过程。
+- Codex 最终结果优先使用 `cti-final` 结果块协议。
+- Markdown 默认走 Feishu card。
+- 结果块解析失败时，不允许蠢裁剪成半截废话；应走可读兜底。
+- 记忆回捞命中结构化键值时，必须保留原始键和值，不能只发概括词。
+
+## 8. 本地模型与 Codex 规则
+
+- 默认策略是 Codex 主脑，本地模型只做明确小活和 Codex 不可用时的兜底。
+- 本地模型可以辅助命令、git 状态、文件读取、记忆检索、简单总结。
+- 本地模型不能伪装完成 Unity、Blender、MCP 多步编排、文档创建、仓库修改。
+- Codex 没额度或不可用时，用户侧要得到可用兜底回复，而不是原始错误堆栈。
+
+## 9. MCP 与工作区安全
+
+- MCP 只能从 `config/mcp.d/*.json` 发现。
+- MCP 的 `cwd` 必须命中默认工作区、允许根目录或明确的 Unity 工程路径。
+- Unity 默认项目是 `C:\unity\ST3\Game`。
+- 没有授权时，不要操作其他 Unity 工程或外部项目。
+- 截图、运行游戏、导入资源这类任务不能被降级成“只检查 MCP 在线”。
+
+## 10. 提交与发布
+
+- 不要自动提交或推送，除非用户明确要求。
+- 发布前先运行发布脚本的语法预检和变更摘要。
+- 一键发布应同步开发版、构建、打包、生成摘要、提交并推送。
+- 发布摘要必须说明 MCP、skill、面板、bridge/runtime 的相关变更。

@@ -53,10 +53,10 @@ function extractContent(response: ChatCompletionResponse): string {
 
 function looksUnsafe(text: string): string | null {
   const normalized = text.toLowerCase();
-  if (!normalized) return '响应为空';
-  if (normalized.includes('<think>') || normalized.includes('</think>')) return '响应包含思维标签';
+  if (!normalized) return '本地模型返回空结果';
+  if (normalized.includes('<think>') || normalized.includes('</think>')) return '本地模型返回了思考标签';
   if (/(我已经|已为你|已经帮你).*(执行|修改|运行|导入|删除|发布|创建)/.test(text)) {
-    return '响应疑似伪造执行结果';
+    return '本地模型疑似伪造执行结果';
   }
   return null;
 }
@@ -71,6 +71,7 @@ function buildAnswerMessages(
     limitReason?: string;
     taskKind?: LocalTaskKind | string;
     commandDraftOnly?: boolean;
+    recallContext?: string;
   },
 ): LocalModelMessage[] {
   const route = options.route;
@@ -97,6 +98,7 @@ function buildAnswerMessages(
   }
 
   const userLines = [
+    options.recallContext ? `已命中的相关历史/记忆:\n${options.recallContext}` : '',
     history ? `最近相关上下文:\n${history}` : '',
     `当前请求:\n${prompt}`,
   ].filter(Boolean);
@@ -175,11 +177,11 @@ export class LocalLlamaProvider {
       limitReason?: string;
       taskKind?: LocalTaskKind | string;
       commandDraftOnly?: boolean;
+      recallContext?: string;
     },
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
     const messages = buildAnswerMessages(params, this.config, options);
-    const result = await this.complete(messages, { temperature: 0.15 });
-    return result;
+    return this.complete(messages, { temperature: 0.15 });
   }
 
   buildLocalOnlyMessage(taskKind: string, reason: string, commandDraftOnly = false): string {
@@ -191,6 +193,7 @@ export class LocalLlamaProvider {
     taskKind: string,
     reason: string,
     commandDraftOnly = false,
+    recallContext?: string,
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
     return this.answer(params, {
       mode: 'local_only',
@@ -198,6 +201,7 @@ export class LocalLlamaProvider {
       limitReason: createLocalOnlyLimitMessage(reason, taskKind, commandDraftOnly),
       taskKind,
       commandDraftOnly,
+      recallContext,
     });
   }
 
@@ -205,12 +209,14 @@ export class LocalLlamaProvider {
     params: StreamChatParams,
     reason: string,
     taskKind: string,
+    recallContext?: string,
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
     return this.answer(params, {
       mode: 'local_only',
       bestEffort: true,
       limitReason: truncateText(reason, 180),
       taskKind,
+      recallContext,
     });
   }
 }

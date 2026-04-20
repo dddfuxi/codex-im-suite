@@ -122,6 +122,13 @@ function parseSseJson<T>(rawText: string): T {
   return JSON.parse(dataLines[dataLines.length - 1]) as T;
 }
 
+function isPathWithin(baseDir: string, targetDir: string): boolean {
+  const baseResolved = path.resolve(baseDir);
+  const targetResolved = path.resolve(targetDir);
+  const relative = path.relative(baseResolved, targetResolved);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
 async function runPowerShellFile(scriptPath: string, cwd: string, env?: Record<string, string>, timeoutMs = 45000): Promise<McpStartStopResult> {
   return new Promise((resolve) => {
     const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
@@ -157,6 +164,34 @@ async function runPowerShellFile(scriptPath: string, cwd: string, env?: Record<s
 export class McpBridge {
   constructor(private readonly config: Config) {}
 
+  private validateManifestWorkspace(manifest: McpManifestRecord): McpHealthStatus {
+    const manifestCwd = expandManifestValue(manifest.cwd, this.config);
+    if (!manifestCwd) {
+      return { ok: true, message: 'manifest 未声明 cwd，跳过工作区约束检查' };
+    }
+
+    const allowedRoots = splitPathList(this.config.allowedWorkspaceRoots?.join(';'));
+    const defaultWorkDir = this.config.defaultWorkDir ? path.resolve(this.config.defaultWorkDir) : '';
+    const unityProjectPath = this.config.unityProjectPath ? path.resolve(this.config.unityProjectPath) : '';
+    const resolvedCwd = path.resolve(manifestCwd);
+
+    const matchesAllowedRoot = allowedRoots.some((root) => isPathWithin(root, resolvedCwd));
+    const matchesDefaultWorkDir = defaultWorkDir ? isPathWithin(defaultWorkDir, resolvedCwd) : false;
+    const matchesUnityProject = unityProjectPath ? isPathWithin(unityProjectPath, resolvedCwd) : false;
+
+    if (matchesAllowedRoot || matchesDefaultWorkDir || matchesUnityProject) {
+      return {
+        ok: true,
+        message: `工作区匹配：${resolvedCwd}`,
+      };
+    }
+
+    return {
+      ok: false,
+      message: `MCP 工作目录不在当前默认工作区内：${resolvedCwd}`,
+    };
+  }
+
   listManifests(): McpManifestRecord[] {
     const manifestDir = path.join(getSuiteRoot(), 'config', 'mcp.d');
     if (!fs.existsSync(manifestDir)) return [];
@@ -186,6 +221,9 @@ export class McpBridge {
   }
 
   async checkHealth(manifest: McpManifestRecord): Promise<McpHealthStatus> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) return workspaceValidation;
+
     if (manifest.type === 'http') {
       const url = expandManifestValue(manifest.healthCheck?.url || '', this.config);
       if (!url) return { ok: false, message: 'manifest 未配置 http healthCheck.url' };
@@ -219,6 +257,10 @@ export class McpBridge {
   }
 
   async startService(manifest: McpManifestRecord): Promise<McpStartStopResult> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      return { ok: false, message: workspaceValidation.message };
+    }
     const launcher = expandManifestValue(manifest.launcher, this.config);
     const cwd = expandManifestValue(manifest.cwd, this.config) || getSuiteRoot();
     if (!launcher || !fs.existsSync(launcher)) {
@@ -228,6 +270,10 @@ export class McpBridge {
   }
 
   async stopService(manifest: McpManifestRecord): Promise<McpStartStopResult> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      return { ok: false, message: workspaceValidation.message };
+    }
     const launcher = expandManifestValue(manifest.stopLauncher || '', this.config);
     const cwd = expandManifestValue(manifest.cwd, this.config) || getSuiteRoot();
     if (!launcher || !fs.existsSync(launcher)) {
@@ -237,11 +283,19 @@ export class McpBridge {
   }
 
   async listHttpTools(manifest: McpManifestRecord): Promise<string[]> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
     const result = await this.sendHttpRequest<{ tools?: Array<{ name?: string }> }>(manifest, 'tools/list', {});
     return (result.tools || []).map((tool) => String(tool.name || '')).filter(Boolean);
   }
 
   async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<string> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
     const result = await this.sendHttpRequest<{ content?: unknown; structuredContent?: unknown; structured_content?: unknown }>(manifest, 'tools/call', {
       name: toolName,
       arguments: args,
