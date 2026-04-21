@@ -317,7 +317,6 @@ function Write-PublishSummaryFiles {
     }
 }
 
-& (Join-Path $scriptDir 'sync-live-skill.ps1')
 & (Join-Path $scriptDir 'package-release.ps1')
 
 Push-Location $suiteRoot

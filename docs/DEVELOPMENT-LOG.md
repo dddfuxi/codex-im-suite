@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-20
+更新时间：2026-04-21
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -15,12 +15,17 @@
 - 建立 `suite.manifest.json` 作为发行层总清单。
 - 建立 `publish-backup.ps1`，发布前自动同步、打包、生成摘要、提交并推送。
 - 建立 `publish-summary.md` 和 `release-notes.md`。
+- 新增 `scripts/doctor-suite-targets.ps1`，用于检查开发版、live skill、portable、installer 和面板 exe 的职责与漂移情况。
+- 将 `scripts/sync-live-skill.ps1` 收口为“开发版 suite -> live skill”方向，避免 live 反向覆盖开发版。
+- 新增 `scripts/import-live-to-suite.ps1` 作为手动救回 live 改动入口，默认 dry-run，不进入发布流程。
+- 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
 
 当前约定：
 
 - 以后开发优先改 suite 目录。
 - live skill 通过同步脚本生成。
 - 上传 GitHub 前必须先打包最新开发版。
+- 面板源码唯一入口是 `apps/control-panel`；安装器源码唯一入口是 `apps/installer`。
 
 ## 2. Feishu 桥接
 
@@ -109,22 +114,22 @@
 
 已完成：
 
-- 服务总览、路径配置、历史索引、MCP 列表、日志区域。
-- 顶部 ToolStrip。
-- 历史索引 / MCP / 日志可拖拽分割。
+- 主窗口收口为服务总览、MCP 列表、面板日志和常用工具入口。
+- 顶部 ToolStrip 提供刷新状态、一键发布、设置、查看会话、同步历史等日常入口。
+- MCP 列表 / 日志可拖拽分割。
 - 每个服务卡内放对应操作按钮。
 - 显示版本、构建时间、commit、当前 exe 路径、suite 根目录。
 - 一键发布前显示变更摘要。
 - 打开最近发布摘要和发布历史。
-- 机器人回复风格预设和自定义风格。
-- 本地 AI 整理风格要求。
+- 路径配置、机器人回复风格预设、自定义风格和本地 AI 整理已移入“设置”弹窗。
+- “查看会话”弹窗使用页签承载会话记录、历史索引检索和同步状态。
 - 本地辅助执行器状态和路由摘要。
 - Feishu WS、私聊补捞、最后阶段、最后活跃请求显示。
 
 近期注意：
 
 - 面板源码以 `apps/control-panel/Program.cs` 为主版本。
-- live 面板构建前会从 suite 同步。
+- live 面板源码镜像和 exe 会从 suite 生成。
 - 如果出现“打开的面板不是最新版”，先看 exe 路径和构建时间。
 
 ## 7. 记忆与历史
@@ -151,6 +156,7 @@
 - 本地模型能力有限，对复杂任务仍不稳定。
 - 正在处理的消息如果 bridge 被强制重启，目前没有断点续跑。
 - Feishu 私聊 WS 漏事件已补捞，但如果历史接口也异常，仍可能延迟。
+- `packages/bridge-runtime/scripts/build-control-panel.ps1` 和 `package-release.ps1` 仍作为兼容入口存在，但不再承载旧源码。
 
 建议下一步：
 

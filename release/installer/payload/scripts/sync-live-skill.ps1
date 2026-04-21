@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$suiteRoot = Split-Path -Parent $scriptDir
+$suiteRoot = Get-SuiteRoot
 $userHome = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
 
 $liveCore = Join-Path $userHome '.codex\skills\claude-to-im-core'
@@ -14,7 +14,9 @@ $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
 function Copy-PathContent {
     param(
         [string]$Source,
-        [string]$Target
+        [string]$Target,
+        [string[]]$ExcludeDirectories = @('node_modules', 'bin', 'obj', '.git', 'coverage', '.turbo', '.next', 'release'),
+        [string[]]$ExcludeFiles = @('*.tmp')
     )
 
     if (-not (Test-Path -LiteralPath $Source)) {
@@ -22,20 +24,74 @@ function Copy-PathContent {
     }
 
     New-Item -ItemType Directory -Force -Path $Target | Out-Null
-    robocopy $Source $Target /MIR /XD node_modules dist bin obj .git coverage .turbo .next release /XF "*.tmp" | Out-Null
+    $args = @($Source, $Target, '/MIR')
+    if ($ExcludeDirectories.Count -gt 0) {
+        $args += '/XD'
+        $args += $ExcludeDirectories
+    }
+    if ($ExcludeFiles.Count -gt 0) {
+        $args += '/XF'
+        $args += $ExcludeFiles
+    }
+
+    robocopy @args | Out-Null
     $code = $LASTEXITCODE
     if ($code -ge 8) {
         throw "robocopy failed ($code): $Source -> $Target"
     }
 }
 
-Write-Host "sync live bridge-core -> suite"
-Copy-PathContent -Source (Join-Path $liveCore 'src') -Target (Join-Path $suiteCore 'src')
+function Copy-ExistingFile {
+    param(
+        [string]$Source,
+        [string]$Target
+    )
 
-Write-Host "sync live bridge-runtime -> suite"
-Copy-PathContent -Source (Join-Path $liveRuntime 'src') -Target (Join-Path $suiteRuntime 'src')
-Copy-PathContent -Source (Join-Path $liveRuntime 'scripts') -Target (Join-Path $suiteRuntime 'scripts')
-Copy-PathContent -Source (Join-Path $liveRuntime 'mcp.d') -Target (Join-Path $suiteRuntime 'mcp.d')
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
+    Copy-Item -LiteralPath $Source -Destination $Target -Force
+}
+
+function Copy-ExistingDirectory {
+    param(
+        [string]$Source,
+        [string]$Target
+    )
+
+    if (Test-Path -LiteralPath $Source) {
+        Copy-PathContent -Source $Source -Target $Target
+    }
+}
+
+Write-Host "sync suite bridge-core -> live skill"
+Copy-ExistingDirectory -Source (Join-Path $suiteCore 'src') -Target (Join-Path $liveCore 'src')
+Copy-ExistingDirectory -Source (Join-Path $suiteCore 'dist') -Target (Join-Path $liveCore 'dist')
+
+$coreFiles = @(
+    'package.json',
+    'package-lock.json',
+    'tsconfig.json',
+    'tsconfig.build.json',
+    'README.md',
+    'README.zh-CN.md',
+    'LICENSE'
+)
+
+foreach ($name in $coreFiles) {
+    Copy-ExistingFile -Source (Join-Path $suiteCore $name) -Target (Join-Path $liveCore $name)
+}
+
+Write-Host "sync suite bridge-runtime -> live skill"
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'src') -Target (Join-Path $liveRuntime 'src')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'scripts') -Target (Join-Path $liveRuntime 'scripts')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'mcp.d') -Target (Join-Path $liveRuntime 'mcp.d')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'references') -Target (Join-Path $liveRuntime 'references')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'evals') -Target (Join-Path $liveRuntime 'evals')
+Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'dist') -Target (Join-Path $liveRuntime 'dist')
 
 $runtimeFiles = @(
     'package.json',
@@ -53,36 +109,21 @@ $runtimeFiles = @(
 )
 
 foreach ($name in $runtimeFiles) {
-    $source = Join-Path $liveRuntime $name
-    $target = Join-Path $suiteRuntime $name
-    if (Test-Path -LiteralPath $source) {
-        Copy-Item -LiteralPath $source -Destination $target -Force
-    }
+    Copy-ExistingFile -Source (Join-Path $suiteRuntime $name) -Target (Join-Path $liveRuntime $name)
 }
 
-$coreFiles = @(
-    'package.json',
-    'package-lock.json',
-    'tsconfig.json',
-    'tsconfig.build.json',
-    'README.md',
-    'LICENSE'
-)
-
-foreach ($name in $coreFiles) {
-    $source = Join-Path $liveCore $name
-    $target = Join-Path $suiteCore $name
-    if (Test-Path -LiteralPath $source) {
-        Copy-Item -LiteralPath $source -Destination $target -Force
-    }
+Write-Host "remove live legacy tools mirror"
+$liveToolsDir = Join-Path $liveRuntime 'tools'
+if (Test-Path -LiteralPath $liveToolsDir) {
+    Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$liveControlPanelProgram = Join-Path $liveRuntime 'tools\ControlPanel\Program.cs'
-$suiteControlPanelProgram = Join-Path $suiteControlPanel 'Program.cs'
+$builtPanelExe = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.exe'
+$builtPanelPdb = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.pdb'
+$livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
+Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe')
+Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
+Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')
+Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb')
 
-if (Test-Path -LiteralPath $suiteControlPanelProgram) {
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $liveControlPanelProgram) | Out-Null
-    Copy-Item -LiteralPath $suiteControlPanelProgram -Destination $liveControlPanelProgram -Force
-}
-
-Write-Host "sync complete"
+Write-Host "sync complete: suite -> live skills"

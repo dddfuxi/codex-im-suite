@@ -39,6 +39,7 @@ flowchart TD
   ControlPanel[控制面板] --> BridgeRuntime
   ControlPanel --> McpBridge
   Scripts[构建和发布脚本] --> Release[(Portable 和 Installer)]
+  Scripts --> LiveSkill[本机 live skill 运行副本]
 ```
 
 ### 1.2 模块边界图
@@ -54,7 +55,7 @@ flowchart TD
   Core --> ReplyEnvelope[cti-final 结果块收口]
   Config[config/*.d] --> Runtime
   Extensions[extensions/skills] --> Scripts[scripts/install-suite-skills.ps1]
-  Scripts --> CodexSkills[本机 Codex skills]
+  Scripts --> CodexSkills[本机 Codex skills 和 live skill]
 ```
 
 ## 2. 运行链路
@@ -215,13 +216,14 @@ Unity Prefab MCP，定位为独立 Unity 资源分析/生成能力。
 - 查看 Codex / 本地辅助模式。
 - 启停和检查 MCP。
 - 自动发现 `mcp.d`、`skills.d`、`plugins.d`。
-- 修改非敏感路径配置。
-- 查看会话、历史索引、本地检索。
+- 通过“设置”弹窗修改非敏感路径配置和回复风格配置。
+- 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
 - 一键发布。
 
 面板原则：
 
 - 面板只做 orchestration，不承载桥接业务逻辑。
+- 主窗口优先服务日常运维，只常驻服务总览、MCP 管理和日志记录。
 - 服务按钮放在对应服务卡里。
 - 状态优先读真实进程和运行审计，不再只信旧 `status.json`。
 
@@ -393,9 +395,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 
 发布脚本职责：
 
-- 同步 live skill。
 - 构建 package。
 - 构建控制面板。
+- 用开发版生成 live skill。
 - 组装 portable。
 - 组装 installer。
 - 生成 `publish-summary.md`。
@@ -404,8 +406,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 
 ```mermaid
 flowchart TD
-  DevTree[开发版 codex-im-suite] --> SyncLive[sync-live-skill.ps1]
-  DevTree --> BuildPackages[build-packages.ps1]
+  DevTree[开发版 codex-im-suite] --> BuildPackages[build-packages.ps1]
+  BuildPackages --> SyncLive[sync-live-skill.ps1]
+  SyncLive --> LiveRuntime[本机 live skill 运行副本]
   DevTree --> ArchCheck[update-architecture-docs.ps1]
   BuildPackages --> Assemble[assemble-portable.ps1]
   Assemble --> Portable[release/portable]
@@ -415,6 +418,22 @@ flowchart TD
   PublishSummary --> ReleaseNotes[release-notes.md]
   ReleaseNotes --> Git[git commit 和 push]
 ```
+
+同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于发布链路。
+
+### 9.1 入口定位
+
+日常维护入口：
+
+- 主源码：`C:\Users\admin\Documents\New project\codex-im-suite`
+- 面板源码：`apps/control-panel`
+- 目标检查：`scripts/doctor-suite-targets.ps1`
+
+非日常源码入口：
+
+- `.codex\skills\claude-to-im*` 是运行副本。
+- `release/portable` 和 `release/installer` 是发布产物。
+- 旧 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 已移除，不作为面板或安装器维护入口。
 
 ## 10. 当前安全边界
 

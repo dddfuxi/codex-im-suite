@@ -13,10 +13,31 @@
 - Agent 维护规则：[AGENTS.md](./AGENTS.md)
 - 架构说明：[docs/PROJECT-ARCHITECTURE.md](./docs/PROJECT-ARCHITECTURE.md)
 - 开发记录：[docs/DEVELOPMENT-LOG.md](./docs/DEVELOPMENT-LOG.md)
+- 目标目录检查：`scripts/doctor-suite-targets.ps1`
 - 架构文档检查：`scripts/update-architecture-docs.ps1`
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
 - 套件清单：[suite.manifest.json](./suite.manifest.json)
+
+## 我该改哪里
+
+默认只改开发版主仓库：
+
+- `C:\Users\admin\Documents\New project\codex-im-suite`
+
+不要把下面目录当成日常源码入口：
+
+- `C:\Users\admin\.codex\skills\claude-to-im`：运行副本，由开发版同步生成。
+- `C:\Users\admin\.codex\skills\claude-to-im-core`：运行副本，由开发版同步生成。
+- `release/portable`、`release/installer`：发布产物，由打包脚本生成。
+
+面板源码唯一入口是 `apps/control-panel`。旧的 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 已移除，拿不准时先运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
+```
+
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口只保留日常运维；路径和回复风格在“设置”，历史索引在“查看会话”里的“历史索引”页签。
 
 ## 目录结构
 
@@ -93,7 +114,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\sync-live-skill.ps1
 ```
 
-发布脚本会自动执行同步和打包，避免“开发版”和“打包版”漂移。
+该脚本方向固定为“开发版 suite -> live skill”。如确实需要从 live 救回改动，使用 `scripts/import-live-to-suite.ps1 -Apply`，不要把它接入发布流程。
+
+发布脚本会先构建开发版，再同步 live、组装 portable 和 installer，避免“开发版”“运行版”和“打包版”漂移。
 
 ## GitHub
 

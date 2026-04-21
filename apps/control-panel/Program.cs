@@ -47,14 +47,7 @@ internal sealed class MainForm : Form
     private System.Windows.Forms.Timer? _manifestReloadTimer;
     private string _pendingManifestReloadReason = "初始化";
 
-    private readonly TextBox _workdir = new();
-    private readonly TextBox _allowedRoots = new();
-    private readonly TextBox _unityProject = new();
     private readonly TextBox _memoryRepo = new();
-    private readonly TextBox _additionalDirs = new();
-    private readonly ComboBox _replyStylePreset = new();
-    private readonly TextBox _replyStyleRequest = new();
-    private readonly TextBox _replyStyleHint = new();
 
     private readonly TextBox _bridgeStatus = CreateStatusBox();
     private readonly TextBox _codexStatus = CreateStatusBox();
@@ -66,12 +59,6 @@ internal sealed class MainForm : Form
     private readonly TextBox _mcpDetails = new();
     private readonly TextBox _log = new();
     private readonly TextBox _historySyncStatus = new();
-    private readonly TextBox _historySearchChat = new();
-    private readonly TextBox _historySearchKeyword = new();
-    private readonly TextBox _historySearchSpeaker = new();
-    private readonly TextBox _historySearchStart = new();
-    private readonly TextBox _historySearchEnd = new();
-    private readonly TextBox _historySearchResults = new();
 
     private Dictionary<string, string> _config = new(StringComparer.OrdinalIgnoreCase);
     private List<McpManifest> _manifests = [];
@@ -123,17 +110,15 @@ internal sealed class MainForm : Form
         MinimumSize = new Size(1240, 920);
         Font = new Font("Microsoft YaHei UI", 9F);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(12) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 282));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 520));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(root);
 
         root.Controls.Add(BuildToolbarPanel(), 0, 0);
         root.Controls.Add(BuildStatusPanel(), 0, 1);
-        root.Controls.Add(BuildConfigPanel(), 0, 2);
-        root.Controls.Add(BuildWorkspacePanel(), 0, 3);
+        root.Controls.Add(BuildWorkspacePanel(), 0, 2);
 
         Load += async (_, _) =>
         {
@@ -175,66 +160,6 @@ internal sealed class MainForm : Form
         return group;
     }
 
-    private Control BuildConfigPanel()
-    {
-        var group = new GroupBox { Text = "路径 / 配置", Dock = DockStyle.Fill };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 9, Padding = new Padding(8) };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 152));
-        for (var i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 94));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
-        group.Controls.Add(layout);
-
-        AddPathRow(layout, 0, "默认工作目录", _workdir, true);
-        AddPathRow(layout, 1, "允许仓库根目录", _allowedRoots, false);
-        AddPathRow(layout, 2, "Unity 工程目录", _unityProject, true);
-        AddPathRow(layout, 3, "聊天记忆仓库", _memoryRepo, true);
-        AddPathRow(layout, 4, "Codex 附加目录", _additionalDirs, false);
-
-        layout.Controls.Add(new Label { Text = "回复风格预设", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 5);
-        _replyStylePreset.Dock = DockStyle.Fill;
-        _replyStylePreset.DropDownStyle = ComboBoxStyle.DropDownList;
-        _replyStylePreset.Items.Add("自定义");
-        foreach (var key in ReplyStylePresets.Keys) _replyStylePreset.Items.Add(key);
-        _replyStylePreset.SelectedIndexChanged += (_, _) =>
-        {
-            var selected = _replyStylePreset.SelectedItem as string;
-            if (string.IsNullOrWhiteSpace(selected) || selected == "自定义") return;
-            if (ReplyStylePresets.TryGetValue(selected, out var preset)) _replyStyleHint.Text = preset;
-        };
-        layout.Controls.Add(_replyStylePreset, 1, 5);
-
-        layout.Controls.Add(new Label { Text = "风格要求", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 6);
-        _replyStyleRequest.Dock = DockStyle.Fill;
-        _replyStyleRequest.Multiline = true;
-        _replyStyleRequest.ScrollBars = ScrollBars.Vertical;
-        _replyStyleRequest.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
-        layout.Controls.Add(_replyStyleRequest, 1, 6);
-
-        var summarizeStyle = new Button { Text = "本地AI整理", Dock = DockStyle.Fill };
-        summarizeStyle.Click += async (_, _) => await SummarizeReplyStyleWithLocalAiAsync();
-        layout.Controls.Add(summarizeStyle, 2, 6);
-
-        layout.Controls.Add(new Label { Text = "自定义风格", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 7);
-        _replyStyleHint.Dock = DockStyle.Fill;
-        _replyStyleHint.Multiline = true;
-        _replyStyleHint.ScrollBars = ScrollBars.Vertical;
-        _replyStyleHint.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
-        layout.Controls.Add(_replyStyleHint, 1, 7);
-
-        var hint = new Label { Text = "这里只保存非敏感路径和回复风格配置。多个目录可用分号分隔。改完后点击“保存配置”，再重启飞书桥接。", Dock = DockStyle.Fill, ForeColor = Color.DimGray, TextAlign = ContentAlignment.TopLeft };
-        layout.Controls.Add(hint, 1, 8);
-
-        var save = new Button { Text = "保存配置", Dock = DockStyle.Fill };
-        save.Click += (_, _) => SaveConfigFromUi();
-        layout.Controls.Add(save, 2, 8);
-        return group;
-    }
-
     private Control BuildToolbarPanel()
     {
         var host = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0) };
@@ -251,6 +176,7 @@ internal sealed class MainForm : Form
 
         AddToolAction(strip, "刷新状态", async () => await RefreshAllAsync());
         AddToolAction(strip, "一键发布", async () => await PublishSuiteAsync());
+        AddToolAction(strip, "设置", ShowSettingsDialog);
         AddToolAction(strip, "查看会话", async () => await ShowConversationViewerAsync());
         AddToolAction(strip, "同步全部历史", async () => await SyncAllFeishuHistoryAsync());
         AddToolAction(strip, "查看同步状态", ShowFeishuHistorySyncStatus);
@@ -270,118 +196,18 @@ internal sealed class MainForm : Form
 
     private Control BuildWorkspacePanel()
     {
-        var outer = new SplitContainer
+        var workspace = new SplitContainer
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
             SplitterWidth = 8,
             FixedPanel = FixedPanel.None,
         };
-        outer.Panel1.Controls.Add(BuildHistoryPanel());
-
-        var lower = new SplitContainer
-        {
-            Dock = DockStyle.Fill,
-            Orientation = Orientation.Horizontal,
-            SplitterWidth = 8,
-            FixedPanel = FixedPanel.None,
-        };
-        lower.Panel1.Controls.Add(BuildMcpPanel());
-        lower.Panel2.Controls.Add(BuildLogPanel());
-        outer.Panel2.Controls.Add(lower);
-
-        return outer;
+        workspace.Panel1.Controls.Add(BuildMcpPanel());
+        workspace.Panel2.Controls.Add(BuildLogPanel());
+        return workspace;
     }
 
-    private Control BuildHistoryPanel()
-    {
-        var group = new GroupBox { Text = "历史索引", Dock = DockStyle.Fill };
-        var container = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(8) };
-        container.RowStyles.Add(new RowStyle(SizeType.Percent, 32));
-        container.RowStyles.Add(new RowStyle(SizeType.Percent, 68));
-        group.Controls.Add(container);
-
-        var syncGroup = new GroupBox { Text = "历史同步状态", Dock = DockStyle.Fill };
-        _historySyncStatus.Dock = DockStyle.Fill;
-        _historySyncStatus.Multiline = true;
-        _historySyncStatus.ReadOnly = true;
-        _historySyncStatus.ScrollBars = ScrollBars.Both;
-        _historySyncStatus.WordWrap = false;
-        _historySyncStatus.Font = new Font("Consolas", 9F);
-        syncGroup.Controls.Add(_historySyncStatus);
-        container.Controls.Add(syncGroup, 0, 0);
-
-        container.Controls.Add(BuildHistorySearchPanel(), 0, 1);
-        return group;
-    }
-
-    private Control BuildHistorySearchPanel()
-    {
-        var group = new GroupBox { Text = "本地历史检索", Dock = DockStyle.Fill };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 4, Padding = new Padding(6) };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        group.Controls.Add(layout);
-
-        layout.Controls.Add(new Label { Text = "群名/Chat", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 0);
-        _historySearchChat.Dock = DockStyle.Fill;
-        layout.Controls.Add(_historySearchChat, 1, 0);
-
-        layout.Controls.Add(new Label { Text = "关键词", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 0);
-        _historySearchKeyword.Dock = DockStyle.Fill;
-        layout.Controls.Add(_historySearchKeyword, 3, 0);
-
-        layout.Controls.Add(new Label { Text = "发言人", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 4, 0);
-        _historySearchSpeaker.Dock = DockStyle.Fill;
-        layout.Controls.Add(_historySearchSpeaker, 5, 0);
-
-        layout.Controls.Add(new Label { Text = "开始时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 1);
-        _historySearchStart.Dock = DockStyle.Fill;
-        _historySearchStart.PlaceholderText = "2026-04-15 09:00";
-        layout.Controls.Add(_historySearchStart, 1, 1);
-
-        layout.Controls.Add(new Label { Text = "结束时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 1);
-        _historySearchEnd.Dock = DockStyle.Fill;
-        _historySearchEnd.PlaceholderText = "2026-04-15 18:00";
-        layout.Controls.Add(_historySearchEnd, 3, 1);
-
-        var buttonPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoSize = true };
-        var searchButton = new Button { Text = "检索历史", Width = 96, Height = 28 };
-        searchButton.Click += (_, _) => RunHistorySearch();
-        var clearButton = new Button { Text = "清空条件", Width = 96, Height = 28 };
-        clearButton.Click += (_, _) =>
-        {
-            _historySearchChat.Clear();
-            _historySearchKeyword.Clear();
-            _historySearchSpeaker.Clear();
-            _historySearchStart.Clear();
-            _historySearchEnd.Clear();
-            _historySearchResults.Clear();
-        };
-        buttonPanel.Controls.Add(searchButton);
-        buttonPanel.Controls.Add(clearButton);
-        layout.SetColumnSpan(buttonPanel, 3);
-        layout.Controls.Add(buttonPanel, 3, 2);
-
-        _historySearchResults.Dock = DockStyle.Fill;
-        _historySearchResults.Multiline = true;
-        _historySearchResults.ReadOnly = true;
-        _historySearchResults.ScrollBars = ScrollBars.Both;
-        _historySearchResults.WordWrap = false;
-        _historySearchResults.Font = new Font("Consolas", 9F);
-        layout.SetColumnSpan(_historySearchResults, 6);
-        layout.Controls.Add(_historySearchResults, 0, 3);
-
-        return group;
-    }
     private Control BuildMcpPanel()
     {
         var group = new GroupBox { Text = "MCP 列表", Dock = DockStyle.Fill };
@@ -489,26 +315,6 @@ internal sealed class MainForm : Form
         return button;
     }
 
-    private static void AddPathRow(TableLayoutPanel layout, int row, string label, TextBox box, bool browseFolder)
-    {
-        layout.Controls.Add(new Label { Text = label, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, row);
-        box.Dock = DockStyle.Fill;
-        layout.Controls.Add(box, 1, row);
-        var browse = new Button { Text = browseFolder ? "浏览" : "打开", Dock = DockStyle.Fill };
-        browse.Click += (_, _) =>
-        {
-            if (browseFolder)
-            {
-                using var dialog = new FolderBrowserDialog { SelectedPath = Directory.Exists(box.Text) ? box.Text : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) };
-                if (dialog.ShowDialog() == DialogResult.OK) box.Text = dialog.SelectedPath;
-                return;
-            }
-            var first = box.Text.Split(';', ',').Select(s => s.Trim()).FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
-            if (!string.IsNullOrWhiteSpace(first)) OpenPath(first);
-        };
-        layout.Controls.Add(browse, 2, row);
-    }
-
     private static void AddAction(FlowLayoutPanel layout, string text, Func<Task> action)
     {
         var button = new Button { Text = text, Width = 118, Height = 34 };
@@ -546,13 +352,7 @@ internal sealed class MainForm : Form
     private void LoadConfig()
     {
         _config = ReadEnvFile(_configPath);
-        _workdir.Text = GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3");
-        _allowedRoots.Text = GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3");
-        _unityProject.Text = GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game");
         _memoryRepo.Text = GetConfig("CTI_MEMORY_REPO_DIR", @"E:\cli-md");
-        _additionalDirs.Text = GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", "");
-        _replyStyleHint.Text = GetConfig("CTI_REPLY_STYLE_HINT", "");
-        _replyStylePreset.SelectedItem = ResolveReplyStylePreset(_replyStyleHint.Text);
         AppendLog($"已读取配置：{_configPath}");
     }
 
@@ -697,28 +497,47 @@ internal sealed class MainForm : Form
     private string GetConfig(string key, string fallback)
         => _config.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
 
-    private void SaveConfigFromUi()
+    private SettingsSnapshot GetSettingsSnapshot() => new(
+        GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
+        GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3"),
+        GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game"),
+        GetConfig("CTI_MEMORY_REPO_DIR", @"E:\cli-md"),
+        GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", ""),
+        GetConfig("CTI_REPLY_STYLE_HINT", "")
+    );
+
+    private void ShowSettingsDialog()
+    {
+        using var form = new SettingsForm(
+            GetSettingsSnapshot(),
+            ReplyStylePresets,
+            SummarizeReplyStyleAsync,
+            SaveSettingsFromDialog,
+            OpenPath);
+        form.ShowDialog(this);
+    }
+
+    private void SaveSettingsFromDialog(SettingsSnapshot settings)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
         var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
-        SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", _workdir.Text.Trim());
-        SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", _allowedRoots.Text.Trim());
-        SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", _unityProject.Text.Trim());
-        SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", _memoryRepo.Text.Trim());
-        SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", _additionalDirs.Text.Trim());
-        SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", _replyStyleHint.Text.Trim());
+        SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", settings.DefaultWorkDir.Trim());
+        SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", settings.AllowedRoots.Trim());
+        SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", settings.UnityProject.Trim());
+        SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", settings.MemoryRepo.Trim());
+        SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", settings.AdditionalDirs.Trim());
+        SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
         AppendLog("配置已保存。回复风格将在重启飞书桥接后生效。");
         LoadConfig();
     }
 
-    private async Task SummarizeReplyStyleWithLocalAiAsync()
+    private async Task<string> SummarizeReplyStyleAsync(string requestText)
     {
-        var requestText = _replyStyleRequest.Text.Trim();
+        requestText = requestText.Trim();
         if (string.IsNullOrWhiteSpace(requestText))
         {
-            MessageBox.Show(this, "先输入用户对机器人说话方式的要求。", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
+            throw new InvalidOperationException("先输入用户对机器人说话方式的要求。");
         }
 
         var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
@@ -727,8 +546,7 @@ internal sealed class MainForm : Form
         if (!probe.Ok)
         {
             AppendLog($"本地AI整理失败：本地模型不可用 | {probe.Message}");
-            MessageBox.Show(this, $"本地模型当前不可用：{probe.Message}", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            throw new InvalidOperationException($"本地模型当前不可用：{probe.Message}");
         }
 
         try
@@ -765,24 +583,14 @@ internal sealed class MainForm : Form
                 throw new InvalidOperationException("本地模型没有返回可用的风格摘要。");
             }
 
-            _replyStyleHint.Text = summarized;
-            _replyStylePreset.SelectedItem = "自定义";
             AppendLog($"本地AI已整理回复风格：{summarized}");
+            return summarized;
         }
         catch (Exception ex)
         {
             AppendLog($"本地AI整理失败：{ex.Message}");
-            MessageBox.Show(this, $"本地AI整理失败：{ex.Message}", "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            throw;
         }
-    }
-
-    private static string ResolveReplyStylePreset(string value)
-    {
-        foreach (var pair in ReplyStylePresets)
-        {
-            if (string.Equals(pair.Value, value, StringComparison.Ordinal)) return pair.Key;
-        }
-        return "自定义";
     }
 
     private static void SetOrAppendEnv(List<string> lines, string key, string value)
@@ -1730,7 +1538,7 @@ internal sealed class MainForm : Form
             "2. 改路径后先保存配置，再重启飞书。",
             "3. 注册全部 MCP 用于重新加载外部 MCP。",
             "4. 查看会话优先读取飞书远端会话，再叠加本地 session / 工作目录 / 记忆信息。",
-            "5. 一键发布会先同步当前运行 skill，再打包并推送 suite。",
+            "5. 一键发布会用开发版生成 live skill、构建并发布 suite。",
         });
         MessageBox.Show(this, helpText, "中控面板帮助", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
@@ -1741,7 +1549,18 @@ internal sealed class MainForm : Form
         {
             var localEntries = LoadConversationEntries();
             var entries = await LoadRemoteConversationEntriesAsync(localEntries);
-            using var form = new ConversationViewerForm(entries, _dataDir, LoadConversationDetailAsync);
+            using var form = new ConversationViewerForm(
+                entries,
+                _dataDir,
+                LoadConversationDetailAsync,
+                SearchHistory,
+                FormatHistorySearchResults,
+                GetFeishuHistorySyncStatusText,
+                async () =>
+                {
+                    await SyncAllFeishuHistoryAsync();
+                    return GetFeishuHistorySyncStatusText(full: true);
+                });
             form.ShowDialog(this);
         }
         catch (Exception ex)
@@ -2238,6 +2057,9 @@ internal sealed class MainForm : Form
     }
 
     private void RefreshFeishuHistorySyncStatusPanel()
+        => _historySyncStatus.Text = GetFeishuHistorySyncStatusText();
+
+    private string GetFeishuHistorySyncStatusText(bool full = false)
     {
         var index = LoadFeishuHistoryIndex()
             .Values
@@ -2247,8 +2069,7 @@ internal sealed class MainForm : Form
 
         if (index.Count == 0)
         {
-            _historySyncStatus.Text = "暂无本地飞书历史索引。";
-            return;
+            return "暂无本地飞书历史索引。";
         }
 
         var lines = new List<string>
@@ -2257,23 +2078,23 @@ internal sealed class MainForm : Form
             $"累计消息: {index.Sum(item => item.MessageCount)}",
             "",
         };
-        foreach (var item in index.Take(8))
+        foreach (var item in (full ? index : index.Take(8)))
         {
             var latest = ParseUnixMsOrIso(item.LatestMessageTime)?.ToString("yyyy-MM-dd HH:mm:ss") ?? "-";
             var syncedAt = ParseUnixMsOrIso(item.LastSyncAt)?.ToString("yyyy-MM-dd HH:mm:ss") ?? item.LastSyncAt ?? "-";
             lines.Add($"{item.DisplayName ?? item.ChatId} | {item.MessageCount} 条 | 最新 {latest} | 同步 {syncedAt}");
         }
-        if (index.Count > 8) lines.Add($"... 其余 {index.Count - 8} 个会话请点“查看同步状态”");
-        _historySyncStatus.Text = string.Join(Environment.NewLine, lines);
+        if (!full && index.Count > 8) lines.Add($"... 其余 {index.Count - 8} 个会话请点“查看同步状态”");
+        return string.Join(Environment.NewLine, lines);
     }
 
-    private void RunHistorySearch()
+    private List<HistorySearchHit> SearchHistory(HistorySearchQuery query)
     {
-        var chatFilter = _historySearchChat.Text.Trim();
-        var keywordFilter = _historySearchKeyword.Text.Trim();
-        var speakerFilter = _historySearchSpeaker.Text.Trim();
-        var startAt = ParseDateTime(_historySearchStart.Text.Trim());
-        var endAt = ParseDateTime(_historySearchEnd.Text.Trim());
+        var chatFilter = query.Chat.Trim();
+        var keywordFilter = query.Keyword.Trim();
+        var speakerFilter = query.Speaker.Trim();
+        var startAt = ParseDateTime(query.Start.Trim());
+        var endAt = ParseDateTime(query.End.Trim());
 
         var keywordTokens = Regex.Split(keywordFilter, @"\s+")
             .Select(token => token.Trim())
@@ -2335,10 +2156,14 @@ internal sealed class MainForm : Form
             .Take(60)
             .ToList();
 
+        return ordered;
+    }
+
+    private static string FormatHistorySearchResults(List<HistorySearchHit> ordered)
+    {
         if (ordered.Count == 0)
         {
-            _historySearchResults.Text = "没有命中本地历史索引。";
-            return;
+            return "没有命中本地历史索引。";
         }
 
         var builder = new StringBuilder();
@@ -2351,7 +2176,7 @@ internal sealed class MainForm : Form
             builder.AppendLine(TrimForSummary(hit.Text, 280));
             builder.AppendLine();
         }
-        _historySearchResults.Text = builder.ToString().TrimEnd();
+        return builder.ToString().TrimEnd();
     }
 
     private void ShowFeishuHistorySyncStatus()
@@ -2996,28 +2821,247 @@ internal sealed class ConversationMessageView
     public string Content { get; set; } = "";
 }
 
-internal sealed class ConversationViewerForm : Form
+internal sealed record SettingsSnapshot(
+    string DefaultWorkDir,
+    string AllowedRoots,
+    string UnityProject,
+    string MemoryRepo,
+    string AdditionalDirs,
+    string ReplyStyleHint);
+
+internal sealed record HistorySearchQuery(
+    string Chat,
+    string Keyword,
+    string Speaker,
+    string Start,
+    string End);
+
+internal sealed class SettingsForm : Form
 {
-    public ConversationViewerForm(List<ConversationEntry> entries, string dataDir, Func<ConversationEntry, Task<ConversationEntry>>? detailLoader)
+    private readonly TextBox _workdir = new();
+    private readonly TextBox _allowedRoots = new();
+    private readonly TextBox _unityProject = new();
+    private readonly TextBox _memoryRepo = new();
+    private readonly TextBox _additionalDirs = new();
+    private readonly ComboBox _replyStylePreset = new();
+    private readonly TextBox _replyStyleRequest = new();
+    private readonly TextBox _replyStyleHint = new();
+    private readonly IReadOnlyDictionary<string, string> _presets;
+    private readonly Func<string, Task<string>> _summarizeReplyStyleAsync;
+    private readonly Action<SettingsSnapshot> _saveSettings;
+    private readonly Action<string> _openPath;
+
+    public SettingsForm(
+        SettingsSnapshot settings,
+        IReadOnlyDictionary<string, string> presets,
+        Func<string, Task<string>> summarizeReplyStyleAsync,
+        Action<SettingsSnapshot> saveSettings,
+        Action<string> openPath)
     {
-        Text = "会话记录查看";
-        Width = 1180;
-        Height = 760;
+        _presets = presets;
+        _summarizeReplyStyleAsync = summarizeReplyStyleAsync;
+        _saveSettings = saveSettings;
+        _openPath = openPath;
+
+        Text = "设置";
+        Width = 920;
+        Height = 640;
+        MinimumSize = new Size(820, 560);
         StartPosition = FormStartPosition.CenterParent;
         Font = new Font("Microsoft YaHei UI", 9F);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(10) };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(10) };
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 220));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         Controls.Add(root);
 
+        root.Controls.Add(BuildPathGroup(), 0, 0);
+        root.Controls.Add(BuildReplyStyleGroup(), 0, 1);
+
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false };
+        var save = new Button { Text = "保存配置", Width = 110, Height = 30 };
+        save.Click += (_, _) =>
+        {
+            _saveSettings(ReadSnapshot());
+            MessageBox.Show(this, "配置已保存。回复风格将在重启飞书桥接后生效。", "设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Close();
+        };
+        var cancel = new Button { Text = "取消", Width = 88, Height = 30 };
+        cancel.Click += (_, _) => Close();
+        buttons.Controls.Add(save);
+        buttons.Controls.Add(cancel);
+        root.Controls.Add(buttons, 0, 2);
+
+        LoadSnapshot(settings);
+    }
+
+    private Control BuildPathGroup()
+    {
+        var group = new GroupBox { Text = "路径配置", Dock = DockStyle.Fill };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 5, Padding = new Padding(8) };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+        for (var i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        group.Controls.Add(layout);
+
+        AddPathRow(layout, 0, "默认工作目录", _workdir, true);
+        AddPathRow(layout, 1, "允许仓库根目录", _allowedRoots, false);
+        AddPathRow(layout, 2, "Unity 工程目录", _unityProject, true);
+        AddPathRow(layout, 3, "聊天记忆仓库", _memoryRepo, true);
+        AddPathRow(layout, 4, "Codex 附加目录", _additionalDirs, false);
+        return group;
+    }
+
+    private Control BuildReplyStyleGroup()
+    {
+        var group = new GroupBox { Text = "回复风格", Dock = DockStyle.Fill };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 5, Padding = new Padding(8) };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        group.Controls.Add(layout);
+
+        layout.Controls.Add(new Label { Text = "风格预设", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 0);
+        _replyStylePreset.Dock = DockStyle.Fill;
+        _replyStylePreset.DropDownStyle = ComboBoxStyle.DropDownList;
+        _replyStylePreset.Items.Add("自定义");
+        foreach (var key in _presets.Keys) _replyStylePreset.Items.Add(key);
+        _replyStylePreset.SelectedIndexChanged += (_, _) =>
+        {
+            var selected = _replyStylePreset.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(selected) || selected == "自定义") return;
+            if (_presets.TryGetValue(selected, out var preset)) _replyStyleHint.Text = preset;
+        };
+        layout.Controls.Add(_replyStylePreset, 1, 0);
+
+        layout.Controls.Add(new Label { Text = "风格要求", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 1);
+        _replyStyleRequest.Dock = DockStyle.Fill;
+        _replyStyleRequest.Multiline = true;
+        _replyStyleRequest.ScrollBars = ScrollBars.Vertical;
+        _replyStyleRequest.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
+        layout.Controls.Add(_replyStyleRequest, 1, 1);
+
+        var summarize = new Button { Text = "本地AI整理", Dock = DockStyle.Fill };
+        summarize.Click += async (_, _) =>
+        {
+            try
+            {
+                summarize.Enabled = false;
+                _replyStyleHint.Text = await _summarizeReplyStyleAsync(_replyStyleRequest.Text);
+                _replyStylePreset.SelectedItem = "自定义";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "本地AI整理", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                summarize.Enabled = true;
+            }
+        };
+        layout.Controls.Add(summarize, 2, 1);
+
+        layout.Controls.Add(new Label { Text = "当前风格", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 2);
+        _replyStyleHint.Dock = DockStyle.Fill;
+        _replyStyleHint.Multiline = true;
+        _replyStyleHint.ScrollBars = ScrollBars.Vertical;
+        _replyStyleHint.PlaceholderText = "例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。";
+        layout.Controls.Add(_replyStyleHint, 1, 2);
+
+        var hint = new Label { Text = "保存后重启飞书桥接生效。", Dock = DockStyle.Fill, ForeColor = Color.DimGray, TextAlign = ContentAlignment.MiddleLeft };
+        layout.SetColumnSpan(hint, 2);
+        layout.Controls.Add(hint, 1, 3);
+        return group;
+    }
+
+    private void AddPathRow(TableLayoutPanel layout, int row, string label, TextBox box, bool browseFolder)
+    {
+        layout.Controls.Add(new Label { Text = label, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, row);
+        box.Dock = DockStyle.Fill;
+        layout.Controls.Add(box, 1, row);
+        var browse = new Button { Text = browseFolder ? "浏览" : "打开", Dock = DockStyle.Fill };
+        browse.Click += (_, _) =>
+        {
+            if (browseFolder)
+            {
+                using var dialog = new FolderBrowserDialog { SelectedPath = Directory.Exists(box.Text) ? box.Text : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) };
+                if (dialog.ShowDialog(this) == DialogResult.OK) box.Text = dialog.SelectedPath;
+                return;
+            }
+            var first = box.Text.Split(';', ',').Select(s => s.Trim()).FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
+            if (!string.IsNullOrWhiteSpace(first)) _openPath(first);
+        };
+        layout.Controls.Add(browse, 2, row);
+    }
+
+    private void LoadSnapshot(SettingsSnapshot settings)
+    {
+        _workdir.Text = settings.DefaultWorkDir;
+        _allowedRoots.Text = settings.AllowedRoots;
+        _unityProject.Text = settings.UnityProject;
+        _memoryRepo.Text = settings.MemoryRepo;
+        _additionalDirs.Text = settings.AdditionalDirs;
+        _replyStyleHint.Text = settings.ReplyStyleHint;
+        _replyStylePreset.SelectedItem = ResolveReplyStylePreset(settings.ReplyStyleHint);
+    }
+
+    private SettingsSnapshot ReadSnapshot() => new(
+        _workdir.Text,
+        _allowedRoots.Text,
+        _unityProject.Text,
+        _memoryRepo.Text,
+        _additionalDirs.Text,
+        _replyStyleHint.Text);
+
+    private string ResolveReplyStylePreset(string value)
+    {
+        foreach (var pair in _presets)
+        {
+            if (string.Equals(pair.Value, value, StringComparison.Ordinal)) return pair.Key;
+        }
+        return "自定义";
+    }
+}
+
+internal sealed class ConversationViewerForm : Form
+{
+    public ConversationViewerForm(
+        List<ConversationEntry> entries,
+        string dataDir,
+        Func<ConversationEntry, Task<ConversationEntry>>? detailLoader,
+        Func<HistorySearchQuery, List<HistorySearchHit>> searchHistory,
+        Func<List<HistorySearchHit>, string> formatHistoryResults,
+        Func<bool, string> getSyncStatusText,
+        Func<Task<string>> syncAllHistoryAsync)
+    {
+        Text = "会话记录查看";
+        Width = 1220;
+        Height = 820;
+        StartPosition = FormStartPosition.CenterParent;
+        Font = new Font("Microsoft YaHei UI", 9F);
+
+        var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(12, 4) };
+        Controls.Add(tabs);
+
         var header = new Label { Dock = DockStyle.Fill, Text = $"远端飞书会话优先，本地存档为辅：{dataDir}", TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.DimGray };
-        root.Controls.Add(header, 0, 0);
+        var conversationPage = new TabPage("会话记录");
+        var conversationRoot = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(10) };
+        conversationRoot.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+        conversationRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        conversationPage.Controls.Add(conversationRoot);
+        conversationRoot.Controls.Add(header, 0, 0);
 
         var contentLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2 };
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 380));
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        root.Controls.Add(contentLayout, 0, 1);
+        conversationRoot.Controls.Add(contentLayout, 0, 1);
 
         var list = new ListBox { Dock = DockStyle.Fill, HorizontalScrollbar = true, DataSource = entries };
         contentLayout.Controls.Add(list, 0, 0);
@@ -3098,5 +3142,104 @@ internal sealed class ConversationViewerForm : Form
             if (entries.Count > 0) await RenderAsync(entries[0]);
             else RenderSync(null);
         };
+
+        tabs.TabPages.Add(conversationPage);
+        tabs.TabPages.Add(BuildHistorySearchPage(searchHistory, formatHistoryResults));
+        tabs.TabPages.Add(BuildSyncStatusPage(getSyncStatusText, syncAllHistoryAsync));
+    }
+
+    private static TabPage BuildHistorySearchPage(Func<HistorySearchQuery, List<HistorySearchHit>> searchHistory, Func<List<HistorySearchHit>, string> formatHistoryResults)
+    {
+        var page = new TabPage("历史索引");
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 4, Padding = new Padding(10) };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(layout);
+
+        var chat = new TextBox { Dock = DockStyle.Fill };
+        var keyword = new TextBox { Dock = DockStyle.Fill };
+        var speaker = new TextBox { Dock = DockStyle.Fill };
+        var start = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "2026-04-15 09:00" };
+        var end = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "2026-04-15 18:00" };
+        var results = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9F) };
+
+        layout.Controls.Add(new Label { Text = "群名/Chat", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 0);
+        layout.Controls.Add(chat, 1, 0);
+        layout.Controls.Add(new Label { Text = "关键词", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 0);
+        layout.Controls.Add(keyword, 3, 0);
+        layout.Controls.Add(new Label { Text = "发言人", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 4, 0);
+        layout.Controls.Add(speaker, 5, 0);
+        layout.Controls.Add(new Label { Text = "开始时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 0, 1);
+        layout.Controls.Add(start, 1, 1);
+        layout.Controls.Add(new Label { Text = "结束时间", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight }, 2, 1);
+        layout.Controls.Add(end, 3, 1);
+
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        var search = new Button { Text = "检索历史", Width = 96, Height = 28 };
+        search.Click += (_, _) =>
+        {
+            try
+            {
+                var hits = searchHistory(new HistorySearchQuery(chat.Text, keyword.Text, speaker.Text, start.Text, end.Text));
+                results.Text = formatHistoryResults(hits);
+            }
+            catch (Exception ex)
+            {
+                results.Text = $"检索失败：{ex.Message}";
+            }
+        };
+        var clear = new Button { Text = "清空条件", Width = 96, Height = 28 };
+        clear.Click += (_, _) =>
+        {
+            chat.Clear();
+            keyword.Clear();
+            speaker.Clear();
+            start.Clear();
+            end.Clear();
+            results.Clear();
+        };
+        buttons.Controls.Add(search);
+        buttons.Controls.Add(clear);
+        layout.SetColumnSpan(buttons, 3);
+        layout.Controls.Add(buttons, 3, 2);
+        layout.SetColumnSpan(results, 6);
+        layout.Controls.Add(results, 0, 3);
+        return page;
+    }
+
+    private static TabPage BuildSyncStatusPage(Func<bool, string> getSyncStatusText, Func<Task<string>> syncAllHistoryAsync)
+    {
+        var page = new TabPage("同步状态");
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(10) };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(layout);
+
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        var refresh = new Button { Text = "刷新状态", Width = 96, Height = 28 };
+        var syncAll = new Button { Text = "同步全部历史", Width = 118, Height = 28 };
+        var status = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 9F) };
+        refresh.Click += (_, _) => status.Text = getSyncStatusText(true);
+        syncAll.Click += async (_, _) =>
+        {
+            syncAll.Enabled = false;
+            try { status.Text = await syncAllHistoryAsync(); }
+            catch (Exception ex) { status.Text = $"同步失败：{ex.Message}"; }
+            finally { syncAll.Enabled = true; }
+        };
+        buttons.Controls.Add(refresh);
+        buttons.Controls.Add(syncAll);
+        layout.Controls.Add(buttons, 0, 0);
+        layout.Controls.Add(status, 0, 1);
+        status.Text = getSyncStatusText(true);
+        return page;
     }
 }

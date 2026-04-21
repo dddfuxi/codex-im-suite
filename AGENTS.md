@@ -7,6 +7,7 @@
 - 始终使用中文回复。
 - 先确认当前修改对象是 `codex-im-suite` 开发版，还是本机 live skill。
 - 默认只修改开发版仓库：`C:\Users\admin\Documents\New project\codex-im-suite`。
+- 遇到同名文件、旧副本或不确定该改哪里时，先看 `suite.manifest.json`，再运行 `scripts/doctor-suite-targets.ps1`；不要把 live skill 或 `release/*` 当成开发主线。
 - 只有用户明确要求“同步运行版 / 修 live / 现在机器人立刻生效”时，才同步到：
   - `C:\Users\admin\.codex\skills\claude-to-im`
   - `C:\Users\admin\.codex\skills\claude-to-im-core`
@@ -17,9 +18,10 @@
 - `packages/bridge-core`：桥接核心，负责 Feishu adapter、消息路由、权限、发送收口、审计。
 - `packages/bridge-runtime`：运行时壳层，负责配置、daemon、provider、Codex、本地模型、本地执行器、MCP bridge。
 - `apps/control-panel`：中控面板，只做服务编排、状态展示、配置入口，不放桥接业务逻辑。
+- `apps/control-panel` 是面板源码唯一入口；旧 `packages/bridge-runtime/tools/ControlPanel` 已移除，不要恢复为维护入口。
 - `config/mcp.d`：MCP manifest 唯一来源，面板和注册脚本不能硬编码 MCP 名称。
 - `extensions/skills`：随项目备份的 skill 副本，不等同于本机 live skill。
-- `release`：打包产物目录，不作为源码维护入口。
+- `release`：打包产物目录，不作为源码维护入口，也不要手工修里面的 portable/installer 副本。
 
 ## 3. 文档收口规则
 
@@ -92,7 +94,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 ## 6. 运行版同步规则
 
 - 开发版是主版本，live skill 是运行副本。
-- 修改开发版后，如果用户要求立即生效，运行同步脚本，而不是手工复制零散文件。
+- 修改开发版后，如果用户要求立即生效，运行 `scripts/sync-live-skill.ps1`，方向固定为“开发版 suite -> live skill”，不要手工复制零散文件。
+- 如确实需要从 live 救回历史改动，只能手动运行 `scripts/import-live-to-suite.ps1 -Apply`，并先确认 `git status`；发布流程不得调用该脚本。
 - 发布前必须确认开发版、live skill、portable 打包版没有分叉。
 - 面板显示异常时，先看 exe 路径、构建时间、commit，再判断是不是旧版本。
 
