@@ -1,0 +1,8 @@
+{
+  "id": "ignis-cli",
+  "displayName": "Ignis CLI",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\ignis-cli",
+  "type": "skill",
+  "enabled": true,
+  "description": "Use Ignis CLI for creative generation, image/video/model workflows, asset upload, session continuation, and result polling."
+}

@@ -21,10 +21,30 @@ $files = Get-ChildItem -LiteralPath $ManifestDir -Filter '*.json' -File | Sort-O
 foreach ($file in $files) {
     $item = Get-Content -LiteralPath $file.FullName -Encoding UTF8 -Raw | ConvertFrom-Json
     if ($item.enabled -eq $false) { continue }
-    if ($item.type -ne 'stdio') { continue }
+    if ($item.type -ne 'stdio' -and $item.type -ne 'http') { continue }
 
     $name = if ($item.registerName) { [string]$item.registerName } else { [string]$item.id }
     $launcher = Expand-SuiteValue -Value ([string]$item.launcher) -SuiteRoot $suiteRoot -Config $config
+    $healthUrl = $null
+    if ($item.healthCheck -and $item.healthCheck.url) {
+        $healthUrl = Expand-SuiteValue -Value ([string]$item.healthCheck.url) -SuiteRoot $suiteRoot -Config $config
+    }
+
+    if ($item.type -eq 'http') {
+        $url = if ($healthUrl) { $healthUrl } else { $launcher }
+        if (-not $url) {
+            Write-Warning "skip $name because http url is missing."
+            continue
+        }
+
+        $existing = codex mcp list
+        if ($existing -match ("(?m)^" + [regex]::Escape($name) + "\s")) {
+            codex mcp remove $name | Out-Host
+        }
+        codex mcp add $name --url $url | Out-Host
+        continue
+    }
+
     if (-not (Test-Path -LiteralPath $launcher)) {
         Write-Warning "skip $name because launcher is missing: $launcher"
         continue

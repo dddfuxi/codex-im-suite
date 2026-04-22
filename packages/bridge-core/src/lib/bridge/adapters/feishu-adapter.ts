@@ -26,6 +26,7 @@ import type {
   OutboundMention,
   OutboundMessage,
   SendResult,
+  UploadedFileLink,
 } from '../types.js';
 import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
@@ -49,6 +50,9 @@ const DEDUP_MAX = 1000;
 
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
+/** Feishu IM file upload limit is 30 MB for bot file messages. */
+const MAX_UPLOAD_FILE_SIZE = 30 * 1024 * 1024;
+type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
@@ -75,6 +79,12 @@ const FEISHU_CHAT_INDEX_PATH = path.join(
   'feishu-chat-index.json',
 );
 
+function formatBytesForDocument(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+  const mib = bytes / (1024 * 1024);
+  return `${mib.toFixed(mib >= 10 ? 1 : 2)} MB`;
+}
+
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
   sender: {
@@ -88,6 +98,10 @@ type FeishuMessageEventData = {
   };
   message: {
     message_id: string;
+    root_id?: string;
+    parent_id?: string;
+    thread_id?: string;
+    upper_message_id?: string;
     chat_id: string;
     chat_type: string;
     message_type: string;
@@ -126,6 +140,10 @@ interface FeishuHistoryIntent {
 
 interface FeishuMessageListItem {
   message_id: string;
+  root_id?: string;
+  parent_id?: string;
+  thread_id?: string;
+  upper_message_id?: string;
   chat_id: string;
   create_time: string;
   deleted?: boolean;
@@ -162,6 +180,15 @@ interface FeishuDocumentOptions {
   title?: string;
   ownerUserId?: string;
 }
+
+type FeishuLinkShareEntity =
+  | 'tenant_readable'
+  | 'tenant_editable'
+  | 'anyone_readable'
+  | 'anyone_editable'
+  | 'closed';
+
+type FeishuExternalAccessEntity = 'open' | 'closed' | 'allow_share_partner_tenant';
 
 export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
@@ -1316,6 +1343,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
         chatType: msg.chat_type,
       },
     };
+    const replyTargetMessageId = this.getReplyTargetMessageId(msg);
+    if (replyTargetMessageId) {
+      rawMetadata = {
+        ...(rawMetadata || {}),
+        feishuReplyTo: {
+          messageId: replyTargetMessageId,
+        },
+      };
+      if (attachments.length === 0) {
+        const replyAttachments = await this.downloadAttachmentsFromMessageId(replyTargetMessageId);
+        if (replyAttachments.length > 0) {
+          attachments.push(...replyAttachments);
+          rawMetadata = {
+            ...(rawMetadata || {}),
+            feishuReplyTo: {
+              messageId: replyTargetMessageId,
+              attachmentCount: replyAttachments.length,
+            },
+          };
+        }
+      }
+    }
 
     const trimmedUserText = text.trim();
     if (isGroup && trimmedUserText) {
@@ -2603,6 +2652,90 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return `[${timeLabel}] ${resolvedSenderLabel}: ${messageText}`;
   }
 
+  private getReplyTargetMessageId(msg: FeishuMessageEventData['message']): string | null {
+    const raw = msg as FeishuMessageEventData['message'] & Record<string, unknown>;
+    const candidates = [
+      raw.parent_id,
+      raw.upper_message_id,
+      raw.root_id,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue;
+      const value = candidate.trim();
+      if (value && value !== msg.message_id) return value;
+    }
+    return null;
+  }
+
+  private async fetchMessageById(messageId: string): Promise<FeishuMessageListItem | null> {
+    if (!this.restClient) return null;
+    try {
+      const res = await this.restClient.im.message.get({
+        path: { message_id: messageId },
+      });
+      const item = res?.data?.items?.[0];
+      if (!item?.message_id || !item.msg_type) return null;
+      return {
+        message_id: item.message_id,
+        root_id: item.root_id,
+        parent_id: item.parent_id,
+        thread_id: item.thread_id,
+        upper_message_id: item.upper_message_id,
+        chat_id: item.chat_id || '',
+        create_time: item.create_time || '',
+        deleted: item.deleted,
+        msg_type: item.msg_type,
+        body: item.body,
+        sender: item.sender,
+      };
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to fetch replied message:', err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  private async downloadAttachmentsFromMessageId(messageId: string): Promise<FileAttachment[]> {
+    const item = await this.fetchMessageById(messageId);
+    if (!item || item.deleted) return [];
+    return this.downloadAttachmentsFromMessageItem(item);
+  }
+
+  private async downloadAttachmentsFromMessageItem(item: FeishuMessageListItem): Promise<FileAttachment[]> {
+    const attachments: FileAttachment[] = [];
+    const content = item.body?.content || '';
+
+    if (item.msg_type === 'image') {
+      const fileKey = this.extractFileKey(content);
+      if (fileKey) {
+        const attachment = await this.downloadResource(item.message_id, fileKey, 'image');
+        if (attachment) attachments.push(attachment);
+      }
+      return attachments;
+    }
+
+    if (item.msg_type === 'file' || item.msg_type === 'audio' || item.msg_type === 'video' || item.msg_type === 'media') {
+      const fileKey = this.extractFileKey(content);
+      if (fileKey) {
+        const resourceType = item.msg_type === 'audio' || item.msg_type === 'video' || item.msg_type === 'media'
+          ? item.msg_type
+          : 'file';
+        const attachment = await this.downloadResource(item.message_id, fileKey, resourceType);
+        if (attachment) attachments.push(attachment);
+      }
+      return attachments;
+    }
+
+    if (item.msg_type === 'post') {
+      const { imageKeys } = this.parsePostContent(content);
+      for (const key of imageKeys) {
+        const attachment = await this.downloadResource(item.message_id, key, 'image');
+        if (attachment) attachments.push(attachment);
+      }
+    }
+
+    return attachments;
+  }
+
   private extractHistoryText(item: FeishuMessageListItem): string {
     const content = item.body?.content || '';
     switch (item.msg_type) {
@@ -2674,6 +2807,320 @@ export class FeishuAdapter extends BaseChannelAdapter {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
       };
+    }
+  }
+
+  async sendLocalFile(chatId: string, filePath: string, replyToMessageId?: string): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    try {
+      if (!fs.existsSync(filePath)) {
+        return { ok: false, error: `File not found: ${filePath}` };
+      }
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) {
+        return { ok: false, error: `Not a file: ${filePath}` };
+      }
+      if (stat.size <= 0) {
+        return { ok: false, error: `File is empty: ${filePath}` };
+      }
+      if (stat.size > MAX_UPLOAD_FILE_SIZE) {
+        return { ok: false, error: `File exceeds Feishu upload limit: ${filePath}` };
+      }
+
+      const uploadRes = await this.restClient.im.file.create({
+        data: {
+          file_type: this.inferFeishuUploadFileType(filePath),
+          file_name: path.basename(filePath),
+          file: fs.createReadStream(filePath),
+        },
+      });
+
+      const fileKey = uploadRes?.file_key;
+      if (!fileKey) {
+        return { ok: false, error: 'Feishu file upload did not return file_key' };
+      }
+
+      const sendRes = replyToMessageId
+        ? await this.restClient.im.message.reply({
+            path: { message_id: replyToMessageId },
+            data: {
+              msg_type: 'file',
+              content: JSON.stringify({ file_key: fileKey }),
+            },
+          })
+        : await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'file',
+              content: JSON.stringify({ file_key: fileKey }),
+            },
+          });
+
+      if (sendRes?.data?.message_id) {
+        return { ok: true, messageId: sendRes.data.message_id };
+      }
+      return { ok: false, error: `Feishu file send failed: ${sendRes?.msg || 'unknown error'}` };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  async uploadLocalFileForLink(filePath: string): Promise<UploadedFileLink | null> {
+    if (!this.restClient) {
+      throw new Error('Feishu client not initialized');
+    }
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      throw new Error(`Not a file: ${filePath}`);
+    }
+    if (stat.size <= 0) {
+      throw new Error(`File is empty: ${filePath}`);
+    }
+
+    const fileName = path.basename(filePath);
+    const deliveryDoc = await this.createFileDeliveryDocument(filePath, fileName, stat.size);
+    await this.ensureDocumentPublicPermission(deliveryDoc.documentId);
+
+    return {
+      title: deliveryDoc.title,
+      url: deliveryDoc.url,
+      platform: 'feishu_docx',
+      fileToken: deliveryDoc.fileToken,
+      documentId: deliveryDoc.documentId,
+    };
+  }
+
+  private inferFeishuUploadFileType(filePath: string): FeishuUploadFileType {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.opus') return 'opus';
+    if (ext === '.mp4') return 'mp4';
+    if (ext === '.pdf') return 'pdf';
+    if (ext === '.doc' || ext === '.docx') return 'doc';
+    if (ext === '.xls' || ext === '.xlsx') return 'xls';
+    if (ext === '.ppt' || ext === '.pptx') return 'ppt';
+    return 'stream';
+  }
+
+  private getDriveLinkShareEntity(): FeishuLinkShareEntity {
+    const store = getBridgeContext().store;
+    const raw = (
+      store.getSetting('bridge_feishu_docx_link_share_entity')
+      || store.getSetting('bridge_feishu_drive_link_share_entity')
+      || process.env.CTI_FEISHU_DOCX_LINK_SHARE_ENTITY
+      || process.env.CTI_FEISHU_DRIVE_LINK_SHARE_ENTITY
+      || 'tenant_readable'
+    ).trim().toLowerCase();
+    const allowed = new Set<FeishuLinkShareEntity>([
+      'tenant_readable',
+      'tenant_editable',
+      'anyone_readable',
+      'anyone_editable',
+      'closed',
+    ]);
+    return allowed.has(raw as FeishuLinkShareEntity)
+      ? raw as FeishuLinkShareEntity
+      : 'tenant_readable';
+  }
+
+  private getDriveExternalAccessEntity(): FeishuExternalAccessEntity | null {
+    const store = getBridgeContext().store;
+    const raw = (
+      store.getSetting('bridge_feishu_docx_external_access_entity')
+      || store.getSetting('bridge_feishu_drive_external_access_entity')
+      || process.env.CTI_FEISHU_DOCX_EXTERNAL_ACCESS_ENTITY
+      || process.env.CTI_FEISHU_DRIVE_EXTERNAL_ACCESS_ENTITY
+      || ''
+    ).trim().toLowerCase();
+    if (!raw) return null;
+    if (raw === 'open' || raw === 'closed' || raw === 'allow_share_partner_tenant') {
+      return raw;
+    }
+    return null;
+  }
+
+  private async uploadDocxAttachmentSingleShot(
+    filePath: string,
+    fileName: string,
+    documentId: string,
+    size: number,
+  ): Promise<string> {
+    const uploadRes = await this.restClient!.drive.media.uploadAll({
+      data: {
+        file_name: fileName,
+        parent_type: 'docx_file',
+        parent_node: documentId,
+        size,
+        file: fs.createReadStream(filePath),
+      },
+    });
+    const fileToken = uploadRes?.file_token;
+    if (!fileToken) {
+      throw new Error('飞书文档附件上传失败：未返回 file_token');
+    }
+    return fileToken;
+  }
+
+  private async uploadDocxAttachmentMultipart(
+    filePath: string,
+    fileName: string,
+    documentId: string,
+    size: number,
+  ): Promise<string> {
+    const prepareRes = await this.restClient!.drive.media.uploadPrepare({
+      data: {
+        file_name: fileName,
+        parent_type: 'docx_file',
+        parent_node: documentId,
+        size,
+      },
+    });
+    const uploadId = prepareRes?.data?.upload_id;
+    const blockSize = prepareRes?.data?.block_size || 4 * 1024 * 1024;
+    const blockNum = prepareRes?.data?.block_num || Math.ceil(size / blockSize);
+    if (!uploadId || !blockNum) {
+      throw new Error('飞书云空间预上传失败：未返回 upload_id');
+    }
+
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      for (let seq = 0; seq < blockNum; seq += 1) {
+        const offset = seq * blockSize;
+        const partSize = Math.min(blockSize, size - offset);
+        const buffer = Buffer.alloc(partSize);
+        const bytesRead = fs.readSync(fd, buffer, 0, partSize, offset);
+        if (bytesRead !== partSize) {
+          throw new Error(`读取文件分片失败：seq=${seq}`);
+        }
+        await this.restClient!.drive.media.uploadPart({
+          data: {
+            upload_id: uploadId,
+            seq,
+            size: partSize,
+            file: buffer,
+          },
+        });
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const finishRes = await this.restClient!.drive.media.uploadFinish({
+      data: {
+        upload_id: uploadId,
+        block_num: blockNum,
+      },
+    });
+    const fileToken = finishRes?.data?.file_token;
+    if (!fileToken) {
+      throw new Error('飞书文档附件完成上传失败：未返回 file_token');
+    }
+    return fileToken;
+  }
+
+  private async createFileDeliveryDocument(
+    filePath: string,
+    fileName: string,
+    size: number,
+  ): Promise<{ documentId: string; fileToken: string; title: string; url: string }> {
+    const title = this.deriveDeliveryDocumentTitle(fileName);
+    const introMarkdown = [
+      `# ${title}`,
+      '',
+      '此文档用于交付超过飞书单文件消息限制的本地结果文件。',
+      '',
+      `- 文件名：${fileName}`,
+      `- 文件大小：${formatBytesForDocument(size)}`,
+      `- 生成时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+      '',
+      '附件如下：',
+    ].join('\n');
+
+    const doc = await this.createDocumentFromMarkdown(introMarkdown, { title });
+    const fileToken = size <= 20 * 1024 * 1024
+      ? await this.uploadDocxAttachmentSingleShot(filePath, fileName, doc.documentId, size)
+      : await this.uploadDocxAttachmentMultipart(filePath, fileName, doc.documentId, size);
+
+    await this.appendDocumentAttachmentBlock(doc.documentId, fileToken, fileName);
+    return {
+      documentId: doc.documentId,
+      fileToken,
+      title: doc.title,
+      url: doc.url,
+    };
+  }
+
+  private deriveDeliveryDocumentTitle(fileName: string): string {
+    const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    return `文件交付 ${fileName} ${now}`.slice(0, 80);
+  }
+
+  private async appendDocumentAttachmentBlock(documentId: string, fileToken: string, fileName: string): Promise<void> {
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+    const children = [
+      {
+        block_type: 2,
+        text: {
+          elements: [
+            {
+              text_run: {
+                content: `${fileName}：`,
+              },
+            },
+            {
+              file: {
+                file_token: fileToken,
+              },
+            },
+          ],
+        },
+      },
+    ];
+
+    const blockResponse = await fetch(`${baseUrl}/open-apis/docx/v1/documents/${documentId}/blocks/${documentId}/children`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tenantAccessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ children }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const blockPayload = await blockResponse.json() as { code?: number; msg?: string };
+    if (!blockResponse.ok || blockPayload.code !== 0) {
+      throw new Error(`飞书文档附件块创建失败 [${blockPayload.code ?? blockResponse.status}]: ${blockPayload.msg || blockResponse.statusText}`);
+    }
+  }
+
+  private async ensureDocumentPublicPermission(documentId: string): Promise<void> {
+    const shareEntity = this.getDriveLinkShareEntity();
+    const externalAccessEntity = this.getDriveExternalAccessEntity();
+    try {
+      await this.restClient!.drive.permissionPublic.patch({
+        data: {
+          link_share_entity: shareEntity,
+          ...(externalAccessEntity ? { external_access_entity: externalAccessEntity } : {}),
+        },
+        params: {
+          type: 'docx',
+        },
+        path: {
+          token: documentId,
+        },
+      });
+    } catch (err) {
+      throw new Error(`飞书云文档分享权限设置失败：${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

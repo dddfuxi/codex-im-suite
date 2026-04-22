@@ -112,6 +112,9 @@ foreach ($name in $runtimeFiles) {
     Copy-ExistingFile -Source (Join-Path $suiteRuntime $name) -Target (Join-Path $liveRuntime $name)
 }
 
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.ps1') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.ps1')
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.py') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.py')
+
 Write-Host "remove live legacy tools mirror"
 $liveToolsDir = Join-Path $liveRuntime 'tools'
 if (Test-Path -LiteralPath $liveToolsDir) {

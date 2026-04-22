@@ -1,0 +1,17 @@
+{
+  "id": "ignisMCP",
+  "displayName": "Ignis MCP",
+  "type": "http",
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-ignis-mcp.ps1",
+  "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-ignis-mcp.ps1",
+  "registerName": "ignisMCP",
+  "env": {
+    "IGNIS_MCP_PORT": "8787"
+  },
+  "healthCheck": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8787/mcp"
+  },
+  "description": "Ignis creative generation CLI MCP for images, videos, 3D models, asset upload, sessions, and result polling."
+}

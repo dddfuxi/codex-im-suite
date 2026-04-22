@@ -11,6 +11,7 @@ import type {
   OutboundMessage,
   PreviewCapabilities,
   SendResult,
+  UploadedFileLink,
 } from './types.js';
 
 export abstract class BaseChannelAdapter {
@@ -51,6 +52,22 @@ export abstract class BaseChannelAdapter {
    */
   async sendLocalImage(_chatId: string, _filePath: string, _replyToMessageId?: string): Promise<SendResult> {
     return { ok: false, error: 'Local image sending is not supported by this adapter' };
+  }
+
+  /**
+   * Send a local file to the channel when the adapter supports outbound files.
+   * Default implementation is unsupported.
+   */
+  async sendLocalFile(_chatId: string, _filePath: string, _replyToMessageId?: string): Promise<SendResult> {
+    return { ok: false, error: 'Local file sending is not supported by this adapter' };
+  }
+
+  /**
+   * Upload a local file to a platform-native cloud space and return a share link.
+   * Used when the channel cannot deliver the file directly due to size limits.
+   */
+  async uploadLocalFileForLink(_filePath: string): Promise<UploadedFileLink | null> {
+    return null;
   }
 
   /**

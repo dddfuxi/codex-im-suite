@@ -161,6 +161,47 @@ async function runPowerShellFile(scriptPath: string, cwd: string, env?: Record<s
   });
 }
 
+async function startPowerShellFileDetached(scriptPath: string, cwd: string, env?: Record<string, string>): Promise<McpStartStopResult> {
+  return new Promise((resolve) => {
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
+      cwd,
+      env: { ...process.env, ...(env || {}) },
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.on('error', (error) => {
+      resolve({
+        ok: false,
+        message: error.message,
+        stderr: error.message,
+      });
+    });
+    child.unref();
+    resolve({
+      ok: true,
+      message: `started detached PID=${child.pid}`,
+      stdout: `PID=${child.pid}`,
+    });
+  });
+}
+
+function formatMcpToolPayload(payload: unknown): string {
+  if (typeof payload === 'string') return payload;
+  if (Array.isArray(payload)) {
+    const texts = payload
+      .map((item) => {
+        if (item && typeof item === 'object' && 'text' in item) {
+          return String((item as { text?: unknown }).text || '');
+        }
+        return '';
+      })
+      .filter(Boolean);
+    if (texts.length > 0) return texts.join('\n');
+  }
+  return JSON.stringify(payload, null, 2);
+}
+
 export class McpBridge {
   constructor(private readonly config: Config) {}
 
@@ -266,6 +307,9 @@ export class McpBridge {
     if (!launcher || !fs.existsSync(launcher)) {
       return { ok: false, message: `launcher 不存在: ${launcher}` };
     }
+    if (manifest.type === 'http') {
+      return startPowerShellFileDetached(launcher, cwd, manifest.env ? this.expandEnvMap(manifest.env) : undefined);
+    }
     return runPowerShellFile(launcher, cwd, manifest.env ? this.expandEnvMap(manifest.env) : undefined, 60000);
   }
 
@@ -301,7 +345,7 @@ export class McpBridge {
       arguments: args,
     });
     const payload = result.content ?? result.structuredContent ?? result.structured_content ?? result;
-    return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+    return formatMcpToolPayload(payload);
   }
 
   private expandEnvMap(values: Record<string, string>): Record<string, string> {

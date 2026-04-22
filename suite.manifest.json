@@ -23,6 +23,11 @@
       "path": "./packages/mcp-unity-prefab",
       "role": "external-mcp",
       "buildScript": "npm run build"
+    },
+    "mcp-ignis": {
+      "path": "./packages/mcp-ignis",
+      "role": "external-mcp",
+      "buildScript": "npm run build"
     }
   },
   "apps": {

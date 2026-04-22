@@ -119,6 +119,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - MCP 只能从 `config/mcp.d/*.json` 发现。
 - MCP 的 `cwd` 必须命中默认工作区、允许根目录或明确的 Unity 工程路径。
 - Unity 默认项目是 `C:\unity\ST3\Game`。
+- Ignis 生成能力通过 `config/mcp.d/ignis-mcp.json` 和 `packages/mcp-ignis` 维护，config/token 只允许放在 `C:\Users\admin\.ignis\config.json`，不得写入仓库、release 包或日志。
 - 没有授权时，不要操作其他 Unity 工程或外部项目。
 - 截图、运行游戏、导入资源这类任务不能被降级成“只检查 MCP 在线”。
 

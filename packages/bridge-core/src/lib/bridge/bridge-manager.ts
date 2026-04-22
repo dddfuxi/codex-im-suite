@@ -7,8 +7,9 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -52,11 +53,30 @@ import {
 const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
+const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const FINAL_ENVELOPE_STATUS_PATH = path.join(
-  process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+  BRIDGE_HOME,
   'runtime',
   'final-envelope-status.json',
 );
+const FEISHU_FILE_UPLOAD_LIMIT_BYTES = 30 * 1024 * 1024;
+
+type ArtifactUploadMode = 'none' | 'local_http' | 'feishu_docx';
+
+interface ArtifactDeliveryConfig {
+  mode: ArtifactUploadMode;
+  publicBaseUrl: string;
+  publicDir: string;
+  publicSubdir: string;
+}
+
+interface UploadedArtifactRecord {
+  fileName: string;
+  sourcePath: string;
+  publicPath: string;
+  url: string;
+  sizeBytes: number;
+}
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -96,6 +116,95 @@ function appendReplyEndMarker(text: string): string {
   if (!trimmed) return marker;
   if (trimmed.endsWith(marker)) return text;
   return `${trimmed}\n\n${marker}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
+  const mib = bytes / (1024 * 1024);
+  return `${mib.toFixed(mib >= 10 ? 1 : 2)} MB`;
+}
+
+function getArtifactDeliveryConfig(): ArtifactDeliveryConfig {
+  const { store } = getBridgeContext();
+  const modeRaw = (store.getSetting('bridge_artifact_upload_mode') || process.env.CTI_ARTIFACT_UPLOAD_MODE || 'none').trim().toLowerCase();
+  const mode: ArtifactUploadMode = modeRaw === 'local_http'
+    ? 'local_http'
+    : (modeRaw === 'feishu_docx' || modeRaw === 'feishu_drive')
+      ? 'feishu_docx'
+      : 'none';
+  const publicBaseUrl = (store.getSetting('bridge_artifact_public_base_url') || process.env.CTI_ARTIFACT_PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+  const publicDir = (store.getSetting('bridge_artifact_public_dir') || process.env.CTI_ARTIFACT_PUBLIC_DIR || '').trim();
+  const publicSubdir = (store.getSetting('bridge_artifact_public_subdir') || process.env.CTI_ARTIFACT_PUBLIC_SUBDIR || 'bridge-artifacts').trim().replace(/^[/\\]+|[/\\]+$/g, '') || 'bridge-artifacts';
+  return { mode, publicBaseUrl, publicDir, publicSubdir };
+}
+
+function joinArtifactUrl(baseUrl: string, relativePath: string): string {
+  const encoded = relativePath
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+  return `${baseUrl}/${encoded}`;
+}
+
+function needsArtifactLinkDelivery(adapter: BaseChannelAdapter, filePath: string, sendError = ''): boolean {
+  if (adapter.channelType === 'feishu') {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.isFile() && stat.size > FEISHU_FILE_UPLOAD_LIMIT_BYTES) return true;
+    } catch {
+      // ignore
+    }
+  }
+  return /exceeds .*upload limit|upload limit/i.test(sendError);
+}
+
+function uploadLocalArtifact(filePath: string): UploadedArtifactRecord {
+  const config = getArtifactDeliveryConfig();
+  if (config.mode !== 'local_http') {
+    throw new Error('未配置可用的大文件上传服务。请设置 CTI_ARTIFACT_UPLOAD_MODE=local_http 或 feishu_docx。');
+  }
+  if (!config.publicBaseUrl) {
+    throw new Error('缺少 CTI_ARTIFACT_PUBLIC_BASE_URL。');
+  }
+  if (!config.publicDir) {
+    throw new Error('缺少 CTI_ARTIFACT_PUBLIC_DIR。');
+  }
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) throw new Error(`不是文件：${filePath}`);
+  const now = new Date();
+  const dateDir = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const safeName = path.basename(filePath).replace(/[^a-zA-Z0-9._-]+/g, '-');
+  const uniqueName = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${safeName}`;
+  const relativePath = path.posix.join(config.publicSubdir.replace(/\\/g, '/'), dateDir, uniqueName);
+  const targetPath = path.join(config.publicDir, ...relativePath.split('/'));
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.copyFileSync(filePath, targetPath);
+  return {
+    fileName: path.basename(filePath),
+    sourcePath: filePath,
+    publicPath: targetPath,
+    url: joinArtifactUrl(config.publicBaseUrl, relativePath),
+    sizeBytes: stat.size,
+  };
+}
+
+function formatArtifactLinkNotice(uploaded: UploadedArtifactRecord): string {
+  return [
+    `${uploaded.fileName} 超过飞书单文件 30MB 限制，已改为下载链接。`,
+    `大小：${formatBytes(uploaded.sizeBytes)}`,
+    `下载：${uploaded.url}`,
+    `本机文件：${uploaded.sourcePath}`,
+  ].join('\n');
+}
+
+function formatPlatformFileLinkNotice(link: UploadedFileLink, filePath: string): string {
+  return [
+    `${link.title} 超过飞书单文件 30MB 限制，已改为飞书云文档附件交付。`,
+    `文档：${link.url}`,
+    ...(link.platform ? [`来源：${link.platform}`] : []),
+    `本机文件：${filePath}`,
+  ].join('\n');
 }
 
 type FinalReplyKind = 'text' | 'image' | 'file' | 'mixed';
@@ -2331,11 +2440,56 @@ async function handleMessage(
       }
       if (localFilePaths.length > 0) {
         if (typeof (adapter as BaseChannelAdapter & { sendLocalFile?: (chatId: string, filePath: string, replyToMessageId?: string) => Promise<SendResult>; }).sendLocalFile === 'function') {
+          const failedLocalFiles: Array<{ name: string; error: string }> = [];
+          const uploadedFileNotices: string[] = [];
           for (const filePath of localFilePaths) {
             const fileSend = await (adapter as BaseChannelAdapter & { sendLocalFile: (chatId: string, filePath: string, replyToMessageId?: string) => Promise<SendResult>; }).sendLocalFile(msg.address.chatId, filePath, msg.messageId);
             if (!fileSend.ok) {
+              if (needsArtifactLinkDelivery(adapter, filePath, fileSend.error || '')) {
+                try {
+                  const artifactMode = getArtifactDeliveryConfig().mode;
+                  if (artifactMode === 'feishu_docx' && adapter.channelType === 'feishu') {
+                    const platformLink = await adapter.uploadLocalFileForLink(filePath);
+                    if (!platformLink) {
+                      throw new Error('飞书云文档未返回文档链接');
+                    }
+                    uploadedFileNotices.push(formatPlatformFileLinkNotice(platformLink, filePath));
+                    continue;
+                  }
+                  const uploaded = uploadLocalArtifact(filePath);
+                  uploadedFileNotices.push(formatArtifactLinkNotice(uploaded));
+                  continue;
+                } catch (uploadError) {
+                  console.warn(`[bridge-manager] Failed to upload oversized file: ${filePath}`, uploadError instanceof Error ? uploadError.message : uploadError);
+                  failedLocalFiles.push({
+                    name: path.basename(filePath),
+                    error: `超过飞书上传限制，且自动上传失败：${uploadError instanceof Error ? uploadError.message : String(uploadError)}`,
+                  });
+                  continue;
+                }
+              }
               console.warn(`[bridge-manager] Failed to send local file: ${filePath}`, fileSend.error);
+              failedLocalFiles.push({
+                name: path.basename(filePath),
+                error: fileSend.error || 'unknown error',
+              });
             }
+          }
+          if (uploadedFileNotices.length > 0) {
+            await deliver(adapter, {
+              address: msg.address,
+              text: appendReplyEndMarker(uploadedFileNotices.join('\n\n')),
+              parseMode: 'plain',
+              replyToMessageId: msg.messageId,
+            }, { sessionId: effectiveBinding.codepilotSessionId });
+          }
+          if (failedLocalFiles.length > 0) {
+            await deliver(adapter, {
+              address: msg.address,
+              text: appendReplyEndMarker(`部分文件未能直接发送：\n${failedLocalFiles.map((file) => `- ${file.name}: ${file.error}`).join('\n')}`),
+              parseMode: 'plain',
+              replyToMessageId: msg.messageId,
+            }, { sessionId: effectiveBinding.codepilotSessionId });
           }
         } else {
           await deliver(adapter, {

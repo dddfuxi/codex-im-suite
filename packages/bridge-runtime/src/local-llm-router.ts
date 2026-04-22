@@ -60,7 +60,7 @@ const HARD_EXCLUDE_PATTERNS: PatternRule[] = [
   { pattern: /\b(blender|blender mcp|glb|gltf)\b/i, reason: '涉及 Blender 或 3D 资产链路', taskKind: 'blender_like' },
   { pattern: /(飞书文档|feishu doc|docx|lark doc|云文档)/i, reason: '涉及飞书文档操作', taskKind: 'doc_like' },
   { pattern: /(截图|图片|image|附件|发图|上传图片|标注图)/i, reason: '涉及图片或附件处理', taskKind: 'tool_request' },
-  { pattern: /\b(git\s+(push|rebase|merge|reset|checkout|switch|cherry-pick|clean|stash(?:\s+(?:pop|apply))?|commit)|publish|pull request)\b/i, reason: '涉及高风险仓库写操作或发布', taskKind: 'repo_query' },
+  { pattern: /\b(git\s+(pull|push|rebase|merge|reset|checkout|switch|cherry-pick|clean|stash(?:\s+(?:pop|apply))?|commit)|publish|pull request)\b/i, reason: '涉及高风险仓库写操作或发布', taskKind: 'repo_query' },
   { pattern: /(删库|清空会话|重置桥接|修改桥接配置|删除飞书文档|永久删除)/i, reason: '涉及高风险删除或桥接配置修改', taskKind: 'tool_request' },
   { pattern: /(创建飞书文档|删除飞书文档|发送到其他群|跨群转发)/i, reason: '涉及外部平台真实操作', taskKind: 'tool_request' },
 ];
@@ -173,6 +173,15 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
 
   if (config.localLlmEnabled !== true) {
     return fallback({ requestKind: 'chat', reason: '本地模型未启用' });
+  }
+
+  if (params.permissionMode === 'acceptEdits') {
+    return fallback({
+      requestKind: 'tool_request',
+      reason: '当前是写入模式，不走本地保守路由',
+      highRisk: true,
+      preferredDecision: 'escalate_codex',
+    });
   }
 
   if (params.files && params.files.length > 0) {

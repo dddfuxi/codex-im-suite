@@ -93,6 +93,14 @@ export interface SendResult {
   error?: string;
 }
 
+export interface UploadedFileLink {
+  title: string;
+  url: string;
+  platform?: string;
+  fileToken?: string;
+  documentId?: string;
+}
+
 // ── Bindings ───────────────────────────────────────────────────
 
 /** Links an IM chat to a CodePilot session */

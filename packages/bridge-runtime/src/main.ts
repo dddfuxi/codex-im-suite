@@ -195,6 +195,10 @@ class HubLlmProvider implements LLMProvider {
     return new ReadableStream<string>({
       start: async (controller) => {
         const conservative = decideConservativeRoute(params, this.config);
+        if (this.localAgent.canHandleIgnisFastPath(params)) {
+          const ignisResult = await this.localAgent.handleIgnisFastPath(controller, params, routerMode);
+          if (ignisResult.handled) return;
+        }
         if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
           try {
             const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, routerMode);

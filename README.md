@@ -45,6 +45,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 - `packages/bridge-runtime`：运行时壳层，包含配置、daemon、provider、Codex、本地模型、本地执行器、MCP 桥接。
 - `packages/mcp-picture`：图片能力 MCP。
 - `packages/mcp-unity-prefab`：Unity Prefab MCP。
+- `packages/mcp-ignis`：Ignis CLI MCP，负责原画、图片、视频、3D 模型生成和结果查询。
 - `apps/control-panel`：Windows 中控面板。
 - `apps/installer`：Windows 安装器。
 - `config/mcp.d`：MCP manifest，面板和注册脚本都从这里发现 MCP。
@@ -60,6 +61,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 本地模型只处理明确的小活，例如简单命令、git 状态、文件读取、MCP 状态检查。
+- 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
+- Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
 - Codex 不可用时，本地模型做兜底，并会先检索本地记忆后再回答记忆类问题。
 - 本地执行器不能伪造完成结果，不能绕过权限和工作区限制。
 
@@ -93,6 +96,35 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\register-external-mcps.ps1
+```
+
+启动 Ignis MCP：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\launch-ignis-mcp.ps1
+```
+
+Ignis CLI 配置只放在本机 `C:\Users\admin\.ignis\config.json`，不进入仓库、release 包或日志。项目内只保存 skill 和 MCP wrapper。
+
+大文件下载链路：
+
+```powershell
+# 超过飞书 30MB 限制时，优先创建飞书云文档并把文件作为附件挂进去，再回文档链接
+CTI_ARTIFACT_UPLOAD_MODE=feishu_docx
+CTI_FEISHU_DOCX_LINK_SHARE_ENTITY=tenant_readable
+CTI_FEISHU_DOCX_EXTERNAL_ACCESS_ENTITY=closed
+
+# 备用方案：复制到公网目录并回下载链接
+# CTI_ARTIFACT_UPLOAD_MODE=local_http
+# CTI_ARTIFACT_PUBLIC_BASE_URL=https://files.example.com
+# CTI_ARTIFACT_PUBLIC_DIR=C:\artifact-publisher\public
+# CTI_ARTIFACT_PUBLIC_SUBDIR=bridge-artifacts
+```
+
+手动拆分 GLB 为 FBX 和贴图：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\export-glb-asset-package.ps1 -SourceGlb "C:\path\to\model.glb"
 ```
 
 检查架构文档是否需要同步：
