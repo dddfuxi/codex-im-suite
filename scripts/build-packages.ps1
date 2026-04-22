@@ -1,8 +1,14 @@
+param(
+    [string]$ControlPanelOutputDir
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
 $suiteRoot = Get-SuiteRoot
 $manifest = Get-SuiteManifest -SuiteRoot $suiteRoot
+
+& (Join-Path $PSScriptRoot 'validate-extension-manifests.ps1')
 
 function Invoke-NpmBuild {
     param(
@@ -67,6 +73,32 @@ function Invoke-BridgeRuntimeBuild {
     }
 }
 
+function Invoke-ControlPanelWebBuild {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'package.json'))) {
+        return
+    }
+    Write-Host "build control-panel web: $Path"
+    Push-Location $Path
+    try {
+        if (Test-Path -LiteralPath 'package-lock.json') {
+            npm ci | Out-Host
+        } else {
+            npm install | Out-Host
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm dependency install failed at $Path"
+        }
+        npm run build | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "control-panel web build failed at $Path"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
 $ordered = @('bridge-core', 'bridge-runtime', 'mcp-picture', 'mcp-unity-prefab', 'mcp-ignis')
 foreach ($key in $ordered) {
     $pkg = $manifest.packages.$key
@@ -78,8 +110,14 @@ foreach ($key in $ordered) {
     }
 }
 
+$controlPanelWeb = Join-Path $suiteRoot 'apps\control-panel\web'
+Invoke-ControlPanelWebBuild -Path $controlPanelWeb
+
 $controlPanel = Join-Path $suiteRoot 'apps\control-panel\CodexImSuite.ControlPanel.csproj'
-dotnet publish $controlPanel -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o (Join-Path $suiteRoot 'release\artifacts\control-panel')
+if (-not $ControlPanelOutputDir) {
+    $ControlPanelOutputDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
+}
+dotnet publish $controlPanel -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $ControlPanelOutputDir
 if ($LASTEXITCODE -ne 0) {
     throw "control-panel publish failed"
 }

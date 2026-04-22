@@ -112,15 +112,20 @@ foreach ($name in $runtimeFiles) {
     Copy-ExistingFile -Source (Join-Path $suiteRuntime $name) -Target (Join-Path $liveRuntime $name)
 }
 
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.ps1') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.ps1')
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.py') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.py')
+
 Write-Host "remove live legacy tools mirror"
 $liveToolsDir = Join-Path $liveRuntime 'tools'
 if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$builtPanelExe = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.exe'
-$builtPanelPdb = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.pdb'
+$builtPanelDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
+$builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'
+$builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
+Copy-ExistingDirectory -Source $builtPanelDir -Target $livePanelDir
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')

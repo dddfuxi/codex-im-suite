@@ -273,6 +273,16 @@ function isIgnisModelFileId(fileId: string): boolean {
   return /\.(?:glb|gltf|fbx|obj|usdz|zip)$/i.test(fileId);
 }
 
+function isIgnisReplayRequest(prompt: string): boolean {
+  const text = prompt.trim();
+  if (!text) return false;
+  const mentionsIgnis = /\bignis\b/i.test(text);
+  const asksReplay = /(再发|重发|补发|重新发|发我一下|发我一份|回传|给我看|下载链接|文件链接)/i.test(text);
+  const referencesPrevious = /(上次|上一个|上一轮|上一版|刚才|之前|前面|上回|最近)/i.test(text);
+  const mentionsGeneratedAsset = /(结果|文件|图片|图像|视频|模型|glb|gltf|fbx|素材|asset)/i.test(text);
+  return asksReplay && (mentionsIgnis || referencesPrevious || mentionsGeneratedAsset);
+}
+
 function pickIgnisReplayFileIds(fileIds: string[], prompt: string): string[] {
   const ids = uniq(fileIds);
   if (ids.length === 0) return [];
@@ -1132,7 +1142,7 @@ export class LocalAgentProvider {
 
   canHandleMcpBridgeFastPath(params: StreamChatParams): boolean {
     const prompt = params.prompt.toLowerCase();
-    const mentionsMcp = /(mcp|unity mcp|blender mcp|picture mcp|prefab mcp|unitymcp|blendermcp)/i.test(params.prompt);
+    const mentionsMcp = /mcp/i.test(params.prompt);
     if (!mentionsMcp) return false;
     if (/(截图|截一张|截图发我|game view|gameview|viewport|视口|相机|camera|拍一张|渲染|导入|生成模型|进入场景|运行游戏|play mode|playmode|场景里|打开unity|呼起unity并|连接mcp截)/i.test(prompt)) return false;
     return /(检查|状态|连通|在线|健康|启动|停止|重启|工具列表|列出.*工具|有哪些工具|调用.*工具|tool call|tools\/list)/i.test(prompt);
@@ -1345,15 +1355,7 @@ export class LocalAgentProvider {
   }
 
   private resolveMcpManifest(prompt: string): McpManifestRecord | null {
-    const normalized = prompt.toLowerCase();
-    if (/(unity mcp|unitymcp|mcp.*unity)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('unity');
-    if (/(blender mcp|blendermcp|mcp.*blender)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('blender');
-    if (/(picture mcp|mcp.*picture|图片 mcp)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('picture');
-    if (/(prefab mcp|unity prefab mcp|mcp.*prefab)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('prefab');
-    return this.mcpBridge.resolveManifestByHint('unity')
-      || this.mcpBridge.resolveManifestByHint('blender')
-      || this.mcpBridge.resolveManifestByHint('picture')
-      || this.mcpBridge.resolveManifestByHint('prefab');
+    return this.mcpBridge.resolveManifestFromPrompt(prompt);
   }
 
   private parseHttpToolCall(prompt: string, manifest: McpManifestRecord): { toolName: string; args: Record<string, unknown> } | null {
@@ -1866,7 +1868,8 @@ export class LocalAgentProvider {
     const intent = inferMcpFastIntent(params.prompt, assessment);
     if (!intent) return { handled: false };
 
-    const hasExplicitTarget = this.hasExplicitMcpTargetV2(params.prompt);
+    const manifest = this.mcpBridge.resolveManifestFromPrompt(params.prompt);
+    const hasExplicitTarget = manifest !== null;
     if (!hasExplicitTarget && (intent === 'status' || intent === 'list_tools')) {
       const text = this.buildGenericMcpHelpReply();
       this.recordMcpBridgeSummary(mode, 'answer_local', 'tool_request', text, true);
@@ -1875,15 +1878,14 @@ export class LocalAgentProvider {
     }
 
     if (!hasExplicitTarget) {
-      const text = '请先明确目标 MCP。可用入口：Unity MCP、Blender MCP、Picture MCP、Prefab MCP、Ignis MCP。';
+      const text = `请先明确目标 MCP。可用入口：${this.formatAvailableMcpNames()}。`;
       this.recordMcpBridgeSummary(mode, 'refuse_local', 'tool_request', text, false);
       this.emitTerminalResponse(controller, params.sessionId, text, true);
       return { handled: true, fallbackToCodex: false, fallbackReason: text };
     }
 
-    const manifest = this.resolveMcpManifestV2(params.prompt);
     if (!manifest) {
-      const text = '未识别目标 MCP。请明确说 Unity MCP、Blender MCP、Picture MCP 或 Prefab MCP。';
+      const text = `未识别目标 MCP。请明确说这些入口之一：${this.formatAvailableMcpNames()}。`;
       this.recordMcpBridgeSummary(mode, 'refuse_local', 'tool_request', text, false);
       this.emitTerminalResponse(controller, params.sessionId, text, true);
       return {
@@ -1958,27 +1960,21 @@ export class LocalAgentProvider {
     return { handled: true };
   }
 
-  private resolveMcpManifestV2(prompt: string): McpManifestRecord | null {
-    const normalized = prompt.toLowerCase();
-    if (/(unity mcp|unitymcp|mcp.*unity)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('unity');
-    if (/(blender mcp|blendermcp|mcp.*blender)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('blender');
-    if (/(picture mcp|mcp.*picture|图片 mcp)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('picture');
-    if (/(prefab mcp|unity prefab mcp|mcp.*prefab|预制体 mcp)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('prefab');
-    if (/(ignis mcp|ignismcp|mcp.*ignis)/i.test(normalized)) return this.mcpBridge.resolveManifestByHint('ignis');
-    return null;
-  }
-
-  private hasExplicitMcpTargetV2(prompt: string): boolean {
-    return /(unity mcp|unitymcp|mcp.*unity|blender mcp|blendermcp|mcp.*blender|picture mcp|mcp.*picture|图片 mcp|prefab mcp|unity prefab mcp|mcp.*prefab|预制体 mcp|ignis mcp|ignismcp|mcp.*ignis)/i.test(prompt);
-  }
-
   private buildGenericMcpHelpReply(): string {
+    const examples = this.mcpBridge.listAvailableManifestNames().slice(0, 2);
+    const statusExample = examples[0] || 'Blender MCP';
+    const toolsExample = examples[1] || examples[0] || 'Unity MCP';
     return [
-      '可用 MCP 入口：Unity MCP、Blender MCP、Picture MCP、Prefab MCP、Ignis MCP。',
-      '要查状态：说“检查一下 Blender MCP 状态”。',
-      '要看工具：说“Unity MCP 有哪些工具”。',
+      `可用 MCP 入口：${this.formatAvailableMcpNames()}。`,
+      `要查状态：说“检查一下 ${statusExample} 状态”。`,
+      `要看工具：说“${toolsExample} 有哪些工具”。`,
       '要启动或停止：请明确目标 MCP，再说“启动一下”或“停止一下”。',
     ].join('\n');
+  }
+
+  private formatAvailableMcpNames(): string {
+    const names = this.mcpBridge.listAvailableManifestNames();
+    return names.length > 0 ? names.join('、') : '当前没有启用的 MCP manifest';
   }
 
   private parseHttpToolCallV2(prompt: string, manifest: McpManifestRecord): { toolName: string; args: Record<string, unknown> } | null {

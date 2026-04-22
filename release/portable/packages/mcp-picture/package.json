@@ -1,6 +1,6 @@
 {
   "name": "mcp-for-picture",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Minimal HTTP service: image -> agent-ready text (multi-provider)",
   "scripts": {

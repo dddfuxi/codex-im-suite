@@ -3,6 +3,15 @@
   "displayName": "Unity MCP Orchestrator",
   "source": "${SUITE_ROOT}\\extensions\\skills\\unity-mcp-orchestrator",
   "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.game-engine",
+  "optional": true,
+  "installState": "bundled",
+  "aliases": ["unity orchestrator", "unity mcp"],
   "enabled": true,
   "description": "Unity Editor orchestration guidance and workflow rules for MCP-driven operations."
 }

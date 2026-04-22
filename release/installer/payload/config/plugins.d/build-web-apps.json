@@ -2,6 +2,16 @@
   "id": "build-web-apps",
   "displayName": "Build Web Apps",
   "type": "plugin",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "plugin.web",
+  "optional": true,
+  "installState": "external",
+  "source": "codex-plugin:build-web-apps",
+  "aliases": ["web apps", "frontend", "vercel"],
   "enabled": true,
   "description": "Optional plugin bundle for web app related skills."
 }

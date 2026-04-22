@@ -3,11 +3,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir 'shared.ps1')
 
 $suiteRoot = Get-SuiteRoot
 $manifest = Get-SuiteManifest -SuiteRoot $suiteRoot
 $config = Get-CtiConfig
+& (Join-Path $scriptDir 'validate-extension-manifests.ps1')
 if (-not $ManifestDir) {
     $ManifestDir = Join-Path $suiteRoot 'config\mcp.d'
 }

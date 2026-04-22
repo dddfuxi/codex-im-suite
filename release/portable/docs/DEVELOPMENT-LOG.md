@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-21
+更新时间：2026-04-22
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -19,12 +19,23 @@
 - 将 `scripts/sync-live-skill.ps1` 收口为“开发版 suite -> live skill”方向，避免 live 反向覆盖开发版。
 - 新增 `scripts/import-live-to-suite.ps1` 作为手动救回 live 改动入口，默认 dry-run，不进入发布流程。
 - 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
+- 将 suite 版本提升到 `0.2.0`，并在 `suite.manifest.json` 中声明 `extension-manifest/v1`。
+- 给 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 补齐统一扩展字段：`version`、`compatibility`、`category`、`optional`、`installState`、`source` 和 `aliases`。
+- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest。
+- 新增 `scripts/package-main-release.ps1` 和 `scripts/prepare-main-release.ps1`，主干发布预检不再同步 live skill，也不自动提交、推送或打 tag。
+- 新增 `scripts/create-main-release-tag.ps1`，打 tag 从预检流程拆出，只允许在干净工作区和稳定分支上执行。
+- 控制面板升级为 WinForms 宿主 + WebView2 + React/Vite 前端；旧 WinForms 控件退为宿主状态层，前端通过白名单命令协议调用本机脚本和状态读取。
+- 控制面板新增 `apps/control-panel/web` 前端源码、GPT 生成的无文字 PNG 氛围素材和 WebView2 Runtime 降级提示。
+- `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
+- 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
+- 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 
 当前约定：
 
 - 以后开发优先改 suite 目录。
 - live skill 通过同步脚本生成。
-- 上传 GitHub 前必须先打包最新开发版。
+- 本机备份发布可以同步 live skill 并推送当前分支；合入 `main` 前必须走主干发布预检。
+- `main` 是稳定产品主干，`codex/dev` 是日常集成分支，功能分支使用 `codex/<topic>`。
 - 面板源码唯一入口是 `apps/control-panel`；安装器源码唯一入口是 `apps/installer`。
 
 ## 2. Feishu 桥接
@@ -62,12 +73,18 @@
 - Codex 失败时切本地兜底。
 - 本地兜底处理记忆类请求时，会先检索本地记忆和 Feishu 历史命中片段。
 - 本地模型不能伪造“已执行 / 已修改 / 已导入 / 已创建”结果。
+- Ignis 创意生成请求可走本地模型快路径，`local_only` 模式下也能提交和查询 Ignis 任务。
+- 本地快路径新增统一前置判定层：进入 Ignis、MCP、本地执行器前，先判定当前消息是询问、只读查询、明确操作还是歧义混合；歧义默认按询问处理，不直接做 mutating 操作。
+- Ignis、MCP、本地执行器不再各自用散落正则单独决定“是否执行”；统一复用 `fast-path-intent` 内部判定模块。
+- `git status`、读文件、搜索文本现在可作为只读查询由本地执行器直接处理；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
+- 中文仓库查询的只读命中已补齐，“帮我看看 git 状态”“当前分支是什么”“最近几条提交”现在会直接落到本地 repo fast-path，不再先漏到 Codex 再做二次规划。
 
 当前限制：
 
 - Unity/Blender/MCP 多步任务不交给本地模型做主脑。
 - 本地模型适合轻任务，不适合复杂规划。
 - 记忆类兜底依赖已有本地索引和检索命中质量。
+- Ignis “再发 / 重发 / 补发上次结果” 现在优先从本机持久化的 session/fileIds 直接回传，不再误判成新生成，也不附带远端助理的长段解释文本。
 
 ## 4. MCP 管理
 
@@ -87,12 +104,54 @@
 - `blenderMCP`
 - `pictureMCP`
 - `unityPrefabMCP`
+- `ignisMCP`
+
+当前扩展协议：
+
+- `extension-manifest/v1` 由 `suite.manifest.json` 声明。
+- MCP / skill / plugin manifest 使用统一字段管理版本、兼容范围、分类、安装状态和来源。
+- MCP 快路径按 manifest 的 `aliases`、`displayName`、`id` 动态匹配目标，不再在本地执行器里维护固定 MCP 名称列表。
 
 最近重点修复：
 
 - 本地辅助执行器不再把“呼起 Unity 并截图”误判成 MCP 状态检查。
 - 只允许明确 MCP 运维小活走本地 MCP 快路径。
 - MCP 的 `cwd` 必须命中当前默认工作区、允许根目录或 Unity 工程路径，防止串到别的项目。
+
+## 4.1 Ignis 创意生成接入
+
+已完成：
+
+- 安装并初始化本机 `ignis-agent-cli`。
+- 将远端 Ignis skill 固化为项目内 `extensions/skills/ignis-cli`，并同步到本机 Codex skills。
+- 新增 `packages/mcp-ignis`，同时提供 HTTP MCP 和 stdio MCP。
+- 新增 `config/mcp.d/ignis-mcp.json` 和 `config/skills.d/ignis-cli.json`。
+- 新增 `scripts/launch-ignis-mcp.ps1` 和 `scripts/stop-ignis-mcp.ps1`。
+- `scripts/register-external-mcps.ps1` 支持 HTTP MCP 注册。
+- 本地模型新增 Ignis fast-path，支持原画、图片、视频、模型、结果查询、等待完成和继续上一版。
+- 飞书 chat/session 的 Ignis 会话映射保存到 `C:\Users\admin\.claude-to-im\runtime\ignis-sessions.json`。
+- 收紧 Ignis 意图识别：状态/安装/配置问题只检查可用性，不再误提交生成任务。
+- 继续收紧 Ignis 意图识别：“最近几次 / 历史 / 整理成列表” 优先走历史列表，不再因为句子里有 “检查” 就误落到状态查询。
+- “再发我一下上次 Ignis 生成的模型文件 / 重发结果” 现在优先走结果回传，不再被误判成新生成请求。
+- Ignis 回复改为 `cti-final` 结果块，飞书只看到短文本和图片/文件，不再裸发 CLI JSON。
+- 生成任务提交后会等待结果并下载 Ignis 资产，完成时自动随回复回传；超时才提示用户稍后查询。
+- 修复参考图回传误判：Ignis 回复只回传 `artifact_summary` / tool output 中的生成文件，不再把用户上传的 `input.file_ids` 当作生成结果发送。
+- Feishu 适配器补齐本地文件上传，Ignis 生成的 `.glb` 等非图片资产会作为飞书文件回传，不再降级为本地路径文本。
+- 超过飞书 IM 单文件上传限制的 Ignis 资产不再伪装成已回传文件，会改为发送可下载链接和限制说明。
+- 如果本地文件上传失败，bridge 会给用户发出文件名和失败原因，不再只在日志里静默失败。
+- Feishu 回复消息如果指向上一条图片/文件，bridge 会尝试读取被回复消息并把附件带入本次请求。
+- Ignis fast-path 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新请求默认新开会话，避免串到旧图。
+- 新增 Ignis 模型资产后处理：用户明确要求“模型拆成 FBX 和贴图”时，bridge 会下载 Ignis GLB/GLTF，调用 `scripts/export-glb-asset-package.ps1` 通过 Blender 导出 `unity/Model`、`unity/Textures`、`unity/Materials` 和 `manifest.json`，再用 `cti-final.files` 回传未超限文件。
+- Ignis 模型后处理的飞书回传现在只默认交付用户真正需要的 `FBX + 贴图`；`manifest.json` 和 `*.mat.json` 保留为本机内部辅助文件，不再误发给用户。
+- 本地文件出站改成正式的大文件交付链路：`cti-final.files` 中单文件超过 30MB 时不再分卷，而是改走 artifact delivery provider。当前飞书优先支持 `feishu_docx`，会自动创建新版云文档、把超限文件作为附件挂入文档并返回文档链接；也保留 `local_http` 作为公网目录备用方案。未配置上传服务时明确提示配置缺失。
+
+当前约束：
+
+- Ignis config 和 token 只保存在 `C:\Users\admin\.ignis\config.json`。
+- 用户提供的 config 链接不写入仓库、不写入日志、不进入 release 包。
+- 生成任务默认异步返回，避免飞书请求长时间阻塞。
+- 如果用户上传飞书附件，bridge 只负责把已落地的文件上传为 Ignis 参考文件，不由本地模型理解图片内容。
+- FBX/贴图拆分依赖本机 Blender；未安装 Blender 或未设置 `BLENDER_EXE` 时，只回报拆分失败原因，不影响 Ignis 原始模型生成结果。
 
 ## 5. Unity / Blender 工作流
 
@@ -154,6 +213,7 @@
 
 - 仍有历史文件存在乱码内容，部分旧记录回捞可能需要编码修复。
 - 本地模型能力有限，对复杂任务仍不稳定。
+- Ignis 生成能力依赖本机 CLI 配置和远端服务可用性，资产生成可能产生等待时间或服务侧额度消耗。
 - 正在处理的消息如果 bridge 被强制重启，目前没有断点续跑。
 - Feishu 私聊 WS 漏事件已补捞，但如果历史接口也异常，仍可能延迟。
 - `packages/bridge-runtime/scripts/build-control-panel.ps1` 和 `package-release.ps1` 仍作为兼容入口存在，但不再承载旧源码。
@@ -168,10 +228,8 @@
 
 ## 9. 当前未发布改动提示
 
-截至本记录生成时，工作区仍有以下近期代码改动，发布前应通过 `publish-backup.ps1` 打包并提交：
+截至本记录生成时，工作区仍有以下近期代码改动，发布前应按目标分支选择发布入口：
 
-- Feishu p2p 补捞优化。
-- 本地记忆兜底增强。
-- 本地 MCP 快路径收紧。
-- MCP 工作目录校验。
-- 本架构文档和 README 修复。
+- 如果只是更新本机运行副本，使用 `publish-backup.ps1`。
+- 如果准备合入 `main`，先使用 `prepare-main-release.ps1` 完成主干发布预检。
+- 当前重点改动是扩展 manifest v1、主干发布预检脚本、版本治理说明和控制面板运营信息展示。

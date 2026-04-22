@@ -2,6 +2,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+apps/control-panel/wwwroot/
 
 # .NET
 bin/
@@ -28,4 +29,5 @@ output/
 # Release working dirs
 release/artifacts/
 release/portable/packages/*/dist/
+*.WebView2/
 

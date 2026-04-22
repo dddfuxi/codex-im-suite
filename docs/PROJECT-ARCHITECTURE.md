@@ -122,7 +122,8 @@ sequenceDiagram
 - Ignis 的“最近几次 / 历史 / 整理成列表”优先走历史列表意图，不再因为出现 “Ignis + 检查” 就误落到状态检查。
 - Ignis 状态、安装、配置、工具列表类问题不进入生成接口；只有明确创意生成意图才提交任务。
 - MCP 快路径只在明确动词下才执行启动、停止、重启和显式 tool call；只说“看看 MCP”时默认返回状态/帮助，不自动操作任何 MCP。
-- 本地执行器把 `git status`、读文件、搜索文本视为只读查询；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
+- 本地执行器把 `git status`、`git branch --show-current`、`git log --oneline -n 10`、读文件、搜索文本视为只读查询；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
+- 中文仓库查询会直接命中同一套只读规则，例如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”会优先走本地 repo fast-path，而不是先升级到 Codex 再二次规划。
 - Ignis 生成类任务提交后会等待完成并下载可回传资产，最终回复走 `cti-final`，避免向飞书裸发 CLI JSON 或大段技术字段。
 - Ignis 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新生成请求默认新开会话。
 - Ignis 模型生成如果明确要求拆成 FBX/贴图，会在 GLB 下载完成后调用 `scripts/export-glb-asset-package.ps1`，输出 FBX、贴图、材质映射和 manifest，并通过 `cti-final.files` 回传不超过飞书限制的文件。
@@ -250,6 +251,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 位置：
 
 - `apps/control-panel`
+- `apps/control-panel/web`
 
 职责：
 
@@ -259,9 +261,18 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 查看 Codex / 本地辅助模式。
 - 启停和检查 MCP。
 - 自动发现 `mcp.d`、`skills.d`、`plugins.d`。
+- 展示 suite 版本、扩展协议版本、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 通过“设置”弹窗修改非敏感路径配置和回复风格配置。
 - 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
-- 一键发布。
+- 本机备份发布和主干发布预检。
+
+截至 2026-04-22，控制面板采用 `WinForms 宿主 + WebView2 + React/Vite`：
+
+- WinForms 负责窗口生命周期、WebView2 Runtime 检测、白名单命令分发、本机脚本调用和文件系统边界。
+- React 前端负责信息架构、导航、状态展示、长任务 pending 状态和活动流。
+- 前端只能通过 WebView 消息协议请求宿主执行命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
+- 本机缺少 WebView2 Runtime 时，宿主显示轻量降级页和安装提示，不回退旧完整 WinForms 面板。
+- GPT 生成的无文字图片素材只用于启动页、空状态和发布预检氛围图，源码位于 `apps/control-panel/web/public/assets`。
 
 面板原则：
 
@@ -270,7 +281,51 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 服务按钮放在对应服务卡里。
 - 状态优先读真实进程和运行审计，不再只信旧 `status.json`。
 
+WebView 命令协议：
+
+```json
+{ "id": "request-id", "type": "command", "command": "state.refresh", "payload": {} }
+```
+
+响应：
+
+```json
+{ "id": "request-id", "type": "result", "ok": true, "data": {} }
+```
+
+宿主推送：
+
+```json
+{ "type": "state", "data": {} }
+```
+
 ## 5. Manifest 驱动扩展
+
+截至 2026-04-22，扩展 manifest 使用 `extension-manifest/v1` 协议。`suite.manifest.json` 是协议版本和 manifest 目录的入口，`scripts/validate-extension-manifests.ps1` 负责校验现有 MCP、skill、plugin 清单。
+
+所有扩展 manifest 都必须声明：
+
+- `id`
+- `displayName`
+- `type`
+- `version`
+- `compatibility`
+- `category`
+- `optional`
+- `installState`
+- `source`
+- `enabled`
+- `description`
+
+通用字段含义：
+
+- `compatibility.protocol` 固定为 `extension-manifest/v1`。
+- `compatibility.suite` 声明兼容的 suite 版本范围。
+- `category` 用于面板展示和运营分组。
+- `optional` 表示缺失时是否阻断主流程。
+- `installState` 表示 `bundled`、`external`、`configured` 或 `missing`。
+- `source` 指向项目内路径、外部插件标识或外部安装源。
+- `aliases` 给运行时提供自然语言匹配词，MCP 快路径按 manifest 动态解析目标，不再维护固定 MCP 名称列表。
 
 ### 5.1 MCP
 
@@ -291,6 +346,13 @@ Ignis CLI MCP，定位为创意生成能力包。
 - `id`
 - `displayName`
 - `type`
+- `version`
+- `compatibility`
+- `category`
+- `optional`
+- `installState`
+- `source`
+- `aliases`
 - `enabled`
 - `launcher`
 - `stopLauncher`
@@ -309,7 +371,10 @@ MCP 安全规则：
 
 ```mermaid
 flowchart LR
-  ManifestDir[config/mcp.d] --> Loader[MCP manifest loader]
+  SuiteManifest[suite.manifest.json] --> Protocol[extension-manifest/v1]
+  Protocol --> ManifestDir[config/mcp.d]
+  ManifestDir --> Loader[MCP manifest loader]
+  Loader --> AliasMatch[按 aliases 和 displayName 匹配目标]
   Loader --> WorkspaceCheck{cwd 是否允许}
   WorkspaceCheck -->|否| Reject[拒绝启动或调用]
   WorkspaceCheck -->|是| Register[注册到 Codex]
@@ -435,19 +500,19 @@ Codex 应输出：
 
 ## 9. 打包与发布
 
-打包：
+本机备份打包：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-发布：
+本机备份发布：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 ```
 
-发布脚本职责：
+本机备份发布脚本职责：
 
 - 构建 package。
 - 构建控制面板。
@@ -458,9 +523,36 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 - 追加 `release-notes.md`。
 - git add / commit / push。
 
+主干发布预检：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\prepare-main-release.ps1
+```
+
+主干发布预检职责：
+
+- 校验 `extension-manifest/v1`。
+- 检查架构文档维护状态。
+- 扫描疑似密钥和 token。
+- 构建 package 和控制面板。
+- 组装 portable 和 installer。
+- 生成 `publish-summary.md` 并追加 `release-notes.md`。
+- 不同步 live skill，不自动 commit，不自动 push。
+
+主干发行标签：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create-main-release-tag.ps1
+```
+
+标签脚本只做只读门禁和 `git tag -a v<version>`：要求工作区干净，默认要求位于 `main`，并重新执行扩展 manifest 严格校验。`prepare-main-release.ps1` 不负责打 tag，避免预检生成的摘要或打包产物把工作区变脏后阻断标签创建。
+
+`main` 是稳定产品主干，`codex/dev` 是日常集成分支，功能分支使用 `codex/<topic>`。合入 `main` 前必须完成构建、测试、扩展 manifest 校验、架构文档检查和发布摘要。
+
 ```mermaid
 flowchart TD
   DevTree[开发版 codex-im-suite] --> BuildPackages[build-packages.ps1]
+  DevTree --> ValidateManifest[validate-extension-manifests.ps1]
   BuildPackages --> SyncLive[sync-live-skill.ps1]
   SyncLive --> LiveRuntime[本机 live skill 运行副本]
   DevTree --> ArchCheck[update-architecture-docs.ps1]
@@ -468,12 +560,17 @@ flowchart TD
   Assemble --> Portable[release/portable]
   Portable --> Zip[portable zip]
   Portable --> Installer[Windows installer]
+  DevTree --> MainPreflight[prepare-main-release.ps1]
+  MainPreflight --> ValidateManifest
+  MainPreflight --> ArchCheck
+  MainPreflight --> Assemble
   DevTree --> PublishSummary[publish-summary.md]
   PublishSummary --> ReleaseNotes[release-notes.md]
   ReleaseNotes --> Git[git commit 和 push]
+  Git --> Tag[create-main-release-tag.ps1]
 ```
 
-同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于发布链路。
+同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。
 
 ### 9.1 入口定位
 

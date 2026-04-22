@@ -13,10 +13,22 @@ interface McpHealthCheck {
   url?: string;
 }
 
+interface ExtensionCompatibility {
+  protocol?: string;
+  suite?: string;
+}
+
 export interface McpManifestRecord {
   id: string;
   displayName?: string;
   type: McpType;
+  version?: string;
+  compatibility?: ExtensionCompatibility;
+  category?: string;
+  optional?: boolean;
+  installState?: string;
+  source?: string;
+  aliases?: string[];
   enabled?: boolean;
   launcher?: string;
   stopLauncher?: string;
@@ -127,6 +139,14 @@ function isPathWithin(baseDir: string, targetDir: string): boolean {
   const targetResolved = path.resolve(targetDir);
   const relative = path.relative(baseResolved, targetResolved);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function compactSearchText(value: string): string {
+  return normalizeSearchText(value).replace(/\s+/g, '');
 }
 
 async function runPowerShellFile(scriptPath: string, cwd: string, env?: Record<string, string>, timeoutMs = 45000): Promise<McpStartStopResult> {
@@ -246,19 +266,58 @@ export class McpBridge {
       });
   }
 
+  private getManifestSearchTerms(manifest: McpManifestRecord): string[] {
+    const rawTerms = [
+      manifest.id,
+      manifest.displayName || '',
+      manifest.registerName || '',
+      manifest.category || '',
+      ...(manifest.aliases || []),
+      path.basename(manifest.manifestPath, '.json'),
+    ];
+    const seen = new Set<string>();
+    return rawTerms
+      .map((item) => normalizeSearchText(item || ''))
+      .filter(Boolean)
+      .filter((item) => {
+        if (seen.has(item)) return false;
+        seen.add(item);
+        return true;
+      })
+      .sort((a, b) => b.length - a.length);
+  }
+
+  listAvailableManifestNames(): string[] {
+    return this.listManifests()
+      .filter((manifest) => manifest.enabled !== false)
+      .map((manifest) => manifest.displayName || manifest.id)
+      .filter(Boolean);
+  }
+
   resolveManifestByHint(hint: string): McpManifestRecord | null {
     const normalized = hint.trim().toLowerCase();
     const manifests = this.listManifests();
     const candidates = manifests.filter((manifest) => {
-      const haystacks = [
-        manifest.id,
-        manifest.displayName || '',
-        manifest.registerName || '',
-        path.basename(manifest.manifestPath, '.json'),
-      ].map((item) => item.toLowerCase());
+      const haystacks = this.getManifestSearchTerms(manifest);
       return haystacks.some((item) => item.includes(normalized) || normalized.includes(item));
     });
     return candidates[0] || null;
+  }
+
+  resolveManifestFromPrompt(prompt: string): McpManifestRecord | null {
+    const normalized = normalizeSearchText(prompt);
+    const compact = compactSearchText(prompt);
+    const candidates = this.listManifests()
+      .filter((manifest) => manifest.enabled !== false)
+      .flatMap((manifest) => this.getManifestSearchTerms(manifest).map((term) => ({ manifest, term })))
+      .sort((a, b) => b.term.length - a.term.length);
+    for (const candidate of candidates) {
+      if (candidate.term.length < 3) continue;
+      if (normalized.includes(candidate.term) || compact.includes(compactSearchText(candidate.term))) {
+        return candidate.manifest;
+      }
+    }
+    return null;
   }
 
   async checkHealth(manifest: McpManifestRecord): Promise<McpHealthStatus> {

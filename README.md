@@ -6,7 +6,19 @@
 
 - 开发入口收口到本仓库，不再依赖散落在外部目录的历史副本。
 - 运行版 live skill 可以从本仓库同步生成。
-- 发布时先同步、构建、打包，再提交和推送，保证 GitHub 备份与可运行产物一致。
+- 本机备份发布继续先同步、构建、打包，再提交和推送，保证 GitHub 备份与可运行产物一致。
+- `main` 主干发布先做协议校验、架构检查和可复现打包，不把本机 live skill 当作主干事实来源。
+
+## 本次大更新
+
+这次更新把仓库从“本机插件拼接版”推进到了“可复现发布的通用套件”：
+
+- 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
+- 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
+- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持服务总览、扩展管理、发布预检、统一日志，以及白天 / 夜晚主题和自适应布局。
+- Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
+- 本地辅助执行器收紧：本地快路径改为统一意图判定，中文只读仓库查询如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”会稳定命中本地 repo fast-path。
+- 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
 ## 快速入口
 
@@ -15,6 +27,10 @@
 - 开发记录：[docs/DEVELOPMENT-LOG.md](./docs/DEVELOPMENT-LOG.md)
 - 目标目录检查：`scripts/doctor-suite-targets.ps1`
 - 架构文档检查：`scripts/update-architecture-docs.ps1`
+- 扩展协议校验：`scripts/validate-extension-manifests.ps1`
+- 主干发布预检：`scripts/prepare-main-release.ps1`
+- 主干发行标签：`scripts/create-main-release-tag.ps1`
+- 控制面板前端源码：`apps/control-panel/web`
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
 - 套件清单：[suite.manifest.json](./suite.manifest.json)
@@ -68,11 +84,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 
 ## 关键命令
 
+校验 MCP / Skill / Plugin 扩展 manifest：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.ps1
+```
+
 构建全部 package 和面板：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
+
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换，并随窗口宽度自动重排导航、卡片和详情区。
 
 打包 portable 和 installer：
 
@@ -80,11 +104,29 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-发布到 GitHub：
+本机备份发布到当前分支：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 ```
+
+该入口会构建开发版、同步 live skill、组装 release、生成摘要、提交并推送当前分支。它用于个人运行副本备份，不作为 `main` 主干门禁。
+
+主干发布预检：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\prepare-main-release.ps1
+```
+
+该入口会校验扩展协议、检查架构文档、构建、打包并生成发布摘要；不会同步 live skill，也不会自动 `git commit`、`git push` 或打 tag。确认 release notes 后再手动提交，并用 `v0.2.0` 这类 tag 标记稳定发行。
+
+主干发行打标签：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create-main-release-tag.ps1
+```
+
+该入口只允许在干净工作区打当前 suite 版本 tag，默认要求位于 `main`；如需在 release 分支试跑，必须显式加 `-AllowNonMain`。
 
 同步项目内 skills 到本机 Codex：
 
@@ -153,3 +195,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\sync-live-skill.ps1
 ## GitHub
 
 仓库地址：[dddfuxi/codex-im-suite](https://github.com/dddfuxi/codex-im-suite)
+
+分支定位：
+
+- `main`：稳定产品主干，只保留可复现源码、通用扩展协议、默认示例和文档。
+- `codex/dev`：日常集成分支。
+- `codex/<topic>`：功能分支前缀。
+
+合入 `main` 前应完成构建、测试、扩展 manifest 校验、架构文档检查、发布摘要和疑似密钥扫描。个人 live skill 更新可以更频繁，但只从已验证的开发版同步，不反向覆盖主干。

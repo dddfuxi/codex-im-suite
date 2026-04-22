@@ -89,4 +89,18 @@ describe('本地执行器判定', () => {
     assert.equal(assessment.executionRisk, 'mutating');
     assert.equal(canExecuteMutatingFastPath(assessment), false);
   });
+
+  it('把中文 git 状态/分支/提交查询判为只读', () => {
+    const statusAssessment = assessExecutorInteraction('帮我看看 git 状态');
+    assert.equal(statusAssessment.interactionIntent, 'query');
+    assert.equal(statusAssessment.executionRisk, 'read_only');
+
+    const branchAssessment = assessExecutorInteraction('当前分支是什么');
+    assert.equal(branchAssessment.interactionIntent, 'query');
+    assert.equal(branchAssessment.executionRisk, 'read_only');
+
+    const logAssessment = assessExecutorInteraction('最近几条提交');
+    assert.equal(logAssessment.interactionIntent, 'query');
+    assert.equal(logAssessment.executionRisk, 'read_only');
+  });
 });

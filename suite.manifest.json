@@ -1,8 +1,39 @@
 {
   "name": "codex-im-suite",
   "displayName": "Feishu CLI / Codex / MCP Suite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "platform": "windows",
+  "branches": {
+    "stable": "main",
+    "integration": "codex/dev",
+    "featurePrefix": "codex/"
+  },
+  "versioning": {
+    "scheme": "semver",
+    "pre1Policy": "Breaking manifest or config protocol changes bump minor; normal features bump minor; fixes bump patch."
+  },
+  "extensionProtocol": {
+    "version": "1.0.0",
+    "id": "extension-manifest/v1",
+    "manifestDirs": [
+      "./config/mcp.d",
+      "./config/skills.d",
+      "./config/plugins.d"
+    ],
+    "requiredFields": [
+      "id",
+      "displayName",
+      "type",
+      "version",
+      "compatibility",
+      "category",
+      "optional",
+      "installState",
+      "source",
+      "enabled",
+      "description"
+    ]
+  },
   "packages": {
     "bridge-core": {
       "path": "./packages/bridge-core",

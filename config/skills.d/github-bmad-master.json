@@ -3,6 +3,15 @@
   "displayName": "GitHub BMAD Master",
   "source": "${SUITE_ROOT}\\extensions\\skills\\github-bmad-master",
   "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.workflow",
+  "optional": true,
+  "installState": "bundled",
+  "aliases": ["bmad", "workflow routing"],
   "enabled": true,
   "description": "Lightweight BMAD workflow orchestrator adapted from GitHub for project status and workflow routing."
 }

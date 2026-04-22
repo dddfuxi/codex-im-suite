@@ -127,9 +127,9 @@ const EXECUTOR_ACTION_RULES: SignalRule[] = [
 ];
 
 const EXECUTOR_READ_ONLY_RULES: SignalRule[] = [
-  { label: 'git状态', pattern: /\bgit status\b/i },
-  { label: 'git分支', pattern: /\bgit branch\b/i },
-  { label: 'git日志', pattern: /\bgit log\b/i },
+  { label: 'git状态', pattern: /(?:\bgit status\b|git\s*状态|查看.*git.*状态|看(?:下|看).*git.*状态|查一下.*git.*状态)/i },
+  { label: 'git分支', pattern: /(?:\bgit branch\b|当前分支|分支是什么|当前.*git.*分支)/i },
+  { label: 'git日志', pattern: /(?:\bgit log\b|最近.*提交|提交记录|最近几条提交)/i },
   { label: '读取文件', pattern: /(读取文件|查看文件|打开文件)/i },
   { label: '搜索文本', pattern: /(搜索文本|查找字符串|搜索[:：]?)/i },
 ];

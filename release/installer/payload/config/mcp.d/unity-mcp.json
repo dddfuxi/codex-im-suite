@@ -2,6 +2,16 @@
   "id": "unityMCP",
   "displayName": "Unity MCP",
   "type": "http",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "mcp.game-engine",
+  "optional": true,
+  "installState": "external",
+  "source": "external:unity-editor-http-mcp",
+  "aliases": ["unity", "unity mcp", "unitymcp"],
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-mcp.ps1",
   "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-unity-mcp.ps1",

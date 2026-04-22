@@ -2,6 +2,16 @@
   "id": "game-studio",
   "displayName": "Game Studio",
   "type": "plugin",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "plugin.game",
+  "optional": true,
+  "installState": "external",
+  "source": "codex-plugin:game-studio",
+  "aliases": ["game studio", "browser game", "playtest"],
   "enabled": true,
   "description": "Optional plugin bundle for game and playtest workflows."
 }

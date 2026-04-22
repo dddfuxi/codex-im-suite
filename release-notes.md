@@ -1,5 +1,17 @@
 ﻿# Release Notes
 
+## 2026-04-22 20:05:43
+
+- Subject: prepare main release v0.2.0
+- Summary source: main-release-preflight
+
+### Preview
+
+- Suite version: 0.2.0
+- Branch policy: main is stable, codex/dev is integration, codex/<topic> is feature work
+- Extension protocol: extension-manifest/v1
+- Package mode: main release packaging skipped live skill sync
+
 ## 2026-04-21 17:20:59
 
 - Subject: refresh panel; sync suite 2026-04-21 17:20:59
@@ -435,11 +447,6 @@ Other suite changes:
 - ?? release/installer/payload/scripts/setup-blender-mcp.ps1
 - ?? release/portable/scripts/setup-blender-mcp.ps1
 - ?? scripts/setup-blender-mcp.ps1
-
-
-
-
-
 
 
 

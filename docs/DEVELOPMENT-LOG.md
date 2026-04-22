@@ -19,12 +19,23 @@
 - 将 `scripts/sync-live-skill.ps1` 收口为“开发版 suite -> live skill”方向，避免 live 反向覆盖开发版。
 - 新增 `scripts/import-live-to-suite.ps1` 作为手动救回 live 改动入口，默认 dry-run，不进入发布流程。
 - 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
+- 将 suite 版本提升到 `0.2.0`，并在 `suite.manifest.json` 中声明 `extension-manifest/v1`。
+- 给 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 补齐统一扩展字段：`version`、`compatibility`、`category`、`optional`、`installState`、`source` 和 `aliases`。
+- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest。
+- 新增 `scripts/package-main-release.ps1` 和 `scripts/prepare-main-release.ps1`，主干发布预检不再同步 live skill，也不自动提交、推送或打 tag。
+- 新增 `scripts/create-main-release-tag.ps1`，打 tag 从预检流程拆出，只允许在干净工作区和稳定分支上执行。
+- 控制面板升级为 WinForms 宿主 + WebView2 + React/Vite 前端；旧 WinForms 控件退为宿主状态层，前端通过白名单命令协议调用本机脚本和状态读取。
+- 控制面板新增 `apps/control-panel/web` 前端源码、GPT 生成的无文字 PNG 氛围素材和 WebView2 Runtime 降级提示。
+- `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
+- 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
+- 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 
 当前约定：
 
 - 以后开发优先改 suite 目录。
 - live skill 通过同步脚本生成。
-- 上传 GitHub 前必须先打包最新开发版。
+- 本机备份发布可以同步 live skill 并推送当前分支；合入 `main` 前必须走主干发布预检。
+- `main` 是稳定产品主干，`codex/dev` 是日常集成分支，功能分支使用 `codex/<topic>`。
 - 面板源码唯一入口是 `apps/control-panel`；安装器源码唯一入口是 `apps/installer`。
 
 ## 2. Feishu 桥接
@@ -66,6 +77,7 @@
 - 本地快路径新增统一前置判定层：进入 Ignis、MCP、本地执行器前，先判定当前消息是询问、只读查询、明确操作还是歧义混合；歧义默认按询问处理，不直接做 mutating 操作。
 - Ignis、MCP、本地执行器不再各自用散落正则单独决定“是否执行”；统一复用 `fast-path-intent` 内部判定模块。
 - `git status`、读文件、搜索文本现在可作为只读查询由本地执行器直接处理；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
+- 中文仓库查询的只读命中已补齐，“帮我看看 git 状态”“当前分支是什么”“最近几条提交”现在会直接落到本地 repo fast-path，不再先漏到 Codex 再做二次规划。
 
 当前限制：
 
@@ -93,6 +105,12 @@
 - `pictureMCP`
 - `unityPrefabMCP`
 - `ignisMCP`
+
+当前扩展协议：
+
+- `extension-manifest/v1` 由 `suite.manifest.json` 声明。
+- MCP / skill / plugin manifest 使用统一字段管理版本、兼容范围、分类、安装状态和来源。
+- MCP 快路径按 manifest 的 `aliases`、`displayName`、`id` 动态匹配目标，不再在本地执行器里维护固定 MCP 名称列表。
 
 最近重点修复：
 
@@ -210,10 +228,8 @@
 
 ## 9. 当前未发布改动提示
 
-截至本记录生成时，工作区仍有以下近期代码改动，发布前应通过 `publish-backup.ps1` 打包并提交：
+截至本记录生成时，工作区仍有以下近期代码改动，发布前应按目标分支选择发布入口：
 
-- Feishu p2p 补捞优化。
-- 本地记忆兜底增强。
-- 本地 MCP 快路径收紧。
-- MCP 工作目录校验。
-- 本架构文档和 README 修复。
+- 如果只是更新本机运行副本，使用 `publish-backup.ps1`。
+- 如果准备合入 `main`，先使用 `prepare-main-release.ps1` 完成主干发布预检。
+- 当前重点改动是扩展 manifest v1、主干发布预检脚本、版本治理说明和控制面板运营信息展示。

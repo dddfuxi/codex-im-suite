@@ -57,6 +57,20 @@ describe('decideConservativeRoute', () => {
     assert.equal(decision.requestKind, 'command_draft');
   });
 
+  it('routes common Chinese git read-only queries to local repo path', () => {
+    const statusDecision = decideConservativeRoute(makeParams('帮我看看 git 状态'), baseConfig);
+    assert.equal(statusDecision.useLocal, true);
+    assert.equal(statusDecision.requestKind, 'repo_query');
+
+    const branchDecision = decideConservativeRoute(makeParams('当前分支是什么'), baseConfig);
+    assert.equal(branchDecision.useLocal, true);
+    assert.equal(branchDecision.requestKind, 'repo_query');
+
+    const logDecision = decideConservativeRoute(makeParams('最近几条提交'), baseConfig);
+    assert.equal(logDecision.useLocal, true);
+    assert.equal(logDecision.requestKind, 'repo_query');
+  });
+
   it('rejects Unity and MCP related requests', () => {
     const decision = decideConservativeRoute(makeParams('帮我检查 Unity MCP 为什么连不上'), baseConfig);
     assert.equal(decision.useLocal, false);

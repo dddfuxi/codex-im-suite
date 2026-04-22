@@ -3,6 +3,15 @@
   "displayName": "Blender MCP GLB Unity Pipeline",
   "source": "${SUITE_ROOT}\\extensions\\skills\\blender-mcp-glb-unity-pipeline",
   "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.asset-pipeline",
+  "optional": true,
+  "installState": "bundled",
+  "aliases": ["blender glb unity", "glb unity pipeline"],
   "enabled": true,
   "description": "Normalize AI-generated GLB assets in Blender, export a stable GLB package with textures, and stage a Unity-ready import package."
 }

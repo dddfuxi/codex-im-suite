@@ -1,3 +1,7 @@
+param(
+    [string]$ControlPanelArtifactDir
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
@@ -5,11 +9,18 @@ $suiteRoot = Get-SuiteRoot
 $portableDir = Join-Path $suiteRoot 'release\portable'
 $artifactsDir = Join-Path $suiteRoot 'release\artifacts'
 $manifest = Get-SuiteManifest -SuiteRoot $suiteRoot
+if (-not $ControlPanelArtifactDir) {
+    $ControlPanelArtifactDir = Join-Path $artifactsDir 'control-panel'
+}
 
 Remove-Item -LiteralPath $portableDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $artifactsDir 'control-panel\CodexImSuiteControlPanel.exe') -Destination $portableDir -Force
+Get-ChildItem -LiteralPath $ControlPanelArtifactDir -Force |
+    Where-Object { $_.Name -notlike '*.pdb' } |
+    ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $portableDir -Recurse -Force
+    }
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'suite.manifest.json') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'README.md') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'AGENTS.md') -Destination $portableDir -Force

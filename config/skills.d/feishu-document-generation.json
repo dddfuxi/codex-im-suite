@@ -3,6 +3,15 @@
   "displayName": "Feishu Document Generation",
   "source": "${SUITE_ROOT}\\extensions\\skills\\feishu-document-generation",
   "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.im-document",
+  "optional": true,
+  "installState": "bundled",
+  "aliases": ["feishu doc", "lark doc", "飞书文档"],
   "enabled": true,
   "description": "Generate or update Feishu docs from bridge output, summaries, and screenshots."
 }

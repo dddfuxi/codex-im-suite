@@ -121,9 +121,11 @@ if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$builtPanelExe = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.exe'
-$builtPanelPdb = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.pdb'
+$builtPanelDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
+$builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'
+$builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
+Copy-ExistingDirectory -Source $builtPanelDir -Target $livePanelDir
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')

@@ -1,6 +1,6 @@
 {
   "name": "mcp-for-unity-prefab",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Unity prefab folder scanner and preview annotator powered by an existing unity-mcp server",
   "scripts": {

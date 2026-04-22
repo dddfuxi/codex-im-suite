@@ -5,6 +5,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 
 namespace ClaudeToImControlPanel;
 
@@ -21,14 +23,18 @@ internal static class Program
 
 internal sealed class MainForm : Form
 {
+    private const string WebHostName = "control-panel.local";
     private readonly string _skillDir;
     private readonly string _ctiHome;
     private readonly string _configPath;
     private readonly string _daemonScript;
     private readonly string _registerMcpScript;
     private readonly string _manifestDir;
+    private readonly string _skillsManifestDir;
+    private readonly string _pluginsManifestDir;
     private readonly string _suiteRoot;
     private readonly string _publishBackupScript;
+    private readonly string _mainReleaseScript;
     private readonly string _localLlmStartScript;
     private readonly string _localLlmStopScript;
     private readonly string _localLlmHealthcheckScript;
@@ -59,6 +65,10 @@ internal sealed class MainForm : Form
     private readonly TextBox _mcpDetails = new();
     private readonly TextBox _log = new();
     private readonly TextBox _historySyncStatus = new();
+    private readonly WebView2 _webView = new();
+    private readonly Panel _webFallback = new();
+    private readonly List<WebActivityRecord> _activities = [];
+    private bool _webReady;
 
     private Dictionary<string, string> _config = new(StringComparer.OrdinalIgnoreCase);
     private List<McpManifest> _manifests = [];
@@ -84,7 +94,14 @@ internal sealed class MainForm : Form
         _manifestDir = string.IsNullOrWhiteSpace(_suiteRoot)
             ? Path.Combine(_skillDir, "mcp.d")
             : Path.Combine(_suiteRoot, "config", "mcp.d");
+        _skillsManifestDir = string.IsNullOrWhiteSpace(_suiteRoot)
+            ? Path.Combine(_skillDir, "skills.d")
+            : Path.Combine(_suiteRoot, "config", "skills.d");
+        _pluginsManifestDir = string.IsNullOrWhiteSpace(_suiteRoot)
+            ? Path.Combine(_skillDir, "plugins.d")
+            : Path.Combine(_suiteRoot, "config", "plugins.d");
         _publishBackupScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "publish-backup.ps1");
+        _mainReleaseScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "prepare-main-release.ps1");
         var localLlmScriptRoot = string.IsNullOrWhiteSpace(_suiteRoot)
             ? Path.Combine(_skillDir, "scripts", "local-llm")
             : Path.Combine(_suiteRoot, "scripts", "local-llm");
@@ -107,18 +124,19 @@ internal sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         Width = 1380;
         Height = 1080;
-        MinimumSize = new Size(1240, 920);
+        MinimumSize = new Size(760, 640);
         Font = new Font("Microsoft YaHei UI", 9F);
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 282));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        Controls.Add(root);
+        var legacyRoot = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12), Visible = false };
+        legacyRoot.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        legacyRoot.RowStyles.Add(new RowStyle(SizeType.Absolute, 282));
+        legacyRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(legacyRoot);
 
-        root.Controls.Add(BuildToolbarPanel(), 0, 0);
-        root.Controls.Add(BuildStatusPanel(), 0, 1);
-        root.Controls.Add(BuildWorkspacePanel(), 0, 2);
+        legacyRoot.Controls.Add(BuildToolbarPanel(), 0, 0);
+        legacyRoot.Controls.Add(BuildStatusPanel(), 0, 1);
+        legacyRoot.Controls.Add(BuildWorkspacePanel(), 0, 2);
+        Controls.Add(BuildWebShellPanel());
 
         Load += async (_, _) =>
         {
@@ -126,8 +144,509 @@ internal sealed class MainForm : Form
             LoadManifests();
             RenderMcpList();
             InitializeManifestWatcher();
+            await InitializeWebViewAsync();
             await RefreshAllAsync();
+            await PushWebStateAsync();
         };
+    }
+
+    private Control BuildWebShellPanel()
+    {
+        var host = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(247, 248, 250) };
+        _webView.Dock = DockStyle.Fill;
+        _webFallback.Dock = DockStyle.Fill;
+        _webFallback.Visible = false;
+        host.Controls.Add(_webView);
+        host.Controls.Add(_webFallback);
+        return host;
+    }
+
+    private async Task InitializeWebViewAsync()
+    {
+        try
+        {
+            _ = CoreWebView2Environment.GetAvailableBrowserVersionString();
+        }
+        catch
+        {
+            ShowWebFallback(
+                "缺少 WebView2 Runtime",
+                "新版控制面板需要 Microsoft Edge WebView2 Runtime。请安装后重启面板。",
+                "https://developer.microsoft.com/microsoft-edge/webview2/");
+            return;
+        }
+
+        var webRoot = ResolveWebRootPath();
+        if (string.IsNullOrWhiteSpace(webRoot) || !Directory.Exists(webRoot))
+        {
+            ShowWebFallback(
+                "前端资源未构建",
+                "未找到 wwwroot/index.html。请先运行 scripts/build-packages.ps1 或在 apps/control-panel/web 执行 npm run build。",
+                string.IsNullOrWhiteSpace(_suiteRoot) ? "" : _suiteRoot);
+            return;
+        }
+
+        try
+        {
+            await _webView.EnsureCoreWebView2Async();
+            _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
+            _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+            _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                WebHostName,
+                webRoot,
+                CoreWebView2HostResourceAccessKind.Allow);
+            _webView.CoreWebView2.WebMessageReceived += async (_, args) => await HandleWebMessageAsync(args.WebMessageAsJson);
+            _webView.CoreWebView2.NavigationCompleted += async (_, args) =>
+            {
+                if (!args.IsSuccess)
+                {
+                    ShowWebFallback("前端加载失败", $"WebView2 无法加载控制面板页面：{args.WebErrorStatus}", webRoot);
+                    return;
+                }
+
+                await PushWebStateAsync();
+            };
+            _webReady = true;
+            _webView.Source = new Uri($"https://{WebHostName}/index.html");
+        }
+        catch (Exception ex)
+        {
+            ShowWebFallback("WebView2 初始化失败", ex.Message, "");
+        }
+    }
+
+    private string ResolveWebRootPath()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "wwwroot"),
+            string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "apps", "control-panel", "wwwroot"),
+        };
+        return candidates.FirstOrDefault(Directory.Exists) ?? "";
+    }
+
+    private void ShowWebFallback(string title, string detail, string target)
+    {
+        _webFallback.Controls.Clear();
+        _webFallback.Visible = true;
+        _webFallback.BringToFront();
+        _webView.Visible = false;
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(42) };
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        _webFallback.Controls.Add(layout);
+
+        var titleLabel = new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            Font = new Font("Microsoft YaHei UI", 18F, FontStyle.Bold),
+            TextAlign = ContentAlignment.BottomCenter,
+        };
+        var detailLabel = new Label
+        {
+            Text = detail,
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DimGray,
+            TextAlign = ContentAlignment.TopCenter,
+        };
+        var buttonBar = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        var openTarget = new Button { Text = "打开相关位置", Width = 132, Height = 34 };
+        openTarget.Click += (_, _) =>
+        {
+            if (!string.IsNullOrWhiteSpace(target)) OpenPath(target);
+        };
+        var refresh = new Button { Text = "重试加载", Width = 108, Height = 34 };
+        refresh.Click += async (_, _) =>
+        {
+            _webFallback.Visible = false;
+            _webView.Visible = true;
+            await InitializeWebViewAsync();
+        };
+        buttonBar.Controls.Add(openTarget);
+        buttonBar.Controls.Add(refresh);
+
+        layout.Controls.Add(titleLabel, 0, 0);
+        layout.Controls.Add(detailLabel, 0, 1);
+        layout.Controls.Add(buttonBar, 0, 2);
+    }
+
+    private async Task HandleWebMessageAsync(string json)
+    {
+        WebCommandRequest? request;
+        try
+        {
+            request = JsonSerializer.Deserialize<WebCommandRequest>(json, WebJsonOptions);
+        }
+        catch (Exception ex)
+        {
+            PostWebMessage(new { type = "result", id = "", ok = false, error = $"请求解析失败：{ex.Message}" });
+            return;
+        }
+
+        if (request is null || request.Type != "command" || string.IsNullOrWhiteSpace(request.Command))
+        {
+            PostWebMessage(new { type = "result", id = request?.Id ?? "", ok = false, error = "无效的 WebView 命令。" });
+            return;
+        }
+
+        try
+        {
+            AddWebActivity("info", "开始执行", request.Command);
+            var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
+            PostWebMessage(new { type = "result", id = request.Id, ok = true, data });
+            await PushWebStateAsync();
+        }
+        catch (Exception ex)
+        {
+            AddWebActivity("error", request.Command, ex.Message);
+            PostWebMessage(new { type = "result", id = request.Id, ok = false, error = ex.Message });
+            await PushWebStateAsync();
+        }
+    }
+
+    private async Task<object?> ExecuteWebCommandAsync(string command, JsonElement payload)
+    {
+        switch (command)
+        {
+            case "state.refresh":
+                await RefreshAllAsync();
+                return await BuildWebStateAsync();
+            case "bridge.start":
+                await RunDaemonAsync("start");
+                return "bridge start requested";
+            case "bridge.stop":
+                await RunDaemonAsync("stop");
+                return "bridge stop requested";
+            case "bridge.restart":
+                await RestartBridgeAsync();
+                return "bridge restarted";
+            case "bridge.logs":
+                await RunDaemonAsync("logs 120");
+                return "bridge logs loaded";
+            case "bridge.status":
+                await CheckBridgeAsync();
+                return _bridgeStatus.Text;
+            case "codex.check":
+                await CheckCodexAsync();
+                return _codexStatus.Text;
+            case "codex.setRouterMode":
+                await SetRouterModeAsync(ReadPayloadString(payload, "mode", "hybrid"));
+                return _codexStatus.Text;
+            case "localLlm.start":
+                await StartLocalLlmAsync();
+                return _localLlmStatus.Text;
+            case "localLlm.stop":
+                await StopLocalLlmAsync();
+                return _localLlmStatus.Text;
+            case "localLlm.check":
+                await CheckLocalLlmAsync();
+                return _localLlmStatus.Text;
+            case "mcp.list":
+                LoadManifests();
+                await UpdateMcpManifestStatesAsync();
+                RenderMcpList();
+                return BuildMcpItems();
+            case "mcp.start":
+                SelectMcpById(ReadPayloadString(payload, "id", ""));
+                await StartSelectedMcpAsync();
+                return _mcpRuntimeStatus.Text;
+            case "mcp.stop":
+                SelectMcpById(ReadPayloadString(payload, "id", ""));
+                await StopSelectedMcpAsync();
+                return _mcpRuntimeStatus.Text;
+            case "mcp.check":
+                SelectMcpById(ReadPayloadString(payload, "id", ""));
+                await CheckSelectedMcpAsync();
+                return _mcpRuntimeStatus.Text;
+            case "mcp.registerAll":
+                await RegisterAllMcpsAsync();
+                return _mcpStatus.Text;
+            case "mcp.openLocation":
+                SelectMcpById(ReadPayloadString(payload, "id", ""));
+                OpenSelectedMcpPath();
+                return "opened";
+            case "release.publishBackup":
+                await PublishSuiteAsync();
+                return "publish backup finished";
+            case "release.prepareMainRelease":
+                await PrepareMainReleaseAsync();
+                return "main release preflight finished";
+            case "release.openSummary":
+                OpenLatestPublishSummary();
+                return "opened";
+            case "release.openNotes":
+                OpenReleaseNotes();
+                return "opened";
+            case "release.openSuite":
+                OpenPath(_suiteRoot);
+                return "opened";
+            case "settings.read":
+                return GetSettingsSnapshot();
+            case "settings.save":
+                SaveSettingsFromDialog(ReadSettingsPayload(payload));
+                return GetSettingsSnapshot();
+            case "history.syncAll":
+                await SyncAllFeishuHistoryAsync();
+                return GetFeishuHistorySyncStatusText(full: true);
+            case "history.status":
+                return GetFeishuHistorySyncStatusText(full: true);
+            case "history.listSessions":
+                return BuildSessionItems();
+            case "path.openConfig":
+                OpenPath(_configPath);
+                return "opened";
+            case "path.openManifestDir":
+                OpenPath(_manifestDir);
+                return "opened";
+            case "path.openMemoryRepo":
+                OpenPath(_memoryRepo.Text);
+                return "opened";
+            default:
+                throw new InvalidOperationException($"未知或未授权命令：{command}");
+        }
+    }
+
+    private async Task PushWebStateAsync()
+    {
+        if (!_webReady || _webView.CoreWebView2 is null) return;
+        var state = await BuildWebStateAsync();
+        PostWebMessage(new { type = "state", data = state });
+    }
+
+    private async Task<object> BuildWebStateAsync()
+    {
+        var branch = !string.IsNullOrWhiteSpace(_suiteRoot) ? await RunGitTextAsync("branch --show-current") : "unknown";
+        var commit = !string.IsNullOrWhiteSpace(_suiteRoot) ? await RunGitTextAsync("rev-parse --short HEAD") : "unknown";
+        var status = !string.IsNullOrWhiteSpace(_suiteRoot)
+            ? await RunProcessAsync("powershell.exe", "-NoLogo -NoProfile -Command \"git status --short\"", _suiteRoot)
+            : new ProcessResult(1, "", "");
+        var statusLines = status.ExitCode == 0
+            ? status.Stdout.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries)
+            : Array.Empty<string>();
+        var suite = ReadSuiteVersionInfo();
+        var extensions = ReadExtensionStatus();
+        var mcpItems = BuildMcpItems();
+        return new
+        {
+            generatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            suite = new
+            {
+                version = suite.Version,
+                protocol = suite.Protocol,
+                branch,
+                commit,
+                gitDirty = statusLines.Length,
+                suiteRoot = _suiteRoot,
+                skillDir = _skillDir,
+            },
+            services = new[]
+            {
+                BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
+                BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
+                BuildServiceItem("localLlm", "本地辅助执行器", _localLlmStatus.Text),
+                BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
+                BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
+            },
+            extensions = new
+            {
+                total = extensions.Total,
+                enabled = extensions.Enabled,
+                disabled = extensions.Disabled,
+                missingSources = extensions.MissingSources,
+                items = BuildExtensionItems(),
+            },
+            mcp = new
+            {
+                total = mcpItems.Length,
+                running = mcpItems.Count(item => item.IsRunning),
+                items = mcpItems,
+                selectedId = (_mcpList.SelectedItem as McpManifest)?.Id,
+                runtimeStatus = _mcpRuntimeStatus.Text,
+                details = _mcpDetails.Text,
+            },
+            release = new
+            {
+                publishSummaryExists = File.Exists(Path.Combine(_suiteRoot, "publish-summary.md")),
+                releaseNotesExists = File.Exists(Path.Combine(_suiteRoot, "release-notes.md")),
+                prepareMainReleaseExists = File.Exists(_mainReleaseScript),
+                tagScriptExists = File.Exists(Path.Combine(_suiteRoot, "scripts", "create-main-release-tag.ps1")),
+                pendingChanges = statusLines.Take(80).ToArray(),
+            },
+            settings = GetSettingsSnapshot(),
+            history = new
+            {
+                status = GetFeishuHistorySyncStatusText(full: false),
+                sessions = BuildSessionItems().Take(80).ToArray(),
+            },
+            paths = new
+            {
+                config = _configPath,
+                manifestDir = _manifestDir,
+                memoryRepo = _memoryRepo.Text,
+                logs = Path.Combine(_ctiHome, "logs"),
+            },
+            activities = _activities.TakeLast(220).ToArray(),
+        };
+    }
+
+    private WebServiceItem BuildServiceItem(string id, string title, string text)
+        => new(id, title, ClassifyStatus(text), text);
+
+    private static string ClassifyStatus(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "idle";
+        if (Regex.IsMatch(text, "失败|不可用|异常|错误|缺少|未找到", RegexOptions.IgnoreCase)) return "error";
+        if (Regex.IsMatch(text, "未运行|未启用|dirty|缺依赖", RegexOptions.IgnoreCase)) return "warning";
+        if (Regex.IsMatch(text, "运行中|通过|可用|online|已注册|启用|Suite", RegexOptions.IgnoreCase)) return "ok";
+        return "idle";
+    }
+
+    private WebMcpItem[] BuildMcpItems()
+    {
+        var states = LoadMcpServiceStates();
+        return _manifests.Select(manifest =>
+        {
+            var running = TryGetRunningServiceState(manifest, states, out var state);
+            return new WebMcpItem(
+                manifest.Id ?? "",
+                manifest.DisplayName ?? manifest.Id ?? "",
+                manifest.Type ?? "",
+                manifest.Category ?? "",
+                manifest.Enabled != false,
+                running,
+                state?.ProcessId,
+                manifest.IsRegistered,
+                manifest.InstallState ?? "",
+                manifest.Source ?? "",
+                manifest.Version ?? "",
+                manifest.Compatibility?.Protocol ?? "",
+                manifest.Compatibility?.Suite ?? "",
+                manifest.Aliases ?? [],
+                manifest.Description ?? "");
+        }).ToArray();
+    }
+
+    private WebExtensionItem[] BuildExtensionItems()
+    {
+        var items = new List<WebExtensionItem>();
+        foreach (var dir in new[] { _manifestDir, _skillsManifestDir, _pluginsManifestDir }.Where(Directory.Exists))
+        {
+            foreach (var file in Directory.GetFiles(dir, "*.json").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(file, Encoding.UTF8));
+                    var root = doc.RootElement;
+                    var source = ReadJsonString(root, "source");
+                    var enabled = !root.TryGetProperty("enabled", out var enabledElement) || enabledElement.ValueKind != JsonValueKind.False;
+                    var sourceExists = true;
+                    if (IsLocalManifestSource(source))
+                    {
+                        var expanded = ExpandManifestValue(source);
+                        sourceExists = File.Exists(expanded) || Directory.Exists(expanded);
+                    }
+                    items.Add(new WebExtensionItem(
+                        ReadJsonString(root, "id"),
+                        ReadJsonString(root, "displayName"),
+                        ReadJsonString(root, "type"),
+                        ReadJsonString(root, "category"),
+                        enabled,
+                        ReadJsonString(root, "installState"),
+                        source,
+                        sourceExists,
+                        ReadJsonString(root, "description"),
+                        file));
+                }
+                catch (Exception ex)
+                {
+                    items.Add(new WebExtensionItem(Path.GetFileNameWithoutExtension(file), Path.GetFileName(file), "unknown", "", false, "missing", "", false, ex.Message, file));
+                }
+            }
+        }
+        return items.ToArray();
+    }
+
+    private WebSessionItem[] BuildSessionItems()
+    {
+        try
+        {
+            return LoadConversationEntries()
+                .OrderByDescending(item => item.LastUpdatedAt)
+                .Take(160)
+                .Select(item => new WebSessionItem(item.DisplayName, item.ChannelType, item.ChatType, item.ChatId, item.SessionId, item.Source, item.LocalMessageCount, item.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "", item.Summary))
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            AddWebActivity("warning", "会话索引读取失败", ex.Message);
+            return [];
+        }
+    }
+
+    private bool SelectMcpById(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+        for (var i = 0; i < _mcpList.Items.Count; i++)
+        {
+            if (_mcpList.Items[i] is McpManifest manifest && string.Equals(manifest.Id, id, StringComparison.OrdinalIgnoreCase))
+            {
+                _mcpList.SelectedIndex = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static string ReadPayloadString(JsonElement payload, string name, string fallback)
+    {
+        return payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? fallback
+            : fallback;
+    }
+
+    private SettingsSnapshot ReadSettingsPayload(JsonElement payload)
+    {
+        if (payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("settings", out var settings))
+        {
+            payload = settings;
+        }
+        var current = GetSettingsSnapshot();
+        return new SettingsSnapshot(
+            ReadPayloadString(payload, "defaultWorkDir", current.DefaultWorkDir),
+            ReadPayloadString(payload, "allowedRoots", current.AllowedRoots),
+            ReadPayloadString(payload, "unityProject", current.UnityProject),
+            ReadPayloadString(payload, "memoryRepo", current.MemoryRepo),
+            ReadPayloadString(payload, "additionalDirs", current.AdditionalDirs),
+            ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint));
+    }
+
+    private static string ReadJsonString(JsonElement root, string name)
+        => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+
+    private void PostWebMessage(object message)
+    {
+        if (!_webReady || _webView.CoreWebView2 is null) return;
+        var json = JsonSerializer.Serialize(message, WebJsonOptions);
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => _webView.CoreWebView2.PostWebMessageAsJson(json));
+            return;
+        }
+        _webView.CoreWebView2.PostWebMessageAsJson(json);
+    }
+
+    private void AddWebActivity(string level, string title, string message)
+    {
+        var record = new WebActivityRecord(level, title, MaskSecrets(message), DateTime.Now.ToString("HH:mm:ss"));
+        _activities.Add(record);
+        if (_activities.Count > 500) _activities.RemoveRange(0, _activities.Count - 500);
+        PostWebMessage(new { type = "activity", level = record.Level, title = record.Title, message = record.Message, timestamp = record.Timestamp });
     }
 
     private Control BuildStatusPanel()
@@ -156,7 +675,7 @@ internal sealed class MainForm : Form
             CreateCardButton("检查", async () => await CheckLocalLlmAsync()),
             CreateCardButton("说明", OpenLocalLlmDocs),
             CreateCardButton("路由摘要", ShowLocalRouterSummary));
-        AddStatusCard(layout, "版本信息", _buildStatus, 4);
+        AddStatusCard(layout, "版本 / 扩展", _buildStatus, 4);
         return group;
     }
 
@@ -175,7 +694,8 @@ internal sealed class MainForm : Form
         host.Controls.Add(strip);
 
         AddToolAction(strip, "刷新状态", async () => await RefreshAllAsync());
-        AddToolAction(strip, "一键发布", async () => await PublishSuiteAsync());
+        AddToolAction(strip, "本机备份发布", async () => await PublishSuiteAsync());
+        AddToolAction(strip, "主干发布预检", async () => await PrepareMainReleaseAsync());
         AddToolAction(strip, "设置", ShowSettingsDialog);
         AddToolAction(strip, "查看会话", async () => await ShowConversationViewerAsync());
         AddToolAction(strip, "同步全部历史", async () => await SyncAllFeishuHistoryAsync());
@@ -483,7 +1003,14 @@ internal sealed class MainForm : Form
             $"名称: {manifest.DisplayName}",
             $"ID: {manifest.Id}",
             $"类型: {manifest.Type}",
+            $"协议版本: {manifest.Compatibility?.Protocol ?? "-"}",
+            $"扩展版本: {manifest.Version ?? "-"}",
+            $"分类: {manifest.Category ?? "-"}",
+            $"安装状态: {manifest.InstallState ?? "-"}",
+            $"可选: {(manifest.Optional == true ? "是" : "否")}",
             $"启用: {manifest.Enabled != false}",
+            $"Source: {FormatManifestSource(manifest.Source, manifest)}",
+            $"Aliases: {string.Join(", ", manifest.Aliases ?? [])}",
             $"Launcher: {ResolveManifestPath(manifest.Launcher, manifest)}",
             $"StopLauncher: {ResolveManifestPath(manifest.StopLauncher, manifest)}",
             $"CWD: {ResolveManifestDirectory(manifest.Cwd, manifest)}",
@@ -774,7 +1301,103 @@ internal sealed class MainForm : Form
         var buildTime = File.Exists(exePath) ? File.GetLastWriteTime(exePath).ToString("yyyy-MM-dd HH:mm:ss") : "unknown";
         var branch = await RunGitTextAsync("branch --show-current");
         var commit = await RunGitTextAsync("rev-parse --short HEAD");
-        _buildStatus.Text = $"构建时间: {buildTime}{Environment.NewLine}分支: {branch}{Environment.NewLine}Commit: {commit}";
+        var suite = ReadSuiteVersionInfo();
+        var extensions = ReadExtensionStatus();
+        var localOverrides = CountLocalConfigOverrides();
+        _buildStatus.Text = string.Join(Environment.NewLine, new[]
+        {
+            $"Suite: {suite.Version}",
+            $"扩展协议: {suite.Protocol}",
+            $"扩展: 启用 {extensions.Enabled}/{extensions.Total}，缺依赖 {extensions.MissingSources}",
+            $"本机配置覆盖: {localOverrides} 项",
+            $"构建时间: {buildTime}",
+            $"分支: {branch}",
+            $"Commit: {commit}",
+        });
+    }
+
+    private (string Version, string Protocol) ReadSuiteVersionInfo()
+    {
+        if (string.IsNullOrWhiteSpace(_suiteRoot)) return ("unknown", "unknown");
+        var manifestPath = Path.Combine(_suiteRoot, "suite.manifest.json");
+        if (!File.Exists(manifestPath)) return ("unknown", "unknown");
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(manifestPath, Encoding.UTF8));
+            var root = doc.RootElement;
+            var version = root.TryGetProperty("version", out var versionElement) ? versionElement.GetString() ?? "unknown" : "unknown";
+            var protocol = "unknown";
+            if (root.TryGetProperty("extensionProtocol", out var protocolElement)
+                && protocolElement.TryGetProperty("id", out var idElement)
+                && protocolElement.TryGetProperty("version", out var protocolVersionElement))
+            {
+                protocol = $"{idElement.GetString()}@{protocolVersionElement.GetString()}";
+            }
+            return (version, protocol);
+        }
+        catch
+        {
+            return ("unreadable", "unreadable");
+        }
+    }
+
+    private (int Total, int Enabled, int Disabled, int MissingSources) ReadExtensionStatus()
+    {
+        var dirs = new[] { _manifestDir, _skillsManifestDir, _pluginsManifestDir };
+        var total = 0;
+        var enabled = 0;
+        var disabled = 0;
+        var missingSources = 0;
+        foreach (var dir in dirs.Where(Directory.Exists))
+        {
+            foreach (var file in Directory.GetFiles(dir, "*.json"))
+            {
+                total++;
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(file, Encoding.UTF8));
+                    var root = doc.RootElement;
+                    var isEnabled = !root.TryGetProperty("enabled", out var enabledElement) || enabledElement.ValueKind != JsonValueKind.False;
+                    if (isEnabled) enabled++;
+                    else disabled++;
+
+                    if (isEnabled
+                        && root.TryGetProperty("source", out var sourceElement)
+                        && sourceElement.ValueKind == JsonValueKind.String
+                        && IsLocalManifestSource(sourceElement.GetString()))
+                    {
+                        var source = ExpandManifestValue(sourceElement.GetString());
+                        if (!File.Exists(source) && !Directory.Exists(source)) missingSources++;
+                    }
+                }
+                catch
+                {
+                    missingSources++;
+                }
+            }
+        }
+        return (total, enabled, disabled, missingSources);
+    }
+
+    private static bool IsLocalManifestSource(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        return !Regex.IsMatch(value, @"^(external|uvx|codex-plugin|npm|git|https?)[:/]", RegexOptions.IgnoreCase);
+    }
+
+    private int CountLocalConfigOverrides()
+    {
+        var keys = new[]
+        {
+            "CTI_DEFAULT_WORKDIR",
+            "CTI_ALLOWED_WORKSPACE_ROOTS",
+            "CTI_UNITY_PROJECT_PATH",
+            "CTI_MEMORY_REPO_DIR",
+            "CTI_CODEX_ADDITIONAL_DIRECTORIES",
+            "CTI_REPLY_STYLE_HINT",
+            "CTI_LOCAL_LLM_ROUTER_MODE",
+        };
+        return keys.Count(key => _config.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value));
     }
 
     private LocalLlmStatusRecord ReadLocalLlmStatus()
@@ -1412,6 +2035,13 @@ internal sealed class MainForm : Form
         return Path.GetFullPath(Path.Combine(baseDir, expanded));
     }
 
+    private string FormatManifestSource(string? value, McpManifest manifest)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        if (!IsLocalManifestSource(value)) return value;
+        return ResolveManifestPath(value, manifest);
+    }
+
     private string ResolveManifestDirectory(string? value, McpManifest manifest)
     {
         var expanded = ExpandManifestValue(value);
@@ -1457,7 +2087,45 @@ internal sealed class MainForm : Form
         }
 
         var result = await RunPowerShellFileAsync(_publishBackupScript, "", _suiteRoot, 900000);
-        AppendCommand("一键发布", result);
+        AppendCommand("本机备份发布", result);
+        await RefreshBuildInfoAsync();
+    }
+
+    private async Task PrepareMainReleaseAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_mainReleaseScript) || !File.Exists(_mainReleaseScript))
+        {
+            AppendLog("未找到 prepare-main-release.ps1。");
+            return;
+        }
+
+        var preflight = await ValidatePowerShellScriptAsync(_mainReleaseScript);
+        if (!preflight.Success)
+        {
+            AppendLog($"主干发布预检脚本语法失败：{preflight.Message}");
+            MessageBox.Show(
+                this,
+                $"主干发布预检脚本语法失败，已阻止继续执行。\n\n{preflight.Message}",
+                "主干发布预检失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            this,
+            "将执行主干发布预检：扩展协议校验、架构文档检查、构建、打包和发布摘要生成。\n\n不会同步 live skill，不会自动 git commit、push 或打标签。",
+            "主干发布预检",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Information);
+        if (confirm != DialogResult.OK)
+        {
+            AppendLog("已取消主干发布预检。");
+            return;
+        }
+
+        var result = await RunPowerShellFileAsync(_mainReleaseScript, "", _suiteRoot, 900000);
+        AppendCommand("主干发布预检", result);
         await RefreshBuildInfoAsync();
     }
 
@@ -1487,7 +2155,7 @@ internal sealed class MainForm : Form
 
         if (lines.Length == 0)
         {
-            return "当前没有待发布改动。继续执行会只触发同步和打包，不会生成新的 git 提交。";
+            return "当前没有待发布改动。继续执行会触发本机 live 同步和打包，不会生成新的 git 提交。";
         }
 
         var mcpLines = lines.Where(line => Regex.IsMatch(line, @"config[\\/]+mcp\.d[\\/].+\.json|scripts[\\/]+(launch|stop)-.+-mcp\.ps1|extensions[\\/]+blender|packages[\\/]+mcp-")).ToList();
@@ -1524,7 +2192,7 @@ internal sealed class MainForm : Form
         }
 
         builder.AppendLine();
-        builder.AppendLine("确认后将执行：同步 -> 打包 -> git add/commit -> git push");
+        builder.AppendLine("确认后将执行：开发版 -> live skill 同步、打包、git add/commit、git push");
         builder.AppendLine("git 提交信息会自动整理包含 MCP/面板更新摘要。");
         return builder.ToString().TrimEnd();
     }
@@ -1538,7 +2206,7 @@ internal sealed class MainForm : Form
             "2. 改路径后先保存配置，再重启飞书。",
             "3. 注册全部 MCP 用于重新加载外部 MCP。",
             "4. 查看会话优先读取飞书远端会话，再叠加本地 session / 工作目录 / 记忆信息。",
-            "5. 一键发布会用开发版生成 live skill、构建并发布 suite。",
+            "5. 本机备份发布会用开发版生成 live skill、构建并推送当前分支；主干发布预检只验证和打包，不会自动同步 live 或推送。",
         });
         MessageBox.Show(this, helpText, "中控面板帮助", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
@@ -2426,6 +3094,7 @@ internal sealed class MainForm : Form
     private void AppendLog(string text)
     {
         if (InvokeRequired) { BeginInvoke(() => AppendLog(text)); return; }
+        AddWebActivity("info", "日志", text);
         _log.AppendText(text + Environment.NewLine);
         _log.SelectionStart = _log.TextLength;
         _log.ScrollToCaret();
@@ -2547,13 +3216,77 @@ internal sealed class MainForm : Form
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true };
+    private static readonly JsonSerializerOptions WebJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
     private readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
 }
+
+internal sealed class WebCommandRequest
+{
+    public string? Id { get; set; }
+    public string? Type { get; set; }
+    public string? Command { get; set; }
+    public JsonElement Payload { get; set; }
+}
+
+internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
+internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
+internal sealed record WebMcpItem(
+    string Id,
+    string DisplayName,
+    string Type,
+    string Category,
+    bool Enabled,
+    bool IsRunning,
+    int? ProcessId,
+    bool IsRegistered,
+    string InstallState,
+    string Source,
+    string Version,
+    string Protocol,
+    string SuiteRange,
+    string[] Aliases,
+    string Description);
+
+internal sealed record WebExtensionItem(
+    string Id,
+    string DisplayName,
+    string Type,
+    string Category,
+    bool Enabled,
+    string InstallState,
+    string Source,
+    bool SourceExists,
+    string Description,
+    string ManifestPath);
+
+internal sealed record WebSessionItem(
+    string DisplayName,
+    string ChannelType,
+    string ChatType,
+    string ChatId,
+    string SessionId,
+    string Source,
+    int LocalMessageCount,
+    string LastUpdatedAt,
+    string Summary);
 internal sealed class McpManifest
 {
     public string? Id { get; set; }
     public string? DisplayName { get; set; }
     public string? Type { get; set; }
+    public string? Version { get; set; }
+    public ExtensionCompatibility? Compatibility { get; set; }
+    public string? Category { get; set; }
+    public bool? Optional { get; set; }
+    public string? InstallState { get; set; }
+    public string? Source { get; set; }
+    public string[]? Aliases { get; set; }
     public bool? Enabled { get; set; }
     public string? Launcher { get; set; }
     public string? StopLauncher { get; set; }
@@ -2570,7 +3303,13 @@ internal sealed class McpManifest
     public bool? HealthOk { get; set; }
     public string? HealthSummary { get; set; }
     public override string ToString()
-        => $"{StatusBadge ?? ""} {(DisplayName ?? Id)} [{Type}] {(Enabled == false ? "disabled" : "enabled")}".Trim();
+        => $"{StatusBadge ?? ""} {(DisplayName ?? Id)} [{Category ?? Type}] {(Enabled == false ? "disabled" : "enabled")}".Trim();
+}
+
+internal sealed class ExtensionCompatibility
+{
+    public string? Protocol { get; set; }
+    public string? Suite { get; set; }
 }
 
 internal sealed class McpHealthCheck

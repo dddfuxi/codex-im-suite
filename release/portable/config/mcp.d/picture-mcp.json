@@ -2,9 +2,18 @@
   "id": "pictureMCP",
   "displayName": "Picture MCP",
   "type": "stdio",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "mcp.vision",
+  "optional": true,
+  "installState": "bundled",
+  "source": "${SUITE_ROOT}\\packages\\mcp-picture",
+  "aliases": ["picture", "picture mcp", "picturemcp", "图片 mcp"],
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-picture-mcp.ps1",
-  "cwd": "${SUITE_ROOT}\\..\\MCP-for-Picture",
   "registerName": "pictureMCP",
   "healthCheck": {
     "kind": "codex-mcp-list"
