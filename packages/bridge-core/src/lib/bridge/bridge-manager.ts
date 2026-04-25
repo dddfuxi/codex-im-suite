@@ -54,6 +54,8 @@ const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
+const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
+const SYSTEM_ACTION_CONFIRM_TTL_MS = 2 * 60 * 1000;
 const FINAL_ENVELOPE_STATUS_PATH = path.join(
   BRIDGE_HOME,
   'runtime',
@@ -116,6 +118,40 @@ function appendReplyEndMarker(text: string): string {
   if (!trimmed) return marker;
   if (trimmed.endsWith(marker)) return text;
   return `${trimmed}\n\n${marker}`;
+}
+
+const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|看一眼|查一下|分析一下|整理.*列表)/i;
+const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
+
+function isToolExecutionRequestText(text: string): boolean {
+  return TOOL_EXECUTION_REQUEST_PATTERN.test(text);
+}
+
+function containsOutsourcedToolReply(text: string): boolean {
+  return OUTSOURCED_TOOL_REPLY_PATTERN.test(text);
+}
+
+function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  if (!containsOutsourcedToolReply(trimmed)) return trimmed;
+  if (!isToolExecutionRequestText(sourcePrompt) && !isToolExecutionRequestText(trimmed)) return trimmed;
+
+  const lines = trimmed
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const blocker = lines.find((line) => /(未完成|失败|不可用|没有可用|无法执行|阻塞|报错|错误)/i.test(line));
+  const domain = /unity|unitymcp|unity\s*mcp|hsscene|furniture_|prefab|timeline|场景|节点/i.test(`${sourcePrompt}\n${trimmed}`)
+    ? 'Unity/MCP'
+    : /blender/i.test(`${sourcePrompt}\n${trimmed}`)
+      ? 'Blender/MCP'
+      : '工具链';
+  return [
+    blocker || `未完成：这个请求需要实际 ${domain} 执行结果，本轮没有拿到可用工具输出。`,
+    '已拦截通用手动排查步骤；这类请求必须由工具执行链完成，不能把任务退回给用户。',
+  ].join('\n');
 }
 
 function formatBytes(bytes: number): string {
@@ -237,6 +273,16 @@ interface PreparedBridgeReplyPayload {
   replyTo?: string;
 }
 
+interface PendingSystemAction {
+  type: 'shutdown';
+  chatId: string;
+  channelType: string;
+  userId: string;
+  sourceMessageId: string;
+  requestedAt: number;
+  expiresAt: number;
+}
+
 function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' | 'HTML' {
   switch ((mode || 'plain').trim().toLowerCase()) {
     case 'markdown':
@@ -246,6 +292,18 @@ function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' |
     default:
       return 'plain';
   }
+}
+
+function getPendingSystemActions(): Map<string, PendingSystemAction> {
+  const globalState = globalThis as Record<string, unknown>;
+  if (!globalState[PENDING_SYSTEM_ACTIONS_KEY]) {
+    globalState[PENDING_SYSTEM_ACTIONS_KEY] = new Map<string, PendingSystemAction>();
+  }
+  return globalState[PENDING_SYSTEM_ACTIONS_KEY] as Map<string, PendingSystemAction>;
+}
+
+function makeSystemActionKey(channelType: string, chatId: string, userId: string): string {
+  return `${channelType}:${chatId}:${userId}`;
 }
 
 function writeFinalEnvelopeStatus(status: FinalEnvelopeStatusRecord): void {
@@ -349,6 +407,7 @@ async function prepareBridgeReplyPayload(
   text: string,
   workingDirectory: string,
   additionalDirectories: string[] = [],
+  sourcePrompt = '',
 ): Promise<PreparedBridgeReplyPayload> {
   const envelope = extractFinalReplyEnvelope(text);
   if (envelope) {
@@ -360,7 +419,7 @@ async function prepareBridgeReplyPayload(
       updatedAt: new Date().toISOString(),
     });
     return {
-      text: appendReplyEndMarker(envelope.text || ''),
+      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(envelope.text || '', sourcePrompt)),
       parseMode: parseReplyMode(envelope.reply_mode),
       images: resolveExplicitPaths(envelope.images, workingDirectory, additionalDirectories),
       files: resolveExplicitPaths(envelope.files, workingDirectory, additionalDirectories),
@@ -380,7 +439,7 @@ async function prepareBridgeReplyPayload(
       updatedAt: new Date().toISOString(),
     });
     return {
-      text: appendReplyEndMarker(visibleEnvelope.text || ''),
+      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(visibleEnvelope.text || '', sourcePrompt)),
       parseMode: parseReplyMode(visibleEnvelope.reply_mode),
       images: resolveExplicitPaths(visibleEnvelope.images, workingDirectory, additionalDirectories),
       files: resolveExplicitPaths(visibleEnvelope.files, workingDirectory, additionalDirectories),
@@ -397,7 +456,7 @@ async function prepareBridgeReplyPayload(
       updatedAt: new Date().toISOString(),
     });
     return {
-      text: appendReplyEndMarker(visible),
+      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(visible, sourcePrompt)),
       parseMode: 'plain',
       images: [],
       files: [],
@@ -413,7 +472,7 @@ async function prepareBridgeReplyPayload(
     updatedAt: new Date().toISOString(),
   });
   return {
-    text: appendReplyEndMarker(compacted),
+    text: appendReplyEndMarker(sanitizeOutsourcedToolReply(compacted, sourcePrompt)),
     parseMode: 'plain',
     images: [],
     files: [],
@@ -1441,7 +1500,44 @@ function buildOwnerRequiredMessage(msg: InboundMessage): string {
 function isDangerousUserRequest(text: string): boolean {
   const normalized = text.replace(/\s+/g, ' ').trim().toLowerCase();
   if (!normalized) return false;
-  return /(删除|删掉|永久删除|物理删除|清空|删库|重置会话|清会话|清记忆|修改代码|改代码|写代码|提交|commit|push|pull|rebase|merge|checkout|switch|npm install|pnpm install|yarn add|rm -rf|del \/s|remove-item|icacls|takeown|chmod|chown|delete|drop database|truncate)/i.test(normalized);
+  return /(删除|删掉|永久删除|物理删除|清空|删库|重置会话|清会话|清记忆|修改代码|改代码|写代码|提交|commit|push|pull|rebase|merge|checkout|switch|npm install|pnpm install|yarn add|rm -rf|del \/s|remove-item|icacls|takeown|chmod|chown|delete|drop database|truncate|关机|关闭电脑|重启电脑|重启机器|\bshutdown\b|shutdown\s*\/[srg])/i.test(normalized);
+}
+
+function isShutdownRequest(text: string): boolean {
+  const normalized = text.replace(/\s+/g, '').toLowerCase();
+  if (!normalized) return false;
+  return /(关机|关闭电脑|shutdown(?:\/s)?(?:\/t0)?)/i.test(normalized);
+}
+
+function isShutdownConfirmation(text: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  return /^确认关机[。！!]?$/u.test(normalized);
+}
+
+function buildShutdownConfirmPrompt(): string {
+  return [
+    '执行关机指令会立即关闭这台电脑，并中断当前所有工作。',
+    '如需继续，请直接回复：确认关机',
+  ].join('\n');
+}
+
+async function executeConfirmedShutdown(msg: InboundMessage): Promise<void> {
+  const { store } = getBridgeContext();
+  const summary = '执行系统关机：shutdown /s /t 0';
+  store.insertAuditLog({
+    channelType: msg.address.channelType,
+    chatId: msg.address.chatId,
+    direction: 'outbound',
+    messageId: msg.messageId,
+    summary,
+  });
+  console.warn(`[bridge-manager] ${summary}; requested by ${msg.address.userId || '(unknown user)'}`);
+
+  if (process.platform !== 'win32') {
+    throw new Error(`当前平台不支持 Windows 关机命令：${process.platform}`);
+  }
+
+  await execFileAsync('shutdown', ['/s', '/t', '0']);
 }
 
 async function syncFeishuDocumentGuideBestEffort(
@@ -1871,6 +1967,7 @@ async function handleMessage(
 
   const rawText = msg.text.trim();
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
+  const ownerMessage = isOwnerMessage(msg);
 
   // Handle attachment-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
@@ -1894,6 +1991,89 @@ async function handleMessage(
     return;
   }
 
+  const shutdownActionKey = makeSystemActionKey(adapter.channelType, msg.address.chatId, msg.address.userId?.trim() || '');
+  const pendingSystemActions = getPendingSystemActions();
+  const pendingShutdown = pendingSystemActions.get(shutdownActionKey);
+  if (pendingShutdown && pendingShutdown.expiresAt <= Date.now()) {
+    pendingSystemActions.delete(shutdownActionKey);
+  }
+
+  if (isShutdownConfirmation(rawText)) {
+    if (adapter.channelType === 'feishu' && !ownerMessage) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: buildOwnerRequiredMessage(msg),
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+    const currentPending = pendingSystemActions.get(shutdownActionKey);
+    if (!currentPending || currentPending.type !== 'shutdown') {
+      await deliver(adapter, {
+        address: msg.address,
+        text: '当前没有待确认的关机请求。请先发送“关机”。',
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+    pendingSystemActions.delete(shutdownActionKey);
+    await deliver(adapter, {
+      address: msg.address,
+      text: '确认关机。正在执行 shutdown /s /t 0。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    ack();
+    setTimeout(() => {
+      executeConfirmedShutdown(msg).catch((error) => {
+        console.error('[bridge-manager] Failed to execute confirmed shutdown:', error);
+        failBridgeRuntimeRequest(error, activeRequest);
+      });
+    }, 800);
+    return;
+  }
+
+  if (isShutdownRequest(rawText)) {
+    if (adapter.channelType === 'feishu' && !ownerMessage) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: buildOwnerRequiredMessage(msg),
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      ack();
+      return;
+    }
+    pendingSystemActions.set(shutdownActionKey, {
+      type: 'shutdown',
+      chatId: msg.address.chatId,
+      channelType: adapter.channelType,
+      userId: msg.address.userId?.trim() || '',
+      sourceMessageId: msg.messageId,
+      requestedAt: Date.now(),
+      expiresAt: Date.now() + SYSTEM_ACTION_CONFIRM_TTL_MS,
+    });
+    store.insertAuditLog({
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: '收到关机请求，等待二次确认',
+    });
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildShutdownConfirmPrompt(),
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    ack();
+    return;
+  }
+
   // ── Numeric shortcut for permission replies (feishu/qq/weixin only) ──
   // On mobile, typing `/perm allow <uuid>` is painful.
   // If the user sends "1", "2", or "3" and there is exactly one pending
@@ -1912,7 +2092,7 @@ async function handleMessage(
     if (/^[123]$/.test(normalized)) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
-        if (adapter.channelType === 'feishu' && !isOwnerMessage(msg)) {
+        if (adapter.channelType === 'feishu' && !ownerMessage) {
           await deliver(adapter, {
             address: msg.address,
             text: buildOwnerRequiredMessage(msg),
@@ -1999,7 +2179,7 @@ async function handleMessage(
     return;
   }
 
-  if (adapter.channelType === 'feishu' && isDangerousUserRequest(rawText) && !isOwnerMessage(msg)) {
+  if (adapter.channelType === 'feishu' && isDangerousUserRequest(rawText) && !ownerMessage) {
     await deliver(adapter, {
       address: msg.address,
       text: buildOwnerRequiredMessage(msg),
@@ -2011,8 +2191,8 @@ async function handleMessage(
   }
 
   const binding = router.resolve(msg.address);
-  const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, isOwnerMessage(msg));
-  if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && adapter.channelType === 'feishu' && !isOwnerMessage(msg)) {
+  const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
+  if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && adapter.channelType === 'feishu' && !ownerMessage) {
     await deliver(adapter, {
       address: msg.address,
       text: buildOwnerRequiredMessage(msg),
@@ -2321,7 +2501,7 @@ async function handleMessage(
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
     const preparedReply = result.responseText
-      ? await prepareBridgeReplyPayload(result.responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories)
+      ? await prepareBridgeReplyPayload(result.responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
     const userFacingResponseText = preparedReply?.text || '';
 
@@ -2858,7 +3038,10 @@ export function computeSdkSessionUpdate(
 export const _testOnly = {
   handleMessage,
   isDangerousUserRequest,
+  isShutdownRequest,
+  isShutdownConfirmation,
   isFeishuDocumentListRequest,
   isFeishuDocGenerationRequestStrict,
   buildUnityScreenshotPolicyInstructions,
+  sanitizeOutsourcedToolReply,
 };

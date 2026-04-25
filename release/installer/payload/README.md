@@ -15,8 +15,11 @@
 
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
-- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持服务总览、扩展管理、发布预检、统一日志，以及白天 / 夜晚主题和自适应布局。
+- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持统一服务模块、扩展 / MCP 市场视图、会话详情抽屉、路径拖拽选择、回复风格快捷预设，以及白天 / 夜晚主题和自适应布局。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
+- Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
+- 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
+- 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 npm 全局 Codex CLI 的白名单更新按钮。
 - 本地辅助执行器收紧：本地快路径改为统一意图判定，中文只读仓库查询如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”会稳定命中本地 repo fast-path。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
@@ -53,7 +56,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口只保留日常运维；路径和回复风格在“设置”，历史索引在“查看会话”里的“历史索引”页签。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 扩展 / 发布 / 会话 / 设置 / 日志”分区；会话页可直接查看完整消息流，设置页支持目录选择、拖拽回填和回复风格快捷预设。
 
 ## 目录结构
 
@@ -75,6 +78,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 
 默认是 `Codex 主脑 + 本地辅助执行器`：
 
+- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和 `local-tool-agent`。
+- 用户可用 `@codex`、`@claude`、`@local` 显式选择执行器；控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 本地模型只处理明确的小活，例如简单命令、git 状态、文件读取、MCP 状态检查。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
@@ -96,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换，并随窗口宽度自动重排导航、卡片和详情区。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换、统一运行单元动作、会话详情抽屉，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
 
 打包 portable 和 installer：
 

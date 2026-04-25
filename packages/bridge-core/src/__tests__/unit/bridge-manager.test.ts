@@ -144,7 +144,32 @@ describe('bridge-manager policy helpers', () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     assert.equal(_testOnly.isDangerousUserRequest('删掉刚才创建的飞书文档'), true);
     assert.equal(_testOnly.isDangerousUserRequest('git pull 拉到最新'), true);
+    assert.equal(_testOnly.isDangerousUserRequest('现在关机'), true);
     assert.equal(_testOnly.isDangerousUserRequest('截一张场景图'), false);
+  });
+
+  it('detects shutdown requests and confirmation phrases', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.equal(_testOnly.isShutdownRequest('关机'), true);
+    assert.equal(_testOnly.isShutdownRequest('shutdown /s /t 0'), true);
+    assert.equal(_testOnly.isShutdownRequest('帮我总结日志'), false);
+    assert.equal(_testOnly.isShutdownConfirmation('确认关机'), true);
+    assert.equal(_testOnly.isShutdownConfirmation('确认关机。'), true);
+    assert.equal(_testOnly.isShutdownConfirmation('确认'), false);
+  });
+
+  it('blocks manual handoff replies for Unity tool execution requests', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sanitized = _testOnly.sanitizeOutsourcedToolReply(
+      [
+        '未完成：当前没有可用的 Unity 或 MCP 工具来执行此操作。',
+        '请手动检查 Unity 项目中的 HSScene 场景，查找所有以 Furniture_ 前缀命名的节点。',
+      ].join('\n'),
+      '帮我用unitymcp看一眼unity里，HSScene的Furniture_前缀的家具节点都代表什么，分析一下整理一份列表发我',
+    );
+    assert.match(sanitized, /未完成/);
+    assert.match(sanitized, /已拦截通用手动排查步骤/);
+    assert.doesNotMatch(sanitized, /请手动检查|打开你的Unity项目|示例列表/);
   });
 });
 

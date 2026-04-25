@@ -399,6 +399,54 @@ describe('CodexProvider', () => {
     }
   });
 
+  it('uses CTI_CODEX_MODEL override before bridge model forwarding', async () => {
+    const oldPassModel = process.env.CTI_CODEX_PASS_MODEL;
+    const oldOverride = process.env.CTI_CODEX_MODEL;
+    process.env.CTI_CODEX_PASS_MODEL = 'true';
+    process.env.CTI_CODEX_MODEL = 'gpt-5.4';
+    try {
+      const { CodexProvider } = await import('../codex-provider.js');
+      const { PendingPermissions } = await import('../permission-gateway.js');
+      const provider = new CodexProvider(new PendingPermissions());
+
+      let capturedStartOptions: Record<string, unknown> | undefined;
+      const mockThread = {
+        runStreamed: () => ({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        }),
+      };
+      (provider as any).sdk = { Codex: class { constructor() {} } };
+      (provider as any).codex = {
+        startThread: (opts: Record<string, unknown>) => {
+          capturedStartOptions = opts;
+          return mockThread;
+        },
+      };
+
+      const stream = provider.streamChat({
+        prompt: 'hello',
+        sessionId: 'model-override-session',
+        model: 'gpt-5.5',
+      });
+      await collectStream(stream);
+
+      assert.equal(capturedStartOptions?.model, 'gpt-5.4');
+    } finally {
+      if (oldPassModel === undefined) {
+        delete process.env.CTI_CODEX_PASS_MODEL;
+      } else {
+        process.env.CTI_CODEX_PASS_MODEL = oldPassModel;
+      }
+      if (oldOverride === undefined) {
+        delete process.env.CTI_CODEX_MODEL;
+      } else {
+        process.env.CTI_CODEX_MODEL = oldOverride;
+      }
+    }
+  });
+
   it('passes skipGitRepoCheck only when CTI_CODEX_SKIP_GIT_REPO_CHECK=true', async () => {
     const old = process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK;
     process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK = 'true';
@@ -584,7 +632,9 @@ describe('CodexProvider image input', () => {
     const parts = capturedInput as Array<Record<string, string>>;
     assert.equal(parts.length, 2);
     assert.equal(parts[0].type, 'text');
-    assert.equal(parts[0].text, 'Current user request:\nDescribe this image');
+    assert.match(parts[0].text, /Bridge reply contract:/);
+    assert.match(parts[0].text, /not a helper giving the user homework/);
+    assert.match(parts[0].text, /Current user request:\nDescribe this image$/);
     assert.equal(parts[1].type, 'local_image');
     assert.ok(parts[1].path.endsWith('.png'), 'Temp file should have .png extension');
   });
@@ -620,7 +670,9 @@ describe('CodexProvider image input', () => {
     await collectStream(stream);
 
     assert.equal(typeof capturedInput, 'string', 'Input should be a plain string without images');
-    assert.equal(capturedInput, 'Current user request:\nHello');
+    assert.match(capturedInput as string, /Bridge reply contract:/);
+    assert.match(capturedInput as string, /Do not answer executable tasks with generic instructions/);
+    assert.match(capturedInput as string, /Current user request:\nHello$/);
   });
 
   it('builds local_image input with multiple images, ignoring non-image files', async () => {

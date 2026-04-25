@@ -1,0 +1,22 @@
+{
+  "name": "codex-im-suite",
+  "version": "0.2.0",
+  "private": true,
+  "workspaces": [
+    "packages/bridge-core",
+    "packages/bridge-runtime",
+    "packages/mcp-picture",
+    "packages/mcp-unity-prefab",
+    "packages/mcp-ignis",
+    "apps/control-panel/web"
+  ],
+  "scripts": {
+    "build": "powershell -ExecutionPolicy Bypass -File ./scripts/build-packages.ps1",
+    "test:core": "npm --workspace packages/bridge-core test",
+    "test:runtime": "npm --workspace packages/bridge-runtime test",
+    "validate:extensions": "powershell -ExecutionPolicy Bypass -File ./scripts/validate-extension-manifests.ps1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

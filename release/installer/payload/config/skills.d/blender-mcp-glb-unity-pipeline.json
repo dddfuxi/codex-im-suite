@@ -11,6 +11,7 @@
   "category": "skill.asset-pipeline",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "aliases": ["blender glb unity", "glb unity pipeline"],
   "enabled": true,
   "description": "Normalize AI-generated GLB assets in Blender, export a stable GLB package with textures, and stage a Unity-ready import package."

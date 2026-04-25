@@ -11,6 +11,7 @@
   "category": "skill.im-document",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "aliases": ["feishu doc", "lark doc", "飞书文档"],
   "enabled": true,
   "description": "Generate or update Feishu docs from bridge output, summaries, and screenshots."

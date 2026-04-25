@@ -10,6 +10,7 @@
   "category": "mcp.vision",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "source": "${SUITE_ROOT}\\packages\\mcp-picture",
   "aliases": ["picture", "picture mcp", "picturemcp", "图片 mcp"],
   "enabled": true,

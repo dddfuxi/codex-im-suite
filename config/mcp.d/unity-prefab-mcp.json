@@ -10,6 +10,7 @@
   "category": "mcp.game-engine",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "source": "${SUITE_ROOT}\\packages\\mcp-unity-prefab",
   "aliases": ["prefab", "prefab mcp", "unity prefab mcp", "预制体 mcp"],
   "enabled": true,

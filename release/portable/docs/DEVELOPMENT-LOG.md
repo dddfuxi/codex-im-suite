@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-22
+更新时间：2026-04-25
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -29,6 +29,14 @@
 - `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
+- 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
+- 会话页新增详情抽屉，支持直接查看完整消息流、复制摘要和复制消息文本，不再强依赖旧 WinForms 会话查看器。
+- 会话详情抽屉补齐图片和附件查看：宿主会读取 Feishu 原始消息资源键，下载图片/文件到本机 `runtime/control-panel-media` 缓存，并通过 WebView2 虚拟域 `control-panel-media.local` 给前端加载。前端展示图片缩略图、附件名称、大小、MIME、路径和下载状态，不再把图片简单显示成占位文本。
+- 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
+- 会话详情对旧本地消息增加只读显示修复：检测到 `鍖/涓/妫/杩/€` 等典型 UTF-8 被 GBK 错读的 mojibake 时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
+- 会话详情新增运行历程回溯：按 `sessionId` / `chatId` 关联 workflow run，展示 executor、阶段、状态、prompt 摘要和事件时间线，便于排查一次请求是否卡在授权、路由、执行、收尾或回传阶段。
+- 回复风格快捷预设改为点击即保存到 `CTI_REPLY_STYLE_HINT`，避免前端临时状态被后续 `state.refresh` 用旧配置覆盖。
+- 设置页恢复目录选择和回复风格快捷设置：路径字段支持拖拽、目录选择、快速打开；回复风格支持预设、当前摘要和本地 AI 整理入口。
 
 当前约定：
 
@@ -77,7 +85,18 @@
 - 本地快路径新增统一前置判定层：进入 Ignis、MCP、本地执行器前，先判定当前消息是询问、只读查询、明确操作还是歧义混合；歧义默认按询问处理，不直接做 mutating 操作。
 - Ignis、MCP、本地执行器不再各自用散落正则单独决定“是否执行”；统一复用 `fast-path-intent` 内部判定模块。
 - `git status`、读文件、搜索文本现在可作为只读查询由本地执行器直接处理；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
-- 中文仓库查询的只读命中已补齐，“帮我看看 git 状态”“当前分支是什么”“最近几条提交”现在会直接落到本地 repo fast-path，不再先漏到 Codex 再做二次规划。
+- 中文仓库查询的只读命中已补齐，但 `hybrid` 模式下不再默认由本地先接；“帮我看看 git 状态”“当前分支是什么”“最近几条提交”现在默认先交给 Codex，只有 Codex 不可用时才回退到本地 repo fast-path。
+- 文件读取 / 搜索文本在 `hybrid` 模式下同样改成 Codex 优先，本地只保留窄兜底。
+- `关机`、`shutdown`、重启机器等系统级动作已加入高风险排除列表，不允许本地辅助器省流接管。
+- bridge 重启时现在会清空本地辅助执行器的瞬时 fallback / refusal 状态，控制面板不再把历史 `You've hit your usage limit...` 之类旧兜底文案当成当前异常显示。
+- 控制面板服务状态卡的颜色判定已收紧为“首行状态 + 明确故障短语”优先，不再因为统计项里出现“失败 3”这类历史计数就把本地辅助执行器误标成“异常”。
+- bridge-runtime 启动阶段现在会立即写入 executor 基线状态，避免首次请求前 `executor-status.json` 缺失导致执行器页或辅助器状态缺少依据。
+- 本地执行计划器新增 `rg` 降级保护：简单 `rg ... "pattern"` shell 计划会转换成内置 `search_text`，并在提示词里要求读取/搜索优先使用受控工具，减少 Windows 上 `rg.exe` 被拒绝执行造成的本地辅助失败。
+- MCP 快路径继续收紧：带 `unitymcp` / `blendermcp` 但实际要求检查场景、节点、Prefab、模型、截图或导入导出的任务，不再被本地辅助当成 MCP 状态查询抢答，必须交回 Codex 做正式工具编排。
+- fast-path 执行前判断改为硬约束：Ignis handler 先判断 intent 再读取 manifest / 健康检查；旧 MCP handler 全部委托到新版 preflight，避免老入口继续用散落正则绕过判断。
+- Skill、Codex prompt 和本地兜底 prompt 已补“解决问题优先”约束：工具类任务不能用通用步骤、示例表格或样例脚本代替真实执行；没有真实工具结果时必须明确说未完成和具体阻塞点。
+- 工具任务降级已加硬收口：Codex/MCP 执行链失败后，Unity/Blender/MCP/文档类请求直接返回确定性阻塞原因，不再交给本地模型生成“请手动检查”的教程式回复；bridge-core 出站前也会拦截这类外包式文案。
+- Codex provider 已补模型隔离：bridge 生成自己的 Codex Home 时剔除全局 `model = ...`，并支持 `CTI_CODEX_MODEL` 运行时覆盖。当前本机 Codex CLI 已从 `0.121.0` 升级到 `0.125.0`，`gpt-5.5` 已通过最小请求验证；live 版当前显式设置 `CTI_CODEX_MODEL=gpt-5.5`。
 
 当前限制：
 
@@ -85,6 +104,27 @@
 - 本地模型适合轻任务，不适合复杂规划。
 - 记忆类兜底依赖已有本地索引和检索命中质量。
 - Ignis “再发 / 重发 / 补发上次结果” 现在优先从本机持久化的 session/fileIds 直接回传，不再误判成新生成，也不附带远端助理的长段解释文本。
+
+## 3.1 Workflow / Executor 平台第一阶段
+
+截至 2026-04-25 已完成：
+
+- 新增 root npm workspace，先把 `bridge-runtime` 对 `bridge-core` 的依赖从本机 junction 改为仓库内 `file:../bridge-core`，降低不可复现风险。
+- 新增 `ExecutorManifest`、`ExecutorRequest`、`ExecutorSelection`、`ExecutorRun` 和 `ToolSandboxPolicy` 类型，为 Codex、Claude CLI、本地模型 agent、未来 MCP/外部 agent 留出统一声明接口。
+- 新增 `ExecutorRegistry` 和自动路由：支持 capability 推断、显式 `@codex` / `@claude` / `@local` 覆盖、会话默认 executor、当前真实 provider 偏好。
+- 新增 `workflow-runs.json` 状态存储，记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed` 的第一阶段状态事件。
+- 新增 `executor-status.json` 和 `executor-session-defaults.json`，供控制面板读取执行器目录、最近路由和会话默认设置。
+- bridge-runtime 的 provider 入口已接入 workflow 观测；Codex / Claude / 本地 hub 请求都会在运行时留下 executor selection 和 workflow run。
+- 控制面板新增“执行器”页和只读 WebView 命令：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`executor.list`、`executor.check`、`executor.setSessionDefault`。
+- 新增 executor registry 和 workflow status 单测，覆盖执行器注册、显式覆盖、自动路由、sandbox 策略、workflow 成功和失败记录。
+
+当前限制：
+
+- 这一阶段是 strangler migration 的外壳层：真实执行仍复用现有 provider / local agent 实现，尚未把每个执行器拆成独立 adapter 文件。
+- workflow 当前只做可观察状态机，不做进程重启后的自动续跑。
+- `cti-final` 解析、Markdown card、图片/文件、大文件交付和 owner 二次确认仍在旧链路内，后续需要逐步挂到 workflow event。
+- 本地模型 agent 已有 sandbox policy 声明，但工具执行层仍需继续从 `local-agent-provider.ts` 拆出独立 tool sandbox。
+- `codex_only` 或部分早退路径仍可能只有 provider 级执行，没有完整业务阶段细分；后续应把权限等待、finalizing 和 delivered 结果收口补齐。
 
 ## 4. MCP 管理
 
@@ -184,12 +224,24 @@
 - “查看会话”弹窗使用页签承载会话记录、历史索引检索和同步状态。
 - 本地辅助执行器状态和路由摘要。
 - Feishu WS、私聊补捞、最后阶段、最后活跃请求显示。
+- WebView 会话详情支持手动删除会话。删除会写入本机面板墓碑记录，当前列表立即隐藏该会话；如果远端会话后续产生新更新时间，下一次同步/刷新会重新拉回。
+- WebView 会话详情现在支持图片缩略图和附件状态展示；旧索引缺少媒体元数据时会尝试重新同步远端会话历史，失败时保留可解释的下载失败状态。
+- WebView 会话详情现在展示关联 workflow run 和事件时间线，配合执行器页可以从单条会话追溯到具体路由和运行阶段。
+- WebView 扩展页已按 `MCP / Skill / Plugin / 其他扩展` 分类展示，不再把 manifest 和 MCP 运行单元混成一张“统一扩展 / MCP 清单”。
+- WebView 扩展页已补齐安装入口：skill 通过 `scripts/install-suite-extension.ps1` 同步到本机 Codex skills，带 `installer` 的 MCP 会显示“安装”按钮并走宿主白名单安装脚本。
+- WebView 扩展页已新增“导入本地目录”：支持选择或拖入目录，识别为 skill / mcp，预览将写入的 manifest，再一键导入到 suite 清单。
+- WebView 扩展页的 MCP 状态显示已改为按健康检查、Codex 注册和托管进程综合判断；HTTP 在线或已注册的 MCP 显示为可用，不再把 `bundled` / `external` 安装来源误显示成“待处理”。
+- WebView 服务页新增 Codex CLI 自动更新动作：仅当宿主检测到 npm 全局 `@openai/codex` 安装时显示“更新”，点击后执行固定白名单命令 `npm install -g @openai/codex@latest` 并刷新 Codex 状态。
+- 记忆仓库路径已加门禁：`CTI_MEMORY_REPO_DIR` 不允许落在默认工作目录、Unity 项目目录或它们的子目录下；命中时自动回退到 `CTI_HOME\\memory-repo`，避免把记忆文件写进工程目录。
+- 运行时已补“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类命中 `memory-repo` 笔记的请求，会直接返回笔记内容，不再因为 Codex 失效或本地模型超时而把错误抛给用户。
+- 会话历史里飞书 `interactive` 卡片消息现在会尽量解析正文文本；对旧的 `[卡片消息]` 占位记录，控制面板会优先按 `messageId` 从 `audit.json` 回填摘要，只有 audit 里也缺内容时才需要重新同步飞书历史。
 
 近期注意：
 
 - 面板源码以 `apps/control-panel/Program.cs` 为主版本。
 - live 面板源码镜像和 exe 会从 suite 生成。
 - 如果出现“打开的面板不是最新版”，先看 exe 路径和构建时间。
+- 服务动作已从页面硬编码按钮收口到统一运行单元动作表；后续新增 CLI / daemon / manifest 能力时，优先先补宿主运行单元描述，再接前端展示。
 
 ## 7. 记忆与历史
 
@@ -209,10 +261,20 @@
 
 ## 8. 已知风险和后续建议
 
+## 2026-04-24
+
+已完成：
+
+- `关机 / shutdown` 由桥接层改为确定性系统动作，不再让模型只回确认文案。
+- 这条链路现在只允许 Feishu owner 发起，并要求二次确认 `确认关机`。
+- 二次确认成功后，桥接会先写审计、发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
+- 新增了桥接核心单测，覆盖关机请求和确认短语识别。
+
 风险：
 
 - 仍有历史文件存在乱码内容，部分旧记录回捞可能需要编码修复。
 - 本地模型能力有限，对复杂任务仍不稳定。
+- 本机安全策略可能拒绝 `rg.exe` 等外部检索命令；本地执行器已有基础降级，但 skills 或外部脚本仍应优先使用 PowerShell 原生命令或受控搜索工具。
 - Ignis 生成能力依赖本机 CLI 配置和远端服务可用性，资产生成可能产生等待时间或服务侧额度消耗。
 - 正在处理的消息如果 bridge 被强制重启，目前没有断点续跑。
 - Feishu 私聊 WS 漏事件已补捞，但如果历史接口也异常，仍可能延迟。

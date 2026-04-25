@@ -77,6 +77,11 @@ function shouldPassModelToCodex(): boolean {
   return process.env.CTI_CODEX_PASS_MODEL === 'true';
 }
 
+function getCodexModelOverride(): string | undefined {
+  const model = (process.env.CTI_CODEX_MODEL || '').trim();
+  return model || undefined;
+}
+
 /** Allow Codex to run outside a trusted Git repository when explicitly enabled. */
 function shouldSkipGitRepoCheck(): boolean {
   return process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK === 'true';
@@ -194,6 +199,7 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string): string {
       continue;
     }
     if (skipSection) continue;
+    if (inTopLevel && /^model\s*=/.test(trimmed)) continue;
     if (trimmed.startsWith('model_reasoning_effort')) continue;
     (inTopLevel ? topLevel : sections).push(line);
   }
@@ -277,6 +283,10 @@ function buildBridgeReplyGuardrails(): string {
     '- Prefer a short natural Chinese reply that states: what was done, the key result, and at most one next step if needed.',
     '- Keep only the essential result unless the user explicitly asks for a detailed walkthrough.',
     '- If the task is unfinished or blocked, state the exact blocker briefly instead of narrating your whole investigation.',
+    '- Execution posture: you are the worker responsible for solving the request, not a helper giving the user homework.',
+    '- Do not answer executable tasks with generic instructions, suggested manual steps, placeholder tables, or sample scripts unless the user explicitly asks for a tutorial or draft.',
+    '- For Unity/Blender/MCP/repository/file tasks, the final answer must be based on real tool output, a real command result, or an explicit blocker from a concrete attempt.',
+    '- If no concrete attempt was made for a requested tool workflow, do not produce a final how-to answer. Attempt the tool path first or report the missing prerequisite.',
     '- Never start the user-facing reply with phrases like: 这次是…… / 我会…… / 我先…… / 我继续…… / 我已经确认…… . Start with the actual answer or result directly.',
     '- If the user asked to send something again, repeat the concrete content directly instead of describing your retrieval process.',
     '- If the answer is a mapping, checklist, or correspondence table, include the actual items. Do not stop at an intro sentence.',
@@ -471,16 +481,17 @@ export class CodexProvider implements LLMProvider {
             }
             let savedThreadId = (params.forceFreshThread || !resumeThreads)
               ? undefined
-              : (params.sdkSessionId || inMemoryThreadId || undefined);
+              : (inMemoryThreadId || params.sdkSessionId || undefined);
 
             const approvalPolicy = toApprovalPolicy(params.permissionMode);
             const passModel = shouldPassModelToCodex();
+            const modelOverride = getCodexModelOverride();
             const sandboxMode = getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
             const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
 
             const threadOptions: Record<string, unknown> = {
-              ...(passModel && params.model ? { model: params.model } : {}),
+              ...(modelOverride ? { model: modelOverride } : passModel && params.model ? { model: params.model } : {}),
               ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
               ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),

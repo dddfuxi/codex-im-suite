@@ -35,14 +35,29 @@ import {
   decideConservativeRoute,
   getLocalRouterMode,
   type LocalRouteProtocolResult,
+  type LocalTaskKind,
 } from './local-llm-router.js';
 import {
   appendLocalLlmRouteSummary,
+  clearLocalLlmTransientStatus,
   readLocalLlmStatus,
   updateLocalLlmStatus,
   type LocalLlmRouteSummary,
 } from './local-llm-status.js';
 import { sseEvent } from './sse-utils.js';
+import {
+  inferRequestedExecutorId,
+  readSessionExecutorDefaults,
+  selectExecutor,
+} from './executor-registry.js';
+import { writeExecutorStatus } from './executor-status.js';
+import {
+  appendWorkflowEvent,
+  completeWorkflowRun,
+  failWorkflowRun,
+  setWorkflowExecutor,
+  startWorkflowRun,
+} from './workflow-status.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
@@ -136,6 +151,127 @@ function truncatePreview(text: string, maxChars = 220): string {
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function collectMarkdownFiles(rootDir: string, limit = 24): string[] {
+  if (!rootDir || !fs.existsSync(rootDir)) return [];
+  const files: string[] = [];
+  const queue = [rootDir];
+  while (queue.length > 0 && files.length < limit) {
+    const current = queue.shift();
+    if (!current || !fs.existsSync(current)) continue;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(fullPath);
+        continue;
+      }
+      if (entry.isFile() && fullPath.toLowerCase().endsWith('.md')) {
+        files.push(fullPath);
+        if (files.length >= limit) break;
+      }
+    }
+  }
+  return files;
+}
+
+function parseMarkdownTable(content: string): Array<{ left: string; right: string }> {
+  const lines = content.split(/\r?\n/);
+  const rows: Array<{ left: string; right: string }> = [];
+  for (let index = 0; index < lines.length - 2; index += 1) {
+    const header = lines[index].trim();
+    const divider = lines[index + 1].trim();
+    if (!header.startsWith('|') || !divider.startsWith('|')) continue;
+    if (!/^\|\s*[-: ]+\|\s*[-: ]+\|\s*$/.test(divider)) continue;
+    for (let bodyIndex = index + 2; bodyIndex < lines.length; bodyIndex += 1) {
+      const row = lines[bodyIndex].trim();
+      if (!row.startsWith('|')) break;
+      const cells = row
+        .split('|')
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (cells.length >= 2) {
+        rows.push({ left: cells[0], right: cells[1] });
+      }
+    }
+    if (rows.length > 0) return rows;
+  }
+  return rows;
+}
+
+function formatSceneMemoryTable(rows: Array<{ left: string; right: string }>, title: string): string | null {
+  if (rows.length === 0) return null;
+  const lines = rows.map((row) => `${row.left} == ${row.right}`);
+  return `${title}\n\n${lines.join('\n')}`;
+}
+
+function buildSceneMemoryReplyFromNotes(prompt: string, config: Config): string | null {
+  const normalized = prompt.replace(/\s+/g, '');
+  if (!/常用场景|场景名称|scene|固定对应表|对应表/u.test(normalized)) return null;
+  const memoryRoot = config.memoryRepoDir;
+  if (!memoryRoot || !fs.existsSync(memoryRoot)) return null;
+
+  for (const filePath of collectMarkdownFiles(memoryRoot)) {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    if (!/Scene Common Names|场景/u.test(content)) continue;
+    const rows = parseMarkdownTable(content);
+    if (rows.length === 0) continue;
+    if (/固定对应表|上次我给你的那份|上次那份/u.test(normalized)) {
+      return formatSceneMemoryTable(rows, '固定对应表再发你一次：');
+    }
+    return formatSceneMemoryTable(rows, '常用场景名称对应表：');
+  }
+
+  return null;
+}
+
+function summarizeCodexFailureMessage(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes('401 unauthorized') || normalized.includes('refresh token') || normalized.includes('authentication token')) {
+    return 'Codex 登录已失效，请重新登录。';
+  }
+  return truncatePreview(message, 180) || 'Codex 当前不可用。';
+}
+
+function buildRecallFallbackReply(recallContext: string, codexFailure: string, localFailure?: string): string {
+  const lines = [
+    '先把本地记忆里能确定的内容发给你：',
+    '',
+    recallContext.trim(),
+    '',
+    `补充：${summarizeCodexFailureMessage(codexFailure)}`,
+  ];
+  if (localFailure) {
+    lines.push(`本地辅助也失败了：${truncatePreview(localFailure, 120)}`);
+  }
+  return lines.join('\n');
+}
+
+const TOOL_EXECUTION_PROMPT_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|模型|看一眼|查一下|分析一下|整理.*列表)/i;
+
+function requiresConcreteToolOutput(taskKind: LocalTaskKind, prompt: string): boolean {
+  if (taskKind === 'unity_like' || taskKind === 'blender_like' || taskKind === 'doc_like') return true;
+  if (taskKind !== 'tool_request') return false;
+  return TOOL_EXECUTION_PROMPT_PATTERN.test(prompt);
+}
+
+function buildToolExecutionBlockerReply(taskKind: LocalTaskKind, prompt: string, codexFailure: string, localFailure?: string): string {
+  const domain = /unity|unitymcp|unity\s*mcp|hsscene|furniture_|prefab|timeline|场景|节点/i.test(prompt)
+    ? 'Unity/MCP'
+    : taskKind === 'blender_like'
+      ? 'Blender/MCP'
+      : taskKind === 'doc_like'
+        ? '飞书文档工具'
+        : '工具链';
+  const lines = [
+    `未完成：这个请求需要实际 ${domain} 执行结果，本轮没有拿到可用工具输出。`,
+    `阻塞原因：${summarizeCodexFailureMessage(codexFailure)}`,
+    '不会降级成手动检查步骤或示例列表；没有真实工具结果就不能伪装完成。',
+  ];
+  if (localFailure) {
+    lines.push(`本地辅助也失败了：${truncatePreview(localFailure, 120)}`);
+  }
+  return lines.join('\n');
+}
+
 function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistory: RetrievedFeishuHistoryContext | null): string | undefined {
   const lines: string[] = [];
 
@@ -174,6 +310,7 @@ class HubLlmProvider implements LLMProvider {
     private readonly localProvider: LocalLlamaProvider,
     private readonly localAgent: LocalAgentProvider,
     private readonly fallbackProvider: LLMProvider,
+    private readonly primaryExecutorId: string,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -194,6 +331,22 @@ class HubLlmProvider implements LLMProvider {
 
     return new ReadableStream<string>({
       start: async (controller) => {
+        const workflowRun = this.startObservedWorkflow(params, 'hybrid');
+        let workflowFailed = false;
+        try {
+        const noteShortcut = buildSceneMemoryReplyFromNotes(params.prompt, this.config);
+        if (noteShortcut) {
+          this.emitLocalSuccess(controller, params.sessionId, noteShortcut, undefined, {
+            mode: routerMode,
+            taskKind: 'summarize',
+            decision: 'answer_local',
+            provider: 'local_best_effort',
+            reason: '命中本地记忆笔记快捷回复',
+            compressedPromptChars: 0,
+            compressedHistoryChars: 0,
+          });
+          return;
+        }
         const conservative = decideConservativeRoute(params, this.config);
         if (this.localAgent.canHandleIgnisFastPath(params)) {
           const ignisResult = await this.localAgent.handleIgnisFastPath(controller, params, routerMode);
@@ -252,8 +405,53 @@ class HubLlmProvider implements LLMProvider {
           });
           await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
         }
+        } catch (error) {
+          workflowFailed = true;
+          failWorkflowRun(workflowRun.id, error);
+          throw error;
+        } finally {
+          if (!workflowFailed) {
+            completeWorkflowRun(workflowRun.id);
+          }
+        }
       },
     });
+  }
+
+  private startObservedWorkflow(
+    params: Parameters<LLMProvider['streamChat']>[0],
+    taskKind?: string,
+  ): ReturnType<typeof startWorkflowRun> {
+    const binding = this.store
+      .listChannelBindings()
+      .find((item) => item.codepilotSessionId === params.sessionId);
+    const workflowRun = startWorkflowRun({
+      sessionId: params.sessionId,
+      prompt: params.prompt,
+      channelType: binding?.channelType,
+      chatId: binding?.chatId,
+    });
+    appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
+    appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话、记忆和工作区上下文已准备');
+    const sessionDefaults = readSessionExecutorDefaults(this.config);
+    const requestedExecutorId = inferRequestedExecutorId(params.prompt) || sessionDefaults[params.sessionId];
+    const selection = selectExecutor(this.config, {
+      sessionId: params.sessionId,
+      prompt: params.prompt,
+      workingDirectory: params.workingDirectory,
+      permissionMode: params.permissionMode,
+      requestedExecutorId,
+      preferredExecutorId: this.primaryExecutorId,
+      taskKind,
+      params,
+    }, sessionDefaults[params.sessionId]);
+    writeExecutorStatus(this.config, { sessionId: params.sessionId, selection });
+    setWorkflowExecutor(workflowRun.id, selection.executor.id, selection.reason);
+    appendWorkflowEvent(workflowRun.id, 'executing', 'executor.executing', `执行器开始处理：${selection.executor.displayName}`, {
+      executorId: selection.executor.id,
+      fallbackExecutorIds: selection.fallbackExecutorIds,
+    });
+    return workflowRun;
   }
 
   private applySafetyOverride(route: LocalRouteProtocolResult, conservative: ReturnType<typeof decideConservativeRoute>): LocalRouteProtocolResult {
@@ -506,33 +704,74 @@ class HubLlmProvider implements LLMProvider {
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const result = conservative.useLocal
-        ? await this.localProvider.answer(params, {
-            mode: 'local_only',
-            bestEffort: true,
-            limitReason: `Codex 不可用，改由本地兜底：${message}`,
-            taskKind: conservative.requestKind,
-            commandDraftOnly: conservative.readOnlyDraftOnly,
-            recallContext,
-          })
-        : await this.localProvider.buildBestEffortAnswer(params, `Codex 不可用，当前仅能本地兜底：${message}`, conservative.requestKind);
+      if (requiresConcreteToolOutput(conservative.requestKind, params.prompt)) {
+        this.emitLocalSuccess(controller, params.sessionId, buildToolExecutionBlockerReply(conservative.requestKind, params.prompt, message), undefined, {
+          mode: 'hybrid',
+          taskKind: conservative.requestKind,
+          decision: 'refuse_local',
+          provider: 'local_best_effort',
+          reason: `Codex/MCP 执行链失败，工具任务禁止降级为教程：${message}`,
+          compressedPromptChars: 0,
+          compressedHistoryChars: 0,
+          fallbackReason: message,
+        });
+        return;
+      }
+      if (conservative.allowLocalFallback && this.localAgent.canHandleFastPath(params, { ...conservative, useLocal: true })) {
+        const fastResult = await this.localAgent.handleFastPath(controller, params, {
+          mode: 'hybrid',
+          conservative: {
+            ...conservative,
+            useLocal: true,
+          },
+        });
+        if (fastResult.handled) return;
+      }
+      try {
+        const result = conservative.useLocal
+          ? await this.localProvider.answer(params, {
+              mode: 'local_only',
+              bestEffort: true,
+              limitReason: `Codex 不可用，改由本地兜底：${message}`,
+              taskKind: conservative.requestKind,
+              commandDraftOnly: conservative.readOnlyDraftOnly,
+              recallContext,
+            })
+          : await this.localProvider.buildBestEffortAnswer(params, `Codex 不可用，当前仅能本地兜底：${message}`, conservative.requestKind);
 
-      const finalResult = !conservative.useLocal && recallContext
-        ? await this.localProvider.buildBestEffortAnswer(params, message, conservative.requestKind, recallContext)
-        : result;
+        const finalResult = !conservative.useLocal && recallContext
+          ? await this.localProvider.buildBestEffortAnswer(params, message, conservative.requestKind, recallContext)
+          : result;
 
-      this.emitLocalSuccess(controller, params.sessionId, finalResult.text, finalResult.usage, {
-        mode: 'hybrid',
-        taskKind: conservative.requestKind,
-        decision: conservative.useLocal ? 'answer_local' : 'refuse_local',
-        provider: 'local_best_effort',
-        reason: conservative.useLocal
-          ? `Codex 不可用，显式小活改由本地兜底：${message}`
-          : `Codex 不可用，当前任务仅能本地尽力回答：${message}`,
-        compressedPromptChars: 0,
-        compressedHistoryChars: 0,
-        fallbackReason: message,
-      });
+        this.emitLocalSuccess(controller, params.sessionId, finalResult.text, finalResult.usage, {
+          mode: 'hybrid',
+          taskKind: conservative.requestKind,
+          decision: conservative.useLocal ? 'answer_local' : 'refuse_local',
+          provider: 'local_best_effort',
+          reason: conservative.useLocal
+            ? `Codex 不可用，显式小活改由本地兜底：${message}`
+            : `Codex 不可用，当前任务仅能本地尽力回答：${message}`,
+          compressedPromptChars: 0,
+          compressedHistoryChars: 0,
+          fallbackReason: message,
+        });
+        return;
+      } catch (localError) {
+        const localFailure = localError instanceof Error ? localError.message : String(localError);
+        const finalText = recallContext
+          ? buildRecallFallbackReply(recallContext, message, localFailure)
+          : `${summarizeCodexFailureMessage(message)}${localFailure ? ` 本地辅助也失败了：${truncatePreview(localFailure, 120)}` : ''}`;
+        this.emitLocalSuccess(controller, params.sessionId, finalText, undefined, {
+          mode: 'hybrid',
+          taskKind: conservative.requestKind,
+          decision: 'refuse_local',
+          provider: 'local_best_effort',
+          reason: `Codex 不可用且本地兜底失败：${message}`,
+          compressedPromptChars: 0,
+          compressedHistoryChars: 0,
+          fallbackReason: localFailure,
+        });
+      }
     }
   }
 
@@ -666,18 +905,81 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
   };
 }
 
+class ObservedLLMProvider implements LLMProvider {
+  constructor(
+    private readonly config: Config,
+    private readonly store: BridgeStore,
+    private readonly provider: LLMProvider,
+    private readonly primaryExecutorId: string,
+  ) {}
+
+  streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
+    return new ReadableStream<string>({
+      start: async (controller) => {
+        const binding = this.store
+          .listChannelBindings()
+          .find((item) => item.codepilotSessionId === params.sessionId);
+        const workflowRun = startWorkflowRun({
+          sessionId: params.sessionId,
+          prompt: params.prompt,
+          channelType: binding?.channelType,
+          chatId: binding?.chatId,
+        });
+        try {
+          appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
+          appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话和工作区上下文已准备');
+          const sessionDefaults = readSessionExecutorDefaults(this.config);
+          const requestedExecutorId = inferRequestedExecutorId(params.prompt) || sessionDefaults[params.sessionId];
+          const selection = selectExecutor(this.config, {
+            sessionId: params.sessionId,
+            prompt: params.prompt,
+            workingDirectory: params.workingDirectory,
+            permissionMode: params.permissionMode,
+            requestedExecutorId,
+            preferredExecutorId: this.primaryExecutorId,
+            params,
+          }, sessionDefaults[params.sessionId]);
+          writeExecutorStatus(this.config, { sessionId: params.sessionId, selection });
+          setWorkflowExecutor(workflowRun.id, selection.executor.id, selection.reason);
+          appendWorkflowEvent(workflowRun.id, 'executing', 'executor.executing', `执行器开始处理：${selection.executor.displayName}`, {
+            executorId: selection.executor.id,
+            fallbackExecutorIds: selection.fallbackExecutorIds,
+          });
+          const stream = this.provider.streamChat(params);
+          const reader = stream.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+          completeWorkflowRun(workflowRun.id);
+          controller.close();
+        } catch (error) {
+          failWorkflowRun(workflowRun.id, error);
+          try {
+            controller.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
+            controller.close();
+          } catch {
+            // ignore already closed controller
+          }
+        }
+      },
+    });
+  }
+}
+
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
-  const wrapWithLocalHub = (provider: LLMProvider): LLMProvider => {
-    if (config.localLlmEnabled !== true) return provider;
+  const wrapWithLocalHub = (provider: LLMProvider, primaryExecutorId: string): LLMProvider => {
+    if (config.localLlmEnabled !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
     const localProvider = new LocalLlamaProvider(config);
-    return new HubLlmProvider(config, store, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider);
+    return new HubLlmProvider(config, store, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider, primaryExecutorId);
   };
 
   const runtime = config.runtime;
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms));
+    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex');
   }
 
   if (runtime === 'auto') {
@@ -686,7 +988,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       const check = preflightCheck(cliPath);
       if (check.ok) {
         console.log(`[claude-to-im] Auto: using Claude CLI at ${cliPath} (${check.version})`);
-        return wrapWithLocalHub(new SDKLLMProvider(pendingPerms, cliPath, config.autoApprove));
+        return wrapWithLocalHub(new SDKLLMProvider(pendingPerms, cliPath, config.autoApprove), 'claude-cli');
       }
       console.warn(
         `[claude-to-im] Auto: Claude CLI at ${cliPath} failed preflight: ${check.error}\n` +
@@ -696,7 +998,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms));
+    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex');
   }
 
   const cliPath = resolveClaudeCliPath();
@@ -726,7 +1028,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
     process.exit(1);
   }
 
-  return wrapWithLocalHub(new SDKLLMProvider(pendingPerms, cliPath, config.autoApprove));
+  return wrapWithLocalHub(new SDKLLMProvider(pendingPerms, cliPath, config.autoApprove), 'claude-cli');
 }
 
 interface StatusInfo {
@@ -751,7 +1053,7 @@ function writeStatus(info: StatusInfo): void {
 async function main(): Promise<void> {
   const config = loadConfig();
   setupLogger();
-  updateLocalLlmStatus(config, {});
+  clearLocalLlmTransientStatus(config);
 
   const runId = crypto.randomUUID();
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);
@@ -771,6 +1073,11 @@ async function main(): Promise<void> {
 
   const store = new JsonFileStore(settings);
   const pendingPerms = new PendingPermissions();
+  try {
+    writeExecutorStatus(config);
+  } catch (error) {
+    console.warn('[claude-to-im] Failed to write executor baseline status:', error instanceof Error ? error.message : error);
+  }
   const llm = await resolveProvider(config, pendingPerms, store);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 

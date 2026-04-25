@@ -10,6 +10,7 @@
   "category": "mcp.creative",
   "optional": true,
   "installState": "external",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "source": "uvx:blender-mcp",
   "aliases": ["blender", "blender mcp", "blendermcp"],
   "enabled": true,

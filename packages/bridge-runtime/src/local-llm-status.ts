@@ -158,6 +158,22 @@ export function updateLocalLlmStatus(config: Config, patch: Partial<LocalLlmRunt
   return next;
 }
 
+export function clearLocalLlmTransientStatus(config: Config): LocalLlmRuntimeStatus {
+  return updateLocalLlmStatus(config, {
+    lastRouteReason: '',
+    lastFallbackReason: '',
+    lastDecision: '',
+    lastRefusalReason: '',
+    lastCompressedPromptChars: 0,
+    lastCompressedHistoryChars: 0,
+    lastProvider: undefined,
+    lastRouteLabel: 'unknown',
+    lastCodexPrimary: false,
+    lastRequestKind: '',
+    lastError: '',
+  });
+}
+
 export function appendLocalLlmRouteSummary(
   config: Config,
   summary: LocalLlmRouteSummary,

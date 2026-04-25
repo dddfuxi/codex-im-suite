@@ -481,6 +481,28 @@ function toTaskKind(value: string | undefined, fallback: LocalTaskKind): LocalTa
   return valid.includes(value as LocalTaskKind) ? (value as LocalTaskKind) : fallback;
 }
 
+function tryConvertRipgrepCommand(command: string): SearchTextStep | null {
+  const normalized = command.trim();
+  if (!/^(?:&\s*)?(?:rg|rg\.exe)\b/i.test(normalized)) return null;
+
+  const quotedPattern = normalized.match(/"([^"]+)"/);
+  if (!quotedPattern?.[1]?.trim()) return null;
+
+  const afterPattern = normalized.slice((quotedPattern.index || 0) + quotedPattern[0].length).trim();
+  const explicitPath = afterPattern
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .find((item) => item && !item.startsWith('-') && !/[|;&<>]/.test(item));
+
+  return {
+    type: 'search_text',
+    path: explicitPath || '.',
+    pattern: quotedPattern[1].trim(),
+    reason: '将 rg 检索转换为内置 search_text，避免本机 rg.exe 被系统拒绝执行',
+    requiresPermission: false,
+  };
+}
+
 export class LocalAgentProvider {
   private readonly mcpBridge: McpBridge;
 
@@ -504,6 +526,13 @@ export class LocalAgentProvider {
     params: StreamChatParams,
     mode: LocalRouterMode,
   ): Promise<LocalAgentHandleResult> {
+    const hasFiles = Boolean(params.files?.length);
+    const assessment = assessIgnisInteraction(params.prompt, hasFiles);
+    const intent = inferIgnisFastIntent(params.prompt, hasFiles, assessment);
+    if (!intent) {
+      return { handled: false, fallbackToCodex: true, fallbackReason: 'Ignis fast-path preflight rejected' };
+    }
+
     const manifest = this.mcpBridge.resolveManifestByHint('ignis');
     if (!manifest) {
       const text = '未找到 Ignis MCP manifest。请确认 config/mcp.d/ignis-mcp.json 已安装。';
@@ -512,12 +541,6 @@ export class LocalAgentProvider {
       return { handled: true, fallbackToCodex: false, fallbackReason: 'Ignis MCP manifest missing' };
     }
 
-    const hasFiles = Boolean(params.files?.length);
-    const assessment = assessIgnisInteraction(params.prompt, hasFiles);
-    const intent = inferIgnisFastIntent(params.prompt, hasFiles, assessment);
-    if (!intent) {
-      return { handled: false, fallbackToCodex: true, fallbackReason: 'not an Ignis action' };
-    }
     const health = await this.ensureIgnisMcpOnline(manifest);
     if (!health.ok) {
       const text = `Ignis MCP 不可用：${health.message}`;
@@ -1141,14 +1164,18 @@ export class LocalAgentProvider {
   }
 
   canHandleMcpBridgeFastPath(params: StreamChatParams): boolean {
-    const prompt = params.prompt.toLowerCase();
-    const mentionsMcp = /mcp/i.test(params.prompt);
-    if (!mentionsMcp) return false;
-    if (/(截图|截一张|截图发我|game view|gameview|viewport|视口|相机|camera|拍一张|渲染|导入|生成模型|进入场景|运行游戏|play mode|playmode|场景里|打开unity|呼起unity并|连接mcp截)/i.test(prompt)) return false;
-    return /(检查|状态|连通|在线|健康|启动|停止|重启|工具列表|列出.*工具|有哪些工具|调用.*工具|tool call|tools\/list)/i.test(prompt);
+    return this.canHandleMcpBridgeFastPathV2(params);
   }
 
   async handleMcpBridgeFastPath(
+    controller: ReadableStreamDefaultController<string>,
+    params: StreamChatParams,
+    mode: LocalRouterMode,
+  ): Promise<LocalAgentHandleResult> {
+    return this.handleMcpBridgeFastPathV2(controller, params, mode);
+  }
+
+  private async handleLegacyMcpBridgeFastPath(
     controller: ReadableStreamDefaultController<string>,
     params: StreamChatParams,
     mode: LocalRouterMode,
@@ -1386,6 +1413,7 @@ export class LocalAgentProvider {
           '如果请求涉及 Unity、Blender、MCP、飞书文档、图片、附件、跨群发送，必须让 steps 为空并 action=answer_only。',
           '不要伪造任何执行结果；这里只生成计划。',
           '如果是 shell_command，只写可直接执行的命令本体，不要包代码块。',
+          '读取文件必须优先用 read_file，搜索文本必须优先用 search_text；不要为了读取或搜索生成 rg、grep、findstr、Get-ChildItem、Select-String 这类 shell_command。',
         ].join('\n'),
       },
       {
@@ -1432,6 +1460,10 @@ export class LocalAgentProvider {
     switch (type) {
       case 'shell_command':
         if (typeof step.command !== 'string' || !step.command.trim()) throw new Error('shell_command 缺少 command');
+        {
+          const converted = tryConvertRipgrepCommand(step.command);
+          if (converted) return converted;
+        }
         return {
           type,
           command: step.command.trim(),

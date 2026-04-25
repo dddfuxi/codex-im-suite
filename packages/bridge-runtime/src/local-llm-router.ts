@@ -32,6 +32,7 @@ export interface LocalRouteProtocolResult {
 
 export interface ConservativeRouteDecision {
   useLocal: boolean;
+  allowLocalFallback: boolean;
   requestKind: LocalTaskKind;
   reason: string;
   highRisk: boolean;
@@ -47,6 +48,8 @@ interface PatternRule {
   pattern: RegExp;
   reason: string;
   taskKind?: LocalTaskKind;
+  preferLocal?: boolean;
+  allowFallback?: boolean;
 }
 
 const DEFAULT_MAX_INPUT_CHARS = 6000;
@@ -61,6 +64,7 @@ const HARD_EXCLUDE_PATTERNS: PatternRule[] = [
   { pattern: /(飞书文档|feishu doc|docx|lark doc|云文档)/i, reason: '涉及飞书文档操作', taskKind: 'doc_like' },
   { pattern: /(截图|图片|image|附件|发图|上传图片|标注图)/i, reason: '涉及图片或附件处理', taskKind: 'tool_request' },
   { pattern: /\b(git\s+(pull|push|rebase|merge|reset|checkout|switch|cherry-pick|clean|stash(?:\s+(?:pop|apply))?|commit)|publish|pull request)\b/i, reason: '涉及高风险仓库写操作或发布', taskKind: 'repo_query' },
+  { pattern: /(关机|重启电脑|重启机器|关闭电脑|\bshutdown\b|shutdown\s*\/[srg])/i, reason: '涉及系统级高风险操作', taskKind: 'tool_request' },
   { pattern: /(删库|清空会话|重置桥接|修改桥接配置|删除飞书文档|永久删除)/i, reason: '涉及高风险删除或桥接配置修改', taskKind: 'tool_request' },
   { pattern: /(创建飞书文档|删除飞书文档|发送到其他群|跨群转发)/i, reason: '涉及外部平台真实操作', taskKind: 'tool_request' },
 ];
@@ -71,8 +75,8 @@ const LOCAL_FRIENDLY_PATTERNS: PatternRule[] = [
   { pattern: /(解释这段代码|解释这个函数|这段函数在做什么|代码片段解释|轻量重写)/i, reason: '代码解释请求', taskKind: 'code_explain' },
   { pattern: /(写一个.*脚本|生成.*脚本|小脚本|模板脚本|单文件脚本)/i, reason: '脚本草案请求', taskKind: 'script_draft' },
   { pattern: /(给我一条.*命令|只返回命令|怎么查|如何查看|ahead|behind|落后几条|领先几条|没拉几条)/i, reason: '只读命令草案请求', taskKind: 'command_draft' },
-  { pattern: /(执行命令|运行命令|帮我执行|请执行|帮我拉取一下\s*git|帮我\s*pull|git pull|git status|git fetch|git branch|git log|查看.*git.*状态|看(?:下|看).*git.*状态|查一下.*git.*状态|当前分支|分支是什么|当前.*git.*分支|最近.*提交|提交记录|最近几条提交)/i, reason: '本地可执行的简单命令请求', taskKind: 'repo_query' },
-  { pattern: /(读取文件|查看文件|打开文件|搜索文本|查找字符串)/i, reason: '本地文件读取或检索请求', taskKind: 'tool_request' },
+  { pattern: /(执行命令|运行命令|帮我执行|请执行|帮我拉取一下\s*git|帮我\s*pull|git pull|git status|git fetch|git branch|git log|查看.*git.*状态|看(?:下|看).*git.*状态|查一下.*git.*状态|当前分支|分支是什么|当前.*git.*分支|最近.*提交|提交记录|最近几条提交)/i, reason: '仓库或命令查询默认优先交给 Codex 判断', taskKind: 'repo_query', preferLocal: false, allowFallback: true },
+  { pattern: /(读取文件|查看文件|打开文件|搜索文本|查找字符串)/i, reason: '文件检索请求默认优先交给 Codex 判断', taskKind: 'tool_request', preferLocal: false, allowFallback: true },
   { pattern: /(帮我总结|概括一下|提炼一下|简要说明)/i, reason: '总结类请求', taskKind: 'summarize' },
 ];
 
@@ -159,6 +163,7 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
 
   const fallback = (patch: Partial<ConservativeRouteDecision>): ConservativeRouteDecision => ({
     useLocal: false,
+    allowLocalFallback: false,
     requestKind: 'chat',
     reason: '未命中本地规则',
     highRisk: false,
@@ -218,14 +223,17 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
       const executionIntent = rule.taskKind === 'repo_query' || rule.taskKind === 'tool_request'
         ? looksLikeExecutionIntent(combinedInput) || /\bgit (pull|status|fetch|branch|log)\b/i.test(combinedInput)
         : false;
+      const preferLocal = rule.preferLocal !== false;
+      const allowLocalFallback = rule.allowFallback === true || preferLocal;
       return fallback({
-        useLocal: true,
+        useLocal: preferLocal,
+        allowLocalFallback,
         requestKind: rule.taskKind || 'chat',
         reason: rule.reason,
-        preferredDecision: 'answer_local',
+        preferredDecision: preferLocal ? 'answer_local' : 'escalate_codex',
         readOnlyDraftOnly: rule.taskKind === 'command_draft',
         executionIntent,
-        canFastPath: executionIntent,
+        canFastPath: preferLocal && executionIntent,
       });
     }
   }
@@ -329,7 +337,7 @@ export function createLocalOnlyLimitMessage(reason: string, taskKind: string, co
     return `当前是仅本地模式。我可以直接执行简单 Git 命令，或给你 Git 命令和排查思路；如果当前请求超出本地执行范围，我不会伪造仓库结果。原因：${reason}`;
   }
   if (taskKind === 'unity_like' || taskKind === 'blender_like' || taskKind === 'tool_request') {
-    return `当前是仅本地模式。我不能伪装完成这类工具链操作，只能给你建议步骤。原因：${reason}`;
+    return `当前是仅本地模式。我不能伪装完成这类工具链操作；没有真实工具结果时只报告阻塞原因，不输出操作教程或示例结果。原因：${reason}`;
   }
   return `当前是仅本地模式。这类请求超出本地模型可安全完成的范围。我可以继续给你解释、建议或草案，但不会伪造执行结果。原因：${reason}`;
 }

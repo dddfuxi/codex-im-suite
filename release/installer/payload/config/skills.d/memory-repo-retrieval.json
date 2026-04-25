@@ -11,6 +11,7 @@
   "category": "skill.memory",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "aliases": ["memory repo", "history retrieval"],
   "enabled": true,
   "description": "Retrieve only relevant history from memory repo to avoid token blow-up."

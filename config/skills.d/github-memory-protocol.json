@@ -11,6 +11,7 @@
   "category": "skill.memory",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "aliases": ["memory protocol", "github memory"],
   "enabled": true,
   "description": "Local markdown memory protocol adapted from GitHub for durable preferences and reusable project constraints."

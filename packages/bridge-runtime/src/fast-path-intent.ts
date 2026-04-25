@@ -110,6 +110,11 @@ const MCP_MUTATING_RULES: SignalRule[] = [
   { label: 'MCP显式调用', pattern: /(调用\s+.*?mcp\s*工具|tool call|tools\/call)/i },
 ];
 
+const MCP_DOMAIN_WORK_RULES: SignalRule[] = [
+  { label: 'Unity实际工作', pattern: /(unity里|场景|scene|hsscene|节点|gameobject|hierarchy|层级|prefab|预制体|材质|贴图|截图|相机|运行游戏|play\s*mode|导入|导出|分析.*节点|家具节点)/i },
+  { label: 'Blender实际工作', pattern: /(blender里|模型|mesh|材质|贴图|渲染|导出|导入|glb|gltf|fbx)/i },
+];
+
 const EXECUTOR_OBJECT_RULES: SignalRule[] = [
   { label: 'Git', pattern: /\bgit\b/i },
   { label: '文件', pattern: /(文件|文本|字符串)/i },
@@ -332,11 +337,16 @@ export function inferMcpFastIntent(
   const mentionsMcp = MCP_SYSTEM_RULES.some((rule) => rule.pattern.test(text));
   if (!mentionsMcp) return null;
   if (assessment.interactionIntent === 'explain') return null;
+  const asksDomainWork = MCP_DOMAIN_WORK_RULES.some((rule) => rule.pattern.test(text));
+  const directStatusPattern = /(状态|连接|在线|离线|健康|连通|可用|能用|启动了吗|运行了吗|帮助|工具列表|有哪些工具|tools\/list)/i;
+  const simpleStatusPattern = /^(?:帮我|请)?\s*(?:看看|看下|看一眼|检查一下|检查)\s*(?:一下)?\s*(?:mcp|unity\s*mcp|blender\s*mcp|picture\s*mcp|prefab\s*mcp|ignis\s*mcp|unitymcp|blendermcp|picturemcp|prefabmcp|ignismcp)\s*(?:状态)?\s*$/i;
   if (assessment.interactionIntent === 'action') {
     if (/(启动|拉起|连接|重启)/i.test(text)) return 'start';
     if (/(停止|关闭)/i.test(text)) return 'stop';
     if (/(调用\s+.*?mcp\s*工具|tool call|tools\/call)/i.test(text)) return 'tool_call';
   }
   if (/(工具列表|列出.*工具|有哪些工具|tools\/list)/i.test(text)) return 'list_tools';
-  return 'status';
+  if (asksDomainWork && !directStatusPattern.test(text)) return null;
+  if (directStatusPattern.test(text) || simpleStatusPattern.test(text)) return 'status';
+  return null;
 }

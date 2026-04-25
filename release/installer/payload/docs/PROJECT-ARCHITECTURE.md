@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-04-22
+更新时间：2026-04-25
 
 ## 0. 架构文档维护规则
 
@@ -76,11 +76,12 @@ Feishu 接收现在是双通道：
 
 1. 记录运行审计。
 2. 去重。
-3. 绑定 chat/session。
-4. 构造上下文。
-5. 调用运行时 provider。
-6. 解析最终结果块。
-7. 通过 Feishu 原生 reply/card/image 等方式回复。
+3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、飞书文档列表和 owner 二次确认系统动作。
+4. 绑定 chat/session。
+5. 构造上下文。
+6. 调用运行时 provider。
+7. 解析最终结果块。
+8. 通过 Feishu 原生 reply/card/image 等方式回复。
 
 ```mermaid
 sequenceDiagram
@@ -93,7 +94,7 @@ sequenceDiagram
 
   User->>Feishu: 发送群聊或私聊消息
   Feishu->>Core: WS 事件或 p2p 轮询补捞
-  Core->>Core: 去重、审计、绑定 chat/session
+  Core->>Core: 去重、审计、直接命令门禁
   Core->>Runtime: 构造上下文并请求执行
   Runtime->>Provider: 按策略选择执行层
   Provider-->>Runtime: 返回 cti-final 或可见结果
@@ -103,27 +104,92 @@ sequenceDiagram
   Sender-->>User: 飞书可见回复
 ```
 
+- `关机 / shutdown` 这类系统级动作不再交给模型自由发挥，而是在 `bridge-manager` 里走固定链路：
+  - 仅 Feishu owner 可发起。
+  - 第一步只记录审计并返回确认提示。
+  - 第二步要求用户明确回复 `确认关机`。
+  - 确认后桥接先发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
+  - 这条链路不经过 Codex、本地模型或本地辅助执行器。
+
 ### 2.2 Provider 选择
+
+截至 2026-04-25，运行时新增第一阶段 workflow / executor 内核。旧 provider 仍负责真实流式执行，但请求进入 provider 前会被标准化为可观察的 workflow run，并通过 executor registry 记录路由选择。当前阶段目标是先打通“入站请求 -> 执行器选择 -> 执行中 -> 成功/失败”的稳定观测闭环，后续再把真实执行实现逐步迁移到 executor adapter。
+
+Workflow 状态：
+
+- `received`
+- `authorized`
+- `contextualized`
+- `routed`
+- `executing`
+- `finalizing`
+- `delivered`
+- `failed`
+
+运行时状态文件：
+
+- `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json`
+- `C:\Users\admin\.claude-to-im\runtime\executor-status.json`
+- `C:\Users\admin\.claude-to-im\runtime\executor-session-defaults.json`
+
+Executor 目录当前内置三类：
+
+- `codex`：默认主脑 CLI / SDK 执行器，能力包含对话、代码、仓库查询、文件读写、图片输入和 artifact delivery。
+- `claude-cli`：可切换 CLI 后端，能力包含对话、代码、仓库查询、文件读写和图片输入。
+- `local-tool-agent`：受控本地模型 agent，声明本地工具能力和 sandbox 策略，只允许白名单内的低风险或授权后操作。
+
+路由规则：
+
+- `@codex`、`@claude`、`@local`、`@本地` 显式覆盖当前会话路由。
+- 控制面板可按 session 写入默认 executor。
+- 没有显式覆盖时，按 capability、executor priority 和当前真实 provider 偏好做自动选择。
+- 本地 agent 的工具边界由 `ToolSandboxPolicy` 声明，当前允许只读 git、文件读取、文本搜索、受限单文件写入和 MCP 运维入口；高风险动作必须进入权限策略。
+
+```mermaid
+flowchart TD
+  Inbound[Feishu 入站请求] --> CoreAdapter[bridge-core 适配和上下文]
+  CoreAdapter --> Workflow[bridge-runtime workflow run]
+  Workflow --> Registry[ExecutorRegistry]
+  Registry --> Router[ExecutorRouter capability + 显式覆盖 + 会话偏好]
+  Router --> CodexExecutor[codex executor]
+  Router --> ClaudeExecutor[claude-cli executor]
+  Router --> LocalAgentExecutor[local-tool-agent executor]
+  LocalAgentExecutor --> Sandbox[ToolSandboxPolicy]
+  Sandbox --> LocalTools[只读 git / 文件 / 搜索 / MCP 运维]
+  CodexExecutor --> Provider[现有 provider 执行层]
+  ClaudeExecutor --> Provider
+  LocalAgentExecutor --> Provider
+  Provider --> FinalResponse[cti-final / 可见结果]
+  FinalResponse --> WorkflowDone[workflow delivered 或 failed]
+```
 
 当前默认策略是 `Codex 主脑 + 本地辅助执行器`：
 
-- `hybrid` 模式：默认走 Codex，只有明确小活走本地。
+- `hybrid` 模式：默认先由 Codex 判断和执行；只有显式小活才允许本地直接接管，仓库查询和文件检索默认也先交给 Codex。
 - `local_only` 模式：只用本地能力，不能完成的任务明确拒绝。
 - `codex_only` 模式：禁用本地辅助，全部走 Codex。
 
 本地辅助范围：
 
-- 简单 shell / PowerShell 命令。
-- 简单 git 状态、fetch、pull、branch、log。
-- 文件读取、文本搜索、受控单文件写入。
+- 简单 shell / PowerShell 命令草案。
+- Codex 不可用时的只读仓库查询兜底，例如 `git status`、`git branch --show-current`、`git log --oneline -n 10`。
+- Codex 不可用时的文件读取、文本搜索和受控单文件写入兜底。
 - MCP 运维小活：状态、启动、停止、工具列表、显式 HTTP tool call。
 - Ignis 创意生成快路径：原画、生成图、视频、模型、canvas、file_id、turn_id 的提交和查询。
 - 本地快路径在进入 Ignis、MCP、本地执行器前，统一先做“询问 / 操作”判定；歧义默认按询问处理，只允许只读查询，不直接触发生成、启动、停止、写入或 `git pull`。
+- 所有 fast-path handler 在触碰 MCP manifest、启动服务、调用工具或执行本地计划前，都必须重新做 intent preflight；旧 MCP 快路径入口也委托到同一套判断，避免绕过新版规则。
 - Ignis 的“最近几次 / 历史 / 整理成列表”优先走历史列表意图，不再因为出现 “Ignis + 检查” 就误落到状态检查。
 - Ignis 状态、安装、配置、工具列表类问题不进入生成接口；只有明确创意生成意图才提交任务。
 - MCP 快路径只在明确动词下才执行启动、停止、重启和显式 tool call；只说“看看 MCP”时默认返回状态/帮助，不自动操作任何 MCP。
+- Unity/Blender 场景、节点、Prefab、模型、截图、导入导出这类实际工作即使写了 `unitymcp` / `blendermcp`，也不允许被本地 MCP 状态快路径抢答，必须回到 Codex 主脑做正式工具编排。
 - 本地执行器把 `git status`、`git branch --show-current`、`git log --oneline -n 10`、读文件、搜索文本视为只读查询；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
-- 中文仓库查询会直接命中同一套只读规则，例如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”会优先走本地 repo fast-path，而不是先升级到 Codex 再二次规划。
+- 本地执行器的文本搜索优先走内置 `search_text`，不依赖本机 `rg.exe`；如果本地模型误生成简单 `rg ... "pattern"` 计划，运行时会转换成 sandbox 内搜索，避免系统拒绝执行外部检索命令导致辅助器误报失败。
+- 中文仓库查询仍会命中同一套只读规则，例如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”；但在 `hybrid` 模式下它们默认先交给 Codex，只有 Codex 不可用时才回退到本地 repo fast-path。
+- “读取文件 / 查看文件 / 搜索文本”在 `hybrid` 模式下同样默认先交给 Codex；本地执行器只保留为失败后的窄兜底，不再抢答主链路。
+- `关机`、`shutdown`、重启机器等系统级动作现在直接标记为高风险请求，不允许走本地省流路径。
+- 对 Unity、Blender、MCP、仓库、文件、图片和历史这类可执行请求，回复契约要求“解决问题优先”：必须基于真实工具结果、真实命令结果或明确阻塞原因回报；不得用通用教程、占位表格或示例脚本替代执行结果。
+- Codex/MCP 执行链失败时，Unity/Blender/MCP/文档等需要真实工具输出的任务不会再降级给本地模型生成教程；runtime 会直接返回确定性 `未完成 + 阻塞原因`，bridge-core 出站前还会拦截“请手动检查 / 自行打开 Unity / 示例列表草案”等外包式回复。
+- bridge runtime 会为 Codex 使用独立 `CTI_CODEX_HOME`，同步全局认证和 MCP 配置时剔除全局顶层 `model = ...`，避免本机 Codex UI 的新模型配置拖垮旧 CLI；运行版可用 `CTI_CODEX_MODEL` 显式指定当前 CLI 已验证可用的模型。
 - Ignis 生成类任务提交后会等待完成并下载可回传资产，最终回复走 `cti-final`，避免向飞书裸发 CLI JSON 或大段技术字段。
 - Ignis 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新生成请求默认新开会话。
 - Ignis 模型生成如果明确要求拆成 FBX/贴图，会在 GLB 下载完成后调用 `scripts/export-glb-asset-package.ps1`，输出 FBX、贴图、材质映射和 manifest，并通过 `cti-final.files` 回传不超过飞书限制的文件。
@@ -142,7 +208,9 @@ flowchart TD
   Request[入站请求] --> Mode{当前模式}
   Mode -->|codex_only| Codex[Codex 主脑]
   Mode -->|local_only| LocalScope{是否本地可处理}
-  Mode -->|hybrid| ExplicitSmallTask{是否明确小活}
+  Mode -->|hybrid| CodexFirst{是否需要 Codex 先判}
+  CodexFirst -->|默认是| Codex
+  CodexFirst -->|显式小活| ExplicitSmallTask{是否允许本地直处理}
   ExplicitSmallTask -->|是| LocalAgent[本地辅助执行器]
   ExplicitSmallTask -->|否| Codex
   LocalScope -->|是| LocalAgent
@@ -264,15 +332,32 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 展示 suite 版本、扩展协议版本、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 通过“设置”弹窗修改非敏感路径配置和回复风格配置。
 - 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
+- 查看 workflow run、executor 目录、最近路由选择和会话默认 executor。
 - 本机备份发布和主干发布预检。
 
-截至 2026-04-22，控制面板采用 `WinForms 宿主 + WebView2 + React/Vite`：
+截至 2026-04-23，控制面板采用 `WinForms 宿主 + WebView2 + React/Vite`：
 
 - WinForms 负责窗口生命周期、WebView2 Runtime 检测、白名单命令分发、本机脚本调用和文件系统边界。
 - React 前端负责信息架构、导航、状态展示、长任务 pending 状态和活动流。
 - 前端只能通过 WebView 消息协议请求宿主执行命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
 - 本机缺少 WebView2 Runtime 时，宿主显示轻量降级页和安装提示，不回退旧完整 WinForms 面板。
-- GPT 生成的无文字图片素材只用于启动页、空状态和发布预检氛围图，源码位于 `apps/control-panel/web/public/assets`。
+- 面板主界面已取消底图依赖，统一改成高密度运营台布局；总览、服务、扩展、会话、设置和日志都按窗口宽度自适应重排。
+- WinForms 宿主新增统一运行单元注册表，桥接服务、Codex CLI、本地辅助执行器、MCP 和扩展 manifest 在前端统一收敛成一套卡片和动作模型。
+- 运行单元动作现在允许按 manifest 暴露安装入口；skill 和部分 MCP 只要声明 `installer` / `bootstrap`，面板就会显示“安装”按钮并走宿主白名单执行。
+- CLI 工具更新也走 `runtime.invokeAction` 白名单。当前 Codex CLI 只有在检测到 npm 全局 `@openai/codex` 安装时才显示“更新”，宿主固定执行 `npm install -g @openai/codex@latest`，不接受前端传入任意命令。
+- 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
+- 扩展页的 MCP 运行状态按健康检查、Codex 注册和托管进程综合判断；`bundled`、`external` 只作为安装来源展示，不再直接映射成“待处理”状态。
+- 会话区新增 WebView 详情抽屉，宿主通过 `history.getSessionDetail` 返回完整消息流；旧 `ConversationViewerForm` 保留为兼容调试入口。
+- 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 WebView2 虚拟域 `https://control-panel-media.local/` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
+- 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
+- 会话详情读取旧本地消息时只做显示层 mojibake 修复；疑似 UTF-8 被 GBK 错读的文本会在面板里还原展示，原始历史 JSON 不被自动改写。
+- 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要和事件时间线，方便回溯一次飞书请求从接收、路由、执行到交付或失败的运行历程。
+- 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
+- 回复风格预设通过 `settings.listReplyPresets` / `settings.applyReplyPreset` / `settings.summarizeReplyStyle` 暴露给 WebView，继续沿用宿主保存语义。
+- 本地辅助执行器状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
+- bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录和会话默认 executor，不再把缺失状态文件误解为辅助器异常。
+- 记忆仓库路径现在强制落在工作目录外；如果 `CTI_MEMORY_REPO_DIR` 指向默认工作目录、Unity 项目目录或其子目录，宿主和运行时都会自动回退到 `CTI_HOME\\memory-repo`。
+- 对“你还记得吗 / 常用场景名称”这类命中本地笔记的回忆型问题，运行时新增确定性记忆快答：优先直接读取 `CTI_MEMORY_REPO_DIR` 下的 Markdown 笔记并返回，不再依赖 Codex 或本地模型生成。
 
 面板原则：
 
@@ -298,6 +383,18 @@ WebView 命令协议：
 ```json
 { "type": "state", "data": {} }
 ```
+
+当前核心白名单命令分组：
+
+- 状态与服务：`state.refresh`、`bridge.*`、`codex.*`、`localLlm.*`
+- Workflow 和执行器：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`executor.list`、`executor.check`、`executor.setSessionDefault`
+- 运行单元：`runtime.listUnits`、`runtime.invokeAction`
+- 扩展：`extension.enable`、`extension.disable`、`extension.remove`、`extension.install`
+- 扩展导入：`extension.detectImport`、`extension.importFromFolder`
+- 会话：`history.listSessions`、`history.getSessionDetail`、`history.openConversationViewer`
+- 设置与路径：`settings.read`、`settings.save`、`settings.listReplyPresets`、`settings.applyReplyPreset`、`settings.summarizeReplyStyle`、`path.pickFolder`、`path.pickFile`、`path.openAny`
+- 历史消息解析会优先提取 Feishu `text / post / interactive` 内容；卡片消息不再统一显示成 `[卡片消息]` 占位。对旧索引里遗留的卡片占位，控制面板会按 `messageId` 从 `data/audit.json` 回填可见摘要，尽量不要求用户手动全量重同步。
+- 历史消息解析会保留飞书 `image / file` 资源键和文件名；旧索引缺少资源元数据时，详情页会触发一次会话级 full sync 尝试补齐。资源下载失败或权限不足时，前端显示明确的附件占位和状态，不伪装成已加载图片。
 
 ## 5. Manifest 驱动扩展
 
@@ -326,6 +423,7 @@ WebView 命令协议：
 - `installState` 表示 `bundled`、`external`、`configured` 或 `missing`。
 - `source` 指向项目内路径、外部插件标识或外部安装源。
 - `aliases` 给运行时提供自然语言匹配词，MCP 快路径按 manifest 动态解析目标，不再维护固定 MCP 名称列表。
+- `installer` / `bootstrap` 用于声明可由控制面板触发的安装脚本；宿主通过白名单环境变量把扩展 ID、类型、source 和 manifest 路径传给安装脚本，不允许前端直接执行 shell。
 
 ### 5.1 MCP
 
@@ -361,6 +459,7 @@ WebView 命令协议：
 - `healthCheck`
 - `registerName`
 - `description`
+- `installer`
 
 MCP 安全规则：
 

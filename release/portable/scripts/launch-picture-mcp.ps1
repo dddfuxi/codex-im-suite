@@ -1,4 +1,9 @@
 $ErrorActionPreference = 'Stop'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+$env:NODE_DISABLE_COLORS = '1'
 $repoRoot = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'packages\mcp-picture'
 $repoRoot = [System.IO.Path]::GetFullPath($repoRoot)
 $entryFile = Join-Path $repoRoot 'dist\src\mcp-stdio.js'

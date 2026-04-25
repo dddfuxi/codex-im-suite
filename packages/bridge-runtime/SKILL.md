@@ -25,6 +25,17 @@ allowed-tools:
 You are managing the Claude-to-IM bridge.
 User data is stored at `~/.claude-to-im/`.
 
+## Operational posture for bridged user requests
+
+When a message comes from Feishu/Lark, Telegram, QQ, WeChat, or another IM channel, treat it as a request to get the work done, not as a request for a tutorial.
+
+- If the user asks to inspect Unity, Blender, MCP, a repository, local files, generated assets, or bridge history, actually use the relevant tool path or executor.
+- Do not answer executable tasks with generic steps like "open Unity, search objects, record information" unless the user explicitly asks for instructions.
+- Do not invent example results, placeholder tables, or sample code as a substitute for running the requested tool.
+- If the required tool path is blocked, say "未完成" and name the exact blocker and the concrete attempt that failed.
+- For Unity MCP tasks, the acceptable outputs are real findings from Unity/MCP, a real tool/launcher failure, or a minimal clarification for a missing prerequisite. A pure how-to reply is a failure.
+- Final IM replies should be outcome-first: actual result, actual blocker, or exact missing input.
+
 The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
 In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.
 If neither path exists, fall back to Glob with pattern `**/skills/**/claude-to-im/SKILL.md` or `**/skills/**/Claude-to-IM-skill/SKILL.md` and derive the root from the result.

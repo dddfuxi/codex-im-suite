@@ -1,3 +1,8 @@
+---
+name: ignis-cli
+description: Use Ignis CLI for creative generation, image/video/model workflows, asset upload, session continuation, and result polling.
+---
+
 # Ignis CLI
 
 Use this guide when work should be done through the `ignis` command line, especially for:

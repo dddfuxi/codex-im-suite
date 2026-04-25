@@ -127,6 +127,24 @@ function mergeWorkspaceRoots(defaultWorkDir: string, explicitRoots?: string[], a
   return merged.length > 0 ? merged : undefined;
 }
 
+function isSameOrChildPath(candidatePath: string, rootPath?: string): boolean {
+  if (!rootPath) return false;
+  const candidate = path.resolve(candidatePath).replace(/[\\/]+$/, "");
+  const root = path.resolve(rootPath).replace(/[\\/]+$/, "");
+  return candidate.toLowerCase() === root.toLowerCase()
+    || candidate.toLowerCase().startsWith((root + path.sep).toLowerCase());
+}
+
+function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string, unityProjectPath?: string): string {
+  const fallback = path.join(CTI_HOME, "memory-repo");
+  const configured = rawMemoryRepoDir && rawMemoryRepoDir.trim() ? rawMemoryRepoDir.trim() : fallback;
+  const normalized = path.resolve(configured);
+  if (isSameOrChildPath(normalized, defaultWorkDir) || isSameOrChildPath(normalized, unityProjectPath)) {
+    return fallback;
+  }
+  return normalized;
+}
+
 export function loadConfig(): Config {
   let env = new Map<string, string>();
   try {
@@ -140,7 +158,7 @@ export function loadConfig(): Config {
   const runtime = (["claude", "codex", "auto"].includes(rawRuntime) ? rawRuntime : "claude") as Config["runtime"];
   const defaultWorkDir = env.get("CTI_DEFAULT_WORKDIR") || process.cwd();
   const codexAdditionalDirectories = splitPathList(env.get("CTI_CODEX_ADDITIONAL_DIRECTORIES"));
-  const memoryRepoDir = env.get("CTI_MEMORY_REPO_DIR") || undefined;
+  const rawMemoryRepoDir = env.get("CTI_MEMORY_REPO_DIR") || undefined;
   const unityProjectPath = env.get("CTI_UNITY_PROJECT_PATH") || undefined;
   const contextHistoryMaxChars = env.get("CTI_CONTEXT_HISTORY_MAX_CHARS")
     ? Number(env.get("CTI_CONTEXT_HISTORY_MAX_CHARS"))
@@ -177,6 +195,7 @@ export function loadConfig(): Config {
     splitPathList(env.get("CTI_ALLOWED_WORKSPACE_ROOTS")),
     codexAdditionalDirectories,
   );
+  const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir, unityProjectPath);
 
   return {
     runtime,

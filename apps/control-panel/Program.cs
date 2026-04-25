@@ -1,8 +1,10 @@
 ﻿using System.Diagnostics;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -24,6 +26,8 @@ internal static class Program
 internal sealed class MainForm : Form
 {
     private const string WebHostName = "control-panel.local";
+    private const string MediaHostName = "control-panel-media.local";
+    private const uint CodePageGb2312 = 936;
     private readonly string _skillDir;
     private readonly string _ctiHome;
     private readonly string _configPath;
@@ -41,14 +45,21 @@ internal sealed class MainForm : Form
     private readonly string _localLlmReadmePath;
     private readonly string _dataDir;
     private readonly string _messagesDir;
+    private readonly string _auditJsonPath;
     private readonly string _statusJsonPath;
     private readonly string _mcpServiceStatePath;
     private readonly string _localLlmStatusPath;
+    private readonly string _executorStatusPath;
+    private readonly string _executorSessionDefaultsPath;
+    private readonly string _workflowStatusPath;
     private readonly string _finalEnvelopeStatusPath;
     private readonly string _bridgeRuntimeAuditPath;
+    private readonly string _mediaCacheDir;
     private readonly string _feishuChatIndexPath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
+    private readonly string _webDiagnosticsLogPath;
+    private readonly string _deletedSessionsPath;
     private FileSystemWatcher? _manifestWatcher;
     private System.Windows.Forms.Timer? _manifestReloadTimer;
     private string _pendingManifestReloadReason = "初始化";
@@ -68,7 +79,12 @@ internal sealed class MainForm : Form
     private readonly WebView2 _webView = new();
     private readonly Panel _webFallback = new();
     private readonly List<WebActivityRecord> _activities = [];
+    private readonly Dictionary<string, WebSessionDetail> _sessionDetailCache = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, string>? _auditSummaryByMessageId;
     private bool _webReady;
+    private int _webNavigationCount;
+    private int _webStatePushCount;
+    private int _webSessionDetailRequestCount;
 
     private Dictionary<string, string> _config = new(StringComparer.OrdinalIgnoreCase);
     private List<McpManifest> _manifests = [];
@@ -111,14 +127,21 @@ internal sealed class MainForm : Form
         _localLlmReadmePath = Path.Combine(localLlmScriptRoot, "README.md");
         _dataDir = Path.Combine(_ctiHome, "data");
         _messagesDir = Path.Combine(_dataDir, "messages");
+        _auditJsonPath = Path.Combine(_dataDir, "audit.json");
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
         _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
         _localLlmStatusPath = Path.Combine(_ctiHome, "runtime", "local-llm-status.json");
+        _executorStatusPath = Path.Combine(_ctiHome, "runtime", "executor-status.json");
+        _executorSessionDefaultsPath = Path.Combine(_ctiHome, "runtime", "executor-session-defaults.json");
+        _workflowStatusPath = Path.Combine(_ctiHome, "runtime", "workflow-runs.json");
         _finalEnvelopeStatusPath = Path.Combine(_ctiHome, "runtime", "final-envelope-status.json");
         _bridgeRuntimeAuditPath = Path.Combine(_ctiHome, "runtime", "bridge-runtime-audit.json");
+        _mediaCacheDir = Path.Combine(_ctiHome, "runtime", "control-panel-media");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
+        _webDiagnosticsLogPath = Path.Combine(_ctiHome, "runtime", "control-panel-webview.log");
+        _deletedSessionsPath = Path.Combine(_ctiHome, "runtime", "control-panel-deleted-sessions.json");
 
         Text = "飞书 / Codex / MCP 中控面板";
         StartPosition = FormStartPosition.CenterScreen;
@@ -191,13 +214,20 @@ internal sealed class MainForm : Form
             await _webView.EnsureCoreWebView2Async();
             _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+            Directory.CreateDirectory(_mediaCacheDir);
             _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
                 WebHostName,
                 webRoot,
                 CoreWebView2HostResourceAccessKind.Allow);
+            _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                MediaHostName,
+                _mediaCacheDir,
+                CoreWebView2HostResourceAccessKind.Allow);
             _webView.CoreWebView2.WebMessageReceived += async (_, args) => await HandleWebMessageAsync(args.WebMessageAsJson);
             _webView.CoreWebView2.NavigationCompleted += async (_, args) =>
             {
+                var navigationCount = Interlocked.Increment(ref _webNavigationCount);
+                AppendWebDiagnostics($"navigation completed success={args.IsSuccess} count={navigationCount} status={args.WebErrorStatus}");
                 if (!args.IsSuccess)
                 {
                     ShowWebFallback("前端加载失败", $"WebView2 无法加载控制面板页面：{args.WebErrorStatus}", webRoot);
@@ -295,18 +325,35 @@ internal sealed class MainForm : Form
 
         try
         {
-            AddWebActivity("info", "开始执行", request.Command);
+            var quietCommand = IsQuietWebCommand(request.Command);
+            AppendWebDiagnostics($"command received quiet={quietCommand} command={request.Command}");
+            if (!quietCommand)
+            {
+                AddWebActivity("info", "开始执行", request.Command);
+            }
             var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
             PostWebMessage(new { type = "result", id = request.Id, ok = true, data });
-            await PushWebStateAsync();
+            if (!quietCommand)
+            {
+                await PushWebStateAsync();
+            }
         }
         catch (Exception ex)
         {
-            AddWebActivity("error", request.Command, ex.Message);
+            if (!IsQuietWebCommand(request.Command))
+            {
+                AddWebActivity("error", request.Command, ex.Message);
+            }
             PostWebMessage(new { type = "result", id = request.Id, ok = false, error = ex.Message });
-            await PushWebStateAsync();
+            if (!IsQuietWebCommand(request.Command))
+            {
+                await PushWebStateAsync();
+            }
         }
     }
+
+    private static bool IsQuietWebCommand(string? command)
+        => string.Equals(command, "history.getSessionDetail", StringComparison.OrdinalIgnoreCase);
 
     private async Task<object?> ExecuteWebCommandAsync(string command, JsonElement payload)
     {
@@ -395,7 +442,14 @@ internal sealed class MainForm : Form
             case "history.status":
                 return GetFeishuHistorySyncStatusText(full: true);
             case "history.listSessions":
-                return BuildSessionItems();
+                return await BuildSessionItemsAsync();
+            case "history.getSessionDetail":
+                return await GetSessionDetailAsync(payload);
+            case "history.deleteSession":
+                return await DeleteSessionAsync(payload);
+            case "history.openConversationViewer":
+                await ShowConversationViewerAsync();
+                return "opened";
             case "path.openConfig":
                 OpenPath(_configPath);
                 return "opened";
@@ -405,6 +459,54 @@ internal sealed class MainForm : Form
             case "path.openMemoryRepo":
                 OpenPath(_memoryRepo.Text);
                 return "opened";
+            case "path.openAny":
+                OpenPath(ReadPayloadString(payload, "path", ""));
+                return "opened";
+            case "path.pickFolder":
+                return PickFolder(ReadPayloadString(payload, "currentPath", ""));
+            case "path.pickFile":
+                return PickFile(ReadPayloadString(payload, "currentPath", ""));
+            case "settings.listReplyPresets":
+                return BuildReplyPresetItems();
+            case "settings.applyReplyPreset":
+                return ApplyReplyPreset(ReadPayloadString(payload, "name", ""));
+            case "settings.summarizeReplyStyle":
+                return await SummarizeReplyStyleAsync(ReadPayloadString(payload, "text", ""));
+            case "runtime.listUnits":
+                return BuildRuntimeUnits();
+            case "runtime.invokeAction":
+                return await InvokeRuntimeUnitActionAsync(payload);
+            case "extension.enable":
+                await SetExtensionEnabledAsync(ReadPayloadString(payload, "manifestPath", ""), true);
+                return "enabled";
+            case "extension.disable":
+                await SetExtensionEnabledAsync(ReadPayloadString(payload, "manifestPath", ""), false);
+                return "disabled";
+            case "extension.remove":
+                await RemoveExtensionAsync(ReadPayloadString(payload, "manifestPath", ""));
+                return "removed";
+            case "extension.install":
+                await InstallExtensionAsync(ReadPayloadString(payload, "manifestPath", ""));
+                return "installed";
+            case "extension.detectImport":
+                return DetectExtensionImport(ReadPayloadString(payload, "folderPath", ""));
+            case "extension.importFromFolder":
+                return await ImportExtensionFromFolderAsync(
+                    ReadPayloadString(payload, "folderPath", ""),
+                    ReadPayloadString(payload, "kind", ""),
+                    ReadPayloadString(payload, "runtimeType", ""));
+            case "workflow.listRuns":
+                return ListWorkflowRuns();
+            case "workflow.getRun":
+                return GetWorkflowRun(payload);
+            case "workflow.getEvents":
+                return GetWorkflowEvents(payload);
+            case "executor.list":
+                return ReadExecutorStatusPayload();
+            case "executor.check":
+                return ReadExecutorStatusPayload();
+            case "executor.setSessionDefault":
+                return SetExecutorSessionDefault(payload);
             default:
                 throw new InvalidOperationException($"未知或未授权命令：{command}");
         }
@@ -413,6 +515,8 @@ internal sealed class MainForm : Form
     private async Task PushWebStateAsync()
     {
         if (!_webReady || _webView.CoreWebView2 is null) return;
+        var pushCount = Interlocked.Increment(ref _webStatePushCount);
+        AppendWebDiagnostics($"push state count={pushCount}");
         var state = await BuildWebStateAsync();
         PostWebMessage(new { type = "state", data = state });
     }
@@ -430,6 +534,7 @@ internal sealed class MainForm : Form
         var suite = ReadSuiteVersionInfo();
         var extensions = ReadExtensionStatus();
         var mcpItems = BuildMcpItems();
+        var sessionItems = await BuildSessionItemsAsync();
         return new
         {
             generatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
@@ -480,7 +585,15 @@ internal sealed class MainForm : Form
             history = new
             {
                 status = GetFeishuHistorySyncStatusText(full: false),
-                sessions = BuildSessionItems().Take(80).ToArray(),
+                sessions = sessionItems.Take(80).ToArray(),
+            },
+            workflow = ListWorkflowRuns(),
+            executors = ReadExecutorStatusPayload(),
+            diagnostics = new
+            {
+                webNavigationCount = Volatile.Read(ref _webNavigationCount),
+                webStatePushCount = Volatile.Read(ref _webStatePushCount),
+                sessionDetailRequestCount = Volatile.Read(ref _webSessionDetailRequestCount),
             },
             paths = new
             {
@@ -494,14 +607,30 @@ internal sealed class MainForm : Form
     }
 
     private WebServiceItem BuildServiceItem(string id, string title, string text)
-        => new(id, title, ClassifyStatus(text), text);
+        => new(id, title, ClassifyStatus(id, text), text);
 
-    private static string ClassifyStatus(string text)
+    private static string ClassifyStatus(string id, string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return "idle";
-        if (Regex.IsMatch(text, "失败|不可用|异常|错误|缺少|未找到", RegexOptions.IgnoreCase)) return "error";
-        if (Regex.IsMatch(text, "未运行|未启用|dirty|缺依赖", RegexOptions.IgnoreCase)) return "warning";
-        if (Regex.IsMatch(text, "运行中|通过|可用|online|已注册|启用|Suite", RegexOptions.IgnoreCase)) return "ok";
+
+        var firstLine = FirstNonEmptyLine(text) ?? "";
+        if (string.Equals(id, "codex", StringComparison.OrdinalIgnoreCase))
+        {
+            if (Regex.IsMatch(firstLine, "不可用|失败|异常|错误|未找到", RegexOptions.IgnoreCase)) return "error";
+            if (Regex.IsMatch(text, "(^|\\n)主脑[:：]\\s*Codex|(^|\\n)降级[:：]\\s*正常", RegexOptions.IgnoreCase)) return "ok";
+        }
+        if (Regex.IsMatch(firstLine, "离线|失败|异常|错误|不可用|缺少|未找到", RegexOptions.IgnoreCase)) return "error";
+        if (Regex.IsMatch(firstLine, "未运行|未启用", RegexOptions.IgnoreCase)) return "warning";
+        if (Regex.IsMatch(firstLine, "在线|运行中|通过|可用|online", RegexOptions.IgnoreCase)) return "ok";
+
+        if (string.Equals(id, "version", StringComparison.OrdinalIgnoreCase))
+        {
+            if (Regex.IsMatch(text, "dirty|缺依赖", RegexOptions.IgnoreCase)) return "warning";
+            if (Regex.IsMatch(text, "Suite|扩展协议", RegexOptions.IgnoreCase)) return "ok";
+        }
+
+        if (Regex.IsMatch(text, "(^|\\n)状态[:：].*(失败|异常|错误|不可用)|(^|\\n)健康[:：].*(失败|异常|错误|不可用)", RegexOptions.IgnoreCase)) return "error";
+        if (Regex.IsMatch(text, "(^|\\n)(运行中|通过|可用|online|已注册|启用)(\\b|$)", RegexOptions.IgnoreCase)) return "ok";
         return "idle";
     }
 
@@ -535,6 +664,11 @@ internal sealed class MainForm : Form
         var items = new List<WebExtensionItem>();
         foreach (var dir in new[] { _manifestDir, _skillsManifestDir, _pluginsManifestDir }.Where(Directory.Exists))
         {
+            var manifestKind = string.Equals(dir, _skillsManifestDir, StringComparison.OrdinalIgnoreCase)
+                ? "skill"
+                : string.Equals(dir, _pluginsManifestDir, StringComparison.OrdinalIgnoreCase)
+                    ? "plugin"
+                    : "extension";
             foreach (var file in Directory.GetFiles(dir, "*.json").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
             {
                 try
@@ -549,9 +683,13 @@ internal sealed class MainForm : Form
                         var expanded = ExpandManifestValue(source);
                         sourceExists = File.Exists(expanded) || Directory.Exists(expanded);
                     }
+                    var canInstall =
+                        (root.TryGetProperty("installer", out var installerElement) && installerElement.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(installerElement.GetString()))
+                        || (root.TryGetProperty("bootstrap", out var bootstrapElement) && bootstrapElement.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(bootstrapElement.GetString()));
                     items.Add(new WebExtensionItem(
                         ReadJsonString(root, "id"),
                         ReadJsonString(root, "displayName"),
+                        manifestKind,
                         ReadJsonString(root, "type"),
                         ReadJsonString(root, "category"),
                         enabled,
@@ -559,22 +697,27 @@ internal sealed class MainForm : Form
                         source,
                         sourceExists,
                         ReadJsonString(root, "description"),
-                        file));
+                        file,
+                        canInstall));
                 }
                 catch (Exception ex)
                 {
-                    items.Add(new WebExtensionItem(Path.GetFileNameWithoutExtension(file), Path.GetFileName(file), "unknown", "", false, "missing", "", false, ex.Message, file));
+                    items.Add(new WebExtensionItem(Path.GetFileNameWithoutExtension(file), Path.GetFileName(file), manifestKind, "unknown", "", false, "missing", "", false, ex.Message, file, false));
                 }
             }
         }
         return items.ToArray();
     }
 
-    private WebSessionItem[] BuildSessionItems()
+    private async Task<WebSessionItem[]> BuildSessionItemsAsync()
     {
         try
         {
-            return LoadConversationEntries()
+            var localEntries = LoadConversationEntries();
+            var mergedEntries = await LoadRemoteConversationEntriesAsync(localEntries);
+            var deletedSessions = LoadDeletedSessions();
+            return mergedEntries
+                .Where(item => !IsSessionDeleted(item, deletedSessions))
                 .OrderByDescending(item => item.LastUpdatedAt)
                 .Take(160)
                 .Select(item => new WebSessionItem(item.DisplayName, item.ChannelType, item.ChatType, item.ChatId, item.SessionId, item.Source, item.LocalMessageCount, item.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "", item.Summary))
@@ -585,6 +728,41 @@ internal sealed class MainForm : Form
             AddWebActivity("warning", "会话索引读取失败", ex.Message);
             return [];
         }
+    }
+
+    private async Task<object> DeleteSessionAsync(JsonElement payload)
+    {
+        var sessionId = ReadPayloadString(payload, "sessionId", "");
+        var chatId = ReadPayloadString(payload, "chatId", "");
+        if (string.IsNullOrWhiteSpace(sessionId) && string.IsNullOrWhiteSpace(chatId))
+        {
+            throw new InvalidOperationException("缺少要删除的会话 ID。");
+        }
+
+        var entries = await LoadRemoteConversationEntriesAsync(LoadConversationEntries());
+        var entry = entries.FirstOrDefault(item =>
+            (!string.IsNullOrWhiteSpace(sessionId) && string.Equals(item.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+            || (!string.IsNullOrWhiteSpace(chatId) && string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase)));
+
+        var key = MakeDeletedSessionKey(chatId, sessionId);
+        var deletedSessions = LoadDeletedSessions();
+        deletedSessions[key] = new DeletedSessionRecord
+        {
+            ChatId = chatId,
+            SessionId = sessionId,
+            DisplayName = entry?.DisplayName ?? "",
+            DeletedAt = DateTime.UtcNow.ToString("o"),
+            LastSeenAt = (entry?.LastUpdatedAt ?? DateTime.MinValue).ToUniversalTime().ToString("o"),
+        };
+        SaveDeletedSessions(deletedSessions);
+
+        if (!string.IsNullOrWhiteSpace(chatId))
+        {
+            _sessionDetailCache.Remove($"{chatId}::{sessionId}");
+        }
+
+        AddWebActivity("info", "会话已删除", entry?.DisplayName ?? chatId ?? sessionId);
+        return "deleted";
     }
 
     private bool SelectMcpById(string id)
@@ -626,6 +804,840 @@ internal sealed class MainForm : Form
             ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint));
     }
 
+    private async Task<WebSessionDetail> GetSessionDetailAsync(JsonElement payload)
+    {
+        var requestCount = Interlocked.Increment(ref _webSessionDetailRequestCount);
+        var sessionId = ReadPayloadString(payload, "sessionId", "");
+        var chatId = ReadPayloadString(payload, "chatId", "");
+        var forceRefresh = payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty("force", out var forceElement)
+            && forceElement.ValueKind is JsonValueKind.True;
+        var cacheKey = $"{chatId}::{sessionId}";
+        if (!forceRefresh && _sessionDetailCache.TryGetValue(cacheKey, out var cached))
+        {
+            AppendWebDiagnostics($"session detail cache-hit count={requestCount} key={cacheKey}");
+            return cached;
+        }
+        AppendWebDiagnostics($"session detail load count={requestCount} key={cacheKey}");
+        var entries = await LoadRemoteConversationEntriesAsync(LoadConversationEntries());
+        var entry = entries.FirstOrDefault(item =>
+            (!string.IsNullOrWhiteSpace(sessionId) && string.Equals(item.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+            || (!string.IsNullOrWhiteSpace(chatId) && string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase)));
+
+        if (entry is null)
+        {
+            throw new InvalidOperationException("未找到对应会话。");
+        }
+
+        if (!entry.RemoteLoaded)
+        {
+            entry = await LoadConversationDetailAsync(entry);
+        }
+
+        var detail = new WebSessionDetail(
+            entry.DisplayName,
+            entry.ChannelType,
+            entry.ChatType,
+            entry.ChatId,
+            entry.SessionId,
+            entry.SdkSessionId,
+            entry.WorkingDirectory,
+            entry.Source,
+            entry.HasLocalBinding,
+            entry.LocalMessageCount,
+            entry.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
+            entry.Summary,
+            entry.Messages.Select(message => new WebConversationMessage(
+                message.Index,
+                message.MessageId,
+                message.Role,
+                message.MsgType,
+                message.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
+                message.Content,
+                message.Attachments.Select(attachment => new WebMessageAttachment(
+                    attachment.Kind,
+                    attachment.Name,
+                    attachment.MimeType,
+                    attachment.Size,
+                    attachment.Path,
+                    attachment.Url,
+                    attachment.ResourceKey,
+                    attachment.Status)).ToArray())).ToArray(),
+            FindWorkflowRunsForSession(entry.SessionId, entry.ChatId));
+        _sessionDetailCache[cacheKey] = detail;
+        if (_sessionDetailCache.Count > 64)
+        {
+            var firstKey = _sessionDetailCache.Keys.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(firstKey))
+            {
+                _sessionDetailCache.Remove(firstKey);
+            }
+        }
+        return detail;
+    }
+
+    private object ListWorkflowRuns()
+    {
+        var root = ReadJsonObjectFile(_workflowStatusPath);
+        var runs = root?["runs"] as JsonArray ?? [];
+        return new
+        {
+            protocol = ReadJsonString(root, "protocol", "workflow-runtime/v1"),
+            updatedAt = ReadJsonString(root, "updatedAt", ""),
+            runs = runs.Select(node => node?.DeepClone()).Where(node => node is not null).TakeLast(80).ToArray(),
+        };
+    }
+
+    private object GetWorkflowRun(JsonElement payload)
+    {
+        var runId = ReadPayloadString(payload, "id", ReadPayloadString(payload, "runId", ""));
+        if (string.IsNullOrWhiteSpace(runId)) return new { found = false, run = (object?)null };
+        var run = FindWorkflowRun(runId);
+        return new { found = run is not null, run };
+    }
+
+    private object GetWorkflowEvents(JsonElement payload)
+    {
+        var runId = ReadPayloadString(payload, "id", ReadPayloadString(payload, "runId", ""));
+        var run = FindWorkflowRun(runId) as JsonObject;
+        var events = run?["events"] as JsonArray ?? [];
+        return new
+        {
+            runId,
+            events = events.Select(node => node?.DeepClone()).Where(node => node is not null).ToArray(),
+        };
+    }
+
+    private JsonNode[] FindWorkflowRunsForSession(string sessionId, string chatId)
+    {
+        var root = ReadJsonObjectFile(_workflowStatusPath);
+        var runs = root?["runs"] as JsonArray;
+        if (runs is null) return [];
+        return runs
+            .OfType<JsonObject>()
+            .Where(run =>
+                (!string.IsNullOrWhiteSpace(sessionId) && string.Equals(ReadJsonString(run, "sessionId", ""), sessionId, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrWhiteSpace(chatId) && string.Equals(ReadJsonString(run, "chatId", ""), chatId, StringComparison.OrdinalIgnoreCase)))
+            .Select(run => run.DeepClone())
+            .TakeLast(30)
+            .ToArray();
+    }
+
+    private JsonNode? FindWorkflowRun(string runId)
+    {
+        var root = ReadJsonObjectFile(_workflowStatusPath);
+        var runs = root?["runs"] as JsonArray;
+        if (runs is null) return null;
+        foreach (var run in runs)
+        {
+            if (run is not JsonObject obj) continue;
+            if (string.Equals(ReadJsonString(obj, "id", ""), runId, StringComparison.OrdinalIgnoreCase))
+            {
+                return obj.DeepClone();
+            }
+        }
+        return null;
+    }
+
+    private object ReadExecutorStatusPayload()
+    {
+        var root = ReadJsonObjectFile(_executorStatusPath);
+        var defaults = ReadJsonObjectFile(_executorSessionDefaultsPath) ?? new JsonObject();
+        if (root is null)
+        {
+            return new
+            {
+                protocol = "executor-runtime/v1",
+                updatedAt = "",
+                executors = Array.Empty<object>(),
+                sessionDefaults = defaults,
+                lastSelection = (object?)null,
+            };
+        }
+        root["sessionDefaults"] = defaults.DeepClone();
+        return root;
+    }
+
+    private object SetExecutorSessionDefault(JsonElement payload)
+    {
+        var sessionId = ReadPayloadString(payload, "sessionId", "");
+        var executorId = ReadPayloadString(payload, "executorId", "");
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            throw new InvalidOperationException("sessionId 不能为空");
+        }
+        var defaults = ReadJsonObjectFile(_executorSessionDefaultsPath) ?? new JsonObject();
+        if (string.IsNullOrWhiteSpace(executorId))
+        {
+            defaults.Remove(sessionId);
+        }
+        else
+        {
+            defaults[sessionId] = executorId;
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(_executorSessionDefaultsPath)!);
+        var tmp = _executorSessionDefaultsPath + ".tmp";
+        File.WriteAllText(tmp, defaults.ToJsonString(WebJsonOptions), Encoding.UTF8);
+        File.Move(tmp, _executorSessionDefaultsPath, overwrite: true);
+        return new { ok = true, sessionId, executorId, sessionDefaults = defaults };
+    }
+
+    private static JsonObject? ReadJsonObjectFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return null;
+            return JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string ReadJsonString(JsonObject? root, string name, string fallback)
+    {
+        if (root is null || !root.TryGetPropertyValue(name, out var node)) return fallback;
+        return node?.GetValue<string>() ?? fallback;
+    }
+
+    private void AppendWebDiagnostics(string message)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(_webDiagnosticsLogPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            File.AppendAllText(
+                _webDiagnosticsLogPath,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}",
+                Encoding.UTF8);
+        }
+        catch
+        {
+        }
+    }
+
+    private Dictionary<string, DeletedSessionRecord> LoadDeletedSessions()
+        => File.Exists(_deletedSessionsPath)
+            ? JsonSerializer.Deserialize<Dictionary<string, DeletedSessionRecord>>(File.ReadAllText(_deletedSessionsPath, Encoding.UTF8), JsonOptions) ?? new Dictionary<string, DeletedSessionRecord>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, DeletedSessionRecord>(StringComparer.OrdinalIgnoreCase);
+
+    private void SaveDeletedSessions(Dictionary<string, DeletedSessionRecord> deletedSessions)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_deletedSessionsPath)!);
+        File.WriteAllText(_deletedSessionsPath, JsonSerializer.Serialize(deletedSessions, JsonOptions), new UTF8Encoding(false));
+    }
+
+    private static string MakeDeletedSessionKey(string chatId, string sessionId)
+        => !string.IsNullOrWhiteSpace(chatId)
+            ? $"chat:{chatId.Trim()}"
+            : $"session:{sessionId.Trim()}";
+
+    private static bool IsSessionDeleted(ConversationEntry entry, IReadOnlyDictionary<string, DeletedSessionRecord> deletedSessions)
+    {
+        var keys = new[]
+        {
+            MakeDeletedSessionKey(entry.ChatId ?? "", entry.SessionId ?? ""),
+            string.IsNullOrWhiteSpace(entry.SessionId) ? "" : MakeDeletedSessionKey("", entry.SessionId),
+        };
+
+        foreach (var key in keys.Where(key => !string.IsNullOrWhiteSpace(key)))
+        {
+            if (!deletedSessions.TryGetValue(key, out var deleted))
+            {
+                continue;
+            }
+
+            var lastSeenAt = ParseDateTime(deleted.LastSeenAt) ?? DateTime.MinValue;
+            var entryUpdatedAt = entry.LastUpdatedAt ?? DateTime.MinValue;
+            if (entryUpdatedAt.ToUniversalTime() <= lastSeenAt.ToUniversalTime())
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string PickFolder(string currentPath)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            SelectedPath = Directory.Exists(currentPath) ? currentPath : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        };
+        return dialog.ShowDialog() == DialogResult.OK ? dialog.SelectedPath : currentPath;
+    }
+
+    private static string PickFile(string currentPath)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            CheckFileExists = true,
+            FileName = File.Exists(currentPath) ? currentPath : "",
+            InitialDirectory = Directory.Exists(Path.GetDirectoryName(currentPath) ?? "")
+                ? Path.GetDirectoryName(currentPath)
+                : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        };
+        return dialog.ShowDialog() == DialogResult.OK ? dialog.FileName : currentPath;
+    }
+
+    private WebReplyPresetItem[] BuildReplyPresetItems()
+        => ReplyStylePresets.Select(pair => new WebReplyPresetItem(pair.Key, pair.Value)).ToArray();
+
+    private object ApplyReplyPreset(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || !ReplyStylePresets.TryGetValue(name, out var value))
+        {
+            throw new InvalidOperationException("未找到对应的回复风格预设。");
+        }
+
+        var current = GetSettingsSnapshot();
+        SaveSettingsFromDialog(current with { ReplyStyleHint = value });
+        return new { name, value, settings = GetSettingsSnapshot() };
+    }
+
+    private WebRuntimeUnit[] BuildRuntimeUnits()
+    {
+        var units = new List<WebRuntimeUnit>
+        {
+            new(
+                "service.bridge",
+                "bridge",
+                "飞书桥接",
+                "service",
+                "bridge",
+                ClassifyStatus("bridge", _bridgeStatus.Text),
+                _bridgeStatus.Text,
+                true,
+                "installed",
+                _skillDir,
+                _skillDir,
+                "",
+                "负责 Feishu / Codex / 本地执行链路的主桥接服务。",
+                false,
+                new[]
+                {
+                    new WebRuntimeAction("status", "状态", true),
+                    new WebRuntimeAction("logs", "日志", true),
+                    new WebRuntimeAction("start", "启动", true),
+                    new WebRuntimeAction("stop", "停止", true),
+                    new WebRuntimeAction("restart", "重启", true),
+                    new WebRuntimeAction("openLocation", "打开位置", true),
+                }),
+            new(
+                "service.codex",
+                "codex",
+                "Codex CLI",
+                "tool",
+                "codex",
+                ClassifyStatus("codex", _codexStatus.Text),
+                _codexStatus.Text,
+                true,
+                "installed",
+                _skillDir,
+                _skillDir,
+                "",
+                "Codex CLI 工具型服务，默认提供检查与工作目录入口，不伪造常驻 daemon 开关。",
+                false,
+                new[]
+                {
+                    new WebRuntimeAction("check", "检查", true),
+                    new WebRuntimeAction("update", "更新", CodexSupportsNpmUpdate()),
+                    new WebRuntimeAction("openLocation", "打开位置", true),
+                }),
+            new(
+                "service.localLlm",
+                "localLlm",
+                "本地辅助执行器",
+                "service",
+                "local-llm",
+                ClassifyStatus("localLlm", _localLlmStatus.Text),
+                _localLlmStatus.Text,
+                true,
+                File.Exists(_localLlmStartScript) ? "installed" : "missing",
+                _localLlmReadmePath,
+                Path.GetDirectoryName(_localLlmStartScript) ?? "",
+                "",
+                "仅用于明确小活和 Codex 不可用时的兜底辅助执行。",
+                false,
+                new[]
+                {
+                    new WebRuntimeAction("check", "检查", true),
+                    new WebRuntimeAction("start", "启动", File.Exists(_localLlmStartScript)),
+                    new WebRuntimeAction("stop", "停止", File.Exists(_localLlmStopScript)),
+                    new WebRuntimeAction("openLocation", "打开位置", true),
+                }),
+        };
+
+        foreach (var manifest in _manifests)
+        {
+            var hasLauncher = !string.IsNullOrWhiteSpace(ResolveManifestPath(manifest.Launcher, manifest)) && File.Exists(ResolveManifestPath(manifest.Launcher, manifest));
+            var canInstall = ManifestSupportsInstall(manifest.ManifestPath);
+            units.Add(new WebRuntimeUnit(
+                $"mcp.{manifest.Id}",
+                manifest.Id ?? "",
+                manifest.DisplayName ?? manifest.Id ?? "",
+                "mcp",
+                manifest.Category ?? manifest.Type ?? "",
+                ClassifyMcpRuntimeStatus(manifest),
+                manifest.HealthSummary ?? manifest.StatusBadge ?? "",
+                manifest.Enabled != false,
+                manifest.InstallState ?? "",
+                FormatManifestSource(manifest.Source, manifest),
+                ResolveManifestDirectory(manifest.Cwd, manifest),
+                manifest.Version ?? "",
+                manifest.Description ?? "",
+                canInstall,
+                new[]
+                {
+                    new WebRuntimeAction("check", "检查", true),
+                    new WebRuntimeAction("start", "启动", manifest.Enabled != false && hasLauncher),
+                    new WebRuntimeAction("stop", "停止", manifest.Enabled != false),
+                    new WebRuntimeAction("install", "安装", canInstall),
+                    new WebRuntimeAction("register", "注册", true),
+                    new WebRuntimeAction("openLocation", "打开位置", true),
+                }));
+        }
+
+        foreach (var item in BuildExtensionItems())
+        {
+            units.Add(new WebRuntimeUnit(
+                $"extension.{item.ManifestPath}",
+                item.Id,
+                string.IsNullOrWhiteSpace(item.DisplayName) ? item.Id : item.DisplayName,
+                item.ManifestKind,
+                item.Category,
+                !item.SourceExists ? "error" : item.Enabled ? "ok" : "warning",
+                item.Description,
+                item.Enabled,
+                item.InstallState,
+                item.Source,
+                item.ManifestPath,
+                "",
+                item.Description,
+                item.CanInstall,
+                new[]
+                {
+                    new WebRuntimeAction("enable", "启用", !item.Enabled),
+                    new WebRuntimeAction("disable", "禁用", item.Enabled),
+                    new WebRuntimeAction("install", "安装", item.CanInstall),
+                    new WebRuntimeAction("remove", "删除", true),
+                    new WebRuntimeAction("openManifest", "Manifest", true),
+                    new WebRuntimeAction("openSource", "Source", item.SourceExists),
+                }));
+        }
+
+        return units.ToArray();
+    }
+
+    private static string ClassifyMcpRuntimeStatus(McpManifest manifest)
+    {
+        if (manifest.Enabled == false) return "idle";
+        if (manifest.HealthOk == false) return "error";
+        if (manifest.HealthOk == true || manifest.IsRunning || manifest.IsRegistered) return "ok";
+        return "warning";
+    }
+
+    private object DetectExtensionImport(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            throw new InvalidOperationException("未找到要导入的目录。");
+        }
+
+        var detection = BuildExtensionImportPreview(folderPath, "", "");
+        return new
+        {
+            folderPath = detection.FolderPath,
+            detectedKind = detection.Kind,
+            runtimeType = detection.RuntimeType,
+            id = detection.Id,
+            displayName = detection.DisplayName,
+            source = detection.Source,
+            manifestPath = detection.ManifestPath,
+            description = detection.Description,
+            installState = detection.InstallState,
+            suggestedKinds = new[] { "skill", "mcp" },
+            canImport = detection.CanImport,
+            reason = detection.Reason,
+        };
+    }
+
+    private async Task<object> ImportExtensionFromFolderAsync(string folderPath, string kind, string runtimeType)
+    {
+        var preview = BuildExtensionImportPreview(folderPath, kind, runtimeType);
+        if (!preview.CanImport)
+        {
+            throw new InvalidOperationException(preview.Reason);
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(preview.ManifestPath)!);
+        var root = new JsonObject
+        {
+            ["id"] = preview.Id,
+            ["displayName"] = preview.DisplayName,
+            ["type"] = preview.Kind == "skill" ? "skill" : preview.RuntimeType,
+            ["version"] = "1.0.0",
+            ["compatibility"] = new JsonObject
+            {
+                ["protocol"] = "extension-manifest/v1",
+                ["suite"] = ">=0.2.0 <1.0.0",
+            },
+            ["category"] = preview.Kind == "skill" ? "skill.imported" : "mcp.imported",
+            ["optional"] = true,
+            ["installState"] = preview.InstallState,
+            ["installer"] = "..\\..\\scripts\\install-suite-extension.ps1",
+            ["source"] = preview.Source,
+            ["enabled"] = true,
+            ["description"] = preview.Description,
+        };
+
+        if (preview.Kind == "mcp")
+        {
+            root["aliases"] = new JsonArray(preview.Id, preview.DisplayName.ToLowerInvariant());
+        }
+
+        SaveManifestNode(preview.ManifestPath, root);
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+        AddWebActivity("info", "扩展已导入", $"{preview.DisplayName} -> {preview.ManifestPath}");
+        return new
+        {
+            manifestPath = preview.ManifestPath,
+            id = preview.Id,
+            displayName = preview.DisplayName,
+            kind = preview.Kind,
+        };
+    }
+
+    private ExtensionImportPreview BuildExtensionImportPreview(string folderPath, string explicitKind, string explicitRuntimeType)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            throw new InvalidOperationException("未找到要导入的目录。");
+        }
+
+        var skillFile = Path.Combine(folderPath, "SKILL.md");
+        var packageJsonPath = Path.Combine(folderPath, "package.json");
+        var packageJson = File.Exists(packageJsonPath) ? JsonNode.Parse(File.ReadAllText(packageJsonPath, Encoding.UTF8)) as JsonObject : null;
+        var packageName = packageJson?["name"]?.GetValue<string?>() ?? "";
+        var packageDescription = packageJson?["description"]?.GetValue<string?>() ?? "";
+        var rawName = !string.IsNullOrWhiteSpace(packageName) ? packageName : Path.GetFileName(folderPath);
+
+        var detectedKind = !string.IsNullOrWhiteSpace(explicitKind)
+            ? explicitKind.Trim().ToLowerInvariant()
+            : File.Exists(skillFile)
+                ? "skill"
+                : Regex.IsMatch($"{rawName} {packageDescription}", @"\bmcp\b", RegexOptions.IgnoreCase)
+                    ? "mcp"
+                    : "";
+
+        var canImport = detectedKind is "skill" or "mcp";
+        var reason = canImport
+            ? ""
+            : "未识别为 skill 或 mcp。当前规则是：目录下有 SKILL.md 视为 skill；目录名或 package.json 名称/描述命中 mcp 视为 mcp。";
+        var normalizedId = NormalizeImportedExtensionId(rawName, folderPath, detectedKind);
+        var displayName = BuildImportedDisplayName(rawName, folderPath);
+        var source = ToManifestSourcePath(folderPath);
+        var manifestDirectory = detectedKind == "skill" ? _skillsManifestDir : _manifestDir;
+        var manifestPath = Path.Combine(manifestDirectory, $"{normalizedId}.json");
+        var runtimeType = detectedKind == "mcp"
+            ? (string.IsNullOrWhiteSpace(explicitRuntimeType) ? "stdio" : explicitRuntimeType.Trim().ToLowerInvariant())
+            : "skill";
+        var installState = source.StartsWith("${SUITE_ROOT}", StringComparison.OrdinalIgnoreCase) ? "bundled" : "external";
+        var description = !string.IsNullOrWhiteSpace(packageDescription)
+            ? packageDescription
+            : detectedKind == "skill"
+                ? "Imported local skill."
+                : "Imported local MCP.";
+
+        return new ExtensionImportPreview(folderPath, detectedKind, runtimeType, normalizedId, displayName, source, manifestPath, description, installState, canImport, reason);
+    }
+
+    private string ToManifestSourcePath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!string.IsNullOrWhiteSpace(_suiteRoot))
+        {
+            var suiteRoot = Path.GetFullPath(_suiteRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (fullPath.StartsWith(suiteRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                var relative = Path.GetRelativePath(suiteRoot, fullPath);
+                return "${SUITE_ROOT}\\" + relative.Replace('/', '\\');
+            }
+        }
+        return fullPath;
+    }
+
+    private static string NormalizeImportedExtensionId(string rawName, string folderPath, string kind)
+    {
+        var seed = string.IsNullOrWhiteSpace(rawName) ? Path.GetFileName(folderPath) : rawName;
+        seed = seed.Replace("@", "").Replace("/", "-").Replace("\\", "-");
+        var normalized = Regex.Replace(seed.ToLowerInvariant(), @"[^a-z0-9._-]+", "-").Trim('-');
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            normalized = $"{kind}-{Guid.NewGuid():N}"[..12];
+        }
+        return normalized;
+    }
+
+    private static string BuildImportedDisplayName(string rawName, string folderPath)
+    {
+        if (!string.IsNullOrWhiteSpace(rawName))
+        {
+            return rawName.Trim();
+        }
+        return Path.GetFileName(folderPath);
+    }
+
+    private async Task<object?> InvokeRuntimeUnitActionAsync(JsonElement payload)
+    {
+        var unitId = ReadPayloadString(payload, "unitId", "");
+        var action = ReadPayloadString(payload, "action", "");
+        if (string.IsNullOrWhiteSpace(unitId) || string.IsNullOrWhiteSpace(action))
+        {
+            throw new InvalidOperationException("缺少运行单元或动作参数。");
+        }
+
+        if (string.Equals(unitId, "service.bridge", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (action)
+            {
+                case "status":
+                    await CheckBridgeAsync();
+                    return _bridgeStatus.Text;
+                case "logs":
+                    await RunDaemonAsync("logs 120");
+                    return _log.Text;
+                case "start":
+                    await RunDaemonAsync("start");
+                    return _bridgeStatus.Text;
+                case "stop":
+                    await RunDaemonAsync("stop");
+                    return _bridgeStatus.Text;
+                case "restart":
+                    await RestartBridgeAsync();
+                    return _bridgeStatus.Text;
+                case "openLocation":
+                    OpenPath(_skillDir);
+                    return "opened";
+            }
+        }
+
+        if (string.Equals(unitId, "service.codex", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (action)
+            {
+                case "check":
+                    await CheckCodexAsync();
+                    return _codexStatus.Text;
+                case "update":
+                    await UpdateCodexCliAsync();
+                    return _codexStatus.Text;
+                case "openLocation":
+                    OpenPath(_skillDir);
+                    return "opened";
+            }
+        }
+
+        if (string.Equals(unitId, "service.localLlm", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (action)
+            {
+                case "check":
+                    await CheckLocalLlmAsync();
+                    return _localLlmStatus.Text;
+                case "start":
+                    await StartLocalLlmAsync();
+                    return _localLlmStatus.Text;
+                case "stop":
+                    await StopLocalLlmAsync();
+                    return _localLlmStatus.Text;
+                case "openLocation":
+                    OpenPath(Path.GetDirectoryName(_localLlmStartScript) ?? "");
+                    return "opened";
+            }
+        }
+
+        if (unitId.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = unitId["mcp.".Length..];
+            SelectMcpById(id);
+            switch (action)
+            {
+                case "check":
+                    await CheckSelectedMcpAsync();
+                    return _mcpRuntimeStatus.Text;
+                case "start":
+                    await StartSelectedMcpAsync();
+                    return _mcpRuntimeStatus.Text;
+                case "stop":
+                    await StopSelectedMcpAsync();
+                    return _mcpRuntimeStatus.Text;
+                case "register":
+                    await RegisterAllMcpsAsync();
+                    return _mcpStatus.Text;
+                case "openLocation":
+                    OpenSelectedMcpPath();
+                    return "opened";
+                case "install":
+                    var selectedManifest = _manifests.FirstOrDefault(candidate => string.Equals(candidate.Id, id, StringComparison.OrdinalIgnoreCase));
+                    if (selectedManifest is null || string.IsNullOrWhiteSpace(selectedManifest.ManifestPath))
+                    {
+                        throw new InvalidOperationException("当前未选中可安装的 MCP。");
+                    }
+                    await InstallExtensionAsync(selectedManifest.ManifestPath);
+                    return "installed";
+            }
+        }
+
+        if (unitId.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
+        {
+            var manifestPath = unitId["extension.".Length..];
+            switch (action)
+            {
+                case "enable":
+                    await SetExtensionEnabledAsync(manifestPath, true);
+                    return "enabled";
+                case "disable":
+                    await SetExtensionEnabledAsync(manifestPath, false);
+                    return "disabled";
+                case "remove":
+                    await RemoveExtensionAsync(manifestPath);
+                    return "removed";
+                case "install":
+                    await InstallExtensionAsync(manifestPath);
+                    return "installed";
+                case "openManifest":
+                    OpenPath(manifestPath);
+                    return "opened";
+                case "openSource":
+                    var item = BuildExtensionItems().FirstOrDefault(candidate => string.Equals(candidate.ManifestPath, manifestPath, StringComparison.OrdinalIgnoreCase));
+                    if (item is not null)
+                    {
+                        OpenPath(ExpandManifestValue(item.Source));
+                    }
+                    return "opened";
+            }
+        }
+
+        throw new InvalidOperationException($"不支持的运行单元动作：{unitId} / {action}");
+    }
+
+    private async Task SetExtensionEnabledAsync(string manifestPath, bool enabled)
+    {
+        var root = LoadManifestNode(manifestPath);
+        root["enabled"] = enabled;
+        SaveManifestNode(manifestPath, root);
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+    }
+
+    private async Task RemoveExtensionAsync(string manifestPath)
+    {
+        if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
+        {
+            throw new InvalidOperationException("未找到 manifest 文件。");
+        }
+
+        File.Delete(manifestPath);
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+    }
+
+    private async Task InstallExtensionAsync(string manifestPath)
+    {
+        var root = LoadManifestNode(manifestPath);
+        var installer = root["installer"]?.GetValue<string?>() ?? root["bootstrap"]?.GetValue<string?>();
+        if (string.IsNullOrWhiteSpace(installer))
+        {
+            throw new InvalidOperationException("该扩展未声明 installer/bootstrap 元数据，当前不能自动安装。");
+        }
+
+        var resolved = ResolveManifestSiblingPath(manifestPath, installer);
+        var environment = BuildExtensionInstallerEnvironment(manifestPath, root);
+        ProcessResult result;
+        if (resolved.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
+        {
+            result = await RunProcessAsync("powershell.exe", $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{resolved}\"", Path.GetDirectoryName(resolved)!, environment, 120000);
+        }
+        else if (resolved.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || resolved.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
+        {
+            result = await RunProcessAsync("cmd.exe", $"/c \"{resolved}\"", Path.GetDirectoryName(resolved)!, environment, 120000);
+        }
+        else
+        {
+            result = await RunProcessAsync(resolved, "", Path.GetDirectoryName(resolved)!, environment, 120000);
+        }
+
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr);
+        }
+
+        LoadManifests();
+        await UpdateMcpManifestStatesAsync();
+    }
+
+    private Dictionary<string, string?> BuildExtensionInstallerEnvironment(string manifestPath, JsonObject root)
+        => new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CTI_EXTENSION_MANIFEST"] = manifestPath,
+            ["CTI_EXTENSION_ID"] = root["id"]?.GetValue<string?>() ?? "",
+            ["CTI_EXTENSION_TYPE"] = root["type"]?.GetValue<string?>() ?? "",
+            ["CTI_EXTENSION_SOURCE"] = ExpandManifestValue(root["source"]?.GetValue<string?>() ?? ""),
+            ["CTI_EXTENSION_DISPLAY_NAME"] = root["displayName"]?.GetValue<string?>() ?? "",
+            ["CTI_SUITE_ROOT"] = _suiteRoot,
+        };
+
+    private bool ManifestSupportsInstall(string? manifestPath)
+    {
+        if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath)) return false;
+        try
+        {
+            var root = LoadManifestNode(manifestPath);
+            var installer = root["installer"]?.GetValue<string?>() ?? root["bootstrap"]?.GetValue<string?>();
+            return !string.IsNullOrWhiteSpace(installer);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private JsonObject LoadManifestNode(string manifestPath)
+    {
+        if (string.IsNullOrWhiteSpace(manifestPath) || !File.Exists(manifestPath))
+        {
+            throw new InvalidOperationException("未找到 manifest 文件。");
+        }
+
+        var root = JsonNode.Parse(File.ReadAllText(manifestPath, Encoding.UTF8)) as JsonObject;
+        if (root is null)
+        {
+            throw new InvalidOperationException("manifest 结构无效。");
+        }
+
+        return root;
+    }
+
+    private static void SaveManifestNode(string manifestPath, JsonObject root)
+    {
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(manifestPath, json, new UTF8Encoding(false));
+    }
+
+    private static string ResolveManifestSiblingPath(string manifestPath, string value)
+    {
+        if (Path.IsPathRooted(value)) return value;
+        var baseDir = Path.GetDirectoryName(manifestPath) ?? Environment.CurrentDirectory;
+        return Path.GetFullPath(Path.Combine(baseDir, value));
+    }
+
     private static string ReadJsonString(JsonElement root, string name)
         => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
 
@@ -662,6 +1674,7 @@ internal sealed class MainForm : Form
             CreateCardButton("日志", async () => await RunDaemonAsync("logs 120")));
         AddStatusCard(layout, "Codex CLI", _codexStatus, 1,
             CreateCardButton("检查", async () => await CheckCodexAsync()),
+            CreateCardButton("更新", async () => await UpdateCodexCliAsync()),
             CreateCardButton("混合模式", async () => await SetRouterModeAsync("hybrid")),
             CreateCardButton("仅本地", async () => await SetRouterModeAsync("local_only")),
             CreateCardButton("仅 Codex", async () => await SetRouterModeAsync("codex_only")),
@@ -872,7 +1885,11 @@ internal sealed class MainForm : Form
     private void LoadConfig()
     {
         _config = ReadEnvFile(_configPath);
-        _memoryRepo.Text = GetConfig("CTI_MEMORY_REPO_DIR", @"E:\cli-md");
+        _memoryRepo.Text = ResolveEffectiveMemoryRepoPath(
+            GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
+            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
+            GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game"),
+            appendLog: true);
         AppendLog($"已读取配置：{_configPath}");
     }
 
@@ -1028,7 +2045,10 @@ internal sealed class MainForm : Form
         GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
         GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3"),
         GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game"),
-        GetConfig("CTI_MEMORY_REPO_DIR", @"E:\cli-md"),
+        ResolveEffectiveMemoryRepoPath(
+            GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
+            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
+            GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game")),
         GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", ""),
         GetConfig("CTI_REPLY_STYLE_HINT", "")
     );
@@ -1046,12 +2066,13 @@ internal sealed class MainForm : Form
 
     private void SaveSettingsFromDialog(SettingsSnapshot settings)
     {
+        var memoryRepo = ResolveEffectiveMemoryRepoPath(settings.MemoryRepo.Trim(), settings.DefaultWorkDir.Trim(), settings.UnityProject.Trim());
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
         var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
         SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", settings.DefaultWorkDir.Trim());
         SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", settings.AllowedRoots.Trim());
         SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", settings.UnityProject.Trim());
-        SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", settings.MemoryRepo.Trim());
+        SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", memoryRepo);
         SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", settings.AdditionalDirs.Trim());
         SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
@@ -1254,6 +2275,35 @@ internal sealed class MainForm : Form
         if (!updateOnly) AppendCommand("codex version", result);
     }
 
+    private async Task UpdateCodexCliAsync()
+    {
+        if (!CodexSupportsNpmUpdate())
+        {
+            _codexStatus.Text = string.Join(Environment.NewLine, new[]
+            {
+                "Codex CLI 当前来源不支持面板自动更新",
+                "仅支持 npm 全局安装的 @openai/codex",
+                "请先检查 codex 命令来源。",
+            });
+            AppendLog("Codex CLI 更新跳过：当前 codex 命令不是 npm 全局 @openai/codex。");
+            return;
+        }
+
+        _codexStatus.Text = "正在更新 Codex CLI...";
+        var result = await RunProcessAsync("cmd.exe", "/c npm install -g @openai/codex@latest", _skillDir, timeoutMs: 300000);
+        AppendCommand("更新 Codex CLI", result);
+        await CheckCodexAsync(true);
+        if (result.ExitCode != 0)
+        {
+            _codexStatus.Text = string.Join(Environment.NewLine, new[]
+            {
+                "Codex CLI 更新失败",
+                FirstNonEmptyLine(result.Stderr) ?? FirstNonEmptyLine(result.Stdout) ?? "未知错误",
+                _codexStatus.Text,
+            });
+        }
+    }
+
     private async Task CheckLocalLlmAsync(bool updateOnly = false)
     {
         var enabled = !string.Equals(GetConfig("CTI_LOCAL_LLM_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
@@ -1280,9 +2330,7 @@ internal sealed class MainForm : Form
             $"本地 {stats.RouteHits} / 升级 {stats.EscalationCount}",
             $"执行 {stats.ExecutionCount} / 失败 {stats.ExecutionFailures}",
             $"兜底 {stats.LocalOnlyAnswers} / 拒答 {stats.LocalRefusals}",
-            string.IsNullOrWhiteSpace(stats.LastRefusalReason)
-                ? (string.IsNullOrWhiteSpace(stats.LastFallbackReason) ? TrimForStatus(stats.LastRouteReason ?? "暂无最近路由", 42) : TrimForStatus(stats.LastFallbackReason, 42))
-                : TrimForStatus(stats.LastRefusalReason, 42),
+            FormatLocalLlmLastStatus(stats),
         });
 
         if (!updateOnly)
@@ -2245,6 +3293,7 @@ internal sealed class MainForm : Form
         var feishuChatIndex = File.Exists(_feishuChatIndexPath)
             ? JsonSerializer.Deserialize<Dictionary<string, FeishuChatIndexRecord>>(File.ReadAllText(_feishuChatIndexPath, Encoding.UTF8), JsonOptions)
             : new Dictionary<string, FeishuChatIndexRecord>(StringComparer.OrdinalIgnoreCase);
+        var feishuHistoryIndex = LoadFeishuHistoryIndex();
         var bindings = File.Exists(bindingsPath) ? JsonSerializer.Deserialize<Dictionary<string, ChannelBindingRecord>>(File.ReadAllText(bindingsPath, Encoding.UTF8), JsonOptions) : new Dictionary<string, ChannelBindingRecord>(StringComparer.OrdinalIgnoreCase);
         var sessions = File.Exists(sessionsPath) ? JsonSerializer.Deserialize<Dictionary<string, SessionRecord>>(File.ReadAllText(sessionsPath, Encoding.UTF8), JsonOptions) : new Dictionary<string, SessionRecord>(StringComparer.OrdinalIgnoreCase);
         feishuChatIndex ??= new Dictionary<string, FeishuChatIndexRecord>(StringComparer.OrdinalIgnoreCase);
@@ -2259,12 +3308,12 @@ internal sealed class MainForm : Form
             var sessionId = binding.CodepilotSessionId ?? "";
             if (!string.IsNullOrWhiteSpace(sessionId)) boundSessionIds.Add(sessionId);
             sessions.TryGetValue(sessionId, out var session);
-            entries.Add(BuildConversationEntry(pair.Key, binding, session));
+            entries.Add(BuildConversationEntry(pair.Key, binding, session, feishuChatIndex, feishuHistoryIndex));
         }
         foreach (var pair in sessions.OrderByDescending(p => ReadMessageFileTimestamp(p.Key)))
         {
             if (boundSessionIds.Contains(pair.Key)) continue;
-            entries.Add(BuildConversationEntry(null, null, pair.Value));
+            entries.Add(BuildConversationEntry(null, null, pair.Value, feishuChatIndex, feishuHistoryIndex));
         }
 
         foreach (var pair in feishuChatIndex.OrderByDescending(p => ParseDateTime(p.Value?.UpdatedAt) ?? ParseDateTime(p.Value?.LastMessageAt)))
@@ -2358,17 +3407,24 @@ internal sealed class MainForm : Form
         return merged.OrderByDescending(entry => entry.LastUpdatedAt ?? DateTime.MinValue).ToList();
     }
 
-    private ConversationEntry BuildConversationEntry(string? bindingKey, ChannelBindingRecord? binding, SessionRecord? session)
+    private ConversationEntry BuildConversationEntry(
+        string? bindingKey,
+        ChannelBindingRecord? binding,
+        SessionRecord? session,
+        IReadOnlyDictionary<string, FeishuChatIndexRecord> feishuChatIndex,
+        IReadOnlyDictionary<string, FeishuHistorySyncRecord> feishuHistoryIndex)
     {
         var sessionId = binding?.CodepilotSessionId ?? session?.Id ?? "";
         var messages = LoadConversationMessages(sessionId);
+        var chatId = binding?.ChatId ?? "";
+        var resolvedDisplayName = ResolveConversationDisplayName(binding, session, feishuChatIndex, feishuHistoryIndex, chatId, sessionId);
         return new ConversationEntry
         {
             BindingKey = bindingKey ?? "",
             ChannelType = binding?.ChannelType ?? "",
-            ChatId = binding?.ChatId ?? "",
+            ChatId = chatId,
             ChatType = binding?.ChatType ?? "",
-            DisplayName = binding?.DisplayName ?? binding?.ChatId ?? sessionId,
+            DisplayName = resolvedDisplayName,
             SessionId = sessionId,
             WorkingDirectory = binding?.WorkingDirectory ?? session?.WorkingDirectory ?? "",
             SdkSessionId = binding?.SdkSessionId ?? session?.SdkSessionId ?? "",
@@ -2382,6 +3438,34 @@ internal sealed class MainForm : Form
         };
     }
 
+    private static string ResolveConversationDisplayName(
+        ChannelBindingRecord? binding,
+        SessionRecord? session,
+        IReadOnlyDictionary<string, FeishuChatIndexRecord> feishuChatIndex,
+        IReadOnlyDictionary<string, FeishuHistorySyncRecord> feishuHistoryIndex,
+        string chatId,
+        string sessionId)
+    {
+        var candidates = new[]
+        {
+            binding?.DisplayName,
+            !string.IsNullOrWhiteSpace(chatId) && feishuChatIndex.TryGetValue(chatId, out var chatIndex) ? chatIndex?.DisplayName : null,
+            !string.IsNullOrWhiteSpace(chatId) && feishuHistoryIndex.TryGetValue(chatId, out var historyIndex) ? historyIndex?.DisplayName : null,
+            binding?.ChatId,
+            sessionId,
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate.Trim();
+            }
+        }
+
+        return "";
+    }
+
     private async Task<ConversationEntry> LoadConversationDetailAsync(ConversationEntry entry)
     {
         if (!string.Equals(entry.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(entry.ChatId))
@@ -2390,12 +3474,13 @@ internal sealed class MainForm : Form
             return entry;
         }
 
-        var indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 400);
-        if (indexedMessages.Count == 0)
+        var rawMessages = LoadIndexedFeishuHistoryRaw(entry.ChatId);
+        if (rawMessages.Count == 0 || NeedsHistoryMediaRefresh(rawMessages))
         {
-            await SyncFeishuChatHistoryAsync(entry.ChatId, entry.DisplayName, entry.ChatType, false);
-            indexedMessages = LoadIndexedFeishuHistoryMessages(entry.ChatId, 400);
+            await SyncFeishuChatHistoryAsync(entry.ChatId, entry.DisplayName, entry.ChatType, rawMessages.Count > 0);
+            rawMessages = LoadIndexedFeishuHistoryRaw(entry.ChatId);
         }
+        var indexedMessages = await BuildIndexedFeishuHistoryMessagesAsync(rawMessages, 400);
         entry.Messages = indexedMessages;
         entry.Summary = BuildConversationSummary(indexedMessages);
         entry.RemoteLoaded = true;
@@ -2409,12 +3494,18 @@ internal sealed class MainForm : Form
         try
         {
             var items = JsonSerializer.Deserialize<List<StoredBridgeMessage>>(File.ReadAllText(filePath, Encoding.UTF8), JsonOptions) ?? [];
-            return items.Select((item, index) => new ConversationMessageView
+            return items.Select((item, index) =>
             {
-                Index = index + 1,
-                Role = item.Role ?? "unknown",
-                CreatedAt = ParseDateTime(item.CreatedAt),
-                Content = FormatStoredMessageContent(item.Content ?? ""),
+                var parsed = ParseStoredMessageContent(item.Content ?? "");
+                return new ConversationMessageView
+                {
+                    Index = index + 1,
+                    Role = item.Role ?? "unknown",
+                    MsgType = "local",
+                    CreatedAt = ParseDateTime(item.CreatedAt),
+                    Content = NormalizeDisplayText(parsed.Content),
+                    Attachments = parsed.Attachments,
+                };
             }).ToList();
         }
         catch (Exception ex)
@@ -2434,12 +3525,29 @@ internal sealed class MainForm : Form
         return parts.Count > 0 ? string.Join(" | ", parts) : "暂无有效摘要";
     }
 
-    private static string FormatStoredMessageContent(string raw)
+    private (string Content, List<ConversationAttachmentView> Attachments) ParseStoredMessageContent(string raw)
     {
         var trimmed = raw.Trim();
-        if (string.IsNullOrWhiteSpace(trimmed)) return "";
-        if (trimmed.StartsWith("[[CTI_SUMMARY]]", StringComparison.Ordinal)) return trimmed["[[CTI_SUMMARY]]".Length..].Trim();
-        if (!trimmed.StartsWith("[", StringComparison.Ordinal)) return trimmed;
+        var attachments = new List<ConversationAttachmentView>();
+        if (string.IsNullOrWhiteSpace(trimmed)) return ("", attachments);
+        if (trimmed.StartsWith("<!--files:", StringComparison.Ordinal))
+        {
+            var end = trimmed.IndexOf("-->", StringComparison.Ordinal);
+            if (end > "<!--files:".Length)
+            {
+                var json = trimmed["<!--files:".Length..end];
+                foreach (var attachment in BuildStoredFileAttachments(json))
+                {
+                    attachments.Add(attachment);
+                }
+                trimmed = trimmed[(end + "-->".Length)..].Trim();
+            }
+        }
+        if (trimmed.StartsWith("[[CTI_SUMMARY]]", StringComparison.Ordinal))
+        {
+            return (NormalizeDisplayText(trimmed["[[CTI_SUMMARY]]".Length..].Trim()), attachments);
+        }
+        if (!trimmed.StartsWith("[", StringComparison.Ordinal)) return (NormalizeDisplayText(trimmed), attachments);
         try
         {
             var blocks = JsonSerializer.Deserialize<List<StoredContentBlock>>(trimmed, JsonOptions) ?? [];
@@ -2449,22 +3557,127 @@ internal sealed class MainForm : Form
                 switch ((block.Type ?? "").Trim())
                 {
                     case "text":
-                        if (!string.IsNullOrWhiteSpace(block.Text)) parts.Add(block.Text.Trim());
+                        if (!string.IsNullOrWhiteSpace(block.Text)) parts.Add(NormalizeDisplayText(block.Text.Trim()));
+                        break;
+                    case "image":
+                    case "local_image":
+                        if (!string.IsNullOrWhiteSpace(block.Path))
+                        {
+                            attachments.Add(BuildLocalAttachment("image", block.Path, block.Name ?? Path.GetFileName(block.Path), block.Type ?? GuessMimeType(block.Path), "", "本地图片"));
+                        }
                         break;
                     case "tool_use":
                         parts.Add($"[工具开始] {block.Name ?? "tool"}");
                         break;
                     case "tool_result":
-                        parts.Add($"[工具结果] {TrimForSummary(block.Content ?? "", 240)}");
+                        parts.Add($"[工具结果] {TrimForSummary(NormalizeDisplayText(block.Content ?? ""), 240)}");
                         break;
                 }
             }
-            return parts.Count > 0 ? string.Join(Environment.NewLine + Environment.NewLine, parts) : trimmed;
+            return (parts.Count > 0 ? string.Join(Environment.NewLine + Environment.NewLine, parts) : NormalizeDisplayText(trimmed), attachments);
         }
         catch
         {
-            return trimmed;
+            return (NormalizeDisplayText(trimmed), attachments);
         }
+    }
+
+    private List<ConversationAttachmentView> BuildStoredFileAttachments(string rawJson)
+    {
+        try
+        {
+            var items = JsonSerializer.Deserialize<List<StoredFileAttachmentMeta>>(rawJson, JsonOptions) ?? [];
+            return items
+                .Where(item => !string.IsNullOrWhiteSpace(item.FilePath))
+                .Select(item =>
+                {
+                    var path = item.FilePath ?? "";
+                    var kind = (item.Type ?? GuessMimeType(path)).StartsWith("image/", StringComparison.OrdinalIgnoreCase)
+                        ? "image"
+                        : "file";
+                    return BuildLocalAttachment(kind, path, item.Name ?? Path.GetFileName(path), item.Type ?? GuessMimeType(path), item.Id ?? "", File.Exists(path) ? "已缓存" : "文件不存在");
+                })
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private ConversationAttachmentView BuildLocalAttachment(
+        string kind,
+        string filePath,
+        string name,
+        string mimeType,
+        string resourceKey,
+        string status)
+    {
+        var size = File.Exists(filePath) ? new FileInfo(filePath).Length : 0L;
+        var url = "";
+        if (File.Exists(filePath))
+        {
+            url = TryBuildMediaCacheUrl(filePath)
+                ?? TryBuildImageDataUrl(filePath, mimeType)
+                ?? new Uri(Path.GetFullPath(filePath)).AbsoluteUri;
+        }
+        return new ConversationAttachmentView(kind, name, mimeType, size, filePath, url, resourceKey, status);
+    }
+
+    private string? TryBuildMediaCacheUrl(string filePath)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return null;
+            var fullPath = Path.GetFullPath(filePath);
+            var mediaRoot = Path.GetFullPath(_mediaCacheDir);
+            var relativePath = Path.GetRelativePath(mediaRoot, fullPath);
+            if (relativePath.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relativePath)) return null;
+            var segments = relativePath
+                .Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(Uri.EscapeDataString);
+            return $"https://{MediaHostName}/{string.Join("/", segments)}";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string? TryBuildImageDataUrl(string filePath, string mimeType)
+    {
+        try
+        {
+            if (!File.Exists(filePath)) return null;
+            if (!mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) return null;
+            var info = new FileInfo(filePath);
+            if (info.Length > 8 * 1024 * 1024) return null;
+            var bytes = File.ReadAllBytes(filePath);
+            return $"data:{mimeType};base64,{Convert.ToBase64String(bytes)}";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string GuessMimeType(string path)
+    {
+        return Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".bmp" => "image/bmp",
+            ".svg" => "image/svg+xml",
+            ".mp4" => "video/mp4",
+            ".ogg" => "audio/ogg",
+            ".pdf" => "application/pdf",
+            ".txt" => "text/plain",
+            ".json" => "application/json",
+            _ => "application/octet-stream",
+        };
     }
 
     private DateTime? ReadMessageFileTimestamp(string sessionId)
@@ -2554,15 +3767,32 @@ internal sealed class MainForm : Form
             {
                 if (item.TryGetProperty("deleted", out var deletedEl) && deletedEl.ValueKind is JsonValueKind.True) continue;
                 if (string.Equals(GetJsonString(item, "msg_type"), "system", StringComparison.OrdinalIgnoreCase)) continue;
+                var msgType = GetJsonString(item, "msg_type") ?? "";
+                var rawContent = ExtractFeishuBodyContentRaw(item);
+                var itemRaw = item.GetRawText();
+                var resourceKey = ExtractFeishuResourceKey(rawContent);
+                if (string.IsNullOrWhiteSpace(resourceKey))
+                {
+                    resourceKey = ExtractFeishuResourceKey(itemRaw);
+                }
+                var fileName = ExtractFeishuFileName(rawContent);
+                if (string.IsNullOrWhiteSpace(fileName))
+                {
+                    fileName = ExtractFeishuFileName(itemRaw);
+                }
                 result.Add(new FeishuIndexedMessageRecord
                 {
                     MessageId = GetJsonString(item, "message_id") ?? "",
                     ChatId = chatId,
                     CreateTime = GetJsonString(item, "create_time") ?? "",
-                    MsgType = GetJsonString(item, "msg_type") ?? "",
+                    MsgType = msgType,
                     SenderId = item.TryGetProperty("sender", out var senderEl) ? GetJsonString(senderEl, "id") : "",
                     SenderType = item.TryGetProperty("sender", out senderEl) ? GetJsonString(senderEl, "sender_type") : "",
                     Text = ExtractFeishuMessageText(item),
+                    RawContent = rawContent,
+                    ResourceKey = resourceKey,
+                    ResourceType = ResolveFeishuResourceType(msgType),
+                    FileName = fileName,
                 });
             }
         }
@@ -2647,7 +3877,30 @@ internal sealed class MainForm : Form
             LastSyncAt = DateTime.UtcNow.ToString("o"),
         };
         SaveFeishuHistoryIndex(index);
+        if (full)
+        {
+            ReviveDeletedSessionAfterFullSync(chatId, ordered.LastOrDefault()?.CreateTime, displayName);
+        }
         RefreshFeishuHistorySyncStatusPanel();
+    }
+
+    private void ReviveDeletedSessionAfterFullSync(string chatId, string? latestMessageTime, string? displayName)
+    {
+        if (string.IsNullOrWhiteSpace(chatId))
+        {
+            return;
+        }
+
+        var key = MakeDeletedSessionKey(chatId, "");
+        var deletedSessions = LoadDeletedSessions();
+        if (!deletedSessions.Remove(key))
+        {
+            return;
+        }
+
+        SaveDeletedSessions(deletedSessions);
+        var label = string.IsNullOrWhiteSpace(displayName) ? chatId : displayName;
+        AppendLog($"全量同步已恢复会话：{label}");
     }
 
     private async Task<Dictionary<string, string>> FetchFeishuChatMemberNamesAsync(string chatId)
@@ -2704,9 +3957,67 @@ internal sealed class MainForm : Form
     private List<FeishuIndexedMessageRecord> LoadIndexedFeishuHistoryRaw(string chatId)
     {
         var filePath = GetFeishuHistoryChatPath(chatId);
-        return File.Exists(filePath)
+        var records = File.Exists(filePath)
             ? JsonSerializer.Deserialize<List<FeishuIndexedMessageRecord>>(File.ReadAllText(filePath, Encoding.UTF8), JsonOptions) ?? []
             : [];
+        RepairCardMessagePlaceholders(records);
+        return records;
+    }
+
+    private void RepairCardMessagePlaceholders(List<FeishuIndexedMessageRecord> records)
+    {
+        if (records.Count == 0) return;
+        var auditIndex = LoadAuditSummaryByMessageId();
+        if (auditIndex.Count == 0) return;
+
+        foreach (var record in records)
+        {
+            if (!string.Equals(record.MsgType, "interactive", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!string.Equals(record.Text, "[卡片消息]", StringComparison.Ordinal)) continue;
+            if (string.IsNullOrWhiteSpace(record.MessageId)) continue;
+            if (!auditIndex.TryGetValue(record.MessageId, out var summary)) continue;
+            if (string.IsNullOrWhiteSpace(summary)) continue;
+            record.Text = summary;
+        }
+    }
+
+    private Dictionary<string, string> LoadAuditSummaryByMessageId()
+    {
+        if (_auditSummaryByMessageId is not null) return _auditSummaryByMessageId;
+
+        var index = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(_auditJsonPath))
+        {
+            _auditSummaryByMessageId = index;
+            return index;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(_auditJsonPath, Encoding.UTF8));
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                _auditSummaryByMessageId = index;
+                return index;
+            }
+
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                var messageId = GetJsonString(item, "messageId");
+                var summary = GetJsonString(item, "summary");
+                if (string.IsNullOrWhiteSpace(messageId) || string.IsNullOrWhiteSpace(summary)) continue;
+                if (summary.StartsWith("[FILTERED]", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(summary, "[卡片消息]", StringComparison.Ordinal)) continue;
+                index[messageId] = summary;
+            }
+        }
+        catch
+        {
+            // ignore audit parse failures; history can still fall back to stored text
+        }
+
+        _auditSummaryByMessageId = index;
+        return index;
     }
 
     private List<ConversationMessageView> LoadIndexedFeishuHistoryMessages(string chatId, int limit)
@@ -2718,10 +4029,106 @@ internal sealed class MainForm : Form
         return selected.Select((item, index) => new ConversationMessageView
         {
             Index = index + 1,
+            MessageId = item.MessageId,
             Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
+            MsgType = item.MsgType,
             CreatedAt = ParseUnixMsOrIso(item.CreateTime),
-            Content = $"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}",
+            Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
+            Attachments = BuildFeishuAttachmentPlaceholders(item),
         }).ToList();
+    }
+
+    private async Task<List<ConversationMessageView>> BuildIndexedFeishuHistoryMessagesAsync(List<FeishuIndexedMessageRecord> rawMessages, int limit)
+    {
+        var selected = rawMessages
+            .OrderBy(item => long.TryParse(item.CreateTime, out var parsed) ? parsed : 0L)
+            .ToList();
+        if (limit > 0 && selected.Count > limit) selected = selected[^limit..];
+        var messages = new List<ConversationMessageView>();
+        for (var index = 0; index < selected.Count; index++)
+        {
+            var item = selected[index];
+            messages.Add(new ConversationMessageView
+            {
+                Index = index + 1,
+                MessageId = item.MessageId,
+                Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
+                MsgType = item.MsgType,
+                CreatedAt = ParseUnixMsOrIso(item.CreateTime),
+                Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
+                Attachments = await BuildFeishuAttachmentsAsync(item),
+            });
+        }
+        return messages;
+    }
+
+    private static bool NeedsHistoryMediaRefresh(List<FeishuIndexedMessageRecord> records)
+        => records.Any(item =>
+            (string.Equals(item.MsgType, "image", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(item.MsgType, "file", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(item.MsgType, "post", StringComparison.OrdinalIgnoreCase))
+            && (string.IsNullOrWhiteSpace(item.RawContent) || string.IsNullOrWhiteSpace(item.ResourceKey))
+            && (string.Equals(item.Text, "[图片]", StringComparison.Ordinal)
+                || string.Equals(item.Text, "[文件]", StringComparison.Ordinal)
+                || string.Equals(item.Text, "[卡片消息]", StringComparison.Ordinal)));
+
+    private List<ConversationAttachmentView> BuildFeishuAttachmentPlaceholders(FeishuIndexedMessageRecord item)
+    {
+        if (string.IsNullOrWhiteSpace(item.ResourceKey)) return [];
+        var kind = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+        var name = !string.IsNullOrWhiteSpace(item.FileName)
+            ? item.FileName!
+            : $"{item.ResourceKey}.{(kind == "image" ? "png" : "bin")}";
+        return [new ConversationAttachmentView(kind, name, GuessMimeType(name), 0, "", "", item.ResourceKey, "未下载")];
+    }
+
+    private async Task<List<ConversationAttachmentView>> BuildFeishuAttachmentsAsync(FeishuIndexedMessageRecord item)
+    {
+        var placeholders = BuildFeishuAttachmentPlaceholders(item);
+        if (placeholders.Count == 0) return [];
+        var first = placeholders[0];
+        var resourceType = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+        var downloaded = await TryDownloadFeishuResourceAsync(item.MessageId, item.ResourceKey, resourceType, first.Name);
+        return downloaded is not null ? [downloaded] : placeholders.Select(attachment => attachment with { Status = "下载失败或无权限" }).ToList();
+    }
+
+    private async Task<ConversationAttachmentView?> TryDownloadFeishuResourceAsync(string messageId, string? resourceKey, string resourceType, string fallbackName)
+    {
+        if (string.IsNullOrWhiteSpace(messageId) || string.IsNullOrWhiteSpace(resourceKey)) return null;
+        try
+        {
+            Directory.CreateDirectory(_mediaCacheDir);
+            var safeKey = Regex.Replace(resourceKey, @"[^a-zA-Z0-9._-]", "_");
+            var ext = Path.GetExtension(fallbackName);
+            if (string.IsNullOrWhiteSpace(ext)) ext = string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? ".png" : ".bin";
+            var cachePath = Path.Combine(_mediaCacheDir, $"{messageId}-{safeKey}{ext}");
+            if (!File.Exists(cachePath) || new FileInfo(cachePath).Length == 0)
+            {
+                var auth = await FetchFeishuTenantAccessTokenAsync();
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+                var typeParam = string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+                var url = $"{auth.BaseUrl}/open-apis/im/v1/messages/{Uri.EscapeDataString(messageId)}/resources/{Uri.EscapeDataString(resourceKey)}?type={typeParam}";
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {auth.Token}");
+                using var response = await http.SendAsync(request);
+                if (!response.IsSuccessStatusCode) return null;
+                var bytes = await response.Content.ReadAsByteArrayAsync();
+                if (bytes.Length == 0 || bytes.Length > 100 * 1024 * 1024) return null;
+                await File.WriteAllBytesAsync(cachePath, bytes);
+            }
+            var mimeType = GuessMimeType(cachePath);
+            return BuildLocalAttachment(
+                string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file",
+                cachePath,
+                fallbackName,
+                mimeType,
+                resourceKey,
+                "已缓存");
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private void RefreshFeishuHistorySyncStatusPanel()
@@ -2913,6 +4320,15 @@ internal sealed class MainForm : Form
         return "user";
     }
 
+    private static string ExtractFeishuBodyContentRaw(JsonElement item)
+    {
+        if (!item.TryGetProperty("body", out var body) || body.ValueKind != JsonValueKind.Object) return "";
+        if (!body.TryGetProperty("content", out var content)) return "";
+        return content.ValueKind == JsonValueKind.String
+            ? content.GetString() ?? ""
+            : content.GetRawText();
+    }
+
     private static string ExtractFeishuMessageText(JsonElement item)
     {
         var msgType = GetJsonString(item, "msg_type") ?? "";
@@ -2921,7 +4337,7 @@ internal sealed class MainForm : Form
             return $"[{msgType}]";
         }
 
-        var content = GetJsonString(body, "content") ?? "";
+        var content = ExtractFeishuBodyContentRaw(item);
         if (string.IsNullOrWhiteSpace(content)) return $"[{msgType}]";
         if (string.Equals(msgType, "text", StringComparison.OrdinalIgnoreCase))
         {
@@ -2931,6 +4347,10 @@ internal sealed class MainForm : Form
         {
             return ParseFeishuPostContent(content);
         }
+        if (string.Equals(msgType, "interactive", StringComparison.OrdinalIgnoreCase))
+        {
+            return ParseFeishuInteractiveContent(content);
+        }
 
         return msgType switch
         {
@@ -2938,9 +4358,71 @@ internal sealed class MainForm : Form
             "file" => "[文件]",
             "audio" => "[语音]",
             "video" or "media" => "[视频]",
-            "interactive" => "[卡片消息]",
             _ => $"[{msgType}]",
         };
+    }
+
+    private static string ResolveFeishuResourceType(string msgType)
+        => string.Equals(msgType, "image", StringComparison.OrdinalIgnoreCase) || string.Equals(msgType, "post", StringComparison.OrdinalIgnoreCase)
+            ? "image"
+            : "file";
+
+    private static string ExtractFeishuResourceKey(string rawContent)
+    {
+        if (string.IsNullOrWhiteSpace(rawContent)) return "";
+        try
+        {
+            using var document = JsonDocument.Parse(rawContent);
+            return FindFirstJsonString(document.RootElement, "image_key", "file_key", "imageKey", "fileKey") ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string ExtractFeishuFileName(string rawContent)
+    {
+        if (string.IsNullOrWhiteSpace(rawContent)) return "";
+        try
+        {
+            using var document = JsonDocument.Parse(rawContent);
+            return FindFirstJsonString(document.RootElement, "file_name", "name", "fileName") ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string? FindFirstJsonString(JsonElement element, params string[] names)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var name in names)
+                {
+                    if (element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String)
+                    {
+                        var result = value.GetString();
+                        if (!string.IsNullOrWhiteSpace(result)) return result;
+                    }
+                }
+                foreach (var property in element.EnumerateObject())
+                {
+                    var nested = FindFirstJsonString(property.Value, names);
+                    if (!string.IsNullOrWhiteSpace(nested)) return nested;
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    var nested = FindFirstJsonString(item, names);
+                    if (!string.IsNullOrWhiteSpace(nested)) return nested;
+                }
+                break;
+        }
+        return null;
     }
 
     private static string ParseFeishuTextContent(string raw)
@@ -2969,6 +4451,23 @@ internal sealed class MainForm : Form
             CollectTextRuns(document.RootElement, parts);
             var merged = string.Join(" ", parts.Where(part => !string.IsNullOrWhiteSpace(part)).Select(part => part.Trim()));
             return Regex.Replace(merged, @"\s+", " ").Trim();
+        }
+        catch
+        {
+            return Regex.Replace(raw, @"\s+", " ").Trim();
+        }
+    }
+
+    private static string ParseFeishuInteractiveContent(string raw)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            var parts = new List<string>();
+            CollectTextRuns(document.RootElement, parts);
+            var merged = string.Join(" ", parts.Where(part => !string.IsNullOrWhiteSpace(part)).Select(part => part.Trim()));
+            merged = Regex.Replace(merged, @"\s+", " ").Trim();
+            return string.IsNullOrWhiteSpace(merged) ? "[卡片消息]" : merged;
         }
         catch
         {
@@ -3024,6 +4523,61 @@ internal sealed class MainForm : Form
         var normalized = Regex.Replace(text ?? "", @"\s+", " ").Trim();
         return normalized.Length <= maxChars ? normalized : normalized[..Math.Max(0, maxChars - 3)] + "...";
     }
+
+    private static string NormalizeDisplayText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || !LooksLikeMojibake(text)) return text;
+        var repaired = TryRepairUtf8ReadAsGbk(text);
+        if (string.IsNullOrWhiteSpace(repaired)) return text;
+        return MojibakeScore(repaired) < MojibakeScore(text) ? repaired : text;
+    }
+
+    private static bool LooksLikeMojibake(string text) => MojibakeScore(text) >= 3;
+
+    private static int MojibakeScore(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        var score = 0;
+        foreach (var token in new[] { "妫", "绱", "鍦", "涓", "鏂", "鎴", "浼", "杩", "鍖", "櫌", "儴", "烘", "櫙", "€", "俓", "", "", "", "", "" })
+        {
+            var index = 0;
+            while ((index = text.IndexOf(token, index, StringComparison.Ordinal)) >= 0)
+            {
+                score++;
+                index += token.Length;
+            }
+        }
+        return score;
+    }
+
+    private static string? TryRepairUtf8ReadAsGbk(string text)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            var byteCount = WideCharToMultiByte(CodePageGb2312, 0, text, text.Length, null, 0, IntPtr.Zero, IntPtr.Zero);
+            if (byteCount <= 0) return null;
+            var bytes = new byte[byteCount];
+            var written = WideCharToMultiByte(CodePageGb2312, 0, text, text.Length, bytes, bytes.Length, IntPtr.Zero, IntPtr.Zero);
+            if (written <= 0) return null;
+            return Encoding.UTF8.GetString(bytes, 0, written);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int WideCharToMultiByte(
+        uint codePage,
+        uint flags,
+        string wideCharString,
+        int wideCharCount,
+        byte[]? multiByteString,
+        int multiByteCount,
+        IntPtr defaultChar,
+        IntPtr usedDefaultChar);
 
     private static Dictionary<string, string> ReadEnvFile(string path)
     {
@@ -3119,6 +4673,41 @@ internal sealed class MainForm : Form
         return value.Length > maxLen ? value[..(maxLen - 3)] + "..." : value;
     }
 
+    private static string FormatLocalLlmLastStatus(LocalLlmStatusRecord status)
+    {
+        if (!HasRecentRouteSignal(status))
+        {
+            return "暂无最近路由";
+        }
+
+        if (!string.IsNullOrWhiteSpace(status.LastRefusalReason))
+        {
+            return TrimForStatus(status.LastRefusalReason, 42);
+        }
+
+        var provider = (status.LastProvider ?? "").Trim().ToLowerInvariant();
+        if (provider == "local_best_effort" && !string.IsNullOrWhiteSpace(status.LastFallbackReason))
+        {
+            return TrimForStatus(status.LastFallbackReason, 42);
+        }
+
+        if (!string.IsNullOrWhiteSpace(status.LastRouteReason))
+        {
+            return TrimForStatus(status.LastRouteReason, 42);
+        }
+
+        return "暂无最近路由";
+    }
+
+    private static bool HasRecentRouteSignal(LocalLlmStatusRecord status)
+    {
+        if ((status.RecentRoutes?.Count ?? 0) > 0) return true;
+        if (!string.IsNullOrWhiteSpace(status.LastRouteReason)) return true;
+        if (!string.IsNullOrWhiteSpace(status.LastFallbackReason)) return true;
+        if (!string.IsNullOrWhiteSpace(status.LastRefusalReason)) return true;
+        return !string.IsNullOrWhiteSpace(status.LastDecision) || !string.IsNullOrWhiteSpace(status.LastProvider);
+    }
+
     private static string RouterModeToLabel(string? mode)
         => (mode ?? "").Trim().ToLowerInvariant() switch
         {
@@ -3126,6 +4715,23 @@ internal sealed class MainForm : Form
             "codex_only" => "仅 Codex",
             _ => "混合模式（Codex 主脑）",
         };
+
+    private static bool CodexSupportsNpmUpdate()
+    {
+        try
+        {
+            var npmRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "npm");
+            var codexShim = Path.Combine(npmRoot, "codex.ps1");
+            var codexPackage = Path.Combine(npmRoot, "node_modules", "@openai", "codex", "package.json");
+            return File.Exists(codexShim) && File.Exists(codexPackage);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private static string FormatLastBrainStatus(LocalLlmStatusRecord status)
     {
@@ -3193,6 +4799,41 @@ internal sealed class MainForm : Form
         if (File.Exists(path) || Directory.Exists(path)) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
     }
 
+    private string GetDefaultMemoryRepoPath()
+        => Path.Combine(_ctiHome, "memory-repo");
+
+    private string ResolveEffectiveMemoryRepoPath(string configuredPath, string defaultWorkDir, string unityProjectPath, bool appendLog = false)
+    {
+        var fallback = Path.GetFullPath(GetDefaultMemoryRepoPath());
+        var normalized = string.IsNullOrWhiteSpace(configuredPath) ? fallback : Path.GetFullPath(configuredPath.Trim());
+        var blockedRoots = new[] { defaultWorkDir, unityProjectPath }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => Path.GetFullPath(value.Trim()))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (blockedRoots.Any(root => IsSameOrChildPath(normalized, root)))
+        {
+            if (appendLog)
+            {
+                AppendLog($"记忆仓库路径已自动改回工作目录外：{normalized} -> {fallback}");
+            }
+            return fallback;
+        }
+
+        return normalized;
+    }
+
+    private static bool IsSameOrChildPath(string candidatePath, string rootPath)
+    {
+        if (string.IsNullOrWhiteSpace(candidatePath) || string.IsNullOrWhiteSpace(rootPath)) return false;
+        var candidate = Path.GetFullPath(candidatePath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var root = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase)
+            || candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || candidate.StartsWith(root + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string FindSkillDir()
     {
         var candidates = new[] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "skills", "claude-to-im"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "skills", "claude-to-im"), AppContext.BaseDirectory };
@@ -3256,6 +4897,7 @@ internal sealed record WebMcpItem(
 internal sealed record WebExtensionItem(
     string Id,
     string DisplayName,
+    string ManifestKind,
     string Type,
     string Category,
     bool Enabled,
@@ -3263,7 +4905,21 @@ internal sealed record WebExtensionItem(
     string Source,
     bool SourceExists,
     string Description,
-    string ManifestPath);
+    string ManifestPath,
+    bool CanInstall);
+
+internal sealed record ExtensionImportPreview(
+    string FolderPath,
+    string Kind,
+    string RuntimeType,
+    string Id,
+    string DisplayName,
+    string Source,
+    string ManifestPath,
+    string Description,
+    string InstallState,
+    bool CanImport,
+    string Reason);
 
 internal sealed record WebSessionItem(
     string DisplayName,
@@ -3275,6 +4931,66 @@ internal sealed record WebSessionItem(
     int LocalMessageCount,
     string LastUpdatedAt,
     string Summary);
+internal sealed record WebSessionDetail(
+    string DisplayName,
+    string ChannelType,
+    string ChatType,
+    string ChatId,
+    string SessionId,
+    string SdkSessionId,
+    string WorkingDirectory,
+    string Source,
+    bool HasLocalBinding,
+    int LocalMessageCount,
+    string LastUpdatedAt,
+    string Summary,
+    WebConversationMessage[] Messages,
+    JsonNode[] WorkflowRuns);
+internal sealed record WebConversationMessage(
+    int Index,
+    string MessageId,
+    string Role,
+    string MsgType,
+    string CreatedAt,
+    string Content,
+    WebMessageAttachment[] Attachments);
+internal sealed record WebMessageAttachment(
+    string Kind,
+    string Name,
+    string MimeType,
+    long Size,
+    string Path,
+    string Url,
+    string ResourceKey,
+    string Status);
+
+internal sealed class DeletedSessionRecord
+{
+    public string? ChatId { get; set; }
+    public string? SessionId { get; set; }
+    public string? DisplayName { get; set; }
+    public string? DeletedAt { get; set; }
+    public string? LastSeenAt { get; set; }
+}
+
+internal sealed record WebReplyPresetItem(string Name, string Value);
+internal sealed record WebRuntimeAction(string Id, string Label, bool Enabled);
+internal sealed record WebRuntimeUnit(
+    string UnitId,
+    string Id,
+    string DisplayName,
+    string Kind,
+    string Category,
+    string Status,
+    string Detail,
+    bool Enabled,
+    string InstallState,
+    string Source,
+    string Cwd,
+    string Version,
+    string Description,
+    bool CanInstall,
+    WebRuntimeAction[] Actions);
 internal sealed class McpManifest
 {
     public string? Id { get; set; }
@@ -3509,6 +5225,15 @@ internal sealed class StoredBridgeMessage
     public string? CreatedAt { get; set; }
 }
 
+internal sealed class StoredFileAttachmentMeta
+{
+    public string? Id { get; set; }
+    public string? Name { get; set; }
+    public string? Type { get; set; }
+    public long Size { get; set; }
+    public string? FilePath { get; set; }
+}
+
 internal sealed class FeishuIndexedMessageRecord
 {
     public string MessageId { get; set; } = "";
@@ -3519,6 +5244,10 @@ internal sealed class FeishuIndexedMessageRecord
     public string? SenderType { get; set; }
     public string? SenderName { get; set; }
     public string Text { get; set; } = "";
+    public string RawContent { get; set; } = "";
+    public string ResourceKey { get; set; } = "";
+    public string ResourceType { get; set; } = "";
+    public string FileName { get; set; } = "";
     public bool HasMore { get; set; }
     public string? NextPageToken { get; set; }
 }
@@ -3529,6 +5258,7 @@ internal sealed class StoredContentBlock
     public string? Name { get; set; }
     public string? Text { get; set; }
     public string? Content { get; set; }
+    public string? Path { get; set; }
 }
 
 internal sealed class ConversationEntry
@@ -3555,10 +5285,23 @@ internal sealed class ConversationEntry
 internal sealed class ConversationMessageView
 {
     public int Index { get; set; }
+    public string MessageId { get; set; } = "";
     public string Role { get; set; } = "";
+    public string MsgType { get; set; } = "";
     public DateTime? CreatedAt { get; set; }
     public string Content { get; set; } = "";
+    public List<ConversationAttachmentView> Attachments { get; set; } = [];
 }
+
+internal sealed record ConversationAttachmentView(
+    string Kind,
+    string Name,
+    string MimeType,
+    long Size,
+    string Path,
+    string Url,
+    string ResourceKey,
+    string Status);
 
 internal sealed record SettingsSnapshot(
     string DefaultWorkDir,

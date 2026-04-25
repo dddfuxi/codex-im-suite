@@ -11,6 +11,7 @@
   "category": "skill.maintenance",
   "optional": false,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "aliases": ["architecture docs", "architecture diagram"],
   "enabled": true,
   "description": "Generate and maintain project architecture documentation with Mermaid diagrams and architecture change rules."

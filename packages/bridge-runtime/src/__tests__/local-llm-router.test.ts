@@ -59,16 +59,27 @@ describe('decideConservativeRoute', () => {
 
   it('routes common Chinese git read-only queries to local repo path', () => {
     const statusDecision = decideConservativeRoute(makeParams('帮我看看 git 状态'), baseConfig);
-    assert.equal(statusDecision.useLocal, true);
+    assert.equal(statusDecision.useLocal, false);
+    assert.equal(statusDecision.allowLocalFallback, true);
     assert.equal(statusDecision.requestKind, 'repo_query');
+    assert.equal(statusDecision.preferredDecision, 'escalate_codex');
 
     const branchDecision = decideConservativeRoute(makeParams('当前分支是什么'), baseConfig);
-    assert.equal(branchDecision.useLocal, true);
+    assert.equal(branchDecision.useLocal, false);
+    assert.equal(branchDecision.allowLocalFallback, true);
     assert.equal(branchDecision.requestKind, 'repo_query');
 
     const logDecision = decideConservativeRoute(makeParams('最近几条提交'), baseConfig);
-    assert.equal(logDecision.useLocal, true);
+    assert.equal(logDecision.useLocal, false);
+    assert.equal(logDecision.allowLocalFallback, true);
     assert.equal(logDecision.requestKind, 'repo_query');
+  });
+
+  it('treats shutdown-like requests as high risk', () => {
+    const decision = decideConservativeRoute(makeParams('现在给我关机，shutdown /s /t 0'), baseConfig);
+    assert.equal(decision.useLocal, false);
+    assert.equal(decision.highRisk, true);
+    assert.match(decision.reason, /系统级高风险操作/);
   });
 
   it('rejects Unity and MCP related requests', () => {
@@ -139,5 +150,13 @@ describe('route protocol helpers', () => {
     assert.equal(next.prompt, '只保留必要问题描述');
     assert.equal(next.conversationHistory?.length, 1);
     assert.match(next.systemPrompt || '', /Local router summary/);
+  });
+
+  it('local-only tool blocker does not ask the user to manually inspect', async () => {
+    const { LocalLlamaProvider } = await import('../local-llm-provider.js');
+    const provider = new LocalLlamaProvider(baseConfig);
+    const message = provider.buildLocalOnlyMessage('unity_like', '涉及 Unity 或 Unity MCP');
+    assert.match(message, /只报告阻塞原因/);
+    assert.doesNotMatch(message, /建议步骤|手动检查/);
   });
 });

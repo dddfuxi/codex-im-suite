@@ -10,6 +10,7 @@
   "category": "mcp.creative",
   "optional": true,
   "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
   "source": "${SUITE_ROOT}\\packages\\mcp-ignis",
   "aliases": ["ignis", "ignis mcp", "ignismcp"],
   "enabled": true,

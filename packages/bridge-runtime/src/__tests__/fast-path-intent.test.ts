@@ -62,6 +62,12 @@ describe('MCP fast-path 判定', () => {
     assert.equal(assessment.interactionIntent, 'query');
     assert.equal(inferMcpFastIntent(prompt, assessment), 'status');
   });
+
+  it('Unity 场景节点分析不走本地 MCP 状态快路径', () => {
+    const prompt = '帮我用unitymcp看一眼unity里，HSScene的Furniture_前缀的家具节点都代表什么，分析一下整理一份列表发我';
+    const assessment = assessMcpInteraction(prompt);
+    assert.equal(inferMcpFastIntent(prompt, assessment), null);
+  });
 });
 
 describe('本地执行器判定', () => {
