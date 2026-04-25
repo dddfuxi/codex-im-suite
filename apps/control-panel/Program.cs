@@ -3770,13 +3770,14 @@ internal sealed class MainForm : Form
                 var msgType = GetJsonString(item, "msg_type") ?? "";
                 var rawContent = ExtractFeishuBodyContentRaw(item);
                 var itemRaw = item.GetRawText();
-                var resourceKey = ExtractFeishuResourceKey(rawContent);
-                if (string.IsNullOrWhiteSpace(resourceKey))
+                var hasDirectResource = IsDirectFeishuResourceMessage(msgType);
+                var resourceKey = hasDirectResource ? ExtractFeishuResourceKey(rawContent) : "";
+                if (hasDirectResource && string.IsNullOrWhiteSpace(resourceKey))
                 {
                     resourceKey = ExtractFeishuResourceKey(itemRaw);
                 }
-                var fileName = ExtractFeishuFileName(rawContent);
-                if (string.IsNullOrWhiteSpace(fileName))
+                var fileName = hasDirectResource ? ExtractFeishuFileName(rawContent) : "";
+                if (hasDirectResource && string.IsNullOrWhiteSpace(fileName))
                 {
                     fileName = ExtractFeishuFileName(itemRaw);
                 }
@@ -3831,7 +3832,12 @@ internal sealed class MainForm : Form
         var latestKnown = existing.Count > 0
             ? existing.Max(item => long.TryParse(item.CreateTime, out var parsed) ? parsed : 0L)
             : 0L;
-        var merged = existing.ToDictionary(item => item.MessageId, StringComparer.OrdinalIgnoreCase);
+        var merged = new Dictionary<string, FeishuIndexedMessageRecord>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in existing)
+        {
+            if (string.IsNullOrWhiteSpace(item.MessageId)) continue;
+            merged[item.MessageId] = item;
+        }
         var speakerNames = await FetchFeishuChatMemberNamesAsync(chatId);
         string? pageToken = null;
 
@@ -3973,12 +3979,21 @@ internal sealed class MainForm : Form
         foreach (var record in records)
         {
             if (!string.Equals(record.MsgType, "interactive", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!string.Equals(record.Text, "[卡片消息]", StringComparison.Ordinal)) continue;
+            if (!IsFeishuInteractiveFallbackText(record.Text)) continue;
             if (string.IsNullOrWhiteSpace(record.MessageId)) continue;
             if (!auditIndex.TryGetValue(record.MessageId, out var summary)) continue;
             if (string.IsNullOrWhiteSpace(summary)) continue;
             record.Text = summary;
         }
+    }
+
+    private static bool IsFeishuInteractiveFallbackText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        var trimmed = text.Trim();
+        return string.Equals(trimmed, "[卡片消息]", StringComparison.Ordinal)
+            || trimmed.Contains("请升级至最新版本客户端", StringComparison.Ordinal)
+            || trimmed.Contains("upgrade", StringComparison.OrdinalIgnoreCase);
     }
 
     private Dictionary<string, string> LoadAuditSummaryByMessageId()
@@ -4045,9 +4060,16 @@ internal sealed class MainForm : Form
             .ToList();
         if (limit > 0 && selected.Count > limit) selected = selected[^limit..];
         var messages = new List<ConversationMessageView>();
+        var downloadBudget = 12;
         for (var index = 0; index < selected.Count; index++)
         {
             var item = selected[index];
+            var shouldTryDownload = downloadBudget > 0 && selected.Count - index <= 80;
+            var attachments = await BuildFeishuAttachmentsAsync(item, shouldTryDownload);
+            if (shouldTryDownload && attachments.Count > 0)
+            {
+                downloadBudget--;
+            }
             messages.Add(new ConversationMessageView
             {
                 Index = index + 1,
@@ -4056,7 +4078,7 @@ internal sealed class MainForm : Form
                 MsgType = item.MsgType,
                 CreatedAt = ParseUnixMsOrIso(item.CreateTime),
                 Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
-                Attachments = await BuildFeishuAttachmentsAsync(item),
+                Attachments = attachments,
             });
         }
         return messages;
@@ -4074,6 +4096,7 @@ internal sealed class MainForm : Form
 
     private List<ConversationAttachmentView> BuildFeishuAttachmentPlaceholders(FeishuIndexedMessageRecord item)
     {
+        if (!IsDirectFeishuResourceMessage(item.MsgType)) return [];
         if (string.IsNullOrWhiteSpace(item.ResourceKey)) return [];
         var kind = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
         var name = !string.IsNullOrWhiteSpace(item.FileName)
@@ -4082,14 +4105,45 @@ internal sealed class MainForm : Form
         return [new ConversationAttachmentView(kind, name, GuessMimeType(name), 0, "", "", item.ResourceKey, "未下载")];
     }
 
-    private async Task<List<ConversationAttachmentView>> BuildFeishuAttachmentsAsync(FeishuIndexedMessageRecord item)
+    private async Task<List<ConversationAttachmentView>> BuildFeishuAttachmentsAsync(FeishuIndexedMessageRecord item, bool allowDownload)
     {
         var placeholders = BuildFeishuAttachmentPlaceholders(item);
         if (placeholders.Count == 0) return [];
         var first = placeholders[0];
         var resourceType = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+        var cached = TryGetCachedFeishuResource(item.MessageId, item.ResourceKey, resourceType, first.Name);
+        if (cached is not null) return [cached];
+        if (!allowDownload)
+        {
+            return placeholders.Select(attachment => attachment with { Status = "未下载，点击刷新详情会优先加载最近附件" }).ToList();
+        }
         var downloaded = await TryDownloadFeishuResourceAsync(item.MessageId, item.ResourceKey, resourceType, first.Name);
         return downloaded is not null ? [downloaded] : placeholders.Select(attachment => attachment with { Status = "下载失败或无权限" }).ToList();
+    }
+
+    private ConversationAttachmentView? TryGetCachedFeishuResource(string messageId, string? resourceKey, string resourceType, string fallbackName)
+    {
+        if (string.IsNullOrWhiteSpace(messageId) || string.IsNullOrWhiteSpace(resourceKey)) return null;
+        try
+        {
+            var safeKey = Regex.Replace(resourceKey, @"[^a-zA-Z0-9._-]", "_");
+            var ext = Path.GetExtension(fallbackName);
+            if (string.IsNullOrWhiteSpace(ext)) ext = string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? ".png" : ".bin";
+            var cachePath = Path.Combine(_mediaCacheDir, $"{messageId}-{safeKey}{ext}");
+            if (!File.Exists(cachePath) || new FileInfo(cachePath).Length == 0) return null;
+            var mimeType = GuessMimeType(cachePath);
+            return BuildLocalAttachment(
+                string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file",
+                cachePath,
+                fallbackName,
+                mimeType,
+                resourceKey,
+                "已缓存");
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task<ConversationAttachmentView?> TryDownloadFeishuResourceAsync(string messageId, string? resourceKey, string resourceType, string fallbackName)
@@ -4362,8 +4416,13 @@ internal sealed class MainForm : Form
         };
     }
 
+    private static bool IsDirectFeishuResourceMessage(string? msgType)
+        => string.Equals(msgType, "image", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(msgType, "file", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(msgType, "media", StringComparison.OrdinalIgnoreCase);
+
     private static string ResolveFeishuResourceType(string msgType)
-        => string.Equals(msgType, "image", StringComparison.OrdinalIgnoreCase) || string.Equals(msgType, "post", StringComparison.OrdinalIgnoreCase)
+        => string.Equals(msgType, "image", StringComparison.OrdinalIgnoreCase)
             ? "image"
             : "file";
 

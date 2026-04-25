@@ -20,6 +20,7 @@ import {
   PlugZap,
   Power,
   RefreshCw,
+  Rocket,
   RotateCw,
   Search,
   Settings,
@@ -536,6 +537,7 @@ function App() {
   const [sessionQuery, setSessionQuery] = useState('');
   const [selectedSessionKey, setSelectedSessionKey] = useState('');
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
+  const [sessionError, setSessionError] = useState('');
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const lastLoadedSessionKeyRef = useRef('');
@@ -575,12 +577,14 @@ function App() {
     const active = sessionsRef.current.find((item) => `${item.chatId}::${item.sessionId}` === sessionKey);
     if (!active) {
       setSessionDetail(null);
+      setSessionError('未在当前会话列表中找到这条记录，请刷新会话列表后重试。');
       setSelectedSessionKey(sessionKey);
       return;
     }
 
     setSelectedSessionKey(sessionKey);
     setSessionDrawerOpen(true);
+    setSessionError('');
 
     if (!force && lastLoadedSessionKeyRef.current === sessionKey && sessionDetail) {
       return;
@@ -597,8 +601,10 @@ function App() {
     try {
       const detail = await sendCommand('history.getSessionDetail', { chatId: active.chatId, sessionId: active.sessionId, force });
       setSessionDetail(detail as SessionDetail);
-    } catch {
+      setSessionError('');
+    } catch (error) {
       setSessionDetail(null);
+      setSessionError(error instanceof Error ? error.message : '会话详情加载失败。');
       lastLoadedSessionKeyRef.current = '';
     } finally {
       inFlightSessionKeyRef.current = '';
@@ -614,6 +620,7 @@ function App() {
 
     await sendCommand('history.deleteSession', { chatId: sessionDetail.chatId, sessionId: sessionDetail.sessionId });
     setSessionDetail(null);
+    setSessionError('');
     setSelectedSessionKey('');
     setSessionDrawerOpen(false);
     lastLoadedSessionKeyRef.current = '';
@@ -696,6 +703,10 @@ function App() {
             <button className="icon-button" title="刷新状态" onClick={() => void sendCommand('state.refresh').then(loadRuntimeUnits)} disabled={pending['state.refresh']}>
               <RefreshCw size={16} className={pending['state.refresh'] ? 'spin' : ''} />
             </button>
+            <button className="primary-button" onClick={() => void run('release.publishBackup').then(loadRuntimeUnits)} disabled={pending['release.publishBackup']}>
+              <Rocket size={16} />
+              一键发布
+            </button>
             <button className="primary-button" onClick={() => void run('release.prepareMainRelease').then(loadRuntimeUnits)} disabled={pending['release.prepareMainRelease']}>
               <ListChecks size={16} />
               主干发布预检
@@ -749,6 +760,7 @@ function App() {
             selectedSessionKey={selectedSessionKey}
             openSessionDetail={openSessionDetail}
             detail={sessionDetail}
+            detailError={sessionError}
             detailLoading={sessionLoading}
             drawerOpen={sessionDrawerOpen}
             setDrawerOpen={setSessionDrawerOpen}
@@ -1187,7 +1199,7 @@ function ReleasePage({ state, run, pending }: PageProps) {
   return (
     <section className="release-layout">
       <section className="panel panel-hero">
-        <SectionHeader title="主干发布预检" />
+        <SectionHeader title="发布门禁" />
         <div className="release-gates wide">
           <GateItem label="发布摘要" ok={state.release.publishSummaryExists} />
           <GateItem label="发布历史" ok={state.release.releaseNotesExists} />
@@ -1198,7 +1210,7 @@ function ReleasePage({ state, run, pending }: PageProps) {
       <section className="panel">
         <SectionHeader title="发布动作" />
         <div className="command-band">
-          <CommandButton label="本机备份发布" command="release.publishBackup" icon={<Layers3 size={16} />} run={run} pending={pending} />
+          <CommandButton label="一键发布" command="release.publishBackup" icon={<Rocket size={16} />} run={run} pending={pending} />
           <CommandButton label="主干发布预检" command="release.prepareMainRelease" icon={<ListChecks size={16} />} run={run} pending={pending} />
           <CommandButton label="打开摘要" command="release.openSummary" icon={<FileText size={16} />} run={run} pending={pending} />
           <CommandButton label="打开历史" command="release.openNotes" icon={<History size={16} />} run={run} pending={pending} />
@@ -1225,6 +1237,7 @@ function SessionsPage({
   selectedSessionKey,
   openSessionDetail,
   detail,
+  detailError,
   detailLoading,
   drawerOpen,
   setDrawerOpen,
@@ -1246,6 +1259,7 @@ function SessionsPage({
   selectedSessionKey: string;
   openSessionDetail: (value: string, force?: boolean) => void | Promise<void>;
   detail: SessionDetail | null;
+  detailError: string;
   detailLoading: boolean;
   drawerOpen: boolean;
   setDrawerOpen: (value: boolean) => void;
@@ -1304,6 +1318,7 @@ function SessionsPage({
         </section>
         <SessionDetailPane
           detail={detail}
+          detailError={detailError}
           detailLoading={detailLoading}
           drawerOpen={drawerOpen}
           setDrawerOpen={setDrawerOpen}
@@ -1317,6 +1332,7 @@ function SessionsPage({
 
 const SessionDetailPane = memo(function SessionDetailPane({
   detail,
+  detailError,
   detailLoading,
   drawerOpen,
   setDrawerOpen,
@@ -1324,6 +1340,7 @@ const SessionDetailPane = memo(function SessionDetailPane({
   refreshDetail,
 }: {
   detail: SessionDetail | null;
+  detailError: string;
   detailLoading: boolean;
   drawerOpen: boolean;
   setDrawerOpen: (value: boolean) => void;
@@ -1448,10 +1465,11 @@ const SessionDetailPane = memo(function SessionDetailPane({
                 )}
               </article>
             ))}
+            {orderedMessages.length === 0 && <div className="empty-inline">这条会话暂无可展示消息，可能是远端历史同步失败或本地索引缺少消息内容。</div>}
           </div>
         </div>
       ) : (
-        <div className="empty-inline">{detailLoading ? '加载中…' : '点击左侧会话后，在这里查看完整消息流。'}</div>
+        <div className="empty-inline">{detailLoading ? '加载中…' : detailError || '点击左侧会话后，在这里查看完整消息流。'}</div>
       )}
     </aside>
   );
