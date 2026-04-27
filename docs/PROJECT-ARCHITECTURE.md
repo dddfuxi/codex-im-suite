@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-04-25
+更新时间：2026-04-27
 
 ## 0. 架构文档维护规则
 
@@ -105,13 +105,44 @@ sequenceDiagram
 ```
 
 - `关机 / shutdown` 这类系统级动作不再交给模型自由发挥，而是在 `bridge-manager` 里走固定链路：
-  - 仅 Feishu owner 可发起。
+  - 仅 `Owner` 角色可发起，适用于所有 IM 渠道。
   - 第一步只记录审计并返回确认提示。
   - 第二步要求用户明确回复 `确认关机`。
   - 确认后桥接先发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
   - 这条链路不经过 Codex、本地模型或本地辅助执行器。
 
-### 2.2 Provider 选择
+### 2.2 权限门禁
+
+截至 2026-04-27，桥接权限从 Feishu 单 owner 列表升级为三档角色模型：
+
+- `Viewer`：允许普通聊天入口，对应各渠道 allowed users。
+- `Operator`：允许中风险运维，例如批准普通工具权限、重启 bridge、启停 MCP 或本地模型。
+- `Owner`：允许高危动作，例如关机、发布、越权路径、权限管理和系统级命令。
+
+权限主数据存储在：
+
+- `C:\Users\admin\.claude-to-im\data\permissions.json`
+
+兼容规则：
+
+- JSON 权限库是主数据。
+- 启动和面板刷新时会从 `CTI_*_ALLOWED_USERS` 导入 `Viewer`，从 `CTI_*_OWNER_USERS` 导入 `Owner`。
+- 保存权限后同步写回兼容 env，避免旧配置和脚本失效。
+- 没有权限 JSON 且 Feishu 只有一个 allowed user 时，仍保留旧逻辑临时视为 owner。
+
+```mermaid
+flowchart TD
+  Message[IM 入站消息] --> Subject[channelType + userId]
+  Subject --> JsonPerm[permissions.json]
+  Subject --> EnvCompat[CTI allowed/owner env]
+  JsonPerm --> Role[Viewer / Operator / Owner]
+  EnvCompat --> Role
+  Role --> ViewerGate[普通聊天]
+  Role --> OperatorGate[工具批准 / MCP / bridge 运维]
+  Role --> OwnerGate[关机 / 发布 / 越权路径 / 权限管理]
+```
+
+### 2.3 Provider 选择
 
 截至 2026-04-25，运行时新增第一阶段 workflow / executor 内核。旧 provider 仍负责真实流式执行，但请求进入 provider 前会被标准化为可观察的 workflow run，并通过 executor registry 记录路由选择。当前阶段目标是先打通“入站请求 -> 执行器选择 -> 执行中 -> 成功/失败”的稳定观测闭环，后续再把真实执行实现逐步迁移到 executor adapter。
 
@@ -250,6 +281,7 @@ flowchart TD
 - 本地 `cti-final.files` 文件超过飞书 30MB 单文件限制时，出站层不再分卷，而是走 artifact delivery provider；飞书场景优先支持 `feishu_docx`，会自动创建新版云文档、把文件作为 `docx_file` 附件挂入文档，并回文档链接；也保留 `local_http` 作为公网目录备用方案。
 - 用户回复到上一条图片/文件时，Feishu adapter 会尽量读取被回复消息并把附件并入本次请求。
 - `bridge-runtime-audit.json` 记录最后阶段、最后消息、WS 状态、p2p 补捞状态。
+- 权限门禁统一通过 `hasRole(message, role)` 判定；`Owner` 包含 `Operator` 和 `Viewer` 能力，`Operator` 包含 `Viewer` 能力。关机、发布、越权路径和 mutating 直达命令只允许 `Owner`，普通工具授权和中风险运维允许 `Operator` 或 `Owner`。
 
 ### 3.2 packages/bridge-runtime
 
@@ -333,13 +365,19 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 通过“设置”弹窗修改非敏感路径配置和回复风格配置。
 - 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
 - 查看 workflow run、executor 目录、最近路由选择和会话默认 executor。
+- 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
 
-截至 2026-04-23，控制面板采用 `WinForms 宿主 + WebView2 + React/Vite`：
+截至 2026-04-27，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
 
-- WinForms 负责窗口生命周期、WebView2 Runtime 检测、白名单命令分发、本机脚本调用和文件系统边界。
+- Control API 是状态读取、白名单命令分发、会话详情、媒体缓存、workflow/executor/permissions 和本机脚本调用的统一后端。
+- WinForms 负责窗口生命周期、WebView2 Runtime 检测，并启动或连接本机 Control API；桌面壳不再把业务命令硬塞进 WebView 事件。
 - React 前端负责信息架构、导航、状态展示、长任务 pending 状态和活动流。
-- 前端只能通过 WebView 消息协议请求宿主执行命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
+- 前端通过 `HostBridge` 自动探测传输层：WebView2 内仍可走 `window.chrome.webview`，普通浏览器走 HTTP API 和 SSE。
+- 前端只能通过 HostBridge 请求后端执行白名单命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
+- Control API 默认只监听 `127.0.0.1:8788`；只有显式配置 `CTI_CONTROL_API_ALLOW_REMOTE=true` 和 `CTI_CONTROL_API_AUTH_TOKEN` 后才允许非本机访问。
+- 远程 token 默认角色是 `viewer`；`CTI_CONTROL_API_AUTH_ROLE=operator|owner` 决定远程请求能否进入中风险或高风险命令。
+- 远程 Owner 高危命令默认关闭，必须额外配置 `CTI_CONTROL_API_ALLOW_REMOTE_DANGEROUS=true` 才能继续进入权限门禁。
 - 本机缺少 WebView2 Runtime 时，宿主显示轻量降级页和安装提示，不回退旧完整 WinForms 面板。
 - 面板主界面已取消底图依赖，统一改成高密度运营台布局；总览、服务、扩展、会话、设置和日志都按窗口宽度自适应重排。
 - WinForms 宿主新增统一运行单元注册表，桥接服务、Codex CLI、本地辅助执行器、MCP 和扩展 manifest 在前端统一收敛成一套卡片和动作模型。
@@ -348,10 +386,12 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
 - 扩展页的 MCP 运行状态按健康检查、Codex 注册和托管进程综合判断；`bundled`、`external` 只作为安装来源展示，不再直接映射成“待处理”状态。
 - 会话区新增 WebView 详情抽屉，宿主通过 `history.getSessionDetail` 返回完整消息流；旧 `ConversationViewerForm` 保留为兼容调试入口。
-- 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 WebView2 虚拟域 `https://control-panel-media.local/` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
+- 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
 - 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
 - 会话详情读取旧本地消息时只做显示层 mojibake 修复；疑似 UTF-8 被 GBK 错读的文本会在面板里还原展示，原始历史 JSON 不被自动改写。
 - 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要和事件时间线，方便回溯一次飞书请求从接收、路由、执行到交付或失败的运行历程。
+- “权限”页读取 `permissions.json` 和最近会话参与人，支持按渠道、角色、名称或 ID 过滤，能把用户设置为 `Viewer`、`Operator` 或 `Owner`，并同步兼容 env 后重启 bridge。
+- 会话详情的参与人列表不再只提供一次性“加 Owner”，而是进入同一套权限库，可直接设置三档角色；显示名优先来自飞书历史，拿不到时显示原始 ID。
 - 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
 - 回复风格预设通过 `settings.listReplyPresets` / `settings.applyReplyPreset` / `settings.summarizeReplyStyle` 暴露给 WebView，继续沿用宿主保存语义。
 - 本地辅助执行器状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
@@ -366,7 +406,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 服务按钮放在对应服务卡里。
 - 状态优先读真实进程和运行审计，不再只信旧 `status.json`。
 
-WebView 命令协议：
+HostBridge 命令协议：
 
 ```json
 { "id": "request-id", "type": "command", "command": "state.refresh", "payload": {} }
@@ -388,6 +428,7 @@ WebView 命令协议：
 
 - 状态与服务：`state.refresh`、`bridge.*`、`codex.*`、`localLlm.*`
 - Workflow 和执行器：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`executor.list`、`executor.check`、`executor.setSessionDefault`
+- 权限：`permissions.list`、`permissions.upsert`、`permissions.remove`、`permissions.syncFromConfig`、`permissions.applyAndRestart`
 - 运行单元：`runtime.listUnits`、`runtime.invokeAction`
 - 扩展：`extension.enable`、`extension.disable`、`extension.remove`、`extension.install`
 - 扩展导入：`extension.detectImport`、`extension.importFromFolder`
@@ -395,6 +436,23 @@ WebView 命令协议：
 - 设置与路径：`settings.read`、`settings.save`、`settings.listReplyPresets`、`settings.applyReplyPreset`、`settings.summarizeReplyStyle`、`path.pickFolder`、`path.pickFile`、`path.openAny`
 - 历史消息解析会优先提取 Feishu `text / post / interactive` 内容；卡片消息不再统一显示成 `[卡片消息]` 占位。对旧索引里遗留的卡片占位，控制面板会按 `messageId` 从 `data/audit.json` 回填可见摘要，尽量不要求用户手动全量重同步。
 - 历史消息解析会保留飞书 `image / file` 资源键和文件名；旧索引缺少资源元数据时，详情页会触发一次会话级 full sync 尝试补齐。资源下载失败或权限不足时，前端显示明确的附件占位和状态，不伪装成已加载图片。
+
+Control API HTTP 接口：
+
+- `GET /healthz`
+- `GET /api/state`
+- `POST /api/commands`
+- `GET /api/events`
+- `GET /api/session/{chatId}/{sessionId}`
+- `GET /media/{resourceId}`
+
+远程部署入口：
+
+- `scripts/start-control-api.ps1` 可直接启动 API-only 模式。
+- `CTI_CONTROL_API_HOST` / `CTI_CONTROL_API_PORT` 控制监听地址。
+- `CTI_CONTROL_API_PUBLIC_BASE_URL` 用于反向代理或公网地址下生成媒体 URL。
+- `CTI_CONTROL_API_AUTH_ROLE` 控制远程 token 的角色等级，默认 `viewer`。
+- 非本机请求通过 `Authorization: Bearer <token>` 或 `?token=<token>` 认证；浏览器模式会保存 URL 里的 token 并用于 HTTP/SSE 请求。
 
 ## 5. Manifest 驱动扩展
 
@@ -557,6 +615,7 @@ Ignis 会话映射：
 
 - `sessions.json`
 - `bindings.json`
+- `permissions.json`
 - `messages`
 - `message-archives`
 - `feishu-chat-index.json`
@@ -690,7 +749,7 @@ flowchart TD
 - 默认工作区固定到配置里的 ST3。
 - 非授权路径默认拒绝。
 - MCP 工作目录必须在允许范围内。
-- 高危操作仍走 owner/权限门禁。
+- 高危操作走 `Owner` 门禁，中风险运维走 `Operator` 或 `Owner` 门禁。
 - 本地模型不能绕过权限。
 - 本地模型不能伪造执行结果。
 - 私有 token/config 不进入 Git。

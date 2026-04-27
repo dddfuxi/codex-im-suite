@@ -158,6 +158,34 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(_testOnly.isShutdownConfirmation('确认'), false);
   });
 
+  it('applies permission role hierarchy across channels', async () => {
+    const store = createMinimalStore({
+      bridge_feishu_allowed_users: 'feishu_viewer',
+      bridge_feishu_owner_users: 'feishu_owner',
+      telegram_bridge_allowed_users: 'tg_viewer',
+      telegram_bridge_owner_users: 'tg_owner',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const message = (channelType: string, userId: string) => ({
+      text: '/whoami',
+      messageId: 'm1',
+      address: { channelType, chatId: 'chat', userId },
+    }) as any;
+
+    assert.equal(_testOnly.hasRole(message('feishu', 'feishu_owner'), 'owner'), true);
+    assert.equal(_testOnly.hasRole(message('feishu', 'feishu_owner'), 'operator'), true);
+    assert.equal(_testOnly.hasRole(message('feishu', 'feishu_viewer'), 'viewer'), true);
+    assert.equal(_testOnly.hasRole(message('feishu', 'feishu_viewer'), 'operator'), false);
+    assert.equal(_testOnly.hasRole(message('telegram', 'tg_owner'), 'owner'), true);
+    assert.equal(_testOnly.hasRole(message('telegram', 'tg_viewer'), 'operator'), false);
+  });
+
   it('blocks manual handoff replies for Unity tool execution requests', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     const sanitized = _testOnly.sanitizeOutsourcedToolReply(

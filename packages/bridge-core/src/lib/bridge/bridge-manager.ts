@@ -54,6 +54,7 @@ const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
+const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
 const SYSTEM_ACTION_CONFIRM_TTL_MS = 2 * 60 * 1000;
 const FINAL_ENVELOPE_STATUS_PATH = path.join(
@@ -281,6 +282,14 @@ interface PendingSystemAction {
   sourceMessageId: string;
   requestedAt: number;
   expiresAt: number;
+}
+
+type PermissionRole = 'viewer' | 'operator' | 'owner';
+
+interface PermissionSubject {
+  channelType?: string;
+  userId?: string;
+  role?: string;
 }
 
 function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' | 'HTML' {
@@ -1472,29 +1481,133 @@ function parseIdList(raw: string | null | undefined): string[] {
     .filter(Boolean);
 }
 
+function normalizePermissionRole(role: string | undefined | null): PermissionRole {
+  const normalized = (role || '').trim().toLowerCase();
+  if (normalized === 'owner') return 'owner';
+  if (normalized === 'operator') return 'operator';
+  return 'viewer';
+}
+
+function permissionRank(role: PermissionRole): number {
+  switch (role) {
+    case 'owner':
+      return 3;
+    case 'operator':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function normalizeChannelType(channelType: string | undefined | null): string {
+  const normalized = (channelType || '').trim().toLowerCase();
+  if (normalized === 'telegram') return 'telegram';
+  if (normalized === 'discord') return 'discord';
+  if (normalized === 'qq') return 'qq';
+  if (normalized === 'weixin' || normalized === 'wechat') return 'weixin';
+  return normalized || 'feishu';
+}
+
+function parseEnvIdList(name: string): string[] {
+  return parseIdList(process.env[name] || '');
+}
+
 function getConfiguredOwnerIds(channelType: string): string[] {
   const { store } = getBridgeContext();
-  if (channelType !== 'feishu') return [];
-  const explicit = parseIdList(store.getSetting('bridge_feishu_owner_users'));
+  const channel = normalizeChannelType(channelType);
+  const ownerEnvByChannel: Record<string, string[]> = {
+    telegram: ['CTI_TG_OWNER_USERS', 'CTI_TELEGRAM_OWNER_USERS'],
+    discord: ['CTI_DISCORD_OWNER_USERS'],
+    feishu: ['CTI_FEISHU_OWNER_USERS'],
+    qq: ['CTI_QQ_OWNER_USERS'],
+    weixin: ['CTI_WEIXIN_OWNER_USERS'],
+  };
+  const ownerStoreByChannel: Record<string, string[]> = {
+    telegram: ['telegram_bridge_owner_users'],
+    discord: ['bridge_discord_owner_users'],
+    feishu: ['bridge_feishu_owner_users'],
+    qq: ['bridge_qq_owner_users'],
+    weixin: ['bridge_weixin_owner_users'],
+  };
+  const explicit = (ownerStoreByChannel[channel] || [])
+    .flatMap((name) => parseIdList(store.getSetting(name)));
   if (explicit.length > 0) return explicit;
+  const envOwners = (ownerEnvByChannel[channel] || [])
+    .flatMap((name) => parseEnvIdList(name));
+  if (envOwners.length > 0) return Array.from(new Set(envOwners));
+  if (channel !== 'feishu') return [];
   const allowed = parseIdList(store.getSetting('bridge_feishu_allowed_users'));
   return allowed.length === 1 ? allowed : [];
 }
 
-function isOwnerMessage(msg: InboundMessage): boolean {
-  const owners = getConfiguredOwnerIds(msg.address.channelType);
-  if (owners.length === 0) return false;
+function getConfiguredAllowedIds(channelType: string): string[] {
+  const { store } = getBridgeContext();
+  const channel = normalizeChannelType(channelType);
+  switch (channel) {
+    case 'feishu':
+      return parseIdList(store.getSetting('bridge_feishu_allowed_users'));
+    case 'telegram':
+      return parseIdList(store.getSetting('telegram_bridge_allowed_users') || process.env.CTI_TG_ALLOWED_USERS || '');
+    case 'discord':
+      return parseIdList(store.getSetting('bridge_discord_allowed_users') || process.env.CTI_DISCORD_ALLOWED_USERS || '');
+    case 'qq':
+      return parseIdList(store.getSetting('bridge_qq_allowed_users') || process.env.CTI_QQ_ALLOWED_USERS || '');
+    case 'weixin':
+      return parseIdList(store.getSetting('bridge_weixin_allowed_users') || process.env.CTI_WEIXIN_ALLOWED_USERS || '');
+    default:
+      return [];
+  }
+}
+
+function readPermissionSubjects(): PermissionSubject[] {
+  try {
+    if (!fs.existsSync(PERMISSIONS_PATH)) return [];
+    const parsed = JSON.parse(fs.readFileSync(PERMISSIONS_PATH, 'utf8')) as { subjects?: PermissionSubject[] };
+    return Array.isArray(parsed.subjects) ? parsed.subjects : [];
+  } catch {
+    return [];
+  }
+}
+
+function getPermissionRoleForMessage(msg: InboundMessage): PermissionRole | null {
   const userId = msg.address.userId?.trim();
-  return !!userId && owners.includes(userId);
+  if (!userId) return null;
+  const channel = normalizeChannelType(msg.address.channelType);
+  const subjects = readPermissionSubjects();
+  const match = subjects.find((subject) =>
+    normalizeChannelType(subject.channelType) === channel
+    && (subject.userId || '').trim() === userId
+  );
+  if (match) return normalizePermissionRole(match.role);
+  if (getConfiguredOwnerIds(channel).includes(userId)) return 'owner';
+  if (getConfiguredAllowedIds(channel).includes(userId)) return 'viewer';
+  return null;
+}
+
+function hasRole(msg: InboundMessage, requiredRole: PermissionRole): boolean {
+  const role = getPermissionRoleForMessage(msg);
+  return !!role && permissionRank(role) >= permissionRank(requiredRole);
+}
+
+function isOwnerMessage(msg: InboundMessage): boolean {
+  return hasRole(msg, 'owner');
+}
+
+function buildRoleRequiredMessage(msg: InboundMessage, role: PermissionRole): string {
+  const userId = msg.address.userId || '(unknown)';
+  const label = role === 'owner' ? 'owner' : 'operator 或 owner';
+  const configHint = role === 'owner'
+    ? '请在控制面板“权限”页把这个 ID 设为 Owner，或加入对应 CTI_*_OWNER_USERS 后重启桥接。'
+    : '请在控制面板“权限”页把这个 ID 设为 Operator/Owner 后重启桥接。';
+  return [
+    `这类操作只允许 ${label} 本人发起或批准。`,
+    `当前发送者 ID：${userId}`,
+    configHint,
+  ].join('\n');
 }
 
 function buildOwnerRequiredMessage(msg: InboundMessage): string {
-  const userId = msg.address.userId || '(unknown)';
-  return [
-    '这类操作只允许飞书 owner 本人发起或批准。',
-    `当前发送者 ID：${userId}`,
-    '如果这是你的账号，请把这个 ID 加到 CTI_FEISHU_OWNER_USERS 后重启桥接。',
-  ].join('\n');
+  return buildRoleRequiredMessage(msg, 'owner');
 }
 
 function isDangerousUserRequest(text: string): boolean {
@@ -1941,10 +2054,10 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    if (adapter.channelType === 'feishu' && !isOwnerMessage(msg)) {
+    if (!hasRole(msg, 'operator')) {
       await deliver(adapter, {
         address: msg.address,
-        text: buildOwnerRequiredMessage(msg),
+        text: buildRoleRequiredMessage(msg, 'operator'),
         parseMode: 'plain',
         replyToMessageId: msg.callbackMessageId,
       });
@@ -1999,7 +2112,7 @@ async function handleMessage(
   }
 
   if (isShutdownConfirmation(rawText)) {
-    if (adapter.channelType === 'feishu' && !ownerMessage) {
+    if (!ownerMessage) {
       await deliver(adapter, {
         address: msg.address,
         text: buildOwnerRequiredMessage(msg),
@@ -2038,7 +2151,7 @@ async function handleMessage(
   }
 
   if (isShutdownRequest(rawText)) {
-    if (adapter.channelType === 'feishu' && !ownerMessage) {
+    if (!ownerMessage) {
       await deliver(adapter, {
         address: msg.address,
         text: buildOwnerRequiredMessage(msg),
@@ -2092,10 +2205,10 @@ async function handleMessage(
     if (/^[123]$/.test(normalized)) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
-        if (adapter.channelType === 'feishu' && !ownerMessage) {
+        if (!hasRole(msg, 'operator')) {
           await deliver(adapter, {
             address: msg.address,
-            text: buildOwnerRequiredMessage(msg),
+            text: buildRoleRequiredMessage(msg, 'operator'),
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
           });
@@ -2179,7 +2292,7 @@ async function handleMessage(
     return;
   }
 
-  if (adapter.channelType === 'feishu' && isDangerousUserRequest(rawText) && !ownerMessage) {
+  if (isDangerousUserRequest(rawText) && !ownerMessage) {
     await deliver(adapter, {
       address: msg.address,
       text: buildOwnerRequiredMessage(msg),
@@ -2192,7 +2305,7 @@ async function handleMessage(
 
   const binding = router.resolve(msg.address);
   const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
-  if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && adapter.channelType === 'feishu' && !ownerMessage) {
+  if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && !ownerMessage) {
     await deliver(adapter, {
       address: msg.address,
       text: buildOwnerRequiredMessage(msg),
@@ -2230,7 +2343,7 @@ async function handleMessage(
   const directCommandRequest = parseDirectCommandRequest(rawText);
 
   if (directCommandRequest) {
-    if (adapter.channelType === 'feishu' && directCommandRequest.mutating && !isOwnerMessage(msg)) {
+    if (directCommandRequest.mutating && !isOwnerMessage(msg)) {
       await deliver(adapter, {
         address: msg.address,
         text: buildOwnerRequiredMessage(msg),
@@ -2904,6 +3017,8 @@ async function handleCommand(
         `user_id: <code>${escapeHtml(sender?.userId || '')}</code>`,
         `union_id: <code>${escapeHtml(sender?.unionId || '')}</code>`,
         `chat_type: <code>${escapeHtml(sender?.chatType || '')}</code>`,
+        `role: <b>${escapeHtml(getPermissionRoleForMessage(msg) || 'none')}</b>`,
+        `operator: <b>${hasRole(msg, 'operator') ? 'yes' : 'no'}</b>`,
         `owner: <b>${isOwnerMessage(msg) ? 'yes' : 'no'}</b>`,
       ].join('\n');
       break;
@@ -2949,8 +3064,8 @@ async function handleCommand(
     }
 
     case '/perm': {
-      if (adapter.channelType === 'feishu' && !isOwnerMessage(msg)) {
-        response = escapeHtml(buildOwnerRequiredMessage(msg));
+      if (!hasRole(msg, 'operator')) {
+        response = escapeHtml(buildRoleRequiredMessage(msg, 'operator'));
         break;
       }
       // Text-based permission approval fallback (for channels without inline buttons)
@@ -3040,6 +3155,8 @@ export const _testOnly = {
   isDangerousUserRequest,
   isShutdownRequest,
   isShutdownConfirmation,
+  hasRole,
+  getPermissionRoleForMessage,
   isFeishuDocumentListRequest,
   isFeishuDocGenerationRequestStrict,
   buildUnityScreenshotPolicyInstructions,

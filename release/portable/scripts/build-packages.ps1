@@ -81,13 +81,15 @@ function Invoke-ControlPanelWebBuild {
     Write-Host "build control-panel web: $Path"
     Push-Location $Path
     try {
-        if (Test-Path -LiteralPath 'package-lock.json') {
-            npm ci | Out-Host
-        } else {
-            npm install | Out-Host
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "npm dependency install failed at $Path"
+        if (-not (Test-Path -LiteralPath 'node_modules')) {
+            if (Test-Path -LiteralPath 'package-lock.json') {
+                npm ci | Out-Host
+            } else {
+                npm install | Out-Host
+            }
+            if ($LASTEXITCODE -ne 0) {
+                throw "npm dependency install failed at $Path"
+            }
         }
         npm run build | Out-Host
         if ($LASTEXITCODE -ne 0) {

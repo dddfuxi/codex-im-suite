@@ -37,6 +37,7 @@ export interface Config {
   tgBotToken?: string;
   tgChatId?: string;
   tgAllowedUsers?: string[];
+  tgOwnerUsers?: string[];
   // Feishu
   feishuAppId?: string;
   feishuAppSecret?: string;
@@ -47,17 +48,21 @@ export interface Config {
   // Discord
   discordBotToken?: string;
   discordAllowedUsers?: string[];
+  discordOwnerUsers?: string[];
   discordAllowedChannels?: string[];
   discordAllowedGuilds?: string[];
   // QQ
   qqAppId?: string;
   qqAppSecret?: string;
   qqAllowedUsers?: string[];
+  qqOwnerUsers?: string[];
   qqImageEnabled?: boolean;
   qqMaxImageSize?: number;
   // WeChat
   weixinBaseUrl?: string;
   weixinCdnBaseUrl?: string;
+  weixinAllowedUsers?: string[];
+  weixinOwnerUsers?: string[];
   weixinMediaEnabled?: boolean;
   // Auto-approve all tool permission requests without user confirmation
   autoApprove?: boolean;
@@ -241,6 +246,7 @@ export function loadConfig(): Config {
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
     tgChatId: env.get("CTI_TG_CHAT_ID") || undefined,
     tgAllowedUsers: splitCsv(env.get("CTI_TG_ALLOWED_USERS")),
+    tgOwnerUsers: splitCsv(env.get("CTI_TG_OWNER_USERS")),
     feishuAppId: env.get("CTI_FEISHU_APP_ID") || undefined,
     feishuAppSecret: env.get("CTI_FEISHU_APP_SECRET") || undefined,
     feishuDomain: env.get("CTI_FEISHU_DOMAIN") || undefined,
@@ -249,6 +255,7 @@ export function loadConfig(): Config {
     feishuDocumentGuideDocId: env.get("CTI_FEISHU_DOCUMENT_GUIDE_DOC_ID") || undefined,
     discordBotToken: env.get("CTI_DISCORD_BOT_TOKEN") || undefined,
     discordAllowedUsers: splitCsv(env.get("CTI_DISCORD_ALLOWED_USERS")),
+    discordOwnerUsers: splitCsv(env.get("CTI_DISCORD_OWNER_USERS")),
     discordAllowedChannels: splitCsv(
       env.get("CTI_DISCORD_ALLOWED_CHANNELS")
     ),
@@ -256,6 +263,7 @@ export function loadConfig(): Config {
     qqAppId: env.get("CTI_QQ_APP_ID") || undefined,
     qqAppSecret: env.get("CTI_QQ_APP_SECRET") || undefined,
     qqAllowedUsers: splitCsv(env.get("CTI_QQ_ALLOWED_USERS")),
+    qqOwnerUsers: splitCsv(env.get("CTI_QQ_OWNER_USERS")),
     qqImageEnabled: env.has("CTI_QQ_IMAGE_ENABLED")
       ? env.get("CTI_QQ_IMAGE_ENABLED") === "true"
       : undefined,
@@ -264,6 +272,8 @@ export function loadConfig(): Config {
       : undefined,
     weixinBaseUrl: env.get("CTI_WEIXIN_BASE_URL") || undefined,
     weixinCdnBaseUrl: env.get("CTI_WEIXIN_CDN_BASE_URL") || undefined,
+    weixinAllowedUsers: splitCsv(env.get("CTI_WEIXIN_ALLOWED_USERS")),
+    weixinOwnerUsers: splitCsv(env.get("CTI_WEIXIN_OWNER_USERS")),
     weixinMediaEnabled: env.has("CTI_WEIXIN_MEDIA_ENABLED")
       ? env.get("CTI_WEIXIN_MEDIA_ENABLED") === "true"
       : undefined,
@@ -335,6 +345,10 @@ export function saveConfig(config: Config): void {
     "CTI_TG_ALLOWED_USERS",
     config.tgAllowedUsers?.join(",")
   );
+  out += formatEnvLine(
+    "CTI_TG_OWNER_USERS",
+    config.tgOwnerUsers?.join(",")
+  );
   out += formatEnvLine("CTI_FEISHU_APP_ID", config.feishuAppId);
   out += formatEnvLine("CTI_FEISHU_APP_SECRET", config.feishuAppSecret);
   out += formatEnvLine("CTI_FEISHU_DOMAIN", config.feishuDomain);
@@ -353,6 +367,10 @@ export function saveConfig(config: Config): void {
     config.discordAllowedUsers?.join(",")
   );
   out += formatEnvLine(
+    "CTI_DISCORD_OWNER_USERS",
+    config.discordOwnerUsers?.join(",")
+  );
+  out += formatEnvLine(
     "CTI_DISCORD_ALLOWED_CHANNELS",
     config.discordAllowedChannels?.join(",")
   );
@@ -366,12 +384,24 @@ export function saveConfig(config: Config): void {
     "CTI_QQ_ALLOWED_USERS",
     config.qqAllowedUsers?.join(",")
   );
+  out += formatEnvLine(
+    "CTI_QQ_OWNER_USERS",
+    config.qqOwnerUsers?.join(",")
+  );
   if (config.qqImageEnabled !== undefined)
     out += formatEnvLine("CTI_QQ_IMAGE_ENABLED", String(config.qqImageEnabled));
   if (config.qqMaxImageSize !== undefined)
     out += formatEnvLine("CTI_QQ_MAX_IMAGE_SIZE", String(config.qqMaxImageSize));
   out += formatEnvLine("CTI_WEIXIN_BASE_URL", config.weixinBaseUrl);
   out += formatEnvLine("CTI_WEIXIN_CDN_BASE_URL", config.weixinCdnBaseUrl);
+  out += formatEnvLine(
+    "CTI_WEIXIN_ALLOWED_USERS",
+    config.weixinAllowedUsers?.join(",")
+  );
+  out += formatEnvLine(
+    "CTI_WEIXIN_OWNER_USERS",
+    config.weixinOwnerUsers?.join(",")
+  );
   if (config.weixinMediaEnabled !== undefined)
     out += formatEnvLine("CTI_WEIXIN_MEDIA_ENABLED", String(config.weixinMediaEnabled));
   if (config.selfOptimizeOnFailure !== undefined)
@@ -405,6 +435,8 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.tgBotToken) m.set("telegram_bot_token", config.tgBotToken);
   if (config.tgAllowedUsers)
     m.set("telegram_bridge_allowed_users", config.tgAllowedUsers.join(","));
+  if (config.tgOwnerUsers)
+    m.set("telegram_bridge_owner_users", config.tgOwnerUsers.join(","));
   if (config.tgChatId) m.set("telegram_chat_id", config.tgChatId);
 
   // ── Discord ──
@@ -419,6 +451,8 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_discord_bot_token", config.discordBotToken);
   if (config.discordAllowedUsers)
     m.set("bridge_discord_allowed_users", config.discordAllowedUsers.join(","));
+  if (config.discordOwnerUsers)
+    m.set("bridge_discord_owner_users", config.discordOwnerUsers.join(","));
   if (config.discordAllowedChannels)
     m.set(
       "bridge_discord_allowed_channels",
@@ -459,6 +493,8 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.qqAppSecret) m.set("bridge_qq_app_secret", config.qqAppSecret);
   if (config.qqAllowedUsers)
     m.set("bridge_qq_allowed_users", config.qqAllowedUsers.join(","));
+  if (config.qqOwnerUsers)
+    m.set("bridge_qq_owner_users", config.qqOwnerUsers.join(","));
   if (config.qqImageEnabled !== undefined)
     m.set("bridge_qq_image_enabled", String(config.qqImageEnabled));
   if (config.qqMaxImageSize !== undefined)
@@ -477,6 +513,10 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_weixin_base_url", config.weixinBaseUrl);
   if (config.weixinCdnBaseUrl)
     m.set("bridge_weixin_cdn_base_url", config.weixinCdnBaseUrl);
+  if (config.weixinAllowedUsers)
+    m.set("bridge_weixin_allowed_users", config.weixinAllowedUsers.join(","));
+  if (config.weixinOwnerUsers)
+    m.set("bridge_weixin_owner_users", config.weixinOwnerUsers.join(","));
 
   // ── Defaults ──
   // Upstream keys: bridge_default_work_dir, bridge_default_model, default_model

@@ -24,6 +24,7 @@ import {
   RotateCw,
   Search,
   Settings,
+  ShieldCheck,
   Square,
   SunMedium,
   Terminal,
@@ -107,6 +108,9 @@ type ConversationMessage = {
   messageId: string;
   role: string;
   msgType: string;
+  senderId: string;
+  senderType: string;
+  senderName: string;
   createdAt: string;
   content: string;
   attachments?: MessageAttachment[];
@@ -137,7 +141,45 @@ type SessionDetail = {
   lastUpdatedAt: string;
   summary: string;
   messages: ConversationMessage[];
+  people?: FeishuPerson[];
   workflowRuns?: WorkflowRun[];
+};
+
+type FeishuPerson = {
+  userId: string;
+  senderType: string;
+  displayName: string;
+  role: PermissionRole | '';
+  isOwner: boolean;
+  messageCount: number;
+};
+
+type PermissionRole = 'viewer' | 'operator' | 'owner';
+
+type PermissionSubject = {
+  channelType: string;
+  userId: string;
+  displayName: string;
+  role: PermissionRole;
+  source: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  updatedAt: string;
+};
+
+type PermissionCandidate = {
+  channelType: string;
+  userId: string;
+  displayName: string;
+  source: string;
+  messageCount: number;
+};
+
+type PermissionSnapshot = {
+  protocol: string;
+  updatedAt: string;
+  subjects: PermissionSubject[];
+  candidates: PermissionCandidate[];
 };
 
 type ReplyPresetItem = {
@@ -277,6 +319,7 @@ type PanelState = {
   };
   workflow: WorkflowStatus;
   executors: ExecutorStatus;
+  permissions: PermissionSnapshot;
   paths: {
     config: string;
     manifestDir: string;
@@ -327,6 +370,7 @@ const navItems = [
   { id: 'overview', label: '总览', icon: Activity },
   { id: 'services', label: '服务', icon: Power },
   { id: 'executors', label: '执行器', icon: Bot },
+  { id: 'permissions', label: '权限', icon: ShieldCheck },
   { id: 'extensions', label: '扩展', icon: Layers3 },
   { id: 'release', label: '发布', icon: GitBranch },
   { id: 'sessions', label: '会话', icon: History },
@@ -355,11 +399,13 @@ const fallbackState: PanelState = {
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
   executors: { protocol: 'executor-runtime/v1', updatedAt: '', executors: [], sessionDefaults: {} },
+  permissions: { protocol: 'cti-permissions/v1', updatedAt: '', subjects: [], candidates: [] },
   paths: { config: '', manifestDir: '', memoryRepo: '', logs: '' },
   activities: [],
 };
 
 const themeStorageKey = 'codex-im-suite-control-panel-theme';
+const controlApiTokenStorageKey = 'codex-im-suite-control-api-token';
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light';
@@ -370,6 +416,23 @@ function getInitialTheme(): ThemeMode {
 
 function createRequestId() {
   return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getControlApiToken() {
+  if (typeof window === 'undefined') return '';
+  const queryToken = new URLSearchParams(window.location.search).get('token') ?? '';
+  if (queryToken) {
+    window.localStorage.setItem(controlApiTokenStorageKey, queryToken);
+    return queryToken;
+  }
+  return window.localStorage.getItem(controlApiTokenStorageKey) ?? '';
+}
+
+function buildApiUrl(path: string, token: string) {
+  if (!token) return path;
+  const url = new URL(path, window.location.origin);
+  url.searchParams.set('token', token);
+  return `${url.pathname}${url.search}`;
 }
 
 function splitPaths(value: string) {
@@ -411,6 +474,57 @@ function getSessionDisplayTitle(item: { displayName?: string; chatId?: string; s
     return `私聊 · ${rawName}`;
   }
   return fallback;
+}
+
+function roleLabel(role: PermissionRole | '') {
+  switch (role) {
+    case 'owner':
+      return 'Owner';
+    case 'operator':
+      return 'Operator';
+    case 'viewer':
+      return 'Viewer';
+    default:
+      return '未授权';
+  }
+}
+
+function roleStatus(role: PermissionRole | ''): StatusKind {
+  switch (role) {
+    case 'owner':
+      return 'ok';
+    case 'operator':
+      return 'warning';
+    case 'viewer':
+      return 'idle';
+    default:
+      return 'idle';
+  }
+}
+
+function channelLabel(channelType: string) {
+  switch ((channelType || '').toLowerCase()) {
+    case 'feishu':
+      return '飞书';
+    case 'telegram':
+      return 'Telegram';
+    case 'discord':
+      return 'Discord';
+    case 'qq':
+      return 'QQ';
+    case 'weixin':
+      return '微信';
+    default:
+      return channelType || '未知渠道';
+  }
+}
+
+function permissionKey(item: { channelType: string; userId: string }) {
+  return `${item.channelType.toLowerCase()}::${item.userId}`;
+}
+
+function needsRoleConfirm(currentRole: PermissionRole | '', nextRole: PermissionRole) {
+  return currentRole !== nextRole && (currentRole === 'owner' || nextRole === 'owner' || currentRole === 'operator' || nextRole === 'operator');
 }
 
 function getRuntimeKindLabel(kind: string) {
@@ -458,6 +572,8 @@ function useHostBridge() {
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [results] = useState(() => new Map<string, { command: string; resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>());
   const pageInstanceIdRef = useRef(createRequestId());
+  const isWebViewHost = typeof window !== 'undefined' && !!window.chrome?.webview;
+  const controlApiToken = useMemo(() => getControlApiToken(), []);
   const [debug, setDebug] = useState(() => ({
     stateMessageCount: 0,
     activityMessageCount: 0,
@@ -466,6 +582,59 @@ function useHostBridge() {
   }));
 
   useEffect(() => {
+    if (!isWebViewHost) {
+      let disposed = false;
+      const loadState = async () => {
+        try {
+          const response = await fetch(buildApiUrl('/api/state', controlApiToken), {
+            cache: 'no-store',
+            headers: controlApiToken ? { Authorization: `Bearer ${controlApiToken}` } : undefined,
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = (await response.json()) as PanelState;
+          if (!disposed) {
+            setDebug((current) => ({ ...current, stateMessageCount: current.stateMessageCount + 1 }));
+            setState(data);
+            setActivities(data.activities ?? []);
+          }
+        } catch (error) {
+          if (!disposed) {
+            setActivities((current) => [...current.slice(-220), {
+              level: 'error',
+              title: 'Control API',
+              message: error instanceof Error ? error.message : '状态读取失败',
+              timestamp: new Date().toLocaleTimeString(),
+            }]);
+          }
+        }
+      };
+      void loadState();
+      const events = new EventSource(buildApiUrl('/api/events', controlApiToken));
+      events.addEventListener('state', (event) => {
+        try {
+          const message = JSON.parse((event as MessageEvent).data) as HostStateMessage;
+          if (message.type === 'state') {
+            setDebug((current) => ({ ...current, stateMessageCount: current.stateMessageCount + 1 }));
+            setState(message.data);
+            setActivities(message.data.activities ?? []);
+          }
+        } catch {
+          // Ignore malformed event frames.
+        }
+      });
+      events.onerror = () => {
+        setActivities((current) => [...current.slice(-220), {
+          level: 'warning',
+          title: 'Control API',
+          message: '事件流已断开，继续使用按需刷新。',
+          timestamp: new Date().toLocaleTimeString(),
+        }]);
+      };
+      return () => {
+        disposed = true;
+        events.close();
+      };
+    }
     window.chrome?.webview?.addEventListener('message', (event: MessageEvent) => {
       const message = event.data as HostResult | HostStateMessage | HostActivityMessage;
       if (!message || typeof message !== 'object') return;
@@ -491,12 +660,49 @@ function useHostBridge() {
         else waiter.reject(new Error(message.error || '命令执行失败'));
       }
     });
-  }, [results]);
+  }, [controlApiToken, isWebViewHost, results]);
 
   const sendCommand = async (command: string, payload: Record<string, unknown> = {}) => {
     const id = createRequestId();
     setPending((current) => ({ ...current, [command]: true }));
     try {
+      if (!isWebViewHost) {
+        if (command === 'state.refresh') {
+          const response = await fetch(buildApiUrl('/api/state', controlApiToken), {
+            cache: 'no-store',
+            headers: controlApiToken ? { Authorization: `Bearer ${controlApiToken}` } : undefined,
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = (await response.json()) as PanelState;
+          setState(data);
+          setActivities(data.activities ?? []);
+          return data;
+        }
+        const response = await fetch(buildApiUrl('/api/commands', controlApiToken), {
+          method: 'POST',
+          headers: controlApiToken ? { 'Content-Type': 'application/json', Authorization: `Bearer ${controlApiToken}` } : { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, type: 'command', command, payload }),
+        });
+        const message = (await response.json()) as { ok: boolean; data?: unknown; error?: string };
+        if (!response.ok || !message.ok) throw new Error(message.error || `HTTP ${response.status}`);
+        if (command === 'history.getSessionDetail') {
+          setDebug((current) => ({ ...current, sessionDetailResultCount: current.sessionDetailResultCount + 1 }));
+        } else {
+          void fetch(buildApiUrl('/api/state', controlApiToken), {
+            cache: 'no-store',
+            headers: controlApiToken ? { Authorization: `Bearer ${controlApiToken}` } : undefined,
+          })
+            .then((stateResponse) => stateResponse.ok ? stateResponse.json() : null)
+            .then((nextState: PanelState | null) => {
+              if (nextState) {
+                setState(nextState);
+                setActivities(nextState.activities ?? []);
+              }
+            })
+            .catch(() => undefined);
+        }
+        return message.data;
+      }
       return await new Promise((resolve, reject) => {
         results.set(id, { command, resolve, reject });
         if (command === 'history.getSessionDetail') {
@@ -627,6 +833,26 @@ function App() {
     inFlightSessionKeyRef.current = '';
   }
 
+  async function setSessionPersonRole(user: FeishuPerson, role: PermissionRole) {
+    const label = user.displayName ? `${user.displayName} (${user.userId})` : user.userId;
+    if (needsRoleConfirm(user.role, role)) {
+      const confirmed = window.confirm(`把“${label}”设置为 ${roleLabel(role)}？\n\n这会修改权限库和兼容配置，并重启桥接后生效。`);
+      if (!confirmed) return;
+    }
+    await sendCommand('permissions.upsert', {
+      channelType: 'feishu',
+      userId: user.userId,
+      displayName: user.displayName,
+      role,
+      source: 'session-detail',
+    });
+    await sendCommand('permissions.applyAndRestart');
+    if (sessionDetail) {
+      await openSessionDetail(`${sessionDetail.chatId}::${sessionDetail.sessionId}`, true);
+    }
+    await sendCommand('state.refresh');
+  }
+
   useEffect(() => {
     void sendCommand('state.refresh').catch(() => undefined);
     void loadRuntimeUnits().catch(() => undefined);
@@ -734,6 +960,7 @@ function App() {
           />
         )}
         {page === 'executors' && <ExecutorsPage state={state} run={run} pending={pending} />}
+        {page === 'permissions' && <PermissionsPage state={state} run={run} pending={pending} />}
         {page === 'extensions' && (
           <ExtensionsPage
             state={state}
@@ -765,6 +992,7 @@ function App() {
             drawerOpen={sessionDrawerOpen}
             setDrawerOpen={setSessionDrawerOpen}
             deleteSession={deleteSelectedSession}
+            setSessionPersonRole={setSessionPersonRole}
           />
         )}
         {page === 'settings' && (
@@ -989,6 +1217,148 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
           ))}
           {recentRuns.length === 0 && <EmptyState icon={<Activity size={28} />} title="暂无 Workflow" text="新的飞书请求进入执行器路由后会在这里出现。" />}
         </div>
+      </section>
+    </section>
+  );
+}
+
+function PermissionsPage({ state, run, pending }: PageProps) {
+  const [query, setQuery] = useState('');
+  const [channel, setChannel] = useState('all');
+  const [role, setRole] = useState<'all' | PermissionRole>('all');
+  const subjects = state.permissions?.subjects ?? [];
+  const candidates = state.permissions?.candidates ?? [];
+  const granted = useMemo(() => new Set(subjects.map(permissionKey)), [subjects]);
+  const filteredSubjects = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return subjects.filter((item) => {
+      if (channel !== 'all' && item.channelType !== channel) return false;
+      if (role !== 'all' && item.role !== role) return false;
+      if (!normalizedQuery) return true;
+      return `${item.channelType} ${item.userId} ${item.displayName} ${item.source} ${item.role}`.toLowerCase().includes(normalizedQuery);
+    });
+  }, [channel, query, role, subjects]);
+  const visibleCandidates = candidates
+    .filter((item) => !granted.has(permissionKey(item)))
+    .filter((item) => {
+      const normalizedQuery = query.trim().toLowerCase();
+      if (channel !== 'all' && item.channelType !== channel) return false;
+      if (!normalizedQuery) return true;
+      return `${item.channelType} ${item.userId} ${item.displayName} ${item.source}`.toLowerCase().includes(normalizedQuery);
+    })
+    .slice(0, 24);
+
+  const saveRole = async (item: PermissionSubject | PermissionCandidate, nextRole: PermissionRole, currentRole: PermissionRole | '' = '') => {
+    const label = item.displayName ? `${item.displayName} (${item.userId})` : item.userId;
+    if (needsRoleConfirm(currentRole, nextRole)) {
+      const confirmed = window.confirm(`把“${label}”设置为 ${roleLabel(nextRole)}？\n\n权限变更会写入本机权限库和兼容 env。Operator/Owner 会扩大可执行范围。`);
+      if (!confirmed) return;
+    }
+    await run('permissions.upsert', {
+      channelType: item.channelType,
+      userId: item.userId,
+      displayName: item.displayName,
+      role: nextRole,
+      source: 'control-panel',
+    });
+    await run('state.refresh');
+  };
+
+  const removeSubject = async (item: PermissionSubject) => {
+    const label = item.displayName ? `${item.displayName} (${item.userId})` : item.userId;
+    const confirmed = window.confirm(`移除“${label}”的 ${channelLabel(item.channelType)} 权限？\n\n这会同步更新兼容 env。`);
+    if (!confirmed) return;
+    await run('permissions.remove', { channelType: item.channelType, userId: item.userId });
+    await run('state.refresh');
+  };
+
+  return (
+    <section className="content-stack permissions-page">
+      <section className="panel">
+        <SectionHeader
+          title="权限总览"
+          action={<MiniButton label="应用并重启" icon={<RotateCw size={14} />} onClick={() => void run('permissions.applyAndRestart').then(() => run('state.refresh'))} pending={pending['permissions.applyAndRestart']} />}
+        />
+        <div className="summary-grid wide">
+          <SummaryFact label="Viewer" value={`${subjects.filter((item) => item.role === 'viewer').length}`} compact />
+          <SummaryFact label="Operator" value={`${subjects.filter((item) => item.role === 'operator').length}`} compact />
+          <SummaryFact label="Owner" value={`${subjects.filter((item) => item.role === 'owner').length}`} compact />
+        </div>
+        <div className="command-band dense">
+          <MiniButton label="从配置同步" icon={<RefreshCw size={14} />} onClick={() => void run('permissions.syncFromConfig').then(() => run('state.refresh'))} pending={pending['permissions.syncFromConfig']} />
+          <MiniButton label="刷新状态" icon={<ListChecks size={14} />} onClick={() => void run('permissions.list').then(() => run('state.refresh'))} pending={pending['permissions.list']} />
+        </div>
+      </section>
+
+      <div className="permission-filter-row">
+        <div className="filter-row">
+          <Search size={14} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、用户 ID、渠道或来源" />
+        </div>
+        <select className="role-select" value={channel} onChange={(event) => setChannel(event.target.value)}>
+          <option value="all">全部渠道</option>
+          <option value="feishu">飞书</option>
+          <option value="telegram">Telegram</option>
+          <option value="discord">Discord</option>
+          <option value="qq">QQ</option>
+          <option value="weixin">微信</option>
+        </select>
+        <select className="role-select" value={role} onChange={(event) => setRole(event.target.value as 'all' | PermissionRole)}>
+          <option value="all">全部角色</option>
+          <option value="viewer">Viewer</option>
+          <option value="operator">Operator</option>
+          <option value="owner">Owner</option>
+        </select>
+      </div>
+
+      <section className="permissions-layout">
+        <section className="panel">
+          <SectionHeader title="已授权用户" />
+          <div className="permission-table">
+            {filteredSubjects.map((item) => (
+              <div key={permissionKey(item)} className="permission-row">
+                <div className="permission-user">
+                  <strong>{item.displayName || item.userId}</strong>
+                  <span>{channelLabel(item.channelType)} · {item.userId}</span>
+                  <span>{item.source || 'manual'} · 更新 {item.updatedAt || '-'}</span>
+                </div>
+                <StatusPill status={roleStatus(item.role)} label={roleLabel(item.role)} />
+                <select
+                  className="role-select"
+                  value={item.role}
+                  onChange={(event) => void saveRole(item, event.target.value as PermissionRole, item.role)}
+                >
+                  <option value="viewer">Viewer</option>
+                  <option value="operator">Operator</option>
+                  <option value="owner">Owner</option>
+                </select>
+                <MiniButton label="移除" icon={<Trash2 size={14} />} onClick={() => void removeSubject(item)} pending={pending['permissions.remove']} />
+              </div>
+            ))}
+            {filteredSubjects.length === 0 && <EmptyState icon={<ShieldCheck size={28} />} title="没有匹配的权限记录" text="可以从最近会话参与人中添加，或先同步配置。" />}
+          </div>
+        </section>
+
+        <section className="panel">
+          <SectionHeader title="最近会话参与人" />
+          <div className="candidate-list">
+            {visibleCandidates.map((item) => (
+              <div key={permissionKey(item)} className="candidate-row">
+                <div>
+                  <strong>{item.displayName || item.userId}</strong>
+                  <span>{channelLabel(item.channelType)} · {item.userId}</span>
+                  <span>{item.source || 'history'} · {item.messageCount} 条</span>
+                </div>
+                <div className="role-button-row">
+                  <MiniButton label="Viewer" icon={<ShieldCheck size={14} />} onClick={() => void saveRole(item, 'viewer')} />
+                  <MiniButton label="Operator" icon={<Power size={14} />} onClick={() => void saveRole(item, 'operator')} />
+                  <MiniButton label="Owner" icon={<CheckCircle2 size={14} />} onClick={() => void saveRole(item, 'owner')} />
+                </div>
+              </div>
+            ))}
+            {visibleCandidates.length === 0 && <div className="empty-inline">暂无可添加的最近参与人。</div>}
+          </div>
+        </section>
       </section>
     </section>
   );
@@ -1242,6 +1612,7 @@ function SessionsPage({
   drawerOpen,
   setDrawerOpen,
   deleteSession,
+  setSessionPersonRole,
 }: {
   state: PanelState;
   run: PageProps['run'];
@@ -1264,6 +1635,7 @@ function SessionsPage({
   drawerOpen: boolean;
   setDrawerOpen: (value: boolean) => void;
   deleteSession: () => void | Promise<void>;
+  setSessionPersonRole: (user: FeishuPerson, role: PermissionRole) => void | Promise<void>;
 }) {
   return (
     <section className="content-stack">
@@ -1323,6 +1695,7 @@ function SessionsPage({
           drawerOpen={drawerOpen}
           setDrawerOpen={setDrawerOpen}
           deleteSession={deleteSession}
+          setSessionPersonRole={setSessionPersonRole}
           refreshDetail={() => detail ? openSessionDetail(`${detail.chatId}::${detail.sessionId}`, true) : undefined}
         />
       </section>
@@ -1337,6 +1710,7 @@ const SessionDetailPane = memo(function SessionDetailPane({
   drawerOpen,
   setDrawerOpen,
   deleteSession,
+  setSessionPersonRole,
   refreshDetail,
 }: {
   detail: SessionDetail | null;
@@ -1345,6 +1719,7 @@ const SessionDetailPane = memo(function SessionDetailPane({
   drawerOpen: boolean;
   setDrawerOpen: (value: boolean) => void;
   deleteSession: () => void | Promise<void>;
+  setSessionPersonRole: (user: FeishuPerson, role: PermissionRole) => void | Promise<void>;
   refreshDetail: () => void | Promise<void> | undefined;
 }) {
   const [messageSortOrder, setMessageSortOrder] = useState<'desc' | 'asc'>('desc');
@@ -1392,6 +1767,44 @@ const SessionDetailPane = memo(function SessionDetailPane({
             <div className="detail-meta">{getSessionDisplayTitle(detail)} · {getSessionTypeLabel(detail)} · {detail.lastUpdatedAt || '-'}</div>
           </div>
           <p className="detail-copy">{detail.summary || '暂无摘要'}</p>
+          {detail.people && detail.people.length > 0 && (
+            <section className="people-block">
+              <div className="subsection-title">
+                <Bot size={15} />
+                <strong>出现的用户 ID</strong>
+              </div>
+              <div className="person-list">
+                {detail.people.map((person) => (
+                  <div key={person.userId} className="person-row">
+                    <div>
+                      <strong>{person.displayName || person.userId}</strong>
+                      <span>{person.senderType || 'user'} · {person.userId} · {person.messageCount} 条</span>
+                    </div>
+                    {person.senderType === 'app' ? (
+                      <StatusPill status="idle" label="应用" />
+                    ) : (
+                      <div className="role-control">
+                        <StatusPill status={roleStatus(person.role)} label={roleLabel(person.role)} />
+                        <select
+                          className="role-select"
+                          value={person.role || ''}
+                          onChange={(event) => {
+                            const nextRole = event.target.value as PermissionRole | '';
+                            if (nextRole) void setSessionPersonRole(person, nextRole);
+                          }}
+                        >
+                          <option value="">设置权限</option>
+                          <option value="viewer">Viewer</option>
+                          <option value="operator">Operator</option>
+                          <option value="owner">Owner</option>
+                        </select>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
           <div className="command-band dense">
             <MiniButton label="复制摘要" icon={<Clipboard size={14} />} onClick={() => void navigator.clipboard.writeText(detail.summary || '')} />
             <MiniButton label="复制消息" icon={<Clipboard size={14} />} onClick={() => void navigator.clipboard.writeText(detail.messages.map((item) => `[${item.index}] ${item.role} ${item.createdAt}\n${item.content}`).join('\n\n'))} />
@@ -1437,9 +1850,15 @@ const SessionDetailPane = memo(function SessionDetailPane({
             {orderedMessages.map((message) => (
               <article key={`${message.index}-${message.createdAt}`} className="message-card">
                 <header>
-                  <strong>{message.role}</strong>
+                  <strong>{message.senderName || message.role}</strong>
                   <span>{message.msgType || 'message'} · {message.createdAt || '-'}</span>
                 </header>
+                {message.senderId && (
+                  <div className="message-sender-meta">
+                    <span>{message.role}</span>
+                    <code>{message.senderId}</code>
+                  </div>
+                )}
                 <pre>{message.content}</pre>
                 {message.attachments && message.attachments.length > 0 && (
                   <div className="attachment-grid">

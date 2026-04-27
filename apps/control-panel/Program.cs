@@ -1,12 +1,19 @@
 ﻿using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.StaticFiles;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -15,10 +22,16 @@ namespace ClaudeToImControlPanel;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         ApplicationConfiguration.Initialize();
+        if (args.Any(arg => string.Equals(arg, "--api-only", StringComparison.OrdinalIgnoreCase)))
+        {
+            using var form = new MainForm();
+            form.RunControlApiOnlyAsync().GetAwaiter().GetResult();
+            return;
+        }
         Application.Run(new MainForm());
     }
 }
@@ -60,6 +73,7 @@ internal sealed class MainForm : Form
     private readonly string _feishuHistoryIndexPath;
     private readonly string _webDiagnosticsLogPath;
     private readonly string _deletedSessionsPath;
+    private readonly string _permissionsPath;
     private FileSystemWatcher? _manifestWatcher;
     private System.Windows.Forms.Timer? _manifestReloadTimer;
     private string _pendingManifestReloadReason = "初始化";
@@ -81,6 +95,10 @@ internal sealed class MainForm : Form
     private readonly List<WebActivityRecord> _activities = [];
     private readonly Dictionary<string, WebSessionDetail> _sessionDetailCache = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, string>? _auditSummaryByMessageId;
+    private WebApplication? _controlApi;
+    private string _controlApiBaseUrl = "";
+    private string _controlApiBindHost = "127.0.0.1";
+    private int _controlApiPort = 8788;
     private bool _webReady;
     private int _webNavigationCount;
     private int _webStatePushCount;
@@ -142,6 +160,7 @@ internal sealed class MainForm : Form
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
         _webDiagnosticsLogPath = Path.Combine(_ctiHome, "runtime", "control-panel-webview.log");
         _deletedSessionsPath = Path.Combine(_ctiHome, "runtime", "control-panel-deleted-sessions.json");
+        _permissionsPath = Path.Combine(_dataDir, "permissions.json");
 
         Text = "飞书 / Codex / MCP 中控面板";
         StartPosition = FormStartPosition.CenterScreen;
@@ -167,10 +186,31 @@ internal sealed class MainForm : Form
             LoadManifests();
             RenderMcpList();
             InitializeManifestWatcher();
+            await StartControlApiAsync();
             await InitializeWebViewAsync();
             await RefreshAllAsync();
             await PushWebStateAsync();
         };
+        FormClosed += async (_, _) =>
+        {
+            if (_controlApi is not null)
+            {
+                await _controlApi.StopAsync();
+                await _controlApi.DisposeAsync();
+            }
+        };
+    }
+
+    public async Task RunControlApiOnlyAsync()
+    {
+        LoadConfig();
+        LoadManifests();
+        await StartControlApiAsync();
+        if (_controlApi is null)
+        {
+            throw new InvalidOperationException("Control API 启动失败，请检查 CTI_CONTROL_API_* 配置和 wwwroot。");
+        }
+        await Task.Delay(Timeout.Infinite);
     }
 
     private Control BuildWebShellPanel()
@@ -182,6 +222,242 @@ internal sealed class MainForm : Form
         host.Controls.Add(_webView);
         host.Controls.Add(_webFallback);
         return host;
+    }
+
+    private async Task StartControlApiAsync()
+    {
+        if (_controlApi is not null) return;
+
+        var webRoot = ResolveWebRootPath();
+        if (string.IsNullOrWhiteSpace(webRoot) || !Directory.Exists(webRoot))
+        {
+            AddWebActivity("warning", "Control API 未启动", "前端 wwwroot 不存在，暂时只保留 WebView 兜底页。");
+            return;
+        }
+
+        var enabled = !string.Equals(GetConfig("CTI_CONTROL_API_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        if (!enabled) return;
+
+        _controlApiBindHost = GetConfig("CTI_CONTROL_API_HOST", GetConfig("CTI_CONTROL_API_BIND", "127.0.0.1")).Trim();
+        if (string.IsNullOrWhiteSpace(_controlApiBindHost)) _controlApiBindHost = "127.0.0.1";
+        _controlApiPort = int.TryParse(GetConfig("CTI_CONTROL_API_PORT", "8788"), out var configuredPort) && configuredPort > 0
+            ? configuredPort
+            : 8788;
+        var allowRemote = string.Equals(GetConfig("CTI_CONTROL_API_ALLOW_REMOTE", "false"), "true", StringComparison.OrdinalIgnoreCase);
+        var token = GetConfig("CTI_CONTROL_API_AUTH_TOKEN", "").Trim();
+        if (!IsLoopbackBindHost(_controlApiBindHost) && (!allowRemote || string.IsNullOrWhiteSpace(token)))
+        {
+            AddWebActivity("error", "Control API 拒绝公网监听", "非本机监听必须同时配置 CTI_CONTROL_API_ALLOW_REMOTE=true 和 CTI_CONTROL_API_AUTH_TOKEN。");
+            return;
+        }
+
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = [],
+            ContentRootPath = AppContext.BaseDirectory,
+        });
+        builder.WebHost.UseUrls($"http://{_controlApiBindHost}:{_controlApiPort}");
+        var app = builder.Build();
+        ConfigureControlApi(app, webRoot);
+        await app.StartAsync();
+        _controlApi = app;
+        _controlApiBaseUrl = GetConfig("CTI_CONTROL_API_PUBLIC_BASE_URL", "").Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(_controlApiBaseUrl))
+        {
+            var browserHost = IsWildcardBindHost(_controlApiBindHost) ? "127.0.0.1" : _controlApiBindHost;
+            _controlApiBaseUrl = $"http://{browserHost}:{_controlApiPort}";
+        }
+        AddWebActivity("info", "Control API 已启动", _controlApiBaseUrl);
+    }
+
+    private void ConfigureControlApi(WebApplication app, string webRoot)
+    {
+        var webFiles = new PhysicalFileProvider(webRoot);
+        app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = webFiles });
+        app.UseStaticFiles(new StaticFileOptions { FileProvider = webFiles });
+        Directory.CreateDirectory(_mediaCacheDir);
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.StartsWithSegments("/media")
+                && !AuthorizeControlApi(context, "history.getSessionDetail", out var failure))
+            {
+                await failure.ExecuteAsync(context);
+                return;
+            }
+            await next();
+        });
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = new PhysicalFileProvider(_mediaCacheDir),
+            RequestPath = "/media",
+            ServeUnknownFileTypes = true,
+            ContentTypeProvider = new FileExtensionContentTypeProvider(),
+        });
+
+        app.MapGet("/healthz", () => Results.Json(new
+        {
+            ok = true,
+            protocol = "cti-control-api/v1",
+            generatedAt = DateTime.UtcNow.ToString("o"),
+        }, WebJsonOptions));
+
+        app.MapGet("/api/state", async (HttpContext context) =>
+        {
+            if (!AuthorizeControlApi(context, "state.refresh", out var failure)) return failure;
+            return Results.Json(await BuildWebStateAsync(), WebJsonOptions);
+        });
+
+        app.MapPost("/api/commands", async (HttpContext context) =>
+        {
+            WebCommandRequest? request;
+            try
+            {
+                request = await JsonSerializer.DeserializeAsync<WebCommandRequest>(context.Request.Body, WebJsonOptions);
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { ok = false, error = $"请求解析失败：{ex.Message}" });
+            }
+            if (request is null || string.IsNullOrWhiteSpace(request.Command))
+            {
+                return Results.BadRequest(new { ok = false, error = "缺少 command。" });
+            }
+            if (!AuthorizeControlApi(context, request.Command, out var failure)) return failure;
+            try
+            {
+                var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
+                AddControlApiAudit(context, request.Command, request.Payload, true, "");
+                return Results.Json(new { ok = true, data }, WebJsonOptions);
+            }
+            catch (Exception ex)
+            {
+                AddControlApiAudit(context, request.Command, request.Payload, false, ex.Message);
+                return Results.Json(new { ok = false, error = ex.Message }, WebJsonOptions, statusCode: 500);
+            }
+        });
+
+        app.MapGet("/api/session/{chatId}/{sessionId}", async (HttpContext context, string chatId, string sessionId) =>
+        {
+            if (!AuthorizeControlApi(context, "history.getSessionDetail", out var failure)) return failure;
+            var payload = JsonSerializer.SerializeToElement(new { chatId, sessionId, force = false }, WebJsonOptions);
+            return Results.Json(await ExecuteWebCommandAsync("history.getSessionDetail", payload), WebJsonOptions);
+        });
+
+        app.MapGet("/api/events", async (HttpContext context) =>
+        {
+            if (!AuthorizeControlApi(context, "state.refresh", out var failure))
+            {
+                context.Response.StatusCode = failure is IStatusCodeHttpResult statusResult ? statusResult.StatusCode ?? 403 : 403;
+                await context.Response.WriteAsJsonAsync(new { ok = false, error = "unauthorized" }, WebJsonOptions);
+                return;
+            }
+            context.Response.Headers.CacheControl = "no-cache";
+            context.Response.Headers.ContentType = "text/event-stream";
+            while (!context.RequestAborted.IsCancellationRequested)
+            {
+                var state = await BuildWebStateAsync();
+                var json = JsonSerializer.Serialize(new { type = "state", data = state }, WebJsonOptions);
+                await context.Response.WriteAsync($"event: state\ndata: {json}\n\n", context.RequestAborted);
+                await context.Response.Body.FlushAsync(context.RequestAborted);
+                await Task.Delay(TimeSpan.FromSeconds(5), context.RequestAborted);
+            }
+        });
+    }
+
+    private bool AuthorizeControlApi(HttpContext context, string command, out IResult failure)
+    {
+        failure = Results.Empty;
+        var remoteIp = context.Connection.RemoteIpAddress;
+        var isLoopback = remoteIp is null || IPAddress.IsLoopback(remoteIp);
+        var requiredRole = RequiredRoleForControlCommand(command);
+        if (!isLoopback)
+        {
+            var token = GetConfig("CTI_CONTROL_API_AUTH_TOKEN", "").Trim();
+            var auth = context.Request.Headers.Authorization.ToString();
+            var queryToken = context.Request.Query["token"].ToString();
+            var presented = auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? auth[7..].Trim() : queryToken.Trim();
+            if (string.IsNullOrWhiteSpace(token) || !CryptographicEquals(token, presented))
+            {
+                failure = Results.Json(new { ok = false, error = "Control API 需要有效 token。" }, WebJsonOptions, statusCode: 401);
+                return false;
+            }
+            var authRole = NormalizeControlApiRole(GetConfig("CTI_CONTROL_API_AUTH_ROLE", "viewer"));
+            if (!ControlRoleAllows(authRole, requiredRole))
+            {
+                failure = Results.Json(new { ok = false, error = $"当前 Control API token 角色为 {authRole}，不能执行 {requiredRole} 命令。" }, WebJsonOptions, statusCode: 403);
+                return false;
+            }
+            var allowDangerous = string.Equals(GetConfig("CTI_CONTROL_API_ALLOW_REMOTE_DANGEROUS", "false"), "true", StringComparison.OrdinalIgnoreCase);
+            if (requiredRole == "owner" && !allowDangerous)
+            {
+                failure = Results.Json(new { ok = false, error = "远程 Owner 高危命令默认关闭，请显式配置 CTI_CONTROL_API_ALLOW_REMOTE_DANGEROUS=true。" }, WebJsonOptions, statusCode: 403);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static string NormalizeControlApiRole(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized is "owner" or "operator" or "viewer" ? normalized : "viewer";
+    }
+
+    private static bool ControlRoleAllows(string actualRole, string requiredRole)
+    {
+        static int Rank(string role) => role switch
+        {
+            "owner" => 3,
+            "operator" => 2,
+            "viewer" => 1,
+            _ => 0,
+        };
+        return Rank(actualRole) >= Rank(requiredRole);
+    }
+
+    private static string RequiredRoleForControlCommand(string command)
+    {
+        if (command.StartsWith("permissions.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("release.", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "security.addFeishuOwner", StringComparison.OrdinalIgnoreCase))
+        {
+            return "owner";
+        }
+        if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("localLlm.", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "settings.save", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
+        {
+            return "operator";
+        }
+        return "viewer";
+    }
+
+    private void AddControlApiAudit(HttpContext context, string command, JsonElement payload, bool ok, string error)
+    {
+        var role = RequiredRoleForControlCommand(command);
+        var summary = payload.ValueKind == JsonValueKind.Undefined ? "" : payload.GetRawText();
+        if (summary.Length > 500) summary = summary[..500] + "...";
+        AddWebActivity(ok ? "info" : "error", $"Control API {command}", $"{role} · {context.Connection.RemoteIpAddress} · {(ok ? "ok" : error)} · {MaskSecrets(summary)}");
+    }
+
+    private static bool IsLoopbackBindHost(string host)
+        => string.Equals(host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "::1", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsWildcardBindHost(string host)
+        => string.Equals(host, "0.0.0.0", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "*", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(host, "+", StringComparison.OrdinalIgnoreCase);
+
+    private static bool CryptographicEquals(string expected, string actual)
+    {
+        var expectedBytes = Encoding.UTF8.GetBytes(expected);
+        var actualBytes = Encoding.UTF8.GetBytes(actual);
+        return expectedBytes.Length == actualBytes.Length && CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
     }
 
     private async Task InitializeWebViewAsync()
@@ -237,7 +513,9 @@ internal sealed class MainForm : Form
                 await PushWebStateAsync();
             };
             _webReady = true;
-            _webView.Source = new Uri($"https://{WebHostName}/index.html");
+            _webView.Source = new Uri(string.IsNullOrWhiteSpace(_controlApiBaseUrl)
+                ? $"https://{WebHostName}/index.html"
+                : $"{_controlApiBaseUrl}/index.html");
         }
         catch (Exception ex)
         {
@@ -447,6 +725,20 @@ internal sealed class MainForm : Form
                 return await GetSessionDetailAsync(payload);
             case "history.deleteSession":
                 return await DeleteSessionAsync(payload);
+            case "security.addFeishuOwner":
+                return await AddFeishuOwnerAsync(payload);
+            case "permissions.list":
+                return LoadPermissionSnapshot(syncFromConfig: true);
+            case "permissions.upsert":
+                return UpsertPermissionSubject(payload);
+            case "permissions.remove":
+                return RemovePermissionSubject(payload);
+            case "permissions.syncFromConfig":
+                return LoadPermissionSnapshot(syncFromConfig: true);
+            case "permissions.applyAndRestart":
+                SyncPermissionSnapshotToConfig(LoadPermissionSnapshot(syncFromConfig: true));
+                await RestartBridgeAsync();
+                return LoadPermissionSnapshot(syncFromConfig: false);
             case "history.openConversationViewer":
                 await ShowConversationViewerAsync();
                 return "opened";
@@ -589,6 +881,7 @@ internal sealed class MainForm : Form
             },
             workflow = ListWorkflowRuns(),
             executors = ReadExecutorStatusPayload(),
+            permissions = LoadPermissionSnapshot(syncFromConfig: true),
             diagnostics = new
             {
                 webNavigationCount = Volatile.Read(ref _webNavigationCount),
@@ -852,6 +1145,9 @@ internal sealed class MainForm : Form
                 message.MessageId,
                 message.Role,
                 message.MsgType,
+                message.SenderId,
+                message.SenderType,
+                message.SenderName,
                 message.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
                 message.Content,
                 message.Attachments.Select(attachment => new WebMessageAttachment(
@@ -863,6 +1159,7 @@ internal sealed class MainForm : Form
                     attachment.Url,
                     attachment.ResourceKey,
                     attachment.Status)).ToArray())).ToArray(),
+            BuildFeishuPeople(entry.Messages),
             FindWorkflowRunsForSession(entry.SessionId, entry.ChatId));
         _sessionDetailCache[cacheKey] = detail;
         if (_sessionDetailCache.Count > 64)
@@ -874,6 +1171,302 @@ internal sealed class MainForm : Form
             }
         }
         return detail;
+    }
+
+    private async Task<object> AddFeishuOwnerAsync(JsonElement payload)
+    {
+        var userId = ReadPayloadString(payload, "userId", "").Trim();
+        var displayName = ReadPayloadString(payload, "displayName", "").Trim();
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            throw new InvalidOperationException("缺少 Feishu 用户 ID。");
+        }
+
+        var snapshot = UpsertPermission("feishu", userId, displayName, "owner", "session-detail");
+        await RestartBridgeAsync();
+        var label = string.IsNullOrWhiteSpace(displayName) ? userId : $"{displayName} ({userId})";
+        AddWebActivity("info", "Owner 已添加", $"{label}；桥接已重启。");
+        return new
+        {
+            userId,
+            displayName,
+            ownerUserIds = snapshot.Subjects.Where(item => item.ChannelType == "feishu" && item.Role == "owner").Select(item => item.UserId).ToArray(),
+            message = "已加入 owner 列表并重启桥接。",
+        };
+    }
+
+    private WebFeishuPerson[] BuildFeishuPeople(IEnumerable<ConversationMessageView> messages)
+    {
+        var permissions = LoadPermissionSnapshot(syncFromConfig: true).Subjects
+            .Where(item => string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase))
+            .ToDictionary(item => item.UserId, item => item, StringComparer.OrdinalIgnoreCase);
+        return messages
+            .Where(message => !string.IsNullOrWhiteSpace(message.SenderId))
+            .GroupBy(message => message.SenderId, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var latest = group.Last();
+                var displayName = group
+                    .Select(message => message.SenderName)
+                    .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name)) ?? "";
+                return new WebFeishuPerson(
+                    group.Key,
+                    latest.SenderType,
+                    displayName,
+                    permissions.TryGetValue(group.Key, out var subject) ? subject.Role : "",
+                    permissions.TryGetValue(group.Key, out subject) && string.Equals(subject.Role, "owner", StringComparison.OrdinalIgnoreCase),
+                    group.Count());
+            })
+            .OrderBy(person => string.Equals(person.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .ThenBy(person => string.IsNullOrWhiteSpace(person.DisplayName) ? person.UserId : person.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private PermissionSnapshot LoadPermissionSnapshot(bool syncFromConfig)
+    {
+        var snapshot = ReadPermissionSnapshotFile();
+        if (syncFromConfig)
+        {
+            snapshot = MergeConfigPermissions(snapshot);
+            SavePermissionSnapshot(snapshot);
+            SyncPermissionSnapshotToConfig(snapshot);
+        }
+        return snapshot;
+    }
+
+    private PermissionSnapshot ReadPermissionSnapshotFile()
+    {
+        try
+        {
+            if (File.Exists(_permissionsPath))
+            {
+                var loaded = JsonSerializer.Deserialize<PermissionSnapshot>(File.ReadAllText(_permissionsPath, Encoding.UTF8), JsonOptions);
+                if (loaded is not null)
+                {
+                    loaded.Subjects = NormalizePermissionSubjects(loaded.Subjects);
+                    loaded.Candidates = BuildPermissionCandidates(loaded.Subjects);
+                    loaded.UpdatedAt = string.IsNullOrWhiteSpace(loaded.UpdatedAt) ? DateTime.UtcNow.ToString("o") : loaded.UpdatedAt;
+                    return loaded;
+                }
+            }
+        }
+        catch
+        {
+            // fall through to a clean snapshot
+        }
+
+        return new PermissionSnapshot
+        {
+            Protocol = "cti-permissions/v1",
+            UpdatedAt = DateTime.UtcNow.ToString("o"),
+            Subjects = [],
+            Candidates = [],
+        };
+    }
+
+    private PermissionSnapshot MergeConfigPermissions(PermissionSnapshot snapshot)
+    {
+        var subjects = NormalizePermissionSubjects(snapshot.Subjects)
+            .ToDictionary(item => MakePermissionKey(item.ChannelType, item.UserId), item => item, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (channel, allowedKey, ownerKey) in PermissionEnvKeys)
+        {
+            foreach (var id in SplitConfigList(GetConfig(allowedKey, "")))
+            {
+                MergePermission(subjects, channel, id, "", "viewer", "config");
+            }
+            foreach (var id in SplitConfigList(GetConfig(ownerKey, "")))
+            {
+                MergePermission(subjects, channel, id, "", "owner", "config");
+            }
+        }
+
+        var merged = subjects.Values
+            .OrderBy(item => ChannelSortRank(item.ChannelType))
+            .ThenByDescending(item => RoleRank(item.Role))
+            .ThenBy(item => string.IsNullOrWhiteSpace(item.DisplayName) ? item.UserId : item.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return new PermissionSnapshot
+        {
+            Protocol = "cti-permissions/v1",
+            UpdatedAt = DateTime.UtcNow.ToString("o"),
+            Subjects = merged,
+            Candidates = BuildPermissionCandidates(merged),
+        };
+    }
+
+    private static void MergePermission(Dictionary<string, PermissionSubject> subjects, string channelType, string userId, string displayName, string role, string source)
+    {
+        channelType = NormalizePermissionChannel(channelType);
+        userId = userId.Trim();
+        if (string.IsNullOrWhiteSpace(channelType) || string.IsNullOrWhiteSpace(userId)) return;
+
+        var key = MakePermissionKey(channelType, userId);
+        var nextRole = NormalizePermissionRole(role);
+        if (subjects.TryGetValue(key, out var existing))
+        {
+            if (RoleRank(nextRole) > RoleRank(existing.Role)) existing.Role = nextRole;
+            if (string.IsNullOrWhiteSpace(existing.DisplayName) && !string.IsNullOrWhiteSpace(displayName)) existing.DisplayName = displayName.Trim();
+            existing.Source = string.IsNullOrWhiteSpace(existing.Source) ? source : existing.Source;
+            existing.UpdatedAt = DateTime.UtcNow.ToString("o");
+            return;
+        }
+
+        var now = DateTime.UtcNow.ToString("o");
+        subjects[key] = new PermissionSubject
+        {
+            ChannelType = channelType,
+            UserId = userId,
+            DisplayName = displayName.Trim(),
+            Role = nextRole,
+            Source = source,
+            FirstSeenAt = now,
+            LastSeenAt = now,
+            UpdatedAt = now,
+        };
+    }
+
+    private PermissionSnapshot UpsertPermissionSubject(JsonElement payload)
+    {
+        var channelType = ReadPayloadString(payload, "channelType", "feishu");
+        var userId = ReadPayloadString(payload, "userId", "");
+        var displayName = ReadPayloadString(payload, "displayName", "");
+        var role = ReadPayloadString(payload, "role", "viewer");
+        return UpsertPermission(channelType, userId, displayName, role, "panel");
+    }
+
+    private PermissionSnapshot UpsertPermission(string channelType, string userId, string displayName, string role, string source)
+    {
+        channelType = NormalizePermissionChannel(channelType);
+        userId = userId.Trim();
+        if (string.IsNullOrWhiteSpace(channelType) || string.IsNullOrWhiteSpace(userId))
+        {
+            throw new InvalidOperationException("缺少渠道或用户 ID。");
+        }
+
+        var snapshot = LoadPermissionSnapshot(syncFromConfig: true);
+        var subjects = snapshot.Subjects.ToDictionary(item => MakePermissionKey(item.ChannelType, item.UserId), item => item, StringComparer.OrdinalIgnoreCase);
+        var key = MakePermissionKey(channelType, userId);
+        var now = DateTime.UtcNow.ToString("o");
+        if (subjects.TryGetValue(key, out var existing))
+        {
+            existing.Role = NormalizePermissionRole(role);
+            if (!string.IsNullOrWhiteSpace(displayName)) existing.DisplayName = displayName.Trim();
+            existing.Source = source;
+            existing.LastSeenAt = now;
+            existing.UpdatedAt = now;
+        }
+        else
+        {
+            subjects[key] = new PermissionSubject
+            {
+                ChannelType = channelType,
+                UserId = userId,
+                DisplayName = displayName.Trim(),
+                Role = NormalizePermissionRole(role),
+                Source = source,
+                FirstSeenAt = now,
+                LastSeenAt = now,
+                UpdatedAt = now,
+            };
+        }
+        snapshot.Subjects = NormalizePermissionSubjects(subjects.Values);
+        snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+        snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
+        SavePermissionSnapshot(snapshot);
+        SyncPermissionSnapshotToConfig(snapshot);
+        _sessionDetailCache.Clear();
+        AddWebActivity("info", "权限已保存", $"{channelType}:{userId} -> {NormalizePermissionRole(role)}");
+        return snapshot;
+    }
+
+    private PermissionSnapshot RemovePermissionSubject(JsonElement payload)
+    {
+        var channelType = NormalizePermissionChannel(ReadPayloadString(payload, "channelType", ""));
+        var userId = ReadPayloadString(payload, "userId", "").Trim();
+        if (string.IsNullOrWhiteSpace(channelType) || string.IsNullOrWhiteSpace(userId))
+        {
+            throw new InvalidOperationException("缺少渠道或用户 ID。");
+        }
+
+        var snapshot = LoadPermissionSnapshot(syncFromConfig: true);
+        snapshot.Subjects = snapshot.Subjects
+            .Where(item => !string.Equals(MakePermissionKey(item.ChannelType, item.UserId), MakePermissionKey(channelType, userId), StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+        snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
+        SavePermissionSnapshot(snapshot);
+        SyncPermissionSnapshotToConfig(snapshot);
+        _sessionDetailCache.Clear();
+        AddWebActivity("info", "权限已移除", $"{channelType}:{userId}");
+        return snapshot;
+    }
+
+    private void SavePermissionSnapshot(PermissionSnapshot snapshot)
+    {
+        snapshot.Protocol = "cti-permissions/v1";
+        snapshot.Subjects = NormalizePermissionSubjects(snapshot.Subjects);
+        snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+        snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
+        Directory.CreateDirectory(Path.GetDirectoryName(_permissionsPath)!);
+        File.WriteAllText(_permissionsPath, JsonSerializer.Serialize(snapshot, JsonOptions), new UTF8Encoding(false));
+    }
+
+    private void SyncPermissionSnapshotToConfig(PermissionSnapshot snapshot)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+        var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
+        foreach (var (channel, allowedKey, ownerKey) in PermissionEnvKeys)
+        {
+            var subjects = snapshot.Subjects
+                .Where(item => string.Equals(item.ChannelType, channel, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            SetOrAppendEnv(lines, allowedKey, string.Join(",", subjects.Select(item => item.UserId).Distinct(StringComparer.OrdinalIgnoreCase)));
+            SetOrAppendEnv(lines, ownerKey, string.Join(",", subjects.Where(item => string.Equals(item.Role, "owner", StringComparison.OrdinalIgnoreCase)).Select(item => item.UserId).Distinct(StringComparer.OrdinalIgnoreCase)));
+        }
+        File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+        LoadConfig();
+    }
+
+    private List<PermissionCandidate> BuildPermissionCandidates(IReadOnlyCollection<PermissionSubject> subjects)
+    {
+        var granted = subjects
+            .Select(item => MakePermissionKey(item.ChannelType, item.UserId))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var candidates = new Dictionary<string, PermissionCandidate>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in Directory.Exists(_feishuHistoryDir) ? Directory.GetFiles(_feishuHistoryDir, "*.json") : [])
+        {
+            foreach (var message in LoadIndexedFeishuHistoryRaw(Path.GetFileNameWithoutExtension(file)))
+            {
+                if (string.IsNullOrWhiteSpace(message.SenderId)) continue;
+                var key = MakePermissionKey("feishu", message.SenderId);
+                if (granted.Contains(key)) continue;
+                if (!candidates.TryGetValue(key, out var candidate))
+                {
+                    candidate = new PermissionCandidate
+                    {
+                        ChannelType = "feishu",
+                        UserId = message.SenderId,
+                        DisplayName = message.SenderName ?? "",
+                        Source = "history",
+                        MessageCount = 0,
+                    };
+                    candidates[key] = candidate;
+                }
+                if (string.IsNullOrWhiteSpace(candidate.DisplayName) && !string.IsNullOrWhiteSpace(message.SenderName))
+                {
+                    candidate.DisplayName = message.SenderName;
+                }
+                candidate.MessageCount += 1;
+            }
+        }
+
+        return candidates.Values
+            .OrderBy(item => ChannelSortRank(item.ChannelType))
+            .ThenBy(item => string.IsNullOrWhiteSpace(item.DisplayName) ? item.UserId : item.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .Take(200)
+            .ToList();
     }
 
     private object ListWorkflowRuns()
@@ -2147,6 +2740,94 @@ internal sealed class MainForm : Form
         var next = key + "=" + value;
         if (index >= 0) lines[index] = next; else lines.Add(next);
     }
+
+    private static readonly (string Channel, string AllowedKey, string OwnerKey)[] PermissionEnvKeys =
+    [
+        ("telegram", "CTI_TG_ALLOWED_USERS", "CTI_TG_OWNER_USERS"),
+        ("discord", "CTI_DISCORD_ALLOWED_USERS", "CTI_DISCORD_OWNER_USERS"),
+        ("feishu", "CTI_FEISHU_ALLOWED_USERS", "CTI_FEISHU_OWNER_USERS"),
+        ("qq", "CTI_QQ_ALLOWED_USERS", "CTI_QQ_OWNER_USERS"),
+        ("weixin", "CTI_WEIXIN_ALLOWED_USERS", "CTI_WEIXIN_OWNER_USERS"),
+    ];
+
+    private static List<string> SplitConfigList(string value)
+        => value
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static string NormalizePermissionChannel(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "tg" => "telegram",
+            "telegram" => "telegram",
+            "discord" => "discord",
+            "lark" => "feishu",
+            "feishu" => "feishu",
+            "qq" => "qq",
+            "wechat" => "weixin",
+            "weixin" => "weixin",
+            _ => normalized,
+        };
+    }
+
+    private static string NormalizePermissionRole(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "owner" => "owner",
+            "operator" => "operator",
+            _ => "viewer",
+        };
+    }
+
+    private static int RoleRank(string value)
+        => NormalizePermissionRole(value) switch
+        {
+            "owner" => 3,
+            "operator" => 2,
+            _ => 1,
+        };
+
+    private static int ChannelSortRank(string value)
+        => NormalizePermissionChannel(value) switch
+        {
+            "feishu" => 0,
+            "telegram" => 1,
+            "discord" => 2,
+            "qq" => 3,
+            "weixin" => 4,
+            _ => 9,
+        };
+
+    private static string MakePermissionKey(string channelType, string userId)
+        => $"{NormalizePermissionChannel(channelType)}::{userId.Trim()}";
+
+    private static List<PermissionSubject> NormalizePermissionSubjects(IEnumerable<PermissionSubject>? subjects)
+        => (subjects ?? [])
+            .Where(item => !string.IsNullOrWhiteSpace(item.ChannelType) && !string.IsNullOrWhiteSpace(item.UserId))
+            .GroupBy(item => MakePermissionKey(item.ChannelType, item.UserId), StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var strongest = group.OrderByDescending(item => RoleRank(item.Role)).First();
+                var now = DateTime.UtcNow.ToString("o");
+                strongest.ChannelType = NormalizePermissionChannel(strongest.ChannelType);
+                strongest.UserId = strongest.UserId.Trim();
+                strongest.DisplayName = group.Select(item => item.DisplayName).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? "";
+                strongest.Role = NormalizePermissionRole(strongest.Role);
+                strongest.Source = string.IsNullOrWhiteSpace(strongest.Source) ? "panel" : strongest.Source;
+                strongest.FirstSeenAt = string.IsNullOrWhiteSpace(strongest.FirstSeenAt) ? now : strongest.FirstSeenAt;
+                strongest.LastSeenAt = string.IsNullOrWhiteSpace(strongest.LastSeenAt) ? strongest.FirstSeenAt : strongest.LastSeenAt;
+                strongest.UpdatedAt = string.IsNullOrWhiteSpace(strongest.UpdatedAt) ? now : strongest.UpdatedAt;
+                return strongest;
+            })
+            .OrderBy(item => ChannelSortRank(item.ChannelType))
+            .ThenByDescending(item => RoleRank(item.Role))
+            .ThenBy(item => string.IsNullOrWhiteSpace(item.DisplayName) ? item.UserId : item.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     private async Task RefreshAllAsync()
     {
@@ -3636,7 +4317,18 @@ internal sealed class MainForm : Form
             var segments = relativePath
                 .Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries)
                 .Select(Uri.EscapeDataString);
-            return $"https://{MediaHostName}/{string.Join("/", segments)}";
+            var resourcePath = string.Join("/", segments);
+            if (!string.IsNullOrWhiteSpace(_controlApiBaseUrl))
+            {
+                var url = $"{_controlApiBaseUrl}/media/{resourcePath}";
+                var token = GetConfig("CTI_CONTROL_API_AUTH_TOKEN", "").Trim();
+                if (!IsLoopbackBindHost(_controlApiBindHost) && !string.IsNullOrWhiteSpace(token))
+                {
+                    url += $"?token={Uri.EscapeDataString(token)}";
+                }
+                return url;
+            }
+            return $"https://{MediaHostName}/{resourcePath}";
         }
         catch
         {
@@ -4047,6 +4739,9 @@ internal sealed class MainForm : Form
             MessageId = item.MessageId,
             Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
             MsgType = item.MsgType,
+            SenderId = item.SenderId ?? "",
+            SenderType = item.SenderType ?? "",
+            SenderName = item.SenderName ?? "",
             CreatedAt = ParseUnixMsOrIso(item.CreateTime),
             Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
             Attachments = BuildFeishuAttachmentPlaceholders(item),
@@ -4076,6 +4771,9 @@ internal sealed class MainForm : Form
                 MessageId = item.MessageId,
                 Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
                 MsgType = item.MsgType,
+                SenderId = item.SenderId ?? "",
+                SenderType = item.SenderType ?? "",
+                SenderName = item.SenderName ?? "",
                 CreatedAt = ParseUnixMsOrIso(item.CreateTime),
                 Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
                 Attachments = attachments,
@@ -5004,15 +5702,26 @@ internal sealed record WebSessionDetail(
     string LastUpdatedAt,
     string Summary,
     WebConversationMessage[] Messages,
+    WebFeishuPerson[] People,
     JsonNode[] WorkflowRuns);
 internal sealed record WebConversationMessage(
     int Index,
     string MessageId,
     string Role,
     string MsgType,
+    string SenderId,
+    string SenderType,
+    string SenderName,
     string CreatedAt,
     string Content,
     WebMessageAttachment[] Attachments);
+internal sealed record WebFeishuPerson(
+    string UserId,
+    string SenderType,
+    string DisplayName,
+    string Role,
+    bool IsOwner,
+    int MessageCount);
 internal sealed record WebMessageAttachment(
     string Kind,
     string Name,
@@ -5033,6 +5742,35 @@ internal sealed class DeletedSessionRecord
 }
 
 internal sealed record WebReplyPresetItem(string Name, string Value);
+internal sealed class PermissionSnapshot
+{
+    public string Protocol { get; set; } = "cti-permissions/v1";
+    public string UpdatedAt { get; set; } = "";
+    public List<PermissionSubject> Subjects { get; set; } = [];
+    public List<PermissionCandidate> Candidates { get; set; } = [];
+}
+
+internal sealed class PermissionSubject
+{
+    public string ChannelType { get; set; } = "";
+    public string UserId { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string Role { get; set; } = "viewer";
+    public string Source { get; set; } = "";
+    public string FirstSeenAt { get; set; } = "";
+    public string LastSeenAt { get; set; } = "";
+    public string UpdatedAt { get; set; } = "";
+}
+
+internal sealed class PermissionCandidate
+{
+    public string ChannelType { get; set; } = "";
+    public string UserId { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string Source { get; set; } = "";
+    public int MessageCount { get; set; }
+}
+
 internal sealed record WebRuntimeAction(string Id, string Label, bool Enabled);
 internal sealed record WebRuntimeUnit(
     string UnitId,
@@ -5347,6 +6085,9 @@ internal sealed class ConversationMessageView
     public string MessageId { get; set; } = "";
     public string Role { get; set; } = "";
     public string MsgType { get; set; } = "";
+    public string SenderId { get; set; } = "";
+    public string SenderType { get; set; } = "";
+    public string SenderName { get; set; } = "";
     public DateTime? CreatedAt { get; set; }
     public string Content { get; set; } = "";
     public List<ConversationAttachmentView> Attachments { get; set; } = [];

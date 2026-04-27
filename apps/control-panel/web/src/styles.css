@@ -79,7 +79,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -344,6 +345,13 @@ button:disabled {
 
 .settings-layout {
   grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+}
+
+.permissions-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(340px, 0.75fr);
+  gap: 14px;
+  align-items: start;
 }
 
 .sessions-layout {
@@ -624,7 +632,8 @@ button:disabled {
 .filter-row input,
 .path-input-group input,
 .token-field input,
-.text-area {
+.text-area,
+.role-select {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -636,9 +645,15 @@ button:disabled {
 .filter-bar input,
 .filter-row input,
 .path-input-group input,
-.token-field input {
+.token-field input,
+.role-select {
   min-height: 36px;
   padding: 0 10px;
+}
+
+.role-select {
+  width: auto;
+  min-width: 118px;
 }
 
 .text-area {
@@ -655,7 +670,8 @@ button:disabled {
 .filter-row input:focus,
 .path-input-group input:focus,
 .token-field input:focus,
-.text-area:focus {
+.text-area:focus,
+.role-select:focus {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-soft) 76%, transparent);
 }
@@ -837,6 +853,16 @@ button:disabled {
   margin-bottom: 8px;
 }
 
+.message-sender-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .subsection-title {
   display: flex;
   align-items: center;
@@ -851,6 +877,94 @@ button:disabled {
 .attachment-grid {
   display: grid;
   gap: 8px;
+}
+
+.people-block,
+.person-list {
+  display: grid;
+  gap: 8px;
+}
+
+.person-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+}
+
+.person-row strong,
+.person-row span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.person-row span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.role-control,
+.role-button-row,
+.permission-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.permission-filter-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto auto;
+}
+
+.permission-table,
+.candidate-list {
+  display: grid;
+  gap: 8px;
+}
+
+.permission-row,
+.candidate-row {
+  display: grid;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+}
+
+.permission-row {
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+}
+
+.candidate-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.permission-user,
+.candidate-row > div:first-child {
+  min-width: 0;
+}
+
+.permission-user strong,
+.permission-user span,
+.candidate-row strong,
+.candidate-row span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.permission-user span,
+.candidate-row span {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .run-card {
@@ -1074,6 +1188,8 @@ button:disabled {
   .services-layout,
   .executor-main-layout,
   .extensions-layout,
+  .permissions-layout,
+  .permission-filter-row,
   .settings-layout,
   .sessions-layout,
   .path-grid {
