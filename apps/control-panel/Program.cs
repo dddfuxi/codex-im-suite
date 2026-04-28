@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -251,16 +252,45 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        var requestedPort = _controlApiPort;
+        var maxAttempts = IsLoopbackBindHost(_controlApiBindHost) && string.IsNullOrWhiteSpace(GetConfig("CTI_CONTROL_API_PUBLIC_BASE_URL", "").Trim())
+            ? 20
+            : 1;
+        Exception? lastError = null;
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
-            Args = [],
-            ContentRootPath = AppContext.BaseDirectory,
-        });
-        builder.WebHost.UseUrls($"http://{_controlApiBindHost}:{_controlApiPort}");
-        var app = builder.Build();
-        ConfigureControlApi(app, webRoot);
-        await app.StartAsync();
-        _controlApi = app;
+            var candidatePort = requestedPort + attempt;
+            try
+            {
+                _controlApi = await StartControlApiOnPortAsync(webRoot, candidatePort);
+                _controlApiPort = candidatePort;
+                if (attempt > 0)
+                {
+                    AddWebActivity("warning", "Control API 端口自动切换", $"端口 {requestedPort} 已被占用，已改用 {_controlApiPort}。");
+                }
+                break;
+            }
+            catch (Exception ex) when (IsPortInUseException(ex))
+            {
+                lastError = ex;
+                if (attempt + 1 >= maxAttempts) break;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                break;
+            }
+        }
+        if (_controlApi is null)
+        {
+            var message = lastError is null ? "未知错误" : lastError.Message;
+            AddWebActivity("error", "Control API 启动失败", message);
+            if (maxAttempts == 1 || !IsLoopbackBindHost(_controlApiBindHost))
+            {
+                throw new InvalidOperationException($"Control API 启动失败：{message}", lastError);
+            }
+            return;
+        }
         _controlApiBaseUrl = GetConfig("CTI_CONTROL_API_PUBLIC_BASE_URL", "").Trim().TrimEnd('/');
         if (string.IsNullOrWhiteSpace(_controlApiBaseUrl))
         {
@@ -268,6 +298,44 @@ internal sealed class MainForm : Form
             _controlApiBaseUrl = $"http://{browserHost}:{_controlApiPort}";
         }
         AddWebActivity("info", "Control API 已启动", _controlApiBaseUrl);
+    }
+
+    private async Task<WebApplication> StartControlApiOnPortAsync(string webRoot, int port)
+    {
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = [],
+            ContentRootPath = AppContext.BaseDirectory,
+        });
+        builder.WebHost.UseUrls($"http://{_controlApiBindHost}:{port}");
+        var app = builder.Build();
+        ConfigureControlApi(app, webRoot);
+        try
+        {
+            await app.StartAsync();
+            return app;
+        }
+        catch
+        {
+            await app.DisposeAsync();
+            throw;
+        }
+    }
+
+    private static bool IsPortInUseException(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is SocketException socket && socket.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                return true;
+            }
+            if (current is IOException io && io.Message.Contains("address", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void ConfigureControlApi(WebApplication app, string webRoot)

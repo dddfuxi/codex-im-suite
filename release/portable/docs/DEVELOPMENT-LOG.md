@@ -28,6 +28,7 @@
 - 控制面板新增 `apps/control-panel/web` 前端源码、GPT 生成的无文字 PNG 氛围素材和 WebView2 Runtime 降级提示。
 - 控制面板新增 Control API 宿主：桌面壳启动本机 HTTP API 并加载同一套 React 页面；普通浏览器可通过 HTTP/SSE 查看状态、会话详情、图片、workflow 和权限数据。
 - 新增 `scripts/start-control-api.ps1`，用于本机或服务器启动 API-only 模式。默认只监听 `127.0.0.1`，远程监听必须配置 token，远程高危命令需要额外显式开启。
+- 桌面面板的 Control API 启动已补端口冲突保护：本机 loopback 模式下如果默认 `8788` 被占用，会自动尝试后续端口，避免多开面板时直接弹未处理异常；远程显式监听仍保持严格失败。
 - `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
