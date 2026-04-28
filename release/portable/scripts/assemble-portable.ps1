@@ -13,7 +13,15 @@ if (-not $ControlPanelArtifactDir) {
     $ControlPanelArtifactDir = Join-Path $artifactsDir 'control-panel'
 }
 
-Remove-Item -LiteralPath $portableDir -Recurse -Force -ErrorAction SilentlyContinue
+Assert-NoRunningProcessInPath -Roots @($portableDir) -Purpose 'assemble portable'
+if (Test-Path -LiteralPath $portableDir) {
+    try {
+        Remove-Item -LiteralPath $portableDir -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        throw "无法清理 portable 目录：$portableDir。请确认没有正在运行的 portable 程序或资源管理器占用后重试。原始错误：$($_.Exception.Message)"
+    }
+}
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
 Get-ChildItem -LiteralPath $ControlPanelArtifactDir -Force |
@@ -38,13 +46,24 @@ foreach ($pkgName in $manifest.packages.PSObject.Properties.Name) {
     $dst = Join-Path $packagesDir $pkgName
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
 
-    foreach ($name in @('dist', 'scripts', 'config.env.example', 'package.json', 'package-lock.json', 'README.md', 'README_CN.md', 'README.zh-CN.md')) {
+    foreach ($name in @('dist', 'scripts', 'config.env.example', 'package.json', 'package-lock.json', 'README.md', 'README_CN.md', 'README.zh-CN.md', 'SKILL.md')) {
         $item = Join-Path $src $name
         if (Test-Path -LiteralPath $item) {
             Copy-Item -LiteralPath $item -Destination $dst -Recurse -Force
         }
     }
 }
+
+$content = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $portableDir -Layout 'Portable'
+$fingerprint = New-SuiteReleaseFingerprint `
+    -SuiteRoot $suiteRoot `
+    -TargetName 'portable artifact' `
+    -TargetRole 'generated portable artifact' `
+    -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
+    -Content $content `
+    -ManifestSummary (Get-ReleaseManifestSummary -Root $portableDir) `
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $portableDir 'CodexImSuiteControlPanel.exe'))
+Write-SuiteReleaseFingerprint -TargetRoot $portableDir -Fingerprint $fingerprint | Out-Null
 
 $zipPath = Join-Path (Join-Path $suiteRoot 'release') 'codex-im-suite-portable.zip'
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }

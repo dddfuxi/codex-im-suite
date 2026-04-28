@@ -76,12 +76,13 @@ Feishu 接收现在是双通道：
 
 1. 记录运行审计。
 2. 去重。
-3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、飞书文档列表和 owner 二次确认系统动作。
+3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、纯闲聊问候、飞书文档列表和 owner 二次确认系统动作。
 4. 绑定 chat/session。
-5. 构造上下文。
-6. 调用运行时 provider。
-7. 解析最终结果块。
-8. 通过 Feishu 原生 reply/card/image 等方式回复。
+5. 记录轻量记忆事件，按 user/chat/global profile 滚动汇总事实、偏好、主题和待跟进项。
+6. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。
+7. 调用运行时 provider。
+8. 解析最终结果块。
+9. 通过 Feishu 原生 reply/card/image 等方式回复。
 
 ```mermaid
 sequenceDiagram
@@ -220,6 +221,7 @@ flowchart TD
 - `关机`、`shutdown`、重启机器等系统级动作现在直接标记为高风险请求，不允许走本地省流路径。
 - 对 Unity、Blender、MCP、仓库、文件、图片和历史这类可执行请求，回复契约要求“解决问题优先”：必须基于真实工具结果、真实命令结果或明确阻塞原因回报；不得用通用教程、占位表格或示例脚本替代执行结果。
 - Codex/MCP 执行链失败时，Unity/Blender/MCP/文档等需要真实工具输出的任务不会再降级给本地模型生成教程；runtime 会直接返回确定性 `未完成 + 阻塞原因`，bridge-core 出站前还会拦截“请手动检查 / 自行打开 Unity / 示例列表草案”等外包式回复。
+- Unity 截图/预览任务要求当前轮真实刷新或截图产物；如果 MCP 握手、场景刷新或截图阻塞，回复必须文本说明阻塞，不得从历史 capture 目录挑旧图回传。Unity HTTP MCP 的裸 `/mcp` 406 响应视为服务已响应但握手头不完整，后续应使用 `Accept: application/json, text/event-stream` 和正式 MCP initialize/list-tools 流程确认工具可用性。
 - bridge runtime 会为 Codex 使用独立 `CTI_CODEX_HOME`，同步全局认证和 MCP 配置时剔除全局顶层 `model = ...`，避免本机 Codex UI 的新模型配置拖垮旧 CLI；运行版可用 `CTI_CODEX_MODEL` 显式指定当前 CLI 已验证可用的模型。
 - Ignis 生成类任务提交后会等待完成并下载可回传资产，最终回复走 `cti-final`，避免向飞书裸发 CLI JSON 或大段技术字段。
 - Ignis 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新生成请求默认新开会话。
@@ -267,6 +269,7 @@ flowchart TD
 - 消息路由和 session 绑定。
 - 权限请求和高危操作门禁。
 - 飞书 Markdown/card/image/file/reply 发送。
+- 图片出站只使用当前回复显式给出的图片路径：`cti-final.images` 或当前可见文本中的本地图片路径。出站层不再扫描最近 assistant 历史消息补发旧图，避免截图/预览任务失败时把历史截图误当成当前结果。
 - 最终结果块解析和出站收口。
 - 运行审计落盘。
 
@@ -294,12 +297,14 @@ flowchart TD
 - 本地辅助执行器。
 - MCP manifest 解析和调用。
 - 本地 JSON store。
-- 记忆检索和 Feishu 历史索引。
+- 记忆检索、Feishu 历史索引和 `memory-profiles.json` 轻量画像索引。
 
 关键能力：
 
 - Codex 失败时切本地模型兜底。
 - 本地模型兜底时会检索本地记忆，不再空猜。
+- 记忆索引分三层：当前会话压缩摘要、按人/按聊天/全局 profile、Feishu 历史片段。模型上下文只注入检索命中的少量片段，当前请求始终优先。
+- `bridge-core` 会在收到普通消息和生成最终回复后写入记忆事件；纯问候、感谢、确认等闲聊会走确定性短回复，不启动 Codex/本地工具链。
 - MCP 工作目录检查，防止误连其他项目。
 - 默认工作区和 Unity 工程路径由配置控制。
 
@@ -386,6 +391,9 @@ Ignis CLI MCP，定位为创意生成能力包。
 - CLI 工具更新也走 `runtime.invokeAction` 白名单。当前 Codex CLI 只有在检测到 npm 全局 `@openai/codex` 安装时才显示“更新”，宿主固定执行 `npm install -g @openai/codex@latest`，不接受前端传入任意命令。
 - 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
 - 扩展页的 MCP 运行状态按健康检查、Codex 注册和托管进程综合判断；`bundled`、`external` 只作为安装来源展示，不再直接映射成“待处理”状态。
+- Unity HTTP MCP 的面板健康检查不再把裸 `/mcp` 的 406 或 HTTP 可达当作可用；只有 Unity MCP 会在 MCP `initialize` 后读取 `mcpforunity://instances`，区分 endpoint 在线、MCP protocol 可用、Unity Editor session 可用三层状态。Ignis 等非 Unity HTTP MCP 只做自身 MCP initialize 检查，不读取 Unity 资源。
+- Unity MCP 的运行单元“修复”动作会重启 `mcp-for-unity` helper，并优先使用 Unity 工程 `Library\MCPForUnity\TerminalScripts\mcp-terminal.cmd` 拉起 HTTP server；如果 Unity Editor 没有注册 session，面板会明确显示 session 不可用或读取超时。
+- bridge-runtime 的 Unity MCP 执行前预检同样要求 `mcpforunity://instances` 返回 `instance_count > 0`；单纯 HTTP 在线或 406 不再允许进入 Unity 截图、场景刷新或 prefab 操作链路。
 - 会话区新增 WebView 详情抽屉，宿主通过 `history.getSessionDetail` 返回完整消息流；旧 `ConversationViewerForm` 保留为兼容调试入口。
 - 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
 - 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
@@ -395,10 +403,12 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 会话详情的参与人列表不再只提供一次性“加 Owner”，而是进入同一套权限库，可直接设置三档角色；显示名优先来自飞书历史，拿不到时显示原始 ID。
 - 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
 - 回复风格预设通过 `settings.listReplyPresets` / `settings.applyReplyPreset` / `settings.summarizeReplyStyle` 暴露给 WebView，继续沿用宿主保存语义。
+- WebView 命令入口执行“一键发布”和“主干发布预检”时不再依赖 WinForms 原生确认框；桌面工具栏保留确认框。发布脚本非零退出会作为命令错误返回前端，避免发布失败被误显示为完成。
 - 本地辅助执行器状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
 - bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录和会话默认 executor，不再把缺失状态文件误解为辅助器异常。
 - 记忆仓库路径现在强制落在工作目录外；如果 `CTI_MEMORY_REPO_DIR` 指向默认工作目录、Unity 项目目录或其子目录，宿主和运行时都会自动回退到 `CTI_HOME\\memory-repo`。
 - 对“你还记得吗 / 常用场景名称”这类命中本地笔记的回忆型问题，运行时新增确定性记忆快答：优先直接读取 `CTI_MEMORY_REPO_DIR` 下的 Markdown 笔记并返回，不再依赖 Codex 或本地模型生成。
+- 桥接运行时新增 `data/memory-profiles.json`：按用户 ID、chatId 和全局 scope 维护事实/偏好、近期主题和待跟进项。该索引由消息事件和 Feishu 历史同步增量更新，只作为检索候选，不会整体注入模型上下文。
 
 面板原则：
 
@@ -678,6 +688,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 - 用开发版生成 live skill。
 - 组装 portable。
 - 组装 installer。
+- 执行发布前分叉体检，比较开发版、live skill、portable、installer payload 的关键文件 hash、manifest、构建时间、commit 和 `.suite-release.json` 指纹。
 - 生成 `publish-summary.md`。
 - 追加 `release-notes.md`。
 - git add / commit / push。
@@ -695,6 +706,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\prepare-main-release.ps1
 - 扫描疑似密钥和 token。
 - 构建 package 和控制面板。
 - 组装 portable 和 installer。
+- 执行 portable / installer payload 分叉体检；live skill 按主干预检策略跳过。
 - 生成 `publish-summary.md` 并追加 `release-notes.md`。
 - 不同步 live skill，不自动 commit，不自动 push。
 
@@ -719,17 +731,20 @@ flowchart TD
   Assemble --> Portable[release/portable]
   Portable --> Zip[portable zip]
   Portable --> Installer[Windows installer]
+  LiveRuntime --> ForkHealth[test-release-fork-health.ps1]
+  Portable --> ForkHealth
+  Installer --> ForkHealth
+  ForkHealth --> PublishSummary[publish-summary.md]
   DevTree --> MainPreflight[prepare-main-release.ps1]
   MainPreflight --> ValidateManifest
   MainPreflight --> ArchCheck
   MainPreflight --> Assemble
-  DevTree --> PublishSummary[publish-summary.md]
   PublishSummary --> ReleaseNotes[release-notes.md]
   ReleaseNotes --> Git[git commit 和 push]
   Git --> Tag[create-main-release-tag.ps1]
 ```
 
-同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。
+同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。发布和同步脚本在覆盖 live、portable 或 installer payload 前会检查这些目录下的运行进程；命中时只报告 PID 和路径并中止，不自动结束进程。
 
 ### 9.1 入口定位
 

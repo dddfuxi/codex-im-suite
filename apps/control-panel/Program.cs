@@ -763,10 +763,10 @@ internal sealed class MainForm : Form
                 OpenSelectedMcpPath();
                 return "opened";
             case "release.publishBackup":
-                await PublishSuiteAsync();
+                await PublishSuiteAsync(requireConfirmation: false);
                 return "publish backup finished";
             case "release.prepareMainRelease":
-                await PrepareMainReleaseAsync();
+                await PrepareMainReleaseAsync(requireConfirmation: false);
                 return "main release preflight finished";
             case "release.openSummary":
                 OpenLatestPublishSummary();
@@ -1856,7 +1856,7 @@ internal sealed class MainForm : Form
                 new[]
                 {
                     new WebRuntimeAction("check", "检查", true),
-                    new WebRuntimeAction("start", "启动", manifest.Enabled != false && hasLauncher),
+                    new WebRuntimeAction("start", IsUnityMcp(manifest) ? "修复" : "启动", manifest.Enabled != false && hasLauncher),
                     new WebRuntimeAction("stop", "停止", manifest.Enabled != false),
                     new WebRuntimeAction("install", "安装", canInstall),
                     new WebRuntimeAction("register", "注册", true),
@@ -2771,7 +2771,7 @@ internal sealed class MainForm : Form
                     new
                     {
                         role = "system",
-                        content = "你负责把用户对机器人说话方式的原始要求，压缩成一段可直接写入配置的中文回复风格规则。输出要求：1. 只输出最终规则文本；2. 60字以内；3. 不要解释原因；4. 不要用项目符号；5. 重点约束语气、长度、是否暴露思考过程。"
+                        content = "你不是聊天助手。你只负责把用户对机器人说话方式的原始要求，改写成一段可直接写入配置的中文回复风格规则。即使用户要求扮演某个角色，也只能转成“回复时……”开头的风格约束，不能进入角色、不能回答用户、不能说“好的/请问有什么可以帮忙”。输出要求：1. 只输出最终规则文本；2. 90字以内；3. 必须以“回复时”开头；4. 不要解释原因；5. 不要用项目符号；6. 重点约束语气、长度、是否暴露思考过程。"
                     },
                     new
                     {
@@ -2786,12 +2786,14 @@ internal sealed class MainForm : Form
             var body = await response.Content.ReadAsStringAsync();
             response.EnsureSuccessStatusCode();
 
-            var summarized = ExtractChatCompletionText(body).Trim();
+            var summarized = NormalizeReplyStyleSummary(requestText, ExtractChatCompletionText(body));
             if (string.IsNullOrWhiteSpace(summarized))
             {
                 throw new InvalidOperationException("本地模型没有返回可用的风格摘要。");
             }
 
+            var current = GetSettingsSnapshot();
+            SaveSettingsFromDialog(current with { ReplyStyleHint = summarized });
             AppendLog($"本地AI已整理回复风格：{summarized}");
             return summarized;
         }
@@ -2800,6 +2802,76 @@ internal sealed class MainForm : Form
             AppendLog($"本地AI整理失败：{ex.Message}");
             throw;
         }
+    }
+
+    private static string NormalizeReplyStyleSummary(string requestText, string modelText)
+    {
+        var text = Regex.Replace(modelText ?? "", @"^\s*[-*>\d.、\s]+", "").Trim();
+        text = text.Trim('`', '"', '\'', '“', '”', '‘', '’');
+        if (string.IsNullOrWhiteSpace(text) || LooksLikeAssistantChatReply(text))
+        {
+            return BuildReplyStyleFallback(requestText);
+        }
+
+        text = Regex.Replace(text, "\\s+", " ");
+        if (!text.StartsWith("回复时", StringComparison.Ordinal))
+        {
+            text = "回复时" + text.TrimStart('，', '。', ':', '：', ' ');
+        }
+        if (LooksLikeAssistantChatReply(text))
+        {
+            return BuildReplyStyleFallback(requestText);
+        }
+        return TrimReplyStyleSummary(text);
+    }
+
+    private static bool LooksLikeAssistantChatReply(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        if (Regex.IsMatch(text, "请问|有什么.*帮|我可以.*帮|需要.*帮助|随时告诉我|很高兴|您好|你好", RegexOptions.IgnoreCase)) return true;
+        if (Regex.IsMatch(text, "^(好的|好呀|可以呀|当然|没问题)[，,。！!？?\\s]*(请问|有什么|我可以|需要)", RegexOptions.IgnoreCase)) return true;
+        return false;
+    }
+
+    private static string BuildReplyStyleFallback(string requestText)
+    {
+        var source = requestText ?? "";
+        var parts = new List<string> { "回复时先说结果" };
+        if (Regex.IsMatch(source, "自然|轻松|口语|直接回消息|聊天", RegexOptions.IgnoreCase))
+        {
+            parts.Add("语气自然轻松");
+        }
+        if (Regex.IsMatch(source, "卖萌|可爱|萌", RegexOptions.IgnoreCase))
+        {
+            parts.Add("可适度卖萌");
+        }
+        if (Regex.IsMatch(source, "不要啰嗦|不啰嗦|简洁|短", RegexOptions.IgnoreCase))
+        {
+            parts.Add("不啰嗦");
+        }
+        if (Regex.IsMatch(source, "思考|过程", RegexOptions.IgnoreCase))
+        {
+            parts.Add("不暴露思考过程");
+        }
+        if (parts.Count == 1)
+        {
+            parts.Add("按用户要求控制语气和长度");
+            parts.Add("不暴露思考过程");
+        }
+        return TrimReplyStyleSummary(string.Join("，", parts) + "。");
+    }
+
+    private static string TrimReplyStyleSummary(string text)
+    {
+        text = text.Trim();
+        if (text.Length <= 120) return text;
+        var cut = text[..120];
+        var lastPunctuation = cut.LastIndexOfAny(['。', '；', '，', ',', ';']);
+        if (lastPunctuation >= 40)
+        {
+            cut = cut[..lastPunctuation];
+        }
+        return cut.TrimEnd('，', ',', '；', ';') + "。";
     }
 
     private static void SetOrAppendEnv(List<string> lines, string key, string value)
@@ -3691,6 +3763,9 @@ internal sealed class MainForm : Form
     private static bool IsHostManagedMcp(McpManifest manifest)
         => string.Equals(manifest.Type, "http", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsUnityMcp(McpManifest manifest)
+        => Regex.IsMatch($"{manifest.Id} {manifest.DisplayName} {manifest.Category} {manifest.Source}", "unity", RegexOptions.IgnoreCase);
+
     private async Task<(bool Success, string Message)> RunManifestHealthCheckAsync(McpManifest manifest)
     {
         if (manifest.HealthCheck is null || string.IsNullOrWhiteSpace(manifest.HealthCheck.Kind))
@@ -3703,6 +3778,12 @@ internal sealed class MainForm : Form
         {
             var url = ExpandManifestValue(manifest.HealthCheck.Url);
             if (string.IsNullOrWhiteSpace(url)) return (false, "healthCheck.url 为空");
+            if (url.EndsWith("/mcp", StringComparison.OrdinalIgnoreCase))
+            {
+                return IsUnityMcp(manifest)
+                    ? await RunUnityMcpHttpHealthCheckAsync(url)
+                    : await RunGenericMcpHttpHealthCheckAsync(url);
+            }
             try
             {
                 using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
@@ -3740,6 +3821,142 @@ internal sealed class MainForm : Form
         }
 
         return (false, $"未知 healthCheck.kind: {manifest.HealthCheck.Kind}");
+    }
+
+    private static async Task<(bool Success, string Message)> RunGenericMcpHttpHealthCheckAsync(string url)
+    {
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+            using var initRequest = BuildMcpInitializeRequest(url, "codex-im-suite-control-panel");
+            using var initResponse = await client.SendAsync(initRequest);
+            var initBody = await initResponse.Content.ReadAsStringAsync();
+            if (!initResponse.IsSuccessStatusCode)
+            {
+                return (false, $"MCP endpoint 在线但 initialize 失败 HTTP {(int)initResponse.StatusCode} {initResponse.ReasonPhrase} | {url} | {TrimForStatus(initBody)}");
+            }
+            if (!TryReadMcpSessionId(initResponse, out _))
+            {
+                return (true, $"MCP protocol 在线 | initialize HTTP {(int)initResponse.StatusCode} | {url}");
+            }
+            return (true, $"MCP protocol 在线 | initialize OK | {url}");
+        }
+        catch (TaskCanceledException)
+        {
+            return (false, $"MCP initialize 超时 | {url}");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            return (false, $"MCP endpoint HTTP {(int)ex.StatusCode.Value} | {url} | {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"MCP endpoint 连接失败 | {url} | {ex.Message}");
+        }
+    }
+
+    private static async Task<(bool Success, string Message)> RunUnityMcpHttpHealthCheckAsync(string url)
+    {
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+            using var initRequest = BuildMcpInitializeRequest(url, "codex-im-suite-control-panel");
+            using var initResponse = await client.SendAsync(initRequest);
+            var initBody = await initResponse.Content.ReadAsStringAsync();
+            if (!initResponse.IsSuccessStatusCode)
+            {
+                return (false, $"MCP endpoint 在线但 initialize 失败 HTTP {(int)initResponse.StatusCode} {initResponse.ReasonPhrase} | {url} | {TrimForStatus(initBody)}");
+            }
+            if (!TryReadMcpSessionId(initResponse, out var sessionId))
+            {
+                return (false, $"MCP initialize 成功但缺少 mcp-session-id | {url}");
+            }
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            using var instancesRequest = new HttpRequestMessage(HttpMethod.Post, url);
+            instancesRequest.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream");
+            instancesRequest.Headers.TryAddWithoutValidation("mcp-session-id", sessionId);
+            instancesRequest.Content = new StringContent(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"mcpforunity://instances\"}}",
+                Encoding.UTF8,
+                "application/json");
+
+            using var instancesResponse = await client.SendAsync(instancesRequest, cts.Token);
+            var instancesBody = await instancesResponse.Content.ReadAsStringAsync(cts.Token);
+            var decoded = DecodeSsePayload(instancesBody);
+            if (!instancesResponse.IsSuccessStatusCode)
+            {
+                return (false, $"MCP protocol 在线，但 Unity instances 读取失败 HTTP {(int)instancesResponse.StatusCode} {instancesResponse.ReasonPhrase} | {TrimForStatus(decoded)}");
+            }
+            if (Regex.IsMatch(decoded, "Unity session not available|No Unity instance|not available|unavailable", RegexOptions.IgnoreCase))
+            {
+                return (false, $"MCP protocol 在线，但 Unity Editor session 不可用 | {TrimForStatus(decoded)}");
+            }
+            if (Regex.IsMatch(decoded, "Name@|instances|mcpforunity://instances|contents|text", RegexOptions.IgnoreCase))
+            {
+                return (true, $"MCP + Unity session 可用 | {SummarizeUnityInstances(decoded)}");
+            }
+            return (false, $"MCP protocol 在线，但 Unity instances 响应不可识别 | {TrimForStatus(decoded)}");
+        }
+        catch (TaskCanceledException)
+        {
+            return (false, $"MCP endpoint 在线可能正常，但 Unity session 读取超时 | {url}");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
+        {
+            return (false, $"MCP endpoint HTTP {(int)ex.StatusCode.Value} | {url} | {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"MCP endpoint 连接失败 | {url} | {ex.Message}");
+        }
+    }
+
+    private static HttpRequestMessage BuildMcpInitializeRequest(string url, string clientName)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, url);
+        request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream");
+        request.Content = new StringContent(
+            $"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{clientName}\",\"version\":\"0.0.0\"}}}}}}",
+            Encoding.UTF8,
+            "application/json");
+        return request;
+    }
+
+    private static bool TryReadMcpSessionId(HttpResponseMessage response, out string sessionId)
+    {
+        sessionId = "";
+        if (!response.Headers.TryGetValues("mcp-session-id", out var values)) return false;
+        sessionId = values.FirstOrDefault() ?? "";
+        return !string.IsNullOrWhiteSpace(sessionId);
+    }
+
+    private static string DecodeSsePayload(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return "";
+        var dataLines = body.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries)
+            .Where(line => line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            .Select(line => line["data:".Length..].Trim())
+            .ToArray();
+        return dataLines.Length == 0 ? body : string.Join("\n", dataLines);
+    }
+
+    private static string SummarizeUnityInstances(string body)
+    {
+        var compact = TrimForStatus(body);
+        var names = Regex.Matches(body, @"[A-Za-z0-9_\- .]+@[a-fA-F0-9]{4,}")
+            .Select(match => match.Value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .ToArray();
+        return names.Length > 0 ? string.Join(", ", names) : compact;
+    }
+
+    private static string TrimForStatus(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var normalized = Regex.Replace(text, "\\s+", " ").Trim();
+        return normalized.Length > 260 ? normalized[..260] + "..." : normalized;
     }
 
     private bool TryGetRunningServiceState(McpManifest manifest, Dictionary<string, McpServiceState> states, out McpServiceState? state)
@@ -3848,82 +4065,102 @@ internal sealed class MainForm : Form
         return Path.GetFullPath(Path.Combine(baseDir, expanded));
     }
 
-    private async Task PublishSuiteAsync()
+    private async Task PublishSuiteAsync(bool requireConfirmation = true)
     {
         if (string.IsNullOrWhiteSpace(_publishBackupScript) || !File.Exists(_publishBackupScript))
         {
-            AppendLog("未找到 publish-backup.ps1。");
-            return;
+            throw new InvalidOperationException("未找到 publish-backup.ps1。");
         }
 
         var preflight = await ValidatePowerShellScriptAsync(_publishBackupScript);
         if (!preflight.Success)
         {
             AppendLog($"发布前语法预检失败：{preflight.Message}");
-            MessageBox.Show(
-                this,
-                $"发布前语法预检失败，已阻止继续发布。\n\n{preflight.Message}",
-                "发布预检失败",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return;
+            if (requireConfirmation)
+            {
+                MessageBox.Show(
+                    this,
+                    $"发布前语法预检失败，已阻止继续发布。\n\n{preflight.Message}",
+                    "发布预检失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            throw new InvalidOperationException($"发布前语法预检失败：{preflight.Message}");
         }
         AppendLog("发布前语法预检通过：PARSE_OK");
 
-        var preview = await BuildPublishPreviewAsync();
-        var confirm = MessageBox.Show(
-            this,
-            preview,
-            "一键发布预览",
-            MessageBoxButtons.OKCancel,
-            MessageBoxIcon.Information);
-        if (confirm != DialogResult.OK)
+        if (requireConfirmation)
         {
-            AppendLog("已取消一键发布。");
-            return;
+            var preview = await BuildPublishPreviewAsync();
+            var confirm = MessageBox.Show(
+                this,
+                preview,
+                "一键发布预览",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information);
+            if (confirm != DialogResult.OK)
+            {
+                AppendLog("已取消一键发布。");
+                return;
+            }
         }
 
         var result = await RunPowerShellFileAsync(_publishBackupScript, "", _suiteRoot, 900000);
         AppendCommand("本机备份发布", result);
         await RefreshBuildInfoAsync();
+        if (result.ExitCode != 0)
+        {
+            var error = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            throw new InvalidOperationException($"一键发布失败 exit={result.ExitCode}: {TrimForStatus(error)}");
+        }
     }
 
-    private async Task PrepareMainReleaseAsync()
+    private async Task PrepareMainReleaseAsync(bool requireConfirmation = true)
     {
         if (string.IsNullOrWhiteSpace(_mainReleaseScript) || !File.Exists(_mainReleaseScript))
         {
-            AppendLog("未找到 prepare-main-release.ps1。");
-            return;
+            throw new InvalidOperationException("未找到 prepare-main-release.ps1。");
         }
 
         var preflight = await ValidatePowerShellScriptAsync(_mainReleaseScript);
         if (!preflight.Success)
         {
             AppendLog($"主干发布预检脚本语法失败：{preflight.Message}");
-            MessageBox.Show(
-                this,
-                $"主干发布预检脚本语法失败，已阻止继续执行。\n\n{preflight.Message}",
-                "主干发布预检失败",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
-            return;
+            if (requireConfirmation)
+            {
+                MessageBox.Show(
+                    this,
+                    $"主干发布预检脚本语法失败，已阻止继续执行。\n\n{preflight.Message}",
+                    "主干发布预检失败",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            throw new InvalidOperationException($"主干发布预检脚本语法失败：{preflight.Message}");
         }
 
-        var confirm = MessageBox.Show(
-            this,
-            "将执行主干发布预检：扩展协议校验、架构文档检查、构建、打包和发布摘要生成。\n\n不会同步 live skill，不会自动 git commit、push 或打标签。",
-            "主干发布预检",
-            MessageBoxButtons.OKCancel,
-            MessageBoxIcon.Information);
-        if (confirm != DialogResult.OK)
+        if (requireConfirmation)
         {
-            AppendLog("已取消主干发布预检。");
-            return;
+            var confirm = MessageBox.Show(
+                this,
+                "将执行主干发布预检：扩展协议校验、架构文档检查、构建、打包和发布摘要生成。\n\n不会同步 live skill，不会自动 git commit、push 或打标签。",
+                "主干发布预检",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Information);
+            if (confirm != DialogResult.OK)
+            {
+                AppendLog("已取消主干发布预检。");
+                return;
+            }
         }
 
         var result = await RunPowerShellFileAsync(_mainReleaseScript, "", _suiteRoot, 900000);
         AppendCommand("主干发布预检", result);
         await RefreshBuildInfoAsync();
+        if (result.ExitCode != 0)
+        {
+            var error = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            throw new InvalidOperationException($"主干发布预检失败 exit={result.ExitCode}: {TrimForStatus(error)}");
+        }
     }
 
     private async Task<(bool Success, string Message)> ValidatePowerShellScriptAsync(string scriptPath)
@@ -5421,15 +5658,25 @@ internal sealed class MainForm : Form
 
     private static async Task<ProcessResult> RunPowerShellFileAsync(string scriptPath, string trailingArgs, string workingDirectory, int timeoutMs, Dictionary<string, string?>? environment = null)
     {
-        var escapedPath = scriptPath.Replace("\"", "\"\"");
-        var arguments = string.IsNullOrWhiteSpace(trailingArgs) ? $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{escapedPath}\"" : $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{escapedPath}\" {trailingArgs}";
+        var command = new StringBuilder();
+        command.Append("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ");
+        command.Append("$OutputEncoding = [Console]::OutputEncoding; ");
+        command.Append("$ProgressPreference = 'SilentlyContinue'; ");
+        command.Append("& ").Append(QuotePowerShellLiteral(scriptPath));
+        if (!string.IsNullOrWhiteSpace(trailingArgs)) command.Append(' ').Append(trailingArgs);
+        command.Append("; if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }");
+        var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(command.ToString()));
+        var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encodedCommand}";
         return await RunProcessAsync("powershell.exe", arguments, workingDirectory, environment, timeoutMs);
     }
+
+    private static string QuotePowerShellLiteral(string value)
+        => "'" + value.Replace("'", "''") + "'";
 
     private static async Task<ProcessResult> RunProcessAsync(string fileName, string arguments, string workingDirectory, Dictionary<string, string?>? environment = null, int timeoutMs = 30000)
     {
         using var process = new Process();
-        var outputEncoding = fileName.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase) ? Encoding.Default : Encoding.UTF8;
+        var outputEncoding = fileName.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase) ? new UTF8Encoding(false) : Encoding.UTF8;
         process.StartInfo = new ProcessStartInfo
         {
             FileName = fileName,

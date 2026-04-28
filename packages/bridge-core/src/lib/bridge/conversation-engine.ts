@@ -15,6 +15,7 @@ import type {
   TokenUsage,
   MessageContentBlock,
   RetrievedMemoryContext,
+  RetrievedFeishuHistoryContext,
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
@@ -64,6 +65,8 @@ export interface ConversationProcessOptions {
   storedUserText?: string;
   historyLimit?: number;
   extraSystemPrompt?: string;
+  memoryUserId?: string;
+  memoryUserDisplayName?: string;
 }
 
 const MUTATING_COMMAND_RE = /\b(git\s+(pull|rebase|merge|checkout|switch|reset|clean|stash(?:\s+(?:pop|apply))?)|npm\s+(install|update|uninstall)|pnpm\s+(install|update|add|remove)|yarn\s+(install|add|remove)|mkdir|rmdir|rm|mv|cp|touch|del|copy|move-item|remove-item|copy-item|new-item|set-content|add-content)\b/i;
@@ -107,8 +110,11 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- Execution posture: you are responsible for solving the task, not coaching the user to do it. Do not turn actionable requests into generic tutorials, manual checklists, placeholder tables, or sample scripts unless the user explicitly asks for instructions.',
     '- If a task requires Unity, Blender, MCP, repository, local file, image, or history access, either use the requested tool path and report real findings, or say "未完成" with the exact concrete blocker. Do not fabricate example findings.',
     '- For Unity MCP requests, always attempt at least one concrete reconnect/start path before declaring failure (for example check existing MCP endpoint, then attempt known local launcher or CLI entry when available), and report the exact failure point if still blocked.',
+    '- For Unity MCP HTTP endpoints, do not treat a bare 406 Not Acceptable from /mcp as offline. It means the service answered but the request probably missed Accept: application/json, text/event-stream; retry a real MCP initialize/list-tools handshake before reporting unavailable.',
     '- Hard requirement for Unity MCP tasks: before saying unavailable, include at least one real attempt artifact (a Unity MCP tool call result, or one launcher shell command + its exact error). If no attempt artifact exists, continue trying instead of giving up.',
     '- If Unity MCP tools are absent in the current tool list, perform one concrete bootstrap attempt (locate/start command in allowed workspace) and report that command result, then ask for the minimal missing prerequisite.',
+    '- For screenshot/preview requests, only send images captured in the current turn or an explicitly requested exact historical file. Never attach a stale screenshot found by scanning capture folders when the user asked to refresh or inspect current Unity state.',
+    '- If scene refresh, play/preview state, or screenshot capture is blocked, reply text-only with the blocker. Do not reuse a previous screenshot as if it validates the current state.',
     '- For image annotation tasks, strictly follow user-specified label format and naming conventions. If the user gives an explicit format (such as Furniture_*), keep that format exactly; do not auto-rename to another schema.',
     '- If required inputs are missing for precise annotation (for example a referenced person\'s chat records or the target screenshot), ask for the missing artifact instead of producing speculative labels.',
     '- Default execution posture: prioritize solving the task with concrete attempts. Do not retreat to generic refusal when a safe, bounded troubleshooting step can be executed immediately.',
@@ -283,11 +289,25 @@ function compactBlockForStorage(block: MessageContentBlock): MessageContentBlock
   }
 }
 
-function buildRetrievedMemoryPrompt(memory: RetrievedMemoryContext | null, maxChars: number): string {
-  if (!memory || memory.hits.length === 0) return '';
+function buildRetrievedMemoryPrompt(
+  memory: RetrievedMemoryContext | null,
+  feishuHistory: RetrievedFeishuHistoryContext | null,
+  maxChars: number,
+): string {
+  const sections: string[] = [];
+  if (memory && memory.hits.length > 0) {
+    sections.push(memory.summary);
+  }
+  if (feishuHistory && feishuHistory.items.length > 0) {
+    sections.push([
+      'Relevant Feishu history snippets:',
+      feishuHistory.summary,
+    ].join('\n'));
+  }
+  if (sections.length === 0) return '';
   const text = [
     'Retrieved memory context:',
-    memory.summary,
+    sections.join('\n\n'),
     'Use these snippets only when relevant. They are selected memory, not the full transcript. If they conflict with the current user request, prefer the current request.',
   ].join('\n\n');
   return truncatePromptText(text, maxChars);
@@ -414,16 +434,25 @@ export async function processMessage(
       sessionId,
       channelType: binding.channelType,
       chatId: binding.chatId,
+      userId: options?.memoryUserId,
+      userDisplayName: options?.memoryUserDisplayName,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       query: text,
       recentHistoryLimit: historyLimit,
     });
+    const retrievedFeishuHistory = binding.channelType === 'feishu' && store.retrieveRelevantFeishuHistory
+      ? store.retrieveRelevantFeishuHistory({
+        chatId: binding.chatId,
+        query: text,
+        limit: 4,
+      })
+      : null;
     const memoryPromptMaxChars = parseSettingInt(
       store.getSetting('bridge_memory_prompt_max_chars'),
       DEFAULT_MEMORY_PROMPT_MAX_CHARS,
       240,
     );
-    const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, memoryPromptMaxChars);
+    const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, retrievedFeishuHistory, memoryPromptMaxChars);
     const mergedExtraSystemPrompt = [options?.extraSystemPrompt?.trim(), memoryPrompt]
       .filter((part): part is string => !!part)
       .join('\n\n');

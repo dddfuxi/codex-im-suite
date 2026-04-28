@@ -126,6 +126,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
+独立检查开发版、live skill、portable 和 installer payload 是否分叉：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test-release-fork-health.ps1 -Mode BackupPublish -FailOnFork
+```
+
 本机备份发布到当前分支：
 
 ```powershell
@@ -134,13 +140,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 
 该入口会构建开发版、同步 live skill、组装 release、生成摘要、提交并推送当前分支。它用于个人运行副本备份，不作为 `main` 主干门禁。
 
+发布链路会在打包后执行分叉体检，比较关键文件 hash、manifest、构建时间、来源 commit 和 `.suite-release.json` 指纹；发现开发版、live skill、portable 或 installer payload 漂移时会中止，不会继续提交或推送。若提示 portable、installer 或 live skill 下有运行进程占用，先关闭输出中的 PID 对应程序后再重试，脚本不会自动结束进程。
+
 主干发布预检：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\prepare-main-release.ps1
 ```
 
-该入口会校验扩展协议、检查架构文档、构建、打包并生成发布摘要；不会同步 live skill，也不会自动 `git commit`、`git push` 或打 tag。确认 release notes 后再手动提交，并用 `v0.2.0` 这类 tag 标记稳定发行。
+该入口会校验扩展协议、检查架构文档、构建、打包、执行 portable / installer payload 分叉体检并生成发布摘要；不会同步 live skill，也不会自动 `git commit`、`git push` 或打 tag。确认 release notes 后再手动提交，并用 `v0.2.0` 这类 tag 标记稳定发行。
 
 主干发行打标签：
 
@@ -212,7 +220,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\sync-live-skill.ps1
 
 该脚本方向固定为“开发版 suite -> live skill”。如确实需要从 live 救回改动，使用 `scripts/import-live-to-suite.ps1 -Apply`，不要把它接入发布流程。
 
-发布脚本会先构建开发版，再同步 live、组装 portable 和 installer，避免“开发版”“运行版”和“打包版”漂移。
+发布脚本会先构建开发版，再同步 live、组装 portable 和 installer，并用 `test-release-fork-health.ps1` 阻断“开发版”“运行版”和“打包版”漂移。
 
 ## GitHub
 

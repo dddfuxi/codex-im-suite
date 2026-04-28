@@ -10,6 +10,9 @@ $liveRuntime = Join-Path $userHome '.codex\skills\claude-to-im'
 $suiteCore = Join-Path $suiteRoot 'packages\bridge-core'
 $suiteRuntime = Join-Path $suiteRoot 'packages\bridge-runtime'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
+$portableDir = Join-Path $suiteRoot 'release\portable'
+
+Assert-NoRunningProcessInPath -Roots @($liveRuntime, $liveCore, $portableDir) -Purpose 'sync live skill'
 
 function Copy-PathContent {
     param(
@@ -121,7 +124,11 @@ if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$builtPanelDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
+$builtPanelDir = if ($env:CTI_RELEASE_CONTROL_PANEL_DIR) {
+    $env:CTI_RELEASE_CONTROL_PANEL_DIR
+} else {
+    Join-Path $suiteRoot 'release\artifacts\control-panel'
+}
 $builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'
 $builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
@@ -130,5 +137,27 @@ Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'Codex
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb')
+
+$runtimeContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveRuntime -Layout 'LiveRuntime'
+$runtimeFingerprint = New-SuiteReleaseFingerprint `
+    -SuiteRoot $suiteRoot `
+    -TargetName 'live runtime skill' `
+    -TargetRole 'runtime copy generated from suite' `
+    -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
+    -Content $runtimeContent `
+    -ManifestSummary (Get-ReleaseManifestSummary -Root $liveRuntime) `
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe'))
+Write-SuiteReleaseFingerprint -TargetRoot $liveRuntime -Fingerprint $runtimeFingerprint | Out-Null
+
+$coreContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveCore -Layout 'LiveCore'
+$coreFingerprint = New-SuiteReleaseFingerprint `
+    -SuiteRoot $suiteRoot `
+    -TargetName 'live core skill' `
+    -TargetRole 'runtime copy generated from suite' `
+    -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
+    -Content $coreContent `
+    -ManifestSummary (Get-ReleaseManifestSummary -Root $liveCore) `
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $liveCore 'dist\control-panel\ClaudeToImControlPanel.exe'))
+Write-SuiteReleaseFingerprint -TargetRoot $liveCore -Fingerprint $coreFingerprint | Out-Null
 
 Write-Host "sync complete: suite -> live skills"

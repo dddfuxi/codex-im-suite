@@ -1,0 +1,42 @@
+﻿{
+    "schema":  "codex-im-suite/release-fingerprint/v1",
+    "generatedAt":  "2026-04-28 19:28:44",
+    "releaseRunId":  "950eb470b4ee46aabdcbd756fad5101d",
+    "targetName":  "portable artifact",
+    "targetRole":  "generated portable artifact",
+    "suite":  {
+                  "name":  "codex-im-suite",
+                  "version":  "0.2.0",
+                  "extensionProtocol":  "extension-manifest/v1",
+                  "branch":  "codex/dev",
+                  "commit":  "f1e22e2",
+                  "dirty":  true
+              },
+    "manifest":  {
+                     "Count":  15,
+                     "Hash":  "F518F63B17FE"
+                 },
+    "panel":  {
+                  "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
+                  "Exists":  true,
+                  "Hash":  "AFB1F2E84A17",
+                  "Length":  1634764,
+                  "Modified":  "2026-04-28 19:21:28"
+              },
+    "content":  {
+                    "runtime.package":  "C7100F3AB5BE",
+                    "runtime.dist":  "4D2283024812",
+                    "runtime.scripts":  "A640FEE092C2",
+                    "runtime.configExample":  "2784AEB44164",
+                    "runtime.skill":  "867CAED0153F",
+                    "core.package":  "1745A29789EC",
+                    "core.dist":  "E09B01E5882C",
+                    "suite.manifest":  "130C14A98B41",
+                    "config.manifests":  "F518F63B17FE",
+                    "extensions.skills":  "3D657A104715",
+                    "release.scripts":  "7B77130EED72",
+                    "docs":  "D79D71BF9B00",
+                    "panel.exe":  "AFB1F2E84A17",
+                    "panel.wwwroot":  "D8DB8CE5D39B"
+                }
+}

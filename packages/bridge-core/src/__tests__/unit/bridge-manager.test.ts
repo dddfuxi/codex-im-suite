@@ -199,6 +199,13 @@ describe('bridge-manager policy helpers', () => {
     assert.match(sanitized, /已拦截通用手动排查步骤/);
     assert.doesNotMatch(sanitized, /请手动检查|打开你的Unity项目|示例列表/);
   });
+
+  it('routes pure small talk without turning it into a tool prompt', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.match(_testOnly.buildSmallTalkReply('你好呀'), /闲聊/);
+    assert.equal(_testOnly.buildSmallTalkReply('帮我看一下 Unity'), '');
+    assert.equal(_testOnly.buildSmallTalkReply('你好呀，帮我发布'), '');
+  });
 });
 
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {

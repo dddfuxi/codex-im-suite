@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-27
+更新时间：2026-04-28
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -16,6 +16,7 @@
 - 建立 `publish-backup.ps1`，发布前自动同步、打包、生成摘要、提交并推送。
 - 建立 `publish-summary.md` 和 `release-notes.md`。
 - 新增 `scripts/doctor-suite-targets.ps1`，用于检查开发版、live skill、portable、installer 和面板 exe 的职责与漂移情况。
+- 新增 `scripts/test-release-fork-health.ps1`，发布前比较开发版、live skill、portable、installer payload 的关键文件 hash、manifest、构建时间、commit 和 `.suite-release.json` 指纹；发现分叉时中止发布。
 - 将 `scripts/sync-live-skill.ps1` 收口为“开发版 suite -> live skill”方向，避免 live 反向覆盖开发版。
 - 新增 `scripts/import-live-to-suite.ps1` 作为手动救回 live 改动入口，默认 dry-run，不进入发布流程。
 - 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
@@ -30,6 +31,7 @@
 - 新增 `scripts/start-control-api.ps1`，用于本机或服务器启动 API-only 模式。默认只监听 `127.0.0.1`，远程监听必须配置 token，远程高危命令需要额外显式开启。
 - 桌面面板的 Control API 启动已补端口冲突保护：本机 loopback 模式下如果默认 `8788` 被占用，会自动尝试后续端口，避免多开面板时直接弹未处理异常；远程显式监听仍保持严格失败。
 - `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
+- `assemble-portable.ps1`、`build-installer.ps1` 和 `sync-live-skill.ps1` 在覆盖运行副本或发布产物前会检查目录下是否有运行进程占用；命中时输出 PID 和路径并停止，不自动 kill。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 - 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
@@ -38,13 +40,18 @@
 - 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
 - 会话详情对旧本地消息增加只读显示修复：检测到 `鍖/涓/妫/杩/€` 等典型 UTF-8 被 GBK 错读的 mojibake 时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
 - 会话详情新增运行历程回溯：按 `sessionId` / `chatId` 关联 workflow run，展示 executor、阶段、状态、prompt 摘要和事件时间线，便于排查一次请求是否卡在授权、路由、执行、收尾或回传阶段。
+- 飞书图片出站收紧：不再从最近 assistant 历史消息里自动捞旧图片随新回答发送；只有当前 `cti-final.images` 或当前回复文本明确出现的本地图片路径会被发送，避免 Unity 截图任务失败时重复发旧截图。
 - 回复风格快捷预设改为点击即保存到 `CTI_REPLY_STYLE_HINT`，避免前端临时状态被后续 `state.refresh` 用旧配置覆盖。
 - 设置页恢复目录选择和回复风格快捷设置：路径字段支持拖拽、目录选择、快速打开；回复风格支持预设、当前摘要和本地 AI 整理入口。
+- bridge-core 新增纯闲聊短路：问候、感谢、确认等不含任务意图的消息直接自然回复并记录会话，不再启动 Codex/本地模型执行链。
+- bridge-runtime 新增 `memory-profiles.json` 轻量记忆画像：按用户 ID、聊天和全局 scope 汇总事实/偏好、近期主题和待跟进项；普通消息和 Feishu 历史同步都会增量更新。
+- Codex 上下文记忆注入改为“会话摘要 + profile 命中 + Feishu 历史命中”的检索式组合，继续受字符预算限制，避免把全部记忆一次性注入导致 token 膨胀。
 
 当前约定：
 
 - 以后开发优先改 suite 目录。
 - live skill 通过同步脚本生成。
+- 完成发布脚本改动后，同步当前使用版本时仍只允许执行 `scripts/sync-live-skill.ps1`，方向固定为开发版 suite -> live skill。
 - 本机备份发布可以同步 live skill 并推送当前分支；合入 `main` 前必须走主干发布预检。
 - `main` 是稳定产品主干，`codex/dev` 是日常集成分支，功能分支使用 `codex/<topic>`。
 - 面板源码唯一入口是 `apps/control-panel`；安装器源码唯一入口是 `apps/installer`。
@@ -99,6 +106,7 @@
 - fast-path 执行前判断改为硬约束：Ignis handler 先判断 intent 再读取 manifest / 健康检查；旧 MCP handler 全部委托到新版 preflight，避免老入口继续用散落正则绕过判断。
 - Skill、Codex prompt 和本地兜底 prompt 已补“解决问题优先”约束：工具类任务不能用通用步骤、示例表格或样例脚本代替真实执行；没有真实工具结果时必须明确说未完成和具体阻塞点。
 - 工具任务降级已加硬收口：Codex/MCP 执行链失败后，Unity/Blender/MCP/文档类请求直接返回确定性阻塞原因，不再交给本地模型生成“请手动检查”的教程式回复；bridge-core 出站前也会拦截这类外包式文案。
+- Codex/桥接提示词补齐 Unity 截图和 MCP 握手约束：截图类任务不得用扫描到的历史截图冒充当前刷新结果；`/mcp` 返回 406 时按“服务在线但缺 MCP Accept 握手头”处理，必须重试正式 initialize/list-tools 流程后才能判定不可用。
 - Codex provider 已补模型隔离：bridge 生成自己的 Codex Home 时剔除全局 `model = ...`，并支持 `CTI_CODEX_MODEL` 运行时覆盖。当前本机 Codex CLI 已从 `0.121.0` 升级到 `0.125.0`，`gpt-5.5` 已通过最小请求验证；live 版当前显式设置 `CTI_CODEX_MODEL=gpt-5.5`。
 
 当前限制：
@@ -239,7 +247,13 @@
 - WebView 扩展页已补齐安装入口：skill 通过 `scripts/install-suite-extension.ps1` 同步到本机 Codex skills，带 `installer` 的 MCP 会显示“安装”按钮并走宿主白名单安装脚本。
 - WebView 扩展页已新增“导入本地目录”：支持选择或拖入目录，识别为 skill / mcp，预览将写入的 manifest，再一键导入到 suite 清单。
 - WebView 扩展页的 MCP 状态显示已改为按健康检查、Codex 注册和托管进程综合判断；HTTP 在线或已注册的 MCP 显示为可用，不再把 `bundled` / `external` 安装来源误显示成“待处理”。
+- Unity MCP 面板检查已细分为 endpoint、MCP initialize、Unity instances/session 三层；`/mcp` 裸 406 或 HTTP 可达不再被视为可执行可用，Unity session 不可用会明确显示失败或超时。该三层 Unity 检查只应用于 Unity MCP，Ignis 等非 Unity HTTP MCP 不再读取 `mcpforunity://instances`。
+- Unity MCP 运行单元的“启动”动作在 HTTP 外部宿主场景下改为“修复”，会重启 `mcp-for-unity` helper 并复用 Unity 工程里的 `Library\MCPForUnity\TerminalScripts\mcp-terminal.cmd`。
+- bridge-runtime 的 Unity MCP 预检也改为真实 MCP initialize + `mcpforunity://instances`，只有 `instance_count > 0` 才返回 READY，避免飞书任务在没有 Unity session 时误走截图或场景操作。
 - WebView 服务页新增 Codex CLI 自动更新动作：仅当宿主检测到 npm 全局 `@openai/codex` 安装时显示“更新”，点击后执行固定白名单命令 `npm install -g @openai/codex@latest` 并刷新 Codex 状态。
+- WebView 设置页的“本地 AI 整理”现在会把生成的回复风格摘要直接保存为当前生效配置，并在快捷预设区显示“自定义”状态，避免整理结果被旧预设状态刷新覆盖。
+- “本地 AI 整理”增加角色逃逸保护：本地模型只能输出以“回复时”开头的风格配置规则；如果返回“好的，请问有什么可以帮忙”等聊天式回复，会被丢弃并用确定性摘要兜底，避免该入口变成可聊天窗口。
+- WebView 的“一键发布”和“主干发布预检”不再弹 WinForms 原生确认框，避免 Web 面板点击后被隐藏弹窗卡住；发布脚本 exit 非 0 时会向前端返回明确错误，不再静默显示 finished。
 - WebView 顶部工具区和发布页都新增醒目的“一键发布”入口，直接调用 `release.publishBackup`，避免用户只能在发布页看到旧的“本机备份发布”名称。
 - 记忆仓库路径已加门禁：`CTI_MEMORY_REPO_DIR` 不允许落在默认工作目录、Unity 项目目录或它们的子目录下；命中时自动回退到 `CTI_HOME\\memory-repo`，避免把记忆文件写进工程目录。
 - 运行时已补“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类命中 `memory-repo` 笔记的请求，会直接返回笔记内容，不再因为 Codex 失效或本地模型超时而把错误抛给用户。
@@ -258,6 +272,7 @@
 
 - 本地消息、归档、审计、Feishu chat index。
 - Feishu 历史按 chatId 增量同步到本地索引。
+- `memory-profiles.json` 按 userId、chatId、global 三档记录轻量摘要，保留事实/偏好、近期主题和待跟进项。
 - 查看器优先使用远端 / 本地索引组合。
 - 本地历史检索支持群名、关键词、发言人、时间段。
 - Codex 不可用时，本地模型可用记忆命中片段回答。
@@ -266,6 +281,7 @@
 
 - Feishu 远端记录是主事实来源。
 - 本地索引用于检索、摘要、节省 token 和容灾。
+- 记忆只按查询相关性少量注入，不允许把所有用户画像或全部历史塞进模型上下文。
 - 记忆类回复不能只给概括，命中结构化键值时应保留原始键和值。
 
 ## 8. 已知风险和后续建议

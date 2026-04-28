@@ -7,7 +7,8 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
+import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
+import type { ConversationMemoryEvent } from './host.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -123,6 +124,18 @@ function appendReplyEndMarker(text: string): string {
 
 const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|看一眼|查一下|分析一下|整理.*列表)/i;
 const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
+const TASK_INTENT_PATTERN = /(帮我|麻烦|请|需要|能不能|可以帮|处理|执行|运行|启动|停止|重启|发布|同步|安装|升级|修|修复|改|修改|替换|检查|排查|诊断|看一下|看一眼|查一下|找一下|分析|整理|总结|汇总|生成|创建|写|删除|添加|上传|下载|截图|回溯|记忆|记得|历史|权限|报错|异常|失败|为什么|怎么回事|哪里|怎么|如何|unity|mcp|codex|claude|bridge|飞书|面板|文件|代码|仓库|commit|push|git)/i;
+const SMALL_TALK_PATTERNS: Array<{ pattern: RegExp; reply: string }> = [
+  { pattern: /^(你好|你好呀|嗨|哈喽|hello|hi|hey)[呀啊~～！!。\s]*$/i, reply: '你好呀，我在呢～今天想闲聊也行，有事也可以直接丢给我。' },
+  { pattern: /^(在吗|在不在|人在吗|你在吗)[？?\s]*$/i, reply: '在的，我看到消息啦。' },
+  { pattern: /^(早|早上好|早安)[呀啊~～！!。\s]*$/i, reply: '早呀，今天我在这边陪你盯着。' },
+  { pattern: /^(晚安|睡啦|睡了)[呀啊~～！!。\s]*$/i, reply: '晚安，好好休息。' },
+  { pattern: /^(谢谢|谢啦|感谢|辛苦了|辛苦)[呀啊~～！!。\s]*$/i, reply: '不客气～有上下文我会顺手记住，后面提到也能帮你接上。' },
+  { pattern: /^(好的|好嘞|收到|ok|嗯|嗯嗯|行|可以)[呀啊~～！!。\s]*$/i, reply: '收到啦。' },
+  { pattern: /^(哈哈|哈哈哈|笑死|可以可以)[哈呀啊~～！!。\s]*$/i, reply: '哈哈，我懂。' },
+  { pattern: /^(能聊天吗|可以聊天吗|你能闲聊吗|你是机器人吗|你是谁)[？?\s]*$/i, reply: '可以闲聊的，我不是只会跑工具；只是你明确让我处理事情时，我才会进入执行模式。' },
+  { pattern: /^(聊会儿|陪我聊聊|随便聊聊|闲聊一下)[呀啊~～！!。\s]*$/i, reply: '可以呀，我在。你随便说，我会按聊天来接，不会一上来就当任务跑。' },
+];
 
 function isToolExecutionRequestText(text: string): boolean {
   return TOOL_EXECUTION_REQUEST_PATTERN.test(text);
@@ -130,6 +143,46 @@ function isToolExecutionRequestText(text: string): boolean {
 
 function containsOutsourcedToolReply(text: string): boolean {
   return OUTSOURCED_TOOL_REPLY_PATTERN.test(text);
+}
+
+function buildSmallTalkReply(text: string): string {
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  if (!normalized || normalized.length > 24) return '';
+  if (TASK_INTENT_PATTERN.test(normalized)) return '';
+  for (const item of SMALL_TALK_PATTERNS) {
+    if (item.pattern.test(normalized)) return item.reply;
+  }
+  return '';
+}
+
+function recordConversationMemoryEvent(
+  msg: InboundMessage,
+  binding: ChannelBinding,
+  role: 'user' | 'assistant',
+  text: string,
+): void {
+  const { store } = getBridgeContext();
+  if (typeof store.recordMemoryEvent !== 'function') return;
+  const timestampMs = Number.isFinite(msg.timestamp)
+    ? (msg.timestamp < 10_000_000_000 ? msg.timestamp * 1000 : msg.timestamp)
+    : Date.now();
+  const event: ConversationMemoryEvent = {
+    sessionId: binding.codepilotSessionId,
+    channelType: binding.channelType,
+    chatId: binding.chatId,
+    chatDisplayName: binding.displayName || msg.address.displayName || msg.address.chatId,
+    userId: msg.address.userId,
+    userDisplayName: msg.address.displayName,
+    role,
+    text,
+    workingDirectory: binding.workingDirectory,
+    createdAt: new Date(timestampMs).toISOString(),
+  };
+  try {
+    store.recordMemoryEvent(event);
+  } catch (error) {
+    console.warn('[bridge-manager] Failed to record conversation memory event:', error instanceof Error ? error.message : error);
+  }
 }
 
 function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
@@ -923,24 +976,6 @@ function extractLocalImagePaths(text: string, workingDirectory: string, addition
       }
       return path.join(workingDirectory, candidate);
     });
-}
-
-function collectRecentAssistantImagePaths(
-  sessionId: string,
-  workingDirectory: string,
-  additionalDirectories: string[] = [],
-): string[] {
-  const { store } = getBridgeContext();
-  const recent = store.getMessages(sessionId, { limit: 4 }).messages;
-  for (let index = recent.length - 1; index >= 0; index -= 1) {
-    const message = recent[index];
-    if (message.role !== 'assistant' || !message.content) continue;
-    const imagePaths = extractLocalImagePaths(message.content, workingDirectory, additionalDirectories);
-    if (imagePaths.length > 0) {
-      return Array.from(new Set(imagePaths));
-    }
-  }
-  return [];
 }
 
 function getAutoReplyImageLimit(): number {
@@ -2304,6 +2339,17 @@ async function handleMessage(
   }
 
   const binding = router.resolve(msg.address);
+  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText) : '';
+  if (smallTalkReply) {
+    store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
+    store.addMessage(binding.codepilotSessionId, 'assistant', smallTalkReply);
+    recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
+    recordConversationMemoryEvent(msg, binding, 'assistant', smallTalkReply);
+    await deliverResponse(adapter, msg.address, smallTalkReply, binding.codepilotSessionId, msg.messageId);
+    ack();
+    return;
+  }
+
   const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
   if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && !ownerMessage) {
     await deliver(adapter, {
@@ -2357,6 +2403,8 @@ async function handleMessage(
     const result = await executeDirectCommand(directCommandRequest, workingDirectory);
     store.addMessage(effectiveBinding.codepilotSessionId, 'user', rawText);
     store.addMessage(effectiveBinding.codepilotSessionId, 'assistant', result.text);
+    recordConversationMemoryEvent(msg, effectiveBinding, 'user', rawText);
+    recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', result.text);
     if (effectiveBinding.id) {
       try {
         store.updateChannelBinding(effectiveBinding.id, { sdkSessionId: '' });
@@ -2589,6 +2637,7 @@ async function handleMessage(
       }
     }
 
+    recordConversationMemoryEvent(msg, effectiveBinding, 'user', text || rawText);
     const result = await engine.processMessage(effectiveBinding, basePromptText, async (perm) => {
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
@@ -2609,6 +2658,8 @@ async function handleMessage(
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
       extraSystemPrompt: fastPathOptions.extraSystemPrompt,
+      memoryUserId: msg.address.userId,
+      memoryUserDisplayName: msg.address.displayName,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
     const resolvedWorkingDirectory =
@@ -2617,6 +2668,11 @@ async function handleMessage(
       ? await prepareBridgeReplyPayload(result.responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
     const userFacingResponseText = preparedReply?.text || '';
+    if (userFacingResponseText) {
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', userFacingResponseText);
+    } else if (result.hasError && result.errorMessage) {
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', `未完成：${result.errorMessage}`);
+    }
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -2713,11 +2769,6 @@ async function handleMessage(
         ...(preparedReply?.images || []),
         ...extractLocalImagePaths(
           result.responseText,
-          resolvedWorkingDirectory,
-          accessibleWorkspaceDirectories,
-        ),
-        ...collectRecentAssistantImagePaths(
-          effectiveBinding.codepilotSessionId,
           resolvedWorkingDirectory,
           accessibleWorkspaceDirectories,
         ),
@@ -3161,4 +3212,5 @@ export const _testOnly = {
   isFeishuDocGenerationRequestStrict,
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
+  buildSmallTalkReply,
 };

@@ -13,6 +13,7 @@ import type {
   BridgeSession,
   BridgeMessage,
   BridgeApiProvider,
+  ConversationMemoryEvent,
   MemoryRetrievalQuery,
   RetrievedMemoryContext,
   RetrievedMemoryHit,
@@ -33,6 +34,7 @@ import { CTI_HOME } from './config.js';
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
+const MEMORY_PROFILES_PATH = path.join(DATA_DIR, 'memory-profiles.json');
 const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
 const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
@@ -45,8 +47,11 @@ const SUMMARY_REFRESH_EVERY = Math.max(6, Number.parseInt(process.env.CTI_SUMMAR
 const MEMORY_MAX_HITS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_MAX_HITS || '6', 10) || 6);
 const MEMORY_MAX_CHARS = Math.max(600, Number.parseInt(process.env.CTI_MEMORY_MAX_CHARS || '2200', 10) || 2200);
 const MEMORY_MIN_SCORE = Number.parseFloat(process.env.CTI_MEMORY_MIN_SCORE || '6') || 6;
+const MEMORY_PROFILE_MAX_ITEMS = Math.max(6, Number.parseInt(process.env.CTI_MEMORY_PROFILE_MAX_ITEMS || '24', 10) || 24);
+const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_PROFILE_EVENT_MIN_CHARS || '2', 10) || 2);
 const ENGLISH_STOP_TOKENS = new Set(['this', 'that', 'with', 'from', 'then', 'just', 'into', 'them', 'they', 'what', 'when', 'where', 'which', 'have', 'will', 'your', 'about', 'please']);
 const CHINESE_STOP_TOKENS = new Set(['这个', '那个', '现在', '刚才', '继续', '直接', '帮我', '处理', '一下', '看看', '这里', '当前', '应该', '进行', '根据', '然后', '就是', '可以', '能够']);
+const MEMORY_RECALL_RE = /(记得|回忆|历史|上次|之前|以前|刚才|说过|提到|对应表|常用|查一下|找一下|回溯|总结|汇总)/i;
 
 // Helpers
 
@@ -101,6 +106,24 @@ interface FeishuChatIndexRecord {
 interface FeishuHistoryIndexRecord extends FeishuHistorySyncStatus {}
 interface FeishuP2pUserAliasIndexRecord extends FeishuP2pUserAliasRecord {}
 
+type MemoryProfileScope = 'user' | 'chat' | 'global';
+
+interface MemoryProfileRecord {
+  scope: MemoryProfileScope;
+  key: string;
+  channelType?: string;
+  chatId?: string;
+  userId?: string;
+  displayName?: string;
+  workingDirectory?: string;
+  topics: string[];
+  facts: string[];
+  pending: string[];
+  messageCount: number;
+  updatedAt: string;
+  lastEventAt: string;
+}
+
 // Store
 
 export class JsonFileStore implements BridgeStore {
@@ -112,6 +135,7 @@ export class JsonFileStore implements BridgeStore {
   private offsets = new Map<string, string>();
   private dedupKeys = new Map<string, number>();
   private locks = new Map<string, LockEntry>();
+  private memoryProfiles = new Map<string, MemoryProfileRecord>();
   private feishuChatIndex = new Map<string, FeishuChatIndexRecord>();
   private feishuP2pUserIndex = new Map<string, FeishuP2pUserAliasIndexRecord>();
   private feishuHistoryIndex = new Map<string, FeishuHistoryIndexRecord>();
@@ -172,6 +196,24 @@ export class JsonFileStore implements BridgeStore {
     );
     for (const [k, v] of Object.entries(dedup)) {
       this.dedupKeys.set(k, v);
+    }
+
+    const memoryProfiles = readJson<Record<string, MemoryProfileRecord>>(
+      MEMORY_PROFILES_PATH,
+      {},
+    );
+    for (const [key, value] of Object.entries(memoryProfiles)) {
+      if (value?.scope && value?.key) {
+        this.memoryProfiles.set(key, {
+          ...value,
+          topics: Array.isArray(value.topics) ? value.topics : [],
+          facts: Array.isArray(value.facts) ? value.facts : [],
+          pending: Array.isArray(value.pending) ? value.pending : [],
+          messageCount: Number.isFinite(value.messageCount) ? value.messageCount : 0,
+          updatedAt: value.updatedAt || now(),
+          lastEventAt: value.lastEventAt || value.updatedAt || now(),
+        });
+      }
     }
 
     const feishuChatIndex = readJson<Record<string, FeishuChatIndexRecord>>(
@@ -279,6 +321,10 @@ export class JsonFileStore implements BridgeStore {
     writeJson(path.join(MESSAGES_DIR, `${sessionId}.json`), msgs);
   }
 
+  private persistMemoryProfiles(): void {
+    writeJson(MEMORY_PROFILES_PATH, Object.fromEntries(this.memoryProfiles));
+  }
+
   private loadMessages(sessionId: string): BridgeMessage[] {
     if (this.messages.has(sessionId)) {
       return this.messages.get(sessionId)!;
@@ -330,6 +376,120 @@ export class JsonFileStore implements BridgeStore {
       .trim();
     if (!cleaned) return '';
     return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 3)}...` : cleaned;
+  }
+
+  private memoryProfileKey(scope: MemoryProfileScope, channelType: string, id = ''): string {
+    const normalizedId = id.trim() || 'all';
+    return `${scope}:${channelType || 'all'}:${normalizedId}`;
+  }
+
+  private appendMemoryItems(existing: string[], incoming: string[]): string[] {
+    const seen = new Set<string>();
+    const combined: string[] = [];
+    for (const item of [...existing, ...incoming]) {
+      const normalized = this.summarizeMessageContent(item, 180);
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      combined.push(normalized);
+    }
+    return combined.slice(-MEMORY_PROFILE_MAX_ITEMS);
+  }
+
+  private extractMemoryProfileItems(text: string, role: 'user' | 'assistant'): {
+    topics: string[];
+    facts: string[];
+    pending: string[];
+  } {
+    const normalized = this.summarizeMessageContent(text, 520);
+    if (!normalized || normalized.length < MEMORY_PROFILE_EVENT_MIN_CHARS) {
+      return { topics: [], facts: [], pending: [] };
+    }
+
+    const facts: string[] = [];
+    const pending: string[] = [];
+    const topics: string[] = [];
+    const lower = normalized.toLowerCase();
+
+    if (
+      /记住|以后|以后.*就|固定|对应表|常用|叫|命名|偏好|喜欢|不要|别|必须|默认|约定|规则|==|=>|->/.test(normalized)
+      || /prefab|scene|mcp|unity|codex|feishu|家具|场景|权限|发布/i.test(normalized)
+    ) {
+      facts.push(normalized);
+    }
+
+    if (/未完成|阻塞|失败|报错|不可用|待办|下次|继续|还没|需要后续/.test(normalized)) {
+      pending.push(normalized);
+    }
+
+    if (role === 'assistant' && /(已|已经|完成|修复|同步|发布|重启|生成|整理|改好|通过|成功)/.test(normalized)) {
+      facts.push(normalized);
+    }
+
+    if (
+      role === 'user'
+      && normalized.length >= 8
+      && !/^(你好|你好呀|hi|hello|在吗|谢谢|好的|收到|嗯|哈哈|晚安|早上好)$/i.test(lower)
+    ) {
+      topics.push(normalized);
+    }
+
+    return { topics, facts, pending };
+  }
+
+  private upsertMemoryProfile(
+    scope: MemoryProfileScope,
+    key: string,
+    event: ConversationMemoryEvent,
+    items: { topics: string[]; facts: string[]; pending: string[] },
+  ): void {
+    const existing = this.memoryProfiles.get(key);
+    const timestamp = event.createdAt || now();
+    const record: MemoryProfileRecord = {
+      scope,
+      key,
+      channelType: event.channelType || existing?.channelType,
+      chatId: scope === 'chat' ? event.chatId : existing?.chatId,
+      userId: scope === 'user' ? event.userId : existing?.userId,
+      displayName: scope === 'user'
+        ? (event.userDisplayName || existing?.displayName || event.userId)
+        : scope === 'chat'
+          ? (event.chatDisplayName || existing?.displayName || event.chatId)
+          : (existing?.displayName || '所有会话'),
+      workingDirectory: event.workingDirectory || existing?.workingDirectory,
+      topics: this.appendMemoryItems(existing?.topics || [], items.topics),
+      facts: this.appendMemoryItems(existing?.facts || [], items.facts),
+      pending: this.appendMemoryItems(existing?.pending || [], items.pending),
+      messageCount: (existing?.messageCount || 0) + 1,
+      updatedAt: now(),
+      lastEventAt: timestamp,
+    };
+    this.memoryProfiles.set(key, record);
+  }
+
+  private recordFeishuHistoryProfiles(chatId: string, displayName: string | undefined, messages: FeishuHistoryIndexedMessage[]): void {
+    let changed = false;
+    for (const item of messages) {
+      if (!item.text?.trim()) continue;
+      const createdAt = item.createTime && /^\d+$/.test(item.createTime)
+        ? new Date(Number.parseInt(item.createTime, 10)).toISOString()
+        : undefined;
+      changed = this.applyMemoryEvent({
+        sessionId: `feishu-history:${chatId}`,
+        channelType: 'feishu',
+        chatId,
+        chatDisplayName: displayName,
+        userId: item.senderId,
+        userDisplayName: item.senderName,
+        role: item.senderType === 'app' ? 'assistant' : 'user',
+        text: item.text,
+        createdAt,
+      }) || changed;
+    }
+    if (changed) {
+      this.persistMemoryProfiles();
+    }
   }
 
   private extractStructuredMessageText(content: string, maxLen: number): string {
@@ -612,6 +772,93 @@ export class JsonFileStore implements BridgeStore {
     return lines.join('\n');
   }
 
+  private summarizeProfileForMemory(profile: MemoryProfileRecord): string {
+    const parts: string[] = [];
+    const label = profile.displayName || profile.userId || profile.chatId || profile.key;
+    if (profile.facts.length > 0) {
+      parts.push(`事实/偏好: ${profile.facts.slice(-6).join(' | ')}`);
+    }
+    if (profile.pending.length > 0) {
+      parts.push(`待跟进: ${profile.pending.slice(-4).join(' | ')}`);
+    }
+    if (profile.topics.length > 0) {
+      parts.push(`近期主题: ${profile.topics.slice(-5).join(' | ')}`);
+    }
+    if (parts.length === 0) return '';
+    return `${label}: ${parts.join('；')}`;
+  }
+
+  private scoreMemoryProfile(query: MemoryRetrievalQuery, tokens: string[], profile: MemoryProfileRecord, text: string): number {
+    const haystack = `${profile.displayName || ''} ${profile.userId || ''} ${profile.chatId || ''} ${text}`;
+    const lower = haystack.toLowerCase();
+    let score = 0;
+
+    for (const token of tokens) {
+      const needle = /[a-z]/i.test(token) ? token.toLowerCase() : token;
+      if (!needle) continue;
+      if (lower.includes(needle.toLowerCase())) {
+        score += /[a-z]/i.test(token)
+          ? Math.min(5, Math.max(2, token.length / 2))
+          : Math.min(4, Math.max(1.5, token.length));
+      }
+    }
+
+    if (profile.channelType && profile.channelType === query.channelType) score += 1;
+    if (profile.chatId && profile.chatId === query.chatId) score += 5;
+    if (query.userId && profile.userId && profile.userId === query.userId) score += 6;
+    if (
+      query.userDisplayName
+      && profile.displayName
+      && (profile.displayName.includes(query.userDisplayName) || query.userDisplayName.includes(profile.displayName))
+    ) {
+      score += 3;
+    }
+    if (
+      profile.workingDirectory
+      && query.workingDirectory
+      && profile.workingDirectory.toLowerCase() === query.workingDirectory.toLowerCase()
+    ) {
+      score += 3;
+    }
+    if (MEMORY_RECALL_RE.test(query.query)) {
+      if (profile.scope === 'user' && query.userId && profile.userId === query.userId) score += 4;
+      if (profile.scope === 'chat' && profile.chatId === query.chatId) score += 3;
+      if (profile.scope === 'global') score += 1;
+    }
+
+    const ageMs = Date.now() - Date.parse(profile.lastEventAt || profile.updatedAt);
+    if (!Number.isNaN(ageMs)) {
+      if (ageMs < 24 * 60 * 60 * 1000) score += 1.5;
+      else if (ageMs < 14 * 24 * 60 * 60 * 1000) score += 0.5;
+    }
+
+    return score;
+  }
+
+  private searchMemoryProfiles(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    if (this.memoryProfiles.size === 0) return [];
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return [];
+
+    const hits: RetrievedMemoryHit[] = [];
+    for (const profile of this.memoryProfiles.values()) {
+      const text = this.summarizeProfileForMemory(profile);
+      if (!text) continue;
+      const score = this.scoreMemoryProfile(query, tokens, profile, text);
+      if (score < MEMORY_MIN_SCORE) continue;
+      hits.push({
+        sessionId: `memory-profile:${profile.key}`,
+        channelType: profile.channelType,
+        chatId: profile.chatId,
+        workingDirectory: profile.workingDirectory,
+        role: 'assistant',
+        source: 'summary',
+        score,
+        content: this.summarizeMessageContent(text, 260),
+      });
+    }
+    return hits;
+  }
+
   private buildMatchedMemoryExcerpt(searchText: string, tokens: string[], maxLen = 220): string {
     const normalized = searchText.replace(/\s+/g, ' ').trim();
     if (!normalized) return '';
@@ -878,6 +1125,7 @@ export class JsonFileStore implements BridgeStore {
       displayName: status.displayName,
       lastMessageAt: status.latestMessageTime,
     });
+    this.recordFeishuHistoryProfiles(chatId, status.displayName, data.messages);
     return status;
   }
 
@@ -1002,14 +1250,50 @@ export class JsonFileStore implements BridgeStore {
     return { messages: [...msgs] };
   }
 
+  private applyMemoryEvent(event: ConversationMemoryEvent): boolean {
+    const text = this.summarizeMessageContent(event.text || '', 800);
+    if (!text) return false;
+
+    const items = this.extractMemoryProfileItems(text, event.role);
+    const hasUsefulItems = items.topics.length > 0 || items.facts.length > 0 || items.pending.length > 0;
+    if (!hasUsefulItems && text.length < 12) return false;
+
+    const timestampedEvent: ConversationMemoryEvent = {
+      ...event,
+      text,
+      createdAt: event.createdAt || now(),
+    };
+
+    const globalKey = this.memoryProfileKey('global', event.channelType);
+    this.upsertMemoryProfile('global', globalKey, timestampedEvent, items);
+
+    if (event.chatId?.trim()) {
+      const chatKey = this.memoryProfileKey('chat', event.channelType, event.chatId);
+      this.upsertMemoryProfile('chat', chatKey, timestampedEvent, items);
+    }
+
+    if (event.userId?.trim() && event.role === 'user') {
+      const userKey = this.memoryProfileKey('user', event.channelType, event.userId);
+      this.upsertMemoryProfile('user', userKey, timestampedEvent, items);
+    }
+
+    return true;
+  }
+
+  recordMemoryEvent(event: ConversationMemoryEvent): void {
+    if (!this.applyMemoryEvent(event)) return;
+    this.persistMemoryProfiles();
+  }
+
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {
     const tokens = this.extractMemoryTokens(query.query);
-    if (tokens.length === 0) return null;
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return null;
 
     const metaBySession = this.buildMemorySessionMeta();
     const sameChatHits: RetrievedMemoryHit[] = [];
     const currentSessionHits: RetrievedMemoryHit[] = [];
     const sameWorkdirHits: RetrievedMemoryHit[] = [];
+    const profileHits = this.searchMemoryProfiles(query, tokens);
     const dedup = new Set<string>();
     const recentHistoryLimit = Math.max(0, query.recentHistoryLimit || 0);
 
@@ -1066,11 +1350,12 @@ export class JsonFileStore implements BridgeStore {
       }
     }
 
-    const hits = sameChatHits.length > 0
-      ? sameChatHits
-      : currentSessionHits.length > 0
-        ? currentSessionHits
-        : sameWorkdirHits;
+    const hits = [
+      ...sameChatHits,
+      ...currentSessionHits,
+      ...sameWorkdirHits,
+      ...profileHits,
+    ];
 
     const selected: RetrievedMemoryHit[] = [];
     let usedChars = 0;

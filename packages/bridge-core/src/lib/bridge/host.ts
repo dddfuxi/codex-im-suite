@@ -84,6 +84,8 @@ export interface MemoryRetrievalQuery {
   sessionId: string;
   channelType: string;
   chatId: string;
+  userId?: string;
+  userDisplayName?: string;
   workingDirectory?: string;
   query: string;
   recentHistoryLimit?: number;
@@ -103,6 +105,19 @@ export interface RetrievedMemoryHit {
 export interface RetrievedMemoryContext {
   summary: string;
   hits: RetrievedMemoryHit[];
+}
+
+export interface ConversationMemoryEvent {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  chatDisplayName?: string;
+  userId?: string;
+  userDisplayName?: string;
+  role: 'user' | 'assistant';
+  text: string;
+  workingDirectory?: string;
+  createdAt?: string;
 }
 
 export interface FeishuHistoryIndexedMessage {
@@ -237,6 +252,7 @@ export interface BridgeStore {
   // ── Messages ──
   addMessage(sessionId: string, role: string, content: string, usage?: string | null): void;
   getMessages(sessionId: string, opts?: { limit?: number }): { messages: BridgeMessage[] };
+  recordMemoryEvent?(event: ConversationMemoryEvent): void;
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null;
   retrieveRelevantFeishuHistory?(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null;
   upsertFeishuHistoryMessages?(data: {

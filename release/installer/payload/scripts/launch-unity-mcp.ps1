@@ -1,6 +1,7 @@
 param(
     [string]$Endpoint = "http://127.0.0.1:8081/mcp",
-    [int]$TimeoutSeconds = 3
+    [int]$TimeoutSeconds = 5,
+    [string]$ProjectPath = $env:CTI_UNITY_PROJECT_PATH
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,11 +10,28 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
 
+function Invoke-McpInitialize {
+    param([string]$Url, [int]$TimeoutSec)
+    $body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"codex-im-suite-launcher","version":"0.0.0"}}}'
+    return Invoke-WebRequest `
+        -Uri $Url `
+        -Method Post `
+        -Headers @{ Accept = 'application/json, text/event-stream' } `
+        -ContentType 'application/json' `
+        -Body $body `
+        -UseBasicParsing `
+        -TimeoutSec $TimeoutSec
+}
+
 function Test-Endpoint {
     param([string]$Url, [int]$TimeoutSec)
     try {
-        $resp = Invoke-WebRequest -Uri $Url -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec
-        return "HTTP $($resp.StatusCode)"
+        $resp = Invoke-McpInitialize -Url $Url -TimeoutSec $TimeoutSec
+        $sessionId = $resp.Headers['mcp-session-id']
+        if ($sessionId) {
+            return "MCP initialize OK HTTP $($resp.StatusCode)"
+        }
+        return "MCP initialize OK HTTP $($resp.StatusCode), but missing mcp-session-id"
     }
     catch {
         if ($_.Exception.Response) {
@@ -23,5 +41,77 @@ function Test-Endpoint {
     }
 }
 
-$result = Test-Endpoint -Url $Endpoint -TimeoutSec $TimeoutSeconds
-Write-Host "Unity MCP reachable: $Endpoint $result"
+function Wait-UnityMcpEndpoint {
+    param([string]$Url, [int]$TimeoutSec, [int]$Attempts = 8)
+    $lastError = $null
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            return Test-Endpoint -Url $Url -TimeoutSec $TimeoutSec
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Host "Waiting Unity MCP endpoint ($i/$Attempts): $lastError"
+            Start-Sleep -Seconds 2
+        }
+    }
+    throw "Unity MCP endpoint did not become ready after repair: $lastError"
+}
+
+function Stop-UnityMcpHelper {
+    $patterns = @(
+        'mcp-for-unity',
+        'mcpforunityserver'
+    )
+    $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $cmd = [string]$_.CommandLine
+            if (-not $cmd) { return $false }
+            foreach ($pattern in $patterns) {
+                if ($cmd -match [regex]::Escape($pattern)) { return $true }
+            }
+            return $false
+        }
+    foreach ($proc in $targets) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+            Write-Host "Stopped Unity MCP helper PID=$($proc.ProcessId)"
+        } catch {
+            Write-Warning "Failed to stop Unity MCP helper PID=$($proc.ProcessId): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Start-UnityMcpHelper {
+    param([string]$Project)
+    if ([string]::IsNullOrWhiteSpace($Project)) {
+        $Project = 'C:\unity\ST3\Game'
+    }
+    $terminalScript = Join-Path $Project 'Library\MCPForUnity\TerminalScripts\mcp-terminal.cmd'
+    $autostartRequest = Join-Path $Project 'Library\MCPForUnity\http-autostart.request'
+    if (Test-Path -LiteralPath $terminalScript) {
+        Start-Process -FilePath $terminalScript -WorkingDirectory (Split-Path -Parent $terminalScript) -WindowStyle Hidden
+        Write-Host "Started Unity MCP helper from $terminalScript"
+        return
+    }
+    if (Test-Path -LiteralPath (Split-Path -Parent $autostartRequest)) {
+        Set-Content -LiteralPath $autostartRequest -Value 'start' -Encoding UTF8
+        Write-Host "Requested Unity MCP HTTP autostart: $autostartRequest"
+        return
+    }
+    throw "Unity MCP terminal script not found. Open Unity project and enable MCPForUnity HTTP server once."
+}
+
+$before = $null
+try {
+    $before = Test-Endpoint -Url $Endpoint -TimeoutSec $TimeoutSeconds
+    Write-Host "Unity MCP before repair: $Endpoint $before"
+} catch {
+    Write-Host "Unity MCP before repair: $Endpoint unavailable | $($_.Exception.Message)"
+}
+
+Stop-UnityMcpHelper
+Start-Sleep -Seconds 1
+Start-UnityMcpHelper -Project $ProjectPath
+Start-Sleep -Seconds 2
+
+$after = Wait-UnityMcpEndpoint -Url $Endpoint -TimeoutSec $TimeoutSeconds
+Write-Host "Unity MCP after repair: $Endpoint $after"

@@ -1909,6 +1909,7 @@ function SettingsPage({
 }) {
   const [settings, setSettings] = useState<SettingsState>(state.settings);
   const [requestText, setRequestText] = useState('');
+  const activePreset = presets.find((preset) => settings.replyStyleHint === preset.value);
 
   useEffect(() => setSettings(state.settings), [state.settings]);
   useEffect(() => reloadPresets(), []);
@@ -1947,6 +1948,9 @@ function SettingsPage({
       <section className="panel">
         <SectionHeader title="回复风格快捷设置" />
         <div className="preset-wall">
+          <button className={!activePreset && settings.replyStyleHint.trim() ? 'preset-chip active' : 'preset-chip'} disabled>
+            自定义
+          </button>
           {presets.map((preset) => (
             <button key={preset.name} className={settings.replyStyleHint === preset.value ? 'preset-chip active' : 'preset-chip'} onClick={() => void applyPreset(preset.name)}>
               {preset.name}
@@ -1954,7 +1958,7 @@ function SettingsPage({
           ))}
         </div>
         <label className="stack-field">
-          <span>当前生效摘要</span>
+          <span>当前生效摘要{activePreset ? ` · ${activePreset.name}` : settings.replyStyleHint.trim() ? ' · 自定义' : ''}</span>
           <textarea className="text-area compact" value={settings.replyStyleHint} onChange={(event) => update('replyStyleHint', event.target.value)} />
         </label>
       </section>

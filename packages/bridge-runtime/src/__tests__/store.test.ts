@@ -137,6 +137,37 @@ describe('JsonFileStore', () => {
     assert.equal(messages[1].content, 'msg3');
   });
 
+  it('records per-user chat and global memory profiles for retrieval', () => {
+    const store = new JsonFileStore(makeSettings());
+    const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');
+    store.recordMemoryEvent({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      chatDisplayName: '测试群',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user',
+      text: '记住 HSScene == 医院内部场景，以后有人问就这么回答',
+      workingDirectory: '/tmp/test-cwd',
+    });
+
+    const memory = store.retrieveRelevantMemory({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      query: '上次 HSScene 对应什么',
+      recentHistoryLimit: 0,
+    });
+
+    assert.ok(memory);
+    assert.match(memory.summary, /HSScene/);
+    assert.match(memory.summary, /医院内部场景/);
+  });
+
   // ── Session Locking ──
 
   it('acquireSessionLock succeeds on first call', () => {
