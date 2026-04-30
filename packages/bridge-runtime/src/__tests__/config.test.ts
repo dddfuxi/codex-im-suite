@@ -188,13 +188,13 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_self_optimize_on_failure'), 'true');
   });
 
-  it('maps local llama routing config', () => {
+  it('maps Ollama routing config and keeps legacy local router keys as compatibility settings', () => {
     const m = configToSettings({
       ...base,
-      localLlmEnabled: true,
-      localLlmBaseUrl: 'http://127.0.0.1:8080',
-      localLlmModel: 'qwen2.5-coder-7b-instruct',
-      localLlmTimeoutMs: 45000,
+      ollamaEnabled: true,
+      ollamaBaseUrl: 'http://127.0.0.1:11434',
+      ollamaModel: 'qwen2.5-coder:7b',
+      ollamaTimeoutMs: 45000,
       localLlmAutoRoute: true,
       localLlmFallbackToCodex: true,
       localLlmRouterEnabled: true,
@@ -207,10 +207,13 @@ describe('configToSettings', () => {
       localLlmMaxOutputTokens: 768,
       localLlmComplexityMode: 'conservative',
     });
+    assert.equal(m.get('bridge_ollama_enabled'), 'true');
+    assert.equal(m.get('bridge_ollama_base_url'), 'http://127.0.0.1:11434');
+    assert.equal(m.get('bridge_ollama_model'), 'qwen2.5-coder:7b');
+    assert.equal(m.get('bridge_ollama_timeout_ms'), '45000');
     assert.equal(m.get('bridge_local_llm_enabled'), 'true');
-    assert.equal(m.get('bridge_local_llm_base_url'), 'http://127.0.0.1:8080');
-    assert.equal(m.get('bridge_local_llm_model'), 'qwen2.5-coder-7b-instruct');
-    assert.equal(m.get('bridge_local_llm_timeout_ms'), '45000');
+    assert.equal(m.get('bridge_local_llm_base_url'), 'http://127.0.0.1:11434');
+    assert.equal(m.get('bridge_local_llm_model'), 'qwen2.5-coder:7b');
     assert.equal(m.get('bridge_local_llm_auto_route'), 'true');
     assert.equal(m.get('bridge_local_llm_fallback_to_codex'), 'true');
     assert.equal(m.get('bridge_local_llm_router_enabled'), 'true');
@@ -229,6 +232,24 @@ describe('configToSettings', () => {
     assert.equal(m.has('telegram_bot_token'), false);
     assert.equal(m.has('bridge_discord_bot_token'), false);
     assert.equal(m.has('bridge_feishu_app_id'), false);
+  });
+
+  it('maps todo push config and defaults it to disabled', () => {
+    const defaultSettings = configToSettings(base);
+    assert.equal(defaultSettings.get('bridge_todo_push_enabled'), 'false');
+    assert.equal(defaultSettings.get('bridge_todo_push_channels'), 'feishu');
+
+    const m = configToSettings({
+      ...base,
+      todoPushEnabled: true,
+      todoPushPollMs: 30000,
+      todoPushWindowMs: 600000,
+      todoPushChannels: ['feishu', 'weixin'],
+    });
+    assert.equal(m.get('bridge_todo_push_enabled'), 'true');
+    assert.equal(m.get('bridge_todo_push_poll_ms'), '30000');
+    assert.equal(m.get('bridge_todo_push_window_ms'), '600000');
+    assert.equal(m.get('bridge_todo_push_channels'), 'feishu,weixin');
   });
 });
 
@@ -262,5 +283,63 @@ describe('loadConfig/saveConfig round-trip', () => {
     assert.equal(m.get('bridge_feishu_enabled'), 'false');
     assert.equal(m.get('bridge_qq_enabled'), 'false');
     assert.equal(m.get('bridge_weixin_enabled'), 'false');
+  });
+
+  it('does not use deprecated llama.cpp endpoint and GGUF model as Ollama runtime source', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-legacy-ollama-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_LOCAL_LLM_ENABLED=true',
+        'CTI_LOCAL_LLM_BASE_URL=http://127.0.0.1:8080',
+        'CTI_LOCAL_LLM_MODEL=Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf',
+        'CTI_LOCAL_LLM_TIMEOUT_MS=45000',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?legacy-ollama-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.ollamaEnabled, true);
+      assert.equal(config.ollamaBaseUrl, 'http://127.0.0.1:11434');
+      assert.equal(config.ollamaModel, 'qwen2.5-coder:7b');
+      assert.equal(config.localLlmBaseUrl, 'http://127.0.0.1:11434');
+      assert.equal(config.localLlmModel, 'qwen2.5-coder:7b');
+      assert.equal(config.localLlmTimeoutMs, 45000);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads todo push env config', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-todo-push-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_TODO_PUSH_ENABLED=true',
+        'CTI_TODO_PUSH_POLL_MS=30000',
+        'CTI_TODO_PUSH_WINDOW_MS=600000',
+        'CTI_TODO_PUSH_CHANNELS=feishu,weixin',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?todo-push-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.todoPushEnabled, true);
+      assert.equal(config.todoPushPollMs, 30000);
+      assert.equal(config.todoPushWindowMs, 600000);
+      assert.deepEqual(config.todoPushChannels, ['feishu', 'weixin']);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
   });
 });

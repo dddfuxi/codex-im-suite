@@ -6,7 +6,7 @@
  * interfaces to use the bridge.
  */
 
-import type { ChannelBinding, ChannelType } from './types.js';
+import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
 
 // ── Bridge-local types (replacing @/types imports) ────────────
 
@@ -338,6 +338,53 @@ export interface LLMProvider {
    * Returns a ReadableStream of SSE-formatted strings.
    */
   streamChat(params: StreamChatParams): ReadableStream<string>;
+}
+
+// ── Host Interface: Reminder Actions ────────────────────────
+
+export interface DirectReminderCreateInput {
+  title: string;
+  dueAt: string;
+  timezone?: string;
+  target: ChannelAddress;
+  sourcePrompt?: string;
+  createdByMessageId?: string;
+  sessionId?: string;
+}
+
+export interface DirectReminderCreateResult {
+  ok: boolean;
+  reminderId?: string;
+  title?: string;
+  dueAt?: string;
+  target?: ChannelAddress;
+  message?: string;
+  error?: string;
+}
+
+export interface ReminderCompleteInput {
+  reminderId: string;
+  chatId?: string;
+  completedAt?: string;
+  completedByUserId?: string;
+  completionSource: 'feishu_card' | 'panel';
+  callbackMessageId?: string;
+}
+
+export interface ReminderCompleteResult {
+  ok: boolean;
+  reminderId?: string;
+  title?: string;
+  status?: 'completed' | 'already_completed' | 'not_found' | 'forbidden' | 'state_only' | 'failed';
+  message?: string;
+  error?: string;
+  sourceUpdated?: boolean;
+}
+
+export interface ReminderActionHost {
+  createDirectReminder(input: DirectReminderCreateInput): Promise<DirectReminderCreateResult>;
+  completeReminder?(input: ReminderCompleteInput): Promise<ReminderCompleteResult>;
+  tickReminders?(): Promise<void>;
 }
 
 // ── Host Interface: Permission Gateway ───────────────────────

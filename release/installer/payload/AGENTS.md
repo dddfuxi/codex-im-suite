@@ -16,7 +16,7 @@
 ## 2. 项目边界
 
 - `packages/bridge-core`：桥接核心，负责 Feishu adapter、消息路由、权限、发送收口、审计。
-- `packages/bridge-runtime`：运行时壳层，负责配置、daemon、provider、Codex、本地模型、本地执行器、MCP bridge。
+- `packages/bridge-runtime`：运行时壳层，负责配置、daemon、provider、Codex、Ollama 本地后端、本地执行器、MCP bridge。
 - `apps/control-panel`：中控面板，只做服务编排、状态展示、配置入口，不放桥接业务逻辑。
 - `apps/control-panel` 是面板源码唯一入口；旧 `packages/bridge-runtime/tools/ControlPanel` 已移除，不要恢复为维护入口。
 - `config/mcp.d`：MCP manifest 唯一来源，面板和注册脚本不能硬编码 MCP 名称。
@@ -110,9 +110,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 ## 8. 本地模型与 Codex 规则
 
 - 默认策略是 Codex 主脑，本地模型只做明确小活和 Codex 不可用时的兜底。
+- 本地模型后端统一是 Ollama；默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`。
+- 不要恢复 `llama-server.exe`、GGUF 模型路径或 `127.0.0.1:8080` 作为默认本地模型链路。
 - 本地模型可以辅助命令、git 状态、文件读取、记忆检索、简单总结。
 - 本地模型不能伪装完成 Unity、Blender、MCP 多步编排、文档创建、仓库修改。
 - Codex 没额度或不可用时，用户侧要得到可用兜底回复，而不是原始错误堆栈。
+- 记忆关键词命中不能绕过 Codex 直答；明确回忆/搜索类请求可检索记忆，其他请求只能把相关记忆注入主执行链。
 
 ## 9. MCP 与工作区安全
 

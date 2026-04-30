@@ -12,6 +12,8 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
 import type { BridgeStore, LifecycleHooks } from '../../lib/bridge/host';
+import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
+import type { OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -131,6 +133,115 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(status.running, false);
     assert.equal(status.adapters.length, 0);
   });
+
+  it('delivers proactive messages through a registered running adapter', async () => {
+    const auditLogs: Array<{ direction: string; chatId: string; summary: string }> = [];
+    const dedupKeys = new Set<string>();
+    const store = {
+      ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+      insertAuditLog: (entry: any) => { auditLogs.push(entry); },
+      checkDedup: (key: string) => dedupKeys.has(key),
+      insertDedup: (key: string) => { dedupKeys.add(key); },
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const sent: OutboundMessage[] = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_1' };
+    });
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    const result = await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_123' },
+      text: '待办提醒：整理主动推送',
+      dedupKey: 'todo-reminder:1',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].address.chatId, 'oc_123');
+    assert.equal(auditLogs.length, 1);
+    assert.equal(auditLogs[0].direction, 'outbound');
+    assert.equal(dedupKeys.has('todo-reminder:1'), true);
+  });
+
+  it('rejects proactive delivery when the channel adapter is unavailable', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const { deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    const result = await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_123' },
+      text: '待办提醒：整理主动推送',
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.error || '', /adapter unavailable/i);
+  });
+
+  it('routes reminder complete card callbacks to the reminder host without Codex', async () => {
+    const completed: unknown[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for reminder callbacks');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      reminders: {
+        createDirectReminder: async () => ({ ok: false, error: 'not used' }),
+        completeReminder: async (input) => {
+          completed.push(input);
+          return {
+            ok: true,
+            reminderId: input.reminderId,
+            title: '看电脑',
+            status: 'completed',
+            message: '已完成',
+          };
+        },
+      },
+      lifecycle: {},
+    });
+    const sent: OutboundMessage[] = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `reply-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'card_action_1',
+      address: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_1' },
+      text: '',
+      timestamp: Date.now(),
+      callbackData: 'reminder:complete:rem_1',
+      callbackMessageId: 'om_card',
+    });
+
+    assert.equal(completed.length, 1);
+    assert.deepEqual(completed[0], {
+      reminderId: 'rem_1',
+      chatId: 'oc_123',
+      completedByUserId: 'ou_1',
+      completionSource: 'feishu_card',
+      callbackMessageId: 'om_card',
+    });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已完成/);
+    assert.equal(sent[0].replyToMessageId, 'om_card');
+  });
 });
 
 describe('bridge-manager policy helpers', () => {
@@ -206,6 +317,57 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(_testOnly.buildSmallTalkReply('帮我看一下 Unity'), '');
     assert.equal(_testOnly.buildSmallTalkReply('你好呀，帮我发布'), '');
   });
+
+  it('extracts cti-reminder action blocks without treating normal task text as reminders', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const extracted = _testOnly.extractCtiReminderAction([
+      '我会交给 bridge 创建提醒。',
+      '',
+      '```cti-reminder',
+      '{"title":"看电脑","dueAt":"2026-04-29T11:42:00.000Z","timezone":"Asia/Shanghai","target":"current_chat","sourcePrompt":"两分钟后提醒我看电脑"}',
+      '```',
+    ].join('\n'));
+
+    assert.equal(extracted.action?.title, '看电脑');
+    assert.equal(extracted.action?.target, 'current_chat');
+    assert.doesNotMatch(extracted.text, /cti-reminder/);
+
+    const normal = _testOnly.extractCtiReminderAction('这个任务为什么卡住，帮我分析一下');
+    assert.equal(normal.action, null);
+    assert.equal(normal.text, '这个任务为什么卡住，帮我分析一下');
+  });
+
+  it('detects fake reminder completion claims that lack bridge action records', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.equal(
+      _testOnly.containsUnverifiedReminderCompletion('已实际创建系统计划任务：CodexFeishuReminder_20260429_1942。'),
+      true,
+    );
+    assert.equal(
+      _testOnly.containsUnverifiedReminderCompletion('帮我写一个 Windows 计划任务脚本，用来提醒我看电脑。'),
+      false,
+    );
+  });
+
+  it('parses only high-confidence natural direct reminder requests', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const now = new Date('2026-04-30T02:24:00.000Z');
+    const parsed = _testOnly.parseNaturalReminderRequest('帮我设置个待办，1分钟后给我发一条消息说时间到了', now);
+    assert.deepEqual(parsed, {
+      title: '时间到了',
+      dueAt: '2026-04-30T02:25:00.000Z',
+    });
+
+    const chineseMinute = _testOnly.parseNaturalReminderRequest('帮我设置个待办，一分钟后提醒我看电脑', now);
+    assert.deepEqual(chineseMinute, {
+      title: '看电脑',
+      dueAt: '2026-04-30T02:25:00.000Z',
+    });
+
+    assert.equal(_testOnly.parseNaturalReminderRequest('这个任务为什么卡住', now), null);
+    assert.equal(_testOnly.parseNaturalReminderRequest('帮我写计划任务脚本，提醒我看电脑', now), null);
+    assert.equal(_testOnly.parseNaturalReminderRequest('今天有什么待办', now), null);
+  });
 });
 
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
@@ -242,4 +404,20 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     getChannelOffset: () => '0',
     setChannelOffset: () => {},
   };
+}
+
+function createRunningAdapter(
+  channelType: string,
+  sendFn: (message: OutboundMessage) => Promise<SendResult>,
+): BaseChannelAdapter {
+  return {
+    channelType,
+    start: async () => {},
+    stop: async () => {},
+    isRunning: () => true,
+    consumeOne: async () => null,
+    send: sendFn,
+    validateConfig: () => null,
+    isAuthorized: () => true,
+  } as unknown as BaseChannelAdapter;
 }

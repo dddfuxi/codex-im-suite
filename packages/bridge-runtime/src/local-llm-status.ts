@@ -66,6 +66,8 @@ const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_PATH = path.join(RUNTIME_DIR, 'local-llm-status.json');
 const MAX_ROUTE_SUMMARIES = 20;
 const MAX_EXECUTION_SUMMARIES = 20;
+const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
+const DEFAULT_OLLAMA_MODEL = 'qwen2.5-coder:7b';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -95,13 +97,13 @@ export function getLocalLlmStatusPath(): string {
 
 export function makeDefaultLocalLlmStatus(config: Config): LocalLlmRuntimeStatus {
   return {
-    enabled: config.localLlmEnabled === true,
+    enabled: (config.ollamaEnabled ?? config.localLlmEnabled) === true,
     autoRoute: config.localLlmAutoRoute !== false,
     routerEnabled: config.localLlmRouterEnabled !== false,
     routerMode: getLocalRouterMode(config),
     forceHub: config.localLlmForceHub !== false,
-    baseUrl: config.localLlmBaseUrl || 'http://127.0.0.1:8080',
-    model: config.localLlmModel || 'qwen2.5-coder-7b-instruct',
+    baseUrl: config.ollamaBaseUrl || config.localLlmBaseUrl || DEFAULT_OLLAMA_BASE_URL,
+    model: config.ollamaModel || config.localLlmModel || DEFAULT_OLLAMA_MODEL,
     routeHits: 0,
     routeMisses: 0,
     routeFailures: 0,
@@ -117,6 +119,31 @@ export function makeDefaultLocalLlmStatus(config: Config): LocalLlmRuntimeStatus
   };
 }
 
+function isDeprecatedLlamaStatus(status: Partial<LocalLlmRuntimeStatus>): boolean {
+  const baseUrl = (status.baseUrl || '').trim();
+  const model = (status.model || '').trim();
+  return baseUrl === 'http://127.0.0.1:8080'
+    || /\.gguf$/i.test(model)
+    || /llama/i.test(model);
+}
+
+function normalizeRuntimeSource(
+  status: LocalLlmRuntimeStatus,
+  config?: Config,
+): LocalLlmRuntimeStatus {
+  const desiredBaseUrl = config?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
+  const desiredModel = config?.ollamaModel || DEFAULT_OLLAMA_MODEL;
+  if (!isDeprecatedLlamaStatus(status)) return status;
+  return {
+    ...status,
+    baseUrl: desiredBaseUrl,
+    model: desiredModel,
+    serverReachable: undefined,
+    lastCheckAt: undefined,
+    lastError: status.lastError || '已忽略旧 llama.cpp 状态，等待 Ollama 健康检查刷新。',
+  };
+}
+
 export function readLocalLlmStatus(config?: Config): LocalLlmRuntimeStatus {
   const fallback = makeDefaultLocalLlmStatus(config || {
     runtime: 'codex',
@@ -128,7 +155,7 @@ export function readLocalLlmStatus(config?: Config): LocalLlmRuntimeStatus {
     if (!fs.existsSync(STATUS_PATH)) return fallback;
     const raw = fs.readFileSync(STATUS_PATH, 'utf-8').trim();
     if (!raw) return fallback;
-    return { ...fallback, ...JSON.parse(raw) as Partial<LocalLlmRuntimeStatus> };
+    return normalizeRuntimeSource({ ...fallback, ...JSON.parse(raw) as Partial<LocalLlmRuntimeStatus> }, config);
   } catch {
     return fallback;
   }
@@ -145,13 +172,13 @@ export function updateLocalLlmStatus(config: Config, patch: Partial<LocalLlmRunt
   const current = readLocalLlmStatus(config);
   const next: LocalLlmRuntimeStatus = {
     ...current,
-    enabled: config.localLlmEnabled === true,
+    enabled: (config.ollamaEnabled ?? config.localLlmEnabled) === true,
     autoRoute: config.localLlmAutoRoute !== false,
     routerEnabled: config.localLlmRouterEnabled !== false,
     routerMode: getLocalRouterMode(config),
     forceHub: config.localLlmForceHub !== false,
-    baseUrl: config.localLlmBaseUrl || current.baseUrl,
-    model: config.localLlmModel || current.model,
+    baseUrl: config.ollamaBaseUrl || config.localLlmBaseUrl || current.baseUrl,
+    model: config.ollamaModel || config.localLlmModel || current.model,
     ...patch,
   };
   writeLocalLlmStatus(next);

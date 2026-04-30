@@ -874,6 +874,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
+    if (message.feishuCardJson) {
+      const result = await this.sendRawInteractiveCard(
+        message.address.chatId,
+        message.feishuCardJson,
+        text,
+        message.replyToMessageId,
+      );
+      if (result.ok) {
+        console.log('[feishu-adapter] Interactive card send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
+      } else {
+        console.warn('[feishu-adapter] Interactive card send failed:', JSON.stringify({ chatId: message.address.chatId, error: result.error }));
+      }
+      return result;
+    }
+
     if (message.parseMode === 'Markdown') {
       const result = await this.sendAsCard(message.address.chatId, text, message.replyToMessageId);
       if (result.ok) {
@@ -896,6 +911,38 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Plain text send failed:', JSON.stringify({ chatId: message.address.chatId, error: result.error }));
     }
     return result;
+  }
+
+  private async sendRawInteractiveCard(
+    chatId: string,
+    cardJson: string,
+    fallbackText: string,
+    replyToMessageId?: string,
+  ): Promise<SendResult> {
+    try {
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { msg_type: 'interactive', content: cardJson },
+        })
+        : await this.restClient!.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: cardJson,
+          },
+        });
+
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id, cardId: (res.data as { card_id?: string }).card_id };
+      }
+      console.warn('[feishu-adapter] Raw interactive card send failed:', res?.msg, res?.code);
+    } catch (err) {
+      console.warn('[feishu-adapter] Raw interactive card error, falling back to text:', err instanceof Error ? err.message : err);
+    }
+
+    return this.sendAsPlainText(chatId, fallbackText, replyToMessageId);
   }
 
   /**

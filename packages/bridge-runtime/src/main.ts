@@ -26,7 +26,7 @@ import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
-import { LocalLlamaProvider } from './local-llm-provider.js';
+import { OllamaProvider } from './local-llm-provider.js';
 import { LocalAgentProvider } from './local-agent-provider.js';
 import {
   compressConversationHistory,
@@ -50,11 +50,28 @@ import {
   readSessionExecutorDefaults,
   selectExecutor,
 } from './executor-registry.js';
+import { shouldRetrieveMemoryForPrompt } from './memory-routing.js';
+import { startKnowledgeIndexWatcher } from './knowledge-index-service.js';
+import {
+  createFeishuPushProvider,
+  createDirectReminder,
+  completeReminder,
+  createWeixinPushProvider,
+  startTodoReminderService,
+  type TodoReminderService,
+} from './todo-reminders.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
   appendWorkflowEvent,
+  claimNextWorkflowRetry,
   completeWorkflowRun,
+  completeWorkflowRetry,
   failWorkflowRun,
+  failWorkflowRetry,
+  markInterruptedWorkflowRuns,
+  readWorkflowStatus,
+  recordWorkflowRecoveryInfo,
+  requestWorkflowRetry,
   setWorkflowExecutor,
   startWorkflowRun,
 } from './workflow-status.js';
@@ -122,105 +139,14 @@ function extractCodexFatalStreamError(chunk: string): string | null {
   return null;
 }
 
-const MEMORY_RECALL_PATTERNS = [
-  /你还记得/u,
-  /还记得/u,
-  /之前(记录|说过|提到|让我记|让你记)/u,
-  /再发我一次/u,
-  /对应关系/u,
-  /映射/u,
-  /别名/u,
-  /上次(记录|说的|提到的)/u,
-  /历史/u,
-  /记忆/u,
-  /\bremember\b/i,
-  /\brecall\b/i,
-  /\bhistory\b/i,
-  /\bprevious\b/i,
-];
-
 function shouldAugmentWithMemory(prompt: string): boolean {
-  const normalized = prompt.trim();
-  if (!normalized) return false;
-  return MEMORY_RECALL_PATTERNS.some((pattern) => pattern.test(normalized));
+  return shouldRetrieveMemoryForPrompt(prompt);
 }
 
 function truncatePreview(text: string, maxChars = 220): string {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return '';
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
-}
-
-function collectMarkdownFiles(rootDir: string, limit = 24): string[] {
-  if (!rootDir || !fs.existsSync(rootDir)) return [];
-  const files: string[] = [];
-  const queue = [rootDir];
-  while (queue.length > 0 && files.length < limit) {
-    const current = queue.shift();
-    if (!current || !fs.existsSync(current)) continue;
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        queue.push(fullPath);
-        continue;
-      }
-      if (entry.isFile() && fullPath.toLowerCase().endsWith('.md')) {
-        files.push(fullPath);
-        if (files.length >= limit) break;
-      }
-    }
-  }
-  return files;
-}
-
-function parseMarkdownTable(content: string): Array<{ left: string; right: string }> {
-  const lines = content.split(/\r?\n/);
-  const rows: Array<{ left: string; right: string }> = [];
-  for (let index = 0; index < lines.length - 2; index += 1) {
-    const header = lines[index].trim();
-    const divider = lines[index + 1].trim();
-    if (!header.startsWith('|') || !divider.startsWith('|')) continue;
-    if (!/^\|\s*[-: ]+\|\s*[-: ]+\|\s*$/.test(divider)) continue;
-    for (let bodyIndex = index + 2; bodyIndex < lines.length; bodyIndex += 1) {
-      const row = lines[bodyIndex].trim();
-      if (!row.startsWith('|')) break;
-      const cells = row
-        .split('|')
-        .map((value) => value.trim())
-        .filter(Boolean);
-      if (cells.length >= 2) {
-        rows.push({ left: cells[0], right: cells[1] });
-      }
-    }
-    if (rows.length > 0) return rows;
-  }
-  return rows;
-}
-
-function formatSceneMemoryTable(rows: Array<{ left: string; right: string }>, title: string): string | null {
-  if (rows.length === 0) return null;
-  const lines = rows.map((row) => `${row.left} == ${row.right}`);
-  return `${title}\n\n${lines.join('\n')}`;
-}
-
-function buildSceneMemoryReplyFromNotes(prompt: string, config: Config): string | null {
-  const normalized = prompt.replace(/\s+/g, '');
-  if (!/常用场景|场景名称|scene|固定对应表|对应表/u.test(normalized)) return null;
-  const memoryRoot = config.memoryRepoDir;
-  if (!memoryRoot || !fs.existsSync(memoryRoot)) return null;
-
-  for (const filePath of collectMarkdownFiles(memoryRoot)) {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    if (!/Scene Common Names|场景/u.test(content)) continue;
-    const rows = parseMarkdownTable(content);
-    if (rows.length === 0) continue;
-    if (/固定对应表|上次我给你的那份|上次那份/u.test(normalized)) {
-      return formatSceneMemoryTable(rows, '固定对应表再发你一次：');
-    }
-    return formatSceneMemoryTable(rows, '常用场景名称对应表：');
-  }
-
-  return null;
 }
 
 function summarizeCodexFailureMessage(message: string): string {
@@ -307,7 +233,7 @@ class HubLlmProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
     private readonly store: BridgeStore,
-    private readonly localProvider: LocalLlamaProvider,
+    private readonly localProvider: OllamaProvider,
     private readonly localAgent: LocalAgentProvider,
     private readonly fallbackProvider: LLMProvider,
     private readonly primaryExecutorId: string,
@@ -315,7 +241,7 @@ class HubLlmProvider implements LLMProvider {
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
     const routerMode = getLocalRouterMode(this.config);
-    const routerEnabled = this.config.localLlmEnabled === true
+    const routerEnabled = (this.config.ollamaEnabled ?? this.config.localLlmEnabled) === true
       && this.config.localLlmRouterEnabled !== false
       && this.config.localLlmForceHub !== false;
 
@@ -334,19 +260,6 @@ class HubLlmProvider implements LLMProvider {
         const workflowRun = this.startObservedWorkflow(params, 'hybrid');
         let workflowFailed = false;
         try {
-        const noteShortcut = buildSceneMemoryReplyFromNotes(params.prompt, this.config);
-        if (noteShortcut) {
-          this.emitLocalSuccess(controller, params.sessionId, noteShortcut, undefined, {
-            mode: routerMode,
-            taskKind: 'summarize',
-            decision: 'answer_local',
-            provider: 'local_best_effort',
-            reason: '命中本地记忆笔记快捷回复',
-            compressedPromptChars: 0,
-            compressedHistoryChars: 0,
-          });
-          return;
-        }
         const conservative = decideConservativeRoute(params, this.config);
         if (this.localAgent.canHandleIgnisFastPath(params)) {
           const ignisResult = await this.localAgent.handleIgnisFastPath(controller, params, routerMode);
@@ -408,6 +321,7 @@ class HubLlmProvider implements LLMProvider {
         } catch (error) {
           workflowFailed = true;
           failWorkflowRun(workflowRun.id, error);
+          requestWorkflowRetry(workflowRun.id, 'auto');
           throw error;
         } finally {
           if (!workflowFailed) {
@@ -428,6 +342,15 @@ class HubLlmProvider implements LLMProvider {
     const workflowRun = startWorkflowRun({
       sessionId: params.sessionId,
       prompt: params.prompt,
+      channelType: binding?.channelType,
+      chatId: binding?.chatId,
+    });
+    recordWorkflowRecoveryInfo(workflowRun.id, {
+      prompt: params.prompt,
+      workingDirectory: params.workingDirectory,
+      model: params.model,
+      systemPrompt: params.systemPrompt,
+      permissionMode: params.permissionMode,
       channelType: binding?.channelType,
       chatId: binding?.chatId,
     });
@@ -898,6 +821,8 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
     path.join(SKILL_ROOT, 'src', 'main.ts'),
     path.join(SKILL_ROOT, 'src', 'local-llm-provider.ts'),
     path.join(SKILL_ROOT, 'src', 'local-llm-router.ts'),
+    path.join(SKILL_ROOT, 'src', 'knowledge-indexer.ts'),
+    path.join(SKILL_ROOT, 'src', 'knowledge-index-service.ts'),
   ];
   return {
     bridgeFingerprint: computeFingerprint(bridgeFiles),
@@ -922,6 +847,15 @@ class ObservedLLMProvider implements LLMProvider {
         const workflowRun = startWorkflowRun({
           sessionId: params.sessionId,
           prompt: params.prompt,
+          channelType: binding?.channelType,
+          chatId: binding?.chatId,
+        });
+        recordWorkflowRecoveryInfo(workflowRun.id, {
+          prompt: params.prompt,
+          workingDirectory: params.workingDirectory,
+          model: params.model,
+          systemPrompt: params.systemPrompt,
+          permissionMode: params.permissionMode,
           channelType: binding?.channelType,
           chatId: binding?.chatId,
         });
@@ -956,6 +890,7 @@ class ObservedLLMProvider implements LLMProvider {
           controller.close();
         } catch (error) {
           failWorkflowRun(workflowRun.id, error);
+          requestWorkflowRetry(workflowRun.id, 'auto');
           try {
             controller.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
             controller.close();
@@ -970,8 +905,8 @@ class ObservedLLMProvider implements LLMProvider {
 
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
   const wrapWithLocalHub = (provider: LLMProvider, primaryExecutorId: string): LLMProvider => {
-    if (config.localLlmEnabled !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
-    const localProvider = new LocalLlamaProvider(config);
+    if ((config.ollamaEnabled ?? config.localLlmEnabled) !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
+    const localProvider = new OllamaProvider(config);
     return new HubLlmProvider(config, store, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider, primaryExecutorId);
   };
 
@@ -1050,6 +985,108 @@ function writeStatus(info: StatusInfo): void {
   fs.renameSync(tmp, STATUS_FILE);
 }
 
+async function collectWorkflowRetryResponse(
+  llm: LLMProvider,
+  params: Parameters<LLMProvider['streamChat']>[0],
+): Promise<string> {
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), 10 * 60 * 1000);
+  const parts: string[] = [];
+  try {
+    const stream = llm.streamChat({
+      ...params,
+      forceFreshThread: true,
+      abortController,
+    });
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const fatal = extractCodexFatalStreamError(value);
+      if (fatal) throw new Error(fatal);
+      for (const event of parseBridgeSseEvents(value)) {
+        if (event.type === 'permission_request') {
+          abortController.abort();
+          throw new Error('重试执行触发权限请求，第一版后台重试不会代替用户授权。请在聊天里重新发送该请求。');
+        }
+        if (event.type === 'text' && typeof event.data === 'string') {
+          parts.push(event.data);
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return parts.join('').trim();
+}
+
+function startWorkflowRetryService(
+  runId: string,
+  llm: LLMProvider,
+  store: BridgeStore,
+): NodeJS.Timeout {
+  let active = false;
+  const workerId = `runtime:${runId}`;
+  const tick = async () => {
+    if (active) return;
+    active = true;
+    const claimed = claimNextWorkflowRetry(workerId);
+    try {
+      if (!claimed) return;
+      const input = claimed.recovery?.input;
+      if (!input?.prompt) {
+        failWorkflowRetry(claimed.id, new Error('缺少可重试输入'));
+        return;
+      }
+      const text = await collectWorkflowRetryResponse(llm, {
+        prompt: input.prompt,
+        sessionId: claimed.sessionId,
+        model: input.model,
+        systemPrompt: input.systemPrompt,
+        workingDirectory: input.workingDirectory,
+        permissionMode: input.permissionMode,
+      });
+      if (!text) {
+        throw new Error('重试执行没有返回可发送文本');
+      }
+      store.addMessage(claimed.sessionId, 'user', input.prompt);
+      store.addMessage(claimed.sessionId, 'assistant', text);
+      const channelType = input.channelType || claimed.channelType;
+      const chatId = input.chatId || claimed.chatId;
+      if (channelType && chatId) {
+        const delivered = await bridgeManager.deliverProactiveMessage({
+          address: {
+            channelType,
+            chatId,
+            displayName: claimed.chatId || chatId,
+          },
+          text: `断点续跑重试结果：\n\n${text}`,
+          parseMode: 'plain',
+          sessionId: claimed.sessionId,
+          dedupKey: `workflow-retry:${claimed.id}:${claimed.retry?.attempts || 0}`,
+        });
+        if (!delivered.ok) {
+          throw new Error(`重试结果发送失败：${delivered.error || 'unknown error'}`);
+        }
+      }
+      completeWorkflowRetry(claimed.id);
+    } catch (error) {
+      const failed = readWorkflowStatus().runs.find((item) => item.retry?.claimedBy === workerId && item.status === 'retrying');
+      if (failed) {
+        failWorkflowRetry(failed.id, error);
+      } else {
+        console.warn('[claude-to-im] Workflow retry failed:', error instanceof Error ? error.message : error);
+      }
+    } finally {
+      active = false;
+    }
+  };
+  setTimeout(() => { tick().catch((error) => console.warn('[claude-to-im] Workflow retry tick failed:', error)); }, 1200);
+  return setInterval(() => {
+    tick().catch((error) => console.warn('[claude-to-im] Workflow retry tick failed:', error));
+  }, 8000);
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   setupLogger();
@@ -1058,6 +1095,11 @@ async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   console.log(`[claude-to-im] Starting bridge (run_id: ${runId})`);
   initializeBridgeRuntimeAudit(runId, process.pid);
+  const interruptedRuns = markInterruptedWorkflowRuns(runId);
+  if (interruptedRuns.length > 0) {
+    const recoverable = interruptedRuns.filter((run) => run.recovery?.kind === 'recoverable').length;
+    console.warn(`[claude-to-im] Workflow recovery: marked ${interruptedRuns.length} interrupted run(s), recoverable=${recoverable}`);
+  }
 
   const settings = configToSettings(config);
   if (!settings.get('bridge_unity_mcp_endpoint_list')) {
@@ -1072,6 +1114,18 @@ async function main(): Promise<void> {
   settings.set('bridge_tooling_fingerprint', toolingFingerprint);
 
   const store = new JsonFileStore(settings);
+  const knowledgeWatcher = config.memoryRepoDir
+    ? startKnowledgeIndexWatcher(config.memoryRepoDir)
+    : null;
+  let todoReminderService: TodoReminderService | null = null;
+  let workflowRetryTimer: NodeJS.Timeout | null = null;
+  if (knowledgeWatcher) {
+    const status = knowledgeWatcher.status();
+    console.log(`[claude-to-im] Knowledge index: ${status.itemCount} items, watching=${status.watching}, root=${status.memoryRoot}`);
+    if (status.lastError) {
+      console.warn(`[claude-to-im] Knowledge index warning: ${status.lastError}`);
+    }
+  }
   const pendingPerms = new PendingPermissions();
   try {
     writeExecutorStatus(config);
@@ -1090,6 +1144,56 @@ async function main(): Promise<void> {
     store,
     llm,
     permissions: gateway,
+    reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
+      createDirectReminder: async (input) => {
+        try {
+          const created = createDirectReminder(config.memoryRepoDir!, {
+            title: input.title,
+            dueAt: input.dueAt,
+            timezone: input.timezone,
+            target: input.target,
+            sourcePrompt: input.sourcePrompt,
+            createdByMessageId: input.createdByMessageId,
+          });
+          return {
+            ok: true,
+            reminderId: created.reminder.id,
+            title: created.reminder.title,
+            dueAt: created.reminder.dueAt,
+            target: created.reminder.target,
+            message: 'direct reminder created',
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+      completeReminder: async (input) => {
+        try {
+          const completed = completeReminder(config.memoryRepoDir!, {
+            reminderId: input.reminderId,
+            chatId: input.chatId,
+            completedAt: input.completedAt,
+            completedByUserId: input.completedByUserId,
+            completionSource: input.completionSource,
+            callbackMessageId: input.callbackMessageId,
+          });
+          return completed;
+        } catch (error) {
+          return {
+            ok: false,
+            reminderId: input.reminderId,
+            status: 'failed',
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+      tickReminders: async () => {
+        await todoReminderService?.tick();
+      },
+    } : undefined,
     lifecycle: {
       onBridgeStart: () => {
         fs.mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -1111,6 +1215,33 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
+  workflowRetryTimer = startWorkflowRetryService(runId, llm, store);
+  if (config.memoryRepoDir) {
+    const todoPushChannels = config.todoPushChannels && config.todoPushChannels.length > 0
+      ? config.todoPushChannels
+      : ['feishu'];
+    const todoPushEnabled = config.todoPushEnabled === true;
+    const directReminderPushEnabled = config.directReminderEnabled !== false && config.directReminderPushEnabled !== false;
+    todoReminderService = startTodoReminderService({
+      memoryRoot: config.memoryRepoDir,
+      enabled: todoPushEnabled || directReminderPushEnabled,
+      enabledSourceTypes: [
+        ...(todoPushEnabled ? ['memory' as const] : []),
+        ...(directReminderPushEnabled ? ['direct' as const] : []),
+      ],
+      pollMs: config.todoPushPollMs ?? 60_000,
+      windowMs: config.todoPushWindowMs ?? 5 * 60_000,
+      enabledChannels: todoPushChannels,
+      providers: [
+        createFeishuPushProvider({
+          enabled: (todoPushEnabled || directReminderPushEnabled) && todoPushChannels.includes('feishu'),
+          deliver: (input) => bridgeManager.deliverProactiveMessage(input),
+        }),
+        createWeixinPushProvider(),
+      ],
+    });
+    console.log(`[claude-to-im] Todo reminder index: enabled=${todoPushEnabled}, channels=${todoPushChannels.join(',')}`);
+  }
   const heartbeatTimer = setInterval(() => {
     touchBridgeRuntimeHeartbeat();
   }, 15_000);
@@ -1123,6 +1254,9 @@ async function main(): Promise<void> {
     console.log(`[claude-to-im] Shutting down (${reason})...`);
     pendingPerms.denyAll();
     await bridgeManager.stop();
+    todoReminderService?.close();
+    knowledgeWatcher?.close();
+    if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
     recordBridgeRuntimeExit(reason);
     writeStatus({ running: false, lastExitReason: reason });
@@ -1140,6 +1274,9 @@ async function main(): Promise<void> {
   });
   process.on('uncaughtException', (err) => {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
+    todoReminderService?.close();
+    knowledgeWatcher?.close();
+    if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
     recordBridgeRuntimeExit(`uncaughtException: ${err.message}`, err);
     writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
@@ -1150,6 +1287,9 @@ async function main(): Promise<void> {
   });
   process.on('exit', (code) => {
     console.log(`[claude-to-im] exit (code: ${code})`);
+    todoReminderService?.close();
+    knowledgeWatcher?.close();
+    if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
   });
 

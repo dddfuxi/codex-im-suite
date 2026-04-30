@@ -29,5 +29,6 @@ output/
 # Release working dirs
 release/artifacts/
 release/portable/packages/*/dist/
+release/*.zip
 *.WebView2/
 

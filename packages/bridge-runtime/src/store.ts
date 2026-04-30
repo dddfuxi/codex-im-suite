@@ -30,6 +30,7 @@ import type {
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
+import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
@@ -772,6 +773,49 @@ export class JsonFileStore implements BridgeStore {
     return lines.join('\n');
   }
 
+  private formatKnowledgeHit(item: KnowledgeItem): string {
+    const source = item.source.path ? path.basename(item.source.path) : 'knowledge';
+    const exact = item.key && item.value
+      ? `${item.key} = ${item.value}`
+      : item.text;
+    const conflict = item.conflict ? '（冲突候选）' : '';
+    return `[知识库/${item.kind}/${source}] ${exact}${conflict}`;
+  }
+
+  private searchKnowledgeIndexForMemory(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return [];
+    const index = readKnowledgeIndex(memoryRoot);
+    if (!index || index.items.length === 0) return [];
+
+    const hits = searchKnowledgeIndex(index, {
+      query: query.query,
+      limit: MEMORY_RECALL_RE.test(query.query) ? 6 : 4,
+    });
+    if (hits.length === 0) return [];
+
+    return hits
+      .map((item) => {
+        const haystack = `${item.key || ''} ${item.value || ''} ${item.text}`.toLowerCase();
+        let score = item.confidence * 6;
+        for (const token of tokens) {
+          if (haystack.includes(token.toLowerCase())) score += /[a-z]/i.test(token) ? 2 : 1.5;
+        }
+        if (MEMORY_RECALL_RE.test(query.query)) score += 4;
+        return {
+          sessionId: `knowledge-index:${item.id}`,
+          channelType: query.channelType,
+          chatId: query.chatId,
+          workingDirectory: query.workingDirectory,
+          role: 'assistant' as const,
+          source: 'summary' as const,
+          score,
+          content: this.summarizeMessageContent(this.formatKnowledgeHit(item), 300),
+        };
+      })
+      .filter((hit) => hit.score >= (MEMORY_RECALL_RE.test(query.query) ? 4 : MEMORY_MIN_SCORE));
+  }
+
   private summarizeProfileForMemory(profile: MemoryProfileRecord): string {
     const parts: string[] = [];
     const label = profile.displayName || profile.userId || profile.chatId || profile.key;
@@ -1287,7 +1331,8 @@ export class JsonFileStore implements BridgeStore {
 
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {
     const tokens = this.extractMemoryTokens(query.query);
-    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return null;
+    const knowledgeHits = this.searchKnowledgeIndexForMemory(query, tokens);
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query) && knowledgeHits.length === 0) return null;
 
     const metaBySession = this.buildMemorySessionMeta();
     const sameChatHits: RetrievedMemoryHit[] = [];
@@ -1351,6 +1396,7 @@ export class JsonFileStore implements BridgeStore {
     }
 
     const hits = [
+      ...knowledgeHits,
       ...sameChatHits,
       ...currentSessionHits,
       ...sameWorkdirHits,

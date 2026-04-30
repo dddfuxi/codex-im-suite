@@ -9,6 +9,9 @@ $liveRuntime = Join-Path $userHome '.codex\skills\claude-to-im'
 
 $suiteCore = Join-Path $suiteRoot 'packages\bridge-core'
 $suiteRuntime = Join-Path $suiteRoot 'packages\bridge-runtime'
+$suiteMcpManifests = Join-Path $suiteRoot 'config\mcp.d'
+$suiteSkillManifests = Join-Path $suiteRoot 'config\skills.d'
+$suitePluginManifests = Join-Path $suiteRoot 'config\plugins.d'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
 $portableDir = Join-Path $suiteRoot 'release\portable'
 
@@ -90,7 +93,9 @@ foreach ($name in $coreFiles) {
 Write-Host "sync suite bridge-runtime -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'src') -Target (Join-Path $liveRuntime 'src')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'scripts') -Target (Join-Path $liveRuntime 'scripts')
-Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'mcp.d') -Target (Join-Path $liveRuntime 'mcp.d')
+Copy-ExistingDirectory -Source $suiteMcpManifests -Target (Join-Path $liveRuntime 'mcp.d')
+Copy-ExistingDirectory -Source $suiteSkillManifests -Target (Join-Path $liveRuntime 'skills.d')
+Copy-ExistingDirectory -Source $suitePluginManifests -Target (Join-Path $liveRuntime 'plugins.d')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'references') -Target (Join-Path $liveRuntime 'references')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'evals') -Target (Join-Path $liveRuntime 'evals')

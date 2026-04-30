@@ -415,6 +415,103 @@ button:disabled {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.memory-visual-grid {
+  display: grid;
+  grid-template-columns: minmax(340px, 1.05fr) minmax(260px, 0.72fr) minmax(320px, 0.95fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.memory-bars,
+.memory-pipeline {
+  display: grid;
+  gap: 10px;
+}
+
+.memory-bar-row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) 42px;
+  gap: 10px;
+  align-items: center;
+}
+
+.memory-bar-row span,
+.memory-radar span,
+.memory-pipeline-step span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.memory-bar-row strong,
+.memory-radar strong,
+.memory-pipeline-step strong {
+  font-weight: 700;
+}
+
+.memory-bar-track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--panel-muted);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.memory-bar-fill {
+  height: 100%;
+  min-width: 4px;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.memory-bar-fill.kind-conclusion {
+  background: #4d7fd0;
+}
+
+.memory-bar-fill.kind-todo {
+  background: #b46f20;
+}
+
+.memory-bar-fill.kind-resource {
+  background: #7d62b8;
+}
+
+.memory-radar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.memory-radar > div,
+.memory-pipeline-step {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.memory-radar strong {
+  font-size: 26px;
+  line-height: 1.05;
+}
+
+.memory-pipeline {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.memory-pipeline-step {
+  position: relative;
+  min-height: 70px;
+  border-color: var(--border);
+}
+
+.memory-pipeline-step.ok {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 44%, var(--panel-muted));
+}
+
 .metric-strip {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1188,6 +1285,7 @@ button:disabled {
   .services-layout,
   .executor-main-layout,
   .extensions-layout,
+  .memory-visual-grid,
   .permissions-layout,
   .permission-filter-row,
   .settings-layout,
@@ -1273,6 +1371,8 @@ button:disabled {
 
   .summary-grid,
   .summary-grid.wide,
+  .memory-radar,
+  .memory-pipeline,
   .metric-strip,
   .release-gates,
   .runtime-grid,

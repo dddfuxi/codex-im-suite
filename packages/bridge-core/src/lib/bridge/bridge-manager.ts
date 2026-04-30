@@ -8,7 +8,7 @@
  */
 
 import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
-import type { ConversationMemoryEvent } from './host.js';
+import type { ConversationMemoryEvent, DirectReminderCreateResult } from './host.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -54,6 +54,7 @@ import {
 const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
+const REMINDER_ACTION_FENCE = 'cti-reminder';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -137,6 +138,24 @@ const SMALL_TALK_PATTERNS: Array<{ pattern: RegExp; reply: string }> = [
   { pattern: /^(聊会儿|陪我聊聊|随便聊聊|闲聊一下)[呀啊~～！!。\s]*$/i, reply: '可以呀，我在。你随便说，我会按聊天来接，不会一上来就当任务跑。' },
 ];
 
+interface CtiReminderAction {
+  title: string;
+  dueAt: string;
+  timezone?: string;
+  target: 'current_chat';
+  sourcePrompt?: string;
+}
+
+interface ExtractedReminderAction {
+  action: CtiReminderAction | null;
+  text: string;
+}
+
+interface ParsedReminderRequest {
+  title: string;
+  dueAt: string;
+}
+
 function isToolExecutionRequestText(text: string): boolean {
   return TOOL_EXECUTION_REQUEST_PATTERN.test(text);
 }
@@ -153,6 +172,256 @@ function buildSmallTalkReply(text: string): string {
     if (item.pattern.test(normalized)) return item.reply;
   }
   return '';
+}
+
+function extractCtiReminderAction(text: string): ExtractedReminderAction {
+  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${REMINDER_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
+  const match = text.match(fencePattern);
+  if (!match) {
+    return { action: null, text };
+  }
+
+  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
+  try {
+    const parsed = JSON.parse(match[2].trim()) as Partial<CtiReminderAction>;
+    if (
+      typeof parsed.title !== 'string'
+      || !parsed.title.trim()
+      || typeof parsed.dueAt !== 'string'
+      || !parsed.dueAt.trim()
+      || parsed.target !== 'current_chat'
+    ) {
+      return { action: null, text: cleaned };
+    }
+    return {
+      action: {
+        title: parsed.title.trim(),
+        dueAt: parsed.dueAt.trim(),
+        timezone: typeof parsed.timezone === 'string' ? parsed.timezone.trim() : undefined,
+        target: 'current_chat',
+        sourcePrompt: typeof parsed.sourcePrompt === 'string' ? parsed.sourcePrompt.trim() : undefined,
+      },
+      text: cleaned,
+    };
+  } catch {
+    return { action: null, text: cleaned };
+  }
+}
+
+function containsUnverifiedReminderCompletion(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const completionClaim = /(已|已经|成功|实际|真的).{0,16}(创建|设好|设置|登记|安排).{0,32}(系统计划任务|计划任务|提醒|消息提醒|定时提醒)/i;
+  const schedulerArtifact = /(CodexFeishuReminder_|Register-ScheduledTask|schtasks\s+\/Create)/i;
+  return completionClaim.test(normalized) || schedulerArtifact.test(normalized);
+}
+
+function parseChineseReminderAmount(token: string): number | null {
+  if (/^\d{1,4}$/.test(token)) return Number(token);
+  const digits: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  if (digits[token] !== undefined) return digits[token];
+  const tenIndex = token.indexOf('十');
+  if (tenIndex >= 0) {
+    const tensToken = token.slice(0, tenIndex);
+    const onesToken = token.slice(tenIndex + 1);
+    const tens = tensToken ? digits[tensToken] : 1;
+    const ones = onesToken ? digits[onesToken] : 0;
+    if (tens === undefined || ones === undefined) return null;
+    return tens * 10 + ones;
+  }
+  return null;
+}
+
+function extractNaturalReminderTitle(tail: string): string {
+  let title = tail.replace(/^[\s,，。；;、:：]+/u, '').trim();
+  for (let i = 0; i < 4; i += 1) {
+    const before = title;
+    title = title
+      .replace(/^(?:给我|帮我|麻烦你?|请你?)\s*/u, '')
+      .replace(/^(?:发|发送)(?:一条|一个|个)?(?:消息|信息|提醒)?\s*/u, '')
+      .replace(/^(?:提醒我|通知我|告诉我|叫我)\s*/u, '')
+      .replace(/^(?:说|内容是|内容为|为|：|:)\s*/u, '')
+      .trim();
+    if (title === before) break;
+  }
+  return title.replace(/[。！？!?\s]+$/u, '').trim();
+}
+
+function parseNaturalReminderRequest(text: string, now = new Date()): ParsedReminderRequest | null {
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  if (!normalized) return null;
+  if (/(为什么|怎么回事|解释|说明|脚本|代码|示例|怎么写|如何写|帮我写|今天有什么|有哪些|查看|列出|查询|搜索)/u.test(normalized)) {
+    return null;
+  }
+  if (!/(提醒我|给我发.{0,8}(消息|提醒|信息)|设置.{0,8}(待办|提醒)|创建.{0,8}(待办|提醒)|安排.{0,8}(待办|提醒))/u.test(normalized)) {
+    return null;
+  }
+
+  const relative = /([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(分钟|分|小时|时|天)后/u.exec(normalized);
+  if (!relative || relative.index === undefined) return null;
+  const amount = parseChineseReminderAmount(relative[1]);
+  if (!amount || amount <= 0) return null;
+  const unit = relative[2];
+  const ms = unit.startsWith('分') ? amount * 60_000
+    : unit.startsWith('小') || unit === '时' ? amount * 60 * 60_000
+      : amount * 24 * 60 * 60_000;
+  const title = extractNaturalReminderTitle(normalized.slice(relative.index + relative[0].length));
+  if (!title || /^(提醒|消息|信息|待办)$/u.test(title)) return null;
+  return { title, dueAt: new Date(now.getTime() + ms).toISOString() };
+}
+
+function getInboundMessageDate(msg: InboundMessage): Date {
+  if (Number.isFinite(msg.timestamp)) {
+    const timestampMs = msg.timestamp! < 10_000_000_000 ? msg.timestamp! * 1000 : msg.timestamp!;
+    const date = new Date(timestampMs);
+    if (Number.isFinite(date.getTime())) return date;
+  }
+  return new Date();
+}
+
+function formatLocalReminderTime(iso: string): string {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return iso;
+  return date.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function buildReminderActionResultText(result: DirectReminderCreateResult): string {
+  if (!result.ok) {
+    return `未完成：提醒没有进入统一提醒系统。\n原因：${result.error || '未知错误'}`;
+  }
+  return [
+    `提醒已进入统一提醒系统：${result.title || '未命名提醒'}`,
+    result.dueAt ? `时间：${formatLocalReminderTime(result.dueAt)}` : '',
+    result.target?.chatId ? `目标：当前 ${result.target.channelType} 会话 ${result.target.chatId}` : '',
+    result.reminderId ? `Reminder ID：${result.reminderId}` : '',
+    '到点后会走 bridge 的 Feishu 推送通道，并在 reminder-state.json 和面板里记录成功或失败。',
+  ].filter(Boolean).join('\n');
+}
+
+async function executeReminderActionFromReply(
+  rawReply: string,
+  msg: InboundMessage,
+  sessionId: string,
+  rawPrompt: string,
+): Promise<string> {
+  const extracted = extractCtiReminderAction(rawReply);
+  const reminders = getBridgeContext().reminders;
+  if (extracted.action) {
+    if (!reminders) {
+      return '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。';
+    }
+    const result = await reminders.createDirectReminder({
+      title: extracted.action.title,
+      dueAt: extracted.action.dueAt,
+      timezone: extracted.action.timezone,
+      target: msg.address,
+      sourcePrompt: extracted.action.sourcePrompt || rawPrompt,
+      createdByMessageId: msg.messageId,
+      sessionId,
+    });
+    await reminders.tickReminders?.();
+    return buildReminderActionResultText(result);
+  }
+
+  if (containsUnverifiedReminderCompletion(rawReply)) {
+    const parsedPrompt = parseNaturalReminderRequest(rawPrompt, getInboundMessageDate(msg));
+    if (parsedPrompt && reminders) {
+      const result = await reminders.createDirectReminder({
+        title: parsedPrompt.title,
+        dueAt: parsedPrompt.dueAt,
+        timezone: 'Asia/Shanghai',
+        target: msg.address,
+        sourcePrompt: rawPrompt,
+        createdByMessageId: msg.messageId,
+        sessionId,
+      });
+      await reminders.tickReminders?.();
+      return buildReminderActionResultText(result);
+    }
+    return [
+      '未完成：这条回复声称已经创建提醒或系统计划任务，但没有进入 bridge 的统一提醒系统。',
+      '为避免伪完成，已拦截原回复。请重新发送明确提醒请求，让 Codex 产出 cti-reminder 动作，或使用 /remind 固定格式。',
+    ].join('\n');
+  }
+
+  return rawReply;
+}
+
+async function tryHandleNaturalDirectReminder(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  binding: ChannelBinding,
+  rawText: string,
+): Promise<boolean> {
+  const parsed = parseNaturalReminderRequest(rawText, getInboundMessageDate(msg));
+  if (!parsed) return false;
+
+  const reminders = getBridgeContext().reminders;
+  let responseText: string;
+  if (!reminders) {
+    responseText = '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。';
+  } else {
+    const result = await reminders.createDirectReminder({
+      title: parsed.title,
+      dueAt: parsed.dueAt,
+      timezone: 'Asia/Shanghai',
+      target: msg.address,
+      sourcePrompt: rawText,
+      createdByMessageId: msg.messageId,
+      sessionId: binding.codepilotSessionId,
+    });
+    await reminders.tickReminders?.();
+    responseText = buildReminderActionResultText(result);
+  }
+
+  const { store } = getBridgeContext();
+  store.addMessage(binding.codepilotSessionId, 'user', rawText);
+  store.addMessage(binding.codepilotSessionId, 'assistant', responseText);
+  recordConversationMemoryEvent(msg, binding, 'user', rawText);
+  recordConversationMemoryEvent(msg, binding, 'assistant', responseText);
+  await deliverResponse(adapter, msg.address, responseText, binding.codepilotSessionId, msg.messageId);
+  return true;
+}
+
+function parseSlashReminderArgs(args: string, now = new Date()): { title: string; dueAt: string } | null {
+  const text = args.trim();
+  if (!text) return null;
+  const relative = text.match(/^(\d{1,4})\s*(分钟|分|小时|时|天)后\s+(.+)$/u);
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const title = relative[3].trim();
+    const ms = unit.startsWith('分') ? amount * 60_000
+      : unit.startsWith('小') || unit === '时' ? amount * 60 * 60_000
+        : amount * 24 * 60 * 60_000;
+    return title ? { title, dueAt: new Date(now.getTime() + ms).toISOString() } : null;
+  }
+  const absolute = text.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})\s+(.+)$/u);
+  if (absolute) {
+    const date = new Date(`${absolute[1]}T${absolute[2].padStart(5, '0')}:00+08:00`);
+    const title = absolute[3].trim();
+    return title && Number.isFinite(date.getTime()) ? { title, dueAt: date.toISOString() } : null;
+  }
+  return null;
 }
 
 function recordConversationMemoryEvent(
@@ -1958,6 +2227,32 @@ export function registerAdapter(adapter: BaseChannelAdapter): void {
   state.adapters.set(adapter.channelType, adapter);
 }
 
+export async function deliverProactiveMessage(input: {
+  address: OutboundMessage['address'];
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+  replyToMessageId?: string;
+  dedupKey?: string;
+  sessionId?: string;
+  feishuCardJson?: string;
+}): Promise<import('./types.js').SendResult> {
+  const state = getState();
+  const adapter = state.adapters.get(input.address.channelType);
+  if (!adapter || !adapter.isRunning()) {
+    return { ok: false, error: `adapter unavailable: ${input.address.channelType}` };
+  }
+  return deliver(adapter, {
+    address: input.address,
+    text: input.text,
+    parseMode: input.parseMode || 'plain',
+    replyToMessageId: input.replyToMessageId,
+    feishuCardJson: input.feishuCardJson,
+  }, {
+    dedupKey: input.dedupKey,
+    sessionId: input.sessionId,
+  });
+}
+
 /**
  * Run the event loop for a single adapter.
  * Messages for different sessions are dispatched concurrently;
@@ -2021,6 +2316,43 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
       meta.lastError = errMsg;
       state.adapterMeta.set(adapter.channelType, meta);
     }
+  });
+}
+
+async function handleReminderCompleteCallback(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+): Promise<void> {
+  const reminderId = (msg.callbackData || '').replace(/^reminder:complete:/, '').trim();
+  const reminders = getBridgeContext().reminders;
+  if (!reminderId || !reminders?.completeReminder) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '未完成：当前 bridge 没有加载统一提醒完成服务。',
+      parseMode: 'plain',
+      replyToMessageId: msg.callbackMessageId,
+    });
+    return;
+  }
+
+  const result = await reminders.completeReminder({
+    reminderId,
+    chatId: msg.address.chatId,
+    completedByUserId: msg.address.userId,
+    completionSource: 'feishu_card',
+    callbackMessageId: msg.callbackMessageId,
+  });
+  const text = result.ok
+    ? result.status === 'already_completed'
+      ? `已完成：${result.title || reminderId} 此前已标记完成。`
+      : `已完成：${result.title || reminderId}`
+    : `未完成：${result.error || result.message || '提醒完成失败。'}`;
+
+  await deliver(adapter, {
+    address: msg.address,
+    text,
+    parseMode: 'plain',
+    replyToMessageId: msg.callbackMessageId,
   });
 }
 
@@ -2089,6 +2421,11 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
+    if (msg.callbackData.startsWith('reminder:complete:')) {
+      await handleReminderCompleteCallback(adapter, msg);
+      ack();
+      return;
+    }
     if (!hasRole(msg, 'operator')) {
       await deliver(adapter, {
         address: msg.address,
@@ -2339,6 +2676,11 @@ async function handleMessage(
   }
 
   const binding = router.resolve(msg.address);
+  if (!hasAttachments && await tryHandleNaturalDirectReminder(adapter, msg, binding, rawText)) {
+    ack();
+    return;
+  }
+
   const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText) : '';
   if (smallTalkReply) {
     store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
@@ -2664,8 +3006,11 @@ async function handleMessage(
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
-    const preparedReply = result.responseText
-      ? await prepareBridgeReplyPayload(result.responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
+    const responseText = result.responseText
+      ? await executeReminderActionFromReply(result.responseText, msg, effectiveBinding.codepilotSessionId, rawText)
+      : '';
+    const preparedReply = responseText
+      ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
     const userFacingResponseText = preparedReply?.text || '';
     if (userFacingResponseText) {
@@ -2694,14 +3039,14 @@ async function handleMessage(
     // Send response text — render via channel-appropriate format.
     // Skip if streaming card was finalized (content already in card).
     let handledAsDoc = false;
-    if (feishuDocRequest && adapter.channelType === 'feishu' && result.responseText) {
+    if (feishuDocRequest && adapter.channelType === 'feishu' && responseText) {
       const createDoc = (adapter as BaseChannelAdapter & {
         createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
       }).createDocumentFromMarkdown;
 
         if (typeof createDoc === 'function') {
           try {
-            const docInfo = await createDoc.call(adapter, userFacingResponseText || result.responseText, {
+            const docInfo = await createDoc.call(adapter, userFacingResponseText || responseText, {
               title: feishuDocRequest.title && !isGenericFeishuDocumentTitle(feishuDocRequest.title)
               ? feishuDocRequest.title
               : undefined,
@@ -2715,7 +3060,7 @@ async function handleMessage(
             requesterId: msg.address.userId,
             workspace: resolvedWorkingDirectory,
             sourceText: rawText,
-            markdown: userFacingResponseText || result.responseText,
+            markdown: userFacingResponseText || responseText,
           });
           const guideInfo = await syncFeishuDocumentGuideBestEffort(
             adapter,
@@ -2751,7 +3096,7 @@ async function handleMessage(
       }
     }
 
-    if (result.responseText) {
+    if (responseText) {
       if (!cardFinalized && !handledAsDoc) {
         updateBridgeRuntimeActiveRequest(activeRequest, 'reply_sending');
         await deliverResponse(
@@ -2768,7 +3113,7 @@ async function handleMessage(
       const localImagePaths = Array.from(new Set([
         ...(preparedReply?.images || []),
         ...extractLocalImagePaths(
-          result.responseText,
+          responseText,
           resolvedWorkingDirectory,
           accessibleWorkspaceDirectories,
         ),
@@ -2955,11 +3300,38 @@ async function handleCommand(
         '/docs - List generated Feishu documents',
         '/projects - List available workspaces',
         '/sessions - List recent sessions',
+        '/remind 10分钟后 内容 - Create a bridge-managed reminder',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
       ].join('\n');
       break;
+
+    case '/remind': {
+      const parsed = parseSlashReminderArgs(args);
+      const reminders = getBridgeContext().reminders;
+      if (!parsed) {
+        response = '用法：/remind 10分钟后 看电脑，或 /remind 2026-04-29 19:42 看电脑';
+        break;
+      }
+      if (!reminders) {
+        response = '未完成：当前 bridge 没有加载统一提醒服务。';
+        break;
+      }
+      const binding = router.resolve(msg.address);
+      const result = await reminders.createDirectReminder({
+        title: parsed.title,
+        dueAt: parsed.dueAt,
+        timezone: 'Asia/Shanghai',
+        target: msg.address,
+        sourcePrompt: text,
+        createdByMessageId: msg.messageId,
+        sessionId: binding.codepilotSessionId,
+      });
+      await reminders.tickReminders?.();
+      response = buildReminderActionResultText(result);
+      break;
+    }
 
     case '/new': {
       // Abort any running task on the current session before creating a new one
@@ -3151,6 +3523,7 @@ async function handleCommand(
         '/docs - List generated Feishu documents',
         '/projects - List available workspaces',
         '/sessions - List recent sessions',
+        '/remind 10分钟后 内容 - Create a bridge-managed reminder',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
@@ -3213,4 +3586,7 @@ export const _testOnly = {
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
   buildSmallTalkReply,
+  extractCtiReminderAction,
+  containsUnverifiedReminderCompletion,
+  parseNaturalReminderRequest,
 };

@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -494,6 +495,7 @@ internal sealed class MainForm : Form
         if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("localLlm.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("ollama.", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "settings.save", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
@@ -738,6 +740,15 @@ internal sealed class MainForm : Form
             case "localLlm.check":
                 await CheckLocalLlmAsync();
                 return _localLlmStatus.Text;
+            case "ollama.start":
+                await StartLocalLlmAsync();
+                return _localLlmStatus.Text;
+            case "ollama.stop":
+                await StopLocalLlmAsync();
+                return _localLlmStatus.Text;
+            case "ollama.check":
+                await CheckLocalLlmAsync();
+                return _localLlmStatus.Text;
             case "mcp.list":
                 LoadManifests();
                 await UpdateMcpManifestStatesAsync();
@@ -793,6 +804,26 @@ internal sealed class MainForm : Form
                 return await GetSessionDetailAsync(payload);
             case "history.deleteSession":
                 return await DeleteSessionAsync(payload);
+            case "memory.status":
+                return BuildKnowledgeIndexStatus();
+            case "memory.search":
+                return SearchKnowledgeIndex(payload);
+            case "memory.archiveItem":
+                return ArchiveKnowledgeItem(payload);
+            case "memory.archives":
+                return BuildKnowledgeArchiveSnapshot();
+            case "memory.deleteArchive":
+                return DeleteKnowledgeArchive(payload);
+            case "memory.reminders":
+            case "memory.checkReminders":
+                return BuildTodoReminderSnapshot();
+            case "memory.testReminder":
+                return await TestTodoReminderAsync(payload);
+            case "memory.completeReminder":
+                return CompleteTodoReminder(payload);
+            case "memory.openSource":
+                OpenPath(ReadPayloadString(payload, "path", ""));
+                return "opened";
             case "security.addFeishuOwner":
                 return await AddFeishuOwnerAsync(payload);
             case "permissions.list":
@@ -861,6 +892,8 @@ internal sealed class MainForm : Form
                 return GetWorkflowRun(payload);
             case "workflow.getEvents":
                 return GetWorkflowEvents(payload);
+            case "workflow.retryRun":
+                return RetryWorkflowRun(payload);
             case "executor.list":
                 return ReadExecutorStatusPayload();
             case "executor.check":
@@ -874,6 +907,24 @@ internal sealed class MainForm : Form
 
     private async Task PushWebStateAsync()
     {
+        if (InvokeRequired)
+        {
+            var completion = new TaskCompletionSource();
+            BeginInvoke(async () =>
+            {
+                try
+                {
+                    await PushWebStateAsync();
+                    completion.SetResult();
+                }
+                catch (Exception ex)
+                {
+                    completion.SetException(ex);
+                }
+            });
+            await completion.Task;
+            return;
+        }
         if (!_webReady || _webView.CoreWebView2 is null) return;
         var pushCount = Interlocked.Increment(ref _webStatePushCount);
         AppendWebDiagnostics($"push state count={pushCount}");
@@ -912,7 +963,7 @@ internal sealed class MainForm : Form
             {
                 BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
                 BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
-                BuildServiceItem("localLlm", "本地辅助执行器", _localLlmStatus.Text),
+                BuildServiceItem("localLlm", "Ollama", _localLlmStatus.Text),
                 BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
                 BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
             },
@@ -947,6 +998,8 @@ internal sealed class MainForm : Form
                 status = GetFeishuHistorySyncStatusText(full: false),
                 sessions = sessionItems.Take(80).ToArray(),
             },
+            memory = BuildKnowledgeIndexStatus(),
+            memoryReminders = BuildTodoReminderSnapshot(),
             workflow = ListWorkflowRuns(),
             executors = ReadExecutorStatusPayload(),
             permissions = LoadPermissionSnapshot(syncFromConfig: true),
@@ -1140,12 +1193,27 @@ internal sealed class MainForm : Form
         return false;
     }
 
+    private McpManifest? FindMcpManifestById(string id)
+        => string.IsNullOrWhiteSpace(id)
+            ? null
+            : _manifests.FirstOrDefault(manifest => string.Equals(manifest.Id, id, StringComparison.OrdinalIgnoreCase));
+
     private static string ReadPayloadString(JsonElement payload, string name, string fallback)
     {
         return payload.ValueKind == JsonValueKind.Object
             && payload.TryGetProperty(name, out var value)
             && value.ValueKind == JsonValueKind.String
             ? value.GetString() ?? fallback
+            : fallback;
+    }
+
+    private static int ReadPayloadInt(JsonElement payload, string name, int fallback)
+    {
+        return payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.Number
+            && value.TryGetInt32(out var parsed)
+            ? parsed
             : fallback;
     }
 
@@ -1483,7 +1551,7 @@ internal sealed class MainForm : Form
     private void SyncPermissionSnapshotToConfig(PermissionSnapshot snapshot)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-        var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
+        var lines = ReadEnvFileLines(_configPath);
         foreach (var (channel, allowedKey, ownerKey) in PermissionEnvKeys)
         {
             var subjects = snapshot.Subjects
@@ -1567,6 +1635,60 @@ internal sealed class MainForm : Form
             runId,
             events = events.Select(node => node?.DeepClone()).Where(node => node is not null).ToArray(),
         };
+    }
+
+    private object RetryWorkflowRun(JsonElement payload)
+    {
+        var runId = ReadPayloadString(payload, "id", ReadPayloadString(payload, "runId", ""));
+        if (string.IsNullOrWhiteSpace(runId)) throw new InvalidOperationException("runId 不能为空");
+        var root = ReadJsonObjectFile(_workflowStatusPath) ?? new JsonObject
+        {
+            ["protocol"] = "workflow-runtime/v1",
+            ["updatedAt"] = DateTime.UtcNow.ToString("o"),
+            ["runs"] = new JsonArray(),
+        };
+        var runs = root["runs"] as JsonArray ?? [];
+        var run = runs.OfType<JsonObject>()
+            .FirstOrDefault(item => string.Equals(ReadJsonString(item, "id", ""), runId, StringComparison.OrdinalIgnoreCase));
+        if (run is null) throw new InvalidOperationException("未找到 workflow run。");
+
+        var recovery = run["recovery"] as JsonObject;
+        var input = recovery?["input"] as JsonObject;
+        var prompt = ReadJsonString(input, "prompt", "");
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            throw new InvalidOperationException("该 workflow run 缺少可重试输入，不能断点续跑。");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("o");
+        var retry = run["retry"] as JsonObject ?? new JsonObject();
+        var attempts = ReadJsonInt(retry, "attempts", 0);
+        var maxAttempts = Math.Max(1, ReadJsonInt(retry, "maxAttempts", 1));
+        retry["status"] = "manual_pending";
+        retry["attempts"] = attempts;
+        retry["maxAttempts"] = maxAttempts;
+        retry["requestedBy"] = "manual";
+        retry["requestedAt"] = timestamp;
+        retry["lastError"] = ReadJsonString(run, "error", "");
+
+        run["status"] = "retry_pending";
+        run["retry"] = retry;
+        run["updatedAt"] = timestamp;
+        var events = run["events"] as JsonArray ?? [];
+        events.Add(new JsonObject
+        {
+            ["id"] = Guid.NewGuid().ToString("D"),
+            ["runId"] = runId,
+            ["stage"] = ReadJsonString(run, "stage", "failed"),
+            ["type"] = "workflow.retry.requested",
+            ["message"] = "控制面板请求手动重试",
+            ["at"] = timestamp,
+            ["data"] = new JsonObject { ["requestedBy"] = "manual" },
+        });
+        run["events"] = events;
+        root["runs"] = runs;
+        WriteJsonObjectFile(_workflowStatusPath, root);
+        return new { ok = true, run = run.DeepClone() };
     }
 
     private JsonNode[] FindWorkflowRunsForSession(string sessionId, string chatId)
@@ -1656,10 +1778,32 @@ internal sealed class MainForm : Form
         }
     }
 
+    private static void WriteJsonObjectFile(string path, JsonObject root)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        root["updatedAt"] = DateTime.UtcNow.ToString("o");
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, root.ToJsonString(WebJsonOptions), Encoding.UTF8);
+        File.Move(tmp, path, overwrite: true);
+    }
+
     private static string ReadJsonString(JsonObject? root, string name, string fallback)
     {
         if (root is null || !root.TryGetPropertyValue(name, out var node)) return fallback;
         return node?.GetValue<string>() ?? fallback;
+    }
+
+    private static int ReadJsonInt(JsonObject? root, string name, int fallback)
+    {
+        if (root is null || !root.TryGetPropertyValue(name, out var node) || node is null) return fallback;
+        try
+        {
+            return node.GetValue<int>();
+        }
+        catch
+        {
+            return fallback;
+        }
     }
 
     private void AppendWebDiagnostics(string message)
@@ -1761,6 +1905,886 @@ internal sealed class MainForm : Form
         return new { name, value, settings = GetSettingsSnapshot() };
     }
 
+    private string GetKnowledgeIndexPath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "knowledge.json");
+
+    private string GetKnowledgeStatusPath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "status.json");
+
+    private string GetTodoReminderIndexPath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "reminders.json");
+
+    private string GetTodoReminderStatePath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "reminder-state.json");
+
+    private string GetKnowledgeArchiveRoot()
+        => Path.Combine(_memoryRepo.Text.Trim(), "archive", "knowledge-units");
+
+    private static bool ShouldSkipKnowledgeDirectory(string path)
+    {
+        var name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        return string.Equals(name, ".git", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, ".cti-index", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "archive", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, ".obsidian", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> EnumerateKnowledgeMarkdownFiles(string root)
+    {
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
+        var stack = new Stack<string>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+            IEnumerable<string> subdirs = [];
+            IEnumerable<string> files = [];
+            try
+            {
+                subdirs = Directory.EnumerateDirectories(dir).Where(path => !ShouldSkipKnowledgeDirectory(path));
+                files = Directory.EnumerateFiles(dir, "*.md");
+            }
+            catch
+            {
+                continue;
+            }
+            foreach (var subdir in subdirs) stack.Push(subdir);
+            foreach (var file in files) yield return file;
+        }
+    }
+
+    private object BuildKnowledgeIndexStatus()
+    {
+        var root = _memoryRepo.Text.Trim();
+        var indexPath = GetKnowledgeIndexPath();
+        var statusPath = GetKnowledgeStatusPath();
+        var markdownCount = EnumerateKnowledgeMarkdownFiles(root).Take(2001).Count();
+        var exists = File.Exists(indexPath);
+        var watching = false;
+        var itemCount = 0;
+        var conflictCount = 0;
+        var sourceFileCount = 0;
+        var kindCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var generatedAt = "";
+        var lastIndexedAt = "";
+        var lastEventAt = "";
+        var watcherStartedAt = "";
+        var watcherPid = 0;
+        var statusUpdatedAt = "";
+        var lastError = "";
+
+        if (exists)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+                var rootElement = document.RootElement;
+                if (rootElement.TryGetProperty("itemCount", out var itemCountElement) && itemCountElement.ValueKind == JsonValueKind.Number)
+                {
+                    itemCount = itemCountElement.GetInt32();
+                }
+                if (rootElement.TryGetProperty("conflictCount", out var conflictElement) && conflictElement.ValueKind == JsonValueKind.Number)
+                {
+                    conflictCount = conflictElement.GetInt32();
+                }
+                if (rootElement.TryGetProperty("generatedAt", out var generatedElement) && generatedElement.ValueKind == JsonValueKind.String)
+                {
+                    generatedAt = generatedElement.GetString() ?? "";
+                }
+                if (rootElement.TryGetProperty("items", out var itemsElement) && itemsElement.ValueKind == JsonValueKind.Array)
+                {
+                    var sourcePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var item in itemsElement.EnumerateArray())
+                    {
+                        var kind = ReadJsonString(item, "kind");
+                        if (!string.IsNullOrWhiteSpace(kind))
+                        {
+                            kindCounts[kind] = kindCounts.TryGetValue(kind, out var current) ? current + 1 : 1;
+                        }
+
+                        if (item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object)
+                        {
+                            var sourcePath = ReadJsonString(sourceElement, "path");
+                            if (!string.IsNullOrWhiteSpace(sourcePath)) sourcePaths.Add(sourcePath);
+                        }
+                    }
+                    sourceFileCount = sourcePaths.Count;
+                }
+            }
+            catch (Exception ex)
+            {
+                lastError = ex.Message;
+            }
+        }
+        else if (!Directory.Exists(root))
+        {
+            lastError = $"记忆仓库不存在：{root}";
+        }
+
+        if (File.Exists(statusPath))
+        {
+            try
+            {
+                using var statusDocument = JsonDocument.Parse(File.ReadAllText(statusPath, Encoding.UTF8));
+                var statusRoot = statusDocument.RootElement;
+                statusUpdatedAt = ReadJsonString(statusRoot, "statusUpdatedAt");
+                var watcherFresh = IsRecentIsoTimestamp(statusUpdatedAt, TimeSpan.FromMinutes(2));
+                watching = ReadJsonBool(statusRoot, "watching") && watcherFresh && IsBridgeRunning();
+                var statusItemCount = ReadJsonInt(statusRoot, "itemCount");
+                var statusConflictCount = ReadJsonInt(statusRoot, "conflictCount");
+                if (statusItemCount > 0) itemCount = statusItemCount;
+                if (statusConflictCount > 0) conflictCount = statusConflictCount;
+                generatedAt = ReadJsonString(statusRoot, "generatedAt", generatedAt);
+                lastIndexedAt = ReadJsonString(statusRoot, "lastIndexedAt");
+                lastEventAt = ReadJsonString(statusRoot, "lastEventAt");
+                watcherStartedAt = ReadJsonString(statusRoot, "watcherStartedAt");
+                watcherPid = ReadJsonInt(statusRoot, "watcherPid");
+                var statusError = ReadJsonString(statusRoot, "lastError");
+                if (!string.IsNullOrWhiteSpace(statusError)) lastError = statusError;
+            }
+            catch (Exception ex)
+            {
+                lastError = string.IsNullOrWhiteSpace(lastError) ? ex.Message : $"{lastError}; {ex.Message}";
+            }
+        }
+
+        return new
+        {
+            schema = "codex-im-suite/knowledge-index-status/v1",
+            memoryRoot = root,
+            indexPath,
+            statusPath,
+            watching,
+            exists,
+            markdownFileCount = markdownCount,
+            itemCount,
+            conflictCount,
+            sourceFileCount,
+            kindCounts,
+            generatedAt,
+            lastIndexedAt,
+            lastEventAt,
+            watcherStartedAt,
+            watcherPid,
+            statusUpdatedAt,
+            lastError,
+        };
+    }
+
+    private static bool IsRecentIsoTimestamp(string value, TimeSpan maxAge)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        return DateTimeOffset.TryParse(value, out var parsed)
+            && DateTimeOffset.UtcNow - parsed.ToUniversalTime() <= maxAge;
+    }
+
+    private bool IsBridgeRunning()
+    {
+        try
+        {
+            if (!File.Exists(_statusJsonPath)) return false;
+            using var document = JsonDocument.Parse(File.ReadAllText(_statusJsonPath, Encoding.UTF8));
+            return document.RootElement.TryGetProperty("running", out var running)
+                && running.ValueKind == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private object SearchKnowledgeIndex(JsonElement payload)
+    {
+        var query = ReadPayloadString(payload, "query", "").Trim();
+        var limit = Math.Clamp(ReadPayloadInt(payload, "limit", 20), 1, 80);
+        var kindFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty("kinds", out var kindsElement)
+            && kindsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in kindsElement.EnumerateArray())
+            {
+                var value = item.GetString();
+                if (!string.IsNullOrWhiteSpace(value)) kindFilter.Add(value.Trim());
+            }
+        }
+
+        var indexPath = GetKnowledgeIndexPath();
+        if (!File.Exists(indexPath))
+        {
+            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>() };
+        }
+
+        var results = new List<object>();
+        using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+        if (!document.RootElement.TryGetProperty("items", out var itemsElement) || itemsElement.ValueKind != JsonValueKind.Array)
+        {
+            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>() };
+        }
+
+        var normalizedQuery = query.ToLowerInvariant();
+        foreach (var item in itemsElement.EnumerateArray())
+        {
+            var kind = ReadJsonString(item, "kind");
+            if (kindFilter.Count > 0 && !kindFilter.Contains(kind)) continue;
+
+            var key = ReadJsonString(item, "key");
+            var value = ReadJsonString(item, "value");
+            var text = ReadJsonString(item, "text");
+            var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+                ? sourceElement
+                : default;
+            var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+            var snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "";
+            var haystack = $"{kind} {key} {value} {text} {sourcePath} {snippet}".ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(normalizedQuery) && !haystack.Contains(normalizedQuery))
+            {
+                var matched = normalizedQuery.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Any(token => haystack.Contains(token));
+                if (!matched) continue;
+            }
+
+            results.Add(new
+            {
+                id = ReadJsonString(item, "id"),
+                kind,
+                key,
+                value,
+                text,
+                confidence = ReadJsonDouble(item, "confidence"),
+                conflict = ReadJsonBool(item, "conflict"),
+                sourcePath,
+                snippet,
+            });
+            if (results.Count >= limit) break;
+        }
+
+        return new { status = BuildKnowledgeIndexStatus(), items = results.ToArray() };
+    }
+
+    private object ArchiveKnowledgeItem(JsonElement payload)
+    {
+        var itemId = ReadPayloadString(payload, "id", "");
+        var item = FindKnowledgeItem(itemId);
+        if (item.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("未找到知识单元。");
+        }
+
+        var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+            ? sourceElement
+            : default;
+        var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+        var root = _memoryRepo.Text.Trim();
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+        {
+            throw new InvalidOperationException("知识单元源文件不存在。");
+        }
+        var fullRoot = Path.GetFullPath(root);
+        var fullSource = Path.GetFullPath(sourcePath);
+        if (!IsPathInside(fullRoot, fullSource))
+        {
+            throw new InvalidOperationException("源文件不在记忆仓库内，已拒绝归档。");
+        }
+
+        var content = File.ReadAllText(fullSource, Encoding.UTF8);
+        var lines = Regex.Split(content, "\r?\n").ToList();
+        var lineIndex = lines.FindIndex(line => KnowledgeLineMatchesItem(line, item));
+        if (lineIndex < 0)
+        {
+            throw new InvalidOperationException("未能在源文件中精确匹配该知识单元。");
+        }
+
+        var originalLine = lines[lineIndex];
+        var archivedAt = DateTime.UtcNow.ToString("o");
+        var archivePath = BuildKnowledgeArchivePath(item, archivedAt);
+        Directory.CreateDirectory(Path.GetDirectoryName(archivePath)!);
+        File.WriteAllText(archivePath, FormatKnowledgeArchiveMarkdown(item, originalLine, archivedAt), Encoding.UTF8);
+        lines.RemoveAt(lineIndex);
+        File.WriteAllText(fullSource, string.Join("\n", lines), Encoding.UTF8);
+
+        RemoveKnowledgeItemFromIndex(itemId);
+        RemoveReminderForKnowledgeItem(itemId);
+        return new { ok = true, itemId, archivePath };
+    }
+
+    private object BuildKnowledgeArchiveSnapshot()
+    {
+        var archiveRoot = GetKnowledgeArchiveRoot();
+        var items = new List<object>();
+        if (Directory.Exists(archiveRoot))
+        {
+            foreach (var file in Directory.EnumerateFiles(archiveRoot, "*.md").OrderByDescending(File.GetLastWriteTimeUtc).Take(200))
+            {
+                try
+                {
+                    var metadata = ParseMarkdownFrontmatter(File.ReadAllText(file, Encoding.UTF8));
+                    items.Add(new
+                    {
+                        id = Path.GetFileNameWithoutExtension(file),
+                        itemId = metadata.GetValueOrDefault("itemId", ""),
+                        kind = metadata.GetValueOrDefault("kind", ""),
+                        text = metadata.GetValueOrDefault("text", ""),
+                        sourcePath = metadata.GetValueOrDefault("sourcePath", ""),
+                        archivedAt = metadata.GetValueOrDefault("archivedAt", ""),
+                        archivePath = file,
+                    });
+                }
+                catch
+                {
+                    // Ignore unreadable archive files.
+                }
+            }
+        }
+        return new { archiveRoot, items = items.ToArray() };
+    }
+
+    private object DeleteKnowledgeArchive(JsonElement payload)
+    {
+        var archivePath = ReadPayloadString(payload, "path", "");
+        var archiveRoot = Path.GetFullPath(GetKnowledgeArchiveRoot());
+        var fullArchive = Path.GetFullPath(archivePath);
+        if (!IsPathInside(archiveRoot, fullArchive))
+        {
+            throw new InvalidOperationException("归档文件不在知识归档目录内，已拒绝删除。");
+        }
+        if (!File.Exists(fullArchive))
+        {
+            throw new InvalidOperationException("归档文件不存在。");
+        }
+        File.Delete(fullArchive);
+        return new { ok = true, archivePath = fullArchive };
+    }
+
+    private object BuildTodoReminderSnapshot()
+    {
+        var root = _memoryRepo.Text.Trim();
+        var indexPath = GetTodoReminderIndexPath();
+        var statePath = GetTodoReminderStatePath();
+        var pushEnabled = string.Equals(GetConfig("CTI_TODO_PUSH_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase);
+        var directEnabled = !string.Equals(GetConfig("CTI_DIRECT_REMINDER_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var directPushEnabled = directEnabled && !string.Equals(GetConfig("CTI_DIRECT_REMINDER_PUSH_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var channels = SplitConfigList(GetConfig("CTI_TODO_PUSH_CHANNELS", "feishu")).DefaultIfEmpty("feishu").ToArray();
+        var deliveries = ReadReminderDeliveries(statePath);
+        var items = new List<object>();
+        var lastError = "";
+
+        if (File.Exists(indexPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+                if (document.RootElement.TryGetProperty("reminders", out var remindersElement)
+                    && remindersElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var reminder in remindersElement.EnumerateArray())
+                    {
+                        var id = ReadJsonString(reminder, "id");
+                        var target = reminder.TryGetProperty("target", out var targetElement) && targetElement.ValueKind == JsonValueKind.Object
+                            ? targetElement
+                            : default;
+                        var source = reminder.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+                            ? sourceElement
+                            : default;
+                        deliveries.TryGetValue(id, out var delivery);
+                        var displayStatus = ResolveReminderDisplayStatus(ReadJsonString(reminder, "status"), ReadJsonString(reminder, "todoStatus"), delivery);
+                        items.Add(new
+                        {
+                            id,
+                            title = ReadJsonString(reminder, "title"),
+                            dueAt = ReadJsonString(reminder, "dueAt"),
+                            todoStatus = ReadJsonString(reminder, "todoStatus"),
+                            status = displayStatus,
+                            sourceType = ReadJsonString(reminder, "sourceType", "memory"),
+                            createdAt = ReadJsonString(reminder, "createdAt"),
+                            createdByMessageId = ReadJsonString(reminder, "createdByMessageId"),
+                            skipReason = ReadJsonString(reminder, "skipReason"),
+                            completedAt = ReadJsonString(delivery, "completedAt", ""),
+                            completedByUserId = ReadJsonString(delivery, "completedByUserId", ""),
+                            completionSource = ReadJsonString(delivery, "completionSource", ""),
+                            completionError = ReadJsonString(delivery, "completionError", ""),
+                            target = new
+                            {
+                                channelType = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "channelType") : "",
+                                chatId = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "chatId") : "",
+                                displayName = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "displayName") : "",
+                                messageId = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "messageId") : "",
+                            },
+                            source = new
+                            {
+                                path = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "",
+                                snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "",
+                                updatedAt = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "updatedAt") : "",
+                            },
+                            delivery = delivery,
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                lastError = ex.Message;
+            }
+        }
+        else if (!Directory.Exists(root))
+        {
+            lastError = $"记忆仓库不存在：{root}";
+        }
+
+        var pendingCount = items.Count(item => ReminderStatusEquals(item, "pending"));
+        var sentCount = items.Count(item => ReminderStatusEquals(item, "sent"));
+        var failedCount = items.Count(item => ReminderStatusEquals(item, "failed"));
+        var skippedCount = items.Count(item => ReminderStatusEquals(item, "skipped"));
+        var completedCount = items.Count(item => ReminderStatusEquals(item, "completed"));
+
+        return new
+        {
+            schema = "codex-im-suite/reminders-panel/v1",
+            memoryRoot = root,
+            indexPath,
+            statePath,
+            exists = File.Exists(indexPath),
+            enabled = pushEnabled || directPushEnabled,
+            memoryPushEnabled = pushEnabled,
+            directReminderEnabled = directEnabled,
+            directReminderPushEnabled = directPushEnabled,
+            pollMs = int.TryParse(GetConfig("CTI_TODO_PUSH_POLL_MS", "60000"), out var pollMs) ? pollMs : 60000,
+            windowMs = int.TryParse(GetConfig("CTI_TODO_PUSH_WINDOW_MS", "300000"), out var windowMs) ? windowMs : 300000,
+            channels,
+            providers = new[]
+            {
+                new { channelType = "feishu", state = (pushEnabled || directPushEnabled) && channels.Contains("feishu", StringComparer.OrdinalIgnoreCase) ? "ok" : "disabled", detail = "飞书主动推送" },
+                new { channelType = "weixin", state = "unsupported", detail = "微信主动推送 v1 未接入" },
+            },
+            counts = new
+            {
+                total = items.Count,
+                pending = pendingCount,
+                sent = sentCount,
+                failed = failedCount,
+                skipped = skippedCount,
+                completed = completedCount,
+            },
+            items = items.ToArray(),
+            lastError,
+        };
+    }
+
+    private static bool ReminderStatusEquals(object item, string expected)
+    {
+        var prop = item.GetType().GetProperty("status");
+        return string.Equals(prop?.GetValue(item)?.ToString(), expected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ResolveReminderDisplayStatus(string reminderStatus, string todoStatus, JsonObject? delivery)
+    {
+        if (!string.IsNullOrWhiteSpace(ReadJsonString(delivery, "completedAt", "")) || string.Equals(todoStatus, "done", StringComparison.OrdinalIgnoreCase))
+        {
+            return "completed";
+        }
+        var deliveryStatus = ReadJsonString(delivery, "status", "");
+        return string.IsNullOrWhiteSpace(deliveryStatus) ? reminderStatus : deliveryStatus;
+    }
+
+    private static Dictionary<string, JsonObject> ReadReminderDeliveries(string statePath)
+    {
+        var result = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(statePath)) return result;
+        try
+        {
+            var node = JsonNode.Parse(File.ReadAllText(statePath, Encoding.UTF8)) as JsonObject;
+            var deliveries = node?["deliveries"] as JsonObject;
+            if (deliveries is null) return result;
+            foreach (var pair in deliveries)
+            {
+                if (pair.Value is JsonObject obj) result[pair.Key] = obj;
+            }
+        }
+        catch
+        {
+            return result;
+        }
+        return result;
+    }
+
+    private JsonElement FindKnowledgeItem(string id)
+    {
+        var indexPath = GetKnowledgeIndexPath();
+        if (string.IsNullOrWhiteSpace(id) || !File.Exists(indexPath)) return default;
+        using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+        if (!document.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) return default;
+        foreach (var item in items.EnumerateArray())
+        {
+            if (string.Equals(ReadJsonString(item, "id"), id, StringComparison.OrdinalIgnoreCase))
+            {
+                return item.Clone();
+            }
+        }
+        return default;
+    }
+
+    private static bool KnowledgeLineMatchesItem(string line, JsonElement item)
+    {
+        var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+            ? sourceElement
+            : default;
+        var normalizedLine = NormalizeKnowledgeLine(line);
+        var snippet = source.ValueKind == JsonValueKind.Object ? NormalizeKnowledgeLine(ReadJsonString(source, "snippet")) : "";
+        if (!string.IsNullOrWhiteSpace(snippet) && string.Equals(normalizedLine, snippet, StringComparison.Ordinal)) return true;
+        var key = NormalizeKnowledgeLine(ReadJsonString(item, "key"));
+        var value = NormalizeKnowledgeLine(ReadJsonString(item, "value"));
+        if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(value))
+        {
+            return normalizedLine.Contains(key, StringComparison.Ordinal) && normalizedLine.Contains(value, StringComparison.Ordinal);
+        }
+        var text = NormalizeKnowledgeLine(ReadJsonString(item, "text"));
+        return !string.IsNullOrWhiteSpace(text) && normalizedLine.Contains(text, StringComparison.Ordinal);
+    }
+
+    private static string NormalizeKnowledgeLine(string value)
+    {
+        var normalized = Regex.Replace(value, @"`([^`]+)`", "$1");
+        normalized = Regex.Replace(normalized, @"\[([^\]]+)\]\([^)]+\)", "$1");
+        normalized = Regex.Replace(normalized, @"^\s*[-*]\s+", "");
+        normalized = Regex.Replace(normalized, @"\s+", " ");
+        return normalized.Trim();
+    }
+
+    private string BuildKnowledgeArchivePath(JsonElement item, string archivedAt)
+    {
+        var stamp = Regex.Replace(archivedAt, @"\D", "");
+        if (stamp.Length > 14) stamp = stamp[..14];
+        if (string.IsNullOrWhiteSpace(stamp)) stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+        var itemId = ReadJsonString(item, "id");
+        var kind = ReadJsonString(item, "kind", "item");
+        var suffix = Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes($"{itemId}:{archivedAt}"))).ToLowerInvariant()[..8];
+        return Path.Combine(GetKnowledgeArchiveRoot(), $"{stamp}-{kind}-{itemId[..Math.Min(8, itemId.Length)]}-{suffix}.md");
+    }
+
+    private static string FormatKnowledgeArchiveMarkdown(JsonElement item, string originalLine, string archivedAt)
+    {
+        var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+            ? sourceElement
+            : default;
+        var text = ReadJsonString(item, "value", ReadJsonString(item, "text"));
+        var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+        return string.Join("\n", new[]
+        {
+            "---",
+            "schema: codex-im-suite/knowledge-archive/v1",
+            $"itemId: {ReadJsonString(item, "id")}",
+            $"kind: {ReadJsonString(item, "kind")}",
+            $"archivedAt: {archivedAt}",
+            $"sourcePath: {sourcePath}",
+            $"text: {text.Replace("\r", " ").Replace("\n", " ").Replace("\"", "\\\"")}",
+            "---",
+            "",
+            "# Archived knowledge unit",
+            "",
+            $"Kind: {ReadJsonString(item, "kind")}",
+            $"Text: {text}",
+            $"Source: {sourcePath}",
+            "",
+            "```markdown",
+            originalLine,
+            "```",
+            "",
+        });
+    }
+
+    private static Dictionary<string, string> ParseMarkdownFrontmatter(string content)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var match = Regex.Match(content, @"^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)");
+        if (!match.Success) return result;
+        foreach (var rawLine in Regex.Split(match.Groups[1].Value, "\r?\n"))
+        {
+            var separator = rawLine.IndexOf(':');
+            if (separator <= 0) continue;
+            var key = rawLine[..separator].Trim();
+            var value = rawLine[(separator + 1)..].Trim().Trim('"', '\'');
+            if (!string.IsNullOrWhiteSpace(key)) result[key] = value;
+        }
+        return result;
+    }
+
+    private void RemoveKnowledgeItemFromIndex(string itemId)
+    {
+        var indexPath = GetKnowledgeIndexPath();
+        var root = ReadJsonObjectFile(indexPath);
+        var items = root?["items"] as JsonArray;
+        if (root is null || items is null) return;
+        for (var index = items.Count - 1; index >= 0; index--)
+        {
+            if (items[index] is JsonObject item && string.Equals(ReadJsonString(item, "id", ""), itemId, StringComparison.OrdinalIgnoreCase))
+            {
+                items.RemoveAt(index);
+            }
+        }
+        root["itemCount"] = items.Count;
+        root["conflictCount"] = items.OfType<JsonObject>().Count(item => ReadJsonBool(item, "conflict"));
+        WriteJsonObjectFile(indexPath, root);
+    }
+
+    private void RemoveReminderForKnowledgeItem(string itemId)
+    {
+        var indexPath = GetTodoReminderIndexPath();
+        var root = ReadJsonObjectFile(indexPath);
+        var reminders = root?["reminders"] as JsonArray;
+        if (root is null || reminders is null) return;
+        for (var index = reminders.Count - 1; index >= 0; index--)
+        {
+            if (reminders[index] is not JsonObject reminder) continue;
+            if (string.Equals(ReadJsonString(reminder, "id", ""), itemId, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ReadJsonString(reminder, "sourceKnowledgeId", ""), itemId, StringComparison.OrdinalIgnoreCase))
+            {
+                reminders.RemoveAt(index);
+            }
+        }
+        root["reminderCount"] = reminders.Count;
+        root["pendingCount"] = reminders.OfType<JsonObject>().Count(item => string.Equals(ReadJsonString(item, "status", ""), "pending", StringComparison.OrdinalIgnoreCase));
+        root["skippedCount"] = reminders.OfType<JsonObject>().Count(item => string.Equals(ReadJsonString(item, "status", ""), "skipped", StringComparison.OrdinalIgnoreCase));
+        WriteJsonObjectFile(indexPath, root);
+    }
+
+    private static bool IsPathInside(string root, string candidate)
+    {
+        var normalizedRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var normalizedCandidate = Path.GetFullPath(candidate);
+        return normalizedCandidate.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<object> TestTodoReminderAsync(JsonElement payload)
+    {
+        var id = ReadPayloadString(payload, "id", "");
+        var reminder = FindTodoReminder(id);
+        if (reminder.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("未找到待办提醒。");
+        }
+        var target = reminder.TryGetProperty("target", out var targetElement) && targetElement.ValueKind == JsonValueKind.Object
+            ? targetElement
+            : default;
+        var channelType = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "channelType") : "";
+        var chatId = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "chatId") : "";
+        if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("测试发送 v1 仅支持飞书；微信主动推送未接入。");
+        }
+        if (string.IsNullOrWhiteSpace(chatId))
+        {
+            throw new InvalidOperationException("缺少飞书 chatId，不能测试发送。");
+        }
+
+        var title = ReadJsonString(reminder, "title", "未命名待办");
+        var dueAt = ReadJsonString(reminder, "dueAt");
+        var text = $"测试待办提醒：{title}\n时间：{dueAt}\n来源：控制面板测试发送";
+        var messageId = await SendFeishuTextAsync(chatId, text);
+        return new { ok = true, messageId };
+    }
+
+    private object CompleteTodoReminder(JsonElement payload)
+    {
+        var id = ReadPayloadString(payload, "id", "");
+        var reminder = FindTodoReminder(id);
+        if (reminder.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("未找到待办提醒。");
+        }
+
+        var delivery = ReadReminderDeliveries(GetTodoReminderStatePath()).GetValueOrDefault(id);
+        if (!string.IsNullOrWhiteSpace(ReadJsonString(delivery, "completedAt", "")) ||
+            string.Equals(ReadJsonString(reminder, "todoStatus"), "done", StringComparison.OrdinalIgnoreCase))
+        {
+            return new { ok = true, status = "already_completed", reminderId = id, title = ReadJsonString(reminder, "title") };
+        }
+
+        var completedAt = DateTime.UtcNow.ToString("o");
+        var sourceUpdated = UpdateReminderMarkdownStatus(reminder, out var completionError);
+        UpdateReminderIndexCompletion(id, sourceUpdated, completionError);
+        UpsertReminderCompletionState(reminder, completedAt, "panel", completionError);
+        return new
+        {
+            ok = true,
+            status = sourceUpdated ? "completed" : "state_only",
+            reminderId = id,
+            title = ReadJsonString(reminder, "title"),
+            sourceUpdated,
+            completionError,
+        };
+    }
+
+    private bool UpdateReminderMarkdownStatus(JsonElement reminder, out string completionError)
+    {
+        completionError = "";
+        var source = reminder.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+            ? sourceElement
+            : default;
+        var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+        var root = _memoryRepo.Text.Trim();
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+        {
+            completionError = "源文件不存在。";
+            return false;
+        }
+        var fullSource = Path.GetFullPath(sourcePath);
+        var fullRoot = Path.GetFullPath(root);
+        if (!fullSource.StartsWith(fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            completionError = "源文件不在记忆仓库内，已拒绝自动修改。";
+            return false;
+        }
+
+        var markdown = File.ReadAllText(fullSource, Encoding.UTF8);
+        var lines = Regex.Split(markdown, "\r?\n").ToList();
+        var title = ReadJsonString(reminder, "title");
+        var index = lines.FindIndex(line =>
+            Regex.IsMatch(line, @"状态\s*[:：]\s*未完成") &&
+            (string.IsNullOrWhiteSpace(title) || line.Contains(title, StringComparison.Ordinal)));
+        if (index >= 0)
+        {
+            lines[index] = Regex.Replace(lines[index], @"状态\s*[:：]\s*未完成", "状态: 完成");
+            File.WriteAllText(fullSource, string.Join("\n", lines), Encoding.UTF8);
+            return true;
+        }
+
+        if (string.Equals(ReadJsonString(reminder, "sourceType", "memory"), "direct", StringComparison.OrdinalIgnoreCase))
+        {
+            var replaced = Regex.Replace(markdown, @"状态\s*[:：]\s*未完成", "状态: 完成", RegexOptions.None, TimeSpan.FromSeconds(1));
+            if (!string.Equals(replaced, markdown, StringComparison.Ordinal))
+            {
+                File.WriteAllText(fullSource, replaced, Encoding.UTF8);
+                return true;
+            }
+        }
+
+        completionError = "未能在源文件中精确匹配同一条未完成待办。";
+        return false;
+    }
+
+    private void UpdateReminderIndexCompletion(string reminderId, bool sourceUpdated, string completionError)
+    {
+        var indexPath = GetTodoReminderIndexPath();
+        var root = ReadJsonObjectFile(indexPath);
+        var reminders = root?["reminders"] as JsonArray;
+        if (root is null || reminders is null) return;
+        foreach (var node in reminders.OfType<JsonObject>())
+        {
+            if (!string.Equals(ReadJsonString(node, "id", ""), reminderId, StringComparison.OrdinalIgnoreCase)) continue;
+            if (sourceUpdated)
+            {
+                node["todoStatus"] = "done";
+                node["status"] = "skipped";
+                node["skipReason"] = "状态为完成";
+                if (node["source"] is JsonObject source && !string.IsNullOrWhiteSpace(ReadJsonString(source, "snippet", "")))
+                {
+                    source["snippet"] = Regex.Replace(ReadJsonString(source, "snippet", ""), @"状态\s*[:：]\s*未完成", "状态: 完成");
+                }
+            }
+            else
+            {
+                node["completionError"] = completionError;
+            }
+            break;
+        }
+        root["pendingCount"] = reminders.OfType<JsonObject>().Count(item => string.Equals(ReadJsonString(item, "status", ""), "pending", StringComparison.OrdinalIgnoreCase));
+        root["skippedCount"] = reminders.OfType<JsonObject>().Count(item => string.Equals(ReadJsonString(item, "status", ""), "skipped", StringComparison.OrdinalIgnoreCase));
+        root["reminderCount"] = reminders.Count;
+        WriteJsonObjectFile(indexPath, root);
+    }
+
+    private void UpsertReminderCompletionState(JsonElement reminder, string completedAt, string completionSource, string completionError)
+    {
+        var statePath = GetTodoReminderStatePath();
+        var root = ReadJsonObjectFile(statePath) ?? new JsonObject
+        {
+            ["schema"] = "codex-im-suite/reminder-state/v1",
+            ["updatedAt"] = DateTime.UtcNow.ToString("o"),
+            ["deliveries"] = new JsonObject(),
+        };
+        var deliveries = root["deliveries"] as JsonObject ?? new JsonObject();
+        root["deliveries"] = deliveries;
+        var id = ReadJsonString(reminder, "id");
+        var target = reminder.TryGetProperty("target", out var targetElement) && targetElement.ValueKind == JsonValueKind.Object
+            ? targetElement
+            : default;
+        var existing = deliveries[id] as JsonObject ?? new JsonObject();
+        existing["reminderId"] = id;
+        existing["status"] = ReadJsonString(existing, "status", ReadJsonString(reminder, "status", "pending"));
+        existing["channelType"] = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "channelType") : "";
+        existing["chatId"] = target.ValueKind == JsonValueKind.Object ? ReadJsonString(target, "chatId") : "";
+        existing["dueAt"] = ReadJsonString(reminder, "dueAt");
+        existing["attempts"] = ReadJsonInt(existing, "attempts", 0);
+        existing["completedAt"] = completedAt;
+        existing["completionSource"] = completionSource;
+        existing["completionError"] = completionError;
+        deliveries[id] = existing;
+        WriteJsonObjectFile(statePath, root);
+    }
+
+    private JsonElement FindTodoReminder(string id)
+    {
+        var indexPath = GetTodoReminderIndexPath();
+        if (string.IsNullOrWhiteSpace(id) || !File.Exists(indexPath)) return default;
+        using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+        if (!document.RootElement.TryGetProperty("reminders", out var reminders) || reminders.ValueKind != JsonValueKind.Array) return default;
+        foreach (var reminder in reminders.EnumerateArray())
+        {
+            if (string.Equals(ReadJsonString(reminder, "id"), id, StringComparison.OrdinalIgnoreCase))
+            {
+                return reminder.Clone();
+            }
+        }
+        return default;
+    }
+
+    private async Task<string> SendFeishuTextAsync(string chatId, string text)
+    {
+        var appId = GetConfig("CTI_FEISHU_APP_ID", "").Trim();
+        var appSecret = GetConfig("CTI_FEISHU_APP_SECRET", "").Trim();
+        if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
+        {
+            throw new InvalidOperationException("缺少 CTI_FEISHU_APP_ID 或 CTI_FEISHU_APP_SECRET。");
+        }
+        var domain = string.Equals(GetConfig("CTI_FEISHU_DOMAIN", "feishu"), "lark", StringComparison.OrdinalIgnoreCase)
+            ? "https://open.larksuite.com"
+            : "https://open.feishu.cn";
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
+        var tokenResponse = await client.PostAsJsonAsync($"{domain}/open-apis/auth/v3/tenant_access_token/internal", new
+        {
+            app_id = appId,
+            app_secret = appSecret,
+        });
+        var tokenText = await tokenResponse.Content.ReadAsStringAsync();
+        using var tokenDoc = JsonDocument.Parse(tokenText);
+        var token = ReadJsonString(tokenDoc.RootElement, "tenant_access_token");
+        if (!tokenResponse.IsSuccessStatusCode || string.IsNullOrWhiteSpace(token))
+        {
+            throw new InvalidOperationException($"飞书 token 获取失败：{tokenText}");
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{domain}/open-apis/im/v1/messages?receive_id_type=chat_id");
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        request.Content = JsonContent.Create(new
+        {
+            receive_id = chatId,
+            msg_type = "text",
+            content = JsonSerializer.Serialize(new { text }, WebJsonOptions),
+        });
+        var response = await client.SendAsync(request);
+        var responseText = await response.Content.ReadAsStringAsync();
+        using var responseDoc = JsonDocument.Parse(responseText);
+        var code = ReadJsonInt(responseDoc.RootElement, "code");
+        if (!response.IsSuccessStatusCode || code != 0)
+        {
+            throw new InvalidOperationException($"飞书消息发送失败：{responseText}");
+        }
+        return responseDoc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object
+            ? ReadJsonString(data, "message_id")
+            : "";
+    }
+
     private WebRuntimeUnit[] BuildRuntimeUnits()
     {
         var units = new List<WebRuntimeUnit>
@@ -1812,10 +2836,10 @@ internal sealed class MainForm : Form
                 }),
             new(
                 "service.localLlm",
-                "localLlm",
-                "本地辅助执行器",
+                "ollama",
+                "Ollama",
                 "service",
-                "local-llm",
+                "ollama",
                 ClassifyStatus("localLlm", _localLlmStatus.Text),
                 _localLlmStatus.Text,
                 true,
@@ -1823,7 +2847,7 @@ internal sealed class MainForm : Form
                 _localLlmReadmePath,
                 Path.GetDirectoryName(_localLlmStartScript) ?? "",
                 "",
-                "仅用于明确小活和 Codex 不可用时的兜底辅助执行。",
+                "Ollama 本地后端，仅用于明确小活、只读问题和 Codex 不可用时的保守兜底。",
                 false,
                 new[]
                 {
@@ -2127,31 +3151,32 @@ internal sealed class MainForm : Form
         if (unitId.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase))
         {
             var id = unitId["mcp.".Length..];
+            var manifest = FindMcpManifestById(id)
+                ?? throw new InvalidOperationException($"未找到 MCP 清单：{id}");
             SelectMcpById(id);
             switch (action)
             {
                 case "check":
-                    await CheckSelectedMcpAsync();
+                    await CheckMcpAsync(manifest, appendLog: true);
                     return _mcpRuntimeStatus.Text;
                 case "start":
-                    await StartSelectedMcpAsync();
+                    await StartMcpAsync(manifest);
                     return _mcpRuntimeStatus.Text;
                 case "stop":
-                    await StopSelectedMcpAsync();
+                    await StopMcpAsync(manifest);
                     return _mcpRuntimeStatus.Text;
                 case "register":
                     await RegisterAllMcpsAsync();
                     return _mcpStatus.Text;
                 case "openLocation":
-                    OpenSelectedMcpPath();
+                    OpenMcpPath(manifest);
                     return "opened";
                 case "install":
-                    var selectedManifest = _manifests.FirstOrDefault(candidate => string.Equals(candidate.Id, id, StringComparison.OrdinalIgnoreCase));
-                    if (selectedManifest is null || string.IsNullOrWhiteSpace(selectedManifest.ManifestPath))
+                    if (string.IsNullOrWhiteSpace(manifest.ManifestPath))
                     {
                         throw new InvalidOperationException("当前未选中可安装的 MCP。");
                     }
-                    await InstallExtensionAsync(selectedManifest.ManifestPath);
+                    await InstallExtensionAsync(manifest.ManifestPath);
                     return "installed";
             }
         }
@@ -2302,15 +3327,44 @@ internal sealed class MainForm : Form
     private static string ReadJsonString(JsonElement root, string name)
         => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
 
+    private static string ReadJsonString(JsonElement root, string name, string fallback)
+        => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? fallback : fallback;
+
+    private static double ReadJsonDouble(JsonElement root, string name)
+        => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetDouble() : 0;
+
+    private static int ReadJsonInt(JsonElement root, string name)
+        => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var parsed) ? parsed : 0;
+
+    private static bool ReadJsonBool(JsonElement root, string name)
+        => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
+
+    private static bool ReadJsonBool(JsonObject? root, string name)
+    {
+        if (root is null || !root.TryGetPropertyValue(name, out var node) || node is null) return false;
+        try
+        {
+            return node.GetValue<bool>();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private void PostWebMessage(object message)
     {
-        if (!_webReady || _webView.CoreWebView2 is null) return;
         var json = JsonSerializer.Serialize(message, WebJsonOptions);
         if (InvokeRequired)
         {
-            BeginInvoke(() => _webView.CoreWebView2.PostWebMessageAsJson(json));
+            BeginInvoke(() =>
+            {
+                if (!_webReady || _webView.CoreWebView2 is null) return;
+                _webView.CoreWebView2.PostWebMessageAsJson(json);
+            });
             return;
         }
+        if (!_webReady || _webView.CoreWebView2 is null) return;
         _webView.CoreWebView2.PostWebMessageAsJson(json);
     }
 
@@ -2343,7 +3397,7 @@ internal sealed class MainForm : Form
         AddStatusCard(layout, "MCP 清单", _mcpStatus, 2,
             CreateCardButton("注册全部", async () => await RegisterAllMcpsAsync()),
             CreateCardButton("刷新", async () => await RefreshAllAsync()));
-        AddStatusCard(layout, "本地辅助执行器", _localLlmStatus, 3,
+        AddStatusCard(layout, "Ollama", _localLlmStatus, 3,
             CreateCardButton("启动", async () => await StartLocalLlmAsync()),
             CreateCardButton("停止", async () => await StopLocalLlmAsync()),
             CreateCardButton("检查", async () => await CheckLocalLlmAsync()),
@@ -2545,7 +3599,20 @@ internal sealed class MainForm : Form
 
     private void LoadConfig()
     {
-        _config = ReadEnvFile(_configPath);
+        try
+        {
+            _config = ReadEnvFile(_configPath);
+        }
+        catch (IOException ex)
+        {
+            AppendLog($"配置文件暂时不可读，面板将使用当前内存配置或默认值继续启动：{ex.Message}");
+            if (_config.Count == 0) _config = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            AppendLog($"配置文件访问被拒绝，面板将使用当前内存配置或默认值继续启动：{ex.Message}");
+            if (_config.Count == 0) _config = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
         _memoryRepo.Text = ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
             GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
@@ -2729,7 +3796,7 @@ internal sealed class MainForm : Form
     {
         var memoryRepo = ResolveEffectiveMemoryRepoPath(settings.MemoryRepo.Trim(), settings.DefaultWorkDir.Trim(), settings.UnityProject.Trim());
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-        var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
+        var lines = ReadEnvFileLines(_configPath);
         SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", settings.DefaultWorkDir.Trim());
         SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", settings.AllowedRoots.Trim());
         SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", settings.UnityProject.Trim());
@@ -2749,13 +3816,13 @@ internal sealed class MainForm : Form
             throw new InvalidOperationException("先输入用户对机器人说话方式的要求。");
         }
 
-        var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
-        var model = GetConfig("CTI_LOCAL_LLM_MODEL", "qwen2.5-coder-7b-instruct");
-        var probe = await ProbeLocalLlmAsync(baseUrl);
+        var baseUrl = GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        var model = GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b");
+        var probe = await ProbeLocalLlmAsync(baseUrl, model);
         if (!probe.Ok)
         {
-            AppendLog($"本地AI整理失败：本地模型不可用 | {probe.Message}");
-            throw new InvalidOperationException($"本地模型当前不可用：{probe.Message}");
+            AppendLog($"本地AI整理失败：Ollama 不可用 | {probe.Message}");
+            throw new InvalidOperationException($"Ollama 当前不可用：{probe.Message}");
         }
 
         try
@@ -3127,27 +4194,28 @@ internal sealed class MainForm : Form
 
     private async Task CheckLocalLlmAsync(bool updateOnly = false)
     {
-        var enabled = !string.Equals(GetConfig("CTI_LOCAL_LLM_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase);
+        var enabled = !string.Equals(GetConfig("CTI_OLLAMA_ENABLED", GetConfig("CTI_LOCAL_LLM_ENABLED", "true")), "false", StringComparison.OrdinalIgnoreCase);
         var routerMode = GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid");
-        var baseUrl = GetConfig("CTI_LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080");
-        var model = GetConfig("CTI_LOCAL_LLM_MODEL", "qwen2.5-coder-7b-instruct");
+        var baseUrl = GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        var model = GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b");
 
         if (!enabled)
         {
             _localLlmStatus.Text = $"未启用{Environment.NewLine}{model}";
-            if (!updateOnly) AppendLog("本地模型未启用。");
+            if (!updateOnly) AppendLog("Ollama 未启用。");
             return;
         }
 
-        var (ok, message) = await ProbeLocalLlmAsync(baseUrl);
+        var (ok, message) = await ProbeLocalLlmAsync(baseUrl, model);
         var stats = ReadLocalLlmStatus();
         _localLlmStatus.Text = string.Join(Environment.NewLine, new[]
         {
             ok ? "在线" : "离线",
             model,
-            $"角色: {(routerMode == "local_only" ? "本地执行主力" : "辅助执行器")}",
+            $"服务: {baseUrl}",
+            $"角色: {(routerMode == "local_only" ? "本地主力" : "只读兜底")}",
             $"模式 {RouterModeToLabel(stats.RouterMode ?? routerMode)}",
-            "范围: 仅显式小活",
+            "范围: 小活 / 只读 / 记忆检索",
             $"本地 {stats.RouteHits} / 升级 {stats.EscalationCount}",
             $"执行 {stats.ExecutionCount} / 失败 {stats.ExecutionFailures}",
             $"兜底 {stats.LocalOnlyAnswers} / 拒答 {stats.LocalRefusals}",
@@ -3156,7 +4224,7 @@ internal sealed class MainForm : Form
 
         if (!updateOnly)
         {
-            AppendLog($"本地模型检查：{(ok ? "通过" : "失败")} | {message}");
+            AppendLog($"Ollama 检查：{(ok ? "通过" : "失败")} | {message}");
         }
     }
 
@@ -3275,14 +4343,38 @@ internal sealed class MainForm : Form
         {
             if (!File.Exists(_localLlmStatusPath)) return new LocalLlmStatusRecord();
             var raw = File.ReadAllText(_localLlmStatusPath, Encoding.UTF8);
-            return string.IsNullOrWhiteSpace(raw)
+            var status = string.IsNullOrWhiteSpace(raw)
                 ? new LocalLlmStatusRecord()
                 : JsonSerializer.Deserialize<LocalLlmStatusRecord>(raw, JsonOptions) ?? new LocalLlmStatusRecord();
+            NormalizeOllamaStatus(status);
+            return status;
         }
         catch
         {
             return new LocalLlmStatusRecord();
         }
+    }
+
+    private void NormalizeOllamaStatus(LocalLlmStatusRecord status)
+    {
+        if (!IsDeprecatedLlamaStatus(status)) return;
+        status.BaseUrl = GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434");
+        status.Model = GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b");
+        status.ServerReachable = null;
+        status.LastCheckAt = null;
+        if (string.IsNullOrWhiteSpace(status.LastError))
+        {
+            status.LastError = "已忽略旧 llama.cpp 状态，等待 Ollama 健康检查刷新。";
+        }
+    }
+
+    private static bool IsDeprecatedLlamaStatus(LocalLlmStatusRecord status)
+    {
+        var baseUrl = (status.BaseUrl ?? "").Trim();
+        var model = (status.Model ?? "").Trim();
+        return string.Equals(baseUrl, "http://127.0.0.1:8080", StringComparison.OrdinalIgnoreCase)
+            || model.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase)
+            || model.Contains("llama", StringComparison.OrdinalIgnoreCase);
     }
 
     private FinalEnvelopeStatusRecord ReadFinalEnvelopeStatus()
@@ -3301,34 +4393,40 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task<(bool Ok, string Message)> ProbeLocalLlmAsync(string baseUrl)
+    private async Task<(bool Ok, string Message)> ProbeLocalLlmAsync(string baseUrl, string? expectedModel = null)
     {
-        var targets = new[]
-        {
-            $"{baseUrl.TrimEnd('/')}/health",
-            $"{baseUrl.TrimEnd('/')}/v1/models",
-            baseUrl,
-        };
-
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-        foreach (var target in targets)
+        var target = $"{baseUrl.TrimEnd('/')}/api/tags";
+        try
         {
-            try
+            using var response = await client.GetAsync(target);
+            var code = (int)response.StatusCode;
+            if (!response.IsSuccessStatusCode)
             {
-                using var response = await client.GetAsync(target);
-                var code = (int)response.StatusCode;
-                if (response.IsSuccessStatusCode || code is 400 or 401 or 403 or 404 or 405 or 406)
+                return (false, $"HTTP {code} | {target}");
+            }
+            var body = await response.Content.ReadAsStringAsync();
+            using var document = JsonDocument.Parse(body);
+            var models = new List<string>();
+            if (document.RootElement.TryGetProperty("models", out var modelsElement) && modelsElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var model in modelsElement.EnumerateArray())
                 {
-                    return (true, $"在线 {code} | {target}");
+                    var name = ReadJsonString(model, "name");
+                    if (string.IsNullOrWhiteSpace(name)) name = ReadJsonString(model, "model");
+                    if (!string.IsNullOrWhiteSpace(name)) models.Add(name);
                 }
             }
-            catch (Exception ex)
+            if (!string.IsNullOrWhiteSpace(expectedModel) && !models.Contains(expectedModel, StringComparer.OrdinalIgnoreCase))
             {
-                if (target == targets[^1]) return (false, $"{target} | {ex.Message}");
+                return (false, $"在线但缺少模型 {expectedModel} | 可用: {string.Join(", ", models.Take(8))}");
             }
+            return (true, $"在线 {code} | 模型 {models.Count}");
         }
-
-        return (false, $"{baseUrl} | 无有效响应");
+        catch (Exception ex)
+        {
+            return (false, $"{target} | {ex.Message}");
+        }
     }
 
     private static string ExtractChatCompletionText(string json)
@@ -3381,11 +4479,11 @@ internal sealed class MainForm : Form
     {
         if (!File.Exists(_localLlmStartScript))
         {
-            AppendLog($"本地模型启动脚本不存在：{_localLlmStartScript}");
+            AppendLog($"Ollama 启动脚本不存在：{_localLlmStartScript}");
             return;
         }
         var result = await RunPowerShellFileAsync(_localLlmStartScript, "", _suiteRoot, 120000);
-        AppendCommand("启动本地模型", result);
+        AppendCommand("启动 Ollama", result);
         await CheckLocalLlmAsync(true);
     }
 
@@ -3393,11 +4491,11 @@ internal sealed class MainForm : Form
     {
         if (!File.Exists(_localLlmStopScript))
         {
-            AppendLog($"本地模型停止脚本不存在：{_localLlmStopScript}");
+            AppendLog($"Ollama 停止脚本不存在：{_localLlmStopScript}");
             return;
         }
         var result = await RunPowerShellFileAsync(_localLlmStopScript, "", _suiteRoot, 120000);
-        AppendCommand("停止本地模型", result);
+        AppendCommand("停止 Ollama", result);
         await CheckLocalLlmAsync(true);
     }
 
@@ -3409,7 +4507,7 @@ internal sealed class MainForm : Form
     private async Task SetRouterModeAsync(string mode)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-        var lines = File.Exists(_configPath) ? File.ReadAllLines(_configPath, Encoding.UTF8).ToList() : [];
+        var lines = ReadEnvFileLines(_configPath);
         SetOrAppendEnv(lines, "CTI_LOCAL_LLM_ROUTER_ENABLED", "true");
         SetOrAppendEnv(lines, "CTI_LOCAL_LLM_FORCE_HUB", "true");
         SetOrAppendEnv(lines, "CTI_LOCAL_LLM_ROUTER_MODE", mode);
@@ -3499,6 +4597,11 @@ internal sealed class MainForm : Form
     private void OpenSelectedMcpPath()
     {
         if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        OpenMcpPath(manifest);
+    }
+
+    private void OpenMcpPath(McpManifest manifest)
+    {
         var cwd = ResolveManifestDirectory(manifest.Cwd, manifest);
         var launcher = ResolveManifestPath(manifest.Launcher, manifest);
         if (!string.IsNullOrWhiteSpace(cwd) && Directory.Exists(cwd))
@@ -3539,6 +4642,11 @@ internal sealed class MainForm : Form
     private async Task StartSelectedMcpAsync()
     {
         if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        await StartMcpAsync(manifest);
+    }
+
+    private async Task StartMcpAsync(McpManifest manifest)
+    {
         if (manifest.Enabled == false)
         {
             AppendLog($"MCP 未启用，跳过启动：{manifest.DisplayName}");
@@ -3626,6 +4734,11 @@ internal sealed class MainForm : Form
     private async Task StopSelectedMcpAsync()
     {
         if (_mcpList.SelectedItem is not McpManifest manifest) return;
+        await StopMcpAsync(manifest);
+    }
+
+    private async Task StopMcpAsync(McpManifest manifest)
+    {
         var states = LoadMcpServiceStates();
         var key = manifest.Id ?? manifest.DisplayName ?? "";
 
@@ -3673,7 +4786,12 @@ internal sealed class MainForm : Form
     private async Task CheckSelectedMcpAsync()
     {
         if (_mcpList.SelectedItem is not McpManifest manifest) return;
-        await RefreshSelectedMcpRuntimeStatusAsync(manifest, appendLog: true);
+        await CheckMcpAsync(manifest, appendLog: true);
+    }
+
+    private async Task CheckMcpAsync(McpManifest manifest, bool appendLog = false)
+    {
+        await RefreshSelectedMcpRuntimeStatusAsync(manifest, appendLog);
         RenderMcpList();
     }
 
@@ -5645,7 +6763,9 @@ internal sealed class MainForm : Form
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(path)) return values;
-        foreach (var rawLine in File.ReadAllLines(path, Encoding.UTF8))
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        while (reader.ReadLine() is { } rawLine)
         {
             var line = rawLine.Trim();
             if (line.Length == 0 || line.StartsWith("#")) continue;
@@ -5654,6 +6774,16 @@ internal sealed class MainForm : Form
             values[line[..index].Trim()] = line[(index + 1)..].Trim();
         }
         return values;
+    }
+
+    private static List<string> ReadEnvFileLines(string path)
+    {
+        if (!File.Exists(path)) return [];
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var lines = new List<string>();
+        while (reader.ReadLine() is { } line) lines.Add(line);
+        return lines;
     }
 
     private static async Task<ProcessResult> RunPowerShellFileAsync(string scriptPath, string trailingArgs, string workingDirectory, int timeoutMs, Dictionary<string, string?>? environment = null)
@@ -5872,7 +7002,7 @@ internal sealed class MainForm : Form
     }
 
     private string GetDefaultMemoryRepoPath()
-        => Path.Combine(_ctiHome, "memory-repo");
+        => OperatingSystem.IsWindows() ? @"E:\cli-md" : Path.Combine(_ctiHome, "memory-repo");
 
     private string ResolveEffectiveMemoryRepoPath(string configuredPath, string defaultWorkDir, string unityProjectPath, bool appendLog = false)
     {
@@ -6480,9 +7610,20 @@ internal sealed class SettingsForm : Form
         var save = new Button { Text = "保存配置", Width = 110, Height = 30 };
         save.Click += (_, _) =>
         {
-            _saveSettings(ReadSnapshot());
-            MessageBox.Show(this, "配置已保存。回复风格将在重启飞书桥接后生效。", "设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            Close();
+            try
+            {
+                _saveSettings(ReadSnapshot());
+                MessageBox.Show(this, "配置已保存。回复风格将在重启飞书桥接后生效。", "设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Close();
+            }
+            catch (IOException ex)
+            {
+                MessageBox.Show(this, $"配置文件正在被其他进程占用，暂时无法保存。\n\n{ex.Message}", "设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                MessageBox.Show(this, $"配置文件访问被拒绝，暂时无法保存。\n\n{ex.Message}", "设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         };
         var cancel = new Button { Text = "取消", Width = 88, Height = 30 };
         cancel.Click += (_, _) => Close();

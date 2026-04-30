@@ -17,6 +17,7 @@ import type {
 const EXECUTOR_HINTS: Array<{ pattern: RegExp; id: string }> = [
   { pattern: /(?:^|\s)@?codex(?:\s|$)/i, id: 'codex' },
   { pattern: /(?:^|\s)@?claude(?:\s|$)/i, id: 'claude-cli' },
+  { pattern: /(?:^|\s)@?(?:ollama|codex-oss|本地codex)(?:\s|$)/i, id: 'codex-oss-ollama' },
   { pattern: /(?:^|\s)@?(?:local|local-agent|本地)(?:\s|$)/i, id: 'local-tool-agent' },
 ];
 
@@ -31,7 +32,11 @@ function isClaudeEnabled(config: Config): boolean {
 }
 
 function isLocalAgentEnabled(config: Config): boolean {
-  return config.localLlmEnabled === true && getLocalRouterMode(config) !== 'codex_only';
+  return (config.ollamaEnabled ?? config.localLlmEnabled) === true && getLocalRouterMode(config) !== 'codex_only';
+}
+
+function isCodexOssOllamaEnabled(config: Config): boolean {
+  return (config.ollamaEnabled ?? config.localLlmEnabled) === true && isCodexEnabled(config);
 }
 
 export function buildToolSandboxPolicy(config: Config): ToolSandboxPolicy {
@@ -48,7 +53,8 @@ export function buildToolSandboxPolicy(config: Config): ToolSandboxPolicy {
 
 export function buildExecutorManifests(config: Config): ExecutorManifest[] {
   const localStatus = readLocalLlmStatus(config);
-  const localModel = config.localLlmModel || localStatus.model || 'local-model';
+  const localModel = config.ollamaModel || config.localLlmModel || localStatus.model || 'qwen2.5-coder:7b';
+  const ollamaBaseUrl = config.ollamaBaseUrl || config.localLlmBaseUrl || localStatus.baseUrl || 'http://127.0.0.1:11434';
   return [
     {
       id: 'codex',
@@ -81,11 +87,29 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       enabled: isLocalAgentEnabled(config),
       priority: getLocalRouterMode(config) === 'local_only' ? 90 : 55,
       description: '受控本地模型 agent，只能通过白名单工具执行低风险或授权后的操作。',
-      healthCheck: { kind: 'http', target: config.localLlmBaseUrl || localStatus.baseUrl },
+      healthCheck: { kind: 'http', target: ollamaBaseUrl },
       configSchema: {
         model: localModel,
         routerMode: getLocalRouterMode(config),
         sandbox: buildToolSandboxPolicy(config),
+      },
+    },
+    {
+      id: 'codex-oss-ollama',
+      displayName: `Codex OSS Ollama (${localModel})`,
+      kind: 'cli',
+      capabilities: ['chat', 'repo_query', 'file_read'],
+      riskLevel: 'read_only',
+      enabled: isCodexOssOllamaEnabled(config),
+      priority: getLocalRouterMode(config) === 'local_only' ? 75 : 45,
+      description: '实验性本地 Codex OSS 执行器，使用 Ollama，只允许只读问题和记忆检索兜底。',
+      healthCheck: { kind: 'http', target: ollamaBaseUrl },
+      configSchema: {
+        provider: 'ollama',
+        model: localModel,
+        baseUrl: ollamaBaseUrl,
+        command: 'codex exec --oss --local-provider ollama',
+        readOnlyOnly: true,
       },
     },
   ];

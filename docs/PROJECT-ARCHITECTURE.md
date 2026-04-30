@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-04-27
+更新时间：2026-04-29
 
 ## 0. 架构文档维护规则
 
@@ -30,7 +30,7 @@ flowchart TD
   FeishuBot --> BridgeCore[bridge-core 消息桥接]
   BridgeCore --> BridgeRuntime[bridge-runtime 运行时]
   BridgeRuntime --> CodexBrain[Codex 主脑]
-  BridgeRuntime --> LocalHelper[本地辅助模型和执行器]
+  BridgeRuntime --> LocalHelper[Ollama 本地后端和辅助执行器]
   BridgeRuntime --> McpBridge[MCP Bridge]
   McpBridge --> UnityMcp[Unity MCP]
   McpBridge --> BlenderMcp[Blender MCP]
@@ -39,7 +39,7 @@ flowchart TD
   IgnisMcp --> IgnisCloud[Ignis 创意生成服务]
   IgnisCloud --> AssetPipeline[GLB 资产后处理]
   AssetPipeline --> BlenderCli[Blender Python 导出 FBX 和贴图]
-  BridgeCore --> LocalHistory[(本地历史和记忆索引)]
+  BridgeCore --> LocalHistory[(本地历史、Markdown 知识库和记忆索引)]
   ControlPanel[控制面板] --> BridgeRuntime
   ControlPanel --> McpBridge
   Scripts[构建和发布脚本] --> Release[(Portable 和 Installer)]
@@ -76,13 +76,14 @@ Feishu 接收现在是双通道：
 
 1. 记录运行审计。
 2. 去重。
-3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、纯闲聊问候、飞书文档列表和 owner 二次确认系统动作。
+3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、纯闲聊问候、飞书文档列表、owner 二次确认系统动作和高置信直接提醒。
 4. 绑定 chat/session。
 5. 记录轻量记忆事件，按 user/chat/global profile 滚动汇总事实、偏好、主题和待跟进项。
 6. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。
 7. 调用运行时 provider。
-8. 解析最终结果块。
-9. 通过 Feishu 原生 reply/card/image 等方式回复。
+8. 解析最终结果块和 `cti-reminder` 动作块。
+9. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
+10. 通过 Feishu 原生 reply/card/image 等方式回复。
 
 ```mermaid
 sequenceDiagram
@@ -100,7 +101,11 @@ sequenceDiagram
   Runtime->>Provider: 按策略选择执行层
   Provider-->>Runtime: 返回 cti-final 或可见结果
   Runtime-->>Core: 返回最终候选回复
-  Core->>Core: 解析结果块和附件声明
+  Core->>Core: 解析结果块、附件声明和 cti-reminder
+  opt 命中 cti-reminder
+    Core->>Runtime: 创建直接提醒
+    Runtime-->>Core: 返回 reminder 执行结果
+  end
   Core->>Sender: 发送 card、reply、图片或文件
   Sender-->>User: 飞书可见回复
 ```
@@ -158,21 +163,38 @@ Workflow 状态：
 - `delivered`
 - `failed`
 
+Workflow run 运行状态：
+
+- `running`：当前 runtime 仍在执行。
+- `succeeded`：已完成并交付。
+- `failed`：执行失败，可能可恢复，也可能不可恢复。
+- `retry_pending`：已排队等待自动或手动断点重试。
+- `retrying`：后台 retry worker 已领取并正在重跑。
+
+断点续跑第一版：
+
+- provider 创建 run 后会向 `workflow-runs.json` 写入最小恢复输入，包括 prompt、工作目录、模型、system prompt、权限模式、channelType 和 chatId。
+- bridge-runtime 启动时会检查上一次遗留的 `running` run；有恢复输入且未耗尽次数的标为 `recoverable + retry_pending`，缺少 prompt 等关键信息的标为 `not_recoverable + failed`。
+- provider 执行失败时会对可恢复 run 排队一次 `auto_pending` 自动重试；控制面板可通过 `workflow.retryRun` 把失败 run 改为 `manual_pending`。
+- retry worker 在 bridge 启动后常驻轮询，优先领取手动 retry，再领取自动 retry；重跑成功后写回会话历史，并在保留 channelType/chatId 时主动回发“断点续跑重试结果”。
+- 当前 retry 是“重新执行最小输入”，不是恢复原 Codex 进程；如果重跑过程中出现新的权限请求，后台 retry 会失败并把错误写回 run。
+
 运行时状态文件：
 
 - `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json`
 - `C:\Users\admin\.claude-to-im\runtime\executor-status.json`
 - `C:\Users\admin\.claude-to-im\runtime\executor-session-defaults.json`
 
-Executor 目录当前内置三类：
+Executor 目录当前内置四类：
 
 - `codex`：默认主脑 CLI / SDK 执行器，能力包含对话、代码、仓库查询、文件读写、图片输入和 artifact delivery。
 - `claude-cli`：可切换 CLI 后端，能力包含对话、代码、仓库查询、文件读写和图片输入。
 - `local-tool-agent`：受控本地模型 agent，声明本地工具能力和 sandbox 策略，只允许白名单内的低风险或授权后操作。
+- `codex-oss-ollama`：实验性只读执行器，声明 `codex exec --oss --local-provider ollama`，只用于只读问题和记忆检索兜底。
 
 路由规则：
 
-- `@codex`、`@claude`、`@local`、`@本地` 显式覆盖当前会话路由。
+- `@codex`、`@claude`、`@local`、`@本地`、`@ollama`、`@codex-oss` 显式覆盖当前会话路由。
 - 控制面板可按 session 写入默认 executor。
 - 没有显式覆盖时，按 capability、executor priority 和当前真实 provider 偏好做自动选择。
 - 本地 agent 的工具边界由 `ToolSandboxPolicy` 声明，当前允许只读 git、文件读取、文本搜索、受限单文件写入和 MCP 运维入口；高风险动作必须进入权限策略。
@@ -193,9 +215,14 @@ flowchart TD
   LocalAgentExecutor --> Provider
   Provider --> FinalResponse[cti-final / 可见结果]
   FinalResponse --> WorkflowDone[workflow delivered 或 failed]
+  WorkflowDone --> RetryState{失败且有恢复输入}
+  RetryState -->|是| RetryQueue[retry_pending]
+  RetryQueue --> RetryWorker[bridge-runtime retry worker]
+  RetryWorker --> Provider
+  RetryState -->|否| NotRecoverable[not_recoverable failed]
 ```
 
-当前默认策略是 `Codex 主脑 + 本地辅助执行器`：
+当前默认策略是 `Codex 主脑 + Ollama 本地辅助执行器`：
 
 - `hybrid` 模式：默认先由 Codex 判断和执行；只有显式小活才允许本地直接接管，仓库查询和文件检索默认也先交给 Codex。
 - `local_only` 模式：只用本地能力，不能完成的任务明确拒绝。
@@ -227,6 +254,7 @@ flowchart TD
 - Ignis 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新生成请求默认新开会话。
 - Ignis 模型生成如果明确要求拆成 FBX/贴图，会在 GLB 下载完成后调用 `scripts/export-glb-asset-package.ps1`，输出 FBX、贴图、材质映射和 manifest，并通过 `cti-final.files` 回传不超过飞书限制的文件。
 - Codex 不可用时的记忆类兜底回答。
+- 本地模型服务统一改为 Ollama，默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`。旧 `llama.cpp` server、GGUF 路径和 `127.0.0.1:8080` 默认地址不再是运行来源。
 
 不交给本地辅助直接完成的范围：
 
@@ -271,6 +299,7 @@ flowchart TD
 - 飞书 Markdown/card/image/file/reply 发送。
 - 图片出站只使用当前回复显式给出的图片路径：`cti-final.images` 或当前可见文本中的本地图片路径。出站层不再扫描最近 assistant 历史消息补发旧图，避免截图/预览任务失败时把历史截图误当成当前结果。
 - 最终结果块解析和出站收口。
+- `cti-reminder` 动作块解析、提醒创建请求转交和伪完成拦截。
 - 运行审计落盘。
 
 关键能力：
@@ -282,6 +311,8 @@ flowchart TD
 - 飞书本地图片和本地文件分别走原生 image/file 消息回传；`.glb` 等非图片资产不能退化成仅发本地路径。
 - 超过飞书 IM 单文件上传限制的生成资产改发文档链接或下载链接，不再假装“已发送文件”。
 - 本地 `cti-final.files` 文件超过飞书 30MB 单文件限制时，出站层不再分卷，而是走 artifact delivery provider；飞书场景优先支持 `feishu_docx`，会自动创建新版云文档、把文件作为 `docx_file` 附件挂入文档，并回文档链接；也保留 `local_http` 作为公网目录备用方案。
+- 直接提醒由 Codex 判断意图，但只允许通过 `cti-reminder` 动作块请求；bridge-core 校验动作后调用运行时 reminder host，防止 Codex 自行声称“已创建系统计划任务 / 已实际发送”。
+- 到点提醒的飞书出站优先使用互动卡片，卡片按钮 callback data 为 `reminder:complete:<reminderId>`；`card.action.trigger` 回调在 `bridge-manager` 内直接转给 reminder host，不进入 Codex，也不复用普通权限按钮链路。
 - 用户回复到上一条图片/文件时，Feishu adapter 会尽量读取被回复消息并把附件并入本次请求。
 - `bridge-runtime-audit.json` 记录最后阶段、最后消息、WS 状态、p2p 补捞状态。
 - 权限门禁统一通过 `hasRole(message, role)` 判定；`Owner` 包含 `Operator` 和 `Viewer` 能力，`Operator` 包含 `Viewer` 能力。关机、发布、越权路径和 mutating 直达命令只允许 `Owner`，普通工具授权和中风险运维允许 `Operator` 或 `Owner`。
@@ -293,20 +324,32 @@ flowchart TD
 - 读取 `config.env`。
 - 启动 daemon/supervisor。
 - 接入 Codex / Claude CLI provider。
-- 接入本地 llama.cpp 模型。
+- 接入 Ollama 本地模型。
 - 本地辅助执行器。
 - MCP manifest 解析和调用。
 - 本地 JSON store。
-- 记忆检索、Feishu 历史索引和 `memory-profiles.json` 轻量画像索引。
+- 记忆检索、Feishu 历史索引、`memory-profiles.json` 轻量画像索引和 Markdown 知识库索引。
+- workflow / executor 观测、运行中请求恢复信息持久化、bridge 重启后的可恢复状态识别和 retry worker。
 
 关键能力：
 
 - Codex 失败时切本地模型兜底。
 - 本地模型兜底时会检索本地记忆，不再空猜。
-- 记忆索引分三层：当前会话压缩摘要、按人/按聊天/全局 profile、Feishu 历史片段。模型上下文只注入检索命中的少量片段，当前请求始终优先。
+- 记忆索引分四层：Markdown 知识库索引、当前会话压缩摘要、按人/按聊天/全局 profile、Feishu 历史片段。模型上下文只注入检索命中的少量片段，当前请求始终优先。
+- Markdown 知识库默认读取 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`。知识单元分为 `事实 / 结论 / 待办 / 资源`，保留来源文件和片段。
+- 控制面板可归档单个知识单元：归档时按知识单元的来源文件和片段精确删除源 Markdown 中对应行，再把原始行和元信息写入 `archive\knowledge-units\*.md`。`archive` 目录被索引器跳过，因此归档项不会在下一次重建后回到知识单元列表；归档区支持手动永久删除归档文件。
+- 待办提醒从 Markdown 知识索引派生：运行时读取 `kind=todo` 的知识单元，解析 `@YYYY-MM-DD HH:mm`、`提醒时间: YYYY-MM-DD HH:mm`、`状态: 未完成|完成|取消` 和来源元信息，生成 `.cti-index\reminders.json`。
+- 直接提醒由 `cti-reminder` 动作或 `/remind` 命令创建，运行时写入 `E:\cli-md\data\todos\direct-reminders\*.md`，随后重建 `knowledge.json` 和 `reminders.json`。Codex 只做意图判断，不直接写 Windows 计划任务，也不直接调用飞书 API。
+- 主动推送状态写入 `.cti-index\reminder-state.json`，记录 `pending`、已发送、失败、跳过原因和完成字段，保证“到点单条提醒一次”不会重复发送。
+- 主动推送默认关闭；启用 `CTI_TODO_PUSH_ENABLED=true` 后按 `CTI_TODO_PUSH_CHANNELS` 加载 PushProvider。v1 飞书 provider 复用 bridge-core 的发送收口、去重和审计；微信 provider 只返回 `unsupported`，面板显示“未接入”。
+- `completeReminder()` 是飞书卡片和控制面板共用的完成收口：直接提醒必须把 `data\todos\direct-reminders\*.md` 中的 `状态: 未完成` 改成 `状态: 完成` 并重建索引；普通记忆待办只在精确匹配同一待办行时自动改源文件，否则仅记录完成状态和需手动确认的原因。
+- 直接提醒的创建和推送由 `CTI_DIRECT_REMINDER_ENABLED`、`CTI_DIRECT_REMINDER_PUSH_ENABLED`、`CTI_DIRECT_REMINDER_DECISION_MODE` 和 `CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND` 控制；默认使用 Codex action 判断和 bridge 统一执行。
+- 待办来源会话必须来自 Markdown frontmatter 或结构化字段 `channelType`、`chatId`、`messageId`、`displayName`。来源无法确认时进入“待补来源”状态，不回退 owner 私聊，也不猜测 chatId。
+- 旧规则 Markdown 归档入口为 `scripts/memory/archive-legacy-rules.ps1`，默认 dry-run；显式 `-Apply` 时才移动到 `archive\legacy-rules` 并生成 `AUTHORITATIVE-RULES.md`。
 - `bridge-core` 会在收到普通消息和生成最终回复后写入记忆事件；纯问候、感谢、确认等闲聊会走确定性短回复，不启动 Codex/本地工具链。
 - MCP 工作目录检查，防止误连其他项目。
 - 默认工作区和 Unity 工程路径由配置控制。
+- `workflow-runs.json` 保存最近 workflow run、事件、recovery 和 retry 状态；它是控制面板展示执行历程、手动重试失败 run 和 bridge 重启后自动续跑的事实来源。
 
 ### 3.3 packages/mcp-picture
 
@@ -363,7 +406,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 启停 Feishu bridge。
 - 查看真实进程状态。
 - 查看 Feishu WS 和私聊补捞状态。
-- 查看 Codex / 本地辅助模式。
+- 查看 Codex / Ollama 本地辅助模式。
 - 启停和检查 MCP。
 - 自动发现 `mcp.d`、`skills.d`、`plugins.d`。
 - 展示 suite 版本、扩展协议版本、启用扩展数量、缺失依赖和本机配置覆盖数量。
@@ -372,6 +415,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 查看 workflow run、executor 目录、最近路由选择和会话默认 executor。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
+- 查看记忆知识库索引状态、监听状态、关键词搜索、类型筛选和来源片段。
 
 截至 2026-04-27，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
 
@@ -386,7 +430,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 远程 Owner 高危命令默认关闭，必须额外配置 `CTI_CONTROL_API_ALLOW_REMOTE_DANGEROUS=true` 才能继续进入权限门禁。
 - 本机缺少 WebView2 Runtime 时，宿主显示轻量降级页和安装提示，不回退旧完整 WinForms 面板。
 - 面板主界面已取消底图依赖，统一改成高密度运营台布局；总览、服务、扩展、会话、设置和日志都按窗口宽度自适应重排。
-- WinForms 宿主新增统一运行单元注册表，桥接服务、Codex CLI、本地辅助执行器、MCP 和扩展 manifest 在前端统一收敛成一套卡片和动作模型。
+- WinForms 宿主新增统一运行单元注册表，桥接服务、Codex CLI、Ollama、MCP 和扩展 manifest 在前端统一收敛成一套卡片和动作模型。
 - 运行单元动作现在允许按 manifest 暴露安装入口；skill 和部分 MCP 只要声明 `installer` / `bootstrap`，面板就会显示“安装”按钮并走宿主白名单执行。
 - CLI 工具更新也走 `runtime.invokeAction` 白名单。当前 Codex CLI 只有在检测到 npm 全局 `@openai/codex` 安装时才显示“更新”，宿主固定执行 `npm install -g @openai/codex@latest`，不接受前端传入任意命令。
 - 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
@@ -398,16 +442,17 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
 - 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
 - 会话详情读取旧本地消息时只做显示层 mojibake 修复；疑似 UTF-8 被 GBK 错读的文本会在面板里还原展示，原始历史 JSON 不被自动改写。
-- 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要和事件时间线，方便回溯一次飞书请求从接收、路由、执行到交付或失败的运行历程。
+- 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要、recovery / retry 状态和事件时间线，方便回溯一次飞书请求从接收、路由、执行、重试到交付或失败的运行历程。
+- 执行器页和会话详情对失败但保留恢复输入的 run 显示“重试”入口，宿主通过 `workflow.retryRun` 原子更新 `workflow-runs.json`，运行时 retry worker 再领取执行。
 - “权限”页读取 `permissions.json` 和最近会话参与人，支持按渠道、角色、名称或 ID 过滤，能把用户设置为 `Viewer`、`Operator` 或 `Owner`，并同步兼容 env 后重启 bridge。
 - 会话详情的参与人列表不再只提供一次性“加 Owner”，而是进入同一套权限库，可直接设置三档角色；显示名优先来自飞书历史，拿不到时显示原始 ID。
 - 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
 - 回复风格预设通过 `settings.listReplyPresets` / `settings.applyReplyPreset` / `settings.summarizeReplyStyle` 暴露给 WebView，继续沿用宿主保存语义。
 - WebView 命令入口执行“一键发布”和“主干发布预检”时不再依赖 WinForms 原生确认框；桌面工具栏保留确认框。发布脚本非零退出会作为命令错误返回前端，避免发布失败被误显示为完成。
-- 本地辅助执行器状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
+- Ollama 状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
 - bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录和会话默认 executor，不再把缺失状态文件误解为辅助器异常。
-- 记忆仓库路径现在强制落在工作目录外；如果 `CTI_MEMORY_REPO_DIR` 指向默认工作目录、Unity 项目目录或其子目录，宿主和运行时都会自动回退到 `CTI_HOME\\memory-repo`。
-- 对“你还记得吗 / 常用场景名称”这类命中本地笔记的回忆型问题，运行时新增确定性记忆快答：优先直接读取 `CTI_MEMORY_REPO_DIR` 下的 Markdown 笔记并返回，不再依赖 Codex 或本地模型生成。
+- 记忆仓库路径现在强制落在工作目录外；如果 `CTI_MEMORY_REPO_DIR` 指向默认工作目录、Unity 项目目录或其子目录，宿主和运行时都会自动回退到默认记忆仓库。Windows 默认记忆仓库为 `E:\cli-md`。
+- 记忆 Markdown 不再因为关键词命中就绕过 Codex 直答。明确“回忆 / 搜索 / 上次 / 记得”类请求会检索记忆；其他请求只把相关记忆作为上下文注入主执行链。
 - 桥接运行时新增 `data/memory-profiles.json`：按用户 ID、chatId 和全局 scope 维护事实/偏好、近期主题和待跟进项。该索引由消息事件和 Feishu 历史同步增量更新，只作为检索候选，不会整体注入模型上下文。
 
 面板原则：
@@ -437,13 +482,14 @@ HostBridge 命令协议：
 
 当前核心白名单命令分组：
 
-- 状态与服务：`state.refresh`、`bridge.*`、`codex.*`、`localLlm.*`
-- Workflow 和执行器：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`executor.list`、`executor.check`、`executor.setSessionDefault`
+- 状态与服务：`state.refresh`、`bridge.*`、`codex.*`、`localLlm.*`、`ollama.*`
+- Workflow 和执行器：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`workflow.retryRun`、`executor.list`、`executor.check`、`executor.setSessionDefault`
 - 权限：`permissions.list`、`permissions.upsert`、`permissions.remove`、`permissions.syncFromConfig`、`permissions.applyAndRestart`
 - 运行单元：`runtime.listUnits`、`runtime.invokeAction`
 - 扩展：`extension.enable`、`extension.disable`、`extension.remove`、`extension.install`
 - 扩展导入：`extension.detectImport`、`extension.importFromFolder`
 - 会话：`history.listSessions`、`history.getSessionDetail`、`history.openConversationViewer`
+- 记忆：`memory.status`、`memory.search`、`memory.openSource`、`memory.reminders`、`memory.checkReminders`、`memory.testReminder`
 - 设置与路径：`settings.read`、`settings.save`、`settings.listReplyPresets`、`settings.applyReplyPreset`、`settings.summarizeReplyStyle`、`path.pickFolder`、`path.pickFile`、`path.openAny`
 - 历史消息解析会优先提取 Feishu `text / post / interactive` 内容；卡片消息不再统一显示成 `[卡片消息]` 占位。对旧索引里遗留的卡片占位，控制面板会按 `messageId` 从 `data/audit.json` 回填可见摘要，尽量不要求用户手动全量重同步。
 - 历史消息解析会保留飞书 `image / file` 资源键和文件名；旧索引缺少资源元数据时，详情页会触发一次会话级 full sync 尝试补齐。资源下载失败或权限不足时，前端显示明确的附件占位和状态，不伪装成已加载图片。
@@ -587,13 +633,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `build-web-apps`
 - `game-studio`
 
-## 6. 本地模型
+## 6. Ollama 本地模型
 
 当前本地模型链路：
 
-- llama.cpp server
-- Qwen2.5-Coder 7B GGUF
-- OpenAI-compatible HTTP API
+- Ollama server
+- 默认地址 `http://127.0.0.1:11434`
+- 默认模型 `qwen2.5-coder:7b`
+- OpenAI-compatible `/v1/chat/completions`
+- 原生 `GET /api/tags` 健康检查和模型可用性检查
 
 定位：
 
@@ -604,11 +652,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 
 脚本：
 
-- `scripts/local-llm/setup-llama-cpp.ps1`
+- `scripts/local-llm/setup-ollama.ps1`
 - `scripts/local-llm/start-local-llm.ps1`
 - `scripts/local-llm/stop-local-llm.ps1`
 - `scripts/local-llm/healthcheck-local-llm.ps1`
 - `scripts/export-glb-asset-package.ps1`
+
+旧 `CTI_LOCAL_LLM_SERVER_EXE`、`CTI_LOCAL_LLM_MODEL_PATH`、`CTI_LOCAL_LLM_SERVER_ARGS`、`llama-server.exe` 和 GGUF 路径配置已废弃。`CTI_LOCAL_LLM_*` 中的路由键暂时保留为兼容项；用户可见配置统一使用 `CTI_OLLAMA_ENABLED`、`CTI_OLLAMA_BASE_URL`、`CTI_OLLAMA_MODEL`、`CTI_OLLAMA_TIMEOUT_MS`。
 
 Ignis 会话映射：
 
@@ -639,7 +689,12 @@ Ignis 会话映射：
 - 远端 Feishu 历史是主来源。
 - 本地索引用于检索、加速、压缩和容灾。
 - AI 不直接吃全量历史，而是先检索相关片段。
-- Codex 不可用时，本地模型会先检索本地记忆再回答记忆类问题。
+- Markdown 知识库默认位于 `E:\cli-md`，运行时监听 Markdown 并生成 `.cti-index\knowledge.json`。
+- 运行时 watcher 同步写入 `.cti-index\status.json`，包含 `watching`、`watcherPid`、`watcherStartedAt`、`lastEventAt`、`lastIndexedAt` 和 `statusUpdatedAt`；控制面板用该心跳判断真实监听状态。
+- 知识单元分为 `事实 / 结论 / 待办 / 资源`，结果保留来源路径、片段和冲突标记。
+- 待办提醒索引为派生文件：`.cti-index\reminders.json` 保存待发送、已发送、跳过和失败的展示数据，`.cti-index\reminder-state.json` 保存 `pending / sent / failed / skipped` 推送状态和最近结果。控制面板“记忆”页显示提醒时间、来源类型、来源会话、来源片段、跳过原因和飞书测试发送入口。
+- `sourceType=direct` 的提醒来自 `cti-reminder` 或 `/remind`，源文件落在 `data\todos\direct-reminders`；面板会把它和普通 `sourceType=memory` 待办区分展示。
+- Codex 不可用时，Ollama 只允许处理只读问题和记忆检索兜底；Unity、Blender、MCP、文件写入、发布等任务不得被本地模型伪装完成。
 
 ## 8. 结果封装协议
 
@@ -647,7 +702,7 @@ Ignis 会话映射：
 
 Codex 应输出：
 
-```text
+````text
 ```cti-final
 {
   "kind": "text",
@@ -657,7 +712,7 @@ Codex 应输出：
   "reply_mode": "markdown"
 }
 ```
-```
+````
 
 桥接行为：
 
@@ -666,6 +721,26 @@ Codex 应输出：
 - Markdown 统一走 Feishu card。
 - 图片和文件由结果块显式声明。
 - 协议失败时保守兜底，不再强行猜半截结果。
+
+直接提醒动作块：
+
+````text
+```cti-reminder
+{
+  "title": "看电脑",
+  "dueAt": "2026-04-29T19:42:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "target": "current_chat",
+  "sourcePrompt": "帮我设置个代办，两分钟后给我发消息提醒我看电脑"
+}
+```
+````
+
+桥接行为：
+
+- 高置信自然语言提醒、`cti-reminder` 或 `/remind` 显式入口会创建直接提醒。高置信自然语言提醒必须同时包含明确创建意图、未来时间和提醒内容；普通任务讨论、脚本请求、待办查询不进入该链路。
+- bridge-core 校验动作块后调用 bridge-runtime reminder host，写入 Markdown 源文件、派生索引和 `reminder-state.json`。
+- 如果 Codex 只声称“已创建系统计划任务 / 已实际发送”但没有动作块，bridge-core 会先尝试从原请求高置信解析提醒；可解析则转成真实 reminder，不可解析才拦截原回复并返回未进入统一提醒系统。
 
 ## 9. 打包与发布
 
@@ -746,6 +821,13 @@ flowchart TD
 
 同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。发布和同步脚本在覆盖 live、portable 或 installer payload 前会检查这些目录下的运行进程；命中时只报告 PID 和路径并中止，不自动结束进程。
 
+live skill 同步时，`scripts/sync-live-skill.ps1` 只把开发版源码和构建产物写入：
+
+- `C:\Users\admin\.codex\skills\claude-to-im`
+- `C:\Users\admin\.codex\skills\claude-to-im-core`
+
+其中 MCP / Skill / Plugin 扩展清单必须从开发版唯一来源 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 复制到 live skill 顶层的 `mcp.d`、`skills.d`、`plugins.d`，供运行版控制面板在脱离 suiteRoot 时读取。不要从旧 `packages/bridge-runtime/mcp.d` 恢复运行版清单。
+
 ### 9.1 入口定位
 
 日常维护入口：
@@ -776,6 +858,7 @@ flowchart TD
 优先看：
 
 - `C:\Users\admin\.claude-to-im\runtime\bridge-runtime-audit.json`
+- `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json`
 - `C:\Users\admin\.claude-to-im\logs\bridge.log`
 - 控制面板服务总览
 
@@ -785,6 +868,9 @@ flowchart TD
 - `lastInboundMessage`
 - `lastActiveRequest`
 - `lastCompletedRequest`
+- `workflow.status`
+- `workflow.recovery.kind`
+- `workflow.retry.status`
 - `feishuWs`
 - `feishuP2pPoll`
 - `lastUnhandledError`

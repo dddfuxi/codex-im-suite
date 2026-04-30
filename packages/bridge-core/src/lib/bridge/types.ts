@@ -77,6 +77,8 @@ export interface OutboundMessage {
   replyToMessageId?: string;
   /** Optional mentions for channels that support native mention formatting */
   mentions?: OutboundMention[];
+  /** Feishu-specific interactive card payload. Non-Feishu adapters ignore it. */
+  feishuCardJson?: string;
 }
 
 /** Inline keyboard button for permission prompts */
@@ -90,6 +92,8 @@ export interface SendResult {
   ok: boolean;
   /** Platform-specific message ID of the sent message */
   messageId?: string;
+  /** Platform-specific card ID when the channel returns one. */
+  cardId?: string;
   error?: string;
 }
 

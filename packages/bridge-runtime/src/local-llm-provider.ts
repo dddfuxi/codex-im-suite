@@ -28,6 +28,22 @@ export interface LocalModelMessage {
   content: string;
 }
 
+interface OllamaTagResponse {
+  models?: Array<{ name?: unknown; model?: unknown }>;
+}
+
+export function parseOllamaTags(payload: unknown): string[] {
+  const data = payload as OllamaTagResponse | null | undefined;
+  if (!data || !Array.isArray(data.models)) return [];
+  return data.models
+    .map((item) => {
+      if (typeof item.name === 'string' && item.name.trim()) return item.name.trim();
+      if (typeof item.model === 'string' && item.model.trim()) return item.model.trim();
+      return '';
+    })
+    .filter(Boolean);
+}
+
 function trimText(text: string): string {
   return text.replace(/\r\n/g, '\n').trim();
 }
@@ -110,16 +126,16 @@ function buildAnswerMessages(
   ];
 }
 
-export class LocalLlamaProvider {
+export class OllamaProvider {
   constructor(private readonly config: Config) {}
 
   async complete(
     messages: LocalModelMessage[],
     options?: { temperature?: number; maxTokens?: number; timeoutMs?: number },
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
-    const baseUrl = (this.config.localLlmBaseUrl || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+    const baseUrl = (this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
     const endpoint = `${baseUrl}/v1/chat/completions`;
-    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -127,7 +143,7 @@ export class LocalLlamaProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: this.config.localLlmModel || 'qwen2.5-coder-7b-instruct',
+          model: this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b',
           messages,
           stream: false,
           temperature: options?.temperature ?? 0.1,
@@ -221,3 +237,5 @@ export class LocalLlamaProvider {
     });
   }
 }
+
+export { OllamaProvider as LocalLlamaProvider };

@@ -18,6 +18,9 @@
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持统一服务模块、权限管理、扩展 / MCP 市场视图、会话详情抽屉、路径拖拽选择、回复风格快捷预设，以及白天 / 夜晚主题和自适应布局。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
+- Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
+- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆”页可搜索来源片段并查看真实监听状态。
+- 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
 - 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 npm 全局 Codex CLI 的白名单更新按钮。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
@@ -32,6 +35,7 @@
 - 目标目录检查：`scripts/doctor-suite-targets.ps1`
 - 架构文档检查：`scripts/update-architecture-docs.ps1`
 - 扩展协议校验：`scripts/validate-extension-manifests.ps1`
+- 旧记忆规则 dry-run 归档：`scripts/memory/archive-legacy-rules.ps1`
 - 主干发布预检：`scripts/prepare-main-release.ps1`
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
@@ -58,7 +62,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 设置 / 日志”分区；权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，设置页支持目录选择、拖拽回填和回复风格快捷预设。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
 
 Control API 默认只监听本机：
 
@@ -92,16 +96,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ## 当前运行模型
 
-默认是 `Codex 主脑 + 本地辅助执行器`：
+默认是 `Codex 主脑 + Ollama 本地辅助执行器`：
 
-- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和 `local-tool-agent`。
-- 用户可用 `@codex`、`@claude`、`@local` 显式选择执行器；控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor。
+- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、`local-tool-agent` 和实验性的 `codex-oss-ollama`。
+- 用户可用 `@codex`、`@claude`、`@local`、`@ollama` 显式选择执行器；控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
-- 本地模型只处理明确的小活，例如简单命令、git 状态、文件读取、MCP 状态检查。
+- Ollama 只处理明确的小活、只读问题和 Codex 不可用时的保守兜底，例如简单命令草案、git 状态、文件读取和记忆检索。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
-- Codex 不可用时，本地模型做兜底，并会先检索本地记忆后再回答记忆类问题。
+- Codex 不可用时，Ollama 可做只读兜底，并会先检索本地记忆后再回答记忆类问题。
 - 本地执行器不能伪造完成结果，不能绕过权限和工作区限制。
+- 记忆关键词不再触发本地直答；明确回忆/搜索类请求会检索记忆，其他请求只把相关记忆注入主执行链。
+- 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
 ## 关键命令
@@ -168,6 +174,63 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\register-external-mcps.ps1
+```
+
+检查 Ollama：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\local-llm\healthcheck-local-llm.ps1
+```
+
+首次使用默认模型：
+
+```powershell
+ollama pull qwen2.5-coder:7b
+```
+
+旧记忆规则归档 dry-run：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\memory\archive-legacy-rules.ps1
+```
+
+待办主动提醒默认关闭。启用前，记忆 Markdown 里的待办需要带来源会话和提醒时间，例如：
+
+```markdown
+---
+channelType: feishu
+chatId: oc_xxx
+displayName: 项目群
+---
+
+待办: 整理方案 @2026-04-29 18:30 状态: 未完成
+```
+
+配置入口：
+
+```powershell
+CTI_TODO_PUSH_ENABLED=true
+CTI_TODO_PUSH_CHANNELS=feishu
+CTI_TODO_PUSH_POLL_MS=60000
+CTI_TODO_PUSH_WINDOW_MS=300000
+```
+
+运行时会从 `.cti-index\knowledge.json` 派生 `.cti-index\reminders.json`，并用 `.cti-index\reminder-state.json` 记录已发送、失败、跳过和完成状态，避免重复推送。来源会话无法确认、状态不是未完成或缺少提醒时间的待办不会发送，只会在面板“记忆”页标注原因。飞书提醒优先发互动卡片，用户点击“完成”后会走 `card.action.trigger` 回调更新本地 Markdown 和状态文件；面板也提供同一套完成入口。知识单元可在面板归档，归档会从源 Markdown 精确移除该行并写入 `archive\knowledge-units`，归档目录不会重新进入索引，归档项可手动永久删除。
+
+直接提醒入口默认开启。Codex 判断用户确实要创建提醒时，只能输出 `cti-reminder` 动作块；bridge 负责写入 `E:\cli-md\data\todos\direct-reminders`、重建索引、记录 `pending / sent / failed / skipped` 状态并到点推送。显式命令也可使用：
+
+```text
+/remind 10分钟后 看电脑
+/remind 2026-04-29 19:42 看电脑
+```
+
+相关配置：
+
+```powershell
+CTI_DIRECT_REMINDER_ENABLED=true
+CTI_DIRECT_REMINDER_PUSH_ENABLED=true
+CTI_DIRECT_REMINDER_DECISION_MODE=codex_action
+CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
 ```
 
 启动 Ignis MCP：

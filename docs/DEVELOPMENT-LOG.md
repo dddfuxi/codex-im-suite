@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-28
+更新时间：2026-04-29
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -45,7 +45,26 @@
 - 设置页恢复目录选择和回复风格快捷设置：路径字段支持拖拽、目录选择、快速打开；回复风格支持预设、当前摘要和本地 AI 整理入口。
 - bridge-core 新增纯闲聊短路：问候、感谢、确认等不含任务意图的消息直接自然回复并记录会话，不再启动 Codex/本地模型执行链。
 - bridge-runtime 新增 `memory-profiles.json` 轻量记忆画像：按用户 ID、聊天和全局 scope 汇总事实/偏好、近期主题和待跟进项；普通消息和 Feishu 历史同步都会增量更新。
-- Codex 上下文记忆注入改为“会话摘要 + profile 命中 + Feishu 历史命中”的检索式组合，继续受字符预算限制，避免把全部记忆一次性注入导致 token 膨胀。
+- Codex 上下文记忆注入改为“Markdown 知识库 + 会话摘要 + profile 命中 + Feishu 历史命中”的检索式组合，继续受字符预算限制，避免把全部记忆一次性注入导致 token 膨胀。
+- 本地模型后端从旧 `llama.cpp` 迁移到 Ollama：新增 `CTI_OLLAMA_ENABLED`、`CTI_OLLAMA_BASE_URL`、`CTI_OLLAMA_MODEL`、`CTI_OLLAMA_TIMEOUT_MS`，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
+- `scripts/local-llm` 改为 Ollama 安装提示、启动、停止和 `/api/tags` 健康检查；旧 `llama-server.exe`、GGUF 路径和 server args 不再作为运行来源。
+- 新增 Markdown 知识索引：默认监听 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`，知识单元分为 `事实 / 结论 / 待办 / 资源`。
+- 知识索引 watcher 新增实时状态文件 `E:\cli-md\.cti-index\status.json`：记录监听心跳、最近事件、最近索引、watcher PID 和错误；控制面板“记忆”页改为读取该状态判断真实监听。
+- 修复记忆关键词误触发：运行时停用“命中 Markdown 就直答”的快答逻辑，明确回忆/搜索类问题才检索记忆；其他请求只把相关记忆注入主执行链。
+- 控制面板服务卡从“本地辅助执行器”改为“Ollama”，并新增“记忆”页展示索引状态、监听状态、类型筛选、关键词搜索和来源片段。
+- 新增待办主动提醒 v1：运行时从 Markdown 知识索引里的 `kind=todo` 派生 `.cti-index\reminders.json`，解析提醒时间、状态和来源会话，并用 `.cti-index\reminder-state.json` 记录已发送、失败和跳过原因。
+- 新增多渠道 PushProvider 抽象：飞书 provider 复用 bridge-core 出站收口、去重和审计；微信 provider 暂返回 `unsupported`，面板显示未接入，不伪装发送成功。
+- 控制面板“记忆”页新增“待办提醒”区域，展示待发送、已发送、跳过、失败、来源片段和最近推送结果，并提供检查提醒和飞书测试发送入口。
+- 待办主动推送默认关闭，通过 `CTI_TODO_PUSH_ENABLED`、`CTI_TODO_PUSH_POLL_MS`、`CTI_TODO_PUSH_WINDOW_MS`、`CTI_TODO_PUSH_CHANNELS` 启用；来源无法确认、状态非未完成或缺少提醒时间的待办只标注原因，不推送。
+- 新增直接提醒动作协议 `cti-reminder`：普通“任务 / 待办 / 提醒”讨论不再被关键词硬拦截，只有 Codex 明确输出动作块或用户使用 `/remind` 时，bridge 才会创建统一 reminder 记录。
+- 直接提醒补高置信自然语言快路径：同时命中创建意图、未来时间和提醒内容时，bridge 直接创建统一 reminder，不再让这类简单提醒进入完整 Codex workflow；“任务为什么卡住”“写计划任务脚本”“今天有什么待办”等仍不会触发。
+- bridge-runtime 新增直接提醒创建链路：写入 `E:\cli-md\data\todos\direct-reminders`，重建 `knowledge.json` / `reminders.json`，并在 `reminder-state.json` 写入 `pending`，后续到点仍走统一飞书 PushProvider。
+- bridge-core 新增提醒伪完成拦截：如果模型声称“已创建系统计划任务 / 已实际发送”但没有 `cti-reminder` 执行记录，会先尝试从原始请求补建真实 reminder；不可解析时才拦截原回复并提示未进入统一提醒系统。提示词也禁止使用 `schtasks`、`Register-ScheduledTask` 或临时 PowerShell 脚本完成提醒。
+- 控制面板“记忆”页的待办提醒区域新增直接提醒来源展示，区分 `sourceType=direct` 和普通记忆待办，并显示直接提醒启用 / 推送状态。
+- 飞书待办提醒升级为互动卡片：到点推送优先发带“完成”按钮的卡片，点击后通过 `card.action.trigger` 回调直接调用 reminder host，不进入 Codex 普通对话。
+- reminder 完成闭环已接入：`completeReminder()` 会更新直接提醒 Markdown、重建索引，并在 `reminder-state.json` 写入 `completedAt`、`completedByUserId`、`completionSource` 和 `completionError`；普通记忆待办无法精确匹配源行时只记录状态并提示源文件需手动确认。
+- 控制面板“记忆”页的待办提醒区域新增“完成”按钮、已完成统计和完成来源显示，面板操作与飞书卡片共用同一套本地状态文件。
+- 新增 `scripts/memory/archive-legacy-rules.ps1`，默认 dry-run，显式 `-Apply` 时把疑似旧规则 Markdown 移到 `archive\legacy-rules` 并生成 `AUTHORITATIVE-RULES.md`。
 
 当前约定：
 
@@ -85,12 +104,13 @@
 
 已完成：
 
-- 本地 llama.cpp 接入。
+- Ollama 本地后端接入。
 - 本地执行器支持 shell、git、文件读写、文本搜索。
 - `hybrid / local_only / codex_only` 三种模式。
 - Codex 失败时切本地兜底。
 - 本地兜底处理记忆类请求时，会先检索本地记忆和 Feishu 历史命中片段。
 - 本地模型不能伪造“已执行 / 已修改 / 已导入 / 已创建”结果。
+- `codex-oss-ollama` 实验执行器已登记到 executor registry，声明 `codex exec --oss --local-provider ollama`，能力限制为只读问题和记忆检索兜底。
 - Ignis 创意生成请求可走本地模型快路径，`local_only` 模式下也能提交和查询 Ignis 任务。
 - 本地快路径新增统一前置判定层：进入 Ignis、MCP、本地执行器前，先判定当前消息是询问、只读查询、明确操作还是歧义混合；歧义默认按询问处理，不直接做 mutating 操作。
 - Ignis、MCP、本地执行器不再各自用散落正则单独决定“是否执行”；统一复用 `fast-path-intent` 内部判定模块。
@@ -129,13 +149,24 @@
 - 控制面板新增“执行器”页和只读 WebView 命令：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`executor.list`、`executor.check`、`executor.setSessionDefault`。
 - 新增 executor registry 和 workflow status 单测，覆盖执行器注册、显式覆盖、自动路由、sandbox 策略、workflow 成功和失败记录。
 
+截至 2026-04-29 已完成：
+
+- 运行中 workflow run 会持久化第一版最小恢复信息：prompt、工作目录、模型、system prompt、权限模式、渠道和 chatId；长文本按上限截断，避免状态文件无限膨胀。
+- bridge-runtime 启动时会扫描 `workflow-runs.json` 中遗留的 `running` run：有恢复输入且未耗尽次数的标为 `retry_pending`，缺少恢复输入的标为不可恢复失败。
+- provider 执行失败时会在可恢复 run 上排队一次自动重试；后台 retry worker 会领取 `auto_pending` / `manual_pending` run，重新流式执行并把结果写回会话历史。
+- retry 结果如果保留了渠道和 chatId，会通过 bridge proactive message 回发“断点续跑重试结果”，避免 bridge 重启后只在本地状态里完成。
+- 控制面板执行器页和会话详情能显示 recovery / retry 状态，并通过 `workflow.retryRun` 对失败且有恢复输入的 run 发起手动重试。
+- workflow status 单测补齐恢复信息持久化、重启后可恢复/不可恢复分类、手动 retry 请求和 runtime 领取顺序。
+- 修复 live skill 同步脚本的扩展清单来源：`mcp.d`、`skills.d`、`plugins.d` 现在从 `config/*.d` 唯一来源同步到运行版，避免同步后 live 面板看不到新版 MCP 或扩展服务入口。
+
 当前限制：
 
 - 这一阶段是 strangler migration 的外壳层：真实执行仍复用现有 provider / local agent 实现，尚未把每个执行器拆成独立 adapter 文件。
-- workflow 当前只做可观察状态机，不做进程重启后的自动续跑。
+- 断点续跑第一版只保存重跑所需的最小输入，不恢复原 Codex 进程、权限等待上下文或半截流式输出；后台 retry 遇到新的权限请求会失败并留给用户手动处理。
 - `cti-final` 解析、Markdown card、图片/文件、大文件交付和 owner 二次确认仍在旧链路内，后续需要逐步挂到 workflow event。
 - 本地模型 agent 已有 sandbox policy 声明，但工具执行层仍需继续从 `local-agent-provider.ts` 拆出独立 tool sandbox。
-- `codex_only` 或部分早退路径仍可能只有 provider 级执行，没有完整业务阶段细分；后续应把权限等待、finalizing 和 delivered 结果收口补齐。
+- retry worker 复用现有 provider 执行层，因此一次断点重试会生成一个新的可观察 workflow run；原 run 负责记录 retry 结果，后续应把 retry 执行 run 与原 run 显式关联。
+- `codex_only` 或部分早退路径仍可能只有 provider 级执行，没有完整业务阶段细分；后续应把权限等待、finalizing、delivered 结果和 retry 回传事件继续收口。
 
 ## 4. MCP 管理
 
@@ -256,7 +287,7 @@
 - WebView 的“一键发布”和“主干发布预检”不再弹 WinForms 原生确认框，避免 Web 面板点击后被隐藏弹窗卡住；发布脚本 exit 非 0 时会向前端返回明确错误，不再静默显示 finished。
 - WebView 顶部工具区和发布页都新增醒目的“一键发布”入口，直接调用 `release.publishBackup`，避免用户只能在发布页看到旧的“本机备份发布”名称。
 - 记忆仓库路径已加门禁：`CTI_MEMORY_REPO_DIR` 不允许落在默认工作目录、Unity 项目目录或它们的子目录下；命中时自动回退到 `CTI_HOME\\memory-repo`，避免把记忆文件写进工程目录。
-- 运行时已补“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类命中 `memory-repo` 笔记的请求，会直接返回笔记内容，不再因为 Codex 失效或本地模型超时而把错误抛给用户。
+- 运行时已取消“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类问题会走记忆检索和主执行链，不再因为关键词命中就绕过 Codex。
 - 会话历史里飞书 `interactive` 卡片消息现在会尽量解析正文文本；对旧的 `[卡片消息]` 占位记录，控制面板会优先按 `messageId` 从 `audit.json` 回填摘要，只有 audit 里也缺内容时才需要重新同步飞书历史。
 
 近期注意：
@@ -273,9 +304,13 @@
 - 本地消息、归档、审计、Feishu chat index。
 - Feishu 历史按 chatId 增量同步到本地索引。
 - `memory-profiles.json` 按 userId、chatId、global 三档记录轻量摘要，保留事实/偏好、近期主题和待跟进项。
+- Markdown 知识库索引默认位于 `E:\cli-md\.cti-index\knowledge.json`，保留来源路径和片段，面板可按类型搜索。
+- 控制面板“记忆”页新增知识单元归档：点击归档会从源 Markdown 精确移除该知识单元行，并写入 `E:\cli-md\archive\knowledge-units\*.md`；归档目录不会进入索引，归档列表支持打开和永久删除。
+- 待办提醒索引默认位于 `E:\cli-md\.cti-index\reminders.json`，推送状态位于 `E:\cli-md\.cti-index\reminder-state.json`；普通记忆待办只针对带来源会话和提醒时间的未完成待办，默认关闭主动推送。
+- 直接提醒源文件默认写入 `E:\cli-md\data\todos\direct-reminders`，由 `cti-reminder` 动作或 `/remind` 显式入口创建，默认通过 bridge 统一推送链路到点发回当前会话。
 - 查看器优先使用远端 / 本地索引组合。
 - 本地历史检索支持群名、关键词、发言人、时间段。
-- Codex 不可用时，本地模型可用记忆命中片段回答。
+- Codex 不可用时，Ollama 只允许用记忆命中片段回答只读问题；工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
 
 当前原则：
 
@@ -301,13 +336,13 @@
 - 本地模型能力有限，对复杂任务仍不稳定。
 - 本机安全策略可能拒绝 `rg.exe` 等外部检索命令；本地执行器已有基础降级，但 skills 或外部脚本仍应优先使用 PowerShell 原生命令或受控搜索工具。
 - Ignis 生成能力依赖本机 CLI 配置和远端服务可用性，资产生成可能产生等待时间或服务侧额度消耗。
-- 正在处理的消息如果 bridge 被强制重启，目前没有断点续跑。
+- 正在处理的消息如果 bridge 被强制重启，当前只支持基于最小恢复输入的重跑；无法恢复原进程内的未完成工具授权或半截模型输出。
 - Feishu 私聊 WS 漏事件已补捞，但如果历史接口也异常，仍可能延迟。
 - `packages/bridge-runtime/scripts/build-control-panel.ps1` 和 `package-release.ps1` 仍作为兼容入口存在，但不再承载旧源码。
 
 建议下一步：
 
-- 做处理中消息自动重试和断点续跑。
+- 把 workflow retry 执行 run 与原始 run 建立显式 parent/child 关联，并把权限等待、finalizing、结果回传细化成 workflow event。
 - 给 Feishu 历史索引增加编码修复工具。
 - 控制面板增加“当前消息是否从 WS 收到还是轮询补捞”的可视标签。
 - Unity MCP 进一步强制匹配 `CTI_UNITY_PROJECT_PATH`，不只依赖 allowed roots。

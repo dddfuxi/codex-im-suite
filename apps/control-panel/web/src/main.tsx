@@ -2,6 +2,7 @@ import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
+  Archive,
   ArrowDownUp,
   Bot,
   CheckCircle2,
@@ -250,6 +251,24 @@ type WorkflowRun = {
   updatedAt: string;
   endedAt?: string;
   error?: string;
+  recovery?: {
+    kind: 'recoverable' | 'not_recoverable';
+    reason: string;
+    input?: { prompt?: string; workingDirectory?: string; model?: string; permissionMode?: string; channelType?: string; chatId?: string };
+    runtimeRunId?: string;
+    markedAt: string;
+  };
+  retry?: {
+    status: 'none' | 'auto_pending' | 'manual_pending' | 'retrying' | 'succeeded' | 'failed' | 'exhausted' | 'unavailable';
+    attempts: number;
+    maxAttempts: number;
+    requestedBy?: string;
+    requestedAt?: string;
+    claimedBy?: string;
+    claimedAt?: string;
+    lastAttemptAt?: string;
+    lastError?: string;
+  };
   events?: Array<{ id: string; stage: string; type: string; message: string; at: string }>;
 };
 
@@ -257,6 +276,97 @@ type WorkflowStatus = {
   protocol: string;
   updatedAt: string;
   runs: WorkflowRun[];
+};
+
+type KnowledgeIndexStatus = {
+  schema: string;
+  memoryRoot: string;
+  indexPath: string;
+  statusPath?: string;
+  watching: boolean;
+  exists: boolean;
+  markdownFileCount: number;
+  itemCount: number;
+  conflictCount: number;
+  sourceFileCount?: number;
+  kindCounts?: Record<string, number>;
+  generatedAt: string;
+  lastIndexedAt?: string;
+  lastEventAt?: string;
+  watcherStartedAt?: string;
+  watcherPid?: number;
+  statusUpdatedAt?: string;
+  lastError: string;
+};
+
+type KnowledgeSearchItem = {
+  id: string;
+  kind: 'fact' | 'conclusion' | 'todo' | 'resource' | string;
+  key: string;
+  value: string;
+  text: string;
+  confidence: number;
+  conflict: boolean;
+  sourcePath: string;
+  snippet: string;
+};
+
+type KnowledgeSearchResponse = {
+  status: KnowledgeIndexStatus;
+  items: KnowledgeSearchItem[];
+};
+
+type KnowledgeArchiveSnapshot = {
+  archiveRoot: string;
+  items: KnowledgeArchiveItem[];
+};
+
+type KnowledgeArchiveItem = {
+  id: string;
+  itemId: string;
+  kind: string;
+  text: string;
+  sourcePath: string;
+  archivedAt: string;
+  archivePath: string;
+};
+
+type TodoReminderSnapshot = {
+  schema: string;
+  memoryRoot: string;
+  indexPath: string;
+  statePath: string;
+  exists: boolean;
+  enabled: boolean;
+  memoryPushEnabled?: boolean;
+  directReminderEnabled?: boolean;
+  directReminderPushEnabled?: boolean;
+  pollMs: number;
+  windowMs: number;
+  channels: string[];
+  providers: Array<{ channelType: string; state: string; detail: string }>;
+  counts: { total: number; pending: number; sent: number; failed: number; skipped: number; completed?: number };
+  items: TodoReminderItem[];
+  lastError: string;
+};
+
+type TodoReminderItem = {
+  id: string;
+  title: string;
+  dueAt: string;
+  todoStatus: string;
+  status: string;
+  sourceType?: string;
+  createdAt?: string;
+  createdByMessageId?: string;
+  completedAt?: string;
+  completedByUserId?: string;
+  completionSource?: string;
+  completionError?: string;
+  skipReason: string;
+  target: { channelType: string; chatId: string; displayName: string; messageId: string };
+  source: { path: string; snippet: string; updatedAt: string };
+  delivery?: { status?: string; messageId?: string; cardId?: string; lastAttemptAt?: string; error?: string; attempts?: number; completedAt?: string; completedByUserId?: string; completionSource?: string; completionError?: string };
 };
 
 type ExtensionKindFilter = 'all' | 'mcp' | 'skill' | 'plugin' | 'extension';
@@ -318,6 +428,8 @@ type PanelState = {
     sessions: SessionItem[];
   };
   workflow: WorkflowStatus;
+  memory: KnowledgeIndexStatus;
+  memoryReminders: TodoReminderSnapshot;
   executors: ExecutorStatus;
   permissions: PermissionSnapshot;
   paths: {
@@ -374,11 +486,13 @@ const navItems = [
   { id: 'extensions', label: '扩展', icon: Layers3 },
   { id: 'release', label: '发布', icon: GitBranch },
   { id: 'sessions', label: '会话', icon: History },
+  { id: 'memory', label: '记忆', icon: Search },
   { id: 'settings', label: '设置', icon: Settings },
   { id: 'logs', label: '日志', icon: Terminal },
 ] as const;
 
 type PageId = (typeof navItems)[number]['id'];
+const pageIds = new Set<PageId>(navItems.map((item) => item.id));
 
 const fallbackState: PanelState = {
   generatedAt: '-',
@@ -398,6 +512,41 @@ const fallbackState: PanelState = {
   settings: { defaultWorkDir: '', allowedRoots: '', unityProject: '', memoryRepo: '', additionalDirs: '', replyStyleHint: '' },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
+  memory: {
+    schema: 'codex-im-suite/knowledge-index-status/v1',
+    memoryRoot: '',
+    indexPath: '',
+    statusPath: '',
+    watching: false,
+    exists: false,
+    markdownFileCount: 0,
+    itemCount: 0,
+    conflictCount: 0,
+    sourceFileCount: 0,
+    kindCounts: {},
+    generatedAt: '',
+    lastIndexedAt: '',
+    lastEventAt: '',
+    watcherStartedAt: '',
+    watcherPid: 0,
+    statusUpdatedAt: '',
+    lastError: '',
+  },
+  memoryReminders: {
+    schema: 'codex-im-suite/reminders-panel/v1',
+    memoryRoot: '',
+    indexPath: '',
+    statePath: '',
+    exists: false,
+    enabled: false,
+    pollMs: 60000,
+    windowMs: 300000,
+    channels: ['feishu'],
+    providers: [],
+    counts: { total: 0, pending: 0, sent: 0, failed: 0, skipped: 0, completed: 0 },
+    items: [],
+    lastError: '',
+  },
   executors: { protocol: 'executor-runtime/v1', updatedAt: '', executors: [], sessionDefaults: {} },
   permissions: { protocol: 'cti-permissions/v1', updatedAt: '', subjects: [], candidates: [] },
   paths: { config: '', manifestDir: '', memoryRepo: '', logs: '' },
@@ -412,6 +561,12 @@ function getInitialTheme(): ThemeMode {
   const saved = window.localStorage.getItem(themeStorageKey);
   if (saved === 'light' || saved === 'dark') return saved;
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function getInitialPage(): PageId {
+  if (typeof window === 'undefined') return 'overview';
+  const hashPage = window.location.hash.replace(/^#\/?/, '') as PageId;
+  return pageIds.has(hashPage) ? hashPage : 'overview';
 }
 
 function createRequestId() {
@@ -444,6 +599,11 @@ function splitPaths(value: string) {
 
 function joinPaths(values: string[]) {
   return values.filter(Boolean).join(';');
+}
+
+function isControlPanelWebViewHost() {
+  if (typeof window === 'undefined') return false;
+  return window.location.hostname === 'control-panel.local' && !!window.chrome?.webview;
 }
 
 function normalizeChatType(value: string) {
@@ -519,6 +679,30 @@ function channelLabel(channelType: string) {
   }
 }
 
+function workflowStatusKind(run: WorkflowRun): StatusKind {
+  if (run.status === 'succeeded') return 'ok';
+  if (run.status === 'failed') return run.recovery?.kind === 'recoverable' ? 'warning' : 'error';
+  if (run.status === 'retry_pending' || run.status === 'retrying') return 'warning';
+  return 'warning';
+}
+
+function workflowStatusLabel(run: WorkflowRun) {
+  if (run.retry?.status === 'auto_pending') return '自动重试排队';
+  if (run.retry?.status === 'manual_pending') return '手动重试排队';
+  if (run.retry?.status === 'retrying') return '重试中';
+  if (run.retry?.status === 'exhausted') return '重试耗尽';
+  if (run.recovery?.kind === 'recoverable' && run.status === 'failed') return '可重试';
+  if (run.recovery?.kind === 'not_recoverable') return '不可恢复';
+  return run.stage || run.status;
+}
+
+function canRetryWorkflow(run: WorkflowRun) {
+  return !!run.recovery?.input?.prompt
+    && run.status !== 'succeeded'
+    && run.status !== 'retry_pending'
+    && run.status !== 'retrying';
+}
+
 function permissionKey(item: { channelType: string; userId: string }) {
   return `${item.channelType.toLowerCase()}::${item.userId}`;
 }
@@ -572,7 +756,7 @@ function useHostBridge() {
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [results] = useState(() => new Map<string, { command: string; resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>());
   const pageInstanceIdRef = useRef(createRequestId());
-  const isWebViewHost = typeof window !== 'undefined' && !!window.chrome?.webview;
+  const isWebViewHost = isControlPanelWebViewHost();
   const controlApiToken = useMemo(() => getControlApiToken(), []);
   const [debug, setDebug] = useState(() => ({
     stateMessageCount: 0,
@@ -734,7 +918,7 @@ function useHostBridge() {
 
 function App() {
   const { state, activities, pending, sendCommand, clearActivities, debug, pageInstanceId } = useHostBridge();
-  const [page, setPage] = useState<PageId>('overview');
+  const [page, setPage] = useState<PageId>(() => getInitialPage());
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [runtimeUnits, setRuntimeUnits] = useState<RuntimeUnit[]>([]);
   const [replyPresets, setReplyPresets] = useState<ReplyPresetItem[]>([]);
@@ -881,6 +1065,18 @@ function App() {
     window.localStorage.setItem(themeStorageKey, theme);
   }, [theme]);
 
+  useEffect(() => {
+    const onHashChange = () => setPage(getInitialPage());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  useEffect(() => {
+    if (window.location.hash !== `#${page}`) {
+      window.history.replaceState(null, '', `#${page}`);
+    }
+  }, [page]);
+
   const run = async (command: string, payload: Record<string, unknown> = {}) => sendCommand(command, payload);
 
   const invokeRuntimeAction = async (unit: RuntimeUnit, action: RuntimeAction) => {
@@ -995,6 +1191,7 @@ function App() {
             setSessionPersonRole={setSessionPersonRole}
           />
         )}
+        {page === 'memory' && <MemoryPage state={state} run={run} pending={pending} />}
         {page === 'settings' && (
           <SettingsPage
             state={state}
@@ -1211,8 +1408,20 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
               <div>
                 <strong>{runItem.promptPreview || runItem.id}</strong>
                 <span>{runItem.stage} · {runItem.executorId || '未选择'} · {runItem.sessionId}</span>
+                {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
+                  <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
+                )}
               </div>
-              <StatusPill status={runItem.status === 'failed' ? 'error' : runItem.status === 'succeeded' ? 'ok' : 'warning'} label={runItem.status} />
+              <div className="row-actions">
+                <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
+                <MiniButton
+                  label="重试"
+                  icon={<RotateCw size={14} />}
+                  onClick={() => void run('workflow.retryRun', { id: runItem.id }).then(() => run('state.refresh'))}
+                  pending={pending['workflow.retryRun']}
+                  disabled={!canRetryWorkflow(runItem)}
+                />
+              </div>
             </div>
           ))}
           {recentRuns.length === 0 && <EmptyState icon={<Activity size={28} />} title="暂无 Workflow" text="新的飞书请求进入执行器路由后会在这里出现。" />}
@@ -1690,6 +1899,8 @@ function SessionsPage({
         </section>
         <SessionDetailPane
           detail={detail}
+          run={run}
+          pending={pending}
           detailError={detailError}
           detailLoading={detailLoading}
           drawerOpen={drawerOpen}
@@ -1705,6 +1916,8 @@ function SessionsPage({
 
 const SessionDetailPane = memo(function SessionDetailPane({
   detail,
+  run,
+  pending,
   detailError,
   detailLoading,
   drawerOpen,
@@ -1714,6 +1927,8 @@ const SessionDetailPane = memo(function SessionDetailPane({
   refreshDetail,
 }: {
   detail: SessionDetail | null;
+  run: PageProps['run'];
+  pending: Record<string, boolean>;
   detailError: string;
   detailLoading: boolean;
   drawerOpen: boolean;
@@ -1824,16 +2039,28 @@ const SessionDetailPane = memo(function SessionDetailPane({
               <strong>运行历程</strong>
             </div>
             <div className="run-timeline">
-              {orderedRuns.map((run) => (
-                <article key={run.id} className="run-card">
+              {orderedRuns.map((runItem) => (
+                <article key={runItem.id} className="run-card">
                   <header>
-                    <strong>{run.executorId || '未选择执行器'}</strong>
-                    <StatusPill status={run.status === 'failed' ? 'error' : run.status === 'succeeded' ? 'ok' : 'warning'} label={run.stage || run.status} />
+                    <strong>{runItem.executorId || '未选择执行器'}</strong>
+                    <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
                   </header>
-                  <p>{run.promptPreview || run.id}</p>
-                  <span>{run.startedAt || '-'} · {run.id}</span>
+                  <p>{runItem.promptPreview || runItem.id}</p>
+                  {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
+                    <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
+                  )}
+                  <span>{runItem.startedAt || '-'} · {runItem.id}</span>
+                  <div className="command-band tight">
+                    <MiniButton
+                      label="重试"
+                      icon={<RotateCw size={14} />}
+                      onClick={() => void run('workflow.retryRun', { id: runItem.id }).then(() => refreshDetail())}
+                      pending={pending['workflow.retryRun']}
+                      disabled={!canRetryWorkflow(runItem)}
+                    />
+                  </div>
                   <div className="event-list">
-                    {(run.events ?? []).map((event) => (
+                    {(runItem.events ?? []).map((event) => (
                       <div key={event.id} className="event-row">
                         <time>{event.at || '-'}</time>
                         <strong>{event.stage}</strong>
@@ -1893,6 +2120,384 @@ const SessionDetailPane = memo(function SessionDetailPane({
     </aside>
   );
 });
+
+const knowledgeKinds = [
+  { id: 'all', label: '全部' },
+  { id: 'fact', label: '事实' },
+  { id: 'conclusion', label: '结论' },
+  { id: 'todo', label: '待办' },
+  { id: 'resource', label: '资源' },
+] as const;
+
+const visualKnowledgeKinds = knowledgeKinds.filter((item) => item.id !== 'all');
+
+function knowledgeKindLabel(kind: string) {
+  switch (kind) {
+    case 'fact':
+      return '事实';
+    case 'conclusion':
+      return '结论';
+    case 'todo':
+      return '待办';
+    case 'resource':
+      return '资源';
+    default:
+      return kind || '未分类';
+  }
+}
+
+function reminderStatusLabel(status: string) {
+  switch ((status || '').toLowerCase()) {
+    case 'pending':
+      return '待发送';
+    case 'sent':
+      return '已发送';
+    case 'completed':
+      return '已完成';
+    case 'failed':
+      return '失败';
+    case 'skipped':
+      return '跳过';
+    default:
+      return status || '未知';
+  }
+}
+
+function reminderStatusKind(status: string): StatusKind {
+  switch ((status || '').toLowerCase()) {
+    case 'completed':
+    case 'sent':
+      return 'ok';
+    case 'failed':
+      return 'error';
+    case 'skipped':
+      return 'warning';
+    case 'pending':
+      return 'idle';
+    default:
+      return 'idle';
+  }
+}
+
+function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps['run']; pending: Record<string, boolean> }) {
+  const [status, setStatus] = useState<KnowledgeIndexStatus>(state.memory);
+  const [reminders, setReminders] = useState<TodoReminderSnapshot>(state.memoryReminders);
+  const [query, setQuery] = useState('');
+  const [kind, setKind] = useState<(typeof knowledgeKinds)[number]['id']>('all');
+  const [items, setItems] = useState<KnowledgeSearchItem[]>([]);
+  const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
+  const [error, setError] = useState('');
+  const runRef = useRef(run);
+
+  useEffect(() => setStatus(state.memory), [state.memory]);
+  useEffect(() => setReminders(state.memoryReminders), [state.memoryReminders]);
+  useEffect(() => {
+    runRef.current = run;
+  }, [run]);
+  useEffect(() => {
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      void runRef.current('memory.status')
+        .then((next) => {
+          if (!disposed) setStatus(next as KnowledgeIndexStatus);
+        })
+        .catch(() => undefined);
+    }, 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const refreshStatus = async () => {
+    setError('');
+    const next = await run('memory.status') as KnowledgeIndexStatus;
+    setStatus(next);
+  };
+
+  const refreshReminders = async () => {
+    setError('');
+    const next = await run('memory.checkReminders') as TodoReminderSnapshot;
+    setReminders(next);
+  };
+
+  const refreshArchives = async () => {
+    const next = await run('memory.archives') as KnowledgeArchiveSnapshot;
+    setArchives(next);
+  };
+
+  const testReminder = async (id: string) => {
+    setError('');
+    await run('memory.testReminder', { id });
+    await refreshReminders();
+  };
+
+  const completeReminder = async (id: string) => {
+    setError('');
+    await run('memory.completeReminder', { id });
+    await refreshReminders();
+  };
+
+  const archiveKnowledgeItem = async (id: string) => {
+    setError('');
+    await run('memory.archiveItem', { id });
+    await search();
+    await refreshReminders();
+    await refreshArchives();
+  };
+
+  const deleteKnowledgeArchive = async (archivePath: string) => {
+    setError('');
+    await run('memory.deleteArchive', { path: archivePath });
+    await refreshArchives();
+  };
+
+  const search = async () => {
+    setError('');
+    try {
+      const result = await run('memory.search', {
+        query,
+        kinds: kind === 'all' ? [] : [kind],
+        limit: 40,
+      }) as KnowledgeSearchResponse;
+      setStatus(result.status);
+      setItems(Array.isArray(result.items) ? result.items : []);
+    } catch (searchError) {
+      setError(searchError instanceof Error ? searchError.message : '搜索失败');
+    }
+  };
+
+  useEffect(() => {
+    void search();
+  }, [kind]);
+
+  useEffect(() => {
+    void refreshArchives();
+  }, []);
+
+  const statusKind: StatusKind = status.lastError
+    ? 'error'
+    : status.exists
+      ? 'ok'
+      : 'warning';
+  const kindCounts = status.kindCounts ?? {};
+  const visibleKindCounts = visualKnowledgeKinds.map((item) => ({
+    ...item,
+    count: kindCounts[item.id] ?? 0,
+  }));
+  const maxKindCount = Math.max(1, ...visibleKindCounts.map((item) => item.count));
+  const conflictRatio = status.itemCount > 0 ? Math.round(((status.conflictCount ?? 0) / status.itemCount) * 100) : 0;
+  const pipelineSteps = [
+    { label: 'Markdown', detail: `${status.markdownFileCount ?? 0} 个文件`, ok: (status.markdownFileCount ?? 0) > 0 },
+    { label: '索引文件', detail: status.exists ? '已生成' : '未生成', ok: status.exists },
+    { label: '监听心跳', detail: status.watching ? '运行中' : '未运行', ok: status.watching },
+    { label: 'Codex 注入', detail: status.exists && !status.lastError ? '可注入' : '等待索引', ok: status.exists && !status.lastError },
+  ];
+
+  return (
+    <section className="content-stack">
+      <section className="memory-visual-grid">
+        <section className="panel">
+          <SectionHeader title="知识分布" />
+          <div className="memory-bars">
+            {visibleKindCounts.map((item) => (
+              <div key={item.id} className="memory-bar-row">
+                <span>{item.label}</span>
+                <div className="memory-bar-track">
+                  <div className={`memory-bar-fill kind-${item.id}`} style={{ width: `${Math.max(4, Math.round((item.count / maxKindCount) * 100))}%` }} />
+                </div>
+                <strong>{item.count}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section className="panel">
+          <SectionHeader title="来源覆盖" />
+          <div className="memory-radar">
+            <div>
+              <strong>{status.sourceFileCount ?? 0}</strong>
+              <span>来源文件</span>
+            </div>
+            <div>
+              <strong>{conflictRatio}%</strong>
+              <span>冲突占比</span>
+            </div>
+            <div>
+              <strong>{status.itemCount ?? 0}</strong>
+              <span>知识单元</span>
+            </div>
+          </div>
+        </section>
+        <section className="panel">
+          <SectionHeader title="索引链路" />
+          <div className="memory-pipeline">
+            {pipelineSteps.map((step) => (
+              <div key={step.label} className={step.ok ? 'memory-pipeline-step ok' : 'memory-pipeline-step'}>
+                <span>{step.label}</span>
+                <strong>{step.detail}</strong>
+              </div>
+            ))}
+          </div>
+        </section>
+      </section>
+      <section className="panel">
+        <SectionHeader
+          title="索引状态"
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStatus()} pending={pending['memory.status']} />}
+        />
+        <div className="summary-grid">
+          <Metric label="索引" value={status.exists ? '已生成' : '未生成'} compact />
+          <Metric label="监听" value={status.watching ? '运行中' : '未运行'} compact />
+          <Metric label="Markdown" value={String(status.markdownFileCount ?? 0)} compact />
+          <Metric label="知识单元" value={String(status.itemCount ?? 0)} compact />
+          <Metric label="冲突" value={String(status.conflictCount ?? 0)} compact />
+        </div>
+        <dl className="kv">
+          <dt>仓库</dt><dd>{status.memoryRoot || state.paths.memoryRepo || '-'}</dd>
+          <dt>索引</dt><dd>{status.indexPath || '-'}</dd>
+          <dt>状态文件</dt><dd>{status.statusPath || '-'}</dd>
+          <dt>索引时间</dt><dd>{status.lastIndexedAt || status.generatedAt || '-'}</dd>
+          <dt>最近事件</dt><dd>{status.lastEventAt || '-'}</dd>
+          <dt>监听启动</dt><dd>{status.watcherStartedAt || '-'}</dd>
+          <dt>监听进程</dt><dd>{status.watcherPid ? String(status.watcherPid) : '-'}</dd>
+          <dt>状态心跳</dt><dd>{status.statusUpdatedAt || '-'}</dd>
+          <dt>状态</dt><dd><StatusPill status={statusKind} label={status.lastError || (status.exists ? '可用' : '等待生成')} /></dd>
+        </dl>
+      </section>
+
+      <section className="panel">
+        <SectionHeader
+          title="待办提醒"
+          action={<MiniButton label="检查提醒" icon={<RefreshCw size={14} />} onClick={() => void refreshReminders()} pending={pending['memory.checkReminders']} />}
+        />
+        <div className="summary-grid">
+          <Metric label="主动推送" value={reminders.enabled ? '已开启' : '未开启'} compact />
+          <Metric label="直接提醒" value={reminders.directReminderPushEnabled ? '已开启' : reminders.directReminderEnabled === false ? '未启用' : '未推送'} compact />
+          <Metric label="待发送" value={String(reminders.counts?.pending ?? 0)} compact />
+          <Metric label="已发送" value={String(reminders.counts?.sent ?? 0)} compact />
+          <Metric label="已完成" value={String(reminders.counts?.completed ?? 0)} compact />
+          <Metric label="失败" value={String(reminders.counts?.failed ?? 0)} compact />
+          <Metric label="跳过" value={String(reminders.counts?.skipped ?? 0)} compact />
+        </div>
+        <div className="detail-meta">
+          索引 {reminders.exists ? '已生成' : '未生成'} · 渠道 {(reminders.channels ?? []).join(', ') || 'feishu'} · 间隔 {Math.round((reminders.pollMs ?? 0) / 1000)}s
+        </div>
+        <div className="preset-wall">
+          {(reminders.providers ?? []).map((provider) => (
+            <span key={provider.channelType} className={provider.state === 'ok' ? 'preset-chip active' : 'preset-chip'}>
+              {channelLabel(provider.channelType)} · {provider.state === 'unsupported' ? '未接入' : provider.state === 'ok' ? '可用' : '未开启'}
+            </span>
+          ))}
+        </div>
+        {reminders.lastError && <div className="empty-inline">{reminders.lastError}</div>}
+        <div className="runtime-list compact-list">
+          {(reminders.items ?? []).map((item) => (
+            <article key={item.id} className="runtime-row">
+              <div>
+                <strong>{item.title || '未命名待办'}</strong>
+                <span>
+                  {item.dueAt || '无提醒时间'} · {item.sourceType === 'direct' ? '直接提醒' : '记忆待办'} · {channelLabel(item.target?.channelType)} · {item.target?.displayName || item.target?.chatId || '缺少来源会话'}
+                </span>
+                <p>{item.completedAt || item.delivery?.completedAt ? `已完成：${item.completedAt || item.delivery?.completedAt} · ${item.completionSource || item.delivery?.completionSource || 'panel'}` : item.completionError || item.delivery?.completionError || item.skipReason || item.delivery?.error || item.source?.snippet || '等待到点推送。'}</p>
+                <code>{item.source?.path || '-'}</code>
+              </div>
+              <div className="row-actions">
+                <StatusPill status={reminderStatusKind(item.status)} label={reminderStatusLabel(item.status)} />
+                <MiniButton
+                  label="完成"
+                  icon={<CheckCircle2 size={14} />}
+                  onClick={() => void completeReminder(item.id)}
+                  pending={pending['memory.completeReminder']}
+                  disabled={item.status === 'completed'}
+                />
+                <MiniButton
+                  label="测试发送"
+                  icon={<Play size={14} />}
+                  onClick={() => void testReminder(item.id)}
+                  pending={pending['memory.testReminder']}
+                  disabled={item.status === 'completed' || (item.target?.channelType || '').toLowerCase() !== 'feishu' || !item.target?.chatId}
+                />
+                <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.source?.path })} pending={pending['memory.openSource']} />
+              </div>
+            </article>
+          ))}
+          {(reminders.items ?? []).length === 0 && <div className="empty-inline">暂无待办提醒。给待办添加提醒时间和来源会话后会在这里出现。</div>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <SectionHeader
+          title="知识单元 / 搜索"
+          action={<MiniButton label="搜索" icon={<Search size={14} />} onClick={() => void search()} pending={pending['memory.search']} />}
+        />
+        <div className="detail-meta">当前显示 {items.length} / {status.itemCount ?? 0} 个知识单元。</div>
+        <div className="filter-row">
+          <Search size={14} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
+            if (event.key === 'Enter') void search();
+          }} placeholder="关键词、场景名、文件名或结论片段" />
+        </div>
+        <div className="preset-wall">
+          {knowledgeKinds.map((item) => (
+            <button key={item.id} className={kind === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setKind(item.id)}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+        {error && <div className="empty-inline">{error}</div>}
+        <div className="runtime-list compact-list">
+          {items.map((item) => (
+            <article key={item.id} className="runtime-row">
+              <div>
+                <strong>{item.key ? `${item.key} = ${item.value || item.text}` : item.text}</strong>
+                <span>{knowledgeKindLabel(item.kind)} · 置信度 {Math.round((item.confidence || 0) * 100)}% · {item.conflict ? '冲突候选' : '正常'}</span>
+                <p>{item.snippet || item.text}</p>
+                <code>{item.sourcePath || '-'}</code>
+              </div>
+              <div className="row-actions">
+                <StatusPill status={item.conflict ? 'warning' : 'ok'} label={knowledgeKindLabel(item.kind)} />
+                <MiniButton
+                  label="归档"
+                  icon={<Archive size={14} />}
+                  onClick={() => void archiveKnowledgeItem(item.id)}
+                  pending={pending['memory.archiveItem']}
+                />
+                <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.sourcePath })} pending={pending['memory.openSource']} />
+              </div>
+            </article>
+          ))}
+          {items.length === 0 && <div className="empty-inline">{status.itemCount ? '暂无匹配结果。清空关键词或切换类型后再搜索。' : '暂无知识单元。'}</div>}
+        </div>
+      </section>
+
+      <section className="panel">
+        <SectionHeader
+          title="知识归档"
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshArchives()} pending={pending['memory.archives']} />}
+        />
+        <div className="detail-meta">归档目录 {archives.archiveRoot || '-'}。这里的文件不会进入知识索引，可手动永久删除。</div>
+        <div className="runtime-list compact-list">
+          {(archives.items ?? []).map((item) => (
+            <article key={item.archivePath} className="runtime-row">
+              <div>
+                <strong>{item.text || item.itemId || '归档知识单元'}</strong>
+                <span>{knowledgeKindLabel(item.kind)} · {item.archivedAt || '未知时间'}</span>
+                <p>{item.sourcePath || '无来源记录'}</p>
+                <code>{item.archivePath}</code>
+              </div>
+              <div className="row-actions">
+                <StatusPill status="idle" label="已归档" />
+                <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.archivePath })} pending={pending['memory.openSource']} />
+                <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteKnowledgeArchive(item.archivePath)} pending={pending['memory.deleteArchive']} />
+              </div>
+            </article>
+          ))}
+          {(archives.items ?? []).length === 0 && <div className="empty-inline">暂无归档知识单元。</div>}
+        </div>
+      </section>
+    </section>
+  );
+}
 
 function SettingsPage({
   state,

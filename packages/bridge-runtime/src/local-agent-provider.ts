@@ -19,7 +19,7 @@ import {
   inferMcpFastIntent,
 } from './fast-path-intent.js';
 import type { PendingPermissions } from './permission-gateway.js';
-import { LocalLlamaProvider, type LocalModelMessage } from './local-llm-provider.js';
+import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
 import { McpBridge, type McpManifestRecord } from './mcp-bridge.js';
 import type {
   ConservativeRouteDecision,
@@ -509,7 +509,7 @@ export class LocalAgentProvider {
   constructor(
     private readonly config: Config,
     private readonly pendingPerms: PendingPermissions,
-    private readonly localProvider: LocalLlamaProvider,
+    private readonly localProvider: OllamaProvider,
   ) {
     this.mcpBridge = new McpBridge(config);
   }

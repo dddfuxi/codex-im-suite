@@ -21,8 +21,9 @@ const baseConfig: Config = {
   localLlmEnabled: true,
   localLlmRouterMode: 'hybrid',
   localLlmForceHub: true,
-  localLlmBaseUrl: 'http://127.0.0.1:8080',
-  localLlmModel: 'qwen2.5-coder-7b-instruct',
+  ollamaEnabled: true,
+  ollamaBaseUrl: 'http://127.0.0.1:11434',
+  ollamaModel: 'qwen2.5-coder:7b',
 };
 
 function params(prompt: string): StreamChatParams {
@@ -40,12 +41,15 @@ describe('executor registry', () => {
     const manifests = buildExecutorManifests(baseConfig);
     assert.ok(manifests.some((manifest) => manifest.id === 'codex'));
     assert.ok(manifests.some((manifest) => manifest.id === 'local-tool-agent'));
+    assert.ok(manifests.some((manifest) => manifest.id === 'codex-oss-ollama'));
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.kind, 'agent');
+    assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.kind, 'cli');
   });
 
   it('detects explicit executor hints', () => {
     assert.equal(inferRequestedExecutorId('@codex 帮我看一下状态'), 'codex');
     assert.equal(inferRequestedExecutorId('@local 帮我总结这段日志'), 'local-tool-agent');
+    assert.equal(inferRequestedExecutorId('@ollama 帮我总结这段日志'), 'codex-oss-ollama');
     assert.equal(inferRequestedExecutorId('@claude 处理这个问题'), 'claude-cli');
   });
 

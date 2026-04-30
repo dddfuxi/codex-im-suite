@@ -118,6 +118,8 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- For image annotation tasks, strictly follow user-specified label format and naming conventions. If the user gives an explicit format (such as Furniture_*), keep that format exactly; do not auto-rename to another schema.',
     '- If required inputs are missing for precise annotation (for example a referenced person\'s chat records or the target screenshot), ask for the missing artifact instead of producing speculative labels.',
     '- Default execution posture: prioritize solving the task with concrete attempts. Do not retreat to generic refusal when a safe, bounded troubleshooting step can be executed immediately.',
+    '- Reminder action protocol: when the user clearly asks to create a future reminder, do not use schtasks, Register-ScheduledTask, temporary PowerShell scripts, or direct platform APIs. Instead output one fenced ```cti-reminder JSON block with title, dueAt, timezone, target="current_chat", and sourcePrompt. The bridge will create and send the reminder.',
+    '- Do not claim that a reminder, scheduled task, or proactive message has been created unless you used the cti-reminder action protocol or the user explicitly asked only for example code.',
   ].join('\n');
 
   return [baseSystemPrompt?.trim(), bridgeGuardrails, extraSystemPrompt?.trim()]

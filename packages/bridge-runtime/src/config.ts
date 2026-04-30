@@ -14,8 +14,20 @@ export interface Config {
   contextHistoryMaxChars?: number;
   contextHistoryMessageMaxChars?: number;
   memoryPromptMaxChars?: number;
+  todoPushEnabled?: boolean;
+  todoPushPollMs?: number;
+  todoPushWindowMs?: number;
+  todoPushChannels?: string[];
+  directReminderEnabled?: boolean;
+  directReminderPushEnabled?: boolean;
+  directReminderDecisionMode?: string;
+  directReminderAllowSlashCommand?: boolean;
   unityMcpEndpoints?: string;
   unityMcpStartCommand?: string;
+  ollamaEnabled?: boolean;
+  ollamaBaseUrl?: string;
+  ollamaModel?: string;
+  ollamaTimeoutMs?: number;
   localLlmEnabled?: boolean;
   localLlmBaseUrl?: string;
   localLlmModel?: string;
@@ -140,8 +152,12 @@ function isSameOrChildPath(candidatePath: string, rootPath?: string): boolean {
     || candidate.toLowerCase().startsWith((root + path.sep).toLowerCase());
 }
 
+function getDefaultMemoryRepoDir(): string {
+  return process.platform === "win32" ? "E:\\cli-md" : path.join(CTI_HOME, "memory-repo");
+}
+
 function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string, unityProjectPath?: string): string {
-  const fallback = path.join(CTI_HOME, "memory-repo");
+  const fallback = getDefaultMemoryRepoDir();
   const configured = rawMemoryRepoDir && rawMemoryRepoDir.trim() ? rawMemoryRepoDir.trim() : fallback;
   const normalized = path.resolve(configured);
   if (isSameOrChildPath(normalized, defaultWorkDir) || isSameOrChildPath(normalized, unityProjectPath)) {
@@ -177,8 +193,17 @@ export function loadConfig(): Config {
   const memoryPromptMaxChars = env.get("CTI_MEMORY_PROMPT_MAX_CHARS")
     ? Number(env.get("CTI_MEMORY_PROMPT_MAX_CHARS"))
     : undefined;
+  const todoPushPollMs = env.get("CTI_TODO_PUSH_POLL_MS")
+    ? Number(env.get("CTI_TODO_PUSH_POLL_MS"))
+    : undefined;
+  const todoPushWindowMs = env.get("CTI_TODO_PUSH_WINDOW_MS")
+    ? Number(env.get("CTI_TODO_PUSH_WINDOW_MS"))
+    : undefined;
   const localLlmTimeoutMs = env.get("CTI_LOCAL_LLM_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_LLM_TIMEOUT_MS"))
+    : undefined;
+  const ollamaTimeoutMs = env.get("CTI_OLLAMA_TIMEOUT_MS")
+    ? Number(env.get("CTI_OLLAMA_TIMEOUT_MS"))
     : undefined;
   const localLlmRouterMaxInputChars = env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS")
     ? Number(env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS"))
@@ -201,6 +226,14 @@ export function loadConfig(): Config {
     codexAdditionalDirectories,
   );
   const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir, unityProjectPath);
+  const ollamaEnabled = env.has("CTI_OLLAMA_ENABLED")
+    ? env.get("CTI_OLLAMA_ENABLED") === "true"
+    : (env.has("CTI_LOCAL_LLM_ENABLED") ? env.get("CTI_LOCAL_LLM_ENABLED") === "true" : true);
+  const ollamaBaseUrl = env.get("CTI_OLLAMA_BASE_URL")
+    || "http://127.0.0.1:11434";
+  const ollamaModel = env.get("CTI_OLLAMA_MODEL")
+    || "qwen2.5-coder:7b";
+  const effectiveOllamaTimeoutMs = ollamaTimeoutMs ?? localLlmTimeoutMs ?? 45000;
 
   return {
     runtime,
@@ -214,14 +247,34 @@ export function loadConfig(): Config {
     contextHistoryMaxChars,
     contextHistoryMessageMaxChars,
     memoryPromptMaxChars,
+    todoPushEnabled: env.has("CTI_TODO_PUSH_ENABLED")
+      ? env.get("CTI_TODO_PUSH_ENABLED") === "true"
+      : false,
+    todoPushPollMs: todoPushPollMs ?? 60000,
+    todoPushWindowMs: todoPushWindowMs ?? 5 * 60 * 1000,
+    todoPushChannels: splitCsv(env.get("CTI_TODO_PUSH_CHANNELS")) ?? ["feishu"],
+    directReminderEnabled: env.has("CTI_DIRECT_REMINDER_ENABLED")
+      ? env.get("CTI_DIRECT_REMINDER_ENABLED") === "true"
+      : true,
+    directReminderPushEnabled: env.has("CTI_DIRECT_REMINDER_PUSH_ENABLED")
+      ? env.get("CTI_DIRECT_REMINDER_PUSH_ENABLED") === "true"
+      : true,
+    directReminderDecisionMode: env.get("CTI_DIRECT_REMINDER_DECISION_MODE") || "codex_action",
+    directReminderAllowSlashCommand: env.has("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND")
+      ? env.get("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND") === "true"
+      : true,
     unityMcpEndpoints: env.get("CTI_UNITY_MCP_ENDPOINTS") || undefined,
     unityMcpStartCommand: env.get("CTI_UNITY_MCP_START_COMMAND") || undefined,
+    ollamaEnabled,
+    ollamaBaseUrl,
+    ollamaModel,
+    ollamaTimeoutMs: effectiveOllamaTimeoutMs,
     localLlmEnabled: env.has("CTI_LOCAL_LLM_ENABLED")
       ? env.get("CTI_LOCAL_LLM_ENABLED") === "true"
-      : true,
-    localLlmBaseUrl: env.get("CTI_LOCAL_LLM_BASE_URL") || "http://127.0.0.1:8080",
-    localLlmModel: env.get("CTI_LOCAL_LLM_MODEL") || "qwen2.5-coder-7b-instruct",
-    localLlmTimeoutMs: localLlmTimeoutMs ?? 45000,
+      : ollamaEnabled,
+    localLlmBaseUrl: ollamaBaseUrl,
+    localLlmModel: ollamaModel,
+    localLlmTimeoutMs: effectiveOllamaTimeoutMs,
     localLlmAutoRoute: env.has("CTI_LOCAL_LLM_AUTO_ROUTE")
       ? env.get("CTI_LOCAL_LLM_AUTO_ROUTE") === "true"
       : true,
@@ -309,14 +362,30 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_CONTEXT_HISTORY_MESSAGE_MAX_CHARS", String(config.contextHistoryMessageMaxChars));
   if (config.memoryPromptMaxChars !== undefined)
     out += formatEnvLine("CTI_MEMORY_PROMPT_MAX_CHARS", String(config.memoryPromptMaxChars));
+  if (config.todoPushEnabled !== undefined)
+    out += formatEnvLine("CTI_TODO_PUSH_ENABLED", String(config.todoPushEnabled));
+  if (config.todoPushPollMs !== undefined)
+    out += formatEnvLine("CTI_TODO_PUSH_POLL_MS", String(config.todoPushPollMs));
+  if (config.todoPushWindowMs !== undefined)
+    out += formatEnvLine("CTI_TODO_PUSH_WINDOW_MS", String(config.todoPushWindowMs));
+  out += formatEnvLine("CTI_TODO_PUSH_CHANNELS", config.todoPushChannels?.join(","));
+  if (config.directReminderEnabled !== undefined)
+    out += formatEnvLine("CTI_DIRECT_REMINDER_ENABLED", String(config.directReminderEnabled));
+  if (config.directReminderPushEnabled !== undefined)
+    out += formatEnvLine("CTI_DIRECT_REMINDER_PUSH_ENABLED", String(config.directReminderPushEnabled));
+  out += formatEnvLine("CTI_DIRECT_REMINDER_DECISION_MODE", config.directReminderDecisionMode);
+  if (config.directReminderAllowSlashCommand !== undefined)
+    out += formatEnvLine("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND", String(config.directReminderAllowSlashCommand));
   out += formatEnvLine("CTI_UNITY_MCP_ENDPOINTS", config.unityMcpEndpoints);
   out += formatEnvLine("CTI_UNITY_MCP_START_COMMAND", config.unityMcpStartCommand);
-  if (config.localLlmEnabled !== undefined)
-    out += formatEnvLine("CTI_LOCAL_LLM_ENABLED", String(config.localLlmEnabled));
-  out += formatEnvLine("CTI_LOCAL_LLM_BASE_URL", config.localLlmBaseUrl);
-  out += formatEnvLine("CTI_LOCAL_LLM_MODEL", config.localLlmModel);
-  if (config.localLlmTimeoutMs !== undefined)
-    out += formatEnvLine("CTI_LOCAL_LLM_TIMEOUT_MS", String(config.localLlmTimeoutMs));
+  if (config.ollamaEnabled !== undefined)
+    out += formatEnvLine("CTI_OLLAMA_ENABLED", String(config.ollamaEnabled));
+  out += formatEnvLine("CTI_OLLAMA_BASE_URL", config.ollamaBaseUrl);
+  out += formatEnvLine("CTI_OLLAMA_MODEL", config.ollamaModel);
+  if (config.ollamaTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_OLLAMA_TIMEOUT_MS", String(config.ollamaTimeoutMs));
+  // Deprecated llama.cpp endpoint/model envs are read for one-time migration only.
+  // Persist new Ollama envs plus legacy router knobs, not old server source keys.
   if (config.localLlmAutoRoute !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_AUTO_ROUTE", String(config.localLlmAutoRoute));
   if (config.localLlmFallbackToCodex !== undefined)
@@ -542,23 +611,51 @@ export function configToSettings(config: Config): Map<string, string> {
   if (typeof config.memoryPromptMaxChars === "number" && Number.isFinite(config.memoryPromptMaxChars)) {
     m.set("bridge_memory_prompt_max_chars", String(Math.max(240, Math.floor(config.memoryPromptMaxChars))));
   }
+  m.set("bridge_todo_push_enabled", String(config.todoPushEnabled === true));
+  m.set("bridge_direct_reminder_enabled", String(config.directReminderEnabled !== false));
+  m.set("bridge_direct_reminder_push_enabled", String(config.directReminderPushEnabled !== false));
+  m.set("bridge_direct_reminder_decision_mode", config.directReminderDecisionMode || "codex_action");
+  m.set("bridge_direct_reminder_allow_slash_command", String(config.directReminderAllowSlashCommand !== false));
+  if (typeof config.todoPushPollMs === "number" && Number.isFinite(config.todoPushPollMs)) {
+    m.set("bridge_todo_push_poll_ms", String(Math.max(5000, Math.floor(config.todoPushPollMs))));
+  }
+  if (typeof config.todoPushWindowMs === "number" && Number.isFinite(config.todoPushWindowMs)) {
+    m.set("bridge_todo_push_window_ms", String(Math.max(0, Math.floor(config.todoPushWindowMs))));
+  }
+  m.set("bridge_todo_push_channels", (config.todoPushChannels && config.todoPushChannels.length > 0 ? config.todoPushChannels : ["feishu"]).join(","));
   if (config.unityMcpEndpoints) {
     m.set("bridge_unity_mcp_endpoint_list", config.unityMcpEndpoints);
   }
   if (config.unityMcpStartCommand) {
     m.set("bridge_unity_mcp_start_command", config.unityMcpStartCommand);
   }
-  if (config.localLlmEnabled !== undefined) {
-    m.set("bridge_local_llm_enabled", String(config.localLlmEnabled));
+  if (config.ollamaEnabled !== undefined) {
+    m.set("bridge_ollama_enabled", String(config.ollamaEnabled));
   }
-  if (config.localLlmBaseUrl) {
-    m.set("bridge_local_llm_base_url", config.localLlmBaseUrl);
+  if (config.ollamaBaseUrl) {
+    m.set("bridge_ollama_base_url", config.ollamaBaseUrl);
   }
-  if (config.localLlmModel) {
-    m.set("bridge_local_llm_model", config.localLlmModel);
+  if (config.ollamaModel) {
+    m.set("bridge_ollama_model", config.ollamaModel);
   }
-  if (typeof config.localLlmTimeoutMs === "number" && Number.isFinite(config.localLlmTimeoutMs)) {
-    m.set("bridge_local_llm_timeout_ms", String(Math.max(1000, Math.floor(config.localLlmTimeoutMs))));
+  if (typeof config.ollamaTimeoutMs === "number" && Number.isFinite(config.ollamaTimeoutMs)) {
+    m.set("bridge_ollama_timeout_ms", String(Math.max(1000, Math.floor(config.ollamaTimeoutMs))));
+  }
+  const localCompatEnabled = config.localLlmEnabled ?? config.ollamaEnabled;
+  const localCompatBaseUrl = config.localLlmBaseUrl || config.ollamaBaseUrl;
+  const localCompatModel = config.localLlmModel || config.ollamaModel;
+  const localCompatTimeout = config.localLlmTimeoutMs ?? config.ollamaTimeoutMs;
+  if (localCompatEnabled !== undefined) {
+    m.set("bridge_local_llm_enabled", String(localCompatEnabled));
+  }
+  if (localCompatBaseUrl) {
+    m.set("bridge_local_llm_base_url", localCompatBaseUrl);
+  }
+  if (localCompatModel) {
+    m.set("bridge_local_llm_model", localCompatModel);
+  }
+  if (typeof localCompatTimeout === "number" && Number.isFinite(localCompatTimeout)) {
+    m.set("bridge_local_llm_timeout_ms", String(Math.max(1000, Math.floor(localCompatTimeout))));
   }
   if (config.localLlmAutoRoute !== undefined) {
     m.set("bridge_local_llm_auto_route", String(config.localLlmAutoRoute));
