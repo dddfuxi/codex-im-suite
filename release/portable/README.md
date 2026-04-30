@@ -132,6 +132,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
+`release\codex-im-suite-portable.zip` 是便携版分发包，体积通常超过 GitHub 普通 Git 单文件 100MB 限制；仓库使用 Git LFS 跟踪 `release/*.zip`，首次克隆或发布前请确认本机已安装并启用 `git lfs`。
+
 独立检查开发版、live skill、portable 和 installer payload 是否分叉：
 
 ```powershell
@@ -193,6 +195,21 @@ ollama pull qwen2.5-coder:7b
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\memory\archive-legacy-rules.ps1
 ```
+
+历史乱码扫描和修复入口：
+
+```powershell
+# 只扫描 CTI_HOME 和记忆仓库里的典型 mojibake
+powershell -ExecutionPolicy Bypass -File .\scripts\repair-history-mojibake.ps1
+
+# 应用修复，自动写入回滚 manifest，并重建 knowledge/reminders 索引
+powershell -ExecutionPolicy Bypass -File .\scripts\repair-history-mojibake.ps1 -Apply
+
+# 按 manifest 回滚
+powershell -ExecutionPolicy Bypass -File .\scripts\repair-history-mojibake.ps1 -Restore C:\Users\admin\.claude-to-im\backups\mojibake-repair\<stamp>\manifest.json
+```
+
+修复器会扫描 `data\messages`、`data\message-archives`、`data\feishu-history`、Feishu/记忆相关索引和记忆 Markdown，识别典型 UTF-8 被 GBK、Latin-1 或替换字符错读后的文本。运行时的 Feishu 历史检索、Markdown 知识索引和待办提醒派生也会先修复或跳过仍无法确认的坏文本，避免继续把乱码喂给 Codex 记忆上下文或提醒推送。
 
 待办主动提醒默认关闭。启用前，记忆 Markdown 里的待办需要带来源会话和提醒时间，例如：
 

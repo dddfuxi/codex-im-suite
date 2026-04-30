@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 
 import type { KnowledgeIndex, KnowledgeItem } from './knowledge-indexer.js';
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
+import { repairLikelyMojibakeText } from './mojibake.js';
 
 export type ReminderStatus = 'pending' | 'sent' | 'failed' | 'skipped';
 export type ReminderProviderState = 'ok' | 'disabled' | 'unsupported' | 'error';
@@ -206,7 +207,8 @@ export function buildReminderIndexFromKnowledge(index: KnowledgeIndex, options: 
   const enabledChannels = new Set((options.enabledChannels || ['feishu']).map((item) => item.toLowerCase()));
   const reminders = index.items
     .filter((item) => item.kind === 'todo')
-    .map((item) => buildReminderFromTodo(item, enabledChannels));
+    .map((item) => buildReminderFromTodo(item, enabledChannels))
+    .filter((item): item is TodoReminder => !!item);
   return {
     schema: 'codex-im-suite/reminders/v1',
     memoryRoot: index.memoryRoot,
@@ -579,9 +581,16 @@ function escapeFeishuCardText(value: string): string {
   }[char] || char));
 }
 
-function buildReminderFromTodo(item: KnowledgeItem, enabledChannels: Set<string>): TodoReminder {
-  const text = item.value || item.text;
-  const metadataText = `${text}\n${item.source.snippet || ''}`;
+function repairReminderText(text: string): string | null {
+  const repaired = repairLikelyMojibakeText(text);
+  return repaired.unresolved ? null : repaired.text;
+}
+
+function buildReminderFromTodo(item: KnowledgeItem, enabledChannels: Set<string>): TodoReminder | null {
+  const text = repairReminderText(item.value || item.text);
+  const snippet = repairReminderText(item.source.snippet || '');
+  if (!text || snippet === null) return null;
+  const metadataText = `${text}\n${snippet}`;
   const dueAt = parseDueAt(metadataText);
   const todoStatus = parseTodoStatus(metadataText);
   const sourceMetadata = (item.source as KnowledgeItem['source'] & { metadata?: Record<string, string> }).metadata;
@@ -619,7 +628,7 @@ function buildReminderFromTodo(item: KnowledgeItem, enabledChannels: Set<string>
     target,
     source: {
       path: item.source.path,
-      snippet: item.source.snippet,
+      snippet,
       updatedAt: item.source.updatedAt,
     },
     createdFromText: text,

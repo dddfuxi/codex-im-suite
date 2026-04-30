@@ -31,6 +31,7 @@ import type {
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
+import { repairLikelyMojibakeText } from './mojibake.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
@@ -376,7 +377,14 @@ export class JsonFileStore implements BridgeStore {
       .replace(/\s+/g, ' ')
       .trim();
     if (!cleaned) return '';
-    return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 3)}...` : cleaned;
+    const repaired = repairLikelyMojibakeText(cleaned);
+    if (repaired.unresolved) return '';
+    return repaired.text.length > maxLen ? `${repaired.text.slice(0, maxLen - 3)}...` : repaired.text;
+  }
+
+  private sanitizePersistedText(content: string): string {
+    const repaired = repairLikelyMojibakeText(content || '');
+    return repaired.unresolved ? '' : repaired.text;
   }
 
   private memoryProfileKey(scope: MemoryProfileScope, channelType: string, id = ''): string {
@@ -472,7 +480,8 @@ export class JsonFileStore implements BridgeStore {
   private recordFeishuHistoryProfiles(chatId: string, displayName: string | undefined, messages: FeishuHistoryIndexedMessage[]): void {
     let changed = false;
     for (const item of messages) {
-      if (!item.text?.trim()) continue;
+      const safeText = this.summarizeMessageContent(item.text || '', 800);
+      if (!safeText) continue;
       const createdAt = item.createTime && /^\d+$/.test(item.createTime)
         ? new Date(Number.parseInt(item.createTime, 10)).toISOString()
         : undefined;
@@ -484,7 +493,7 @@ export class JsonFileStore implements BridgeStore {
         userId: item.senderId,
         userDisplayName: item.senderName,
         role: item.senderType === 'app' ? 'assistant' : 'user',
-        text: item.text,
+        text: safeText,
         createdAt,
       }) || changed;
     }
@@ -655,7 +664,9 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private extractMemoryTokens(text: string): string[] {
-    const normalized = text
+    const repaired = repairLikelyMojibakeText(text);
+    if (repaired.unresolved) return [];
+    const normalized = repaired.text
       .replace(/<!--files:[\s\S]*?-->/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -1141,10 +1152,11 @@ export class JsonFileStore implements BridgeStore {
     for (const item of existing) merged.set(item.messageId, item);
     for (const item of data.messages) {
       if (!item.messageId?.trim()) continue;
+      const text = this.sanitizePersistedText(item.text || '');
       merged.set(item.messageId, {
         ...item,
         chatId,
-        text: item.text || '',
+        text,
       });
     }
 
@@ -1184,7 +1196,13 @@ export class JsonFileStore implements BridgeStore {
   retrieveRelevantFeishuHistory(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null {
     const chatId = query.chatId.trim();
     if (!chatId) return null;
-    const allMessages = this.loadFeishuHistoryMessages(chatId);
+    const allMessages = this.loadFeishuHistoryMessages(chatId)
+      .map((item) => ({
+        ...item,
+        senderName: this.sanitizePersistedText(item.senderName || ''),
+        text: this.sanitizePersistedText(item.text || ''),
+      }))
+      .filter((item) => item.text);
     if (allMessages.length === 0) return null;
 
     const tokens = this.extractMemoryTokens(query.query);

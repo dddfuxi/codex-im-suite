@@ -13,6 +13,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "claude-to-im": "file:../bridge-core",
+    "iconv-lite": "^0.7.2",
     "qrcode": "^1.5.4"
   },
   "optionalDependencies": {

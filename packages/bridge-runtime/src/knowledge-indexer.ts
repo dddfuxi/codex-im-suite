@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { repairLikelyMojibakeText } from './mojibake.js';
+
 export type KnowledgeKind = 'fact' | 'conclusion' | 'todo' | 'resource';
 
 export interface KnowledgeSourceFile {
@@ -71,27 +73,47 @@ function makeSnippet(text: string, maxChars = 260): string {
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function normalizeIndexedText(text: string): string | null {
+  const repaired = repairLikelyMojibakeText(text);
+  return repaired.unresolved ? null : repaired.text;
+}
+
 function makeItem(
   kind: KnowledgeKind,
   file: KnowledgeSourceFile,
   text: string,
   key?: string,
   value?: string,
-): KnowledgeItem {
-  const normalizedText = stripMarkdown(text);
+): KnowledgeItem | null {
+  const normalizedText = normalizeIndexedText(stripMarkdown(text));
+  if (!normalizedText) return null;
+  let normalizedKey: string | undefined;
+  if (key) {
+    const candidate = normalizeIndexedText(key);
+    if (!candidate) return null;
+    normalizedKey = candidate;
+  }
+  let normalizedValue: string | undefined;
+  if (value) {
+    const candidate = normalizeIndexedText(value);
+    if (!candidate) return null;
+    normalizedValue = candidate;
+  }
   const sourceKey = `${file.path}:${kind}:${key || ''}:${value || normalizedText}`;
+  const snippet = normalizeIndexedText(makeSnippet(text));
+  if (!snippet) return null;
   return {
     id: sha1(sourceKey),
     kind,
-    key,
-    value,
+    key: normalizedKey,
+    value: normalizedValue,
     text: normalizedText,
     confidence: kind === 'resource' ? 0.9 : 0.75,
     conflict: false,
     source: {
       path: file.path,
       updatedAt: file.updatedAt,
-      snippet: makeSnippet(text),
+      snippet,
       metadata: parseFrontmatterMetadata(file.content),
     },
   };
@@ -150,7 +172,8 @@ function collectItemsFromFile(file: KnowledgeSourceFile): KnowledgeItem[] {
   for (const row of parseMarkdownTableRows(file.content)) {
     const [key, value] = row.cells;
     if (!key || !value) continue;
-    items.push(makeItem('resource', file, row.raw, key, value));
+    const item = makeItem('resource', file, row.raw, key, value);
+    if (item) items.push(item);
   }
 
   for (const rawLine of file.content.split(/\r?\n/)) {
@@ -160,10 +183,40 @@ function collectItemsFromFile(file: KnowledgeSourceFile): KnowledgeItem[] {
     if (!kind) continue;
     const text = stripMarkdown(line).replace(/^(事实|偏好|约定|结论|决策|决定|待办|todo|TODO|后续|风险|资源|文件|图片|链接|场景|Scene)\s*[:：]\s*/iu, '');
     if (!text) continue;
-    items.push(makeItem(kind, file, line, undefined, text));
+    const item = makeItem(kind, file, line, undefined, text);
+    if (item) items.push(item);
   }
 
   return items;
+}
+
+function sanitizeItemForSearch(item: KnowledgeItem): KnowledgeItem | null {
+  const text = normalizeIndexedText(item.text);
+  if (!text) return null;
+  let key: string | undefined;
+  if (item.key) {
+    const candidate = normalizeIndexedText(item.key);
+    if (!candidate) return null;
+    key = candidate;
+  }
+  let value: string | undefined;
+  if (item.value) {
+    const candidate = normalizeIndexedText(item.value);
+    if (!candidate) return null;
+    value = candidate;
+  }
+  const snippet = normalizeIndexedText(item.source.snippet);
+  if (!snippet) return null;
+  return {
+    ...item,
+    key,
+    value,
+    text,
+    source: {
+      ...item.source,
+      snippet,
+    },
+  };
 }
 
 function markConflicts(items: KnowledgeItem[]): KnowledgeItem[] {
@@ -201,6 +254,8 @@ export function searchKnowledgeIndex(index: KnowledgeIndex, query: KnowledgeSear
   const kinds = new Set(query.kinds || []);
   const limit = Math.max(1, query.limit || 20);
   return index.items
+    .map(sanitizeItemForSearch)
+    .filter((item): item is KnowledgeItem => !!item)
     .filter((item) => kinds.size === 0 || kinds.has(item.kind))
     .map((item) => {
       const haystack = `${item.key || ''} ${item.value || ''} ${item.text} ${item.source.path}`.toLowerCase();

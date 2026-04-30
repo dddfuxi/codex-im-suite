@@ -6,6 +6,7 @@ import { JsonFileStore } from '../store.js';
 import { CTI_HOME } from '../config.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
+const GB_MOJIBAKE_CHINESE = '\u6d93\ue15f\u6783';
 
 // We construct the store with a settings map directly
 function makeSettings(): Map<string, string> {
@@ -166,6 +167,48 @@ describe('JsonFileStore', () => {
     assert.ok(memory);
     assert.match(memory.summary, /HSScene/);
     assert.match(memory.summary, /医院内部场景/);
+  });
+
+  it('repairs Feishu history mojibake before retrieval and memory profile indexing', () => {
+    const store = new JsonFileStore(makeSettings());
+    store.upsertFeishuHistoryMessages({
+      chatId: 'oc_chat',
+      displayName: '测试群',
+      messages: [{
+        messageId: 'om_mojibake',
+        chatId: 'oc_chat',
+        senderId: 'ou_user_1',
+        senderName: '刘丹',
+        senderType: 'user',
+        msgType: 'text',
+        createTime: '1770000000000',
+        text: `记住 HSScene 是 ${GB_MOJIBAKE_CHINESE}场景`,
+      }],
+      syncedAt: '2026-04-30T00:00:00.000Z',
+    });
+
+    const history = store.retrieveRelevantFeishuHistory({
+      chatId: 'oc_chat',
+      query: '中文场景',
+      limit: 1,
+    });
+    assert.ok(history);
+    assert.match(history.summary, /中文场景/);
+    assert.doesNotMatch(history.summary, new RegExp(GB_MOJIBAKE_CHINESE));
+
+    const memory = store.retrieveRelevantMemory({
+      sessionId: 'feishu-history:oc_chat',
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      query: '上次 HSScene 是什么场景',
+      recentHistoryLimit: 0,
+    });
+    assert.ok(memory);
+    assert.match(memory.summary, /中文场景/);
+    assert.doesNotMatch(memory.summary, new RegExp(GB_MOJIBAKE_CHINESE));
   });
 
   // ── Session Locking ──

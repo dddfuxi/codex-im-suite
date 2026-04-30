@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-04-30 11:45:58",
-    "releaseRunId":  "a994aa493ff44b639fa27702d955fed9",
+    "generatedAt":  "2026-04-30 18:06:51",
+    "releaseRunId":  "a340479a1adc4e0f8c906a8df42dff77",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/dev",
-                  "commit":  "ea7f5d1",
+                  "commit":  "0671560",
                   "dirty":  true
               },
     "manifest":  {
@@ -19,13 +19,13 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "3CA266772F16",
+                  "Hash":  "C726EB2B1462",
                   "Length":  1704396,
-                  "Modified":  "2026-04-30 11:34:10"
+                  "Modified":  "2026-04-30 18:06:19"
               },
     "content":  {
-                    "runtime.package":  "C7100F3AB5BE",
-                    "runtime.dist":  "7A0D9883DAF8",
+                    "runtime.package":  "2E1866861405",
+                    "runtime.dist":  "E382E584EA9E",
                     "runtime.scripts":  "A640FEE092C2",
                     "runtime.configExample":  "2784AEB44164",
                     "runtime.skill":  "867CAED0153F",
@@ -34,9 +34,9 @@
                     "suite.manifest":  "130C14A98B41",
                     "config.manifests":  "F518F63B17FE",
                     "extensions.skills":  "3D657A104715",
-                    "release.scripts":  "0D738D4DF0A8",
-                    "docs":  "22EAF2F0FE24",
-                    "panel.exe":  "3CA266772F16",
+                    "release.scripts":  "3B27BBC4D5D5",
+                    "docs":  "E34199845904",
+                    "panel.exe":  "C726EB2B1462",
                     "panel.wwwroot":  "130541F27BAA"
                 }
 }

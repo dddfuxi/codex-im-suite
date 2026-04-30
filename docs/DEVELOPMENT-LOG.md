@@ -52,6 +52,8 @@
 - 新增 Markdown 知识索引：默认监听 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`，知识单元分为 `事实 / 结论 / 待办 / 资源`。
 - 知识索引 watcher 新增实时状态文件 `E:\cli-md\.cti-index\status.json`：记录监听心跳、最近事件、最近索引、watcher PID 和错误；控制面板“记忆”页改为读取该状态判断真实监听。
 - 修复记忆关键词误触发：运行时停用“命中 Markdown 就直答”的快答逻辑，明确回忆/搜索类问题才检索记忆；其他请求只把相关记忆注入主执行链。
+- 新增历史乱码修复入口 v1：`scripts/repair-history-mojibake.ps1` 默认扫描 `CTI_HOME\data` 历史、Feishu 历史索引、记忆 Markdown 和 `.cti-index`，`-Apply` 会为改写文件写入可回滚 manifest，并触发 `knowledge.json` / `reminders.json` 重建；`-Restore <manifest>` 可按备份回滚。
+- Feishu 历史同步、记忆 profile 入库、Markdown 知识索引和待办提醒派生加入 mojibake 防护：能识别并修复典型 UTF-8 错读文本，仍无法确认的文本不再进入记忆检索摘要或待办提醒标题。
 - 控制面板服务卡从“本地辅助执行器”改为“Ollama”，并新增“记忆”页展示索引状态、监听状态、类型筛选、关键词搜索和来源片段。
 - 新增待办主动提醒 v1：运行时从 Markdown 知识索引里的 `kind=todo` 派生 `.cti-index\reminders.json`，解析提醒时间、状态和来源会话，并用 `.cti-index\reminder-state.json` 记录已发送、失败和跳过原因。
 - 新增多渠道 PushProvider 抽象：飞书 provider 复用 bridge-core 出站收口、去重和审计；微信 provider 暂返回 `unsupported`，面板显示未接入，不伪装发送成功。

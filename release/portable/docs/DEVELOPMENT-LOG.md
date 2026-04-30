@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-04-29
+更新时间：2026-04-30
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -32,6 +32,7 @@
 - 桌面面板的 Control API 启动已补端口冲突保护：本机 loopback 模式下如果默认 `8788` 被占用，会自动尝试后续端口，避免多开面板时直接弹未处理异常；远程显式监听仍保持严格失败。
 - `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
 - `assemble-portable.ps1`、`build-installer.ps1` 和 `sync-live-skill.ps1` 在覆盖运行副本或发布产物前会检查目录下是否有运行进程占用；命中时输出 PID 和路径并停止，不自动 kill。
+- 发布便携包 `release\codex-im-suite-portable.zip` 改为通过 Git LFS 跟踪 `release/*.zip`，避免 GitHub 普通 Git 单文件 100MB 限制阻断备份发布。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 - 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
@@ -51,6 +52,8 @@
 - 新增 Markdown 知识索引：默认监听 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`，知识单元分为 `事实 / 结论 / 待办 / 资源`。
 - 知识索引 watcher 新增实时状态文件 `E:\cli-md\.cti-index\status.json`：记录监听心跳、最近事件、最近索引、watcher PID 和错误；控制面板“记忆”页改为读取该状态判断真实监听。
 - 修复记忆关键词误触发：运行时停用“命中 Markdown 就直答”的快答逻辑，明确回忆/搜索类问题才检索记忆；其他请求只把相关记忆注入主执行链。
+- 新增历史乱码修复入口 v1：`scripts/repair-history-mojibake.ps1` 默认扫描 `CTI_HOME\data` 历史、Feishu 历史索引、记忆 Markdown 和 `.cti-index`，`-Apply` 会为改写文件写入可回滚 manifest，并触发 `knowledge.json` / `reminders.json` 重建；`-Restore <manifest>` 可按备份回滚。
+- Feishu 历史同步、记忆 profile 入库、Markdown 知识索引和待办提醒派生加入 mojibake 防护：能识别并修复典型 UTF-8 错读文本，仍无法确认的文本不再进入记忆检索摘要或待办提醒标题。
 - 控制面板服务卡从“本地辅助执行器”改为“Ollama”，并新增“记忆”页展示索引状态、监听状态、类型筛选、关键词搜索和来源片段。
 - 新增待办主动提醒 v1：运行时从 Markdown 知识索引里的 `kind=todo` 派生 `.cti-index\reminders.json`，解析提醒时间、状态和来源会话，并用 `.cti-index\reminder-state.json` 记录已发送、失败和跳过原因。
 - 新增多渠道 PushProvider 抽象：飞书 provider 复用 bridge-core 出站收口、去重和审计；微信 provider 暂返回 `unsupported`，面板显示未接入，不伪装发送成功。

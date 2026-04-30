@@ -6,7 +6,25 @@ import {
   searchKnowledgeIndex,
 } from '../knowledge-indexer.js';
 
+const GB_MOJIBAKE_CHINESE = '\u6d93\ue15f\u6783';
+
 describe('knowledge indexer', () => {
+  it('repairs mojibake before indexing searchable knowledge', () => {
+    const index = buildKnowledgeIndexFromMarkdown({
+      memoryRoot: 'E:\\cli-md',
+      files: [{
+        path: 'E:\\cli-md\\notes.md',
+        updatedAt: '2026-04-30T10:00:00.000Z',
+        content: `- 事实：HSScene 是 ${GB_MOJIBAKE_CHINESE}场景。`,
+      }],
+    });
+
+    assert.equal(index.items.length, 1);
+    assert.match(index.items[0].text, /中文场景/);
+    assert.doesNotMatch(index.items[0].text, new RegExp(GB_MOJIBAKE_CHINESE));
+    assert.equal(searchKnowledgeIndex(index, { query: '中文场景' }).length, 1);
+  });
+
   it('extracts facts and resources from markdown tables with source snippets', () => {
     const index = buildKnowledgeIndexFromMarkdown({
       memoryRoot: 'E:\\cli-md',
