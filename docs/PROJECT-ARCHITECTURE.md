@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-04-29
+更新时间：2026-04-30
 
 ## 0. 架构文档维护规则
 
@@ -762,6 +762,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 - 构建控制面板。
 - 用开发版生成 live skill。
 - 组装 portable。
+- 生成 `release\codex-im-suite-portable.zip` 便携分发包；zip 通过 Git LFS 跟踪 `release/*.zip`，避免超过 GitHub 普通 Git blob 上限。
 - 组装 installer。
 - 执行发布前分叉体检，比较开发版、live skill、portable、installer payload 的关键文件 hash、manifest、构建时间、commit 和 `.suite-release.json` 指纹。
 - 生成 `publish-summary.md`。
@@ -804,7 +805,7 @@ flowchart TD
   DevTree --> ArchCheck[update-architecture-docs.ps1]
   BuildPackages --> Assemble[assemble-portable.ps1]
   Assemble --> Portable[release/portable]
-  Portable --> Zip[portable zip]
+  Portable --> Zip[portable zip via Git LFS]
   Portable --> Installer[Windows installer]
   LiveRuntime --> ForkHealth[test-release-fork-health.ps1]
   Portable --> ForkHealth

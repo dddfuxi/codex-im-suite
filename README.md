@@ -132,6 +132,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
+`release\codex-im-suite-portable.zip` 是便携版分发包，体积通常超过 GitHub 普通 Git 单文件 100MB 限制；仓库使用 Git LFS 跟踪 `release/*.zip`，首次克隆或发布前请确认本机已安装并启用 `git lfs`。
+
 独立检查开发版、live skill、portable 和 installer payload 是否分叉：
 
 ```powershell
