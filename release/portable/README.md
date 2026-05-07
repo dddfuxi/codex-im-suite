@@ -62,7 +62,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
 
 Control API 默认只监听本机：
 
@@ -124,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换、统一运行单元动作、会话详情抽屉，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换、统一运行单元动作、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
 
 打包 portable 和 installer：
 

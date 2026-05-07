@@ -710,6 +710,13 @@ function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | null {
   }
 }
 
+function stripFinalReplyProtocolArtifacts(text: string): string {
+  return text
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${FINAL_REPLY_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function resolveExplicitPaths(
   items: string[],
   workingDirectory: string,
@@ -778,7 +785,8 @@ async function prepareBridgeReplyPayload(
       replyTo: visibleEnvelope.reply_to,
     };
   }
-  if (visible) {
+  const safeVisible = visible ? stripFinalReplyProtocolArtifacts(visible) : '';
+  if (safeVisible) {
     writeFinalEnvelopeStatus({
       parsed: false,
       kind: null,
@@ -787,14 +795,14 @@ async function prepareBridgeReplyPayload(
       updatedAt: new Date().toISOString(),
     });
     return {
-      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(visible, sourcePrompt)),
+      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(safeVisible, sourcePrompt)),
       parseMode: 'plain',
       images: [],
       files: [],
     };
   }
 
-  const compacted = compactBridgeReplyForDelivery(text);
+  const compacted = compactBridgeReplyForDelivery(stripFinalReplyProtocolArtifacts(text) || text);
   writeFinalEnvelopeStatus({
     parsed: false,
     kind: null,

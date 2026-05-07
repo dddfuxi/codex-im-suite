@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-04-30
+更新时间：2026-05-07
 
 ## 0. 架构文档维护规则
 
@@ -446,6 +446,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 会话详情读取旧本地消息时仍保留显示层 mojibake 修复；需要改写历史 JSON 或记忆索引时走 `scripts/repair-history-mojibake.ps1 -Apply`，由备份 manifest 承担回滚。
 - 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要、recovery / retry 状态和事件时间线，方便回溯一次飞书请求从接收、路由、执行、重试到交付或失败的运行历程。
 - 执行器页和会话详情对失败但保留恢复输入的 run 显示“重试”入口，宿主通过 `workflow.retryRun` 原子更新 `workflow-runs.json`，运行时 retry worker 再领取执行。
+- 顶部栏显示 live skill 同步状态；宿主在 `state.refresh` 中读取 live `.suite-release.json.generatedAt`、suite/live commit 与关键内容 hash，必要时通过 `live.sync` 只执行 `scripts/sync-live-skill.ps1`，不打包、不提交、不推送、不重启 bridge。
 - “权限”页读取 `permissions.json` 和最近会话参与人，支持按渠道、角色、名称或 ID 过滤，能把用户设置为 `Viewer`、`Operator` 或 `Owner`，并同步兼容 env 后重启 bridge。
 - 会话详情的参与人列表不再只提供一次性“加 Owner”，而是进入同一套权限库，可直接设置三档角色；显示名优先来自飞书历史，拿不到时显示原始 ID。
 - 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
@@ -484,7 +485,8 @@ HostBridge 命令协议：
 
 当前核心白名单命令分组：
 
-- 状态与服务：`state.refresh`、`bridge.*`、`codex.*`、`localLlm.*`、`ollama.*`
+- 状态与服务：`state.refresh`、`panel.*`、`bridge.*`、`codex.*`、`localLlm.*`、`ollama.*`
+- Live 同步：`live.sync`
 - Workflow 和执行器：`workflow.listRuns`、`workflow.getRun`、`workflow.getEvents`、`workflow.retryRun`、`executor.list`、`executor.check`、`executor.setSessionDefault`
 - 权限：`permissions.list`、`permissions.upsert`、`permissions.remove`、`permissions.syncFromConfig`、`permissions.applyAndRestart`
 - 运行单元：`runtime.listUnits`、`runtime.invokeAction`
@@ -830,6 +832,8 @@ live skill 同步时，`scripts/sync-live-skill.ps1` 只把开发版源码和构
 - `C:\Users\admin\.codex\skills\claude-to-im-core`
 
 其中 MCP / Skill / Plugin 扩展清单必须从开发版唯一来源 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 复制到 live skill 顶层的 `mcp.d`、`skills.d`、`plugins.d`，供运行版控制面板在脱离 suiteRoot 时读取。不要从旧 `packages/bridge-runtime/mcp.d` 恢复运行版清单。
+
+同步控制面板发布目录时必须排除 `CodexImSuiteControlPanel.exe.WebView2` 用户数据目录，避免 WebView2 Cookie/Cache 临时文件被 robocopy 镜像到 live skill。
 
 ### 9.1 入口定位
 

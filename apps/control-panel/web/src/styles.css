@@ -242,6 +242,51 @@ textarea::placeholder {
   font-size: 24px;
 }
 
+.topbar-title {
+  display: grid;
+  gap: 6px;
+  min-width: 260px;
+  flex: 1 1 360px;
+}
+
+.live-sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: min(720px, 100%);
+  min-height: 34px;
+  padding: 5px 6px 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-strong);
+}
+
+.live-sync-banner.current {
+  border-color: color-mix(in srgb, var(--success-text) 16%, var(--border));
+  background: color-mix(in srgb, var(--success-bg) 42%, var(--panel-strong));
+}
+
+.live-sync-banner.outdated,
+.live-sync-banner.missing {
+  border-color: color-mix(in srgb, var(--warning-text) 18%, var(--border));
+  background: color-mix(in srgb, var(--warning-bg) 42%, var(--panel-strong));
+}
+
+.live-sync-banner.error {
+  border-color: color-mix(in srgb, var(--danger-text) 18%, var(--border));
+  background: color-mix(in srgb, var(--danger-bg) 42%, var(--panel-strong));
+}
+
+.live-sync-copy {
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .topbar-actions,
 .command-band,
 .filter-row,
@@ -1367,6 +1412,15 @@ button:disabled {
 
   .topbar h1 {
     font-size: 20px;
+  }
+
+  .topbar-title,
+  .live-sync-banner {
+    width: 100%;
+  }
+
+  .live-sync-copy {
+    white-space: normal;
   }
 
   .summary-grid,

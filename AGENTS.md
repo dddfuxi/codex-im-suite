@@ -95,6 +95,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 
 - 开发版是主版本，live skill 是运行副本。
 - 修改开发版后，如果用户要求立即生效，运行 `scripts/sync-live-skill.ps1`，方向固定为“开发版 suite -> live skill”，不要手工复制零散文件。
+- 控制面板顶部的 live 同步提示以 live runtime `.suite-release.json.generatedAt`、suite/live commit 和关键内容 hash 为依据；看到“Live 落后 / 未记录同步时间 / 读取失败”时，优先使用面板“一键同步”或手动运行 `scripts/sync-live-skill.ps1`，不要改 live 副本里的零散文件。
+- 面板 `live.sync` / “一键同步”只允许执行开发版 suite -> live skill 同步；它不打包、不提交、不推送，也不自动重启 bridge。需要让 daemon 重新加载新代码时，必须把“同步”和“重启 bridge”作为两个明确步骤处理。
+- `scripts/sync-live-skill.ps1` 复制控制面板发布目录时必须排除 `CodexImSuiteControlPanel.exe.WebView2` 用户数据目录，避免 WebView2 Cookie/Cache 临时文件导致 robocopy 误报失败。
 - 如确实需要从 live 救回历史改动，只能手动运行 `scripts/import-live-to-suite.ps1 -Apply`，并先确认 `git status`；发布流程不得调用该脚本。
 - 发布前必须确认开发版、live skill、portable 打包版没有分叉。
 - 面板显示异常时，先看 exe 路径、构建时间、commit，再判断是不是旧版本。

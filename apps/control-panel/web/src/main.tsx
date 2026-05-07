@@ -388,6 +388,16 @@ type ExtensionImportPreview = {
   reason: string;
 };
 
+type LiveSyncState = {
+  status: 'current' | 'outdated' | 'missing' | 'error' | 'unavailable';
+  lastSyncedAt: string;
+  suiteCommit: string;
+  liveCommit: string;
+  summary: string;
+  canSync: boolean;
+  detail: string;
+};
+
 type PanelState = {
   generatedAt: string;
   suite: {
@@ -422,6 +432,7 @@ type PanelState = {
     tagScriptExists: boolean;
     pendingChanges: string[];
   };
+  liveSync: LiveSyncState;
   settings: SettingsState;
   history: {
     status: string;
@@ -509,6 +520,7 @@ const fallbackState: PanelState = {
   extensions: { total: 0, enabled: 0, disabled: 0, missingSources: 0, items: [] },
   mcp: { total: 0, running: 0, items: [], runtimeStatus: '', details: '' },
   release: { publishSummaryExists: false, releaseNotesExists: false, prepareMainReleaseExists: false, tagScriptExists: false, pendingChanges: [] },
+  liveSync: { status: 'unavailable', lastSyncedAt: '', suiteCommit: '', liveCommit: '', summary: 'Live 同步状态不可用', canSync: false, detail: '' },
   settings: { defaultWorkDir: '', allowedRoots: '', unityProject: '', memoryRepo: '', additionalDirs: '', replyStyleHint: '' },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
@@ -1079,6 +1091,14 @@ function App() {
 
   const run = async (command: string, payload: Record<string, unknown> = {}) => sendCommand(command, payload);
 
+  const syncLive = async () => {
+    const confirmed = window.confirm('将执行开发版 suite -> live skill 同步；不会提交、推送或打包。');
+    if (!confirmed) return;
+    await sendCommand('live.sync');
+    await sendCommand('state.refresh');
+    await loadRuntimeUnits();
+  };
+
   const invokeRuntimeAction = async (unit: RuntimeUnit, action: RuntimeAction) => {
     await sendCommand('runtime.invokeAction', { unitId: unit.unitId, action: action.id });
     await loadRuntimeUnits();
@@ -1113,9 +1133,10 @@ function App() {
 
       <main className="workspace">
         <header className="topbar">
-          <div>
+          <div className="topbar-title">
             <div className="eyebrow">Suite {state.suite.version} · 协议 {state.suite.protocol}</div>
             <h1>{navItems.find((item) => item.id === page)?.label}</h1>
+            <LiveSyncBanner liveSync={state.liveSync} pending={pending['live.sync']} onSync={() => void syncLive()} />
           </div>
           <div className="topbar-actions">
             <button className="theme-button" title="切换白天 / 夜晚模式" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>
@@ -1124,6 +1145,19 @@ function App() {
             </button>
             <button className="icon-button" title="刷新状态" onClick={() => void sendCommand('state.refresh').then(loadRuntimeUnits)} disabled={pending['state.refresh']}>
               <RefreshCw size={16} className={pending['state.refresh'] ? 'spin' : ''} />
+            </button>
+            <button
+              className="theme-button"
+              title="重启控制面板"
+              onClick={() => {
+                if (window.confirm('重启控制面板？\n\n新面板启动后，当前窗口会自动关闭。')) {
+                  void run('panel.restart');
+                }
+              }}
+              disabled={pending['panel.restart']}
+            >
+              <RotateCw size={16} className={pending['panel.restart'] ? 'spin' : ''} />
+              <span>重启面板</span>
             </button>
             <button className="primary-button" onClick={() => void run('release.publishBackup').then(loadRuntimeUnits)} disabled={pending['release.publishBackup']}>
               <Rocket size={16} />
@@ -2691,6 +2725,39 @@ function SectionHeader({ title, action }: { title: string; action?: React.ReactN
     <div className="section-header">
       <h2>{title}</h2>
       {action}
+    </div>
+  );
+}
+
+function liveSyncStatusKind(status: LiveSyncState['status']): StatusKind {
+  switch (status) {
+    case 'current':
+      return 'ok';
+    case 'outdated':
+    case 'missing':
+      return 'warning';
+    case 'error':
+      return 'error';
+    default:
+      return 'idle';
+  }
+}
+
+function LiveSyncBanner({ liveSync, pending, onSync }: { liveSync: LiveSyncState; pending?: boolean; onSync: () => void }) {
+  const canShowSync = liveSync.canSync && ['outdated', 'missing', 'error'].includes(liveSync.status);
+  const summary = liveSync.summary || 'Live 同步状态不可用';
+  return (
+    <div className={`live-sync-banner ${liveSync.status}`} title={liveSync.detail || summary}>
+      <StatusPill status={liveSyncStatusKind(liveSync.status)} label={liveSync.status === 'current' ? 'Live' : 'Live 待处理'} />
+      <span className="live-sync-copy">{summary}</span>
+      {canShowSync && (
+        <MiniButton
+          label="一键同步"
+          icon={<ArrowDownUp size={14} />}
+          onClick={onSync}
+          pending={pending}
+        />
+      )}
     </div>
   );
 }

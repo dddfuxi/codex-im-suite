@@ -11,9 +11,9 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import type { BridgeStore, LifecycleHooks } from '../../lib/bridge/host';
+import type { BridgeStore, LifecycleHooks, UpsertChannelBindingInput } from '../../lib/bridge/host';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
-import type { OutboundMessage, SendResult } from '../../lib/bridge/types';
+import type { ChannelBinding, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -244,6 +244,195 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager result block delivery', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('delivers cti-final plain text through the Feishu outbound path without protocol artifacts', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = [
+      '过程说明不应该出现在最终消息里。',
+      '',
+      '```cti-final',
+      JSON.stringify({
+        kind: 'text',
+        text: '任务已完成：纯文本结果',
+        reply_mode: 'plain',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请输出纯文本结果'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /任务已完成：纯文本结果/);
+    assert.doesNotMatch(sent[0].text, /cti-final|"kind"|"reply_mode"|过程说明/);
+    assert.equal(sent[0].parseMode, 'Markdown');
+  });
+
+  it('delivers cti-final markdown through the Feishu outbound path as markdown', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = [
+      '```cti-final',
+      JSON.stringify({
+        kind: 'text',
+        text: '## 结果\n\n- 已完成 **Markdown** 输出',
+        reply_mode: 'markdown',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请输出 markdown 结果'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /## 结果/);
+    assert.match(sent[0].text, /\*\*Markdown\*\*/);
+    assert.doesNotMatch(sent[0].text, /cti-final|"kind"|"reply_mode"/);
+    assert.equal(sent[0].parseMode, 'Markdown');
+  });
+
+  it('falls back to readable text when cti-final JSON is malformed instead of sending raw JSON fragments', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = [
+      '我会先整理结果。',
+      '',
+      '```cti-final',
+      '{"kind":"text","text":"这个 JSON 被截断了","reply_mode":"markdown"',
+      '```',
+      '',
+      '最终可读结果：已完成兜底发送。',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请输出一个最终结果'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /最终可读结果：已完成兜底发送。/);
+    assert.doesNotMatch(sent[0].text, /cti-final|"kind"|"reply_mode"|这个 JSON 被截断了/);
+  });
+
+  it('executes cti-reminder through the real reminder host and only sends the host result', async () => {
+    const sent: OutboundMessage[] = [];
+    const created: unknown[] = [];
+    let ticked = false;
+    const dueAt = '2026-05-07T04:30:00.000Z';
+    const response = [
+      '我会交给 bridge 创建提醒。',
+      '',
+      '```cti-reminder',
+      JSON.stringify({
+        title: '看电脑',
+        dueAt,
+        timezone: 'Asia/Shanghai',
+        target: 'current_chat',
+        sourcePrompt: '半小时后提醒我看电脑',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      reminders: {
+        createDirectReminder: async (input) => {
+          created.push(input);
+          return {
+            ok: true,
+            reminderId: 'rem_real_1',
+            title: input.title,
+            dueAt: input.dueAt,
+            target: input.target,
+          };
+        },
+        tickReminders: async () => {
+          ticked = true;
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('半小时后提醒我看电脑'));
+
+    assert.equal(created.length, 1);
+    assert.deepEqual(created[0], {
+      title: '看电脑',
+      dueAt,
+      timezone: 'Asia/Shanghai',
+      target: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_1' },
+      sourcePrompt: '半小时后提醒我看电脑',
+      createdByMessageId: 'm_1',
+      sessionId: 'session_1',
+    });
+    assert.equal(ticked, true);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /提醒已进入统一提醒系统：看电脑/);
+    assert.match(sent[0].text, /Reminder ID：rem_real_1/);
+    assert.doesNotMatch(sent[0].text, /cti-reminder|"target":"current_chat"|我会交给 bridge 创建提醒/);
+  });
+
+  it('blocks fake reminder completion claims and avoids leaking the original pseudo-success text', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = '已成功创建系统计划任务：CodexFeishuReminder_20260507_1230，稍后会提醒你。';
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('提醒我看电脑'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /未完成：这条回复声称已经创建提醒或系统计划任务/);
+    assert.match(sent[0].text, /没有进入 bridge 的统一提醒系统/);
+    assert.doesNotMatch(sent[0].text, /CodexFeishuReminder_20260507_1230|稍后会提醒你/);
+  });
+});
+
 describe('bridge-manager policy helpers', () => {
   it('detects generated document list requests without needing full history', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
@@ -403,6 +592,97 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     listPendingPermissionLinksByChat: () => [],
     getChannelOffset: () => '0',
     setChannelOffset: () => {},
+  };
+}
+
+function createStatefulStore(settings: Record<string, string> = {}): BridgeStore {
+  const sessions = new Map<string, any>();
+  const bindings = new Map<string, ChannelBinding>();
+  const messages = new Map<string, Array<{ role: string; content: string }>>();
+  let sessionCounter = 0;
+
+  const store = {
+    ...createMinimalStore({
+      bridge_default_work_dir: process.cwd(),
+      ...settings,
+    }),
+    getChannelBinding: (channelType: string, chatId: string) => bindings.get(`${channelType}:${chatId}`) ?? null,
+    upsertChannelBinding: (input: UpsertChannelBindingInput) => {
+      const key = `${input.channelType}:${input.chatId}`;
+      const existing = bindings.get(key);
+      const now = new Date('2026-05-07T00:00:00.000Z').toISOString();
+      const mode = input.mode === 'plan' || input.mode === 'ask' || input.mode === 'code'
+        ? input.mode
+        : existing?.mode ?? 'code';
+      const binding: ChannelBinding = {
+        id: existing?.id || `binding_${bindings.size + 1}`,
+        channelType: input.channelType,
+        chatId: input.chatId,
+        displayName: input.displayName,
+        chatType: input.chatType,
+        codepilotSessionId: input.codepilotSessionId,
+        sdkSessionId: input.sdkSessionId ?? existing?.sdkSessionId ?? '',
+        workingDirectory: input.workingDirectory ?? existing?.workingDirectory ?? process.cwd(),
+        model: input.model ?? existing?.model ?? '',
+        mode,
+        bridgeFingerprint: input.bridgeFingerprint ?? existing?.bridgeFingerprint,
+        toolingFingerprint: input.toolingFingerprint ?? existing?.toolingFingerprint,
+        active: existing?.active ?? true,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      };
+      bindings.set(key, binding);
+      return binding;
+    },
+    updateChannelBinding: (id: string, updates: Partial<ChannelBinding>) => {
+      for (const [key, binding] of bindings) {
+        if (binding.id === id) {
+          bindings.set(key, { ...binding, ...updates, updatedAt: new Date('2026-05-07T00:00:00.000Z').toISOString() });
+          return;
+        }
+      }
+    },
+    listChannelBindings: (channelType?: string) => Array.from(bindings.values()).filter((binding) => !channelType || binding.channelType === channelType),
+    createSession: (_title: string, model = '', systemPrompt?: string, workingDirectory = process.cwd()) => {
+      sessionCounter += 1;
+      const session = {
+        id: `session_${sessionCounter}`,
+        working_directory: workingDirectory,
+        model,
+        system_prompt: systemPrompt,
+        provider_id: '',
+      };
+      sessions.set(session.id, session);
+      return session;
+    },
+    getSession: (sessionId: string) => sessions.get(sessionId) ?? null,
+    addMessage: (sessionId: string, role: string, content: string) => {
+      const current = messages.get(sessionId) ?? [];
+      current.push({ role, content });
+      messages.set(sessionId, current);
+    },
+    getMessages: (sessionId: string) => ({ messages: messages.get(sessionId) ?? [] }),
+  } satisfies BridgeStore;
+
+  return store;
+}
+
+function createTextStream(text: string): ReadableStream<string> {
+  return new ReadableStream<string>({
+    start(controller) {
+      controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: text })}\n\n`);
+      controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: '{}' })}\n\n`);
+      controller.close();
+    },
+  });
+}
+
+function createInboundMessage(text: string) {
+  return {
+    messageId: 'm_1',
+    address: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_1' },
+    text,
+    timestamp: new Date('2026-05-07T04:00:00.000Z').getTime(),
   };
 }
 

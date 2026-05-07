@@ -54,6 +54,7 @@ internal sealed class MainForm : Form
     private readonly string _suiteRoot;
     private readonly string _publishBackupScript;
     private readonly string _mainReleaseScript;
+    private readonly string _syncLiveSkillScript;
     private readonly string _localLlmStartScript;
     private readonly string _localLlmStopScript;
     private readonly string _localLlmHealthcheckScript;
@@ -138,6 +139,7 @@ internal sealed class MainForm : Form
             : Path.Combine(_suiteRoot, "config", "plugins.d");
         _publishBackupScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "publish-backup.ps1");
         _mainReleaseScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "prepare-main-release.ps1");
+        _syncLiveSkillScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "sync-live-skill.ps1");
         var localLlmScriptRoot = string.IsNullOrWhiteSpace(_suiteRoot)
             ? Path.Combine(_skillDir, "scripts", "local-llm")
             : Path.Combine(_suiteRoot, "scripts", "local-llm");
@@ -488,11 +490,13 @@ internal sealed class MainForm : Form
     {
         if (command.StartsWith("permissions.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("release.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("live.", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "security.addFeishuOwner", StringComparison.OrdinalIgnoreCase))
         {
             return "owner";
         }
         if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("panel.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("localLlm.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("ollama.", StringComparison.OrdinalIgnoreCase)
@@ -710,6 +714,10 @@ internal sealed class MainForm : Form
             case "state.refresh":
                 await RefreshAllAsync();
                 return await BuildWebStateAsync();
+            case "panel.restart":
+                return await RestartControlPanelAsync();
+            case "live.sync":
+                return await SyncLiveSkillAsync();
             case "bridge.start":
                 await RunDaemonAsync("start");
                 return "bridge start requested";
@@ -992,6 +1000,7 @@ internal sealed class MainForm : Form
                 tagScriptExists = File.Exists(Path.Combine(_suiteRoot, "scripts", "create-main-release-tag.ps1")),
                 pendingChanges = statusLines.Take(80).ToArray(),
             },
+            liveSync = BuildLiveSyncStatus(commit),
             settings = GetSettingsSnapshot(),
             history = new
             {
@@ -1018,6 +1027,151 @@ internal sealed class MainForm : Form
             },
             activities = _activities.TakeLast(220).ToArray(),
         };
+    }
+
+    private WebLiveSyncStatus BuildLiveSyncStatus(string suiteCommit)
+    {
+        var canSync = !string.IsNullOrWhiteSpace(_suiteRoot) && File.Exists(_syncLiveSkillScript);
+        if (string.IsNullOrWhiteSpace(_suiteRoot) || !Directory.Exists(_suiteRoot) || string.IsNullOrWhiteSpace(_skillDir))
+        {
+            return new WebLiveSyncStatus("unavailable", "", suiteCommit, "", "Live 同步状态不可用", canSync, "未找到开发版 suiteRoot 或 live skill 路径。");
+        }
+
+        var fingerprintPath = Path.Combine(_skillDir, ".suite-release.json");
+        if (!File.Exists(fingerprintPath))
+        {
+            return new WebLiveSyncStatus("missing", "", suiteCommit, "", "Live 未记录同步时间", canSync, fingerprintPath);
+        }
+
+        try
+        {
+            using var stream = new FileStream(fingerprintPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var doc = JsonDocument.Parse(stream);
+            var root = doc.RootElement;
+            var lastSyncedAt = ReadJsonString(root, "generatedAt");
+            var liveCommit = "";
+            if (root.TryGetProperty("suite", out var suiteElement))
+            {
+                liveCommit = ReadJsonString(suiteElement, "commit");
+            }
+            if (string.IsNullOrWhiteSpace(lastSyncedAt))
+            {
+                return new WebLiveSyncStatus("missing", "", suiteCommit, liveCommit, "Live 未记录同步时间", canSync, fingerprintPath);
+            }
+
+            var reasons = new List<string>();
+            if (string.IsNullOrWhiteSpace(liveCommit))
+            {
+                reasons.Add("live commit 缺失");
+            }
+            else if (!string.IsNullOrWhiteSpace(suiteCommit)
+                && !string.Equals(suiteCommit, liveCommit, StringComparison.OrdinalIgnoreCase))
+            {
+                reasons.Add($"commit {liveCommit} != {suiteCommit}");
+            }
+            if (HasLiveContentMismatch(reasons))
+            {
+                var summary = string.IsNullOrWhiteSpace(lastSyncedAt)
+                    ? "Live 落后 · 未记录同步时间"
+                    : $"Live 落后 · 上次同步 {FormatSyncTime(lastSyncedAt)}";
+                return new WebLiveSyncStatus("outdated", lastSyncedAt, suiteCommit, liveCommit, summary, canSync, string.Join("；", reasons.Take(6)));
+            }
+
+            var currentSummary = string.IsNullOrWhiteSpace(lastSyncedAt)
+                ? "Live 已同步"
+                : $"Live 已同步 · 上次同步 {FormatSyncTime(lastSyncedAt)}";
+            return new WebLiveSyncStatus("current", lastSyncedAt, suiteCommit, liveCommit, currentSummary, canSync, "");
+        }
+        catch (Exception ex)
+        {
+            return new WebLiveSyncStatus("error", "", suiteCommit, "", $"Live 状态读取失败：{TrimForStatus(ex.Message, 80)}", canSync, ex.Message);
+        }
+    }
+
+    private bool HasLiveContentMismatch(List<string> reasons)
+    {
+        var liveCoreDir = ResolveLiveCoreDir();
+        CompareFileHash("runtime src", Path.Combine(_suiteRoot, "packages", "bridge-runtime", "src", "main.ts"), Path.Combine(_skillDir, "src", "main.ts"), reasons);
+        CompareFileHash("core bridge", Path.Combine(_suiteRoot, "packages", "bridge-core", "src", "lib", "bridge", "bridge-manager.ts"), Path.Combine(liveCoreDir, "src", "lib", "bridge", "bridge-manager.ts"), reasons);
+        CompareFileHash("panel exe", Path.Combine(_suiteRoot, "release", "artifacts", "control-panel", "CodexImSuiteControlPanel.exe"), Path.Combine(_skillDir, "dist", "control-panel", "ClaudeToImControlPanel.exe"), reasons);
+        CompareDirectoryHash("panel wwwroot", Path.Combine(_suiteRoot, "release", "artifacts", "control-panel", "wwwroot"), Path.Combine(_skillDir, "dist", "control-panel", "wwwroot"), reasons);
+        return reasons.Count > 0;
+    }
+
+    private string ResolveLiveCoreDir()
+    {
+        var parent = Directory.GetParent(_skillDir)?.FullName;
+        return string.IsNullOrWhiteSpace(parent) ? "" : Path.Combine(parent, "claude-to-im-core");
+    }
+
+    private static void CompareFileHash(string label, string suitePath, string livePath, List<string> reasons)
+    {
+        if (!File.Exists(suitePath))
+        {
+            reasons.Add($"{label} 开发版缺失");
+            return;
+        }
+        if (!File.Exists(livePath))
+        {
+            reasons.Add($"{label} live 缺失");
+            return;
+        }
+        var suiteHash = ComputeFileSha256(suitePath);
+        var liveHash = ComputeFileSha256(livePath);
+        if (!string.Equals(suiteHash, liveHash, StringComparison.OrdinalIgnoreCase))
+        {
+            reasons.Add($"{label} hash 不一致");
+        }
+    }
+
+    private static void CompareDirectoryHash(string label, string suiteDir, string liveDir, List<string> reasons)
+    {
+        if (!Directory.Exists(suiteDir))
+        {
+            reasons.Add($"{label} 开发版缺失");
+            return;
+        }
+        if (!Directory.Exists(liveDir))
+        {
+            reasons.Add($"{label} live 缺失");
+            return;
+        }
+        var suiteHash = ComputeDirectorySha256(suiteDir);
+        var liveHash = ComputeDirectorySha256(liveDir);
+        if (!string.Equals(suiteHash, liveHash, StringComparison.OrdinalIgnoreCase))
+        {
+            reasons.Add($"{label} hash 不一致");
+        }
+    }
+
+    private static string ComputeFileSha256(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static string ComputeDirectorySha256(string root)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            var relative = Path.GetRelativePath(root, file).Replace('\\', '/').ToLowerInvariant();
+            var nameBytes = Encoding.UTF8.GetBytes(relative);
+            hash.AppendData(nameBytes);
+            hash.AppendData(new byte[] { 0 });
+            hash.AppendData(File.ReadAllBytes(file));
+            hash.AppendData(new byte[] { 0 });
+        }
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static string FormatSyncTime(string value)
+    {
+        if (DateTimeOffset.TryParse(value, out var parsed))
+        {
+            return parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+        }
+        return value;
     }
 
     private WebServiceItem BuildServiceItem(string id, string title, string text)
@@ -3214,6 +3368,56 @@ internal sealed class MainForm : Form
         throw new InvalidOperationException($"不支持的运行单元动作：{unitId} / {action}");
     }
 
+    private Task<string> RestartControlPanelAsync()
+    {
+        var executablePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+        {
+            throw new InvalidOperationException("无法定位当前控制面板程序，不能自动重启。");
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            WorkingDirectory = AppContext.BaseDirectory,
+            UseShellExecute = false,
+        };
+        foreach (var argument in Environment.GetCommandLineArgs().Skip(1))
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("新控制面板进程启动失败。");
+        AddWebActivity("info", "控制面板重启", $"已启动新面板 PID={process.Id}，当前面板即将退出。");
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(800);
+            try
+            {
+                if (!IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(Close));
+                    return;
+                }
+
+                if (_controlApi is not null)
+                {
+                    await _controlApi.StopAsync();
+                    await _controlApi.DisposeAsync();
+                }
+            }
+            catch
+            {
+                // Restart is a best-effort escape hatch; the new process is already launched.
+            }
+            Environment.Exit(0);
+        });
+
+        return Task.FromResult($"panel restart requested PID={process.Id}");
+    }
+
     private async Task SetExtensionEnabledAsync(string manifestPath, bool enabled)
     {
         var root = LoadManifestNode(manifestPath);
@@ -5281,6 +5485,34 @@ internal sealed class MainForm : Form
         }
     }
 
+    private async Task<WebLiveSyncStatus> SyncLiveSkillAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_syncLiveSkillScript) || !File.Exists(_syncLiveSkillScript))
+        {
+            throw new InvalidOperationException("未找到 sync-live-skill.ps1。");
+        }
+
+        var preflight = await ValidatePowerShellScriptAsync(_syncLiveSkillScript);
+        if (!preflight.Success)
+        {
+            AppendLog($"live 同步脚本语法失败：{preflight.Message}");
+            throw new InvalidOperationException($"live 同步脚本语法失败：{preflight.Message}");
+        }
+
+        var result = await RunPowerShellFileAsync(_syncLiveSkillScript, "", _suiteRoot, 900000);
+        AppendCommand("同步 live skill", result);
+        await RefreshBuildInfoAsync();
+        if (result.ExitCode != 0)
+        {
+            var error = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            throw new InvalidOperationException($"同步 live skill 失败 exit={result.ExitCode}: {TrimForStatus(error, 240)}");
+        }
+
+        AddWebActivity("success", "Live 同步完成", "已执行开发版 suite -> live skill 同步；未提交、推送、打包或重启 bridge。");
+        var commit = !string.IsNullOrWhiteSpace(_suiteRoot) ? await RunGitTextAsync("rev-parse --short HEAD") : "unknown";
+        return BuildLiveSyncStatus(commit);
+    }
+
     private async Task<(bool Success, string Message)> ValidatePowerShellScriptAsync(string scriptPath)
     {
         var escaped = scriptPath.Replace("'", "''");
@@ -7079,6 +7311,7 @@ internal sealed class WebCommandRequest
 
 internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
 internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
+internal sealed record WebLiveSyncStatus(string Status, string LastSyncedAt, string SuiteCommit, string LiveCommit, string Summary, bool CanSync, string Detail);
 internal sealed record WebMcpItem(
     string Id,
     string DisplayName,

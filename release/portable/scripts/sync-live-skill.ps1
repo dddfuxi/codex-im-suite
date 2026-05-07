@@ -21,7 +21,7 @@ function Copy-PathContent {
     param(
         [string]$Source,
         [string]$Target,
-        [string[]]$ExcludeDirectories = @('node_modules', 'bin', 'obj', '.git', 'coverage', '.turbo', '.next', 'release'),
+        [string[]]$ExcludeDirectories = @('node_modules', 'bin', 'obj', '.git', 'coverage', '.turbo', '.next', 'release', 'CodexImSuiteControlPanel.exe.WebView2'),
         [string[]]$ExcludeFiles = @('*.tmp')
     )
 
