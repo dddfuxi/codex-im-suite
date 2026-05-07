@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-05-07 16:29:51",
-    "releaseRunId":  "e4db4393397f481884963ec799be74b9",
+    "generatedAt":  "2026-05-07 20:00:38",
+    "releaseRunId":  "d7727eae00e5478e80fd4cb24bdefebc",
     "targetName":  "portable artifact",
     "targetRole":  "generated portable artifact",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/dev",
-                  "commit":  "a048478",
+                  "commit":  "a92961f",
                   "dirty":  true
               },
     "manifest":  {
@@ -19,13 +19,13 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "FF80644E1943",
-                  "Length":  1631715,
-                  "Modified":  "2026-05-07 16:29:33"
+                  "Hash":  "430888495840",
+                  "Length":  1635811,
+                  "Modified":  "2026-05-07 20:00:17"
               },
     "content":  {
                     "runtime.package":  "2E1866861405",
-                    "runtime.dist":  "FB5B86BB03F6",
+                    "runtime.dist":  "3D79D203EE85",
                     "runtime.scripts":  "A640FEE092C2",
                     "runtime.configExample":  "2784AEB44164",
                     "runtime.skill":  "867CAED0153F",
@@ -34,9 +34,9 @@
                     "suite.manifest":  "130C14A98B41",
                     "config.manifests":  "F518F63B17FE",
                     "extensions.skills":  "3D657A104715",
-                    "release.scripts":  "BBBB07556232",
-                    "docs":  "DE4DABD942A0",
-                    "panel.exe":  "FF80644E1943",
-                    "panel.wwwroot":  "E67D854B09D7"
+                    "release.scripts":  "685CEBFD6CDB",
+                    "docs":  "90147931E17B",
+                    "panel.exe":  "430888495840",
+                    "panel.wwwroot":  "AE04C15B4983"
                 }
 }

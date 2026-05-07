@@ -35,8 +35,12 @@
 - 发布便携包 `release\codex-im-suite-portable.zip` 改为通过 Git LFS 跟踪 `release/*.zip`，避免 GitHub 普通 Git 单文件 100MB 限制阻断备份发布。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板顶部新增 live skill 同步状态：启动和刷新状态时读取 live `.suite-release.json.generatedAt`、commit 与关键内容 hash，显示“Live 已同步 / 落后 / 未记录同步时间 / 读取失败”，并在需要时提供只执行 `scripts/sync-live-skill.ps1` 的“一键同步”按钮；该按钮不会打包、提交、推送或重启 bridge。
+- 控制面板对 Live 同步、一键发布和主干发布预检新增顶部任务反馈条：点击后立即显示执行中，结束后显示成功 / 失败和用时；Live 已同步时也保留“重新同步”入口，方便手动强制同步。
+- 控制面板 exe 入口已收口：`CodexImSuiteControlPanel.exe` 是唯一正式入口，live 同步不再生成 `ClaudeToImControlPanel.exe`，doctor、liveSync hash 和 release fingerprint 也统一只检查正式入口。
+- 控制面板清理 PowerShell 子进程的 CLIXML 输出：Live 同步、一键发布和主干发布预检失败时会显示可读脚本日志和错误原因，不再把 `#< CLIXML` 原始片段截断给用户。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 - 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
+- 控制面板“执行器”页已和“服务”页区分：服务页继续承载运行单元生命周期操作；执行器页的 Executor Registry 改为可选中的只读路由目录，右侧展示选中 executor 的能力、风险、优先级和最近路由，不暴露默认执行器写入入口。
 - 会话页新增详情抽屉，支持直接查看完整消息流、复制摘要和复制消息文本，不再强依赖旧 WinForms 会话查看器。
 - 会话详情抽屉补齐图片和附件查看：宿主会读取 Feishu 原始消息资源键，下载图片/文件到本机 `runtime/control-panel-media` 缓存，并通过 WebView2 虚拟域 `control-panel-media.local` 给前端加载。前端展示图片缩略图、附件名称、大小、MIME、路径和下载状态，不再把图片简单显示成占位文本。
 - 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
@@ -279,6 +283,7 @@
 - 飞书 `interactive` 卡片详情展示会识别“请升级至最新版本客户端”等客户端兜底文案，并优先用 `audit.json` 中同 `messageId` 的发送摘要回填，避免卡片消息只显示不可读占位。
 - WebView 权限管理升级为三档角色模型：新增 `permissions.json` 权限库和“权限”页，支持按渠道、角色、名称或 ID 管理 `Viewer`、`Operator`、`Owner`，并从最近会话参与人添加权限。
 - WebView 会话详情里的 Feishu ID 快捷 owner 按钮已改为“设置权限”，直接写入统一权限库；消息会显示发送者 open_id 和飞书显示名，权限变更同步兼容 env 并可重启 bridge 立即生效。
+- 权限文件并发访问已收口：控制面板读取 `permissions.json` 使用共享读、短重试和原子写，状态刷新不再在无权限变化时反复写文件；运行时临时授权链接迁移到 `permission-links.json`，避免与三档角色权限协议共用同一个 JSON。
 - WebView 扩展页已按 `MCP / Skill / Plugin / 其他扩展` 分类展示，不再把 manifest 和 MCP 运行单元混成一张“统一扩展 / MCP 清单”。
 - WebView 扩展页已补齐安装入口：skill 通过 `scripts/install-suite-extension.ps1` 同步到本机 Codex skills，带 `installer` 的 MCP 会显示“安装”按钮并走宿主白名单安装脚本。
 - WebView 扩展页已新增“导入本地目录”：支持选择或拖入目录，识别为 skill / mcp，预览将写入的 manifest，再一键导入到 suite 清单。

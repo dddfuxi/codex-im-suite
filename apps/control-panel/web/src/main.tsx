@@ -36,12 +36,21 @@ import './styles.css';
 
 type StatusKind = 'ok' | 'warning' | 'error' | 'idle';
 type ThemeMode = 'light' | 'dark';
+type CommandNoticeStatus = 'running' | 'success' | 'error';
 
 type ActivityRecord = {
   level: string;
   title: string;
   message: string;
   timestamp: string;
+};
+
+type CommandNotice = {
+  command: string;
+  label: string;
+  status: CommandNoticeStatus;
+  message: string;
+  startedAt: number;
 };
 
 type ServiceItem = {
@@ -396,6 +405,8 @@ type LiveSyncState = {
   summary: string;
   canSync: boolean;
   detail: string;
+  legacyEntryPresent?: boolean;
+  legacyEntryPath?: string;
 };
 
 type PanelState = {
@@ -567,6 +578,12 @@ const fallbackState: PanelState = {
 
 const themeStorageKey = 'codex-im-suite-control-panel-theme';
 const controlApiTokenStorageKey = 'codex-im-suite-control-api-token';
+const commandLabels: Record<string, string> = {
+  'live.sync': 'Live 同步',
+  'release.publishBackup': '一键发布',
+  'release.prepareMainRelease': '主干发布预检',
+};
+const trackedCommands = new Set(Object.keys(commandLabels));
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light';
@@ -747,6 +764,14 @@ function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDuration(ms: number) {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
 }
 
 function getRuntimeCategoryLabel(category: string) {
@@ -942,6 +967,7 @@ function App() {
   const [sessionError, setSessionError] = useState('');
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
+  const [commandNotice, setCommandNotice] = useState<CommandNotice | null>(null);
   const lastLoadedSessionKeyRef = useRef('');
   const sessionsRef = useRef<SessionItem[]>([]);
   const inFlightSessionKeyRef = useRef('');
@@ -1089,12 +1115,49 @@ function App() {
     }
   }, [page]);
 
-  const run = async (command: string, payload: Record<string, unknown> = {}) => sendCommand(command, payload);
+  const run = async (command: string, payload: Record<string, unknown> = {}) => {
+    const label = commandLabels[command] ?? command;
+    const tracked = trackedCommands.has(command);
+    const startedAt = Date.now();
+    if (tracked) {
+      setCommandNotice({
+        command,
+        label,
+        status: 'running',
+        message: `${label}正在执行，请不要重复点击。`,
+        startedAt,
+      });
+    }
+    try {
+      const result = await sendCommand(command, payload);
+      if (tracked) {
+        setCommandNotice({
+          command,
+          label,
+          status: 'success',
+          message: `${label}已完成 · 用时 ${formatDuration(Date.now() - startedAt)}`,
+          startedAt,
+        });
+      }
+      return result;
+    } catch (error) {
+      if (tracked) {
+        setCommandNotice({
+          command,
+          label,
+          status: 'error',
+          message: `${label}失败：${error instanceof Error ? error.message : String(error)}`,
+          startedAt,
+        });
+      }
+      throw error;
+    }
+  };
 
   const syncLive = async () => {
     const confirmed = window.confirm('将执行开发版 suite -> live skill 同步；不会提交、推送或打包。');
     if (!confirmed) return;
-    await sendCommand('live.sync');
+    await run('live.sync');
     await sendCommand('state.refresh');
     await loadRuntimeUnits();
   };
@@ -1159,16 +1222,17 @@ function App() {
               <RotateCw size={16} className={pending['panel.restart'] ? 'spin' : ''} />
               <span>重启面板</span>
             </button>
-            <button className="primary-button" onClick={() => void run('release.publishBackup').then(loadRuntimeUnits)} disabled={pending['release.publishBackup']}>
-              <Rocket size={16} />
+            <button className="primary-button" onClick={() => void run('release.publishBackup').then(loadRuntimeUnits).catch(() => undefined)} disabled={pending['release.publishBackup']}>
+              <Rocket size={16} className={pending['release.publishBackup'] ? 'spin' : ''} />
               一键发布
             </button>
-            <button className="primary-button" onClick={() => void run('release.prepareMainRelease').then(loadRuntimeUnits)} disabled={pending['release.prepareMainRelease']}>
-              <ListChecks size={16} />
+            <button className="primary-button" onClick={() => void run('release.prepareMainRelease').then(loadRuntimeUnits).catch(() => undefined)} disabled={pending['release.prepareMainRelease']}>
+              <ListChecks size={16} className={pending['release.prepareMainRelease'] ? 'spin' : ''} />
               主干发布预检
             </button>
           </div>
         </header>
+        {commandNotice && <CommandStatusBanner notice={commandNotice} onDismiss={() => setCommandNotice(null)} />}
 
         {page === 'overview' && (
           <OverviewPage
@@ -1385,10 +1449,25 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
   const runs = state.workflow?.runs ?? [];
   const lastSelection = state.executors?.lastSelection;
   const recentRuns = runs.slice(-12).reverse();
+  const [selectedExecutorId, setSelectedExecutorId] = useState('');
+  const selectedExecutor = executors.find((executor) => executor.id === selectedExecutorId) ?? executors[0];
+
+  useEffect(() => {
+    if (executors.length === 0) {
+      setSelectedExecutorId('');
+      return;
+    }
+    const currentStillExists = executors.some((executor) => executor.id === selectedExecutorId);
+    if (currentStillExists) return;
+    const recentExecutor = executors.find((executor) => executor.id === lastSelection?.executorId);
+    setSelectedExecutorId(recentExecutor?.id ?? executors[0].id);
+  }, [executors, lastSelection?.executorId, selectedExecutorId]);
+
   return (
     <section className="content-stack executor-page">
       <section className="panel">
         <SectionHeader title="执行器目录" />
+        <p className="detail-copy">执行器是请求路由候选，不是可启动或停止的服务。</p>
         <div className="summary-grid">
           <SummaryFact label="可用执行器" value={`${executors.filter((item) => item.enabled).length}/${executors.length}`} compact />
           <SummaryFact label="最近选择" value={lastSelection?.executorId || '-'} compact />
@@ -1404,19 +1483,46 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
           <SectionHeader title="Executor Registry" />
           <div className="runtime-list">
             {executors.map((executor) => (
-              <div key={executor.id} className="runtime-row">
+              <button key={executor.id} type="button" className={selectedExecutor?.id === executor.id ? 'runtime-row active' : 'runtime-row'} onClick={() => setSelectedExecutorId(executor.id)}>
                 <div>
                   <strong>{executor.displayName}</strong>
                   <span>{executor.kind} · {executor.riskLevel} · priority {executor.priority}</span>
                 </div>
                 <StatusPill status={executor.enabled ? 'ok' : 'idle'} label={executor.enabled ? '启用' : '停用'} />
-              </div>
+              </button>
             ))}
             {executors.length === 0 && <EmptyState icon={<Bot size={28} />} title="暂无执行器状态" text="bridge 运行一次后会写入 executor-status.json。" />}
           </div>
         </section>
         <section className="panel detail-panel">
           <SectionHeader title="能力与最近路由" />
+          {selectedExecutor ? (
+            <div className="detail-stack">
+              <div className="runtime-tile-head">
+                <strong>{selectedExecutor.displayName}</strong>
+                <StatusPill status={selectedExecutor.enabled ? 'ok' : 'idle'} label={selectedExecutor.enabled ? '启用' : '停用'} />
+              </div>
+              <p className="detail-copy">{selectedExecutor.description || '暂无说明。'}</p>
+              <dl className="kv">
+                <dt>ID</dt><dd>{selectedExecutor.id}</dd>
+                <dt>类型</dt><dd>{selectedExecutor.kind || '-'}</dd>
+                <dt>风险</dt><dd>{selectedExecutor.riskLevel || '-'}</dd>
+                <dt>优先级</dt><dd>{selectedExecutor.priority}</dd>
+              </dl>
+              <div className="tag-cloud">
+                {(selectedExecutor.capabilities ?? []).map((capability) => (
+                  <span key={`${selectedExecutor.id}:${capability}`} className="tag">{capability}</span>
+                ))}
+                {(selectedExecutor.capabilities ?? []).length === 0 && <span className="tag">暂无能力声明</span>}
+              </div>
+            </div>
+          ) : (
+            <EmptyState icon={<Bot size={28} />} title="暂无执行器详情" text="bridge 运行一次后会写入 executor-status.json。" />
+          )}
+          <div className="subsection-title">
+            <Activity size={14} />
+            <span>最近路由</span>
+          </div>
           {lastSelection ? (
             <dl className="kv">
               <dt>Session</dt><dd>{lastSelection.sessionId}</dd>
@@ -1427,11 +1533,6 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
           ) : (
             <p className="detail-copy">暂无路由选择记录。</p>
           )}
-          <div className="tag-cloud">
-            {executors.flatMap((executor) => executor.capabilities.map((capability) => `${executor.id}:${capability}`)).slice(0, 32).map((item) => (
-              <span key={item} className="tag">{item}</span>
-            ))}
-          </div>
         </section>
       </section>
       <section className="panel executor-workflow-panel">
@@ -2744,19 +2845,37 @@ function liveSyncStatusKind(status: LiveSyncState['status']): StatusKind {
 }
 
 function LiveSyncBanner({ liveSync, pending, onSync }: { liveSync: LiveSyncState; pending?: boolean; onSync: () => void }) {
-  const canShowSync = liveSync.canSync && ['outdated', 'missing', 'error'].includes(liveSync.status);
+  const canShowSync = liveSync.canSync;
   const summary = liveSync.summary || 'Live 同步状态不可用';
+  const syncLabel = liveSync.status === 'current' ? '重新同步' : '一键同步';
   return (
     <div className={`live-sync-banner ${liveSync.status}`} title={liveSync.detail || summary}>
       <StatusPill status={liveSyncStatusKind(liveSync.status)} label={liveSync.status === 'current' ? 'Live' : 'Live 待处理'} />
       <span className="live-sync-copy">{summary}</span>
+      {liveSync.legacyEntryPresent && (
+        <span className="live-sync-legacy" title={liveSync.legacyEntryPath || '旧兼容入口仍存在'}>旧兼容入口可删除</span>
+      )}
       {canShowSync && (
         <MiniButton
-          label="一键同步"
+          label={syncLabel}
           icon={<ArrowDownUp size={14} />}
           onClick={onSync}
           pending={pending}
         />
+      )}
+    </div>
+  );
+}
+
+function CommandStatusBanner({ notice, onDismiss }: { notice: CommandNotice; onDismiss: () => void }) {
+  return (
+    <div className={`command-status-banner ${notice.status}`}>
+      <StatusPill status={notice.status === 'running' ? 'warning' : notice.status === 'success' ? 'ok' : 'error'} label={notice.status === 'running' ? '执行中' : notice.status === 'success' ? '完成' : '失败'} />
+      <span>{notice.message}</span>
+      {notice.status !== 'running' && (
+        <button className="icon-button compact" title="关闭提示" onClick={onDismiss}>
+          <X size={14} />
+        </button>
       )}
     </div>
   );

@@ -139,9 +139,15 @@ $builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
 Copy-ExistingDirectory -Source $builtPanelDir -Target $livePanelDir
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe')
-Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')
-Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb')
+
+$legacyPanelExe = Join-Path $livePanelDir 'ClaudeToImControlPanel.exe'
+$legacyPanelPdb = Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb'
+foreach ($legacyPath in @($legacyPanelExe, $legacyPanelPdb)) {
+    if (Test-Path -LiteralPath $legacyPath) {
+        Remove-Item -LiteralPath $legacyPath -Force
+    }
+}
 
 $runtimeContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveRuntime -Layout 'LiveRuntime'
 $runtimeFingerprint = New-SuiteReleaseFingerprint `
@@ -151,7 +157,7 @@ $runtimeFingerprint = New-SuiteReleaseFingerprint `
     -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
     -Content $runtimeContent `
     -ManifestSummary (Get-ReleaseManifestSummary -Root $liveRuntime) `
-    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe'))
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe'))
 Write-SuiteReleaseFingerprint -TargetRoot $liveRuntime -Fingerprint $runtimeFingerprint | Out-Null
 
 $coreContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveCore -Layout 'LiveCore'
@@ -162,7 +168,7 @@ $coreFingerprint = New-SuiteReleaseFingerprint `
     -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
     -Content $coreContent `
     -ManifestSummary (Get-ReleaseManifestSummary -Root $liveCore) `
-    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $liveCore 'dist\control-panel\ClaudeToImControlPanel.exe'))
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $liveCore 'dist\control-panel\CodexImSuiteControlPanel.exe'))
 Write-SuiteReleaseFingerprint -TargetRoot $liveCore -Fingerprint $coreFingerprint | Out-Null
 
 Write-Host "sync complete: suite -> live skills"

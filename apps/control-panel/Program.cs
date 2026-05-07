@@ -11,6 +11,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -42,6 +43,8 @@ internal sealed class MainForm : Form
 {
     private const string WebHostName = "control-panel.local";
     private const string MediaHostName = "control-panel-media.local";
+    private const string OfficialControlPanelExeName = "CodexImSuiteControlPanel.exe";
+    private const string LegacyControlPanelExeName = "ClaudeToImControlPanel.exe";
     private const uint CodePageGb2312 = 936;
     private readonly string _skillDir;
     private readonly string _ctiHome;
@@ -77,6 +80,7 @@ internal sealed class MainForm : Form
     private readonly string _webDiagnosticsLogPath;
     private readonly string _deletedSessionsPath;
     private readonly string _permissionsPath;
+    private readonly object _permissionFileLock = new();
     private FileSystemWatcher? _manifestWatcher;
     private System.Windows.Forms.Timer? _manifestReloadTimer;
     private string _pendingManifestReloadReason = "初始化";
@@ -1032,6 +1036,8 @@ internal sealed class MainForm : Form
     private WebLiveSyncStatus BuildLiveSyncStatus(string suiteCommit)
     {
         var canSync = !string.IsNullOrWhiteSpace(_suiteRoot) && File.Exists(_syncLiveSkillScript);
+        var legacyPanelPath = Path.Combine(_skillDir, "dist", "control-panel", LegacyControlPanelExeName);
+        var legacyEntryPresent = File.Exists(legacyPanelPath);
         if (string.IsNullOrWhiteSpace(_suiteRoot) || !Directory.Exists(_suiteRoot) || string.IsNullOrWhiteSpace(_skillDir))
         {
             return new WebLiveSyncStatus("unavailable", "", suiteCommit, "", "Live 同步状态不可用", canSync, "未找到开发版 suiteRoot 或 live skill 路径。");
@@ -1040,7 +1046,7 @@ internal sealed class MainForm : Form
         var fingerprintPath = Path.Combine(_skillDir, ".suite-release.json");
         if (!File.Exists(fingerprintPath))
         {
-            return new WebLiveSyncStatus("missing", "", suiteCommit, "", "Live 未记录同步时间", canSync, fingerprintPath);
+            return new WebLiveSyncStatus("missing", "", suiteCommit, "", "Live 未记录同步时间", canSync, fingerprintPath, legacyEntryPresent, legacyPanelPath);
         }
 
         try
@@ -1056,7 +1062,7 @@ internal sealed class MainForm : Form
             }
             if (string.IsNullOrWhiteSpace(lastSyncedAt))
             {
-                return new WebLiveSyncStatus("missing", "", suiteCommit, liveCommit, "Live 未记录同步时间", canSync, fingerprintPath);
+                return new WebLiveSyncStatus("missing", "", suiteCommit, liveCommit, "Live 未记录同步时间", canSync, fingerprintPath, legacyEntryPresent, legacyPanelPath);
             }
 
             var reasons = new List<string>();
@@ -1074,13 +1080,13 @@ internal sealed class MainForm : Form
                 var summary = string.IsNullOrWhiteSpace(lastSyncedAt)
                     ? "Live 落后 · 未记录同步时间"
                     : $"Live 落后 · 上次同步 {FormatSyncTime(lastSyncedAt)}";
-                return new WebLiveSyncStatus("outdated", lastSyncedAt, suiteCommit, liveCommit, summary, canSync, string.Join("；", reasons.Take(6)));
+                return new WebLiveSyncStatus("outdated", lastSyncedAt, suiteCommit, liveCommit, summary, canSync, string.Join("；", reasons.Take(6)), legacyEntryPresent, legacyPanelPath);
             }
 
             var currentSummary = string.IsNullOrWhiteSpace(lastSyncedAt)
                 ? "Live 已同步"
                 : $"Live 已同步 · 上次同步 {FormatSyncTime(lastSyncedAt)}";
-            return new WebLiveSyncStatus("current", lastSyncedAt, suiteCommit, liveCommit, currentSummary, canSync, "");
+            return new WebLiveSyncStatus("current", lastSyncedAt, suiteCommit, liveCommit, currentSummary, canSync, "", legacyEntryPresent, legacyPanelPath);
         }
         catch (Exception ex)
         {
@@ -1093,7 +1099,7 @@ internal sealed class MainForm : Form
         var liveCoreDir = ResolveLiveCoreDir();
         CompareFileHash("runtime src", Path.Combine(_suiteRoot, "packages", "bridge-runtime", "src", "main.ts"), Path.Combine(_skillDir, "src", "main.ts"), reasons);
         CompareFileHash("core bridge", Path.Combine(_suiteRoot, "packages", "bridge-core", "src", "lib", "bridge", "bridge-manager.ts"), Path.Combine(liveCoreDir, "src", "lib", "bridge", "bridge-manager.ts"), reasons);
-        CompareFileHash("panel exe", Path.Combine(_suiteRoot, "release", "artifacts", "control-panel", "CodexImSuiteControlPanel.exe"), Path.Combine(_skillDir, "dist", "control-panel", "ClaudeToImControlPanel.exe"), reasons);
+        CompareFileHash("panel exe", Path.Combine(_suiteRoot, "release", "artifacts", "control-panel", OfficialControlPanelExeName), Path.Combine(_skillDir, "dist", "control-panel", OfficialControlPanelExeName), reasons);
         CompareDirectoryHash("panel wwwroot", Path.Combine(_suiteRoot, "release", "artifacts", "control-panel", "wwwroot"), Path.Combine(_skillDir, "dist", "control-panel", "wwwroot"), reasons);
         return reasons.Count > 0;
     }
@@ -1514,14 +1520,22 @@ internal sealed class MainForm : Form
 
     private PermissionSnapshot LoadPermissionSnapshot(bool syncFromConfig)
     {
-        var snapshot = ReadPermissionSnapshotFile();
-        if (syncFromConfig)
+        lock (_permissionFileLock)
         {
-            snapshot = MergeConfigPermissions(snapshot);
-            SavePermissionSnapshot(snapshot);
-            SyncPermissionSnapshotToConfig(snapshot);
+            var snapshot = ReadPermissionSnapshotFile();
+            if (syncFromConfig)
+            {
+                var merged = MergeConfigPermissions(snapshot);
+                if (!PermissionSubjectsEquivalent(snapshot.Subjects, merged.Subjects))
+                {
+                    SavePermissionSnapshot(merged);
+                    SyncPermissionSnapshotToConfig(merged);
+                    return merged;
+                }
+                snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+            }
+            return snapshot;
         }
-        return snapshot;
     }
 
     private PermissionSnapshot ReadPermissionSnapshotFile()
@@ -1530,7 +1544,7 @@ internal sealed class MainForm : Form
         {
             if (File.Exists(_permissionsPath))
             {
-                var loaded = JsonSerializer.Deserialize<PermissionSnapshot>(File.ReadAllText(_permissionsPath, Encoding.UTF8), JsonOptions);
+                var loaded = JsonSerializer.Deserialize<PermissionSnapshot>(ReadUtf8TextShared(_permissionsPath), JsonOptions);
                 if (loaded is not null)
                 {
                     loaded.Subjects = NormalizePermissionSubjects(loaded.Subjects);
@@ -1634,37 +1648,41 @@ internal sealed class MainForm : Form
             throw new InvalidOperationException("缺少渠道或用户 ID。");
         }
 
-        var snapshot = LoadPermissionSnapshot(syncFromConfig: true);
-        var subjects = snapshot.Subjects.ToDictionary(item => MakePermissionKey(item.ChannelType, item.UserId), item => item, StringComparer.OrdinalIgnoreCase);
-        var key = MakePermissionKey(channelType, userId);
-        var now = DateTime.UtcNow.ToString("o");
-        if (subjects.TryGetValue(key, out var existing))
+        PermissionSnapshot snapshot;
+        lock (_permissionFileLock)
         {
-            existing.Role = NormalizePermissionRole(role);
-            if (!string.IsNullOrWhiteSpace(displayName)) existing.DisplayName = displayName.Trim();
-            existing.Source = source;
-            existing.LastSeenAt = now;
-            existing.UpdatedAt = now;
-        }
-        else
-        {
-            subjects[key] = new PermissionSubject
+            snapshot = LoadPermissionSnapshot(syncFromConfig: true);
+            var subjects = snapshot.Subjects.ToDictionary(item => MakePermissionKey(item.ChannelType, item.UserId), item => item, StringComparer.OrdinalIgnoreCase);
+            var key = MakePermissionKey(channelType, userId);
+            var now = DateTime.UtcNow.ToString("o");
+            if (subjects.TryGetValue(key, out var existing))
             {
-                ChannelType = channelType,
-                UserId = userId,
-                DisplayName = displayName.Trim(),
-                Role = NormalizePermissionRole(role),
-                Source = source,
-                FirstSeenAt = now,
-                LastSeenAt = now,
-                UpdatedAt = now,
-            };
+                existing.Role = NormalizePermissionRole(role);
+                if (!string.IsNullOrWhiteSpace(displayName)) existing.DisplayName = displayName.Trim();
+                existing.Source = source;
+                existing.LastSeenAt = now;
+                existing.UpdatedAt = now;
+            }
+            else
+            {
+                subjects[key] = new PermissionSubject
+                {
+                    ChannelType = channelType,
+                    UserId = userId,
+                    DisplayName = displayName.Trim(),
+                    Role = NormalizePermissionRole(role),
+                    Source = source,
+                    FirstSeenAt = now,
+                    LastSeenAt = now,
+                    UpdatedAt = now,
+                };
+            }
+            snapshot.Subjects = NormalizePermissionSubjects(subjects.Values);
+            snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+            snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
+            SavePermissionSnapshot(snapshot);
+            SyncPermissionSnapshotToConfig(snapshot);
         }
-        snapshot.Subjects = NormalizePermissionSubjects(subjects.Values);
-        snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
-        snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
-        SavePermissionSnapshot(snapshot);
-        SyncPermissionSnapshotToConfig(snapshot);
         _sessionDetailCache.Clear();
         AddWebActivity("info", "权限已保存", $"{channelType}:{userId} -> {NormalizePermissionRole(role)}");
         return snapshot;
@@ -1679,14 +1697,18 @@ internal sealed class MainForm : Form
             throw new InvalidOperationException("缺少渠道或用户 ID。");
         }
 
-        var snapshot = LoadPermissionSnapshot(syncFromConfig: true);
-        snapshot.Subjects = snapshot.Subjects
-            .Where(item => !string.Equals(MakePermissionKey(item.ChannelType, item.UserId), MakePermissionKey(channelType, userId), StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
-        snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
-        SavePermissionSnapshot(snapshot);
-        SyncPermissionSnapshotToConfig(snapshot);
+        PermissionSnapshot snapshot;
+        lock (_permissionFileLock)
+        {
+            snapshot = LoadPermissionSnapshot(syncFromConfig: true);
+            snapshot.Subjects = snapshot.Subjects
+                .Where(item => !string.Equals(MakePermissionKey(item.ChannelType, item.UserId), MakePermissionKey(channelType, userId), StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
+            snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
+            SavePermissionSnapshot(snapshot);
+            SyncPermissionSnapshotToConfig(snapshot);
+        }
         _sessionDetailCache.Clear();
         AddWebActivity("info", "权限已移除", $"{channelType}:{userId}");
         return snapshot;
@@ -1699,7 +1721,7 @@ internal sealed class MainForm : Form
         snapshot.Candidates = BuildPermissionCandidates(snapshot.Subjects);
         snapshot.UpdatedAt = DateTime.UtcNow.ToString("o");
         Directory.CreateDirectory(Path.GetDirectoryName(_permissionsPath)!);
-        File.WriteAllText(_permissionsPath, JsonSerializer.Serialize(snapshot, JsonOptions), new UTF8Encoding(false));
+        WriteUtf8TextAtomic(_permissionsPath, JsonSerializer.Serialize(snapshot, JsonOptions));
     }
 
     private void SyncPermissionSnapshotToConfig(PermissionSnapshot snapshot)
@@ -3370,7 +3392,7 @@ internal sealed class MainForm : Form
 
     private Task<string> RestartControlPanelAsync()
     {
-        var executablePath = Environment.ProcessPath;
+        var executablePath = GetOfficialControlPanelPath();
         if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
         {
             throw new InvalidOperationException("无法定位当前控制面板程序，不能自动重启。");
@@ -3416,6 +3438,19 @@ internal sealed class MainForm : Form
         });
 
         return Task.FromResult($"panel restart requested PID={process.Id}");
+    }
+
+    private static string? GetOfficialControlPanelPath()
+    {
+        var officialPath = Path.Combine(AppContext.BaseDirectory, OfficialControlPanelExeName);
+        if (File.Exists(officialPath)) return officialPath;
+        var processPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(processPath)
+            && string.Equals(Path.GetFileName(processPath), LegacyControlPanelExeName, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return processPath;
     }
 
     private async Task SetExtensionEnabledAsync(string manifestPath, bool enabled)
@@ -4240,6 +4275,17 @@ internal sealed class MainForm : Form
             .ThenBy(item => string.IsNullOrWhiteSpace(item.DisplayName) ? item.UserId : item.DisplayName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+    private static bool PermissionSubjectsEquivalent(IEnumerable<PermissionSubject>? left, IEnumerable<PermissionSubject>? right)
+    {
+        var normalizedLeft = NormalizePermissionSubjects(left)
+            .Select(item => $"{NormalizePermissionChannel(item.ChannelType)}\n{item.UserId.Trim()}\n{NormalizePermissionRole(item.Role)}\n{(item.DisplayName ?? "").Trim()}")
+            .ToArray();
+        var normalizedRight = NormalizePermissionSubjects(right)
+            .Select(item => $"{NormalizePermissionChannel(item.ChannelType)}\n{item.UserId.Trim()}\n{NormalizePermissionRole(item.Role)}\n{(item.DisplayName ?? "").Trim()}")
+            .ToArray();
+        return normalizedLeft.SequenceEqual(normalizedRight, StringComparer.Ordinal);
+    }
+
     private async Task RefreshAllAsync()
     {
         LoadConfig();
@@ -4437,7 +4483,7 @@ internal sealed class MainForm : Form
         var exePath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(exePath))
         {
-            exePath = Path.Combine(AppContext.BaseDirectory, "ClaudeToImControlPanel.exe");
+            exePath = Path.Combine(AppContext.BaseDirectory, OfficialControlPanelExeName);
         }
         var buildTime = File.Exists(exePath) ? File.GetLastWriteTime(exePath).ToString("yyyy-MM-dd HH:mm:ss") : "unknown";
         var branch = await RunGitTextAsync("branch --show-current");
@@ -7018,14 +7064,75 @@ internal sealed class MainForm : Form
         return lines;
     }
 
+    private static string ReadUtf8TextShared(string path)
+    {
+        const int maxAttempts = 6;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+                return reader.ReadToEnd();
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(40 * attempt);
+            }
+        }
+    }
+
+    private static void WriteUtf8TextAtomic(string path, string content)
+    {
+        const int maxAttempts = 6;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var tempPath = $"{path}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(tempPath, content, new UTF8Encoding(false));
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        File.Replace(tempPath, path, null, ignoreMetadataErrors: true);
+                    }
+                    else
+                    {
+                        File.Move(tempPath, path);
+                    }
+                    return;
+                }
+                catch (IOException) when (attempt < maxAttempts)
+                {
+                    Thread.Sleep(40 * attempt);
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
+            catch
+            {
+                // best effort cleanup
+            }
+        }
+    }
+
     private static async Task<ProcessResult> RunPowerShellFileAsync(string scriptPath, string trailingArgs, string workingDirectory, int timeoutMs, Dictionary<string, string?>? environment = null)
     {
         var command = new StringBuilder();
         command.Append("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ");
         command.Append("$OutputEncoding = [Console]::OutputEncoding; ");
         command.Append("$ProgressPreference = 'SilentlyContinue'; ");
+        command.Append("$InformationPreference = 'Continue'; ");
         command.Append("& ").Append(QuotePowerShellLiteral(scriptPath));
         if (!string.IsNullOrWhiteSpace(trailingArgs)) command.Append(' ').Append(trailingArgs);
+        command.Append(" 6>&1");
         command.Append("; if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }");
         var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(command.ToString()));
         var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encodedCommand}";
@@ -7067,10 +7174,70 @@ internal sealed class MainForm : Form
         catch (OperationCanceledException)
         {
             try { process.Kill(entireProcessTree: true); } catch { }
-            return new ProcessResult(-1, stdout.ToString(), stderr + $"Timeout after {timeoutMs} ms.");
+            return new ProcessResult(-1, NormalizeProcessOutput(stdout.ToString()), NormalizeProcessOutput(stderr + $"Timeout after {timeoutMs} ms."));
         }
-        return new ProcessResult(process.ExitCode, stdout.ToString(), stderr.ToString());
+        return new ProcessResult(process.ExitCode, NormalizeProcessOutput(stdout.ToString()), NormalizeProcessOutput(stderr.ToString()));
     }
+
+    private static string NormalizeProcessOutput(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || !text.Contains("#< CLIXML", StringComparison.OrdinalIgnoreCase))
+        {
+            return text;
+        }
+
+        var marker = text.IndexOf("#< CLIXML", StringComparison.OrdinalIgnoreCase);
+        var prefix = marker > 0 ? text[..marker].Trim() : "";
+        var xmlStart = text.IndexOf("<Objs", marker, StringComparison.OrdinalIgnoreCase);
+        if (xmlStart < 0)
+        {
+            return string.IsNullOrWhiteSpace(prefix) ? StripCliXmlMarker(text) : prefix;
+        }
+
+        var decoded = DecodePowerShellCliXml(text[xmlStart..]);
+        var parts = new[] { prefix, decoded }
+            .Where(part => !string.IsNullOrWhiteSpace(part))
+            .Select(part => part.Trim());
+        return string.Join(Environment.NewLine, parts);
+    }
+
+    private static string StripCliXmlMarker(string text)
+        => text.Replace("#< CLIXML", "", StringComparison.OrdinalIgnoreCase).Trim();
+
+    private static string DecodePowerShellCliXml(string xml)
+    {
+        try
+        {
+            var document = XDocument.Parse(xml.Trim(), LoadOptions.None);
+            var lines = new List<string>();
+            foreach (var value in document.Descendants().Where(element => element.Name.LocalName == "ToString").Select(element => element.Value))
+            {
+                AddCliXmlLine(lines, value);
+            }
+            if (lines.Count == 0)
+            {
+                foreach (var value in document.Descendants().Where(element => element.Name.LocalName == "S").Select(element => element.Value))
+                {
+                    AddCliXmlLine(lines, value);
+                }
+            }
+            return string.Join(Environment.NewLine, lines);
+        }
+        catch
+        {
+            return StripCliXmlMarker(xml);
+        }
+    }
+
+    private static void AddCliXmlLine(List<string> lines, string value)
+    {
+        var decoded = DecodeCliXmlEscapes(value).Trim();
+        if (string.IsNullOrWhiteSpace(decoded)) return;
+        if (!lines.Contains(decoded, StringComparer.Ordinal)) lines.Add(decoded);
+    }
+
+    private static string DecodeCliXmlEscapes(string value)
+        => Regex.Replace(value, "_x([0-9A-Fa-f]{4})_", match => ((char)Convert.ToInt32(match.Groups[1].Value, 16)).ToString());
 
     private void AppendCommand(string title, ProcessResult result)
     {
@@ -7311,7 +7478,7 @@ internal sealed class WebCommandRequest
 
 internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
 internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
-internal sealed record WebLiveSyncStatus(string Status, string LastSyncedAt, string SuiteCommit, string LiveCommit, string Summary, bool CanSync, string Detail);
+internal sealed record WebLiveSyncStatus(string Status, string LastSyncedAt, string SuiteCommit, string LiveCommit, string Summary, bool CanSync, string Detail, bool LegacyEntryPresent = false, string LegacyEntryPath = "");
 internal sealed record WebMcpItem(
     string Id,
     string DisplayName,

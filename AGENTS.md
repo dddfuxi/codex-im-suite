@@ -19,6 +19,7 @@
 - `packages/bridge-runtime`：运行时壳层，负责配置、daemon、provider、Codex、Ollama 本地后端、本地执行器、MCP bridge。
 - `apps/control-panel`：中控面板，只做服务编排、状态展示、配置入口，不放桥接业务逻辑。
 - `apps/control-panel` 是面板源码唯一入口；旧 `packages/bridge-runtime/tools/ControlPanel` 已移除，不要恢复为维护入口。
+- 控制面板 exe 唯一正式入口是 `CodexImSuiteControlPanel.exe`；旧 `ClaudeToImControlPanel.exe` 已退出发布入口，只能作为残留检测/清理对象，不得在脚本、文档或快捷方式里继续当主入口。
 - `config/mcp.d`：MCP manifest 唯一来源，面板和注册脚本不能硬编码 MCP 名称。
 - `extensions/skills`：随项目备份的 skill 副本，不等同于本机 live skill。
 - `release`：打包产物目录，不作为源码维护入口，也不要手工修里面的 portable/installer 副本。
@@ -97,10 +98,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - 修改开发版后，如果用户要求立即生效，运行 `scripts/sync-live-skill.ps1`，方向固定为“开发版 suite -> live skill”，不要手工复制零散文件。
 - 控制面板顶部的 live 同步提示以 live runtime `.suite-release.json.generatedAt`、suite/live commit 和关键内容 hash 为依据；看到“Live 落后 / 未记录同步时间 / 读取失败”时，优先使用面板“一键同步”或手动运行 `scripts/sync-live-skill.ps1`，不要改 live 副本里的零散文件。
 - 面板 `live.sync` / “一键同步”只允许执行开发版 suite -> live skill 同步；它不打包、不提交、不推送，也不自动重启 bridge。需要让 daemon 重新加载新代码时，必须把“同步”和“重启 bridge”作为两个明确步骤处理。
+- live 控制面板路径统一为 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`；`scripts/sync-live-skill.ps1` 成功同步后应清理旧 `ClaudeToImControlPanel.exe` / `.pdb`，doctor、fingerprint 和 hash 检查只认正式入口。
 - `scripts/sync-live-skill.ps1` 复制控制面板发布目录时必须排除 `CodexImSuiteControlPanel.exe.WebView2` 用户数据目录，避免 WebView2 Cookie/Cache 临时文件导致 robocopy 误报失败。
 - 如确实需要从 live 救回历史改动，只能手动运行 `scripts/import-live-to-suite.ps1 -Apply`，并先确认 `git status`；发布流程不得调用该脚本。
 - 发布前必须确认开发版、live skill、portable 打包版没有分叉。
-- 面板显示异常时，先看 exe 路径、构建时间、commit，再判断是不是旧版本。
+- 面板显示异常时，先看 exe 路径、构建时间、commit，再判断是不是旧版本；如果路径仍指向 `ClaudeToImControlPanel.exe`，应改用正式入口而不是修旧入口。
 
 ## 7. Feishu 回复收口规则
 

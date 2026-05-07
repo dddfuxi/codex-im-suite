@@ -37,6 +37,7 @@ const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
 const MEMORY_PROFILES_PATH = path.join(DATA_DIR, 'memory-profiles.json');
+const PERMISSION_LINKS_PATH = path.join(DATA_DIR, 'permission-links.json');
 const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
 const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
@@ -78,6 +79,22 @@ function readJson<T>(filePath: string, fallback: T): T {
 
 function writeJson(filePath: string, data: unknown): void {
   atomicWrite(filePath, JSON.stringify(data, null, 2));
+}
+
+function readPermissionLinks(): Record<string, PermissionLinkRecord> {
+  const current = readJson<Record<string, PermissionLinkRecord> | null>(PERMISSION_LINKS_PATH, null);
+  if (current) return current;
+
+  const legacyPath = path.join(DATA_DIR, 'permissions.json');
+  const legacy = readJson<unknown>(legacyPath, null);
+  if (!legacy || typeof legacy !== 'object' || Array.isArray(legacy)) return {};
+  if ((legacy as { protocol?: unknown; Protocol?: unknown }).protocol === 'cti-permissions/v1'
+    || (legacy as { protocol?: unknown; Protocol?: unknown }).Protocol === 'cti-permissions/v1'
+    || Array.isArray((legacy as { subjects?: unknown; Subjects?: unknown }).subjects)
+    || Array.isArray((legacy as { subjects?: unknown; Subjects?: unknown }).Subjects)) {
+    return {};
+  }
+  return legacy as Record<string, PermissionLinkRecord>;
 }
 
 function uuid(): string {
@@ -174,10 +191,7 @@ export class JsonFileStore implements BridgeStore {
     }
 
     // Permission links
-    const perms = readJson<Record<string, PermissionLinkRecord>>(
-      path.join(DATA_DIR, 'permissions.json'),
-      {},
-    );
+    const perms = readPermissionLinks();
     for (const [id, p] of Object.entries(perms)) {
       this.permissionLinks.set(id, p);
     }
@@ -262,7 +276,7 @@ export class JsonFileStore implements BridgeStore {
 
   private persistPermissions(): void {
     writeJson(
-      path.join(DATA_DIR, 'permissions.json'),
+      PERMISSION_LINKS_PATH,
       Object.fromEntries(this.permissionLinks),
     );
   }

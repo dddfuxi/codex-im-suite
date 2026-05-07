@@ -129,9 +129,14 @@ sequenceDiagram
 
 - `C:\Users\admin\.claude-to-im\data\permissions.json`
 
+临时工具授权按钮和数字快捷回复使用独立运行时文件：
+
+- `C:\Users\admin\.claude-to-im\data\permission-links.json`
+
 兼容规则：
 
 - JSON 权限库是主数据。
+- `permissions.json` 只保存三档角色权限；`permission-links.json` 只保存待处理授权链接，两个协议不能共用同一文件。
 - 启动和面板刷新时会从 `CTI_*_ALLOWED_USERS` 导入 `Viewer`，从 `CTI_*_OWNER_USERS` 导入 `Owner`。
 - 保存权限后同步写回兼容 env，避免旧配置和脚本失效。
 - 没有权限 JSON 且 Feishu 只有一个 allowed user 时，仍保留旧逻辑临时视为 owner。
@@ -447,6 +452,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要、recovery / retry 状态和事件时间线，方便回溯一次飞书请求从接收、路由、执行、重试到交付或失败的运行历程。
 - 执行器页和会话详情对失败但保留恢复输入的 run 显示“重试”入口，宿主通过 `workflow.retryRun` 原子更新 `workflow-runs.json`，运行时 retry worker 再领取执行。
 - 顶部栏显示 live skill 同步状态；宿主在 `state.refresh` 中读取 live `.suite-release.json.generatedAt`、suite/live commit 与关键内容 hash，必要时通过 `live.sync` 只执行 `scripts/sync-live-skill.ps1`，不打包、不提交、不推送、不重启 bridge。
+- 控制面板唯一正式 exe 入口是 `CodexImSuiteControlPanel.exe`；live 同步、doctor、fingerprint 和内容 hash 都只认该入口。旧 `ClaudeToImControlPanel.exe` 不再发布，若 live 目录仍残留会在同步时清理。
 - “权限”页读取 `permissions.json` 和最近会话参与人，支持按渠道、角色、名称或 ID 过滤，能把用户设置为 `Viewer`、`Operator` 或 `Owner`，并同步兼容 env 后重启 bridge。
 - 会话详情的参与人列表不再只提供一次性“加 Owner”，而是进入同一套权限库，可直接设置三档角色；显示名优先来自飞书历史，拿不到时显示原始 ID。
 - 设置页新增 `path.pickFolder` / `path.pickFile` / `path.openAny` 等目录选择协议，路径字段支持拖拽、回填和快速打开。
@@ -681,6 +687,7 @@ Ignis 会话映射：
 - `sessions.json`
 - `bindings.json`
 - `permissions.json`
+- `permission-links.json`
 - `messages`
 - `message-archives`
 - `feishu-chat-index.json`

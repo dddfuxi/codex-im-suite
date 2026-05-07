@@ -276,7 +276,7 @@ function Get-SuiteReleaseActualContentMap {
         $map['runtime.scripts'] = Get-ReleaseContentHash -Paths @((Join-Path $TargetRoot 'scripts'))
         $map['runtime.configExample'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'config.env.example')
         $map['runtime.skill'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'SKILL.md')
-        $map['panel.exe'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'dist\control-panel\ClaudeToImControlPanel.exe')
+        $map['panel.exe'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'dist\control-panel\CodexImSuiteControlPanel.exe')
         $map['panel.wwwroot'] = Get-ReleaseContentHash -Paths @((Join-Path $TargetRoot 'dist\control-panel\wwwroot'))
         return $map
     }

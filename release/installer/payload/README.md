@@ -62,7 +62,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
 
 Control API 默认只监听本机：
 
