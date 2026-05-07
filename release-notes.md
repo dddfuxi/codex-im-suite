@@ -1,5 +1,51 @@
 ﻿# Release Notes
 
+## 2026-05-07 16:30:06
+
+- Subject: sync suite 2026-05-07 16:30:06
+- Summary source: fallback-rule
+
+### Preview
+
+MCP changes: none
+
+Other changes:
+- M publish-summary.md
+- M release-notes.md
+- M release/codex-im-suite-portable.zip
+- M release/installer/CodexImSuiteInstaller.dll
+- M release/installer/CodexImSuiteInstaller.exe
+- M release/installer/CodexImSuiteInstaller.pdb
+- M release/installer/payload/.suite-release.json
+- M release/installer/payload/CodexImSuiteControlPanel.exe
+- ... and 2 more
+
+### Commit Body
+
+Other suite changes:
+- M publish-summary.md
+- M release-notes.md
+- M release/codex-im-suite-portable.zip
+- M release/installer/CodexImSuiteInstaller.dll
+- M release/installer/CodexImSuiteInstaller.exe
+- M release/installer/CodexImSuiteInstaller.pdb
+- M release/installer/payload/.suite-release.json
+- M release/installer/payload/CodexImSuiteControlPanel.exe
+- M release/portable/.suite-release.json
+- M release/portable/CodexImSuiteControlPanel.exe
+
+## 2026-05-07 16:28:57
+
+- Subject: prepare main release v0.2.0
+- Summary source: main-release-preflight
+
+### Preview
+
+- Suite version: 0.2.0
+- Branch policy: main is stable, codex/dev is integration, codex/<topic> is feature work
+- Extension protocol: extension-manifest/v1
+- Package mode: main release packaging skipped live skill sync
+
 ## 2026-05-07 16:23:27
 
 - Subject: refresh panel; sync suite 2026-05-07 16:23:27
@@ -245,18 +291,6 @@ Other suite changes:
 - M release/installer/payload/CodexImSuiteControlPanel.exe
 - D release/installer/payload/CodexImSuiteControlPanel.runtimeconfig.json
 - ... and 62 more
-
-## 2026-04-28 11:21:09
-
-- Subject: prepare main release v0.2.0
-- Summary source: main-release-preflight
-
-### Preview
-
-- Suite version: 0.2.0
-- Branch policy: main is stable, codex/dev is integration, codex/<topic> is feature work
-- Extension protocol: extension-manifest/v1
-- Package mode: main release packaging skipped live skill sync
 
 ## 2026-04-28 10:21:36
 
@@ -849,6 +883,10 @@ Other suite changes:
 - ?? release/installer/payload/scripts/setup-blender-mcp.ps1
 - ?? release/portable/scripts/setup-blender-mcp.ps1
 - ?? scripts/setup-blender-mcp.ps1
+
+
+
+
 
 
 

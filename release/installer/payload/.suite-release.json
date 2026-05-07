@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-05-07 16:23:22",
-    "releaseRunId":  "198c4382085d4ff983959515f03f7ccc",
+    "generatedAt":  "2026-05-07 16:30:02",
+    "releaseRunId":  "e4db4393397f481884963ec799be74b9",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/dev",
-                  "commit":  "0dd034b",
+                  "commit":  "a048478",
                   "dirty":  true
               },
     "manifest":  {
@@ -19,9 +19,9 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "524FF5256B85",
+                  "Hash":  "FF80644E1943",
                   "Length":  1631715,
-                  "Modified":  "2026-05-07 16:22:34"
+                  "Modified":  "2026-05-07 16:29:33"
               },
     "content":  {
                     "runtime.package":  "2E1866861405",
@@ -36,7 +36,7 @@
                     "extensions.skills":  "3D657A104715",
                     "release.scripts":  "BBBB07556232",
                     "docs":  "DE4DABD942A0",
-                    "panel.exe":  "524FF5256B85",
+                    "panel.exe":  "FF80644E1943",
                     "panel.wwwroot":  "E67D854B09D7"
                 }
 }
