@@ -27,7 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ── Paths ──
+# Paths
 $DefaultCtiHome = Join-Path $HOME '.claude-to-im'
 if (-not $env:CTI_HOME) {
     $env:CTI_HOME = $DefaultCtiHome
@@ -45,7 +45,7 @@ $DaemonMjs  = Join-Path (Join-Path $SkillDir 'dist') 'daemon.mjs'
 
 $ServiceName = 'ClaudeToIMBridge'
 
-# ── Helpers ──
+# Helpers
 
 function Ensure-Dirs {
     @('data','logs','runtime','data/messages') | ForEach-Object {
@@ -96,6 +96,27 @@ function Test-PidAlive {
     catch { return $false }
 }
 
+function Stop-PidIfAlive {
+    param(
+        [string]$ProcessIdValue,
+        [string]$Label
+    )
+    if (-not $ProcessIdValue) { return $false }
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+    try {
+        Stop-Process -Id ([int]$ProcessIdValue) -Force -ErrorAction Stop
+        if ($Label) { Write-Host "$Label stopped" }
+        return $true
+    } catch {
+        $message = $_.Exception.Message
+        if ($_.FullyQualifiedErrorId -like '*NoProcessFoundForGivenId*' -or $message -match 'Cannot find a process|process identifier') {
+            if ($Label) { Write-Host "$Label was already stopped" }
+            return $false
+        }
+        throw
+    }
+}
+
 function Test-StatusRunning {
     if (-not (Test-Path $StatusFile)) { return $false }
     try {
@@ -143,7 +164,7 @@ function Get-NodePath {
     return $nodePath
 }
 
-# ── WinSW / NSSM detection ──
+# WinSW / NSSM detection
 
 function Find-ServiceManager {
     # Prefer WinSW, then NSSM
@@ -234,7 +255,7 @@ function Install-NSSMService {
     Write-Host "Or:          sc.exe start $ServiceName"
 }
 
-# ── Fallback: Start-Process (no service manager) ──
+# Fallback: Start-Process (no service manager)
 
 function Start-Fallback {
     if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
@@ -286,7 +307,7 @@ function Run-SupervisorLoop {
     if (Test-Path $PidFile) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
 }
 
-# ── Commands ──
+# Commands
 
 switch ($Command) {
     'start' {
@@ -354,16 +375,11 @@ switch ($Command) {
             $bridgePid = Read-Pid
             $supervisorPid = Read-SupervisorPid
             if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; exit 0 }
-            if (Test-PidAlive $bridgePid) {
-                Stop-Process -Id ([int]$bridgePid) -Force
-                Write-Host "Bridge stopped"
-            } else {
+            $bridgeStopped = Stop-PidIfAlive $bridgePid 'Bridge'
+            if ($bridgePid -and -not $bridgeStopped) {
                 Write-Host "Bridge was not running (stale PID file)"
             }
-            if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
-                Stop-Process -Id ([int]$supervisorPid) -Force
-                Write-Host "Supervisor stopped"
-            }
+            [void](Stop-PidIfAlive $supervisorPid 'Supervisor')
             if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
             if (Test-Path $SupervisorPidFile) { Remove-Item $SupervisorPidFile -Force }
             if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }

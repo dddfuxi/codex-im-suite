@@ -24,6 +24,18 @@ export interface Config {
   directReminderAllowSlashCommand?: boolean;
   unityMcpEndpoints?: string;
   unityMcpStartCommand?: string;
+  localAiKind?: 'ollama' | 'lmstudio' | 'vllm' | 'openai-compatible' | 'custom';
+  localAiBaseUrl?: string;
+  localAiModel?: string;
+  localAiApiKey?: string;
+  localAiTimeoutMs?: number;
+  codexBaseUrl?: string;
+  codexApiKey?: string;
+  codexModel?: string;
+  codexPassModel?: boolean;
+  codexReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  codexLocalFallbackEnabled?: boolean;
+  codexLocalFallbackReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   ollamaEnabled?: boolean;
   ollamaBaseUrl?: string;
   ollamaModel?: string;
@@ -56,7 +68,18 @@ export interface Config {
   feishuDomain?: string;
   feishuAllowedUsers?: string[];
   feishuOwnerUsers?: string[];
+  feishuGrantedScopes?: string[];
   feishuDocumentGuideDocId?: string;
+  feishuOAuthMode?: 'callback' | 'manual';
+  feishuOAuthPublicBaseUrl?: string;
+  feishuOAuthManualRedirectUri?: string;
+  feishuOAuthCallbackPath?: string;
+  feishuOAuthScopes?: string[];
+  feishuOAuthCallbackPort?: number;
+  feishuCloudMaxChars?: number;
+  feishuCloudMaxRows?: number;
+  feishuCloudMaxRecords?: number;
+  feishuCloudMaxSheets?: number;
   // Discord
   discordBotToken?: string;
   discordAllowedUsers?: string[];
@@ -205,6 +228,9 @@ export function loadConfig(): Config {
   const ollamaTimeoutMs = env.get("CTI_OLLAMA_TIMEOUT_MS")
     ? Number(env.get("CTI_OLLAMA_TIMEOUT_MS"))
     : undefined;
+  const localAiTimeoutMs = env.get("CTI_LOCAL_AI_TIMEOUT_MS")
+    ? Number(env.get("CTI_LOCAL_AI_TIMEOUT_MS"))
+    : undefined;
   const localLlmRouterMaxInputChars = env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS")
     ? Number(env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS"))
     : undefined;
@@ -220,6 +246,21 @@ export function loadConfig(): Config {
   const localLlmMaxOutputTokens = env.get("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS")
     ? Number(env.get("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS"))
     : undefined;
+  const feishuOAuthCallbackPort = env.get("CTI_FEISHU_OAUTH_CALLBACK_PORT")
+    ? Number(env.get("CTI_FEISHU_OAUTH_CALLBACK_PORT"))
+    : undefined;
+  const feishuCloudMaxChars = env.get("CTI_FEISHU_CLOUD_MAX_CHARS")
+    ? Number(env.get("CTI_FEISHU_CLOUD_MAX_CHARS"))
+    : undefined;
+  const feishuCloudMaxRows = env.get("CTI_FEISHU_CLOUD_MAX_ROWS")
+    ? Number(env.get("CTI_FEISHU_CLOUD_MAX_ROWS"))
+    : undefined;
+  const feishuCloudMaxRecords = env.get("CTI_FEISHU_CLOUD_MAX_RECORDS")
+    ? Number(env.get("CTI_FEISHU_CLOUD_MAX_RECORDS"))
+    : undefined;
+  const feishuCloudMaxSheets = env.get("CTI_FEISHU_CLOUD_MAX_SHEETS")
+    ? Number(env.get("CTI_FEISHU_CLOUD_MAX_SHEETS"))
+    : undefined;
   const allowedWorkspaceRoots = mergeWorkspaceRoots(
     defaultWorkDir,
     splitPathList(env.get("CTI_ALLOWED_WORKSPACE_ROOTS")),
@@ -229,11 +270,28 @@ export function loadConfig(): Config {
   const ollamaEnabled = env.has("CTI_OLLAMA_ENABLED")
     ? env.get("CTI_OLLAMA_ENABLED") === "true"
     : (env.has("CTI_LOCAL_LLM_ENABLED") ? env.get("CTI_LOCAL_LLM_ENABLED") === "true" : true);
-  const ollamaBaseUrl = env.get("CTI_OLLAMA_BASE_URL")
+  const rawLocalAiKind = (env.get("CTI_LOCAL_AI_KIND") || "ollama").trim().toLowerCase();
+  const localAiKind = (["ollama", "lmstudio", "vllm", "openai-compatible", "custom"].includes(rawLocalAiKind)
+    ? rawLocalAiKind
+    : "ollama") as NonNullable<Config["localAiKind"]>;
+  const localAiBaseUrl = env.get("CTI_LOCAL_AI_BASE_URL")
+    || env.get("CTI_OLLAMA_BASE_URL")
     || "http://127.0.0.1:11434";
-  const ollamaModel = env.get("CTI_OLLAMA_MODEL")
+  const localAiModel = env.get("CTI_LOCAL_AI_MODEL")
+    || env.get("CTI_OLLAMA_MODEL")
     || "qwen2.5-coder:7b";
-  const effectiveOllamaTimeoutMs = ollamaTimeoutMs ?? localLlmTimeoutMs ?? 45000;
+  const effectiveLocalAiTimeoutMs = localAiTimeoutMs ?? ollamaTimeoutMs ?? localLlmTimeoutMs ?? 45000;
+  const ollamaBaseUrl = localAiBaseUrl;
+  const ollamaModel = localAiModel;
+  const effectiveOllamaTimeoutMs = effectiveLocalAiTimeoutMs;
+  const rawCodexReasoningEffort = (env.get("CTI_CODEX_REASONING_EFFORT") || "").trim().toLowerCase();
+  const codexReasoningEffort = ["minimal", "low", "medium", "high", "xhigh"].includes(rawCodexReasoningEffort)
+    ? rawCodexReasoningEffort as NonNullable<Config["codexReasoningEffort"]>
+    : undefined;
+  const rawCodexLocalFallbackReasoningEffort = (env.get("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT") || "").trim().toLowerCase();
+  const codexLocalFallbackReasoningEffort = ["minimal", "low", "medium", "high", "xhigh"].includes(rawCodexLocalFallbackReasoningEffort)
+    ? rawCodexLocalFallbackReasoningEffort as NonNullable<Config["codexLocalFallbackReasoningEffort"]>
+    : "minimal";
 
   return {
     runtime,
@@ -265,6 +323,18 @@ export function loadConfig(): Config {
       : true,
     unityMcpEndpoints: env.get("CTI_UNITY_MCP_ENDPOINTS") || undefined,
     unityMcpStartCommand: env.get("CTI_UNITY_MCP_START_COMMAND") || undefined,
+    localAiKind,
+    localAiBaseUrl,
+    localAiModel,
+    localAiApiKey: env.get("CTI_LOCAL_AI_API_KEY") || undefined,
+    localAiTimeoutMs: effectiveLocalAiTimeoutMs,
+    codexBaseUrl: env.get("CTI_CODEX_BASE_URL") || undefined,
+    codexApiKey: env.get("CTI_CODEX_API_KEY") || undefined,
+    codexModel: env.get("CTI_CODEX_MODEL") || undefined,
+    codexPassModel: env.has("CTI_CODEX_PASS_MODEL") ? env.get("CTI_CODEX_PASS_MODEL") === "true" : undefined,
+    codexReasoningEffort,
+    codexLocalFallbackEnabled: env.has("CTI_CODEX_LOCAL_FALLBACK_ENABLED") ? env.get("CTI_CODEX_LOCAL_FALLBACK_ENABLED") === "true" : true,
+    codexLocalFallbackReasoningEffort,
     ollamaEnabled,
     ollamaBaseUrl,
     ollamaModel,
@@ -305,7 +375,27 @@ export function loadConfig(): Config {
     feishuDomain: env.get("CTI_FEISHU_DOMAIN") || undefined,
     feishuAllowedUsers: splitCsv(env.get("CTI_FEISHU_ALLOWED_USERS")),
     feishuOwnerUsers: splitCsv(env.get("CTI_FEISHU_OWNER_USERS")),
+    feishuGrantedScopes: splitCsv(env.get("CTI_FEISHU_GRANTED_SCOPES")),
     feishuDocumentGuideDocId: env.get("CTI_FEISHU_DOCUMENT_GUIDE_DOC_ID") || undefined,
+    feishuOAuthMode: (env.get("CTI_FEISHU_OAUTH_MODE") || "callback").trim().toLowerCase() === "manual" ? "manual" : "callback",
+    feishuOAuthPublicBaseUrl: env.get("CTI_FEISHU_OAUTH_PUBLIC_BASE_URL") || undefined,
+    feishuOAuthManualRedirectUri: env.get("CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI") || undefined,
+    feishuOAuthCallbackPath: env.get("CTI_FEISHU_OAUTH_CALLBACK_PATH") || "/feishu/oauth/callback",
+    feishuOAuthScopes: splitCsv(env.get("CTI_FEISHU_OAUTH_SCOPES")) ?? [
+      "offline_access",
+      "auth:user.id:read",
+      "docx:document:readonly",
+      "sheets:spreadsheet:readonly",
+      "bitable:app:readonly",
+      "base:table:read",
+      "base:field:read",
+      "base:record:retrieve",
+    ],
+    feishuOAuthCallbackPort: feishuOAuthCallbackPort ?? 17321,
+    feishuCloudMaxChars: feishuCloudMaxChars ?? 80000,
+    feishuCloudMaxRows: feishuCloudMaxRows ?? 500,
+    feishuCloudMaxRecords: feishuCloudMaxRecords ?? 500,
+    feishuCloudMaxSheets: feishuCloudMaxSheets ?? 5,
     discordBotToken: env.get("CTI_DISCORD_BOT_TOKEN") || undefined,
     discordAllowedUsers: splitCsv(env.get("CTI_DISCORD_ALLOWED_USERS")),
     discordOwnerUsers: splitCsv(env.get("CTI_DISCORD_OWNER_USERS")),
@@ -378,6 +468,21 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND", String(config.directReminderAllowSlashCommand));
   out += formatEnvLine("CTI_UNITY_MCP_ENDPOINTS", config.unityMcpEndpoints);
   out += formatEnvLine("CTI_UNITY_MCP_START_COMMAND", config.unityMcpStartCommand);
+  out += formatEnvLine("CTI_LOCAL_AI_KIND", config.localAiKind);
+  out += formatEnvLine("CTI_LOCAL_AI_BASE_URL", config.localAiBaseUrl);
+  out += formatEnvLine("CTI_LOCAL_AI_MODEL", config.localAiModel);
+  out += formatEnvLine("CTI_LOCAL_AI_API_KEY", config.localAiApiKey);
+  if (config.localAiTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_LOCAL_AI_TIMEOUT_MS", String(config.localAiTimeoutMs));
+  out += formatEnvLine("CTI_CODEX_BASE_URL", config.codexBaseUrl);
+  out += formatEnvLine("CTI_CODEX_API_KEY", config.codexApiKey);
+  out += formatEnvLine("CTI_CODEX_MODEL", config.codexModel);
+  if (config.codexPassModel !== undefined)
+    out += formatEnvLine("CTI_CODEX_PASS_MODEL", String(config.codexPassModel));
+  out += formatEnvLine("CTI_CODEX_REASONING_EFFORT", config.codexReasoningEffort);
+  if (config.codexLocalFallbackEnabled !== undefined)
+    out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_ENABLED", String(config.codexLocalFallbackEnabled));
+  out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", config.codexLocalFallbackReasoningEffort);
   if (config.ollamaEnabled !== undefined)
     out += formatEnvLine("CTI_OLLAMA_ENABLED", String(config.ollamaEnabled));
   out += formatEnvLine("CTI_OLLAMA_BASE_URL", config.ollamaBaseUrl);
@@ -429,7 +534,23 @@ export function saveConfig(config: Config): void {
     "CTI_FEISHU_OWNER_USERS",
     config.feishuOwnerUsers?.join(",")
   );
+  out += formatEnvLine("CTI_FEISHU_GRANTED_SCOPES", config.feishuGrantedScopes?.join(","));
   out += formatEnvLine("CTI_FEISHU_DOCUMENT_GUIDE_DOC_ID", config.feishuDocumentGuideDocId);
+  out += formatEnvLine("CTI_FEISHU_OAUTH_MODE", config.feishuOAuthMode);
+  out += formatEnvLine("CTI_FEISHU_OAUTH_PUBLIC_BASE_URL", config.feishuOAuthPublicBaseUrl);
+  out += formatEnvLine("CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI", config.feishuOAuthManualRedirectUri);
+  out += formatEnvLine("CTI_FEISHU_OAUTH_CALLBACK_PATH", config.feishuOAuthCallbackPath);
+  out += formatEnvLine("CTI_FEISHU_OAUTH_SCOPES", config.feishuOAuthScopes?.join(","));
+  if (config.feishuOAuthCallbackPort !== undefined)
+    out += formatEnvLine("CTI_FEISHU_OAUTH_CALLBACK_PORT", String(config.feishuOAuthCallbackPort));
+  if (config.feishuCloudMaxChars !== undefined)
+    out += formatEnvLine("CTI_FEISHU_CLOUD_MAX_CHARS", String(config.feishuCloudMaxChars));
+  if (config.feishuCloudMaxRows !== undefined)
+    out += formatEnvLine("CTI_FEISHU_CLOUD_MAX_ROWS", String(config.feishuCloudMaxRows));
+  if (config.feishuCloudMaxRecords !== undefined)
+    out += formatEnvLine("CTI_FEISHU_CLOUD_MAX_RECORDS", String(config.feishuCloudMaxRecords));
+  if (config.feishuCloudMaxSheets !== undefined)
+    out += formatEnvLine("CTI_FEISHU_CLOUD_MAX_SHEETS", String(config.feishuCloudMaxSheets));
   out += formatEnvLine("CTI_DISCORD_BOT_TOKEN", config.discordBotToken);
   out += formatEnvLine(
     "CTI_DISCORD_ALLOWED_USERS",
@@ -548,8 +669,30 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_feishu_allowed_users", config.feishuAllowedUsers.join(","));
   if (config.feishuOwnerUsers)
     m.set("bridge_feishu_owner_users", config.feishuOwnerUsers.join(","));
+  if (config.feishuGrantedScopes)
+    m.set("bridge_feishu_granted_scopes", config.feishuGrantedScopes.join(","));
   if (config.feishuDocumentGuideDocId)
     m.set("bridge_feishu_document_guide_doc_id", config.feishuDocumentGuideDocId);
+  if (config.feishuOAuthMode)
+    m.set("bridge_feishu_oauth_mode", config.feishuOAuthMode);
+  if (config.feishuOAuthPublicBaseUrl)
+    m.set("bridge_feishu_oauth_public_base_url", config.feishuOAuthPublicBaseUrl);
+  if (config.feishuOAuthManualRedirectUri)
+    m.set("bridge_feishu_oauth_manual_redirect_uri", config.feishuOAuthManualRedirectUri);
+  if (config.feishuOAuthCallbackPath)
+    m.set("bridge_feishu_oauth_callback_path", config.feishuOAuthCallbackPath);
+  if (config.feishuOAuthScopes)
+    m.set("bridge_feishu_oauth_scopes", config.feishuOAuthScopes.join(","));
+  if (typeof config.feishuOAuthCallbackPort === "number" && Number.isFinite(config.feishuOAuthCallbackPort))
+    m.set("bridge_feishu_oauth_callback_port", String(Math.max(1, Math.floor(config.feishuOAuthCallbackPort))));
+  if (typeof config.feishuCloudMaxChars === "number" && Number.isFinite(config.feishuCloudMaxChars))
+    m.set("bridge_feishu_cloud_max_chars", String(Math.max(1000, Math.floor(config.feishuCloudMaxChars))));
+  if (typeof config.feishuCloudMaxRows === "number" && Number.isFinite(config.feishuCloudMaxRows))
+    m.set("bridge_feishu_cloud_max_rows", String(Math.max(1, Math.floor(config.feishuCloudMaxRows))));
+  if (typeof config.feishuCloudMaxRecords === "number" && Number.isFinite(config.feishuCloudMaxRecords))
+    m.set("bridge_feishu_cloud_max_records", String(Math.max(1, Math.floor(config.feishuCloudMaxRecords))));
+  if (typeof config.feishuCloudMaxSheets === "number" && Number.isFinite(config.feishuCloudMaxSheets))
+    m.set("bridge_feishu_cloud_max_sheets", String(Math.max(1, Math.floor(config.feishuCloudMaxSheets))));
 
   // ── QQ ──
   // Upstream keys: bridge_qq_enabled, bridge_qq_app_id, bridge_qq_app_secret,
@@ -629,6 +772,48 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.unityMcpStartCommand) {
     m.set("bridge_unity_mcp_start_command", config.unityMcpStartCommand);
   }
+  if (config.localAiKind) {
+    m.set("bridge_local_ai_kind", config.localAiKind);
+  }
+  if (config.localAiBaseUrl) {
+    m.set("bridge_local_ai_base_url", config.localAiBaseUrl);
+  }
+  if (config.localAiModel) {
+    m.set("bridge_local_ai_model", config.localAiModel);
+  }
+  if (config.localAiApiKey) {
+    m.set("bridge_local_ai_api_key_set", "true");
+    m.set("bridge_local_ai_api_key_masked", maskSecret(config.localAiApiKey));
+  } else {
+    m.set("bridge_local_ai_api_key_set", "false");
+  }
+  if (typeof config.localAiTimeoutMs === "number" && Number.isFinite(config.localAiTimeoutMs)) {
+    m.set("bridge_local_ai_timeout_ms", String(Math.max(1000, Math.floor(config.localAiTimeoutMs))));
+  }
+  if (config.codexBaseUrl) {
+    m.set("bridge_codex_base_url", config.codexBaseUrl);
+  }
+  if (config.codexApiKey) {
+    m.set("bridge_codex_api_key_set", "true");
+    m.set("bridge_codex_api_key_masked", maskSecret(config.codexApiKey));
+  } else {
+    m.set("bridge_codex_api_key_set", "false");
+  }
+  if (config.codexModel) {
+    m.set("bridge_codex_model", config.codexModel);
+  }
+  if (config.codexPassModel !== undefined) {
+    m.set("bridge_codex_pass_model", String(config.codexPassModel));
+  }
+  if (config.codexReasoningEffort) {
+    m.set("bridge_codex_reasoning_effort", config.codexReasoningEffort);
+  }
+  if (config.codexLocalFallbackEnabled !== undefined) {
+    m.set("bridge_codex_local_fallback_enabled", String(config.codexLocalFallbackEnabled));
+  }
+  if (config.codexLocalFallbackReasoningEffort) {
+    m.set("bridge_codex_local_fallback_reasoning_effort", config.codexLocalFallbackReasoningEffort);
+  }
   if (config.ollamaEnabled !== undefined) {
     m.set("bridge_ollama_enabled", String(config.ollamaEnabled));
   }
@@ -642,9 +827,9 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_ollama_timeout_ms", String(Math.max(1000, Math.floor(config.ollamaTimeoutMs))));
   }
   const localCompatEnabled = config.localLlmEnabled ?? config.ollamaEnabled;
-  const localCompatBaseUrl = config.localLlmBaseUrl || config.ollamaBaseUrl;
-  const localCompatModel = config.localLlmModel || config.ollamaModel;
-  const localCompatTimeout = config.localLlmTimeoutMs ?? config.ollamaTimeoutMs;
+  const localCompatBaseUrl = config.localLlmBaseUrl || config.localAiBaseUrl || config.ollamaBaseUrl;
+  const localCompatModel = config.localLlmModel || config.localAiModel || config.ollamaModel;
+  const localCompatTimeout = config.localLlmTimeoutMs ?? config.localAiTimeoutMs ?? config.ollamaTimeoutMs;
   if (localCompatEnabled !== undefined) {
     m.set("bridge_local_llm_enabled", String(localCompatEnabled));
   }

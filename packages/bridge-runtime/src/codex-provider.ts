@@ -30,6 +30,7 @@ const MIME_EXT: Record<string, string> = {
 
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
 const DEFAULT_REASONING_EFFORT = 'low';
+const DEFAULT_LOCAL_FALLBACK_REASONING_EFFORT = 'minimal';
 const DEFAULT_CONTEXT_CHAR_BUDGET = 12000;
 const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
@@ -47,6 +48,11 @@ type CodexModule = any;
 type CodexInstance = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ThreadInstance = any;
+export type CodexProviderProfile = 'primary' | 'local_fallback';
+
+interface CodexProviderOptions {
+  profile?: CodexProviderProfile;
+}
 
 /**
  * Map bridge permission modes to Codex approval policies.
@@ -73,11 +79,16 @@ function getSandboxMode(): string {
 }
 
 /** Whether to forward bridge model to Codex CLI. Default: false (use Codex current/default model). */
-function shouldPassModelToCodex(): boolean {
+function shouldPassModelToCodex(profile: CodexProviderProfile): boolean {
+  if (profile === 'local_fallback') return true;
   return process.env.CTI_CODEX_PASS_MODEL === 'true';
 }
 
-function getCodexModelOverride(): string | undefined {
+function getCodexModelOverride(profile: CodexProviderProfile): string | undefined {
+  if (profile === 'local_fallback') {
+    const model = (process.env.CTI_LOCAL_AI_MODEL || process.env.CTI_OLLAMA_MODEL || 'qwen2.5-coder:7b').trim();
+    return model || 'qwen2.5-coder:7b';
+  }
   const model = (process.env.CTI_CODEX_MODEL || '').trim();
   return model || undefined;
 }
@@ -96,8 +107,8 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
-function getReasoningEffort(): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
-  const raw = (process.env.CTI_CODEX_REASONING_EFFORT || DEFAULT_REASONING_EFFORT).trim().toLowerCase();
+function normalizeReasoningEffort(value: string | undefined, fallback: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
+  const raw = (value || fallback).trim().toLowerCase();
   switch (raw) {
     case 'minimal':
     case 'low':
@@ -106,9 +117,23 @@ function getReasoningEffort(): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
     case 'xhigh':
       return raw;
     default:
-      return DEFAULT_REASONING_EFFORT;
+      return fallback;
   }
 }
+
+function getReasoningEffort(profile: CodexProviderProfile): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
+  if (profile === 'local_fallback') {
+    return normalizeReasoningEffort(process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT, DEFAULT_LOCAL_FALLBACK_REASONING_EFFORT);
+  }
+  return normalizeReasoningEffort(process.env.CTI_CODEX_REASONING_EFFORT, DEFAULT_REASONING_EFFORT);
+}
+
+type CodexClientOptions = {
+  apiKey?: string;
+  baseUrl?: string;
+  config: { model_reasoning_effort: ReturnType<typeof normalizeReasoningEffort> };
+  env: Record<string, string>;
+};
 
 function shouldResumeThreads(): boolean {
   return process.env.CTI_CODEX_RESUME_THREADS === 'true';
@@ -127,6 +152,17 @@ function getGlobalCodexHome(): string {
 
 function getBridgeCodexHome(): string {
   return process.env.CTI_CODEX_HOME || path.join(CTI_HOME, 'runtime', 'codex-home');
+}
+
+function getLocalFallbackCodexHome(): string {
+  return process.env.CTI_CODEX_LOCAL_FALLBACK_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-local-fallback');
+}
+
+function normalizeLocalFallbackBaseUrl(baseUrl: string, kind: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (kind === 'ollama' && !/\/v1$/i.test(trimmed)) return `${trimmed}/v1`;
+  return trimmed;
 }
 
 function normalizeAdditionalDirectories(additionalDirectories?: string[]): string[] {
@@ -230,10 +266,10 @@ function resetBridgeStateDatabases(bridgeHome: string): void {
   }
 }
 
-function ensureBridgeCodexHome(): string {
-  const bridgeHome = getBridgeCodexHome();
+function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
+  const bridgeHome = profile === 'local_fallback' ? getLocalFallbackCodexHome() : getBridgeCodexHome();
   const globalHome = getGlobalCodexHome();
-  const reasoningEffort = getReasoningEffort();
+  const reasoningEffort = getReasoningEffort(profile);
 
   fs.mkdirSync(bridgeHome, { recursive: true });
   fs.mkdirSync(path.join(bridgeHome, 'sessions'), { recursive: true });
@@ -255,6 +291,39 @@ function ensureBridgeCodexHome(): string {
   fs.writeFileSync(bridgeConfigPath, bridgeConfig, 'utf-8');
 
   return bridgeHome;
+}
+
+function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): CodexClientOptions & { modelOverride?: string; passModel: boolean; profile: CodexProviderProfile } {
+  const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
+  const apiKey = profile === 'local_fallback'
+    ? (process.env.CTI_LOCAL_AI_API_KEY || undefined)
+    : (process.env.CTI_CODEX_API_KEY
+      || process.env.CODEX_API_KEY
+      || process.env.OPENAI_API_KEY
+      || undefined);
+  const baseUrl = profile === 'local_fallback'
+    ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
+    : (process.env.CTI_CODEX_BASE_URL || undefined);
+  const bridgeCodexHome = ensureBridgeCodexHome(profile);
+  process.env.CODEX_HOME = bridgeCodexHome;
+  return {
+    ...(apiKey ? { apiKey } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    config: {
+      model_reasoning_effort: getReasoningEffort(profile),
+    },
+    env: {
+      ...toTextEnv(process.env),
+      CODEX_HOME: bridgeCodexHome,
+    },
+    modelOverride: getCodexModelOverride(profile),
+    passModel: shouldPassModelToCodex(profile),
+    profile,
+  };
+}
+
+export function buildCodexClientOptionsForTest(profile: CodexProviderProfile = 'primary'): CodexClientOptions & { modelOverride?: string; passModel: boolean; profile: CodexProviderProfile } {
+  return buildCodexClientOptions(profile);
 }
 
 function normalizeText(text: string): string {
@@ -418,7 +487,10 @@ export class CodexProvider implements LLMProvider {
   /** Maps session IDs to Codex thread IDs for resume. */
   private threadIds = new Map<string, string>();
 
-  constructor(private pendingPerms: PendingPermissions) {}
+  constructor(
+    private pendingPerms: PendingPermissions,
+    private readonly options: CodexProviderOptions = {},
+  ) {}
 
   /**
    * Lazily load the Codex SDK. Throws a clear error if not installed.
@@ -437,27 +509,14 @@ export class CodexProvider implements LLMProvider {
       );
     }
 
-    // Resolve API key: CTI_CODEX_API_KEY > CODEX_API_KEY > OPENAI_API_KEY > (login auth)
-    const apiKey = process.env.CTI_CODEX_API_KEY
-      || process.env.CODEX_API_KEY
-      || process.env.OPENAI_API_KEY
-      || undefined;
-    const baseUrl = process.env.CTI_CODEX_BASE_URL || undefined;
-    const bridgeCodexHome = ensureBridgeCodexHome();
-    process.env.CODEX_HOME = bridgeCodexHome;
-    const env = {
-      ...toTextEnv(process.env),
-      CODEX_HOME: bridgeCodexHome,
-    };
+    const clientOptions = buildCodexClientOptions(this.options.profile || 'primary');
 
     const CodexClass = this.sdk.Codex;
     this.codex = new CodexClass({
-      ...(apiKey ? { apiKey } : {}),
-      ...(baseUrl ? { baseUrl } : {}),
-      config: {
-        model_reasoning_effort: getReasoningEffort(),
-      },
-      env,
+      ...(clientOptions.apiKey ? { apiKey: clientOptions.apiKey } : {}),
+      ...(clientOptions.baseUrl ? { baseUrl: clientOptions.baseUrl } : {}),
+      config: clientOptions.config,
+      env: clientOptions.env,
     });
 
     return { sdk: this.sdk, codex: this.codex };
@@ -487,8 +546,8 @@ export class CodexProvider implements LLMProvider {
               : (inMemoryThreadId || params.sdkSessionId || undefined);
 
             const approvalPolicy = toApprovalPolicy(params.permissionMode);
-            const passModel = shouldPassModelToCodex();
-            const modelOverride = getCodexModelOverride();
+            const passModel = shouldPassModelToCodex(self.options.profile || 'primary');
+            const modelOverride = getCodexModelOverride(self.options.profile || 'primary');
             const sandboxMode = getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
             const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
@@ -500,7 +559,7 @@ export class CodexProvider implements LLMProvider {
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,
               sandboxMode,
-              modelReasoningEffort: getReasoningEffort(),
+              modelReasoningEffort: getReasoningEffort(self.options.profile || 'primary'),
             };
 
             // Build input: Codex SDK UserInput supports { type: "text" } and

@@ -1,0 +1,334 @@
+{
+  "protocol": "extension-catalog/v1",
+  "updatedAt": "2026-05-08",
+  "items": [
+    {
+      "id": "ollama-qwen2.5-coder-7b",
+      "type": "model",
+      "displayName": "Qwen2.5 Coder 7B",
+      "version": "7b",
+      "category": "model.ollama",
+      "description": "默认 Ollama 本地辅助模型，适合小命令、只读仓库查询和 Codex 不可用时的保守兜底。",
+      "source": "qwen2.5-coder:7b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen2.5-coder:7b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-8b",
+      "type": "model",
+      "displayName": "Qwen3 8B",
+      "version": "8b",
+      "category": "model.ollama",
+      "description": "Ollama 常用开放权重通用模型，适合中英文问答、轻量推理和日常辅助。",
+      "source": "qwen3:8b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3:8b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-deepseek-r1-8b",
+      "type": "model",
+      "displayName": "DeepSeek R1 8B",
+      "version": "8b",
+      "category": "model.ollama",
+      "description": "Ollama 常用开放权重推理模型，适合本地思路草拟和复杂问题分解。",
+      "source": "deepseek-r1:8b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "deepseek-r1:8b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-llama3.1-8b",
+      "type": "model",
+      "displayName": "Llama 3.1 8B",
+      "version": "8b",
+      "category": "model.ollama",
+      "description": "Ollama 常用开放权重通用模型，适合英文任务、摘要和保守兜底。",
+      "source": "llama3.1:8b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "llama3.1:8b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-gemma3-4b",
+      "type": "model",
+      "displayName": "Gemma 3 4B",
+      "version": "4b",
+      "category": "model.ollama",
+      "description": "Ollama 轻量开放权重模型，适合资源较紧时的简短问答和摘要。",
+      "source": "gemma3:4b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "gemma3:4b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-nomic-embed-text",
+      "type": "model",
+      "displayName": "Nomic Embed Text",
+      "version": "latest",
+      "category": "model.embedding",
+      "description": "Ollama 常用文本向量模型，适合本地检索、记忆索引和相似度搜索。",
+      "source": "nomic-embed-text:latest",
+      "artifact": {
+        "kind": "ollama",
+        "model": "nomic-embed-text:latest"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "mcp-sequential-thinking",
+      "type": "mcp",
+      "displayName": "Sequential Thinking MCP",
+      "version": "latest",
+      "category": "mcp.reasoning",
+      "description": "官方常用 MCP server，提供结构化分步思考工具，不需要外部密钥。",
+      "source": "@modelcontextprotocol/server-sequential-thinking",
+      "artifact": {
+        "kind": "npm",
+        "packageName": "@modelcontextprotocol/server-sequential-thinking"
+      },
+      "installHandler": "mcp.npm"
+    },
+    {
+      "id": "mcp-memory",
+      "type": "mcp",
+      "displayName": "Memory MCP",
+      "version": "latest",
+      "category": "mcp.memory",
+      "description": "官方常用 MCP server，提供本地知识图谱式记忆工具，不需要外部密钥。",
+      "source": "@modelcontextprotocol/server-memory",
+      "artifact": {
+        "kind": "npm",
+        "packageName": "@modelcontextprotocol/server-memory"
+      },
+      "installHandler": "mcp.npm"
+    },
+    {
+      "id": "mcp-fetch",
+      "type": "mcp",
+      "displayName": "Fetch MCP",
+      "version": "latest",
+      "category": "mcp.web",
+      "description": "官方常用 MCP server，提供网页抓取能力；使用前请确认网络访问策略。",
+      "source": "mcp-server-fetch",
+      "artifact": {
+        "kind": "uvx",
+        "packageName": "mcp-server-fetch"
+      },
+      "installHandler": "mcp.uvx"
+    },
+    {
+      "id": "project-architecture-diagram",
+      "type": "skill",
+      "displayName": "Project Architecture Diagram",
+      "version": "1.0.0",
+      "category": "skill.docs",
+      "description": "维护项目架构文档和 Mermaid 图的 suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\project-architecture-diagram",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "project-architecture-diagram",
+        "displayName": "Project Architecture Diagram",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.docs",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\project-architecture-diagram",
+        "enabled": true,
+        "description": "Generate and maintain project architecture documentation with Mermaid diagrams."
+      }
+    },
+    {
+      "id": "memory-repo-retrieval",
+      "type": "skill",
+      "displayName": "Memory Repo Retrieval",
+      "version": "1.0.0",
+      "category": "skill.memory",
+      "description": "从本地聊天记忆仓库检索相关上下文的 suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\memory-repo-retrieval",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "memory-repo-retrieval",
+        "displayName": "Memory Repo Retrieval",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.memory",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\memory-repo-retrieval",
+        "enabled": true,
+        "description": "Retrieve focused context from the local chat memory repository."
+      }
+    },
+    {
+      "id": "github-memory-protocol",
+      "type": "skill",
+      "displayName": "GitHub Memory Protocol",
+      "version": "1.0.0",
+      "category": "skill.memory",
+      "description": "本地 Markdown 记忆协议 suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\github-memory-protocol",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "github-memory-protocol",
+        "displayName": "GitHub Memory Protocol",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.memory",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\github-memory-protocol",
+        "enabled": true,
+        "description": "Codex-compatible local markdown memory protocol."
+      }
+    },
+    {
+      "id": "unity-mcp-orchestrator",
+      "type": "skill",
+      "displayName": "Unity MCP Orchestrator",
+      "version": "1.0.0",
+      "category": "skill.unity",
+      "description": "通过 Unity MCP 编排 Unity Editor 操作的 suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\unity-mcp-orchestrator",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "unity-mcp-orchestrator",
+        "displayName": "Unity MCP Orchestrator",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.unity",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\unity-mcp-orchestrator",
+        "enabled": true,
+        "description": "Orchestrate Unity Editor work through MCP for Unity."
+      }
+    },
+    {
+      "id": "ignis-cli",
+      "type": "skill",
+      "displayName": "Ignis CLI",
+      "version": "1.0.0",
+      "category": "skill.assets",
+      "description": "Ignis 创意生成 CLI suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\ignis-cli",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "ignis-cli",
+        "displayName": "Ignis CLI",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.assets",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\ignis-cli",
+        "enabled": true,
+        "description": "Use Ignis CLI for creative generation workflows."
+      }
+    },
+    {
+      "id": "feishu-document-generation",
+      "type": "skill",
+      "displayName": "Feishu Document Generation",
+      "version": "1.0.0",
+      "category": "skill.feishu",
+      "description": "从聊天总结、执行结果或截图生成飞书文档的 suite skill 记录项。",
+      "source": "${SUITE_ROOT}\\extensions\\skills\\feishu-document-generation",
+      "installHandler": "manifest.record",
+      "manifestTemplate": {
+        "id": "feishu-document-generation",
+        "displayName": "Feishu Document Generation",
+        "type": "skill",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "skill.feishu",
+        "optional": true,
+        "installState": "bundled",
+        "source": "${SUITE_ROOT}\\extensions\\skills\\feishu-document-generation",
+        "enabled": true,
+        "description": "Generate or update Feishu docs from bridge output, summaries, and screenshots."
+      }
+    },
+    {
+      "id": "browser-use",
+      "type": "plugin",
+      "displayName": "Browser",
+      "version": "0.1.0-alpha2",
+      "category": "plugin.bundled",
+      "description": "OpenAI bundled Browser 插件记录项；移除只删除 suite 记录，不删除插件缓存。",
+      "source": "codex-plugin:browser-use",
+      "installHandler": "codex-plugin.record",
+      "manifestTemplate": {
+        "id": "browser-use",
+        "displayName": "Browser",
+        "type": "plugin",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "plugin.bundled",
+        "optional": true,
+        "installState": "external",
+        "source": "codex-plugin:browser-use",
+        "enabled": true,
+        "description": "Browser / browser-use plugin record. Removing this record does not delete the OpenAI bundled plugin cache."
+      }
+    },
+    {
+      "id": "build-web-apps",
+      "type": "plugin",
+      "displayName": "Build Web Apps",
+      "version": "1.0.0",
+      "category": "plugin.frontend",
+      "description": "Codex app plugin 记录项；移除只删除 suite 用户记录，不删除插件缓存。",
+      "source": "codex-plugin:build-web-apps",
+      "installHandler": "codex-plugin.record"
+    },
+    {
+      "id": "game-studio",
+      "type": "plugin",
+      "displayName": "Game Studio",
+      "version": "1.0.0",
+      "category": "plugin.game",
+      "description": "Codex app plugin 记录项；移除只删除 suite 用户记录，不删除插件缓存。",
+      "source": "codex-plugin:game-studio",
+      "installHandler": "codex-plugin.record"
+    }
+  ]
+}

@@ -90,6 +90,7 @@ type ExtensionItem = {
   description: string;
   manifestPath: string;
   canInstall?: boolean;
+  canRemove?: boolean;
 };
 
 type SettingsState = {
@@ -99,7 +100,61 @@ type SettingsState = {
   memoryRepo: string;
   additionalDirs: string;
   replyStyleHint: string;
+  localAiKind: string;
+  localAiBaseUrl: string;
+  localAiModel: string;
+  localAiApiKeyAction: 'keep' | 'set' | 'clear';
+  localAiApiKeyValue: string;
+  localAiApiKeyMasked: string;
+  localAiApiKeySet: boolean;
+  localAiTimeoutMs: string;
+  codexBaseUrl: string;
+  codexModel: string;
+  codexPassModel: boolean;
+  codexReasoningEffort: string;
+  codexLocalFallbackEnabled: boolean;
+  codexLocalFallbackReasoningEffort: string;
+  codexApiKeyAction: 'keep' | 'set' | 'clear';
+  codexApiKeyValue: string;
+  codexApiKeyMasked: string;
+  codexApiKeySet: boolean;
 };
+
+type AiStrategy = 'default_codex' | 'codex_with_local_fallback' | 'custom_api';
+
+const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeoutMs: string }> = {
+  ollama: { label: 'Ollama', baseUrl: 'http://127.0.0.1:11434', timeoutMs: '45000' },
+  lmstudio: { label: 'LM Studio', baseUrl: 'http://127.0.0.1:1234/v1', timeoutMs: '45000' },
+  vllm: { label: 'vLLM / OpenAI-compatible', baseUrl: 'http://127.0.0.1:8000/v1', timeoutMs: '45000' },
+  'openai-compatible': { label: 'OpenAI-compatible', baseUrl: 'http://127.0.0.1:8000/v1', timeoutMs: '45000' },
+  custom: { label: '自定义', baseUrl: '', timeoutMs: '45000' },
+};
+
+function inferAiStrategy(settings: SettingsState): AiStrategy {
+  const usesCustomCodexApi = settings.codexBaseUrl.trim()
+    || settings.codexModel.trim()
+    || settings.codexPassModel
+    || settings.codexApiKeySet
+    || settings.codexApiKeyAction === 'set';
+  if (usesCustomCodexApi) return 'custom_api';
+  if (settings.codexLocalFallbackEnabled) return 'codex_with_local_fallback';
+  return 'default_codex';
+}
+
+function strategyLabel(strategy: AiStrategy): string {
+  switch (strategy) {
+    case 'codex_with_local_fallback':
+      return 'Codex + 本地兜底';
+    case 'custom_api':
+      return '完全使用自定义 API';
+    default:
+      return '默认 Codex';
+  }
+}
+
+function localAiLabel(kind: string): string {
+  return LOCAL_AI_PRESETS[kind]?.label || '自定义';
+}
 
 type SessionItem = {
   displayName: string;
@@ -379,6 +434,7 @@ type TodoReminderItem = {
 };
 
 type ExtensionKindFilter = 'all' | 'mcp' | 'skill' | 'plugin' | 'extension';
+type ExtensionCatalogFilter = 'all' | 'mcp' | 'skill' | 'plugin' | 'model';
 type ImportKind = '' | 'skill' | 'mcp';
 type McpRuntimeType = 'stdio' | 'http';
 
@@ -394,6 +450,47 @@ type ExtensionImportPreview = {
   installState: string;
   suggestedKinds: string[];
   canImport: boolean;
+  reason: string;
+};
+
+type ExtensionCatalogItem = {
+  id: string;
+  type: string;
+  displayName: string;
+  version: string;
+  category: string;
+  description: string;
+  installHandler: string;
+  artifactUrl?: string;
+  catalogSource: string;
+  trusted: boolean;
+  trustReason: string;
+  canInstall: boolean;
+  installed: boolean;
+  canRemove: boolean;
+  installedVersion: string;
+  installedAt: string;
+  installPath: string;
+};
+
+type ExtensionCatalogSnapshot = {
+  protocol: string;
+  refreshedAt: string;
+  sourceCount: number;
+  items: ExtensionCatalogItem[];
+};
+
+type RemoteExtensionPreview = {
+  id: string;
+  type: string;
+  displayName: string;
+  version: string;
+  category: string;
+  description: string;
+  installHandler: string;
+  artifactUrl?: string;
+  sourceUrl: string;
+  trusted: boolean;
   reason: string;
 };
 
@@ -532,7 +629,32 @@ const fallbackState: PanelState = {
   mcp: { total: 0, running: 0, items: [], runtimeStatus: '', details: '' },
   release: { publishSummaryExists: false, releaseNotesExists: false, prepareMainReleaseExists: false, tagScriptExists: false, pendingChanges: [] },
   liveSync: { status: 'unavailable', lastSyncedAt: '', suiteCommit: '', liveCommit: '', summary: 'Live 同步状态不可用', canSync: false, detail: '' },
-  settings: { defaultWorkDir: '', allowedRoots: '', unityProject: '', memoryRepo: '', additionalDirs: '', replyStyleHint: '' },
+  settings: {
+    defaultWorkDir: '',
+    allowedRoots: '',
+    unityProject: '',
+    memoryRepo: '',
+    additionalDirs: '',
+    replyStyleHint: '',
+    localAiKind: 'ollama',
+    localAiBaseUrl: 'http://127.0.0.1:11434',
+    localAiModel: 'qwen2.5-coder:7b',
+    localAiApiKeyAction: 'keep',
+    localAiApiKeyValue: '',
+    localAiApiKeyMasked: '',
+    localAiApiKeySet: false,
+    localAiTimeoutMs: '45000',
+    codexBaseUrl: '',
+    codexModel: '',
+    codexPassModel: false,
+    codexReasoningEffort: 'low',
+    codexLocalFallbackEnabled: true,
+    codexLocalFallbackReasoningEffort: 'minimal',
+    codexApiKeyAction: 'keep',
+    codexApiKeyValue: '',
+    codexApiKeyMasked: '',
+    codexApiKeySet: false,
+  },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
   memory: {
@@ -584,6 +706,16 @@ const commandLabels: Record<string, string> = {
   'release.prepareMainRelease': '主干发布预检',
 };
 const trackedCommands = new Set(Object.keys(commandLabels));
+
+function confirmReleaseCommand(command: string): boolean {
+  if (command === 'release.publishBackup') {
+    return window.confirm('将执行一键发布：开发版 -> live skill 同步、构建、打包、git add/commit、git push。\n\n如果目标发布目录、live skill 或 portable/installer 里的 exe 正在运行，脚本会自动关闭这些目标目录内的进程后继续；若当前窗口来自被更新目录，窗口可能关闭。');
+  }
+  if (command === 'release.prepareMainRelease') {
+    return window.confirm('将执行主干发布预检：扩展协议校验、架构文档检查、构建、打包和发布摘要生成。\n\n不会同步 live skill，不会自动 git commit、push 或打标签。如果目标发布目录、portable 或 installer 里的 exe 正在运行，脚本会自动关闭这些目标目录内的进程后继续。');
+  }
+  return true;
+}
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light';
@@ -772,6 +904,14 @@ function formatDuration(ms: number) {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return rest > 0 ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+function formatCommandResult(result: unknown) {
+  if (result && typeof result === 'object' && 'message' in result) {
+    return String((result as { message?: unknown }).message ?? '');
+  }
+  if (typeof result === 'string') return result;
+  return JSON.stringify(result, null, 2);
 }
 
 function getRuntimeCategoryLabel(category: string) {
@@ -1155,7 +1295,7 @@ function App() {
   };
 
   const syncLive = async () => {
-    const confirmed = window.confirm('将执行开发版 suite -> live skill 同步；不会提交、推送或打包。');
+    const confirmed = window.confirm('将执行开发版 suite -> live skill 同步；不会提交、推送或打包。\n\n如果 live skill、portable 或相关发布目录里的 exe 正在运行，脚本会自动关闭这些目标目录内的进程后继续；若当前窗口来自被更新目录，窗口可能关闭。');
     if (!confirmed) return;
     await run('live.sync');
     await sendCommand('state.refresh');
@@ -1222,11 +1362,19 @@ function App() {
               <RotateCw size={16} className={pending['panel.restart'] ? 'spin' : ''} />
               <span>重启面板</span>
             </button>
-            <button className="primary-button" onClick={() => void run('release.publishBackup').then(loadRuntimeUnits).catch(() => undefined)} disabled={pending['release.publishBackup']}>
+            <button className="primary-button" onClick={() => {
+              if (confirmReleaseCommand('release.publishBackup')) {
+                void run('release.publishBackup').then(loadRuntimeUnits).catch(() => undefined);
+              }
+            }} disabled={pending['release.publishBackup']}>
               <Rocket size={16} className={pending['release.publishBackup'] ? 'spin' : ''} />
               一键发布
             </button>
-            <button className="primary-button" onClick={() => void run('release.prepareMainRelease').then(loadRuntimeUnits).catch(() => undefined)} disabled={pending['release.prepareMainRelease']}>
+            <button className="primary-button" onClick={() => {
+              if (confirmReleaseCommand('release.prepareMainRelease')) {
+                void run('release.prepareMainRelease').then(loadRuntimeUnits).catch(() => undefined);
+              }
+            }} disabled={pending['release.prepareMainRelease']}>
               <ListChecks size={16} className={pending['release.prepareMainRelease'] ? 'spin' : ''} />
               主干发布预检
             </button>
@@ -1732,6 +1880,11 @@ function ExtensionsPage({
   const [importPreview, setImportPreview] = useState<ExtensionImportPreview | null>(null);
   const [importKind, setImportKind] = useState<ImportKind>('');
   const [importRuntimeType, setImportRuntimeType] = useState<McpRuntimeType>('stdio');
+  const [catalog, setCatalog] = useState<ExtensionCatalogSnapshot | null>(null);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [catalogFilter, setCatalogFilter] = useState<ExtensionCatalogFilter>('all');
+  const [remoteUrl, setRemoteUrl] = useState('');
+  const [remotePreview, setRemotePreview] = useState<RemoteExtensionPreview | null>(null);
   const filterItems: Array<{ id: ExtensionKindFilter; label: string; count: number }> = useMemo(() => {
     const counts = {
       all: units.length,
@@ -1756,6 +1909,23 @@ function ExtensionsPage({
     return units.filter((unit) => unit.kind === kindFilter);
   }, [kindFilter, units]);
   const selected = filteredUnits.find((unit) => unit.unitId === selectedUnitId) ?? filteredUnits[0];
+  const filteredCatalogItems = useMemo(() => {
+    const query = catalogQuery.trim().toLowerCase();
+    return (catalog?.items ?? []).filter((item) => {
+      if (catalogFilter !== 'all' && item.type !== catalogFilter) return false;
+      if (!query) return true;
+      return `${item.id} ${item.displayName} ${item.category} ${item.description} ${item.installHandler}`.toLowerCase().includes(query);
+    });
+  }, [catalog?.items, catalogFilter, catalogQuery]);
+
+  async function loadCatalog(refresh = false) {
+    const snapshot = await run(refresh ? 'extension.catalog.refresh' : 'extension.catalog.list') as ExtensionCatalogSnapshot;
+    setCatalog(snapshot);
+  }
+
+  useEffect(() => {
+    void loadCatalog(false);
+  }, []);
 
   async function pickImportFolder() {
     const picked = await run('path.pickFolder', { currentPath: importPath }) as string;
@@ -1781,6 +1951,36 @@ function ExtensionsPage({
     const importedKind = result?.kind || importKind || importPreview.detectedKind;
     const importedId = result?.id || importPreview.id;
     setSelectedUnitId(importedKind === 'mcp' ? `mcp.${importedId}` : `extension.${importPreview.manifestPath}`);
+  }
+
+  async function installCatalogItem(item: ExtensionCatalogItem) {
+    const trustLine = item.trusted ? '来源含校验信息，安装时会校验。' : '该条目没有 sha256，将按不可信来源安装。';
+    const confirmed = window.confirm(`安装“${item.displayName}”？\n\n类型：${getRuntimeKindLabel(item.type)}\n来源：${item.artifactUrl || item.catalogSource || '-'}\n${trustLine}\n\n安装内容会写入本机 CTI_HOME 扩展目录。`);
+    if (!confirmed) return;
+    await run('extension.remote.install', { id: item.id, allowUntrusted: !item.trusted });
+    await Promise.all([loadCatalog(true), refreshUnits()]);
+  }
+
+  async function removeCatalogItem(item: ExtensionCatalogItem) {
+    const confirmed = window.confirm(`移除“${item.displayName}”的 suite 记录？\n\n只会删除由套件生成的用户覆盖层 manifest、launcher 或安装锁记录；不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。`);
+    if (!confirmed) return;
+    await run('extension.remote.remove', { id: item.id, type: item.type });
+    await Promise.all([loadCatalog(true), refreshUnits()]);
+  }
+
+  async function previewRemoteUrl() {
+    if (!remoteUrl.trim()) return;
+    const preview = await run('extension.remote.preview', { url: remoteUrl.trim() }) as RemoteExtensionPreview;
+    setRemotePreview(preview);
+  }
+
+  async function installRemotePreview() {
+    if (!remotePreview) return;
+    const confirmed = window.confirm(`从 URL 安装“${remotePreview.displayName}”？\n\n${remotePreview.reason}\n来源：${remotePreview.artifactUrl || remotePreview.sourceUrl}`);
+    if (!confirmed) return;
+    await run('extension.remote.install', { url: remotePreview.sourceUrl, allowUntrusted: !remotePreview.trusted });
+    setRemotePreview(null);
+    await Promise.all([loadCatalog(true), refreshUnits()]);
   }
 
   function handleImportDrop(event: React.DragEvent<HTMLDivElement>) {
@@ -1812,6 +2012,70 @@ function ExtensionsPage({
               {item.label} <span>{item.count}</span>
             </button>
           ))}
+        </div>
+        <div className="field-block catalog-panel">
+          <span>在线目录</span>
+          <div className="summary-grid">
+            <SummaryFact label="目录源" value={`${catalog?.sourceCount ?? 0}`} compact />
+            <SummaryFact label="条目" value={`${catalog?.items.length ?? 0}`} compact />
+          </div>
+          <div className="command-band dense path-input-group">
+            <input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="搜索扩展、模型、MCP 或 Skill" />
+            <MiniButton label="刷新目录" icon={<RefreshCw size={14} />} onClick={() => void loadCatalog(true)} pending={pending['extension.catalog.refresh']} />
+          </div>
+          <div className="preset-wall">
+            {(['all', 'mcp', 'skill', 'plugin', 'model'] as ExtensionCatalogFilter[]).map((item) => (
+              <button key={item} className={catalogFilter === item ? 'preset-chip active' : 'preset-chip'} onClick={() => setCatalogFilter(item)}>
+                {item === 'all' ? '全部' : getRuntimeKindLabel(item)}
+              </button>
+            ))}
+          </div>
+          <div className="runtime-list compact-list catalog-list">
+            {filteredCatalogItems.slice(0, 12).map((item) => (
+              <div key={`${item.type}-${item.id}`} className="runtime-row">
+                <div>
+                  <strong>{item.displayName}</strong>
+                  <span>{getRuntimeKindLabel(item.type)} · {item.installHandler} · {item.version}</span>
+                  <p>{item.description || item.artifactUrl || item.catalogSource}</p>
+                </div>
+                <div className="row-actions">
+                  <StatusPill status={item.installed ? 'ok' : item.canInstall ? (item.trusted ? 'idle' : 'warning') : 'idle'} label={item.installed ? '已安装' : item.canInstall ? (item.trusted ? '可安装' : '需确认') : '只读'} />
+                  {item.installed ? (
+                    item.canRemove ? (
+                      <MiniButton label="移除记录" icon={<Trash2 size={14} />} onClick={() => void removeCatalogItem(item)} pending={pending['extension.remote.remove']} />
+                    ) : (
+                      <MiniButton label="本机已有" icon={<ListChecks size={14} />} onClick={() => {}} disabled />
+                    )
+                  ) : (
+                    <MiniButton label={item.canInstall ? '安装' : '记录'} icon={<Layers3 size={14} />} onClick={() => void installCatalogItem(item)} pending={pending['extension.remote.install']} disabled={!item.canInstall} />
+                  )}
+                </div>
+              </div>
+            ))}
+            {filteredCatalogItems.length === 0 && <div className="empty-inline">暂无在线目录条目。可配置 CTI_EXTENSION_CATALOG_URLS 或粘贴 URL 预览。</div>}
+          </div>
+          <div className="field-block remote-url-box">
+            <span>URL 预览</span>
+            <div className="command-band dense path-input-group">
+              <input value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} placeholder="粘贴 HTTPS catalog item JSON 或带 extension.json 的 zip" />
+              <MiniButton label="预览" icon={<Search size={14} />} onClick={() => void previewRemoteUrl()} pending={pending['extension.remote.preview']} disabled={!remoteUrl.trim()} />
+            </div>
+            {remotePreview ? (
+              <div className="detail-stack remote-preview">
+                <div className="summary-grid">
+                  <SummaryFact label="名称" value={remotePreview.displayName} compact />
+                  <SummaryFact label="信任" value={remotePreview.trusted ? 'sha256' : '未校验'} compact />
+                </div>
+                <dl className="kv">
+                  <dt>类型</dt><dd>{getRuntimeKindLabel(remotePreview.type)}</dd>
+                  <dt>Handler</dt><dd>{remotePreview.installHandler}</dd>
+                  <dt>来源</dt><dd>{remotePreview.artifactUrl || remotePreview.sourceUrl}</dd>
+                  <dt>说明</dt><dd>{remotePreview.reason}</dd>
+                </dl>
+                <MiniButton label="安装预览项" icon={<Layers3 size={14} />} onClick={() => void installRemotePreview()} pending={pending['extension.remote.install']} />
+              </div>
+            ) : null}
+          </div>
         </div>
         <div className="field-block import-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={handleImportDrop}>
           <span>导入本地目录</span>
@@ -2654,7 +2918,56 @@ function SettingsPage({
   useEffect(() => setSettings(state.settings), [state.settings]);
   useEffect(() => reloadPresets(), []);
 
-  const update = (key: keyof SettingsState, value: string) => setSettings((current) => ({ ...current, [key]: value }));
+  const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => setSettings((current) => ({ ...current, [key]: value }));
+  const aiStrategy = inferAiStrategy(settings);
+  const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
+
+  const applyLocalAiKind = (kind: string) => {
+    const preset = LOCAL_AI_PRESETS[kind] || LOCAL_AI_PRESETS.custom;
+    setSettings((current) => ({
+      ...current,
+      localAiKind: kind,
+      localAiBaseUrl: preset.baseUrl || current.localAiBaseUrl,
+      localAiTimeoutMs: preset.timeoutMs,
+    }));
+  };
+
+  const applyAiStrategy = (strategy: AiStrategy) => {
+    setSettings((current) => {
+      const clearCodexKey = current.codexApiKeySet ? 'clear' : current.codexApiKeyAction;
+      if (strategy === 'default_codex') {
+        return {
+          ...current,
+          codexBaseUrl: '',
+          codexModel: '',
+          codexPassModel: false,
+          codexReasoningEffort: 'low',
+          codexLocalFallbackEnabled: false,
+          codexApiKeyAction: clearCodexKey,
+          codexApiKeyValue: '',
+        };
+      }
+      if (strategy === 'codex_with_local_fallback') {
+        return {
+          ...current,
+          codexBaseUrl: '',
+          codexModel: '',
+          codexPassModel: false,
+          codexReasoningEffort: 'low',
+          codexLocalFallbackEnabled: true,
+          codexLocalFallbackReasoningEffort: current.codexLocalFallbackReasoningEffort || 'minimal',
+          codexApiKeyAction: clearCodexKey,
+          codexApiKeyValue: '',
+        };
+      }
+      return {
+        ...current,
+        codexLocalFallbackEnabled: false,
+        codexPassModel: true,
+        codexReasoningEffort: current.codexReasoningEffort || 'low',
+      };
+    });
+  };
 
   const applyPreset = async (name: string) => {
     const result = (await run('settings.applyReplyPreset', { name })) as { value: string; settings?: SettingsState };
@@ -2670,6 +2983,32 @@ function SettingsPage({
     update('replyStyleHint', String(result ?? ''));
   };
 
+  const testLocalAi = async () => {
+    const result = await run('settings.testLocalAi', { settings });
+    window.alert(formatCommandResult(result));
+  };
+
+  const testCodexApi = async () => {
+    const result = await run('settings.testCodexApi', { settings });
+    window.alert(formatCommandResult(result));
+  };
+
+  const testAiStrategy = async () => {
+    const results: string[] = [];
+    const codexResult = await run('settings.testCodexApi', { settings });
+    results.push(`Codex 主 API：${formatCommandResult(codexResult)}`);
+    if (aiStrategy === 'codex_with_local_fallback') {
+      const localResult = await run('settings.testLocalAi', { settings });
+      results.push(`本地 Agent API：${formatCommandResult(localResult)}`);
+    }
+    window.alert(results.join('\n\n'));
+  };
+
+  const saveAndRestartBridge = async () => {
+    const result = await run('settings.saveAndRestartBridge', { settings });
+    setSettings(result as SettingsState);
+  };
+
   return (
     <section className="settings-layout">
       <section className="panel panel-span-2">
@@ -2683,6 +3022,145 @@ function SettingsPage({
           <PathField label="Unity 工程" value={settings.unityProject} onChange={(value) => update('unityProject', value)} run={run} />
           <PathField label="记忆仓库" value={settings.memoryRepo} onChange={(value) => update('memoryRepo', value)} run={run} />
           <TokenPathField label="Codex 附加目录" value={settings.additionalDirs} onChange={(value) => update('additionalDirs', value)} run={run} />
+        </div>
+      </section>
+      <section className="panel panel-span-2">
+        <SectionHeader
+          title="AI API"
+          action={<MiniButton label="保存并重启 Bridge" icon={<RotateCw size={14} />} onClick={() => void saveAndRestartBridge()} pending={pending['settings.saveAndRestartBridge']} />}
+        />
+        <div className="ai-strategy-shell">
+          <label className="stack-field">
+            <span>运行策略</span>
+            <select value={aiStrategy} onChange={(event) => applyAiStrategy(event.target.value as AiStrategy)}>
+              <option value="default_codex">默认 Codex</option>
+              <option value="codex_with_local_fallback">Codex + 本地兜底</option>
+              <option value="custom_api">完全使用自定义 API</option>
+            </select>
+          </label>
+          <div className="ai-summary-grid">
+            <div>
+              <span>当前策略</span>
+              <strong>{strategyLabel(aiStrategy)}</strong>
+            </div>
+            <div>
+              <span>主脑</span>
+              <strong>{aiStrategy === 'custom_api' ? (settings.codexModel || '自定义 API') : 'Codex 默认'}</strong>
+            </div>
+            <div>
+              <span>兜底</span>
+              <strong>{aiStrategy === 'codex_with_local_fallback' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : '关闭'}</strong>
+            </div>
+          </div>
+          {aiStrategy === 'default_codex' && (
+            <p className="field-hint">最省心：继续使用当前 Codex 登录态和默认模型。本地 Agent API 不参与普通飞书消息。</p>
+          )}
+          {aiStrategy === 'codex_with_local_fallback' && (
+            <div className="path-grid">
+              <label className="stack-field">
+                <span>本地服务</span>
+                <select value={settings.localAiKind} onChange={(event) => applyLocalAiKind(event.target.value)}>
+                  <option value="ollama">Ollama</option>
+                  <option value="lmstudio">LM Studio</option>
+                  <option value="vllm">vLLM / OpenAI-compatible</option>
+                  <option value="openai-compatible">OpenAI-compatible</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>模型</span>
+                <input value={settings.localAiModel} onChange={(event) => update('localAiModel', event.target.value)} placeholder="例如 qwen2.5-coder:7b" />
+              </label>
+              <label className="stack-field">
+                <span>地址</span>
+                <input value={settings.localAiBaseUrl} onChange={(event) => update('localAiBaseUrl', event.target.value)} placeholder={localPreset.baseUrl || 'http://127.0.0.1:8000/v1'} />
+              </label>
+            </div>
+          )}
+          {aiStrategy === 'custom_api' && (
+            <div className="path-grid">
+              <label className="stack-field">
+                <span>主 API Base URL</span>
+                <input value={settings.codexBaseUrl} onChange={(event) => update('codexBaseUrl', event.target.value)} placeholder="例如 http://127.0.0.1:11434/v1 或 https://api.example.com/v1" />
+              </label>
+              <label className="stack-field">
+                <span>主 API Model</span>
+                <input value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)} placeholder="例如 qwen3:8b / gpt-4.1" />
+              </label>
+              <label className="stack-field">
+                <span>主 API Key · {settings.codexApiKeySet ? `已设置 ${settings.codexApiKeyMasked}` : '未设置'}</span>
+                <select value={settings.codexApiKeyAction} onChange={(event) => update('codexApiKeyAction', event.target.value as SettingsState['codexApiKeyAction'])}>
+                  <option value="keep">保持不变</option>
+                  <option value="set">设置新值</option>
+                  <option value="clear">清除</option>
+                </select>
+              </label>
+              {settings.codexApiKeyAction === 'set' && (
+                <label className="stack-field">
+                  <span>主 API Key 新值</span>
+                  <input type="password" value={settings.codexApiKeyValue} onChange={(event) => update('codexApiKeyValue', event.target.value)} />
+                </label>
+              )}
+            </div>
+          )}
+          <details className="advanced-settings">
+            <summary>高级设置</summary>
+            <div className="path-grid">
+              <div className="settings-subhead">本地 Agent API（兜底/省流）</div>
+              <label className="stack-field">
+                <span>本地 Agent API Timeout(ms)</span>
+                <input value={settings.localAiTimeoutMs} onChange={(event) => update('localAiTimeoutMs', event.target.value)} />
+              </label>
+              <label className="stack-field">
+                <span>本地 Agent API Key · {settings.localAiApiKeySet ? `已设置 ${settings.localAiApiKeyMasked}` : '未设置'}</span>
+                <select value={settings.localAiApiKeyAction} onChange={(event) => update('localAiApiKeyAction', event.target.value as SettingsState['localAiApiKeyAction'])}>
+                  <option value="keep">保持不变</option>
+                  <option value="set">设置新值</option>
+                  <option value="clear">清除</option>
+                </select>
+              </label>
+              {settings.localAiApiKeyAction === 'set' && (
+                <label className="stack-field">
+                  <span>本地 Agent API Key 新值</span>
+                  <input type="password" value={settings.localAiApiKeyValue} onChange={(event) => update('localAiApiKeyValue', event.target.value)} />
+                </label>
+              )}
+              <label className="stack-field inline-field">
+                <input type="checkbox" checked={settings.codexLocalFallbackEnabled} onChange={(event) => update('codexLocalFallbackEnabled', event.target.checked)} />
+                <span>Codex 失败时使用本地 Agent API</span>
+              </label>
+              <label className="stack-field">
+                <span>本地 Agent 兜底 Reasoning</span>
+                <select value={settings.codexLocalFallbackReasoningEffort} onChange={(event) => update('codexLocalFallbackReasoningEffort', event.target.value)}>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <div className="settings-subhead">Codex 主 API</div>
+              <label className="stack-field">
+                <span>Codex 主 API Reasoning</span>
+                <select value={settings.codexReasoningEffort} onChange={(event) => update('codexReasoningEffort', event.target.value)}>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <label className="stack-field inline-field">
+                <input type="checkbox" checked={settings.codexPassModel} onChange={(event) => update('codexPassModel', event.target.checked)} />
+                <span>向 Codex 显式传递 model</span>
+              </label>
+            </div>
+          </details>
+        </div>
+        <div className="command-band tight">
+          <MiniButton label="一键检测" icon={<Bot size={14} />} onClick={() => void testAiStrategy()} pending={pending['settings.testLocalAi'] || pending['settings.testCodexApi']} />
+          <MiniButton label="测试本地 Agent API" icon={<Bot size={14} />} onClick={() => void testLocalAi()} pending={pending['settings.testLocalAi']} />
+          <MiniButton label="测试 Codex API" icon={<Bot size={14} />} onClick={() => void testCodexApi()} pending={pending['settings.testCodexApi']} />
         </div>
       </section>
       <section className="panel">
@@ -2887,7 +3365,11 @@ function StatusPill({ status, label }: { status: StatusKind; label: string }) {
 
 function CommandButton({ label, command, icon, run, pending }: { label: string; command: string; icon: React.ReactNode; run: PageProps['run']; pending: Record<string, boolean> }) {
   return (
-    <button className="command-button" onClick={() => void run(command)} disabled={pending[command]}>
+    <button className="command-button" onClick={() => {
+      if (confirmReleaseCommand(command)) {
+        void run(command);
+      }
+    }} disabled={pending[command]}>
       {icon}
       <span>{label}</span>
     </button>

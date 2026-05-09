@@ -1,5 +1,6 @@
 param(
-    [string]$ControlPanelArtifactDir
+    [string]$ControlPanelArtifactDir,
+    [switch]$NoForceUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,14 +14,9 @@ if (-not $ControlPanelArtifactDir) {
     $ControlPanelArtifactDir = Join-Path $artifactsDir 'control-panel'
 }
 
-Assert-NoRunningProcessInPath -Roots @($portableDir) -Purpose 'assemble portable'
+Clear-RunningProcessInPathForUpdate -Roots @($portableDir) -Purpose 'assemble portable' -NoForceUpdate:$NoForceUpdate
 if (Test-Path -LiteralPath $portableDir) {
-    try {
-        Remove-Item -LiteralPath $portableDir -Recurse -Force -ErrorAction Stop
-    }
-    catch {
-        throw "无法清理 portable 目录：$portableDir。请确认没有正在运行的 portable 程序或资源管理器占用后重试。原始错误：$($_.Exception.Message)"
-    }
+    Remove-PathForUpdate -Path $portableDir -Purpose 'assemble portable cleanup'
 }
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 

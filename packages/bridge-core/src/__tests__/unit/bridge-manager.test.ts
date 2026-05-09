@@ -11,7 +11,17 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import type { BridgeStore, LifecycleHooks, UpsertChannelBindingInput } from '../../lib/bridge/host';
+import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities';
+import type {
+  BridgeStore,
+  ExtensionActionActor,
+  ExtensionCatalogHost,
+  FeishuCloudDocumentHost,
+  FeishuOAuthManualHost,
+  LifecycleHooks,
+  StreamChatParams,
+  UpsertChannelBindingInput,
+} from '../../lib/bridge/host';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { ChannelBinding, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
@@ -244,6 +254,204 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager extension install commands', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('searches the extension catalog from /ext search without installing', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for /ext search'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/ext search qwen'));
+
+    assert.equal(extensionHost.installs.length, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /Qwen3 8B/);
+    assert.match(sent[0].text, /ollama-qwen3-8b/);
+  });
+
+  it('prepares an install confirmation card for a unique /ext install match', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for /ext install'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/ext install qwen3', 'ou_owner'));
+
+    assert.equal(extensionHost.installs.length, 0);
+    assert.equal(extensionHost.preparedInstalls.length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /等待确认安装/);
+    assert.ok(sent[0].feishuCardJson);
+    assert.match(sent[0].feishuCardJson || '', /extinstall:confirm:nonce-install-1/);
+  });
+
+  it('rejects install confirmation callbacks from non-owner users', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for extension callback'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_viewer'),
+      callbackData: 'extinstall:confirm:nonce-install-1',
+      callbackMessageId: 'om_card',
+    });
+
+    assert.equal(extensionHost.installs.length, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /只允许 owner/);
+    assert.equal(sent[0].replyToMessageId, 'om_card');
+  });
+
+  it('rejects expired install confirmation callbacks', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost({ expiredConfirm: true });
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for extension callback'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_owner'),
+      callbackData: 'extinstall:confirm:expired',
+      callbackMessageId: 'om_card',
+    });
+
+    assert.equal(extensionHost.installs.length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /确认已过期/);
+  });
+
+  it('confirms install callbacks through the extension host for owner users', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for extension callback'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_owner'),
+      callbackData: 'extinstall:confirm:nonce-install-1',
+      callbackMessageId: 'om_card',
+    });
+
+    assert.deepEqual(extensionHost.installs[0], {
+      nonce: 'nonce-install-1',
+      actor: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_owner', messageId: 'm_1' },
+    });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /安装已完成/);
+  });
+
+  it('previews https URL installs and rejects non-https URLs', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for URL extension install'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/ext install http://example.test/ext.json', 'ou_owner'));
+    await _testOnly.handleMessage(adapter, createInboundMessage('/ext install https://example.test/ext.json', 'ou_owner'));
+
+    assert.equal(extensionHost.previews.length, 1);
+    assert.equal(extensionHost.previews[0], 'https://example.test/ext.json');
+    assert.match(sent[0].text, /只允许 HTTPS/);
+    assert.match(sent[1].text, /等待确认安装/);
+    assert.match(sent[1].feishuCardJson || '', /extinstall:confirm:nonce-install-1/);
+  });
+
+  it('prepares browser remove confirmation without deleting bundled plugin cache directly', async () => {
+    const sent: OutboundMessage[] = [];
+    const extensionHost = createExtensionHost();
+    initBridgeContext({
+      store: createMinimalStore({ bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => { throw new Error('LLM should not be called for /ext remove'); } },
+      permissions: { resolvePendingPermission: () => false },
+      extensions: extensionHost,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/ext remove browser-use', 'ou_owner'));
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_owner'),
+      callbackData: 'extinstall:remove:nonce-remove-1',
+      callbackMessageId: 'om_card',
+    });
+
+    assert.equal(extensionHost.preparedRemoves.length, 1);
+    assert.equal(extensionHost.removes.length, 1);
+    assert.match(sent[0].text, /移除记录/);
+    assert.match(sent[0].text, /不删除插件缓存/);
+    assert.match(sent[1].text, /记录已移除/);
+  });
+});
+
 describe('bridge-manager result block delivery', () => {
   beforeEach(() => {
     delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
@@ -430,6 +638,182 @@ describe('bridge-manager result block delivery', () => {
     assert.match(sent[0].text, /未完成：这条回复声称已经创建提醒或系统计划任务/);
     assert.match(sent[0].text, /没有进入 bridge 的统一提醒系统/);
     assert.doesNotMatch(sent[0].text, /CodexFeishuReminder_20260507_1230|稍后会提醒你/);
+  });
+});
+
+describe('bridge-manager Feishu cloud documents', () => {
+  it('binds Feishu OAuth user tokens from a manually pasted callback URL without invoking the LLM', async () => {
+    const sent: OutboundMessage[] = [];
+    const feishuOAuth: FeishuOAuthManualHost = {
+      handleManualCallbackText: async (input) => {
+        assert.equal(input.text, 'http://127.0.0.1:17321/feishu/oauth/callback?code=auth-code&state=nonce-1');
+        assert.equal(input.userId, 'ou_1');
+        assert.equal(input.chatId, 'oc_123');
+        return {
+          status: 'bound',
+          userMessage: '飞书授权成功，请重新发送原问题。',
+        };
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for Feishu OAuth callback binding');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuOAuth,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('http://127.0.0.1:17321/feishu/oauth/callback?code=auth-code&state=nonce-1'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /授权成功/);
+  });
+
+  it('injects resolved Feishu cloud document content into the provider system prompt', async () => {
+    const sent: OutboundMessage[] = [];
+    let streamParams: StreamChatParams | null = null;
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async (input) => {
+        assert.equal(input.text, '总结 https://example.feishu.cn/docx/doc_abc');
+        assert.equal(input.userId, 'ou_1');
+        assert.equal(input.chatId, 'oc_123');
+        return {
+          status: 'resolved',
+          linkCount: 1,
+          systemPrompt: [
+            'Feishu cloud document context:',
+            'Source: https://example.feishu.cn/docx/doc_abc',
+            '正文：这里是飞书文档真实内容。',
+          ].join('\n'),
+        };
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams = params;
+          return createTextStream('已基于飞书文档总结。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('总结 https://example.feishu.cn/docx/doc_abc'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已基于飞书文档总结/);
+    assert.match((streamParams as StreamChatParams | null)?.systemPrompt || '', /飞书文档真实内容/);
+  });
+
+  it('asks the Feishu user to authorize when cloud document access needs login', async () => {
+    const sent: OutboundMessage[] = [];
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async () => ({
+        status: 'auth_required',
+        linkCount: 1,
+        loginUrl: 'https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=nonce',
+        userMessage: '需要你登录飞书后，我才能安全读取这个云文档。',
+        feishuCardJson: '{"config":{"wide_screen_mode":true}}',
+      }),
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should wait until Feishu authorization succeeds');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('看一下 https://example.feishu.cn/sheets/sht_abc'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /登录飞书/);
+    assert.equal(sent[0].feishuCardJson, '{"config":{"wide_screen_mode":true}}');
+  });
+
+  it('reports a clear blocker when the logged-in Feishu user still lacks document permission', async () => {
+    const sent: OutboundMessage[] = [];
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async () => ({
+        status: 'permission_denied',
+        linkCount: 1,
+        userMessage: '未完成：当前登录飞书用户也没有这个云文档权限，请让文档所有者分享给你或导出内容。',
+      }),
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called after Feishu permission denial');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('总结 https://example.feishu.cn/base/bascn123'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /当前登录飞书用户也没有这个云文档权限/);
+    assert.match(sent[0].text, /文档所有者分享/);
+  });
+});
+
+describe('bridge-manager Feishu capability diagnostics', () => {
+  it('renders Feishu developer platform scope gaps for owners', () => {
+    const report = buildFeishuCapabilityReport(createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_app_id: 'cli_xxx',
+        bridge_feishu_app_secret: 'secret',
+        bridge_feishu_oauth_mode: 'manual',
+        bridge_feishu_oauth_manual_redirect_uri: 'http://127.0.0.1:17321/feishu/oauth/callback',
+        bridge_feishu_oauth_public_base_url: 'https://bot.example.com',
+        bridge_feishu_oauth_callback_path: '/feishu/oauth/callback',
+        bridge_feishu_oauth_scopes: 'offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly',
+        bridge_feishu_granted_scopes: 'im:message,im:message:receive_v1,docx:document:readonly,sheets:spreadsheet:readonly',
+        bridge_feishu_owner_users: 'ou_owner',
+    }));
+
+    assert.match(report, /Feishu Developer Platform Capabilities/);
+    assert.match(report, /应用 token 直读云文档/);
+    assert.match(report, /用户 OAuth fallback/);
+    assert.match(report, /OAuth mode: manual/);
+    assert.match(report, /CTI_FEISHU_GRANTED_SCOPES/);
+    assert.match(report, /Missing declared scopes:/);
+    assert.match(report, /base:record:retrieve/);
+    assert.doesNotMatch(report, /app-secret/);
   });
 });
 
@@ -677,13 +1061,117 @@ function createTextStream(text: string): ReadableStream<string> {
   });
 }
 
-function createInboundMessage(text: string) {
+function createInboundMessage(text: string, userId = 'ou_1') {
   return {
     messageId: 'm_1',
-    address: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_1' },
+    address: { channelType: 'feishu', chatId: 'oc_123', userId },
     text,
     timestamp: new Date('2026-05-07T04:00:00.000Z').getTime(),
   };
+}
+
+function createExtensionHost(options: { expiredConfirm?: boolean } = {}) {
+  const items = [
+    {
+      id: 'ollama-qwen3-8b',
+      type: 'model',
+      displayName: 'Qwen3 8B',
+      version: '8b',
+      category: 'model.ollama',
+      description: 'Ollama 本地模型',
+      installHandler: 'ollama.pull',
+      installed: false,
+      canRemove: false,
+    },
+    {
+      id: 'browser-use',
+      type: 'plugin',
+      displayName: 'Browser',
+      version: '0.1.0-alpha2',
+      category: 'plugin.bundled',
+      description: 'OpenAI bundled Browser 插件记录',
+      installHandler: 'codex-plugin.record',
+      installed: true,
+      canRemove: true,
+    },
+  ];
+  const preparedInstalls: unknown[] = [];
+  const preparedRemoves: unknown[] = [];
+  const installs: unknown[] = [];
+  const removes: unknown[] = [];
+  const previews: string[] = [];
+  const host: ExtensionCatalogHost & {
+    preparedInstalls: unknown[];
+    preparedRemoves: unknown[];
+    installs: unknown[];
+    removes: unknown[];
+    previews: string[];
+  } = {
+    preparedInstalls,
+    preparedRemoves,
+    installs,
+    removes,
+    previews,
+    searchExtensions: async (query) => items.filter((item) =>
+      `${item.id} ${item.displayName} ${item.description}`.toLowerCase().includes(query.toLowerCase())
+    ),
+    previewExtensionUrl: async (url) => {
+      previews.push(url);
+      return {
+        id: 'remote-demo',
+        type: 'skill',
+        displayName: 'Remote Demo',
+        version: '1.0.0',
+        category: 'skill.remote',
+        description: '远程扩展',
+        installHandler: 'manifest.record',
+        source: url,
+        trusted: false,
+      };
+    },
+    prepareInstallAction: async (input) => {
+      preparedInstalls.push(input);
+      return {
+        ok: true,
+        nonce: 'nonce-install-1',
+        expiresAt: '2026-05-07T04:10:00.000Z',
+        item: input.item,
+        message: '等待确认安装',
+      };
+    },
+    confirmInstallAction: async (nonce: string, actor: ExtensionActionActor) => {
+      installs.push({ nonce, actor });
+      if (options.expiredConfirm) {
+        return { ok: false, status: 'expired', message: '确认已过期' };
+      }
+      return {
+        ok: true,
+        status: 'installed',
+        message: '安装已完成：Qwen3 8B',
+        item: items[0],
+      };
+    },
+    prepareRemoveAction: async (input) => {
+      preparedRemoves.push(input);
+      return {
+        ok: true,
+        nonce: 'nonce-remove-1',
+        expiresAt: '2026-05-07T04:10:00.000Z',
+        item: items[1],
+        message: '移除记录，不删除插件缓存。',
+      };
+    },
+    confirmRemoveAction: async (nonce: string, actor: ExtensionActionActor) => {
+      removes.push({ nonce, actor });
+      return {
+        ok: true,
+        status: 'removed',
+        message: '记录已移除：Browser',
+        item: items[1],
+      };
+    },
+  };
+  return host;
 }
 
 function createRunningAdapter(

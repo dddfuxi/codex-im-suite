@@ -972,6 +972,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
       console.warn('[feishu-adapter] Card send failed:', res?.msg, res?.code);
     } catch (err) {
+      if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
+        console.warn('[feishu-adapter] Card reply target missing, retrying as direct chat send');
+        return this.sendAsCard(chatId, text);
+      }
       console.warn('[feishu-adapter] Card send error, falling back to post:', err instanceof Error ? err.message : err);
     }
 
@@ -1006,6 +1010,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
       console.warn('[feishu-adapter] Post send failed:', res?.msg, res?.code);
     } catch (err) {
+      if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
+        console.warn('[feishu-adapter] Post reply target missing, retrying as direct chat send');
+        return this.sendAsPost(chatId, text);
+      }
       console.warn('[feishu-adapter] Post send error, falling back to text:', err instanceof Error ? err.message : err);
     }
 
@@ -1274,7 +1282,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention && !this.isBotMentioned(msg.mentions)) {
+      if (requireMention && !this.isBotMentionedFromMessage(msg)) {
         console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
         try {
           getBridgeContext().store.insertAuditLog({
@@ -1717,8 +1725,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
       return { ok: false, error: res?.msg || 'Send failed' };
     } catch (err) {
+      if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
+        console.warn('[feishu-adapter] Text reply target missing, retrying as direct chat send');
+        return this.sendAsPlainText(chatId, text, undefined, message);
+      }
       return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
     }
+  }
+
+  private isInvalidReplyTargetError(err: unknown): boolean {
+    const code = Number((err as { response?: { data?: { code?: number | string } } })?.response?.data?.code);
+    return code === 230011 || code === 231003;
   }
 
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
@@ -3244,6 +3261,42 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
       return ids.some((id) => this.botIds.has(id));
     });
+  }
+
+  private isBotMentionedFromMessage(
+    message: Pick<FeishuMessageEventData['message'], 'content' | 'mentions'>,
+  ): boolean {
+    if (this.isBotMentioned(message.mentions)) return true;
+    if (this.botIds.size === 0 || !message.content) return false;
+
+    try {
+      const parsed = JSON.parse(message.content) as {
+        text?: string;
+        content?: Array<Array<{ tag?: string; user_id?: string }>>;
+      };
+
+      const text = typeof parsed.text === 'string' ? parsed.text : '';
+      const textMentionIds = Array.from(text.matchAll(/<at\s+user_id="([^"]+)"/gi))
+        .map((match) => match[1]?.trim())
+        .filter(Boolean) as string[];
+      if (textMentionIds.some((id) => this.botIds.has(id))) {
+        return true;
+      }
+
+      const paragraphs = Array.isArray(parsed.content) ? parsed.content : [];
+      for (const paragraph of paragraphs) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const element of paragraph) {
+          if (element?.tag === 'at' && element.user_id && this.botIds.has(element.user_id)) {
+            return true;
+          }
+        }
+      }
+    } catch {
+      return false;
+    }
+
+    return false;
   }
 
   private stripMentionMarkers(text: string): string {

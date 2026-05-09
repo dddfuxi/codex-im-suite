@@ -72,6 +72,32 @@ describe('workflow status store', () => {
     assert.equal(recovered?.recovery?.input?.prompt, '继续处理这条消息');
   });
 
+  it('persists Feishu sender metadata for cloud document retry prechecks', () => {
+    const run = startWorkflowRun({
+      sessionId: 'session-feishu-cloud-retry',
+      prompt: '总结 https://example.feishu.cn/sheets/sht_abc',
+      channelType: 'feishu',
+      chatId: 'oc_retry',
+    });
+    recordWorkflowRecoveryInfo(run.id, {
+      prompt: '总结 https://example.feishu.cn/sheets/sht_abc',
+      workingDirectory: 'C:\\workspace',
+      channelType: 'feishu',
+      chatId: 'oc_retry',
+      userId: 'ou_liudan',
+      userDisplayName: '刘丹',
+      messageId: 'm_retry',
+      maxAutoAttempts: 1,
+    });
+
+    const status = readWorkflowStatus();
+    const recovered = status.runs.find((item) => item.id === run.id);
+
+    assert.equal(recovered?.recovery?.input?.userId, 'ou_liudan');
+    assert.equal(recovered?.recovery?.input?.userDisplayName, '刘丹');
+    assert.equal(recovered?.recovery?.input?.messageId, 'm_retry');
+  });
+
   it('marks interrupted running runs without retry input as not recoverable', () => {
     const run = startWorkflowRun({
       sessionId: 'session-not-recoverable',

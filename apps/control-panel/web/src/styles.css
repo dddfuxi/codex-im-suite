@@ -759,6 +759,44 @@ button:disabled {
   font-size: 12px;
 }
 
+.runtime-row p {
+  margin-top: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.row-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.compact-list {
+  max-height: 320px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.catalog-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.catalog-list {
+  max-height: 360px;
+}
+
+.remote-url-box,
+.remote-preview {
+  margin-top: 10px;
+}
+
 .session-row p {
   margin-top: 6px;
   font-size: 12px;
@@ -931,6 +969,80 @@ button:disabled {
 .field-block span,
 .stack-field span {
   color: var(--text-muted);
+}
+
+.field-hint {
+  margin: 0 0 16px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.settings-subhead {
+  grid-column: 1 / -1;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.ai-strategy-shell {
+  display: grid;
+  gap: 14px;
+}
+
+.ai-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ai-summary-grid div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+}
+
+.ai-summary-grid span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ai-summary-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.advanced-settings {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.advanced-settings[open] summary {
+  margin-bottom: 12px;
+}
+
+.inline-field {
+  grid-auto-flow: column;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  justify-content: start;
+}
+
+.inline-field input {
+  width: auto;
 }
 
 .path-input-group {
@@ -1395,6 +1507,10 @@ button:disabled {
   .settings-layout,
   .sessions-layout,
   .path-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ai-summary-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

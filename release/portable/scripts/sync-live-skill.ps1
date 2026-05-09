@@ -1,3 +1,7 @@
+param(
+    [switch]$NoForceUpdate
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
@@ -15,7 +19,7 @@ $suitePluginManifests = Join-Path $suiteRoot 'config\plugins.d'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
 $portableDir = Join-Path $suiteRoot 'release\portable'
 
-Assert-NoRunningProcessInPath -Roots @($liveRuntime, $liveCore, $portableDir) -Purpose 'sync live skill'
+Clear-RunningProcessInPathForUpdate -Roots @($liveRuntime, $liveCore, $portableDir) -Purpose 'sync live skill' -NoForceUpdate:$NoForceUpdate
 
 function Copy-PathContent {
     param(
@@ -58,7 +62,18 @@ function Copy-ExistingFile {
     }
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
-    Copy-Item -LiteralPath $Source -Destination $Target -Force
+    $maxAttempts = 10
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt += 1) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Target -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge $maxAttempts -or -not ($_.Exception -is [System.IO.IOException])) {
+                throw
+            }
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
 }
 
 function Copy-ExistingDirectory {

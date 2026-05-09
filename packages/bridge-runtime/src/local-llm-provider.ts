@@ -133,17 +133,21 @@ export class OllamaProvider {
     messages: LocalModelMessage[],
     options?: { temperature?: number; maxTokens?: number; timeoutMs?: number },
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
-    const baseUrl = (this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
     const endpoint = `${baseUrl}/v1/chat/completions`;
-    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.config.localAiApiKey) {
+      headers.Authorization = `Bearer ${this.config.localAiApiKey}`;
+    }
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          model: this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b',
+          model: this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b',
           messages,
           stream: false,
           temperature: options?.temperature ?? 0.1,

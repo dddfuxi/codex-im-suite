@@ -10,7 +10,7 @@ export interface LocalLlmRouteSummary {
   mode: LocalRouterMode;
   taskKind: string;
   decision: string;
-  provider: 'local' | 'codex' | 'local_best_effort' | 'refuse_local' | 'codex_only';
+  provider: 'local' | 'codex' | 'codex_local_fallback' | 'local_best_effort' | 'refuse_local' | 'codex_only';
   reason: string;
   compressedPromptChars: number;
   compressedHistoryChars: number;
@@ -48,8 +48,8 @@ export interface LocalLlmRuntimeStatus {
   lastCheckAt?: string;
   lastRouteReason?: string;
   lastFallbackReason?: string;
-  lastProvider?: 'local' | 'codex' | 'local_best_effort' | 'refuse_local' | 'codex_only';
-  lastRouteLabel?: 'codex_primary' | 'local_explicit_task' | 'local_fallback_no_codex' | 'local_refused_out_of_scope' | 'unknown';
+  lastProvider?: 'local' | 'codex' | 'codex_local_fallback' | 'local_best_effort' | 'refuse_local' | 'codex_only';
+  lastRouteLabel?: 'codex_primary' | 'codex_local_fallback' | 'local_explicit_task' | 'local_fallback_no_codex' | 'local_refused_out_of_scope' | 'unknown';
   lastCodexPrimary?: boolean;
   lastRequestKind?: string;
   lastDecision?: string;
@@ -77,6 +77,7 @@ function toRouteLabel(summary: LocalLlmRouteSummary): LocalLlmRuntimeStatus['las
   const provider = (summary.provider || '').trim().toLowerCase();
   const mode = (summary.mode || '').trim().toLowerCase();
   if (provider === 'codex' || provider === 'codex_only') return 'codex_primary';
+  if (provider === 'codex_local_fallback') return 'codex_local_fallback';
   if (provider === 'local_best_effort') return 'local_fallback_no_codex';
   if (provider === 'refuse_local') return 'local_refused_out_of_scope';
   if (provider === 'local' && mode === 'hybrid') return 'local_explicit_task';
@@ -102,8 +103,8 @@ export function makeDefaultLocalLlmStatus(config: Config): LocalLlmRuntimeStatus
     routerEnabled: config.localLlmRouterEnabled !== false,
     routerMode: getLocalRouterMode(config),
     forceHub: config.localLlmForceHub !== false,
-    baseUrl: config.ollamaBaseUrl || config.localLlmBaseUrl || DEFAULT_OLLAMA_BASE_URL,
-    model: config.ollamaModel || config.localLlmModel || DEFAULT_OLLAMA_MODEL,
+    baseUrl: config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl || DEFAULT_OLLAMA_BASE_URL,
+    model: config.localAiModel || config.ollamaModel || config.localLlmModel || DEFAULT_OLLAMA_MODEL,
     routeHits: 0,
     routeMisses: 0,
     routeFailures: 0,
@@ -123,16 +124,15 @@ function isDeprecatedLlamaStatus(status: Partial<LocalLlmRuntimeStatus>): boolea
   const baseUrl = (status.baseUrl || '').trim();
   const model = (status.model || '').trim();
   return baseUrl === 'http://127.0.0.1:8080'
-    || /\.gguf$/i.test(model)
-    || /llama/i.test(model);
+    || /\.gguf$/i.test(model);
 }
 
 function normalizeRuntimeSource(
   status: LocalLlmRuntimeStatus,
   config?: Config,
 ): LocalLlmRuntimeStatus {
-  const desiredBaseUrl = config?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
-  const desiredModel = config?.ollamaModel || DEFAULT_OLLAMA_MODEL;
+  const desiredBaseUrl = config?.localAiBaseUrl || config?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
+  const desiredModel = config?.localAiModel || config?.ollamaModel || DEFAULT_OLLAMA_MODEL;
   if (!isDeprecatedLlamaStatus(status)) return status;
   return {
     ...status,
@@ -177,8 +177,8 @@ export function updateLocalLlmStatus(config: Config, patch: Partial<LocalLlmRunt
     routerEnabled: config.localLlmRouterEnabled !== false,
     routerMode: getLocalRouterMode(config),
     forceHub: config.localLlmForceHub !== false,
-    baseUrl: config.ollamaBaseUrl || config.localLlmBaseUrl || current.baseUrl,
-    model: config.ollamaModel || config.localLlmModel || current.model,
+    baseUrl: config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl || current.baseUrl,
+    model: config.localAiModel || config.ollamaModel || config.localLlmModel || current.model,
     ...patch,
   };
   writeLocalLlmStatus(next);

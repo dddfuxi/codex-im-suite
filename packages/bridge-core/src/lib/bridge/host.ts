@@ -164,6 +164,61 @@ export interface RetrievedFeishuHistoryContext {
   syncStatus?: FeishuHistorySyncStatus;
 }
 
+// ── Host Interface: Feishu Cloud Documents ───────────────────
+
+export interface FeishuCloudLinkResolveInput {
+  text: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
+}
+
+export type FeishuCloudLinkResolveStatus =
+  | 'no_links'
+  | 'resolved'
+  | 'auth_required'
+  | 'permission_denied'
+  | 'error';
+
+export interface FeishuCloudLinkResolveResult {
+  status: FeishuCloudLinkResolveStatus;
+  linkCount?: number;
+  systemPrompt?: string;
+  userMessage?: string;
+  loginUrl?: string;
+  feishuCardJson?: string;
+  error?: string;
+}
+
+export interface FeishuCloudDocumentHost {
+  resolveFeishuCloudLinks(input: FeishuCloudLinkResolveInput): Promise<FeishuCloudLinkResolveResult>;
+}
+
+// ── Host Interface: Feishu OAuth Manual Callback ─────────────
+
+export interface FeishuOAuthManualCallbackInput {
+  text: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
+}
+
+export type FeishuOAuthManualCallbackStatus = 'no_callback' | 'bound' | 'error';
+
+export interface FeishuOAuthManualCallbackResult {
+  status: FeishuOAuthManualCallbackStatus;
+  userMessage?: string;
+  error?: string;
+}
+
+export interface FeishuOAuthManualHost {
+  handleManualCallbackText(input: FeishuOAuthManualCallbackInput): Promise<FeishuOAuthManualCallbackResult>;
+}
+
 // ── Host Interface: Settings ─────────────────────────────────
 
 export interface SettingsProvider {
@@ -330,6 +385,9 @@ export interface StreamChatParams {
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   files?: FileAttachment[];
   onRuntimeStatusChange?: (status: string) => void;
+  sourceUserId?: string;
+  sourceUserDisplayName?: string;
+  sourceMessageId?: string;
 }
 
 export interface LLMProvider {
@@ -385,6 +443,67 @@ export interface ReminderActionHost {
   createDirectReminder(input: DirectReminderCreateInput): Promise<DirectReminderCreateResult>;
   completeReminder?(input: ReminderCompleteInput): Promise<ReminderCompleteResult>;
   tickReminders?(): Promise<void>;
+}
+
+// ── Host Interface: Extension Catalog Actions ────────────────
+
+export interface ExtensionCatalogItemSummary {
+  id: string;
+  type: 'model' | 'mcp' | 'skill' | 'plugin' | string;
+  displayName: string;
+  version?: string;
+  category?: string;
+  description?: string;
+  installHandler?: string;
+  source?: string;
+  installed?: boolean;
+  canRemove?: boolean;
+  trusted?: boolean;
+  trustLabel?: string;
+}
+
+export interface ExtensionActionActor {
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  messageId?: string;
+}
+
+export interface ExtensionInstallPrepareInput {
+  item: ExtensionCatalogItemSummary;
+  url?: string;
+  actor: ExtensionActionActor;
+}
+
+export interface ExtensionRemovePrepareInput {
+  item: ExtensionCatalogItemSummary;
+  actor: ExtensionActionActor;
+}
+
+export interface ExtensionActionPrepareResult {
+  ok: boolean;
+  nonce?: string;
+  expiresAt?: string;
+  item?: ExtensionCatalogItemSummary;
+  message?: string;
+  error?: string;
+}
+
+export interface ExtensionActionConfirmResult {
+  ok: boolean;
+  status?: 'installed' | 'removed' | 'expired' | 'forbidden' | 'not_found' | 'failed' | string;
+  item?: ExtensionCatalogItemSummary;
+  message?: string;
+  error?: string;
+}
+
+export interface ExtensionCatalogHost {
+  searchExtensions(query: string): Promise<ExtensionCatalogItemSummary[]>;
+  previewExtensionUrl(url: string): Promise<ExtensionCatalogItemSummary>;
+  prepareInstallAction(input: ExtensionInstallPrepareInput): Promise<ExtensionActionPrepareResult>;
+  confirmInstallAction(nonce: string, actor: ExtensionActionActor): Promise<ExtensionActionConfirmResult>;
+  prepareRemoveAction(input: ExtensionRemovePrepareInput): Promise<ExtensionActionPrepareResult>;
+  confirmRemoveAction(nonce: string, actor: ExtensionActionActor): Promise<ExtensionActionConfirmResult>;
 }
 
 // ── Host Interface: Permission Gateway ───────────────────────

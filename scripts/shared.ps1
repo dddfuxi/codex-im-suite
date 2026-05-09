@@ -355,6 +355,16 @@ function Find-RunningProcessInPath {
     return $matches.ToArray()
 }
 
+function Write-RunningProcessMatches {
+    param(
+        [object[]]$Matches
+    )
+
+    foreach ($match in $Matches) {
+        Write-Host ("  PID {0} | {1} | {2}" -f $match.Id, $match.ProcessName, $match.Path)
+    }
+}
+
 function Assert-NoRunningProcessInPath {
     param(
         [string[]]$Roots,
@@ -367,8 +377,139 @@ function Assert-NoRunningProcessInPath {
     }
 
     Write-Host "Release process lock check failed: $Purpose"
-    foreach ($match in $matches) {
-        Write-Host ("  PID {0} | {1} | {2}" -f $match.Id, $match.ProcessName, $match.Path)
-    }
+    Write-RunningProcessMatches -Matches $matches
     throw "Running release/runtime copy process found. Close the listed process and retry; this script will not kill it automatically."
+}
+
+function Test-ReleaseForceUpdateEnabled {
+    param([switch]$NoForceUpdate)
+
+    if ($NoForceUpdate) {
+        return $false
+    }
+
+    $value = [string]$env:CTI_RELEASE_FORCE_UPDATE
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $true
+    }
+
+    return -not @('0', 'false', 'no', 'off').Contains($value.Trim().ToLowerInvariant())
+}
+
+function Stop-RunningProcessInPath {
+    param(
+        [string[]]$Roots,
+        [string]$Purpose = 'release operation',
+        [int]$TimeoutSeconds = 20
+    )
+
+    $matches = @(Find-RunningProcessInPath -Roots $Roots)
+    if ($matches.Count -eq 0) {
+        return
+    }
+
+    Write-Host "Release process lock check: $Purpose"
+    Write-Host "Force update is enabled; stopping running process(es) inside target path(s)."
+    Write-RunningProcessMatches -Matches $matches
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($match in $matches) {
+        if (-not $seen.Add([int]$match.Id)) {
+            continue
+        }
+        try {
+            Stop-Process -Id ([int]$match.Id) -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Failed to stop PID=$($match.Id): $($_.Exception.Message)"
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    do {
+        Start-Sleep -Milliseconds 250
+        $remaining = @(Find-RunningProcessInPath -Roots $Roots)
+        if ($remaining.Count -eq 0) {
+            Write-Host "Release process lock cleared: $Purpose"
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    Write-Host "Release process lock check failed after force stop: $Purpose"
+    Write-RunningProcessMatches -Matches $remaining
+    throw "Running release/runtime copy process still exists after force stop."
+}
+
+function Clear-RunningProcessInPathForUpdate {
+    param(
+        [string[]]$Roots,
+        [string]$Purpose = 'release operation',
+        [int]$TimeoutSeconds = 20,
+        [switch]$NoForceUpdate
+    )
+
+    if (Test-ReleaseForceUpdateEnabled -NoForceUpdate:$NoForceUpdate) {
+        Stop-RunningProcessInPath -Roots $Roots -Purpose $Purpose -TimeoutSeconds $TimeoutSeconds
+        return
+    }
+
+    Assert-NoRunningProcessInPath -Roots $Roots -Purpose $Purpose
+}
+
+function Clear-DeleteAttributes {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $item.Attributes = 'Normal'
+    }
+    catch {
+    }
+
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try {
+                    $_.Attributes = 'Normal'
+                }
+                catch {
+                }
+            }
+    }
+}
+
+function Remove-PathForUpdate {
+    param(
+        [string]$Path,
+        [string]$Purpose = 'release cleanup',
+        [int]$RetryCount = 12,
+        [int]$DelayMilliseconds = 500
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le [Math]::Max(1, $RetryCount); $attempt++) {
+        try {
+            Clear-DeleteAttributes -Path $Path
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -ge [Math]::Max(1, $RetryCount)) {
+                break
+            }
+            Write-Warning ("Cleanup retry {0}/{1} for {2}: {3}" -f $attempt, $RetryCount, $Purpose, $lastError)
+            Start-Sleep -Milliseconds ([Math]::Max(50, $DelayMilliseconds))
+        }
+    }
+
+    throw "无法清理更新目录：$Path。请确认没有资源管理器、杀毒软件或外部进程占用后重试。原始错误：$lastError"
 }

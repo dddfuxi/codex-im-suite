@@ -21,10 +21,11 @@
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆”页可搜索来源片段并查看真实监听状态。
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
+- 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
 - 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 npm 全局 Codex CLI 的白名单更新按钮。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
-- 本地辅助执行器收紧：本地快路径改为统一意图判定，中文只读仓库查询如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”会稳定命中本地 repo fast-path。
+- 本地 Agent 兜底收紧：本地模型不再直接回复普通飞书消息；Codex 主 API 失败时改由 Codex agent 切到本地 OpenAI-compatible API 继续执行。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
 ## 快速入口
@@ -90,22 +91,26 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `config/mcp.d`：MCP manifest，面板和注册脚本都从这里发现 MCP。
 - `config/skills.d`：随项目备份的 skill manifest。
 - `config/plugins.d`：随项目备份的 plugin manifest。
+- `config/extension-catalog.json`：在线扩展目录的本地种子，远端目录可通过 `CTI_EXTENSION_CATALOG_URLS` 追加。
 - `extensions/skills`：自定义 skill 的项目内副本。
 - `scripts`：启动、注册、构建、打包、发布、同步脚本。
 - `release`：portable、installer、zip 等发布产物。
 
+控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d` 和 `extensions\manifests\plugins.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
+
 ## 当前运行模型
 
-默认是 `Codex 主脑 + Ollama 本地辅助执行器`：
+默认是 `Codex 主脑 + 本地 Agent API（兜底/省流）`：
 
-- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、`local-tool-agent` 和实验性的 `codex-oss-ollama`。
+- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、`codex-local-fallback`、历史兼容的 `local-tool-agent` 和实验性的 `codex-oss-ollama`。
 - 用户可用 `@codex`、`@claude`、`@local`、`@ollama` 显式选择执行器；控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
-- Ollama 只处理明确的小活、只读问题和 Codex 不可用时的保守兜底，例如简单命令草案、git 状态、文件读取和记忆检索。
+- Codex 主 API 失败后，运行时不再让本地模型直接生成用户回复，而是复用 Codex agent 执行链并把 API 切到本地 OpenAI-compatible 后端；主 API 和本地 Agent API 都不可用时才返回明确阻塞。
+- 设置页的“AI API”改为运行策略向导：可选“默认 Codex”“Codex + 本地兜底”“完全使用自定义 API”。常用模式只需填服务和模型，高级字段折叠保留；保存后用“保存并重启 Bridge”让飞书运行时生效。
+- `hybrid` 模式下 MCP 状态、工具和可用性询问默认先走 Codex；只有 `local_only` 或 Codex 不可用后才使用本地 MCP 动态状态兜底，不再返回硬编码入口列表。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
-- Codex 不可用时，Ollama 可做只读兜底，并会先检索本地记忆后再回答记忆类问题。
-- 本地执行器不能伪造完成结果，不能绕过权限和工作区限制。
+- 本地模型只作为 agent API 后端和少数内部测试/整理入口使用；普通飞书消息不再走本地模型直答。
 - 记忆关键词不再触发本地直答；明确回忆/搜索类请求会检索记忆，其他请求只把相关记忆注入主执行链。
 - 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
@@ -116,6 +121,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.ps1
+```
+
+控制面板“扩展”页支持在线目录、HTTPS URL 预览和本机安装。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
+
+```powershell
+CTI_EXTENSION_CATALOG_URLS=https://example.com/codex-im-suite/catalog.json
 ```
 
 构建全部 package 和面板：
@@ -148,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 
 该入口会构建开发版、同步 live skill、组装 release、生成摘要、提交并推送当前分支。它用于个人运行副本备份，不作为 `main` 主干门禁。
 
-发布链路会在打包后执行分叉体检，比较关键文件 hash、manifest、构建时间、来源 commit 和 `.suite-release.json` 指纹；发现开发版、live skill、portable 或 installer payload 漂移时会中止，不会继续提交或推送。若提示 portable、installer 或 live skill 下有运行进程占用，先关闭输出中的 PID 对应程序后再重试，脚本不会自动结束进程。
+发布链路会在打包后执行分叉体检，比较关键文件 hash、manifest、构建时间、来源 commit 和 `.suite-release.json` 指纹；发现开发版、live skill、portable 或 installer payload 漂移时会中止，不会继续提交或推送。覆盖发布产物、portable、installer 或 live skill 前，脚本默认会自动结束目标目录内正在运行的进程后继续更新；如果需要保留旧的阻断行为，可传 `-NoForceUpdate` 或设置 `CTI_RELEASE_FORCE_UPDATE=false`。
 
 主干发布预检：
 
@@ -249,6 +260,26 @@ CTI_DIRECT_REMINDER_PUSH_ENABLED=true
 CTI_DIRECT_REMINDER_DECISION_MODE=codex_action
 CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
 ```
+
+飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；如果应用没有该文档访问权限或开放平台 scope 不足，再给发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
+
+```powershell
+CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,offline_access,auth:user.id:read,sheets:spreadsheet:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_OAUTH_MODE=manual
+CTI_FEISHU_OAUTH_PUBLIC_BASE_URL=https://bot.example.com
+CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI=http://127.0.0.1:17321/feishu/oauth/callback
+CTI_FEISHU_OAUTH_CALLBACK_PATH=/feishu/oauth/callback
+CTI_FEISHU_OAUTH_CALLBACK_PORT=17321
+CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_CLOUD_MAX_CHARS=80000
+CTI_FEISHU_CLOUD_MAX_ROWS=500
+CTI_FEISHU_CLOUD_MAX_RECORDS=500
+CTI_FEISHU_CLOUD_MAX_SHEETS=5
+```
+
+`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，授权卡片会打开飞书官方 `authen/v1/authorize` 页面，用户授权后把浏览器地址栏里的 `code/state` 回调 URL 复制回飞书，bridge 再换取并保存 user token。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
+
+本轮权限映射按飞书开放平台服务端 API 文档整理：Docx 读取走 `docx/v1/documents/:document_id/raw_content`，Sheets 先 `sheets/query` 再读范围，Base 读取 tables / fields / records。遇到 401/403 或飞书权限错误码时，bridge 会同时提示“用户没有文档访问权限”和对应 API 所需 scope，避免只给 404/空总结。
 
 启动 Ignis MCP：
 

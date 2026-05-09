@@ -34,6 +34,7 @@ import {
   createCompressedParams,
   decideConservativeRoute,
   getLocalRouterMode,
+  shouldRunPreCodexLocalFastPath,
   type LocalRouteProtocolResult,
   type LocalTaskKind,
 } from './local-llm-router.js';
@@ -60,6 +61,15 @@ import {
   startTodoReminderService,
   type TodoReminderService,
 } from './todo-reminders.js';
+import { createExtensionCatalogHost } from './extension-catalog-host.js';
+import { createFeishuCloudDocumentHost, FeishuTenantAccessTokenProvider } from './feishu-cloud-documents.js';
+import {
+  FeishuOAuthService,
+  FeishuOAuthStateStore,
+  FeishuOAuthTokenStore,
+  startFeishuOAuthCallbackServer,
+} from './feishu-oauth.js';
+import { prepareWorkflowRetryExecution } from './workflow-retry.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
   appendWorkflowEvent,
@@ -157,45 +167,12 @@ function summarizeCodexFailureMessage(message: string): string {
   return truncatePreview(message, 180) || 'Codex 当前不可用。';
 }
 
-function buildRecallFallbackReply(recallContext: string, codexFailure: string, localFailure?: string): string {
-  const lines = [
-    '先把本地记忆里能确定的内容发给你：',
-    '',
-    recallContext.trim(),
-    '',
-    `补充：${summarizeCodexFailureMessage(codexFailure)}`,
-  ];
-  if (localFailure) {
-    lines.push(`本地辅助也失败了：${truncatePreview(localFailure, 120)}`);
-  }
-  return lines.join('\n');
-}
-
 const TOOL_EXECUTION_PROMPT_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|模型|看一眼|查一下|分析一下|整理.*列表)/i;
 
 function requiresConcreteToolOutput(taskKind: LocalTaskKind, prompt: string): boolean {
   if (taskKind === 'unity_like' || taskKind === 'blender_like' || taskKind === 'doc_like') return true;
   if (taskKind !== 'tool_request') return false;
   return TOOL_EXECUTION_PROMPT_PATTERN.test(prompt);
-}
-
-function buildToolExecutionBlockerReply(taskKind: LocalTaskKind, prompt: string, codexFailure: string, localFailure?: string): string {
-  const domain = /unity|unitymcp|unity\s*mcp|hsscene|furniture_|prefab|timeline|场景|节点/i.test(prompt)
-    ? 'Unity/MCP'
-    : taskKind === 'blender_like'
-      ? 'Blender/MCP'
-      : taskKind === 'doc_like'
-        ? '飞书文档工具'
-        : '工具链';
-  const lines = [
-    `未完成：这个请求需要实际 ${domain} 执行结果，本轮没有拿到可用工具输出。`,
-    `阻塞原因：${summarizeCodexFailureMessage(codexFailure)}`,
-    '不会降级成手动检查步骤或示例列表；没有真实工具结果就不能伪装完成。',
-  ];
-  if (localFailure) {
-    lines.push(`本地辅助也失败了：${truncatePreview(localFailure, 120)}`);
-  }
-  return lines.join('\n');
 }
 
 function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistory: RetrievedFeishuHistoryContext | null): string | undefined {
@@ -236,6 +213,7 @@ class HubLlmProvider implements LLMProvider {
     private readonly localProvider: OllamaProvider,
     private readonly localAgent: LocalAgentProvider,
     private readonly fallbackProvider: LLMProvider,
+    private readonly localAgentFallbackProvider: LLMProvider | null,
     private readonly primaryExecutorId: string,
   ) {}
 
@@ -261,45 +239,24 @@ class HubLlmProvider implements LLMProvider {
         let workflowFailed = false;
         try {
         const conservative = decideConservativeRoute(params, this.config);
-        if (this.localAgent.canHandleIgnisFastPath(params)) {
-          const ignisResult = await this.localAgent.handleIgnisFastPath(controller, params, routerMode);
-          if (ignisResult.handled) return;
-        }
-        if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
-          try {
-            const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, routerMode);
-            if (mcpResult.handled) return;
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
-            return;
-          }
-        }
-        if (this.localAgent.canHandleFastPath(params, conservative)) {
-          try {
-            const fastResult = await this.localAgent.handleFastPath(controller, params, {
-              mode: routerMode,
-              conservative,
-            });
-            if (fastResult.handled) return;
-            if (fastResult.fallbackToCodex) {
-              await this.dispatchAfterRouteFailure(
-                controller,
-                params,
-                conservative,
-                routerMode,
-                fastResult.fallbackReason || conservative.reason,
-              );
+        if (shouldRunPreCodexLocalFastPath(routerMode)) {
+          if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
+            try {
+              const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, routerMode);
+              if (mcpResult.handled) return;
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
               return;
             }
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
-            return;
           }
         }
         if (routerMode === 'hybrid') {
           await this.pipeCodexPrimaryWithFallback(controller, params, conservative, '默认直达 Codex（Codex 主脑）');
+          return;
+        }
+        if (routerMode === 'local_only') {
+          await this.pipeLocalAgentApiFallback(controller, params, conservative, '当前模式为仅本地 Agent API');
           return;
         }
         try {
@@ -353,6 +310,9 @@ class HubLlmProvider implements LLMProvider {
       permissionMode: params.permissionMode,
       channelType: binding?.channelType,
       chatId: binding?.chatId,
+      userId: params.sourceUserId,
+      userDisplayName: params.sourceUserDisplayName,
+      messageId: params.sourceMessageId,
     });
     appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
     appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话、记忆和工作区上下文已准备');
@@ -435,55 +395,12 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
     reason: string,
   ): Promise<void> {
-    const recallContext = this.buildRecallContext(params, conservative.requestKind);
     if (mode !== 'local_only') {
       await this.pipeCodexPrimaryWithFallback(controller, params, conservative, `本地辅助失败，升级 Codex：${reason}`);
       return;
     }
 
-    if (mode !== 'local_only' && !conservative.useLocal) {
-      const compressedParams = createCompressedParams(
-        params,
-        conservative.compressedPrompt || compressPromptText(params, this.config),
-        conservative.compressedHistory || compressConversationHistory(params, this.config),
-        `Conservative fallback: ${conservative.reason}`,
-      );
-      await this.pipeFallbackStream(controller, compressedParams, {
-        mode,
-        taskKind: conservative.requestKind,
-        decision: 'escalate_codex',
-        provider: 'codex',
-        reason: `本地路由失败，按保守规则升级：${conservative.reason}`,
-        compressedPromptChars: compressedParams.prompt.length,
-        compressedHistoryChars: compressedParams.conversationHistory?.[0]?.content.length || 0,
-        fallbackReason: reason,
-      });
-      return;
-    }
-
-    const result = conservative.useLocal
-      ? await this.localProvider.answer(params, {
-          mode: 'local_only',
-          bestEffort: true,
-          limitReason: `本地路由失败，按保守规则直接本地回答：${conservative.reason}`,
-          taskKind: conservative.requestKind,
-          commandDraftOnly: conservative.readOnlyDraftOnly,
-          recallContext,
-        })
-      : await this.localProvider.buildBestEffortAnswer(params, reason, conservative.requestKind, recallContext);
-
-    this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
-      mode,
-      taskKind: conservative.requestKind,
-      decision: conservative.useLocal ? 'answer_local' : 'refuse_local',
-      provider: 'local_best_effort',
-      reason: conservative.useLocal
-        ? `本地路由失败，保守规则允许本地处理：${conservative.reason}`
-        : `本地路由失败且当前不可升级：${reason}`,
-      compressedPromptChars: conservative.compressedPrompt.length,
-      compressedHistoryChars: conservative.compressedHistory.length,
-      fallbackReason: reason,
-    });
+    await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由失败，切换本地 Agent API：${reason}`);
   }
 
   private async dispatchByRoute(
@@ -493,7 +410,6 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
     conservative: ReturnType<typeof decideConservativeRoute>,
   ): Promise<void> {
-    const recallContext = this.buildRecallContext(params, route.taskKind);
     switch (route.decision) {
       case 'answer_local': {
         const executed = await this.localAgent.handleRoutedExecution(controller, params, {
@@ -515,44 +431,13 @@ class HubLlmProvider implements LLMProvider {
           });
           return;
         }
-        const result = await this.localProvider.answer(params, {
-          route,
-          mode,
-          commandDraftOnly: route.taskKind === 'command_draft',
-          recallContext,
-        });
-        this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
-          mode,
-          taskKind: route.taskKind,
-          decision: route.decision,
-          provider: 'local',
-          reason: route.reason,
-          compressedPromptChars: route.compressedPrompt.length,
-          compressedHistoryChars: route.compressedHistory.length,
-        });
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由要求直答，改用本地 Agent API：${route.reason}`);
         return;
       }
 
       case 'escalate_codex': {
         if (mode === 'local_only') {
-          const result = await this.localProvider.answer(params, {
-            route,
-            mode,
-            bestEffort: true,
-            limitReason: this.localProvider.buildLocalOnlyMessage(route.taskKind, route.reason, route.taskKind === 'command_draft'),
-            taskKind: route.taskKind,
-            commandDraftOnly: route.taskKind === 'command_draft',
-            recallContext,
-          });
-          this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
-            mode,
-            taskKind: route.taskKind,
-            decision: route.decision,
-            provider: 'local_best_effort',
-            reason: `当前仅本地模式，未升级 Codex：${route.reason}`,
-            compressedPromptChars: route.compressedPrompt.length,
-            compressedHistoryChars: route.compressedHistory.length,
-          });
+          await this.pipeLocalAgentApiFallback(controller, params, conservative, `当前仅本地模式，使用本地 Agent API：${route.reason}`);
           return;
         }
 
@@ -585,25 +470,74 @@ class HubLlmProvider implements LLMProvider {
           return;
         }
 
-        const result = await this.localProvider.answer(params, {
-          route,
-          mode: 'local_only',
-          bestEffort: true,
-          limitReason: this.localProvider.buildLocalOnlyMessage(route.taskKind, route.reason, route.taskKind === 'command_draft'),
-          taskKind: route.taskKind,
-          commandDraftOnly: route.taskKind === 'command_draft',
-          recallContext,
-        });
-        this.emitLocalSuccess(controller, params.sessionId, result.text, result.usage, {
-          mode,
-          taskKind: route.taskKind,
-          decision: route.decision,
-          provider: 'refuse_local',
-          reason: route.reason,
-          compressedPromptChars: route.compressedPrompt.length,
-          compressedHistoryChars: route.compressedHistory.length,
-        });
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由拒绝直答，使用本地 Agent API：${route.reason}`);
       }
+    }
+  }
+
+  private isLocalAgentApiFallbackEnabled(): boolean {
+    return this.config.codexLocalFallbackEnabled !== false;
+  }
+
+  private buildAgentFallbackUnavailableReply(primaryFailure: string, localFailure?: string): string {
+    const parts = [
+      `主 Codex API 与本地 Agent API 都不可用。主 API：${summarizeCodexFailureMessage(primaryFailure)}`,
+    ];
+    if (localFailure) {
+      parts.push(`本地 Agent API：${truncatePreview(localFailure, 180)}`);
+    } else if (!this.isLocalAgentApiFallbackEnabled()) {
+      parts.push('本地 Agent API 兜底已关闭。');
+    } else if (!this.localAgentFallbackProvider) {
+      parts.push('本地 Agent API provider 未初始化。');
+    }
+    return parts.join(' ');
+  }
+
+  private async pipeLocalAgentApiFallback(
+    controller: ReadableStreamDefaultController<string>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    reason: string,
+    primaryFailure?: string,
+  ): Promise<void> {
+    const routeMode = getLocalRouterMode(this.config);
+    if (!this.isLocalAgentApiFallbackEnabled() || !this.localAgentFallbackProvider) {
+      this.emitLocalSuccess(controller, params.sessionId, this.buildAgentFallbackUnavailableReply(primaryFailure || reason), undefined, {
+        mode: routeMode,
+        taskKind: conservative.requestKind,
+        decision: 'refuse_local',
+        provider: 'codex_local_fallback',
+        reason,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: primaryFailure || reason,
+      });
+      return;
+    }
+
+    try {
+      await this.pipeFallbackStream(controller, params, {
+        mode: routeMode,
+        taskKind: conservative.requestKind,
+        decision: 'escalate_codex',
+        provider: 'codex_local_fallback',
+        reason,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: primaryFailure,
+      }, this.localAgentFallbackProvider);
+    } catch (fallbackError) {
+      const localFailure = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      this.emitLocalSuccess(controller, params.sessionId, this.buildAgentFallbackUnavailableReply(primaryFailure || reason, localFailure), undefined, {
+        mode: routeMode,
+        taskKind: conservative.requestKind,
+        decision: 'refuse_local',
+        provider: 'codex_local_fallback',
+        reason: `本地 Agent API 兜底失败：${reason}`,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: localFailure,
+      });
     }
   }
 
@@ -613,7 +547,6 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
     reason: string,
   ): Promise<void> {
-    const recallContext = this.buildRecallContext(params, conservative.requestKind);
     try {
       await this.pipeFallbackStream(controller, params, {
         mode: 'hybrid',
@@ -627,74 +560,30 @@ class HubLlmProvider implements LLMProvider {
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
+        try {
+          const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, 'hybrid');
+          if (mcpResult.handled) return;
+        } catch (mcpError) {
+          const localFailure = mcpError instanceof Error ? mcpError.message : String(mcpError);
+          this.emitLocalSuccess(controller, params.sessionId, `Codex/MCP 执行链不可用：${summarizeCodexFailureMessage(message)} 本地 MCP 状态检查也失败了：${truncatePreview(localFailure, 120)}`, undefined, {
+            mode: 'hybrid',
+            taskKind: conservative.requestKind,
+            decision: 'refuse_local',
+            provider: 'codex_local_fallback',
+            reason: `Codex 失败后 MCP 动态检查失败：${message}`,
+            compressedPromptChars: 0,
+            compressedHistoryChars: 0,
+            fallbackReason: localFailure,
+          });
+          return;
+        }
+      }
       if (requiresConcreteToolOutput(conservative.requestKind, params.prompt)) {
-        this.emitLocalSuccess(controller, params.sessionId, buildToolExecutionBlockerReply(conservative.requestKind, params.prompt, message), undefined, {
-          mode: 'hybrid',
-          taskKind: conservative.requestKind,
-          decision: 'refuse_local',
-          provider: 'local_best_effort',
-          reason: `Codex/MCP 执行链失败，工具任务禁止降级为教程：${message}`,
-          compressedPromptChars: 0,
-          compressedHistoryChars: 0,
-          fallbackReason: message,
-        });
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地 Agent API 继续工具任务：${message}`, message);
         return;
       }
-      if (conservative.allowLocalFallback && this.localAgent.canHandleFastPath(params, { ...conservative, useLocal: true })) {
-        const fastResult = await this.localAgent.handleFastPath(controller, params, {
-          mode: 'hybrid',
-          conservative: {
-            ...conservative,
-            useLocal: true,
-          },
-        });
-        if (fastResult.handled) return;
-      }
-      try {
-        const result = conservative.useLocal
-          ? await this.localProvider.answer(params, {
-              mode: 'local_only',
-              bestEffort: true,
-              limitReason: `Codex 不可用，改由本地兜底：${message}`,
-              taskKind: conservative.requestKind,
-              commandDraftOnly: conservative.readOnlyDraftOnly,
-              recallContext,
-            })
-          : await this.localProvider.buildBestEffortAnswer(params, `Codex 不可用，当前仅能本地兜底：${message}`, conservative.requestKind);
-
-        const finalResult = !conservative.useLocal && recallContext
-          ? await this.localProvider.buildBestEffortAnswer(params, message, conservative.requestKind, recallContext)
-          : result;
-
-        this.emitLocalSuccess(controller, params.sessionId, finalResult.text, finalResult.usage, {
-          mode: 'hybrid',
-          taskKind: conservative.requestKind,
-          decision: conservative.useLocal ? 'answer_local' : 'refuse_local',
-          provider: 'local_best_effort',
-          reason: conservative.useLocal
-            ? `Codex 不可用，显式小活改由本地兜底：${message}`
-            : `Codex 不可用，当前任务仅能本地尽力回答：${message}`,
-          compressedPromptChars: 0,
-          compressedHistoryChars: 0,
-          fallbackReason: message,
-        });
-        return;
-      } catch (localError) {
-        const localFailure = localError instanceof Error ? localError.message : String(localError);
-        const finalText = recallContext
-          ? buildRecallFallbackReply(recallContext, message, localFailure)
-          : `${summarizeCodexFailureMessage(message)}${localFailure ? ` 本地辅助也失败了：${truncatePreview(localFailure, 120)}` : ''}`;
-        this.emitLocalSuccess(controller, params.sessionId, finalText, undefined, {
-          mode: 'hybrid',
-          taskKind: conservative.requestKind,
-          decision: 'refuse_local',
-          provider: 'local_best_effort',
-          reason: `Codex 不可用且本地兜底失败：${message}`,
-          compressedPromptChars: 0,
-          compressedHistoryChars: 0,
-          fallbackReason: localFailure,
-        });
-      }
+      await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地 Agent API：${message}`, message);
     }
   }
 
@@ -702,6 +591,7 @@ class HubLlmProvider implements LLMProvider {
     controller: ReadableStreamDefaultController<string>,
     params: Parameters<LLMProvider['streamChat']>[0],
     summary: Omit<LocalLlmRouteSummary, 'timestamp'>,
+    provider: LLMProvider = this.fallbackProvider,
   ): Promise<void> {
     const current = readLocalLlmStatus(this.config);
     appendLocalLlmRouteSummary(this.config, {
@@ -715,7 +605,7 @@ class HubLlmProvider implements LLMProvider {
       lastError: '',
     });
     controller.enqueue(sseEvent('status', {
-      provider: 'codex',
+      provider: summary.provider,
       routeMode: summary.mode,
       routeDecision: summary.decision,
       routeReason: summary.reason,
@@ -723,7 +613,7 @@ class HubLlmProvider implements LLMProvider {
       compressedHistoryChars: summary.compressedHistoryChars,
     }));
     try {
-      const stream = this.fallbackProvider.streamChat(params);
+      const stream = provider.streamChat(params);
       const reader = stream.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -858,6 +748,9 @@ class ObservedLLMProvider implements LLMProvider {
           permissionMode: params.permissionMode,
           channelType: binding?.channelType,
           chatId: binding?.chatId,
+          userId: params.sourceUserId,
+          userDisplayName: params.sourceUserDisplayName,
+          messageId: params.sourceMessageId,
         });
         try {
           appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
@@ -904,17 +797,25 @@ class ObservedLLMProvider implements LLMProvider {
 }
 
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
-  const wrapWithLocalHub = (provider: LLMProvider, primaryExecutorId: string): LLMProvider => {
+  const wrapWithLocalHub = (provider: LLMProvider, primaryExecutorId: string, localAgentFallbackProvider: LLMProvider | null = null): LLMProvider => {
     if ((config.ollamaEnabled ?? config.localLlmEnabled) !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
     const localProvider = new OllamaProvider(config);
-    return new HubLlmProvider(config, store, localProvider, new LocalAgentProvider(config, pendingPerms, localProvider), provider, primaryExecutorId);
+    return new HubLlmProvider(
+      config,
+      store,
+      localProvider,
+      new LocalAgentProvider(config, pendingPerms, localProvider),
+      provider,
+      localAgentFallbackProvider,
+      primaryExecutorId,
+    );
   };
 
   const runtime = config.runtime;
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex');
+    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }));
   }
 
   if (runtime === 'auto') {
@@ -933,7 +834,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex');
+    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }));
   }
 
   const cliPath = resolveClaudeCliPath();
@@ -972,7 +873,7 @@ interface StatusInfo {
   runId?: string;
   startedAt?: string;
   channels?: string[];
-  lastExitReason?: string;
+  lastExitReason?: string | null;
 }
 
 function writeStatus(info: StatusInfo): void {
@@ -1024,6 +925,7 @@ function startWorkflowRetryService(
   runId: string,
   llm: LLMProvider,
   store: BridgeStore,
+  cloudDocuments?: ReturnType<typeof createFeishuCloudDocumentHost>,
 ): NodeJS.Timeout {
   let active = false;
   const workerId = `runtime:${runId}`;
@@ -1038,21 +940,39 @@ function startWorkflowRetryService(
         failWorkflowRetry(claimed.id, new Error('缺少可重试输入'));
         return;
       }
-      const text = await collectWorkflowRetryResponse(llm, {
-        prompt: input.prompt,
-        sessionId: claimed.sessionId,
-        model: input.model,
-        systemPrompt: input.systemPrompt,
-        workingDirectory: input.workingDirectory,
-        permissionMode: input.permissionMode,
+      const prepared = await prepareWorkflowRetryExecution({
+        run: claimed,
+        cloudDocuments,
       });
+      const channelType = input.channelType || claimed.channelType;
+      const chatId = input.chatId || claimed.chatId;
+      if (prepared.status === 'blocked') {
+        if (channelType && chatId) {
+          const delivered = await bridgeManager.deliverProactiveMessage({
+            address: {
+              channelType,
+              chatId,
+              displayName: claimed.chatId || chatId,
+            },
+            text: prepared.text,
+            parseMode: 'plain',
+            sessionId: claimed.sessionId,
+            feishuCardJson: prepared.feishuCardJson,
+            dedupKey: `workflow-retry-cloud-blocker:${claimed.id}:${claimed.retry?.attempts || 0}`,
+          });
+          if (!delivered.ok) {
+            throw new Error(`云文档授权提示发送失败：${delivered.error || 'unknown error'}`);
+          }
+        }
+        failWorkflowRetry(claimed.id, new Error(prepared.text));
+        return;
+      }
+      const text = await collectWorkflowRetryResponse(llm, prepared.params);
       if (!text) {
         throw new Error('重试执行没有返回可发送文本');
       }
       store.addMessage(claimed.sessionId, 'user', input.prompt);
       store.addMessage(claimed.sessionId, 'assistant', text);
-      const channelType = input.channelType || claimed.channelType;
-      const chatId = input.chatId || claimed.chatId;
       if (channelType && chatId) {
         const delivered = await bridgeManager.deliverProactiveMessage({
           address: {
@@ -1139,11 +1059,61 @@ async function main(): Promise<void> {
     resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>
       pendingPerms.resolve(id, resolution),
   };
+  const feishuOAuthTokenStore = new FeishuOAuthTokenStore(path.join(CTI_HOME, 'data', 'feishu-oauth-tokens.json'));
+  const feishuOAuthStateStore = new FeishuOAuthStateStore(path.join(CTI_HOME, 'runtime', 'feishu-oauth-states.json'));
+  const feishuOAuthService = new FeishuOAuthService({
+    config: {
+      appId: config.feishuAppId,
+      appSecret: config.feishuAppSecret,
+      mode: config.feishuOAuthMode || 'callback',
+      publicBaseUrl: config.feishuOAuthPublicBaseUrl,
+      manualRedirectUri: config.feishuOAuthManualRedirectUri,
+      callbackPath: config.feishuOAuthCallbackPath || '/feishu/oauth/callback',
+      callbackPort: config.feishuOAuthCallbackPort ?? 17321,
+      scopes: config.feishuOAuthScopes || [],
+      waitForAuthorizationMs: 0,
+    },
+    tokenStore: feishuOAuthTokenStore,
+    stateStore: feishuOAuthStateStore,
+  });
+  const feishuTenantTokenProvider = new FeishuTenantAccessTokenProvider({
+    appId: config.feishuAppId,
+    appSecret: config.feishuAppSecret,
+  });
+  const feishuCloudDocuments = createFeishuCloudDocumentHost({
+    config: {
+      appId: config.feishuAppId,
+      appSecret: config.feishuAppSecret,
+      maxChars: config.feishuCloudMaxChars ?? 80000,
+      maxRows: config.feishuCloudMaxRows ?? 500,
+      maxRecords: config.feishuCloudMaxRecords ?? 500,
+      maxSheets: config.feishuCloudMaxSheets ?? 5,
+    },
+    tokenProvider: feishuOAuthService,
+    tenantTokenProvider: feishuTenantTokenProvider,
+  });
+  const feishuOAuthCallbackServer = config.feishuOAuthPublicBaseUrl
+    ? startFeishuOAuthCallbackServer(feishuOAuthService, {
+      port: config.feishuOAuthCallbackPort ?? 17321,
+      callbackPath: config.feishuOAuthCallbackPath || '/feishu/oauth/callback',
+    })
+    : null;
+  if (feishuOAuthCallbackServer) {
+    console.log(`[claude-to-im] Feishu OAuth callback listening on 127.0.0.1:${config.feishuOAuthCallbackPort ?? 17321}${config.feishuOAuthCallbackPath || '/feishu/oauth/callback'}`);
+  }
 
   initBridgeContext({
     store,
     llm,
     permissions: gateway,
+    extensions: createExtensionCatalogHost(),
+    feishuCloudDocuments,
+    feishuOAuth: {
+      handleManualCallbackText: async (input) => feishuOAuthService.handleManualCallbackText({
+        text: input.text,
+        userId: input.userId,
+      }),
+    },
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         try {
@@ -1204,10 +1174,12 @@ async function main(): Promise<void> {
           runId,
           startedAt: new Date().toISOString(),
           channels: config.enabledChannels,
+          lastExitReason: null,
         });
         console.log(`[claude-to-im] Bridge started (PID: ${process.pid}, channels: ${config.enabledChannels.join(', ')})`);
       },
       onBridgeStop: () => {
+        feishuOAuthCallbackServer?.close();
         writeStatus({ running: false });
         console.log('[claude-to-im] Bridge stopped');
       },
@@ -1215,7 +1187,7 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
-  workflowRetryTimer = startWorkflowRetryService(runId, llm, store);
+  workflowRetryTimer = startWorkflowRetryService(runId, llm, store, feishuCloudDocuments);
   if (config.memoryRepoDir) {
     const todoPushChannels = config.todoPushChannels && config.todoPushChannels.length > 0
       ? config.todoPushChannels

@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $suiteRoot = Split-Path -Parent $scriptDir
 $manifestDir = Join-Path $suiteRoot 'config\skills.d'
+$ctiHome = if ([string]::IsNullOrWhiteSpace($env:CTI_HOME)) { Join-Path $env:USERPROFILE '.claude-to-im' } else { [string]$env:CTI_HOME }
+$overlayManifestDir = Join-Path $ctiHome 'extensions\manifests\skills.d'
 $skillsRoot = Join-Path $suiteRoot 'extensions\skills'
 $targetRoot = Join-Path $env:USERPROFILE '.codex\skills'
 
@@ -13,15 +15,34 @@ function Resolve-ManifestValue {
     )
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
-    return $Value.Replace('${SUITE_ROOT}', $SuiteRoot)
+    $result = $Value.Replace('${SUITE_ROOT}', $SuiteRoot)
+    $result = $result.Replace('${CTI_HOME}', $script:ctiHome)
+    $result = $result.Replace('${USERPROFILE}', $env:USERPROFILE)
+    return [Environment]::ExpandEnvironmentVariables($result)
 }
 
 New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
 
-$manifests = Get-ChildItem -LiteralPath $manifestDir -Filter *.json -File | Sort-Object Name
+$manifestFiles = @()
+foreach ($dir in @($manifestDir, $overlayManifestDir)) {
+    if (Test-Path -LiteralPath $dir) {
+        $manifestFiles += @(Get-ChildItem -LiteralPath $dir -Filter *.json -File | Sort-Object Name)
+    }
+}
 
-foreach ($manifestFile in $manifests) {
+$manifestsById = [ordered]@{}
+foreach ($manifestFile in $manifestFiles) {
     $manifest = Get-Content -LiteralPath $manifestFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $id = [string]$manifest.id
+    if ([string]::IsNullOrWhiteSpace($id)) { continue }
+    $manifestsById[$id] = [pscustomobject]@{
+        Manifest = $manifest
+        File = $manifestFile
+    }
+}
+
+foreach ($entry in $manifestsById.Values) {
+    $manifest = $entry.Manifest
     if ($manifest.type -ne 'skill') { continue }
     if ($manifest.enabled -eq $false) { continue }
 

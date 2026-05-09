@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-05-07
+更新时间：2026-05-09
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
@@ -23,6 +23,12 @@
 - 将 suite 版本提升到 `0.2.0`，并在 `suite.manifest.json` 中声明 `extension-manifest/v1`。
 - 给 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 补齐统一扩展字段：`version`、`compatibility`、`category`、`optional`、`installState`、`source` 和 `aliases`。
 - 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest。
+- 新增在线扩展目录 v1：`config/extension-catalog.json` 作为本地种子，`CTI_EXTENSION_CATALOG_URLS` 可追加远端精选目录；控制面板“扩展”页支持目录搜索、HTTPS URL 预览、本机安装和移除记录。
+- 扩展安装内容固定落在 `C:\Users\admin\.claude-to-im\extensions`，并生成用户 manifest overlay；`mcp-bridge`、控制面板、`install-suite-skills.ps1` 和 `register-external-mcps.ps1` 已合并读取 suite manifest 与用户 overlay。
+- 在线安装 handler 收口为 `skill.copy`、`mcp.npm`、`mcp.uvx`、`mcp.zip`、`ollama.pull`、`manifest.record`、`codex-plugin.record`；无 `sha256` 的 URL 预览会标记为不可信，远程 Control API 安装和移除要求 Owner。
+- 在线目录种子已加入常用 Ollama 模型、无需密钥的常用 MCP、suite 已维护 skill 和 Browser 插件记录项；Browser 记录为 OpenAI bundled 插件，移除时只删除 suite 记录，不删除插件缓存。
+- 控制面板在线目录会读取 Ollama `/api/tags`、内置 manifest、用户 overlay manifest 和安装锁；已存在模型或内置 config 记录显示为“已安装”，只有用户 overlay 或安装锁记录才显示“移除记录”，避免把不可删除的源配置当成可卸载内容。
+- 飞书新增 `/ext search`、`/ext install`、`/ext remove` 和自然语言触发入口；安装/移除默认发 Owner 确认卡片，待确认动作写入 `C:\Users\admin\.claude-to-im\data\extension-install-actions.json`，确认后统一调用控制面板 Control API。
 - 新增 `scripts/package-main-release.ps1` 和 `scripts/prepare-main-release.ps1`，主干发布预检不再同步 live skill，也不自动提交、推送或打 tag。
 - 新增 `scripts/create-main-release-tag.ps1`，打 tag 从预检流程拆出，只允许在干净工作区和稳定分支上执行。
 - 控制面板升级为 WinForms 宿主 + WebView2 + React/Vite 前端；旧 WinForms 控件退为宿主状态层，前端通过白名单命令协议调用本机脚本和状态读取。
@@ -31,13 +37,14 @@
 - 新增 `scripts/start-control-api.ps1`，用于本机或服务器启动 API-only 模式。默认只监听 `127.0.0.1`，远程监听必须配置 token，远程高危命令需要额外显式开启。
 - 桌面面板的 Control API 启动已补端口冲突保护：本机 loopback 模式下如果默认 `8788` 被占用，会自动尝试后续端口，避免多开面板时直接弹未处理异常；远程显式监听仍保持严格失败。
 - `build-packages.ps1` 会先构建控制面板 Web 前端，`assemble-portable.ps1` 会复制完整控制面板发布目录，确保 `wwwroot` 和 WebView2 运行依赖进入 portable/installer。
-- `assemble-portable.ps1`、`build-installer.ps1` 和 `sync-live-skill.ps1` 在覆盖运行副本或发布产物前会检查目录下是否有运行进程占用；命中时输出 PID 和路径并停止，不自动 kill。
+- `build-packages.ps1`、`assemble-portable.ps1`、`build-installer.ps1` 和 `sync-live-skill.ps1` 在覆盖运行副本或发布产物前会检查目录下是否有运行进程占用；默认只结束目标目录内的进程后继续更新，传 `-NoForceUpdate` 或设置 `CTI_RELEASE_FORCE_UPDATE=false` 时恢复只报告 PID 并停止。
 - 发布便携包 `release\codex-im-suite-portable.zip` 改为通过 Git LFS 跟踪 `release/*.zip`，避免 GitHub 普通 Git 单文件 100MB 限制阻断备份发布。
 - 控制面板把发布入口拆成“本机备份发布”和“主干发布预检”，版本卡片显示 suite 版本、扩展协议、启用扩展数量、缺失依赖和本机配置覆盖数量。
 - 控制面板顶部新增 live skill 同步状态：启动和刷新状态时读取 live `.suite-release.json.generatedAt`、commit 与关键内容 hash，显示“Live 已同步 / 落后 / 未记录同步时间 / 读取失败”，并在需要时提供只执行 `scripts/sync-live-skill.ps1` 的“一键同步”按钮；该按钮不会打包、提交、推送或重启 bridge。
 - 控制面板对 Live 同步、一键发布和主干发布预检新增顶部任务反馈条：点击后立即显示执行中，结束后显示成功 / 失败和用时；Live 已同步时也保留“重新同步”入口，方便手动强制同步。
 - 控制面板 exe 入口已收口：`CodexImSuiteControlPanel.exe` 是唯一正式入口，live 同步不再生成 `ClaudeToImControlPanel.exe`，doctor、liveSync hash 和 release fingerprint 也统一只检查正式入口。
 - 控制面板清理 PowerShell 子进程的 CLIXML 输出：Live 同步、一键发布和主干发布预检失败时会显示可读脚本日志和错误原因，不再把 `#< CLIXML` 原始片段截断给用户。
+- 控制面板发布产物目录在 `build-packages.ps1` 中改为发布前先检查运行进程并清空输出目录，避免 Vite hash 资源旧文件残留导致主干发布预检的 `panel.wwwroot` fork health 误报不一致。
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 - 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
 - 控制面板“执行器”页已和“服务”页区分：服务页继续承载运行单元生命周期操作；执行器页的 Executor Registry 改为可选中的只读路由目录，右侧展示选中 executor 的能力、风险、优先级和最近路由，不暴露默认执行器写入入口。
@@ -53,6 +60,14 @@
 - bridge-runtime 新增 `memory-profiles.json` 轻量记忆画像：按用户 ID、聊天和全局 scope 汇总事实/偏好、近期主题和待跟进项；普通消息和 Feishu 历史同步都会增量更新。
 - Codex 上下文记忆注入改为“Markdown 知识库 + 会话摘要 + profile 命中 + Feishu 历史命中”的检索式组合，继续受字符预算限制，避免把全部记忆一次性注入导致 token 膨胀。
 - 本地模型后端从旧 `llama.cpp` 迁移到 Ollama：新增 `CTI_OLLAMA_ENABLED`、`CTI_OLLAMA_BASE_URL`、`CTI_OLLAMA_MODEL`、`CTI_OLLAMA_TIMEOUT_MS`，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
+- 本地辅助 AI 从固定 Ollama 扩展为 OpenAI-compatible Chat Completions 配置：新增 `CTI_LOCAL_AI_KIND`、`CTI_LOCAL_AI_BASE_URL`、`CTI_LOCAL_AI_MODEL`、`CTI_LOCAL_AI_API_KEY`、`CTI_LOCAL_AI_TIMEOUT_MS`，继续兼容 `CTI_OLLAMA_*` 默认值。
+- Codex API 配置正式纳入面板和运行时配置：支持 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`、`CTI_CODEX_REASONING_EFFORT`，API key 在 Web 状态里只显示掩码。
+- 控制面板设置页新增“AI API”区域，可测试本地 AI 和 Codex API 配置，并提供“保存并重启 Bridge”让飞书运行时加载全局执行链配置；本地 AI 类型不是 Ollama 时，执行器目录不再把 `codex-oss-ollama` 显示为可用。
+- `hybrid` / `codex_only` 模式下停止在 Codex 前执行 MCP/本地工具快路径；“Fetch MCP 能用吗”等 MCP 状态问题默认先进入 Codex，Codex 不可用时才读取合并 manifest 与 `codex mcp list` 做动态兜底，避免返回硬编码 MCP 入口列表。
+- 本地模型直答兜底已改为本地 Agent API 兜底：Codex 主 API 失败后复用 `CodexProvider(local_fallback)`，读取 `CTI_LOCAL_AI_*`，强制传本地模型，并使用独立 `CODEX_HOME`。
+- 新增 `CTI_CODEX_LOCAL_FALLBACK_ENABLED` 和 `CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT`；面板“AI API”区域改为“Codex 主 API”和“本地 Agent API（兜底/省流）”，支持开关和保存后重启 Bridge。
+- 面板“AI API”进一步改成运行策略向导：默认只展示“默认 Codex / Codex + 本地兜底 / 完全使用自定义 API”、当前策略摘要和必要字段，高级 Base URL、API key、reasoning、pass model 等仍保留在折叠区。
+- Executor registry 新增 `codex-local-fallback`，`@local` / `@本地` 指向该执行器；`local-tool-agent` 仅保留历史兼容，普通消息不再使用本地模型直接生成最终回复。
 - `scripts/local-llm` 改为 Ollama 安装提示、启动、停止和 `/api/tags` 健康检查；旧 `llama-server.exe`、GGUF 路径和 server args 不再作为运行来源。
 - 新增 Markdown 知识索引：默认监听 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`，知识单元分为 `事实 / 结论 / 待办 / 资源`。
 - 知识索引 watcher 新增实时状态文件 `E:\cli-md\.cti-index\status.json`：记录监听心跳、最近事件、最近索引、watcher PID 和错误；控制面板“记忆”页改为读取该状态判断真实监听。
@@ -89,6 +104,10 @@
 已完成：
 
 - Feishu 文本、Markdown card、图片发送、群聊 reply 支持。
+- Feishu 云文档读取 v1：支持 Docx、Sheets、Base/多维表格链接解析；bridge-core 通过 host interface 调用 runtime，runtime 先用应用 `tenant_access_token` 读取，应用无权时再使用发起人 OAuth 用户 token 读取内容并注入 Codex 上下文。
+- Feishu OAuth 登录授权 v1：缺少用户 token 时发送登录卡片，回调 state 绑定发起人、chat、message 和链接 hash；支持公网 callback 模式和无公网 manual code/state 回传模式；用户 token 存到 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
+- Feishu 开放平台能力诊断 v1：新增 Owner 命令 `/feishu`，按消息收发、资源、历史、reaction、CardKit、Docx、Sheets、Base 等能力列出所需 scope，并和 `CTI_FEISHU_GRANTED_SCOPES` 声明的已开通权限做差异检查。
+- Feishu 云文档权限错误提示补强：Docx / Sheets / Base 读取遇到 401/403 或飞书权限错误码时，会同时提示用户文档访问权限和对应接口所需 scope，避免把缺少开放平台权限误判成文档内容为空。
 - 群聊中回复某条消息时支持原生 reply，并可 @ 提问人。
 - Markdown 输出统一走 Feishu card，避免纯文本表格错乱。
 - 结果块协议 `cti-final` 已接入，避免桥接再靠猜测裁剪最终回复。
@@ -102,22 +121,29 @@
 - 面板假在线问题：状态不再只信旧 `status.json`。
 - 私聊漏事件问题：新增 p2p 补捞，轮询间隔已降到 5 秒，并在启动时立即补捞一次。
 - 出站卡住问题：Codex SSE error/result.is_error 现在会触发本地兜底，不再把原始报错发给用户。
+- 2026-05-08 修复 live 桥接配置被截断后无法启动的问题：恢复完整 `config.env`，并加固 `bridge-runtime-audit.json` 写入，避免 Windows 下并发 rename 报 `EPERM` 导致面板误报未运行。
+- 2026-05-09 修复 Windows supervisor 停止 / 重启时的 stale PID 竞态：live 同步后如果 bridge 或 supervisor 进程已自行退出，`daemon.ps1 restart` 不再因为 `Stop-Process` 找不到旧 PID 而中断。
+- 2026-05-09 加固 live 同步脚本的单文件覆盖：控制面板 exe 刚退出或被短暂扫描占用时，`sync-live-skill.ps1` 会短重试，避免 core/runtime 已复制但最终指纹未写入的半同步状态。
+- 2026-05-09 新增飞书云文档权限读取链路：收到私有 Docx / Sheets / Base 链接时不再让 Codex 直接公网抓取，而是先按发起人飞书账号读取；登录后仍无权限会提示让文档所有者分享或导出，不自动绕过权限。
+- 2026-05-09 修复飞书云文档断点续跑绕过预读取的问题：workflow retry 现在会先执行云文档解析，优先应用 token、再发起人 user token，缺授权时回发登录/权限阻断，不再把飞书登录页交给 Codex 总结。
+- 2026-05-09 新增飞书 OAuth manual 模式：不暴露公网时，授权卡片打开飞书官方 `authen/v1/authorize` 页面，用户授权后把浏览器地址栏里的 `code/state` 回调 URL 发回飞书，bridge 校验 state 后换取并保存 user token。
+- 2026-05-09 修复飞书群聊 @bot 漏判：`require_mention=true` 时不再只依赖事件 `message.mentions`，如果飞书长连事件没带 mentions 数组，会继续解析正文里的 `<at ...>` 和富文本 `tag=at`，避免真实艾特被误记成 `[FILTERED] Group message dropped: bot not @mentioned`，同时恢复会话入库和机器人回复。
 
 ## 3. Codex 与本地模型策略
 
 当前策略：
 
 - Codex 是主脑。
-- 本地模型是辅助执行器和兜底。
-- 本地模型不再作为默认中枢先判断所有请求。
+- 本地模型是 Codex agent 的本地 API 后端和少数内部整理/测试工具。
+- 本地模型不再作为普通飞书消息的直接最终回复器。
 
 已完成：
 
 - Ollama 本地后端接入。
 - 本地执行器支持 shell、git、文件读写、文本搜索。
 - `hybrid / local_only / codex_only` 三种模式。
-- Codex 失败时切本地兜底。
-- 本地兜底处理记忆类请求时，会先检索本地记忆和 Feishu 历史命中片段。
+- Codex 主 API 失败时切 `codex_local_fallback`，由同一套 Codex agent 链路改用本地 Agent API 继续执行。
+- 主 API 与本地 Agent API 都不可用时返回明确阻塞，不再生成教程式或静态 canned 回复。
 - 本地模型不能伪造“已执行 / 已修改 / 已导入 / 已创建”结果。
 - `codex-oss-ollama` 实验执行器已登记到 executor registry，声明 `codex exec --oss --local-provider ollama`，能力限制为只读问题和记忆检索兜底。
 - Ignis 创意生成请求可走本地模型快路径，`local_only` 模式下也能提交和查询 Ignis 任务。
@@ -322,7 +348,7 @@
 - 直接提醒源文件默认写入 `E:\cli-md\data\todos\direct-reminders`，由 `cti-reminder` 动作或 `/remind` 显式入口创建，默认通过 bridge 统一推送链路到点发回当前会话。
 - 查看器优先使用远端 / 本地索引组合。
 - 本地历史检索支持群名、关键词、发言人、时间段。
-- Codex 不可用时，Ollama 只允许用记忆命中片段回答只读问题；工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
+- Codex 主 API 不可用时，兜底仍由 Codex agent 切到本地 Agent API 执行；本地 API 也不可用时，工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
 
 当前原则：
 
@@ -350,6 +376,7 @@
 - Ignis 生成能力依赖本机 CLI 配置和远端服务可用性，资产生成可能产生等待时间或服务侧额度消耗。
 - 正在处理的消息如果 bridge 被强制重启，当前只支持基于最小恢复输入的重跑；无法恢复原进程内的未完成工具授权或半截模型输出。
 - Feishu 私聊 WS 漏事件已补捞，但如果历史接口也异常，仍可能延迟。
+- Feishu OAuth 回调依赖 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL` 和反向代理配置；公网回调不可达时只能提示用户配置授权入口，不能读取私有云文档。
 - `packages/bridge-runtime/scripts/build-control-panel.ps1` 和 `package-release.ps1` 仍作为兼容入口存在，但不再承载旧源码。
 
 建议下一步：

@@ -1,3 +1,7 @@
+param(
+    [switch]$NoForceUpdate
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
@@ -6,14 +10,9 @@ $portableDir = Join-Path $suiteRoot 'release\portable'
 $installerDir = Join-Path $suiteRoot 'release\installer'
 $project = Join-Path $suiteRoot 'apps\installer\CodexImSuite.Installer.csproj'
 
-Assert-NoRunningProcessInPath -Roots @($installerDir) -Purpose 'build installer'
+Clear-RunningProcessInPathForUpdate -Roots @($installerDir) -Purpose 'build installer' -NoForceUpdate:$NoForceUpdate
 if (Test-Path -LiteralPath $installerDir) {
-    try {
-        Remove-Item -LiteralPath $installerDir -Recurse -Force -ErrorAction Stop
-    }
-    catch {
-        throw "无法清理 installer 目录：$installerDir。请确认没有正在运行的 installer/payload 程序或资源管理器占用后重试。原始错误：$($_.Exception.Message)"
-    }
+    Remove-PathForUpdate -Path $installerDir -Purpose 'build installer cleanup'
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $installerDir 'payload') | Out-Null
 Copy-Item -Path (Join-Path $portableDir '*') -Destination (Join-Path $installerDir 'payload') -Recurse -Force

@@ -50,6 +50,9 @@ export interface WorkflowRecoveryInput {
   permissionMode?: string;
   channelType?: string;
   chatId?: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
 }
 
 export interface WorkflowRecoveryState {
@@ -211,6 +214,9 @@ export function recordWorkflowRecoveryInfo(
         permissionMode: input.permissionMode,
         channelType: input.channelType || current.runs[index].channelType,
         chatId: input.chatId || current.runs[index].chatId,
+        userId: input.userId,
+        userDisplayName: input.userDisplayName,
+        messageId: input.messageId,
       },
       markedAt: timestamp,
     },

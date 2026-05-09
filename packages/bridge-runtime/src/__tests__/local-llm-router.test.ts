@@ -10,6 +10,7 @@ import {
   decideConservativeRoute,
   getLocalRouterMode,
   parseLocalRoutePayload,
+  shouldRunPreCodexLocalFastPath,
 } from '../local-llm-router.js';
 
 const baseConfig: Config = {
@@ -47,6 +48,14 @@ describe('getLocalRouterMode', () => {
 
   it('falls back to local_only when legacy fallback is disabled', () => {
     assert.equal(getLocalRouterMode({ ...baseConfig, localLlmRouterMode: undefined, localLlmFallbackToCodex: false }), 'local_only');
+  });
+});
+
+describe('shouldRunPreCodexLocalFastPath', () => {
+  it('only allows pre-Codex fast-path in local_only mode', () => {
+    assert.equal(shouldRunPreCodexLocalFastPath('local_only'), true);
+    assert.equal(shouldRunPreCodexLocalFastPath('hybrid'), false);
+    assert.equal(shouldRunPreCodexLocalFastPath('codex_only'), false);
   });
 });
 

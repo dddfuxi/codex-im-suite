@@ -37,18 +37,33 @@ function params(prompt: string): StreamChatParams {
 }
 
 describe('executor registry', () => {
-  it('registers codex and local tool agent executors', () => {
+  it('registers codex and local agent fallback executors', () => {
     const manifests = buildExecutorManifests(baseConfig);
     assert.ok(manifests.some((manifest) => manifest.id === 'codex'));
+    assert.ok(manifests.some((manifest) => manifest.id === 'codex-local-fallback'));
     assert.ok(manifests.some((manifest) => manifest.id === 'local-tool-agent'));
     assert.ok(manifests.some((manifest) => manifest.id === 'codex-oss-ollama'));
+    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, true);
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.kind, 'agent');
+    assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.enabled, false);
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.kind, 'cli');
+  });
+
+  it('disables codex-oss-ollama when local AI is not Ollama', () => {
+    const manifests = buildExecutorManifests({
+      ...baseConfig,
+      localAiKind: 'openai-compatible',
+      localAiBaseUrl: 'http://127.0.0.1:1234',
+      localAiModel: 'lmstudio-model',
+    });
+    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, true);
+    assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.enabled, false);
+    assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.enabled, false);
   });
 
   it('detects explicit executor hints', () => {
     assert.equal(inferRequestedExecutorId('@codex 帮我看一下状态'), 'codex');
-    assert.equal(inferRequestedExecutorId('@local 帮我总结这段日志'), 'local-tool-agent');
+    assert.equal(inferRequestedExecutorId('@local 帮我总结这段日志'), 'codex-local-fallback');
     assert.equal(inferRequestedExecutorId('@ollama 帮我总结这段日志'), 'codex-oss-ollama');
     assert.equal(inferRequestedExecutorId('@claude 处理这个问题'), 'claude-cli');
   });
@@ -57,10 +72,10 @@ describe('executor registry', () => {
     const selection = selectExecutor(baseConfig, {
       sessionId: 'session-1',
       prompt: '@local 帮我看看 git 状态',
-      requestedExecutorId: 'local-tool-agent',
+      requestedExecutorId: 'codex-local-fallback',
       params: params('@local 帮我看看 git 状态'),
     });
-    assert.equal(selection.executor.id, 'local-tool-agent');
+    assert.equal(selection.executor.id, 'codex-local-fallback');
     assert.equal(selection.explicit, true);
   });
 

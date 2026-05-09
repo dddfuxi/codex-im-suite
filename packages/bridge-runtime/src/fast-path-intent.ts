@@ -87,11 +87,11 @@ const MCP_SYSTEM_RULES: SignalRule[] = [
 
 const MCP_OBJECT_RULES: SignalRule[] = [
   { label: 'MCP工具', pattern: /(工具|tools\/list|tools\/call|tool call)/i },
-  { label: 'MCP状态', pattern: /(状态|连接|在线|离线|健康)/i },
+  { label: 'MCP状态', pattern: /(状态|连接|在线|离线|健康|可用|能用)/i },
 ];
 
 const MCP_QUERY_RULES: SignalRule[] = [
-  { label: 'MCP状态查询', pattern: /(检查|状态|连接|在线|离线|健康|看看|看下|帮助)/i },
+  { label: 'MCP状态查询', pattern: /(检查|状态|连接|在线|离线|健康|可用|能用|看看|看下|帮助)/i },
   { label: 'MCP工具查询', pattern: /(工具列表|列出.*工具|有哪些工具|tools\/list)/i },
 ];
 
@@ -102,7 +102,7 @@ const MCP_ACTION_RULES: SignalRule[] = [
 ];
 
 const MCP_READ_ONLY_RULES: SignalRule[] = [
-  { label: 'MCP只读', pattern: /(状态|连接|在线|离线|健康|工具列表|列出.*工具|有哪些工具|tools\/list)/i },
+  { label: 'MCP只读', pattern: /(状态|连接|在线|离线|健康|可用|能用|工具列表|列出.*工具|有哪些工具|tools\/list)/i },
 ];
 
 const MCP_MUTATING_RULES: SignalRule[] = [
@@ -223,6 +223,14 @@ export function assessIgnisInteraction(prompt: string, hasFiles: boolean): FastP
       : IGNIS_MUTATING_RULES,
   });
   const assessment = makeAssessment(signals);
+  if (
+    assessment.interactionIntent === 'action'
+    && signals.query.length > 0
+    && signals.readOnly.length > 0
+    && signals.mutating.length === 0
+  ) {
+    return { ...assessment, interactionIntent: 'query' };
+  }
   if (assessment.interactionIntent === 'ambiguous') {
     return { ...assessment, interactionIntent: 'query' };
   }
@@ -240,6 +248,14 @@ export function assessMcpInteraction(prompt: string): FastPathInteractionAssessm
     mutating: MCP_MUTATING_RULES,
   });
   const assessment = makeAssessment(signals);
+  if (
+    assessment.interactionIntent === 'action'
+    && signals.query.length > 0
+    && signals.readOnly.length > 0
+    && signals.mutating.length === 0
+  ) {
+    return { ...assessment, interactionIntent: 'query' };
+  }
   if (assessment.interactionIntent === 'ambiguous') {
     return { ...assessment, interactionIntent: 'query' };
   }

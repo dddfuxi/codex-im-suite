@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-05-07
+更新时间：2026-05-09
 
 ## 0. 架构文档维护规则
 
@@ -71,19 +71,22 @@ Feishu 接收现在是双通道：
 
 - WS 长连是主链路。
 - p2p 私聊有历史轮询补捞兜底，避免私聊事件偶发漏掉。
+- 群聊 `require_mention=true` 时，adapter 先读事件自带 `message.mentions`，缺失时再从正文里的飞书 `<at ...>` / post `tag=at` 结构兜底识别 bot mention，避免长连事件缺少 mentions 数组时把真实 @bot 消息误丢弃。
 
 收到消息后进入 `bridge-core` 的消息处理主线：
 
 1. 记录运行审计。
 2. 去重。
-3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、纯闲聊问候、飞书文档列表、owner 二次确认系统动作和高置信直接提醒。
+3. 先在 `bridge-manager` 处理无需模型参与的确定性入口，例如权限数字快捷回复、纯闲聊问候、飞书文档列表、`/feishu` 开放平台能力诊断、在线扩展搜索/安装确认、owner 二次确认系统动作和高置信直接提醒。
 4. 绑定 chat/session。
 5. 记录轻量记忆事件，按 user/chat/global profile 滚动汇总事实、偏好、主题和待跟进项。
-6. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。
-7. 调用运行时 provider。
-8. 解析最终结果块和 `cti-reminder` 动作块。
-9. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
-10. 通过 Feishu 原生 reply/card/image 等方式回复。
+6. 如果消息里包含飞书 Docx、Sheets 或 Base 链接，bridge-core 调用 bridge-runtime 的云文档 host；runtime 先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户 token 读取，并把真实内容作为本轮 system context 注入。缺用户 token 时发送登录授权卡片；`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网回调，用户把飞书授权后的 `code/state` 回调 URL 复制回飞书完成绑定。登录后仍无权限时返回明确阻塞。
+7. Feishu Owner 可用 `/feishu` 查看开放平台能力诊断：本地配置、应用 token 直读能力、OAuth fallback 请求 scope、`CTI_FEISHU_GRANTED_SCOPES` 声明的已开通权限，以及各能力缺口。
+8. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。
+9. 调用运行时 provider。
+10. 解析最终结果块和 `cti-reminder` 动作块。
+11. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
+12. 通过 Feishu 原生 reply/card/image 等方式回复。
 
 ```mermaid
 sequenceDiagram
@@ -91,12 +94,21 @@ sequenceDiagram
   participant Feishu as Feishu WS/History
   participant Core as bridge-core
   participant Runtime as bridge-runtime
+  participant Cloud as Feishu 云文档 API/OAuth
   participant Provider as Codex 或本地辅助
   participant Sender as Feishu 发送器
 
   User->>Feishu: 发送群聊或私聊消息
   Feishu->>Core: WS 事件或 p2p 轮询补捞
   Core->>Core: 去重、审计、直接命令门禁
+  opt 消息包含飞书云文档链接
+    Core->>Runtime: 请求解析云文档链接
+    Runtime->>Cloud: 先用 tenant_access_token 读取
+    Runtime->>Cloud: 应用无权时用发起人 user_access_token 读取
+    User->>Core: manual 模式下回传 code/state
+    Cloud-->>Runtime: 返回内容或权限阻塞
+    Runtime-->>Core: 注入上下文或登录/权限提示
+  end
   Core->>Runtime: 构造上下文并请求执行
   Runtime->>Provider: 按策略选择执行层
   Provider-->>Runtime: 返回 cti-final 或可见结果
@@ -178,10 +190,10 @@ Workflow run 运行状态：
 
 断点续跑第一版：
 
-- provider 创建 run 后会向 `workflow-runs.json` 写入最小恢复输入，包括 prompt、工作目录、模型、system prompt、权限模式、channelType 和 chatId。
+- provider 创建 run 后会向 `workflow-runs.json` 写入最小恢复输入，包括 prompt、工作目录、模型、system prompt、权限模式、channelType、chatId、发起人 userId、显示名和 messageId。
 - bridge-runtime 启动时会检查上一次遗留的 `running` run；有恢复输入且未耗尽次数的标为 `recoverable + retry_pending`，缺少 prompt 等关键信息的标为 `not_recoverable + failed`。
 - provider 执行失败时会对可恢复 run 排队一次 `auto_pending` 自动重试；控制面板可通过 `workflow.retryRun` 把失败 run 改为 `manual_pending`。
-- retry worker 在 bridge 启动后常驻轮询，优先领取手动 retry，再领取自动 retry；重跑成功后写回会话历史，并在保留 channelType/chatId 时主动回发“断点续跑重试结果”。
+- retry worker 在 bridge 启动后常驻轮询，优先领取手动 retry，再领取自动 retry；重跑前会执行同一套飞书云文档预读取，成功时注入真实内容，缺授权时发送登录/权限阻断而不让 Codex 公网抓取私有链接；重跑成功后写回会话历史，并在保留 channelType/chatId 时主动回发“断点续跑重试结果”。
 - 当前 retry 是“重新执行最小输入”，不是恢复原 Codex 进程；如果重跑过程中出现新的权限请求，后台 retry 会失败并把错误写回 run。
 
 运行时状态文件：
@@ -190,16 +202,17 @@ Workflow run 运行状态：
 - `C:\Users\admin\.claude-to-im\runtime\executor-status.json`
 - `C:\Users\admin\.claude-to-im\runtime\executor-session-defaults.json`
 
-Executor 目录当前内置四类：
+Executor 目录当前内置五类：
 
 - `codex`：默认主脑 CLI / SDK 执行器，能力包含对话、代码、仓库查询、文件读写、图片输入和 artifact delivery。
 - `claude-cli`：可切换 CLI 后端，能力包含对话、代码、仓库查询、文件读写和图片输入。
-- `local-tool-agent`：受控本地模型 agent，声明本地工具能力和 sandbox 策略，只允许白名单内的低风险或授权后操作。
-- `codex-oss-ollama`：实验性只读执行器，声明 `codex exec --oss --local-provider ollama`，只用于只读问题和记忆检索兜底。
+- `codex-local-fallback`：本地 Agent API 兜底执行器，复用 Codex agent 执行链，只把 API profile 切到本地 OpenAI-compatible 后端。
+- `local-tool-agent`：历史兼容执行器，保留 sandbox 声明但普通用户消息不再选择它作为本地直答入口。
+- `codex-oss-ollama`：实验性只读执行器，仅在本地 AI 类型为 Ollama 时可用，声明 `codex exec --oss --local-provider ollama`。
 
 路由规则：
 
-- `@codex`、`@claude`、`@local`、`@本地`、`@ollama`、`@codex-oss` 显式覆盖当前会话路由。
+- `@codex`、`@claude`、`@local`、`@本地`、`@ollama`、`@codex-oss` 显式覆盖当前会话路由；`@local` / `@本地` 指向 `codex-local-fallback`。
 - 控制面板可按 session 写入默认 executor。
 - 没有显式覆盖时，按 capability、executor priority 和当前真实 provider 偏好做自动选择。
 - 本地 agent 的工具边界由 `ToolSandboxPolicy` 声明，当前允许只读 git、文件读取、文本搜索、受限单文件写入和 MCP 运维入口；高风险动作必须进入权限策略。
@@ -212,11 +225,13 @@ flowchart TD
   Registry --> Router[ExecutorRouter capability + 显式覆盖 + 会话偏好]
   Router --> CodexExecutor[codex executor]
   Router --> ClaudeExecutor[claude-cli executor]
-  Router --> LocalAgentExecutor[local-tool-agent executor]
+  Router --> LocalFallbackExecutor[codex-local-fallback executor]
+  Router --> LocalAgentExecutor[local-tool-agent legacy executor]
   LocalAgentExecutor --> Sandbox[ToolSandboxPolicy]
-  Sandbox --> LocalTools[只读 git / 文件 / 搜索 / MCP 运维]
+  Sandbox --> LocalTools[历史兼容本地工具边界]
   CodexExecutor --> Provider[现有 provider 执行层]
   ClaudeExecutor --> Provider
+  LocalFallbackExecutor --> Provider
   LocalAgentExecutor --> Provider
   Provider --> FinalResponse[cti-final / 可见结果]
   FinalResponse --> WorkflowDone[workflow delivered 或 failed]
@@ -227,39 +242,36 @@ flowchart TD
   RetryState -->|否| NotRecoverable[not_recoverable failed]
 ```
 
-当前默认策略是 `Codex 主脑 + Ollama 本地辅助执行器`：
+当前默认策略是 `Codex 主脑 + 本地 Agent API（兜底/省流）`：
 
-- `hybrid` 模式：默认先由 Codex 判断和执行；只有显式小活才允许本地直接接管，仓库查询和文件检索默认也先交给 Codex。
-- `local_only` 模式：只用本地能力，不能完成的任务明确拒绝。
+- `hybrid` 模式：默认先由 Codex 主 API 判断和执行；主 API 失败后，运行时复用 Codex agent 执行链并切到本地 Agent API profile。
+- `local_only` 模式：默认直接走本地 Agent API profile，不再让本地模型直接生成用户可见回复。
 - `codex_only` 模式：禁用本地辅助，全部走 Codex。
 
-本地辅助范围：
+本地 Agent API 范围：
 
-- 简单 shell / PowerShell 命令草案。
-- Codex 不可用时的只读仓库查询兜底，例如 `git status`、`git branch --show-current`、`git log --oneline -n 10`。
-- Codex 不可用时的文件读取、文本搜索和受控单文件写入兜底。
-- MCP 运维小活：状态、启动、停止、工具列表、显式 HTTP tool call。
+- 作为 Codex agent 的 OpenAI-compatible 后端，用于 Codex 主 API 不可用时继续执行同一请求。
+- 显式 `local_only` 或 `@local` 请求使用同一套本地 Agent API profile，强制传递 `CTI_LOCAL_AI_MODEL`。
+- 使用独立 `CODEX_HOME`：`CTI_HOME\runtime\codex-home-local-fallback`，避免主 Codex 会话、模型名和 resume thread 混用。
+- 通过 `CTI_CODEX_LOCAL_FALLBACK_ENABLED` 控制是否启用，默认启用；`CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT` 默认 `minimal`。
+- MCP 运维小活：状态、启动、停止、工具列表、显式 HTTP tool call。`hybrid` / `codex_only` 模式下这些请求先交给 Codex 主链路；本地 MCP 快路径只在 `local_only` 或 Codex 明确失败后的受控兜底里执行。
 - Ignis 创意生成快路径：原画、生成图、视频、模型、canvas、file_id、turn_id 的提交和查询。
 - 本地快路径在进入 Ignis、MCP、本地执行器前，统一先做“询问 / 操作”判定；歧义默认按询问处理，只允许只读查询，不直接触发生成、启动、停止、写入或 `git pull`。
 - 所有 fast-path handler 在触碰 MCP manifest、启动服务、调用工具或执行本地计划前，都必须重新做 intent preflight；旧 MCP 快路径入口也委托到同一套判断，避免绕过新版规则。
 - Ignis 的“最近几次 / 历史 / 整理成列表”优先走历史列表意图，不再因为出现 “Ignis + 检查” 就误落到状态检查。
 - Ignis 状态、安装、配置、工具列表类问题不进入生成接口；只有明确创意生成意图才提交任务。
-- MCP 快路径只在明确动词下才执行启动、停止、重启和显式 tool call；只说“看看 MCP”时默认返回状态/帮助，不自动操作任何 MCP。
+- MCP 快路径只在明确动词下才执行启动、停止、重启和显式 tool call；只说“看看 MCP”时默认返回基于合并 manifest 的动态状态/帮助，不自动操作任何 MCP，也不维护硬编码入口列表。
 - Unity/Blender 场景、节点、Prefab、模型、截图、导入导出这类实际工作即使写了 `unitymcp` / `blendermcp`，也不允许被本地 MCP 状态快路径抢答，必须回到 Codex 主脑做正式工具编排。
-- 本地执行器把 `git status`、`git branch --show-current`、`git log --oneline -n 10`、读文件、搜索文本视为只读查询；`git pull`、`git fetch`、写文件等 mutating 操作必须命中明确动作语义才会执行。
-- 本地执行器的文本搜索优先走内置 `search_text`，不依赖本机 `rg.exe`；如果本地模型误生成简单 `rg ... "pattern"` 计划，运行时会转换成 sandbox 内搜索，避免系统拒绝执行外部检索命令导致辅助器误报失败。
-- 中文仓库查询仍会命中同一套只读规则，例如“帮我看看 git 状态”“当前分支是什么”“最近几条提交”；但在 `hybrid` 模式下它们默认先交给 Codex，只有 Codex 不可用时才回退到本地 repo fast-path。
-- “读取文件 / 查看文件 / 搜索文本”在 `hybrid` 模式下同样默认先交给 Codex；本地执行器只保留为失败后的窄兜底，不再抢答主链路。
+- 历史本地执行器仍保留只读规则和 sandbox 工具边界，但不再作为普通飞书消息的最终回复 provider；需要兜底时由 Codex agent 切本地 API 后继续执行。
 - `关机`、`shutdown`、重启机器等系统级动作现在直接标记为高风险请求，不允许走本地省流路径。
 - 对 Unity、Blender、MCP、仓库、文件、图片和历史这类可执行请求，回复契约要求“解决问题优先”：必须基于真实工具结果、真实命令结果或明确阻塞原因回报；不得用通用教程、占位表格或示例脚本替代执行结果。
-- Codex/MCP 执行链失败时，Unity/Blender/MCP/文档等需要真实工具输出的任务不会再降级给本地模型生成教程；runtime 会直接返回确定性 `未完成 + 阻塞原因`，bridge-core 出站前还会拦截“请手动检查 / 自行打开 Unity / 示例列表草案”等外包式回复。
+- Codex/MCP 执行链失败时，Unity/Blender/MCP/文档等需要真实工具输出的任务会先尝试本地 Agent API profile；主 Codex API 和本地 Agent API 都不可用时才返回确定性 `未完成 + 阻塞原因`，不再降级给本地模型生成教程。MCP 状态类问题在失败兜底里会读取 suite manifest 与用户 overlay，并用 `codex mcp list` 判断 stdio MCP 是否已注册，已注册但未握手时显示“待 Codex 会话握手时加载”。
 - Unity 截图/预览任务要求当前轮真实刷新或截图产物；如果 MCP 握手、场景刷新或截图阻塞，回复必须文本说明阻塞，不得从历史 capture 目录挑旧图回传。Unity HTTP MCP 的裸 `/mcp` 406 响应视为服务已响应但握手头不完整，后续应使用 `Accept: application/json, text/event-stream` 和正式 MCP initialize/list-tools 流程确认工具可用性。
-- bridge runtime 会为 Codex 使用独立 `CTI_CODEX_HOME`，同步全局认证和 MCP 配置时剔除全局顶层 `model = ...`，避免本机 Codex UI 的新模型配置拖垮旧 CLI；运行版可用 `CTI_CODEX_MODEL` 显式指定当前 CLI 已验证可用的模型。
+- bridge runtime 会为 Codex 主 profile 使用独立 `CTI_CODEX_HOME`，同步全局认证和 MCP 配置时剔除全局顶层 `model = ...`，避免本机 Codex UI 的新模型配置拖垮旧 CLI；运行版可用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL` 和 `CTI_CODEX_REASONING_EFFORT` 显式指定 Codex 主 API 入口和模型策略。
 - Ignis 生成类任务提交后会等待完成并下载可回传资产，最终回复走 `cti-final`，避免向飞书裸发 CLI JSON 或大段技术字段。
 - Ignis 仅在“该/这张/刚才/上一版/继续”等明确引用时复用上一轮 session 和参考图；普通新生成请求默认新开会话。
 - Ignis 模型生成如果明确要求拆成 FBX/贴图，会在 GLB 下载完成后调用 `scripts/export-glb-asset-package.ps1`，输出 FBX、贴图、材质映射和 manifest，并通过 `cti-final.files` 回传不超过飞书限制的文件。
-- Codex 不可用时的记忆类兜底回答。
-- 本地模型服务统一改为 Ollama，默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`。旧 `llama.cpp` server、GGUF 路径和 `127.0.0.1:8080` 默认地址不再是运行来源。
+- 本地模型默认仍使用 Ollama，默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`；也可以通过 `CTI_LOCAL_AI_KIND`、`CTI_LOCAL_AI_BASE_URL`、`CTI_LOCAL_AI_MODEL`、`CTI_LOCAL_AI_API_KEY` 和 `CTI_LOCAL_AI_TIMEOUT_MS` 切到 LM Studio、vLLM 或其他 OpenAI-compatible Chat Completions 服务。旧 `llama.cpp` server、GGUF 路径和 `127.0.0.1:8080` 默认地址不再是运行来源。
 
 不交给本地辅助直接完成的范围：
 
@@ -273,22 +285,17 @@ flowchart TD
 flowchart TD
   Request[入站请求] --> Mode{当前模式}
   Mode -->|codex_only| Codex[Codex 主脑]
-  Mode -->|local_only| LocalScope{是否本地可处理}
-  Mode -->|hybrid| CodexFirst{是否需要 Codex 先判}
-  CodexFirst -->|默认是| Codex
-  CodexFirst -->|显式小活| ExplicitSmallTask{是否允许本地直处理}
-  ExplicitSmallTask -->|是| LocalAgent[本地辅助执行器]
-  ExplicitSmallTask -->|否| Codex
-  LocalScope -->|是| LocalAgent
-  LocalScope -->|否| LocalLimit[说明本地模式限制]
+  Mode -->|local_only| LocalFallback[Codex agent + 本地 Agent API]
+  Mode -->|hybrid| Codex
   Codex -->|成功| FinalReply[cti-final 结果块]
-  Codex -->|不可用或额度失败| LocalFallback[本地兜底]
-  LocalAgent --> FinalReply
-  LocalFallback --> MemoryRecall[检索本地记忆]
-  LocalAgent --> IgnisFastPath[Ignis MCP 异步生成和查询]
+  Codex -->|主 API 失败| LocalFallback
+  LocalFallback -->|成功| FinalReply
+  LocalFallback -->|失败或关闭| Blocker[主 Codex API 与本地 Agent API 都不可用]
+  Blocker --> FinalReply
+  LocalFallback --> MemoryContext[同一请求上下文和记忆注入]
+  MemoryContext --> FinalReply
+  Codex --> IgnisFastPath[Ignis MCP 异步生成和查询]
   IgnisFastPath --> FinalReply
-  MemoryRecall --> FinalReply
-  LocalLimit --> FinalReply
 ```
 
 ## 3. 核心包职责
@@ -311,13 +318,18 @@ flowchart TD
 
 - Feishu 群聊原生 reply。
 - 群聊 reply 时可自动 @ 提问人。
+- 群聊 mention 判定优先使用事件 `mentions`，事件缺字段时再解析正文里的飞书 at 标记，避免“已 @ 机器人但消息未入会话”。
 - Feishu Markdown 默认走 card。
+- 飞书 Docx、Sheets、Base 入站链接会先走运行时云文档 host；bridge-core 只接收结构化结果，不持有应用 token 或用户 OAuth token。
+- `/feishu` 是 Owner 诊断入口：按飞书开放平台能力列出消息、资源、历史、reaction、CardKit、应用 token 云文档直读、用户 OAuth fallback、Docx、Sheets、Base 等所需 scope，并和 `CTI_FEISHU_GRANTED_SCOPES` 做本地差异检查；不会读取或显示 App Secret。
 - 图片和文件由结果块显式声明，桥接不再靠正文猜路径。
 - 飞书本地图片和本地文件分别走原生 image/file 消息回传；`.glb` 等非图片资产不能退化成仅发本地路径。
 - 超过飞书 IM 单文件上传限制的生成资产改发文档链接或下载链接，不再假装“已发送文件”。
 - 本地 `cti-final.files` 文件超过飞书 30MB 单文件限制时，出站层不再分卷，而是走 artifact delivery provider；飞书场景优先支持 `feishu_docx`，会自动创建新版云文档、把文件作为 `docx_file` 附件挂入文档，并回文档链接；也保留 `local_http` 作为公网目录备用方案。
 - 直接提醒由 Codex 判断意图，但只允许通过 `cti-reminder` 动作块请求；bridge-core 校验动作后调用运行时 reminder host，防止 Codex 自行声称“已创建系统计划任务 / 已实际发送”。
 - 到点提醒的飞书出站优先使用互动卡片，卡片按钮 callback data 为 `reminder:complete:<reminderId>`；`card.action.trigger` 回调在 `bridge-manager` 内直接转给 reminder host，不进入 Codex，也不复用普通权限按钮链路。
+- 在线扩展安装由 `/ext search`、`/ext install`、`/ext remove` 和高置信自然语言触发进入确定性链路；搜索只展示候选，安装和移除必须发确认卡片。卡片按钮 callback data 使用 `extinstall:confirm:<nonce>` 或 `extinstall:remove:<nonce>`，不复用 `perm:*` 权限按钮。
+- 扩展安装和移除确认只允许同一 chat、同一 Feishu user 且具备 `Owner` 角色的发起人点击；bridge-core 只做命令解析、权限和卡片交互，不直接写扩展目录。
 - 用户回复到上一条图片/文件时，Feishu adapter 会尽量读取被回复消息并把附件并入本次请求。
 - `bridge-runtime-audit.json` 记录最后阶段、最后消息、WS 状态、p2p 补捞状态。
 - 权限门禁统一通过 `hasRole(message, role)` 判定；`Owner` 包含 `Operator` 和 `Viewer` 能力，`Operator` 包含 `Viewer` 能力。关机、发布、越权路径和 mutating 直达命令只允许 `Owner`，普通工具授权和中风险运维允许 `Operator` 或 `Owner`。
@@ -329,17 +341,19 @@ flowchart TD
 - 读取 `config.env`。
 - 启动 daemon/supervisor。
 - 接入 Codex / Claude CLI provider。
-- 接入 Ollama 本地模型。
-- 本地辅助执行器。
+- 接入本地 Agent API profile（默认 Ollama，也支持 OpenAI-compatible）。
+- 保留历史本地辅助执行器边界。
 - MCP manifest 解析和调用。
 - 本地 JSON store。
 - 记忆检索、Feishu 历史索引、`memory-profiles.json` 轻量画像索引和 Markdown 知识库索引。
 - workflow / executor 观测、运行中请求恢复信息持久化、bridge 重启后的可恢复状态识别和 retry worker。
+- 扩展目录 host：接收 bridge-core 的搜索、URL 预览、准备安装、确认安装和确认移除请求，通过本机 Control API 调用控制面板，不在运行时重新实现安装器。
+- Feishu OAuth 和云文档 host：先用应用 `tenant_access_token` 读取 Docx / Sheets / Base，应用无权时再使用发起人 OAuth token；保存加密用户 token。callback 模式按需启动公网回调监听，manual 模式使用飞书官方 `authen/v1/authorize` 授权页并让用户把 `code/state` 回调 URL 发回飞书；读取失败时会按具体接口返回需要检查的只读 scope，避免把权限不足伪装成空内容。
 
 关键能力：
 
-- Codex 失败时切本地模型兜底。
-- 本地模型兜底时会检索本地记忆，不再空猜。
+- Codex 主 API 失败时切到 `codex_local_fallback`，复用 Codex agent 并使用本地 Agent API。
+- 主 API 与本地 Agent API 都不可用时返回明确阻塞，不再生成本地模型直答。
 - 记忆索引分四层：Markdown 知识库索引、当前会话压缩摘要、按人/按聊天/全局 profile、Feishu 历史片段。模型上下文只注入检索命中的少量片段，当前请求始终优先。
 - Markdown 知识库默认读取 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`。知识单元分为 `事实 / 结论 / 待办 / 资源`，保留来源文件和片段。
 - 历史乱码修复入口为 `scripts/repair-history-mojibake.ps1`。默认 dry-run 扫描 `CTI_HOME\data` 历史、Feishu 历史索引、记忆 Markdown 和 `.cti-index`；显式 `-Apply` 时备份原文件、修复典型 mojibake、重建 `knowledge.json` 和 `reminders.json`，`-Restore <manifest>` 可回滚备份。
@@ -357,6 +371,7 @@ flowchart TD
 - MCP 工作目录检查，防止误连其他项目。
 - 默认工作区和 Unity 工程路径由配置控制。
 - `workflow-runs.json` 保存最近 workflow run、事件、recovery 和 retry 状态；它是控制面板展示执行历程、手动重试失败 run 和 bridge 重启后自动续跑的事实来源。
+- 扩展确认动作写入 `C:\Users\admin\.claude-to-im\data\extension-install-actions.json`，默认 TTL 10 分钟；确认时校验 nonce、chat、user 和过期时间，通过后调用 Control API 的 `extension.remote.install` 或 `extension.remote.remove`。
 
 ### 3.3 packages/mcp-picture
 
@@ -423,6 +438,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
 - 查看记忆知识库索引状态、监听状态、关键词搜索、类型筛选和来源片段。
+- 通过“AI API”运行策略向导配置和测试 Codex 主 API / 本地 Agent API；常用模式只展示策略、服务、模型和地址，高级字段折叠保留。API key 只写入本机 `config.env`，Web 状态只返回是否已设置和掩码。
 
 截至 2026-04-27，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
 
@@ -498,6 +514,7 @@ HostBridge 命令协议：
 - 运行单元：`runtime.listUnits`、`runtime.invokeAction`
 - 扩展：`extension.enable`、`extension.disable`、`extension.remove`、`extension.install`
 - 扩展导入：`extension.detectImport`、`extension.importFromFolder`
+- 在线扩展目录：`extension.catalog.list`、`extension.catalog.refresh`、`extension.remote.preview`、`extension.remote.install`、`extension.remote.remove`
 - 会话：`history.listSessions`、`history.getSessionDetail`、`history.openConversationViewer`
 - 记忆：`memory.status`、`memory.search`、`memory.openSource`、`memory.reminders`、`memory.checkReminders`、`memory.testReminder`
 - 设置与路径：`settings.read`、`settings.save`、`settings.listReplyPresets`、`settings.applyReplyPreset`、`settings.summarizeReplyStyle`、`path.pickFolder`、`path.pickFile`、`path.openAny`
@@ -550,11 +567,23 @@ Control API HTTP 接口：
 - `aliases` 给运行时提供自然语言匹配词，MCP 快路径按 manifest 动态解析目标，不再维护固定 MCP 名称列表。
 - `installer` / `bootstrap` 用于声明可由控制面板触发的安装脚本；宿主通过白名单环境变量把扩展 ID、类型、source 和 manifest 路径传给安装脚本，不允许前端直接执行 shell。
 
+截至 2026-05-08，控制面板新增在线扩展目录 v1：
+
+- 本地种子是 `config/extension-catalog.json`，远端精选目录通过 `CTI_EXTENSION_CATALOG_URLS` 追加。
+- 下载和安装内容只落在 `C:\Users\admin\.claude-to-im\extensions`，不进入 `release` 或源码仓库。
+- 用户安装生成的 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d`、`extensions\manifests\plugins.d`，面板、`mcp-bridge`、`install-suite-skills.ps1` 和 `register-external-mcps.ps1` 会和 `config/*.d` 合并读取。
+- 允许的安装 handler 固定为 `skill.copy`、`mcp.npm`、`mcp.uvx`、`mcp.zip`、`ollama.pull`、`manifest.record` 和 `codex-plugin.record`；HTTPS URL 预览只接受单个 catalog item JSON 或带 `extension.json` 的 zip。
+- 目录快照会同时识别 `installed-lock.json`、本机 Ollama `/api/tags`、内置 `config/*.d` manifest 和用户 overlay manifest。内置 config 记录显示为已安装但不可从目录删除，只有用户 overlay 或安装锁记录显示可“移除记录”。
+- “移除记录”只删除 suite 生成的用户覆盖层 manifest、launcher 或安装锁记录；不删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。
+- 精选目录条目有 `sha256` 时安装前校验；没有校验值的 URL 被标记为不可信，必须由用户确认。远程 Control API 安装和移除要求 Owner；飞书入口还会先发 Owner 确认卡片。
+- Codex app plugin 条目可以出现在目录中作为 `codex-plugin.record` 记录项，例如 Browser 插件记录为 `source=codex-plugin:browser-use`；安装只写 suite 记录，移除只删除 suite 记录。
+
 ### 5.1 MCP
 
 目录：
 
 - `config/mcp.d`
+- `C:\Users\admin\.claude-to-im\extensions\manifests\mcp.d`
 
 当前 MCP：
 
@@ -597,6 +626,8 @@ MCP 安全规则：
 flowchart LR
   SuiteManifest[suite.manifest.json] --> Protocol[extension-manifest/v1]
   Protocol --> ManifestDir[config/mcp.d]
+  Catalog[extension-catalog/v1 在线目录] --> UserOverlay[CTI_HOME extensions/manifests]
+  UserOverlay --> Loader[MCP manifest loader]
   ManifestDir --> Loader[MCP manifest loader]
   Loader --> AliasMatch[按 aliases 和 displayName 匹配目标]
   Loader --> WorkspaceCheck{cwd 是否允许}
@@ -615,6 +646,7 @@ flowchart LR
 
 - `config/skills.d`
 - `extensions/skills`
+- `C:\Users\admin\.claude-to-im\extensions\manifests\skills.d`
 
 当前纳入项目备份的 skills：
 
@@ -637,17 +669,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 目录：
 
 - `config/plugins.d`
+- `C:\Users\admin\.claude-to-im\extensions\manifests\plugins.d`
 
 当前记录：
 
+- `browser-use`
 - `build-web-apps`
 - `game-studio`
 
-## 6. Ollama 本地模型
+## 6. 本地 Agent API
 
-当前本地模型链路：
+当前本地 Agent API 链路：
 
-- Ollama server
+- 默认 Ollama server，也支持 OpenAI-compatible Chat Completions
 - 默认地址 `http://127.0.0.1:11434`
 - 默认模型 `qwen2.5-coder:7b`
 - OpenAI-compatible `/v1/chat/completions`
@@ -656,9 +690,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 定位：
 
 - 不是主脑。
-- 是本地辅助执行器和 Codex 不可用时的兜底。
-- 适合小命令、简单解释、记忆类兜底、轻量文件操作。
-- 在 `local_only` 模式下，原画、生成图、视频、模型等 Ignis 请求可以直接调用 Ignis MCP。
+- 是 Codex agent 的本地/自托管 API 后端，用于 Codex 主 API 失败后的省流兜底。
+- 不作为普通飞书消息的直接回复器，不再生成 `local_best_effort` 用户可见答复。
+- 面板配置写入 `CTI_LOCAL_AI_*`，Codex fallback profile 会读取这些值并强制传递本地模型名。
+- 在 `local_only` 模式下，仍通过 Codex agent + 本地 Agent API 执行请求。
 
 脚本：
 
@@ -668,7 +703,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `scripts/local-llm/healthcheck-local-llm.ps1`
 - `scripts/export-glb-asset-package.ps1`
 
-旧 `CTI_LOCAL_LLM_SERVER_EXE`、`CTI_LOCAL_LLM_MODEL_PATH`、`CTI_LOCAL_LLM_SERVER_ARGS`、`llama-server.exe` 和 GGUF 路径配置已废弃。`CTI_LOCAL_LLM_*` 中的路由键暂时保留为兼容项；用户可见配置统一使用 `CTI_OLLAMA_ENABLED`、`CTI_OLLAMA_BASE_URL`、`CTI_OLLAMA_MODEL`、`CTI_OLLAMA_TIMEOUT_MS`。
+新配置优先级：
+
+- `CTI_LOCAL_AI_KIND`：`ollama`、`lmstudio`、`vllm`、`openai-compatible` 或 `custom`。
+- `CTI_LOCAL_AI_BASE_URL` / `CTI_LOCAL_AI_MODEL` / `CTI_LOCAL_AI_API_KEY` / `CTI_LOCAL_AI_TIMEOUT_MS`：本地 AI 请求入口、模型、可选 Bearer key 和超时。
+- `CTI_CODEX_LOCAL_FALLBACK_ENABLED`：控制 Codex 主 API 失败后是否启用本地 Agent API，默认 `true`。
+- `CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT`：本地 fallback profile 的 reasoning effort，默认 `minimal`。
+- `CTI_OLLAMA_*` 保留兼容；未设置 `CTI_LOCAL_AI_*` 时继续作为默认值来源。
+
+旧 `CTI_LOCAL_LLM_SERVER_EXE`、`CTI_LOCAL_LLM_MODEL_PATH`、`CTI_LOCAL_LLM_SERVER_ARGS`、`llama-server.exe` 和 GGUF 路径配置已废弃。`CTI_LOCAL_LLM_*` 中的路由键暂时保留为兼容项；用户可见配置统一通过面板“AI API”写入“Codex 主 API”和“本地 Agent API（兜底/省流）”。
 
 Ignis 会话映射：
 
@@ -688,6 +731,7 @@ Ignis 会话映射：
 - `bindings.json`
 - `permissions.json`
 - `permission-links.json`
+- `feishu-oauth-tokens.json`
 - `messages`
 - `message-archives`
 - `feishu-chat-index.json`
@@ -705,7 +749,7 @@ Ignis 会话映射：
 - 知识单元分为 `事实 / 结论 / 待办 / 资源`，结果保留来源路径、片段和冲突标记。
 - 待办提醒索引为派生文件：`.cti-index\reminders.json` 保存待发送、已发送、跳过和失败的展示数据，`.cti-index\reminder-state.json` 保存 `pending / sent / failed / skipped` 推送状态和最近结果。控制面板“记忆”页显示提醒时间、来源类型、来源会话、来源片段、跳过原因和飞书测试发送入口。
 - `sourceType=direct` 的提醒来自 `cti-reminder` 或 `/remind`，源文件落在 `data\todos\direct-reminders`；面板会把它和普通 `sourceType=memory` 待办区分展示。
-- Codex 不可用时，Ollama 只允许处理只读问题和记忆检索兜底；Unity、Blender、MCP、文件写入、发布等任务不得被本地模型伪装完成。
+- Codex 主 API 不可用时，兜底仍由 Codex agent 切到本地 Agent API 执行；如果本地 API 也不可用，工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
 
 ## 8. 结果封装协议
 
@@ -791,7 +835,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\prepare-main-release.ps1
 - 校验 `extension-manifest/v1`。
 - 检查架构文档维护状态。
 - 扫描疑似密钥和 token。
-- 构建 package 和控制面板。
+- 构建 package 和控制面板；控制面板发布输出目录会先做运行进程检查并清空，避免旧 Vite hash 资产残留影响 fork health。
 - 组装 portable 和 installer。
 - 执行 portable / installer payload 分叉体检；live skill 按主干预检策略跳过。
 - 生成 `publish-summary.md` 并追加 `release-notes.md`。
@@ -831,7 +875,7 @@ flowchart TD
   Git --> Tag[create-main-release-tag.ps1]
 ```
 
-同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。发布和同步脚本在覆盖 live、portable 或 installer payload 前会检查这些目录下的运行进程；命中时只报告 PID 和路径并中止，不自动结束进程。
+同步方向固定为 `suite -> live`。`scripts/import-live-to-suite.ps1` 只用于手动救回 live 中的历史改动，默认 dry-run，不属于主干发布链路。发布和同步脚本在覆盖控制面板发布目录、live、portable 或 installer payload 前会检查这些目录下的运行进程；默认只结束目标目录内的进程后继续更新，不按进程名全局结束。需要恢复阻断模式时，传 `-NoForceUpdate` 或设置 `CTI_RELEASE_FORCE_UPDATE=false`。
 
 live skill 同步时，`scripts/sync-live-skill.ps1` 只把开发版源码和构建产物写入：
 

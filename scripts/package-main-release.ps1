@@ -1,3 +1,7 @@
+param(
+    [switch]$NoForceUpdate
+)
+
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -12,9 +16,9 @@ $env:CTI_RELEASE_CONTROL_PANEL_DIR = $controlPanelArtifactDir
 
 try {
     & (Join-Path $scriptDir 'validate-extension-manifests.ps1')
-    & (Join-Path $scriptDir 'build-packages.ps1') -ControlPanelOutputDir $controlPanelArtifactDir
-    & (Join-Path $scriptDir 'assemble-portable.ps1') -ControlPanelArtifactDir $controlPanelArtifactDir
-    & (Join-Path $scriptDir 'build-installer.ps1')
+    & (Join-Path $scriptDir 'build-packages.ps1') -ControlPanelOutputDir $controlPanelArtifactDir -NoForceUpdate:$NoForceUpdate
+    & (Join-Path $scriptDir 'assemble-portable.ps1') -ControlPanelArtifactDir $controlPanelArtifactDir -NoForceUpdate:$NoForceUpdate
+    & (Join-Path $scriptDir 'build-installer.ps1') -NoForceUpdate:$NoForceUpdate
     & (Join-Path $scriptDir 'test-release-fork-health.ps1') -Mode MainPreflight -FailOnFork
     if ($LASTEXITCODE -ne 0) {
         throw "release fork health failed ($LASTEXITCODE)"

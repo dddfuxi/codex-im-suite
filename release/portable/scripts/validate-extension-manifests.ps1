@@ -14,15 +14,20 @@ if (-not $ManifestRoot) {
 $suiteManifest = Get-SuiteManifest -SuiteRoot $suiteRoot
 $protocolId = if ($suiteManifest.extensionProtocol.id) { [string]$suiteManifest.extensionProtocol.id } else { 'extension-manifest/v1' }
 $suiteVersion = [string]$suiteManifest.version
+$ctiHome = if ([string]::IsNullOrWhiteSpace($env:CTI_HOME)) { Join-Path $env:USERPROFILE '.claude-to-im' } else { [string]$env:CTI_HOME }
+$overlayManifestRoot = Join-Path $ctiHome 'extensions\manifests'
 $requiredFields = @($suiteManifest.extensionProtocol.requiredFields | ForEach-Object { [string]$_ })
 if ($requiredFields.Count -eq 0) {
     $requiredFields = @('id', 'displayName', 'type', 'version', 'compatibility', 'category', 'optional', 'installState', 'source', 'enabled', 'description')
 }
 
 $knownDirs = @(
-    @{ Path = Join-Path $ManifestRoot 'mcp.d'; Types = @('http', 'stdio'); Label = 'mcp' },
-    @{ Path = Join-Path $ManifestRoot 'skills.d'; Types = @('skill'); Label = 'skill' },
-    @{ Path = Join-Path $ManifestRoot 'plugins.d'; Types = @('plugin'); Label = 'plugin' }
+    @{ Path = Join-Path $ManifestRoot 'mcp.d'; Types = @('http', 'stdio'); Label = 'mcp'; Required = $true },
+    @{ Path = Join-Path $overlayManifestRoot 'mcp.d'; Types = @('http', 'stdio'); Label = 'mcp overlay'; Required = $false },
+    @{ Path = Join-Path $ManifestRoot 'skills.d'; Types = @('skill'); Label = 'skill'; Required = $true },
+    @{ Path = Join-Path $overlayManifestRoot 'skills.d'; Types = @('skill'); Label = 'skill overlay'; Required = $false },
+    @{ Path = Join-Path $ManifestRoot 'plugins.d'; Types = @('plugin'); Label = 'plugin'; Required = $true },
+    @{ Path = Join-Path $overlayManifestRoot 'plugins.d'; Types = @('plugin'); Label = 'plugin overlay'; Required = $false }
 )
 
 $errors = New-Object System.Collections.Generic.List[string]
@@ -164,7 +169,9 @@ function Test-ManifestFile {
 
 foreach ($dir in $knownDirs) {
     if (-not (Test-Path -LiteralPath $dir.Path)) {
-        Add-Error "manifest 目录不存在：$($dir.Path)"
+        if ($dir.Required) {
+            Add-Error "manifest 目录不存在：$($dir.Path)"
+        }
         continue
     }
     Get-ChildItem -LiteralPath $dir.Path -Filter '*.json' -File | Sort-Object Name | ForEach-Object {

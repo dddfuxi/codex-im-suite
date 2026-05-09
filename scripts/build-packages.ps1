@@ -1,5 +1,6 @@
 param(
-    [string]$ControlPanelOutputDir
+    [string]$ControlPanelOutputDir,
+    [switch]$NoForceUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,6 +119,10 @@ Invoke-ControlPanelWebBuild -Path $controlPanelWeb
 $controlPanel = Join-Path $suiteRoot 'apps\control-panel\CodexImSuite.ControlPanel.csproj'
 if (-not $ControlPanelOutputDir) {
     $ControlPanelOutputDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
+}
+Clear-RunningProcessInPathForUpdate -Roots @($ControlPanelOutputDir) -Purpose 'control panel publish' -NoForceUpdate:$NoForceUpdate
+if (Test-Path -LiteralPath $ControlPanelOutputDir) {
+    Remove-PathForUpdate -Path $ControlPanelOutputDir -Purpose 'control panel publish cleanup'
 }
 dotnet publish $controlPanel -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $ControlPanelOutputDir
 if ($LASTEXITCODE -ne 0) {

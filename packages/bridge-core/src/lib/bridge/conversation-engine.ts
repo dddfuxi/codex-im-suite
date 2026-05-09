@@ -67,6 +67,7 @@ export interface ConversationProcessOptions {
   extraSystemPrompt?: string;
   memoryUserId?: string;
   memoryUserDisplayName?: string;
+  sourceMessageId?: string;
 }
 
 const MUTATING_COMMAND_RE = /\b(git\s+(pull|rebase|merge|checkout|switch|reset|clean|stash(?:\s+(?:pop|apply))?)|npm\s+(install|update|uninstall)|pnpm\s+(install|update|add|remove)|yarn\s+(install|add|remove)|mkdir|rmdir|rm|mv|cp|touch|del|copy|move-item|remove-item|copy-item|new-item|set-content|add-content)\b/i;
@@ -483,6 +484,9 @@ export async function processMessage(
       provider: resolvedProvider,
       conversationHistory: compactHistory,
       files,
+      sourceUserId: options?.memoryUserId,
+      sourceUserDisplayName: options?.memoryUserDisplayName,
+      sourceMessageId: options?.sourceMessageId,
       onRuntimeStatusChange: (status: string) => {
         try { store.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },

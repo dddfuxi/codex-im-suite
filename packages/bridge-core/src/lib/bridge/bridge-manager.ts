@@ -8,7 +8,15 @@
  */
 
 import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
-import type { ConversationMemoryEvent, DirectReminderCreateResult } from './host.js';
+import type {
+  ConversationMemoryEvent,
+  DirectReminderCreateResult,
+  ExtensionActionActor,
+  ExtensionActionConfirmResult,
+  ExtensionActionPrepareResult,
+  ExtensionCatalogItemSummary,
+  FeishuCloudLinkResolveResult,
+} from './host.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -41,6 +49,7 @@ import {
   recordFeishuDocumentMemory,
   renderFeishuDocumentMemoryList,
 } from './feishu-document-memory.js';
+import { buildFeishuCapabilityReport } from './feishu-capabilities.js';
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -422,6 +431,325 @@ function parseSlashReminderArgs(args: string, now = new Date()): { title: string
     return title && Number.isFinite(date.getTime()) ? { title, dueAt: date.toISOString() } : null;
   }
   return null;
+}
+
+function buildExtensionActor(msg: InboundMessage): ExtensionActionActor {
+  return {
+    channelType: msg.address.channelType,
+    chatId: msg.address.chatId,
+    userId: msg.address.userId,
+    messageId: msg.messageId,
+  };
+}
+
+function formatExtensionItemLine(item: ExtensionCatalogItemSummary): string {
+  const installed = item.installed ? ' · 已安装' : '';
+  const removable = item.canRemove ? ' · 可移除记录' : '';
+  const version = item.version ? ` ${item.version}` : '';
+  const source = item.source ? ` · ${item.source}` : '';
+  return `- ${item.displayName}${version} (${item.type}/${item.id})${installed}${removable}${source}`;
+}
+
+function renderExtensionSearchResults(query: string, items: ExtensionCatalogItemSummary[]): string {
+  if (items.length === 0) {
+    return `没有找到匹配的扩展：${query}`;
+  }
+  return [
+    `扩展目录搜索：${query}`,
+    '',
+    ...items.slice(0, 8).map(formatExtensionItemLine),
+    items.length > 8 ? `还有 ${items.length - 8} 个结果，请缩小关键词。` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function buildExtensionActionCard(
+  title: string,
+  body: string,
+  buttonText: string,
+  callbackData: string,
+  buttonType: 'primary' | 'danger' = 'primary',
+): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      template: buttonType === 'danger' ? 'red' : 'blue',
+      title: { tag: 'plain_text', content: title },
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: body },
+        { tag: 'hr' },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: buttonText },
+          type: buttonType,
+          size: 'medium',
+          value: { callback_data: callbackData },
+        },
+      ],
+    },
+  });
+}
+
+function renderExtensionPrepareText(action: 'install' | 'remove', result: ExtensionActionPrepareResult): string {
+  const item = result.item;
+  const title = action === 'install' ? '等待确认安装' : '等待确认移除记录';
+  const lines = [
+    result.message || title,
+    item ? formatExtensionItemLine(item) : '',
+    result.expiresAt ? `过期时间：${result.expiresAt}` : '',
+    action === 'remove' ? '移除记录不会删除插件缓存、模型本体或外部包管理器内容。' : '',
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+function parseExtensionCallback(callbackData: string): { action: 'confirm' | 'remove'; nonce: string } | null {
+  const parts = callbackData.split(':');
+  if (parts.length < 3 || parts[0] !== 'extinstall') return null;
+  const action = parts[1];
+  if (action !== 'confirm' && action !== 'remove') return null;
+  const nonce = parts.slice(2).join(':').trim();
+  return nonce ? { action, nonce } : null;
+}
+
+function isHttpsText(value: string): boolean {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function isUrlLike(value: string): boolean {
+  return /^https?:\/\//i.test(value.trim());
+}
+
+async function handleExtensionCallback(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  parsed: { action: 'confirm' | 'remove'; nonce: string },
+): Promise<void> {
+  const { extensions } = getBridgeContext();
+  if (!extensions) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '面板未在线或扩展安装能力不可用。',
+      parseMode: 'plain',
+      replyToMessageId: msg.callbackMessageId,
+    });
+    return;
+  }
+  if (!isOwnerMessage(msg)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildOwnerRequiredMessage(msg),
+      parseMode: 'plain',
+      replyToMessageId: msg.callbackMessageId,
+    });
+    return;
+  }
+
+  const actor = buildExtensionActor(msg);
+  const result: ExtensionActionConfirmResult = parsed.action === 'confirm'
+    ? await extensions.confirmInstallAction(parsed.nonce, actor)
+    : await extensions.confirmRemoveAction(parsed.nonce, actor);
+  const text = result.message || result.error || (
+    result.ok
+      ? (parsed.action === 'confirm' ? '安装已完成。' : '记录已移除。')
+      : '扩展操作失败。'
+  );
+  await deliver(adapter, {
+    address: msg.address,
+    text,
+    parseMode: 'plain',
+    replyToMessageId: msg.callbackMessageId,
+  });
+}
+
+function parseNaturalExtensionIntent(text: string): { action: 'search' | 'install'; query: string } | null {
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  const searchMatch = normalized.match(/(?:搜索|查找|找一下).{0,8}(model|模型|mcp|插件|plugin|skill|扩展)?\s*([a-zA-Z0-9_.:@/\-\s]{2,})/i);
+  if (searchMatch) {
+    return { action: 'search', query: searchMatch[2].trim() };
+  }
+  const installMatch = normalized.match(/(?:安装|装|加一下).{0,8}([a-zA-Z0-9_.:@/\-\s]{2,})(?:\s*(?:model|模型|mcp|插件|plugin|skill|扩展))?/i);
+  if (installMatch && /(model|模型|mcp|插件|plugin|skill|扩展|qwen|browser|sequential|memory|fetch|ollama)/i.test(normalized)) {
+    return { action: 'install', query: installMatch[1].trim() };
+  }
+  return null;
+}
+
+async function prepareExtensionInstall(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  queryOrUrl: string,
+): Promise<void> {
+  const { extensions } = getBridgeContext();
+  if (!extensions) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '面板未在线或扩展安装能力不可用。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (!isOwnerMessage(msg)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildOwnerRequiredMessage(msg),
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+
+  let item: ExtensionCatalogItemSummary | null = null;
+  let url = '';
+  if (isUrlLike(queryOrUrl)) {
+    if (!isHttpsText(queryOrUrl)) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: 'URL 安装只允许 HTTPS。',
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    url = queryOrUrl;
+    item = await extensions.previewExtensionUrl(queryOrUrl);
+  } else {
+    const matches = await extensions.searchExtensions(queryOrUrl);
+    if (matches.length === 0) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: `没有找到可安装扩展：${queryOrUrl}`,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    if (matches.length > 1) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: renderExtensionSearchResults(queryOrUrl, matches),
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    item = matches[0];
+  }
+
+  const prepared = await extensions.prepareInstallAction({ item, url: url || undefined, actor: buildExtensionActor(msg) });
+  if (!prepared.ok || !prepared.nonce) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: prepared.error || prepared.message || '扩展安装确认创建失败。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const text = renderExtensionPrepareText('install', prepared);
+  await deliver(adapter, {
+    address: msg.address,
+    text,
+    parseMode: 'plain',
+    replyToMessageId: msg.messageId,
+    feishuCardJson: buildExtensionActionCard('扩展安装确认', text, '安装', `extinstall:confirm:${prepared.nonce}`),
+  });
+}
+
+async function prepareExtensionRemove(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  query: string,
+): Promise<void> {
+  const { extensions } = getBridgeContext();
+  if (!extensions) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '面板未在线或扩展安装能力不可用。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (!isOwnerMessage(msg)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildOwnerRequiredMessage(msg),
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const matches = await extensions.searchExtensions(query);
+  if (matches.length === 0) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `没有找到可移除记录：${query}`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (matches.length > 1) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: renderExtensionSearchResults(query, matches),
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const prepared = await extensions.prepareRemoveAction({ item: matches[0], actor: buildExtensionActor(msg) });
+  if (!prepared.ok || !prepared.nonce) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: prepared.error || prepared.message || '扩展移除确认创建失败。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const text = renderExtensionPrepareText('remove', prepared);
+  await deliver(adapter, {
+    address: msg.address,
+    text,
+    parseMode: 'plain',
+    replyToMessageId: msg.messageId,
+    feishuCardJson: buildExtensionActionCard('移除扩展记录确认', text, '移除记录', `extinstall:remove:${prepared.nonce}`, 'danger'),
+  });
+}
+
+async function handleExtensionCommand(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  args: string,
+): Promise<string> {
+  const { extensions } = getBridgeContext();
+  if (!extensions) return '面板未在线或扩展安装能力不可用。';
+  const [subcommandRaw, ...rest] = args.split(/\s+/);
+  const subcommand = (subcommandRaw || 'search').toLowerCase();
+  const query = rest.join(' ').trim();
+  if (subcommand === 'search') {
+    if (!query) return '用法：/ext search <关键词>';
+    return renderExtensionSearchResults(query, await extensions.searchExtensions(query));
+  }
+  if (subcommand === 'install') {
+    if (!query) return '用法：/ext install <关键词或https-url>';
+    await prepareExtensionInstall(adapter, msg, query);
+    return '';
+  }
+  if (subcommand === 'remove') {
+    if (!query) return '用法：/ext remove <id或关键词>';
+    await prepareExtensionRemove(adapter, msg, query);
+    return '';
+  }
+  return '用法：/ext search|install|remove <关键词或URL>';
 }
 
 function recordConversationMemoryEvent(
@@ -1800,6 +2128,25 @@ function normalizePermissionRole(role: string | undefined | null): PermissionRol
   return 'viewer';
 }
 
+function shouldTryFeishuCloudLinkResolve(adapter: BaseChannelAdapter, text: string): boolean {
+  if (adapter.channelType !== 'feishu') return false;
+  return /https?:\/\/[^\s<>"']*(?:feishu\.cn|larksuite\.com)\/(?:docx|docs|sheets|base|bitable)\//i.test(text);
+}
+
+function shouldTryFeishuOAuthManualCallback(adapter: BaseChannelAdapter, text: string): boolean {
+  if (adapter.channelType !== 'feishu') return false;
+  return /\bcode=[^&\s]+(?:&|&amp;)state=[^&\s]+|\bstate=[^&\s]+(?:&|&amp;)code=[^&\s]+/i.test(text);
+}
+
+function buildFeishuCloudBlockerMessage(result: FeishuCloudLinkResolveResult): string {
+  const fallback = result.status === 'auth_required'
+    ? '需要你登录飞书后，我才能安全读取这个云文档。'
+    : result.status === 'permission_denied'
+      ? '未完成：当前登录飞书用户也没有这个云文档权限，请让文档所有者分享给你或导出内容。'
+      : '未完成：读取飞书云文档失败。';
+  return result.userMessage?.trim() || result.error?.trim() || fallback;
+}
+
 function permissionRank(role: PermissionRole): number {
   switch (role) {
     case 'owner':
@@ -2434,6 +2781,12 @@ async function handleMessage(
       ack();
       return;
     }
+    const extensionCallback = parseExtensionCallback(msg.callbackData);
+    if (extensionCallback) {
+      await handleExtensionCallback(adapter, msg, extensionCallback);
+      ack();
+      return;
+    }
     if (!hasRole(msg, 'operator')) {
       await deliver(adapter, {
         address: msg.address,
@@ -2482,6 +2835,30 @@ async function handleMessage(
     }
     ack();
     return;
+  }
+
+  if (shouldTryFeishuOAuthManualCallback(adapter, rawText)) {
+    const feishuOAuth = getBridgeContext().feishuOAuth;
+    if (feishuOAuth) {
+      const result = await feishuOAuth.handleManualCallbackText({
+        text: rawText,
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        messageId: msg.messageId,
+      });
+      if (result.status === 'bound' || result.status === 'error') {
+        await deliver(adapter, {
+          address: msg.address,
+          text: result.userMessage?.trim() || result.error?.trim() || '飞书授权处理失败。',
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        });
+        ack();
+        return;
+      }
+    }
   }
 
   const shutdownActionKey = makeSystemActionKey(adapter.channelType, msg.address.chatId, msg.address.userId?.trim() || '');
@@ -2643,6 +3020,28 @@ async function handleMessage(
     await handleCommand(adapter, msg, rawText);
     ack();
     return;
+  }
+
+  if (adapter.channelType === 'feishu') {
+    const extensionIntent = parseNaturalExtensionIntent(rawText);
+    if (extensionIntent) {
+      if (extensionIntent.action === 'search') {
+        const { extensions } = getBridgeContext();
+        const response = extensions
+          ? renderExtensionSearchResults(extensionIntent.query, await extensions.searchExtensions(extensionIntent.query))
+          : '面板未在线或扩展安装能力不可用。';
+        await deliver(adapter, {
+          address: msg.address,
+          text: response,
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        });
+      } else {
+        await prepareExtensionInstall(adapter, msg, extensionIntent.query);
+      }
+      ack();
+      return;
+    }
   }
 
   // Sanitize general message text before routing to conversation engine
@@ -2959,6 +3358,35 @@ async function handleMessage(
       ? buildFeishuDocumentRewritePrompt(directFeishuDocSourceMarkdown, rawText)
       : (text || (hasAttachments ? 'Describe this image.' : ''));
     let fastPathOptions = getFastPathOptions(rawText);
+    let feishuCloudSystemPrompt = '';
+    if (!directFeishuDocRequest && shouldTryFeishuCloudLinkResolve(adapter, rawText)) {
+      const feishuCloudDocuments = getBridgeContext().feishuCloudDocuments;
+      if (feishuCloudDocuments) {
+        const feishuSender = rawData?.feishuSender;
+        const resolved = await feishuCloudDocuments.resolveFeishuCloudLinks({
+          text: rawText,
+          channelType: adapter.channelType,
+          chatId: msg.address.chatId,
+          userId: feishuSender?.openId || msg.address.userId,
+          userDisplayName: msg.address.displayName,
+          messageId: msg.messageId,
+        });
+        if (resolved.status === 'resolved' && resolved.systemPrompt) {
+          feishuCloudSystemPrompt = resolved.systemPrompt;
+        } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
+          progressPulse?.stop();
+          await deliver(adapter, {
+            address: msg.address,
+            text: buildFeishuCloudBlockerMessage(resolved),
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+            feishuCardJson: resolved.feishuCardJson,
+          }, { sessionId: effectiveBinding.codepilotSessionId });
+          ack();
+          return;
+        }
+      }
+    }
     if (shouldUseUnityQuickActionFastPath(rawText)) {
       const unityMcpCheck = await ensureUnityMcpReady(
         effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || process.cwd(),
@@ -3007,9 +3435,10 @@ async function handleMessage(
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, {
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
-      extraSystemPrompt: fastPathOptions.extraSystemPrompt,
+      extraSystemPrompt: [fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt].filter(Boolean).join('\n\n'),
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
+      sourceMessageId: msg.messageId,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
     const resolvedWorkingDirectory =
@@ -3305,10 +3734,12 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/whoami - Show current Feishu sender IDs',
+        '/feishu - Show Feishu developer platform capability and scope diagnostics',
         '/docs - List generated Feishu documents',
         '/projects - List available workspaces',
         '/sessions - List recent sessions',
         '/remind 10分钟后 内容 - Create a bridge-managed reminder',
+        '/ext search|install|remove <关键词或URL> - Manage extension catalog',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
@@ -3338,6 +3769,11 @@ async function handleCommand(
       });
       await reminders.tickReminders?.();
       response = buildReminderActionResultText(result);
+      break;
+    }
+
+    case '/ext': {
+      response = await handleExtensionCommand(adapter, msg, args);
       break;
     }
 
@@ -3455,6 +3891,15 @@ async function handleCommand(
       break;
     }
 
+    case '/feishu': {
+      if (!isOwnerMessage(msg)) {
+        response = escapeHtml(buildOwnerRequiredMessage(msg));
+        break;
+      }
+      response = escapeHtml(buildFeishuCapabilityReport(store));
+      break;
+    }
+
     case '/docs': {
       response = escapeHtml(renderFeishuDocumentMemoryList(store));
       break;
@@ -3528,10 +3973,12 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/whoami - Show current Feishu sender IDs',
+        '/feishu - Show Feishu developer platform capability and scope diagnostics',
         '/docs - List generated Feishu documents',
         '/projects - List available workspaces',
         '/sessions - List recent sessions',
         '/remind 10分钟后 内容 - Create a bridge-managed reminder',
+        '/ext search|install|remove &lt;关键词或URL&gt; - Manage extension catalog',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',

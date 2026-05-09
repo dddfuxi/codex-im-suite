@@ -63,6 +63,13 @@ describe('MCP fast-path 判定', () => {
     assert.equal(inferMcpFastIntent(prompt, assessment), 'status');
   });
 
+  it('把用户覆盖层安装的 Fetch MCP 可用性问题判为状态查询', () => {
+    const prompt = 'Fetch MCP能用吗';
+    const assessment = assessMcpInteraction(prompt);
+    assert.equal(assessment.interactionIntent, 'query');
+    assert.equal(inferMcpFastIntent(prompt, assessment), 'status');
+  });
+
   it('Unity 场景节点分析不走本地 MCP 状态快路径', () => {
     const prompt = '帮我用unitymcp看一眼unity里，HSScene的Furniture_前缀的家具节点都代表什么，分析一下整理一份列表发我';
     const assessment = assessMcpInteraction(prompt);

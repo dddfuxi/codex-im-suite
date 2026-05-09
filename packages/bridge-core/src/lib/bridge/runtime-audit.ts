@@ -101,9 +101,22 @@ export function readBridgeRuntimeAudit(): BridgeRuntimeAudit {
 
 export function writeBridgeRuntimeAudit(next: BridgeRuntimeAudit): void {
   ensureParentDir();
-  const tmp = `${BRIDGE_RUNTIME_AUDIT_PATH}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
-  fs.renameSync(tmp, BRIDGE_RUNTIME_AUDIT_PATH);
+  const payload = JSON.stringify(next, null, 2);
+  const tmp = `${BRIDGE_RUNTIME_AUDIT_PATH}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, payload, 'utf8');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fs.renameSync(tmp, BRIDGE_RUNTIME_AUDIT_PATH);
+      return;
+    } catch (error) {
+      if (attempt === 2) {
+        try { fs.unlinkSync(tmp); } catch { /* ignore cleanup failure */ }
+        fs.writeFileSync(BRIDGE_RUNTIME_AUDIT_PATH, payload, 'utf8');
+        return;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
 }
 
 export function patchBridgeRuntimeAudit(patch: Partial<BridgeRuntimeAudit>): BridgeRuntimeAudit {

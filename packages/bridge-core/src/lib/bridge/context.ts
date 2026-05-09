@@ -14,6 +14,9 @@ import type {
   PermissionGateway,
   LifecycleHooks,
   ReminderActionHost,
+  ExtensionCatalogHost,
+  FeishuCloudDocumentHost,
+  FeishuOAuthManualHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -22,6 +25,9 @@ export interface BridgeContext {
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;
   reminders?: ReminderActionHost;
+  extensions?: ExtensionCatalogHost;
+  feishuCloudDocuments?: FeishuCloudDocumentHost;
+  feishuOAuth?: FeishuOAuthManualHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

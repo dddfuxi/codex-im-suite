@@ -1,5 +1,6 @@
 param(
-    [switch]$RequireClean
+    [switch]$RequireClean,
+    [switch]$NoForceUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -174,7 +175,7 @@ if ($RequireClean -and $statusBefore.Count -gt 0) {
 & (Join-Path $scriptDir 'validate-extension-manifests.ps1')
 & (Join-Path $scriptDir 'update-architecture-docs.ps1')
 Assert-NoSecretLeak
-& (Join-Path $scriptDir 'package-main-release.ps1')
+& (Join-Path $scriptDir 'package-main-release.ps1') -NoForceUpdate:$NoForceUpdate
 
 $statusAfter = Get-GitStatusLines
 Write-MainReleaseSummary -Version $version -Branch $branch -Commit $commit -StatusLines $statusAfter

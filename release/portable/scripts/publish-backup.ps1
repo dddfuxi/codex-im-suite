@@ -1,3 +1,7 @@
+param(
+    [switch]$NoForceUpdate
+)
+
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -317,7 +321,7 @@ function Write-PublishSummaryFiles {
     }
 }
 
-& (Join-Path $scriptDir 'package-release.ps1')
+& (Join-Path $scriptDir 'package-release.ps1') -NoForceUpdate:$NoForceUpdate
 
 Push-Location $suiteRoot
 try {

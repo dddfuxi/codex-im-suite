@@ -47,6 +47,90 @@ function parseSSEChunks(chunks: string[]): Array<{ type: string; data: string }>
 }
 
 describe('CodexProvider', () => {
+  it('builds Codex client options from explicit API settings without leaking unrelated env', async () => {
+    const oldBaseUrl = process.env.CTI_CODEX_BASE_URL;
+    const oldApiKey = process.env.CTI_CODEX_API_KEY;
+    const oldModel = process.env.CTI_CODEX_MODEL;
+    const oldPassModel = process.env.CTI_CODEX_PASS_MODEL;
+    const oldEffort = process.env.CTI_CODEX_REASONING_EFFORT;
+    process.env.CTI_CODEX_BASE_URL = 'https://codex.example.test/v1';
+    process.env.CTI_CODEX_API_KEY = 'codex-secret';
+    process.env.CTI_CODEX_MODEL = 'gpt-local';
+    process.env.CTI_CODEX_PASS_MODEL = 'true';
+    process.env.CTI_CODEX_REASONING_EFFORT = 'medium';
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest();
+
+      assert.equal(options.apiKey, 'codex-secret');
+      assert.equal(options.baseUrl, 'https://codex.example.test/v1');
+      assert.equal(options.config.model_reasoning_effort, 'medium');
+      assert.equal(options.env.CODEX_HOME, process.env.CODEX_HOME);
+      assert.equal(options.modelOverride, 'gpt-local');
+      assert.equal(options.passModel, true);
+    } finally {
+      if (oldBaseUrl === undefined) delete process.env.CTI_CODEX_BASE_URL;
+      else process.env.CTI_CODEX_BASE_URL = oldBaseUrl;
+      if (oldApiKey === undefined) delete process.env.CTI_CODEX_API_KEY;
+      else process.env.CTI_CODEX_API_KEY = oldApiKey;
+      if (oldModel === undefined) delete process.env.CTI_CODEX_MODEL;
+      else process.env.CTI_CODEX_MODEL = oldModel;
+      if (oldPassModel === undefined) delete process.env.CTI_CODEX_PASS_MODEL;
+      else process.env.CTI_CODEX_PASS_MODEL = oldPassModel;
+      if (oldEffort === undefined) delete process.env.CTI_CODEX_REASONING_EFFORT;
+      else process.env.CTI_CODEX_REASONING_EFFORT = oldEffort;
+    }
+  });
+
+  it('builds local fallback Codex options from local AI settings and isolates CODEX_HOME', async () => {
+    const saved = {
+      localKind: process.env.CTI_LOCAL_AI_KIND,
+      localBaseUrl: process.env.CTI_LOCAL_AI_BASE_URL,
+      localApiKey: process.env.CTI_LOCAL_AI_API_KEY,
+      localModel: process.env.CTI_LOCAL_AI_MODEL,
+      localEffort: process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT,
+      localHome: process.env.CTI_CODEX_LOCAL_FALLBACK_HOME,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const tempHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-local-${Date.now()}`)));
+    process.env.CTI_LOCAL_AI_KIND = 'ollama';
+    process.env.CTI_LOCAL_AI_BASE_URL = 'http://127.0.0.1:11434';
+    process.env.CTI_LOCAL_AI_API_KEY = 'local-secret';
+    process.env.CTI_LOCAL_AI_MODEL = 'qwen3:8b';
+    process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT = 'minimal';
+    process.env.CTI_CODEX_LOCAL_FALLBACK_HOME = tempHome;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('local_fallback');
+
+      assert.equal(options.profile, 'local_fallback');
+      assert.equal(options.apiKey, 'local-secret');
+      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
+      assert.equal(options.modelOverride, 'qwen3:8b');
+      assert.equal(options.passModel, true);
+      assert.equal(options.config.model_reasoning_effort, 'minimal');
+      assert.equal(options.env.CODEX_HOME, tempHome);
+      assert.equal(process.env.CODEX_HOME, tempHome);
+    } finally {
+      const fs = await import('node:fs');
+      fs.rmSync(tempHome, { recursive: true, force: true });
+      if (saved.localKind === undefined) delete process.env.CTI_LOCAL_AI_KIND;
+      else process.env.CTI_LOCAL_AI_KIND = saved.localKind;
+      if (saved.localBaseUrl === undefined) delete process.env.CTI_LOCAL_AI_BASE_URL;
+      else process.env.CTI_LOCAL_AI_BASE_URL = saved.localBaseUrl;
+      if (saved.localApiKey === undefined) delete process.env.CTI_LOCAL_AI_API_KEY;
+      else process.env.CTI_LOCAL_AI_API_KEY = saved.localApiKey;
+      if (saved.localModel === undefined) delete process.env.CTI_LOCAL_AI_MODEL;
+      else process.env.CTI_LOCAL_AI_MODEL = saved.localModel;
+      if (saved.localEffort === undefined) delete process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT;
+      else process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT = saved.localEffort;
+      if (saved.localHome === undefined) delete process.env.CTI_CODEX_LOCAL_FALLBACK_HOME;
+      else process.env.CTI_CODEX_LOCAL_FALLBACK_HOME = saved.localHome;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
   it('emits error when SDK init fails', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');

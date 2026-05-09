@@ -82,11 +82,31 @@ describe('configToSettings', () => {
       feishuAppSecret: 'app-secret',
       feishuDomain: 'example.com',
       feishuAllowedUsers: ['fu1'],
+      feishuGrantedScopes: ['im:message', 'docx:document:readonly'],
+      feishuOAuthMode: 'manual',
+      feishuOAuthPublicBaseUrl: 'https://bot.example.com',
+      feishuOAuthManualRedirectUri: 'http://127.0.0.1:17321/feishu/oauth/callback',
+      feishuOAuthCallbackPath: '/feishu/oauth/callback',
+      feishuOAuthScopes: ['offline_access', 'docx:document:readonly'],
+      feishuCloudMaxChars: 80000,
+      feishuCloudMaxRows: 500,
+      feishuCloudMaxRecords: 500,
+      feishuCloudMaxSheets: 5,
     });
     assert.equal(m.get('bridge_feishu_app_id'), 'app-id');
     assert.equal(m.get('bridge_feishu_app_secret'), 'app-secret');
     assert.equal(m.get('bridge_feishu_domain'), 'example.com');
     assert.equal(m.get('bridge_feishu_allowed_users'), 'fu1');
+    assert.equal(m.get('bridge_feishu_granted_scopes'), 'im:message,docx:document:readonly');
+    assert.equal(m.get('bridge_feishu_oauth_mode'), 'manual');
+    assert.equal(m.get('bridge_feishu_oauth_public_base_url'), 'https://bot.example.com');
+    assert.equal(m.get('bridge_feishu_oauth_manual_redirect_uri'), 'http://127.0.0.1:17321/feishu/oauth/callback');
+    assert.equal(m.get('bridge_feishu_oauth_callback_path'), '/feishu/oauth/callback');
+    assert.equal(m.get('bridge_feishu_oauth_scopes'), 'offline_access,docx:document:readonly');
+    assert.equal(m.get('bridge_feishu_cloud_max_chars'), '80000');
+    assert.equal(m.get('bridge_feishu_cloud_max_rows'), '500');
+    assert.equal(m.get('bridge_feishu_cloud_max_records'), '500');
+    assert.equal(m.get('bridge_feishu_cloud_max_sheets'), '5');
   });
 
   it('sets bridge_qq_enabled based on enabledChannels', () => {
@@ -227,6 +247,44 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
   });
 
+  it('maps generic local AI and Codex API settings without exposing secrets in normal settings', () => {
+    const m = configToSettings({
+      ...base,
+      ollamaEnabled: true,
+      localAiKind: 'openai-compatible',
+      localAiBaseUrl: 'http://127.0.0.1:1234',
+      localAiModel: 'local-model',
+      localAiApiKey: 'local-secret-abcd',
+      localAiTimeoutMs: 30000,
+      codexBaseUrl: 'https://api.example.test/v1',
+      codexApiKey: 'codex-secret-wxyz',
+      codexModel: 'gpt-local',
+      codexPassModel: true,
+      codexReasoningEffort: 'low',
+      codexLocalFallbackEnabled: true,
+      codexLocalFallbackReasoningEffort: 'minimal',
+    });
+
+    assert.equal(m.get('bridge_local_ai_kind'), 'openai-compatible');
+    assert.equal(m.get('bridge_local_ai_base_url'), 'http://127.0.0.1:1234');
+    assert.equal(m.get('bridge_local_ai_model'), 'local-model');
+    assert.equal(m.get('bridge_local_ai_api_key_set'), 'true');
+    assert.equal(m.get('bridge_local_ai_api_key_masked'), '*************abcd');
+    assert.equal(m.get('bridge_local_ai_timeout_ms'), '30000');
+    assert.equal(m.get('bridge_local_llm_base_url'), 'http://127.0.0.1:1234');
+    assert.equal(m.get('bridge_local_llm_model'), 'local-model');
+    assert.equal(m.get('bridge_codex_base_url'), 'https://api.example.test/v1');
+    assert.equal(m.get('bridge_codex_api_key_set'), 'true');
+    assert.equal(m.get('bridge_codex_api_key_masked'), '*************wxyz');
+    assert.equal(m.get('bridge_codex_model'), 'gpt-local');
+    assert.equal(m.get('bridge_codex_pass_model'), 'true');
+    assert.equal(m.get('bridge_codex_reasoning_effort'), 'low');
+    assert.equal(m.get('bridge_codex_local_fallback_enabled'), 'true');
+    assert.equal(m.get('bridge_codex_local_fallback_reasoning_effort'), 'minimal');
+    assert.equal(Array.from(m.values()).some((value) => value.includes('local-secret-abcd')), false);
+    assert.equal(Array.from(m.values()).some((value) => value.includes('codex-secret-wxyz')), false);
+  });
+
   it('omits optional fields when not set', () => {
     const m = configToSettings(base);
     assert.equal(m.has('telegram_bot_token'), false);
@@ -315,6 +373,54 @@ describe('loadConfig/saveConfig round-trip', () => {
     }
   });
 
+  it('prefers CTI_LOCAL_AI settings over legacy CTI_OLLAMA settings', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-ai-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_OLLAMA_BASE_URL=http://127.0.0.1:11434',
+        'CTI_OLLAMA_MODEL=qwen2.5-coder:7b',
+        'CTI_LOCAL_AI_KIND=openai-compatible',
+        'CTI_LOCAL_AI_BASE_URL=http://127.0.0.1:1234',
+        'CTI_LOCAL_AI_MODEL=lmstudio-model',
+        'CTI_LOCAL_AI_API_KEY=local-secret',
+        'CTI_LOCAL_AI_TIMEOUT_MS=30000',
+        'CTI_CODEX_BASE_URL=https://codex.example.test/v1',
+        'CTI_CODEX_API_KEY=codex-secret',
+        'CTI_CODEX_MODEL=gpt-local',
+        'CTI_CODEX_PASS_MODEL=true',
+        'CTI_CODEX_REASONING_EFFORT=medium',
+        'CTI_CODEX_LOCAL_FALLBACK_ENABLED=false',
+        'CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT=low',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?local-ai-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.localAiKind, 'openai-compatible');
+      assert.equal(config.localAiBaseUrl, 'http://127.0.0.1:1234');
+      assert.equal(config.localAiModel, 'lmstudio-model');
+      assert.equal(config.localAiApiKey, 'local-secret');
+      assert.equal(config.localAiTimeoutMs, 30000);
+      assert.equal(config.ollamaBaseUrl, 'http://127.0.0.1:1234');
+      assert.equal(config.ollamaModel, 'lmstudio-model');
+      assert.equal(config.codexBaseUrl, 'https://codex.example.test/v1');
+      assert.equal(config.codexApiKey, 'codex-secret');
+      assert.equal(config.codexModel, 'gpt-local');
+      assert.equal(config.codexPassModel, true);
+      assert.equal(config.codexReasoningEffort, 'medium');
+      assert.equal(config.codexLocalFallbackEnabled, false);
+      assert.equal(config.codexLocalFallbackReasoningEffort, 'low');
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it('loads todo push env config', async () => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-todo-push-config-'));
     const previousCtiHome = process.env.CTI_HOME;
@@ -336,6 +442,48 @@ describe('loadConfig/saveConfig round-trip', () => {
       assert.equal(config.todoPushPollMs, 30000);
       assert.equal(config.todoPushWindowMs, 600000);
       assert.deepEqual(config.todoPushChannels, ['feishu', 'weixin']);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads Feishu OAuth and cloud document env config', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-cloud-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_FEISHU_OAUTH_MODE=manual',
+        'CTI_FEISHU_OAUTH_PUBLIC_BASE_URL=https://bot.example.com',
+        'CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI=http://127.0.0.1:17321/feishu/oauth/callback',
+        'CTI_FEISHU_GRANTED_SCOPES=im:message,docx:document:readonly',
+        'CTI_FEISHU_OAUTH_CALLBACK_PATH=/feishu/oauth/callback',
+        'CTI_FEISHU_OAUTH_SCOPES=offline_access,docx:document:readonly',
+        'CTI_FEISHU_OAUTH_CALLBACK_PORT=17321',
+        'CTI_FEISHU_CLOUD_MAX_CHARS=90000',
+        'CTI_FEISHU_CLOUD_MAX_ROWS=600',
+        'CTI_FEISHU_CLOUD_MAX_RECORDS=700',
+        'CTI_FEISHU_CLOUD_MAX_SHEETS=6',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?feishu-cloud-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.feishuOAuthPublicBaseUrl, 'https://bot.example.com');
+      assert.equal(config.feishuOAuthMode, 'manual');
+      assert.equal(config.feishuOAuthManualRedirectUri, 'http://127.0.0.1:17321/feishu/oauth/callback');
+      assert.deepEqual(config.feishuGrantedScopes, ['im:message', 'docx:document:readonly']);
+      assert.equal(config.feishuOAuthCallbackPath, '/feishu/oauth/callback');
+      assert.deepEqual(config.feishuOAuthScopes, ['offline_access', 'docx:document:readonly']);
+      assert.equal(config.feishuOAuthCallbackPort, 17321);
+      assert.equal(config.feishuCloudMaxChars, 90000);
+      assert.equal(config.feishuCloudMaxRows, 600);
+      assert.equal(config.feishuCloudMaxRecords, 700);
+      assert.equal(config.feishuCloudMaxSheets, 6);
     } finally {
       if (previousCtiHome === undefined) delete process.env.CTI_HOME;
       else process.env.CTI_HOME = previousCtiHome;

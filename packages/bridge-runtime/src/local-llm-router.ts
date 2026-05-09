@@ -101,6 +101,10 @@ export function getLocalRouterMode(config: Config): LocalRouterMode {
   return config.localLlmFallbackToCodex === false ? 'local_only' : 'hybrid';
 }
 
+export function shouldRunPreCodexLocalFastPath(mode: LocalRouterMode): boolean {
+  return mode === 'local_only';
+}
+
 export function getRouterMaxInputChars(config: Config): number {
   const raw = config.localLlmRouterMaxInputChars ?? config.localLlmMaxInputChars ?? DEFAULT_MAX_INPUT_CHARS;
   return Math.max(1200, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_MAX_INPUT_CHARS);

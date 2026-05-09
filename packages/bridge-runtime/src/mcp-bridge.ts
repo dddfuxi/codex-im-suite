@@ -85,6 +85,26 @@ function getCtiHome(): string {
   return process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 }
 
+function getExtensionManifestDir(kind: 'mcp.d' | 'skills.d' | 'plugins.d'): string {
+  return path.join(getCtiHome(), 'extensions', 'manifests', kind);
+}
+
+function getManifestDirs(kind: 'mcp.d' | 'skills.d' | 'plugins.d'): string[] {
+  const dirs = [
+    path.join(getSuiteRoot(), 'config', kind),
+    getExtensionManifestDir(kind),
+  ];
+  const seen = new Set<string>();
+  return dirs
+    .map((dir) => path.resolve(dir))
+    .filter((dir) => {
+      const key = dir.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return fs.existsSync(dir);
+    });
+}
+
 function splitPathList(rawValue?: string | null): string[] {
   if (!rawValue) return [];
   const seen = new Set<string>();
@@ -149,11 +169,47 @@ function compactSearchText(value: string): string {
   return normalizeSearchText(value).replace(/\s+/g, '');
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 async function runPowerShellFile(scriptPath: string, cwd: string, env?: Record<string, string>, timeoutMs = 45000): Promise<McpStartStopResult> {
   return new Promise((resolve) => {
     const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
       cwd,
       env: { ...process.env, ...(env || {}) },
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill(), timeoutMs);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        ok: (code ?? 1) === 0,
+        message: (stdout || stderr || `exit=${code ?? 1}`).trim(),
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+      });
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        message: error.message,
+        stderr: error.message,
+      });
+    });
+  });
+}
+
+async function runPowerShellCommand(command: string, cwd: string, timeoutMs = 45000): Promise<McpStartStopResult> {
+  return new Promise((resolve) => {
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-Command', command], {
+      cwd,
+      env: process.env,
       windowsHide: true,
     });
     let stdout = '';
@@ -234,13 +290,15 @@ export class McpBridge {
     const allowedRoots = splitPathList(this.config.allowedWorkspaceRoots?.join(';'));
     const defaultWorkDir = this.config.defaultWorkDir ? path.resolve(this.config.defaultWorkDir) : '';
     const unityProjectPath = this.config.unityProjectPath ? path.resolve(this.config.unityProjectPath) : '';
+    const userExtensionRoot = path.resolve(getCtiHome(), 'extensions');
     const resolvedCwd = path.resolve(manifestCwd);
 
     const matchesAllowedRoot = allowedRoots.some((root) => isPathWithin(root, resolvedCwd));
     const matchesDefaultWorkDir = defaultWorkDir ? isPathWithin(defaultWorkDir, resolvedCwd) : false;
     const matchesUnityProject = unityProjectPath ? isPathWithin(unityProjectPath, resolvedCwd) : false;
+    const matchesUserExtensions = isPathWithin(userExtensionRoot, resolvedCwd);
 
-    if (matchesAllowedRoot || matchesDefaultWorkDir || matchesUnityProject) {
+    if (matchesAllowedRoot || matchesDefaultWorkDir || matchesUnityProject || matchesUserExtensions) {
       return {
         ok: true,
         message: `工作区匹配：${resolvedCwd}`,
@@ -254,16 +312,16 @@ export class McpBridge {
   }
 
   listManifests(): McpManifestRecord[] {
-    const manifestDir = path.join(getSuiteRoot(), 'config', 'mcp.d');
-    if (!fs.existsSync(manifestDir)) return [];
-    return fs.readdirSync(manifestDir)
-      .filter((name) => name.endsWith('.json'))
-      .map((name) => {
+    const byId = new Map<string, McpManifestRecord>();
+    for (const manifestDir of getManifestDirs('mcp.d')) {
+      for (const name of fs.readdirSync(manifestDir).filter((item) => item.endsWith('.json')).sort()) {
         const fullPath = path.join(manifestDir, name);
         const raw = fs.readFileSync(fullPath, 'utf-8');
         const parsed = JSON.parse(raw) as Omit<McpManifestRecord, 'manifestPath'>;
-        return { ...parsed, manifestPath: fullPath };
-      });
+        byId.set(parsed.id, { ...parsed, manifestPath: fullPath });
+      }
+    }
+    return [...byId.values()];
   }
 
   private getManifestSearchTerms(manifest: McpManifestRecord): string[] {
@@ -340,15 +398,13 @@ export class McpBridge {
     }
 
     if (manifest.healthCheck?.kind === 'codex-mcp-list' && manifest.registerName) {
-      const result = await runPowerShellFile(
-        path.join(getSuiteRoot(), 'scripts', 'register-external-mcps.ps1'),
-        getSuiteRoot(),
-        undefined,
-        1000,
-      );
+      const result = await runPowerShellCommand('codex mcp list', getSuiteRoot(), 5000);
       const output = `${result.stdout || ''}\n${result.stderr || ''}`;
-      if (new RegExp(`^${manifest.registerName}\\s`, 'm').test(output)) {
-        return { ok: true, message: `已注册到 Codex: ${manifest.registerName}` };
+      if (new RegExp(`^${escapeRegExp(manifest.registerName)}\\s`, 'm').test(output)) {
+        return { ok: true, message: `已注册到 Codex，待 Codex 会话握手时加载：${manifest.registerName}` };
+      }
+      if (!result.ok) {
+        return { ok: false, message: `codex mcp list 执行失败：${result.message || '无输出'}` };
       }
       return { ok: false, message: `未在 codex mcp list 中发现 ${manifest.registerName}` };
     }
