@@ -91,6 +91,21 @@ export interface MemoryRetrievalQuery {
   recentHistoryLimit?: number;
 }
 
+export type MemoryQueryIntent = 'explicit_recall' | 'memory_write' | 'context_augment' | 'none';
+export type MemoryAnswerMode = 'direct_if_confident' | 'augment_only' | 'none';
+export type MemoryHitSourceType = 'knowledge' | 'profile' | 'audit' | 'chat' | 'session' | 'workdir';
+export type MemoryHitAnswerability = 'structured' | 'summary' | 'none';
+export type MemoryHitQuality = 'high' | 'medium' | 'low';
+
+export interface MemoryQueryPlan {
+  intent: MemoryQueryIntent;
+  queryText: string;
+  normalizedKey?: string;
+  answerMode: MemoryAnswerMode;
+  minConfidence: number;
+  allowDirectAnswer: boolean;
+}
+
 export interface RetrievedMemoryHit {
   sessionId: string;
   channelType?: string;
@@ -98,13 +113,121 @@ export interface RetrievedMemoryHit {
   workingDirectory?: string;
   role: 'user' | 'assistant';
   source: 'summary' | 'message';
+  sourceType?: MemoryHitSourceType;
   score: number;
+  confidence?: number;
+  answerability?: MemoryHitAnswerability;
+  quality?: MemoryHitQuality;
+  structuredKey?: string;
+  structuredValue?: string;
+  structuredPairs?: Array<{ key: string; value: string }>;
   content: string;
 }
 
 export interface RetrievedMemoryContext {
   summary: string;
   hits: RetrievedMemoryHit[];
+}
+
+export type MemoryReplyDecision =
+  | {
+    type: 'direct_reply';
+    text: string;
+    hit: RetrievedMemoryHit;
+    plan: MemoryQueryPlan;
+  }
+  | {
+    type: 'augment_codex';
+    systemPrompt?: string;
+    memory: RetrievedMemoryContext | null;
+    plan: MemoryQueryPlan;
+  }
+  | {
+    type: 'no_memory_answer';
+    text: string;
+    plan: MemoryQueryPlan;
+  };
+
+export type AnswerReviewVerdict = 'pass' | 'warn' | 'block' | 'replace';
+export type AnswerReviewMode = 'observe' | 'block_or_replace';
+
+export interface AnswerReviewInput {
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
+  sessionId?: string;
+  workingDirectory?: string;
+  userText: string;
+  answerText: string;
+  memoryPlan?: MemoryQueryPlan;
+  memoryHits?: RetrievedMemoryHit[];
+  source?: 'direct_memory' | 'codex' | 'local' | 'system';
+}
+
+export interface AnswerReviewDecision {
+  verdict: AnswerReviewVerdict;
+  reasonCodes: string[];
+  mode: AnswerReviewMode;
+  createdAt: string;
+  replacementText?: string;
+  memoryWriteCandidates?: Array<{ key?: string; value?: string; text: string }>;
+}
+
+export interface MemoryWriteInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  chatDisplayName?: string;
+  userId?: string;
+  userDisplayName?: string;
+  text: string;
+  workingDirectory?: string;
+  createdAt?: string;
+}
+
+export interface MemoryWriteResult {
+  ok: boolean;
+  skipped?: boolean;
+  memoryRoot?: string;
+  filePath?: string;
+  knowledgeRebuilt?: boolean;
+  error?: string;
+}
+
+export interface MemoryGraphNode {
+  id: string;
+  label: string;
+  kind: 'knowledge' | 'alias' | 'project' | 'entity' | 'path' | 'command' | 'scene';
+  sourceItemIds?: string[];
+  sourcePaths?: string[];
+}
+
+export interface MemoryGraphEdge {
+  from: string;
+  to: string;
+  type: 'alias_of' | 'maps_to' | 'related_to' | 'mentions' | 'conflicts_with' | 'reverse_lookup';
+  weight: number;
+  sourceItemIds?: string[];
+  sourcePaths?: string[];
+}
+
+export interface MemoryGraphRelatedItem {
+  id: string;
+  label: string;
+  kind: MemoryGraphNode['kind'];
+  score: number;
+  via: string[];
+  edgeTypes: MemoryGraphEdge['type'][];
+  sourcePaths: string[];
+}
+
+export interface MemoryGraphContext {
+  query: string;
+  summary: string;
+  related: MemoryGraphRelatedItem[];
+  generatedAt?: string;
 }
 
 export interface ConversationMemoryEvent {
@@ -209,10 +332,20 @@ export interface FeishuOAuthManualCallbackInput {
 
 export type FeishuOAuthManualCallbackStatus = 'no_callback' | 'bound' | 'error';
 
+export interface FeishuOAuthManualResumeRequest {
+  text: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
+}
+
 export interface FeishuOAuthManualCallbackResult {
   status: FeishuOAuthManualCallbackStatus;
   userMessage?: string;
   error?: string;
+  resume?: FeishuOAuthManualResumeRequest;
 }
 
 export interface FeishuOAuthManualHost {
@@ -308,7 +441,11 @@ export interface BridgeStore {
   addMessage(sessionId: string, role: string, content: string, usage?: string | null): void;
   getMessages(sessionId: string, opts?: { limit?: number }): { messages: BridgeMessage[] };
   recordMemoryEvent?(event: ConversationMemoryEvent): void;
+  persistMemoryWrite?(input: MemoryWriteInput): MemoryWriteResult;
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null;
+  decideMemoryReply?(query: MemoryRetrievalQuery): MemoryReplyDecision;
+  reviewOutboundAnswer?(input: AnswerReviewInput): AnswerReviewDecision;
+  retrieveMemoryGraphContext?(query: MemoryRetrievalQuery): MemoryGraphContext | null;
   retrieveRelevantFeishuHistory?(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null;
   upsertFeishuHistoryMessages?(data: {
     chatId: string;

@@ -27,6 +27,17 @@ function getAllowedWorkspaceRoots(): string[] {
   return splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
 }
 
+function getSessionIdleFreshMs(): number {
+  const fallback = 12 * 60 * 60 * 1000;
+  return Math.max(5 * 60 * 1000, Number.parseInt(process.env.CTI_SESSION_IDLE_FRESH_MS || `${fallback}`, 10) || fallback);
+}
+
+function shouldRotateIdleBinding(existing: ChannelBinding): boolean {
+  const updatedAtMs = Date.parse(existing.updatedAt || '');
+  if (!Number.isFinite(updatedAtMs)) return false;
+  return (Date.now() - updatedAtMs) > getSessionIdleFreshMs();
+}
+
 function rebindToFreshSession(existing: ChannelBinding, workingDirectoryOverride?: string): ChannelBinding {
   const { store } = getBridgeContext();
   const currentSession = store.getSession(existing.codepilotSessionId);
@@ -103,6 +114,9 @@ export function resolve(address: ChannelAddress): ChannelBinding {
   const { store } = getBridgeContext();
   const existing = store.getChannelBinding(address.channelType, address.chatId);
   if (existing) {
+    if (shouldRotateIdleBinding(existing)) {
+      return rebindToFreshSession(existing);
+    }
     const session = store.getSession(existing.codepilotSessionId);
     if (session) return refreshBindingForRuntimeChanges(enforceWorkspacePolicy(existing));
     return createBinding(address);

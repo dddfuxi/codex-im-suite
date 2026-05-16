@@ -14,6 +14,7 @@ import type {
   BridgeMessage,
   BridgeApiProvider,
   ConversationMemoryEvent,
+  MemoryReplyDecision,
   MemoryRetrievalQuery,
   RetrievedMemoryContext,
   RetrievedMemoryHit,
@@ -30,8 +31,17 @@ import type {
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
+import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReviewInput } from './answer-review.js';
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
+import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
+import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext } from './memory-graph.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
+import {
+  decideMemoryReply as decideMemoryReplyFromHits,
+  inferStructuredMemories,
+  isLowValueMemoryText,
+  planMemoryQuery,
+} from './memory-routing.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
@@ -42,6 +52,7 @@ const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
 const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
 const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
+const ANSWER_REVIEW_AUDIT_PATH = path.join(DATA_DIR, 'answer-review-audit.json');
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
 const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '80', 10) || 80);
 const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '32000', 10) || 32000);
@@ -55,6 +66,7 @@ const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.C
 const ENGLISH_STOP_TOKENS = new Set(['this', 'that', 'with', 'from', 'then', 'just', 'into', 'them', 'they', 'what', 'when', 'where', 'which', 'have', 'will', 'your', 'about', 'please']);
 const CHINESE_STOP_TOKENS = new Set(['这个', '那个', '现在', '刚才', '继续', '直接', '帮我', '处理', '一下', '看看', '这里', '当前', '应该', '进行', '根据', '然后', '就是', '可以', '能够']);
 const MEMORY_RECALL_RE = /(记得|回忆|历史|上次|之前|以前|刚才|说过|提到|对应表|常用|查一下|找一下|回溯|总结|汇总)/i;
+const EXPLICIT_MEMORY_DIR = 'data/explicit-memories';
 
 // Helpers
 
@@ -105,6 +117,40 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function slugForFileName(text: string): string {
+  const ascii = text
+    .normalize('NFKC')
+    .replace(/[^A-Za-z0-9\u4e00-\u9fff_-]+/gu, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 48);
+  return ascii || 'memory';
+}
+
+function escapeMarkdownTableCell(text: string): string {
+  return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+}
+
+function inferExplicitMemoryPrefixedLine(text: string): string | null {
+  if (/[\r\n|]/.test(text)) return null;
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length > 240 || /^(事实|偏好|约定|结论|决策|决定|待办|todo|TODO|后续|风险|资源|文件|图片|链接|场景|Scene)\s*[:：]/u.test(normalized)) {
+    return null;
+  }
+  const content = normalized
+    .replace(/^(?:请你|你也|也|帮我|麻烦你)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*/u, '')
+    .replace(/[，,。.\s]*(?:请你|你也|也|帮我|麻烦你)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*$/u, '')
+    .trim();
+  if (!content || content.length > 220 || /\r?\n|\|/.test(content)) return null;
+  if (/(?:待办|TODO|todo|后续|提醒|待处理|需要处理|风险|修复|跟进|检查|补齐|完善|实现|迁移|清理)/iu.test(content)) {
+    return `待办: ${content}`;
+  }
+  if (/(?:决定|决策|采用|默认|不要|不能|必须|需要|优先|策略|规则|约定|边界|统一|改为|不再|只允许|禁止)/u.test(content)) {
+    return `结论: ${content}`;
+  }
+  return `事实: ${content}`;
+}
+
 // Lock entry
 
 interface LockEntry {
@@ -141,6 +187,37 @@ interface MemoryProfileRecord {
   messageCount: number;
   updatedAt: string;
   lastEventAt: string;
+}
+
+interface AnswerReviewAuditRecord extends AnswerReviewDecision {
+  id: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userText: string;
+  answerText: string;
+  source?: AnswerReviewInput['source'];
+}
+
+interface MemoryWriteInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  chatDisplayName?: string;
+  userId?: string;
+  userDisplayName?: string;
+  text: string;
+  workingDirectory?: string;
+  createdAt?: string;
+}
+
+interface MemoryWriteResult {
+  ok: boolean;
+  skipped?: boolean;
+  memoryRoot?: string;
+  filePath?: string;
+  knowledgeRebuilt?: boolean;
+  error?: string;
 }
 
 // Store
@@ -427,6 +504,9 @@ export class JsonFileStore implements BridgeStore {
   } {
     const normalized = this.summarizeMessageContent(text, 520);
     if (!normalized || normalized.length < MEMORY_PROFILE_EVENT_MIN_CHARS) {
+      return { topics: [], facts: [], pending: [] };
+    }
+    if (isLowValueMemoryText(normalized)) {
       return { topics: [], facts: [], pending: [] };
     }
 
@@ -822,7 +902,13 @@ export class JsonFileStore implements BridgeStore {
     return hits
       .map((item) => {
         const haystack = `${item.key || ''} ${item.value || ''} ${item.text}`.toLowerCase();
+        const normalizedQuery = query.query.trim().toLowerCase();
+        const itemKey = (item.key || '').trim().toLowerCase();
         let score = item.confidence * 6;
+        if (normalizedQuery && itemKey) {
+          if (itemKey === normalizedQuery) score += 42;
+          else if (itemKey.includes(normalizedQuery) || normalizedQuery.includes(itemKey)) score += 24;
+        }
         for (const token of tokens) {
           if (haystack.includes(token.toLowerCase())) score += /[a-z]/i.test(token) ? 2 : 1.5;
         }
@@ -834,7 +920,13 @@ export class JsonFileStore implements BridgeStore {
           workingDirectory: query.workingDirectory,
           role: 'assistant' as const,
           source: 'summary' as const,
+          sourceType: 'knowledge' as const,
           score,
+          confidence: Math.max(0, Math.min(0.98, item.confidence + (item.key && item.value ? 0.08 : 0))),
+          answerability: item.key && item.value ? 'structured' as const : 'summary' as const,
+          quality: item.conflict ? 'medium' as const : 'high' as const,
+          structuredKey: item.key,
+          structuredValue: item.value,
           content: this.summarizeMessageContent(this.formatKnowledgeHit(item), 300),
         };
       })
@@ -914,6 +1006,8 @@ export class JsonFileStore implements BridgeStore {
       if (!text) continue;
       const score = this.scoreMemoryProfile(query, tokens, profile, text);
       if (score < MEMORY_MIN_SCORE) continue;
+      const structuredPairs = inferStructuredMemories(text);
+      const structured = structuredPairs[0] || null;
       hits.push({
         sessionId: `memory-profile:${profile.key}`,
         channelType: profile.channelType,
@@ -921,8 +1015,71 @@ export class JsonFileStore implements BridgeStore {
         workingDirectory: profile.workingDirectory,
         role: 'assistant',
         source: 'summary',
+        sourceType: 'profile',
         score,
+        confidence: Math.max(0, Math.min(0.9, score / 18)),
+        answerability: structured ? 'structured' : 'summary',
+        quality: isLowValueMemoryText(text) ? 'low' : (structured ? 'high' : 'medium'),
+        structuredKey: structured?.key,
+        structuredValue: structured?.value,
+        structuredPairs,
         content: this.summarizeMessageContent(text, 260),
+      });
+    }
+    return hits;
+  }
+
+  private searchAuditLogForMemory(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    if (this.auditLog.length === 0) return [];
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return [];
+
+    const hits: RetrievedMemoryHit[] = [];
+    const dedup = new Set<string>();
+    for (const entry of this.auditLog) {
+      if (entry.direction !== 'outbound') continue;
+      const searchText = this.summarizeMessageContent(entry.summary || '', 12000);
+      if (!searchText || isLowValueMemoryText(searchText)) continue;
+      const contentKey = crypto
+        .createHash('sha1')
+        .update(`${entry.channelType}:${entry.chatId}:${entry.direction}:${searchText}`)
+        .digest('hex');
+      if (dedup.has(contentKey)) continue;
+
+      let score = this.scoreMemoryHit(
+        query,
+        tokens,
+        searchText,
+        {
+          channelType: entry.channelType,
+          chatId: entry.chatId,
+          updatedAt: entry.createdAt,
+        },
+        `audit:${entry.id}`,
+        'message',
+        entry.direction === 'outbound' ? 'assistant' : 'user',
+      );
+      if (entry.direction === 'outbound') score += 1;
+      if (MEMORY_RECALL_RE.test(query.query) && /(对应表|常用|==|=>|->)/.test(searchText)) score += 3;
+      if (score < (MEMORY_RECALL_RE.test(query.query) ? 4 : MEMORY_MIN_SCORE)) continue;
+
+      dedup.add(contentKey);
+      const structuredPairs = inferStructuredMemories(searchText);
+      const structured = structuredPairs[0] || null;
+      hits.push({
+        sessionId: `audit:${entry.id}`,
+        channelType: entry.channelType,
+        chatId: entry.chatId,
+        role: entry.direction === 'outbound' ? 'assistant' : 'user',
+        source: 'message',
+        sourceType: 'audit',
+        score,
+        confidence: Math.max(0, Math.min(0.92, score / 16)),
+        answerability: structured ? 'structured' : 'summary',
+        quality: structured ? 'high' : 'medium',
+        structuredKey: structured?.key,
+        structuredValue: structured?.value,
+        structuredPairs,
+        content: this.buildMatchedMemoryExcerpt(searchText, tokens, 300),
       });
     }
     return hits;
@@ -1330,6 +1487,9 @@ export class JsonFileStore implements BridgeStore {
     const text = this.summarizeMessageContent(event.text || '', 800);
     if (!text) return false;
 
+    const rawText = this.sanitizePersistedText(event.text || '');
+    this.persistExplicitMemoryWrite(event, rawText || text);
+
     const items = this.extractMemoryProfileItems(text, event.role);
     const hasUsefulItems = items.topics.length > 0 || items.facts.length > 0 || items.pending.length > 0;
     if (!hasUsefulItems && text.length < 12) return false;
@@ -1356,6 +1516,96 @@ export class JsonFileStore implements BridgeStore {
     return true;
   }
 
+  private persistExplicitMemoryWrite(event: ConversationMemoryEvent, text: string): MemoryWriteResult {
+    if (event.role !== 'user') return { ok: false, skipped: true, error: 'not_user_message' };
+    const plan = planMemoryQuery(text);
+    if (plan.intent !== 'memory_write') return { ok: false, skipped: true, error: 'not_memory_write' };
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return { ok: false, error: 'bridge_memory_repo_dir is not configured' };
+
+    const pairs = inferStructuredMemories(text);
+    const title = plan.normalizedKey || text.slice(0, 40);
+    const dir = path.join(memoryRoot, EXPLICIT_MEMORY_DIR);
+    const filePath = path.join(dir, `${slugForFileName(title)}.md`);
+    const createdAt = event.createdAt || now();
+    const aliases = Array.from(new Set((text.match(/\bSTH\b|\bST2H\b|H项目/giu) || []).map((value) => value.trim())));
+    const frontmatter = [
+      '---',
+      'schema: codex-im-suite/explicit-memory/v1',
+      `createdAt: ${createdAt}`,
+      `updatedAt: ${now()}`,
+      `channelType: ${event.channelType || ''}`,
+      `chatId: ${event.chatId || ''}`,
+      `userId: ${event.userId || ''}`,
+      `displayName: ${event.userDisplayName || ''}`,
+      '---',
+      '',
+    ].join('\n');
+    const body: string[] = [
+      `# ${title}`,
+      '',
+      text,
+      '',
+    ];
+    const prefixedLine = inferExplicitMemoryPrefixedLine(text);
+    if (prefixedLine) {
+      body.push(prefixedLine, '');
+    }
+
+    if (aliases.length > 0) {
+      body.push('| key | value |', '| --- | --- |');
+      for (const alias of aliases) {
+        body.push(`| ${escapeMarkdownTableCell(alias)} | ${escapeMarkdownTableCell(title)} |`);
+      }
+      body.push('');
+    }
+
+    if (pairs.length > 0) {
+      body.push('| key | value |', '| --- | --- |');
+      for (const pair of pairs) {
+        body.push(`| ${escapeMarkdownTableCell(pair.key)} | ${escapeMarkdownTableCell(pair.value)} |`);
+      }
+      body.push('');
+    }
+
+    try {
+      ensureDir(dir);
+      atomicWrite(filePath, `${frontmatter}${body.join('\n')}`);
+      rebuildKnowledgeIndex(memoryRoot);
+      return {
+        ok: true,
+        memoryRoot,
+        filePath,
+        knowledgeRebuilt: true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('[store] Failed to persist explicit memory write:', message);
+      return {
+        ok: false,
+        memoryRoot,
+        filePath,
+        knowledgeRebuilt: false,
+        error: message,
+      };
+    }
+  }
+
+  persistMemoryWrite(input: MemoryWriteInput): MemoryWriteResult {
+    return this.persistExplicitMemoryWrite({
+      sessionId: input.sessionId,
+      channelType: input.channelType,
+      chatId: input.chatId,
+      chatDisplayName: input.chatDisplayName,
+      userId: input.userId,
+      userDisplayName: input.userDisplayName,
+      role: 'user',
+      text: input.text,
+      workingDirectory: input.workingDirectory,
+      createdAt: input.createdAt || now(),
+    }, this.sanitizePersistedText(input.text || ''));
+  }
+
   recordMemoryEvent(event: ConversationMemoryEvent): void {
     if (!this.applyMemoryEvent(event)) return;
     this.persistMemoryProfiles();
@@ -1364,12 +1614,32 @@ export class JsonFileStore implements BridgeStore {
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {
     const tokens = this.extractMemoryTokens(query.query);
     const knowledgeHits = this.searchKnowledgeIndexForMemory(query, tokens);
-    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query) && knowledgeHits.length === 0) return null;
+    const graphContext = this.retrieveMemoryGraphContext(query);
+    const graphHits: RetrievedMemoryHit[] = (graphContext?.related || [])
+      .slice(0, 4)
+      .map((item) => ({
+        sessionId: `memory-graph:${item.id}`,
+        channelType: query.channelType,
+        chatId: query.chatId,
+        workingDirectory: query.workingDirectory,
+        role: 'assistant' as const,
+        source: 'summary' as const,
+        sourceType: 'knowledge' as const,
+        score: Math.max(0, item.score) + 3,
+        confidence: Math.max(0.45, Math.min(0.88, item.score / 12)),
+        answerability: item.edgeTypes.includes('maps_to') || item.edgeTypes.includes('reverse_lookup') ? 'structured' as const : 'summary' as const,
+        quality: 'medium' as const,
+        structuredKey: query.query,
+        structuredValue: item.label,
+        content: `[记忆关系图] ${query.query} -> ${item.label}（${item.edgeTypes.join(', ')}）`,
+      }));
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query) && knowledgeHits.length === 0 && graphHits.length === 0) return null;
 
     const metaBySession = this.buildMemorySessionMeta();
     const sameChatHits: RetrievedMemoryHit[] = [];
     const currentSessionHits: RetrievedMemoryHit[] = [];
     const sameWorkdirHits: RetrievedMemoryHit[] = [];
+    const auditHits = this.searchAuditLogForMemory(query, tokens);
     const profileHits = this.searchMemoryProfiles(query, tokens);
     const dedup = new Set<string>();
     const recentHistoryLimit = Math.max(0, query.recentHistoryLimit || 0);
@@ -1411,6 +1681,8 @@ export class JsonFileStore implements BridgeStore {
         if (score < MEMORY_MIN_SCORE) continue;
 
         dedup.add(contentKey);
+        const structuredPairs = inferStructuredMemories(summarized.searchText);
+        const structured = structuredPairs[0] || null;
         const hit: RetrievedMemoryHit = {
           sessionId,
           channelType: meta.channelType,
@@ -1418,7 +1690,14 @@ export class JsonFileStore implements BridgeStore {
           workingDirectory: meta.workingDirectory,
           role: message.role === 'assistant' ? 'assistant' : 'user',
           source: summarized.source,
+          sourceType: sameChat ? 'chat' : (isCurrentSession ? 'session' : 'workdir'),
           score,
+          confidence: Math.max(0, Math.min(0.9, score / 18)),
+          answerability: structured ? 'structured' : 'summary',
+          quality: isLowValueMemoryText(summarized.searchText) ? 'low' : (structured ? 'high' : 'medium'),
+          structuredKey: structured?.key,
+          structuredValue: structured?.value,
+          structuredPairs,
           content: this.buildMatchedMemoryExcerpt(summarized.searchText, tokens),
         };
         if (sameChat) sameChatHits.push(hit);
@@ -1429,15 +1708,18 @@ export class JsonFileStore implements BridgeStore {
 
     const hits = [
       ...knowledgeHits,
+      ...graphHits,
       ...sameChatHits,
       ...currentSessionHits,
       ...sameWorkdirHits,
+      ...auditHits,
       ...profileHits,
     ];
 
     const selected: RetrievedMemoryHit[] = [];
     let usedChars = 0;
     for (const hit of hits.sort((left, right) => right.score - left.score)) {
+      if (hit.quality === 'low' || isLowValueMemoryText(hit.content)) continue;
       const nextChars = usedChars + hit.content.length;
       if (selected.length > 0 && nextChars > MEMORY_MAX_CHARS) break;
       selected.push(hit);
@@ -1450,6 +1732,58 @@ export class JsonFileStore implements BridgeStore {
       summary: this.buildMemorySummary(selected),
       hits: selected,
     };
+  }
+
+  decideMemoryReply(query: MemoryRetrievalQuery): MemoryReplyDecision {
+    const plan = planMemoryQuery(query.query);
+    if (plan.intent !== 'explicit_recall') {
+      return {
+        type: 'augment_codex',
+        memory: null,
+        plan,
+      };
+    }
+    const memory = this.retrieveRelevantMemory({
+      ...query,
+      query: plan.normalizedKey || plan.queryText,
+      recentHistoryLimit: plan.intent === 'explicit_recall' ? 0 : query.recentHistoryLimit,
+    });
+    return decideMemoryReplyFromHits(plan, memory);
+  }
+
+  retrieveMemoryGraphContext(query: MemoryRetrievalQuery): MemoryGraphContext | null {
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return null;
+    const graph = readMemoryGraphIndex(memoryRoot);
+    if (!graph) return null;
+    const context = searchMemoryGraph(graph, query.query, { limit: MEMORY_MAX_HITS });
+    return context.related.length > 0 ? context : null;
+  }
+
+  reviewOutboundAnswer(input: AnswerReviewInput): AnswerReviewDecision {
+    const modeSetting = this.settings.get('bridge_answer_review_mode') || process.env.CTI_ANSWER_REVIEW_MODE || '';
+    const configuredMode = modeSetting === 'block_or_replace'
+      ? 'block_or_replace'
+      : 'observe';
+    const decision = reviewOutboundAnswerRules(input, { mode: configuredMode });
+    this.appendAnswerReviewAudit(input, decision);
+    return decision;
+  }
+
+  private appendAnswerReviewAudit(input: AnswerReviewInput, decision: AnswerReviewDecision): void {
+    if (decision.verdict === 'pass' && decision.reasonCodes.length === 0) return;
+    const existing = readJson<AnswerReviewAuditRecord[]>(ANSWER_REVIEW_AUDIT_PATH, []);
+    const record: AnswerReviewAuditRecord = {
+      ...decision,
+      id: uuid(),
+      channelType: input.channelType,
+      chatId: input.chatId,
+      userId: input.userId,
+      userText: this.summarizeMessageContent(input.userText || '', 800),
+      answerText: this.summarizeMessageContent(input.answerText || '', 1200),
+      source: input.source,
+    };
+    writeJson(ANSWER_REVIEW_AUDIT_PATH, [...existing, record].slice(-500));
   }
 
   // Session Locking

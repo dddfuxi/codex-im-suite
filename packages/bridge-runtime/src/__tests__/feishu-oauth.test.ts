@@ -7,6 +7,7 @@ import {
   FeishuOAuthService,
   FeishuOAuthStateStore,
   FeishuOAuthTokenStore,
+  startFeishuOAuthCallbackServer,
 } from '../feishu-oauth.js';
 
 describe('Feishu OAuth token store', () => {
@@ -43,6 +44,7 @@ describe('Feishu OAuth state and refresh', () => {
   it('builds a manual authorization card without requiring a public callback URL', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-manual-'));
     try {
+      const statePath = path.join(dir, 'states.json');
       const service = new FeishuOAuthService({
         config: {
           appId: 'cli_xxx',
@@ -56,20 +58,29 @@ describe('Feishu OAuth state and refresh', () => {
           protect: async (value) => value,
           unprotect: async (value) => value,
         }),
-        stateStore: new FeishuOAuthStateStore(path.join(dir, 'states.json')),
+        stateStore: new FeishuOAuthStateStore(statePath),
         now: () => new Date('2026-05-09T09:00:00.000Z'),
       });
 
       const result = await service.requestUserAuthorization({
         userId: 'ou_1',
         chatId: 'oc_1',
+        channelType: 'feishu',
+        userDisplayName: 'Liu Dan',
         messageId: 'm_1',
+        text: 'summarize https://example.feishu.cn/docx/doccn123',
         linkUrls: ['https://example.feishu.cn/docx/doccn123'],
       });
 
       assert.equal(result.status, 'auth_required');
-      assert.match(result.loginUrl || '', /^https:\/\/open\.feishu\.cn\/open-apis\/authen\/v1\/authorize\?/);
+      assert.match(result.loginUrl || '', /^https:\/\/open\.feishu\.cn\/open-apis\/authen\/v1\/index\?/);
       assert.match(result.loginUrl || '', /redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A17321%2Ffeishu%2Foauth%2Fcallback/);
+      assert.doesNotMatch(result.loginUrl || '', /scope=/);
+      assert.doesNotMatch(result.loginUrl || '', /code_challenge=/);
+      const persistedStates = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, any>;
+      const persistedState = Object.values(persistedStates)[0];
+      assert.equal(persistedState.pendingRequest.text, 'summarize https://example.feishu.cn/docx/doccn123');
+      assert.equal(persistedState.pendingRequest.userDisplayName, 'Liu Dan');
       assert.match(result.userMessage, /复制浏览器地址栏/);
       assert.match(result.feishuCardJson || '', /复制回调地址/);
     } finally {
@@ -90,6 +101,14 @@ describe('Feishu OAuth state and refresh', () => {
         redirectUri: 'http://127.0.0.1:17321/feishu/oauth/callback',
         linkHashes: ['abc'],
         expiresAt: '2026-05-09T09:05:00.000Z',
+        pendingRequest: {
+          text: 'summarize https://example.feishu.cn/docx/doc_abc',
+          channelType: 'feishu',
+          chatId: 'oc_1',
+          userId: 'ou_1',
+          userDisplayName: 'Liu Dan',
+          messageId: 'm_1',
+        },
       });
       const tokenStore = new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
         protect: async (value) => `p:${value}`,
@@ -107,17 +126,22 @@ describe('Feishu OAuth state and refresh', () => {
         tokenStore,
         stateStore,
         now: () => new Date('2026-05-09T09:00:00.000Z'),
-        fetch: async (_url, init) => {
+        fetch: async (url, init) => {
+          if (String(url).includes('/auth/v3/app_access_token/internal')) {
+            return new Response(JSON.stringify({
+              code: 0,
+              app_access_token: 'app-access-token',
+              expire: 7200,
+            }), { status: 200 });
+          }
+          assert.match(String(url), /\/open-apis\/authen\/v1\/access_token/);
+          assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer app-access-token');
           assert.match(String(init?.body), /"code":"auth-code"/);
-          assert.match(String(init?.body), /"redirect_uri":"http:\/\/127\.0\.0\.1:17321\/feishu\/oauth\/callback"/);
           return new Response(JSON.stringify({
             code: 0,
             data: {
               access_token: 'new-access',
-              refresh_token: 'new-refresh',
               expires_in: 7200,
-              refresh_token_expires_in: 2592000,
-              scope: 'offline_access',
               open_id: 'ou_1',
             },
           }), { status: 200 });
@@ -130,9 +154,84 @@ describe('Feishu OAuth state and refresh', () => {
       });
 
       assert.equal(result.status, 'bound');
-      assert.match(result.userMessage, /授权成功/);
+      assert.equal(result.userMessage, '已收到，正在处理中。');
+      assert.equal(result.resume?.text, 'summarize https://example.feishu.cn/docx/doc_abc');
+      assert.equal(result.resume?.userDisplayName, 'Liu Dan');
       const stored = await tokenStore.getTokens('ou_1');
       assert.equal(stored?.accessToken, 'new-access');
+      assert.equal(stored?.refreshToken, undefined);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes original request after localhost callback server receives OAuth redirect', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-callback-resume-'));
+    try {
+      const stateStore = new FeishuOAuthStateStore(path.join(dir, 'states.json'), () => new Date('2026-05-09T09:00:00.000Z'));
+      await stateStore.put({
+        state: 'nonce-resume-1',
+        userId: 'ou_1',
+        chatId: 'oc_1',
+        messageId: 'm_1',
+        codeVerifier: 'verifier',
+        redirectUri: 'http://127.0.0.1:17321/feishu/oauth/callback',
+        linkHashes: ['abc'],
+        expiresAt: '2026-05-09T09:05:00.000Z',
+        pendingRequest: {
+          text: 'summarize https://example.feishu.cn/docx/doc_resume',
+          channelType: 'feishu',
+          chatId: 'oc_1',
+          userId: 'ou_1',
+          userDisplayName: 'Liu Dan',
+          messageId: 'm_1',
+        },
+      });
+      const tokenStore = new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
+        protect: async (value) => value,
+        unprotect: async (value) => value,
+      });
+      const service = new FeishuOAuthService({
+        config: {
+          appId: 'cli_xxx',
+          appSecret: 'secret',
+          mode: 'manual',
+          callbackPath: '/feishu/oauth/callback',
+          scopes: ['offline_access'],
+          waitForAuthorizationMs: 0,
+        },
+        tokenStore,
+        stateStore,
+        now: () => new Date('2026-05-09T09:00:00.000Z'),
+        fetch: async (url, init) => {
+          if (String(url).includes('/auth/v3/app_access_token/internal')) {
+            return new Response(JSON.stringify({ code: 0, app_access_token: 'app-access-token', expire: 7200 }), { status: 200 });
+          }
+          assert.match(String(url), /\/open-apis\/authen\/v1\/access_token/);
+          assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer app-access-token');
+          return new Response(JSON.stringify({ code: 0, data: { access_token: 'new-access', expires_in: 7200, open_id: 'ou_1' } }), { status: 200 });
+        },
+      });
+      let resumed: any = null;
+      const server = startFeishuOAuthCallbackServer(service, {
+        host: '127.0.0.1',
+        port: 0,
+        callbackPath: '/feishu/oauth/callback',
+        onResume: async (resume) => {
+          resumed = resume;
+        },
+      });
+      await new Promise<void>((resolve) => server.once('listening', resolve));
+      const addr = server.address();
+      assert.ok(addr && typeof addr === 'object');
+      const port = addr.port;
+      const resp = await fetch(`http://127.0.0.1:${port}/feishu/oauth/callback?code=auth-code&state=nonce-resume-1`);
+      assert.equal(resp.status, 200);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.ok(resumed);
+      assert.equal(resumed.text, 'summarize https://example.feishu.cn/docx/doc_resume');
+      assert.equal(resumed.userDisplayName, 'Liu Dan');
+      server.close();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

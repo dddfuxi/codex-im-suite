@@ -1,10 +1,18 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-05-09
+更新时间：2026-05-12
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
 ## 1. 项目收口
+
+- 2026-05-11 修正 Feishu 入站权限模型：`bridge_feishu_allowed_users` 不再作为 adapter 层会话白名单，任何用户都可以进入普通会话；兼容配置里的 allowed users 只再映射为 `Viewer` 角色，危险动作继续由 `Viewer / Operator / Owner` 门禁控制。
+- 2026-05-11 重整记忆召回链路：移除 `常用场景名称` 这类单词条快路径，改为 `MemoryQueryPlan -> RetrievedMemoryHit 元数据 -> MemoryReplyDecision`。明确回忆类请求只有高置信结构化命中才直答；模糊召回受限交给 Codex；普通任务只注入记忆上下文。`audit.json` 已发结果、profile、知识索引和会话历史统一带来源、置信度、可回答性和质量标记，错误兜底不再写入或召回为有效记忆。
+- 2026-05-11 补齐显式记忆写入可见性：用户发送“记住 / 记一下 / 保存记忆”时，运行时除了更新 `memory-profiles.json`，还会把原始内容写入 Markdown 知识库 `data/explicit-memories/*.md` 并重建索引，避免机器人说“记住了”但控制面板“记忆”页看不到。
+- 2026-05-12 新增记忆答案审查层：`bridge-core` 在 direct memory reply 和 Codex 最终回复发送前调用 runtime/store 的 `reviewOutboundAnswer`，v1 规则先检查乱码、协议残留、低价值兜底、工具假完成和记忆 key 不匹配；默认 `observe` 只写 `answer-review-audit.json`，配置 `bridge_answer_review_mode=block_or_replace` 后才替换或拦截用户可见回复。
+- 2026-05-12 新增显式记忆关系图：知识索引重建后同步生成 `.cti-index/memory-graph.json`，从结构化 key/value、同文件上下文和冲突标记建立 `maps_to`、`reverse_lookup`、`related_to` 等可解释边；检索会同时提供正向和反向候选，例如“雷霆龙”可关联回“第十三条龙”、展示 prefab 和 UIScene 路径。
+- 2026-05-12 显式记忆写入收口到可见知识库：`memory_write` 意图会先落 `data/explicit-memories/*.md` 并重建知识/关系索引，成功后才返回“记住了”；写入失败会直接说明阻塞，不再让模型假装已记住。控制面板“记忆”页显示关系图规模、节点/边预览、知识单元关联节点和最近答案审查 warning；关系图候选只做上下文增强，不参与直接记忆回答。
+- 2026-05-14 显式记忆分类和网格可视化收口：Markdown 表格行不再固定归为资源，而是按路径/链接/文件扩展名/Prefab/UIScene/预制体/路径、决策规则词、待办风险词等保守推断为事实、结论、待办或资源；单纯的 Scene 标识到常用名映射按事实处理，并记录分类原因；控制面板“记忆”页改为 TanStack Table 网格，可切换知识单元、关系节点、关系边视图。
 
 已完成：
 
@@ -161,6 +169,7 @@
 - fast-path 执行前判断改为硬约束：Ignis handler 先判断 intent 再读取 manifest / 健康检查；旧 MCP handler 全部委托到新版 preflight，避免老入口继续用散落正则绕过判断。
 - Skill、Codex prompt 和本地兜底 prompt 已补“解决问题优先”约束：工具类任务不能用通用步骤、示例表格或样例脚本代替真实执行；没有真实工具结果时必须明确说未完成和具体阻塞点。
 - 工具任务降级已加硬收口：Codex/MCP 执行链失败后，Unity/Blender/MCP/文档类请求直接返回确定性阻塞原因，不再交给本地模型生成“请手动检查”的教程式回复；bridge-core 出站前也会拦截这类外包式文案。
+- 2026-05-15 补齐 Unity/Prefab 工具任务的入口伪澄清拦截：如果用户已经提出 `unitymcp`、Prefab、场景或对象结构查看请求，Codex 或本地 Agent 失败后的回复不能再要求用户“指定 MCP 入口”或返回 MCP 入口列表；出站收口会改写成“未完成 + 需要真实 Unity/MCP 执行结果”的阻塞说明，并新增 `STH_AreaView` prefab 回归测试。
 - Codex/桥接提示词补齐 Unity 截图和 MCP 握手约束：截图类任务不得用扫描到的历史截图冒充当前刷新结果；`/mcp` 返回 406 时按“服务在线但缺 MCP Accept 握手头”处理，必须重试正式 initialize/list-tools 流程后才能判定不可用。
 - Codex provider 已补模型隔离：bridge 生成自己的 Codex Home 时剔除全局 `model = ...`，并支持 `CTI_CODEX_MODEL` 运行时覆盖。当前本机 Codex CLI 已从 `0.121.0` 升级到 `0.125.0`，`gpt-5.5` 已通过最小请求验证；live 版当前显式设置 `CTI_CODEX_MODEL=gpt-5.5`。
 
@@ -189,6 +198,9 @@
 - 运行中 workflow run 会持久化第一版最小恢复信息：prompt、工作目录、模型、system prompt、权限模式、渠道和 chatId；长文本按上限截断，避免状态文件无限膨胀。
 - bridge-runtime 启动时会扫描 `workflow-runs.json` 中遗留的 `running` run：有恢复输入且未耗尽次数的标为 `retry_pending`，缺少恢复输入的标为不可恢复失败。
 - provider 执行失败时会在可恢复 run 上排队一次自动重试；后台 retry worker 会领取 `auto_pending` / `manual_pending` run，重新流式执行并把结果写回会话历史。
+- 2026-05-15 新增自动重试新鲜度窗口：`auto_pending` 只会在 `CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS` 窗口内被后台 retry worker 领取，默认 6 小时；手动重试不受该窗口影响。
+- 2026-05-15 新增长时间空闲 fresh session 保护：同一 chat 绑定超过 `CTI_SESSION_IDLE_FRESH_MS`（默认 12 小时）后，下次消息会重绑到新 session 并清空 `sdkSessionId`，避免长时间断线后继续复用旧 Codex thread 和旧上下文。
+- 2026-05-15 Codex provider 新增失效工作区兜底：`workingDirectory` 或 `additionalDirectories` 命中不存在的路径时，不再原样传给 Codex CLI；会优先回退到有效的 `CTI_DEFAULT_WORKDIR`，并过滤掉不存在的附加目录，避免 workflow retry 或旧绑定因为失效路径直接触发 `Error: 系统找不到指定的文件 (os error 2)`。
 - retry 结果如果保留了渠道和 chatId，会通过 bridge proactive message 回发“断点续跑重试结果”，避免 bridge 重启后只在本地状态里完成。
 - 控制面板执行器页和会话详情能显示 recovery / retry 状态，并通过 `workflow.retryRun` 对失败且有恢复输入的 run 发起手动重试。
 - workflow status 单测补齐恢复信息持久化、重启后可恢复/不可恢复分类、手动 retry 请求和 runtime 领取顺序。
@@ -327,6 +339,8 @@
 - 运行时已取消“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类问题会走记忆检索和主执行链，不再因为关键词命中就绕过 Codex。
 - 会话历史里飞书 `interactive` 卡片消息现在会尽量解析正文文本；对旧的 `[卡片消息]` 占位记录，控制面板会优先按 `messageId` 从 `audit.json` 回填摘要，只有 audit 里也缺内容时才需要重新同步飞书历史。
 - Bridge 结果块协议已补回归测试：覆盖 `cti-final` 文本/Markdown 经 Feishu 出站、 malformed `cti-final` 可读兜底、`cti-reminder` 进入统一提醒 host，以及拦截伪提醒完成，避免原始 JSON 或协议残片发给用户。
+- 直接提醒自然语言快路径补齐“发消息提示我/通知我”句式：例如“一分钟后发消息提示我看一下unity”现在会直接创建 bridge 统一提醒，不再进入 Codex 普通回复后被伪完成拦截。
+- 直接提醒自然语言快路径补齐通用时间解析：支持相对时间、当天/明天/后天时刻和年月日时刻，提醒内容可出现在时间前或时间后；未带日期且时间已过时按次日同一时间处理，避免明确提醒请求落入普通 Codex 回复。
 
 近期注意：
 
@@ -356,6 +370,8 @@
 - 本地索引用于检索、摘要、节省 token 和容灾。
 - 记忆只按查询相关性少量注入，不允许把所有用户画像或全部历史塞进模型上下文。
 - 记忆类回复不能只给概括，命中结构化键值时应保留原始键和值。
+- 2026-05-11 记忆回忆路由补齐 Feishu 群聊 @ 噪声剥离和短问句键值识别：类似“第十三条龙叫啥@机器人”会按“第十三条龙”检索结构化知识，但“场景名称是什么”这类抽象普通问句仍不触发直答。
+- 2026-05-11 继续加固记忆直答排序：结构化直答必须匹配结构化 key 或明确表标题，不能因为聊天记录里包含用户问题就用不相关表格抢答；知识库精确 key 命中会优先于同群噪声历史。
 
 ## 8. 已知风险和后续建议
 

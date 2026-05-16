@@ -177,6 +177,26 @@ describe('channel-router', () => {
     assert.equal(second.workingDirectory, '/tmp/test');
   });
 
+  it('resolve() rebinds to a fresh session after the binding has been idle too long', () => {
+    const oldIdleMs = process.env.CTI_SESSION_IDLE_FRESH_MS;
+    process.env.CTI_SESSION_IDLE_FRESH_MS = '3600000';
+    try {
+      const first = router.resolve({ channelType: 'telegram', chatId: 'idle-chat' });
+      store.bindings.set('telegram:idle-chat', {
+        ...first,
+        sdkSessionId: 'old-sdk-session',
+        updatedAt: new Date(Date.now() - 2 * 3600000).toISOString(),
+      });
+
+      const second = router.resolve({ channelType: 'telegram', chatId: 'idle-chat' });
+      assert.notEqual(first.codepilotSessionId, second.codepilotSessionId);
+      assert.equal(second.sdkSessionId, '');
+    } finally {
+      if (oldIdleMs === undefined) delete process.env.CTI_SESSION_IDLE_FRESH_MS;
+      else process.env.CTI_SESSION_IDLE_FRESH_MS = oldIdleMs;
+    }
+  });
+
   it('createBinding() uses custom working directory', () => {
     const binding = router.createBinding(
       { channelType: 'telegram', chatId: '456' },

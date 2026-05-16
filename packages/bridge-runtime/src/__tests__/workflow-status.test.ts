@@ -137,4 +137,38 @@ describe('workflow status store', () => {
     assert.equal(claimed?.retry?.status, 'retrying');
     assert.equal(claimed?.retry?.claimedBy, 'worker-1');
   });
+
+  it('does not auto-claim stale interrupted runs after the auto-retry age window has passed', () => {
+    const oldMaxAge = process.env.CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS;
+    process.env.CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS = '1';
+    try {
+      const run = startWorkflowRun({
+        sessionId: 'session-stale-auto-retry',
+        prompt: '桥接断开后继续旧任务',
+        channelType: 'feishu',
+        chatId: 'chat-stale-auto-retry',
+      });
+      recordWorkflowRecoveryInfo(run.id, {
+        prompt: '桥接断开后继续旧任务',
+        workingDirectory: 'C:\\workspace',
+        maxAutoAttempts: 1,
+      });
+
+      const marked = markInterruptedWorkflowRuns('runtime-stale-window');
+      const recovered = marked.find((item) => item.id === run.id);
+      assert.equal(recovered?.status, 'retry_pending');
+      assert.equal(recovered?.retry?.status, 'auto_pending');
+
+      const until = Date.now() + 10;
+      while (Date.now() < until) {
+        // wait for the retry window to expire without relying on file mutation
+      }
+
+      const claimed = claimNextWorkflowRetry('worker-stale');
+      assert.equal(claimed, null);
+    } finally {
+      if (oldMaxAge === undefined) delete process.env.CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS;
+      else process.env.CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS = oldMaxAge;
+    }
+  });
 });

@@ -272,6 +272,8 @@ describe('Feishu cloud document links', () => {
 
     assert.equal(result.status, 'resolved');
     assert.equal(calls.length, 2);
+    assert.match(result.systemPrompt || '', /Do not fetch, browse, curl/);
+    assert.match(result.systemPrompt || '', /requires public sharing/);
     assert.match(result.systemPrompt || '', /问题收集/);
     assert.match(result.systemPrompt || '', /卡顿/);
     assert.match(result.systemPrompt || '', /优化加载/);
@@ -389,5 +391,49 @@ describe('Feishu cloud document links', () => {
     assert.equal(result.status, 'permission_denied');
     assert.match(result.userMessage || '', /bitable:app:readonly/);
     assert.match(result.userMessage || '', /base:table:read/);
+  });
+
+  it('asks the Feishu user to re-authorize when an existing user token is missing newly granted Sheets scopes', async () => {
+    let authorizationRequested = false;
+    const host = createFeishuCloudDocumentHost({
+      config: {
+        appId: 'cli_xxx',
+        appSecret: 'secret',
+        maxChars: 80000,
+        maxRows: 500,
+        maxRecords: 500,
+        maxSheets: 5,
+      },
+      tokenProvider: {
+        getAccessToken: async () => 'old-user-token',
+        requestUserAuthorization: async (input) => {
+          authorizationRequested = true;
+          assert.equal(input.text, 'summarize https://example.feishu.cn/sheets/shtcn123');
+          return {
+            status: 'auth_required',
+            loginUrl: 'https://open.feishu.cn/open-apis/authen/v1/index?state=nonce',
+            userMessage: '需要重新授权以刷新 Sheets 用户权限。',
+            feishuCardJson: '{"config":{"wide_screen_mode":true}}',
+          };
+        },
+      },
+      fetch: async () => jsonResponse({
+        code: 125403,
+        msg: 'Access denied. One of the following scopes is required: [sheets:spreadsheet, drive:drive, sheets:spreadsheet:readonly, drive:drive:readonly, sheets:spreadsheet:read]. token_type=user',
+      }, 403),
+    });
+
+    const result = await host.resolveFeishuCloudLinks({
+      text: 'summarize https://example.feishu.cn/sheets/shtcn123',
+      channelType: 'feishu',
+      chatId: 'oc_1',
+      userId: 'ou_1',
+      messageId: 'm_1',
+    });
+
+    assert.equal(result.status, 'auth_required');
+    assert.equal(authorizationRequested, true);
+    assert.match(result.userMessage || '', /重新授权/);
+    assert.equal(result.feishuCardJson, '{"config":{"wide_screen_mode":true}}');
   });
 });

@@ -1,6 +1,14 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
+  flexRender,
+  getCoreRowModel,
+  getSortedRowModel,
+  useReactTable,
+  type ColumnDef,
+  type SortingState,
+} from '@tanstack/react-table';
+import {
   Activity,
   Archive,
   ArrowDownUp,
@@ -347,13 +355,27 @@ type KnowledgeIndexStatus = {
   memoryRoot: string;
   indexPath: string;
   statusPath?: string;
+  memoryGraphPath?: string;
   watching: boolean;
   exists: boolean;
   markdownFileCount: number;
   itemCount: number;
   conflictCount: number;
+  memoryGraphNodeCount?: number;
+  memoryGraphEdgeCount?: number;
+  memoryGraphPreview?: {
+    nodes: Array<{ id: string; label: string; kind: string }>;
+    edges: Array<{ from: string; to: string; fromLabel?: string; toLabel?: string; type: string; weight: number }>;
+  };
   sourceFileCount?: number;
   kindCounts?: Record<string, number>;
+  recentReviewWarnings?: Array<{
+    createdAt: string;
+    verdict: string;
+    reasonCodes: string[];
+    userText: string;
+    answerText: string;
+  }>;
   generatedAt: string;
   lastIndexedAt?: string;
   lastEventAt?: string;
@@ -371,8 +393,12 @@ type KnowledgeSearchItem = {
   text: string;
   confidence: number;
   conflict: boolean;
+  classificationReason?: string;
+  classificationSource?: string;
   sourcePath: string;
+  sourceUpdatedAt?: string;
   snippet: string;
+  related?: Array<{ label: string; kind: string; type: string; score: number }>;
 };
 
 type KnowledgeSearchResponse = {
@@ -662,13 +688,18 @@ const fallbackState: PanelState = {
     memoryRoot: '',
     indexPath: '',
     statusPath: '',
+    memoryGraphPath: '',
     watching: false,
     exists: false,
     markdownFileCount: 0,
     itemCount: 0,
     conflictCount: 0,
+    memoryGraphNodeCount: 0,
+    memoryGraphEdgeCount: 0,
+    memoryGraphPreview: { nodes: [], edges: [] },
     sourceFileCount: 0,
     kindCounts: {},
+    recentReviewWarnings: [],
     generatedAt: '',
     lastIndexedAt: '',
     lastEventAt: '',
@@ -2578,11 +2609,70 @@ function reminderStatusKind(status: string): StatusKind {
   }
 }
 
+function MemoryDataGrid<T extends object>({
+  data,
+  columns,
+  emptyText,
+}: {
+  data: T[];
+  columns: Array<ColumnDef<T>>;
+  emptyText: string;
+}) {
+  const [sorting, setSorting] = useState<SortingState>([]);
+  const table = useReactTable({
+    data,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+  });
+
+  return (
+    <div className="memory-grid-shell">
+      <table className="memory-data-grid">
+        <thead>
+          {table.getHeaderGroups().map((headerGroup) => (
+            <tr key={headerGroup.id}>
+              {headerGroup.headers.map((header) => (
+                <th key={header.id} style={{ width: header.getSize() || undefined }}>
+                  {header.isPlaceholder ? null : (
+                    <button
+                      type="button"
+                      className={header.column.getCanSort() ? 'grid-sort-button' : 'grid-sort-button disabled'}
+                      onClick={header.column.getToggleSortingHandler()}
+                      disabled={!header.column.getCanSort()}
+                    >
+                      {flexRender(header.column.columnDef.header, header.getContext())}
+                      {header.column.getCanSort() && <ArrowDownUp size={12} />}
+                    </button>
+                  )}
+                </th>
+              ))}
+            </tr>
+          ))}
+        </thead>
+        <tbody>
+          {table.getRowModel().rows.map((row) => (
+            <tr key={row.id}>
+              {row.getVisibleCells().map((cell) => (
+                <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {data.length === 0 && <div className="empty-inline">{emptyText}</div>}
+    </div>
+  );
+}
+
 function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps['run']; pending: Record<string, boolean> }) {
   const [status, setStatus] = useState<KnowledgeIndexStatus>(state.memory);
   const [reminders, setReminders] = useState<TodoReminderSnapshot>(state.memoryReminders);
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<(typeof knowledgeKinds)[number]['id']>('all');
+  const [gridView, setGridView] = useState<'items' | 'nodes' | 'edges'>('items');
   const [items, setItems] = useState<KnowledgeSearchItem[]>([]);
   const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
   const [error, setError] = useState('');
@@ -2692,6 +2782,91 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     { label: '监听心跳', detail: status.watching ? '运行中' : '未运行', ok: status.watching },
     { label: 'Codex 注入', detail: status.exists && !status.lastError ? '可注入' : '等待索引', ok: status.exists && !status.lastError },
   ];
+  const graphNodes = status.memoryGraphPreview?.nodes ?? [];
+  const graphEdges = status.memoryGraphPreview?.edges ?? [];
+  const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
+    {
+      accessorKey: 'kind',
+      header: '类型',
+      cell: ({ row }) => <StatusPill status={row.original.conflict ? 'warning' : 'ok'} label={knowledgeKindLabel(row.original.kind)} />,
+      size: 92,
+    },
+    {
+      id: 'memory',
+      header: '记忆',
+      accessorFn: (row) => row.key ? `${row.key} = ${row.value || row.text}` : row.text,
+      cell: ({ row }) => (
+        <div className="grid-main-cell">
+          <strong>{row.original.key ? `${row.original.key} = ${row.original.value || row.original.text}` : row.original.text}</strong>
+          <span>{row.original.snippet || row.original.text}</span>
+        </div>
+      ),
+      size: 360,
+    },
+    {
+      id: 'confidence',
+      header: '置信度',
+      accessorFn: (row) => row.confidence || 0,
+      cell: ({ row }) => `${Math.round((row.original.confidence || 0) * 100)}%`,
+      size: 88,
+    },
+    {
+      id: 'related',
+      header: '关联',
+      accessorFn: (row) => row.related?.length ?? 0,
+      cell: ({ row }) => (row.original.related ?? []).slice(0, 4).map((related) => `${related.label} (${related.type})`).join('；') || '-',
+      size: 240,
+    },
+    {
+      id: 'classification',
+      header: '分类原因',
+      accessorFn: (row) => row.classificationReason || row.classificationSource || '',
+      cell: ({ row }) => row.original.classificationReason || row.original.classificationSource || '-',
+      size: 210,
+    },
+    {
+      id: 'source',
+      header: '来源',
+      accessorFn: (row) => row.sourcePath,
+      cell: ({ row }) => <code>{row.original.sourcePath || '-'}</code>,
+      size: 260,
+    },
+    {
+      id: 'updated',
+      header: '更新时间',
+      accessorFn: (row) => row.sourceUpdatedAt || '',
+      cell: ({ row }) => row.original.sourceUpdatedAt || '-',
+      size: 180,
+    },
+    {
+      id: 'actions',
+      header: '操作',
+      enableSorting: false,
+      cell: ({ row }) => (
+        <div className="grid-actions">
+          <MiniButton
+            label="归档"
+            icon={<Archive size={14} />}
+            onClick={() => void archiveKnowledgeItem(row.original.id)}
+            pending={pending['memory.archiveItem']}
+          />
+          <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: row.original.sourcePath })} pending={pending['memory.openSource']} />
+        </div>
+      ),
+      size: 190,
+    },
+  ], [pending, run]);
+  const nodeColumns = useMemo<Array<ColumnDef<{ id: string; label: string; kind: string }>>>(() => [
+    { accessorKey: 'label', header: '节点', cell: ({ row }) => <strong>{row.original.label}</strong>, size: 260 },
+    { accessorKey: 'kind', header: '类型', cell: ({ row }) => row.original.kind || '-', size: 120 },
+    { accessorKey: 'id', header: 'ID', cell: ({ row }) => <code>{row.original.id}</code>, size: 220 },
+  ], []);
+  const edgeColumns = useMemo<Array<ColumnDef<{ from: string; to: string; fromLabel?: string; toLabel?: string; type: string; weight: number }>>>(() => [
+    { id: 'from', header: '起点', accessorFn: (row) => row.fromLabel || row.from, cell: ({ row }) => row.original.fromLabel || row.original.from, size: 240 },
+    { id: 'type', header: '关系', accessorFn: (row) => row.type, cell: ({ row }) => row.original.type || '-', size: 140 },
+    { id: 'to', header: '终点', accessorFn: (row) => row.toLabel || row.to, cell: ({ row }) => row.original.toLabel || row.original.to, size: 240 },
+    { id: 'weight', header: '权重', accessorFn: (row) => row.weight || 0, cell: ({ row }) => (row.original.weight || 0).toFixed(2), size: 90 },
+  ], []);
 
   return (
     <section className="content-stack">
@@ -2750,10 +2925,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           <Metric label="Markdown" value={String(status.markdownFileCount ?? 0)} compact />
           <Metric label="知识单元" value={String(status.itemCount ?? 0)} compact />
           <Metric label="冲突" value={String(status.conflictCount ?? 0)} compact />
+          <Metric label="关系节点" value={String(status.memoryGraphNodeCount ?? 0)} compact />
+          <Metric label="关系边" value={String(status.memoryGraphEdgeCount ?? 0)} compact />
         </div>
         <dl className="kv">
           <dt>仓库</dt><dd>{status.memoryRoot || state.paths.memoryRepo || '-'}</dd>
           <dt>索引</dt><dd>{status.indexPath || '-'}</dd>
+          <dt>关系图</dt><dd>{status.memoryGraphPath || '-'}</dd>
           <dt>状态文件</dt><dd>{status.statusPath || '-'}</dd>
           <dt>索引时间</dt><dd>{status.lastIndexedAt || status.generatedAt || '-'}</dd>
           <dt>最近事件</dt><dd>{status.lastEventAt || '-'}</dd>
@@ -2762,6 +2940,39 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           <dt>状态心跳</dt><dd>{status.statusUpdatedAt || '-'}</dd>
           <dt>状态</dt><dd><StatusPill status={statusKind} label={status.lastError || (status.exists ? '可用' : '等待生成')} /></dd>
         </dl>
+        {(((status.memoryGraphPreview?.nodes ?? []).length > 0) || ((status.memoryGraphPreview?.edges ?? []).length > 0)) && (
+          <div className="runtime-list compact-list">
+            <article className="runtime-row">
+              <div>
+                <strong>关系节点</strong>
+                <p>{(status.memoryGraphPreview?.nodes ?? []).slice(0, 8).map((node) => `${node.label} (${node.kind})`).join('；') || '-'}</p>
+              </div>
+              <StatusPill status="ok" label={`${status.memoryGraphNodeCount ?? 0} nodes`} />
+            </article>
+            <article className="runtime-row">
+              <div>
+                <strong>关系边</strong>
+                <p>{(status.memoryGraphPreview?.edges ?? []).slice(0, 8).map((edge) => `${edge.fromLabel || edge.from} -> ${edge.toLabel || edge.to} (${edge.type})`).join('；') || '-'}</p>
+              </div>
+              <StatusPill status="ok" label={`${status.memoryGraphEdgeCount ?? 0} edges`} />
+            </article>
+          </div>
+        )}
+        {(status.recentReviewWarnings ?? []).length > 0 && (
+          <div className="runtime-list compact-list">
+            {(status.recentReviewWarnings ?? []).map((item, index) => (
+              <article key={`${item.createdAt}-${index}`} className="runtime-row">
+                <div>
+                  <strong>{item.reasonCodes?.join(', ') || item.verdict}</strong>
+                  <span>{item.createdAt || '-'}</span>
+                  <p>{item.userText || '-'}</p>
+                  <code>{item.answerText || '-'}</code>
+                </div>
+                <StatusPill status="warning" label={item.verdict || 'warn'} />
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -2826,10 +3037,10 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
 
       <section className="panel">
         <SectionHeader
-          title="知识单元 / 搜索"
+          title="记忆网格 / 搜索"
           action={<MiniButton label="搜索" icon={<Search size={14} />} onClick={() => void search()} pending={pending['memory.search']} />}
         />
-        <div className="detail-meta">当前显示 {items.length} / {status.itemCount ?? 0} 个知识单元。</div>
+        <div className="detail-meta">当前显示 {items.length} / {status.itemCount ?? 0} 个知识单元；关系图缓存 {graphNodes.length} 个节点、{graphEdges.length} 条边。</div>
         <div className="filter-row">
           <Search size={14} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
@@ -2837,36 +3048,39 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           }} placeholder="关键词、场景名、文件名或结论片段" />
         </div>
         <div className="preset-wall">
+          {[
+            { id: 'items', label: '知识单元' },
+            { id: 'nodes', label: '关系节点' },
+            { id: 'edges', label: '关系边' },
+          ].map((item) => (
+            <button key={item.id} className={gridView === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setGridView(item.id as typeof gridView)}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+        {gridView === 'items' && (
+          <div className="preset-wall">
           {knowledgeKinds.map((item) => (
             <button key={item.id} className={kind === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setKind(item.id)}>
               {item.label}
             </button>
           ))}
-        </div>
+          </div>
+        )}
         {error && <div className="empty-inline">{error}</div>}
-        <div className="runtime-list compact-list">
-          {items.map((item) => (
-            <article key={item.id} className="runtime-row">
-              <div>
-                <strong>{item.key ? `${item.key} = ${item.value || item.text}` : item.text}</strong>
-                <span>{knowledgeKindLabel(item.kind)} · 置信度 {Math.round((item.confidence || 0) * 100)}% · {item.conflict ? '冲突候选' : '正常'}</span>
-                <p>{item.snippet || item.text}</p>
-                <code>{item.sourcePath || '-'}</code>
-              </div>
-              <div className="row-actions">
-                <StatusPill status={item.conflict ? 'warning' : 'ok'} label={knowledgeKindLabel(item.kind)} />
-                <MiniButton
-                  label="归档"
-                  icon={<Archive size={14} />}
-                  onClick={() => void archiveKnowledgeItem(item.id)}
-                  pending={pending['memory.archiveItem']}
-                />
-                <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.sourcePath })} pending={pending['memory.openSource']} />
-              </div>
-            </article>
-          ))}
-          {items.length === 0 && <div className="empty-inline">{status.itemCount ? '暂无匹配结果。清空关键词或切换类型后再搜索。' : '暂无知识单元。'}</div>}
-        </div>
+        {gridView === 'items' && (
+          <MemoryDataGrid
+            data={items}
+            columns={itemColumns}
+            emptyText={status.itemCount ? '暂无匹配结果。清空关键词或切换类型后再搜索。' : '暂无知识单元。'}
+          />
+        )}
+        {gridView === 'nodes' && (
+          <MemoryDataGrid data={graphNodes} columns={nodeColumns} emptyText="暂无关系节点。重建知识索引后会在这里出现。" />
+        )}
+        {gridView === 'edges' && (
+          <MemoryDataGrid data={graphEdges} columns={edgeColumns} emptyText="暂无关系边。结构化记忆建立映射后会在这里出现。" />
+        )}
       </section>
 
       <section className="panel">

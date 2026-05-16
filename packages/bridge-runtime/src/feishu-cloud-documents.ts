@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   FeishuCloudDocumentHost,
   FeishuCloudLinkResolveInput,
   FeishuCloudLinkResolveResult,
@@ -77,7 +77,7 @@ export class FeishuTenantAccessTokenProvider implements FeishuCloudTenantTokenPr
 }
 
 export function parseFeishuCloudLinks(text: string): FeishuCloudLink[] {
-  const urls = text.match(/https?:\/\/[^\s<>"'，。！？、)）\]]+/gi) || [];
+  const urls = text.match(/https?:\/\/[^\s<>"'\]\)]+/gi) || [];
   const seen = new Set<string>();
   const links: FeishuCloudLink[] = [];
   for (const rawUrl of urls) {
@@ -166,22 +166,28 @@ export function createFeishuCloudDocumentHost(options: {
         };
       }
 
+      const requestAuthorization = () => options.tokenProvider.requestUserAuthorization({
+        userId: input.userId!,
+        chatId: input.chatId,
+        channelType: input.channelType,
+        userDisplayName: input.userDisplayName,
+        messageId: input.messageId,
+        text: input.text,
+        linkUrls: links.map((link) => link.url),
+      });
+      const buildAuthorizationRequiredResult = (authorization: Extract<FeishuAuthorizationResult, { status: 'auth_required' }>): FeishuCloudLinkResolveResult => ({
+        status: 'auth_required',
+        linkCount: links.length,
+        loginUrl: authorization.loginUrl,
+        userMessage: authorization.userMessage,
+        feishuCardJson: authorization.feishuCardJson,
+      });
+
       let accessToken = await options.tokenProvider.getAccessToken(input.userId);
       if (!accessToken) {
-        const authorization = await options.tokenProvider.requestUserAuthorization({
-          userId: input.userId,
-          chatId: input.chatId,
-          messageId: input.messageId,
-          linkUrls: links.map((link) => link.url),
-        });
+        const authorization = await requestAuthorization();
         if (authorization.status !== 'authorized') {
-          return {
-            status: 'auth_required',
-            linkCount: links.length,
-            loginUrl: authorization.loginUrl,
-            userMessage: authorization.userMessage,
-            feishuCardJson: authorization.feishuCardJson,
-          };
+          return buildAuthorizationRequiredResult(authorization);
         }
         accessToken = authorization.accessToken;
       }
@@ -195,6 +201,35 @@ export function createFeishuCloudDocumentHost(options: {
         };
       } catch (error) {
         if (error instanceof FeishuCloudPermissionError) {
+          if (error.scopeRelated && !input.messageId?.endsWith(':oauth-resume')) {
+            const authorization = await requestAuthorization();
+            if (authorization.status !== 'authorized') {
+              return buildAuthorizationRequiredResult(authorization);
+            }
+            try {
+              const resolved = await readLinks(links, authorization.accessToken, options.config, fetchImpl);
+              return {
+                status: 'resolved',
+                linkCount: links.length,
+                systemPrompt: buildSystemPrompt(resolved.sections, resolved.truncated, 'user'),
+              };
+            } catch (retryError) {
+              if (retryError instanceof FeishuCloudPermissionError) {
+                return {
+                  status: 'permission_denied',
+                  linkCount: links.length,
+                  userMessage: buildUserPermissionDeniedMessage(retryError, tenantPermissionError, tenantTokenError),
+                  error: retryError.message,
+                };
+              }
+              return {
+                status: 'error',
+                linkCount: links.length,
+                userMessage: `未完成：读取飞书云文档失败：${retryError instanceof Error ? retryError.message : String(retryError)}`,
+                error: retryError instanceof Error ? retryError.message : String(retryError),
+              };
+            }
+          }
           return {
             status: 'permission_denied',
             linkCount: links.length,
@@ -271,7 +306,7 @@ async function readSheets(
     accessToken,
     fetchImpl,
     {},
-    ['sheets:spreadsheet:readonly'],
+    ['sheets:spreadsheet:readonly', 'sheets:spreadsheet:read', 'drive:drive:readonly'],
   );
   const allSheets = queryPayload.data?.sheets || queryPayload.sheets || [];
   const selectedSheets = link.sheetId
@@ -296,7 +331,7 @@ async function readSheets(
       accessToken,
       fetchImpl,
       {},
-      ['sheets:spreadsheet:readonly'],
+      ['sheets:spreadsheet:readonly', 'sheets:spreadsheet:read', 'drive:drive:readonly'],
     );
     const values = valuesPayload.data?.valueRange?.values || valuesPayload.data?.values || [];
     sections.push('', `### Sheet: ${title} (${sheetId})`, `Rows read: ${values.length}`, formatRows(values));
@@ -393,7 +428,7 @@ async function feishuRequest<T>(
   if (!response.ok || code !== 0) {
     const message = payload.msg || payload.message || `HTTP ${response.status}`;
     if (response.status === 401 || response.status === 403 || PERMISSION_CODES.has(code)) {
-      throw new FeishuCloudPermissionError(message, requiredScopes);
+      throw new FeishuCloudPermissionError(message, requiredScopes, isScopeRelatedPermissionMessage(message));
     }
     throw new Error(message);
   }
@@ -401,9 +436,18 @@ async function feishuRequest<T>(
 }
 
 class FeishuCloudPermissionError extends Error {
-  constructor(message: string, readonly requiredScopes: string[] = []) {
+  constructor(
+    message: string,
+    readonly requiredScopes: string[] = [],
+    readonly scopeRelated = false,
+  ) {
     super(message);
   }
+}
+
+function isScopeRelatedPermissionMessage(message: string): boolean {
+  return /scope|scopes|token_type=user|openapi|permission/i.test(message)
+    && /sheets:|docx:|drive:|bitable:|base:|auth:/i.test(message);
 }
 
 function buildSystemPrompt(sections: string[], truncated: boolean, tokenSource: 'tenant' | 'user'): string {
@@ -414,6 +458,8 @@ function buildSystemPrompt(sections: string[], truncated: boolean, tokenSource: 
     'Feishu cloud document context (authoritative for this turn):',
     sourceLine,
     '- Use this content as source material when answering the user request.',
+    '- Do not fetch, browse, curl, or otherwise access the original Feishu cloud document URLs again in this turn.',
+    '- If the user asks to view, summarize, or analyze the document, answer from this context instead of saying the link is private, unavailable, or requires public sharing.',
     truncated ? '- Content was truncated by bridge limits; mention truncation if it affects completeness.' : '',
     '',
     ...sections,

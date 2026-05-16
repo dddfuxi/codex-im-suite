@@ -639,9 +639,219 @@ describe('bridge-manager result block delivery', () => {
     assert.match(sent[0].text, /没有进入 bridge 的统一提醒系统/);
     assert.doesNotMatch(sent[0].text, /CodexFeishuReminder_20260507_1230|稍后会提醒你/);
   });
+  it('creates a direct reminder for send-message prompt wording without invoking Codex', async () => {
+    const sent: OutboundMessage[] = [];
+    const created: any[] = [];
+    let ticked = false;
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for high-confidence natural reminders');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      reminders: {
+        createDirectReminder: async (input) => {
+          created.push(input);
+          return {
+            ok: true,
+            reminderId: 'rem_prompt_1',
+            title: input.title,
+            dueAt: input.dueAt,
+            target: input.target,
+          };
+        },
+        tickReminders: async () => {
+          ticked = true;
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('一分钟后发消息提示我看一下unity'));
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].title, '看一下unity');
+    assert.equal(created[0].dueAt, '2026-05-07T04:01:00.000Z');
+    assert.equal(created[0].sourcePrompt, '一分钟后发消息提示我看一下unity');
+    assert.equal(ticked, true);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /提醒已进入统一提醒系统：看一下unity/);
+    assert.match(sent[0].text, /Reminder ID：rem_prompt_1/);
+  });
+
+  it('creates a same-day direct reminder for absolute time wording without invoking Codex', async () => {
+    const sent: OutboundMessage[] = [];
+    const created: any[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for high-confidence absolute-time reminders');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      reminders: {
+        createDirectReminder: async (input) => {
+          created.push(input);
+          return {
+            ok: true,
+            reminderId: 'rem_absolute_1',
+            title: input.title,
+            dueAt: input.dueAt,
+            target: input.target,
+          };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(
+      adapter,
+      createInboundMessage('11：30提醒我看消息', 'ou_1', 'oc_123', new Date('2026-05-12T03:24:06.000Z').getTime()),
+    );
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].title, '看消息');
+    assert.equal(created[0].dueAt, '2026-05-12T03:30:00.000Z');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /提醒已进入统一提醒系统：看消息/);
+    assert.match(sent[0].text, /Reminder ID：rem_absolute_1/);
+  });
+
+  it('creates direct reminders when the reminder content appears before the time', async () => {
+    const sent: OutboundMessage[] = [];
+    const created: any[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for deterministic reminder parsing');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      reminders: {
+        createDirectReminder: async (input) => {
+          created.push(input);
+          return {
+            ok: true,
+            reminderId: 'rem_before_time_1',
+            title: input.title,
+            dueAt: input.dueAt,
+            target: input.target,
+          };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(
+      adapter,
+      createInboundMessage('提醒我看消息，明天9点半', 'ou_1', 'oc_123', new Date('2026-05-12T03:24:06.000Z').getTime()),
+    );
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].title, '看消息');
+    assert.equal(created[0].dueAt, '2026-05-13T01:30:00.000Z');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /提醒已进入统一提醒系统：看消息/);
+  });
 });
 
 describe('bridge-manager Feishu cloud documents', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('continues the original Feishu cloud document request after a manual OAuth callback succeeds', async () => {
+    const sent: OutboundMessage[] = [];
+    let streamParams: StreamChatParams | null = null;
+    const feishuOAuth: FeishuOAuthManualHost = {
+      handleManualCallbackText: async (input) => {
+        assert.equal(input.text, 'http://127.0.0.1:17321/feishu/oauth/callback?code=auth-code&state=nonce-1');
+        assert.equal(input.userId, 'ou_1');
+        assert.equal(input.chatId, 'oc_oauth_resume');
+        return {
+          status: 'bound',
+          userMessage: '已收到，正在处理中。',
+          resume: {
+            text: 'summarize https://example.feishu.cn/docx/doc_abc',
+            channelType: 'feishu',
+            chatId: 'oc_oauth_resume',
+            userId: 'ou_1',
+            userDisplayName: 'Liu Dan',
+            messageId: 'm_original',
+          },
+        };
+      },
+    };
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async (input) => {
+        assert.equal(input.text, 'summarize https://example.feishu.cn/docx/doc_abc');
+        assert.equal(input.userId, 'ou_1');
+        assert.equal(input.chatId, 'oc_oauth_resume');
+        assert.equal(input.messageId, 'm_original:oauth-resume');
+        return {
+          status: 'resolved',
+          linkCount: 1,
+          systemPrompt: [
+            'Feishu cloud document context:',
+            'Source: https://example.feishu.cn/docx/doc_abc',
+            'raw content from authorized Feishu document',
+          ].join('\n'),
+        };
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams = params;
+          return createTextStream('summary generated from authorized document');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuOAuth,
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      'http://127.0.0.1:17321/feishu/oauth/callback?code=auth-code&state=nonce-1',
+      'ou_1',
+      'oc_oauth_resume',
+    ));
+
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].text, '已收到，正在处理中。');
+    assert.equal(sent[0].replyToMessageId, 'm_1');
+    assert.match(sent[1].text, /summary generated from authorized document/);
+    assert.equal(sent[1].replyToMessageId, 'm_original');
+    assert.match((streamParams as StreamChatParams | null)?.systemPrompt || '', /authorized Feishu document/);
+  });
+
   it('binds Feishu OAuth user tokens from a manually pasted callback URL without invoking the LLM', async () => {
     const sent: OutboundMessage[] = [];
     const feishuOAuth: FeishuOAuthManualHost = {
@@ -720,6 +930,50 @@ describe('bridge-manager Feishu cloud documents', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /已基于飞书文档总结/);
     assert.match((streamParams as StreamChatParams | null)?.systemPrompt || '', /飞书文档真实内容/);
+    assert.match((streamParams as StreamChatParams | null)?.prompt || '', /Feishu cloud document context/);
+    assert.match((streamParams as StreamChatParams | null)?.prompt || '', /飞书文档真实内容/);
+    assert.match((streamParams as StreamChatParams | null)?.prompt || '', /bridge/);
+    assert.doesNotMatch((streamParams as StreamChatParams | null)?.prompt || '', /https:\/\/example\.feishu\.cn\/docx\/doc_abc/);
+  });
+  it('summarizes resolved Feishu cloud Sheets directly when the request only asks for a summary', async () => {
+    const sent: OutboundMessage[] = [];
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async () => ({
+        status: 'resolved',
+        linkCount: 1,
+        systemPrompt: [
+          'Feishu cloud document context:',
+          '### Sheet: 建议收集 (415299)',
+          'Rows read: 3',
+          '1. 问题序号 | 建议人 | 问题类型 | 问题描述 | 问题解决的建议（如果有） | 图示（如果有） | 优先度等级判断（1-5） | 排期状态 | 任务链接',
+          '2. 1 | carr | 建议（问题+建议） | 玩家下一步操作的图标是死的，不会主动提示玩家 | 增加预操作提示 |  | 5 | 等方案 | ',
+          '3. 2 | 小明 | 吐槽（模糊问题、无建议） | 病房升级体验感不足，花了钱就完事了 | 增强收益表达 |  | 4 | 已排期 | ',
+        ].join('\n'),
+      }),
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          throw new Error('LLM should not be called for a resolved Sheets summary fallback');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('看一下并总结 https://example.feishu.cn/sheets/sht_abc', 'ou_1', 'oc_cloud_summary'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已读取飞书表格内容/);
+    assert.match(sent[0].text, /问题类型分布/);
+    assert.match(sent[0].text, /高优先级样例/);
   });
 
   it('asks the Feishu user to authorize when cloud document access needs login', async () => {
@@ -884,11 +1138,168 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(sanitized, /请手动检查|打开你的Unity项目|示例列表/);
   });
 
+  it('blocks MCP entry clarification replies for concrete Unity prefab requests', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sourcePrompt = 'unitymcp看一下STH_AreaView这个prefab的结构是怎样的';
+
+    const sanitized = _testOnly.sanitizeOutsourcedToolReply(
+      '请指定要使用的 Unity MCP 入口。例如：Blender MCP、Ignis MCP、Picture MCP、Unity MCP、Unity Prefab MCP、Fetch MCP。',
+      sourcePrompt,
+    );
+
+    assert.match(sanitized, /未完成/);
+    assert.match(sanitized, /需要实际 Unity\/MCP 执行结果/);
+    assert.doesNotMatch(sanitized, /请指定要使用的 Unity MCP 入口|Blender MCP、Ignis MCP/);
+  });
+
+  it('blocks short follow-up MCP entry clarification after a Unity tool prompt', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sanitized = _testOnly.sanitizeOutsourcedToolReply(
+      '请指定要使用的 Unity MCP 入口。',
+      'unity',
+    );
+
+    assert.match(sanitized, /未完成/);
+    assert.doesNotMatch(sanitized, /请指定要使用的 Unity MCP 入口/);
+  });
+
   it('routes pure small talk without turning it into a tool prompt', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     assert.match(_testOnly.buildSmallTalkReply('你好呀'), /闲聊/);
     assert.equal(_testOnly.buildSmallTalkReply('帮我看一下 Unity'), '');
     assert.equal(_testOnly.buildSmallTalkReply('你好呀，帮我发布'), '');
+  });
+
+  it('answers high-confidence memory decisions without invoking Codex', async () => {
+    const sent: OutboundMessage[] = [];
+    const reviewed: string[] = [];
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      retrieveRelevantMemory: () => {
+        throw new Error('bridge-core should consume the memory reply decision, not reimplement retrieval');
+      },
+      decideMemoryReply: () => ({
+        type: 'direct_reply' as const,
+        text: [
+          '常用场景名称对应表：',
+          '',
+          '`HSScene` == 医院内部场景',
+          '`city3d_citystage_ST2H_Scene` == 外城场景',
+        ].join('\n'),
+        hit: {
+          sessionId: 'audit:1',
+          role: 'assistant' as const,
+          source: 'message' as const,
+          sourceType: 'audit' as const,
+          score: 16,
+          confidence: 0.92,
+          answerability: 'structured' as const,
+          quality: 'high' as const,
+          structuredKey: '常用场景名称',
+          structuredValue: 'HSScene == 医院内部场景',
+          content: '常用场景名称对应表： `HSScene` == 医院内部场景',
+        },
+        plan: {
+          intent: 'explicit_recall' as const,
+          queryText: '常用场景名称',
+          normalizedKey: '常用场景名称',
+          answerMode: 'direct_if_confident' as const,
+          minConfidence: 0.78,
+          allowDirectAnswer: true,
+        },
+      }),
+      reviewOutboundAnswer: (input: any) => {
+        reviewed.push(input.answerText);
+        return {
+          verdict: 'warn' as const,
+          reasonCodes: ['memory_key_mismatch'],
+          mode: 'observe' as const,
+          createdAt: '2026-05-12T00:00:00.000Z',
+        };
+      },
+    };
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          throw new Error('Codex should not be called for direct memory decisions');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('常用场景名称', 'ou_1', 'oc_memory'));
+
+    assert.equal(sent.length, 1);
+    assert.equal(reviewed.length, 1);
+    assert.match(sent[0].text, /HSScene/);
+    assert.match(sent[0].text, /医院内部场景/);
+  });
+
+  it('uses answer review replacement when enforcement is enabled', async () => {
+    const sent: OutboundMessage[] = [];
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      decideMemoryReply: () => ({
+        type: 'direct_reply' as const,
+        text: '项目 HSScene：医院内部场景',
+        hit: {
+          sessionId: 'audit:bad',
+          role: 'assistant' as const,
+          source: 'message' as const,
+          sourceType: 'audit' as const,
+          score: 16,
+          confidence: 0.92,
+          answerability: 'structured' as const,
+          quality: 'high' as const,
+          structuredKey: '项目 HSScene',
+          structuredValue: '医院内部场景',
+          content: '项目 HSScene：医院内部场景',
+        },
+        plan: {
+          intent: 'explicit_recall' as const,
+          queryText: '第十三条龙叫啥',
+          normalizedKey: '第十三条龙',
+          answerMode: 'direct_if_confident' as const,
+          minConfidence: 0.78,
+          allowDirectAnswer: true,
+        },
+      }),
+      reviewOutboundAnswer: () => ({
+        verdict: 'replace' as const,
+        reasonCodes: ['memory_key_mismatch'],
+        replacementText: '第十三条龙：雷霆龙',
+        mode: 'block_or_replace' as const,
+        createdAt: '2026-05-12T00:00:00.000Z',
+      }),
+    };
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          throw new Error('Codex should not be called for direct memory decisions');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('第十三条龙叫啥', 'ou_1', 'oc_memory'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /第十三条龙：雷霆龙/);
+    assert.doesNotMatch(sent[0].text, /HSScene/);
   });
 
   it('extracts cti-reminder action blocks without treating normal task text as reminders', async () => {
@@ -1061,12 +1472,17 @@ function createTextStream(text: string): ReadableStream<string> {
   });
 }
 
-function createInboundMessage(text: string, userId = 'ou_1') {
+function createInboundMessage(
+  text: string,
+  userId = 'ou_1',
+  chatId = 'oc_123',
+  timestamp = new Date('2026-05-07T04:00:00.000Z').getTime(),
+) {
   return {
     messageId: 'm_1',
-    address: { channelType: 'feishu', chatId: 'oc_123', userId },
+    address: { channelType: 'feishu', chatId, userId },
     text,
-    timestamp: new Date('2026-05-07T04:00:00.000Z').getTime(),
+    timestamp,
   };
 }
 

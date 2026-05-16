@@ -1,6 +1,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { JsonFileStore } from '../store.js';
 import { CTI_HOME } from '../config.js';
@@ -9,12 +10,13 @@ const DATA_DIR = path.join(CTI_HOME, 'data');
 const GB_MOJIBAKE_CHINESE = '\u6d93\ue15f\u6783';
 
 // We construct the store with a settings map directly
-function makeSettings(): Map<string, string> {
+function makeSettings(extra: Array<[string, string]> = []): Map<string, string> {
   return new Map([
     ['remote_bridge_enabled', 'true'],
     ['bridge_default_work_dir', '/tmp/test-cwd'],
     ['bridge_default_model', 'test-model'],
     ['bridge_default_mode', 'code'],
+    ...extra,
   ]);
 }
 
@@ -167,6 +169,214 @@ describe('JsonFileStore', () => {
     assert.ok(memory);
     assert.match(memory.summary, /HSScene/);
     assert.match(memory.summary, /医院内部场景/);
+  });
+
+  it('persists explicit memory writes into the visible knowledge repository', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-visible-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+
+    store.recordMemoryEvent({
+      sessionId: 'sess-memory',
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user',
+      workingDirectory: '/tmp/test-cwd',
+      createdAt: '2026-05-11T09:26:16.228Z',
+      text: [
+        '记一下，这些常用场景名称是STH项目的，也叫ST2H，H项目',
+        '',
+        'HSScene == 医院内部场景',
+        'city3d_citystage_ST2H_Scene == 外城场景',
+        'pve_gunship == pve场景',
+        'Timeline_ST2H_Scene_01 == timeline场景',
+      ].join('\n'),
+    });
+
+    const indexPath = path.join(memoryRoot, '.cti-index', 'knowledge.json');
+    assert.equal(fs.existsSync(indexPath), true);
+    const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as {
+      items: Array<{ kind: string; key?: string; value?: string; text: string; classificationSource?: string }>;
+    };
+    assert.ok(index.items.some((item) => item.key === 'HSScene' && item.value === '医院内部场景'));
+    assert.ok(index.items.some((item) => item.key === 'STH' && item.value?.includes('常用场景名称')));
+    assert.ok(index.items.some((item) => item.kind === 'fact'));
+    assert.equal(index.items.some((item) => item.key === 'HSScene' && item.kind === 'resource'), false);
+    assert.ok(index.items.some((item) => item.classificationSource === 'table_inference'));
+  });
+
+  it('retrieves remembered mappings from audit history and ignores failed memory fallbacks', () => {
+    const store = new JsonFileStore(makeSettings());
+    const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');
+    store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      codepilotSessionId: session.id,
+      workingDirectory: '/tmp/test-cwd',
+      model: 'model',
+    });
+
+    store.insertAuditLog({
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      direction: 'outbound',
+      messageId: 'om_bad',
+      summary: '目前没有可用的常用场景名称记忆功能。请手动记录您常用的场景名称。',
+    });
+    store.insertAuditLog({
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      direction: 'outbound',
+      messageId: 'om_good',
+      summary: [
+        '常用场景名称对应表：',
+        '`HSScene` == 医院内部场景',
+        '`city3d_citystage_ST2H_Scene` == 外城场景',
+        '`pve_gunship` == pve场景',
+        '`Timeline_ST2H_Scene_01` == timeline场景',
+      ].join('\n'),
+    });
+
+    const memory = store.retrieveRelevantMemory({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      query: '常用场景名称',
+      recentHistoryLimit: 0,
+    });
+
+    assert.ok(memory);
+    assert.match(memory.summary, /HSScene/);
+    assert.match(memory.summary, /医院内部场景/);
+    assert.doesNotMatch(memory.summary, /请手动记录/);
+    assert.equal(memory.hits[0].sourceType, 'audit');
+    assert.equal(memory.hits[0].answerability, 'structured');
+    assert.equal(memory.hits[0].quality, 'high');
+    assert.equal(memory.hits[0].structuredPairs?.length, 4);
+  });
+
+  it('decides direct memory replies for non-scene structured recall keys', () => {
+    const store = new JsonFileStore(makeSettings());
+    const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');
+    store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      codepilotSessionId: session.id,
+      workingDirectory: '/tmp/test-cwd',
+      model: 'model',
+    });
+
+    store.insertAuditLog({
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      direction: 'outbound',
+      messageId: 'om_deploy',
+      summary: '部署命令 = npm run build && npm test',
+    });
+
+    const decision = store.decideMemoryReply({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      query: '我之前记的部署命令是什么',
+      recentHistoryLimit: 0,
+    });
+
+    assert.equal(decision.type, 'direct_reply');
+    assert.match(decision.type === 'direct_reply' ? decision.text : '', /部署命令/);
+    assert.match(decision.type === 'direct_reply' ? decision.text : '', /npm run build/);
+  });
+
+  it('prefers exact structured knowledge keys over noisy same-chat recall history', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-exact-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+    const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');
+    store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      codepilotSessionId: session.id,
+      workingDirectory: '/tmp/test-cwd',
+      model: 'model',
+    });
+    store.recordMemoryEvent({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user',
+      workingDirectory: '/tmp/test-cwd',
+      text: '请你记一下，第十三条龙 == 雷霆龙',
+    });
+    store.addMessage(session.id, 'user', '第十三条龙叫啥@小虾米');
+    store.addMessage(
+      session.id,
+      'assistant',
+      '项目 HSScene：医院内部场景 city3d_citystage_ST2H_Scene == 外城场景 pve_gunship == pve场景',
+    );
+
+    const decision = store.decideMemoryReply({
+      sessionId: session.id,
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      query: '第十三条龙叫啥@小虾米',
+      recentHistoryLimit: 0,
+    });
+
+    assert.equal(decision.type, 'direct_reply');
+    assert.match(decision.type === 'direct_reply' ? decision.text : '', /第十三条龙/);
+    assert.match(decision.type === 'direct_reply' ? decision.text : '', /雷霆龙/);
+    assert.doesNotMatch(decision.type === 'direct_reply' ? decision.text : '', /HSScene/);
+  });
+
+  it('retrieves reverse memory graph context for related knowledge', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-graph-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+
+    store.recordMemoryEvent({
+      sessionId: 'sess-graph',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user',
+      workingDirectory: '/tmp/test-cwd',
+      text: [
+        '请你记一下，ST横板第十三条龙相关信息',
+        '第十三条龙 == 雷霆龙',
+        '雷霆龙商城展示界面Unity预制体 == PreviewDragon_Thunde',
+        'ST龙相关展示场景路径 == Assets/__ArtData/_Resources/Prefab/City3D/UIScene',
+      ].join('\n'),
+    });
+
+    const graph = store.retrieveMemoryGraphContext({
+      sessionId: 'sess-graph',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      query: '雷霆龙',
+      recentHistoryLimit: 0,
+    });
+
+    assert.ok(graph);
+    assert.match(graph.summary, /第十三条龙/);
+    assert.match(graph.summary, /PreviewDragon_Thunde/);
+    assert.match(graph.summary, /UIScene/);
   });
 
   it('repairs Feishu history mojibake before retrieval and memory profile indexing', () => {

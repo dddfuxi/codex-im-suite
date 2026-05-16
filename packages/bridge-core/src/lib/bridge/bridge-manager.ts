@@ -9,6 +9,7 @@
 
 import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
 import type {
+  AnswerReviewInput,
   ConversationMemoryEvent,
   DirectReminderCreateResult,
   ExtensionActionActor,
@@ -16,6 +17,7 @@ import type {
   ExtensionActionPrepareResult,
   ExtensionCatalogItemSummary,
   FeishuCloudLinkResolveResult,
+  FeishuOAuthManualResumeRequest,
 } from './host.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -134,6 +136,7 @@ function appendReplyEndMarker(text: string): string {
 
 const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|看一眼|查一下|分析一下|整理.*列表)/i;
 const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
+const MCP_ENTRY_CLARIFICATION_REPLY_PATTERN = /(?:请(?:先)?(?:明确|指定).{0,12}(?:MCP|Unity MCP).{0,12}(?:入口|目标)|可用\s*MCP\s*入口|例如[:：].{0,80}(?:Unity MCP|Unity Prefab MCP|Blender MCP|Fetch MCP))/i;
 const TASK_INTENT_PATTERN = /(帮我|麻烦|请|需要|能不能|可以帮|处理|执行|运行|启动|停止|重启|发布|同步|安装|升级|修|修复|改|修改|替换|检查|排查|诊断|看一下|看一眼|查一下|找一下|分析|整理|总结|汇总|生成|创建|写|删除|添加|上传|下载|截图|回溯|记忆|记得|历史|权限|报错|异常|失败|为什么|怎么回事|哪里|怎么|如何|unity|mcp|codex|claude|bridge|飞书|面板|文件|代码|仓库|commit|push|git)/i;
 const SMALL_TALK_PATTERNS: Array<{ pattern: RegExp; reply: string }> = [
   { pattern: /^(你好|你好呀|嗨|哈喽|hello|hi|hey)[呀啊~～！!。\s]*$/i, reply: '你好呀，我在呢～今天想闲聊也行，有事也可以直接丢给我。' },
@@ -169,8 +172,14 @@ function isToolExecutionRequestText(text: string): boolean {
   return TOOL_EXECUTION_REQUEST_PATTERN.test(text);
 }
 
+function isMemoryRecallRequestText(text: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /(记忆|还记得|你还记得|上次|之前|历史|对应表)/.test(normalized);
+}
+
 function containsOutsourcedToolReply(text: string): boolean {
-  return OUTSOURCED_TOOL_REPLY_PATTERN.test(text);
+  return OUTSOURCED_TOOL_REPLY_PATTERN.test(text) || MCP_ENTRY_CLARIFICATION_REPLY_PATTERN.test(text);
 }
 
 function buildSmallTalkReply(text: string): string {
@@ -259,12 +268,67 @@ function extractNaturalReminderTitle(tail: string): string {
     title = title
       .replace(/^(?:给我|帮我|麻烦你?|请你?)\s*/u, '')
       .replace(/^(?:发|发送)(?:一条|一个|个)?(?:消息|信息|提醒)?\s*/u, '')
-      .replace(/^(?:提醒我|通知我|告诉我|叫我)\s*/u, '')
+      .replace(/^(?:提醒我|提示我|通知我|告诉我|叫我)\s*/u, '')
       .replace(/^(?:说|内容是|内容为|为|：|:)\s*/u, '')
       .trim();
     if (title === before) break;
   }
-  return title.replace(/[。！？!?\s]+$/u, '').trim();
+  return title.replace(/[，,。！？!?\s]+$/u, '').trim();
+}
+
+function buildAbsoluteReminderDueAt(
+  normalized: string,
+  now: Date,
+): { dueAt: string; start: number; end: number } | null {
+  const dated = /(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日号]?\s*([01]?\d|2[0-3])\s*(?:(?::|点|时)\s*([0-5]\d)|([点时])半|点|时)(?:\s*分)?/u.exec(normalized);
+  if (dated && dated.index !== undefined) {
+    const year = dated[1] ? Number(dated[1]) : now.getFullYear();
+    const month = Number(dated[2]);
+    const day = Number(dated[3]);
+    const hour = Number(dated[4]);
+    const minute = dated[6] ? 30 : dated[5] ? Number(dated[5]) : 0;
+    const due = new Date(now.getTime());
+    due.setFullYear(year, month - 1, day);
+    due.setHours(hour, minute, 0, 0);
+    if (!Number.isFinite(due.getTime()) || due.getMonth() !== month - 1 || due.getDate() !== day) return null;
+    if (!dated[1] && due.getTime() <= now.getTime()) {
+      due.setFullYear(due.getFullYear() + 1);
+    }
+    return {
+      dueAt: due.toISOString(),
+      start: dated.index,
+      end: dated.index + dated[0].length,
+    };
+  }
+
+  const absolute = /(?:^|[^\d])(?:(今天|明天|后天)\s*)?([01]?\d|2[0-3])\s*(?:(?::|点|时)\s*([0-5]\d)|([点时])半|点|时)(?:\s*分)?/u.exec(normalized);
+  if (!absolute || absolute.index === undefined) return null;
+  const leading = absolute[0].match(/^[^\d今明后]?/u)?.[0] || '';
+  const dayToken = absolute[1] || '';
+  const start = absolute.index + leading.length;
+  const hour = Number(absolute[2]);
+  const minute = absolute[4] ? 30 : absolute[3] ? Number(absolute[3]) : 0;
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  const due = new Date(now.getTime());
+  due.setHours(hour, minute, 0, 0);
+  if (dayToken === '明天') {
+    due.setDate(due.getDate() + 1);
+  } else if (dayToken === '后天') {
+    due.setDate(due.getDate() + 2);
+  } else if (!dayToken && due.getTime() <= now.getTime()) {
+    due.setDate(due.getDate() + 1);
+  } else if (dayToken === '今天' && due.getTime() <= now.getTime()) {
+    return null;
+  }
+
+  return {
+    dueAt: due.toISOString(),
+    start,
+    end: absolute.index + absolute[0].length,
+  };
 }
 
 function parseNaturalReminderRequest(text: string, now = new Date()): ParsedReminderRequest | null {
@@ -273,21 +337,30 @@ function parseNaturalReminderRequest(text: string, now = new Date()): ParsedRemi
   if (/(为什么|怎么回事|解释|说明|脚本|代码|示例|怎么写|如何写|帮我写|今天有什么|有哪些|查看|列出|查询|搜索)/u.test(normalized)) {
     return null;
   }
-  if (!/(提醒我|给我发.{0,8}(消息|提醒|信息)|设置.{0,8}(待办|提醒)|创建.{0,8}(待办|提醒)|安排.{0,8}(待办|提醒))/u.test(normalized)) {
+  if (!/(提醒我|提示我|给我发.{0,8}(消息|提醒|信息)|发.{0,8}(消息|提醒|信息).{0,8}(提醒我|提示我|通知我)|设置.{0,8}(待办|提醒)|创建.{0,8}(待办|提醒)|安排.{0,8}(待办|提醒))/u.test(normalized)) {
     return null;
   }
 
   const relative = /([0-9]{1,4}|[一二两三四五六七八九十]{1,3})\s*(分钟|分|小时|时|天)后/u.exec(normalized);
-  if (!relative || relative.index === undefined) return null;
-  const amount = parseChineseReminderAmount(relative[1]);
-  if (!amount || amount <= 0) return null;
-  const unit = relative[2];
-  const ms = unit.startsWith('分') ? amount * 60_000
-    : unit.startsWith('小') || unit === '时' ? amount * 60 * 60_000
-      : amount * 24 * 60 * 60_000;
-  const title = extractNaturalReminderTitle(normalized.slice(relative.index + relative[0].length));
-  if (!title || /^(提醒|消息|信息|待办)$/u.test(title)) return null;
-  return { title, dueAt: new Date(now.getTime() + ms).toISOString() };
+  if (relative && relative.index !== undefined) {
+    const amount = parseChineseReminderAmount(relative[1]);
+    if (!amount || amount <= 0) return null;
+    const unit = relative[2];
+    const ms = unit.startsWith('分') ? amount * 60_000
+      : unit.startsWith('小') || unit === '时' ? amount * 60 * 60_000
+        : amount * 24 * 60 * 60_000;
+    const title = extractNaturalReminderTitle(normalized.slice(relative.index + relative[0].length))
+      || extractNaturalReminderTitle(normalized.slice(0, relative.index));
+    if (!title || /^(提醒|消息|信息|待办)$/u.test(title)) return null;
+    return { title, dueAt: new Date(now.getTime() + ms).toISOString() };
+  }
+
+  const absolute = buildAbsoluteReminderDueAt(normalized, now);
+  if (!absolute) return null;
+  const absoluteTitle = extractNaturalReminderTitle(normalized.slice(absolute.end))
+    || extractNaturalReminderTitle(normalized.slice(0, absolute.start));
+  if (!absoluteTitle || /^(提醒|消息|信息|待办)$/u.test(absoluteTitle)) return null;
+  return { title: absoluteTitle, dueAt: absolute.dueAt };
 }
 
 function getInboundMessageDate(msg: InboundMessage): Date {
@@ -782,10 +855,33 @@ function recordConversationMemoryEvent(
   }
 }
 
+function applyOutboundAnswerReview(input: AnswerReviewInput): string {
+  const { store } = getBridgeContext();
+  if (typeof store.reviewOutboundAnswer !== 'function') return input.answerText;
+  try {
+    const decision = store.reviewOutboundAnswer(input);
+    if (
+      decision.mode === 'block_or_replace'
+      && decision.verdict === 'replace'
+      && decision.replacementText?.trim()
+    ) {
+      return decision.replacementText.trim();
+    }
+    if (decision.mode === 'block_or_replace' && decision.verdict === 'block') {
+      return decision.replacementText?.trim()
+        || '这条回复未通过答案审查，已拦截。请换个说法重试，或让我重新按已检索到的记忆回答。';
+    }
+  } catch (error) {
+    console.warn('[bridge-manager] Failed to review outbound answer:', error instanceof Error ? error.message : error);
+  }
+  return input.answerText;
+}
+
 function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
   const trimmed = text.trim();
   if (!trimmed) return trimmed;
   if (!containsOutsourcedToolReply(trimmed)) return trimmed;
+  if (isMemoryRecallRequestText(sourcePrompt)) return trimmed;
   if (!isToolExecutionRequestText(sourcePrompt) && !isToolExecutionRequestText(trimmed)) return trimmed;
 
   const lines = trimmed
@@ -2147,6 +2243,135 @@ function buildFeishuCloudBlockerMessage(result: FeishuCloudLinkResolveResult): s
   return result.userMessage?.trim() || result.error?.trim() || fallback;
 }
 
+function sanitizeFeishuCloudDocumentLinks(text: string): string {
+  return text
+    .replace(/https?:\/\/[^\s<>"')\]]*(?:feishu\.cn|larksuite\.com)\/(?:docx|docs|sheets|base|bitable)\/[^\s<>"')\]]*/gi, '[已读取的飞书云文档]')
+    .trim();
+}
+
+function buildFeishuCloudResolvedPrompt(originalText: string, cloudSystemPrompt: string): string {
+  const sanitizedRequest = sanitizeFeishuCloudDocumentLinks(originalText);
+  const sanitizedCloudContext = sanitizeFeishuCloudDocumentLinks(cloudSystemPrompt);
+  return [
+    '=== 已读取的飞书云文档内容开始 ===',
+    sanitizedCloudContext,
+    '=== 已读取的飞书云文档内容结束 ===',
+    '',
+    '飞书云文档内容已由 bridge 预读取，并放在系统上下文的 "Feishu cloud document context" 中。',
+    '请直接基于该上下文回答用户请求；不要再访问、抓取或测试原始飞书链接；不要要求用户公开链接、截图或导出内容，除非系统上下文明示读取失败。',
+    '',
+    '用户原始请求：',
+    sanitizedRequest || '请总结已读取的飞书云文档内容。',
+  ].join('\n');
+}
+
+function shouldUseFeishuCloudDirectSummary(text: string): boolean {
+  const normalized = text.replace(/\s+/g, '');
+  return /(总结|归纳|整理|看一下|看看|提炼|概括|汇总)/.test(normalized)
+    && !/(查找|搜索|筛选|第\d+行|指定|只看|导出|生成文档|写入|修改)/.test(normalized);
+}
+
+interface FeishuCloudTableRow {
+  issueNo: string;
+  author: string;
+  type: string;
+  description: string;
+  suggestion: string;
+  priority: string;
+  status: string;
+}
+
+function parseFeishuCloudRows(cloudContext: string): FeishuCloudTableRow[] {
+  const rows: FeishuCloudTableRow[] = [];
+  for (const line of cloudContext.split(/\r?\n/)) {
+    const match = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (!match) continue;
+    const cells = match[1].split('|').map((cell) => cell.trim());
+    if (cells.length < 8 || cells[0] === '问题序号') continue;
+    rows.push({
+      issueNo: cells[0] || '',
+      author: cells[1] || '',
+      type: cells[2] || '',
+      description: cells[3] || '',
+      suggestion: cells[4] || '',
+      priority: cells[6] || '',
+      status: cells[7] || '',
+    });
+  }
+  return rows;
+}
+
+function topEntriesFromMap(map: Map<string, number>, limit = 5): string[] {
+  return Array.from(map.entries())
+    .filter(([key]) => key.trim())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-Hans-CN'))
+    .slice(0, limit)
+    .map(([key, value]) => `${key} ${value}`);
+}
+
+function addCount(map: Map<string, number>, key: string): void {
+  const normalized = key.trim() || '未填写';
+  map.set(normalized, (map.get(normalized) || 0) + 1);
+}
+
+function classifyFeishuCloudIssue(row: FeishuCloudTableRow): string[] {
+  const text = `${row.description} ${row.suggestion}`;
+  const categories: Array<[string, RegExp]> = [
+    ['引导/任务指引', /引导|任务|指引|引导线|教程|下一步|目标|跳转/],
+    ['交互操作/点击反馈', /交互|点击|操作|按钮|气泡|环形菜单|触碰|靠近|派遣|收拾|整理/],
+    ['表现包装/音效动画', /表现|动画|音效|震动|CG|ASMR|表演|镜头|爽快|视觉|变化|氛围/],
+    ['数值收益/升级节奏', /升级|资源|收益|效率|费用|等待|读条|赚钱|数值|等级/],
+    ['剧情角色/代入感', /剧情|角色|南希|莱拉|医生|病人|幸存者|对话|代入|人物/],
+    ['玩法结构/长期目标', /SLG|模拟|医院|主城|玩法|房间|区域|格子间|持续目标|关联度/],
+    ['UI/视角/文字', /UI|视角|文字|遮挡|编号|图标|气泡巨大|显示/],
+  ];
+  return categories.filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
+}
+
+function buildFeishuCloudDirectSummary(cloudContext: string): string | null {
+  const rows = parseFeishuCloudRows(cloudContext);
+  if (rows.length === 0) return null;
+
+  const typeCounts = new Map<string, number>();
+  const statusCounts = new Map<string, number>();
+  const priorityCounts = new Map<string, number>();
+  const categoryCounts = new Map<string, number>();
+  for (const row of rows) {
+    addCount(typeCounts, row.type);
+    addCount(statusCounts, row.status);
+    addCount(priorityCounts, row.priority);
+    const categories = classifyFeishuCloudIssue(row);
+    if (categories.length === 0) addCount(categoryCounts, '其他/未归类');
+    for (const category of categories) addCount(categoryCounts, category);
+  }
+
+  const highPriority = rows
+    .filter((row) => row.priority === '5' || row.priority === '4')
+    .slice(0, 10)
+    .map((row) => `- #${row.issueNo || '?'} ${row.author || '未填写'}｜P${row.priority || '-'}｜${row.status || '未填写'}：${row.description.slice(0, 90)}`);
+
+  return [
+    `已读取飞书表格内容，当前可见数据约 ${rows.length} 条问题/建议记录。`,
+    '',
+    '总体结论：反馈主要集中在新手引导、交互反馈、表现包装、升级收益感、剧情角色代入和医院模拟玩法目标感上。高优先级项里，“引导线/任务目标不清”“治疗气泡等预操作提示不足”“角色/剧情表演缺失”“升级和收益传达弱”是最需要优先收敛的方向。',
+    '',
+    `问题类型分布：${topEntriesFromMap(typeCounts).join('，') || '无'}`,
+    `排期状态分布：${topEntriesFromMap(statusCounts).join('，') || '无'}`,
+    `优先级分布：${topEntriesFromMap(priorityCounts).join('，') || '无'}`,
+    `主题归类 Top：${topEntriesFromMap(categoryCounts, 7).join('，') || '无'}`,
+    '',
+    '建议优先处理：',
+    '1. 新手引导和任务目标：修正引导线和任务目标不一致、顶部任务消失后缺少承接、下一步操作提示不主动等问题。',
+    '2. 交互反馈：补足治疗气泡、清理、派遣、靠近角色、刷新区域等操作的反馈，让玩家明确知道该点什么、点完发生了什么。',
+    '3. 升级和经营收益：强化病房升级、护士升级、房间选择、费用/效率变化的表达，避免“花了钱但没感觉”。',
+    '4. 表现包装：补充音效、动画、ASMR、CG 第一人称/镜头、角色表演和从坏到好的变化，提升爽感和代入感。',
+    '5. 玩法结构：医院模拟与 SLG 主城的关联、长期目标、格子间后续新鲜感需要重新梳理，否则玩家容易觉得医院玩法目的不明确。',
+    '',
+    '高优先级样例：',
+    ...(highPriority.length > 0 ? highPriority : ['- 暂无可解析的 P4/P5 样例。']),
+  ].join('\n');
+}
+
 function permissionRank(role: PermissionRole): number {
   switch (role) {
     case 'owner':
@@ -2608,6 +2833,36 @@ export async function deliverProactiveMessage(input: {
   });
 }
 
+export async function resumeFeishuOAuthRequest(resume: FeishuOAuthManualResumeRequest): Promise<void> {
+  const state = getState();
+  const adapter = state.adapters.get(resume.channelType);
+  if (!adapter || !adapter.isRunning()) {
+    console.warn(`[bridge-manager] Cannot resume Feishu OAuth request; adapter unavailable: ${resume.channelType}`);
+    return;
+  }
+  const address = {
+    channelType: resume.channelType,
+    chatId: resume.chatId,
+    userId: resume.userId || resume.chatId,
+    displayName: resume.userDisplayName || resume.userId || resume.chatId,
+  };
+  await deliver(adapter, {
+    address,
+    text: '已收到，正在处理中。',
+    parseMode: 'plain',
+    replyToMessageId: resume.messageId,
+  });
+  await handleMessage(adapter, {
+    messageId: `${resume.messageId || `oauth-${Date.now()}`}:oauth-callback`,
+    text: resume.text,
+    address,
+    timestamp: Date.now(),
+    raw: {
+      feishuSender: resume.userId ? { openId: resume.userId } : undefined,
+    },
+  });
+}
+
 /**
  * Run the event loop for a single adapter.
  * Messages for different sessions are dispatched concurrently;
@@ -2855,6 +3110,22 @@ async function handleMessage(
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
         });
+        if (result.status === 'bound' && result.resume?.text?.trim()) {
+          const resume = result.resume;
+          const resumeMessage: InboundMessage = {
+            messageId: `${resume.messageId || msg.messageId}:oauth-resume`,
+            address: {
+              ...msg.address,
+              channelType: resume.channelType || adapter.channelType,
+              chatId: resume.chatId || msg.address.chatId,
+              userId: resume.userId || msg.address.userId,
+              displayName: resume.userDisplayName || msg.address.displayName,
+            },
+            text: resume.text,
+            timestamp: Date.now(),
+          };
+          await handleMessage(adapter, resumeMessage);
+        }
         ack();
         return;
       }
@@ -3099,6 +3370,81 @@ async function handleMessage(
     return;
   }
 
+  if (!hasAttachments && typeof store.persistMemoryWrite === 'function') {
+    const memoryWrite = store.persistMemoryWrite({
+      sessionId: binding.codepilotSessionId,
+      channelType: binding.channelType,
+      chatId: binding.chatId,
+      chatDisplayName: binding.displayName || msg.address.displayName || msg.address.chatId,
+      userId: msg.address.userId,
+      userDisplayName: msg.address.displayName,
+      text: text || rawText,
+      workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
+    });
+    if (!memoryWrite.skipped) {
+      const reply = memoryWrite.ok
+        ? '记住了。'
+        : `这条记忆没有写入成功：${memoryWrite.error || '未知错误'}`;
+      const reviewedText = applyOutboundAnswerReview({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        messageId: msg.messageId,
+        sessionId: binding.codepilotSessionId,
+        workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
+        userText: rawText,
+        answerText: reply,
+        source: 'system',
+      });
+      store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
+      store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
+      recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
+      recordConversationMemoryEvent(msg, binding, 'assistant', reviewedText);
+      await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
+      ack();
+      return;
+    }
+  }
+
+  let memoryRecallExtraSystemPrompt = '';
+  if (!hasAttachments && store.decideMemoryReply) {
+    const memoryDecision = store.decideMemoryReply({
+      sessionId: binding.codepilotSessionId,
+      channelType: binding.channelType,
+      chatId: binding.chatId,
+      userId: msg.address.userId,
+      userDisplayName: msg.address.displayName,
+      workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
+      query: rawText,
+      recentHistoryLimit: 0,
+    });
+    if (memoryDecision.type === 'direct_reply' || memoryDecision.type === 'no_memory_answer') {
+      const reviewedText = applyOutboundAnswerReview({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        messageId: msg.messageId,
+        sessionId: binding.codepilotSessionId,
+        workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
+        userText: rawText,
+        answerText: memoryDecision.text,
+        memoryPlan: memoryDecision.plan,
+        memoryHits: memoryDecision.type === 'direct_reply' ? [memoryDecision.hit] : [],
+        source: 'direct_memory',
+      });
+      store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
+      store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
+      recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
+      recordConversationMemoryEvent(msg, binding, 'assistant', reviewedText);
+      await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
+      ack();
+      return;
+    }
+    memoryRecallExtraSystemPrompt = memoryDecision.systemPrompt || '';
+  }
+
   const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
   if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && !ownerMessage) {
     await deliver(adapter, {
@@ -3136,6 +3482,37 @@ async function handleMessage(
     && (isFeishuDocGenerationRequest(rawText) || isFeishuDocGenerationRequestStrict(rawText))
     && !rawData?.feishuDocRequest;
   const directCommandRequest = parseDirectCommandRequest(rawText);
+  let feishuCloudSystemPrompt = '';
+
+  if (!directFeishuDocRequest && shouldTryFeishuCloudLinkResolve(adapter, rawText)) {
+    const feishuCloudDocuments = getBridgeContext().feishuCloudDocuments;
+    if (feishuCloudDocuments) {
+      const feishuSender = rawData?.feishuSender;
+      const resolved = await feishuCloudDocuments.resolveFeishuCloudLinks({
+        text: rawText,
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: feishuSender?.openId || msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        messageId: msg.messageId,
+      });
+      if (resolved.status === 'resolved' && resolved.systemPrompt) {
+        feishuCloudSystemPrompt = resolved.systemPrompt;
+      } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
+        await deliver(adapter, {
+          address: msg.address,
+          text: buildFeishuCloudBlockerMessage(resolved),
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+          feishuCardJson: resolved.feishuCardJson,
+        }, { sessionId: effectiveBinding.codepilotSessionId });
+        ack();
+        return;
+      }
+    } else {
+      console.warn('[bridge-manager] Feishu cloud link detected, but cloud document host is not configured.');
+    }
+  }
 
   if (directCommandRequest) {
     if (directCommandRequest.mutating && !isOwnerMessage(msg)) {
@@ -3164,6 +3541,27 @@ async function handleMessage(
     await deliverResponse(adapter, msg.address, result.text, effectiveBinding.codepilotSessionId, msg.messageId);
     ack();
     return;
+  }
+
+  if (feishuCloudSystemPrompt && !directFeishuDocRequest && shouldUseFeishuCloudDirectSummary(rawText)) {
+    const summary = buildFeishuCloudDirectSummary(feishuCloudSystemPrompt);
+    if (summary) {
+      store.addMessage(effectiveBinding.codepilotSessionId, 'user', rawText);
+      store.addMessage(effectiveBinding.codepilotSessionId, 'assistant', summary);
+      recordConversationMemoryEvent(msg, effectiveBinding, 'user', rawText);
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', summary);
+      await deliverResponse(
+        adapter,
+        msg.address,
+        appendReplyEndMarker(summary),
+        effectiveBinding.codepilotSessionId,
+        msg.messageId,
+        true,
+        'Markdown',
+      );
+      ack();
+      return;
+    }
   }
 
   if (false && directFeishuDocRequest) {
@@ -3358,8 +3756,14 @@ async function handleMessage(
       ? buildFeishuDocumentRewritePrompt(directFeishuDocSourceMarkdown, rawText)
       : (text || (hasAttachments ? 'Describe this image.' : ''));
     let fastPathOptions = getFastPathOptions(rawText);
-    let feishuCloudSystemPrompt = '';
-    if (!directFeishuDocRequest && shouldTryFeishuCloudLinkResolve(adapter, rawText)) {
+    if (memoryRecallExtraSystemPrompt) {
+      fastPathOptions = {
+        ...fastPathOptions,
+        historyLimit: 0,
+        extraSystemPrompt: [fastPathOptions.extraSystemPrompt, memoryRecallExtraSystemPrompt].filter(Boolean).join('\n\n'),
+      };
+    }
+    if (!feishuCloudSystemPrompt && !directFeishuDocRequest && shouldTryFeishuCloudLinkResolve(adapter, rawText)) {
       const feishuCloudDocuments = getBridgeContext().feishuCloudDocuments;
       if (feishuCloudDocuments) {
         const feishuSender = rawData?.feishuSender;
@@ -3416,7 +3820,10 @@ async function handleMessage(
     }
 
     recordConversationMemoryEvent(msg, effectiveBinding, 'user', text || rawText);
-    const result = await engine.processMessage(effectiveBinding, basePromptText, async (perm) => {
+    const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
+      ? buildFeishuCloudResolvedPrompt(rawText, feishuCloudSystemPrompt)
+      : basePromptText;
+    const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
         permissionType: perm.toolName,
@@ -3449,7 +3856,20 @@ async function handleMessage(
     const preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
-    const userFacingResponseText = preparedReply?.text || '';
+    const userFacingResponseText = preparedReply?.text
+      ? applyOutboundAnswerReview({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        messageId: msg.messageId,
+        sessionId: effectiveBinding.codepilotSessionId,
+        workingDirectory: resolvedWorkingDirectory,
+        userText: rawText,
+        answerText: preparedReply.text,
+        source: 'codex',
+      })
+      : '';
     if (userFacingResponseText) {
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', userFacingResponseText);
     } else if (result.hasError && result.errorMessage) {

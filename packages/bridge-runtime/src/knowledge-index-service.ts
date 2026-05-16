@@ -12,6 +12,12 @@ import {
   type KnowledgeKind,
   type KnowledgeSourceFile,
 } from './knowledge-indexer.js';
+import {
+  buildMemoryGraphFromKnowledgeIndex,
+  getMemoryGraphIndexPath,
+  readMemoryGraphIndex,
+  writeMemoryGraphIndex,
+} from './memory-graph.js';
 
 export interface KnowledgeIndexStatus {
   schema: 'codex-im-suite/knowledge-index-status/v1';
@@ -22,6 +28,9 @@ export interface KnowledgeIndexStatus {
   markdownFileCount: number;
   itemCount: number;
   conflictCount: number;
+  memoryGraphPath?: string;
+  memoryGraphNodeCount?: number;
+  memoryGraphEdgeCount?: number;
   generatedAt?: string;
   lastIndexedAt?: string;
   lastEventAt?: string;
@@ -93,6 +102,7 @@ function makeStatus(
   patch: Partial<KnowledgeIndexStatus> = {},
 ): KnowledgeIndexStatus {
   const index = readKnowledgeIndex(memoryRoot);
+  const graph = readMemoryGraphIndex(memoryRoot);
   return {
     schema: STATUS_SCHEMA,
     memoryRoot,
@@ -102,6 +112,9 @@ function makeStatus(
     markdownFileCount: 0,
     itemCount: index?.itemCount ?? 0,
     conflictCount: index?.conflictCount ?? 0,
+    memoryGraphPath: getMemoryGraphIndexPath(memoryRoot),
+    memoryGraphNodeCount: graph?.nodeCount ?? 0,
+    memoryGraphEdgeCount: graph?.edgeCount ?? 0,
     generatedAt: index?.generatedAt,
     statusUpdatedAt: new Date().toISOString(),
     ...patch,
@@ -159,11 +172,15 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
     files: sources,
   });
   writeKnowledgeIndex(root, index);
+  const graph = buildMemoryGraphFromKnowledgeIndex(index);
+  writeMemoryGraphIndex(root, graph);
   const status = makeStatus(root, {
     exists: true,
     markdownFileCount: markdownFiles.length,
     itemCount: index.itemCount,
     conflictCount: index.conflictCount,
+    memoryGraphNodeCount: graph.nodeCount,
+    memoryGraphEdgeCount: graph.edgeCount,
     generatedAt: index.generatedAt,
     lastIndexedAt: new Date().toISOString(),
   });

@@ -2186,6 +2186,12 @@ internal sealed class MainForm : Form
     private string GetKnowledgeStatusPath()
         => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "status.json");
 
+    private string GetMemoryGraphIndexPath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "memory-graph.json");
+
+    private string GetAnswerReviewAuditPath()
+        => Path.Combine(_dataDir, "answer-review-audit.json");
+
     private string GetTodoReminderIndexPath()
         => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "reminders.json");
 
@@ -2240,7 +2246,11 @@ internal sealed class MainForm : Form
         var itemCount = 0;
         var conflictCount = 0;
         var sourceFileCount = 0;
+        var memoryGraphNodeCount = 0;
+        var memoryGraphEdgeCount = 0;
+        object memoryGraphPreview = new { nodes = Array.Empty<object>(), edges = Array.Empty<object>() };
         var kindCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var recentReviewWarnings = ReadRecentAnswerReviewWarnings(6);
         var generatedAt = "";
         var lastIndexedAt = "";
         var lastEventAt = "";
@@ -2324,19 +2334,40 @@ internal sealed class MainForm : Form
             }
         }
 
+        var graphPath = GetMemoryGraphIndexPath();
+        if (File.Exists(graphPath))
+        {
+            try
+            {
+                using var graphDocument = JsonDocument.Parse(File.ReadAllText(graphPath, Encoding.UTF8));
+                memoryGraphNodeCount = ReadJsonInt(graphDocument.RootElement, "nodeCount");
+                memoryGraphEdgeCount = ReadJsonInt(graphDocument.RootElement, "edgeCount");
+                memoryGraphPreview = ReadMemoryGraphPreview(graphDocument.RootElement, 300);
+            }
+            catch (Exception ex)
+            {
+                lastError = string.IsNullOrWhiteSpace(lastError) ? ex.Message : $"{lastError}; {ex.Message}";
+            }
+        }
+
         return new
         {
             schema = "codex-im-suite/knowledge-index-status/v1",
             memoryRoot = root,
             indexPath,
             statusPath,
+            memoryGraphPath = graphPath,
             watching,
             exists,
             markdownFileCount = markdownCount,
             itemCount,
             conflictCount,
+            memoryGraphNodeCount,
+            memoryGraphEdgeCount,
+            memoryGraphPreview,
             sourceFileCount,
             kindCounts,
+            recentReviewWarnings,
             generatedAt,
             lastIndexedAt,
             lastEventAt,
@@ -2345,6 +2376,75 @@ internal sealed class MainForm : Form
             statusUpdatedAt,
             lastError,
         };
+    }
+
+    private static object ReadMemoryGraphPreview(JsonElement root, int limit)
+    {
+        var max = Math.Max(1, limit);
+        var nodeSnapshots = root.TryGetProperty("nodes", out var nodesElement) && nodesElement.ValueKind == JsonValueKind.Array
+            ? nodesElement.EnumerateArray()
+                .Take(max)
+                .Select(node => new
+                {
+                    id = ReadJsonString(node, "id"),
+                    label = ReadJsonString(node, "label"),
+                    kind = ReadJsonString(node, "kind"),
+                })
+                .ToArray<object>()
+            : [];
+        var nodeLabels = root.TryGetProperty("nodes", out var allNodesElement) && allNodesElement.ValueKind == JsonValueKind.Array
+            ? allNodesElement.EnumerateArray()
+                .Select(node => new { id = ReadJsonString(node, "id"), label = ReadJsonString(node, "label") })
+                .Where(node => !string.IsNullOrWhiteSpace(node.id))
+                .ToDictionary(node => node.id, node => node.label, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var edges = root.TryGetProperty("edges", out var edgesElement) && edgesElement.ValueKind == JsonValueKind.Array
+            ? edgesElement.EnumerateArray()
+                .Take(max)
+                .Select(edge => new
+                {
+                    from = ReadJsonString(edge, "from"),
+                    to = ReadJsonString(edge, "to"),
+                    fromLabel = nodeLabels.GetValueOrDefault(ReadJsonString(edge, "from"), ReadJsonString(edge, "from")),
+                    toLabel = nodeLabels.GetValueOrDefault(ReadJsonString(edge, "to"), ReadJsonString(edge, "to")),
+                    type = ReadJsonString(edge, "type"),
+                    weight = ReadJsonDouble(edge, "weight"),
+                })
+                .ToArray<object>()
+            : [];
+
+        return new { nodes = nodeSnapshots, edges };
+    }
+
+    private object[] ReadRecentAnswerReviewWarnings(int limit)
+    {
+        var auditPath = GetAnswerReviewAuditPath();
+        if (!File.Exists(auditPath)) return [];
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(auditPath, Encoding.UTF8));
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return [];
+            return document.RootElement.EnumerateArray()
+                .Reverse()
+                .Where(item => !string.Equals(ReadJsonString(item, "verdict"), "pass", StringComparison.OrdinalIgnoreCase))
+                .Take(Math.Max(1, limit))
+                .Select(item => new
+                {
+                    createdAt = ReadJsonString(item, "createdAt"),
+                    verdict = ReadJsonString(item, "verdict"),
+                    reasonCodes = item.TryGetProperty("reasonCodes", out var reasons) && reasons.ValueKind == JsonValueKind.Array
+                        ? reasons.EnumerateArray().Select(reason => reason.GetString() ?? "").Where(value => !string.IsNullOrWhiteSpace(value)).ToArray()
+                        : [],
+                    userText = ReadJsonString(item, "userText"),
+                    answerText = ReadJsonString(item, "answerText"),
+                })
+                .ToArray<object>();
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     private static bool IsRecentIsoTimestamp(string value, TimeSpan maxAge)
@@ -2392,6 +2492,7 @@ internal sealed class MainForm : Form
         }
 
         var results = new List<object>();
+        var graphRelated = BuildMemoryGraphRelatedLookup();
         using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
         if (!document.RootElement.TryGetProperty("items", out var itemsElement) || itemsElement.ValueKind != JsonValueKind.Array)
         {
@@ -2411,6 +2512,7 @@ internal sealed class MainForm : Form
                 ? sourceElement
                 : default;
             var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+            var sourceUpdatedAt = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "updatedAt") : "";
             var snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "";
             var haystack = $"{kind} {key} {value} {text} {sourcePath} {snippet}".ToLowerInvariant();
             if (!string.IsNullOrWhiteSpace(normalizedQuery) && !haystack.Contains(normalizedQuery))
@@ -2429,13 +2531,96 @@ internal sealed class MainForm : Form
                 text,
                 confidence = ReadJsonDouble(item, "confidence"),
                 conflict = ReadJsonBool(item, "conflict"),
+                classificationReason = ReadJsonString(item, "classificationReason"),
+                classificationSource = ReadJsonString(item, "classificationSource"),
                 sourcePath,
+                sourceUpdatedAt,
                 snippet,
+                related = LookupMemoryGraphRelated(graphRelated, key, value, text),
             });
             if (results.Count >= limit) break;
         }
 
         return new { status = BuildKnowledgeIndexStatus(), items = results.ToArray() };
+    }
+
+    private Dictionary<string, List<object>> BuildMemoryGraphRelatedLookup()
+    {
+        var graphPath = GetMemoryGraphIndexPath();
+        if (!File.Exists(graphPath)) return new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(graphPath, Encoding.UTF8));
+            var root = document.RootElement;
+            if (!root.TryGetProperty("nodes", out var nodesElement) || nodesElement.ValueKind != JsonValueKind.Array
+                || !root.TryGetProperty("edges", out var edgesElement) || edgesElement.ValueKind != JsonValueKind.Array)
+            {
+                return new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            var nodesById = nodesElement.EnumerateArray()
+                .Select(node => new
+                {
+                    id = ReadJsonString(node, "id"),
+                    label = ReadJsonString(node, "label"),
+                    kind = ReadJsonString(node, "kind"),
+                })
+                .Where(node => !string.IsNullOrWhiteSpace(node.id) && !string.IsNullOrWhiteSpace(node.label))
+                .ToDictionary(node => node.id, node => node, StringComparer.OrdinalIgnoreCase);
+            var related = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var edge in edgesElement.EnumerateArray())
+            {
+                var from = ReadJsonString(edge, "from");
+                var to = ReadJsonString(edge, "to");
+                if (!nodesById.TryGetValue(from, out var fromNode) || !nodesById.TryGetValue(to, out var toNode)) continue;
+                var item = new
+                {
+                    label = toNode.label,
+                    kind = toNode.kind,
+                    type = ReadJsonString(edge, "type"),
+                    score = ReadJsonDouble(edge, "weight"),
+                };
+                var key = fromNode.label.Trim();
+                if (!related.TryGetValue(key, out var list))
+                {
+                    list = [];
+                    related[key] = list;
+                }
+                if (!list.Any(existing => string.Equals(ReadObjectProperty(existing, "label"), item.label, StringComparison.OrdinalIgnoreCase)))
+                {
+                    list.Add(item);
+                }
+            }
+            return related;
+        }
+        catch
+        {
+            return new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static object[] LookupMemoryGraphRelated(Dictionary<string, List<object>> related, params string[] labels)
+    {
+        var merged = new List<object>();
+        foreach (var label in labels.Select(value => value.Trim()).Where(value => !string.IsNullOrWhiteSpace(value)))
+        {
+            if (!related.TryGetValue(label, out var items)) continue;
+            foreach (var item in items)
+            {
+                if (!merged.Any(existing => string.Equals(ReadObjectProperty(existing, "label"), ReadObjectProperty(item, "label"), StringComparison.OrdinalIgnoreCase)))
+                {
+                    merged.Add(item);
+                }
+                if (merged.Count >= 8) return merged.ToArray();
+            }
+        }
+        return merged.ToArray();
+    }
+
+    private static string ReadObjectProperty(object value, string propertyName)
+    {
+        var property = value.GetType().GetProperty(propertyName);
+        return property?.GetValue(value)?.ToString() ?? "";
     }
 
     private object ArchiveKnowledgeItem(JsonElement payload)

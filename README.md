@@ -63,7 +63,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页可搜索知识库来源片段，设置页支持目录选择、拖拽回填和回复风格快捷预设。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页用网格查看知识单元、关系图节点/边、分类原因和答案审查 warning，设置页支持目录选择、拖拽回填和回复风格快捷预设。
 
 Control API 默认只监听本机：
 
@@ -111,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
 - 本地模型只作为 agent API 后端和少数内部测试/整理入口使用；普通飞书消息不再走本地模型直答。
-- 记忆关键词不再触发本地直答；明确回忆/搜索类请求会检索记忆，其他请求只把相关记忆注入主执行链。
+- 记忆关键词不再触发本地直答；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。只有 `quality=high` 的高置信结构化命中才由记忆层直接回复，关系图候选和其他低确定性结果只注入主执行链。
 - 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
@@ -264,22 +264,22 @@ CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
 飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；如果应用没有该文档访问权限或开放平台 scope 不足，再给发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
 
 ```powershell
-CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,offline_access,auth:user.id:read,sheets:spreadsheet:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,drive:drive:readonly,offline_access,auth:user.id:read,sheets:spreadsheet:readonly,sheets:spreadsheet:read,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
 CTI_FEISHU_OAUTH_MODE=manual
 CTI_FEISHU_OAUTH_PUBLIC_BASE_URL=https://bot.example.com
 CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI=http://127.0.0.1:17321/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PATH=/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PORT=17321
-CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,sheets:spreadsheet:read,drive:drive:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
 CTI_FEISHU_CLOUD_MAX_CHARS=80000
 CTI_FEISHU_CLOUD_MAX_ROWS=500
 CTI_FEISHU_CLOUD_MAX_RECORDS=500
 CTI_FEISHU_CLOUD_MAX_SHEETS=5
 ```
 
-`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，授权卡片会打开飞书官方 `authen/v1/authorize` 页面，用户授权后把浏览器地址栏里的 `code/state` 回调 URL 复制回飞书，bridge 再换取并保存 user token。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
+`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，bridge 会启动本机 `127.0.0.1:${CTI_FEISHU_OAUTH_CALLBACK_PORT}` 回调监听，授权卡片会打开飞书官方 `authen/v1/index` 免登授权页；如果用户在运行 bridge 的同一台 Windows 机器浏览器里完成授权，会自动回调、保存 user token、回复“已收到，正在处理中。”并续跑原始云文档问题。如果用户在手机或另一台电脑打开授权页，`127.0.0.1` 指向用户自己的设备，无法自动连到 bridge，此时需要把浏览器地址栏里的完整 `code/state` 回调 URL 复制回飞书，bridge 会走同一套校验和续跑逻辑。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
 
-本轮权限映射按飞书开放平台服务端 API 文档整理：Docx 读取走 `docx/v1/documents/:document_id/raw_content`，Sheets 先 `sheets/query` 再读范围，Base 读取 tables / fields / records。遇到 401/403 或飞书权限错误码时，bridge 会同时提示“用户没有文档访问权限”和对应 API 所需 scope，避免只给 404/空总结。
+本轮权限映射按飞书开放平台服务端 API 文档整理：Docx 读取走 `docx/v1/documents/:document_id/raw_content`，Sheets 先 `sheets/query` 再读范围，Base 读取 tables / fields / records。遇到 401/403 或飞书权限错误码时，bridge 会同时提示“用户没有文档访问权限”和对应 API 所需 scope，避免只给 404/空总结。若已有 user token 因新开通 Sheets/Drive scope 而过期失配，bridge 会重新发送授权卡片刷新 token；刷新后仍失败才按文档权限或开放平台权限阻断处理。
 
 启动 Ignis MCP：
 

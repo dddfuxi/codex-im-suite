@@ -1,9 +1,80 @@
-import { describe, it } from 'node:test';
+import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { initBridgeContext } from '../../lib/bridge/context.js';
 import { FeishuAdapter } from '../../lib/bridge/adapters/feishu-adapter.js';
+import type { BridgeStore } from '../../lib/bridge/host.js';
+
+function createMockStore(settings: Record<string, string> = {}) {
+  return {
+    getSetting: (key: string) => settings[key] ?? null,
+    getChannelBinding: () => null,
+    upsertChannelBinding: () => ({} as any),
+    updateChannelBinding: () => {},
+    listChannelBindings: () => [],
+    getSession: () => null,
+    createSession: () => ({ id: '1', working_directory: '', model: '' }),
+    updateSessionProviderId: () => {},
+    addMessage: () => {},
+    getMessages: () => ({ messages: [] }),
+    acquireSessionLock: () => true,
+    renewSessionLock: () => {},
+    releaseSessionLock: () => {},
+    setSessionRuntimeStatus: () => {},
+    updateSdkSessionId: () => {},
+    updateSessionModel: () => {},
+    syncSdkTasks: () => {},
+    getProvider: () => undefined,
+    getDefaultProviderId: () => null,
+    insertAuditLog: () => {},
+    checkDedup: () => false,
+    insertDedup: () => {},
+    cleanupExpiredDedup: () => {},
+    insertOutboundRef: () => {},
+    insertPermissionLink: () => {},
+    getPermissionLink: () => null,
+    markPermissionLinkResolved: () => false,
+    listPendingPermissionLinksByChat: () => [],
+    getChannelOffset: () => '0',
+    setChannelOffset: () => {},
+  };
+}
+
+function setupContext(settings: Record<string, string> = {}) {
+  delete (globalThis as Record<string, unknown>).__bridge_context__;
+  initBridgeContext({
+    store: createMockStore(settings) as unknown as BridgeStore,
+    llm: { streamChat: () => new ReadableStream() },
+    permissions: { resolvePendingPermission: () => false },
+    lifecycle: {},
+  });
+}
+
+describe('FeishuAdapter authorization', () => {
+  beforeEach(() => {
+    setupContext();
+  });
+
+  it('allows inbound chat even when bridge_feishu_allowed_users does not include sender', () => {
+    setupContext({ bridge_feishu_allowed_users: 'ou_owner_only' });
+    const adapter = new FeishuAdapter();
+
+    assert.equal(adapter.isAuthorized('ou_random_user', 'oc_group'), true);
+  });
+
+  it('allows inbound chat even when bridge_feishu_allowed_users includes unrelated chat ids', () => {
+    setupContext({ bridge_feishu_allowed_users: 'oc_other_group,ou_owner_only' });
+    const adapter = new FeishuAdapter();
+
+    assert.equal(adapter.isAuthorized('ou_random_user', 'oc_target_group'), true);
+  });
+});
 
 describe('FeishuAdapter mention detection fallback', () => {
+  beforeEach(() => {
+    setupContext();
+  });
+
   it('detects bot mention from text content when mentions array is missing', () => {
     const adapter = new FeishuAdapter() as any;
     adapter.botIds.add('ou_bot');
@@ -38,6 +109,10 @@ describe('FeishuAdapter mention detection fallback', () => {
 });
 
 describe('FeishuAdapter reply fallback', () => {
+  beforeEach(() => {
+    setupContext();
+  });
+
   it('retries as plain chat send when reply target was withdrawn', async () => {
     const adapter = new FeishuAdapter() as any;
     const calls: string[] = [];

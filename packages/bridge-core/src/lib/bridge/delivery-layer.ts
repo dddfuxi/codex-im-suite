@@ -21,6 +21,7 @@ const BASE_DELAY_MS = 1000;
 const JITTER_MAX_MS = 500;
 /** Delay between sending multiple chunks to avoid rate limits. */
 const INTER_CHUNK_DELAY_MS = 300;
+const INTERNAL_MESSAGE_ID_SUFFIX_RE = /:(?:oauth-resume|oauth-callback)$/;
 
 /** Shared rate limiter instance (20 messages/minute per chat). */
 const rateLimiter = new ChatRateLimiter();
@@ -56,6 +57,10 @@ function chunkText(text: string, maxLength: number): string[] {
   }
 
   return chunks;
+}
+
+function platformReplyToMessageId(messageId: string | undefined): string | undefined {
+  return messageId?.replace(INTERNAL_MESSAGE_ID_SUFFIX_RE, '');
 }
 
 /**
@@ -186,7 +191,7 @@ export async function deliver(
       // Only attach inline buttons to the last chunk
       inlineButtons: i === chunks.length - 1 ? message.inlineButtons : undefined,
       // Pass through replyToMessageId for platforms that need it (e.g. QQ passive reply)
-      replyToMessageId: message.replyToMessageId,
+      replyToMessageId: platformReplyToMessageId(message.replyToMessageId),
     };
 
     const result = await sendWithRetry(adapter, chunkMessage);

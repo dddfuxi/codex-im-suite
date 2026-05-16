@@ -606,6 +606,57 @@ describe('CodexProvider', () => {
     );
   });
 
+  it('falls back to CTI_DEFAULT_WORKDIR when the requested workingDirectory is missing and drops missing additionalDirectories', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    const originalDefaultWorkdir = process.env.CTI_DEFAULT_WORKDIR;
+    const fallbackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-fallback-'));
+    const extraDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-extra-'));
+    process.env.CTI_DEFAULT_WORKDIR = fallbackDir;
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    try {
+      const stream = provider.streamChat({
+        prompt: 'hello',
+        sessionId: 'missing-working-directory-session',
+        workingDirectory: 'C:\\workspace',
+        additionalDirectories: [extraDir, 'C:\\workspace\\missing-dir', extraDir],
+      });
+      await collectStream(stream);
+
+      assert.equal(capturedStartOptions?.workingDirectory, fallbackDir);
+      assert.deepEqual(capturedStartOptions?.additionalDirectories, [extraDir]);
+    } finally {
+      fs.rmSync(fallbackDir, { recursive: true, force: true });
+      fs.rmSync(extraDir, { recursive: true, force: true });
+      if (originalDefaultWorkdir === undefined) {
+        delete process.env.CTI_DEFAULT_WORKDIR;
+      } else {
+        process.env.CTI_DEFAULT_WORKDIR = originalDefaultWorkdir;
+      }
+    }
+  });
+
   it('retries with fresh thread when resume fails before any events', async () => {
     const oldResume = process.env.CTI_CODEX_RESUME_THREADS;
     process.env.CTI_CODEX_RESUME_THREADS = 'true';

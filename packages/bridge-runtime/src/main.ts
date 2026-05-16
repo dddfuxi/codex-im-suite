@@ -1092,10 +1092,15 @@ async function main(): Promise<void> {
     tokenProvider: feishuOAuthService,
     tenantTokenProvider: feishuTenantTokenProvider,
   });
-  const feishuOAuthCallbackServer = config.feishuOAuthPublicBaseUrl
+  const shouldStartFeishuOAuthCallbackServer = Boolean(config.feishuOAuthPublicBaseUrl)
+    || config.feishuOAuthMode === 'manual';
+  const feishuOAuthCallbackServer = shouldStartFeishuOAuthCallbackServer
     ? startFeishuOAuthCallbackServer(feishuOAuthService, {
       port: config.feishuOAuthCallbackPort ?? 17321,
       callbackPath: config.feishuOAuthCallbackPath || '/feishu/oauth/callback',
+      onResume: async (resume) => {
+        await bridgeManager.resumeFeishuOAuthRequest(resume);
+      },
     })
     : null;
   if (feishuOAuthCallbackServer) {

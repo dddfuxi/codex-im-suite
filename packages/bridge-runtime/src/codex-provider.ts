@@ -174,12 +174,28 @@ function normalizeAdditionalDirectories(additionalDirectories?: string[]): strin
     const trimmed = entry.trim();
     if (!trimmed) continue;
     const absolute = path.resolve(trimmed);
+    if (!fs.existsSync(absolute)) continue;
     const dedupeKey = absolute.toLowerCase();
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
     resolved.push(absolute);
   }
   return resolved;
+}
+
+function resolveWorkingDirectory(workingDirectory?: string): string | undefined {
+  const candidates = [
+    workingDirectory,
+    process.env.CTI_DEFAULT_WORKDIR,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    const absolute = path.resolve(trimmed);
+    if (fs.existsSync(absolute)) return absolute;
+  }
+  return undefined;
 }
 
 function toTextEnv(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -355,6 +371,7 @@ function buildBridgeReplyGuardrails(): string {
     '- Execution posture: you are the worker responsible for solving the request, not a helper giving the user homework.',
     '- Do not answer executable tasks with generic instructions, suggested manual steps, placeholder tables, or sample scripts unless the user explicitly asks for a tutorial or draft.',
     '- For Unity/Blender/MCP/repository/file tasks, the final answer must be based on real tool output, a real command result, or an explicit blocker from a concrete attempt.',
+    '- For a concrete Unity/Prefab/scene request, never answer with "please specify MCP entry" or an MCP entry list if the user already named Unity, Unity MCP, unitymcp, prefab, a scene, or a prefab/object name. Attempt Unity tooling, or report the exact blocker.',
     '- For screenshot requests, only send images that were captured or regenerated during the current turn, or images that the user explicitly asked to resend by exact path/name. Do not search old capture folders and reuse a historical screenshot as proof of a new scene refresh.',
     '- If Unity scene refresh or preview capture fails, return a text-only "未完成" blocker. Do not attach a previous screenshot to make the task look complete.',
     '- For HTTP MCP endpoints, a 406 Not Acceptable response from /mcp usually means the endpoint is alive but the request missed the MCP Accept header. Retry with Accept: application/json, text/event-stream and a proper initialize handshake before declaring the MCP offline.',
@@ -550,11 +567,12 @@ export class CodexProvider implements LLMProvider {
             const modelOverride = getCodexModelOverride(self.options.profile || 'primary');
             const sandboxMode = getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
+            const workingDirectory = resolveWorkingDirectory(params.workingDirectory);
             const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
 
             const threadOptions: Record<string, unknown> = {
               ...(modelOverride ? { model: modelOverride } : passModel && params.model ? { model: params.model } : {}),
-              ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
+              ...(workingDirectory ? { workingDirectory } : {}),
               ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,

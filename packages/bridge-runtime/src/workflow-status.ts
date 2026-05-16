@@ -103,6 +103,20 @@ function truncateRecoveryText(text: string | undefined): string | undefined {
     : text;
 }
 
+function getAutoRetryMaxAgeMs(): number {
+  const fallback = 6 * 60 * 60 * 1000;
+  return Math.max(1, Number.parseInt(process.env.CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS || `${fallback}`, 10) || fallback);
+}
+
+function isAutoRetryStillFresh(run: WorkflowRun): boolean {
+  const retry = run.retry;
+  if (retry?.status !== 'auto_pending') return true;
+  const requestedAt = retry.requestedAt || run.updatedAt || run.endedAt || run.startedAt;
+  const requestedAtMs = Date.parse(requestedAt || '');
+  if (!Number.isFinite(requestedAtMs)) return true;
+  return (Date.now() - requestedAtMs) <= getAutoRetryMaxAgeMs();
+}
+
 function makeRetryState(
   status: WorkflowRetryState['status'],
   attempts: number,
@@ -420,6 +434,7 @@ export function claimNextWorkflowRetry(workerId: string): WorkflowRun | null {
       run.status === 'retry_pending'
       && (run.retry?.status === 'auto_pending' || run.retry?.status === 'manual_pending')
       && !!run.recovery?.input?.prompt
+      && isAutoRetryStillFresh(run)
     )
     .sort((left, right) => {
       const leftManual = left.run.retry?.status === 'manual_pending' ? 1 : 0;

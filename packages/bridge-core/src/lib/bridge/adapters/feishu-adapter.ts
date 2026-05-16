@@ -1197,20 +1197,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   isAuthorized(userId: string, chatId: string): boolean {
-    const allowedUsers = getBridgeContext().store.getSetting('bridge_feishu_allowed_users') || '';
-    if (!allowedUsers) {
-      // No restriction configured — allow all
-      return true;
-    }
-
-    const allowed = allowedUsers
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    if (allowed.length === 0) return true;
-
-    return allowed.includes(userId) || allowed.includes(chatId);
+    void userId;
+    void chatId;
+    // Feishu inbound is role-driven: everyone can enter a conversation.
+    // Sensitive actions are gated later by Viewer / Operator / Owner checks.
+    // `bridge_feishu_allowed_users` stays only as a compatibility source that
+    // maps configured ids to Viewer during permission-role resolution.
+    return true;
   }
 
   // ── Incoming event handler ──────────────────────────────────

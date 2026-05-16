@@ -75,6 +75,12 @@ describe('MCP fast-path 判定', () => {
     const assessment = assessMcpInteraction(prompt);
     assert.equal(inferMcpFastIntent(prompt, assessment), null);
   });
+
+  it('Unity prefab 结构查看不走本地 MCP 入口澄清快路径', () => {
+    const prompt = 'unitymcp看一下STH_AreaView这个prefab的结构是怎样的';
+    const assessment = assessMcpInteraction(prompt);
+    assert.equal(inferMcpFastIntent(prompt, assessment), null);
+  });
 });
 
 describe('本地执行器判定', () => {

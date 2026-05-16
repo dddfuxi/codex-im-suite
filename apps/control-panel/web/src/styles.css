@@ -774,6 +774,82 @@ button:disabled {
   gap: 8px;
 }
 
+.memory-grid-shell {
+  margin-top: 12px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel-muted);
+}
+
+.memory-data-grid {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.memory-data-grid th,
+.memory-data-grid td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+}
+
+.memory-data-grid th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel-strong);
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.memory-data-grid tr:hover td {
+  background: color-mix(in srgb, var(--panel-strong) 68%, transparent);
+}
+
+.grid-sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.grid-sort-button.disabled {
+  cursor: default;
+}
+
+.grid-main-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 240px;
+}
+
+.grid-main-cell strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.grid-main-cell span {
+  color: var(--text-soft);
+}
+
+.grid-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 150px;
+}
+
 .compact-list {
   max-height: 320px;
   overflow: auto;

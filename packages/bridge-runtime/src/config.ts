@@ -386,6 +386,8 @@ export function loadConfig(): Config {
       "auth:user.id:read",
       "docx:document:readonly",
       "sheets:spreadsheet:readonly",
+      "sheets:spreadsheet:read",
+      "drive:drive:readonly",
       "bitable:app:readonly",
       "base:table:read",
       "base:field:read",

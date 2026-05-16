@@ -5,6 +5,7 @@ import path from 'node:path';
 import { repairLikelyMojibakeText } from './mojibake.js';
 
 export type KnowledgeKind = 'fact' | 'conclusion' | 'todo' | 'resource';
+export type KnowledgeClassificationSource = 'prefix' | 'table_inference' | 'resource_pattern';
 
 export interface KnowledgeSourceFile {
   path: string;
@@ -20,6 +21,8 @@ export interface KnowledgeItem {
   text: string;
   confidence: number;
   conflict: boolean;
+  classificationReason?: string;
+  classificationSource?: KnowledgeClassificationSource;
   source: {
     path: string;
     updatedAt?: string;
@@ -84,6 +87,7 @@ function makeItem(
   text: string,
   key?: string,
   value?: string,
+  classification?: { reason: string; source: KnowledgeClassificationSource },
 ): KnowledgeItem | null {
   const normalizedText = normalizeIndexedText(stripMarkdown(text));
   if (!normalizedText) return null;
@@ -110,6 +114,8 @@ function makeItem(
     text: normalizedText,
     confidence: kind === 'resource' ? 0.9 : 0.75,
     conflict: false,
+    classificationReason: classification?.reason,
+    classificationSource: classification?.source,
     source: {
       path: file.path,
       updatedAt: file.updatedAt,
@@ -119,8 +125,12 @@ function makeItem(
   };
 }
 
+function stripFrontmatter(content: string): string {
+  return content.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/u, '');
+}
+
 function parseFrontmatterMetadata(content: string): Record<string, string> | undefined {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u);
+  const match = content.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u);
   if (!match) return undefined;
   const metadata: Record<string, string> = {};
   for (const rawLine of match[1].split(/\r?\n/)) {
@@ -156,34 +166,93 @@ function parseMarkdownTableRows(content: string): Array<{ raw: string; cells: st
   return rows;
 }
 
-function inferLineKind(line: string): KnowledgeKind | null {
+interface KnowledgeKindInference {
+  kind: KnowledgeKind;
+  reason: string;
+  source: KnowledgeClassificationSource;
+}
+
+const PATH_OR_FILE_PATTERN_RE = /https?:\/\/|(?:[A-Za-z]:\\|\.{1,2}\/|Assets\/|Packages\/)|[A-Za-z0-9_-]+\.(?:png|jpe?g|webp|gif|mp4|mov|glb|gltf|fbx|obj|zip|pdf|md|docx?|xlsx?|cs|ts|tsx|json|prefab|unity)\b/iu;
+const TABLE_RESOURCE_HINT_RE = /(?:\bPrefab\b|\bUIScene\b|材质|贴图|图片|模型|文件|路径|链接|文档|预制体)/iu;
+const CONCLUSION_PATTERN_RE = /(?:决定|决策|采用|默认|不要|不能|必须|需要|优先|策略|规则|约定|边界|统一|改为|不再|只允许|禁止)/u;
+const TODO_PATTERN_RE = /(?:待办|TODO|todo|后续|提醒|待处理|需要处理|风险|修复|跟进|检查|补齐|完善|实现|迁移|清理)/iu;
+
+function inferLineKind(line: string): KnowledgeKindInference | null {
   const normalized = stripMarkdown(line);
   for (const label of KIND_LABELS) {
-    if (label.pattern.test(normalized)) return label.kind;
+    if (label.pattern.test(normalized)) {
+      return {
+        kind: label.kind,
+        reason: `显式前缀匹配 ${label.kind}`,
+        source: 'prefix',
+      };
+    }
   }
-  if (/https?:\/\/|[A-Za-z0-9_-]+\.(?:png|jpe?g|webp|gif|mp4|mov|glb|gltf|fbx|obj|zip|pdf|md)\b/u.test(normalized)) {
-    return 'resource';
+  if (PATH_OR_FILE_PATTERN_RE.test(normalized)) {
+    return {
+      kind: 'resource',
+      reason: '包含路径、链接或文件名',
+      source: 'resource_pattern',
+    };
   }
   return null;
 }
 
+function inferTableRowKind(key: string, value: string): KnowledgeKindInference {
+  const text = `${key} ${value}`;
+  if (PATH_OR_FILE_PATTERN_RE.test(text) || TABLE_RESOURCE_HINT_RE.test(text)) {
+    return {
+      kind: 'resource',
+      reason: '表格 key/value 包含路径、链接、文件名或资源标识',
+      source: 'table_inference',
+    };
+  }
+  if (TODO_PATTERN_RE.test(text)) {
+    return {
+      kind: 'todo',
+      reason: '表格 key/value 包含待办、提醒、风险或后续动作',
+      source: 'table_inference',
+    };
+  }
+  if (CONCLUSION_PATTERN_RE.test(text)) {
+    return {
+      kind: 'conclusion',
+      reason: '表格 key/value 包含决策、默认、规则或优先级表述',
+      source: 'table_inference',
+    };
+  }
+  return {
+    kind: 'fact',
+    reason: '表格 key/value 是普通结构化映射',
+    source: 'table_inference',
+  };
+}
+
 function collectItemsFromFile(file: KnowledgeSourceFile): KnowledgeItem[] {
   const items: KnowledgeItem[] = [];
-  for (const row of parseMarkdownTableRows(file.content)) {
+  const content = stripFrontmatter(file.content);
+  for (const row of parseMarkdownTableRows(content)) {
     const [key, value] = row.cells;
     if (!key || !value) continue;
-    const item = makeItem('resource', file, row.raw, key, value);
+    const inference = inferTableRowKind(key, value);
+    const item = makeItem(inference.kind, file, row.raw, key, value, {
+      reason: inference.reason,
+      source: inference.source,
+    });
     if (item) items.push(item);
   }
 
-  for (const rawLine of file.content.split(/\r?\n/)) {
+  for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#') || line.startsWith('|')) continue;
-    const kind = inferLineKind(line);
-    if (!kind) continue;
+    const inference = inferLineKind(line);
+    if (!inference) continue;
     const text = stripMarkdown(line).replace(/^(事实|偏好|约定|结论|决策|决定|待办|todo|TODO|后续|风险|资源|文件|图片|链接|场景|Scene)\s*[:：]\s*/iu, '');
     if (!text) continue;
-    const item = makeItem(kind, file, line, undefined, text);
+    const item = makeItem(inference.kind, file, line, undefined, text, {
+      reason: inference.reason,
+      source: inference.source,
+    });
     if (item) items.push(item);
   }
 

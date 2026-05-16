@@ -96,6 +96,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 
 - 开发版是主版本，live skill 是运行副本。
 - 修改开发版后，如果用户要求立即生效，运行 `scripts/sync-live-skill.ps1`，方向固定为“开发版 suite -> live skill”，不要手工复制零散文件。
+- 截至 2026-05-15，用户已要求 bridge/runtime 相关修复后默认让本机 live 机器人立刻生效；因此涉及 Feishu bridge、`bridge-core`、`bridge-runtime`、provider 路由、MCP 工具链、出站收口、reminder、memory 或控制面板运行行为的开发版修改，在完成构建和验证后，应自动执行 `scripts/sync-live-skill.ps1` 并重启 live bridge，再复核 `status.json`、`bridge-runtime-audit.json` 和 `bridge.log`。纯文档、测试、非运行时脚本或用户明确要求“不同步 live”时除外。
 - 控制面板顶部的 live 同步提示以 live runtime `.suite-release.json.generatedAt`、suite/live commit 和关键内容 hash 为依据；看到“Live 落后 / 未记录同步时间 / 读取失败”时，优先使用面板“一键同步”或手动运行 `scripts/sync-live-skill.ps1`，不要改 live 副本里的零散文件。
 - 面板 `live.sync` / “一键同步”只允许执行开发版 suite -> live skill 同步；它不打包、不提交、不推送，也不自动重启 bridge。需要让 daemon 重新加载新代码时，必须把“同步”和“重启 bridge”作为两个明确步骤处理。
 - live 控制面板路径统一为 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`；`scripts/sync-live-skill.ps1` 成功同步后应清理旧 `ClaudeToImControlPanel.exe` / `.pdb`，doctor、fingerprint 和 hash 检查只认正式入口。

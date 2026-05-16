@@ -28,12 +28,19 @@ describe('knowledge index service realtime status', () => {
     const statusPath = path.join(tmpDir, '.cti-index', 'status.json');
 
     assert.equal(status.itemCount, 1);
+    assert.ok(status.memoryGraphPath?.endsWith(path.join('.cti-index', 'memory-graph.json')));
+    assert.ok((status.memoryGraphNodeCount ?? 0) >= 1);
+    assert.ok((status.memoryGraphEdgeCount ?? 0) >= 0);
     assert.ok(fs.existsSync(statusPath));
+    assert.equal(fs.existsSync(status.memoryGraphPath || ''), true);
 
     const persisted = JSON.parse(fs.readFileSync(statusPath, 'utf-8')) as typeof status;
     assert.equal(persisted.schema, 'codex-im-suite/knowledge-index-status/v1');
     assert.equal(persisted.watching, false);
     assert.equal(persisted.itemCount, 1);
+    assert.equal(persisted.memoryGraphPath, status.memoryGraphPath);
+    assert.equal(persisted.memoryGraphNodeCount, status.memoryGraphNodeCount);
+    assert.equal(persisted.memoryGraphEdgeCount, status.memoryGraphEdgeCount);
     assert.equal(persisted.markdownFileCount, 1);
     assert.ok(persisted.lastIndexedAt);
 

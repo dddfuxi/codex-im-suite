@@ -6,8 +6,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-const FEISHU_AUTHORIZE_URL = 'https://open.feishu.cn/open-apis/authen/v1/authorize';
+const FEISHU_OAUTH_V2_AUTHORIZE_URL = 'https://open.feishu.cn/open-apis/authen/v1/authorize';
+const FEISHU_MANUAL_AUTHORIZE_URL = 'https://open.feishu.cn/open-apis/authen/v1/index';
 const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
+const FEISHU_AUTHEN_V1_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v1/access_token';
+const FEISHU_APP_ACCESS_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal';
 const CLOCK_SKEW_MS = 60 * 1000;
 
 export interface StoredFeishuUserTokens {
@@ -47,6 +50,16 @@ export interface FeishuOAuthState {
   redirectUri: string;
   linkHashes: string[];
   expiresAt: string;
+  pendingRequest?: FeishuOAuthPendingRequest;
+}
+
+export interface FeishuOAuthPendingRequest {
+  text: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  messageId?: string;
 }
 
 export interface FeishuOAuthConfig {
@@ -64,7 +77,10 @@ export interface FeishuOAuthConfig {
 export interface FeishuAuthorizationInput {
   userId: string;
   chatId: string;
+  channelType?: string;
+  userDisplayName?: string;
   messageId?: string;
+  text?: string;
   linkUrls: string[];
 }
 
@@ -74,8 +90,14 @@ export type FeishuAuthorizationResult =
 
 export type FeishuManualCallbackResult =
   | { status: 'no_callback' }
-  | { status: 'bound'; userMessage: string }
+  | { status: 'bound'; userMessage: string; resume?: FeishuOAuthPendingRequest }
   | { status: 'error'; userMessage: string; error?: string };
+
+export type FeishuOAuthCallbackResult = {
+  ok: boolean;
+  message: string;
+  resume?: FeishuOAuthPendingRequest;
+};
 
 export class FeishuOAuthTokenStore {
   constructor(
@@ -172,6 +194,7 @@ export class FeishuOAuthService {
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
+  private cachedAppToken: { token: string; expiresAtMs: number } | null = null;
 
   constructor(private readonly options: {
     config: FeishuOAuthConfig;
@@ -239,7 +262,7 @@ export class FeishuOAuthService {
     return Promise.race([completed, timeout]);
   }
 
-  async handleOAuthCallback(callbackUrl: URL): Promise<{ ok: boolean; message: string }> {
+  async handleOAuthCallback(callbackUrl: URL): Promise<FeishuOAuthCallbackResult> {
     const code = callbackUrl.searchParams.get('code') || '';
     const stateValue = callbackUrl.searchParams.get('state') || '';
     if (!code || !stateValue) {
@@ -261,6 +284,9 @@ export class FeishuOAuthService {
       if (pending) {
         this.pending.delete(state.state);
         pending.resolve({ status: 'authorized', accessToken: tokens.accessToken });
+      }
+      if (state.pendingRequest?.text?.trim()) {
+        return { ok: true, message: '飞书授权成功。已收到，正在处理中。', resume: state.pendingRequest };
       }
       return { ok: true, message: '飞书授权成功，可以回到聊天继续。' };
     } catch (error) {
@@ -297,6 +323,13 @@ export class FeishuOAuthService {
         return { status: 'error', userMessage: '授权账号与发起请求的飞书用户不一致，已拒绝绑定。' };
       }
       await this.options.tokenStore.saveTokens(state.userId, tokens);
+      if (state.pendingRequest?.text?.trim()) {
+        return {
+          status: 'bound',
+          userMessage: '已收到，正在处理中。',
+          resume: state.pendingRequest,
+        };
+      }
       return { status: 'bound', userMessage: '飞书授权成功。请回到聊天里重新发送原问题，我会按你的飞书身份读取云文档。' };
     } catch (error) {
       return {
@@ -328,13 +361,30 @@ export class FeishuOAuthService {
       redirectUri: this.getRedirectUri(),
       linkHashes: input.linkUrls.map((url) => crypto.createHash('sha256').update(url).digest('hex')),
       expiresAt: new Date(this.now().getTime() + 5 * 60 * 1000).toISOString(),
+      pendingRequest: input.text?.trim()
+        ? {
+          text: input.text,
+          channelType: input.channelType || 'feishu',
+          chatId: input.chatId,
+          userId: input.userId,
+          userDisplayName: input.userDisplayName,
+          messageId: input.messageId,
+        }
+        : undefined,
     };
     await this.options.stateStore.put(state);
     return state;
   }
 
   private buildAuthorizationUrl(state: FeishuOAuthState): string {
-    const url = new URL(FEISHU_AUTHORIZE_URL);
+    if (this.options.config.mode === 'manual') {
+      const url = new URL(FEISHU_MANUAL_AUTHORIZE_URL);
+      url.searchParams.set('redirect_uri', state.redirectUri);
+      url.searchParams.set('app_id', this.options.config.appId!);
+      url.searchParams.set('state', state.state);
+      return url.toString();
+    }
+    const url = new URL(FEISHU_OAUTH_V2_AUTHORIZE_URL);
     url.searchParams.set('client_id', this.options.config.appId!);
     url.searchParams.set('app_id', this.options.config.appId!);
     url.searchParams.set('redirect_uri', state.redirectUri);
@@ -355,6 +405,9 @@ export class FeishuOAuthService {
   }
 
   private async exchangeAuthorizationCode(code: string, state: FeishuOAuthState): Promise<StoredFeishuUserTokens> {
+    if (this.options.config.mode === 'manual') {
+      return this.requestAuthenV1Token(code);
+    }
     return this.requestToken({
       grant_type: 'authorization_code',
       client_id: this.options.config.appId!,
@@ -363,6 +416,68 @@ export class FeishuOAuthService {
       redirect_uri: state.redirectUri,
       code_verifier: state.codeVerifier,
     });
+  }
+
+  private async requestAuthenV1Token(code: string): Promise<StoredFeishuUserTokens> {
+    const appAccessToken = await this.getAppAccessToken();
+    const response = await this.fetchImpl(FEISHU_AUTHEN_V1_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${appAccessToken}`,
+        'content-type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code,
+      }),
+    });
+    const payload = await response.json() as any;
+    if (!response.ok || payload.code !== 0) {
+      throw new Error(payload.msg || payload.message || `HTTP ${response.status}`);
+    }
+    const data = payload.data || payload;
+    const nowMs = this.now().getTime();
+    const accessTtlMs = Number(data.expires_in || data.expire || 7200) * 1000;
+    return {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      scopes: this.options.config.scopes,
+      accessTokenExpiresAt: new Date(nowMs + accessTtlMs).toISOString(),
+      refreshTokenExpiresAt: data.refresh_token_expires_in
+        ? new Date(nowMs + Number(data.refresh_token_expires_in) * 1000).toISOString()
+        : undefined,
+      openId: data.open_id || data.user?.open_id,
+      unionId: data.union_id || data.user?.union_id,
+      userId: data.user_id || data.user?.user_id,
+    };
+  }
+
+  private async getAppAccessToken(): Promise<string> {
+    const nowMs = this.now().getTime();
+    if (this.cachedAppToken && this.cachedAppToken.expiresAtMs > nowMs + CLOCK_SKEW_MS) {
+      return this.cachedAppToken.token;
+    }
+    const response = await this.fetchImpl(FEISHU_APP_ACCESS_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({
+        app_id: this.options.config.appId!,
+        app_secret: this.options.config.appSecret!,
+      }),
+    });
+    const payload = await response.json() as any;
+    if (!response.ok || Number(payload.code || 0) !== 0) {
+      throw new Error(payload.msg || payload.message || `HTTP ${response.status}`);
+    }
+    const token = payload.app_access_token || payload.tenant_access_token;
+    if (!token) {
+      throw new Error('飞书未返回 app_access_token。');
+    }
+    this.cachedAppToken = {
+      token: String(token),
+      expiresAtMs: nowMs + Math.max(60, Number(payload.expire || payload.expires_in || 7200)) * 1000,
+    };
+    return this.cachedAppToken.token;
   }
 
   private async refreshAccessToken(userId: string, refreshToken: string): Promise<string | null> {
@@ -411,7 +526,7 @@ export class FeishuOAuthService {
 
 export function startFeishuOAuthCallbackServer(
   service: FeishuOAuthService,
-  options: { host?: string; port: number; callbackPath: string },
+  options: { host?: string; port: number; callbackPath: string; onResume?: (resume: FeishuOAuthPendingRequest) => Promise<void> | void },
 ): http.Server {
   const callbackPath = normalizeCallbackPath(options.callbackPath);
   const server = http.createServer(async (req, res) => {
@@ -423,6 +538,11 @@ export function startFeishuOAuthCallbackServer(
         return;
       }
       const result = await service.handleOAuthCallback(requestUrl);
+      if (result.ok && result.resume && options.onResume) {
+        void Promise.resolve(options.onResume(result.resume)).catch((error) => {
+          console.warn('[feishu-oauth] callback resume error:', error instanceof Error ? error.message : error);
+        });
+      }
       res.writeHead(result.ok ? 200 : 400, { 'content-type': 'text/html; charset=utf-8' });
       res.end(renderCallbackHtml(result.ok, result.message));
     } catch (error) {
@@ -482,6 +602,15 @@ function buildAuthorizationCard(loginUrl: string): string {
             text: { tag: 'plain_text', content: '登录飞书授权' },
             type: 'primary',
             url: loginUrl,
+          },
+        ],
+      },
+      {
+        tag: 'note',
+        elements: [
+          {
+            tag: 'plain_text',
+            content: '如果浏览器显示 127.0.0.1 拒绝连接：请复制地址栏完整 URL 发回飞书；如果在本机打开则会自动回调。',
           },
         ],
       },
