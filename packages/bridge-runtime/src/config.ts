@@ -29,13 +29,22 @@ export interface Config {
   localAiModel?: string;
   localAiApiKey?: string;
   localAiTimeoutMs?: number;
+  codexModelSource?: 'official' | 'local_api' | 'external_api';
   codexBaseUrl?: string;
   codexApiKey?: string;
   codexModel?: string;
   codexPassModel?: boolean;
   codexReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  codexInheritGlobalMcp?: boolean;
   codexLocalFallbackEnabled?: boolean;
   codexLocalFallbackReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  codexFailureFallbackMode?: 'none' | 'local_agent';
+  localAgentMode?: 'text_only' | 'agent_verified';
+  localToolCallRequired?: boolean;
+  executionRequiredRoute?: 'primary' | 'codex_or_external' | 'refuse';
+  memoryOptimizerEnabled?: boolean;
+  memoryOptimizerIntervalDays?: number;
+  memoryOptimizerModelSource?: 'codex_primary' | 'local_ai' | 'external_api';
   ollamaEnabled?: boolean;
   ollamaBaseUrl?: string;
   ollamaModel?: string;
@@ -292,6 +301,25 @@ export function loadConfig(): Config {
   const codexLocalFallbackReasoningEffort = ["minimal", "low", "medium", "high", "xhigh"].includes(rawCodexLocalFallbackReasoningEffort)
     ? rawCodexLocalFallbackReasoningEffort as NonNullable<Config["codexLocalFallbackReasoningEffort"]>
     : "minimal";
+  const rawCodexModelSource = (env.get("CTI_CODEX_MODEL_SOURCE") || "").trim().toLowerCase();
+  const codexModelSource = (["official", "local_api", "external_api"].includes(rawCodexModelSource)
+    ? rawCodexModelSource
+    : ((env.get("CTI_CODEX_BASE_URL") || env.get("CTI_CODEX_MODEL") || env.get("CTI_CODEX_API_KEY")) ? "external_api" : "official")) as NonNullable<Config["codexModelSource"]>;
+  const rawCodexFailureFallbackMode = (env.get("CTI_CODEX_FAILURE_FALLBACK_MODE") || "").trim().toLowerCase();
+  const codexFailureFallbackMode = (rawCodexFailureFallbackMode === "local_agent" ? "local_agent" : "none") as NonNullable<Config["codexFailureFallbackMode"]>;
+  const rawLocalAgentMode = (env.get("CTI_LOCAL_AGENT_MODE") || "").trim().toLowerCase();
+  const localAgentMode = (rawLocalAgentMode === "agent_verified" ? "agent_verified" : "text_only") as NonNullable<Config["localAgentMode"]>;
+  const rawExecutionRequiredRoute = (env.get("CTI_EXECUTION_REQUIRED_ROUTE") || "").trim().toLowerCase();
+  const executionRequiredRoute = (["primary", "codex_or_external", "refuse"].includes(rawExecutionRequiredRoute)
+    ? rawExecutionRequiredRoute
+    : "codex_or_external") as NonNullable<Config["executionRequiredRoute"]>;
+  const memoryOptimizerIntervalDays = env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS")
+    ? Number(env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS"))
+    : 7;
+  const rawMemoryOptimizerModelSource = (env.get("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE") || "").trim().toLowerCase();
+  const memoryOptimizerModelSource = (["codex_primary", "local_ai", "external_api"].includes(rawMemoryOptimizerModelSource)
+    ? rawMemoryOptimizerModelSource
+    : "codex_primary") as NonNullable<Config["memoryOptimizerModelSource"]>;
 
   return {
     runtime,
@@ -328,13 +356,22 @@ export function loadConfig(): Config {
     localAiModel,
     localAiApiKey: env.get("CTI_LOCAL_AI_API_KEY") || undefined,
     localAiTimeoutMs: effectiveLocalAiTimeoutMs,
+    codexModelSource,
     codexBaseUrl: env.get("CTI_CODEX_BASE_URL") || undefined,
     codexApiKey: env.get("CTI_CODEX_API_KEY") || undefined,
     codexModel: env.get("CTI_CODEX_MODEL") || undefined,
     codexPassModel: env.has("CTI_CODEX_PASS_MODEL") ? env.get("CTI_CODEX_PASS_MODEL") === "true" : undefined,
     codexReasoningEffort,
-    codexLocalFallbackEnabled: env.has("CTI_CODEX_LOCAL_FALLBACK_ENABLED") ? env.get("CTI_CODEX_LOCAL_FALLBACK_ENABLED") === "true" : true,
+    codexInheritGlobalMcp: env.has("CTI_CODEX_INHERIT_GLOBAL_MCP") ? env.get("CTI_CODEX_INHERIT_GLOBAL_MCP") === "true" : false,
+    codexLocalFallbackEnabled: env.has("CTI_CODEX_LOCAL_FALLBACK_ENABLED") ? env.get("CTI_CODEX_LOCAL_FALLBACK_ENABLED") === "true" : false,
     codexLocalFallbackReasoningEffort,
+    codexFailureFallbackMode,
+    localAgentMode,
+    localToolCallRequired: env.has("CTI_LOCAL_TOOL_CALL_REQUIRED") ? env.get("CTI_LOCAL_TOOL_CALL_REQUIRED") !== "false" : true,
+    executionRequiredRoute,
+    memoryOptimizerEnabled: env.has("CTI_MEMORY_OPTIMIZER_ENABLED") ? env.get("CTI_MEMORY_OPTIMIZER_ENABLED") === "true" : false,
+    memoryOptimizerIntervalDays: Number.isFinite(memoryOptimizerIntervalDays) ? Math.max(1, Math.floor(memoryOptimizerIntervalDays)) : 7,
+    memoryOptimizerModelSource,
     ollamaEnabled,
     ollamaBaseUrl,
     ollamaModel,
@@ -476,15 +513,28 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_LOCAL_AI_API_KEY", config.localAiApiKey);
   if (config.localAiTimeoutMs !== undefined)
     out += formatEnvLine("CTI_LOCAL_AI_TIMEOUT_MS", String(config.localAiTimeoutMs));
+  out += formatEnvLine("CTI_CODEX_MODEL_SOURCE", config.codexModelSource);
   out += formatEnvLine("CTI_CODEX_BASE_URL", config.codexBaseUrl);
   out += formatEnvLine("CTI_CODEX_API_KEY", config.codexApiKey);
   out += formatEnvLine("CTI_CODEX_MODEL", config.codexModel);
   if (config.codexPassModel !== undefined)
     out += formatEnvLine("CTI_CODEX_PASS_MODEL", String(config.codexPassModel));
   out += formatEnvLine("CTI_CODEX_REASONING_EFFORT", config.codexReasoningEffort);
+  if (config.codexInheritGlobalMcp !== undefined)
+    out += formatEnvLine("CTI_CODEX_INHERIT_GLOBAL_MCP", String(config.codexInheritGlobalMcp));
   if (config.codexLocalFallbackEnabled !== undefined)
     out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_ENABLED", String(config.codexLocalFallbackEnabled));
   out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", config.codexLocalFallbackReasoningEffort);
+  out += formatEnvLine("CTI_CODEX_FAILURE_FALLBACK_MODE", config.codexFailureFallbackMode);
+  out += formatEnvLine("CTI_LOCAL_AGENT_MODE", config.localAgentMode);
+  if (config.localToolCallRequired !== undefined)
+    out += formatEnvLine("CTI_LOCAL_TOOL_CALL_REQUIRED", String(config.localToolCallRequired));
+  out += formatEnvLine("CTI_EXECUTION_REQUIRED_ROUTE", config.executionRequiredRoute);
+  if (config.memoryOptimizerEnabled !== undefined)
+    out += formatEnvLine("CTI_MEMORY_OPTIMIZER_ENABLED", String(config.memoryOptimizerEnabled));
+  if (config.memoryOptimizerIntervalDays !== undefined)
+    out += formatEnvLine("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", String(config.memoryOptimizerIntervalDays));
+  out += formatEnvLine("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", config.memoryOptimizerModelSource);
   if (config.ollamaEnabled !== undefined)
     out += formatEnvLine("CTI_OLLAMA_ENABLED", String(config.ollamaEnabled));
   out += formatEnvLine("CTI_OLLAMA_BASE_URL", config.ollamaBaseUrl);
@@ -792,6 +842,9 @@ export function configToSettings(config: Config): Map<string, string> {
   if (typeof config.localAiTimeoutMs === "number" && Number.isFinite(config.localAiTimeoutMs)) {
     m.set("bridge_local_ai_timeout_ms", String(Math.max(1000, Math.floor(config.localAiTimeoutMs))));
   }
+  if (config.codexModelSource) {
+    m.set("bridge_codex_model_source", config.codexModelSource);
+  }
   if (config.codexBaseUrl) {
     m.set("bridge_codex_base_url", config.codexBaseUrl);
   }
@@ -810,12 +863,22 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.codexReasoningEffort) {
     m.set("bridge_codex_reasoning_effort", config.codexReasoningEffort);
   }
+  m.set("bridge_codex_inherit_global_mcp", String(config.codexInheritGlobalMcp === true));
   if (config.codexLocalFallbackEnabled !== undefined) {
     m.set("bridge_codex_local_fallback_enabled", String(config.codexLocalFallbackEnabled));
   }
   if (config.codexLocalFallbackReasoningEffort) {
     m.set("bridge_codex_local_fallback_reasoning_effort", config.codexLocalFallbackReasoningEffort);
   }
+  if (config.codexFailureFallbackMode) {
+    m.set("bridge_codex_failure_fallback_mode", config.codexFailureFallbackMode);
+  }
+  m.set("bridge_local_agent_mode", config.localAgentMode || "text_only");
+  m.set("bridge_local_tool_call_required", String(config.localToolCallRequired !== false));
+  m.set("bridge_execution_required_route", config.executionRequiredRoute || "codex_or_external");
+  m.set("bridge_memory_optimizer_enabled", String(config.memoryOptimizerEnabled === true));
+  m.set("bridge_memory_optimizer_interval_days", String(config.memoryOptimizerIntervalDays ?? 7));
+  m.set("bridge_memory_optimizer_model_source", config.memoryOptimizerModelSource || "codex_primary");
   if (config.ollamaEnabled !== undefined) {
     m.set("bridge_ollama_enabled", String(config.ollamaEnabled));
   }

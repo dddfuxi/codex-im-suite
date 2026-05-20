@@ -102,7 +102,7 @@ function Invoke-ControlPanelWebBuild {
     }
 }
 
-$ordered = @('bridge-core', 'bridge-runtime', 'mcp-picture', 'mcp-unity-prefab', 'mcp-ignis')
+$ordered = @('contracts', 'bridge-core', 'bridge-runtime', 'mcp-picture', 'mcp-unity-prefab', 'mcp-ignis')
 foreach ($key in $ordered) {
     $pkg = $manifest.packages.$key
     $path = [System.IO.Path]::GetFullPath((Join-Path $suiteRoot $pkg.path))

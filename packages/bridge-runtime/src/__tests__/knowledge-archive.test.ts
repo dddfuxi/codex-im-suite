@@ -10,6 +10,7 @@ import {
   archiveKnowledgeItem,
   deleteKnowledgeArchive,
   listKnowledgeArchives,
+  restoreKnowledgeArchive,
 } from '../knowledge-archive.js';
 
 describe('knowledge archive', () => {
@@ -45,11 +46,74 @@ describe('knowledge archive', () => {
     }
   });
 
+  it('restores an archived knowledge unit to its source markdown', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-restore-'));
+    try {
+      const sourcePath = path.join(root, 'notes.md');
+      fs.writeFileSync(sourcePath, '事实: 可恢复归档\n', 'utf-8');
+      rebuildKnowledgeIndex(root);
+      const item = readKnowledgeIndex(root)?.items[0];
+      assert.ok(item);
+      const archived = archiveKnowledgeItem(root, {
+        itemId: item.id,
+        archivedAt: '2026-04-30T03:31:00.000Z',
+      });
+      assert.equal(archived.ok, true);
+      assert.doesNotMatch(fs.readFileSync(sourcePath, 'utf-8'), /可恢复归档/);
+
+      const restored = restoreKnowledgeArchive(root, { archivePath: archived.archivePath! });
+
+      assert.equal(restored.ok, true);
+      assert.match(fs.readFileSync(sourcePath, 'utf-8'), /事实: 可恢复归档/);
+      assert.equal(fs.existsSync(archived.archivePath!), false);
+      assert.equal(readKnowledgeIndex(root)?.items.some((entry) => entry.text.includes('可恢复归档')), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects restore paths outside the archive directory', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-escape-'));
+    try {
+      const outside = path.join(os.tmpdir(), 'outside-archive.md');
+      fs.writeFileSync(outside, 'bad', 'utf-8');
+      const restored = restoreKnowledgeArchive(root, { archivePath: outside });
+      assert.equal(restored.ok, false);
+      assert.match(restored.error || '', /归档文件不在知识归档目录/);
+      fs.rmSync(outside, { force: true });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a source-missing restore blocker', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-missing-source-'));
+    try {
+      const sourcePath = path.join(root, 'notes.md');
+      fs.writeFileSync(sourcePath, '事实: 源文件会消失\n', 'utf-8');
+      rebuildKnowledgeIndex(root);
+      const item = readKnowledgeIndex(root)?.items[0];
+      assert.ok(item);
+      const archived = archiveKnowledgeItem(root, {
+        itemId: item.id,
+        archivedAt: '2026-04-30T03:32:00.000Z',
+      });
+      fs.rmSync(sourcePath, { force: true });
+
+      const restored = restoreKnowledgeArchive(root, { archivePath: archived.archivePath! });
+
+      assert.equal(restored.ok, false);
+      assert.match(restored.error || '', /源文件不存在/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('deletes an archived knowledge unit permanently', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-delete-'));
     try {
       const sourcePath = path.join(root, 'notes.md');
-      fs.writeFileSync(sourcePath, '事实: 可删除归档。', 'utf-8');
+      fs.writeFileSync(sourcePath, '事实: 可删除归档', 'utf-8');
       rebuildKnowledgeIndex(root);
       const item = readKnowledgeIndex(root)?.items[0];
       assert.ok(item);

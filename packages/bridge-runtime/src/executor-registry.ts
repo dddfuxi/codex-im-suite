@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 
 import type { Config } from './config.js';
+import { readLocalModelCapabilityProfile, shouldTrustLocalApiForExecution } from './local-model-capability.js';
 import { resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { getLocalRouterMode, readLocalLlmStatus } from './local-llm-status.js';
 import type {
@@ -34,7 +35,7 @@ function isClaudeEnabled(config: Config): boolean {
 function isCodexLocalFallbackEnabled(config: Config): boolean {
   return isCodexEnabled(config)
     && (config.ollamaEnabled ?? config.localLlmEnabled) === true
-    && config.codexLocalFallbackEnabled !== false
+    && config.codexLocalFallbackEnabled === true
     && getLocalRouterMode(config) !== 'codex_only';
 }
 
@@ -60,10 +61,17 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
   const localAiKind = config.localAiKind || 'ollama';
   const localModel = config.localAiModel || config.ollamaModel || config.localLlmModel || localStatus.model || 'qwen2.5-coder:7b';
   const localBaseUrl = config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl || localStatus.baseUrl || 'http://127.0.0.1:11434';
+  const localCapabilities = readLocalModelCapabilityProfile(config);
+  const codexModelSource = config.codexModelSource || ((config.codexBaseUrl || config.codexModel || config.codexApiKey) ? 'external_api' : 'official');
+  const codexDisplayName = codexModelSource === 'local_api'
+    ? `Codex CLI (本地 API 主模型: ${localModel})`
+    : codexModelSource === 'external_api'
+      ? `Codex CLI (外部 API: ${config.codexModel || '未指定模型'})`
+      : 'Codex CLI / SDK';
   return [
     {
       id: 'codex',
-      displayName: 'Codex CLI / SDK',
+      displayName: codexDisplayName,
       kind: 'cli',
       capabilities: ['chat', 'code', 'repo_query', 'file_read', 'file_write', 'image_input', 'artifact_delivery'],
       riskLevel: 'workspace_write',
@@ -71,6 +79,20 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       priority: config.runtime === 'codex' ? 100 : 80,
       description: '默认主脑执行器，负责复杂仓库修改、多步任务和工具调用。',
       healthCheck: { kind: 'runtime_status', target: 'codex' },
+      configSchema: {
+        modelSource: codexModelSource,
+        model: codexModelSource === 'local_api' ? localModel : config.codexModel,
+        baseUrl: codexModelSource === 'local_api' ? localBaseUrl : config.codexBaseUrl,
+        failureFallbackMode: config.codexFailureFallbackMode || 'none',
+        localFallbackEnabled: config.codexLocalFallbackEnabled === true,
+        localAgentMode: config.localAgentMode || 'text_only',
+        localToolCallRequired: config.localToolCallRequired !== false,
+        executionRequiredRoute: config.executionRequiredRoute || 'codex_or_external',
+        localToolCallingState: localCapabilities.toolCallingState,
+        localToolCallingMessage: localCapabilities.message,
+        localExecutionTrusted: codexModelSource !== 'local_api' || shouldTrustLocalApiForExecution(config),
+        codexHome: codexModelSource === 'local_api' ? 'runtime/codex-home-local-primary' : 'runtime/codex-home',
+      },
     },
     {
       id: 'claude-cli',
@@ -97,6 +119,9 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
         provider: localAiKind,
         model: localModel,
         baseUrl: localBaseUrl,
+        toolCallingState: localCapabilities.toolCallingState,
+        toolCallingMessage: localCapabilities.message,
+        recommendedMode: localCapabilities.recommendedMode,
         codexHome: 'runtime/codex-home-local-fallback',
         forceModel: true,
       },
@@ -114,6 +139,8 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       configSchema: {
         provider: localAiKind,
         model: localModel,
+        toolCallingState: localCapabilities.toolCallingState,
+        toolCallingMessage: localCapabilities.message,
         routerMode: getLocalRouterMode(config),
         sandbox: buildToolSandboxPolicy(config),
       },

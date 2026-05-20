@@ -52,6 +52,10 @@ function Test-ActionableSecretHit {
     $assignment = [regex]::Match($trimmed, '(?i)(app[_-]?secret|client[_-]?secret|access[_-]?token|api[_-]?key)\s*[:=]\s*["'']?([^"''\s#]+)')
     if ($assignment.Success) {
         $value = $assignment.Groups[2].Value.Trim()
+        $afterValue = $trimmed.Substring([Math]::Min($trimmed.Length, $assignment.Index + $assignment.Length)).TrimStart()
+        if ($value -match '^[A-Za-z_][A-Za-z0-9_]*\(?$' -and ($value.EndsWith('(') -or $afterValue.StartsWith('('))) {
+            return $false
+        }
         if ($value -match '(?i)^(your-|example|placeholder|change-me|changeme|replace-me|dummy|sample|test)') {
             return $false
         }

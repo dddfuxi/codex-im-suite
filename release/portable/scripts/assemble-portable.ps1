@@ -14,6 +14,30 @@ if (-not $ControlPanelArtifactDir) {
     $ControlPanelArtifactDir = Join-Path $artifactsDir 'control-panel'
 }
 
+function Remove-FileWithRetry {
+    param(
+        [string]$Path,
+        [int]$Retries = 8
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($i -eq ($Retries - 1)) {
+                throw
+            }
+            Start-Sleep -Milliseconds (250 * ($i + 1))
+        }
+    }
+}
+
 Clear-RunningProcessInPathForUpdate -Roots @($portableDir) -Purpose 'assemble portable' -NoForceUpdate:$NoForceUpdate
 if (Test-Path -LiteralPath $portableDir) {
     Remove-PathForUpdate -Path $portableDir -Purpose 'assemble portable cleanup'
@@ -62,7 +86,21 @@ $fingerprint = New-SuiteReleaseFingerprint `
 Write-SuiteReleaseFingerprint -TargetRoot $portableDir -Fingerprint $fingerprint | Out-Null
 
 $zipPath = Join-Path (Join-Path $suiteRoot 'release') 'codex-im-suite-portable.zip'
-if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath $zipPath -Force
+$zipTempPath = "$zipPath.tmp-$([guid]::NewGuid().ToString('N')).zip"
+Remove-FileWithRetry -Path $zipTempPath
+try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $portableDir,
+        $zipTempPath,
+        [System.IO.Compression.CompressionLevel]::Optimal,
+        $false,
+        [System.Text.Encoding]::UTF8)
+    Remove-FileWithRetry -Path $zipPath
+    Move-Item -LiteralPath $zipTempPath -Destination $zipPath -Force
+}
+finally {
+    Remove-FileWithRetry -Path $zipTempPath
+}
 Write-Host "portable assembled: $portableDir"
 Write-Host "portable zip: $zipPath"

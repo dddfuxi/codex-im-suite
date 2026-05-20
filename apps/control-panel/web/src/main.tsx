@@ -12,9 +12,13 @@ import {
   Activity,
   Archive,
   ArrowDownUp,
+  ArrowLeftRight,
+  Bell,
   Bot,
+  BrainCircuit,
   CheckCircle2,
   Clipboard,
+  Database,
   ExternalLink,
   FileText,
   FolderOpen,
@@ -24,7 +28,9 @@ import {
   Layers3,
   ListChecks,
   Logs,
+  MessageCircle,
   MoonStar,
+  Network,
   Play,
   PlugZap,
   Power,
@@ -32,6 +38,7 @@ import {
   Rocket,
   RotateCw,
   Search,
+  Send,
   Settings,
   ShieldCheck,
   Square,
@@ -66,6 +73,36 @@ type ServiceItem = {
   title: string;
   status: StatusKind;
   detail: string;
+};
+
+type NodeCapability = {
+  id: string;
+  displayName: string;
+  category: string;
+  status: 'online' | 'degraded' | 'offline' | 'unknown';
+  detail: string;
+  risk: 'low' | 'medium' | 'high';
+};
+
+type NodeAgent = {
+  nodeId: string;
+  displayName: string;
+  kind: 'local' | 'remote' | 'fake';
+  status: 'online' | 'degraded' | 'offline' | 'unknown';
+  version: string;
+  host: string;
+  lastSeenAt: string;
+  capabilities: NodeCapability[];
+  detail: string;
+  isLocal: boolean;
+  canManage: boolean;
+};
+
+type NodeSnapshot = {
+  schema: 'codex-im-suite/control-plane-state/v1';
+  generatedAt: string;
+  activeNodeId: string;
+  nodes: NodeAgent[];
 };
 
 type McpItem = {
@@ -116,19 +153,27 @@ type SettingsState = {
   localAiApiKeyMasked: string;
   localAiApiKeySet: boolean;
   localAiTimeoutMs: string;
+  codexModelSource: 'official' | 'local_api' | 'external_api' | string;
   codexBaseUrl: string;
   codexModel: string;
   codexPassModel: boolean;
   codexReasoningEffort: string;
   codexLocalFallbackEnabled: boolean;
   codexLocalFallbackReasoningEffort: string;
+  codexFailureFallbackMode: 'none' | 'local_agent' | string;
+  localAgentMode: 'text_only' | 'agent_verified' | string;
+  localToolCallRequired: boolean;
+  executionRequiredRoute: 'primary' | 'codex_or_external' | 'refuse' | string;
+  memoryOptimizerEnabled: boolean;
+  memoryOptimizerIntervalDays: string;
+  memoryOptimizerModelSource: 'codex_primary' | 'local_ai' | 'external_api' | string;
   codexApiKeyAction: 'keep' | 'set' | 'clear';
   codexApiKeyValue: string;
   codexApiKeyMasked: string;
   codexApiKeySet: boolean;
 };
 
-type AiStrategy = 'default_codex' | 'codex_with_local_fallback' | 'custom_api';
+type AiStrategy = 'official' | 'local_api' | 'external_api';
 
 const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeoutMs: string }> = {
   ollama: { label: 'Ollama', baseUrl: 'http://127.0.0.1:11434', timeoutMs: '45000' },
@@ -139,21 +184,20 @@ const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeout
 };
 
 function inferAiStrategy(settings: SettingsState): AiStrategy {
-  const usesCustomCodexApi = settings.codexBaseUrl.trim()
-    || settings.codexModel.trim()
-    || settings.codexPassModel
-    || settings.codexApiKeySet
-    || settings.codexApiKeyAction === 'set';
-  if (usesCustomCodexApi) return 'custom_api';
-  if (settings.codexLocalFallbackEnabled) return 'codex_with_local_fallback';
-  return 'default_codex';
+  const source = (settings.codexModelSource || '').trim();
+  if (source === 'local_api' || source === 'external_api') return source;
+  if (settings.codexBaseUrl.trim() || settings.codexModel.trim() || settings.codexApiKeySet || settings.codexApiKeyAction === 'set') return 'external_api';
+  return 'official';
 }
 
 function strategyLabel(strategy: AiStrategy): string {
+  if (strategy === 'local_api') return '本地 API 作为主模型';
+  if (strategy === 'external_api') return '外部 API 作为主模型';
+  return '官方 Codex';
   switch (strategy) {
-    case 'codex_with_local_fallback':
+    case 'local_api':
       return 'Codex + 本地兜底';
-    case 'custom_api':
+    case 'external_api':
       return '完全使用自定义 API';
     default:
       return '默认 Codex';
@@ -368,6 +412,8 @@ type KnowledgeIndexStatus = {
     edges: Array<{ from: string; to: string; fromLabel?: string; toLabel?: string; type: string; weight: number }>;
   };
   sourceFileCount?: number;
+  sourceCoverage?: MemorySourceSummaryItem[];
+  skippedDirectories?: string[];
   kindCounts?: Record<string, number>;
   recentReviewWarnings?: Array<{
     createdAt: string;
@@ -383,6 +429,7 @@ type KnowledgeIndexStatus = {
   watcherPid?: number;
   statusUpdatedAt?: string;
   lastError: string;
+  optimization?: MemoryOptimizationStatus;
 };
 
 type KnowledgeSearchItem = {
@@ -391,6 +438,7 @@ type KnowledgeSearchItem = {
   key: string;
   value: string;
   text: string;
+  sourceGroup?: MemorySourceGroup;
   confidence: number;
   conflict: boolean;
   classificationReason?: string;
@@ -404,6 +452,135 @@ type KnowledgeSearchItem = {
 type KnowledgeSearchResponse = {
   status: KnowledgeIndexStatus;
   items: KnowledgeSearchItem[];
+  totalMatched?: number;
+  offset?: number;
+  limit?: number;
+};
+
+type MemorySourceGroup = 'explicit_memory' | 'direct_reminder' | 'generated_summary' | 'context_doc' | 'document_index' | 'root_note' | 'other' | string;
+
+type MemorySourceSummaryItem = {
+  sourcePath: string;
+  sourceGroup: MemorySourceGroup;
+  itemCount: number;
+  updatedAt?: string;
+  autoSelectable: boolean;
+  defaultRisk: 'low' | 'medium' | 'high' | string;
+};
+
+type MemoryOptimizationAction = {
+  id: string;
+  type: 'add' | 'update' | 'archive';
+  title: string;
+  reason: string;
+  confidence: number;
+  risk: 'low' | 'medium' | 'high';
+  sourceGroup?: MemorySourceGroup;
+  defaultSelected?: boolean;
+  requiresManualReview?: boolean;
+  source?: { itemId?: string; path?: string; snippet?: string };
+  targetPath?: string;
+  before?: string;
+  after?: string;
+};
+
+type MemoryOptimizationDraft = {
+  draftId: string;
+  generatedAt: string;
+  generatedBy?: 'manual' | 'schedule';
+  status: 'draft' | 'applied' | 'discarded' | 'undone';
+  sourceIndexGeneratedAt?: string;
+  summary: string;
+  sourceSummary?: MemorySourceSummaryItem[];
+  actions: MemoryOptimizationAction[];
+  appliedAt?: string;
+  discardedAt?: string;
+  appliedActionIds?: string[];
+  skippedActionIds?: string[];
+  undoneAt?: string;
+  undoRestoredActionIds?: string[];
+  undoManualActionIds?: string[];
+  undoMissingArchiveActionIds?: string[];
+};
+
+type MemoryOptimizationStatus = {
+  schema: string;
+  memoryRoot: string;
+  statePath: string;
+  draftsDir: string;
+  enabled: boolean;
+  intervalDays: number;
+  modelSource: 'codex_primary' | 'local_ai' | 'external_api' | string;
+  lastGeneratedAt?: string;
+  nextRunAt?: string;
+  draftCount: number;
+  recentError?: string;
+  drafts: MemoryOptimizationDraft[];
+};
+
+type UserFacingStatus = 'normal' | 'attention' | 'disabled';
+
+type BlueprintActionKind = 'runtime' | 'command' | 'navigate';
+
+type BlueprintAction = {
+  id: string;
+  label: string;
+  kind: BlueprintActionKind;
+  unitId?: string;
+  actionId?: string;
+  command?: string;
+  targetPage?: PageId;
+  targetUnitId?: string;
+  description?: string;
+};
+
+type SystemBlueprintNode = {
+  id: 'entry' | 'bridge' | 'brain' | 'assist' | 'reply';
+  title: string;
+  detail: string;
+  status: UserFacingStatus;
+  helpText?: string;
+  targetPage?: PageId;
+  targetUnitId?: string;
+  primaryAction?: BlueprintAction;
+  secondaryActions?: BlueprintAction[];
+  children?: Array<{
+    id: string;
+    title: string;
+    detail: string;
+    status: UserFacingStatus;
+    helpText?: string;
+    targetPage?: PageId;
+    targetUnitId?: string;
+    primaryAction?: BlueprintAction;
+    secondaryActions?: BlueprintAction[];
+  }>;
+};
+
+type BlueprintNodeView = {
+  id: string;
+  title: string;
+  detail: string;
+  status: UserFacingStatus;
+  helpText?: string;
+  targetPage?: PageId;
+  targetUnitId?: string;
+  primaryAction?: BlueprintAction;
+  secondaryActions?: BlueprintAction[];
+  parentTitle?: string;
+};
+
+type MemoryRelationGroup = {
+  id: string;
+  title: string;
+  status: UserFacingStatus;
+  items: Array<{
+    id: string;
+    label: string;
+    detail: string;
+    relation: string;
+    status: UserFacingStatus;
+  }>;
 };
 
 type KnowledgeArchiveSnapshot = {
@@ -544,6 +721,7 @@ type PanelState = {
     skillDir: string;
   };
   services: ServiceItem[];
+  nodes: NodeSnapshot;
   extensions: {
     total: number;
     enabled: number;
@@ -626,6 +804,7 @@ declare global {
 const navItems = [
   { id: 'overview', label: '总览', icon: Activity },
   { id: 'services', label: '服务', icon: Power },
+  { id: 'nodes', label: '节点', icon: PlugZap },
   { id: 'executors', label: '执行器', icon: Bot },
   { id: 'permissions', label: '权限', icon: ShieldCheck },
   { id: 'extensions', label: '扩展', icon: Layers3 },
@@ -651,6 +830,7 @@ const fallbackState: PanelState = {
     skillDir: '',
   },
   services: [],
+  nodes: { schema: 'codex-im-suite/control-plane-state/v1', generatedAt: '', activeNodeId: 'local', nodes: [] },
   extensions: { total: 0, enabled: 0, disabled: 0, missingSources: 0, items: [] },
   mcp: { total: 0, running: 0, items: [], runtimeStatus: '', details: '' },
   release: { publishSummaryExists: false, releaseNotesExists: false, prepareMainReleaseExists: false, tagScriptExists: false, pendingChanges: [] },
@@ -670,12 +850,20 @@ const fallbackState: PanelState = {
     localAiApiKeyMasked: '',
     localAiApiKeySet: false,
     localAiTimeoutMs: '45000',
+    codexModelSource: 'official',
     codexBaseUrl: '',
     codexModel: '',
     codexPassModel: false,
     codexReasoningEffort: 'low',
-    codexLocalFallbackEnabled: true,
+    codexLocalFallbackEnabled: false,
     codexLocalFallbackReasoningEffort: 'minimal',
+    codexFailureFallbackMode: 'none',
+    localAgentMode: 'text_only',
+    localToolCallRequired: true,
+    executionRequiredRoute: 'codex_or_external',
+    memoryOptimizerEnabled: false,
+    memoryOptimizerIntervalDays: '7',
+    memoryOptimizerModelSource: 'codex_primary',
     codexApiKeyAction: 'keep',
     codexApiKeyValue: '',
     codexApiKeyMasked: '',
@@ -707,6 +895,17 @@ const fallbackState: PanelState = {
     watcherPid: 0,
     statusUpdatedAt: '',
     lastError: '',
+    optimization: {
+      schema: 'codex-im-suite/memory-optimization-status/v1',
+      memoryRoot: '',
+      statePath: '',
+      draftsDir: '',
+      enabled: false,
+      intervalDays: 7,
+      modelSource: 'codex_primary',
+      draftCount: 0,
+      drafts: [],
+    },
   },
   memoryReminders: {
     schema: 'codex-im-suite/reminders-panel/v1',
@@ -876,6 +1075,485 @@ function workflowStatusKind(run: WorkflowRun): StatusKind {
   if (run.status === 'failed') return run.recovery?.kind === 'recoverable' ? 'warning' : 'error';
   if (run.status === 'retry_pending' || run.status === 'retrying') return 'warning';
   return 'warning';
+}
+
+function nodeStatusKind(status: NodeAgent['status'] | NodeCapability['status']): StatusKind {
+  if (status === 'online') return 'ok';
+  if (status === 'degraded') return 'warning';
+  if (status === 'offline') return 'error';
+  return 'idle';
+}
+
+function nodeStatusLabel(status: NodeAgent['status'] | NodeCapability['status']) {
+  switch (status) {
+    case 'online':
+      return '在线';
+    case 'degraded':
+      return '降级';
+    case 'offline':
+      return '离线';
+    default:
+      return '未知';
+  }
+}
+
+function nodeKindLabel(kind: NodeAgent['kind']) {
+  switch (kind) {
+    case 'local':
+      return '本机';
+    case 'remote':
+      return '远端';
+    case 'fake':
+      return '模拟';
+    default:
+      return kind;
+  }
+}
+
+function userStatusKind(status: UserFacingStatus): StatusKind {
+  switch (status) {
+    case 'normal':
+      return 'ok';
+    case 'attention':
+      return 'warning';
+    case 'disabled':
+    default:
+      return 'idle';
+  }
+}
+
+function userStatusLabel(status: UserFacingStatus) {
+  switch (status) {
+    case 'normal':
+      return '正常';
+    case 'attention':
+      return '需要处理';
+    case 'disabled':
+    default:
+      return '未启用';
+  }
+}
+
+function toUserStatus(status?: StatusKind, idleMeansDisabled = true): UserFacingStatus {
+  if (status === 'ok') return 'normal';
+  if (status === 'warning' || status === 'error') return 'attention';
+  return idleMeansDisabled ? 'disabled' : 'attention';
+}
+
+function combineUserStatuses(statuses: UserFacingStatus[]): UserFacingStatus {
+  if (statuses.some((status) => status === 'attention')) return 'attention';
+  if (statuses.some((status) => status === 'normal')) return 'normal';
+  return 'disabled';
+}
+
+function findService(state: PanelState, id: string) {
+  return state.services.find((service) => service.id === id || service.title.toLowerCase().includes(id.toLowerCase()));
+}
+
+function runtimeAction(id: string, label: string, unitId: string, actionId: string, description?: string): BlueprintAction {
+  return { id, label, kind: 'runtime', unitId, actionId, description };
+}
+
+function commandAction(id: string, label: string, command: string, description?: string): BlueprintAction {
+  return { id, label, kind: 'command', command, description };
+}
+
+function navigateAction(id: string, label: string, targetPage: PageId, targetUnitId?: string, description?: string): BlueprintAction {
+  return { id, label, kind: 'navigate', targetPage, targetUnitId, description };
+}
+
+function blueprintActionKey(action: BlueprintAction) {
+  return `${action.kind}:${action.unitId ?? ''}:${action.actionId ?? ''}:${action.command ?? ''}:${action.targetPage ?? ''}:${action.targetUnitId ?? ''}`;
+}
+
+function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): SystemBlueprintNode[] {
+  const bridgeService = findService(state, 'bridge');
+  const codexService = findService(state, 'codex');
+  const localService = findService(state, 'localLlm');
+  const bridgeStatus = toUserStatus(bridgeService?.status, false);
+  const codexStatus = toUserStatus(codexService?.status, false);
+  const localStatus = toUserStatus(localService?.status);
+  const aiStatus = codexStatus === 'normal'
+    ? 'normal'
+    : localStatus === 'normal'
+      ? 'attention'
+      : combineUserStatuses([codexStatus, localStatus]);
+  const mcpUnits = runtimeUnits.filter((unit) => unit.kind === 'mcp');
+  const okMcpUnits = mcpUnits.filter((unit) => unit.status === 'ok');
+  const mcpStatus: UserFacingStatus = mcpUnits.length > 0
+    ? okMcpUnits.length === mcpUnits.length
+      ? 'normal'
+      : 'attention'
+    : state.mcp.total <= 0
+      ? 'disabled'
+      : toUserStatus(findService(state, 'mcp')?.status, false);
+  const memoryStatus: UserFacingStatus = state.memory.lastError
+    ? 'attention'
+    : state.memory.exists
+      ? 'normal'
+      : 'disabled';
+  const reminderStatus: UserFacingStatus = state.memoryReminders.lastError
+    ? 'attention'
+    : state.memoryReminders.enabled || state.memoryReminders.directReminderPushEnabled
+      ? 'normal'
+      : 'disabled';
+  const assistStatus = combineUserStatuses([mcpStatus, memoryStatus, reminderStatus]);
+  const replyStatus = bridgeStatus === 'normal' && aiStatus !== 'disabled' ? 'normal' : 'attention';
+  const activeExecutors = runtimeUnits.filter((unit) => unit.kind === 'tool' && unit.status === 'ok').length;
+  const mcpAttentionUnits = mcpUnits
+    .filter((unit) => unit.status !== 'ok')
+    .slice(0, 3);
+  const firstMcpUnitId = mcpAttentionUnits[0]?.unitId || runtimeUnits.find((unit) => unit.kind === 'mcp')?.unitId;
+  const mcpRuntimeActions = mcpAttentionUnits.flatMap((unit) => [
+    runtimeAction(`mcp-check-${unit.unitId}`, `检查 ${unit.displayName}`, unit.unitId, 'check', '查看这个 MCP 当前是否可用。'),
+    runtimeAction(`mcp-start-${unit.unitId}`, unit.displayName.includes('Unity') ? `修复 ${unit.displayName}` : `启动 ${unit.displayName}`, unit.unitId, 'start', '尝试启动或修复这个 MCP。'),
+  ]);
+
+  return [
+    {
+      id: 'entry',
+      title: '用户入口',
+      detail: bridgeStatus === 'normal' ? '飞书消息可以进入桥接服务。' : '先检查飞书桥接是否在线。',
+      status: bridgeStatus,
+      helpText: '入口异常通常意味着飞书长连接或 Bridge 服务需要检查。',
+      targetPage: 'services',
+      targetUnitId: 'service.bridge',
+      primaryAction: runtimeAction('entry-check-bridge', '检查入口', 'service.bridge', 'status', '检查 Bridge 是否能接收飞书消息。'),
+      secondaryActions: [
+        runtimeAction('entry-logs', '查看日志', 'service.bridge', 'logs', '打开最近 Bridge 日志。'),
+        navigateAction('entry-open-service', '打开服务页', 'services', 'service.bridge', '查看完整 Bridge 操作。'),
+      ],
+    },
+    {
+      id: 'bridge',
+      title: 'Bridge 收发',
+      detail: bridgeService?.detail?.split('\n').find(Boolean) || '负责接收消息、判断权限并收口回复。',
+      status: bridgeStatus,
+      helpText: 'Bridge 是飞书收发的核心。需要处理时，优先查看状态和日志，再决定启动或重启。',
+      targetPage: 'services',
+      targetUnitId: 'service.bridge',
+      primaryAction: bridgeStatus === 'normal'
+        ? runtimeAction('bridge-status', '检查状态', 'service.bridge', 'status', '刷新 Bridge 状态。')
+        : runtimeAction('bridge-start', '启动 Bridge', 'service.bridge', 'start', '启动 Bridge 服务。'),
+      secondaryActions: [
+        runtimeAction('bridge-restart', '重启 Bridge', 'service.bridge', 'restart', '重启后重新加载配置和运行时代码。'),
+        runtimeAction('bridge-logs', '查看日志', 'service.bridge', 'logs', '查看最近 Bridge 日志。'),
+        runtimeAction('bridge-location', '打开位置', 'service.bridge', 'openLocation', '打开 live skill 目录。'),
+        navigateAction('bridge-open-service', '打开服务页', 'services', 'service.bridge', '查看完整 Bridge 操作。'),
+      ],
+    },
+    {
+      id: 'brain',
+      title: 'AI 执行',
+      detail: codexStatus === 'normal'
+        ? `Codex 主链路可用，${activeExecutors || 1} 个执行入口处于可用状态。`
+        : localStatus === 'normal'
+          ? 'Codex 需要检查，本地兜底可作为备援。'
+          : 'Codex 和本地兜底都需要检查。',
+      status: aiStatus,
+      helpText: 'AI 执行负责把用户请求交给 Codex；本地 Agent API 只做兜底或小任务。',
+      targetPage: 'settings',
+      targetUnitId: 'ai',
+      primaryAction: runtimeAction('ai-check-codex', '检查 Codex', 'service.codex', 'check', '确认 Codex CLI 和路由状态。'),
+      secondaryActions: [
+        runtimeAction('ai-update-codex', '更新 Codex', 'service.codex', 'update', '仅在 Codex CLI 支持 npm 更新时可用。'),
+        runtimeAction('ai-check-local', '检查本地兜底', 'service.localLlm', 'check', '检查本地 Agent API。'),
+        runtimeAction('ai-start-local', '启动本地兜底', 'service.localLlm', 'start', '启动本地 Agent API。'),
+        navigateAction('ai-open-settings', '设置 AI', 'settings', 'ai', '调整 Codex / 本地兜底策略。'),
+      ],
+    },
+    {
+      id: 'assist',
+      title: '辅助能力',
+      detail: 'MCP 工具、记忆和提醒会按需参与，不直接抢答普通请求。',
+      status: assistStatus,
+      helpText: '辅助能力负责扩展工具、检索记忆和发送提醒；异常时可以分别处理。',
+      targetPage: 'extensions',
+      targetUnitId: firstMcpUnitId,
+      primaryAction: navigateAction('assist-open-extensions', '处理辅助能力', 'extensions', firstMcpUnitId, '查看 MCP、Skill 和插件状态。'),
+      secondaryActions: [
+        commandAction('assist-refresh-state', '刷新状态', 'state.refresh', '刷新整个平台状态。'),
+        navigateAction('assist-open-memory', '查看记忆', 'memory', 'memory', '打开记忆关系树。'),
+        navigateAction('assist-open-settings', '打开设置', 'settings', 'paths', '检查记忆仓库和运行路径。'),
+      ],
+      children: [
+        {
+          id: 'mcp',
+          title: 'MCP 工具',
+          detail: mcpUnits.length > 0 ? `${okMcpUnits.length}/${mcpUnits.length} 个 MCP 可用` : '暂未配置 MCP 清单',
+          status: mcpStatus,
+          helpText: 'MCP 负责连接 Unity、Blender、图片等外部工具。需要处理时优先检查异常 MCP。',
+          targetPage: 'extensions',
+          targetUnitId: firstMcpUnitId,
+          primaryAction: firstMcpUnitId
+            ? runtimeAction('mcp-check-first', '检查 MCP', firstMcpUnitId, 'check', '检查选中的 MCP。')
+            : navigateAction('mcp-open-extensions', '处理 MCP', 'extensions', undefined, '查看 MCP 清单。'),
+          secondaryActions: [
+            ...mcpRuntimeActions,
+            firstMcpUnitId ? runtimeAction('mcp-register', '注册 MCP', firstMcpUnitId, 'register', '把 MCP 清单注册到 Codex。') : navigateAction('mcp-register-help', '查看 MCP', 'extensions'),
+            navigateAction('mcp-open-extensions', '打开扩展页', 'extensions', firstMcpUnitId, '查看所有 MCP。'),
+          ],
+        },
+        {
+          id: 'memory',
+          title: '记忆仓库',
+          detail: state.memory.exists ? `${state.memory.itemCount ?? 0} 条记忆可检索` : '等待生成记忆索引',
+          status: memoryStatus,
+          helpText: '记忆仓库用于给 Codex 提供上下文；不存在索引时先检查仓库路径和监听状态。',
+          targetPage: 'memory',
+          targetUnitId: 'memory',
+          primaryAction: commandAction('memory-refresh', '刷新记忆', 'memory.status', '重新读取记忆索引状态。'),
+          secondaryActions: [
+            navigateAction('memory-open-page', '查看记忆', 'memory', 'memory', '打开记忆关系树。'),
+            navigateAction('memory-open-settings', '设置记忆仓库', 'settings', 'memoryRepo', '检查记忆仓库路径。'),
+          ],
+        },
+        {
+          id: 'reminder',
+          title: '提醒',
+          detail: state.memoryReminders.enabled || state.memoryReminders.directReminderPushEnabled
+            ? `${state.memoryReminders.counts?.pending ?? 0} 条待发送`
+            : '主动提醒未开启',
+          status: reminderStatus,
+          helpText: '提醒来自记忆待办和直接提醒请求；未启用时先查看记忆页和配置提示。',
+          targetPage: 'memory',
+          targetUnitId: 'reminders',
+          primaryAction: commandAction('reminder-check', '检查提醒', 'memory.checkReminders', '刷新提醒状态。'),
+          secondaryActions: [
+            navigateAction('reminder-open-memory', '查看提醒', 'memory', 'reminders', '打开记忆页提醒区。'),
+            navigateAction('reminder-open-settings', '打开设置', 'settings', 'memoryRepo', '检查记忆和提醒相关路径。'),
+          ],
+        },
+      ],
+    },
+    {
+      id: 'reply',
+      title: '回复用户',
+      detail: replyStatus === 'normal' ? '最终只发送用户可见结果。' : '回复链路依赖前面的桥接和执行状态。',
+      status: replyStatus,
+      helpText: '回复收口由 Bridge 统一处理。回复异常时先看 Bridge 状态和日志。',
+      targetPage: 'services',
+      targetUnitId: 'service.bridge',
+      primaryAction: runtimeAction('reply-check-bridge', '检查回复链路', 'service.bridge', 'status', '确认 Bridge 是否正常。'),
+      secondaryActions: [
+        runtimeAction('reply-logs', '查看日志', 'service.bridge', 'logs', '查看最近出站和回复日志。'),
+        navigateAction('reply-open-service', '打开服务页', 'services', 'service.bridge', '查看完整 Bridge 操作。'),
+      ],
+    },
+  ];
+
+  return [
+    {
+      id: 'entry',
+      title: '用户入口',
+      detail: bridgeStatus === 'normal' ? '飞书消息可以进入桥接服务。' : '先检查飞书桥接是否在线。',
+      status: bridgeStatus,
+    },
+    {
+      id: 'bridge',
+      title: 'Bridge 收发',
+      detail: bridgeService?.detail?.split('\n').find(Boolean) || '负责接收消息、判断权限并收口回复。',
+      status: bridgeStatus,
+    },
+    {
+      id: 'brain',
+      title: 'AI 执行',
+      detail: codexStatus === 'normal'
+        ? `Codex 主链路可用，${activeExecutors || 1} 个执行入口处于可用状态。`
+        : localStatus === 'normal'
+          ? 'Codex 需要检查，本地兜底可作为备援。'
+          : 'Codex 和本地兜底都需要检查。',
+      status: aiStatus,
+    },
+    {
+      id: 'assist',
+      title: '辅助能力',
+      detail: 'MCP 工具、记忆和提醒会按需参与，不直接抢答普通请求。',
+      status: assistStatus,
+      children: [
+        {
+          id: 'mcp',
+          title: 'MCP 工具',
+          detail: state.mcp.total > 0 ? `${state.mcp.running}/${state.mcp.total} 个清单运行中` : '暂未配置 MCP 清单',
+          status: mcpStatus,
+        },
+        {
+          id: 'memory',
+          title: '记忆仓库',
+          detail: state.memory.exists ? `${state.memory.itemCount ?? 0} 条记忆可检索` : '等待生成记忆索引',
+          status: memoryStatus,
+        },
+        {
+          id: 'reminder',
+          title: '提醒',
+          detail: state.memoryReminders.enabled || state.memoryReminders.directReminderPushEnabled
+            ? `${state.memoryReminders.counts?.pending ?? 0} 条待发送`
+            : '主动提醒未开启',
+          status: reminderStatus,
+        },
+      ],
+    },
+    {
+      id: 'reply',
+      title: '回复用户',
+      detail: replyStatus === 'normal' ? '最终只发送用户可见结果。' : '回复链路依赖前面的桥接和执行状态。',
+      status: replyStatus,
+    },
+  ];
+}
+
+function BlueprintIcon({ id }: { id: SystemBlueprintNode['id'] | string }) {
+  const props = { size: 20, strokeWidth: 2 };
+  switch (id) {
+    case 'entry':
+      return <MessageCircle {...props} />;
+    case 'bridge':
+      return <Network {...props} />;
+    case 'brain':
+      return <BrainCircuit {...props} />;
+    case 'assist':
+      return <PlugZap {...props} />;
+    case 'reply':
+      return <Send {...props} />;
+    case 'memory':
+      return <Database {...props} />;
+    case 'reminder':
+      return <Bell {...props} />;
+    default:
+      return <Activity {...props} />;
+  }
+}
+
+function relationTypeLabel(type: string) {
+  switch (type) {
+    case 'maps_to':
+      return '对应到';
+    case 'reverse_lookup':
+      return '可反查';
+    case 'related_to':
+      return '同一上下文';
+    case 'conflicts_with':
+      return '可能冲突';
+    case 'mentions':
+      return '提到';
+    case 'alias_of':
+      return '别名';
+    default:
+      return type || '相关';
+  }
+}
+
+function memoryNodeKindLabel(kind: string) {
+  switch (kind) {
+    case 'path':
+      return '路径';
+    case 'command':
+      return '命令';
+    case 'scene':
+      return '场景';
+    case 'project':
+      return '项目';
+    case 'alias':
+      return '别名';
+    case 'knowledge':
+      return '记忆';
+    case 'entity':
+      return '对象';
+    default:
+      return kind || '对象';
+  }
+}
+
+function displayMemoryTitle(item?: KnowledgeSearchItem | null) {
+  if (!item) return '选择一条记忆';
+  if (item.key) return item.key;
+  return (item.text || item.snippet || '未命名记忆').slice(0, 80);
+}
+
+function displayMemoryValue(item: KnowledgeSearchItem) {
+  return item.value || item.text || item.snippet || '暂无内容';
+}
+
+function compactPathLabel(pathValue: string) {
+  if (!pathValue) return '暂无来源文件';
+  const parts = pathValue.split(/[\\/]+/).filter(Boolean);
+  return parts.slice(-2).join('\\') || pathValue;
+}
+
+function buildMemoryRelationGroups(item: KnowledgeSearchItem | undefined, reminders: TodoReminderSnapshot): MemoryRelationGroup[] {
+  if (!item) return [];
+  const memoryText = `${item.key} ${item.value} ${item.text} ${item.snippet} ${item.sourcePath}`.toLowerCase();
+  const relatedReminders = (reminders.items ?? []).filter((reminder) => {
+    const reminderText = `${reminder.title} ${reminder.source?.snippet ?? ''} ${reminder.source?.path ?? ''}`.toLowerCase();
+    return (!!item.sourcePath && reminder.source?.path === item.sourcePath)
+      || (!!reminder.title && memoryText.includes(reminder.title.toLowerCase()))
+      || (!!item.key && reminderText.includes(item.key.toLowerCase()));
+  }).slice(0, 4);
+
+  return [
+    {
+      id: 'value',
+      title: '对应内容',
+      status: 'normal',
+      items: [{
+        id: `${item.id}:value`,
+        label: displayMemoryValue(item),
+        detail: item.key ? `${item.key} 的记录值` : '这条记忆的正文内容',
+        relation: item.key ? '对应到' : '记录为',
+        status: 'normal',
+      }],
+    },
+    {
+      id: 'related',
+      title: '相关对象',
+      status: (item.related ?? []).length > 0 ? 'normal' : 'disabled',
+      items: (item.related ?? []).slice(0, 6).map((related, index) => ({
+        id: `${item.id}:related:${index}`,
+        label: related.label,
+        detail: memoryNodeKindLabel(related.kind),
+        relation: relationTypeLabel(related.type),
+        status: 'normal',
+      })),
+    },
+    {
+      id: 'reminders',
+      title: '待办提醒',
+      status: relatedReminders.length > 0 ? 'normal' : 'disabled',
+      items: relatedReminders.map((reminder) => ({
+        id: `${item.id}:reminder:${reminder.id}`,
+        label: reminder.title || '未命名提醒',
+        detail: reminder.dueAt || reminder.skipReason || '等待提醒时间',
+        relation: reminder.sourceType === 'direct' ? '直接提醒' : '记忆待办',
+        status: reminder.status === 'failed' ? 'attention' : reminder.status === 'completed' ? 'disabled' : 'normal',
+      })),
+    },
+    {
+      id: 'conflict',
+      title: '可能冲突',
+      status: item.conflict ? 'attention' : 'disabled',
+      items: item.conflict
+        ? [{
+            id: `${item.id}:conflict`,
+            label: '需要人工确认',
+            detail: item.classificationReason || item.classificationSource || '这条记忆被标记为可能冲突。',
+            relation: '可能冲突',
+            status: 'attention',
+          }]
+        : [],
+    },
+    {
+      id: 'source',
+      title: '来源文件',
+      status: item.sourcePath ? 'normal' : 'disabled',
+      items: [{
+        id: `${item.id}:source`,
+        label: compactPathLabel(item.sourcePath),
+        detail: item.sourceUpdatedAt || item.snippet || '可从来源文件继续追溯。',
+        relation: '来自',
+        status: item.sourcePath ? 'normal' : 'disabled',
+      }],
+    },
+  ];
 }
 
 function workflowStatusLabel(run: WorkflowRun) {
@@ -1335,7 +2013,18 @@ function App() {
 
   const invokeRuntimeAction = async (unit: RuntimeUnit, action: RuntimeAction) => {
     await sendCommand('runtime.invokeAction', { unitId: unit.unitId, action: action.id });
+    await sendCommand('state.refresh');
     await loadRuntimeUnits();
+  };
+
+  const navigateFromBlueprint = (targetPage: PageId, targetUnitId?: string) => {
+    if (targetPage === 'services' && targetUnitId) {
+      setSelectedServiceUnitId(targetUnitId);
+    }
+    if (targetPage === 'extensions' && targetUnitId) {
+      setSelectedExtensionUnitId(targetUnitId);
+    }
+    setPage(targetPage);
   };
 
   return (
@@ -1421,6 +2110,10 @@ function App() {
             openLogs={() => setPage('logs')}
             refresh={() => void sendCommand('state.refresh').then(loadRuntimeUnits)}
             refreshPending={pending['state.refresh']}
+            run={run}
+            invokeAction={invokeRuntimeAction}
+            navigate={navigateFromBlueprint}
+            pending={pending}
           />
         )}
         {page === 'services' && (
@@ -1432,6 +2125,7 @@ function App() {
             pending={pending}
           />
         )}
+        {page === 'nodes' && <NodesPage state={state} run={run} pending={pending} />}
         {page === 'executors' && <ExecutorsPage state={state} run={run} pending={pending} />}
         {page === 'permissions' && <PermissionsPage state={state} run={run} pending={pending} />}
         {page === 'extensions' && (
@@ -1497,6 +2191,10 @@ function OverviewPage({
   openLogs,
   refresh,
   refreshPending,
+  run,
+  invokeAction,
+  navigate,
+  pending,
 }: {
   state: PanelState;
   runtimeUnits: RuntimeUnit[];
@@ -1504,8 +2202,43 @@ function OverviewPage({
   openLogs: () => void;
   refresh: () => void;
   refreshPending?: boolean;
+  run: PageProps['run'];
+  invokeAction: (unit: RuntimeUnit, action: RuntimeAction) => Promise<void>;
+  navigate: (targetPage: PageId, targetUnitId?: string) => void;
+  pending: Record<string, boolean>;
 }) {
   const headlineUnits = runtimeUnits.filter((unit) => ['service', 'tool', 'mcp'].includes(unit.kind)).slice(0, 6);
+  const systemBlueprint = useMemo(() => buildSystemBlueprint(state, runtimeUnits), [state, runtimeUnits]);
+  const [selectedBlueprintNodeId, setSelectedBlueprintNodeId] = useState<string>(systemBlueprint[0]?.id ?? '');
+  const blueprintNodes = useMemo(() => flattenBlueprintNodes(systemBlueprint), [systemBlueprint]);
+  const selectedBlueprintNode = blueprintNodes.find((node) => node.id === selectedBlueprintNodeId) ?? blueprintNodes[0];
+
+  useEffect(() => {
+    if (!blueprintNodes.length) return;
+    if (!blueprintNodes.some((node) => node.id === selectedBlueprintNodeId)) {
+      setSelectedBlueprintNodeId(blueprintNodes[0].id);
+    }
+  }, [blueprintNodes, selectedBlueprintNodeId]);
+
+  const runBlueprintAction = async (action: BlueprintAction) => {
+    if (action.kind === 'navigate' && action.targetPage) {
+      navigate(action.targetPage, action.targetUnitId);
+      return;
+    }
+    if (action.kind === 'command' && action.command) {
+      await run(action.command);
+      refresh();
+      return;
+    }
+    if (action.kind === 'runtime' && action.unitId && action.actionId) {
+      const unit = runtimeUnits.find((item) => item.unitId === action.unitId);
+      const runtime = unit?.actions.find((item) => item.id === action.actionId);
+      if (unit && runtime && runtime.enabled) {
+        await invokeAction(unit, runtime);
+      }
+    }
+  };
+
   return (
     <section className="page-grid overview-grid">
       <section className="panel panel-hero">
@@ -1524,6 +2257,24 @@ function OverviewPage({
           <SummaryFact label="MCP 运行" value={`${state.mcp.running}/${state.mcp.total}`} />
           <SummaryFact label="会话索引" value={`${state.history.sessions.length}`} />
         </div>
+      </section>
+      <section className="panel panel-span-2">
+        <SectionHeader title="系统蓝图" />
+        <p className="panel-intro">这张图按普通用户路径展示一次请求如何流转，专业诊断细节仍保留在各功能页。</p>
+        <InteractiveSystemBlueprint
+          nodes={systemBlueprint}
+          selectedNodeId={selectedBlueprintNode?.id ?? ''}
+          onSelect={setSelectedBlueprintNodeId}
+        />
+        {selectedBlueprintNode && (
+          <BlueprintActionPanel
+            node={selectedBlueprintNode}
+            runtimeUnits={runtimeUnits}
+            onRunAction={(action) => void runBlueprintAction(action)}
+            onNavigate={navigate}
+            pending={pending}
+          />
+        )}
       </section>
       <section className="metric-strip">
         <Metric label="扩展启用" value={`${state.extensions.enabled}/${state.extensions.total}`} />
@@ -1553,6 +2304,170 @@ function OverviewPage({
         <ActivityList activities={activities.slice(-8)} compact />
       </section>
     </section>
+  );
+}
+
+function flattenBlueprintNodes(nodes: SystemBlueprintNode[]): BlueprintNodeView[] {
+  return nodes.flatMap((node) => [
+    { ...node, children: undefined },
+    ...(node.children ?? []).map((child) => ({ ...child, parentTitle: node.title })),
+  ]);
+}
+
+function resolveBlueprintAction(action: BlueprintAction, runtimeUnits: RuntimeUnit[]): { enabled: boolean; reason?: string } {
+  if (action.kind === 'navigate' || action.kind === 'command') return { enabled: true };
+  const unit = runtimeUnits.find((item) => item.unitId === action.unitId);
+  if (!unit) return { enabled: false, reason: '暂未找到对应运行单元' };
+  const runtime = unit.actions.find((item) => item.id === action.actionId);
+  if (!runtime) return { enabled: false, reason: '当前运行单元没有这个操作' };
+  return { enabled: runtime.enabled, reason: runtime.enabled ? undefined : '当前状态下不可用' };
+}
+
+function uniqueBlueprintActions(actions: BlueprintAction[]) {
+  const seen = new Set<string>();
+  return actions.filter((action) => {
+    const key = blueprintActionKey(action);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function InteractiveSystemBlueprint({
+  nodes,
+  selectedNodeId,
+  onSelect,
+}: {
+  nodes: SystemBlueprintNode[];
+  selectedNodeId: string;
+  onSelect: (nodeId: string) => void;
+}) {
+  return (
+    <div className="system-blueprint" aria-label="系统蓝图">
+      {nodes.map((node, index) => (
+        <React.Fragment key={node.id}>
+          <article className={`blueprint-node ${node.status} ${selectedNodeId === node.id ? 'active' : ''}`}>
+            <button className="blueprint-node-button" onClick={() => onSelect(node.id)} aria-pressed={selectedNodeId === node.id}>
+              <div className="blueprint-node-head">
+                <span className="blueprint-icon"><BlueprintIcon id={node.id} /></span>
+                <StatusPill status={userStatusKind(node.status)} label={userStatusLabel(node.status)} />
+              </div>
+              <strong>{node.title}</strong>
+              <p>{node.detail}</p>
+              <span className="blueprint-action-hint">点击处理</span>
+            </button>
+            {node.children && node.children.length > 0 && (
+              <div className="blueprint-children">
+                {node.children.map((child) => (
+                  <button
+                    key={child.id}
+                    className={`blueprint-child ${child.status} ${selectedNodeId === child.id ? 'active' : ''}`}
+                    onClick={() => onSelect(child.id)}
+                    aria-pressed={selectedNodeId === child.id}
+                  >
+                    <span><BlueprintIcon id={child.id} /></span>
+                    <div>
+                      <strong>{child.title}</strong>
+                      <p>{child.detail}</p>
+                    </div>
+                    <StatusPill status={userStatusKind(child.status)} label={userStatusLabel(child.status)} />
+                  </button>
+                ))}
+              </div>
+            )}
+          </article>
+          {index < nodes.length - 1 && <div className="blueprint-connector" aria-hidden="true" />}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function BlueprintActionPanel({
+  node,
+  runtimeUnits,
+  onRunAction,
+  onNavigate,
+  pending,
+}: {
+  node: BlueprintNodeView;
+  runtimeUnits: RuntimeUnit[];
+  onRunAction: (action: BlueprintAction) => void;
+  onNavigate: (targetPage: PageId, targetUnitId?: string) => void;
+  pending: Record<string, boolean>;
+}) {
+  const actions = uniqueBlueprintActions([
+    ...(node.primaryAction ? [node.primaryAction] : []),
+    ...(node.secondaryActions ?? []),
+  ]);
+  const primaryKey = node.primaryAction ? blueprintActionKey(node.primaryAction) : '';
+  const busy = pending['runtime.invokeAction'] || pending['state.refresh'] || pending['memory.status'] || pending['memory.checkReminders'];
+
+  return (
+    <aside className={`blueprint-action-panel ${node.status}`}>
+      <div className="blueprint-action-copy">
+        <span>{node.parentTitle ? `${node.parentTitle} / ${node.title}` : node.title}</span>
+        <strong>{userStatusLabel(node.status)}</strong>
+        <p>{node.helpText || node.detail}</p>
+      </div>
+      <div className="blueprint-action-buttons">
+        {actions.map((action) => {
+          const resolved = resolveBlueprintAction(action, runtimeUnits);
+          const isPrimary = primaryKey === blueprintActionKey(action);
+          return (
+            <MiniButton
+              key={action.id}
+              label={action.label}
+              icon={actionIcon(action.kind === 'navigate' ? 'openLocation' : action.actionId || action.command || action.id)}
+              onClick={() => onRunAction(action)}
+              pending={busy && isPrimary}
+              disabled={!resolved.enabled}
+            />
+          );
+        })}
+        {node.targetPage && (
+          <MiniButton
+            label="查看详情"
+            icon={<ExternalLink size={14} />}
+            onClick={() => onNavigate(node.targetPage!, node.targetUnitId)}
+          />
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function SystemBlueprint({ nodes }: { nodes: SystemBlueprintNode[] }) {
+  return (
+    <div className="system-blueprint" aria-label="系统蓝图">
+      {nodes.map((node, index) => (
+        <React.Fragment key={node.id}>
+          <article className={`blueprint-node ${node.status}`}>
+            <div className="blueprint-node-head">
+              <span className="blueprint-icon"><BlueprintIcon id={node.id} /></span>
+              <StatusPill status={userStatusKind(node.status)} label={userStatusLabel(node.status)} />
+            </div>
+            <strong>{node.title}</strong>
+            <p>{node.detail}</p>
+            {node.children && node.children.length > 0 && (
+              <div className="blueprint-children">
+                {node.children.map((child) => (
+                  <div key={child.id} className={`blueprint-child ${child.status}`}>
+                    <span><BlueprintIcon id={child.id} /></span>
+                    <div>
+                      <strong>{child.title}</strong>
+                      <p>{child.detail}</p>
+                    </div>
+                    <StatusPill status={userStatusKind(child.status)} label={userStatusLabel(child.status)} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </article>
+          {index < nodes.length - 1 && <div className="blueprint-connector" aria-hidden="true" />}
+        </React.Fragment>
+      ))}
+    </div>
   );
 }
 
@@ -1617,6 +2532,80 @@ function ServicesPage({
           </>
         ) : (
           <EmptyState icon={<Power size={28} />} title="暂无服务模块" text="当前没有可呈现的运行单元。" />
+        )}
+      </section>
+    </section>
+  );
+}
+
+function NodesPage({ state, run, pending }: PageProps) {
+  const nodes = state.nodes?.nodes ?? [];
+  const [selectedNodeId, setSelectedNodeId] = useState(state.nodes?.activeNodeId || nodes[0]?.nodeId || '');
+  const selected = nodes.find((node) => node.nodeId === selectedNodeId) ?? nodes[0];
+
+  useEffect(() => {
+    if (!nodes.length) return;
+    if (!nodes.some((node) => node.nodeId === selectedNodeId)) {
+      setSelectedNodeId(state.nodes.activeNodeId || nodes[0].nodeId);
+    }
+  }, [nodes, selectedNodeId, state.nodes.activeNodeId]);
+
+  return (
+    <section className="services-layout">
+      <section className="panel list-panel">
+        <SectionHeader
+          title="运行节点"
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void run('state.refresh')} pending={pending['state.refresh']} />}
+        />
+        <div className="summary-grid">
+          <SummaryFact label="节点数" value={`${nodes.length}`} compact />
+          <SummaryFact label="活动节点" value={state.nodes?.activeNodeId || 'local'} compact />
+        </div>
+        <div className="runtime-list">
+          {nodes.map((node) => (
+            <button key={node.nodeId} className={selected?.nodeId === node.nodeId ? 'runtime-row active' : 'runtime-row'} onClick={() => setSelectedNodeId(node.nodeId)}>
+              <div>
+                <strong>{node.displayName}</strong>
+                <span>{nodeKindLabel(node.kind)} · {node.host || node.nodeId}</span>
+              </div>
+              <StatusPill status={nodeStatusKind(node.status)} label={nodeStatusLabel(node.status)} />
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="panel">
+        {selected ? (
+          <>
+            <SectionHeader title={selected.displayName} />
+            <div className="detail-stack">
+              <div className="detail-summary">
+                <StatusPill status={nodeStatusKind(selected.status)} label={nodeStatusLabel(selected.status)} />
+                <div className="detail-meta">{nodeKindLabel(selected.kind)} · v{selected.version} · {selected.lastSeenAt || '未上报心跳'}</div>
+              </div>
+              <p className="detail-copy">{selected.detail}</p>
+              <div className="summary-grid wide">
+                <SummaryFact label="节点 ID" value={selected.nodeId} compact />
+                <SummaryFact label="能力数" value={`${selected.capabilities.length}`} compact />
+                <SummaryFact label="可管理" value={selected.canManage ? '是' : '否'} compact />
+              </div>
+              <SectionHeader title="能力清单" />
+              <div className="runtime-list">
+                {selected.capabilities.map((capability) => (
+                  <div key={capability.id} className="runtime-row">
+                    <div>
+                      <strong>{capability.displayName}</strong>
+                      <span>{capability.category} · risk={capability.risk}</span>
+                      <p>{capability.detail}</p>
+                    </div>
+                    <StatusPill status={nodeStatusKind(capability.status)} label={nodeStatusLabel(capability.status)} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        ) : (
+          <EmptyState icon={<PlugZap size={30} />} title="没有节点" text="控制面还没有读到本机或远端 runtime 节点。" />
         )}
       </section>
     </section>
@@ -2561,6 +3550,41 @@ const knowledgeKinds = [
 
 const visualKnowledgeKinds = knowledgeKinds.filter((item) => item.id !== 'all');
 
+const memorySourceGroups = [
+  { id: 'all', label: '全部来源' },
+  { id: 'explicit_memory', label: '显式记忆' },
+  { id: 'direct_reminder', label: '直接提醒' },
+  { id: 'generated_summary', label: '生成摘要' },
+  { id: 'context_doc', label: '上下文文档' },
+  { id: 'document_index', label: '文档索引' },
+  { id: 'root_note', label: '根目录笔记' },
+  { id: 'other', label: '其他来源' },
+] as const;
+
+function memorySourceGroupLabel(group: string) {
+  return memorySourceGroups.find((item) => item.id === group)?.label || group || '未知来源';
+}
+
+function memorySourceBucket(group: string) {
+  switch (group) {
+    case 'explicit_memory':
+    case 'direct_reminder':
+      return 'primary';
+    case 'generated_summary':
+      return 'summary';
+    case 'context_doc':
+    case 'document_index':
+    case 'root_note':
+    case 'other':
+    default:
+      return 'context';
+  }
+}
+
+function pickDefaultMemoryItem(items: KnowledgeSearchItem[]) {
+  return items.find((item) => memorySourceBucket(item.sourceGroup || 'other') === 'primary') ?? items[0];
+}
+
 function knowledgeKindLabel(kind: string) {
   switch (kind) {
     case 'fact':
@@ -2667,18 +3691,152 @@ function MemoryDataGrid<T extends object>({
   );
 }
 
+function MemoryRelationTree({
+  selected,
+  groups,
+  items,
+  selectedId,
+  onSelect,
+  onOpenSource,
+  pending,
+}: {
+  selected?: KnowledgeSearchItem;
+  groups: MemoryRelationGroup[];
+  items: KnowledgeSearchItem[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+  onOpenSource: (pathValue: string) => void;
+  pending: boolean;
+}) {
+  const primaryItems = items.filter((item) => memorySourceBucket(item.sourceGroup || 'other') === 'primary');
+  const summaryItems = items.filter((item) => memorySourceBucket(item.sourceGroup || 'other') === 'summary');
+  const contextItems = items.filter((item) => memorySourceBucket(item.sourceGroup || 'other') === 'context');
+  const renderPick = (item: KnowledgeSearchItem) => (
+    <button
+      key={item.id}
+      className={item.id === selectedId ? 'memory-pick active' : 'memory-pick'}
+      type="button"
+      onClick={() => onSelect(item.id)}
+    >
+      <span>{displayMemoryTitle(item)}</span>
+      <small>{memorySourceGroupLabel(item.sourceGroup || 'other')} · {knowledgeKindLabel(item.kind)} · {Math.round((item.confidence || 0) * 100)}%</small>
+    </button>
+  );
+
+  return (
+    <div className="memory-tree-layout">
+      <aside className="memory-tree-picker" aria-label="记忆选择">
+        <strong>记忆列表</strong>
+        <div className="memory-tree-picker-list">
+          <section className="memory-source-section">
+            <header>
+              <span>普通记忆</span>
+              <small>{primaryItems.length}</small>
+            </header>
+            {primaryItems.length > 0 ? primaryItems.map(renderPick) : (
+              <div className="empty-inline">当前结果里没有显式记忆或直接提醒。</div>
+            )}
+          </section>
+          {summaryItems.length > 0 && (
+            <details className="memory-source-section" open={summaryItems.some((item) => item.id === selectedId)}>
+              <summary>
+                <span>生成摘要</span>
+                <small>{summaryItems.length}</small>
+              </summary>
+              <div className="memory-source-section-body">
+                {summaryItems.map(renderPick)}
+              </div>
+            </details>
+          )}
+          {contextItems.length > 0 && (
+            <details className="memory-source-section" open={contextItems.some((item) => item.id === selectedId)}>
+              <summary>
+                <span>上下文 / 索引资料</span>
+                <small>{contextItems.length}</small>
+              </summary>
+              <p>这些条目用于让 Codex 理解工程、文档和历史索引，默认不当成普通记忆整理。</p>
+              <div className="memory-source-section-body">
+                {contextItems.map(renderPick)}
+              </div>
+            </details>
+          )}
+          {items.length === 0 && <div className="empty-inline">先搜索或等待记忆索引生成后，这里会出现可展开的记忆。</div>}
+        </div>
+      </aside>
+      <div className="memory-tree-canvas">
+        {selected ? (
+          <>
+            <article className={selected.conflict ? 'memory-center attention' : 'memory-center normal'}>
+              <span className="blueprint-icon"><Database size={20} /></span>
+              <div>
+                <strong>{displayMemoryTitle(selected)}</strong>
+                <p>{displayMemoryValue(selected)}</p>
+                <div className="memory-center-meta">
+                  <StatusPill status={selected.conflict ? 'warning' : 'ok'} label={knowledgeKindLabel(selected.kind)} />
+                  <span>{Math.round((selected.confidence || 0) * 100)}% 可信</span>
+                  {selected.sourcePath && (
+                    <MiniButton
+                      label="来源"
+                      icon={<ExternalLink size={14} />}
+                      onClick={() => onOpenSource(selected.sourcePath)}
+                      pending={pending}
+                    />
+                  )}
+                </div>
+              </div>
+            </article>
+            <div className="memory-branches">
+              {groups.map((group) => (
+                <section key={group.id} className={`memory-branch-group ${group.status}`}>
+                  <header>
+                    <span>{group.title}</span>
+                    <StatusPill status={userStatusKind(group.status)} label={userStatusLabel(group.status)} />
+                  </header>
+                  <div className="memory-branch-items">
+                    {group.items.length > 0 ? group.items.map((item) => (
+                      <article key={item.id} className={`memory-branch-item ${item.status}`}>
+                        <span>{item.relation}</span>
+                        <strong>{item.label}</strong>
+                        <p>{item.detail}</p>
+                      </article>
+                    )) : (
+                      <article className="memory-branch-item disabled">
+                        <span>暂无</span>
+                        <strong>没有发现{group.title}</strong>
+                        <p>这不是错误，只表示当前记忆没有这类联系。</p>
+                      </article>
+                    )}
+                  </div>
+                </section>
+              ))}
+            </div>
+          </>
+        ) : (
+          <EmptyState icon={<Database size={30} />} title="还没有可展开的记忆" text="搜索关键词或等待索引生成后，关系树会围绕选中的记忆展开。" />
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps['run']; pending: Record<string, boolean> }) {
   const [status, setStatus] = useState<KnowledgeIndexStatus>(state.memory);
   const [reminders, setReminders] = useState<TodoReminderSnapshot>(state.memoryReminders);
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<(typeof knowledgeKinds)[number]['id']>('all');
+  const [sourceGroup, setSourceGroup] = useState<MemorySourceGroup>('all');
   const [gridView, setGridView] = useState<'items' | 'nodes' | 'edges'>('items');
+  const [selectedMemoryId, setSelectedMemoryId] = useState('');
   const [items, setItems] = useState<KnowledgeSearchItem[]>([]);
+  const [searchMeta, setSearchMeta] = useState({ totalMatched: 0, offset: 0, limit: 200 });
   const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
+  const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(state.memory.optimization);
+  const [selectedOptimizationActions, setSelectedOptimizationActions] = useState<string[]>([]);
   const [error, setError] = useState('');
   const runRef = useRef(run);
 
   useEffect(() => setStatus(state.memory), [state.memory]);
+  useEffect(() => setOptimization(state.memory.optimization), [state.memory.optimization]);
   useEffect(() => setReminders(state.memoryReminders), [state.memoryReminders]);
   useEffect(() => {
     runRef.current = run;
@@ -2688,7 +3846,11 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     const timer = window.setInterval(() => {
       void runRef.current('memory.status')
         .then((next) => {
-          if (!disposed) setStatus(next as KnowledgeIndexStatus);
+          if (!disposed) {
+            const statusNext = next as KnowledgeIndexStatus;
+            setStatus(statusNext);
+            if (statusNext.optimization) setOptimization(statusNext.optimization);
+          }
         })
         .catch(() => undefined);
     }, 5000);
@@ -2702,6 +3864,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     setError('');
     const next = await run('memory.status') as KnowledgeIndexStatus;
     setStatus(next);
+    if (next.optimization) setOptimization(next.optimization);
   };
 
   const refreshReminders = async () => {
@@ -2713,6 +3876,67 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const refreshArchives = async () => {
     const next = await run('memory.archives') as KnowledgeArchiveSnapshot;
     setArchives(next);
+  };
+
+  const refreshOptimization = async () => {
+    const next = await run('memory.optimizeStatus') as MemoryOptimizationStatus;
+    setOptimization(next);
+    const draft = (next.drafts ?? []).find((item) => item.status === 'draft');
+    setSelectedOptimizationActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
+  };
+
+  const generateOptimizationDraft = async () => {
+    setError('');
+    const result = await run('memory.optimizePreview', {
+      modelSource: optimization?.modelSource || 'codex_primary',
+    }) as { status?: MemoryOptimizationStatus };
+    if (result.status) {
+      setOptimization(result.status);
+      const draft = (result.status.drafts ?? []).find((item) => item.status === 'draft');
+      setSelectedOptimizationActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
+    }
+    await refreshStatus();
+  };
+
+  const applyOptimizationDraft = async (draft: MemoryOptimizationDraft) => {
+    setError('');
+    if (!window.confirm(`确认应用这份记忆整理草稿？将执行 ${selectedOptimizationActions.length} 个已勾选动作，未勾选动作不会执行，归档项可恢复。`)) return;
+    const result = await run('memory.optimizeApply', {
+      draftId: draft.draftId,
+      selectedActionIds: selectedOptimizationActions,
+    }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    setSelectedOptimizationActions([]);
+    await search();
+    await refreshReminders();
+    await refreshArchives();
+  };
+
+  const undoOptimizationDraft = async (draft: MemoryOptimizationDraft) => {
+    setError('');
+    if (!window.confirm('确认撤销这份已应用草稿？只会自动恢复归档动作，新增/更新动作会标记为需要人工确认。')) return;
+    const result = await run('memory.optimizeUndo', { draftId: draft.draftId }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    await search();
+    await refreshReminders();
+    await refreshArchives();
+  };
+
+  const discardOptimizationDraft = async (draftId: string) => {
+    setError('');
+    const result = await run('memory.optimizeDiscard', { draftId }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    setSelectedOptimizationActions([]);
+  };
+
+  const updateOptimizationSchedule = async (enabled: boolean) => {
+    setError('');
+    const result = await run('memory.optimizeSchedule', {
+      enabled,
+      intervalDays: optimization?.intervalDays || 7,
+      modelSource: optimization?.modelSource || 'codex_primary',
+    }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
   };
 
   const testReminder = async (id: string) => {
@@ -2741,28 +3965,51 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     await refreshArchives();
   };
 
-  const search = async () => {
+  const restoreKnowledgeArchive = async (archivePath: string) => {
+    setError('');
+    await run('memory.restoreArchive', { archivePath });
+    await search();
+    await refreshReminders();
+    await refreshArchives();
+  };
+
+  const search = async (nextOffset = searchMeta.offset) => {
     setError('');
     try {
       const result = await run('memory.search', {
         query,
         kinds: kind === 'all' ? [] : [kind],
-        limit: 40,
+        sourceGroup,
+        offset: nextOffset,
+        limit: 200,
       }) as KnowledgeSearchResponse;
+      const nextItems = Array.isArray(result.items) ? result.items : [];
       setStatus(result.status);
-      setItems(Array.isArray(result.items) ? result.items : []);
+      setItems(nextItems);
+      setSearchMeta({
+        totalMatched: result.totalMatched ?? nextItems.length,
+        offset: result.offset ?? nextOffset,
+        limit: result.limit ?? 200,
+      });
+      setSelectedMemoryId((current) => nextItems.some((item) => item.id === current) ? current : pickDefaultMemoryItem(nextItems)?.id ?? '');
     } catch (searchError) {
       setError(searchError instanceof Error ? searchError.message : '搜索失败');
     }
   };
 
   useEffect(() => {
-    void search();
-  }, [kind]);
+    void search(0);
+  }, [kind, sourceGroup]);
 
   useEffect(() => {
     void refreshArchives();
+    void refreshOptimization();
   }, []);
+  useEffect(() => {
+    const draft = (optimization?.drafts ?? []).find((item) => item.status === 'draft');
+    if (!draft) return;
+    setSelectedOptimizationActions((current) => current.length > 0 ? current : draft.actions.filter((action) => action.defaultSelected !== false).map((action) => action.id));
+  }, [optimization?.drafts?.[0]?.draftId]);
 
   const statusKind: StatusKind = status.lastError
     ? 'error'
@@ -2777,13 +4024,19 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const maxKindCount = Math.max(1, ...visibleKindCounts.map((item) => item.count));
   const conflictRatio = status.itemCount > 0 ? Math.round(((status.conflictCount ?? 0) / status.itemCount) * 100) : 0;
   const pipelineSteps = [
-    { label: 'Markdown', detail: `${status.markdownFileCount ?? 0} 个文件`, ok: (status.markdownFileCount ?? 0) > 0 },
-    { label: '索引文件', detail: status.exists ? '已生成' : '未生成', ok: status.exists },
-    { label: '监听心跳', detail: status.watching ? '运行中' : '未运行', ok: status.watching },
-    { label: 'Codex 注入', detail: status.exists && !status.lastError ? '可注入' : '等待索引', ok: status.exists && !status.lastError },
+    { label: '文件读取', detail: `${status.markdownFileCount ?? 0} 个文件`, ok: (status.markdownFileCount ?? 0) > 0 },
+    { label: '关系整理', detail: status.exists ? '已生成' : '未生成', ok: status.exists },
+    { label: '自动监听', detail: status.watching ? '运行中' : '未运行', ok: status.watching },
+    { label: '可供使用', detail: status.exists && !status.lastError ? '已就绪' : '等待整理', ok: status.exists && !status.lastError },
   ];
   const graphNodes = status.memoryGraphPreview?.nodes ?? [];
   const graphEdges = status.memoryGraphPreview?.edges ?? [];
+  const selectedMemory = items.find((item) => item.id === selectedMemoryId) ?? pickDefaultMemoryItem(items);
+  const activeOptimizationDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft') ?? (optimization?.drafts ?? [])[0];
+  const pendingDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft');
+  const appliedDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'applied');
+  const selectedActionCount = pendingDraft ? selectedOptimizationActions.length : 0;
+  const memoryRelationGroups = useMemo(() => buildMemoryRelationGroups(selectedMemory, reminders), [selectedMemory, reminders]);
   const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
     {
       accessorKey: 'kind',
@@ -2812,9 +4065,9 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     },
     {
       id: 'related',
-      header: '关联',
+      header: '相关对象',
       accessorFn: (row) => row.related?.length ?? 0,
-      cell: ({ row }) => (row.original.related ?? []).slice(0, 4).map((related) => `${related.label} (${related.type})`).join('；') || '-',
+      cell: ({ row }) => (row.original.related ?? []).slice(0, 4).map((related) => `${related.label}（${relationTypeLabel(related.type)}）`).join('；') || '-',
       size: 240,
     },
     {
@@ -2828,7 +4081,12 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
       id: 'source',
       header: '来源',
       accessorFn: (row) => row.sourcePath,
-      cell: ({ row }) => <code>{row.original.sourcePath || '-'}</code>,
+      cell: ({ row }) => (
+        <div className="grid-main-cell">
+          <span>{memorySourceGroupLabel(row.original.sourceGroup || 'other')}</span>
+          <code>{row.original.sourcePath || '-'}</code>
+        </div>
+      ),
       size: 260,
     },
     {
@@ -2857,22 +4115,87 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     },
   ], [pending, run]);
   const nodeColumns = useMemo<Array<ColumnDef<{ id: string; label: string; kind: string }>>>(() => [
-    { accessorKey: 'label', header: '节点', cell: ({ row }) => <strong>{row.original.label}</strong>, size: 260 },
+    { accessorKey: 'label', header: '相关对象', cell: ({ row }) => <strong>{row.original.label}</strong>, size: 260 },
     { accessorKey: 'kind', header: '类型', cell: ({ row }) => row.original.kind || '-', size: 120 },
     { accessorKey: 'id', header: 'ID', cell: ({ row }) => <code>{row.original.id}</code>, size: 220 },
   ], []);
   const edgeColumns = useMemo<Array<ColumnDef<{ from: string; to: string; fromLabel?: string; toLabel?: string; type: string; weight: number }>>>(() => [
-    { id: 'from', header: '起点', accessorFn: (row) => row.fromLabel || row.from, cell: ({ row }) => row.original.fromLabel || row.original.from, size: 240 },
-    { id: 'type', header: '关系', accessorFn: (row) => row.type, cell: ({ row }) => row.original.type || '-', size: 140 },
-    { id: 'to', header: '终点', accessorFn: (row) => row.toLabel || row.to, cell: ({ row }) => row.original.toLabel || row.original.to, size: 240 },
+    { id: 'from', header: '从', accessorFn: (row) => row.fromLabel || row.from, cell: ({ row }) => row.original.fromLabel || row.original.from, size: 240 },
+    { id: 'type', header: '联系', accessorFn: (row) => row.type, cell: ({ row }) => relationTypeLabel(row.original.type), size: 140 },
+    { id: 'to', header: '到', accessorFn: (row) => row.toLabel || row.to, cell: ({ row }) => row.original.toLabel || row.original.to, size: 240 },
     { id: 'weight', header: '权重', accessorFn: (row) => row.weight || 0, cell: ({ row }) => (row.original.weight || 0).toFixed(2), size: 90 },
   ], []);
 
   return (
     <section className="content-stack">
+      <section className="panel memory-tree-primary">
+        <SectionHeader
+          title="记忆关系树"
+          action={<MiniButton label="搜索" icon={<Search size={14} />} onClick={() => void search()} pending={pending['memory.search']} />}
+        />
+        <p className="panel-intro">左侧按来源分开：普通记忆默认展开，上下文文档和索引资料默认折叠；选中一条后，右侧展开它对应到什么、关联了哪些资源、是否带提醒或冲突。</p>
+        <div className="memory-quick-actions">
+          <div>
+            <strong>整理记忆从这里开始</strong>
+            <span>
+              生成整理草稿只做预览，不会直接写回；确认时只执行你勾选的动作。当前{pendingDraft ? `有 1 份待确认草稿，已勾选 ${selectedActionCount} 项。` : appliedDraft ? '最近草稿已应用，可生成新草稿重新扫描。' : '还没有待确认草稿。'}
+            </span>
+          </div>
+          <div className="row-actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => void generateOptimizationDraft()}
+              disabled={pending['memory.optimizePreview']}
+            >
+              <ListChecks size={15} />
+              生成整理草稿
+            </button>
+            <MiniButton
+              label={pendingDraft ? '查看待确认草稿' : appliedDraft ? '查看已应用草稿' : '查看整理区'}
+              icon={<ArrowDownUp size={14} />}
+              onClick={() => document.getElementById('memory-optimizer-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+            />
+          </div>
+        </div>
+        <div className="filter-row">
+          <Search size={14} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
+            if (event.key === 'Enter') void search();
+          }} placeholder="搜索场景名、文件名、结论或记忆片段" />
+        </div>
+        <div className="preset-wall">
+          {knowledgeKinds.map((item) => (
+            <button key={item.id} className={kind === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setKind(item.id)}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="preset-wall">
+          {memorySourceGroups.map((item) => (
+            <button key={item.id} className={sourceGroup === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setSourceGroup(item.id)}>
+              {item.label}
+            </button>
+          ))}
+        </div>
+        {error && <div className="empty-inline">{error}</div>}
+        <MemoryRelationTree
+          selected={selectedMemory}
+          groups={memoryRelationGroups}
+          items={items}
+          selectedId={selectedMemory?.id ?? selectedMemoryId}
+          onSelect={setSelectedMemoryId}
+          onOpenSource={(pathValue) => void run('memory.openSource', { path: pathValue })}
+          pending={pending['memory.openSource']}
+        />
+        {searchMeta.totalMatched > items.length && (
+          <div className="detail-meta">当前已显示 {items.length} / {searchMeta.totalMatched} 条。结果过多时，请用搜索或来源筛选缩小范围。</div>
+        )}
+      </section>
+
       <section className="memory-visual-grid">
         <section className="panel">
-          <SectionHeader title="知识分布" />
+          <SectionHeader title="记忆分布" />
           <div className="memory-bars">
             {visibleKindCounts.map((item) => (
               <div key={item.id} className="memory-bar-row">
@@ -2903,7 +4226,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           </div>
         </section>
         <section className="panel">
-          <SectionHeader title="索引链路" />
+          <SectionHeader title="记忆链路" />
           <div className="memory-pipeline">
             {pipelineSteps.map((step) => (
               <div key={step.label} className={step.ok ? 'memory-pipeline-step ok' : 'memory-pipeline-step'}>
@@ -2914,7 +4237,133 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           </div>
         </section>
       </section>
-      <section className="panel">
+
+      <section id="memory-optimizer-panel" className="panel memory-optimizer-panel">
+        <SectionHeader
+          title="记忆整理"
+          action={<MiniButton label="生成整理草稿" icon={<ListChecks size={14} />} onClick={() => void generateOptimizationDraft()} pending={pending['memory.optimizePreview']} />}
+        />
+        <p className="panel-intro">这里是草稿确认区。生成草稿只预览建议；真正写回前，你还要勾选动作并点“确认应用所选”。</p>
+        <div className="memory-optimizer-summary">
+          <Metric label="定期草稿" value={optimization?.enabled ? '已开启' : '未开启'} compact />
+          <Metric label="草稿待确认" value={String(optimization?.draftCount ?? 0)} compact />
+          <Metric label="上次生成" value={optimization?.lastGeneratedAt || '-'} compact />
+          <Metric label="下次计划" value={optimization?.nextRunAt || '-'} compact />
+        </div>
+        {optimization?.recentError && <div className="empty-inline">{optimization.recentError}</div>}
+        <div className="command-band tight">
+          <MiniButton
+            label={optimization?.enabled ? '关闭定期草稿' : '开启每周草稿'}
+            icon={<RefreshCw size={14} />}
+            onClick={() => void updateOptimizationSchedule(!(optimization?.enabled))}
+            pending={pending['memory.optimizeSchedule']}
+          />
+          <MiniButton label="刷新状态" icon={<RefreshCw size={14} />} onClick={() => void refreshOptimization()} pending={pending['memory.optimizeStatus']} />
+        </div>
+        {activeOptimizationDraft ? (
+          <div className="memory-optimizer-draft">
+            <div className="optimizer-draft-head">
+              <div>
+                <strong>{activeOptimizationDraft.summary || '记忆整理草稿'}</strong>
+                <span>{activeOptimizationDraft.generatedAt || '-'} · {activeOptimizationDraft.generatedBy === 'schedule' ? '定期生成' : '手动生成'} · {activeOptimizationDraft.status}</span>
+              </div>
+              <div className="row-actions">
+                <MiniButton
+                  label="确认应用所选"
+                  icon={<CheckCircle2 size={14} />}
+                  onClick={() => void applyOptimizationDraft(activeOptimizationDraft)}
+                  pending={pending['memory.optimizeApply']}
+                  disabled={activeOptimizationDraft.status !== 'draft'}
+                />
+                <MiniButton
+                  label="撤销应用"
+                  icon={<RotateCw size={14} />}
+                  onClick={() => void undoOptimizationDraft(activeOptimizationDraft)}
+                  pending={pending['memory.optimizeUndo']}
+                  disabled={activeOptimizationDraft.status !== 'applied'}
+                />
+                <MiniButton
+                  label="丢弃草稿"
+                  icon={<Trash2 size={14} />}
+                  onClick={() => void discardOptimizationDraft(activeOptimizationDraft.draftId)}
+                  pending={pending['memory.optimizeDiscard']}
+                  disabled={activeOptimizationDraft.status !== 'draft'}
+                />
+              </div>
+            </div>
+            <div className="optimizer-action-list">
+              {(activeOptimizationDraft.actions ?? []).map((action) => {
+                const selected = selectedOptimizationActions.includes(action.id);
+                return (
+                  <label key={action.id} className={selected ? `optimizer-action risk-${action.risk}` : 'optimizer-action excluded'}>
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={activeOptimizationDraft.status !== 'draft'}
+                      onChange={(event) => {
+                        setSelectedOptimizationActions((current) => event.target.checked
+                          ? [...new Set([...current, action.id])]
+                          : current.filter((id) => id !== action.id));
+                      }}
+                    />
+                    <div>
+                      <strong>{action.title}</strong>
+                      <span>
+                        {action.type === 'add' ? '新增' : action.type === 'update' ? '更新' : '归档'}
+                        {' · '}{memorySourceGroupLabel(action.sourceGroup || 'other')}
+                        {' · '}风险 {action.risk}
+                        {' · '}置信 {Math.round((action.confidence || 0) * 100)}%
+                        {action.requiresManualReview ? ' · 默认不执行' : ' · 默认勾选'}
+                      </span>
+                      <p>{action.reason}</p>
+                      <code>{action.targetPath || action.source?.path || '-'}</code>
+                    </div>
+                  </label>
+                );
+              })}
+              {(activeOptimizationDraft.actions ?? []).length === 0 && <div className="empty-inline">这份草稿没有需要应用的动作。</div>}
+            </div>
+          </div>
+        ) : (
+          <div className="empty-inline">还没有整理草稿。点击“生成整理草稿”后，可以先查看清单，再确认应用所选动作。</div>
+        )}
+      </section>
+
+      <details className="panel advanced-diagnostics memory-source-details">
+        <summary>
+          <span>为什么草稿会包含当前列表没显示的来源？</span>
+          <small>完整索引来源、默认风险和跳过目录。一般不需要展开。</small>
+        </summary>
+        <div className="advanced-diagnostics-body">
+          <section className="diagnostic-section">
+            <p className="panel-intro">
+              整理草稿基于完整索引生成，不只基于当前搜索结果。当前索引共有 {status.itemCount ?? 0} 条知识单元，搜索显示 {items.length} / {searchMeta.totalMatched || status.itemCount || 0} 条。
+            </p>
+            <div className="memory-source-list">
+              {(status.sourceCoverage ?? []).slice(0, 12).map((source) => (
+                <article key={source.sourcePath} className={source.autoSelectable ? 'memory-source-card safe' : 'memory-source-card review'}>
+                  <div>
+                    <strong>{memorySourceGroupLabel(source.sourceGroup)}</strong>
+                    <span>{source.itemCount} 条 · {source.autoSelectable ? '可默认整理' : '默认需人工确认'} · 风险 {source.defaultRisk}</span>
+                    <code>{source.sourcePath}</code>
+                  </div>
+                  <StatusPill status={source.autoSelectable ? 'ok' : 'warning'} label={source.autoSelectable ? '默认可选' : '需确认'} />
+                </article>
+              ))}
+              {(status.sourceCoverage ?? []).length === 0 && <div className="empty-inline">暂无来源覆盖数据，请先刷新记忆索引。</div>}
+            </div>
+            <div className="detail-meta">索引器跳过目录：{(status.skippedDirectories ?? []).join('、') || '.git、.cti-index、archive、node_modules、.obsidian'}。</div>
+          </section>
+        </div>
+      </details>
+
+      <details className="panel advanced-diagnostics">
+        <summary>
+          <span>高级诊断</span>
+          <small>索引路径、关系缓存、需要检查的回复</small>
+        </summary>
+        <div className="advanced-diagnostics-body">
+          <section className="diagnostic-section">
         <SectionHeader
           title="索引状态"
           action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStatus()} pending={pending['memory.status']} />}
@@ -2925,13 +4374,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           <Metric label="Markdown" value={String(status.markdownFileCount ?? 0)} compact />
           <Metric label="知识单元" value={String(status.itemCount ?? 0)} compact />
           <Metric label="冲突" value={String(status.conflictCount ?? 0)} compact />
-          <Metric label="关系节点" value={String(status.memoryGraphNodeCount ?? 0)} compact />
-          <Metric label="关系边" value={String(status.memoryGraphEdgeCount ?? 0)} compact />
+          <Metric label="相关对象" value={String(status.memoryGraphNodeCount ?? 0)} compact />
+          <Metric label="联系" value={String(status.memoryGraphEdgeCount ?? 0)} compact />
         </div>
         <dl className="kv">
           <dt>仓库</dt><dd>{status.memoryRoot || state.paths.memoryRepo || '-'}</dd>
           <dt>索引</dt><dd>{status.indexPath || '-'}</dd>
-          <dt>关系图</dt><dd>{status.memoryGraphPath || '-'}</dd>
+          <dt>关系缓存</dt><dd>{status.memoryGraphPath || '-'}</dd>
           <dt>状态文件</dt><dd>{status.statusPath || '-'}</dd>
           <dt>索引时间</dt><dd>{status.lastIndexedAt || status.generatedAt || '-'}</dd>
           <dt>最近事件</dt><dd>{status.lastEventAt || '-'}</dd>
@@ -2944,17 +4393,17 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           <div className="runtime-list compact-list">
             <article className="runtime-row">
               <div>
-                <strong>关系节点</strong>
+                <strong>相关对象</strong>
                 <p>{(status.memoryGraphPreview?.nodes ?? []).slice(0, 8).map((node) => `${node.label} (${node.kind})`).join('；') || '-'}</p>
               </div>
-              <StatusPill status="ok" label={`${status.memoryGraphNodeCount ?? 0} nodes`} />
+              <StatusPill status="ok" label={`${status.memoryGraphNodeCount ?? 0} 个`} />
             </article>
             <article className="runtime-row">
               <div>
-                <strong>关系边</strong>
-                <p>{(status.memoryGraphPreview?.edges ?? []).slice(0, 8).map((edge) => `${edge.fromLabel || edge.from} -> ${edge.toLabel || edge.to} (${edge.type})`).join('；') || '-'}</p>
+                <strong>联系</strong>
+                <p>{(status.memoryGraphPreview?.edges ?? []).slice(0, 8).map((edge) => `${edge.fromLabel || edge.from} -> ${edge.toLabel || edge.to} (${relationTypeLabel(edge.type)})`).join('；') || '-'}</p>
               </div>
-              <StatusPill status="ok" label={`${status.memoryGraphEdgeCount ?? 0} edges`} />
+              <StatusPill status="ok" label={`${status.memoryGraphEdgeCount ?? 0} 条`} />
             </article>
           </div>
         )}
@@ -2963,17 +4412,19 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
             {(status.recentReviewWarnings ?? []).map((item, index) => (
               <article key={`${item.createdAt}-${index}`} className="runtime-row">
                 <div>
-                  <strong>{item.reasonCodes?.join(', ') || item.verdict}</strong>
-                  <span>{item.createdAt || '-'}</span>
-                  <p>{item.userText || '-'}</p>
-                  <code>{item.answerText || '-'}</code>
-                </div>
-                <StatusPill status="warning" label={item.verdict || 'warn'} />
+                <strong>{item.reasonCodes?.join(', ') || item.verdict}</strong>
+                <span>{item.createdAt || '-'}</span>
+                <p>{item.userText || '-'}</p>
+                <code>{item.answerText || '-'}</code>
+              </div>
+                <StatusPill status="warning" label="需要检查" />
               </article>
             ))}
           </div>
         )}
-      </section>
+          </section>
+        </div>
+      </details>
 
       <section className="panel">
         <SectionHeader
@@ -3035,12 +4486,18 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         </div>
       </section>
 
-      <section className="panel">
+      <details className="panel advanced-diagnostics">
+        <summary>
+          <span>高级表格</span>
+          <small>知识单元、相关对象和联系明细</small>
+        </summary>
+        <div className="advanced-diagnostics-body">
+          <section className="diagnostic-section">
         <SectionHeader
-          title="记忆网格 / 搜索"
+          title="网格明细 / 搜索"
           action={<MiniButton label="搜索" icon={<Search size={14} />} onClick={() => void search()} pending={pending['memory.search']} />}
         />
-        <div className="detail-meta">当前显示 {items.length} / {status.itemCount ?? 0} 个知识单元；关系图缓存 {graphNodes.length} 个节点、{graphEdges.length} 条边。</div>
+        <div className="detail-meta">当前显示 {items.length} / {status.itemCount ?? 0} 条记忆；关系缓存包含 {graphNodes.length} 个相关对象、{graphEdges.length} 条联系。</div>
         <div className="filter-row">
           <Search size={14} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
@@ -3050,8 +4507,8 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         <div className="preset-wall">
           {[
             { id: 'items', label: '知识单元' },
-            { id: 'nodes', label: '关系节点' },
-            { id: 'edges', label: '关系边' },
+            { id: 'nodes', label: '相关对象' },
+            { id: 'edges', label: '联系' },
           ].map((item) => (
             <button key={item.id} className={gridView === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setGridView(item.id as typeof gridView)}>
               {item.label}
@@ -3067,21 +4524,51 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           ))}
           </div>
         )}
+        {gridView === 'items' && (
+          <div className="preset-wall">
+            {memorySourceGroups.map((item) => (
+              <button key={item.id} className={sourceGroup === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setSourceGroup(item.id)}>
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
         {error && <div className="empty-inline">{error}</div>}
         {gridView === 'items' && (
-          <MemoryDataGrid
-            data={items}
-            columns={itemColumns}
-            emptyText={status.itemCount ? '暂无匹配结果。清空关键词或切换类型后再搜索。' : '暂无知识单元。'}
-          />
+          <>
+            <div className="detail-meta">当前页 {searchMeta.offset + 1} - {Math.min(searchMeta.offset + items.length, searchMeta.totalMatched)} / {searchMeta.totalMatched} 条匹配。</div>
+            <MemoryDataGrid
+              data={items}
+              columns={itemColumns}
+              emptyText={status.itemCount ? '暂无匹配结果。清空关键词或切换类型后再搜索。' : '暂无知识单元。'}
+            />
+            <div className="row-actions">
+              <MiniButton
+                label="上一页"
+                icon={<ArrowLeftRight size={14} />}
+                onClick={() => void search(Math.max(0, searchMeta.offset - searchMeta.limit))}
+                disabled={searchMeta.offset <= 0}
+                pending={pending['memory.search']}
+              />
+              <MiniButton
+                label="下一页"
+                icon={<ArrowLeftRight size={14} />}
+                onClick={() => void search(searchMeta.offset + searchMeta.limit)}
+                disabled={searchMeta.offset + searchMeta.limit >= searchMeta.totalMatched}
+                pending={pending['memory.search']}
+              />
+            </div>
+          </>
         )}
         {gridView === 'nodes' && (
-          <MemoryDataGrid data={graphNodes} columns={nodeColumns} emptyText="暂无关系节点。重建知识索引后会在这里出现。" />
+          <MemoryDataGrid data={graphNodes} columns={nodeColumns} emptyText="暂无相关对象。整理记忆关系后会在这里出现。" />
         )}
         {gridView === 'edges' && (
-          <MemoryDataGrid data={graphEdges} columns={edgeColumns} emptyText="暂无关系边。结构化记忆建立映射后会在这里出现。" />
+          <MemoryDataGrid data={graphEdges} columns={edgeColumns} emptyText="暂无联系。结构化记忆建立映射后会在这里出现。" />
         )}
-      </section>
+          </section>
+        </div>
+      </details>
 
       <section className="panel">
         <SectionHeader
@@ -3101,6 +4588,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
               <div className="row-actions">
                 <StatusPill status="idle" label="已归档" />
                 <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.archivePath })} pending={pending['memory.openSource']} />
+                <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restoreKnowledgeArchive(item.archivePath)} pending={pending['memory.restoreArchive']} />
                 <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteKnowledgeArchive(item.archivePath)} pending={pending['memory.deleteArchive']} />
               </div>
             </article>
@@ -3149,26 +4637,30 @@ function SettingsPage({
   const applyAiStrategy = (strategy: AiStrategy) => {
     setSettings((current) => {
       const clearCodexKey = current.codexApiKeySet ? 'clear' : current.codexApiKeyAction;
-      if (strategy === 'default_codex') {
+      if (strategy === 'official') {
         return {
           ...current,
+          codexModelSource: 'official',
           codexBaseUrl: '',
           codexModel: '',
           codexPassModel: false,
           codexReasoningEffort: 'low',
           codexLocalFallbackEnabled: false,
+          codexFailureFallbackMode: 'none',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
         };
       }
-      if (strategy === 'codex_with_local_fallback') {
+      if (strategy === 'local_api') {
         return {
           ...current,
+          codexModelSource: 'local_api',
           codexBaseUrl: '',
           codexModel: '',
-          codexPassModel: false,
+          codexPassModel: true,
           codexReasoningEffort: 'low',
-          codexLocalFallbackEnabled: true,
+          codexLocalFallbackEnabled: false,
+          codexFailureFallbackMode: 'none',
           codexLocalFallbackReasoningEffort: current.codexLocalFallbackReasoningEffort || 'minimal',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
@@ -3176,7 +4668,9 @@ function SettingsPage({
       }
       return {
         ...current,
+        codexModelSource: 'external_api',
         codexLocalFallbackEnabled: false,
+        codexFailureFallbackMode: 'none',
         codexPassModel: true,
         codexReasoningEffort: current.codexReasoningEffort || 'low',
       };
@@ -3202,6 +4696,12 @@ function SettingsPage({
     window.alert(formatCommandResult(result));
   };
 
+  const testLocalTools = async () => {
+    const result = await run('settings.testLocalTools', { settings });
+    window.alert(formatCommandResult(result));
+    await run('state.refresh');
+  };
+
   const testCodexApi = async () => {
     const result = await run('settings.testCodexApi', { settings });
     window.alert(formatCommandResult(result));
@@ -3211,7 +4711,7 @@ function SettingsPage({
     const results: string[] = [];
     const codexResult = await run('settings.testCodexApi', { settings });
     results.push(`Codex 主 API：${formatCommandResult(codexResult)}`);
-    if (aiStrategy === 'codex_with_local_fallback') {
+    if (aiStrategy === 'local_api' || settings.codexLocalFallbackEnabled) {
       const localResult = await run('settings.testLocalAi', { settings });
       results.push(`本地 Agent API：${formatCommandResult(localResult)}`);
     }
@@ -3240,16 +4740,16 @@ function SettingsPage({
       </section>
       <section className="panel panel-span-2">
         <SectionHeader
-          title="AI API"
+          title="Codex CLI 模型来源"
           action={<MiniButton label="保存并重启 Bridge" icon={<RotateCw size={14} />} onClick={() => void saveAndRestartBridge()} pending={pending['settings.saveAndRestartBridge']} />}
         />
         <div className="ai-strategy-shell">
           <label className="stack-field">
             <span>运行策略</span>
             <select value={aiStrategy} onChange={(event) => applyAiStrategy(event.target.value as AiStrategy)}>
-              <option value="default_codex">默认 Codex</option>
-              <option value="codex_with_local_fallback">Codex + 本地兜底</option>
-              <option value="custom_api">完全使用自定义 API</option>
+              <option value="official">官方 Codex</option>
+              <option value="local_api">本地 API 作为主模型</option>
+              <option value="external_api">外部 API 作为主模型</option>
             </select>
           </label>
           <div className="ai-summary-grid">
@@ -3259,20 +4759,20 @@ function SettingsPage({
             </div>
             <div>
               <span>主脑</span>
-              <strong>{aiStrategy === 'custom_api' ? (settings.codexModel || '自定义 API') : 'Codex 默认'}</strong>
+              <strong>{aiStrategy === 'local_api' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : aiStrategy === 'external_api' ? (settings.codexModel || '外部 API') : 'Codex 默认'}</strong>
             </div>
             <div>
-              <span>兜底</span>
-              <strong>{aiStrategy === 'codex_with_local_fallback' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : '关闭'}</strong>
+              <span>失败后备用</span>
+              <strong>{settings.codexLocalFallbackEnabled && settings.codexFailureFallbackMode === 'local_agent' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : '关闭'}</strong>
             </div>
           </div>
-          {aiStrategy === 'default_codex' && (
-            <p className="field-hint">最省心：继续使用当前 Codex 登录态和默认模型。本地 Agent API 不参与普通飞书消息。</p>
+          {aiStrategy === 'official' && (
+            <p className="field-hint">使用官方 Codex 登录态和默认模型。主模型失败时默认直接暴露错误，不会悄悄切到弱备用模型。</p>
           )}
-          {aiStrategy === 'codex_with_local_fallback' && (
+          {aiStrategy === 'local_api' && (
             <div className="path-grid">
               <label className="stack-field">
-                <span>本地服务</span>
+                <span>本地主模型服务</span>
                 <select value={settings.localAiKind} onChange={(event) => applyLocalAiKind(event.target.value)}>
                   <option value="ollama">Ollama</option>
                   <option value="lmstudio">LM Studio</option>
@@ -3291,7 +4791,7 @@ function SettingsPage({
               </label>
             </div>
           )}
-          {aiStrategy === 'custom_api' && (
+          {aiStrategy === 'external_api' && (
             <div className="path-grid">
               <label className="stack-field">
                 <span>主 API Base URL</span>
@@ -3340,8 +4840,34 @@ function SettingsPage({
                 </label>
               )}
               <label className="stack-field inline-field">
-                <input type="checkbox" checked={settings.codexLocalFallbackEnabled} onChange={(event) => update('codexLocalFallbackEnabled', event.target.checked)} />
-                <span>Codex 失败时使用本地 Agent API</span>
+                <input
+                  type="checkbox"
+                  checked={settings.codexLocalFallbackEnabled && settings.codexFailureFallbackMode === 'local_agent'}
+                  onChange={(event) => {
+                    update('codexLocalFallbackEnabled', event.target.checked);
+                    update('codexFailureFallbackMode', event.target.checked ? 'local_agent' : 'none');
+                  }}
+                />
+                <span>主模型失败时才使用备用本地 Agent API</span>
+              </label>
+              <label className="stack-field">
+                <span>本地执行模式</span>
+                <select value={settings.localAgentMode || 'text_only'} onChange={(event) => update('localAgentMode', event.target.value)}>
+                  <option value="text_only">仅文本/总结，不承接执行</option>
+                  <option value="agent_verified">工具探测通过后允许受控执行</option>
+                </select>
+              </label>
+              <label className="stack-field inline-field">
+                <input type="checkbox" checked={settings.localToolCallRequired !== false} onChange={(event) => update('localToolCallRequired', event.target.checked)} />
+                <span>执行类任务必须通过工具调用探测</span>
+              </label>
+              <label className="stack-field">
+                <span>本地工具未验证时</span>
+                <select value={settings.executionRequiredRoute || 'codex_or_external'} onChange={(event) => update('executionRequiredRoute', event.target.value)}>
+                  <option value="codex_or_external">转交官方 Codex / 外部 API</option>
+                  <option value="refuse">直接拒绝执行并说明原因</option>
+                  <option value="primary">仍使用当前主模型（不推荐）</option>
+                </select>
               </label>
               <label className="stack-field">
                 <span>本地 Agent 兜底 Reasoning</span>
@@ -3374,6 +4900,7 @@ function SettingsPage({
         <div className="command-band tight">
           <MiniButton label="一键检测" icon={<Bot size={14} />} onClick={() => void testAiStrategy()} pending={pending['settings.testLocalAi'] || pending['settings.testCodexApi']} />
           <MiniButton label="测试本地 Agent API" icon={<Bot size={14} />} onClick={() => void testLocalAi()} pending={pending['settings.testLocalAi']} />
+          <MiniButton label="测试工具调用" icon={<ListChecks size={14} />} onClick={() => void testLocalTools()} pending={pending['settings.testLocalTools']} />
           <MiniButton label="测试 Codex API" icon={<Bot size={14} />} onClick={() => void testCodexApi()} pending={pending['settings.testCodexApi']} />
         </div>
       </section>

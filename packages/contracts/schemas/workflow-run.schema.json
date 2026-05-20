@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/workflow-run.schema.json",
+  "title": "WorkflowRunContract",
+  "type": "object",
+  "required": ["schema", "id", "nodeId", "status", "stage", "createdAt", "updatedAt", "checkpoints", "events"],
+  "properties": {
+    "schema": { "const": "codex-im-suite/workflow-run/v1" },
+    "id": { "type": "string", "minLength": 1 },
+    "nodeId": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["running", "succeeded", "failed", "retry_pending", "retrying"] },
+    "stage": { "enum": ["received", "authorized", "contextualized", "routed", "executing", "finalizing", "delivered", "failed"] },
+    "sessionId": { "type": "string" },
+    "chatId": { "type": "string" },
+    "executorId": { "type": "string" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "checkpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "stage", "createdAt", "summary", "recoverable"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["input", "permission", "tool", "provider", "finalizer", "delivery", "retry"] },
+          "stage": { "enum": ["received", "authorized", "contextualized", "routed", "executing", "finalizing", "delivered", "failed"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "summary": { "type": "string" },
+          "recoverable": { "type": "boolean" },
+          "payloadRef": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "stage", "type", "createdAt", "summary"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "stage": { "enum": ["received", "authorized", "contextualized", "routed", "executing", "finalizing", "delivered", "failed"] },
+          "type": { "type": "string", "minLength": 1 },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "summary": { "type": "string" },
+          "nodeId": { "type": "string" },
+          "checkpointId": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

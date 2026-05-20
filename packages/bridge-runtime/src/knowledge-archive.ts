@@ -37,6 +37,15 @@ export interface KnowledgeArchiveDeleteInput {
   archivePath: string;
 }
 
+export interface KnowledgeArchiveRestoreInput {
+  archivePath: string;
+}
+
+export interface KnowledgeArchiveRestoreResult extends KnowledgeArchiveResult {
+  sourcePath?: string;
+  restoredLine?: string;
+}
+
 export function archiveKnowledgeItem(memoryRoot: string, input: KnowledgeArchiveInput): KnowledgeArchiveResult {
   const root = path.resolve(memoryRoot);
   const index = readKnowledgeIndex(root);
@@ -114,6 +123,55 @@ export function deleteKnowledgeArchive(memoryRoot: string, input: KnowledgeArchi
   return { ok: true, archivePath };
 }
 
+export function restoreKnowledgeArchive(memoryRoot: string, input: KnowledgeArchiveRestoreInput): KnowledgeArchiveRestoreResult {
+  const root = path.resolve(memoryRoot);
+  const archiveRoot = getKnowledgeArchiveRoot(root);
+  const archivePath = path.resolve(input.archivePath);
+  if (!isInside(archiveRoot, archivePath)) {
+    return { ok: false, archivePath, error: '归档文件不在知识归档目录内，已拒绝恢复。' };
+  }
+  if (!fs.existsSync(archivePath)) {
+    return { ok: false, archivePath, error: '归档文件不存在。' };
+  }
+
+  const archiveContent = fs.readFileSync(archivePath, 'utf-8');
+  const metadata = parseFrontmatter(archiveContent);
+  const sourcePath = path.resolve(metadata.sourcePath || '');
+  if (!metadata.sourcePath || !isInside(root, sourcePath)) {
+    return { ok: false, archivePath, sourcePath, error: '归档记录的源文件不在记忆仓库内，已拒绝恢复。' };
+  }
+  if (!fs.existsSync(sourcePath)) {
+    return { ok: false, archivePath, sourcePath, error: '归档记录的源文件不存在，无法自动恢复。' };
+  }
+
+  const originalLine = extractArchivedMarkdownLine(archiveContent);
+  if (!originalLine) {
+    return { ok: false, archivePath, sourcePath, error: '归档文件缺少原始 Markdown 行，无法恢复。' };
+  }
+
+  const current = fs.readFileSync(sourcePath, 'utf-8');
+  if (!current.split(/\r?\n/).some((line) => normalizeLine(line) === normalizeLine(originalLine))) {
+    const newline = current.includes('\r\n') ? '\r\n' : '\n';
+    const prefix = current.trim().length > 0 && !current.endsWith('\n') && !current.endsWith('\r\n') ? newline : '';
+    fs.writeFileSync(sourcePath, `${current}${prefix}${originalLine}${newline}`, 'utf-8');
+  }
+  fs.unlinkSync(archivePath);
+
+  const status = rebuildKnowledgeIndex(root);
+  if (status.lastError) {
+    return { ok: false, archivePath, sourcePath, error: status.lastError };
+  }
+  const nextIndex = readKnowledgeIndex(root);
+  if (nextIndex) rebuildReminderIndexFromKnowledge(root, nextIndex);
+  return {
+    ok: true,
+    itemId: metadata.itemId || '',
+    archivePath,
+    sourcePath,
+    restoredLine: originalLine,
+  };
+}
+
 export function getKnowledgeArchiveRoot(memoryRoot: string): string {
   return path.join(path.resolve(memoryRoot), 'archive', 'knowledge-units');
 }
@@ -186,9 +244,15 @@ function parseFrontmatter(content: string): Record<string, string> {
   for (const rawLine of match[1].split(/\r?\n/)) {
     const separator = rawLine.indexOf(':');
     if (separator <= 0) continue;
-    metadata[rawLine.slice(0, separator).trim()] = rawLine.slice(separator + 1).trim().replace(/^['"]|['"]$/g, '');
+    metadata[rawLine.slice(0, separator).trim()] = rawLine.slice(separator + 1).trim().replace(/^[ '"]|[ '"]$/g, '');
   }
   return metadata;
+}
+
+function extractArchivedMarkdownLine(content: string): string {
+  const match = content.match(/```markdown\r?\n([\s\S]*?)\r?\n```/u);
+  if (!match) return '';
+  return match[1].split(/\r?\n/)[0]?.trimEnd() || '';
 }
 
 function escapeFrontmatterValue(value: string): string {

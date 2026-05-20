@@ -35,6 +35,11 @@
     ]
   },
   "packages": {
+    "contracts": {
+      "path": "./packages/contracts",
+      "role": "shared-contracts",
+      "buildScript": "npm run build"
+    },
     "bridge-core": {
       "path": "./packages/bridge-core",
       "role": "core-library",

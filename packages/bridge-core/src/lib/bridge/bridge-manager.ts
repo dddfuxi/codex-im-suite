@@ -261,6 +261,95 @@ function parseChineseReminderAmount(token: string): number | null {
   return null;
 }
 
+function parseChineseClockHour(token: string): number | null {
+  if (/^\d{1,2}$/.test(token)) {
+    const value = Number(token);
+    return value >= 0 && value <= 23 ? value : null;
+  }
+  const value = parseChineseReminderAmount(token);
+  return value !== null && value >= 0 && value <= 23 ? value : null;
+}
+
+type ReminderDayToken = '今天' | '明天' | '后天';
+type ReminderMeridiemToken = '凌晨' | '早上' | '上午' | '中午' | '下午' | '晚上' | '今晚';
+
+interface ReminderClockParts {
+  year?: number;
+  month?: number;
+  day?: number;
+  dayToken?: ReminderDayToken;
+  meridiem?: ReminderMeridiemToken;
+  hour: number;
+  minute: number;
+  start: number;
+  end: number;
+  hasExplicitYear?: boolean;
+}
+
+const CLOCK_HOUR_PATTERN = String.raw`([01]?\d|2[0-3]|[一二两三四五六七八九十]{1,3})`;
+const CLOCK_MINUTE_PATTERN = String.raw`(?:(?::|点|时)\s*([0-5]\d)|([点时])半|点\s*([一二三四五六七八九]刻)|点|时)`;
+const DAY_TOKEN_PATTERN = String.raw`(今天|明天|后天)?`;
+const MERIDIEM_PATTERN = String.raw`(凌晨|早上|上午|中午|下午|晚上|今晚)?`;
+const TIME_PREFIX_BOUNDARY_PATTERN = String.raw`(?:^|[^\d一二两三四五六七八九十])`;
+
+function parseClockMinute(minuteText?: string, halfMarker?: string, quarterText?: string): number | null {
+  if (halfMarker) return 30;
+  if (minuteText) return Number(minuteText);
+  if (quarterText) {
+    const quarter = parseChineseReminderAmount(quarterText.replace(/刻$/u, ''));
+    return quarter !== null && quarter >= 1 && quarter <= 3 ? quarter * 15 : null;
+  }
+  return 0;
+}
+
+function applyReminderMeridiem(hour: number, meridiem?: ReminderMeridiemToken): number | null {
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+  if (!meridiem) return hour;
+  if (meridiem === '下午' || meridiem === '晚上' || meridiem === '今晚') {
+    return hour >= 1 && hour <= 11 ? hour + 12 : hour;
+  }
+  if (meridiem === '中午') {
+    return hour >= 1 && hour <= 10 ? hour + 12 : hour;
+  }
+  return hour;
+}
+
+function buildReminderDueDate(parts: ReminderClockParts, now: Date): Date | null {
+  const hour = applyReminderMeridiem(parts.hour, parts.meridiem);
+  if (hour === null || !Number.isInteger(parts.minute) || parts.minute < 0 || parts.minute > 59) return null;
+  const due = new Date(now.getTime());
+
+  if (parts.month !== undefined && parts.day !== undefined) {
+    due.setFullYear(parts.year ?? now.getFullYear(), parts.month - 1, parts.day);
+    due.setHours(hour, parts.minute, 0, 0);
+    if (!Number.isFinite(due.getTime()) || due.getMonth() !== parts.month - 1 || due.getDate() !== parts.day) {
+      return null;
+    }
+    if (!parts.hasExplicitYear && due.getTime() <= now.getTime()) {
+      due.setFullYear(due.getFullYear() + 1);
+    }
+    return due;
+  }
+
+  due.setHours(hour, parts.minute, 0, 0);
+  if (parts.dayToken === '明天') {
+    due.setDate(due.getDate() + 1);
+  } else if (parts.dayToken === '后天') {
+    due.setDate(due.getDate() + 2);
+  } else if (!parts.dayToken && !parts.meridiem && parts.hour >= 1 && parts.hour <= 11 && due.getTime() <= now.getTime()) {
+    due.setHours(parts.hour + 12, parts.minute, 0, 0);
+    if (due.getTime() <= now.getTime()) {
+      due.setDate(due.getDate() + 1);
+      due.setHours(parts.hour, parts.minute, 0, 0);
+    }
+  } else if (!parts.dayToken && due.getTime() <= now.getTime()) {
+    due.setDate(due.getDate() + 1);
+  } else if (parts.dayToken === '今天' && due.getTime() <= now.getTime()) {
+    return null;
+  }
+  return due;
+}
+
 function extractNaturalReminderTitle(tail: string): string {
   let title = tail.replace(/^[\s,，。；;、:：]+/u, '').trim();
   for (let i = 0; i < 4; i += 1) {
@@ -280,20 +369,26 @@ function buildAbsoluteReminderDueAt(
   normalized: string,
   now: Date,
 ): { dueAt: string; start: number; end: number } | null {
-  const dated = /(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日号]?\s*([01]?\d|2[0-3])\s*(?:(?::|点|时)\s*([0-5]\d)|([点时])半|点|时)(?:\s*分)?/u.exec(normalized);
+  const dated = new RegExp(
+    String.raw`(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})[日号]?\s*${MERIDIEM_PATTERN}\s*${CLOCK_HOUR_PATTERN}\s*${CLOCK_MINUTE_PATTERN}(?:\s*分)?`,
+    'u',
+  ).exec(normalized);
   if (dated && dated.index !== undefined) {
-    const year = dated[1] ? Number(dated[1]) : now.getFullYear();
-    const month = Number(dated[2]);
-    const day = Number(dated[3]);
-    const hour = Number(dated[4]);
-    const minute = dated[6] ? 30 : dated[5] ? Number(dated[5]) : 0;
-    const due = new Date(now.getTime());
-    due.setFullYear(year, month - 1, day);
-    due.setHours(hour, minute, 0, 0);
-    if (!Number.isFinite(due.getTime()) || due.getMonth() !== month - 1 || due.getDate() !== day) return null;
-    if (!dated[1] && due.getTime() <= now.getTime()) {
-      due.setFullYear(due.getFullYear() + 1);
-    }
+    const hour = parseChineseClockHour(dated[5]);
+    const minute = parseClockMinute(dated[6], dated[7], dated[8]);
+    if (hour === null || minute === null) return null;
+    const due = buildReminderDueDate({
+      year: dated[1] ? Number(dated[1]) : undefined,
+      month: Number(dated[2]),
+      day: Number(dated[3]),
+      meridiem: dated[4] as ReminderMeridiemToken | undefined,
+      hour,
+      minute,
+      start: dated.index,
+      end: dated.index + dated[0].length,
+      hasExplicitYear: Boolean(dated[1]),
+    }, now);
+    if (!due) return null;
     return {
       dueAt: due.toISOString(),
       start: dated.index,
@@ -301,32 +396,30 @@ function buildAbsoluteReminderDueAt(
     };
   }
 
-  const absolute = /(?:^|[^\d])(?:(今天|明天|后天)\s*)?([01]?\d|2[0-3])\s*(?:(?::|点|时)\s*([0-5]\d)|([点时])半|点|时)(?:\s*分)?/u.exec(normalized);
+  const absolute = new RegExp(
+    String.raw`${TIME_PREFIX_BOUNDARY_PATTERN}\s*${DAY_TOKEN_PATTERN}\s*${MERIDIEM_PATTERN}\s*${CLOCK_HOUR_PATTERN}\s*${CLOCK_MINUTE_PATTERN}(?:\s*分)?`,
+    'u',
+  ).exec(normalized);
   if (!absolute || absolute.index === undefined) return null;
-  const leading = absolute[0].match(/^[^\d今明后]?/u)?.[0] || '';
+  const leading = absolute[0].match(/^[^\d一二两三四五六七八九十今明后]?/u)?.[0] || '';
   const dayToken = absolute[1] || '';
-  const start = absolute.index + leading.length;
-  const hour = Number(absolute[2]);
-  const minute = absolute[4] ? 30 : absolute[3] ? Number(absolute[3]) : 0;
-  if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
-    return null;
-  }
-
-  const due = new Date(now.getTime());
-  due.setHours(hour, minute, 0, 0);
-  if (dayToken === '明天') {
-    due.setDate(due.getDate() + 1);
-  } else if (dayToken === '后天') {
-    due.setDate(due.getDate() + 2);
-  } else if (!dayToken && due.getTime() <= now.getTime()) {
-    due.setDate(due.getDate() + 1);
-  } else if (dayToken === '今天' && due.getTime() <= now.getTime()) {
-    return null;
-  }
+  const meridiem = absolute[2] as ReminderMeridiemToken | undefined;
+  const hour = parseChineseClockHour(absolute[3]);
+  const minute = parseClockMinute(absolute[4], absolute[5], absolute[6]);
+  if (hour === null || minute === null) return null;
+  const due = buildReminderDueDate({
+    dayToken: dayToken as ReminderDayToken | undefined,
+    meridiem,
+    hour,
+    minute,
+    start: absolute.index + leading.length,
+    end: absolute.index + absolute[0].length,
+  }, now);
+  if (!due) return null;
 
   return {
     dueAt: due.toISOString(),
-    start,
+    start: absolute.index + leading.length,
     end: absolute.index + absolute[0].length,
   };
 }
@@ -1020,6 +1113,8 @@ interface PreparedBridgeReplyPayload {
   replyTo?: string;
 }
 
+type ExecutionEvidence = NonNullable<engine.ConversationResult['executionEvidence']>;
+
 interface PendingSystemAction {
   type: 'shutdown';
   chatId: string;
@@ -1163,6 +1258,80 @@ function resolveExplicitPaths(
     }
   }
   return Array.from(resolved);
+}
+
+const CONCRETE_EXECUTION_REQUEST_RE = /(ignis|unity|blender|mcp|截图|图片|图像|关机|关闭电脑|shutdown|文件|文档|txt|\.txt|\.md|\.json|(?:生成|创建|新建|写入|保存|删除|移动|复制|上传|下载|导入|导出|安装|启动|停止|重启|运行|执行).{0,32}(文件|文档|图片|图像|截图|txt|项目|服务|bridge|mcp|命令|脚本|本机|电脑|工作区))/i;
+const POSITIVE_EXECUTION_CLAIM_RE = /(已|已经|成功|完成|生成|创建|新建|写入|保存|上传|下载|导入|导出|安装|启动|停止|重启|执行|正在执行|已提交).{0,48}(文件|文档|图片|图像|截图|命令|脚本|操作|任务|请求|shutdown|关机|本地|工作区|路径|生成|创建|写入|保存|执行|完成|成功)/i;
+const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拦截)/i;
+
+function requiresExecutionEvidenceForReply(userText: string, answerText: string): boolean {
+  const combined = `${userText}\n${answerText}`;
+  if (isMemoryRecallRequestText(userText)) return false;
+  if (!CONCRETE_EXECUTION_REQUEST_RE.test(userText) && !isToolExecutionRequestText(userText)) return false;
+  if (NEGATIVE_EXECUTION_RESULT_RE.test(answerText)) return false;
+  return POSITIVE_EXECUTION_CLAIM_RE.test(combined);
+}
+
+function existingLocalFile(filePath: string): boolean {
+  try {
+    return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function formatPathList(paths: string[], limit = 4): string {
+  const listed = paths.slice(0, limit).map((item) => `- ${item}`);
+  if (paths.length > limit) listed.push(`- 另外 ${paths.length - limit} 个路径`);
+  return listed.join('\n');
+}
+
+function buildNoExecutionEvidenceReply(reason: string, evidence: ExecutionEvidence): string {
+  const details = [
+    `未完成：${reason}`,
+    '我已拦截这条可能的假完成回复，没有把它当成真实结果发送。',
+    `本轮工具证据：tool_use=${evidence.toolUseCount}，tool_result=${evidence.toolResultCount}，成功结果=${evidence.successfulToolResultCount}。`,
+  ];
+  if (evidence.toolNames.length > 0) {
+    details.push(`工具：${evidence.toolNames.slice(0, 6).join('、')}`);
+  }
+  return appendReplyEndMarker(details.join('\n'));
+}
+
+function verifyPreparedReplyExecution(
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    userText: string;
+    executionEvidence: ExecutionEvidence;
+  },
+): PreparedBridgeReplyPayload {
+  const missingImages = payload.images.filter((item) => !existingLocalFile(item));
+  const missingFiles = payload.files.filter((item) => !existingLocalFile(item));
+  if (missingImages.length > 0 || missingFiles.length > 0) {
+    const missing = [...missingImages, ...missingFiles];
+    return {
+      ...payload,
+      text: buildNoExecutionEvidenceReply(`模型声称有本地产物，但这些路径不存在：\n${formatPathList(missing)}`, context.executionEvidence),
+      parseMode: 'plain',
+      images: payload.images.filter((item) => !missingImages.includes(item)),
+      files: payload.files.filter((item) => !missingFiles.includes(item)),
+    };
+  }
+
+  if (
+    requiresExecutionEvidenceForReply(context.userText, payload.text)
+    && context.executionEvidence.successfulToolResultCount <= 0
+  ) {
+    return {
+      ...payload,
+      text: buildNoExecutionEvidenceReply('模型声称已经执行或创建了结果，但本轮没有检测到真实工具执行成功记录。', context.executionEvidence),
+      parseMode: 'plain',
+      images: [],
+      files: [],
+    };
+  }
+
+  return payload;
 }
 
 async function prepareBridgeReplyPayload(
@@ -2815,22 +2984,65 @@ export async function deliverProactiveMessage(input: {
   dedupKey?: string;
   sessionId?: string;
   feishuCardJson?: string;
+  prepareFinalReply?: boolean;
+  workingDirectory?: string;
+  additionalDirectories?: string[];
+  sourcePrompt?: string;
 }): Promise<import('./types.js').SendResult> {
   const state = getState();
   const adapter = state.adapters.get(input.address.channelType);
   if (!adapter || !adapter.isRunning()) {
     return { ok: false, error: `adapter unavailable: ${input.address.channelType}` };
   }
-  return deliver(adapter, {
+
+  const prepared = input.prepareFinalReply
+    ? await prepareBridgeReplyPayload(
+      input.text,
+      input.workingDirectory || '',
+      input.additionalDirectories || [],
+      input.sourcePrompt || '',
+    )
+    : null;
+  const outboundText = prepared?.text || input.text;
+  const outboundParseMode = prepared?.parseMode || input.parseMode || 'plain';
+  const localImagePaths = input.prepareFinalReply
+    ? Array.from(new Set([
+      ...(prepared?.images || []),
+      ...extractLocalImagePaths(input.text, input.workingDirectory || '', input.additionalDirectories || []),
+    ]))
+    : [];
+  const localFilePaths = input.prepareFinalReply
+    ? Array.from(new Set(prepared?.files || []))
+    : [];
+
+  const sent = await deliver(adapter, {
     address: input.address,
-    text: input.text,
-    parseMode: input.parseMode || 'plain',
-    replyToMessageId: input.replyToMessageId,
+    text: outboundText,
+    parseMode: outboundParseMode,
+    replyToMessageId: prepared?.replyTo || input.replyToMessageId,
+    mentions: prepared?.mentions,
     feishuCardJson: input.feishuCardJson,
   }, {
     dedupKey: input.dedupKey,
     sessionId: input.sessionId,
   });
+  if (!sent.ok) return sent;
+
+  for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
+    const imageSend = await adapter.sendLocalImage(input.address.chatId, imagePath, prepared?.replyTo || input.replyToMessageId);
+    if (!imageSend.ok) {
+      console.warn(`[bridge-manager] Failed to send proactive local image: ${imagePath}`, imageSend.error);
+      return imageSend;
+    }
+  }
+  for (const filePath of localFilePaths) {
+    const fileSend = await adapter.sendLocalFile(input.address.chatId, filePath, prepared?.replyTo || input.replyToMessageId);
+    if (!fileSend.ok) {
+      console.warn(`[bridge-manager] Failed to send proactive local file: ${filePath}`, fileSend.error);
+      return fileSend;
+    }
+  }
+  return sent;
 }
 
 export async function resumeFeishuOAuthRequest(resume: FeishuOAuthManualResumeRequest): Promise<void> {
@@ -3853,9 +4065,15 @@ async function handleMessage(
     const responseText = result.responseText
       ? await executeReminderActionFromReply(result.responseText, msg, effectiveBinding.codepilotSessionId, rawText)
       : '';
-    const preparedReply = responseText
+    let preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
+    if (preparedReply && !feishuDocRequest) {
+      preparedReply = verifyPreparedReplyExecution(preparedReply, {
+        userText: rawText,
+        executionEvidence: result.executionEvidence,
+      });
+    }
     const userFacingResponseText = preparedReply?.text
       ? applyOutboundAnswerReview({
         channelType: adapter.channelType,
@@ -3868,6 +4086,7 @@ async function handleMessage(
         userText: rawText,
         answerText: preparedReply.text,
         source: 'codex',
+        executionEvidence: result.executionEvidence,
       })
       : '';
     if (userFacingResponseText) {

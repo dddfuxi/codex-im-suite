@@ -75,7 +75,7 @@ const LOCAL_FRIENDLY_PATTERNS: PatternRule[] = [
   { pattern: /(解释这段代码|解释这个函数|这段函数在做什么|代码片段解释|轻量重写)/i, reason: '代码解释请求', taskKind: 'code_explain' },
   { pattern: /(写一个.*脚本|生成.*脚本|小脚本|模板脚本|单文件脚本)/i, reason: '脚本草案请求', taskKind: 'script_draft' },
   { pattern: /(给我一条.*命令|只返回命令|怎么查|如何查看|ahead|behind|落后几条|领先几条|没拉几条)/i, reason: '只读命令草案请求', taskKind: 'command_draft' },
-  { pattern: /(执行命令|运行命令|帮我执行|请执行|帮我拉取一下\s*git|帮我\s*pull|git pull|git status|git fetch|git branch|git log|查看.*git.*状态|看(?:下|看).*git.*状态|查一下.*git.*状态|当前分支|分支是什么|当前.*git.*分支|最近.*提交|提交记录|最近几条提交)/i, reason: '仓库或命令查询默认优先交给 Codex 判断', taskKind: 'repo_query', preferLocal: false, allowFallback: true },
+  { pattern: /(执行命令|运行命令|帮我执行|请执行|帮我拉取一下\s*git|帮我\s*pull|git pull|git status|git fetch|git branch|git log|git.*暂存区|暂存区.*(有啥|有什么|状态|内容)|staged|cached|查看.*git.*状态|看(?:下|看).*git.*状态|查一下.*git.*状态|当前分支|分支是什么|当前.*git.*分支|最近.*提交|提交记录|最近几条提交)/i, reason: '仓库或命令查询默认优先交给 Codex 判断', taskKind: 'repo_query', preferLocal: false, allowFallback: true },
   { pattern: /(读取文件|查看文件|打开文件|搜索文本|查找字符串)/i, reason: '文件检索请求默认优先交给 Codex 判断', taskKind: 'tool_request', preferLocal: false, allowFallback: true },
   { pattern: /(帮我总结|概括一下|提炼一下|简要说明)/i, reason: '总结类请求', taskKind: 'summarize' },
 ];

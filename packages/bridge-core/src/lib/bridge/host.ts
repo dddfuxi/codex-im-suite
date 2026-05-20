@@ -164,6 +164,14 @@ export interface AnswerReviewInput {
   memoryPlan?: MemoryQueryPlan;
   memoryHits?: RetrievedMemoryHit[];
   source?: 'direct_memory' | 'codex' | 'local' | 'system';
+  executionEvidence?: {
+    toolUseCount: number;
+    toolResultCount: number;
+    successfulToolResultCount: number;
+    failedToolResultCount: number;
+    toolNames: string[];
+    permissionRequestCount: number;
+  };
 }
 
 export interface AnswerReviewDecision {

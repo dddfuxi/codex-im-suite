@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-05-09 19:07:23",
-    "releaseRunId":  "0f5ac15521f74b0290074cf334367391",
+    "generatedAt":  "2026-05-20 17:13:54",
+    "releaseRunId":  "f3c6ac11e7c94642b032ae5ac9bcab55",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,34 +9,34 @@
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/dev",
-                  "commit":  "a439ff3",
+                  "commit":  "684ecf3",
                   "dirty":  true
               },
     "manifest":  {
                      "Count":  15,
-                     "Hash":  "98A5797D177B"
+                     "Hash":  "CE5AA7699CB8"
                  },
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "C02038756FDF",
-                  "Length":  1713635,
-                  "Modified":  "2026-05-09 19:06:44"
+                  "Hash":  "4566C4248AAC",
+                  "Length":  1799651,
+                  "Modified":  "2026-05-20 17:13:37"
               },
     "content":  {
-                    "runtime.package":  "2E1866861405",
-                    "runtime.dist":  "4BEA515AE8F9",
-                    "runtime.scripts":  "DE46071AA714",
-                    "runtime.configExample":  "F8E3AA362076",
+                    "runtime.package":  "43E79CE167A5",
+                    "runtime.dist":  "FAD8D16CF40D",
+                    "runtime.scripts":  "163121198BC0",
+                    "runtime.configExample":  "FA26F9DC9F90",
                     "runtime.skill":  "867CAED0153F",
                     "core.package":  "1745A29789EC",
-                    "core.dist":  "028935D7630B",
-                    "suite.manifest":  "130C14A98B41",
-                    "config.manifests":  "98A5797D177B",
+                    "core.dist":  "144325EAC3EE",
+                    "suite.manifest":  "0BA171EEACA3",
+                    "config.manifests":  "CE5AA7699CB8",
                     "extensions.skills":  "3D657A104715",
-                    "release.scripts":  "3265937B993F",
-                    "docs":  "42BAADC685C8",
-                    "panel.exe":  "C02038756FDF",
-                    "panel.wwwroot":  "39B0CAD3F5C8"
+                    "release.scripts":  "61D15F132D14",
+                    "docs":  "59FDFF7464BB",
+                    "panel.exe":  "4566C4248AAC",
+                    "panel.wwwroot":  "B693E42E5EA6"
                 }
 }

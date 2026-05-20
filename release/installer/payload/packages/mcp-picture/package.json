@@ -13,7 +13,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
     "@modelcontextprotocol/sdk": "^1.17.4",
-    "@openai/codex-sdk": "^0.110.0",
+    "@openai/codex-sdk": "^0.132.0",
     "express": "^4.21.0",
     "openai": "^5.12.2",
     "sharp": "^0.34.4"

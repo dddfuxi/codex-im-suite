@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
@@ -40,7 +41,7 @@ internal static class Program
     }
 }
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private const string WebHostName = "control-panel.local";
     private const string MediaHostName = "control-panel-media.local";
@@ -79,6 +80,7 @@ internal sealed class MainForm : Form
     private readonly string _statusJsonPath;
     private readonly string _mcpServiceStatePath;
     private readonly string _localLlmStatusPath;
+    private readonly string _localModelCapabilityPath;
     private readonly string _executorStatusPath;
     private readonly string _executorSessionDefaultsPath;
     private readonly string _workflowStatusPath;
@@ -181,6 +183,7 @@ internal sealed class MainForm : Form
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
         _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
         _localLlmStatusPath = Path.Combine(_ctiHome, "runtime", "local-llm-status.json");
+        _localModelCapabilityPath = Path.Combine(_ctiHome, "runtime", "local-model-capabilities.json");
         _executorStatusPath = Path.Combine(_ctiHome, "runtime", "executor-status.json");
         _executorSessionDefaultsPath = Path.Combine(_ctiHome, "runtime", "executor-session-defaults.json");
         _workflowStatusPath = Path.Combine(_ctiHome, "runtime", "workflow-runs.json");
@@ -748,6 +751,19 @@ internal sealed class MainForm : Form
             case "state.refresh":
                 await RefreshAllAsync();
                 return await BuildWebStateAsync();
+            case "nodes.list":
+                {
+                    var suite = ReadSuiteVersionInfo();
+                    var services = new[]
+                    {
+                        BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
+                        BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
+                        BuildServiceItem("localLlm", "本地 Agent API", _localLlmStatus.Text),
+                        BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
+                        BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
+                    };
+                    return BuildNodeSnapshot(suite.Version, services, BuildMcpItems(), ReadExtensionStatus());
+                }
             case "panel.restart":
                 return await RestartControlPanelAsync();
             case "live.sync":
@@ -782,6 +798,8 @@ internal sealed class MainForm : Form
             case "localLlm.check":
                 await CheckLocalLlmAsync();
                 return _localLlmStatus.Text;
+            case "localLlm.probeTools":
+                return await ProbeLocalLlmToolCallingAsync(payload);
             case "ollama.start":
                 await StartLocalLlmAsync();
                 return _localLlmStatus.Text;
@@ -860,6 +878,20 @@ internal sealed class MainForm : Form
                 return BuildKnowledgeArchiveSnapshot();
             case "memory.deleteArchive":
                 return DeleteKnowledgeArchive(payload);
+            case "memory.restoreArchive":
+                return await RunMemoryOptimizerCliAsync("restore-archive", payload);
+            case "memory.optimizeStatus":
+                return BuildMemoryOptimizationStatusSnapshot();
+            case "memory.optimizePreview":
+                return await RunMemoryOptimizerCliAsync("preview", payload);
+            case "memory.optimizeApply":
+                return await RunMemoryOptimizerCliAsync("apply", payload);
+            case "memory.optimizeUndo":
+                return await RunMemoryOptimizerCliAsync("undo", payload);
+            case "memory.optimizeDiscard":
+                return await RunMemoryOptimizerCliAsync("discard", payload);
+            case "memory.optimizeSchedule":
+                return await RunMemoryOptimizerCliAsync("schedule", payload);
             case "memory.reminders":
             case "memory.checkReminders":
                 return BuildTodoReminderSnapshot();
@@ -911,6 +943,8 @@ internal sealed class MainForm : Form
                 return await SummarizeReplyStyleAsync(ReadPayloadString(payload, "text", ""));
             case "settings.testLocalAi":
                 return await TestLocalAiSettingsAsync(payload);
+            case "settings.testLocalTools":
+                return await ProbeLocalLlmToolCallingAsync(payload);
             case "settings.testCodexApi":
                 return TestCodexApiSettings(payload);
             case "runtime.listUnits":
@@ -1005,6 +1039,14 @@ internal sealed class MainForm : Form
         var extensions = ReadExtensionStatus();
         var mcpItems = BuildMcpItems();
         var sessionItems = await BuildSessionItemsAsync();
+        var services = new[]
+        {
+            BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
+            BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
+            BuildServiceItem("localLlm", "本地 Agent API", _localLlmStatus.Text),
+            BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
+            BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
+        };
         return new
         {
             generatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
@@ -1018,14 +1060,8 @@ internal sealed class MainForm : Form
                 suiteRoot = _suiteRoot,
                 skillDir = _skillDir,
             },
-            services = new[]
-            {
-                BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
-                BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
-                BuildServiceItem("localLlm", "本地 Agent API", _localLlmStatus.Text),
-                BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
-                BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
-            },
+            services,
+            nodes = BuildNodeSnapshot(suite.Version, services, mcpItems, extensions),
             extensions = new
             {
                 total = extensions.Total,
@@ -1480,12 +1516,20 @@ internal sealed class MainForm : Form
             ReadPayloadString(payload, "localAiApiKeyMasked", current.LocalAiApiKeyMasked),
             ReadPayloadBool(payload, "localAiApiKeySet", current.LocalAiApiKeySet),
             ReadPayloadString(payload, "localAiTimeoutMs", current.LocalAiTimeoutMs),
+            NormalizeCodexModelSource(ReadPayloadString(payload, "codexModelSource", current.CodexModelSource)),
             ReadPayloadString(payload, "codexBaseUrl", current.CodexBaseUrl),
             ReadPayloadString(payload, "codexModel", current.CodexModel),
             ReadPayloadBool(payload, "codexPassModel", current.CodexPassModel),
             NormalizeCodexReasoningEffort(ReadPayloadString(payload, "codexReasoningEffort", current.CodexReasoningEffort)),
             ReadPayloadBool(payload, "codexLocalFallbackEnabled", current.CodexLocalFallbackEnabled),
             NormalizeCodexReasoningEffort(ReadPayloadString(payload, "codexLocalFallbackReasoningEffort", current.CodexLocalFallbackReasoningEffort)),
+            NormalizeCodexFailureFallbackMode(ReadPayloadString(payload, "codexFailureFallbackMode", current.CodexFailureFallbackMode)),
+            NormalizeLocalAgentMode(ReadPayloadString(payload, "localAgentMode", current.LocalAgentMode)),
+            ReadPayloadBool(payload, "localToolCallRequired", current.LocalToolCallRequired),
+            NormalizeExecutionRequiredRoute(ReadPayloadString(payload, "executionRequiredRoute", current.ExecutionRequiredRoute)),
+            ReadPayloadBool(payload, "memoryOptimizerEnabled", current.MemoryOptimizerEnabled),
+            NormalizePositiveNumber(ReadPayloadString(payload, "memoryOptimizerIntervalDays", current.MemoryOptimizerIntervalDays), "7"),
+            NormalizeMemoryOptimizerModelSource(ReadPayloadString(payload, "memoryOptimizerModelSource", current.MemoryOptimizerModelSource)),
             ReadPayloadString(payload, "codexApiKeyAction", current.CodexApiKeyAction),
             ReadPayloadString(payload, "codexApiKeyValue", ""),
             ReadPayloadString(payload, "codexApiKeyMasked", current.CodexApiKeyMasked),
@@ -2198,8 +2242,78 @@ internal sealed class MainForm : Form
     private string GetTodoReminderStatePath()
         => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "reminder-state.json");
 
+    private string GetMemoryOptimizerStatePath()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "memory-optimizer-state.json");
+
+    private string GetMemoryOptimizationDraftsDir()
+        => Path.Combine(_memoryRepo.Text.Trim(), ".cti-index", "memory-optimization-drafts");
+
     private string GetKnowledgeArchiveRoot()
         => Path.Combine(_memoryRepo.Text.Trim(), "archive", "knowledge-units");
+
+    private sealed class SourceCoverageAccumulator
+    {
+        public string SourcePath { get; init; } = "";
+        public string SourceGroup { get; init; } = "other";
+        public int ItemCount { get; set; }
+        public string UpdatedAt { get; set; } = "";
+        public bool AutoSelectable { get; init; }
+        public string DefaultRisk { get; init; } = "medium";
+
+        public object ToSnapshot() => new
+        {
+            sourcePath = SourcePath,
+            sourceGroup = SourceGroup,
+            itemCount = ItemCount,
+            updatedAt = UpdatedAt,
+            autoSelectable = AutoSelectable,
+            defaultRisk = DefaultRisk,
+        };
+    }
+
+    private void AddSourceCoverage(Dictionary<string, SourceCoverageAccumulator> coverage, string sourcePath, string updatedAt)
+    {
+        var sourceGroup = ClassifyMemorySourceGroup(sourcePath);
+        if (!coverage.TryGetValue(sourcePath, out var current))
+        {
+            current = new SourceCoverageAccumulator
+            {
+                SourcePath = sourcePath,
+                SourceGroup = sourceGroup,
+                AutoSelectable = IsAutoSelectableSourceGroup(sourceGroup),
+                DefaultRisk = IsAutoSelectableSourceGroup(sourceGroup) ? "low" : "medium",
+            };
+            coverage[sourcePath] = current;
+        }
+        current.ItemCount += 1;
+        if (string.Compare(updatedAt, current.UpdatedAt, StringComparison.Ordinal) > 0)
+        {
+            current.UpdatedAt = updatedAt;
+        }
+    }
+
+    private string ClassifyMemorySourceGroup(string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath)) return "other";
+        var root = Path.GetFullPath(_memoryRepo.Text.Trim());
+        var fullPath = string.IsNullOrWhiteSpace(sourcePath) ? sourcePath : Path.GetFullPath(sourcePath);
+        var relative = IsPathInside(root, fullPath)
+            ? Path.GetRelativePath(root, fullPath)
+            : fullPath;
+        var normalized = relative.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+        if (normalized.EndsWith("data/explicit-memories/memory-summary.md", StringComparison.OrdinalIgnoreCase)) return "generated_summary";
+        if (normalized.Contains("data/explicit-memories/", StringComparison.OrdinalIgnoreCase)) return "explicit_memory";
+        if (normalized.Contains("data/todos/direct-reminders/", StringComparison.OrdinalIgnoreCase)) return "direct_reminder";
+        if (normalized.Contains("data/documents/document_guide.md", StringComparison.OrdinalIgnoreCase)) return "document_index";
+        if (normalized.StartsWith("docs/", StringComparison.OrdinalIgnoreCase) || normalized.Contains("/docs/", StringComparison.OrdinalIgnoreCase)) return "context_doc";
+        if (!normalized.Contains('/') && normalized.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) return "root_note";
+        return "other";
+    }
+
+    private static bool IsAutoSelectableSourceGroup(string sourceGroup)
+        => string.Equals(sourceGroup, "explicit_memory", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sourceGroup, "direct_reminder", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sourceGroup, "generated_summary", StringComparison.OrdinalIgnoreCase);
 
     private static bool ShouldSkipKnowledgeDirectory(string path)
     {
@@ -2250,6 +2364,7 @@ internal sealed class MainForm : Form
         var memoryGraphEdgeCount = 0;
         object memoryGraphPreview = new { nodes = Array.Empty<object>(), edges = Array.Empty<object>() };
         var kindCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var sourceCoverage = new Dictionary<string, SourceCoverageAccumulator>(StringComparer.OrdinalIgnoreCase);
         var recentReviewWarnings = ReadRecentAnswerReviewWarnings(6);
         var generatedAt = "";
         var lastIndexedAt = "";
@@ -2291,7 +2406,11 @@ internal sealed class MainForm : Form
                         if (item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object)
                         {
                             var sourcePath = ReadJsonString(sourceElement, "path");
-                            if (!string.IsNullOrWhiteSpace(sourcePath)) sourcePaths.Add(sourcePath);
+                            if (!string.IsNullOrWhiteSpace(sourcePath))
+                            {
+                                sourcePaths.Add(sourcePath);
+                                AddSourceCoverage(sourceCoverage, sourcePath, ReadJsonString(sourceElement, "updatedAt"));
+                            }
                         }
                     }
                     sourceFileCount = sourcePaths.Count;
@@ -2366,6 +2485,12 @@ internal sealed class MainForm : Form
             memoryGraphEdgeCount,
             memoryGraphPreview,
             sourceFileCount,
+            sourceCoverage = sourceCoverage.Values
+                .OrderByDescending(item => item.ItemCount)
+                .ThenBy(item => item.SourcePath, StringComparer.OrdinalIgnoreCase)
+                .Select(item => item.ToSnapshot())
+                .ToArray(),
+            skippedDirectories = new[] { ".git", ".cti-index", "archive", "node_modules", ".obsidian" },
             kindCounts,
             recentReviewWarnings,
             generatedAt,
@@ -2375,6 +2500,55 @@ internal sealed class MainForm : Form
             watcherPid,
             statusUpdatedAt,
             lastError,
+            optimization = BuildMemoryOptimizationStatusSnapshot(),
+        };
+    }
+
+    private object BuildMemoryOptimizationStatusSnapshot()
+    {
+        var root = _memoryRepo.Text.Trim();
+        var statePath = GetMemoryOptimizerStatePath();
+        var draftsDir = GetMemoryOptimizationDraftsDir();
+        var state = ReadJsonObjectFile(statePath);
+        var drafts = new List<JsonObject>();
+        if (Directory.Exists(draftsDir))
+        {
+            foreach (var file in Directory.EnumerateFiles(draftsDir, "*.json"))
+            {
+                try
+                {
+                    if (JsonNode.Parse(File.ReadAllText(file, Encoding.UTF8)) is JsonObject draft
+                        && string.Equals(ReadJsonString(draft, "schema", ""), "codex-im-suite/memory-optimization-draft/v1", StringComparison.OrdinalIgnoreCase))
+                    {
+                        drafts.Add(draft);
+                    }
+                }
+                catch
+                {
+                    // Ignore unreadable draft files; the optimizer CLI will surface hard errors when invoked.
+                }
+            }
+        }
+        drafts.Sort((left, right) => string.Compare(ReadJsonString(right, "generatedAt", ""), ReadJsonString(left, "generatedAt", ""), StringComparison.Ordinal));
+        var recentDrafts = drafts.Take(20).ToArray();
+        var enabled = state is not null && ReadJsonBool(state, "enabled");
+        var intervalDays = ReadJsonInt(state, "intervalDays", 7);
+        if (intervalDays <= 0) intervalDays = 7;
+        var modelSource = ReadJsonString(state, "modelSource", "codex_primary");
+        return new
+        {
+            schema = "codex-im-suite/memory-optimization-status/v1",
+            memoryRoot = root,
+            statePath,
+            draftsDir,
+            enabled,
+            intervalDays,
+            modelSource,
+            lastGeneratedAt = ReadJsonString(state, "lastGeneratedAt", ""),
+            nextRunAt = ReadJsonString(state, "nextRunAt", ""),
+            draftCount = drafts.Count(draft => string.Equals(ReadJsonString(draft, "status", ""), "draft", StringComparison.OrdinalIgnoreCase)),
+            recentError = ReadJsonString(state, "recentError", ""),
+            drafts = recentDrafts,
         };
     }
 
@@ -2472,7 +2646,9 @@ internal sealed class MainForm : Form
     private object SearchKnowledgeIndex(JsonElement payload)
     {
         var query = ReadPayloadString(payload, "query", "").Trim();
-        var limit = Math.Clamp(ReadPayloadInt(payload, "limit", 20), 1, 80);
+        var limit = Math.Clamp(ReadPayloadInt(payload, "limit", 20), 1, 200);
+        var offset = Math.Max(0, ReadPayloadInt(payload, "offset", 0));
+        var sourceGroupFilter = ReadPayloadString(payload, "sourceGroup", "").Trim();
         var kindFilter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (payload.ValueKind == JsonValueKind.Object
             && payload.TryGetProperty("kinds", out var kindsElement)
@@ -2488,15 +2664,15 @@ internal sealed class MainForm : Form
         var indexPath = GetKnowledgeIndexPath();
         if (!File.Exists(indexPath))
         {
-            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>() };
+            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>(), totalMatched = 0, offset, limit };
         }
 
-        var results = new List<object>();
+        var matches = new List<object>();
         var graphRelated = BuildMemoryGraphRelatedLookup();
         using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
         if (!document.RootElement.TryGetProperty("items", out var itemsElement) || itemsElement.ValueKind != JsonValueKind.Array)
         {
-            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>() };
+            return new { status = BuildKnowledgeIndexStatus(), items = Array.Empty<object>(), totalMatched = 0, offset, limit };
         }
 
         var normalizedQuery = query.ToLowerInvariant();
@@ -2514,6 +2690,13 @@ internal sealed class MainForm : Form
             var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
             var sourceUpdatedAt = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "updatedAt") : "";
             var snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "";
+            var sourceGroup = ClassifyMemorySourceGroup(sourcePath);
+            if (!string.IsNullOrWhiteSpace(sourceGroupFilter)
+                && !string.Equals(sourceGroupFilter, "all", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(sourceGroup, sourceGroupFilter, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
             var haystack = $"{kind} {key} {value} {text} {sourcePath} {snippet}".ToLowerInvariant();
             if (!string.IsNullOrWhiteSpace(normalizedQuery) && !haystack.Contains(normalizedQuery))
             {
@@ -2522,13 +2705,14 @@ internal sealed class MainForm : Form
                 if (!matched) continue;
             }
 
-            results.Add(new
+            matches.Add(new
             {
                 id = ReadJsonString(item, "id"),
                 kind,
                 key,
                 value,
                 text,
+                sourceGroup,
                 confidence = ReadJsonDouble(item, "confidence"),
                 conflict = ReadJsonBool(item, "conflict"),
                 classificationReason = ReadJsonString(item, "classificationReason"),
@@ -2538,10 +2722,16 @@ internal sealed class MainForm : Form
                 snippet,
                 related = LookupMemoryGraphRelated(graphRelated, key, value, text),
             });
-            if (results.Count >= limit) break;
         }
 
-        return new { status = BuildKnowledgeIndexStatus(), items = results.ToArray() };
+        return new
+        {
+            status = BuildKnowledgeIndexStatus(),
+            items = matches.Skip(offset).Take(limit).ToArray(),
+            totalMatched = matches.Count,
+            offset,
+            limit,
+        };
     }
 
     private Dictionary<string, List<object>> BuildMemoryGraphRelatedLookup()
@@ -3014,6 +3204,108 @@ internal sealed class MainForm : Form
         var normalizedCandidate = Path.GetFullPath(candidate);
         return normalizedCandidate.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
     }
+
+    private async Task<object> RunMemoryOptimizerCliAsync(string command, JsonElement payload)
+    {
+        var root = _memoryRepo.Text.Trim();
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            throw new InvalidOperationException("记忆仓库路径为空。");
+        }
+        var runtimeRoot = Path.Combine(_suiteRoot, "packages", "bridge-runtime");
+        var distCli = Path.Combine(runtimeRoot, "dist", "memory-optimizer-cli.mjs");
+        var srcCli = Path.Combine(runtimeRoot, "src", "memory-optimizer-cli.ts");
+        var useDist = File.Exists(distCli);
+        var cliPath = useDist ? distCli : srcCli;
+        if (!File.Exists(cliPath))
+        {
+            throw new InvalidOperationException("未找到记忆整理 CLI。请先运行 bridge-runtime 构建。");
+        }
+
+        var args = new List<string>();
+        if (!useDist)
+        {
+            args.Add("--import");
+            args.Add("tsx");
+        }
+        args.Add(cliPath);
+        args.Add(command);
+        args.Add("--memory-root");
+        args.Add(root);
+
+        if (string.Equals(command, "preview", StringComparison.OrdinalIgnoreCase))
+        {
+            args.Add("--model-source");
+            args.Add(ReadPayloadString(payload, "modelSource", GetConfig("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", "codex_primary")));
+            args.Add("--generated-by");
+            args.Add("manual");
+        }
+        else if (string.Equals(command, "apply", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "undo", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "discard", StringComparison.OrdinalIgnoreCase))
+        {
+            var draftId = ReadPayloadString(payload, "draftId", "");
+            if (string.IsNullOrWhiteSpace(draftId)) throw new InvalidOperationException("缺少草稿 ID。");
+            args.Add("--draft-id");
+            args.Add(draftId);
+            if (string.Equals(command, "apply", StringComparison.OrdinalIgnoreCase))
+            {
+                args.Add("--select");
+                args.Add(ReadSelectedActionIds(payload));
+            }
+        }
+        else if (string.Equals(command, "restore-archive", StringComparison.OrdinalIgnoreCase))
+        {
+            var archivePath = ReadPayloadString(payload, "archivePath", ReadPayloadString(payload, "path", ""));
+            if (string.IsNullOrWhiteSpace(archivePath)) throw new InvalidOperationException("缺少归档文件路径。");
+            args.Add("--archive-path");
+            args.Add(archivePath);
+        }
+        else if (string.Equals(command, "schedule", StringComparison.OrdinalIgnoreCase))
+        {
+            args.Add("--enabled");
+            args.Add(ReadPayloadBool(payload, "enabled", false) ? "true" : "false");
+            args.Add("--interval-days");
+            args.Add(ReadPayloadInt(payload, "intervalDays", 7).ToString(CultureInfo.InvariantCulture));
+            args.Add("--model-source");
+            args.Add(ReadPayloadString(payload, "modelSource", "codex_primary"));
+        }
+
+        var result = await RunProcessAsync("node", string.Join(" ", args.Select(QuoteProcessArgument)), runtimeRoot, timeoutMs: 120000);
+        if (result.ExitCode != 0)
+        {
+            var detail = string.Join("\n", new[] { result.Stdout, result.Stderr }.Where(text => !string.IsNullOrWhiteSpace(text))).Trim();
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(detail) ? "记忆整理命令执行失败。" : detail);
+        }
+        if (string.Equals(command, "schedule", StringComparison.OrdinalIgnoreCase))
+        {
+            var lines = ReadEnvFileLines(_configPath);
+            SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", ReadPayloadBool(payload, "enabled", false) ? "true" : "false");
+            SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(ReadPayloadInt(payload, "intervalDays", 7).ToString(CultureInfo.InvariantCulture), "7"));
+            SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(ReadPayloadString(payload, "modelSource", "codex_primary")));
+            File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+            LoadConfig();
+        }
+        var stdout = result.Stdout.Trim();
+        if (string.IsNullOrWhiteSpace(stdout)) return BuildMemoryOptimizationStatusSnapshot();
+        return JsonNode.Parse(stdout) ?? new JsonObject();
+    }
+
+    private static string ReadSelectedActionIds(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object
+            || !payload.TryGetProperty("selectedActionIds", out var element)
+            || element.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+        return string.Join(",", element.EnumerateArray()
+            .Select(item => item.GetString() ?? "")
+            .Where(value => !string.IsNullOrWhiteSpace(value)));
+    }
+
+    private static string QuoteProcessArgument(string value)
+        => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 
     private async Task<object> TestTodoReminderAsync(JsonElement payload)
     {
@@ -5050,6 +5342,13 @@ exit $LASTEXITCODE
     private string GetConfig(string key, string fallback)
         => _config.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
 
+    private string InferCodexModelSource()
+        => !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_BASE_URL", ""))
+           || !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_MODEL", ""))
+           || !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_API_KEY", ""))
+            ? "external_api"
+            : "official";
+
     private SettingsSnapshot GetSettingsSnapshot() => new(
         GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
         GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3"),
@@ -5068,12 +5367,20 @@ exit $LASTEXITCODE
         MaskSecretForSettings(GetConfig("CTI_LOCAL_AI_API_KEY", "")),
         !string.IsNullOrWhiteSpace(GetConfig("CTI_LOCAL_AI_API_KEY", "")),
         GetConfig("CTI_LOCAL_AI_TIMEOUT_MS", GetConfig("CTI_OLLAMA_TIMEOUT_MS", "45000")),
+        NormalizeCodexModelSource(GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource())),
         GetConfig("CTI_CODEX_BASE_URL", ""),
         GetConfig("CTI_CODEX_MODEL", ""),
         string.Equals(GetConfig("CTI_CODEX_PASS_MODEL", "false"), "true", StringComparison.OrdinalIgnoreCase),
         NormalizeCodexReasoningEffort(GetConfig("CTI_CODEX_REASONING_EFFORT", "low")),
-        !string.Equals(GetConfig("CTI_CODEX_LOCAL_FALLBACK_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase),
+        string.Equals(GetConfig("CTI_CODEX_LOCAL_FALLBACK_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase),
         NormalizeCodexReasoningEffort(GetConfig("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", "minimal")),
+        NormalizeCodexFailureFallbackMode(GetConfig("CTI_CODEX_FAILURE_FALLBACK_MODE", "none")),
+        NormalizeLocalAgentMode(GetConfig("CTI_LOCAL_AGENT_MODE", "text_only")),
+        !string.Equals(GetConfig("CTI_LOCAL_TOOL_CALL_REQUIRED", "true"), "false", StringComparison.OrdinalIgnoreCase),
+        NormalizeExecutionRequiredRoute(GetConfig("CTI_EXECUTION_REQUIRED_ROUTE", "codex_or_external")),
+        string.Equals(GetConfig("CTI_MEMORY_OPTIMIZER_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase),
+        NormalizePositiveNumber(GetConfig("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", "7"), "7"),
+        NormalizeMemoryOptimizerModelSource(GetConfig("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", "codex_primary")),
         "keep",
         "",
         MaskSecretForSettings(GetConfig("CTI_CODEX_API_KEY", "")),
@@ -5110,15 +5417,23 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_OLLAMA_BASE_URL", settings.LocalAiBaseUrl.Trim());
         SetOrAppendEnv(lines, "CTI_OLLAMA_MODEL", settings.LocalAiModel.Trim());
         SetOrAppendEnv(lines, "CTI_OLLAMA_TIMEOUT_MS", NormalizePositiveNumber(settings.LocalAiTimeoutMs, "45000"));
+        SetOrAppendEnv(lines, "CTI_CODEX_MODEL_SOURCE", NormalizeCodexModelSource(settings.CodexModelSource));
         SetOrAppendEnv(lines, "CTI_CODEX_BASE_URL", settings.CodexBaseUrl.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_MODEL", settings.CodexModel.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", settings.CodexPassModel ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_CODEX_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexReasoningEffort));
         SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_ENABLED", settings.CodexLocalFallbackEnabled ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexLocalFallbackReasoningEffort));
+        SetOrAppendEnv(lines, "CTI_CODEX_FAILURE_FALLBACK_MODE", NormalizeCodexFailureFallbackMode(settings.CodexFailureFallbackMode));
+        SetOrAppendEnv(lines, "CTI_LOCAL_AGENT_MODE", NormalizeLocalAgentMode(settings.LocalAgentMode));
+        SetOrAppendEnv(lines, "CTI_LOCAL_TOOL_CALL_REQUIRED", settings.LocalToolCallRequired ? "true" : "false");
+        SetOrAppendEnv(lines, "CTI_EXECUTION_REQUIRED_ROUTE", NormalizeExecutionRequiredRoute(settings.ExecutionRequiredRoute));
+        SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", settings.MemoryOptimizerEnabled ? "true" : "false");
+        SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
+        SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(settings.MemoryOptimizerModelSource));
         ApplySecretEnv(lines, "CTI_CODEX_API_KEY", settings.CodexApiKeyAction, settings.CodexApiKeyValue);
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
-        AppendLog("配置已保存。AI API、路径和回复风格将在重启飞书桥接后生效。");
+        AppendLog("配置已保存。Codex CLI 模型来源、路径和回复风格将在重启飞书桥接后生效。");
         LoadConfig();
     }
 
@@ -5154,9 +5469,21 @@ exit $LASTEXITCODE
         {
             problems.Add("Codex Base URL 不是有效绝对 URL。");
         }
+        if (settings.CodexModelSource == "local_api" && string.IsNullOrWhiteSpace(settings.LocalAiBaseUrl))
+        {
+            problems.Add("本地 API 作为主模型时，本地 API 地址不能为空。");
+        }
+        if (settings.CodexModelSource == "external_api" && string.IsNullOrWhiteSpace(baseUrl))
+        {
+            problems.Add("外部 API 作为主模型时，Base URL 不能为空。");
+        }
         if (settings.CodexPassModel && string.IsNullOrWhiteSpace(model))
         {
-            problems.Add("已启用传递 model，但 Codex model 为空。");
+            var modelSource = settings.CodexModelSource == "local_api" ? settings.LocalAiModel : model;
+            if (string.IsNullOrWhiteSpace(modelSource))
+            {
+                problems.Add("已启用传递 model，但模型名称为空。");
+            }
         }
         var keyStatus = string.IsNullOrWhiteSpace(apiKey) ? "未设置 API key，将使用 Codex 登录态或环境默认凭据。" : $"API key 已设置 {MaskSecretForSettings(apiKey)}。";
         if (problems.Count > 0)
@@ -5169,9 +5496,11 @@ exit $LASTEXITCODE
             message = $"Codex API 配置形态正常。{keyStatus} 未发送真实模型请求。",
             baseUrl,
             model,
+            modelSource = settings.CodexModelSource,
             passModel = settings.CodexPassModel,
             reasoningEffort = effort,
             localFallbackEnabled = settings.CodexLocalFallbackEnabled,
+            failureFallbackMode = settings.CodexFailureFallbackMode,
             localFallbackReasoningEffort = NormalizeCodexReasoningEffort(settings.CodexLocalFallbackReasoningEffort),
             apiKeySet = !string.IsNullOrWhiteSpace(apiKey),
         };
@@ -5366,6 +5695,36 @@ exit $LASTEXITCODE
         return value is "minimal" or "low" or "medium" or "high" or "xhigh"
             ? value
             : "low";
+    }
+
+    private static string NormalizeCodexModelSource(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "official" or "local_api" or "external_api" ? value : "official";
+    }
+
+    private static string NormalizeCodexFailureFallbackMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value == "local_agent" ? "local_agent" : "none";
+    }
+
+    private static string NormalizeLocalAgentMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value == "agent_verified" ? "agent_verified" : "text_only";
+    }
+
+    private static string NormalizeExecutionRequiredRoute(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "primary" or "codex_or_external" or "refuse" ? value : "codex_or_external";
+    }
+
+    private static string NormalizeMemoryOptimizerModelSource(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "codex_primary" or "local_ai" or "external_api" ? value : "codex_primary";
     }
 
     private static string NormalizePositiveNumber(string value, string fallback)
@@ -5907,6 +6266,196 @@ exit $LASTEXITCODE
         {
             return (false, $"{target} | {ex.Message}");
         }
+    }
+
+    private async Task<object> ProbeLocalLlmToolCallingAsync(JsonElement payload)
+    {
+        var settings = ReadSettingsPayload(payload);
+        var apiKey = ResolveSecretForTest("CTI_LOCAL_AI_API_KEY", settings.LocalAiApiKeyAction, settings.LocalAiApiKeyValue);
+        var kind = NormalizeLocalAiKind(settings.LocalAiKind);
+        var model = settings.LocalAiModel.Trim();
+        var baseUrl = NormalizeOpenAiCompatibleBaseUrl(settings.LocalAiBaseUrl.Trim(), kind);
+        var endpoint = $"{baseUrl.TrimEnd('/')}/chat/completions";
+        var toolName = "cti_probe_echo";
+        using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(5000, ParsePositiveInt(settings.LocalAiTimeoutMs, 45000))) };
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        if (!string.IsNullOrWhiteSpace(apiKey))
+        {
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey.Trim());
+        }
+
+        var body = new JsonObject
+        {
+            ["model"] = string.IsNullOrWhiteSpace(model) ? "default" : model,
+            ["stream"] = false,
+            ["temperature"] = 0,
+            ["max_tokens"] = 96,
+            ["messages"] = new JsonArray
+            {
+                new JsonObject { ["role"] = "system", ["content"] = "Return a structured tool call when a tool is needed. Do not answer in prose." },
+                new JsonObject { ["role"] = "user", ["content"] = "Use the probe tool with marker cti-tool-probe." },
+            },
+            ["tools"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "function",
+                    ["function"] = new JsonObject
+                    {
+                        ["name"] = toolName,
+                        ["description"] = "Echo a marker for local tool-call capability probing.",
+                        ["parameters"] = new JsonObject
+                        {
+                            ["type"] = "object",
+                            ["required"] = new JsonArray(JsonValue.Create("marker")),
+                            ["properties"] = new JsonObject
+                            {
+                                ["marker"] = new JsonObject
+                                {
+                                    ["type"] = "string",
+                                    ["description"] = "The marker to echo."
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            ["tool_choice"] = "auto",
+        };
+        request.Content = new StringContent(body.ToJsonString(JsonOptions), Encoding.UTF8, "application/json");
+
+        try
+        {
+            using var response = await client.SendAsync(request);
+            var raw = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                var failed = WriteLocalToolCapabilityResult(kind, baseUrl, model, "failed", "text_only", $"工具探测请求失败：HTTP {(int)response.StatusCode} {response.ReasonPhrase} | {TrimForStatus(raw)}", endpoint, 0, "", raw);
+                return failed;
+            }
+
+            using var document = JsonDocument.Parse(raw);
+            var (count, names, contentPreview) = ReadToolCallProbeEvidence(document.RootElement);
+            var passed = names.Any(name => string.Equals(name, toolName, StringComparison.OrdinalIgnoreCase));
+            var state = passed ? "passed" : "text_only";
+            var mode = passed ? "agent_verified" : "text_only";
+            var message = passed
+                ? "本地 API 已返回结构化 tool_calls；可作为受控工具模型候选，仍需运行时执行证据验收。"
+                : "本地 API 在线，但没有返回结构化 tool_calls；执行类任务会转交官方/外部 Codex 或被拒绝。";
+            var result = WriteLocalToolCapabilityResult(kind, baseUrl, model, state, mode, message, endpoint, count, string.Join(", ", names), contentPreview);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            return WriteLocalToolCapabilityResult(kind, baseUrl, model, "failed", "text_only", $"工具探测失败：{ex.Message}", endpoint, 0, "", "");
+        }
+    }
+
+    private static int ParsePositiveInt(string value, int fallback)
+        => int.TryParse((value ?? "").Trim(), out var parsed) && parsed > 0 ? parsed : fallback;
+
+    private static string NormalizeOpenAiCompatibleBaseUrl(string baseUrl, string kind)
+    {
+        var trimmed = (baseUrl ?? "").Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            trimmed = kind == "ollama" ? "http://127.0.0.1:11434" : "http://127.0.0.1:8000/v1";
+        }
+        if (kind == "ollama" && !trimmed.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed += "/v1";
+        }
+        return trimmed;
+    }
+
+    private static (int Count, List<string> Names, string ContentPreview) ReadToolCallProbeEvidence(JsonElement root)
+    {
+        var names = new List<string>();
+        var content = "";
+        if (root.TryGetProperty("choices", out var choices) && choices.ValueKind == JsonValueKind.Array && choices.GetArrayLength() > 0)
+        {
+            var first = choices[0];
+            if (first.TryGetProperty("message", out var message))
+            {
+                if (message.TryGetProperty("content", out var contentElement))
+                {
+                    content = contentElement.ValueKind == JsonValueKind.String ? contentElement.GetString() ?? "" : contentElement.GetRawText();
+                }
+                if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var call in toolCalls.EnumerateArray())
+                    {
+                        if (call.TryGetProperty("function", out var function)
+                            && function.TryGetProperty("name", out var name)
+                            && name.ValueKind == JsonValueKind.String
+                            && !string.IsNullOrWhiteSpace(name.GetString()))
+                        {
+                            names.Add(name.GetString()!.Trim());
+                        }
+                    }
+                }
+            }
+        }
+        return (names.Count, names, TrimForStatus(content));
+    }
+
+    private object WriteLocalToolCapabilityResult(string kind, string baseUrl, string model, string state, string mode, string message, string endpoint, int toolCallCount, string toolNames, string rawPreview)
+    {
+        var now = DateTimeOffset.Now.ToString("O");
+        Directory.CreateDirectory(Path.GetDirectoryName(_localModelCapabilityPath)!);
+        var profile = new JsonObject
+        {
+            ["schema"] = "codex-im-suite/local-model-capabilities/v1",
+            ["updatedAt"] = now,
+            ["provider"] = kind,
+            ["baseUrl"] = baseUrl,
+            ["model"] = model,
+            ["toolCallingState"] = state,
+            ["recommendedMode"] = mode,
+            ["message"] = message,
+            ["evidence"] = new JsonObject
+            {
+                ["endpoint"] = endpoint,
+                ["toolCallCount"] = toolCallCount,
+                ["toolNames"] = toolNames,
+                ["rawContentPreview"] = TrimForStatus(rawPreview),
+            },
+        };
+        File.WriteAllText(_localModelCapabilityPath, profile.ToJsonString(JsonOptions), Encoding.UTF8);
+
+        JsonObject status;
+        try
+        {
+            status = File.Exists(_localLlmStatusPath)
+                ? JsonNode.Parse(File.ReadAllText(_localLlmStatusPath, Encoding.UTF8)) as JsonObject ?? new JsonObject()
+                : new JsonObject();
+        }
+        catch
+        {
+            status = new JsonObject();
+        }
+        status["toolCallingState"] = state;
+        status["toolCallingCheckedAt"] = now;
+        status["toolCallingModel"] = model;
+        status["toolCallingBaseUrl"] = baseUrl;
+        status["toolCallingMessage"] = message;
+        status["toolCallingRecommendedMode"] = mode;
+        status["updatedAt"] = now;
+        Directory.CreateDirectory(Path.GetDirectoryName(_localLlmStatusPath)!);
+        File.WriteAllText(_localLlmStatusPath, status.ToJsonString(JsonOptions), Encoding.UTF8);
+
+        return new
+        {
+            ok = state == "passed",
+            state,
+            recommendedMode = mode,
+            message,
+            kind,
+            baseUrl,
+            model,
+            toolCallCount,
+            toolNames,
+        };
     }
 
     private static string ExtractChatCompletionText(string json)
@@ -6703,7 +7252,16 @@ exit $LASTEXITCODE
             }
         }
 
-        var result = await RunPowerShellFileAsync(_publishBackupScript, "", _suiteRoot, 900000);
+        var publishEnvironment = new Dictionary<string, string?>();
+        var runningPanelPath = Environment.ProcessPath;
+        var defaultPanelOutputDir = Path.Combine(_suiteRoot, "release", "artifacts", "control-panel");
+        if (!string.IsNullOrWhiteSpace(runningPanelPath)
+            && IsSameOrChildPath(runningPanelPath, defaultPanelOutputDir))
+        {
+            publishEnvironment["CTI_RELEASE_CONTROL_PANEL_DIR"] = Path.Combine(_suiteRoot, "release", "artifacts", "control-panel-publish");
+        }
+
+        var result = await RunPowerShellFileAsync(_publishBackupScript, "", _suiteRoot, 900000, publishEnvironment.Count > 0 ? publishEnvironment : null);
         AppendCommand("本机备份发布", result);
         await RefreshBuildInfoAsync();
         if (result.ExitCode != 0)
@@ -8723,6 +9281,20 @@ internal sealed class WebCommandRequest
 
 internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
 internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
+internal sealed record WebNodeCapability(string Id, string DisplayName, string Category, string Status, string Detail, string Risk);
+internal sealed record WebNodeAgent(
+    string NodeId,
+    string DisplayName,
+    string Kind,
+    string Status,
+    string Version,
+    string Host,
+    string LastSeenAt,
+    WebNodeCapability[] Capabilities,
+    string Detail,
+    bool IsLocal,
+    bool CanManage);
+internal sealed record WebNodeSnapshot(string Schema, string GeneratedAt, string ActiveNodeId, WebNodeAgent[] Nodes);
 internal sealed record WebLiveSyncStatus(string Status, string LastSyncedAt, string SuiteCommit, string LiveCommit, string Summary, bool CanSync, string Detail, bool LegacyEntryPresent = false, string LegacyEntryPath = "");
 internal sealed record WebMcpItem(
     string Id,
@@ -9103,6 +9675,12 @@ internal sealed class LocalLlmStatusRecord
     public int ExecutionFailures { get; set; }
     public int FallbackCount { get; set; }
     public bool? ServerReachable { get; set; }
+    public string? ToolCallingState { get; set; }
+    public string? ToolCallingCheckedAt { get; set; }
+    public string? ToolCallingModel { get; set; }
+    public string? ToolCallingBaseUrl { get; set; }
+    public string? ToolCallingMessage { get; set; }
+    public string? ToolCallingRecommendedMode { get; set; }
     public string? LastCheckAt { get; set; }
     public string? LastRouteReason { get; set; }
     public string? LastFallbackReason { get; set; }
@@ -9306,12 +9884,20 @@ internal sealed record SettingsSnapshot(
     string LocalAiApiKeyMasked = "",
     bool LocalAiApiKeySet = false,
     string LocalAiTimeoutMs = "45000",
+    string CodexModelSource = "official",
     string CodexBaseUrl = "",
     string CodexModel = "",
     bool CodexPassModel = false,
     string CodexReasoningEffort = "low",
-    bool CodexLocalFallbackEnabled = true,
+    bool CodexLocalFallbackEnabled = false,
     string CodexLocalFallbackReasoningEffort = "minimal",
+    string CodexFailureFallbackMode = "none",
+    string LocalAgentMode = "text_only",
+    bool LocalToolCallRequired = true,
+    string ExecutionRequiredRoute = "codex_or_external",
+    bool MemoryOptimizerEnabled = false,
+    string MemoryOptimizerIntervalDays = "7",
+    string MemoryOptimizerModelSource = "codex_primary",
     string CodexApiKeyAction = "keep",
     string CodexApiKeyValue = "",
     string CodexApiKeyMasked = "",

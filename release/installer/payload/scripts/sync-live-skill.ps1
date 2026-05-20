@@ -87,6 +87,84 @@ function Copy-ExistingDirectory {
     }
 }
 
+function Get-PackageDependencyVersion {
+    param(
+        [string]$PackageJsonPath,
+        [string]$PackageName
+    )
+
+    if (-not (Test-Path -LiteralPath $PackageJsonPath)) {
+        return $null
+    }
+
+    $package = Get-Content -Raw -LiteralPath $PackageJsonPath | ConvertFrom-Json
+    foreach ($section in @('dependencies', 'optionalDependencies', 'devDependencies')) {
+        $items = $package.$section
+        if ($null -ne $items -and $items.PSObject.Properties.Name -contains $PackageName) {
+            return [string]$items.PSObject.Properties[$PackageName].Value
+        }
+    }
+
+    return $null
+}
+
+function Convert-NpmRangeToInstallVersion {
+    param([string]$Range)
+
+    if ([string]::IsNullOrWhiteSpace($Range)) {
+        return $null
+    }
+
+    $trimmed = $Range.Trim()
+    if ($trimmed -match '^[\^~>=<\s]*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$') {
+        return $Matches[1]
+    }
+
+    return $trimmed
+}
+
+function Get-InstalledNodePackageVersion {
+    param(
+        [string]$Root,
+        [string]$PackageName
+    )
+
+    $packageJson = Join-Path $Root ("node_modules\" + $PackageName.Replace('/', '\') + "\package.json")
+    if (-not (Test-Path -LiteralPath $packageJson)) {
+        return $null
+    }
+
+    $package = Get-Content -Raw -LiteralPath $packageJson | ConvertFrom-Json
+    return [string]$package.version
+}
+
+function Ensure-NpmPackageVersion {
+    param(
+        [string]$Root,
+        [string]$PackageName,
+        [string]$RequiredRange
+    )
+
+    $requiredVersion = Convert-NpmRangeToInstallVersion -Range $RequiredRange
+    if ([string]::IsNullOrWhiteSpace($requiredVersion)) {
+        return
+    }
+
+    $installedVersion = Get-InstalledNodePackageVersion -Root $Root -PackageName $PackageName
+    if ($installedVersion -eq $requiredVersion) {
+        return
+    }
+
+    $currentLabel = if ([string]::IsNullOrWhiteSpace($installedVersion)) { 'missing' } else { $installedVersion }
+    Write-Host "install live dependency $PackageName@$requiredVersion (current: $currentLabel)"
+    Push-Location $Root
+    try {
+        npm install "$PackageName@$requiredVersion" --no-save --package-lock=false | Out-Host
+    } finally {
+        Pop-Location
+    }
+}
+
 Write-Host "sync suite bridge-core -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'src') -Target (Join-Path $liveCore 'src')
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'dist') -Target (Join-Path $liveCore 'dist')
@@ -134,6 +212,9 @@ $runtimeFiles = @(
 foreach ($name in $runtimeFiles) {
     Copy-ExistingFile -Source (Join-Path $suiteRuntime $name) -Target (Join-Path $liveRuntime $name)
 }
+
+$codexSdkRange = Get-PackageDependencyVersion -PackageJsonPath (Join-Path $suiteRuntime 'package.json') -PackageName '@openai/codex-sdk'
+Ensure-NpmPackageVersion -Root $liveRuntime -PackageName '@openai/codex-sdk' -RequiredRange $codexSdkRange
 
 Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.ps1') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.ps1')
 Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.py') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.py')

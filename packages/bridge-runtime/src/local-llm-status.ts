@@ -45,6 +45,13 @@ export interface LocalLlmRuntimeStatus {
   executionFailures: number;
   fallbackCount: number;
   serverReachable?: boolean;
+  toolCallingState?: 'untested' | 'passed' | 'failed' | 'text_only';
+  toolCallingCheckedAt?: string;
+  toolCallingModel?: string;
+  toolCallingBaseUrl?: string;
+  toolCallingMessage?: string;
+  toolCallingRecommendedMode?: 'text_only' | 'agent_verified';
+  recommendedModels?: LocalModelRecommendation[];
   lastCheckAt?: string;
   lastRouteReason?: string;
   lastFallbackReason?: string;
@@ -60,6 +67,15 @@ export interface LocalLlmRuntimeStatus {
   updatedAt?: string;
   recentRoutes?: LocalLlmRouteSummary[];
   recentExecutions?: LocalLlmExecutionSummary[];
+}
+
+export interface LocalModelRecommendation {
+  model: string;
+  provider: 'ollama' | 'vllm' | 'lmstudio' | 'openai-compatible';
+  label: string;
+  role: 'text' | 'tool_candidate' | 'strong_tool_candidate' | 'embedding';
+  minMemoryGb?: number;
+  notes: string;
 }
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
@@ -114,6 +130,9 @@ export function makeDefaultLocalLlmStatus(config: Config): LocalLlmRuntimeStatus
     executionCount: 0,
     executionFailures: 0,
     fallbackCount: 0,
+    toolCallingState: 'untested',
+    toolCallingRecommendedMode: 'text_only',
+    recommendedModels: [],
     recentRoutes: [],
     recentExecutions: [],
     updatedAt: nowIso(),

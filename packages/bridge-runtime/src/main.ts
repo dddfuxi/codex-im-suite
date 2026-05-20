@@ -45,6 +45,10 @@ import {
   updateLocalLlmStatus,
   type LocalLlmRouteSummary,
 } from './local-llm-status.js';
+import {
+  readLocalModelCapabilityProfile,
+  shouldTrustLocalApiForExecution,
+} from './local-model-capability.js';
 import { sseEvent } from './sse-utils.js';
 import {
   inferRequestedExecutorId,
@@ -53,6 +57,7 @@ import {
 } from './executor-registry.js';
 import { shouldRetrieveMemoryForPrompt } from './memory-routing.js';
 import { startKnowledgeIndexWatcher } from './knowledge-index-service.js';
+import { startMemoryOptimizerService, type MemoryOptimizerService } from './memory-optimizer.js';
 import {
   createFeishuPushProvider,
   createDirectReminder,
@@ -215,6 +220,7 @@ class HubLlmProvider implements LLMProvider {
     private readonly fallbackProvider: LLMProvider,
     private readonly localAgentFallbackProvider: LLMProvider | null,
     private readonly primaryExecutorId: string,
+    private readonly trustedExecutionProvider: LLMProvider = fallbackProvider,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -476,7 +482,8 @@ class HubLlmProvider implements LLMProvider {
   }
 
   private isLocalAgentApiFallbackEnabled(): boolean {
-    return this.config.codexLocalFallbackEnabled !== false;
+    return this.config.codexFailureFallbackMode === 'local_agent'
+      && this.config.codexLocalFallbackEnabled === true;
   }
 
   private buildAgentFallbackUnavailableReply(primaryFailure: string, localFailure?: string): string {
@@ -501,6 +508,21 @@ class HubLlmProvider implements LLMProvider {
     primaryFailure?: string,
   ): Promise<void> {
     const routeMode = getLocalRouterMode(this.config);
+    if (requiresConcreteToolOutput(conservative.requestKind, params.prompt) && !shouldTrustLocalApiForExecution(this.config)) {
+      this.emitLocalSuccess(controller, params.sessionId, this.buildLocalApiUnverifiedReply(), undefined, {
+        mode: routeMode,
+        taskKind: conservative.requestKind,
+        decision: 'refuse_local',
+        provider: 'refuse_local',
+        reason: primaryFailure
+          ? `主执行模型失败，且本地 API 未通过工具调用探测：${primaryFailure}`
+          : '本地 API 未通过工具调用探测，拒绝执行类任务',
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: primaryFailure || reason,
+      });
+      return;
+    }
     if (!this.isLocalAgentApiFallbackEnabled() || !this.localAgentFallbackProvider) {
       this.emitLocalSuccess(controller, params.sessionId, this.buildAgentFallbackUnavailableReply(primaryFailure || reason), undefined, {
         mode: routeMode,
@@ -541,25 +563,74 @@ class HubLlmProvider implements LLMProvider {
     }
   }
 
+  private shouldAvoidLocalPrimaryForExecution(
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+  ): boolean {
+    if (this.config.codexModelSource !== 'local_api') return false;
+    if (!requiresConcreteToolOutput(conservative.requestKind, params.prompt)) return false;
+    return !shouldTrustLocalApiForExecution(this.config);
+  }
+
+  private buildLocalApiUnverifiedReply(): string {
+    const capability = readLocalModelCapabilityProfile(this.config);
+    const checked = capability.updatedAt ? `最近探测：${capability.updatedAt}` : '尚未探测';
+    return [
+      '未执行：当前本地 API 主模型还没有通过工具调用能力探测。',
+      `模型：${capability.model || this.config.localAiModel || 'unknown'}`,
+      `状态：${capability.toolCallingState}，${capability.message || checked}`,
+      '为了避免“未执行却编结果”，执行类任务已被拦截。请在扩展页/设置页运行“测试工具调用”，或改用官方 Codex / 外部 API 作为执行模型。',
+    ].join('\n');
+  }
+
   private async pipeCodexPrimaryWithFallback(
     controller: ReadableStreamDefaultController<string>,
     params: Parameters<LLMProvider['streamChat']>[0],
     conservative: ReturnType<typeof decideConservativeRoute>,
     reason: string,
   ): Promise<void> {
+    const useTrustedExecutionProvider = this.shouldAvoidLocalPrimaryForExecution(conservative, params);
+    if (useTrustedExecutionProvider && this.config.executionRequiredRoute === 'refuse') {
+      this.emitLocalSuccess(controller, params.sessionId, this.buildLocalApiUnverifiedReply(), undefined, {
+        mode: 'hybrid',
+        taskKind: conservative.requestKind,
+        decision: 'refuse_local',
+        provider: 'refuse_local',
+        reason: '本地 API 未通过工具调用探测，按配置拒绝执行类任务',
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+      });
+      return;
+    }
+    const provider = useTrustedExecutionProvider && this.config.executionRequiredRoute !== 'primary'
+      ? this.trustedExecutionProvider
+      : this.fallbackProvider;
+    const executionReason = useTrustedExecutionProvider
+      ? `${reason}；本地 API 未通过工具调用探测，执行类任务改交官方/外部 Codex`
+      : reason;
     try {
       await this.pipeFallbackStream(controller, params, {
         mode: 'hybrid',
         taskKind: conservative.requestKind,
         decision: 'escalate_codex',
         provider: 'codex',
-        reason,
+        reason: executionReason,
         compressedPromptChars: 0,
         compressedHistoryChars: 0,
-      });
+      }, provider);
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const handledByLocalToolFallback = await this.tryDeterministicLocalToolFallbackAfterCodexFailure(
+        controller,
+        params,
+        conservative,
+        message,
+      );
+      if (handledByLocalToolFallback) return;
+      if (!this.isLocalAgentApiFallbackEnabled()) {
+        throw new Error(`Codex 主模型失败，备用模型未启用：${summarizeCodexFailureMessage(message)}`);
+      }
       if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
         try {
           const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, 'hybrid');
@@ -585,6 +656,51 @@ class HubLlmProvider implements LLMProvider {
       }
       await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地 Agent API：${message}`, message);
     }
+  }
+
+  private async tryDeterministicLocalToolFallbackAfterCodexFailure(
+    controller: ReadableStreamDefaultController<string>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    primaryFailure: string,
+  ): Promise<boolean> {
+    if (!this.isDeterministicReadOnlyFallbackCandidate(params.prompt)) return false;
+    const safeConservative = {
+      ...conservative,
+      useLocal: true,
+      allowLocalFallback: true,
+      highRisk: false,
+      canFastPath: true,
+      preferredDecision: 'answer_local' as const,
+      reason: `Codex 主模型失败，尝试受控只读工具兜底：${conservative.reason}`,
+    };
+    if (!this.localAgent.canHandleFastPath(params, safeConservative)) return false;
+    const executed = await this.localAgent.handleFastPath(controller, params, {
+      mode: 'hybrid',
+      conservative: safeConservative,
+    });
+    if (executed.handled) return true;
+    appendLocalLlmRouteSummary(this.config, {
+      timestamp: new Date().toISOString(),
+      mode: 'hybrid',
+      taskKind: conservative.requestKind,
+      decision: 'escalate_codex',
+      provider: 'local_best_effort',
+      reason: `Codex 失败后只读工具兜底未处理：${executed.fallbackReason || primaryFailure}`,
+      compressedPromptChars: 0,
+      compressedHistoryChars: 0,
+      fallbackReason: primaryFailure,
+    });
+    return false;
+  }
+
+  private isDeterministicReadOnlyFallbackCandidate(prompt: string): boolean {
+    const text = (prompt || '').trim();
+    if (!text) return false;
+    if (/(git\s+(pull|push|fetch|rebase|merge|reset|checkout|switch|cherry-pick|clean|stash|commit)|发布|修改|写入|删除|创建文件|保存|关机|shutdown|unity|mcp|blender|截图|图片|附件|导入|导出)/i.test(text)) {
+      return false;
+    }
+    return /(\bgit status\b|\bgit branch\b|\bgit log\b|git.*暂存区|暂存区.*(有啥|有什么|状态|内容)|staged|cached|当前分支|分支是什么|最近.*提交|提交记录|读取文件|查看文件|打开文件|搜索文本|查找字符串)/i.test(text);
   }
 
   private async pipeFallbackStream(
@@ -720,6 +836,74 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
   };
 }
 
+interface StreamEvidence {
+  toolUseCount: number;
+  toolResultCount: number;
+  successfulToolResultCount: number;
+  failedToolResultCount: number;
+  toolNames: string[];
+  provider?: string;
+  codexProfile?: string;
+  modelSource?: string;
+  model?: string;
+  baseUrl?: string;
+}
+
+function emptyStreamEvidence(): StreamEvidence {
+  return {
+    toolUseCount: 0,
+    toolResultCount: 0,
+    successfulToolResultCount: 0,
+    failedToolResultCount: 0,
+    toolNames: [],
+  };
+}
+
+function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
+  for (const line of value.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    let event: { type?: string; data?: unknown };
+    try {
+      event = JSON.parse(line.slice(6));
+    } catch {
+      continue;
+    }
+    let data: Record<string, unknown> | null = null;
+    if (typeof event.data === 'string') {
+      try {
+        const parsed = JSON.parse(event.data);
+        if (parsed && typeof parsed === 'object') data = parsed as Record<string, unknown>;
+      } catch {
+        data = null;
+      }
+    } else if (event.data && typeof event.data === 'object') {
+      data = event.data as Record<string, unknown>;
+    }
+    if (event.type === 'tool_use') {
+      evidence.toolUseCount += 1;
+      const name = typeof data?.name === 'string' ? data.name.trim() : '';
+      if (name && !evidence.toolNames.includes(name)) evidence.toolNames.push(name);
+      continue;
+    }
+    if (event.type === 'tool_result') {
+      evidence.toolResultCount += 1;
+      if (data?.is_error) {
+        evidence.failedToolResultCount += 1;
+      } else {
+        evidence.successfulToolResultCount += 1;
+      }
+      continue;
+    }
+    if (event.type === 'status' && data) {
+      if (typeof data.provider === 'string') evidence.provider = data.provider;
+      if (typeof data.codexProfile === 'string') evidence.codexProfile = data.codexProfile;
+      if (typeof data.modelSource === 'string') evidence.modelSource = data.modelSource;
+      if (typeof data.model === 'string') evidence.model = data.model;
+      if (typeof data.baseUrl === 'string') evidence.baseUrl = data.baseUrl;
+    }
+  }
+}
+
 class ObservedLLMProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
@@ -768,17 +952,30 @@ class ObservedLLMProvider implements LLMProvider {
           }, sessionDefaults[params.sessionId]);
           writeExecutorStatus(this.config, { sessionId: params.sessionId, selection });
           setWorkflowExecutor(workflowRun.id, selection.executor.id, selection.reason);
+          const configuredModelSource = this.config.codexModelSource || (
+            this.config.codexBaseUrl || this.config.codexModel || this.config.codexApiKey
+              ? 'external_api'
+              : 'official'
+          );
           appendWorkflowEvent(workflowRun.id, 'executing', 'executor.executing', `执行器开始处理：${selection.executor.displayName}`, {
             executorId: selection.executor.id,
             fallbackExecutorIds: selection.fallbackExecutorIds,
+            codexModelSource: configuredModelSource,
+            codexFailureFallbackMode: this.config.codexFailureFallbackMode || 'none',
+            codexLocalFallbackEnabled: this.config.codexLocalFallbackEnabled === true,
+            localAiModel: this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel,
+            localAiBaseUrl: this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl,
           });
           const stream = this.provider.streamChat(params);
           const reader = stream.getReader();
+          const evidence = emptyStreamEvidence();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            collectStreamEvidence(value, evidence);
             controller.enqueue(value);
           }
+          appendWorkflowEvent(workflowRun.id, 'finalizing', 'execution.evidence', '执行证据已记录', { ...evidence });
           completeWorkflowRun(workflowRun.id);
           controller.close();
         } catch (error) {
@@ -797,7 +994,12 @@ class ObservedLLMProvider implements LLMProvider {
 }
 
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
-  const wrapWithLocalHub = (provider: LLMProvider, primaryExecutorId: string, localAgentFallbackProvider: LLMProvider | null = null): LLMProvider => {
+  const wrapWithLocalHub = (
+    provider: LLMProvider,
+    primaryExecutorId: string,
+    localAgentFallbackProvider: LLMProvider | null = null,
+    trustedExecutionProvider: LLMProvider = provider,
+  ): LLMProvider => {
     if ((config.ollamaEnabled ?? config.localLlmEnabled) !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
     const localProvider = new OllamaProvider(config);
     return new HubLlmProvider(
@@ -808,6 +1010,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       provider,
       localAgentFallbackProvider,
       primaryExecutorId,
+      trustedExecutionProvider,
     );
   };
 
@@ -815,7 +1018,12 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }));
+    const primaryProfile = config.codexModelSource === 'local_api' ? 'local_primary' : 'primary';
+    const primaryProvider = new CodexProvider(pendingPerms, { profile: primaryProfile });
+    const trustedExecutionProvider = config.codexModelSource === 'local_api'
+      ? new CodexProvider(pendingPerms, { profile: 'primary' })
+      : primaryProvider;
+    return wrapWithLocalHub(primaryProvider, 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }), trustedExecutionProvider);
   }
 
   if (runtime === 'auto') {
@@ -834,7 +1042,12 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    return wrapWithLocalHub(new CodexProvider(pendingPerms), 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }));
+    const primaryProfile = config.codexModelSource === 'local_api' ? 'local_primary' : 'primary';
+    const primaryProvider = new CodexProvider(pendingPerms, { profile: primaryProfile });
+    const trustedExecutionProvider = config.codexModelSource === 'local_api'
+      ? new CodexProvider(pendingPerms, { profile: 'primary' })
+      : primaryProvider;
+    return wrapWithLocalHub(primaryProvider, 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }), trustedExecutionProvider);
   }
 
   const cliPath = resolveClaudeCliPath();
@@ -974,15 +1187,23 @@ function startWorkflowRetryService(
       store.addMessage(claimed.sessionId, 'user', input.prompt);
       store.addMessage(claimed.sessionId, 'assistant', text);
       if (channelType && chatId) {
+        const hasFinalReplyBlock = /```cti-final\b/i.test(text) || /"kind"\s*:\s*"(?:text|image|file|mixed)"/i.test(text);
+        const outboundText = hasFinalReplyBlock
+          ? text
+          : `断点续跑重试结果：\n\n${text}`;
         const delivered = await bridgeManager.deliverProactiveMessage({
           address: {
             channelType,
             chatId,
             displayName: claimed.chatId || chatId,
           },
-          text: `断点续跑重试结果：\n\n${text}`,
+          text: outboundText,
           parseMode: 'plain',
+          replyToMessageId: input.messageId,
           sessionId: claimed.sessionId,
+          prepareFinalReply: true,
+          workingDirectory: input.workingDirectory,
+          sourcePrompt: input.prompt,
           dedupKey: `workflow-retry:${claimed.id}:${claimed.retry?.attempts || 0}`,
         });
         if (!delivered.ok) {
@@ -1037,6 +1258,9 @@ async function main(): Promise<void> {
   const knowledgeWatcher = config.memoryRepoDir
     ? startKnowledgeIndexWatcher(config.memoryRepoDir)
     : null;
+  const memoryOptimizer = config.memoryRepoDir
+    ? startMemoryOptimizerService(config.memoryRepoDir, config)
+    : null;
   let todoReminderService: TodoReminderService | null = null;
   let workflowRetryTimer: NodeJS.Timeout | null = null;
   if (knowledgeWatcher) {
@@ -1044,6 +1268,13 @@ async function main(): Promise<void> {
     console.log(`[claude-to-im] Knowledge index: ${status.itemCount} items, watching=${status.watching}, root=${status.memoryRoot}`);
     if (status.lastError) {
       console.warn(`[claude-to-im] Knowledge index warning: ${status.lastError}`);
+    }
+  }
+  if (memoryOptimizer) {
+    const status = memoryOptimizer.status();
+    console.log(`[claude-to-im] Memory optimizer: enabled=${status.enabled}, drafts=${status.draftCount}, next=${status.nextRunAt || '-'}`);
+    if (status.recentError) {
+      console.warn(`[claude-to-im] Memory optimizer warning: ${status.recentError}`);
     }
   }
   const pendingPerms = new PendingPermissions();
@@ -1233,6 +1464,7 @@ async function main(): Promise<void> {
     await bridgeManager.stop();
     todoReminderService?.close();
     knowledgeWatcher?.close();
+    memoryOptimizer?.close();
     if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
     recordBridgeRuntimeExit(reason);
@@ -1253,6 +1485,7 @@ async function main(): Promise<void> {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
     todoReminderService?.close();
     knowledgeWatcher?.close();
+    memoryOptimizer?.close();
     if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
     recordBridgeRuntimeExit(`uncaughtException: ${err.message}`, err);
@@ -1266,6 +1499,7 @@ async function main(): Promise<void> {
     console.log(`[claude-to-im] exit (code: ${code})`);
     todoReminderService?.close();
     knowledgeWatcher?.close();
+    memoryOptimizer?.close();
     if (workflowRetryTimer) clearInterval(workflowRetryTimer);
     clearInterval(heartbeatTimer);
   });

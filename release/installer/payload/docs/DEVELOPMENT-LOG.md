@@ -1,10 +1,33 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-05-09
+更新时间：2026-05-20
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
 ## 1. 项目收口
+
+- 2026-05-19 优化直接提醒自然语言解析：`五点半提醒我替换pve场景的背景图`、`下午五点半提醒我...`、`明天上午九点提醒我...`、`晚上8点15分提醒我...` 这类请求会走可复用时间短语解析层，命中 bridge-core 的高置信 reminder fast-path，创建 `data/todos/direct-reminders/*.md` 并重建 `.cti-index/reminders.json`，避免 Codex 文本回复“收到”但面板没有待办记录。
+- 2026-05-11 修正 Feishu 入站权限模型：`bridge_feishu_allowed_users` 不再作为 adapter 层会话白名单，任何用户都可以进入普通会话；兼容配置里的 allowed users 只再映射为 `Viewer` 角色，危险动作继续由 `Viewer / Operator / Owner` 门禁控制。
+- 2026-05-11 重整记忆召回链路：移除 `常用场景名称` 这类单词条快路径，改为 `MemoryQueryPlan -> RetrievedMemoryHit 元数据 -> MemoryReplyDecision`。明确回忆类请求只有高置信结构化命中才直答；模糊召回受限交给 Codex；普通任务只注入记忆上下文。`audit.json` 已发结果、profile、知识索引和会话历史统一带来源、置信度、可回答性和质量标记，错误兜底不再写入或召回为有效记忆。
+- 2026-05-11 补齐显式记忆写入可见性：用户发送“记住 / 记一下 / 保存记忆”时，运行时除了更新 `memory-profiles.json`，还会把原始内容写入 Markdown 知识库 `data/explicit-memories/*.md` 并重建索引，避免机器人说“记住了”但控制面板“记忆”页看不到。
+- 2026-05-12 新增记忆答案审查层：`bridge-core` 在 direct memory reply 和 Codex 最终回复发送前调用 runtime/store 的 `reviewOutboundAnswer`，v1 规则先检查乱码、协议残留、低价值兜底、工具假完成和记忆 key 不匹配；默认 `observe` 只写 `answer-review-audit.json`，配置 `bridge_answer_review_mode=block_or_replace` 后才替换或拦截用户可见回复。
+- 2026-05-12 新增显式记忆关系图：知识索引重建后同步生成 `.cti-index/memory-graph.json`，从结构化 key/value、同文件上下文和冲突标记建立 `maps_to`、`reverse_lookup`、`related_to` 等可解释边；检索会同时提供正向和反向候选，例如“雷霆龙”可关联回“第十三条龙”、展示 prefab 和 UIScene 路径。
+- 2026-05-12 显式记忆写入收口到可见知识库：`memory_write` 意图会先落 `data/explicit-memories/*.md` 并重建知识/关系索引，成功后才返回“记住了”；写入失败会直接说明阻塞，不再让模型假装已记住。控制面板“记忆”页显示关系图规模、节点/边预览、知识单元关联节点和最近答案审查 warning；关系图候选只做上下文增强，不参与直接记忆回答。
+- 2026-05-14 显式记忆分类和网格可视化收口：Markdown 表格行不再固定归为资源，而是按路径/链接/文件扩展名/Prefab/UIScene/预制体/路径、决策规则词、待办风险词等保守推断为事实、结论、待办或资源；单纯的 Scene 标识到常用名映射按事实处理，并记录分类原因；控制面板“记忆”页改为 TanStack Table 网格，可切换知识单元、关系节点、关系边视图。
+- 2026-05-16 平台化第一阶段打底：新增 `packages/contracts` 共享契约包，集中维护 Control API、workflow run、node agent heartbeat 和 extension trust policy schema；bridge-runtime 增加 workflow contract adapter，把现有 `workflow-runs.json` 映射为 checkpoint/trace event 契约；控制面板新增节点快照和“节点”页，先展示本机 node 与 fake remote node 的能力清单，为后续多 runtime 控制面预留边界。
+- 2026-05-16 控制面板蓝图化降门槛：总览页新增系统蓝图，用普通用户路径解释飞书入口、Bridge、AI 执行、辅助能力和最终回复；“记忆”页新增关系树，把结构化记忆展开为对应内容、相关对象、待办提醒、可能冲突和来源文件，原始知识单元、相关对象、联系权重、索引路径和需要检查的回复默认折叠到高级诊断。
+- 2026-05-16 系统蓝图可操作化：总览页蓝图节点从只读状态升级为点击后打开处理面板，入口、Bridge、AI、MCP、记忆、提醒和回复链路均可复用现有运行单元动作或跳转到服务、扩展、记忆、设置页处理。
+- 2026-05-16 系统蓝图 MCP 状态口径修正：MCP 子节点改用扩展页同一套 `runtime.listUnits` 健康结果判断可用性，不再用托管进程 `running/total` 把按需 stdio 或外部 HTTP MCP 误显示为“需要处理”。
+- 2026-05-16 记忆一键整理与 Codex CLI 模型来源优化：运行时新增 `.cti-index/memory-optimization-drafts` 草稿和 `.cti-index/memory-optimizer-state.json` 定期状态，Control API 增加 `memory.optimizePreview/apply/discard/schedule/status`；面板“记忆”页支持生成整理草稿、逐项取消、确认覆盖和丢弃，定期模式只生成待确认草稿。设置页从“AI API / 本地兜底”改为“Codex CLI 模型来源”，官方 Codex、本地 API、外部 API 都可作为主模型，`CTI_CODEX_FAILURE_FALLBACK_MODE` 默认 `none`，只有显式开启备用模型才切到本地 Agent API。
+- 2026-05-18 Codex CLI 本地 API 假完成拦截：ConversationResult 记录本轮 `tool_use/tool_result` 执行证据；CodexProvider 在 status 事件中写入 `codexProfile/modelSource/model/baseUrl`；workflow run 追加 `execution.evidence` 事件。出站前会验证 `cti-final.images/files` 本地路径存在，并在“创建/生成/写入/执行”等回复缺少成功工具证据时改写为“未完成”，避免本地 API 主模型或备用模型编造成果。
+- 2026-05-19 本地 / 外部模型执行路由优化：新增 `local-model-capabilities.json` 工具调用探测，Control API 增加 `localLlm.probeTools` / `settings.testLocalTools`；设置页新增“本地执行模式、执行类任务必须通过工具调用探测、本地工具未验证时如何处理”。当 `CTI_CODEX_MODEL_SOURCE=local_api` 但模型没有真实 `tool_calls` 证据时，执行类任务默认改交官方 Codex / 外部 API 或按配置拒绝，不再让本地文本模型伪装工具执行。Codex 失败后，`git status`、当前分支、最近提交、暂存区内容、读文件和搜文本这类只读固定动作可由 runtime 受控工具兜底，仍不让本地模型直答。扩展目录补入 `qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b` 工具候选模型，`qwen2.5-coder:7b` 继续定位为文本/总结兜底。
+- 2026-05-20 Codex bridge 配置隔离：CodexProvider 生成 bridge 专用 `CODEX_HOME` 时默认剔除全局 `mcp_servers.*`，只同步认证、skills/plugins/vendor/rules 等共享资源，避免桌面 Codex 配置里的 Unity MCP、Blender MCP 或其他外部 MCP 未启动时导致飞书 bridge 的 Codex 主模型直接退出。需要继承桌面 MCP 时必须显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
+- 2026-05-20 Codex SDK 版本跟进：`@openai/codex-sdk` 升级到 `0.132.0`，修复 live bridge 仍使用 `0.110.0` SDK 读取新版 `CODEX_HOME` 状态库时反复 `Codex Exec exited with code 1` 的问题；`scripts/sync-live-skill.ps1` 同步后会校验并安装 live runtime 所需 SDK 版本，避免 package 与 `node_modules` 脱节。
+- 2026-05-20 断点续跑图片回传收口：workflow retry 如果得到 `cti-final` 结果块，不再给用户发送“断点续跑重试结果”包装文本或原始 JSON，而是复用 bridge-core 出站收口解析最终文本、图片和文件；Unity Game 视角截图这类重试结果会按 reply 关系发送干净文本和本地图片附件。
+- 2026-05-20 记忆整理透明化与安全归档优化：控制面板“记忆”页新增索引来源总览、来源分组筛选和分页搜索，明确面板默认显示不是全部 `knowledge.json`；整理草稿按显式记忆、直接提醒、生成摘要、文档/根目录笔记等来源分层，文档和索引类来源默认不勾选。`memory.optimizeApply` 改为只执行 `selectedActionIds`，旧草稿会按 `sourceIndexGeneratedAt` 拒绝应用；新增 `memory.restoreArchive` 和 `memory.optimizeUndo`，归档恢复限定在 `E:\cli-md\archive\knowledge-units` 内并校验源文件仍在记忆仓库。
+- 2026-05-20 记忆页入口降噪：控制面板“记忆”页把“记忆关系树”提升到第一屏，并在树内新增“整理记忆从这里开始”行动区；“生成整理草稿”改为主按钮，草稿确认区文案改为“确认应用所选”。索引来源总览降级为默认折叠的来源解释，只在用户追查“草稿为什么包含当前列表没显示的来源”时展开。
+- 2026-05-20 记忆关系树全量化：关系树左侧不再只截取前 8 条结果，默认请求最多 200 条并列出当前检索命中的全部记忆；右侧继续围绕选中记忆展开关系，结果超过上限时提示用搜索或来源筛选缩小范围。
+- 2026-05-20 记忆来源分组降噪：关系树左侧不再把 `AI_BRIDGE_CONTEXT.md`、生成摘要、根目录笔记和显式记忆混成一个平铺列表；普通记忆默认展开，生成摘要和上下文/索引资料默认折叠，避免系统工程上下文被误解为用户显式记忆。
 
 已完成：
 
@@ -13,6 +36,7 @@
 - 新增 `scripts/update-architecture-docs.ps1`，用于发布前或架构变更后检查架构文档维护状态。
 - 将原先分散的桥接核心、运行时、MCP、控制面板、安装器收口到 `packages` 和 `apps`。
 - 建立 `suite.manifest.json` 作为发行层总清单。
+- 新增 `packages/contracts`，作为 Control API DTO、workflow schema、node agent schema 和 extension capability schema 的共享事实来源。
 - 建立 `publish-backup.ps1`，发布前自动同步、打包、生成摘要、提交并推送。
 - 建立 `publish-summary.md` 和 `release-notes.md`。
 - 新增 `scripts/doctor-suite-targets.ps1`，用于检查开发版、live skill、portable、installer 和面板 exe 的职责与漂移情况。
@@ -48,6 +72,8 @@
 - 控制面板主界面已切到无底图运营台样式，支持白天 / 夜晚主题切换，并按窗口宽度自适应切换侧栏、顶部工具条、概览卡片和详情区布局。
 - 控制面板第二轮改造已完成：服务、Codex CLI、本地辅助执行器、MCP、扩展 manifest 统一抽象成运行单元卡片，WebView 通过 `runtime.listUnits` / `runtime.invokeAction` 渲染和执行动作。
 - 控制面板“执行器”页已和“服务”页区分：服务页继续承载运行单元生命周期操作；执行器页的 Executor Registry 改为可选中的只读路由目录，右侧展示选中 executor 的能力、风险、优先级和最近路由，不暴露默认执行器写入入口。
+- 控制面板新增“节点”页和 `nodes.list` 命令，基于共享 node agent 契约展示本机 runtime node、fake remote node、heartbeat、能力清单和可管理状态；当前只读，不执行远端动作。
+- 控制面板总览页新增可点击处理的系统蓝图，“记忆”页新增关系树视图；面向普通用户默认展示业务联系、状态和推荐操作，高级诊断仍保留索引状态、网格、关系缓存和答案审查细节。
 - 会话页新增详情抽屉，支持直接查看完整消息流、复制摘要和复制消息文本，不再强依赖旧 WinForms 会话查看器。
 - 会话详情抽屉补齐图片和附件查看：宿主会读取 Feishu 原始消息资源键，下载图片/文件到本机 `runtime/control-panel-media` 缓存，并通过 WebView2 虚拟域 `control-panel-media.local` 给前端加载。前端展示图片缩略图、附件名称、大小、MIME、路径和下载状态，不再把图片简单显示成占位文本。
 - 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
@@ -62,11 +88,12 @@
 - 本地模型后端从旧 `llama.cpp` 迁移到 Ollama：新增 `CTI_OLLAMA_ENABLED`、`CTI_OLLAMA_BASE_URL`、`CTI_OLLAMA_MODEL`、`CTI_OLLAMA_TIMEOUT_MS`，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 本地辅助 AI 从固定 Ollama 扩展为 OpenAI-compatible Chat Completions 配置：新增 `CTI_LOCAL_AI_KIND`、`CTI_LOCAL_AI_BASE_URL`、`CTI_LOCAL_AI_MODEL`、`CTI_LOCAL_AI_API_KEY`、`CTI_LOCAL_AI_TIMEOUT_MS`，继续兼容 `CTI_OLLAMA_*` 默认值。
 - Codex API 配置正式纳入面板和运行时配置：支持 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`、`CTI_CODEX_REASONING_EFFORT`，API key 在 Web 状态里只显示掩码。
-- 控制面板设置页新增“AI API”区域，可测试本地 AI 和 Codex API 配置，并提供“保存并重启 Bridge”让飞书运行时加载全局执行链配置；本地 AI 类型不是 Ollama 时，执行器目录不再把 `codex-oss-ollama` 显示为可用。
+- 控制面板设置页新增模型来源区域，可测试本地 AI 和 Codex API 配置，并提供“保存并重启 Bridge”让飞书运行时加载全局执行链配置；本地 AI 类型不是 Ollama 时，执行器目录不再把 `codex-oss-ollama` 显示为可用。
 - `hybrid` / `codex_only` 模式下停止在 Codex 前执行 MCP/本地工具快路径；“Fetch MCP 能用吗”等 MCP 状态问题默认先进入 Codex，Codex 不可用时才读取合并 manifest 与 `codex mcp list` 做动态兜底，避免返回硬编码 MCP 入口列表。
-- 本地模型直答兜底已改为本地 Agent API 兜底：Codex 主 API 失败后复用 `CodexProvider(local_fallback)`，读取 `CTI_LOCAL_AI_*`，强制传本地模型，并使用独立 `CODEX_HOME`。
-- 新增 `CTI_CODEX_LOCAL_FALLBACK_ENABLED` 和 `CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT`；面板“AI API”区域改为“Codex 主 API”和“本地 Agent API（兜底/省流）”，支持开关和保存后重启 Bridge。
-- 面板“AI API”进一步改成运行策略向导：默认只展示“默认 Codex / Codex + 本地兜底 / 完全使用自定义 API”、当前策略摘要和必要字段，高级 Base URL、API key、reasoning、pass model 等仍保留在折叠区。
+- 本地模型直答兜底已改为 Codex CLI profile：主模型来源可用官方 Codex、本地 API 或外部 API；备用本地 Agent API 读取 `CTI_LOCAL_AI_*`，强制传本地模型，并使用独立 `CODEX_HOME`。
+- 新增 `CTI_CODEX_MODEL_SOURCE`、`CTI_CODEX_FAILURE_FALLBACK_MODE`、`CTI_CODEX_LOCAL_FALLBACK_ENABLED` 和 `CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT`；主模型失败默认不自动降级，备用本地 Agent API 只在显式开启时生效。
+- 面板模型来源区域默认只展示“官方 Codex / 本地 API 作为主模型 / 外部 API 作为主模型”、当前策略摘要和必要字段，高级 Base URL、API key、reasoning、pass model 等仍保留在折叠区。
+- 面板“AI API”改名为“Codex CLI 模型来源”：官方 Codex、本地 API 和外部 API 都是主模型来源；本地 API 复用 `CTI_LOCAL_AI_*`，外部 API 复用 `CTI_CODEX_*`，失败后默认不自动降级，备用本地 Agent API 只在用户明确开启时生效。
 - Executor registry 新增 `codex-local-fallback`，`@local` / `@本地` 指向该执行器；`local-tool-agent` 仅保留历史兼容，普通消息不再使用本地模型直接生成最终回复。
 - `scripts/local-llm` 改为 Ollama 安装提示、启动、停止和 `/api/tags` 健康检查；旧 `llama-server.exe`、GGUF 路径和 server args 不再作为运行来源。
 - 新增 Markdown 知识索引：默认监听 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`，知识单元分为 `事实 / 结论 / 待办 / 资源`。
@@ -142,8 +169,9 @@
 - Ollama 本地后端接入。
 - 本地执行器支持 shell、git、文件读写、文本搜索。
 - `hybrid / local_only / codex_only` 三种模式。
-- Codex 主 API 失败时切 `codex_local_fallback`，由同一套 Codex agent 链路改用本地 Agent API 继续执行。
-- 主 API 与本地 Agent API 都不可用时返回明确阻塞，不再生成教程式或静态 canned 回复。
+- Codex CLI 主模型来源可配置为官方 Codex、本地 API 或外部 API；主模型失败默认返回明确阻塞，不再自动切到弱兜底。
+- 本地 API 作为主模型或备用模型时，执行类任务必须先通过 OpenAI-compatible `tools` 探测；未通过时默认交给官方 / 外部 Codex profile 或拒绝，避免“没调用工具却声称已执行”。
+- 只有用户显式开启备用本地 Agent API 时才切 `codex_local_fallback`，主模型和备用模型都不可用时返回明确阻塞，不生成教程式或静态 canned 回复。
 - 本地模型不能伪造“已执行 / 已修改 / 已导入 / 已创建”结果。
 - `codex-oss-ollama` 实验执行器已登记到 executor registry，声明 `codex exec --oss --local-provider ollama`，能力限制为只读问题和记忆检索兜底。
 - Ignis 创意生成请求可走本地模型快路径，`local_only` 模式下也能提交和查询 Ignis 任务。
@@ -161,6 +189,7 @@
 - fast-path 执行前判断改为硬约束：Ignis handler 先判断 intent 再读取 manifest / 健康检查；旧 MCP handler 全部委托到新版 preflight，避免老入口继续用散落正则绕过判断。
 - Skill、Codex prompt 和本地兜底 prompt 已补“解决问题优先”约束：工具类任务不能用通用步骤、示例表格或样例脚本代替真实执行；没有真实工具结果时必须明确说未完成和具体阻塞点。
 - 工具任务降级已加硬收口：Codex/MCP 执行链失败后，Unity/Blender/MCP/文档类请求直接返回确定性阻塞原因，不再交给本地模型生成“请手动检查”的教程式回复；bridge-core 出站前也会拦截这类外包式文案。
+- 2026-05-15 补齐 Unity/Prefab 工具任务的入口伪澄清拦截：如果用户已经提出 `unitymcp`、Prefab、场景或对象结构查看请求，Codex 或本地 Agent 失败后的回复不能再要求用户“指定 MCP 入口”或返回 MCP 入口列表；出站收口会改写成“未完成 + 需要真实 Unity/MCP 执行结果”的阻塞说明，并新增 `STH_AreaView` prefab 回归测试。
 - Codex/桥接提示词补齐 Unity 截图和 MCP 握手约束：截图类任务不得用扫描到的历史截图冒充当前刷新结果；`/mcp` 返回 406 时按“服务在线但缺 MCP Accept 握手头”处理，必须重试正式 initialize/list-tools 流程后才能判定不可用。
 - Codex provider 已补模型隔离：bridge 生成自己的 Codex Home 时剔除全局 `model = ...`，并支持 `CTI_CODEX_MODEL` 运行时覆盖。当前本机 Codex CLI 已从 `0.121.0` 升级到 `0.125.0`，`gpt-5.5` 已通过最小请求验证；live 版当前显式设置 `CTI_CODEX_MODEL=gpt-5.5`。
 
@@ -189,6 +218,9 @@
 - 运行中 workflow run 会持久化第一版最小恢复信息：prompt、工作目录、模型、system prompt、权限模式、渠道和 chatId；长文本按上限截断，避免状态文件无限膨胀。
 - bridge-runtime 启动时会扫描 `workflow-runs.json` 中遗留的 `running` run：有恢复输入且未耗尽次数的标为 `retry_pending`，缺少恢复输入的标为不可恢复失败。
 - provider 执行失败时会在可恢复 run 上排队一次自动重试；后台 retry worker 会领取 `auto_pending` / `manual_pending` run，重新流式执行并把结果写回会话历史。
+- 2026-05-15 新增自动重试新鲜度窗口：`auto_pending` 只会在 `CTI_WORKFLOW_AUTO_RETRY_MAX_AGE_MS` 窗口内被后台 retry worker 领取，默认 6 小时；手动重试不受该窗口影响。
+- 2026-05-15 新增长时间空闲 fresh session 保护：同一 chat 绑定超过 `CTI_SESSION_IDLE_FRESH_MS`（默认 12 小时）后，下次消息会重绑到新 session 并清空 `sdkSessionId`，避免长时间断线后继续复用旧 Codex thread 和旧上下文。
+- 2026-05-15 Codex provider 新增失效工作区兜底：`workingDirectory` 或 `additionalDirectories` 命中不存在的路径时，不再原样传给 Codex CLI；会优先回退到有效的 `CTI_DEFAULT_WORKDIR`，并过滤掉不存在的附加目录，避免 workflow retry 或旧绑定因为失效路径直接触发 `Error: 系统找不到指定的文件 (os error 2)`。
 - retry 结果如果保留了渠道和 chatId，会通过 bridge proactive message 回发“断点续跑重试结果”，避免 bridge 重启后只在本地状态里完成。
 - 控制面板执行器页和会话详情能显示 recovery / retry 状态，并通过 `workflow.retryRun` 对失败且有恢复输入的 run 发起手动重试。
 - workflow status 单测补齐恢复信息持久化、重启后可恢复/不可恢复分类、手动 retry 请求和 runtime 领取顺序。
@@ -327,6 +359,8 @@
 - 运行时已取消“本地记忆笔记快答”：像“常用场景名称你还记得吗”这类问题会走记忆检索和主执行链，不再因为关键词命中就绕过 Codex。
 - 会话历史里飞书 `interactive` 卡片消息现在会尽量解析正文文本；对旧的 `[卡片消息]` 占位记录，控制面板会优先按 `messageId` 从 `audit.json` 回填摘要，只有 audit 里也缺内容时才需要重新同步飞书历史。
 - Bridge 结果块协议已补回归测试：覆盖 `cti-final` 文本/Markdown 经 Feishu 出站、 malformed `cti-final` 可读兜底、`cti-reminder` 进入统一提醒 host，以及拦截伪提醒完成，避免原始 JSON 或协议残片发给用户。
+- 直接提醒自然语言快路径补齐“发消息提示我/通知我”句式：例如“一分钟后发消息提示我看一下unity”现在会直接创建 bridge 统一提醒，不再进入 Codex 普通回复后被伪完成拦截。
+- 直接提醒自然语言快路径补齐通用时间解析：支持相对时间、当天/明天/后天时刻和年月日时刻，提醒内容可出现在时间前或时间后；未带日期且时间已过时按次日同一时间处理，避免明确提醒请求落入普通 Codex 回复。
 
 近期注意：
 
@@ -346,9 +380,10 @@
 - 控制面板“记忆”页新增知识单元归档：点击归档会从源 Markdown 精确移除该知识单元行，并写入 `E:\cli-md\archive\knowledge-units\*.md`；归档目录不会进入索引，归档列表支持打开和永久删除。
 - 待办提醒索引默认位于 `E:\cli-md\.cti-index\reminders.json`，推送状态位于 `E:\cli-md\.cti-index\reminder-state.json`；普通记忆待办只针对带来源会话和提醒时间的未完成待办，默认关闭主动推送。
 - 直接提醒源文件默认写入 `E:\cli-md\data\todos\direct-reminders`，由 `cti-reminder` 动作或 `/remind` 显式入口创建，默认通过 bridge 统一推送链路到点发回当前会话。
+- 记忆整理草稿默认写入 `E:\cli-md\.cti-index\memory-optimization-drafts`，只在用户确认后修改 Markdown；归档动作进入既有归档目录，定期模式只生成待确认草稿。
 - 查看器优先使用远端 / 本地索引组合。
 - 本地历史检索支持群名、关键词、发言人、时间段。
-- Codex 主 API 不可用时，兜底仍由 Codex agent 切到本地 Agent API 执行；本地 API 也不可用时，工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
+- Codex CLI 主模型不可用时默认报告真实阻塞；只有用户显式开启备用本地 Agent API 时才切换备用 profile。工具链、写文件、发布和 Unity/Blender/MCP 任务必须报告真实阻塞。
 
 当前原则：
 
@@ -356,6 +391,8 @@
 - 本地索引用于检索、摘要、节省 token 和容灾。
 - 记忆只按查询相关性少量注入，不允许把所有用户画像或全部历史塞进模型上下文。
 - 记忆类回复不能只给概括，命中结构化键值时应保留原始键和值。
+- 2026-05-11 记忆回忆路由补齐 Feishu 群聊 @ 噪声剥离和短问句键值识别：类似“第十三条龙叫啥@机器人”会按“第十三条龙”检索结构化知识，但“场景名称是什么”这类抽象普通问句仍不触发直答。
+- 2026-05-11 继续加固记忆直答排序：结构化直答必须匹配结构化 key 或明确表标题，不能因为聊天记录里包含用户问题就用不相关表格抢答；知识库精确 key 命中会优先于同群噪声历史。
 
 ## 8. 已知风险和后续建议
 

@@ -197,6 +197,7 @@ interface AnswerReviewAuditRecord extends AnswerReviewDecision {
   userText: string;
   answerText: string;
   source?: AnswerReviewInput['source'];
+  executionEvidence?: AnswerReviewInput['executionEvidence'];
 }
 
 interface MemoryWriteInput {
@@ -1782,6 +1783,7 @@ export class JsonFileStore implements BridgeStore {
       userText: this.summarizeMessageContent(input.userText || '', 800),
       answerText: this.summarizeMessageContent(input.answerText || '', 1200),
       source: input.source,
+      executionEvidence: input.executionEvidence,
     };
     writeJson(ANSWER_REVIEW_AUDIT_PATH, [...existing, record].slice(-500));
   }

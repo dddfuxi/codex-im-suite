@@ -24,6 +24,7 @@ const baseConfig: Config = {
   ollamaEnabled: true,
   ollamaBaseUrl: 'http://127.0.0.1:11434',
   ollamaModel: 'qwen2.5-coder:7b',
+  codexLocalFallbackEnabled: true,
 };
 
 function params(prompt: string): StreamChatParams {
@@ -49,6 +50,14 @@ describe('executor registry', () => {
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.kind, 'cli');
   });
 
+  it('keeps local fallback disabled unless explicitly enabled', () => {
+    const manifests = buildExecutorManifests({
+      ...baseConfig,
+      codexLocalFallbackEnabled: undefined,
+    });
+    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, false);
+  });
+
   it('disables codex-oss-ollama when local AI is not Ollama', () => {
     const manifests = buildExecutorManifests({
       ...baseConfig,
@@ -59,6 +68,21 @@ describe('executor registry', () => {
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, true);
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.enabled, false);
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.enabled, false);
+  });
+
+  it('surfaces local API tool-call trust state in executor metadata', () => {
+    const manifests = buildExecutorManifests({
+      ...baseConfig,
+      codexModelSource: 'local_api',
+      localAgentMode: 'text_only',
+      localToolCallRequired: true,
+      executionRequiredRoute: 'codex_or_external',
+    });
+    const codex = manifests.find((manifest) => manifest.id === 'codex');
+    assert.equal(codex?.configSchema?.modelSource, 'local_api');
+    assert.equal(codex?.configSchema?.localAgentMode, 'text_only');
+    assert.equal(codex?.configSchema?.localToolCallingState, 'untested');
+    assert.equal(codex?.configSchema?.localExecutionTrusted, false);
   });
 
   it('detects explicit executor hints', () => {

@@ -1,6 +1,6 @@
 {
   "protocol": "extension-catalog/v1",
-  "updatedAt": "2026-05-08",
+  "updatedAt": "2026-05-19",
   "items": [
     {
       "id": "ollama-qwen2.5-coder-7b",
@@ -27,6 +27,62 @@
       "artifact": {
         "kind": "ollama",
         "model": "qwen3:8b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-14b",
+      "type": "model",
+      "displayName": "Qwen3 14B",
+      "version": "14b",
+      "category": "model.ollama.tool-candidate",
+      "description": "本地工具调用候选模型。适合先跑“测试工具调用”，通过后再允许受控执行类任务。",
+      "source": "qwen3:14b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3:14b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-30b",
+      "type": "model",
+      "displayName": "Qwen3 30B A3B",
+      "version": "30b-a3b",
+      "category": "model.ollama.tool-candidate",
+      "description": "更强的本地 Agent 候选，适合高配机器或独立推理机；仍需工具调用探测通过后再承接执行。",
+      "source": "qwen3:30b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3:30b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-32b",
+      "type": "model",
+      "displayName": "Qwen3 32B",
+      "version": "32b",
+      "category": "model.ollama.tool-candidate",
+      "description": "多步规划和结构化输出更稳的本地工具候选；建议只在显存/内存充足时安装。",
+      "source": "qwen3:32b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3:32b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen2.5-32b",
+      "type": "model",
+      "displayName": "Qwen2.5 32B",
+      "version": "32b",
+      "category": "model.ollama.tool-candidate",
+      "description": "中文和结构化输出较稳的本地工具候选，可作为 Qwen3 之外的备选。",
+      "source": "qwen2.5:32b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen2.5:32b"
       },
       "installHandler": "ollama.pull"
     },

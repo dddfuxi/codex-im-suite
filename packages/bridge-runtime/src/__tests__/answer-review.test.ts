@@ -49,4 +49,24 @@ describe('answer review', () => {
     assert.ok(decision.reasonCodes.includes('mojibake'));
     assert.ok(decision.reasonCodes.includes('protocol_leakage'));
   });
+
+  it('warns when an execution completion claim has no successful tool evidence', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: '在工作区新建一个txt文档并在里面写一个1，命名为测试',
+      answerText: '已成功在工作区新建了一个名为“测试”的txt文档，并在其中写入了数字1。',
+      executionEvidence: {
+        toolUseCount: 0,
+        toolResultCount: 0,
+        successfulToolResultCount: 0,
+        failedToolResultCount: 0,
+        toolNames: [],
+        permissionRequestCount: 0,
+      },
+    });
+
+    assert.equal(decision.verdict, 'warn');
+    assert.ok(decision.reasonCodes.includes('unsupported_execution_claim'));
+  });
 });

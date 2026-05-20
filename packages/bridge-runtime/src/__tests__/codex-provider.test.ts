@@ -82,6 +82,57 @@ describe('CodexProvider', () => {
     }
   });
 
+  it('isolates bridge Codex config from global MCP servers by default', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      bridgeHome: process.env.CTI_CODEX_HOME,
+      inheritMcp: process.env.CTI_CODEX_INHERIT_GLOBAL_MCP,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-mcp-isolation-'));
+    const globalHome = path.join(root, 'global');
+    const bridgeHome = path.join(root, 'bridge');
+    fs.mkdirSync(globalHome, { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf-8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), [
+      'model = "gpt-5.3-codex"',
+      'model_reasoning_effort = "high"',
+      '[features]',
+      'rmcp_client = true',
+      '[mcp_servers.unityMCP]',
+      'url = "http://127.0.0.1:8081/mcp"',
+      '[projects.\'C:\\\\unity\\\\ST3\']',
+      'trust_level = "trusted"',
+    ].join('\n'), 'utf-8');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_HOME = bridgeHome;
+    delete process.env.CTI_CODEX_INHERIT_GLOBAL_MCP;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('primary');
+      const bridgeConfig = fs.readFileSync(path.join(options.env.CODEX_HOME, 'config.toml'), 'utf-8');
+
+      assert.equal(options.env.CODEX_HOME, bridgeHome);
+      assert.ok(!bridgeConfig.includes('[mcp_servers.unityMCP]'));
+      assert.ok(!bridgeConfig.includes('rmcp_client'));
+      assert.ok(bridgeConfig.includes("[projects.'C:\\\\unity\\\\ST3']"));
+      assert.ok(bridgeConfig.includes('model_reasoning_effort'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.bridgeHome === undefined) delete process.env.CTI_CODEX_HOME;
+      else process.env.CTI_CODEX_HOME = saved.bridgeHome;
+      if (saved.inheritMcp === undefined) delete process.env.CTI_CODEX_INHERIT_GLOBAL_MCP;
+      else process.env.CTI_CODEX_INHERIT_GLOBAL_MCP = saved.inheritMcp;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
   it('builds local fallback Codex options from local AI settings and isolates CODEX_HOME', async () => {
     const saved = {
       localKind: process.env.CTI_LOCAL_AI_KIND,
@@ -126,6 +177,50 @@ describe('CodexProvider', () => {
       else process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT = saved.localEffort;
       if (saved.localHome === undefined) delete process.env.CTI_CODEX_LOCAL_FALLBACK_HOME;
       else process.env.CTI_CODEX_LOCAL_FALLBACK_HOME = saved.localHome;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
+  it('builds local primary Codex options from local AI settings without using fallback home', async () => {
+    const saved = {
+      localKind: process.env.CTI_LOCAL_AI_KIND,
+      localBaseUrl: process.env.CTI_LOCAL_AI_BASE_URL,
+      localApiKey: process.env.CTI_LOCAL_AI_API_KEY,
+      localModel: process.env.CTI_LOCAL_AI_MODEL,
+      localHome: process.env.CTI_CODEX_LOCAL_PRIMARY_HOME,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const tempHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-local-primary-${Date.now()}`)));
+    process.env.CTI_LOCAL_AI_KIND = 'ollama';
+    process.env.CTI_LOCAL_AI_BASE_URL = 'http://127.0.0.1:11434';
+    process.env.CTI_LOCAL_AI_API_KEY = 'test-local-primary-secret';
+    process.env.CTI_LOCAL_AI_MODEL = 'qwen3:14b';
+    process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = tempHome;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('local_primary');
+
+      assert.equal(options.profile, 'local_primary');
+      assert.equal(options.apiKey, 'test-local-primary-secret');
+      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
+      assert.equal(options.modelOverride, 'qwen3:14b');
+      assert.equal(options.passModel, true);
+      assert.equal(options.env.CODEX_HOME, tempHome);
+      assert.equal(process.env.CODEX_HOME, tempHome);
+    } finally {
+      const fs = await import('node:fs');
+      fs.rmSync(tempHome, { recursive: true, force: true });
+      if (saved.localKind === undefined) delete process.env.CTI_LOCAL_AI_KIND;
+      else process.env.CTI_LOCAL_AI_KIND = saved.localKind;
+      if (saved.localBaseUrl === undefined) delete process.env.CTI_LOCAL_AI_BASE_URL;
+      else process.env.CTI_LOCAL_AI_BASE_URL = saved.localBaseUrl;
+      if (saved.localApiKey === undefined) delete process.env.CTI_LOCAL_AI_API_KEY;
+      else process.env.CTI_LOCAL_AI_API_KEY = saved.localApiKey;
+      if (saved.localModel === undefined) delete process.env.CTI_LOCAL_AI_MODEL;
+      else process.env.CTI_LOCAL_AI_MODEL = saved.localModel;
+      if (saved.localHome === undefined) delete process.env.CTI_CODEX_LOCAL_PRIMARY_HOME;
+      else process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = saved.localHome;
       if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = saved.codeHome;
     }

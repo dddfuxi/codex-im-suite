@@ -218,6 +218,7 @@ textarea::placeholder {
   position: sticky;
   top: 0;
   z-index: 10;
+  flex: 0 0 auto;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -491,8 +492,20 @@ button:disabled {
   gap: 10px;
 }
 
+.section-header > div {
+  min-width: 0;
+}
+
 .section-header h2 {
   font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.panel-intro {
+  margin: -2px 0 12px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .summary-grid,
@@ -511,6 +524,203 @@ button:disabled {
 
 .summary-grid.wide {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.system-blueprint {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 28px minmax(150px, 1fr) 28px minmax(150px, 1fr) 28px minmax(190px, 1.35fr) 28px minmax(150px, 1fr);
+  gap: 0;
+  align-items: center;
+}
+
+.blueprint-node,
+.memory-center,
+.memory-branch-group,
+.memory-branch-item,
+.memory-pick {
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--panel-muted);
+}
+
+.blueprint-node {
+  display: grid;
+  gap: 10px;
+  min-height: 170px;
+  padding: 13px;
+  border-radius: 12px;
+}
+
+.blueprint-node.active,
+.blueprint-child.active {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent), var(--panel-shadow);
+}
+
+.blueprint-node-button {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.blueprint-action-hint {
+  width: fit-content;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.blueprint-node.normal,
+.memory-center.normal,
+.memory-branch-group.normal,
+.memory-branch-item.normal {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 36%, var(--panel-muted));
+}
+
+.blueprint-node.attention,
+.memory-center.attention,
+.memory-branch-group.attention,
+.memory-branch-item.attention {
+  border-color: color-mix(in srgb, var(--warning-text) 26%, var(--border));
+  background: color-mix(in srgb, var(--warning-bg) 42%, var(--panel-muted));
+}
+
+.blueprint-node.disabled,
+.memory-branch-group.disabled,
+.memory-branch-item.disabled {
+  opacity: 0.78;
+}
+
+.blueprint-node-head,
+.memory-center-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.blueprint-icon {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--accent-strong);
+  background: var(--panel-strong);
+}
+
+.blueprint-node strong,
+.blueprint-child strong,
+.memory-center strong,
+.memory-branch-item strong,
+.memory-pick span {
+  overflow-wrap: anywhere;
+}
+
+.blueprint-node p,
+.blueprint-child p,
+.memory-center p,
+.memory-branch-item p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.blueprint-connector {
+  height: 2px;
+  margin: 0 8px;
+  background: linear-gradient(90deg, var(--border-strong), var(--accent), var(--border-strong));
+}
+
+.blueprint-children {
+  display: grid;
+  gap: 8px;
+}
+
+.blueprint-child {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: inherit;
+  background: color-mix(in srgb, var(--panel-strong) 78%, transparent);
+  text-align: left;
+  cursor: pointer;
+}
+
+.blueprint-child > span {
+  display: inline-flex;
+  color: var(--accent-strong);
+}
+
+.blueprint-action-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.85fr) minmax(0, 1.4fr);
+  gap: 14px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.blueprint-action-panel.normal {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 28%, var(--panel-muted));
+}
+
+.blueprint-action-panel.attention {
+  border-color: color-mix(in srgb, var(--warning-text) 26%, var(--border));
+  background: color-mix(in srgb, var(--warning-bg) 35%, var(--panel-muted));
+}
+
+.blueprint-action-panel.disabled {
+  opacity: 0.9;
+}
+
+.blueprint-action-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.blueprint-action-copy span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.blueprint-action-copy strong {
+  font-size: 18px;
+}
+
+.blueprint-action-copy p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.blueprint-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-content: start;
+  justify-content: flex-end;
 }
 
 .memory-visual-grid {
@@ -544,6 +754,72 @@ button:disabled {
 .memory-radar strong,
 .memory-pipeline-step strong {
   font-weight: 700;
+}
+
+.memory-source-list {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-source-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.memory-source-card.review {
+  border-color: color-mix(in srgb, var(--warning) 32%, var(--border));
+}
+
+.memory-source-card > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.memory-source-card span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.memory-source-card code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.memory-tree-primary {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
+}
+
+.memory-quick-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin: 0 0 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 14%, transparent), transparent 42%),
+    var(--panel-muted);
+}
+
+.memory-quick-actions > div:first-child {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.memory-quick-actions span {
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .memory-bar-track {
@@ -608,6 +884,309 @@ button:disabled {
 .memory-pipeline-step.ok {
   border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
   background: color-mix(in srgb, var(--accent-soft) 44%, var(--panel-muted));
+}
+
+.memory-tree-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.32fr) minmax(0, 1fr);
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.memory-tree-picker {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.memory-tree-picker-list {
+  display: grid;
+  gap: 8px;
+  max-height: 640px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.memory-source-section {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel-muted) 62%, transparent);
+}
+
+.memory-source-section header,
+.memory-source-section summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-weight: 700;
+  cursor: default;
+}
+
+.memory-source-section summary {
+  cursor: pointer;
+}
+
+.memory-source-section small {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.memory-source-section p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.memory-source-section-body {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-pick {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  padding: 10px;
+  border-radius: 10px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.memory-pick.active {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 62%, var(--panel-strong));
+}
+
+.memory-pick small {
+  color: var(--text-muted);
+}
+
+.memory-tree-canvas {
+  position: relative;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.memory-center {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px;
+  border-radius: 12px;
+}
+
+.memory-center-meta {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.memory-branches {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.memory-branch-group {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 12px;
+}
+
+.memory-branch-group::before {
+  content: "";
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  width: 1px;
+  height: 14px;
+  background: var(--border-strong);
+}
+
+.memory-branch-group header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  font-weight: 700;
+}
+
+.memory-branch-items {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-branch-item {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border-radius: 10px;
+}
+
+.memory-branch-item > span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.memory-optimizer-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.memory-optimizer-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.memory-optimizer-draft {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.optimizer-draft-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.optimizer-draft-head > div:first-child {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.optimizer-draft-head span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.optimizer-action-list {
+  display: grid;
+  gap: 8px;
+}
+
+.optimizer-action {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-strong);
+}
+
+.optimizer-action input {
+  margin-top: 3px;
+}
+
+.optimizer-action > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.optimizer-action span,
+.optimizer-action p {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.optimizer-action code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.optimizer-action.risk-medium {
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--border));
+}
+
+.optimizer-action.risk-high {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.optimizer-action.excluded {
+  opacity: 0.58;
+  background: var(--panel-muted);
+}
+
+.advanced-diagnostics {
+  padding: 0;
+}
+
+.advanced-diagnostics > summary {
+  position: relative;
+  padding: 14px;
+  padding-right: 42px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.advanced-diagnostics > summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-diagnostics > summary span {
+  display: block;
+  font-weight: 700;
+}
+
+.advanced-diagnostics > summary small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.advanced-diagnostics > summary::after {
+  content: "+";
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.advanced-diagnostics[open] > summary::after {
+  content: "-";
+}
+
+.advanced-diagnostics[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.advanced-diagnostics-body {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+}
+
+.diagnostic-section {
+  display: grid;
+  gap: 10px;
 }
 
 .metric-strip {
@@ -1577,6 +2156,10 @@ button:disabled {
   .services-layout,
   .executor-main-layout,
   .extensions-layout,
+  .system-blueprint,
+  .blueprint-action-panel,
+  .memory-tree-layout,
+  .memory-branches,
   .memory-visual-grid,
   .permissions-layout,
   .permission-filter-row,
@@ -1590,8 +2173,35 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .memory-optimizer-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .memory-quick-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .panel-span-2 {
     grid-column: auto;
+  }
+
+  .system-blueprint {
+    gap: 10px;
+  }
+
+  .blueprint-connector {
+    width: 2px;
+    height: 18px;
+    margin: 0 auto;
+    background: linear-gradient(180deg, var(--border-strong), var(--accent), var(--border-strong));
+  }
+
+  .blueprint-node {
+    min-height: 0;
+  }
+
+  .blueprint-action-buttons {
+    justify-content: flex-start;
   }
 
   .detail-drawer {
@@ -1657,7 +2267,10 @@ button:disabled {
   }
 
   .topbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
     position: static;
+    align-items: stretch;
     padding: 12px;
   }
 
@@ -1667,7 +2280,20 @@ button:disabled {
 
   .topbar-title,
   .live-sync-banner {
+    min-width: 0;
     width: 100%;
+  }
+
+  .topbar-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .topbar-actions > *,
+  .topbar-actions .icon-button {
+    width: 100%;
+    min-width: 0;
   }
 
   .live-sync-copy {
@@ -1678,6 +2304,11 @@ button:disabled {
   .summary-grid.wide,
   .memory-radar,
   .memory-pipeline,
+  .memory-optimizer-summary,
+  .optimizer-draft-head,
+  .blueprint-action-panel,
+  .memory-tree-layout,
+  .memory-branches,
   .metric-strip,
   .release-gates,
   .runtime-grid,
@@ -1693,8 +2324,10 @@ button:disabled {
   }
 
   .runtime-row,
+  .optimizer-draft-head,
   .session-row,
   .activity-item,
+  .section-header,
   .message-card header {
     flex-direction: column;
     align-items: flex-start;

@@ -8,7 +8,11 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'shared.ps1')
 $suiteRoot = Split-Path -Parent $scriptDir
 $defaultControlPanelDir = Join-Path $suiteRoot 'release\artifacts\control-panel'
-$controlPanelDir = $defaultControlPanelDir
+$controlPanelDir = if ([string]::IsNullOrWhiteSpace($env:CTI_RELEASE_CONTROL_PANEL_DIR)) {
+    $defaultControlPanelDir
+} else {
+    [System.IO.Path]::GetFullPath($env:CTI_RELEASE_CONTROL_PANEL_DIR)
+}
 $previousReleaseRunId = $env:CTI_RELEASE_RUN_ID
 $previousControlPanelDir = $env:CTI_RELEASE_CONTROL_PANEL_DIR
 if ([string]::IsNullOrWhiteSpace($env:CTI_RELEASE_RUN_ID)) {

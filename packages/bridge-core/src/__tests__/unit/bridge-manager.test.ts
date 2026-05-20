@@ -10,6 +10,9 @@
 
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { initBridgeContext } from '../../lib/bridge/context';
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities';
 import type {
@@ -179,6 +182,69 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(auditLogs.length, 1);
     assert.equal(auditLogs[0].direction, 'outbound');
     assert.equal(dedupKeys.has('todo-reminder:1'), true);
+  });
+
+  it('delivers proactive cti-final images as clean text plus local image attachments', async () => {
+    const auditLogs: Array<{ direction: string; chatId: string; summary: string }> = [];
+    const store = {
+      ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+      insertAuditLog: (entry: any) => { auditLogs.push(entry); },
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-proactive-image-'));
+    const imagePath = path.join(tempDir, 'game-view.png');
+    fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const sent: OutboundMessage[] = [];
+    const sentImages: Array<{ chatId: string; filePath: string; replyTo?: string }> = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_text' };
+    });
+    adapter.sendLocalImage = async (chatId, filePath, replyToMessageId) => {
+      sentImages.push({ chatId, filePath, replyTo: replyToMessageId });
+      return { ok: true, messageId: 'om_image' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    try {
+      const result = await deliverProactiveMessage({
+        address: { channelType: 'feishu', chatId: 'oc_123' },
+        text: [
+          '中间过程：已截取 Game 视角。',
+          '',
+          '```cti-final',
+          JSON.stringify({
+            kind: 'image',
+            text: 'Unity Game 视角截图如下。',
+            images: [imagePath],
+            files: [],
+            reply_mode: 'plain',
+          }),
+          '```',
+        ].join('\n'),
+        replyToMessageId: 'om_source',
+        sessionId: 'session-1',
+        prepareFinalReply: true,
+        workingDirectory: tempDir,
+      });
+
+      assert.equal(result.ok, true);
+      assert.equal(sent.length, 1);
+      assert.match(sent[0].text, /^Unity Game 视角截图如下。/);
+      assert.doesNotMatch(sent[0].text, /cti-final|中间过程|"kind"/);
+      assert.equal(sentImages.length, 1);
+      assert.deepEqual(sentImages[0], { chatId: 'oc_123', filePath: imagePath, replyTo: 'om_source' });
+      assert.equal(auditLogs.length, 1);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('rejects proactive delivery when the channel adapter is unavailable', async () => {
@@ -551,6 +617,72 @@ describe('bridge-manager result block delivery', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /最终可读结果：已完成兜底发送。/);
     assert.doesNotMatch(sent[0].text, /cti-final|"kind"|"reply_mode"|这个 JSON 被截断了/);
+  });
+
+  it('blocks fake file creation success when the stream has no tool evidence', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = [
+      '```cti-final',
+      JSON.stringify({
+        kind: 'text',
+        text: '已成功在工作区新建了一个名为“测试”的txt文档，并在其中写入了数字1。',
+        images: [],
+        files: [],
+        reply_mode: 'plain',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('在工作区新建一个txt文档并在里面写一个1，命名为测试'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /未完成/);
+    assert.match(sent[0].text, /没有检测到真实工具执行成功记录/);
+    assert.doesNotMatch(sent[0].text, /已成功在工作区新建/);
+  });
+
+  it('blocks fake image success when the declared image path does not exist', async () => {
+    const sent: OutboundMessage[] = [];
+    const response = [
+      '```cti-final',
+      JSON.stringify({
+        kind: 'image',
+        text: '我已生成一张卡通小猫的图片，并将其保存在本地。',
+        images: ['C:\\definitely-missing\\cartoon_cat.png'],
+        files: [],
+        reply_mode: 'plain',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('Ignis 生成一个卡通小猫的图片'));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /未完成/);
+    assert.match(sent[0].text, /路径不存在/);
+    assert.doesNotMatch(sent[0].text, /我已生成一张卡通小猫/);
   });
 
   it('executes cti-reminder through the real reminder host and only sends the host result', async () => {
@@ -1346,6 +1478,29 @@ describe('bridge-manager policy helpers', () => {
     assert.deepEqual(chineseMinute, {
       title: '看电脑',
       dueAt: '2026-04-30T02:25:00.000Z',
+    });
+
+    const chineseClock = _testOnly.parseNaturalReminderRequest('五点半提醒我替换pve场景的背景图', now);
+    assert.deepEqual(chineseClock, {
+      title: '替换pve场景的背景图',
+      dueAt: '2026-04-30T09:30:00.000Z',
+    });
+
+    assert.deepEqual(_testOnly.parseNaturalReminderRequest('下午五点半提醒我替换pve场景的背景图', now), {
+      title: '替换pve场景的背景图',
+      dueAt: '2026-04-30T09:30:00.000Z',
+    });
+    assert.deepEqual(_testOnly.parseNaturalReminderRequest('提醒我看消息，明天上午九点', now), {
+      title: '看消息',
+      dueAt: '2026-05-01T01:00:00.000Z',
+    });
+    assert.deepEqual(_testOnly.parseNaturalReminderRequest('晚上8点15分提醒我看公告', now), {
+      title: '看公告',
+      dueAt: '2026-04-30T12:15:00.000Z',
+    });
+    assert.deepEqual(_testOnly.parseNaturalReminderRequest('2026年5月19日下午五点半提醒我替换pve场景的背景图', now), {
+      title: '替换pve场景的背景图',
+      dueAt: '2026-05-19T09:30:00.000Z',
     });
 
     assert.equal(_testOnly.parseNaturalReminderRequest('这个任务为什么卡住', now), null);

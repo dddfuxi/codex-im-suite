@@ -261,8 +261,17 @@ describe('configToSettings', () => {
       codexModel: 'gpt-local',
       codexPassModel: true,
       codexReasoningEffort: 'low',
+      codexInheritGlobalMcp: true,
       codexLocalFallbackEnabled: true,
       codexLocalFallbackReasoningEffort: 'minimal',
+      codexModelSource: 'external_api',
+      codexFailureFallbackMode: 'local_agent',
+      localAgentMode: 'agent_verified',
+      localToolCallRequired: true,
+      executionRequiredRoute: 'refuse',
+      memoryOptimizerEnabled: true,
+      memoryOptimizerIntervalDays: 7,
+      memoryOptimizerModelSource: 'codex_primary',
     });
 
     assert.equal(m.get('bridge_local_ai_kind'), 'openai-compatible');
@@ -279,8 +288,17 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_codex_model'), 'gpt-local');
     assert.equal(m.get('bridge_codex_pass_model'), 'true');
     assert.equal(m.get('bridge_codex_reasoning_effort'), 'low');
+    assert.equal(m.get('bridge_codex_inherit_global_mcp'), 'true');
     assert.equal(m.get('bridge_codex_local_fallback_enabled'), 'true');
     assert.equal(m.get('bridge_codex_local_fallback_reasoning_effort'), 'minimal');
+    assert.equal(m.get('bridge_codex_model_source'), 'external_api');
+    assert.equal(m.get('bridge_codex_failure_fallback_mode'), 'local_agent');
+    assert.equal(m.get('bridge_local_agent_mode'), 'agent_verified');
+    assert.equal(m.get('bridge_local_tool_call_required'), 'true');
+    assert.equal(m.get('bridge_execution_required_route'), 'refuse');
+    assert.equal(m.get('bridge_memory_optimizer_enabled'), 'true');
+    assert.equal(m.get('bridge_memory_optimizer_interval_days'), '7');
+    assert.equal(m.get('bridge_memory_optimizer_model_source'), 'codex_primary');
     assert.equal(Array.from(m.values()).some((value) => value.includes('local-secret-abcd')), false);
     assert.equal(Array.from(m.values()).some((value) => value.includes('codex-secret-wxyz')), false);
   });
@@ -392,8 +410,14 @@ describe('loadConfig/saveConfig round-trip', () => {
         'CTI_CODEX_MODEL=gpt-local',
         'CTI_CODEX_PASS_MODEL=true',
         'CTI_CODEX_REASONING_EFFORT=medium',
+        'CTI_CODEX_INHERIT_GLOBAL_MCP=true',
+        'CTI_CODEX_MODEL_SOURCE=external_api',
         'CTI_CODEX_LOCAL_FALLBACK_ENABLED=false',
         'CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT=low',
+        'CTI_CODEX_FAILURE_FALLBACK_MODE=none',
+        'CTI_MEMORY_OPTIMIZER_ENABLED=true',
+        'CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS=9',
+        'CTI_MEMORY_OPTIMIZER_MODEL_SOURCE=local_ai',
       ].join('\n'), 'utf-8');
       process.env.CTI_HOME = configDir;
 
@@ -412,8 +436,17 @@ describe('loadConfig/saveConfig round-trip', () => {
       assert.equal(config.codexModel, 'gpt-local');
       assert.equal(config.codexPassModel, true);
       assert.equal(config.codexReasoningEffort, 'medium');
+      assert.equal(config.codexInheritGlobalMcp, true);
+      assert.equal(config.codexModelSource, 'external_api');
       assert.equal(config.codexLocalFallbackEnabled, false);
       assert.equal(config.codexLocalFallbackReasoningEffort, 'low');
+      assert.equal(config.codexFailureFallbackMode, 'none');
+      assert.equal(config.localAgentMode, 'text_only');
+      assert.equal(config.localToolCallRequired, true);
+      assert.equal(config.executionRequiredRoute, 'codex_or_external');
+      assert.equal(config.memoryOptimizerEnabled, true);
+      assert.equal(config.memoryOptimizerIntervalDays, 9);
+      assert.equal(config.memoryOptimizerModelSource, 'local_ai');
     } finally {
       if (previousCtiHome === undefined) delete process.env.CTI_HOME;
       else process.env.CTI_HOME = previousCtiHome;

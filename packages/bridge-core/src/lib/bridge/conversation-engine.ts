@@ -59,6 +59,14 @@ export interface ConversationResult {
   sdkSessionId: string | null;
   /** Whether the next turn should start a fresh SDK thread while keeping local history. */
   shouldRefreshSession: boolean;
+  executionEvidence: {
+    toolUseCount: number;
+    toolResultCount: number;
+    successfulToolResultCount: number;
+    failedToolResultCount: number;
+    toolNames: string[];
+    permissionRequestCount: number;
+  };
 }
 
 export interface ConversationProcessOptions {
@@ -68,6 +76,17 @@ export interface ConversationProcessOptions {
   memoryUserId?: string;
   memoryUserDisplayName?: string;
   sourceMessageId?: string;
+}
+
+function emptyExecutionEvidence(): ConversationResult['executionEvidence'] {
+  return {
+    toolUseCount: 0,
+    toolResultCount: 0,
+    successfulToolResultCount: 0,
+    failedToolResultCount: 0,
+    toolNames: [],
+    permissionRequestCount: 0,
+  };
 }
 
 const MUTATING_COMMAND_RE = /\b(git\s+(pull|rebase|merge|checkout|switch|reset|clean|stash(?:\s+(?:pop|apply))?)|npm\s+(install|update|uninstall)|pnpm\s+(install|update|add|remove)|yarn\s+(install|add|remove)|mkdir|rmdir|rm|mv|cp|touch|del|copy|move-item|remove-item|copy-item|new-item|set-content|add-content)\b/i;
@@ -345,6 +364,7 @@ export async function processMessage(
       permissionRequests: [],
       sdkSessionId: null,
       shouldRefreshSession: false,
+      executionEvidence: emptyExecutionEvidence(),
     };
   }
 
@@ -527,6 +547,15 @@ async function consumeStream(
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
   let shouldRefreshSession = false;
+  const executionEvidence = {
+    toolUseCount: 0,
+    toolResultCount: 0,
+    successfulToolResultCount: 0,
+    failedToolResultCount: 0,
+    toolNames: [] as string[],
+    permissionRequestCount: 0,
+  };
+  const seenToolNames = new Set<string>();
 
   try {
     while (true) {
@@ -566,6 +595,12 @@ async function consumeStream(
                 name: toolData.name,
                 input: toolData.input,
               });
+              executionEvidence.toolUseCount += 1;
+              const toolName = String(toolData.name || '').trim();
+              if (toolName && !seenToolNames.has(toolName)) {
+                seenToolNames.add(toolName);
+                executionEvidence.toolNames.push(toolName);
+              }
               if (shouldRefreshForToolUse(String(toolData.name || ''), toolData.input)) {
                 shouldRefreshSession = true;
               }
@@ -593,6 +628,12 @@ async function consumeStream(
               } else {
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
+                executionEvidence.toolResultCount += 1;
+                if (resultData.is_error) {
+                  executionEvidence.failedToolResultCount += 1;
+                } else {
+                  executionEvidence.successfulToolResultCount += 1;
+                }
               }
               if (shouldRefreshForToolResult(resultData.content)) {
                 shouldRefreshSession = true;
@@ -620,6 +661,7 @@ async function consumeStream(
                 suggestions: permData.suggestions,
               };
               permissionRequests.push(perm);
+              executionEvidence.permissionRequestCount += 1;
               // Forward immediately — the stream blocks until the permission is
               // resolved, so we must send the IM prompt *now*, not after the stream ends.
               if (onPermissionRequest) {
@@ -717,6 +759,7 @@ async function consumeStream(
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
       shouldRefreshSession,
+      executionEvidence,
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -751,6 +794,7 @@ async function consumeStream(
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
       shouldRefreshSession,
+      executionEvidence,
     };
   }
 }

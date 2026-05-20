@@ -1321,6 +1321,20 @@ export class LocalAgentProvider {
       };
     }
 
+    if (/(git.*暂存区|暂存区.*(有啥|有什么|状态|内容)|staged|cached)/i.test(prompt)) {
+      return {
+        action: 'run_shell',
+        reason: '读取 Git 暂存区',
+        taskKind: 'repo_query',
+        finalReplyMode: 'concise',
+        safetyFlags: ['read_only'],
+        steps: [
+          { type: 'shell_command', command: 'git diff --cached --name-status', requiresPermission: false },
+          { type: 'shell_command', command: 'git status --short', requiresPermission: false },
+        ],
+      };
+    }
+
     if ((/\bgit fetch\b/i.test(prompt) || /(同步一下远端|fetch 一下)/i.test(prompt)) && allowMutating) {
       return {
         action: 'run_shell',

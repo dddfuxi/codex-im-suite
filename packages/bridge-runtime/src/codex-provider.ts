@@ -48,7 +48,7 @@ type CodexModule = any;
 type CodexInstance = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ThreadInstance = any;
-export type CodexProviderProfile = 'primary' | 'local_fallback';
+export type CodexProviderProfile = 'primary' | 'local_primary' | 'local_fallback';
 
 interface CodexProviderOptions {
   profile?: CodexProviderProfile;
@@ -80,12 +80,12 @@ function getSandboxMode(): string {
 
 /** Whether to forward bridge model to Codex CLI. Default: false (use Codex current/default model). */
 function shouldPassModelToCodex(profile: CodexProviderProfile): boolean {
-  if (profile === 'local_fallback') return true;
+  if (profile === 'local_fallback' || profile === 'local_primary') return true;
   return process.env.CTI_CODEX_PASS_MODEL === 'true';
 }
 
 function getCodexModelOverride(profile: CodexProviderProfile): string | undefined {
-  if (profile === 'local_fallback') {
+  if (profile === 'local_fallback' || profile === 'local_primary') {
     const model = (process.env.CTI_LOCAL_AI_MODEL || process.env.CTI_OLLAMA_MODEL || 'qwen2.5-coder:7b').trim();
     return model || 'qwen2.5-coder:7b';
   }
@@ -156,6 +156,10 @@ function getBridgeCodexHome(): string {
 
 function getLocalFallbackCodexHome(): string {
   return process.env.CTI_CODEX_LOCAL_FALLBACK_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-local-fallback');
+}
+
+function getLocalPrimaryCodexHome(): string {
+  return process.env.CTI_CODEX_LOCAL_PRIMARY_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-local-primary');
 }
 
 function normalizeLocalFallbackBaseUrl(baseUrl: string, kind: string): string {
@@ -240,12 +244,15 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string): string {
   const sections: string[] = [];
   let skipSection = false;
   let inTopLevel = true;
+  const inheritGlobalMcp = process.env.CTI_CODEX_INHERIT_GLOBAL_MCP === 'true';
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
       const sectionName = trimmed.slice(1, -1).trim();
-      skipSection = sectionName === 'features' || sectionName.startsWith('features.');
+      const isFeatureSection = sectionName === 'features' || sectionName.startsWith('features.');
+      const isMcpSection = sectionName === 'mcp_servers' || sectionName.startsWith('mcp_servers.');
+      skipSection = isFeatureSection || (!inheritGlobalMcp && isMcpSection);
       inTopLevel = false;
       if (!skipSection) sections.push(line);
       continue;
@@ -283,7 +290,11 @@ function resetBridgeStateDatabases(bridgeHome: string): void {
 }
 
 function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
-  const bridgeHome = profile === 'local_fallback' ? getLocalFallbackCodexHome() : getBridgeCodexHome();
+  const bridgeHome = profile === 'local_fallback'
+    ? getLocalFallbackCodexHome()
+    : profile === 'local_primary'
+      ? getLocalPrimaryCodexHome()
+      : getBridgeCodexHome();
   const globalHome = getGlobalCodexHome();
   const reasoningEffort = getReasoningEffort(profile);
 
@@ -311,13 +322,14 @@ function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
 
 function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): CodexClientOptions & { modelOverride?: string; passModel: boolean; profile: CodexProviderProfile } {
   const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
-  const apiKey = profile === 'local_fallback'
+  const useLocalApi = profile === 'local_fallback' || profile === 'local_primary';
+  const apiKey = useLocalApi
     ? (process.env.CTI_LOCAL_AI_API_KEY || undefined)
     : (process.env.CTI_CODEX_API_KEY
       || process.env.CODEX_API_KEY
       || process.env.OPENAI_API_KEY
       || undefined);
-  const baseUrl = profile === 'local_fallback'
+  const baseUrl = useLocalApi
     ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
     : (process.env.CTI_CODEX_BASE_URL || undefined);
   const bridgeCodexHome = ensureBridgeCodexHome(profile);
@@ -562,13 +574,29 @@ export class CodexProvider implements LLMProvider {
               ? undefined
               : (inMemoryThreadId || params.sdkSessionId || undefined);
 
+            const profile = self.options.profile || 'primary';
             const approvalPolicy = toApprovalPolicy(params.permissionMode);
-            const passModel = shouldPassModelToCodex(self.options.profile || 'primary');
-            const modelOverride = getCodexModelOverride(self.options.profile || 'primary');
+            const passModel = shouldPassModelToCodex(profile);
+            const modelOverride = getCodexModelOverride(profile);
             const sandboxMode = getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
             const workingDirectory = resolveWorkingDirectory(params.workingDirectory);
             const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
+            const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
+            const modelSource = profile === 'local_primary'
+              ? 'local_api'
+              : (process.env.CTI_CODEX_MODEL_SOURCE || (process.env.CTI_CODEX_BASE_URL ? 'external_api' : 'official'));
+            const baseUrl = profile === 'local_primary' || profile === 'local_fallback'
+              ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
+              : (process.env.CTI_CODEX_BASE_URL || undefined);
+
+            controller.enqueue(sseEvent('status', {
+              provider: 'codex',
+              codexProfile: profile,
+              modelSource,
+              model: modelOverride || (passModel ? params.model : undefined),
+              baseUrl,
+            }));
 
             const threadOptions: Record<string, unknown> = {
               ...(modelOverride ? { model: modelOverride } : passModel && params.model ? { model: params.model } : {}),

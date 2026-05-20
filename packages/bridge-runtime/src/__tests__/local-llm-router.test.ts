@@ -82,6 +82,11 @@ describe('decideConservativeRoute', () => {
     assert.equal(logDecision.useLocal, false);
     assert.equal(logDecision.allowLocalFallback, true);
     assert.equal(logDecision.requestKind, 'repo_query');
+
+    const stagedDecision = decideConservativeRoute(makeParams('当前git暂存区有啥'), baseConfig);
+    assert.equal(stagedDecision.useLocal, false);
+    assert.equal(stagedDecision.allowLocalFallback, true);
+    assert.equal(stagedDecision.requestKind, 'repo_query');
   });
 
   it('treats shutdown-like requests as high risk', () => {
