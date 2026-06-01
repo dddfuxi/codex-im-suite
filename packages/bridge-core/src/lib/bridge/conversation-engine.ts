@@ -20,6 +20,16 @@ import type {
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
 import { splitWorkspacePathList } from './security/validators.js';
+import {
+  buildExecutionRequirementPrompt,
+  buildNoEvidenceRetryPrompt,
+  buildNoExecutionEvidenceText,
+  classifyExecutionRequirement,
+  isExecutionEvidenceSatisfied,
+  requiresSuccessfulToolEvidence,
+  shouldReplaceWithNoExecutionEvidenceText,
+  type ExecutionRequirement,
+} from './execution-requirement.js';
 
 export interface PermissionRequestInfo {
   permissionRequestId: string;
@@ -66,7 +76,16 @@ export interface ConversationResult {
     failedToolResultCount: number;
     toolNames: string[];
     permissionRequestCount: number;
+    requiredEvidenceKind?: ExecutionRequirement['kind'];
+    evidenceSatisfied?: boolean;
+    noEvidenceRetryAttempted?: boolean;
+    requiredToolFamilies?: string[];
   };
+}
+
+interface InternalConversationResult extends ConversationResult {
+  assistantStorageContent?: string;
+  assistantStorageTokenUsage?: TokenUsage | null;
 }
 
 export interface ConversationProcessOptions {
@@ -78,7 +97,7 @@ export interface ConversationProcessOptions {
   sourceMessageId?: string;
 }
 
-function emptyExecutionEvidence(): ConversationResult['executionEvidence'] {
+function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRetryAttempted = false): ConversationResult['executionEvidence'] {
   return {
     toolUseCount: 0,
     toolResultCount: 0,
@@ -86,6 +105,12 @@ function emptyExecutionEvidence(): ConversationResult['executionEvidence'] {
     failedToolResultCount: 0,
     toolNames: [],
     permissionRequestCount: 0,
+    ...(requirement ? {
+      requiredEvidenceKind: requirement.kind,
+      evidenceSatisfied: requirement.kind === 'none',
+      noEvidenceRetryAttempted,
+      requiredToolFamilies: requirement.requiredToolFamilies,
+    } : {}),
   };
 }
 
@@ -476,6 +501,12 @@ export async function processMessage(
       240,
     );
     const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, retrievedFeishuHistory, memoryPromptMaxChars);
+    const executionRequirement = classifyExecutionRequirement({
+      userText: options?.storedUserText || text,
+      workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+      files,
+    });
+    const executionRequirementPrompt = buildExecutionRequirementPrompt(executionRequirement);
     const mergedExtraSystemPrompt = [options?.extraSystemPrompt?.trim(), memoryPrompt]
       .filter((part): part is string => !!part)
       .join('\n\n');
@@ -490,13 +521,19 @@ export async function processMessage(
       }
     }
 
-    const stream = llm.streamChat({
+    const runAttempt = async (attempt: 'initial' | 'no_evidence_retry'): Promise<InternalConversationResult> => {
+      const attemptPrompt = [
+        mergedExtraSystemPrompt,
+        executionRequirementPrompt,
+        attempt === 'no_evidence_retry' ? buildNoEvidenceRetryPrompt(executionRequirement) : '',
+      ].filter(Boolean).join('\n\n');
+      const stream = llm.streamChat({
       prompt: text,
       sessionId,
-      sdkSessionId: binding.sdkSessionId || undefined,
-      forceFreshThread: !binding.sdkSessionId,
+      sdkSessionId: attempt === 'initial' ? binding.sdkSessionId || undefined : undefined,
+      forceFreshThread: attempt === 'initial' ? !binding.sdkSessionId : true,
       model: effectiveModel,
-      systemPrompt: buildBridgeScopedSystemPrompt(binding, session?.system_prompt || undefined, mergedExtraSystemPrompt || undefined),
+      systemPrompt: buildBridgeScopedSystemPrompt(binding, session?.system_prompt || undefined, attemptPrompt || undefined),
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       additionalDirectories,
       abortController,
@@ -507,6 +544,8 @@ export async function processMessage(
       sourceUserId: options?.memoryUserId,
       sourceUserDisplayName: options?.memoryUserDisplayName,
       sourceMessageId: options?.sourceMessageId,
+      executionRequirement,
+      noEvidenceRetryAttempted: attempt === 'no_evidence_retry',
       onRuntimeStatusChange: (status: string) => {
         try { store.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },
@@ -515,7 +554,54 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+      return await consumeStream(
+        stream,
+        sessionId,
+        onPermissionRequest,
+        attempt === 'initial' && requiresSuccessfulToolEvidence(executionRequirement) ? undefined : onPartialText,
+        onToolEvent,
+        executionRequirement,
+        attempt === 'no_evidence_retry',
+      );
+    };
+
+    let result = await runAttempt('initial');
+    if (
+      requiresSuccessfulToolEvidence(executionRequirement)
+      && !isExecutionEvidenceSatisfied(executionRequirement, result.executionEvidence)
+      && !abortController.signal.aborted
+    ) {
+      result = await runAttempt('no_evidence_retry');
+    }
+
+    if (
+      shouldReplaceWithNoExecutionEvidenceText(
+        executionRequirement,
+        result.executionEvidence,
+        result.responseText,
+      )
+    ) {
+      const blockedText = buildNoExecutionEvidenceText(executionRequirement, result.executionEvidence);
+      result = {
+        ...result,
+        responseText: blockedText,
+        hasError: false,
+        errorMessage: '',
+        assistantStorageContent: blockedText,
+        assistantStorageTokenUsage: result.tokenUsage,
+        executionEvidence: {
+          ...result.executionEvidence,
+          evidenceSatisfied: false,
+          noEvidenceRetryAttempted: true,
+        },
+      };
+    }
+
+    if (result.assistantStorageContent) {
+      store.addMessage(sessionId, 'assistant', result.assistantStorageContent, result.assistantStorageTokenUsage ? JSON.stringify(result.assistantStorageTokenUsage) : null);
+    }
+
+    return result;
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -533,7 +619,9 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
-): Promise<ConversationResult> {
+  executionRequirement?: ExecutionRequirement,
+  noEvidenceRetryAttempted = false,
+): Promise<InternalConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
@@ -547,15 +635,10 @@ async function consumeStream(
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
   let shouldRefreshSession = false;
-  const executionEvidence = {
-    toolUseCount: 0,
-    toolResultCount: 0,
-    successfulToolResultCount: 0,
-    failedToolResultCount: 0,
-    toolNames: [] as string[],
-    permissionRequestCount: 0,
-  };
+  const executionEvidence = emptyExecutionEvidence(executionRequirement, noEvidenceRetryAttempted);
   const seenToolNames = new Set<string>();
+  let assistantStorageContent = '';
+  let assistantStorageTokenUsage: TokenUsage | null = null;
 
   try {
     while (true) {
@@ -740,7 +823,8 @@ async function consumeStream(
             .trim();
 
       if (content) {
-        store.addMessage(sessionId, 'assistant', content, tokenUsage ? JSON.stringify(tokenUsage) : null);
+        assistantStorageContent = content;
+        assistantStorageTokenUsage = tokenUsage;
       }
     }
 
@@ -751,6 +835,10 @@ async function consumeStream(
       .join('')
       .trim();
 
+    executionEvidence.evidenceSatisfied = executionRequirement
+      ? isExecutionEvidenceSatisfied(executionRequirement, executionEvidence)
+      : true;
+
     return {
       responseText,
       tokenUsage,
@@ -760,6 +848,8 @@ async function consumeStream(
       sdkSessionId: capturedSdkSessionId,
       shouldRefreshSession,
       executionEvidence,
+      assistantStorageContent,
+      assistantStorageTokenUsage,
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -779,12 +869,17 @@ async function consumeStream(
             .join('\n\n')
             .trim();
       if (content) {
-        store.addMessage(sessionId, 'assistant', content);
+        assistantStorageContent = content;
+        assistantStorageTokenUsage = tokenUsage;
       }
     }
 
     const isAbort = e instanceof DOMException && e.name === 'AbortError'
       || e instanceof Error && e.name === 'AbortError';
+
+    executionEvidence.evidenceSatisfied = executionRequirement
+      ? isExecutionEvidenceSatisfied(executionRequirement, executionEvidence)
+      : true;
 
     return {
       responseText: '',
@@ -795,6 +890,8 @@ async function consumeStream(
       sdkSessionId: capturedSdkSessionId,
       shouldRefreshSession,
       executionEvidence,
+      assistantStorageContent,
+      assistantStorageTokenUsage,
     };
   }
 }

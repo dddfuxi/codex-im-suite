@@ -265,6 +265,8 @@ describe('configToSettings', () => {
       codexLocalFallbackEnabled: true,
       codexLocalFallbackReasoningEffort: 'minimal',
       codexModelSource: 'external_api',
+      codexRoutingMode: 'auto_failover',
+      codexApiFallbackChain: ['local_api', 'external_api'],
       codexFailureFallbackMode: 'local_agent',
       localAgentMode: 'agent_verified',
       localToolCallRequired: true,
@@ -292,6 +294,8 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_codex_local_fallback_enabled'), 'true');
     assert.equal(m.get('bridge_codex_local_fallback_reasoning_effort'), 'minimal');
     assert.equal(m.get('bridge_codex_model_source'), 'external_api');
+    assert.equal(m.get('bridge_codex_routing_mode'), 'auto_failover');
+    assert.equal(m.get('bridge_codex_api_fallback_chain'), 'local_api,external_api');
     assert.equal(m.get('bridge_codex_failure_fallback_mode'), 'local_agent');
     assert.equal(m.get('bridge_local_agent_mode'), 'agent_verified');
     assert.equal(m.get('bridge_local_tool_call_required'), 'true');

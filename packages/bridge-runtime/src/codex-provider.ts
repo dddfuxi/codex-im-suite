@@ -48,7 +48,7 @@ type CodexModule = any;
 type CodexInstance = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ThreadInstance = any;
-export type CodexProviderProfile = 'primary' | 'local_primary' | 'local_fallback';
+export type CodexProviderProfile = 'primary' | 'official' | 'external' | 'local_primary' | 'local_fallback';
 
 interface CodexProviderOptions {
   profile?: CodexProviderProfile;
@@ -60,7 +60,7 @@ interface CodexProviderOptions {
  * - 'plan' → 'on-request' (ask before executing)
  * - 'default' (ask mode) → 'on-request'
  */
-function toApprovalPolicy(permissionMode?: string): string {
+export function toApprovalPolicy(permissionMode?: string): string {
   switch (permissionMode) {
     case 'acceptEdits': return 'never';
     case 'plan': return 'on-request';
@@ -74,13 +74,14 @@ function toApprovalPolicy(permissionMode?: string): string {
  * Default to danger-full-access so bridge-side coding sessions do not get
  * blocked on repo metadata writes such as `.git/FETCH_HEAD`.
  */
-function getSandboxMode(): string {
+export function getSandboxMode(): string {
   return process.env.CTI_CODEX_SANDBOX_MODE || 'danger-full-access';
 }
 
 /** Whether to forward bridge model to Codex CLI. Default: false (use Codex current/default model). */
 function shouldPassModelToCodex(profile: CodexProviderProfile): boolean {
   if (profile === 'local_fallback' || profile === 'local_primary') return true;
+  if (profile === 'official') return false;
   return process.env.CTI_CODEX_PASS_MODEL === 'true';
 }
 
@@ -89,12 +90,13 @@ function getCodexModelOverride(profile: CodexProviderProfile): string | undefine
     const model = (process.env.CTI_LOCAL_AI_MODEL || process.env.CTI_OLLAMA_MODEL || 'qwen2.5-coder:7b').trim();
     return model || 'qwen2.5-coder:7b';
   }
+  if (profile === 'official') return undefined;
   const model = (process.env.CTI_CODEX_MODEL || '').trim();
   return model || undefined;
 }
 
 /** Allow Codex to run outside a trusted Git repository when explicitly enabled. */
-function shouldSkipGitRepoCheck(): boolean {
+export function shouldSkipGitRepoCheck(): boolean {
   return process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK === 'true';
 }
 
@@ -121,7 +123,7 @@ function normalizeReasoningEffort(value: string | undefined, fallback: 'minimal'
   }
 }
 
-function getReasoningEffort(profile: CodexProviderProfile): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
+export function getReasoningEffort(profile: CodexProviderProfile): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
   if (profile === 'local_fallback') {
     return normalizeReasoningEffort(process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT, DEFAULT_LOCAL_FALLBACK_REASONING_EFFORT);
   }
@@ -154,6 +156,14 @@ function getBridgeCodexHome(): string {
   return process.env.CTI_CODEX_HOME || path.join(CTI_HOME, 'runtime', 'codex-home');
 }
 
+function getOfficialCodexHome(): string {
+  return process.env.CTI_CODEX_OFFICIAL_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-official');
+}
+
+function getExternalCodexHome(): string {
+  return process.env.CTI_CODEX_EXTERNAL_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-external');
+}
+
 function getLocalFallbackCodexHome(): string {
   return process.env.CTI_CODEX_LOCAL_FALLBACK_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-local-fallback');
 }
@@ -169,7 +179,16 @@ function normalizeLocalFallbackBaseUrl(baseUrl: string, kind: string): string {
   return trimmed;
 }
 
-function normalizeAdditionalDirectories(additionalDirectories?: string[]): string[] {
+export function sanitizeLocalApiEnv(env: Record<string, string>): Record<string, string> {
+  const next = { ...env };
+  delete next.OPENAI_API_KEY;
+  delete next.CODEX_API_KEY;
+  delete next.CTI_CODEX_API_KEY;
+  delete next.CTI_CODEX_BASE_URL;
+  return next;
+}
+
+export function normalizeAdditionalDirectories(additionalDirectories?: string[]): string[] {
   if (!Array.isArray(additionalDirectories)) return [];
   const seen = new Set<string>();
   const resolved: string[] = [];
@@ -187,7 +206,7 @@ function normalizeAdditionalDirectories(additionalDirectories?: string[]): strin
   return resolved;
 }
 
-function resolveWorkingDirectory(workingDirectory?: string): string | undefined {
+export function resolveWorkingDirectory(workingDirectory?: string): string | undefined {
   const candidates = [
     workingDirectory,
     process.env.CTI_DEFAULT_WORKDIR,
@@ -202,7 +221,7 @@ function resolveWorkingDirectory(workingDirectory?: string): string | undefined 
   return undefined;
 }
 
-function toTextEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+export function toTextEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (typeof value === 'string') out[key] = value;
@@ -289,12 +308,16 @@ function resetBridgeStateDatabases(bridgeHome: string): void {
   }
 }
 
-function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
+export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
   const bridgeHome = profile === 'local_fallback'
     ? getLocalFallbackCodexHome()
     : profile === 'local_primary'
       ? getLocalPrimaryCodexHome()
-      : getBridgeCodexHome();
+      : profile === 'official'
+        ? getOfficialCodexHome()
+        : profile === 'external'
+          ? getExternalCodexHome()
+          : getBridgeCodexHome();
   const globalHome = getGlobalCodexHome();
   const reasoningEffort = getReasoningEffort(profile);
 
@@ -324,26 +347,31 @@ function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): Cod
   const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
   const useLocalApi = profile === 'local_fallback' || profile === 'local_primary';
   const apiKey = useLocalApi
-    ? (process.env.CTI_LOCAL_AI_API_KEY || undefined)
-    : (process.env.CTI_CODEX_API_KEY
+    ? undefined
+    : profile === 'official'
+      ? undefined
+      : (process.env.CTI_CODEX_API_KEY
       || process.env.CODEX_API_KEY
       || process.env.OPENAI_API_KEY
       || undefined);
   const baseUrl = useLocalApi
-    ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
-    : (process.env.CTI_CODEX_BASE_URL || undefined);
+    ? undefined
+    : profile === 'official'
+      ? undefined
+      : (process.env.CTI_CODEX_BASE_URL || undefined);
   const bridgeCodexHome = ensureBridgeCodexHome(profile);
   process.env.CODEX_HOME = bridgeCodexHome;
+  const env = {
+    ...toTextEnv(process.env),
+    CODEX_HOME: bridgeCodexHome,
+  };
   return {
     ...(apiKey ? { apiKey } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     config: {
       model_reasoning_effort: getReasoningEffort(profile),
     },
-    env: {
-      ...toTextEnv(process.env),
-      CODEX_HOME: bridgeCodexHome,
-    },
+    env: useLocalApi ? sanitizeLocalApiEnv(env) : env,
     modelOverride: getCodexModelOverride(profile),
     passModel: shouldPassModelToCodex(profile),
     profile,
@@ -492,7 +520,7 @@ function selectHistoryEntries(
   return selected.reverse();
 }
 
-function buildTurnPrompt(params: StreamChatParams): string {
+export function buildTurnPrompt(params: StreamChatParams): string {
   const sections: string[] = [];
   const systemPrompt = truncateText(params.systemPrompt || '', 4000);
   const historyEntries = selectHistoryEntries(params.conversationHistory);
@@ -583,12 +611,18 @@ export class CodexProvider implements LLMProvider {
             const workingDirectory = resolveWorkingDirectory(params.workingDirectory);
             const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
             const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
-            const modelSource = profile === 'local_primary'
+            const modelSource = profile === 'local_primary' || profile === 'local_fallback'
               ? 'local_api'
-              : (process.env.CTI_CODEX_MODEL_SOURCE || (process.env.CTI_CODEX_BASE_URL ? 'external_api' : 'official'));
+              : profile === 'official'
+                ? 'official'
+                : profile === 'external'
+                  ? 'external_api'
+                  : (process.env.CTI_CODEX_MODEL_SOURCE || (process.env.CTI_CODEX_BASE_URL ? 'external_api' : 'official'));
             const baseUrl = profile === 'local_primary' || profile === 'local_fallback'
               ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
-              : (process.env.CTI_CODEX_BASE_URL || undefined);
+              : profile === 'official'
+                ? undefined
+                : (process.env.CTI_CODEX_BASE_URL || undefined);
 
             controller.enqueue(sseEvent('status', {
               provider: 'codex',

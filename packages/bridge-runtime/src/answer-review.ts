@@ -1,7 +1,7 @@
 import type { MemoryQueryPlan, RetrievedMemoryHit } from 'claude-to-im/src/lib/bridge/host.js';
 
 import { repairLikelyMojibakeText } from './mojibake.js';
-import { inferStructuredMemories, isLowValueMemoryText } from './memory-routing.js';
+import { decideMemoryReply, inferStructuredMemories, isLowValueMemoryText } from './memory-routing.js';
 
 export type AnswerReviewMode = 'observe' | 'block_or_replace';
 
@@ -25,6 +25,10 @@ export interface AnswerReviewInput {
     failedToolResultCount: number;
     toolNames: string[];
     permissionRequestCount: number;
+    requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+    evidenceSatisfied?: boolean;
+    noEvidenceRetryAttempted?: boolean;
+    requiredToolFamilies?: string[];
   };
 }
 
@@ -38,6 +42,7 @@ export interface AnswerReviewDecision {
 }
 
 const PROTOCOL_LEAKAGE_RE = /```(?:cti-final|cti-reminder)|\bcti-final\b|\bcti-reminder\b|"reply_mode"|"kind"\s*:/iu;
+const INTERNAL_TOOL_LEAKAGE_RE = /\bmulti_agent_v\d+\b|unsupported call:\s*[a-z0-9_.-]+|\btool is not supported in this environment\b|\bavailable tools\b/iu;
 const TOOL_FAKE_COMPLETION_RE = /(已完成|已经完成|记住了|已记住|已经记下|创建好了).*(未拿到|没有拿到|不可用|失败|无法执行|没法执行)|(?:未完成|失败).*(已完成|记住了)/u;
 
 const CONCRETE_EXECUTION_REQUEST_RE = /(ignis|unity|blender|mcp|截图|图片|图像|关机|关闭电脑|shutdown|文件|文档|txt|\.txt|\.md|\.json|(?:生成|创建|新建|写入|保存|删除|移动|复制|上传|下载|导入|导出|安装|启动|停止|重启|运行|执行).{0,32}(文件|文档|图片|图像|截图|txt|项目|服务|bridge|mcp|命令|脚本|本机|电脑|工作区))/i;
@@ -81,9 +86,30 @@ function shouldCheckMemoryKeyMismatch(input: AnswerReviewInput): boolean {
 function hasUnsupportedExecutionClaim(input: AnswerReviewInput): boolean {
   if (!input.executionEvidence) return false;
   if (input.executionEvidence.successfulToolResultCount > 0) return false;
+  if (
+    input.executionEvidence.requiredEvidenceKind
+    && input.executionEvidence.requiredEvidenceKind !== 'none'
+    && input.executionEvidence.evidenceSatisfied === false
+    && !NEGATIVE_EXECUTION_RESULT_RE.test(input.answerText || '')
+  ) {
+    return true;
+  }
   if (!CONCRETE_EXECUTION_REQUEST_RE.test(input.userText || '')) return false;
   if (NEGATIVE_EXECUTION_RESULT_RE.test(input.answerText || '')) return false;
   return POSITIVE_EXECUTION_CLAIM_RE.test(`${input.userText}\n${input.answerText}`);
+}
+
+function recomposeMemoryReplacement(input: AnswerReviewInput): string | undefined {
+  if (!input.memoryPlan || input.memoryPlan.intent !== 'explicit_recall') return undefined;
+  const memoryHits = (input.memoryHits || []).filter((hit) => hit.content?.trim());
+  if (memoryHits.length === 0) return undefined;
+  const decision = decideMemoryReply(input.memoryPlan, {
+    summary: '',
+    hits: memoryHits,
+  });
+  if (decision.type !== 'direct_reply') return undefined;
+  const text = decision.text.trim();
+  return text && !INTERNAL_TOOL_LEAKAGE_RE.test(text) ? text : undefined;
 }
 
 export function reviewOutboundAnswerRules(
@@ -102,6 +128,10 @@ export function reviewOutboundAnswerRules(
     reasonCodes.push('protocol_leakage');
   }
 
+  if (INTERNAL_TOOL_LEAKAGE_RE.test(answerText)) {
+    reasonCodes.push('internal_tool_leakage');
+  }
+
   if (isLowValueMemoryText(answerText)) {
     reasonCodes.push('low_value_memory');
   }
@@ -118,10 +148,18 @@ export function reviewOutboundAnswerRules(
     reasonCodes.push('memory_key_mismatch');
   }
 
+  const uniqueReasonCodes = Array.from(new Set(reasonCodes));
+  const internalToolLeakage = uniqueReasonCodes.includes('internal_tool_leakage');
+  const replacementText = internalToolLeakage
+    ? recomposeMemoryReplacement(input)
+      || '未完成：本地模型返回了无效执行器回复，已拦截。'
+    : undefined;
+
   return {
-    verdict: reasonCodes.length > 0 ? 'warn' : 'pass',
-    reasonCodes: Array.from(new Set(reasonCodes)),
+    verdict: internalToolLeakage ? 'replace' : uniqueReasonCodes.length > 0 ? 'warn' : 'pass',
+    reasonCodes: uniqueReasonCodes,
     mode: options.mode || 'observe',
     createdAt: options.createdAt || new Date().toISOString(),
+    ...(replacementText ? { replacementText } : {}),
   };
 }

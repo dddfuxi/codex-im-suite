@@ -1510,8 +1510,12 @@ describe('bridge-manager policy helpers', () => {
 });
 
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
+  const mergedSettings: Record<string, string> = {
+    bridge_delivery_rate_limit_max_messages: '0',
+    ...settings,
+  };
   return {
-    getSetting: (key: string) => settings[key] ?? null,
+    getSetting: (key: string) => mergedSettings[key] ?? null,
     getChannelBinding: () => null,
     upsertChannelBinding: () => ({} as any),
     updateChannelBinding: () => {},

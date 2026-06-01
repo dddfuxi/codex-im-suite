@@ -1,0 +1,21 @@
+{
+  "id": "unity.game_view_screenshot",
+  "displayName": "Unity Game View Screenshot",
+  "enabled": true,
+  "type": "mcp_tool_call",
+  "match": {
+    "regex": [
+      "(?:unity\\s*mcp|unitymcp|unity).*(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view)",
+      "(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view).*(?:unity\\s*mcp|unitymcp|unity)"
+    ]
+  },
+  "mcp": {
+    "manifestHint": "unitymcp",
+    "tool": "manage_camera",
+    "arguments": {
+      "action": "screenshot",
+      "capture_source": "game_view",
+      "include_image": false
+    }
+  }
+}

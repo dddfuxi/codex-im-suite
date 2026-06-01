@@ -142,6 +142,10 @@ describe('CodexProvider', () => {
       localEffort: process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT,
       localHome: process.env.CTI_CODEX_LOCAL_FALLBACK_HOME,
       codeHome: process.env.CODEX_HOME,
+      openAiKey: process.env.OPENAI_API_KEY,
+      codexApiKey: process.env.CODEX_API_KEY,
+      ctiCodexApiKey: process.env.CTI_CODEX_API_KEY,
+      ctiCodexBaseUrl: process.env.CTI_CODEX_BASE_URL,
     };
     const tempHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-local-${Date.now()}`)));
     process.env.CTI_LOCAL_AI_KIND = 'ollama';
@@ -150,17 +154,25 @@ describe('CodexProvider', () => {
     process.env.CTI_LOCAL_AI_MODEL = 'qwen3:8b';
     process.env.CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT = 'minimal';
     process.env.CTI_CODEX_LOCAL_FALLBACK_HOME = tempHome;
+    process.env.OPENAI_API_KEY = 'paid-openai-secret';
+    process.env.CODEX_API_KEY = 'paid-codex-secret';
+    process.env.CTI_CODEX_API_KEY = 'paid-cti-codex-secret';
+    process.env.CTI_CODEX_BASE_URL = 'https://paid.example.test/v1';
     try {
       const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
       const options = buildCodexClientOptionsForTest('local_fallback');
 
       assert.equal(options.profile, 'local_fallback');
-      assert.equal(options.apiKey, 'local-secret');
-      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
+      assert.equal(options.apiKey, undefined);
+      assert.equal(options.baseUrl, undefined);
       assert.equal(options.modelOverride, 'qwen3:8b');
       assert.equal(options.passModel, true);
       assert.equal(options.config.model_reasoning_effort, 'minimal');
       assert.equal(options.env.CODEX_HOME, tempHome);
+      assert.equal(options.env.OPENAI_API_KEY, undefined);
+      assert.equal(options.env.CODEX_API_KEY, undefined);
+      assert.equal(options.env.CTI_CODEX_API_KEY, undefined);
+      assert.equal(options.env.CTI_CODEX_BASE_URL, undefined);
       assert.equal(process.env.CODEX_HOME, tempHome);
     } finally {
       const fs = await import('node:fs');
@@ -179,6 +191,14 @@ describe('CodexProvider', () => {
       else process.env.CTI_CODEX_LOCAL_FALLBACK_HOME = saved.localHome;
       if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = saved.codeHome;
+      if (saved.openAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved.openAiKey;
+      if (saved.codexApiKey === undefined) delete process.env.CODEX_API_KEY;
+      else process.env.CODEX_API_KEY = saved.codexApiKey;
+      if (saved.ctiCodexApiKey === undefined) delete process.env.CTI_CODEX_API_KEY;
+      else process.env.CTI_CODEX_API_KEY = saved.ctiCodexApiKey;
+      if (saved.ctiCodexBaseUrl === undefined) delete process.env.CTI_CODEX_BASE_URL;
+      else process.env.CTI_CODEX_BASE_URL = saved.ctiCodexBaseUrl;
     }
   });
 
@@ -190,23 +210,35 @@ describe('CodexProvider', () => {
       localModel: process.env.CTI_LOCAL_AI_MODEL,
       localHome: process.env.CTI_CODEX_LOCAL_PRIMARY_HOME,
       codeHome: process.env.CODEX_HOME,
+      openAiKey: process.env.OPENAI_API_KEY,
+      codexApiKey: process.env.CODEX_API_KEY,
+      ctiCodexApiKey: process.env.CTI_CODEX_API_KEY,
+      ctiCodexBaseUrl: process.env.CTI_CODEX_BASE_URL,
     };
     const tempHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-local-primary-${Date.now()}`)));
     process.env.CTI_LOCAL_AI_KIND = 'ollama';
     process.env.CTI_LOCAL_AI_BASE_URL = 'http://127.0.0.1:11434';
-    process.env.CTI_LOCAL_AI_API_KEY = 'test-local-primary-secret';
+    delete process.env.CTI_LOCAL_AI_API_KEY;
     process.env.CTI_LOCAL_AI_MODEL = 'qwen3:14b';
     process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = tempHome;
+    process.env.OPENAI_API_KEY = 'paid-openai-secret';
+    process.env.CODEX_API_KEY = 'paid-codex-secret';
+    process.env.CTI_CODEX_API_KEY = 'paid-cti-codex-secret';
+    process.env.CTI_CODEX_BASE_URL = 'https://paid.example.test/v1';
     try {
       const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
       const options = buildCodexClientOptionsForTest('local_primary');
 
       assert.equal(options.profile, 'local_primary');
-      assert.equal(options.apiKey, 'test-local-primary-secret');
-      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
+      assert.equal(options.apiKey, undefined);
+      assert.equal(options.baseUrl, undefined);
       assert.equal(options.modelOverride, 'qwen3:14b');
       assert.equal(options.passModel, true);
       assert.equal(options.env.CODEX_HOME, tempHome);
+      assert.equal(options.env.OPENAI_API_KEY, undefined);
+      assert.equal(options.env.CODEX_API_KEY, undefined);
+      assert.equal(options.env.CTI_CODEX_API_KEY, undefined);
+      assert.equal(options.env.CTI_CODEX_BASE_URL, undefined);
       assert.equal(process.env.CODEX_HOME, tempHome);
     } finally {
       const fs = await import('node:fs');
@@ -223,6 +255,14 @@ describe('CodexProvider', () => {
       else process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = saved.localHome;
       if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = saved.codeHome;
+      if (saved.openAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved.openAiKey;
+      if (saved.codexApiKey === undefined) delete process.env.CODEX_API_KEY;
+      else process.env.CODEX_API_KEY = saved.codexApiKey;
+      if (saved.ctiCodexApiKey === undefined) delete process.env.CTI_CODEX_API_KEY;
+      else process.env.CTI_CODEX_API_KEY = saved.ctiCodexApiKey;
+      if (saved.ctiCodexBaseUrl === undefined) delete process.env.CTI_CODEX_BASE_URL;
+      else process.env.CTI_CODEX_BASE_URL = saved.ctiCodexBaseUrl;
     }
   });
 

@@ -16,6 +16,9 @@ $suiteRuntime = Join-Path $suiteRoot 'packages\bridge-runtime'
 $suiteMcpManifests = Join-Path $suiteRoot 'config\mcp.d'
 $suiteSkillManifests = Join-Path $suiteRoot 'config\skills.d'
 $suitePluginManifests = Join-Path $suiteRoot 'config\plugins.d'
+$suiteRuntimeManifests = Join-Path $suiteRoot 'config\runtime.d'
+$suiteLocalAgentToolManifests = Join-Path $suiteRoot 'config\local-agent-tools.d'
+$suiteExtensionCatalog = Join-Path $suiteRoot 'config\extension-catalog.json'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
 $portableDir = Join-Path $suiteRoot 'release\portable'
 
@@ -189,6 +192,9 @@ Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'scripts') -Target (Join
 Copy-ExistingDirectory -Source $suiteMcpManifests -Target (Join-Path $liveRuntime 'mcp.d')
 Copy-ExistingDirectory -Source $suiteSkillManifests -Target (Join-Path $liveRuntime 'skills.d')
 Copy-ExistingDirectory -Source $suitePluginManifests -Target (Join-Path $liveRuntime 'plugins.d')
+Copy-ExistingDirectory -Source $suiteRuntimeManifests -Target (Join-Path $liveRuntime 'config\runtime.d')
+Copy-ExistingDirectory -Source $suiteLocalAgentToolManifests -Target (Join-Path $liveRuntime 'config\local-agent-tools.d')
+Copy-ExistingFile -Source $suiteExtensionCatalog -Target (Join-Path $liveRuntime 'config\extension-catalog.json')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'references') -Target (Join-Path $liveRuntime 'references')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'evals') -Target (Join-Path $liveRuntime 'evals')

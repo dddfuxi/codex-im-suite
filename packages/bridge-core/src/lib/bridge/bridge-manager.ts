@@ -953,6 +953,9 @@ function applyOutboundAnswerReview(input: AnswerReviewInput): string {
   if (typeof store.reviewOutboundAnswer !== 'function') return input.answerText;
   try {
     const decision = store.reviewOutboundAnswer(input);
+    if (decision.verdict === 'replace' && decision.replacementText?.trim()) {
+      return decision.replacementText.trim();
+    }
     if (
       decision.mode === 'block_or_replace'
       && decision.verdict === 'replace'
@@ -1260,7 +1263,7 @@ function resolveExplicitPaths(
   return Array.from(resolved);
 }
 
-const CONCRETE_EXECUTION_REQUEST_RE = /(ignis|unity|blender|mcp|截图|图片|图像|关机|关闭电脑|shutdown|文件|文档|txt|\.txt|\.md|\.json|(?:生成|创建|新建|写入|保存|删除|移动|复制|上传|下载|导入|导出|安装|启动|停止|重启|运行|执行).{0,32}(文件|文档|图片|图像|截图|txt|项目|服务|bridge|mcp|命令|脚本|本机|电脑|工作区))/i;
+const CONCRETE_EXECUTION_REQUEST_RE = /(ignis|unity|blender|mcp|截图|图片|图像|关机|关闭电脑|shutdown|文件|文档|txt|\.txt|\.md|\.json|(?:看一眼|看一下|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|读取|打开|搜索).{0,32}(本地|工作目录|目录|文件夹|文件|项目|仓库|路径|Game|Assets)|(?:生成|创建|新建|写入|保存|删除|移动|复制|上传|下载|导入|导出|安装|启动|停止|重启|运行|执行).{0,32}(文件|文档|图片|图像|截图|txt|项目|服务|bridge|mcp|命令|脚本|本机|电脑|工作区))/i;
 const POSITIVE_EXECUTION_CLAIM_RE = /(已|已经|成功|完成|生成|创建|新建|写入|保存|上传|下载|导入|导出|安装|启动|停止|重启|执行|正在执行|已提交).{0,48}(文件|文档|图片|图像|截图|命令|脚本|操作|任务|请求|shutdown|关机|本地|工作区|路径|生成|创建|写入|保存|执行|完成|成功)/i;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拦截)/i;
 
@@ -1315,6 +1318,21 @@ function verifyPreparedReplyExecution(
       parseMode: 'plain',
       images: payload.images.filter((item) => !missingImages.includes(item)),
       files: payload.files.filter((item) => !missingFiles.includes(item)),
+    };
+  }
+
+  if (
+    context.executionEvidence.requiredEvidenceKind
+    && context.executionEvidence.requiredEvidenceKind !== 'none'
+    && context.executionEvidence.evidenceSatisfied === false
+    && !NEGATIVE_EXECUTION_RESULT_RE.test(payload.text)
+  ) {
+    return {
+      ...payload,
+      text: buildNoExecutionEvidenceReply('模型回答了需要本地工具证据的任务，但本轮没有检测到真实工具执行成功记录。', context.executionEvidence),
+      parseMode: 'plain',
+      images: [],
+      files: [],
     };
   }
 
@@ -3620,6 +3638,7 @@ async function handleMessage(
   }
 
   let memoryRecallExtraSystemPrompt = '';
+  let memoryReviewContext: Pick<AnswerReviewInput, 'memoryPlan' | 'memoryHits'> = {};
   if (!hasAttachments && store.decideMemoryReply) {
     const memoryDecision = store.decideMemoryReply({
       sessionId: binding.codepilotSessionId,
@@ -3654,6 +3673,10 @@ async function handleMessage(
       ack();
       return;
     }
+    memoryReviewContext = {
+      memoryPlan: memoryDecision.plan,
+      memoryHits: memoryDecision.memory?.hits || [],
+    };
     memoryRecallExtraSystemPrompt = memoryDecision.systemPrompt || '';
   }
 
@@ -4085,6 +4108,7 @@ async function handleMessage(
         workingDirectory: resolvedWorkingDirectory,
         userText: rawText,
         answerText: preparedReply.text,
+        ...memoryReviewContext,
         source: 'codex',
         executionEvidence: result.executionEvidence,
       })

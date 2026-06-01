@@ -32,6 +32,7 @@ export type SSEEventType =
   | 'tool_result'
   | 'tool_output'
   | 'tool_timeout'
+  | 'progress'
   | 'status'
   | 'result'
   | 'error'
@@ -150,6 +151,7 @@ export type MemoryReplyDecision =
 
 export type AnswerReviewVerdict = 'pass' | 'warn' | 'block' | 'replace';
 export type AnswerReviewMode = 'observe' | 'block_or_replace';
+export type ExecutionRequirementKind = 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
 
 export interface AnswerReviewInput {
   channelType: string;
@@ -171,6 +173,10 @@ export interface AnswerReviewInput {
     failedToolResultCount: number;
     toolNames: string[];
     permissionRequestCount: number;
+    requiredEvidenceKind?: ExecutionRequirementKind;
+    evidenceSatisfied?: boolean;
+    noEvidenceRetryAttempted?: boolean;
+    requiredToolFamilies?: string[];
   };
 }
 
@@ -533,6 +539,12 @@ export interface StreamChatParams {
   sourceUserId?: string;
   sourceUserDisplayName?: string;
   sourceMessageId?: string;
+  executionRequirement?: {
+    kind: ExecutionRequirementKind;
+    reason: string;
+    requiredToolFamilies: string[];
+  };
+  noEvidenceRetryAttempted?: boolean;
 }
 
 export interface LLMProvider {

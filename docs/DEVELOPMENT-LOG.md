@@ -1,11 +1,29 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-05-20
+更新时间：2026-06-01
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
 ## 1. 项目收口
 
+- 2026-05-30 本地 API 工具回归修正：`local_api` 的 `tool_required` / `local_read_required` 不再把所有工具请求都先交给本地模型生成 JSON。runtime 会先按用户原文、允许工作区和 `config/local-agent-tools.d` manifest 生成可验证的确定性工具计划；只有模糊请求才让模型输出 JSON。Workflow 顶层 `execution` 同步记录 `toolUseCount`、`toolResultCount`、`successfulToolResultCount`、`failedToolResultCount` 和 `toolNames`，控制面板证据摘要显示工具计数，便于确认 `tool_required` 是否真的出现成功 `tool_result`。
+- 2026-06-01 本地 API MCP 动作 manifest 化：JSON 工具协议新增 `mcp_call`，`config/local-agent-tools.d/*.json` 可声明任意 MCP manifest、tool 和参数模板。`Unitymcp截一个game图` 这类自然语言请求不再依赖本地模型临场写 JSON，而是由 manifest 匹配到 Unity MCP `manage_camera` Game view 截图动作，workflow 会出现 `JsonTool:mcp_call` 和成功 `tool_result`。该机制可继续扩展到其他 MCP 动作，不在 provider 里写死单条中文请求。
+- 2026-06-01 本地 API MCP schema 多步规划补齐：模糊 MCP 任务不再停留在单步 JSON 请求或 manifest 快捷命中。runtime 会从 MCP `tools/list` 读取工具说明和输入 schema，按用户请求挑选相关工具注入本地模型，让模型先搜索/读取真实 path、id 或 name，再基于 `tool_result` 继续规划下一次 `tool_request`，最多执行受控多步工具循环。该修复用于 `unitymcp切换hsscene场景` 这类需要先解析资产再执行动作的任务，不在 provider 中写死场景名、中文请求或具体路径。
+- 2026-06-01 本地 API 工具后终答生成：JSON 工具协议完成真实工具动作后，不再把原始 MCP JSON 或运行时验证摘要直接发给用户。runtime 会把用户原文和真实工具历史交给本地模型生成面向飞书卡片的 Markdown/`cti-final` 终答，可展示简短“处理思路 / 执行结果”，但不暴露内部推理链、`JsonTool` 协议或原始 `tool_result` JSON。工具证据仍完整保留在 workflow 事件里，用于审计和控制面板复核。
+- 2026-06-01 本地 API 工具产物回传收口：JSON 工具协议成功后会从 `JsonToolResult` 递归提取真实存在的本地图片和文件路径，并优先生成 `cti-final.images/files` 结果块。明确工具、MCP、文件、命令、截图或生成物任务禁止降级成快问快答；没有真实工具证据时继续按“未完成”阻塞，成功截图/导出则走 Feishu 图片或文件附件发送链路。
+- 2026-05-30 出站限流配置化：delivery layer 的每聊天发送限流改为读取 `bridge_delivery_rate_limit_max_messages` / `bridge_delivery_rate_limit_window_ms`，默认仍为 20 条/分钟，`max_messages<=0` 可禁用本地限流。单测显式关闭该限流，避免全量测试因同一 mock chat 连续发消息而被生产限流睡眠阻塞。
+- 2026-05-29 本地 agent 执行证据误判修正：`ExecutionRequirement` 现在以用户原文而不是注入后的 provider prompt 做分类，避免飞书云文档上下文里的“不要截图/导出”等安全提示把普通总结误判成 `artifact_required`；`pve关卡场景叫啥` 这类名字/记忆查询不再因“场景”二字强制工具证据，仍由记忆/主模型正常回答。`cti-final` 结果块会先进入出站路径校验，再决定是否拦截缺失本地文件，避免通用 no-evidence 文案覆盖更具体的“路径不存在”阻塞。
+- 2026-05-29 记忆直答和内部工具泄漏兜底：结构化记忆表现在支持按 value/描述反查 key，类似 `pve关卡场景叫啥` 会从“`pve_gunship` == pve场景”这类高置信表项直接回复，不再退给本地模型自由生成。出站答案审查新增 `internal_tool_leakage`，如果本地模型泄漏内部工具协议错误，发送前会先用本轮 `memoryPlan + memoryHits` 重新组织高置信记忆答案；没有可重组答案时才替换成不含内部工具名的短阻塞，避免把执行器内部状态暴露给飞书用户。
+- 2026-05-22 通用自更新协议第一版：新增 `runtime-manifest/v1` 和 `config/runtime.d`，把 `service.bridge`、`service.codex`、`service.feishuCli`、`service.localLlm` 收口成声明式运行单元。控制面板不再只对 Codex CLI 写死更新逻辑，服务页与扩展页统一改走 `update` 块解析、来源判定、白名单模板执行和 post-check 刷新。
+- 2026-05-22 live 面板更新体验修正：`suite_live_sync` 在 live 控制面板内触发时，宿主会先安排当前面板退出后的自动重开，避免同步脚本替换 `dist/control-panel` 时把面板直接关掉后没有新窗口；服务页同时补齐运行单元动态版本显示，Bridge / 飞书 CLI / 本地 Agent API 读取 live `package.json`，Codex CLI 读取 npm 全局 `@openai/codex` 版本。
+- 2026-05-22 运行单元状态口径修正：飞书 CLI / Codex CLI 这类可更新工具在“已同步 / 已是最新版本 / 无需更新”时改显示为正常，不再因为“当前没有可更新动作”被误标成待处理；只有来源未知、无法判断最新版本或确实有待处理更新时才显示待处理。
+- 2026-05-22 飞书 CLI 更新来源诊断落地：`packages/bridge-runtime/scripts/install-codex.sh` 在复制安装时写入 `.cti-install.json`，记录 `installKind`、`installedAt`、`sourceRoot`、`installScript`。面板优先用元数据判断 `skill_codex_copy`，历史安装再按 live 路径、`.git` 仓库和 `sourceRootHint` 回退推断；仍无法确认时禁用自动更新并显示“来源未知”。
+- 2026-05-22 manifest 校验扩展到 runtime：`scripts/validate-extension-manifests.ps1` 现在同时校验 `extension-manifest/v1`、`runtime-manifest/v1` 和可选 `update` 块，约束 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种更新模板，避免面板或脚本绕过白名单执行任意命令。
+- 2026-05-22 本地 JSON 工具失败回传修正：`local_api` 通过 JSON 工具协议真实执行 shell/list_dir 但返回失败时，bridge-core 不再把 provider 给出的 stderr、exitCode 或路径阻塞原因覆盖成笼统“没有工具证据”；只有完全没有成功工具证据且模型仍假完成时才使用通用拦截文本。
+- 2026-05-22 本地 JSON 工具协议接入 Unity MCP：`tool_required` 且需要 Unity MCP 时，工具目录会优先暴露 `unity_mcp_execute_code`，runtime 通过 `McpBridge.callHttpTool(unityMCP, "execute_code", ...)` 在 Unity Editor 内执行 C#。具体工具别名改由 `config/local-agent-tools.d/*.json` 声明匹配规则和 C# 模板，provider 主逻辑不写死某个工具名；当前仅用 manifest 注册 FXTools Doctor 作为一个普通别名。
+- 2026-05-22 在线扩展目录三层化：控制面板目录页从“本地种子 + 远端精选 URL”升级为“静态种子 + 动态排行榜源 + 用户自定义 URL”。动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自 Top 5，缓存到 `runtime/extension-catalog-dynamic-cache.json`，并在条目上展示来源层、抓取时间、排行依据和名次。相同 `type + id` 冲突时按 `custom_url > seed > dynamic` 覆盖，动态刷新失败时回退最近缓存。
+- 2026-05-22 Qwen 本地模型目录更新：扩展目录补入 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder-next:q8_0`、`qwen3-coder-next:cloud`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3-coder:480b-cloud` 和 `qwen3-coder:480b-a35b-q4_K_M`，设置页“本地 API -> 模型”改为读取在线目录生成候选列表，同时保留手动输入任意 Ollama 模型名。`local-model-capabilities.json` 的推荐列表同步把 Qwen3 Coder Next 和 Qwen3 Coder 30B 放到本地代码 agent 候选前列；live 同步脚本现在同步 `config/extension-catalog.json`，避免运行版面板缺少目录种子。
+- 2026-05-22 Ollama 模型安装管理补齐：控制面板新增异步模型安装 job，在线目录里的 Ollama 模型安装会显示进度、支持暂停、配置 `CTI_OLLAMA_MODELS_DIR` / `OLLAMA_MODELS` 安装目录、完成后自动设为本地 API 模型并重启 Bridge；已安装模型可在扩展页直接使用或卸载。设置页新增“已安装模型”下拉，读取在线目录和 Ollama `/api/tags`，不再只靠手动输入模型名。
 - 2026-05-19 优化直接提醒自然语言解析：`五点半提醒我替换pve场景的背景图`、`下午五点半提醒我...`、`明天上午九点提醒我...`、`晚上8点15分提醒我...` 这类请求会走可复用时间短语解析层，命中 bridge-core 的高置信 reminder fast-path，创建 `data/todos/direct-reminders/*.md` 并重建 `.cti-index/reminders.json`，避免 Codex 文本回复“收到”但面板没有待办记录。
 - 2026-05-11 修正 Feishu 入站权限模型：`bridge_feishu_allowed_users` 不再作为 adapter 层会话白名单，任何用户都可以进入普通会话；兼容配置里的 allowed users 只再映射为 `Viewer` 角色，危险动作继续由 `Viewer / Operator / Owner` 门禁控制。
 - 2026-05-11 重整记忆召回链路：移除 `常用场景名称` 这类单词条快路径，改为 `MemoryQueryPlan -> RetrievedMemoryHit 元数据 -> MemoryReplyDecision`。明确回忆类请求只有高置信结构化命中才直答；模糊召回受限交给 Codex；普通任务只注入记忆上下文。`audit.json` 已发结果、profile、知识索引和会话历史统一带来源、置信度、可回答性和质量标记，错误兜底不再写入或召回为有效记忆。
@@ -46,7 +64,7 @@
 - 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
 - 将 suite 版本提升到 `0.2.0`，并在 `suite.manifest.json` 中声明 `extension-manifest/v1`。
 - 给 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 补齐统一扩展字段：`version`、`compatibility`、`category`、`optional`、`installState`、`source` 和 `aliases`。
-- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest。
+- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest；截至 2026-05-22 该脚本也同时校验 `config/runtime.d` 和 `update` 协议。
 - 新增在线扩展目录 v1：`config/extension-catalog.json` 作为本地种子，`CTI_EXTENSION_CATALOG_URLS` 可追加远端精选目录；控制面板“扩展”页支持目录搜索、HTTPS URL 预览、本机安装和移除记录。
 - 扩展安装内容固定落在 `C:\Users\admin\.claude-to-im\extensions`，并生成用户 manifest overlay；`mcp-bridge`、控制面板、`install-suite-skills.ps1` 和 `register-external-mcps.ps1` 已合并读取 suite manifest 与用户 overlay。
 - 在线安装 handler 收口为 `skill.copy`、`mcp.npm`、`mcp.uvx`、`mcp.zip`、`ollama.pull`、`manifest.record`、`codex-plugin.record`；无 `sha256` 的 URL 预览会标记为不可信，远程 Control API 安装和移除要求 Owner。
@@ -77,7 +95,7 @@
 - 会话页新增详情抽屉，支持直接查看完整消息流、复制摘要和复制消息文本，不再强依赖旧 WinForms 会话查看器。
 - 会话详情抽屉补齐图片和附件查看：宿主会读取 Feishu 原始消息资源键，下载图片/文件到本机 `runtime/control-panel-media` 缓存，并通过 WebView2 虚拟域 `control-panel-media.local` 给前端加载。前端展示图片缩略图、附件名称、大小、MIME、路径和下载状态，不再把图片简单显示成占位文本。
 - 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
-- 会话详情对旧本地消息增加只读显示修复：检测到 `鍖/涓/妫/杩/€` 等典型 UTF-8 被 GBK 错读的 mojibake 时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
+- 会话详情对旧本地消息增加只读显示修复：检测到典型 UTF-8 被 GBK 错读的 mojibake 特征时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
 - 会话详情新增运行历程回溯：按 `sessionId` / `chatId` 关联 workflow run，展示 executor、阶段、状态、prompt 摘要和事件时间线，便于排查一次请求是否卡在授权、路由、执行、收尾或回传阶段。
 - 飞书图片出站收紧：不再从最近 assistant 历史消息里自动捞旧图片随新回答发送；只有当前 `cti-final.images` 或当前回复文本明确出现的本地图片路径会被发送，避免 Unity 截图任务失败时重复发旧截图。
 - 回复风格快捷预设改为点击即保存到 `CTI_REPLY_STYLE_HINT`，避免前端临时状态被后续 `state.refresh` 用旧配置覆盖。
@@ -259,6 +277,8 @@
 
 - `extension-manifest/v1` 由 `suite.manifest.json` 声明。
 - MCP / skill / plugin manifest 使用统一字段管理版本、兼容范围、分类、安装状态和来源。
+- `runtime-manifest/v1` 由 `suite.manifest.json` 声明，内建服务 manifest 存放在 `config/runtime.d`。
+- `update` 块当前只允许 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种模板；宿主负责把模板映射成固定命令。
 - MCP 快路径按 manifest 的 `aliases`、`displayName`、`id` 动态匹配目标，不再在本地执行器里维护固定 MCP 名称列表。
 
 最近重点修复：
@@ -426,8 +446,23 @@
 
 ## 9. 当前未发布改动提示
 
+- 2026-05-20 workflow 运行记录新增任务级 `execution` / `tokenUsage` 摘要：runtime 会从流式 `status/result` 事件汇总模型来源、模型名和 token 用量写回 `workflow-runs.json` 顶层；控制面板在“执行器 -> 最近 Workflow”和“会话详情 -> 运行历程”同步展示模型、来源、总 token、输入/输出 token，并在有值时显示 cache token。
+- 2026-05-21 针对 live workflow 自旋补了两层防护：一是 `workflow-runs.json` 在 Windows 上被占用时，runtime 不再只依赖 `renameSync` 覆盖文件，而是回退为直接写目标文件；二是对 `usage limit`、鉴权失效、`405 Method Not Allowed`、`/v1/responses` 这类确定性失败，workflow 不再自动排 `auto_retry`，避免一条消息失败后持续自旋重跑。
+- 2026-05-21 workflow 面板补齐时间与可视范围：执行器页“最近 Workflow”从最近 12 条扩大到最近 40 条，并直接显示开始时间和耗时；会话详情“运行历程”新增开始、结束和耗时字段，方便区分短失败、长执行和断点续跑中的 run。
+- 2026-05-21 修复 workflow 单测污染 live 运行记录：`workflow-status` 状态文件路径改为按调用时读取 `CTI_HOME`，单测每次运行都切到临时目录，避免 `session-stale-auto-retry`、`session-recoverable` 这类测试 run 再写进 `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json` 干扰真实面板。
+- 2026-05-21 Codex CLI 模型来源改为“Codex agent + API 来源链”：新增 `CTI_CODEX_ROUTING_MODE=manual|auto_failover` 与 `CTI_CODEX_API_FALLBACK_CHAIN`；手动本地 API 模式只使用 `local_primary` profile，清理 `OPENAI_API_KEY` / `CODEX_API_KEY` / `CTI_CODEX_API_KEY` 等付费侧环境变量，不再因工具探测或旧安全兜底键自动转官方 Codex。`codex-local-fallback` 从用户可选执行器移除，`@local` / `@本地` 改为选择 `codex` 的本地模型来源；自动切换只在模型/API 层失败后按链尝试，默认链为 `local_api,external_api`，官方 Codex 必须显式加入才会被调用。控制面板“运行策略”新增“自动切换”与可排序来源链，并隐藏旧本地 Agent API 兜底控件。
+- 2026-05-21 Codex API 自动切换修复：Codex provider 如果把 `/v1/responses`、405、鉴权或额度问题包装成 SSE `error` 事件，`CodexApiFailoverProvider` 现在也会识别为模型/API 层失败并继续尝试链内下一个已配置来源；未配置 `CTI_CODEX_BASE_URL` 的 `external_api` 会被跳过，避免把外部 API 空配置误当成官方 Codex。若链内只剩 Ollama，本地失败会明确提示“Ollama Chat Completions 不支持 Codex SDK 需要的 Responses/WebSocket `/v1/responses` 接口”。
+- 2026-05-21 控制面板 live 产物同步修正：重新运行 `scripts/build-packages.ps1` 发布 `release\artifacts\control-panel`，再同步 live skill 并重启面板/Bridge；总览页系统蓝图的 AI 执行节点同步改为“Codex agent + 模型来源/自动切换链”口径，不再显示“本地兜底”作为备援。
+- 2026-05-21 本地模型 provider registry 接入 Codex CLI：`local_api` 不再走 `@openai/codex-sdk` 的 `/v1/responses`，而是按 `CTI_LOCAL_AI_KIND` 选择 adapter；当前 `ollama` 和 `lmstudio` 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，模型名来自配置，不写死 `qwen2.5-coder:7b`。`vllm`、`openai-compatible` 和 `custom` 当前标记为仅 Chat Completions，手动本地 API 会明确阻断，自动链只继续尝试链中后续已配置来源。Workflow 会记录实际 adapter、模型、来源和 Codex CLI JSONL token usage，控制面板本地 API 区显示 provider 是否支持 Codex agent。
+- 2026-05-21 Agent 工具证据验收升级：`bridge-core` 新增 `ExecutionRequirement` 分类，本地目录/文件读取、Unity/MCP/Blender、截图和产物任务会在进入 provider 前注入明确工具规范。非 `none` 请求如果第一次没有成功 `tool_result`，同一模型来源自动重试一次；仍无证据时返回“未完成：本轮没有检测到真实工具执行成功记录”。Workflow 顶层记录证据要求、是否满足和是否已重试，控制面板“最近 Workflow”和“运行历程”同步显示证据状态。
+- 2026-05-21 本地模型 JSON 工具协议落地：`local_api` 的本地读取类任务不再只依赖 Codex OSS 模型自发产生 `command_execution`，而是先让本地模型输出严格 `tool_request` JSON，runtime 校验并执行 `list_dir/read_file/search_files` 只读工具，再基于真实 `JsonToolResult` 做确定性最终化，避免只读任务再消耗一次本地模型总结调用。若本地模型两次都没有输出 JSON，runtime 仅对可保守推断的只读目标补全白名单工具请求。Workflow 新增 `evidenceProtocol=json_tool_request`、`requestedTool`、`executedTool`、`jsonToolRetryAttempted`、`jsonToolFallbackUsed`，面板同步显示 JSON 工具协议证据状态；该失败不触发切官方 Codex。
+- 2026-05-22 本地模型 JSON 工具协议扩展到 shell：`local_api` 的 `tool_required` 请求也进入 JSON 工具协议，支持模型或 runtime 保守补全 `{"tool":"shell"}` 请求。runtime 会校验 shell `cwd` 在允许根内，执行用户明确要求的命令，记录 stdout/stderr/exitCode/duration，并把 `shellExitCode` / `shellDurationMs` 写入 workflow 摘要和控制面板证据展示。命令失败、路径不唯一或协议失败仍属于工具失败，不触发官方 Codex 自动切换。
+
 截至本记录生成时，工作区仍有以下近期代码改动，发布前应按目标分支选择发布入口：
 
 - 如果只是更新本机运行副本，使用 `publish-backup.ps1`。
 - 如果准备合入 `main`，先使用 `prepare-main-release.ps1` 完成主干发布预检。
 - 当前重点改动是扩展 manifest v1、主干发布预检脚本、版本治理说明和控制面板运营信息展示。
+
+- 2026-05-26 控制面板模型安装交互补齐：修复 WebView/Control API 的目录选择弹窗没有绑定宿主窗口导致“选择目录”无响应或弹到背后的问题；设置页增加本地草稿保护，后台 `state` 推送不再覆盖尚未保存的模型来源、路径和 API 配置；在线目录的 Ollama 安装任务不再只显示 `running` 状态，失败、暂停、完成都会保留任务摘要、进度和最近输出，避免安装失败后一秒钟看起来又变回“未安装”。
+- 2026-05-26 控制面板 Ollama CLI 路径解析补齐：在线目录安装/卸载 Ollama 模型不再直接依赖面板进程 PATH 中存在 `ollama`，会优先读取 `CTI_OLLAMA_EXE` / `OLLAMA_EXE`，再查 PATH 和常见 Windows 安装目录；找不到时返回明确的“未找到 Ollama CLI”阻塞提示，避免底层 `系统找不到指定的文件` 泄漏到用户侧。

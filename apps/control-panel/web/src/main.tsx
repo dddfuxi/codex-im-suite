@@ -147,6 +147,7 @@ type SettingsState = {
   replyStyleHint: string;
   localAiKind: string;
   localAiBaseUrl: string;
+  ollamaModelsDir: string;
   localAiModel: string;
   localAiApiKeyAction: 'keep' | 'set' | 'clear';
   localAiApiKeyValue: string;
@@ -154,6 +155,8 @@ type SettingsState = {
   localAiApiKeySet: boolean;
   localAiTimeoutMs: string;
   codexModelSource: 'official' | 'local_api' | 'external_api' | string;
+  codexRoutingMode: 'manual' | 'auto_failover' | string;
+  codexApiFallbackChain: string;
   codexBaseUrl: string;
   codexModel: string;
   codexPassModel: boolean;
@@ -173,7 +176,14 @@ type SettingsState = {
   codexApiKeySet: boolean;
 };
 
-type AiStrategy = 'official' | 'local_api' | 'external_api';
+type AiStrategy = 'official' | 'local_api' | 'external_api' | 'auto_failover';
+type CodexSource = 'local_api' | 'external_api' | 'official';
+
+const CODEX_SOURCE_LABELS: Record<CodexSource, string> = {
+  local_api: '本地 API',
+  external_api: '外部 API',
+  official: '官方 Codex',
+};
 
 const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeoutMs: string }> = {
   ollama: { label: 'Ollama', baseUrl: 'http://127.0.0.1:11434', timeoutMs: '45000' },
@@ -184,6 +194,7 @@ const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeout
 };
 
 function inferAiStrategy(settings: SettingsState): AiStrategy {
+  if ((settings.codexRoutingMode || '').trim() === 'auto_failover') return 'auto_failover';
   const source = (settings.codexModelSource || '').trim();
   if (source === 'local_api' || source === 'external_api') return source;
   if (settings.codexBaseUrl.trim() || settings.codexModel.trim() || settings.codexApiKeySet || settings.codexApiKeyAction === 'set') return 'external_api';
@@ -191,21 +202,47 @@ function inferAiStrategy(settings: SettingsState): AiStrategy {
 }
 
 function strategyLabel(strategy: AiStrategy): string {
-  if (strategy === 'local_api') return '本地 API 作为主模型';
-  if (strategy === 'external_api') return '外部 API 作为主模型';
+  if (strategy === 'local_api') return '本地 API';
+  if (strategy === 'external_api') return '外部 API';
+  if (strategy === 'auto_failover') return '自动切换';
   return '官方 Codex';
-  switch (strategy) {
-    case 'local_api':
-      return 'Codex + 本地兜底';
-    case 'external_api':
-      return '完全使用自定义 API';
-    default:
-      return '默认 Codex';
-  }
 }
 
 function localAiLabel(kind: string): string {
   return LOCAL_AI_PRESETS[kind]?.label || '自定义';
+}
+
+function localAiCapabilityLabel(kind: string): string {
+  const normalized = (kind || '').trim().toLowerCase();
+  if (normalized === 'ollama' || normalized === 'lmstudio') return '支持 Codex agent';
+  if (normalized === 'vllm' || normalized === 'openai-compatible' || normalized === 'custom') return '仅 Chat Completions';
+  return '不可用';
+}
+
+function localAiCapabilityHint(kind: string): string {
+  const normalized = (kind || '').trim().toLowerCase();
+  if (normalized === 'ollama' || normalized === 'lmstudio') {
+    return '会通过 codex exec --oss --local-provider 使用本地模型，不调用 Codex SDK /v1/responses。';
+  }
+  return '该 provider 当前不能作为 Codex CLI OSS agent 执行器；手动本地 API 会直接阻断，自动切换只会继续尝试链里的其他来源。';
+}
+
+function parseCodexChain(value: string): CodexSource[] {
+  const valid = new Set<CodexSource>(['local_api', 'external_api', 'official']);
+  const seen = new Set<CodexSource>();
+  const chain: CodexSource[] = [];
+  for (const part of (value || '').split(',')) {
+    const source = part.trim() as CodexSource;
+    if (valid.has(source) && !seen.has(source)) {
+      seen.add(source);
+      chain.push(source);
+    }
+  }
+  return chain.length ? chain : ['local_api', 'external_api'];
+}
+
+function formatCodexChain(value: string): string {
+  return parseCodexChain(value).join(',');
 }
 
 type SessionItem = {
@@ -308,6 +345,7 @@ type RuntimeAction = {
   id: string;
   label: string;
   enabled: boolean;
+  reason?: string;
 };
 
 type RuntimeUnit = {
@@ -367,6 +405,38 @@ type WorkflowRun = {
   updatedAt: string;
   endedAt?: string;
   error?: string;
+  execution?: {
+    provider?: string;
+    codexProfile?: string;
+    modelSource?: string;
+    attemptedSources?: string[];
+    selectedSource?: 'local_api' | 'external_api' | 'official';
+    model?: string;
+    baseUrl?: string;
+    requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+    evidenceSatisfied?: boolean;
+    noEvidenceRetryAttempted?: boolean;
+    requiredToolFamilies?: string[];
+    toolUseCount?: number;
+    toolResultCount?: number;
+    successfulToolResultCount?: number;
+    failedToolResultCount?: number;
+    toolNames?: string[];
+    evidenceProtocol?: string;
+    requestedTool?: string;
+    executedTool?: string;
+    jsonToolRetryAttempted?: boolean;
+    jsonToolFallbackUsed?: boolean;
+    shellExitCode?: number;
+    shellDurationMs?: number;
+  };
+  tokenUsage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    total_tokens?: number;
+  };
   recovery?: {
     kind: 'recoverable' | 'not_recoverable';
     reason: string;
@@ -666,6 +736,11 @@ type ExtensionCatalogItem = {
   installHandler: string;
   artifactUrl?: string;
   catalogSource: string;
+  sourceLayer: 'seed' | 'dynamic' | 'custom_url' | string;
+  sourceName: string;
+  fetchedAt: string;
+  rankBasis: string;
+  rankOrder: number;
   trusted: boolean;
   trustReason: string;
   canInstall: boolean;
@@ -676,10 +751,36 @@ type ExtensionCatalogItem = {
   installPath: string;
 };
 
+type ExtensionInstallJob = {
+  jobId: string;
+  itemId: string;
+  type: string;
+  displayName: string;
+  model: string;
+  installPath: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled' | string;
+  stage: string;
+  message: string;
+  percent: number;
+  canCancel: boolean;
+  useAfterInstall: boolean;
+  exitCode?: number;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string;
+  recentLines: string[];
+};
+
 type ExtensionCatalogSnapshot = {
   protocol: string;
   refreshedAt: string;
   sourceCount: number;
+  layerCounts: {
+    seed: number;
+    dynamic: number;
+    customUrl: number;
+    local?: number;
+  };
   items: ExtensionCatalogItem[];
 };
 
@@ -844,6 +945,7 @@ const fallbackState: PanelState = {
     replyStyleHint: '',
     localAiKind: 'ollama',
     localAiBaseUrl: 'http://127.0.0.1:11434',
+    ollamaModelsDir: '',
     localAiModel: 'qwen2.5-coder:7b',
     localAiApiKeyAction: 'keep',
     localAiApiKeyValue: '',
@@ -851,6 +953,8 @@ const fallbackState: PanelState = {
     localAiApiKeySet: false,
     localAiTimeoutMs: '45000',
     codexModelSource: 'official',
+    codexRoutingMode: 'manual',
+    codexApiFallbackChain: 'local_api,external_api',
     codexBaseUrl: '',
     codexModel: '',
     codexPassModel: false,
@@ -859,8 +963,8 @@ const fallbackState: PanelState = {
     codexLocalFallbackReasoningEffort: 'minimal',
     codexFailureFallbackMode: 'none',
     localAgentMode: 'text_only',
-    localToolCallRequired: true,
-    executionRequiredRoute: 'codex_or_external',
+    localToolCallRequired: false,
+    executionRequiredRoute: 'primary',
     memoryOptimizerEnabled: false,
     memoryOptimizerIntervalDays: '7',
     memoryOptimizerModelSource: 'codex_primary',
@@ -1246,20 +1350,20 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
       id: 'brain',
       title: 'AI 执行',
       detail: codexStatus === 'normal'
-        ? `Codex 主链路可用，${activeExecutors || 1} 个执行入口处于可用状态。`
+        ? `Codex agent 可用，${activeExecutors || 1} 个执行入口处于可用状态。`
         : localStatus === 'normal'
-          ? 'Codex 需要检查，本地兜底可作为备援。'
-          : 'Codex 和本地兜底都需要检查。',
+          ? 'Codex 需要检查；本地 API 可作为 Codex CLI 的模型来源或自动切换来源。'
+          : 'Codex 和本地 API 都需要检查。',
       status: aiStatus,
-      helpText: 'AI 执行负责把用户请求交给 Codex；本地 Agent API 只做兜底或小任务。',
+      helpText: 'AI 执行负责把用户请求交给 Codex；本地 API 可作为 Codex CLI 的模型来源。',
       targetPage: 'settings',
       targetUnitId: 'ai',
       primaryAction: runtimeAction('ai-check-codex', '检查 Codex', 'service.codex', 'check', '确认 Codex CLI 和路由状态。'),
       secondaryActions: [
         runtimeAction('ai-update-codex', '更新 Codex', 'service.codex', 'update', '仅在 Codex CLI 支持 npm 更新时可用。'),
-        runtimeAction('ai-check-local', '检查本地兜底', 'service.localLlm', 'check', '检查本地 Agent API。'),
-        runtimeAction('ai-start-local', '启动本地兜底', 'service.localLlm', 'start', '启动本地 Agent API。'),
-        navigateAction('ai-open-settings', '设置 AI', 'settings', 'ai', '调整 Codex / 本地兜底策略。'),
+        runtimeAction('ai-check-local', '检查本地 API', 'service.localLlm', 'check', '检查本地模型 API 是否可用。'),
+        runtimeAction('ai-start-local', '启动本地 API', 'service.localLlm', 'start', '启动本地模型 API。'),
+        navigateAction('ai-open-settings', '设置 AI', 'settings', 'ai', '调整 Codex 模型来源和自动切换链。'),
       ],
     },
     {
@@ -1359,10 +1463,10 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
       id: 'brain',
       title: 'AI 执行',
       detail: codexStatus === 'normal'
-        ? `Codex 主链路可用，${activeExecutors || 1} 个执行入口处于可用状态。`
+        ? `Codex agent 可用，${activeExecutors || 1} 个执行入口处于可用状态。`
         : localStatus === 'normal'
-          ? 'Codex 需要检查，本地兜底可作为备援。'
-          : 'Codex 和本地兜底都需要检查。',
+          ? 'Codex 需要检查；本地 API 可作为 Codex CLI 的模型来源或自动切换来源。'
+          : 'Codex 和本地 API 都需要检查。',
       status: aiStatus,
     },
     {
@@ -1566,6 +1670,111 @@ function workflowStatusLabel(run: WorkflowRun) {
   return run.stage || run.status;
 }
 
+function workflowModelLabel(run: WorkflowRun) {
+  return run.execution?.model || '未知';
+}
+
+function workflowModelSourceLabel(run: WorkflowRun) {
+  return run.execution?.modelSource || '未知';
+}
+
+function formatWorkflowTimestamp(value?: string) {
+  if (!value) return '未知';
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(timestamp));
+}
+
+function workflowDurationSummary(run: WorkflowRun) {
+  const startedAt = Date.parse(run.startedAt || '');
+  if (!Number.isFinite(startedAt)) return '未知';
+  const endedAt = run.endedAt ? Date.parse(run.endedAt) : NaN;
+  if (Number.isFinite(endedAt)) {
+    return formatDuration(Math.max(1000, endedAt - startedAt));
+  }
+  return `进行中 ${formatDuration(Math.max(1000, Date.now() - startedAt))}`;
+}
+
+function formatWorkflowTokenPart(value?: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : '未知';
+}
+
+function workflowTokenSummary(run: WorkflowRun) {
+  const usage = run.tokenUsage;
+  if (!usage) return '未知';
+  const input = typeof usage.input_tokens === 'number' && Number.isFinite(usage.input_tokens)
+    ? usage.input_tokens
+    : undefined;
+  const output = typeof usage.output_tokens === 'number' && Number.isFinite(usage.output_tokens)
+    ? usage.output_tokens
+    : undefined;
+  const total = typeof usage.total_tokens === 'number' && Number.isFinite(usage.total_tokens)
+    ? usage.total_tokens
+    : (input !== undefined || output !== undefined)
+      ? (input || 0) + (output || 0)
+      : undefined;
+  if (total === undefined && input === undefined && output === undefined) return '未知';
+  return `总 ${formatWorkflowTokenPart(total)}（入 ${formatWorkflowTokenPart(input)} / 出 ${formatWorkflowTokenPart(output)}）`;
+}
+
+function workflowCacheTokenSummary(run: WorkflowRun) {
+  const usage = run.tokenUsage;
+  if (!usage) return '';
+  const cacheRead = typeof usage.cache_read_input_tokens === 'number' && Number.isFinite(usage.cache_read_input_tokens)
+    ? usage.cache_read_input_tokens
+    : 0;
+  const cacheCreation = typeof usage.cache_creation_input_tokens === 'number' && Number.isFinite(usage.cache_creation_input_tokens)
+    ? usage.cache_creation_input_tokens
+    : 0;
+  if (cacheRead <= 0 && cacheCreation <= 0) return '';
+  return `读 ${cacheRead} / 写 ${cacheCreation}`;
+}
+
+function workflowEvidenceSummary(run: WorkflowRun) {
+  const kind = run.execution?.requiredEvidenceKind;
+  if (!kind || kind === 'none') return '证据：不要求';
+  if (run.execution?.evidenceSatisfied === true) return `证据：已满足（${kind}）`;
+  if (run.execution?.noEvidenceRetryAttempted) return `证据：重试后仍缺少工具结果（${kind}）`;
+  return `证据：缺少工具结果（${kind}）`;
+}
+
+function workflowEvidenceSummaryV2(run: WorkflowRun) {
+  const kind = run.execution?.requiredEvidenceKind;
+  const tool = run.execution?.executedTool || run.execution?.requestedTool;
+  const counts = run.execution
+    ? [
+      typeof run.execution.successfulToolResultCount === 'number' ? `成功：${run.execution.successfulToolResultCount}` : '',
+      typeof run.execution.toolResultCount === 'number' ? `结果：${run.execution.toolResultCount}` : '',
+      typeof run.execution.toolUseCount === 'number' ? `调用：${run.execution.toolUseCount}` : '',
+    ].filter(Boolean).join('，')
+    : '';
+  const shellSuffix = tool === 'shell' || tool === 'JsonTool:shell'
+    ? [
+      typeof run.execution?.shellExitCode === 'number' ? `exitCode：${run.execution.shellExitCode}` : '',
+      typeof run.execution?.shellDurationMs === 'number' ? `耗时：${formatDuration(run.execution.shellDurationMs)}` : '',
+    ].filter(Boolean).join('，')
+    : '';
+  const toolSuffix = tool || shellSuffix || counts
+    ? `，${[tool ? `工具：${tool}` : '', counts, shellSuffix].filter(Boolean).join('，')}`
+    : '';
+  if (!kind || kind === 'none') return '证据：不要求';
+  if (run.execution?.evidenceProtocol === 'json_tool_request' && run.execution?.evidenceSatisfied === true) {
+    const fallback = run.execution?.jsonToolFallbackUsed ? '，runtime 保守补全' : '';
+    return `证据：JSON 工具协议已满足（${kind}${toolSuffix}${fallback}）`;
+  }
+  if (run.execution?.evidenceSatisfied === true) return `证据：已满足（${kind}${toolSuffix}）`;
+  if (run.execution?.jsonToolRetryAttempted) return `证据：JSON 工具协议重试后失败（${kind}${toolSuffix}）`;
+  if (run.execution?.noEvidenceRetryAttempted) return `证据：重试后仍缺少工具结果（${kind}${toolSuffix}）`;
+  return `证据：缺少工具结果（${kind}${toolSuffix}）`;
+}
+
 function canRetryWorkflow(run: WorkflowRun) {
   return !!run.recovery?.input?.prompt
     && run.status !== 'succeeded'
@@ -1597,6 +1806,25 @@ function getRuntimeKindLabel(kind: string) {
       return '其他扩展';
     default:
       return kind || '未分类';
+  }
+}
+
+function formatRuntimeVersion(version: string) {
+  return version ? `v${version}` : '未标注版本';
+}
+
+function getCatalogLayerLabel(layer: string) {
+  switch (layer) {
+    case 'local':
+      return '本机已安装';
+    case 'seed':
+      return '静态种子';
+    case 'dynamic':
+      return '动态排行';
+    case 'custom_url':
+      return '自定义 URL';
+    default:
+      return layer || '未知来源';
   }
 }
 
@@ -2494,7 +2722,7 @@ function ServicesPage({
             <button key={unit.unitId} className={selected?.unitId === unit.unitId ? 'runtime-row active' : 'runtime-row'} onClick={() => setSelectedUnitId(unit.unitId)}>
               <div>
                 <strong>{unit.displayName}</strong>
-                <span>{getRuntimeKindLabel(unit.kind)} · {getRuntimeCategoryLabel(unit.category)} · {unit.installState || 'installed'}</span>
+                <span>{getRuntimeKindLabel(unit.kind)} · {getRuntimeCategoryLabel(unit.category)} · {formatRuntimeVersion(unit.version)} · {unit.installState || 'installed'}</span>
               </div>
               <StatusPill status={unit.status} label={runtimeStatusText(unit)} />
             </button>
@@ -2508,7 +2736,7 @@ function ServicesPage({
             <div className="detail-stack">
               <div className="detail-summary">
                 <StatusPill status={selected.status} label={runtimeStatusText(selected)} />
-                <div className="detail-meta">{getRuntimeKindLabel(selected.kind)} · {getRuntimeCategoryLabel(selected.category)} · {selected.version || '未标注版本'}</div>
+                <div className="detail-meta">{getRuntimeKindLabel(selected.kind)} · {getRuntimeCategoryLabel(selected.category)} · {formatRuntimeVersion(selected.version)}</div>
               </div>
               <p className="detail-copy">{selected.description || selected.detail || '暂无说明。'}</p>
               <div className="command-band dense">
@@ -2520,6 +2748,7 @@ function ServicesPage({
                     onClick={() => void invokeAction(selected, action)}
                     pending={pending['runtime.invokeAction']}
                     disabled={!action.enabled}
+                    title={!action.enabled ? (action.reason || `${action.label} 当前不可用`) : action.label}
                   />
                 ))}
               </div>
@@ -2616,7 +2845,7 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
   const executors = state.executors?.executors ?? [];
   const runs = state.workflow?.runs ?? [];
   const lastSelection = state.executors?.lastSelection;
-  const recentRuns = runs.slice(-12).reverse();
+  const recentRuns = runs.slice(-40).reverse();
   const [selectedExecutorId, setSelectedExecutorId] = useState('');
   const selectedExecutor = executors.find((executor) => executor.id === selectedExecutorId) ?? executors[0];
 
@@ -2704,13 +2933,22 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
         </section>
       </section>
       <section className="panel executor-workflow-panel">
-        <SectionHeader title="最近 Workflow" />
+        <SectionHeader title={`最近 Workflow（${recentRuns.length}/${runs.length}）`} />
         <div className="runtime-list compact-list workflow-list">
           {recentRuns.map((runItem) => (
             <div key={runItem.id} className="runtime-row">
               <div>
                 <strong>{runItem.promptPreview || runItem.id}</strong>
                 <span>{runItem.stage} · {runItem.executorId || '未选择'} · {runItem.sessionId}</span>
+                <span className="workflow-inline-summary">
+                  模型：{workflowModelLabel(runItem)}　Token：{workflowTokenSummary(runItem)}　来源：{workflowModelSourceLabel(runItem)}
+                </span>
+                <span className="workflow-inline-summary">
+                  开始：{formatWorkflowTimestamp(runItem.startedAt)}　耗时：{workflowDurationSummary(runItem)}
+                </span>
+                <span className="workflow-inline-summary">
+                  {workflowEvidenceSummaryV2(runItem)}
+                </span>
                 {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
                   <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
                 )}
@@ -2903,6 +3141,11 @@ function ExtensionsPage({
   const [catalog, setCatalog] = useState<ExtensionCatalogSnapshot | null>(null);
   const [catalogQuery, setCatalogQuery] = useState('');
   const [catalogFilter, setCatalogFilter] = useState<ExtensionCatalogFilter>('all');
+  const [catalogLayerFilter, setCatalogLayerFilter] = useState<'all' | 'local' | 'seed' | 'dynamic' | 'custom_url'>('all');
+  const [installJobs, setInstallJobs] = useState<ExtensionInstallJob[]>([]);
+  const refreshedTerminalInstallJobsRef = useRef<Set<string>>(new Set());
+  const [modelInstallPath, setModelInstallPath] = useState(state.settings.ollamaModelsDir || '');
+  const [useModelAfterInstall, setUseModelAfterInstall] = useState(true);
   const [remoteUrl, setRemoteUrl] = useState('');
   const [remotePreview, setRemotePreview] = useState<RemoteExtensionPreview | null>(null);
   const filterItems: Array<{ id: ExtensionKindFilter; label: string; count: number }> = useMemo(() => {
@@ -2933,19 +3176,41 @@ function ExtensionsPage({
     const query = catalogQuery.trim().toLowerCase();
     return (catalog?.items ?? []).filter((item) => {
       if (catalogFilter !== 'all' && item.type !== catalogFilter) return false;
+      if (catalogLayerFilter !== 'all' && item.sourceLayer !== catalogLayerFilter) return false;
       if (!query) return true;
-      return `${item.id} ${item.displayName} ${item.category} ${item.description} ${item.installHandler}`.toLowerCase().includes(query);
+      return `${item.id} ${item.displayName} ${item.category} ${item.description} ${item.installHandler} ${item.sourceName} ${item.rankBasis}`.toLowerCase().includes(query);
     });
-  }, [catalog?.items, catalogFilter, catalogQuery]);
+  }, [catalog?.items, catalogFilter, catalogLayerFilter, catalogQuery]);
 
   async function loadCatalog(refresh = false) {
     const snapshot = await run(refresh ? 'extension.catalog.refresh' : 'extension.catalog.list') as ExtensionCatalogSnapshot;
     setCatalog(snapshot);
   }
 
+  async function loadInstallJobs() {
+    const jobs = await run('extension.installJobs') as ExtensionInstallJob[];
+    setInstallJobs(Array.isArray(jobs) ? jobs : []);
+  }
+
   useEffect(() => {
     void loadCatalog(false);
+    void loadInstallJobs();
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadInstallJobs().catch(() => undefined);
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const terminalJobs = installJobs.filter((job) => job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled');
+    const unseen = terminalJobs.filter((job) => !refreshedTerminalInstallJobsRef.current.has(job.jobId));
+    if (unseen.length === 0) return;
+    for (const job of unseen) refreshedTerminalInstallJobsRef.current.add(job.jobId);
+    void loadCatalog(false).catch(() => undefined);
+  }, [installJobs]);
 
   async function pickImportFolder() {
     const picked = await run('path.pickFolder', { currentPath: importPath }) as string;
@@ -2973,7 +3238,51 @@ function ExtensionsPage({
     setSelectedUnitId(importedKind === 'mcp' ? `mcp.${importedId}` : `extension.${importPreview.manifestPath}`);
   }
 
+  function catalogModelName(item: ExtensionCatalogItem) {
+    return (item.artifactUrl || item.installPath || item.id || '').trim();
+  }
+
+  function installJobForItem(item: ExtensionCatalogItem) {
+    const model = catalogModelName(item);
+    return installJobs
+      .filter((job) => job.itemId === item.id || (!!model && job.model === model))
+      .sort((left, right) => (right.updatedAt || '').localeCompare(left.updatedAt || ''))[0];
+  }
+
+  function shouldShowInstallJob(item: ExtensionCatalogItem, job?: ExtensionInstallJob) {
+    if (!job) return false;
+    if (job.status === 'succeeded' && item.installed) return false;
+    return job.status === 'running' || job.status === 'failed' || job.status === 'cancelled' || job.status === 'succeeded';
+  }
+
+  function installJobStatusLabel(job: ExtensionInstallJob) {
+    if (job.status === 'running') return '安装中';
+    if (job.status === 'failed') return '安装失败';
+    if (job.status === 'cancelled') return '已暂停';
+    if (job.status === 'succeeded') return '安装完成';
+    return job.status || '安装任务';
+  }
+
+  function installJobStatusKind(job: ExtensionInstallJob): StatusKind {
+    if (job.status === 'succeeded') return 'ok';
+    if (job.status === 'failed') return 'error';
+    if (job.status === 'cancelled') return 'warning';
+    return 'warning';
+  }
+
   async function installCatalogItem(item: ExtensionCatalogItem) {
+    if (item.type === 'model' && item.installHandler === 'ollama.pull') {
+      const confirmed = window.confirm(`安装 Ollama 模型“${item.displayName}”？\n\n模型：${catalogModelName(item)}\n目录：${modelInstallPath.trim() || 'Ollama 默认模型目录'}\n\n安装会显示进度，可暂停；完成后默认会设为本地 API 模型并重启 Bridge。`);
+      if (!confirmed) return;
+      await run('extension.model.install.start', {
+        id: item.id,
+        allowUntrusted: !item.trusted,
+        installPath: modelInstallPath.trim(),
+        useAfterInstall: useModelAfterInstall,
+      });
+      await Promise.all([loadCatalog(false), loadInstallJobs()]);
+      return;
+    }
     const trustLine = item.trusted ? '来源含校验信息，安装时会校验。' : '该条目没有 sha256，将按不可信来源安装。';
     const confirmed = window.confirm(`安装“${item.displayName}”？\n\n类型：${getRuntimeKindLabel(item.type)}\n来源：${item.artifactUrl || item.catalogSource || '-'}\n${trustLine}\n\n安装内容会写入本机 CTI_HOME 扩展目录。`);
     if (!confirmed) return;
@@ -2982,10 +3291,35 @@ function ExtensionsPage({
   }
 
   async function removeCatalogItem(item: ExtensionCatalogItem) {
+    if (item.type === 'model' && item.installHandler === 'ollama.pull') {
+      const model = catalogModelName(item);
+      const confirmed = window.confirm(`卸载 Ollama 模型“${item.displayName}”？\n\n模型：${model}\n\n这会执行 ollama rm，删除本机模型本体，并在完成后重启 Bridge。`);
+      if (!confirmed) return;
+      await run('extension.model.remove', { id: item.id, model });
+      await Promise.all([loadCatalog(true), loadInstallJobs(), refreshUnits()]);
+      return;
+    }
     const confirmed = window.confirm(`移除“${item.displayName}”的 suite 记录？\n\n只会删除由套件生成的用户覆盖层 manifest、launcher 或安装锁记录；不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。`);
     if (!confirmed) return;
     await run('extension.remote.remove', { id: item.id, type: item.type });
     await Promise.all([loadCatalog(true), refreshUnits()]);
+  }
+
+  async function useCatalogModel(item: ExtensionCatalogItem) {
+    const model = catalogModelName(item);
+    if (!model) return;
+    await run('extension.model.use', { model });
+    await Promise.all([loadCatalog(false), refreshUnits()]);
+  }
+
+  async function cancelInstallJob(job: ExtensionInstallJob) {
+    await run('extension.model.install.cancel', { jobId: job.jobId });
+    await loadInstallJobs();
+  }
+
+  async function pickModelInstallPath() {
+    const picked = await run('path.pickFolder', { currentPath: modelInstallPath || state.settings.ollamaModelsDir || '' }) as string;
+    if (picked) setModelInstallPath(picked);
   }
 
   async function previewRemoteUrl() {
@@ -2996,6 +3330,19 @@ function ExtensionsPage({
 
   async function installRemotePreview() {
     if (!remotePreview) return;
+    if (remotePreview.type === 'model' && remotePreview.installHandler === 'ollama.pull') {
+      const confirmed = window.confirm(`从 URL 安装 Ollama 模型“${remotePreview.displayName}”？\n\n来源：${remotePreview.artifactUrl || remotePreview.sourceUrl}`);
+      if (!confirmed) return;
+      await run('extension.model.install.start', {
+        url: remotePreview.sourceUrl,
+        allowUntrusted: !remotePreview.trusted,
+        installPath: modelInstallPath.trim(),
+        useAfterInstall: useModelAfterInstall,
+      });
+      setRemotePreview(null);
+      await Promise.all([loadCatalog(false), loadInstallJobs()]);
+      return;
+    }
     const confirmed = window.confirm(`从 URL 安装“${remotePreview.displayName}”？\n\n${remotePreview.reason}\n来源：${remotePreview.artifactUrl || remotePreview.sourceUrl}`);
     if (!confirmed) return;
     await run('extension.remote.install', { url: remotePreview.sourceUrl, allowUntrusted: !remotePreview.trusted });
@@ -3038,6 +3385,23 @@ function ExtensionsPage({
           <div className="summary-grid">
             <SummaryFact label="目录源" value={`${catalog?.sourceCount ?? 0}`} compact />
             <SummaryFact label="条目" value={`${catalog?.items.length ?? 0}`} compact />
+            <SummaryFact label="本机模型" value={`${catalog?.items.filter((item) => item.sourceLayer === 'local').length ?? 0}`} compact />
+            <SummaryFact label="静态种子" value={`${catalog?.layerCounts.seed ?? 0}`} compact />
+            <SummaryFact label="动态排行" value={`${catalog?.layerCounts.dynamic ?? 0}`} compact />
+            <SummaryFact label="自定义 URL" value={`${catalog?.layerCounts.customUrl ?? 0}`} compact />
+          </div>
+          <div className="model-install-config">
+            <label className="stack-field">
+              <span>Ollama 模型安装目录</span>
+              <div className="path-input-group">
+                <input value={modelInstallPath} onChange={(event) => setModelInstallPath(event.target.value)} placeholder="留空使用 Ollama 默认目录，或选择自定义模型目录" />
+                <MiniButton label="选择目录" icon={<FolderOpen size={14} />} onClick={() => void pickModelInstallPath()} pending={pending['path.pickFolder']} />
+              </div>
+            </label>
+            <label className="inline-field model-install-toggle">
+              <input type="checkbox" checked={useModelAfterInstall} onChange={(event) => setUseModelAfterInstall(event.target.checked)} />
+              <span>模型安装完成后设为本地 API 模型并自动重启 Bridge</span>
+            </label>
           </div>
           <div className="command-band dense path-input-group">
             <input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="搜索扩展、模型、MCP 或 Skill" />
@@ -3050,28 +3414,70 @@ function ExtensionsPage({
               </button>
             ))}
           </div>
-          <div className="runtime-list compact-list catalog-list">
-            {filteredCatalogItems.slice(0, 12).map((item) => (
-              <div key={`${item.type}-${item.id}`} className="runtime-row">
-                <div>
-                  <strong>{item.displayName}</strong>
-                  <span>{getRuntimeKindLabel(item.type)} · {item.installHandler} · {item.version}</span>
-                  <p>{item.description || item.artifactUrl || item.catalogSource}</p>
-                </div>
-                <div className="row-actions">
-                  <StatusPill status={item.installed ? 'ok' : item.canInstall ? (item.trusted ? 'idle' : 'warning') : 'idle'} label={item.installed ? '已安装' : item.canInstall ? (item.trusted ? '可安装' : '需确认') : '只读'} />
-                  {item.installed ? (
-                    item.canRemove ? (
-                      <MiniButton label="移除记录" icon={<Trash2 size={14} />} onClick={() => void removeCatalogItem(item)} pending={pending['extension.remote.remove']} />
-                    ) : (
-                      <MiniButton label="本机已有" icon={<ListChecks size={14} />} onClick={() => {}} disabled />
-                    )
-                  ) : (
-                    <MiniButton label={item.canInstall ? '安装' : '记录'} icon={<Layers3 size={14} />} onClick={() => void installCatalogItem(item)} pending={pending['extension.remote.install']} disabled={!item.canInstall} />
-                  )}
-                </div>
-              </div>
+          <div className="preset-wall">
+            {([
+              { id: 'all', label: '全部层' },
+              { id: 'local', label: '本机已安装' },
+              { id: 'seed', label: '静态种子' },
+              { id: 'dynamic', label: '动态排行' },
+              { id: 'custom_url', label: '自定义 URL' },
+            ] as const).map((item) => (
+              <button key={item.id} className={catalogLayerFilter === item.id ? 'preset-chip active' : 'preset-chip'} onClick={() => setCatalogLayerFilter(item.id)}>
+                {item.label}
+              </button>
             ))}
+          </div>
+          <div className="runtime-list compact-list catalog-list">
+            {filteredCatalogItems.slice(0, 12).map((item) => {
+              const installJob = installJobForItem(item);
+              const visibleInstallJob = shouldShowInstallJob(item, installJob) ? installJob : undefined;
+              const isOllamaModel = item.type === 'model' && item.installHandler === 'ollama.pull';
+              return (
+                <div key={`${item.type}-${item.id}`} className="runtime-row">
+                  <div>
+                    <strong>{item.displayName}</strong>
+                    <span>{getRuntimeKindLabel(item.type)} · {getCatalogLayerLabel(item.sourceLayer)} · {item.sourceName || item.installHandler} · {item.version}</span>
+                    <p>{item.description || item.artifactUrl || item.catalogSource}</p>
+                    <span>{`抓取 ${item.fetchedAt || '-'} · 排行 ${item.rankBasis || '-'}${item.rankOrder > 0 ? ` · #${item.rankOrder}` : ''}`}</span>
+                    {visibleInstallJob && (
+                      <div className="install-progress">
+                        <div className="install-progress-head">
+                          <span>{visibleInstallJob.message || installJobStatusLabel(visibleInstallJob)}</span>
+                          <strong>{visibleInstallJob.percent > 0 ? `${visibleInstallJob.percent}%` : installJobStatusLabel(visibleInstallJob)}</strong>
+                        </div>
+                        <div className="install-progress-track">
+                          <div className="install-progress-fill" style={{ width: `${Math.max(4, Math.min(100, visibleInstallJob.percent || 4))}%` }} />
+                        </div>
+                        {visibleInstallJob.recentLines?.length ? <p>{visibleInstallJob.recentLines[visibleInstallJob.recentLines.length - 1]}</p> : null}
+                      </div>
+                    )}
+                  </div>
+                  <div className="row-actions">
+                    <StatusPill status={visibleInstallJob ? installJobStatusKind(visibleInstallJob) : item.installed ? 'ok' : item.canInstall ? (item.trusted ? 'idle' : 'warning') : 'idle'} label={visibleInstallJob ? installJobStatusLabel(visibleInstallJob) : item.installed ? '已安装' : item.canInstall ? (item.trusted ? '可安装' : '需确认') : '只读'} />
+                    {visibleInstallJob ? (
+                      visibleInstallJob.status === 'running' ? (
+                        <MiniButton label="暂停" icon={<RotateCw size={14} />} onClick={() => void cancelInstallJob(visibleInstallJob)} pending={pending['extension.model.install.cancel']} disabled={!visibleInstallJob.canCancel} />
+                      ) : (
+                        <MiniButton label={visibleInstallJob.status === 'failed' ? '重试' : '继续安装'} icon={<Layers3 size={14} />} onClick={() => void installCatalogItem(item)} pending={pending['extension.model.install.start']} disabled={!item.canInstall} />
+                      )
+                    ) : item.installed ? (
+                      <>
+                        {isOllamaModel && <MiniButton label="使用" icon={<CheckCircle2 size={14} />} onClick={() => void useCatalogModel(item)} pending={pending['extension.model.use']} />}
+                        {isOllamaModel ? (
+                          <MiniButton label="卸载" icon={<Trash2 size={14} />} onClick={() => void removeCatalogItem(item)} pending={pending['extension.model.remove']} />
+                        ) : item.canRemove ? (
+                          <MiniButton label="移除记录" icon={<Trash2 size={14} />} onClick={() => void removeCatalogItem(item)} pending={pending['extension.remote.remove']} />
+                        ) : (
+                          <MiniButton label="本机已有" icon={<ListChecks size={14} />} onClick={() => {}} disabled />
+                        )}
+                      </>
+                    ) : (
+                      <MiniButton label={item.canInstall ? '安装' : '记录'} icon={<Layers3 size={14} />} onClick={() => void installCatalogItem(item)} pending={pending['extension.remote.install'] || pending['extension.model.install.start']} disabled={!item.canInstall} />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
             {filteredCatalogItems.length === 0 && <div className="empty-inline">暂无在线目录条目。可配置 CTI_EXTENSION_CATALOG_URLS 或粘贴 URL 预览。</div>}
           </div>
           <div className="field-block remote-url-box">
@@ -3175,6 +3581,7 @@ function ExtensionsPage({
                     onClick={() => void invokeAction(selected, action)}
                     pending={pending['runtime.invokeAction']}
                     disabled={!action.enabled}
+                    title={!action.enabled ? (action.reason || `${action.label} 当前不可用`) : action.label}
                   />
                 ))}
               </div>
@@ -3465,10 +3872,46 @@ const SessionDetailPane = memo(function SessionDetailPane({
                     <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
                   </header>
                   <p>{runItem.promptPreview || runItem.id}</p>
+                  <dl className="workflow-run-meta">
+                    <div>
+                      <dt>开始</dt>
+                      <dd>{formatWorkflowTimestamp(runItem.startedAt)}</dd>
+                    </div>
+                    <div>
+                      <dt>结束</dt>
+                      <dd>{runItem.endedAt ? formatWorkflowTimestamp(runItem.endedAt) : '进行中'}</dd>
+                    </div>
+                    <div>
+                      <dt>耗时</dt>
+                      <dd>{workflowDurationSummary(runItem)}</dd>
+                    </div>
+                    <div>
+                      <dt>模型</dt>
+                      <dd>{workflowModelLabel(runItem)}</dd>
+                    </div>
+                    <div>
+                      <dt>来源</dt>
+                      <dd>{workflowModelSourceLabel(runItem)}</dd>
+                    </div>
+                    <div>
+                      <dt>Token</dt>
+                      <dd>{workflowTokenSummary(runItem)}</dd>
+                    </div>
+                    <div>
+                      <dt>证据</dt>
+                      <dd>{workflowEvidenceSummaryV2(runItem)}</dd>
+                    </div>
+                    {workflowCacheTokenSummary(runItem) && (
+                      <div>
+                        <dt>Cache</dt>
+                        <dd>{workflowCacheTokenSummary(runItem)}</dd>
+                      </div>
+                    )}
+                  </dl>
                   {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
                     <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
                   )}
-                  <span>{runItem.startedAt || '-'} · {runItem.id}</span>
+                  <span>{runItem.id}</span>
                   <div className="command-band tight">
                     <MiniButton
                       label="重试"
@@ -4614,18 +5057,84 @@ function SettingsPage({
   reloadPresets: () => void;
 }) {
   const [settings, setSettings] = useState<SettingsState>(state.settings);
+  const [settingsDirty, setSettingsDirty] = useState(false);
   const [requestText, setRequestText] = useState('');
+  const [modelCatalogItems, setModelCatalogItems] = useState<ExtensionCatalogItem[]>([]);
+  const [modelCatalogError, setModelCatalogError] = useState('');
+  const settingsDirtyRef = useRef(false);
   const activePreset = presets.find((preset) => settings.replyStyleHint === preset.value);
 
-  useEffect(() => setSettings(state.settings), [state.settings]);
+  useEffect(() => {
+    settingsDirtyRef.current = settingsDirty;
+  }, [settingsDirty]);
+  useEffect(() => {
+    if (!settingsDirtyRef.current) setSettings(state.settings);
+  }, [state.settings]);
   useEffect(() => reloadPresets(), []);
 
-  const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => setSettings((current) => ({ ...current, [key]: value }));
+  const update = <K extends keyof SettingsState>(key: K, value: SettingsState[K]) => {
+    setSettingsDirty(true);
+    setSettings((current) => ({ ...current, [key]: value }));
+  };
   const aiStrategy = inferAiStrategy(settings);
   const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
+  const fallbackChain = parseCodexChain(settings.codexApiFallbackChain);
+  const localModelOptions = useMemo(() => {
+    const byModel = new Map<string, ExtensionCatalogItem>();
+    for (const item of modelCatalogItems) {
+      if (item.type !== 'model') continue;
+      if (item.installHandler !== 'ollama.pull') continue;
+      const model = (item.artifactUrl || '').trim();
+      if (!model) continue;
+      if (!byModel.has(model) || item.installed) byModel.set(model, item);
+    }
+    return Array.from(byModel.entries())
+      .sort(([, left], [, right]) => {
+        if (left.installed !== right.installed) return left.installed ? -1 : 1;
+        return (left.displayName || left.artifactUrl || '').localeCompare(right.displayName || right.artifactUrl || '');
+      });
+  }, [modelCatalogItems]);
+  const installedLocalModelOptions = useMemo(
+    () => localModelOptions.filter(([, item]) => item.installed),
+    [localModelOptions],
+  );
+
+  const loadModelCatalog = async (refresh = false) => {
+    try {
+      const snapshot = await run(refresh ? 'extension.catalog.refresh' : 'extension.catalog.list') as ExtensionCatalogSnapshot;
+      setModelCatalogItems(snapshot.items ?? []);
+      setModelCatalogError('');
+    } catch (error) {
+      setModelCatalogError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  useEffect(() => {
+    void loadModelCatalog(false);
+  }, []);
+
+  const setFallbackChain = (chain: CodexSource[]) => {
+    const unique = Array.from(new Set(chain));
+    update('codexApiFallbackChain', (unique.length ? unique : ['local_api', 'external_api']).join(','));
+  };
+
+  const toggleFallbackSource = (source: CodexSource, checked: boolean) => {
+    const next = checked ? [...fallbackChain, source] : fallbackChain.filter((item) => item !== source);
+    setFallbackChain(next);
+  };
+
+  const moveFallbackSource = (source: CodexSource, delta: number) => {
+    const index = fallbackChain.indexOf(source);
+    const target = index + delta;
+    if (index < 0 || target < 0 || target >= fallbackChain.length) return;
+    const next = [...fallbackChain];
+    [next[index], next[target]] = [next[target], next[index]];
+    setFallbackChain(next);
+  };
 
   const applyLocalAiKind = (kind: string) => {
     const preset = LOCAL_AI_PRESETS[kind] || LOCAL_AI_PRESETS.custom;
+    setSettingsDirty(true);
     setSettings((current) => ({
       ...current,
       localAiKind: kind,
@@ -4635,18 +5144,22 @@ function SettingsPage({
   };
 
   const applyAiStrategy = (strategy: AiStrategy) => {
+    setSettingsDirty(true);
     setSettings((current) => {
       const clearCodexKey = current.codexApiKeySet ? 'clear' : current.codexApiKeyAction;
       if (strategy === 'official') {
         return {
           ...current,
           codexModelSource: 'official',
+          codexRoutingMode: 'manual',
           codexBaseUrl: '',
           codexModel: '',
           codexPassModel: false,
           codexReasoningEffort: 'low',
           codexLocalFallbackEnabled: false,
           codexFailureFallbackMode: 'none',
+          localToolCallRequired: false,
+          executionRequiredRoute: 'primary',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
         };
@@ -4655,6 +5168,7 @@ function SettingsPage({
         return {
           ...current,
           codexModelSource: 'local_api',
+          codexRoutingMode: 'manual',
           codexBaseUrl: '',
           codexModel: '',
           codexPassModel: true,
@@ -4662,15 +5176,32 @@ function SettingsPage({
           codexLocalFallbackEnabled: false,
           codexFailureFallbackMode: 'none',
           codexLocalFallbackReasoningEffort: current.codexLocalFallbackReasoningEffort || 'minimal',
+          localToolCallRequired: false,
+          executionRequiredRoute: 'primary',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
+        };
+      }
+      if (strategy === 'auto_failover') {
+        return {
+          ...current,
+          codexRoutingMode: 'auto_failover',
+          codexApiFallbackChain: formatCodexChain(current.codexApiFallbackChain || 'local_api,external_api'),
+          codexLocalFallbackEnabled: false,
+          codexFailureFallbackMode: 'none',
+          codexPassModel: true,
+          localToolCallRequired: false,
+          executionRequiredRoute: 'primary',
         };
       }
       return {
         ...current,
         codexModelSource: 'external_api',
+        codexRoutingMode: 'manual',
         codexLocalFallbackEnabled: false,
         codexFailureFallbackMode: 'none',
+        localToolCallRequired: false,
+        executionRequiredRoute: 'primary',
         codexPassModel: true,
         codexReasoningEffort: current.codexReasoningEffort || 'low',
       };
@@ -4681,6 +5212,7 @@ function SettingsPage({
     const result = (await run('settings.applyReplyPreset', { name })) as { value: string; settings?: SettingsState };
     if (result.settings) {
       setSettings(result.settings);
+      setSettingsDirty(false);
       return;
     }
     update('replyStyleHint', result.value);
@@ -4709,18 +5241,25 @@ function SettingsPage({
 
   const testAiStrategy = async () => {
     const results: string[] = [];
-    const codexResult = await run('settings.testCodexApi', { settings });
-    results.push(`Codex 主 API：${formatCommandResult(codexResult)}`);
-    if (aiStrategy === 'local_api' || settings.codexLocalFallbackEnabled) {
+    if (aiStrategy === 'local_api' || (aiStrategy === 'auto_failover' && fallbackChain.includes('local_api'))) {
       const localResult = await run('settings.testLocalAi', { settings });
-      results.push(`本地 Agent API：${formatCommandResult(localResult)}`);
+      results.push(`本地 API（真实请求）：${formatCommandResult(localResult)}`);
+    }
+    if (aiStrategy === 'external_api' || aiStrategy === 'official' || (aiStrategy === 'auto_failover' && (fallbackChain.includes('external_api') || fallbackChain.includes('official')))) {
+      const codexResult = await run('settings.testCodexApi', { settings });
+      results.push(`Codex API（真实请求）：${formatCommandResult(codexResult)}`);
     }
     window.alert(results.join('\n\n'));
   };
 
-  const saveAndRestartBridge = async () => {
-    const result = await run('settings.saveAndRestartBridge', { settings });
+  const saveSettings = async (restartBridge: boolean) => {
+    const result = await run(restartBridge ? 'settings.saveAndRestartBridge' : 'settings.save', { settings });
     setSettings(result as SettingsState);
+    setSettingsDirty(false);
+  };
+
+  const saveAndRestartBridge = async () => {
+    await saveSettings(true);
   };
 
   return (
@@ -4728,7 +5267,7 @@ function SettingsPage({
       <section className="panel panel-span-2">
         <SectionHeader
           title="路径配置"
-          action={<MiniButton label="保存" icon={<CheckCircle2 size={14} />} onClick={() => void run('settings.save', { settings })} pending={pending['settings.save']} />}
+          action={<MiniButton label={settingsDirty ? '保存未应用修改' : '保存'} icon={<CheckCircle2 size={14} />} onClick={() => void saveSettings(false)} pending={pending['settings.save']} />}
         />
         <div className="path-grid">
           <PathField label="默认工作目录" value={settings.defaultWorkDir} onChange={(value) => update('defaultWorkDir', value)} run={run} />
@@ -4748,8 +5287,9 @@ function SettingsPage({
             <span>运行策略</span>
             <select value={aiStrategy} onChange={(event) => applyAiStrategy(event.target.value as AiStrategy)}>
               <option value="official">官方 Codex</option>
-              <option value="local_api">本地 API 作为主模型</option>
-              <option value="external_api">外部 API 作为主模型</option>
+              <option value="local_api">本地 API</option>
+              <option value="external_api">外部 API</option>
+              <option value="auto_failover">自动切换</option>
             </select>
           </label>
           <div className="ai-summary-grid">
@@ -4759,36 +5299,103 @@ function SettingsPage({
             </div>
             <div>
               <span>主脑</span>
-              <strong>{aiStrategy === 'local_api' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : aiStrategy === 'external_api' ? (settings.codexModel || '外部 API') : 'Codex 默认'}</strong>
+              <strong>{aiStrategy === 'local_api' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : aiStrategy === 'external_api' ? (settings.codexModel || '外部 API') : aiStrategy === 'auto_failover' ? fallbackChain.map((source) => CODEX_SOURCE_LABELS[source]).join(' -> ') : 'Codex 默认'}</strong>
             </div>
             <div>
-              <span>失败后备用</span>
-              <strong>{settings.codexLocalFallbackEnabled && settings.codexFailureFallbackMode === 'local_agent' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : '关闭'}</strong>
+              <span>失败后切换</span>
+              <strong>{aiStrategy === 'auto_failover' ? fallbackChain.map((source) => CODEX_SOURCE_LABELS[source]).join(' -> ') : '关闭'}</strong>
             </div>
           </div>
           {aiStrategy === 'official' && (
             <p className="field-hint">使用官方 Codex 登录态和默认模型。主模型失败时默认直接暴露错误，不会悄悄切到弱备用模型。</p>
           )}
           {aiStrategy === 'local_api' && (
-            <div className="path-grid">
-              <label className="stack-field">
-                <span>本地主模型服务</span>
-                <select value={settings.localAiKind} onChange={(event) => applyLocalAiKind(event.target.value)}>
-                  <option value="ollama">Ollama</option>
-                  <option value="lmstudio">LM Studio</option>
-                  <option value="vllm">vLLM / OpenAI-compatible</option>
-                  <option value="openai-compatible">OpenAI-compatible</option>
-                  <option value="custom">自定义</option>
-                </select>
-              </label>
-              <label className="stack-field">
-                <span>模型</span>
-                <input value={settings.localAiModel} onChange={(event) => update('localAiModel', event.target.value)} placeholder="例如 qwen2.5-coder:7b" />
-              </label>
-              <label className="stack-field">
-                <span>地址</span>
-                <input value={settings.localAiBaseUrl} onChange={(event) => update('localAiBaseUrl', event.target.value)} placeholder={localPreset.baseUrl || 'http://127.0.0.1:8000/v1'} />
-              </label>
+            <>
+              <div className="path-grid">
+                <label className="stack-field">
+                  <span>本地主模型服务</span>
+                  <select value={settings.localAiKind} onChange={(event) => applyLocalAiKind(event.target.value)}>
+                    <option value="ollama">Ollama</option>
+                    <option value="lmstudio">LM Studio</option>
+                    <option value="vllm">vLLM / OpenAI-compatible</option>
+                    <option value="openai-compatible">OpenAI-compatible</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                </label>
+                <label className="stack-field">
+                  <span>模型</span>
+                  <div className="path-input-group">
+                    <input
+                      list="local-ai-model-catalog"
+                      value={settings.localAiModel}
+                      onChange={(event) => update('localAiModel', event.target.value)}
+                      placeholder="例如 qwen3-coder:30b"
+                    />
+                    <MiniButton label="刷新目录" icon={<RefreshCw size={14} />} onClick={() => void loadModelCatalog(true)} pending={pending['extension.catalog.refresh']} />
+                  </div>
+                  <datalist id="local-ai-model-catalog">
+                    {localModelOptions.map(([model, item]) => (
+                      <option
+                        key={model}
+                        value={model}
+                        label={`${item.displayName || model}${item.installed ? ' · 已安装' : ''}`}
+                      />
+                    ))}
+                  </datalist>
+                </label>
+                <label className="stack-field">
+                  <span>已安装模型</span>
+                  <div className="path-input-group">
+                    <select value="" onChange={(event) => event.target.value && update('localAiModel', event.target.value)}>
+                      <option value="">{installedLocalModelOptions.length ? '选择本机已安装模型' : '暂无本机已安装模型'}</option>
+                      {installedLocalModelOptions.map(([model, item]) => (
+                        <option key={model} value={model}>{item.displayName || model}</option>
+                      ))}
+                    </select>
+                    <MiniButton label="应用并重启" icon={<RotateCw size={14} />} onClick={() => void saveAndRestartBridge()} pending={pending['settings.saveAndRestartBridge']} disabled={!settings.localAiModel.trim()} />
+                  </div>
+                </label>
+                <label className="stack-field">
+                  <span>地址</span>
+                  <input value={settings.localAiBaseUrl} onChange={(event) => update('localAiBaseUrl', event.target.value)} placeholder={localPreset.baseUrl || 'http://127.0.0.1:8000/v1'} />
+                </label>
+                <label className="stack-field">
+                  <span>Ollama 模型目录</span>
+                  <div className="path-input-group">
+                    <input value={settings.ollamaModelsDir} onChange={(event) => update('ollamaModelsDir', event.target.value)} placeholder="留空使用 Ollama 默认模型目录" />
+                    <MiniButton label="选择目录" icon={<FolderOpen size={14} />} onClick={() => void run('path.pickFolder', { currentPath: settings.ollamaModelsDir }).then((next) => update('ollamaModelsDir', String(next ?? settings.ollamaModelsDir)))} pending={pending['path.pickFolder']} />
+                  </div>
+                </label>
+              </div>
+              <p className="field-hint">
+                Provider 能力：{localAiCapabilityLabel(settings.localAiKind)}。{localAiCapabilityHint(settings.localAiKind)}
+                模型候选来自扩展在线目录；仍可手动输入任意 Ollama 模型名。
+                {modelCatalogError ? ` 目录读取失败：${modelCatalogError}` : ''}
+              </p>
+            </>
+          )}
+          {aiStrategy === 'auto_failover' && (
+            <div className="failover-chain-panel">
+              {(['local_api', 'external_api', 'official'] as CodexSource[]).map((source) => {
+                const enabled = fallbackChain.includes(source);
+                const index = fallbackChain.indexOf(source);
+                return (
+                  <div key={source} className="failover-chain-row">
+                    <label className="inline-field">
+                      <input type="checkbox" checked={enabled} onChange={(event) => toggleFallbackSource(source, event.target.checked)} />
+                      <span>{CODEX_SOURCE_LABELS[source]}</span>
+                    </label>
+                    <div className="chain-order-actions">
+                      <button type="button" disabled={!enabled || index <= 0} onClick={() => moveFallbackSource(source, -1)}>↑</button>
+                      <button type="button" disabled={!enabled || index < 0 || index >= fallbackChain.length - 1} onClick={() => moveFallbackSource(source, 1)}>↓</button>
+                    </div>
+                  </div>
+                );
+              })}
+              <p className="field-hint">自动切换只在模型/API 请求失败后按顺序尝试；官方 Codex 不会默认加入，勾选后才可能消耗官方流量。</p>
+              {fallbackChain.includes('local_api') && (
+                <p className="field-hint">本地 API provider：{localAiLabel(settings.localAiKind)} · {localAiCapabilityLabel(settings.localAiKind)}。</p>
+              )}
             </div>
           )}
           {aiStrategy === 'external_api' && (
@@ -4820,7 +5427,7 @@ function SettingsPage({
           <details className="advanced-settings">
             <summary>高级设置</summary>
             <div className="path-grid">
-              <div className="settings-subhead">本地 Agent API（兜底/省流）</div>
+              <div className="settings-subhead">本地 API（模型来源）</div>
               <label className="stack-field">
                 <span>本地 Agent API Timeout(ms)</span>
                 <input value={settings.localAiTimeoutMs} onChange={(event) => update('localAiTimeoutMs', event.target.value)} />
@@ -4839,46 +5446,6 @@ function SettingsPage({
                   <input type="password" value={settings.localAiApiKeyValue} onChange={(event) => update('localAiApiKeyValue', event.target.value)} />
                 </label>
               )}
-              <label className="stack-field inline-field">
-                <input
-                  type="checkbox"
-                  checked={settings.codexLocalFallbackEnabled && settings.codexFailureFallbackMode === 'local_agent'}
-                  onChange={(event) => {
-                    update('codexLocalFallbackEnabled', event.target.checked);
-                    update('codexFailureFallbackMode', event.target.checked ? 'local_agent' : 'none');
-                  }}
-                />
-                <span>主模型失败时才使用备用本地 Agent API</span>
-              </label>
-              <label className="stack-field">
-                <span>本地执行模式</span>
-                <select value={settings.localAgentMode || 'text_only'} onChange={(event) => update('localAgentMode', event.target.value)}>
-                  <option value="text_only">仅文本/总结，不承接执行</option>
-                  <option value="agent_verified">工具探测通过后允许受控执行</option>
-                </select>
-              </label>
-              <label className="stack-field inline-field">
-                <input type="checkbox" checked={settings.localToolCallRequired !== false} onChange={(event) => update('localToolCallRequired', event.target.checked)} />
-                <span>执行类任务必须通过工具调用探测</span>
-              </label>
-              <label className="stack-field">
-                <span>本地工具未验证时</span>
-                <select value={settings.executionRequiredRoute || 'codex_or_external'} onChange={(event) => update('executionRequiredRoute', event.target.value)}>
-                  <option value="codex_or_external">转交官方 Codex / 外部 API</option>
-                  <option value="refuse">直接拒绝执行并说明原因</option>
-                  <option value="primary">仍使用当前主模型（不推荐）</option>
-                </select>
-              </label>
-              <label className="stack-field">
-                <span>本地 Agent 兜底 Reasoning</span>
-                <select value={settings.codexLocalFallbackReasoningEffort} onChange={(event) => update('codexLocalFallbackReasoningEffort', event.target.value)}>
-                  <option value="minimal">minimal</option>
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
-                  <option value="xhigh">xhigh</option>
-                </select>
-              </label>
               <div className="settings-subhead">Codex 主 API</div>
               <label className="stack-field">
                 <span>Codex 主 API Reasoning</span>
@@ -4899,7 +5466,7 @@ function SettingsPage({
         </div>
         <div className="command-band tight">
           <MiniButton label="一键检测" icon={<Bot size={14} />} onClick={() => void testAiStrategy()} pending={pending['settings.testLocalAi'] || pending['settings.testCodexApi']} />
-          <MiniButton label="测试本地 Agent API" icon={<Bot size={14} />} onClick={() => void testLocalAi()} pending={pending['settings.testLocalAi']} />
+          <MiniButton label="测试本地 API（真实请求）" icon={<Bot size={14} />} onClick={() => void testLocalAi()} pending={pending['settings.testLocalAi']} />
           <MiniButton label="测试工具调用" icon={<ListChecks size={14} />} onClick={() => void testLocalTools()} pending={pending['settings.testLocalTools']} />
           <MiniButton label="测试 Codex API" icon={<Bot size={14} />} onClick={() => void testCodexApi()} pending={pending['settings.testCodexApi']} />
         </div>
@@ -5123,15 +5690,17 @@ function MiniButton({
   onClick,
   pending,
   disabled,
+  title,
 }: {
   label: string;
   icon: React.ReactNode;
   onClick: () => void;
   pending?: boolean;
   disabled?: boolean;
+  title?: string;
 }) {
   return (
-    <button className="mini-button" onClick={onClick} disabled={pending || disabled}>
+    <button className="mini-button" onClick={onClick} disabled={pending || disabled} title={title || label}>
       <span className={pending ? 'spin' : ''}>{icon}</span>
       <span>{label}</span>
     </button>

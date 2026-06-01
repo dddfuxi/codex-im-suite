@@ -50,6 +50,57 @@ describe('answer review', () => {
     assert.ok(decision.reasonCodes.includes('protocol_leakage'));
   });
 
+  it('replaces provider-internal tool failure text without leaking internal names', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: 'pve关卡场景叫啥',
+      answerText: 'I notice that the multi_agent_v1 tool is not supported in this environment. Could you please let me know what specific task or question you would like help with?',
+    });
+
+    assert.equal(decision.verdict, 'replace');
+    assert.ok(decision.reasonCodes.includes('internal_tool_leakage'));
+    assert.match(decision.replacementText || '', /未完成/);
+    assert.doesNotMatch(decision.replacementText || '', /multi_agent|tool|unsupported/i);
+  });
+
+  it('recomposes quick memory lookup answers from structured hits during review', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: 'pve关卡场景叫啥',
+      answerText: 'unsupported call: multi_agent_v1',
+      memoryPlan: {
+        intent: 'explicit_recall',
+        queryText: 'pve关卡场景叫啥',
+        normalizedKey: 'pve关卡场景',
+        answerMode: 'direct_if_confident',
+        minConfidence: 0.78,
+        allowDirectAnswer: true,
+      },
+      memoryHits: [{
+        sessionId: 'knowledge-index:scene',
+        role: 'assistant',
+        source: 'summary',
+        sourceType: 'knowledge',
+        score: 18,
+        confidence: 0.92,
+        answerability: 'structured',
+        quality: 'high',
+        content: [
+          '常用场景名称对应表：',
+          '',
+          '`HSScene` == 医院内部场景',
+          '`pve_gunship` == pve场景',
+        ].join('\n'),
+      }],
+    });
+
+    assert.equal(decision.verdict, 'replace');
+    assert.equal(decision.replacementText, 'pve_gunship：pve场景');
+    assert.doesNotMatch(decision.replacementText || '', /multi_agent|unsupported|tool/i);
+  });
+
   it('warns when an execution completion claim has no successful tool evidence', () => {
     const decision = reviewOutboundAnswerRules({
       channelType: 'feishu',
@@ -63,6 +114,30 @@ describe('answer review', () => {
         failedToolResultCount: 0,
         toolNames: [],
         permissionRequestCount: 0,
+      },
+    });
+
+    assert.equal(decision.verdict, 'warn');
+    assert.ok(decision.reasonCodes.includes('unsupported_execution_claim'));
+  });
+
+  it('warns when a local read answer lacks required tool evidence', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: '你能看一眼本地工作目录Game里都有哪些文件夹吗',
+      answerText: 'Game 文件夹下有 Assets、Library、Scripts、Scenes。',
+      executionEvidence: {
+        toolUseCount: 0,
+        toolResultCount: 0,
+        successfulToolResultCount: 0,
+        failedToolResultCount: 0,
+        toolNames: [],
+        permissionRequestCount: 0,
+        requiredEvidenceKind: 'local_read_required',
+        evidenceSatisfied: false,
+        noEvidenceRetryAttempted: true,
+        requiredToolFamilies: ['shell', 'read', 'search'],
       },
     });
 

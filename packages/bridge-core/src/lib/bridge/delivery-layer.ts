@@ -22,9 +22,17 @@ const JITTER_MAX_MS = 500;
 /** Delay between sending multiple chunks to avoid rate limits. */
 const INTER_CHUNK_DELAY_MS = 300;
 const INTERNAL_MESSAGE_ID_SUFFIX_RE = /:(?:oauth-resume|oauth-callback)$/;
+const DEFAULT_RATE_LIMIT_MAX_MESSAGES = 20;
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_MESSAGES_SETTING = 'bridge_delivery_rate_limit_max_messages';
+const RATE_LIMIT_WINDOW_MS_SETTING = 'bridge_delivery_rate_limit_window_ms';
 
 /** Shared rate limiter instance (20 messages/minute per chat). */
-const rateLimiter = new ChatRateLimiter();
+let rateLimiter = new ChatRateLimiter({
+  maxMessages: DEFAULT_RATE_LIMIT_MAX_MESSAGES,
+  windowMs: DEFAULT_RATE_LIMIT_WINDOW_MS,
+});
+let rateLimiterConfigKey = `${DEFAULT_RATE_LIMIT_MAX_MESSAGES}:${DEFAULT_RATE_LIMIT_WINDOW_MS}`;
 
 // Periodically clean up idle rate limiter buckets (every 5 minutes).
 // unref() so the timer doesn't prevent Node.js process exit (e.g. in tests).
@@ -61,6 +69,25 @@ function chunkText(text: string, maxLength: number): string[] {
 
 function platformReplyToMessageId(messageId: string | undefined): string | undefined {
   return messageId?.replace(INTERNAL_MESSAGE_ID_SUFFIX_RE, '');
+}
+
+function readIntegerSetting(value: string | null | undefined, fallback: number): number {
+  if (value === null || value === undefined || !value.trim()) return fallback;
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getRateLimiter(): ChatRateLimiter | null {
+  const { store } = getBridgeContext();
+  const maxMessages = readIntegerSetting(store.getSetting(RATE_LIMIT_MAX_MESSAGES_SETTING), DEFAULT_RATE_LIMIT_MAX_MESSAGES);
+  if (maxMessages <= 0) return null;
+  const windowMs = Math.max(1000, readIntegerSetting(store.getSetting(RATE_LIMIT_WINDOW_MS_SETTING), DEFAULT_RATE_LIMIT_WINDOW_MS));
+  const configKey = `${maxMessages}:${windowMs}`;
+  if (configKey !== rateLimiterConfigKey) {
+    rateLimiter = new ChatRateLimiter({ maxMessages, windowMs });
+    rateLimiterConfigKey = configKey;
+  }
+  return rateLimiter;
 }
 
 /**
@@ -163,6 +190,7 @@ export async function deliver(
 
   const limit = limits[adapter.channelType] || 4096;
   let chunks = chunkText(message.text, limit);
+  const limiter = getRateLimiter();
 
   // QQ: limit to max 3 segments to avoid flooding
   if (adapter.channelType === 'qq' && chunks.length > 3) {
@@ -178,7 +206,7 @@ export async function deliver(
 
   for (let i = 0; i < chunks.length; i++) {
     // Rate limit: wait if this chat is sending too fast
-    await rateLimiter.acquire(message.address.chatId);
+    await limiter?.acquire(message.address.chatId);
 
     // Inter-chunk delay to avoid hitting rate limits on multi-chunk messages
     if (i > 0) {

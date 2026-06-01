@@ -24,6 +24,40 @@ export interface WorkflowEvent {
   data?: Record<string, unknown>;
 }
 
+export interface WorkflowExecutionSummary {
+  provider?: string;
+  codexProfile?: string;
+  modelSource?: string;
+  attemptedSources?: string[];
+  selectedSource?: 'local_api' | 'external_api' | 'official';
+  model?: string;
+  baseUrl?: string;
+  requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+  evidenceSatisfied?: boolean;
+  noEvidenceRetryAttempted?: boolean;
+  requiredToolFamilies?: string[];
+  toolUseCount?: number;
+  toolResultCount?: number;
+  successfulToolResultCount?: number;
+  failedToolResultCount?: number;
+  toolNames?: string[];
+  evidenceProtocol?: string;
+  requestedTool?: string;
+  executedTool?: string;
+  jsonToolRetryAttempted?: boolean;
+  jsonToolFallbackUsed?: boolean;
+  shellExitCode?: number;
+  shellDurationMs?: number;
+}
+
+export interface WorkflowTokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  total_tokens?: number;
+}
+
 export interface WorkflowRun {
   id: string;
   sessionId: string;
@@ -37,6 +71,8 @@ export interface WorkflowRun {
   updatedAt: string;
   endedAt?: string;
   error?: string;
+  execution?: WorkflowExecutionSummary;
+  tokenUsage?: WorkflowTokenUsage;
   recovery?: WorkflowRecoveryState;
   retry?: WorkflowRetryState;
   events: WorkflowEvent[];
@@ -81,11 +117,15 @@ export interface WorkflowStatusFile {
   runs: WorkflowRun[];
 }
 
-const STATUS_PATH = path.join(CTI_HOME, 'runtime', 'workflow-runs.json');
 const MAX_RUNS = 80;
 const MAX_EVENTS_PER_RUN = 80;
 const DEFAULT_MAX_AUTO_ATTEMPTS = 1;
 const MAX_RECOVERY_PROMPT_CHARS = 12_000;
+
+function getStatusPathInternal(): string {
+  const ctiHome = process.env.CTI_HOME?.trim() || CTI_HOME;
+  return path.join(ctiHome, 'runtime', 'workflow-runs.json');
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -135,16 +175,132 @@ function makeRetryState(
   };
 }
 
+function readStringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readNumberField(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return undefined;
+}
+
+function readSourceList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const sources = value
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter((item): item is 'local_api' | 'external_api' | 'official' => item === 'local_api' || item === 'external_api' || item === 'official');
+  return sources.length > 0 ? Array.from(new Set(sources)) : undefined;
+}
+
+function readSelectedSource(value: unknown): 'local_api' | 'external_api' | 'official' | undefined {
+  return value === 'local_api' || value === 'external_api' || value === 'official' ? value : undefined;
+}
+
+function readEvidenceKind(value: unknown): WorkflowExecutionSummary['requiredEvidenceKind'] | undefined {
+  return value === 'none' || value === 'local_read_required' || value === 'tool_required' || value === 'artifact_required'
+    ? value
+    : undefined;
+}
+
+function readBooleanField(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function readStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean);
+  return items.length > 0 ? Array.from(new Set(items)) : undefined;
+}
+
+function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExecutionSummary | undefined {
+  if (!data) return undefined;
+  const source = data.execution && typeof data.execution === 'object'
+    ? data.execution as Record<string, unknown>
+    : data;
+  const execution: WorkflowExecutionSummary = {
+    provider: readStringField(source.provider),
+    codexProfile: readStringField(source.codexProfile),
+    modelSource: readStringField(source.modelSource),
+    attemptedSources: readSourceList(source.attemptedSources),
+    selectedSource: readSelectedSource(source.selectedSource),
+    model: readStringField(source.model),
+    baseUrl: readStringField(source.baseUrl),
+    requiredEvidenceKind: readEvidenceKind(source.requiredEvidenceKind),
+    evidenceSatisfied: readBooleanField(source.evidenceSatisfied),
+    noEvidenceRetryAttempted: readBooleanField(source.noEvidenceRetryAttempted),
+    requiredToolFamilies: readStringList(source.requiredToolFamilies),
+    toolUseCount: readNumberField(source.toolUseCount),
+    toolResultCount: readNumberField(source.toolResultCount),
+    successfulToolResultCount: readNumberField(source.successfulToolResultCount),
+    failedToolResultCount: readNumberField(source.failedToolResultCount),
+    toolNames: readStringList(source.toolNames),
+    evidenceProtocol: readStringField(source.evidenceProtocol),
+    requestedTool: readStringField(source.requestedTool),
+    executedTool: readStringField(source.executedTool),
+    jsonToolRetryAttempted: readBooleanField(source.jsonToolRetryAttempted),
+    jsonToolFallbackUsed: readBooleanField(source.jsonToolFallbackUsed),
+    shellExitCode: readNumberField(source.shellExitCode),
+    shellDurationMs: readNumberField(source.shellDurationMs),
+  };
+  return Object.values(execution).some((value) => value !== undefined) ? execution : undefined;
+}
+
+function normalizeTokenUsage(data?: Record<string, unknown>): WorkflowTokenUsage | undefined {
+  if (!data) return undefined;
+  const source = data.tokenUsage && typeof data.tokenUsage === 'object'
+    ? data.tokenUsage as Record<string, unknown>
+    : data.usage && typeof data.usage === 'object'
+      ? data.usage as Record<string, unknown>
+      : data;
+  const inputTokens = readNumberField(source.input_tokens);
+  const outputTokens = readNumberField(source.output_tokens);
+  const cacheReadInputTokens = readNumberField(source.cache_read_input_tokens);
+  const cacheCreationInputTokens = readNumberField(source.cache_creation_input_tokens);
+  if (
+    inputTokens === undefined
+    && outputTokens === undefined
+    && cacheReadInputTokens === undefined
+    && cacheCreationInputTokens === undefined
+  ) {
+    return undefined;
+  }
+  const tokenUsage: WorkflowTokenUsage = {};
+  if (inputTokens !== undefined) tokenUsage.input_tokens = inputTokens;
+  if (outputTokens !== undefined) tokenUsage.output_tokens = outputTokens;
+  if (cacheReadInputTokens !== undefined) tokenUsage.cache_read_input_tokens = cacheReadInputTokens;
+  if (cacheCreationInputTokens !== undefined) tokenUsage.cache_creation_input_tokens = cacheCreationInputTokens;
+  if (inputTokens !== undefined || outputTokens !== undefined) {
+    tokenUsage.total_tokens = (inputTokens || 0) + (outputTokens || 0);
+  }
+  return tokenUsage;
+}
+
+function mergeWorkflowTelemetry(run: WorkflowRun, data?: Record<string, unknown>): WorkflowRun {
+  const execution = normalizeExecutionSummary(data);
+  const tokenUsage = normalizeTokenUsage(data);
+  if (!execution && !tokenUsage) return run;
+  return {
+    ...run,
+    ...(execution ? { execution: { ...(run.execution || {}), ...execution } } : {}),
+    ...(tokenUsage ? { tokenUsage: { ...(run.tokenUsage || {}), ...tokenUsage } } : {}),
+  };
+}
+
 export function getWorkflowStatusPath(): string {
-  return STATUS_PATH;
+  return getStatusPathInternal();
 }
 
 export function readWorkflowStatus(): WorkflowStatusFile {
+  const statusPath = getStatusPathInternal();
   try {
-    if (!fs.existsSync(STATUS_PATH)) {
+    if (!fs.existsSync(statusPath)) {
       return { protocol: 'workflow-runtime/v1', updatedAt: nowIso(), runs: [] };
     }
-    const parsed = JSON.parse(fs.readFileSync(STATUS_PATH, 'utf-8')) as Partial<WorkflowStatusFile>;
+    const parsed = JSON.parse(fs.readFileSync(statusPath, 'utf-8')) as Partial<WorkflowStatusFile>;
     return {
       protocol: 'workflow-runtime/v1',
       updatedAt: parsed.updatedAt || nowIso(),
@@ -156,10 +312,25 @@ export function readWorkflowStatus(): WorkflowStatusFile {
 }
 
 function writeWorkflowStatus(next: WorkflowStatusFile): WorkflowStatusFile {
-  fs.mkdirSync(path.dirname(STATUS_PATH), { recursive: true });
-  const tmp = `${STATUS_PATH}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ ...next, updatedAt: nowIso() }, null, 2), 'utf-8');
-  fs.renameSync(tmp, STATUS_PATH);
+  const statusPath = getStatusPathInternal();
+  fs.mkdirSync(path.dirname(statusPath), { recursive: true });
+  const tmp = `${statusPath}.tmp`;
+  const serialized = JSON.stringify({ ...next, updatedAt: nowIso() }, null, 2);
+  fs.writeFileSync(tmp, serialized, 'utf-8');
+  try {
+    fs.renameSync(tmp, statusPath);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+    if (code !== 'EPERM' && code !== 'EACCES') {
+      throw error;
+    }
+    fs.writeFileSync(statusPath, serialized, 'utf-8');
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // ignore cleanup failure
+    }
+  }
   return next;
 }
 
@@ -305,12 +476,12 @@ export function appendWorkflowEvent(
   const index = current.runs.findIndex((run) => run.id === runId);
   if (index < 0) return null;
   const nextEvent = event(runId, stage, type, message, data);
-  const run = {
+  const run = mergeWorkflowTelemetry({
     ...current.runs[index],
     stage,
     updatedAt: nowIso(),
     events: [...current.runs[index].events, nextEvent].slice(-MAX_EVENTS_PER_RUN),
-  };
+  }, data);
   const runs = [...current.runs];
   runs[index] = run;
   writeWorkflowStatus({ ...current, runs });

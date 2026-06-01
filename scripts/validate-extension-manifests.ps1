@@ -11,190 +11,278 @@ if (-not $ManifestRoot) {
     $ManifestRoot = Join-Path $suiteRoot 'config'
 }
 
-$suiteManifest = Get-SuiteManifest -SuiteRoot $suiteRoot
-$protocolId = if ($suiteManifest.extensionProtocol.id) { [string]$suiteManifest.extensionProtocol.id } else { 'extension-manifest/v1' }
-$suiteVersion = [string]$suiteManifest.version
 $ctiHome = if ([string]::IsNullOrWhiteSpace($env:CTI_HOME)) { Join-Path $env:USERPROFILE '.claude-to-im' } else { [string]$env:CTI_HOME }
-$overlayManifestRoot = Join-Path $ctiHome 'extensions\manifests'
-$requiredFields = @($suiteManifest.extensionProtocol.requiredFields | ForEach-Object { [string]$_ })
-if ($requiredFields.Count -eq 0) {
-    $requiredFields = @('id', 'displayName', 'type', 'version', 'compatibility', 'category', 'optional', 'installState', 'source', 'enabled', 'description')
+$env:CTI_VALIDATE_MANIFEST_ROOT = $ManifestRoot
+$env:CTI_VALIDATE_SUITE_ROOT = $suiteRoot
+$env:CTI_VALIDATE_CTI_HOME = $ctiHome
+$env:CTI_VALIDATE_STRICT = if ($Strict) { 'true' } else { 'false' }
+
+$nodeScript = @'
+const fs = require("fs");
+const path = require("path");
+
+const manifestRoot = process.env.CTI_VALIDATE_MANIFEST_ROOT;
+const suiteRoot = process.env.CTI_VALIDATE_SUITE_ROOT;
+const ctiHome = process.env.CTI_VALIDATE_CTI_HOME;
+const strict = process.env.CTI_VALIDATE_STRICT === "true";
+
+const suiteManifest = JSON.parse(fs.readFileSync(path.join(suiteRoot, "suite.manifest.json"), "utf8"));
+const extensionProtocolId = suiteManifest.extensionProtocol?.id || "extension-manifest/v1";
+const runtimeProtocolId = suiteManifest.runtimeProtocol?.id || "runtime-manifest/v1";
+const suiteVersion = String(suiteManifest.version || "");
+const requiredExtensionFields = suiteManifest.extensionProtocol?.requiredFields?.length
+  ? suiteManifest.extensionProtocol.requiredFields.map(String)
+  : ["id", "displayName", "type", "version", "compatibility", "category", "optional", "installState", "source", "enabled", "description"];
+const requiredRuntimeFields = suiteManifest.runtimeProtocol?.requiredFields?.length
+  ? suiteManifest.runtimeProtocol.requiredFields.map(String)
+  : ["id", "displayName", "kind", "category", "enabled", "installState", "source", "cwd", "version", "description"];
+
+const overlayManifestRoot = path.join(ctiHome, "extensions", "manifests");
+const knownDirs = [
+  { path: path.join(manifestRoot, "mcp.d"), types: ["http", "stdio"], label: "mcp", required: true },
+  { path: path.join(overlayManifestRoot, "mcp.d"), types: ["http", "stdio"], label: "mcp overlay", required: false },
+  { path: path.join(manifestRoot, "skills.d"), types: ["skill"], label: "skill", required: true },
+  { path: path.join(overlayManifestRoot, "skills.d"), types: ["skill"], label: "skill overlay", required: false },
+  { path: path.join(manifestRoot, "plugins.d"), types: ["plugin"], label: "plugin", required: true },
+  { path: path.join(overlayManifestRoot, "plugins.d"), types: ["plugin"], label: "plugin overlay", required: false },
+];
+const runtimeDir = path.join(manifestRoot, "runtime.d");
+
+const errors = [];
+const warnings = [];
+const seenIds = new Set();
+let checked = 0;
+let enabled = 0;
+let disabled = 0;
+
+function addError(message) {
+  errors.push(message);
 }
 
-$knownDirs = @(
-    @{ Path = Join-Path $ManifestRoot 'mcp.d'; Types = @('http', 'stdio'); Label = 'mcp'; Required = $true },
-    @{ Path = Join-Path $overlayManifestRoot 'mcp.d'; Types = @('http', 'stdio'); Label = 'mcp overlay'; Required = $false },
-    @{ Path = Join-Path $ManifestRoot 'skills.d'; Types = @('skill'); Label = 'skill'; Required = $true },
-    @{ Path = Join-Path $overlayManifestRoot 'skills.d'; Types = @('skill'); Label = 'skill overlay'; Required = $false },
-    @{ Path = Join-Path $ManifestRoot 'plugins.d'; Types = @('plugin'); Label = 'plugin'; Required = $true },
-    @{ Path = Join-Path $overlayManifestRoot 'plugins.d'; Types = @('plugin'); Label = 'plugin overlay'; Required = $false }
-)
-
-$errors = New-Object System.Collections.Generic.List[string]
-$warnings = New-Object System.Collections.Generic.List[string]
-$seenIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$checked = 0
-$enabled = 0
-$disabled = 0
-
-function Has-Property {
-    param($Object, [string]$Name)
-    return $null -ne $Object -and ($Object.PSObject.Properties.Name -contains $Name)
+function addWarning(message) {
+  warnings.push(message);
 }
 
-function Add-Error {
-    param([string]$Message)
-    $script:errors.Add($Message) | Out-Null
+function expandManifestSource(value) {
+  if (!value) return "";
+  return String(value)
+    .replaceAll("${SUITE_ROOT}", suiteRoot)
+    .replaceAll("${CTI_HOME}", ctiHome)
+    .replaceAll("${USERPROFILE}", process.env.USERPROFILE || "");
 }
 
-function Add-Warning {
-    param([string]$Message)
-    $script:warnings.Add($Message) | Out-Null
+function isExternalSource(value) {
+  return /^(external|uvx|codex-plugin|npm|git|https?)[:/]/i.test(String(value || ""));
 }
 
-function Expand-ManifestSource {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-    return Expand-SuiteValue -Value $Value -SuiteRoot $suiteRoot -Config (Get-CtiConfig)
-}
+function validateUpdateBlock(manifest, filePath) {
+  if (!manifest.update) return;
+  const update = manifest.update;
+  if (typeof update !== "object" || Array.isArray(update)) {
+    addError(`${filePath}: update must be an object`);
+    return;
+  }
 
-function Is-ExternalSource {
-    param([string]$Value)
-    return $Value -match '^(external|uvx|codex-plugin|npm|git|https?)[:/]'
-}
+  if ("enabled" in update && typeof update.enabled !== "boolean") {
+    addError(`${filePath}: update.enabled must be a boolean`);
+  }
 
-function Test-ManifestFile {
-    param(
-        [System.IO.FileInfo]$File,
-        [string[]]$AllowedTypes,
-        [string]$DirectoryLabel
-    )
+  if (!["npm_global_package", "skill_git_repo", "skill_codex_copy", "suite_live_sync"].includes(String(update.kind || ""))) {
+    addError(`${filePath}: unsupported update.kind '${String(update.kind || "")}'`);
+  }
 
-    $script:checked++
-    $raw = Get-Content -LiteralPath $File.FullName -Raw -Encoding UTF8
-    try {
-        $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        Add-Error "$($File.FullName): JSON 解析失败：$($_.Exception.Message)"
-        return
-    }
-
-    foreach ($field in $requiredFields) {
-        if (-not (Has-Property $manifest $field)) {
-            Add-Error "$($File.FullName): 缺少扩展协议字段 '$field'"
+  if ("surfaces" in update) {
+    if (!Array.isArray(update.surfaces)) {
+      addError(`${filePath}: update.surfaces must be an array`);
+    } else {
+      for (const surface of update.surfaces) {
+        if (!["service", "extension"].includes(String(surface || ""))) {
+          addError(`${filePath}: invalid update.surfaces value '${String(surface || "")}'`);
         }
+      }
     }
+  }
 
-    $id = if (Has-Property $manifest 'id') { [string]$manifest.id } else { '' }
-    if ([string]::IsNullOrWhiteSpace($id)) {
-        Add-Error "$($File.FullName): id 不能为空"
-    }
-    elseif ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-        Add-Error "$($File.FullName): id '$id' 只能包含字母、数字、点、下划线和短横线，并且必须以字母或数字开头"
-    }
-    elseif (-not $seenIds.Add($id)) {
-        Add-Error "$($File.FullName): id '$id' 与其他扩展重复"
-    }
+  if ("postCheckUnitIds" in update && !Array.isArray(update.postCheckUnitIds)) {
+    addError(`${filePath}: update.postCheckUnitIds must be an array`);
+  }
 
-    $type = if (Has-Property $manifest 'type') { [string]$manifest.type } else { '' }
-    if ($AllowedTypes -notcontains $type) {
-        Add-Error "$($File.FullName): type '$type' 不符合 $DirectoryLabel manifest 目录要求，允许值：$($AllowedTypes -join ', ')"
-    }
+  if ("packageName" in update && update.packageName != null && typeof update.packageName !== "string") {
+    addError(`${filePath}: update.packageName must be a string`);
+  }
 
-    if ((Has-Property $manifest 'enabled') -and ($manifest.enabled -is [bool]) -and $manifest.enabled -eq $false) {
-        $script:disabled++
-        Add-Warning "$($File.Name): 扩展已禁用，运行时会跳过启用流程"
-        return
-    }
-    $script:enabled++
-
-    if (-not (Has-Property $manifest 'optional') -or -not ($manifest.optional -is [bool])) {
-        Add-Error "$($File.FullName): optional 必须是 boolean"
-    }
-
-    $compatProtocol = if ($manifest.compatibility -and (Has-Property $manifest.compatibility 'protocol')) { [string]$manifest.compatibility.protocol } else { '' }
-    if ($compatProtocol -ne $protocolId) {
-        Add-Error "$($File.FullName): compatibility.protocol '$compatProtocol' 不匹配 suite 协议 '$protocolId'"
-    }
-
-    if (-not $manifest.compatibility -or -not (Has-Property $manifest.compatibility 'suite') -or [string]::IsNullOrWhiteSpace([string]$manifest.compatibility.suite)) {
-        Add-Error "$($File.FullName): compatibility.suite 不能为空"
-    }
-
-    foreach ($textField in @('displayName', 'version', 'category', 'installState', 'source', 'description')) {
-        if (-not (Has-Property $manifest $textField) -or [string]::IsNullOrWhiteSpace([string]$manifest.$textField)) {
-            Add-Error "$($File.FullName): $textField 不能为空"
-        }
-    }
-
-    $installState = if (Has-Property $manifest 'installState') { [string]$manifest.installState } else { '' }
-    if (@('bundled', 'external', 'configured', 'missing') -notcontains $installState) {
-        Add-Error "$($File.FullName): installState '$installState' 不受支持，允许值：bundled, external, configured, missing"
-    }
-
-    $source = if (Has-Property $manifest 'source') { [string]$manifest.source } else { '' }
-    if (-not [string]::IsNullOrWhiteSpace($source) -and -not (Is-ExternalSource $source)) {
-        $expandedSource = Expand-ManifestSource $source
-        if ($installState -eq 'bundled' -and -not (Test-Path -LiteralPath $expandedSource)) {
-            Add-Error "$($File.FullName): bundled source 不存在：$expandedSource"
-        }
-        elseif (-not (Test-Path -LiteralPath $expandedSource)) {
-            Add-Warning "$($File.Name): source 当前不可访问：$expandedSource"
-        }
-    }
-
-    if ($type -in @('http', 'stdio')) {
-        if (-not (Has-Property $manifest 'launcher') -or [string]::IsNullOrWhiteSpace([string]$manifest.launcher)) {
-            Add-Error "$($File.FullName): MCP manifest 必须声明 launcher"
-        }
-        else {
-            $launcher = Expand-ManifestSource ([string]$manifest.launcher)
-            if ($launcher -notmatch '\$\{.+\}' -and -not (Test-Path -LiteralPath $launcher)) {
-                Add-Warning "$($File.Name): launcher 当前不可访问：$launcher"
-            }
-        }
-        if ($type -eq 'http' -and (-not $manifest.healthCheck -or [string]::IsNullOrWhiteSpace([string]$manifest.healthCheck.url))) {
-            Add-Error "$($File.FullName): HTTP MCP manifest 必须声明 healthCheck.url"
-        }
-    }
-
-    if ($type -eq 'skill') {
-        $expandedSkillSource = Expand-ManifestSource ([string]$manifest.source)
-        if (-not (Test-Path -LiteralPath (Join-Path $expandedSkillSource 'SKILL.md'))) {
-            Add-Error "$($File.FullName): skill source 缺少 SKILL.md：$expandedSkillSource"
-        }
-    }
+  if (String(update.kind || "") === "npm_global_package" && !String(update.packageName || "").trim()) {
+    addError(`${filePath}: npm_global_package requires update.packageName`);
+  }
 }
 
-foreach ($dir in $knownDirs) {
-    if (-not (Test-Path -LiteralPath $dir.Path)) {
-        if ($dir.Required) {
-            Add-Error "manifest 目录不存在：$($dir.Path)"
-        }
-        continue
+function validateExtensionManifest(filePath, allowedTypes, directoryLabel) {
+  checked += 1;
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    addError(`${filePath}: JSON parse failed: ${error.message}`);
+    return;
+  }
+
+  for (const field of requiredExtensionFields) {
+    if (!(field in manifest)) {
+      addError(`${filePath}: missing extension field '${field}'`);
     }
-    Get-ChildItem -LiteralPath $dir.Path -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
-        Test-ManifestFile -File $_ -AllowedTypes $dir.Types -DirectoryLabel $dir.Label
+  }
+
+  const id = String(manifest.id || "");
+  if (!id) {
+    addError(`${filePath}: id must not be empty`);
+  } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    addError(`${filePath}: invalid id '${id}'`);
+  } else if (seenIds.has(id.toLowerCase())) {
+    addError(`${filePath}: duplicate id '${id}'`);
+  } else {
+    seenIds.add(id.toLowerCase());
+  }
+
+  const type = String(manifest.type || "");
+  if (!allowedTypes.includes(type)) {
+    addError(`${filePath}: type '${type}' is invalid for ${directoryLabel}; expected ${allowedTypes.join(", ")}`);
+  }
+
+  if (manifest.enabled === false) {
+    disabled += 1;
+    addWarning(`${path.basename(filePath)}: extension disabled; runtime activation will be skipped`);
+    return;
+  }
+  enabled += 1;
+
+  if (typeof manifest.optional !== "boolean") {
+    addError(`${filePath}: optional must be a boolean`);
+  }
+
+  if (String(manifest.compatibility?.protocol || "") !== extensionProtocolId) {
+    addError(`${filePath}: compatibility.protocol '${String(manifest.compatibility?.protocol || "")}' does not match '${extensionProtocolId}'`);
+  }
+
+  if (!String(manifest.compatibility?.suite || "")) {
+    addError(`${filePath}: compatibility.suite must not be empty`);
+  }
+
+  for (const field of ["displayName", "version", "category", "installState", "source", "description"]) {
+    if (!String(manifest[field] || "")) {
+      addError(`${filePath}: ${field} must not be empty`);
     }
-}
+  }
 
-foreach ($warning in $warnings) {
-    Write-Warning $warning
-}
+  const installState = String(manifest.installState || "");
+  if (!["bundled", "external", "configured", "missing"].includes(installState)) {
+    addError(`${filePath}: unsupported installState '${installState}'`);
+  }
 
-if ($errors.Count -gt 0) {
-    Write-Error "扩展 manifest 校验失败：$($errors.Count) 个错误。"
-    foreach ($errorItem in $errors) {
-        Write-Error $errorItem
+  const source = String(manifest.source || "");
+  if (source && !isExternalSource(source)) {
+    const expandedSource = expandManifestSource(source);
+    if (installState === "bundled" && !fs.existsSync(expandedSource)) {
+      addError(`${filePath}: bundled source does not exist: ${expandedSource}`);
+    } else if (!fs.existsSync(expandedSource)) {
+      addWarning(`${path.basename(filePath)}: source is not currently accessible: ${expandedSource}`);
     }
-    exit 1
+  }
+
+  if (["http", "stdio"].includes(type)) {
+    if (!String(manifest.launcher || "")) {
+      addError(`${filePath}: MCP manifest must declare launcher`);
+    }
+    if (type === "http" && !String(manifest.healthCheck?.url || "")) {
+      addError(`${filePath}: HTTP MCP manifest must declare healthCheck.url`);
+    }
+  }
+
+  if (type === "skill") {
+    const expandedSkillSource = expandManifestSource(String(manifest.source || ""));
+    if (!fs.existsSync(path.join(expandedSkillSource, "SKILL.md"))) {
+      addError(`${filePath}: skill source is missing SKILL.md: ${expandedSkillSource}`);
+    }
+  }
+
+  validateUpdateBlock(manifest, filePath);
 }
 
-if ($Strict -and $warnings.Count -gt 0) {
-    Write-Error "扩展 manifest 严格校验失败：$($warnings.Count) 个警告。"
-    exit 1
+function validateRuntimeManifest(filePath) {
+  checked += 1;
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    addError(`${filePath}: JSON parse failed: ${error.message}`);
+    return;
+  }
+
+  for (const field of requiredRuntimeFields) {
+    if (!(field in manifest)) {
+      addError(`${filePath}: missing runtime field '${field}'`);
+    }
+  }
+
+  if (manifest.enabled === false) {
+    disabled += 1;
+  } else {
+    enabled += 1;
+  }
+
+  for (const field of ["displayName", "kind", "category", "installState", "source", "cwd", "description"]) {
+    if (!String(manifest[field] || "")) {
+      addError(`${filePath}: runtime.${field} must not be empty`);
+    }
+  }
+
+  validateUpdateBlock(manifest, filePath);
 }
 
-Write-Host "extension manifest protocol: $protocolId | suite $suiteVersion"
-Write-Host "extension manifests valid: checked=$checked enabled=$enabled disabled=$disabled warnings=$($warnings.Count)"
+for (const dir of knownDirs) {
+  if (!fs.existsSync(dir.path)) {
+    if (dir.required) addError(`manifest directory does not exist: ${dir.path}`);
+    continue;
+  }
+  for (const entry of fs.readdirSync(dir.path).filter((name) => name.endsWith(".json")).sort()) {
+    validateExtensionManifest(path.join(dir.path, entry), dir.types, dir.label);
+  }
+}
+
+if (!fs.existsSync(runtimeDir)) {
+  addError(`runtime manifest directory does not exist: ${runtimeDir}`);
+} else {
+  for (const entry of fs.readdirSync(runtimeDir).filter((name) => name.endsWith(".json")).sort()) {
+    validateRuntimeManifest(path.join(runtimeDir, entry));
+  }
+}
+
+for (const warning of warnings) {
+  console.warn(warning);
+}
+
+if (errors.length > 0) {
+  console.error(`Manifest validation failed with ${errors.length} error(s).`);
+  for (const error of errors) {
+    console.error(error);
+  }
+  process.exit(1);
+}
+
+if (strict && warnings.length > 0) {
+  console.error(`Strict manifest validation failed with ${warnings.length} warning(s).`);
+  process.exit(1);
+}
+
+console.log(`extension manifest protocol: ${extensionProtocolId} | runtime protocol: ${runtimeProtocolId} | suite ${suiteVersion}`);
+console.log(`extension/runtime manifests valid: checked=${checked} enabled=${enabled} disabled=${disabled} warnings=${warnings.length}`);
+'@
+
+$tempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("cti-validate-manifests-" + [guid]::NewGuid().ToString("N") + ".cjs")
+Set-Content -LiteralPath $tempScript -Value $nodeScript -Encoding UTF8
+try {
+    & node $tempScript
+    exit $LASTEXITCODE
+}
+finally {
+    Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+}

@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+﻿import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
@@ -38,24 +38,23 @@ function params(prompt: string): StreamChatParams {
 }
 
 describe('executor registry', () => {
-  it('registers codex and local agent fallback executors', () => {
+  it('registers codex and disables legacy local tool agent', () => {
     const manifests = buildExecutorManifests(baseConfig);
     assert.ok(manifests.some((manifest) => manifest.id === 'codex'));
-    assert.ok(manifests.some((manifest) => manifest.id === 'codex-local-fallback'));
     assert.ok(manifests.some((manifest) => manifest.id === 'local-tool-agent'));
     assert.ok(manifests.some((manifest) => manifest.id === 'codex-oss-ollama'));
-    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, true);
+    assert.equal(manifests.some((manifest) => manifest.id === 'codex-local-fallback'), false);
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.kind, 'agent');
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.enabled, false);
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.kind, 'cli');
   });
 
-  it('keeps local fallback disabled unless explicitly enabled', () => {
+  it('ignores legacy local fallback enablement', () => {
     const manifests = buildExecutorManifests({
       ...baseConfig,
-      codexLocalFallbackEnabled: undefined,
+      codexLocalFallbackEnabled: true,
     });
-    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, false);
+    assert.equal(manifests.some((manifest) => manifest.id === 'codex-local-fallback'), false);
   });
 
   it('disables codex-oss-ollama when local AI is not Ollama', () => {
@@ -65,7 +64,7 @@ describe('executor registry', () => {
       localAiBaseUrl: 'http://127.0.0.1:1234',
       localAiModel: 'lmstudio-model',
     });
-    assert.equal(manifests.find((manifest) => manifest.id === 'codex-local-fallback')?.enabled, true);
+    assert.equal(manifests.some((manifest) => manifest.id === 'codex-local-fallback'), false);
     assert.equal(manifests.find((manifest) => manifest.id === 'local-tool-agent')?.enabled, false);
     assert.equal(manifests.find((manifest) => manifest.id === 'codex-oss-ollama')?.enabled, false);
   });
@@ -82,33 +81,34 @@ describe('executor registry', () => {
     assert.equal(codex?.configSchema?.modelSource, 'local_api');
     assert.equal(codex?.configSchema?.localAgentMode, 'text_only');
     assert.equal(codex?.configSchema?.localToolCallingState, 'untested');
-    assert.equal(codex?.configSchema?.localExecutionTrusted, false);
+    assert.equal(codex?.configSchema?.localExecutionTrusted, true);
+    assert.equal(codex?.configSchema?.executionRequiredRoute, 'primary');
   });
 
   it('detects explicit executor hints', () => {
-    assert.equal(inferRequestedExecutorId('@codex 帮我看一下状态'), 'codex');
-    assert.equal(inferRequestedExecutorId('@local 帮我总结这段日志'), 'codex-local-fallback');
-    assert.equal(inferRequestedExecutorId('@ollama 帮我总结这段日志'), 'codex-oss-ollama');
-    assert.equal(inferRequestedExecutorId('@claude 处理这个问题'), 'claude-cli');
+    assert.equal(inferRequestedExecutorId('@codex check status'), 'codex');
+    assert.equal(inferRequestedExecutorId('@local summarize logs'), 'codex');
+    assert.equal(inferRequestedExecutorId('@ollama summarize logs'), 'codex-oss-ollama');
+    assert.equal(inferRequestedExecutorId('@claude handle issue'), 'claude-cli');
   });
 
   it('selects an explicit executor over automatic routing', () => {
     const selection = selectExecutor(baseConfig, {
       sessionId: 'session-1',
-      prompt: '@local 帮我看看 git 状态',
-      requestedExecutorId: 'codex-local-fallback',
-      params: params('@local 帮我看看 git 状态'),
+      prompt: '@local check git status',
+      requestedExecutorId: 'codex',
+      params: params('@local check git status'),
     });
-    assert.equal(selection.executor.id, 'codex-local-fallback');
+    assert.equal(selection.executor.id, 'codex');
     assert.equal(selection.explicit, true);
   });
 
   it('keeps automatic routing distinct from preferred executor bias', () => {
     const selection = selectExecutor(baseConfig, {
       sessionId: 'session-1',
-      prompt: '帮我看看 git 状态',
+      prompt: 'check git status',
       preferredExecutorId: 'codex',
-      params: params('帮我看看 git 状态'),
+      params: params('check git status'),
     });
     assert.equal(selection.executor.id, 'codex');
     assert.equal(selection.explicit, false);
@@ -116,7 +116,7 @@ describe('executor registry', () => {
 
   it('infers capabilities from prompt and attachments', () => {
     const caps = inferCapabilities({
-      ...params('搜索文件并读取结果'),
+      ...params('Get-Content package.json'),
       files: [{ id: 'img', name: 'a.png', type: 'image/png', size: 1, data: 'AA==' }],
     });
     assert.ok(caps.includes('file_read'));
@@ -130,3 +130,4 @@ describe('executor registry', () => {
     assert.deepEqual(policy.allowedWorkspaceRoots, [process.cwd()]);
   });
 });
+

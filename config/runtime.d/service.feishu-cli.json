@@ -1,0 +1,25 @@
+{
+  "id": "service.feishuCli",
+  "displayName": "飞书 CLI",
+  "kind": "tool",
+  "category": "bridge-skill",
+  "enabled": true,
+  "installState": "installed",
+  "source": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
+  "cwd": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
+  "version": "",
+  "description": "负责桥接 Skill / runtime 包更新，不承担 daemon 启停。",
+  "update": {
+    "enabled": true,
+    "surfaces": [
+      "service",
+      "extension"
+    ],
+    "kind": "skill_git_repo",
+    "packageName": "",
+    "postCheckUnitIds": [
+      "service.feishuCli"
+    ],
+    "sourceRootHint": "${SUITE_ROOT}\\packages\\bridge-runtime"
+  }
+}

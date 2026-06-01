@@ -244,11 +244,58 @@ function hitConfidence(hit: RetrievedMemoryHit): number {
   return scoreConfidence;
 }
 
+function normalizedMatchText(text: string | undefined): string {
+  return normalizeText(text || '').toLowerCase();
+}
+
+function asciiTerms(text: string): string[] {
+  return Array.from(new Set((text.match(/[a-z0-9][a-z0-9_-]{1,}/giu) || []).map((term) => term.toLowerCase())));
+}
+
+function cjkDescriptorTerms(text: string): string[] {
+  const descriptors = ['场景', '关卡', '名称', '名字', '命令', '路径', '地址', '链接', '账号', '配置', '版本', '对应表', '清单', '列表', '预制体', '材质', '贴图', '节点'];
+  return descriptors.filter((term) => text.includes(term));
+}
+
+function pairMatchesPlan(plan: MemoryQueryPlan, pair: StructuredMemoryPair): boolean {
+  if (!plan.normalizedKey) return true;
+  if (/^(user|assistant|system|human|用户|助手)$/iu.test(pair.key.trim())) return false;
+  const key = normalizedMatchText(plan.normalizedKey);
+  const pairKey = normalizedMatchText(pair.key);
+  const pairValue = normalizedMatchText(pair.value);
+  const pairText = `${pairKey} ${pairValue}`;
+  if (!key || !pairText.trim()) return false;
+  if (pairText.includes(key) || key.includes(pairKey) || key.includes(pairValue)) return true;
+
+  const queryAsciiTerms = asciiTerms(key);
+  const pairAsciiText = pairText.toLowerCase();
+  if (queryAsciiTerms.length > 0 && queryAsciiTerms.some((term) => pairAsciiText.includes(term))) {
+    const queryDescriptors = cjkDescriptorTerms(key);
+    if (queryDescriptors.length === 0) return true;
+    return queryDescriptors.some((term) => pairText.includes(term));
+  }
+
+  const queryDescriptors = cjkDescriptorTerms(key).filter((term) => term !== '名称' && term !== '名字');
+  return queryDescriptors.length > 0
+    && queryDescriptors.every((term) => pairText.includes(term))
+    && key.length <= pairText.length + 8;
+}
+
+function structuredPairsForHit(hit: RetrievedMemoryHit): StructuredMemoryPair[] {
+  return hit.structuredPairs && hit.structuredPairs.length > 0
+    ? hit.structuredPairs
+    : inferStructuredMemories(hit.content);
+}
+
+function findStructuredPairMatch(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): StructuredMemoryPair | null {
+  return structuredPairsForHit(hit).find((pair) => pairMatchesPlan(plan, pair)) || null;
+}
+
 function keyMatchesPlan(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): boolean {
   if (!plan.normalizedKey) return true;
   const key = plan.normalizedKey.toLowerCase();
   const haystack = `${hit.structuredKey || ''} ${hit.content || ''}`.toLowerCase();
-  return haystack.includes(key) || key.includes((hit.structuredKey || '').toLowerCase());
+  return haystack.includes(key) || key.includes((hit.structuredKey || '').toLowerCase()) || !!findStructuredPairMatch(plan, hit);
 }
 
 function structuredKeyMatchesPlan(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): boolean {
@@ -333,11 +380,27 @@ export function decideMemoryReply(
       && confidence >= plan.minConfidence
       && hit.answerability === 'structured'
       && hit.quality === 'high'
-      && (structuredKeyMatchesPlan(plan, hit) || structuredTableTitleMatchesPlan(plan, hit))
+      && (structuredKeyMatchesPlan(plan, hit) || structuredTableTitleMatchesPlan(plan, hit) || !!findStructuredPairMatch(plan, hit))
       && !!(hit.structuredValue || inferStructuredMemory(hit.content)?.value);
   });
 
   if (directHit) {
+    const exactKeyMatch = structuredKeyMatchesPlan(plan, directHit);
+    const tableTitleMatch = structuredTableTitleMatchesPlan(plan, directHit);
+    const matchingPair = !exactKeyMatch && !tableTitleMatch ? findStructuredPairMatch(plan, directHit) : null;
+    if (matchingPair) {
+      return {
+        type: 'direct_reply',
+        text: directReplyText(plan, {
+          ...directHit,
+          structuredKey: matchingPair.key,
+          structuredValue: matchingPair.value,
+          structuredPairs: [matchingPair],
+        }),
+        hit: directHit,
+        plan,
+      };
+    }
     const inferred = directHit.structuredValue ? null : inferStructuredMemory(directHit.content);
     const hit = inferred
       ? { ...directHit, structuredKey: directHit.structuredKey || inferred.key, structuredValue: inferred.value }

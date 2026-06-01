@@ -15,6 +15,7 @@
 
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
+- 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务也收口成声明式运行单元；服务页和扩展页共用同一套 `update` 协议与白名单执行模板。
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持统一服务模块、可点击处理的系统蓝图、权限管理、扩展 / MCP 市场视图、会话详情抽屉、路径拖拽选择、回复风格快捷预设，以及白天 / 夜晚主题和自适应布局。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
@@ -25,10 +26,10 @@
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
-- 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 npm 全局 Codex CLI 的白名单更新按钮。
+- 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种白名单更新模板。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
 - Workflow 契约适配：`workflow-runs.json` 继续作为本地事实来源，runtime 额外提供共享 `WorkflowRunContract` 映射，统一 checkpoint、trace event、recovery 和 delivery 字段。
-- Codex CLI 模型来源收口：设置页支持官方 Codex、本地 OpenAI-compatible API 和外部 API 作为主模型来源；本地 API 新增结构化工具调用探测，未通过时执行类任务默认改交官方/外部模型或直接拒绝，不再让文本模型伪造执行结果。
+- Codex CLI 模型来源收口：设置页支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源；本地 API 通过 Codex agent 接入，执行类和本地读取类任务统一走工具证据验收，缺少成功工具结果会同源重试一次，仍失败则返回“未完成”，不会因为工具证据缺失自动改交官方模型。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
 ## 快速入口
@@ -66,7 +67,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 节点 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，总览页用系统蓝图解释飞书入口、Bridge、AI 执行、辅助能力和最终回复的流转，点击蓝图节点会打开处理面板，可检查状态、启动/重启服务、处理 MCP 或跳到设置/记忆/扩展页；节点页展示本机 runtime node 与 fake remote node 的能力清单，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页默认用关系树和“记忆整理”草稿面板查看、优化记忆，专业网格、索引路径、相关对象、联系权重和需要检查的回复折叠在高级诊断里，设置页支持目录选择、拖拽回填、回复风格快捷预设和 Codex CLI 模型来源配置。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 节点 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，总览页用系统蓝图解释飞书入口、Bridge、AI 执行、辅助能力和最终回复的流转，点击蓝图节点会打开处理面板，可检查状态、启动/重启服务、处理 MCP 或跳到设置/记忆/扩展页；节点页展示本机 runtime node 与 fake remote node 的能力清单，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页默认用关系树和“记忆整理”草稿面板查看、优化记忆，专业网格、索引路径、相关对象、联系权重和需要检查的回复折叠在高级诊断里，设置页支持目录选择、拖拽回填、回复风格快捷预设和 Codex CLI 模型来源配置；扩展页的在线模型安装会显示 Ollama 拉取进度、支持暂停、卸载、选择模型目录，并可在完成后自动设为本地 API 模型和重启 Bridge。
 
 Control API 默认只监听本机：
 
@@ -95,7 +96,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `config/mcp.d`：MCP manifest，面板和注册脚本都从这里发现 MCP。
 - `config/skills.d`：随项目备份的 skill manifest。
 - `config/plugins.d`：随项目备份的 plugin manifest。
-- `config/extension-catalog.json`：在线扩展目录的本地种子，远端目录可通过 `CTI_EXTENSION_CATALOG_URLS` 追加。
+- `config/runtime.d`：内建服务的 runtime manifest，声明服务显示信息、来源路径和 update 策略。
+- `config/extension-catalog.json`：在线扩展目录的静态种子；控制面板还会叠加动态排行榜源和 `CTI_EXTENSION_CATALOG_URLS` 自定义 URL。
 - `extensions/skills`：自定义 skill 的项目内副本。
 - `scripts`：启动、注册、构建、打包、发布、同步脚本。
 - `release`：portable、installer、zip 等发布产物。
@@ -104,15 +106,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ## 当前运行模型
 
-默认是 `Codex CLI 主模型 + 显式备用模型`：
+默认是 `Codex CLI agent + 可选模型 API 来源链`：
 
-- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、`codex-local-fallback`、历史兼容的 `local-tool-agent` 和实验性的 `codex-oss-ollama`。
-- 用户可用 `@codex`、`@claude`、`@local`、`@ollama` 显式选择执行器；控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor，“节点”页可查看本机 node 与 fake remote node 的能力清单。
+- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、历史兼容且默认禁用的 `local-tool-agent` 和实验性的 `codex-oss-ollama`；本地 API 通过 `codex` 的模型来源接入，不再作为独立兜底执行器。
+- 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor，“节点”页可查看本机 node 与 fake remote node 的能力清单。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
-- 设置页的“Codex CLI 模型来源”可选官方 Codex、本地 API 或外部 API 作为主模型；本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
-- 本地 API 默认是 `CTI_LOCAL_AGENT_MODE=text_only`，只适合文本、总结、配置整理和轻量辅助；点击“测试工具调用”后，只有真实返回 OpenAI-compatible `tool_calls` 的模型才会被标为 `agent_verified`。
-- 执行类任务默认要求 `CTI_LOCAL_TOOL_CALL_REQUIRED=true`。当主模型来源是 `local_api` 且工具探测未通过时，`CTI_EXECUTION_REQUIRED_ROUTE=codex_or_external` 会把任务交给官方 Codex / 外部 API；也可配置为 `refuse` 直接说明未执行。`primary` 是显式风险选项，不建议普通用户启用。
-- 主模型失败默认不自动降级，`CTI_CODEX_FAILURE_FALLBACK_MODE=none`；只有用户在高级设置里开启备用本地 Agent API 时，才会设置 `CTI_CODEX_FAILURE_FALLBACK_MODE=local_agent` 并使用 `CTI_CODEX_LOCAL_FALLBACK_ENABLED=true`。
+- 设置页的“Codex CLI 模型来源”可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
+- 本地 API 现在作为 Codex CLI 的普通模型来源接入，不再因为工具探测未通过或旧本地兜底键自动转官方 Codex；`ollama` / `lmstudio` 会通过 provider registry 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，不会走 Codex SDK 的 `/v1/responses`。`vllm`、`openai-compatible` 和 `custom` 在未接入 Codex CLI OSS agent 前只显示为 Chat Completions 能力，不能伪装执行。
+- 本地 API 的目录/文件读取和明确工具类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令或 `config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一校验路径 / cwd / MCP manifest，执行 `list_dir/read_file/search_files/shell/mcp_call/unity_mcp_execute_code`。工具完成后，runtime 会再次调用本地模型作为终答整理层，只把真实工具历史交给它生成面向用户的 Markdown/`cti-final` 回复；可展示“处理思路 / 执行结果”，但不暴露内部推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
+- 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
 - 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 失败后允许走 runtime 自己的受控工具兜底；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
 - bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
 - live 同步会校验运行副本里的 `@openai/codex-sdk` 版本，避免 package 已更新但 live `node_modules` 仍停在旧 Codex CLI，导致新旧 `CODEX_HOME` 状态库迁移不兼容。
@@ -127,18 +129,23 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ## 关键命令
 
-校验 MCP / Skill / Plugin 扩展 manifest：
+校验扩展 manifest 和 runtime manifest：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.ps1
 ```
 
-控制面板“扩展”页支持在线目录、HTTPS URL 预览和本机安装。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
+`runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli` 和 `service.localLlm`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`，`service.feishuCli` 会按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
 
-扩展目录内的本地工具模型候选包括 `qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后仍需要先在设置页跑“测试工具调用”。默认 `qwen2.5-coder:7b` 只按文本 / 总结兜底使用。
+控制面板“扩展”页支持三层在线目录、HTTPS URL 预览和本机安装。目录由静态种子、动态排行榜源、自定义 URL 叠加而成；动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自前 5 项，并在条目上显示来源、抓取时间和排行依据。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
+
+扩展目录内的本地工具模型候选包括 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后可在设置页“本地 API -> 已安装模型”下拉中选择并“应用并重启”，也仍可手动输入任意 Ollama 模型名。扩展页会把 Ollama `/api/tags` 中已安装但不在目录里的模型补成“本机已安装”条目，支持直接使用或 `ollama rm` 卸载。默认 `qwen2.5-coder:7b` 只按文本 / 总结兜底使用。
 
 ```powershell
 CTI_EXTENSION_CATALOG_URLS=https://example.com/codex-im-suite/catalog.json
+CTI_EXTENSION_CATALOG_DYNAMIC_PROVIDERS=npm,pypi,github,huggingface,ollama,mcp_registry
+CTI_EXTENSION_CATALOG_DYNAMIC_TOP_N=5
+CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS=24
 ```
 
 构建全部 package 和面板：

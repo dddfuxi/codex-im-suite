@@ -107,8 +107,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 
 ## 7. Feishu 回复收口规则
 
-- 飞书最终回复必须只发用户可见结果，不发思考过程、工具过程、检索过程。
+- 飞书最终回复必须只发用户可见结果，不发内部思考链、原始工具过程或检索过程；需要解释时只输出可展示的“处理思路 / 依据 / 结果”摘要。
 - Codex 最终结果优先使用 `cti-final` 结果块协议。
+- 明确要求工具、MCP、文件、命令、截图、生成物或本地产物的任务，禁止降级成快问快答、闲聊短路或本地模型直答；必须进入 workflow / 工具证据链，成功时带真实 `tool_result`，失败时返回具体“未完成”阻塞原因。
+- 工具链成功后，用户可见正文应由 agent/model 基于真实工具历史整理成可读 Markdown/卡片内容；不要把原始 MCP JSON、运行时验证摘要或 `JsonTool/tool_request/tool_result` 协议名直接当最终回复。
+- 工具或 MCP 产生图片、文件等本地产物时，最终回复必须通过通用 `cti-final.images/files` 声明真实存在的路径，让飞书发送附件；不要只把路径当普通文本发出。
 - Markdown 默认走 Feishu card。
 - 结果块解析失败时，不允许蠢裁剪成半截废话；应走可读兜底。
 - 记忆回捞命中结构化键值时，必须保留原始键和值，不能只发概括词。
@@ -120,6 +123,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - 不要恢复 `llama-server.exe`、GGUF 模型路径或 `127.0.0.1:8080` 作为默认本地模型链路。
 - 本地模型可以辅助命令、git 状态、文件读取、记忆检索、简单总结。
 - 本地模型不能伪装完成 Unity、Blender、MCP 多步编排、文档创建、仓库修改。
+- 本地 API 作为 Codex 模型来源时，`tool_required` / `local_read_required` 必须走通用 JSON 工具协议和 manifest/配置驱动动作；不得为了某个中文请求、某个 MCP 名称或某个截图路径写死特例。
+- 本地 API 的 JSON 工具协议必须支持模型基于 MCP 工具 schema 自主规划多步调用；当参数不明确时，应先查找/读取，再用真实返回的 path/id/name 执行动作，不能只靠预置单步 manifest 才算可用。
+- 本地 API 工具执行完成后，终答整理也应走模型生成，但输入只能是真实用户请求和真实工具历史；允许输出可展示处理思路，不允许伪造未执行动作或泄漏内部协议。
 - Codex 没额度或不可用时，用户侧要得到可用兜底回复，而不是原始错误堆栈。
 - 记忆关键词命中不能绕过 Codex 直答；明确回忆/搜索类请求可检索记忆，其他请求只能把相关记忆注入主执行链。
 

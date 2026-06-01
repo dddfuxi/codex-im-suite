@@ -198,6 +198,39 @@ describe('memory routing', () => {
     assert.match(text, /Timeline_ST2H_Scene_01.*timeline场景/s);
   });
 
+  it('direct-answers a named lookup from a matching structured table value', () => {
+    const plan = planMemoryQuery('pve关卡场景叫啥');
+    const decision = decideMemoryReply(plan, {
+      summary: 'memory',
+      hits: [{
+        sessionId: 'audit:scene-table',
+        channelType: 'feishu',
+        chatId: 'oc_memory',
+        role: 'assistant',
+        source: 'message',
+        sourceType: 'audit',
+        score: 18,
+        confidence: 0.92,
+        answerability: 'structured',
+        quality: 'high',
+        content: [
+          '常用场景名称对应表：',
+          '',
+          '`HSScene` == 医院内部场景',
+          '`city3d_citystage_ST2H_Scene` == 外城场景',
+          '`pve_gunship` == pve场景',
+          '`Timeline_ST2H_Scene_01` == timeline场景',
+        ].join('\n'),
+      }],
+    });
+
+    assert.equal(decision.type, 'direct_reply');
+    const text = decision.type === 'direct_reply' ? decision.text : '';
+    assert.match(text, /pve_gunship/);
+    assert.match(text, /pve场景/i);
+    assert.doesNotMatch(text, /HSScene/);
+  });
+
   it('does not direct-answer a malformed heading-only mapping', () => {
     const plan = planMemoryQuery('常用场景名称');
     const decision = decideMemoryReply(plan, {

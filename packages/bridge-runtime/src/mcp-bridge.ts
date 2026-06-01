@@ -66,6 +66,13 @@ export interface McpStartStopResult {
   stderr?: string;
 }
 
+export interface McpToolInfo {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+}
+
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME_ROOT = path.resolve(MODULE_DIR, '..');
 
@@ -441,13 +448,24 @@ export class McpBridge {
     return runPowerShellFile(launcher, cwd, manifest.env ? this.expandEnvMap(manifest.env) : undefined, 60000);
   }
 
-  async listHttpTools(manifest: McpManifestRecord): Promise<string[]> {
+  async listHttpToolDetails(manifest: McpManifestRecord): Promise<McpToolInfo[]> {
     const workspaceValidation = this.validateManifestWorkspace(manifest);
     if (!workspaceValidation.ok) {
       throw new Error(workspaceValidation.message);
     }
-    const result = await this.sendHttpRequest<{ tools?: Array<{ name?: string }> }>(manifest, 'tools/list', {});
-    return (result.tools || []).map((tool) => String(tool.name || '')).filter(Boolean);
+    const result = await this.sendHttpRequest<{ tools?: Array<{ name?: string; title?: string; description?: string; inputSchema?: unknown }> }>(manifest, 'tools/list', {});
+    return (result.tools || [])
+      .map((tool) => ({
+        name: String(tool.name || '').trim(),
+        title: typeof tool.title === 'string' ? tool.title : undefined,
+        description: typeof tool.description === 'string' ? tool.description : undefined,
+        inputSchema: tool.inputSchema,
+      }))
+      .filter((tool) => tool.name);
+  }
+
+  async listHttpTools(manifest: McpManifestRecord): Promise<string[]> {
+    return (await this.listHttpToolDetails(manifest)).map((tool) => tool.name);
   }
 
   async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<string> {

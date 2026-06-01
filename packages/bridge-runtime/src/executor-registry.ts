@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 
 import type { Config } from './config.js';
-import { readLocalModelCapabilityProfile, shouldTrustLocalApiForExecution } from './local-model-capability.js';
+import { readLocalModelCapabilityProfile } from './local-model-capability.js';
 import { resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { getLocalRouterMode, readLocalLlmStatus } from './local-llm-status.js';
 import type {
@@ -19,7 +19,7 @@ const EXECUTOR_HINTS: Array<{ pattern: RegExp; id: string }> = [
   { pattern: /(?:^|\s)@?codex(?:\s|$)/i, id: 'codex' },
   { pattern: /(?:^|\s)@?claude(?:\s|$)/i, id: 'claude-cli' },
   { pattern: /(?:^|\s)@?(?:ollama|codex-oss|本地codex)(?:\s|$)/i, id: 'codex-oss-ollama' },
-  { pattern: /(?:^|\s)@?(?:local|local-agent|本地)(?:\s|$)/i, id: 'codex-local-fallback' },
+  { pattern: /(?:^|\s)@?(?:local|local-agent|本地)(?:\s|$)/i, id: 'codex' },
 ];
 
 function isCodexEnabled(config: Config): boolean {
@@ -30,13 +30,6 @@ function isClaudeEnabled(config: Config): boolean {
   if (config.runtime === 'codex') return false;
   const cliPath = resolveClaudeCliPath();
   return !!cliPath && preflightCheck(cliPath).ok;
-}
-
-function isCodexLocalFallbackEnabled(config: Config): boolean {
-  return isCodexEnabled(config)
-    && (config.ollamaEnabled ?? config.localLlmEnabled) === true
-    && config.codexLocalFallbackEnabled === true
-    && getLocalRouterMode(config) !== 'codex_only';
 }
 
 function isCodexOssOllamaEnabled(config: Config): boolean {
@@ -63,11 +56,14 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
   const localBaseUrl = config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl || localStatus.baseUrl || 'http://127.0.0.1:11434';
   const localCapabilities = readLocalModelCapabilityProfile(config);
   const codexModelSource = config.codexModelSource || ((config.codexBaseUrl || config.codexModel || config.codexApiKey) ? 'external_api' : 'official');
+  const codexRoutingMode = config.codexRoutingMode || 'manual';
   const codexDisplayName = codexModelSource === 'local_api'
     ? `Codex CLI (本地 API 主模型: ${localModel})`
     : codexModelSource === 'external_api'
       ? `Codex CLI (外部 API: ${config.codexModel || '未指定模型'})`
-      : 'Codex CLI / SDK';
+      : codexRoutingMode === 'auto_failover'
+        ? `Codex CLI (auto failover: ${(config.codexApiFallbackChain || ['local_api', 'external_api']).join(' -> ')})`
+        : 'Codex CLI / SDK';
   return [
     {
       id: 'codex',
@@ -83,14 +79,16 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
         modelSource: codexModelSource,
         model: codexModelSource === 'local_api' ? localModel : config.codexModel,
         baseUrl: codexModelSource === 'local_api' ? localBaseUrl : config.codexBaseUrl,
+        routingMode: codexRoutingMode,
+        fallbackChain: config.codexApiFallbackChain || ['local_api', 'external_api'],
         failureFallbackMode: config.codexFailureFallbackMode || 'none',
-        localFallbackEnabled: config.codexLocalFallbackEnabled === true,
+        localFallbackEnabled: false,
         localAgentMode: config.localAgentMode || 'text_only',
-        localToolCallRequired: config.localToolCallRequired !== false,
-        executionRequiredRoute: config.executionRequiredRoute || 'codex_or_external',
+        localToolCallRequired: false,
+        executionRequiredRoute: 'primary',
         localToolCallingState: localCapabilities.toolCallingState,
         localToolCallingMessage: localCapabilities.message,
-        localExecutionTrusted: codexModelSource !== 'local_api' || shouldTrustLocalApiForExecution(config),
+        localExecutionTrusted: true,
         codexHome: codexModelSource === 'local_api' ? 'runtime/codex-home-local-primary' : 'runtime/codex-home',
       },
     },
@@ -104,27 +102,6 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       priority: config.runtime === 'claude' ? 95 : 70,
       description: 'Claude Code CLI 执行器，保留为可切换 CLI 后端。',
       healthCheck: { kind: 'command', target: 'claude --version' },
-    },
-    {
-      id: 'codex-local-fallback',
-      displayName: `Codex Local Agent API (${localModel})`,
-      kind: 'agent',
-      capabilities: ['chat', 'code', 'repo_query', 'file_read', 'file_write', 'image_input', 'artifact_delivery', 'local_tool_agent'],
-      riskLevel: 'workspace_write',
-      enabled: isCodexLocalFallbackEnabled(config),
-      priority: getLocalRouterMode(config) === 'local_only' ? 98 : 65,
-      description: 'Codex agent 兜底执行器，复用 Codex 执行链并把 API 切到本地 OpenAI-compatible 后端。',
-      healthCheck: { kind: 'http', target: localBaseUrl },
-      configSchema: {
-        provider: localAiKind,
-        model: localModel,
-        baseUrl: localBaseUrl,
-        toolCallingState: localCapabilities.toolCallingState,
-        toolCallingMessage: localCapabilities.message,
-        recommendedMode: localCapabilities.recommendedMode,
-        codexHome: 'runtime/codex-home-local-fallback',
-        forceModel: true,
-      },
     },
     {
       id: 'local-tool-agent',

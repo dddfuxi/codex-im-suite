@@ -27,6 +27,46 @@ export interface LocalModelCapabilityProfile {
 
 export const RECOMMENDED_LOCAL_MODELS: LocalModelRecommendation[] = [
   {
+    model: 'qwen3-coder-next:latest',
+    provider: 'ollama',
+    label: 'Qwen3 Coder Next',
+    role: 'strong_tool_candidate',
+    minMemoryGb: 64,
+    notes: 'Qwen 新一代 coding agent 候选，约 52GB；适合高配机器测试本地 Codex agent 主模型。',
+  },
+  {
+    model: 'qwen3-coder-next:q4_K_M',
+    provider: 'ollama',
+    label: 'Qwen3 Coder Next Q4_K_M',
+    role: 'strong_tool_candidate',
+    minMemoryGb: 64,
+    notes: '固定 Q4_K_M 标签，约 52GB；资源要求高于 30B A3B。',
+  },
+  {
+    model: 'qwen3-coder:30b',
+    provider: 'ollama',
+    label: 'Qwen3 Coder 30B A3B',
+    role: 'strong_tool_candidate',
+    minMemoryGb: 24,
+    notes: '当前优先推荐的 Qwen 本地代码 agent 候选；安装后仍需跑工具调用探测。',
+  },
+  {
+    model: 'qwen3-coder:30b-a3b-q4_K_M',
+    provider: 'ollama',
+    label: 'Qwen3 Coder 30B A3B Q4_K_M',
+    role: 'strong_tool_candidate',
+    minMemoryGb: 24,
+    notes: '固定量化标签，约 19GB；适合不想依赖 latest/30b 别名的本地安装。',
+  },
+  {
+    model: 'qwen3-coder:30b-a3b-q8_0',
+    provider: 'ollama',
+    label: 'Qwen3 Coder 30B A3B Q8',
+    role: 'strong_tool_candidate',
+    minMemoryGb: 40,
+    notes: '更高精度版本，资源占用更高；适合内存/显存更充足时测试。',
+  },
+  {
     model: 'qwen3:14b',
     provider: 'ollama',
     label: 'Qwen3 14B',
@@ -240,7 +280,7 @@ export async function probeLocalModelCapabilities(config: Config): Promise<Local
       return writeLocalModelCapabilityProfile(config, buildProfile(config, {
         toolCallingState: 'text_only',
         recommendedMode: 'text_only',
-        message: '本地 API 在线，但没有返回结构化 tool_calls；执行类任务会转交官方/外部 Codex 或被拒绝。',
+        message: '本地 API 在线，但没有返回结构化 tool_calls；新路由不会因此自动转官方 Codex。',
         evidence: {
           endpoint,
           toolCallCount: calls.length,

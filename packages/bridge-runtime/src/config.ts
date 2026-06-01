@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getLocalCodexProviderCapabilities } from "./local-codex-provider-registry.js";
 
 export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
@@ -30,6 +31,8 @@ export interface Config {
   localAiApiKey?: string;
   localAiTimeoutMs?: number;
   codexModelSource?: 'official' | 'local_api' | 'external_api';
+  codexRoutingMode?: 'manual' | 'auto_failover';
+  codexApiFallbackChain?: Array<'local_api' | 'external_api' | 'official'>;
   codexBaseUrl?: string;
   codexApiKey?: string;
   codexModel?: string;
@@ -305,6 +308,12 @@ export function loadConfig(): Config {
   const codexModelSource = (["official", "local_api", "external_api"].includes(rawCodexModelSource)
     ? rawCodexModelSource
     : ((env.get("CTI_CODEX_BASE_URL") || env.get("CTI_CODEX_MODEL") || env.get("CTI_CODEX_API_KEY")) ? "external_api" : "official")) as NonNullable<Config["codexModelSource"]>;
+  const rawCodexRoutingMode = (env.get("CTI_CODEX_ROUTING_MODE") || "").trim().toLowerCase();
+  const codexRoutingMode = (rawCodexRoutingMode === "auto_failover" ? "auto_failover" : "manual") as NonNullable<Config["codexRoutingMode"]>;
+  const rawCodexApiFallbackChain = splitCsv(env.get("CTI_CODEX_API_FALLBACK_CHAIN")) || ["local_api", "external_api"];
+  const codexApiFallbackChain = Array.from(new Set(rawCodexApiFallbackChain
+    .map((item) => item.trim().toLowerCase())
+    .filter((item): item is 'local_api' | 'external_api' | 'official' => item === "local_api" || item === "external_api" || item === "official")));
   const rawCodexFailureFallbackMode = (env.get("CTI_CODEX_FAILURE_FALLBACK_MODE") || "").trim().toLowerCase();
   const codexFailureFallbackMode = (rawCodexFailureFallbackMode === "local_agent" ? "local_agent" : "none") as NonNullable<Config["codexFailureFallbackMode"]>;
   const rawLocalAgentMode = (env.get("CTI_LOCAL_AGENT_MODE") || "").trim().toLowerCase();
@@ -357,6 +366,8 @@ export function loadConfig(): Config {
     localAiApiKey: env.get("CTI_LOCAL_AI_API_KEY") || undefined,
     localAiTimeoutMs: effectiveLocalAiTimeoutMs,
     codexModelSource,
+    codexRoutingMode,
+    codexApiFallbackChain: codexApiFallbackChain.length > 0 ? codexApiFallbackChain : ["local_api", "external_api"],
     codexBaseUrl: env.get("CTI_CODEX_BASE_URL") || undefined,
     codexApiKey: env.get("CTI_CODEX_API_KEY") || undefined,
     codexModel: env.get("CTI_CODEX_MODEL") || undefined,
@@ -514,6 +525,8 @@ export function saveConfig(config: Config): void {
   if (config.localAiTimeoutMs !== undefined)
     out += formatEnvLine("CTI_LOCAL_AI_TIMEOUT_MS", String(config.localAiTimeoutMs));
   out += formatEnvLine("CTI_CODEX_MODEL_SOURCE", config.codexModelSource);
+  out += formatEnvLine("CTI_CODEX_ROUTING_MODE", config.codexRoutingMode);
+  out += formatEnvLine("CTI_CODEX_API_FALLBACK_CHAIN", config.codexApiFallbackChain?.join(","));
   out += formatEnvLine("CTI_CODEX_BASE_URL", config.codexBaseUrl);
   out += formatEnvLine("CTI_CODEX_API_KEY", config.codexApiKey);
   out += formatEnvLine("CTI_CODEX_MODEL", config.codexModel);
@@ -827,6 +840,12 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.localAiKind) {
     m.set("bridge_local_ai_kind", config.localAiKind);
   }
+  const localProviderCapabilities = getLocalCodexProviderCapabilities(config.localAiKind);
+  m.set("bridge_local_provider_supports_codex_agent", String(localProviderCapabilities.supportsCodexAgent));
+  m.set("bridge_local_provider_codex_local_provider", localProviderCapabilities.codexLocalProvider || "");
+  m.set("bridge_local_provider_capability_message", localProviderCapabilities.supportsCodexAgent
+    ? `${localProviderCapabilities.displayName} 支持 Codex CLI OSS agent。`
+    : (localProviderCapabilities.unsupportedReason || `${localProviderCapabilities.displayName} 当前不能作为 Codex agent 执行器。`));
   if (config.localAiBaseUrl) {
     m.set("bridge_local_ai_base_url", config.localAiBaseUrl);
   }
@@ -845,6 +864,8 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.codexModelSource) {
     m.set("bridge_codex_model_source", config.codexModelSource);
   }
+  m.set("bridge_codex_routing_mode", config.codexRoutingMode || "manual");
+  m.set("bridge_codex_api_fallback_chain", (config.codexApiFallbackChain || ["local_api", "external_api"]).join(","));
   if (config.codexBaseUrl) {
     m.set("bridge_codex_base_url", config.codexBaseUrl);
   }

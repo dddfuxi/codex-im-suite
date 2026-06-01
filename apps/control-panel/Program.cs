@@ -48,6 +48,12 @@ internal sealed partial class MainForm : Form
     private const string OfficialControlPanelExeName = "CodexImSuiteControlPanel.exe";
     private const string LegacyControlPanelExeName = "ClaudeToImControlPanel.exe";
     private const uint CodePageGb2312 = 936;
+    private static readonly string[] OllamaRelativeExecutableCandidates =
+    [
+        @"Programs\OllamaPortable\app\ollama.exe",
+        @"Programs\Ollama\ollama.exe",
+        @"Ollama\ollama.exe",
+    ];
     private readonly string _skillDir;
     private readonly string _ctiHome;
     private readonly string _configPath;
@@ -65,7 +71,10 @@ internal sealed partial class MainForm : Form
     private readonly string _userSkillsManifestDir;
     private readonly string _userPluginsManifestDir;
     private readonly string _extensionCatalogSeedPath;
+    private readonly string _extensionCatalogDynamicCachePath;
     private readonly string _extensionLockPath;
+    private readonly object _extensionInstallJobLock = new();
+    private readonly Dictionary<string, ExtensionInstallJobState> _extensionInstallJobs = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _suiteRoot;
     private readonly string _publishBackupScript;
     private readonly string _mainReleaseScript;
@@ -166,6 +175,7 @@ internal sealed partial class MainForm : Form
         _extensionCatalogSeedPath = string.IsNullOrWhiteSpace(_suiteRoot)
             ? Path.Combine(_skillDir, "config", "extension-catalog.json")
             : Path.Combine(_suiteRoot, "config", "extension-catalog.json");
+        _extensionCatalogDynamicCachePath = Path.Combine(_ctiHome, "runtime", "extension-catalog-dynamic-cache.json");
         _extensionLockPath = Path.Combine(_userExtensionRoot, "installed-lock.json");
         _publishBackupScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "publish-backup.ps1");
         _mainReleaseScript = string.IsNullOrWhiteSpace(_suiteRoot) ? "" : Path.Combine(_suiteRoot, "scripts", "prepare-main-release.ps1");
@@ -742,7 +752,8 @@ internal sealed partial class MainForm : Form
     }
 
     private static bool IsQuietWebCommand(string? command)
-        => string.Equals(command, "history.getSessionDetail", StringComparison.OrdinalIgnoreCase);
+        => string.Equals(command, "history.getSessionDetail", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(command, "extension.installJobs", StringComparison.OrdinalIgnoreCase);
 
     private async Task<object?> ExecuteWebCommandAsync(string command, JsonElement payload)
     {
@@ -932,9 +943,9 @@ internal sealed partial class MainForm : Form
                 OpenPath(ReadPayloadString(payload, "path", ""));
                 return "opened";
             case "path.pickFolder":
-                return PickFolder(ReadPayloadString(payload, "currentPath", ""));
+                return await PickFolderAsync(ReadPayloadString(payload, "currentPath", ""));
             case "path.pickFile":
-                return PickFile(ReadPayloadString(payload, "currentPath", ""));
+                return await PickFileAsync(ReadPayloadString(payload, "currentPath", ""));
             case "settings.listReplyPresets":
                 return BuildReplyPresetItems();
             case "settings.applyReplyPreset":
@@ -979,6 +990,16 @@ internal sealed partial class MainForm : Form
                 return await InstallRemoteExtensionAsync(payload);
             case "extension.remote.remove":
                 return RemoveRemoteExtension(payload);
+            case "extension.installJobs":
+                return GetExtensionInstallJobs();
+            case "extension.model.install.start":
+                return await StartModelInstallJobAsync(payload);
+            case "extension.model.install.cancel":
+                return CancelModelInstallJob(payload);
+            case "extension.model.remove":
+                return await RemoveModelAsync(payload);
+            case "extension.model.use":
+                return await UseLocalModelAsync(payload);
             case "workflow.listRuns":
                 return ListWorkflowRuns();
             case "workflow.getRun":
@@ -1510,6 +1531,7 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint),
             NormalizeLocalAiKind(ReadPayloadString(payload, "localAiKind", current.LocalAiKind)),
             ReadPayloadString(payload, "localAiBaseUrl", current.LocalAiBaseUrl),
+            ReadPayloadString(payload, "ollamaModelsDir", current.OllamaModelsDir),
             ReadPayloadString(payload, "localAiModel", current.LocalAiModel),
             ReadPayloadString(payload, "localAiApiKeyAction", current.LocalAiApiKeyAction),
             ReadPayloadString(payload, "localAiApiKeyValue", ""),
@@ -1517,6 +1539,8 @@ internal sealed partial class MainForm : Form
             ReadPayloadBool(payload, "localAiApiKeySet", current.LocalAiApiKeySet),
             ReadPayloadString(payload, "localAiTimeoutMs", current.LocalAiTimeoutMs),
             NormalizeCodexModelSource(ReadPayloadString(payload, "codexModelSource", current.CodexModelSource)),
+            NormalizeCodexRoutingMode(ReadPayloadString(payload, "codexRoutingMode", current.CodexRoutingMode)),
+            NormalizeCodexApiFallbackChain(ReadPayloadString(payload, "codexApiFallbackChain", current.CodexApiFallbackChain)),
             ReadPayloadString(payload, "codexBaseUrl", current.CodexBaseUrl),
             ReadPayloadString(payload, "codexModel", current.CodexModel),
             ReadPayloadBool(payload, "codexPassModel", current.CodexPassModel),
@@ -2187,16 +2211,43 @@ internal sealed partial class MainForm : Form
         return false;
     }
 
-    private static string PickFolder(string currentPath)
+    private Task<string> PickFolderAsync(string currentPath)
+    {
+        if (!InvokeRequired) return Task.FromResult(PickFolderOnUiThread(currentPath));
+        var completion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BeginInvoke(() =>
+        {
+            try { completion.SetResult(PickFolderOnUiThread(currentPath)); }
+            catch (Exception ex) { completion.SetException(ex); }
+        });
+        return completion.Task;
+    }
+
+    private string PickFolderOnUiThread(string currentPath)
     {
         using var dialog = new FolderBrowserDialog
         {
+            Description = "选择目录",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true,
             SelectedPath = Directory.Exists(currentPath) ? currentPath : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         };
-        return dialog.ShowDialog() == DialogResult.OK ? dialog.SelectedPath : currentPath;
+        return dialog.ShowDialog(this) == DialogResult.OK ? dialog.SelectedPath : currentPath;
     }
 
-    private static string PickFile(string currentPath)
+    private Task<string> PickFileAsync(string currentPath)
+    {
+        if (!InvokeRequired) return Task.FromResult(PickFileOnUiThread(currentPath));
+        var completion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BeginInvoke(() =>
+        {
+            try { completion.SetResult(PickFileOnUiThread(currentPath)); }
+            catch (Exception ex) { completion.SetException(ex); }
+        });
+        return completion.Task;
+    }
+
+    private string PickFileOnUiThread(string currentPath)
     {
         using var dialog = new OpenFileDialog
         {
@@ -2206,7 +2257,7 @@ internal sealed partial class MainForm : Form
                 ? Path.GetDirectoryName(currentPath)
                 : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         };
-        return dialog.ShowDialog() == DialogResult.OK ? dialog.FileName : currentPath;
+        return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : currentPath;
     }
 
     private WebReplyPresetItem[] BuildReplyPresetItems()
@@ -3539,81 +3590,76 @@ internal sealed partial class MainForm : Form
 
     private WebRuntimeUnit[] BuildRuntimeUnits()
     {
+        var runtimeManifests = LoadRuntimeUnitManifestMap();
         var units = new List<WebRuntimeUnit>
         {
-            new(
+            BuildBridgeRuntimeUnit(GetRuntimeManifestOrFallback(
+                runtimeManifests,
                 "service.bridge",
-                "bridge",
                 "飞书桥接",
                 "service",
                 "bridge",
-                ClassifyStatus("bridge", _bridgeStatus.Text),
-                _bridgeStatus.Text,
-                true,
                 "installed",
                 _skillDir,
                 _skillDir,
                 "",
-                "负责 Feishu / Codex / 本地执行链路的主桥接服务。",
-                false,
-                new[]
-                {
-                    new WebRuntimeAction("status", "状态", true),
-                    new WebRuntimeAction("logs", "日志", true),
-                    new WebRuntimeAction("start", "启动", true),
-                    new WebRuntimeAction("stop", "停止", true),
-                    new WebRuntimeAction("restart", "重启", true),
-                    new WebRuntimeAction("openLocation", "打开位置", true),
-                }),
-            new(
+                "负责 Feishu / Codex / 本地执行链路的主桥接服务。")),
+            BuildCodexRuntimeUnit(GetRuntimeManifestOrFallback(
+                runtimeManifests,
                 "service.codex",
-                "codex",
                 "Codex CLI",
                 "tool",
                 "codex",
-                ClassifyStatus("codex", _codexStatus.Text),
-                _codexStatus.Text,
-                true,
+                "installed",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"),
+                "",
+                "Codex CLI 工具型服务，默认提供检查与工作目录入口，不伪造常驻 daemon 开关。")),
+            BuildFeishuCliRuntimeUnit(GetRuntimeManifestOrFallback(
+                runtimeManifests,
+                "service.feishuCli",
+                "飞书 CLI",
+                "tool",
+                "bridge-skill",
                 "installed",
                 _skillDir,
                 _skillDir,
                 "",
-                "Codex CLI 工具型服务，默认提供检查与工作目录入口，不伪造常驻 daemon 开关。",
-                false,
-                new[]
-                {
-                    new WebRuntimeAction("check", "检查", true),
-                    new WebRuntimeAction("update", "更新", CodexSupportsNpmUpdate()),
-                    new WebRuntimeAction("openLocation", "打开位置", true),
-                }),
-            new(
+                "负责桥接 Skill / runtime 包更新，不承担 daemon 启停。")),
+            BuildLocalLlmRuntimeUnit(GetRuntimeManifestOrFallback(
+                runtimeManifests,
                 "service.localLlm",
-                "ollama",
                 "本地 Agent API",
                 "service",
                 "local-ai",
-                ClassifyStatus("localLlm", _localLlmStatus.Text),
-                _localLlmStatus.Text,
-                true,
-                File.Exists(_localLlmStartScript) ? "installed" : "missing",
+                "installed",
                 _localLlmReadmePath,
                 Path.GetDirectoryName(_localLlmStartScript) ?? "",
                 "",
-                "本地 / 自托管 OpenAI-compatible 后端，仅用于明确小活、只读问题和 Codex 不可用时的保守兜底。",
-                false,
-                new[]
-                {
-                    new WebRuntimeAction("check", "检查", true),
-                    new WebRuntimeAction("start", "启动", File.Exists(_localLlmStartScript)),
-                    new WebRuntimeAction("stop", "停止", File.Exists(_localLlmStopScript)),
-                    new WebRuntimeAction("openLocation", "打开位置", true),
-                }),
+                "本地 / 自托管 OpenAI-compatible 后端，仅用于明确小活、只读问题和 Codex 不可用时的保守兜底。")),
         };
 
         foreach (var manifest in _manifests)
         {
             var hasLauncher = !string.IsNullOrWhiteSpace(ResolveManifestPath(manifest.Launcher, manifest)) && File.Exists(ResolveManifestPath(manifest.Launcher, manifest));
             var canInstall = ManifestSupportsInstall(manifest.ManifestPath);
+            var updatePlan = ResolveManifestUpdatePlan(
+                manifest.ManifestPath ?? "",
+                ResolveManifestDirectory(manifest.Cwd, manifest),
+                FormatManifestSource(manifest.Source, manifest));
+            var actions = new List<WebRuntimeAction>
+            {
+                new("check", "检查", true),
+                new("start", IsUnityMcp(manifest) ? "修复" : "启动", manifest.Enabled != false && hasLauncher),
+                new("stop", "停止", manifest.Enabled != false),
+                new("install", "安装", canInstall),
+            };
+            if (updatePlan is not null)
+            {
+                actions.Add(new WebRuntimeAction("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
+            }
+            actions.Add(new WebRuntimeAction("register", "注册", true));
+            actions.Add(new WebRuntimeAction("openLocation", "打开位置", true));
             units.Add(new WebRuntimeUnit(
                 $"mcp.{manifest.Id}",
                 manifest.Id ?? "",
@@ -3629,19 +3675,25 @@ internal sealed partial class MainForm : Form
                 manifest.Version ?? "",
                 manifest.Description ?? "",
                 canInstall,
-                new[]
-                {
-                    new WebRuntimeAction("check", "检查", true),
-                    new WebRuntimeAction("start", IsUnityMcp(manifest) ? "修复" : "启动", manifest.Enabled != false && hasLauncher),
-                    new WebRuntimeAction("stop", "停止", manifest.Enabled != false),
-                    new WebRuntimeAction("install", "安装", canInstall),
-                    new WebRuntimeAction("register", "注册", true),
-                    new WebRuntimeAction("openLocation", "打开位置", true),
-                }));
+                actions.ToArray()));
         }
 
         foreach (var item in BuildExtensionItems())
         {
+            var updatePlan = ResolveManifestUpdatePlan(item.ManifestPath, ExpandManifestValue(item.Source), item.Source);
+            var actions = new List<WebRuntimeAction>
+            {
+                new("enable", "启用", !item.Enabled),
+                new("disable", "禁用", item.Enabled),
+                new("install", "安装", item.CanInstall),
+            };
+            if (updatePlan is not null)
+            {
+                actions.Add(new WebRuntimeAction("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
+            }
+            actions.Add(new WebRuntimeAction("remove", "移除记录", item.CanRemove));
+            actions.Add(new WebRuntimeAction("openManifest", "Manifest", true));
+            actions.Add(new WebRuntimeAction("openSource", "Source", item.SourceExists));
             units.Add(new WebRuntimeUnit(
                 $"extension.{item.ManifestPath}",
                 item.Id,
@@ -3657,15 +3709,7 @@ internal sealed partial class MainForm : Form
                 "",
                 item.Description,
                 item.CanInstall,
-                new[]
-                {
-                    new WebRuntimeAction("enable", "启用", !item.Enabled),
-                    new WebRuntimeAction("disable", "禁用", item.Enabled),
-                    new WebRuntimeAction("install", "安装", item.CanInstall),
-                    new WebRuntimeAction("remove", "移除记录", item.CanRemove),
-                    new WebRuntimeAction("openManifest", "Manifest", true),
-                    new WebRuntimeAction("openSource", "Source", item.SourceExists),
-                }));
+                actions.ToArray()));
         }
 
         return units.ToArray();
@@ -3835,8 +3879,12 @@ internal sealed partial class MainForm : Form
     {
         var entries = await LoadExtensionCatalogEntriesAsync(forceRefresh);
         var lockFile = ReadExtensionInstallLock();
-        var ollamaModels = await ReadInstalledOllamaCatalogModelsAsync(entries);
+        var ollamaModels = await ReadInstalledOllamaModelNamesAsync();
         var installedManifests = ReadCatalogInstalledManifests();
+        var catalogModels = entries
+            .Select(entry => GetOllamaCatalogModel(entry.Item))
+            .Where(model => !string.IsNullOrWhiteSpace(model))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var items = entries
             .Select(entry =>
             {
@@ -3859,6 +3907,11 @@ internal sealed partial class MainForm : Form
                     entry.Item.InstallHandler,
                     entry.Item.Artifact?.Url ?? entry.Item.Source,
                     entry.CatalogSource,
+                    entry.SourceLayer,
+                    entry.SourceName,
+                    entry.FetchedAt,
+                    entry.RankBasis,
+                    entry.RankOrder,
                     entry.Trusted || !string.IsNullOrWhiteSpace(entry.Item.Sha256),
                     string.IsNullOrWhiteSpace(entry.Item.Sha256) ? "untrusted" : "sha256",
                     IsSupportedInstallHandler(entry.Item.InstallHandler),
@@ -3868,10 +3921,44 @@ internal sealed partial class MainForm : Form
                     installed?.InstalledAt ?? (manifestInstall is not null ? "manifest" : detectedOllamaModel ? "detected by Ollama" : ""),
                     installed?.PackagePath ?? installed?.ManifestPath ?? manifestInstall?.ManifestPath ?? (detectedOllamaModel ? ollamaModel : ""));
             })
-            .OrderBy(item => item.Type, StringComparer.OrdinalIgnoreCase)
+            .Concat(ollamaModels
+                .Where(model => !catalogModels.Contains(model))
+                .Select(model => new WebExtensionCatalogItem(
+                    NormalizeCatalogId($"ollama-local-{model}"),
+                    "model",
+                    model,
+                    "local",
+                    "model.ollama.local",
+                    "Ollama 本机已安装模型；可直接设为本地 API 模型，或从本机卸载。",
+                    "ollama.pull",
+                    model,
+                    "ollama://local",
+                    "local",
+                    "Ollama 本机",
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    "本机 /api/tags",
+                    0,
+                    true,
+                    "local",
+                    true,
+                    true,
+                    true,
+                    "local",
+                    "detected by Ollama",
+                    model)))
+            .OrderBy(item => GetCatalogLayerSortRank(item.SourceLayer))
+            .ThenBy(item => item.Type, StringComparer.OrdinalIgnoreCase)
             .ThenBy(item => item.DisplayName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        return new WebExtensionCatalogSnapshot("extension-catalog/v1", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), entries.Select(item => item.CatalogSource).Distinct(StringComparer.OrdinalIgnoreCase).Count(), items);
+        return new WebExtensionCatalogSnapshot(
+            "extension-catalog/v2",
+            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            entries.Select(item => item.CatalogSource).Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+            new WebExtensionCatalogLayerCounts(
+                items.Count(item => item.SourceLayer == "seed"),
+                items.Count(item => item.SourceLayer == "dynamic"),
+                items.Count(item => item.SourceLayer == "custom_url")),
+            items);
     }
 
     private Dictionary<string, CatalogInstalledManifest> ReadCatalogInstalledManifests()
@@ -3909,8 +3996,18 @@ internal sealed partial class MainForm : Form
         var entries = new List<ExtensionCatalogEntry>();
         if (File.Exists(_extensionCatalogSeedPath))
         {
-            entries.AddRange(ParseExtensionCatalog(File.ReadAllText(_extensionCatalogSeedPath, Encoding.UTF8), _extensionCatalogSeedPath, trusted: true));
+            var fetchedAt = File.GetLastWriteTime(_extensionCatalogSeedPath).ToString("yyyy-MM-dd HH:mm:ss");
+            entries.AddRange(ParseExtensionCatalog(
+                File.ReadAllText(_extensionCatalogSeedPath, Encoding.UTF8),
+                _extensionCatalogSeedPath,
+                trusted: true,
+                sourceLayer: "seed",
+                sourceName: "本地种子",
+                fetchedAt: fetchedAt,
+                rankBasis: "suite 静态种子"));
         }
+
+        entries.AddRange(await LoadDynamicExtensionCatalogEntriesAsync(forceRefresh));
 
         var urls = SplitConfigList(GetConfig("CTI_EXTENSION_CATALOG_URLS", ""));
         if (urls.Count > 0)
@@ -3926,7 +4023,14 @@ internal sealed partial class MainForm : Form
                 try
                 {
                     var raw = await client.GetStringAsync(url);
-                    entries.AddRange(ParseExtensionCatalog(raw, url, trusted: true));
+                    entries.AddRange(ParseExtensionCatalog(
+                        raw,
+                        url,
+                        trusted: true,
+                        sourceLayer: "custom_url",
+                        sourceName: new Uri(url).Host,
+                        fetchedAt: DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                        rankBasis: "用户自定义 URL"));
                 }
                 catch (Exception ex)
                 {
@@ -3935,20 +4039,21 @@ internal sealed partial class MainForm : Form
             }
         }
 
-        return entries
-            .Where(entry => !string.IsNullOrWhiteSpace(entry.Item.Id))
-            .GroupBy(entry => $"{entry.Item.Type}::{entry.Item.Id}", StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.Last())
-            .ToList();
-    }
-
-    private async Task<HashSet<string>> ReadInstalledOllamaCatalogModelsAsync(IEnumerable<ExtensionCatalogEntry> entries)
-    {
-        if (!entries.Any(entry => !string.IsNullOrWhiteSpace(GetOllamaCatalogModel(entry.Item))))
+        var bestEntries = new Dictionary<string, ExtensionCatalogEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in entries.Where(entry => !string.IsNullOrWhiteSpace(entry.Item.Id)))
         {
-            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var key = $"{entry.Item.Type}::{entry.Item.Id}";
+            if (!bestEntries.TryGetValue(key, out var existing) || GetCatalogLayerPriority(entry.SourceLayer) >= GetCatalogLayerPriority(existing.SourceLayer))
+            {
+                bestEntries[key] = entry;
+            }
         }
 
+        return bestEntries.Values.ToList();
+    }
+
+    private async Task<HashSet<string>> ReadInstalledOllamaModelNamesAsync()
+    {
         var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var baseUrl = GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434");
         try
@@ -3996,7 +4101,213 @@ internal sealed partial class MainForm : Form
         return (item.Artifact?.Model ?? item.Source ?? "").Trim();
     }
 
-    private List<ExtensionCatalogEntry> ParseExtensionCatalog(string rawJson, string source, bool trusted)
+    private async Task<List<ExtensionCatalogEntry>> LoadDynamicExtensionCatalogEntriesAsync(bool forceRefresh)
+    {
+        if (string.Equals(GetConfig("CTI_EXTENSION_CATALOG_DYNAMIC_ENABLED", "true"), "false", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var topN = int.TryParse(GetConfig("CTI_EXTENSION_CATALOG_DYNAMIC_TOP_N", "5"), out var configuredTopN) && configuredTopN > 0
+            ? Math.Min(configuredTopN, 20)
+            : 5;
+        var refreshHours = int.TryParse(GetConfig("CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS", "24"), out var configuredRefreshHours) && configuredRefreshHours > 0
+            ? configuredRefreshHours
+            : 24;
+        var providers = SplitConfigList(GetConfig("CTI_EXTENSION_CATALOG_DYNAMIC_PROVIDERS", "npm,pypi,github,huggingface,ollama,mcp_registry"))
+            .Select(item => item.Trim().ToLowerInvariant())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var cached = ReadDynamicCatalogCache();
+        if (!forceRefresh && cached is not null && IsDynamicCatalogCacheFresh(cached, providers, topN, refreshHours))
+        {
+            return cached.Items.Select(ConvertCachedCatalogEntry).ToList();
+        }
+
+        try
+        {
+            var freshEntries = await RefreshDynamicCatalogEntriesAsync(providers, topN);
+            SaveDynamicCatalogCache(providers, topN, freshEntries);
+            return freshEntries;
+        }
+        catch (Exception ex)
+        {
+            AddWebActivity("warning", "动态目录刷新失败", ex.Message);
+            return cached?.Items.Select(ConvertCachedCatalogEntry).ToList() ?? [];
+        }
+    }
+
+    private async Task<List<ExtensionCatalogEntry>> RefreshDynamicCatalogEntriesAsync(string[] providers, int topN)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("codex-im-suite-control-panel");
+        client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+
+        var entries = new List<ExtensionCatalogEntry>();
+        foreach (var provider in providers)
+        {
+            var fetchedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            switch (provider)
+            {
+                case "npm":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParseNpmSearchJson(await client.GetStringAsync($"https://registry.npmjs.org/-/v1/search?text={Uri.EscapeDataString("mcp")}&size={topN}"), topN),
+                        "npm",
+                        "https://registry.npmjs.org/-/v1/search",
+                        fetchedAt,
+                        "npm search score"));
+                    break;
+                case "pypi":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParsePyPiRssXml(await client.GetStringAsync("https://pypi.org/rss/updates.xml"), topN),
+                        "PyPI",
+                        "https://pypi.org/rss/updates.xml",
+                        fetchedAt,
+                        "PyPI 官方 RSS 最新更新"));
+                    break;
+                case "github":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParseGitHubRepositoriesJson(await client.GetStringAsync($"https://api.github.com/search/repositories?q={Uri.EscapeDataString("topic:model-context-protocol")}&sort=stars&order=desc&per_page={topN}"), topN),
+                        "GitHub",
+                        "https://api.github.com/search/repositories",
+                        fetchedAt,
+                        "GitHub stars"));
+                    break;
+                case "huggingface":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParseHuggingFaceModelsJson(await client.GetStringAsync($"https://huggingface.co/api/models?search={Uri.EscapeDataString("mcp")}&sort=downloads&direction=-1&limit={topN}"), topN),
+                        "Hugging Face",
+                        "https://huggingface.co/api/models",
+                        fetchedAt,
+                        "Hugging Face downloads"));
+                    break;
+                case "ollama":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParseOllamaLibraryHtml(await client.GetStringAsync("https://ollama.com/library?sort=popular"), topN),
+                        "Ollama Library",
+                        "https://ollama.com/library?sort=popular",
+                        fetchedAt,
+                        "Ollama popular pulls"));
+                    break;
+                case "mcp_registry":
+                    entries.AddRange(BuildDynamicCatalogEntries(
+                        ExtensionCatalogDynamicSources.ParseMcpRegistryServersJson(await client.GetStringAsync($"https://registry.modelcontextprotocol.io/v0.1/servers?limit={topN}&version=latest"), topN),
+                        "Official MCP Registry",
+                        "https://registry.modelcontextprotocol.io/v0.1/servers",
+                        fetchedAt,
+                        "Registry latest version list"));
+                    break;
+            }
+        }
+
+        return entries;
+    }
+
+    private List<ExtensionCatalogEntry> BuildDynamicCatalogEntries(
+        IReadOnlyList<DynamicCatalogCandidate> candidates,
+        string sourceName,
+        string sourceUrl,
+        string fetchedAt,
+        string rankBasis)
+    {
+        var entries = new List<ExtensionCatalogEntry>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            var item = new ExtensionCatalogItem
+            {
+                Id = NormalizeCatalogId(candidate.Id),
+                Type = NormalizeCatalogType(candidate.Type),
+                DisplayName = candidate.DisplayName.Trim(),
+                Version = string.IsNullOrWhiteSpace(candidate.Version) ? "latest" : candidate.Version.Trim(),
+                Category = candidate.Category.Trim(),
+                Description = candidate.Description?.Trim() ?? "",
+                Source = string.IsNullOrWhiteSpace(candidate.Source) ? null : candidate.Source.Trim(),
+                InstallHandler = candidate.InstallHandler.Trim().ToLowerInvariant(),
+                Artifact = string.IsNullOrWhiteSpace(candidate.ArtifactKind)
+                    && string.IsNullOrWhiteSpace(candidate.ArtifactUrl)
+                    && string.IsNullOrWhiteSpace(candidate.ArtifactModel)
+                    && string.IsNullOrWhiteSpace(candidate.ArtifactPackageName)
+                    && string.IsNullOrWhiteSpace(candidate.ArtifactCommand)
+                    ? null
+                    : new ExtensionCatalogArtifact
+                    {
+                        Url = candidate.ArtifactUrl,
+                        Kind = candidate.ArtifactKind,
+                        Model = candidate.ArtifactModel,
+                        PackageName = candidate.ArtifactPackageName,
+                        Command = candidate.ArtifactCommand,
+                    },
+            };
+            entries.Add(new ExtensionCatalogEntry(item, sourceUrl, true, "dynamic", sourceName, fetchedAt, $"{rankBasis} · {candidate.RankMetric}", candidate.RankOrder));
+        }
+
+        return entries;
+    }
+
+    private DynamicCatalogCacheSnapshot? ReadDynamicCatalogCache()
+    {
+        if (!File.Exists(_extensionCatalogDynamicCachePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<DynamicCatalogCacheSnapshot>(File.ReadAllText(_extensionCatalogDynamicCachePath, Encoding.UTF8), JsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool IsDynamicCatalogCacheFresh(DynamicCatalogCacheSnapshot cache, string[] providers, int topN, int refreshHours)
+    {
+        if (!string.Equals(cache.Protocol, "extension-catalog-dynamic-cache/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (cache.TopN != topN)
+        {
+            return false;
+        }
+
+        if (!providers.SequenceEqual(cache.Providers ?? [], StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return DateTimeOffset.TryParse(cache.GeneratedAt, out var generatedAt)
+            && DateTimeOffset.Now - generatedAt.ToLocalTime() <= TimeSpan.FromHours(refreshHours);
+    }
+
+    private void SaveDynamicCatalogCache(string[] providers, int topN, List<ExtensionCatalogEntry> entries)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_extensionCatalogDynamicCachePath)!);
+        var payload = new DynamicCatalogCacheSnapshot(
+            "extension-catalog-dynamic-cache/v1",
+            DateTimeOffset.Now.ToString("O"),
+            topN,
+            providers,
+            entries.Select(entry => new CachedExtensionCatalogEntry(
+                entry.Item,
+                entry.CatalogSource,
+                entry.Trusted,
+                entry.SourceLayer,
+                entry.SourceName,
+                entry.FetchedAt,
+                entry.RankBasis,
+                entry.RankOrder)).ToArray());
+        WriteUtf8TextAtomic(_extensionCatalogDynamicCachePath, JsonSerializer.Serialize(payload, JsonOptions));
+    }
+
+    private static ExtensionCatalogEntry ConvertCachedCatalogEntry(CachedExtensionCatalogEntry cached)
+        => new(cached.Item, cached.CatalogSource, cached.Trusted, cached.SourceLayer, cached.SourceName, cached.FetchedAt, cached.RankBasis, cached.RankOrder);
+
+    private List<ExtensionCatalogEntry> ParseExtensionCatalog(string rawJson, string source, bool trusted, string sourceLayer, string sourceName, string fetchedAt, string rankBasis)
     {
         var entries = new List<ExtensionCatalogEntry>();
         using var doc = JsonDocument.Parse(rawJson, new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
@@ -4005,23 +4316,27 @@ internal sealed partial class MainForm : Form
             && root.TryGetProperty("items", out var items)
             && items.ValueKind == JsonValueKind.Array)
         {
+            var rank = 0;
             foreach (var item in items.EnumerateArray())
             {
-                entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(item), source, trusted));
+                rank++;
+                entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(item), source, trusted, sourceLayer, sourceName, fetchedAt, rankBasis, rank));
             }
             return entries;
         }
 
         if (root.ValueKind == JsonValueKind.Array)
         {
+            var rank = 0;
             foreach (var item in root.EnumerateArray())
             {
-                entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(item), source, trusted));
+                rank++;
+                entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(item), source, trusted, sourceLayer, sourceName, fetchedAt, rankBasis, rank));
             }
             return entries;
         }
 
-        entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(root), source, trusted));
+        entries.Add(new ExtensionCatalogEntry(ParseExtensionCatalogItem(root), source, trusted, sourceLayer, sourceName, fetchedAt, rankBasis, 1));
         return entries;
     }
 
@@ -4038,6 +4353,25 @@ internal sealed partial class MainForm : Form
         item.Description = item.Description?.Trim() ?? "";
         return item;
     }
+
+    private static int GetCatalogLayerPriority(string sourceLayer)
+        => sourceLayer switch
+        {
+            "custom_url" => 3,
+            "seed" => 2,
+            "dynamic" => 1,
+            _ => 0,
+        };
+
+    private static int GetCatalogLayerSortRank(string sourceLayer)
+        => sourceLayer switch
+        {
+            "local" => 0,
+            "seed" => 1,
+            "dynamic" => 2,
+            "custom_url" => 3,
+            _ => 9,
+        };
 
     private async Task<WebRemoteExtensionPreview> PreviewRemoteExtensionAsync(string url)
     {
@@ -4090,7 +4424,7 @@ internal sealed partial class MainForm : Form
         }
 
         var raw = await client.GetStringAsync(url);
-        var entries = ParseExtensionCatalog(raw, url, trusted: false);
+        var entries = ParseExtensionCatalog(raw, url, trusted: false, sourceLayer: "custom_url", sourceName: new Uri(url).Host, fetchedAt: DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), rankBasis: "URL 预览");
         if (entries.Count != 1)
         {
             throw new InvalidOperationException("URL 预览只接受单个 catalog item JSON；目录 URL 请写入 CTI_EXTENSION_CATALOG_URLS。");
@@ -4106,8 +4440,8 @@ internal sealed partial class MainForm : Form
         ExtensionCatalogEntry entry;
         if (!string.IsNullOrWhiteSpace(url))
         {
-            var item = await LoadRemoteCatalogItemAsync(url);
-            entry = new ExtensionCatalogEntry(item, url, false);
+            var remoteItem = await LoadRemoteCatalogItemAsync(url);
+            entry = new ExtensionCatalogEntry(remoteItem, url, false, "custom_url", new Uri(url).Host, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), "URL 安装", 1);
         }
         else
         {
@@ -4157,6 +4491,456 @@ internal sealed partial class MainForm : Form
         return new { removed = record.Id, record.Type };
     }
 
+    private object GetExtensionInstallJobs()
+    {
+        lock (_extensionInstallJobLock)
+        {
+            return _extensionInstallJobs.Values
+                .OrderByDescending(job => job.UpdatedAt)
+                .Select(ToWebInstallJob)
+                .ToArray();
+        }
+    }
+
+    private async Task<object> StartModelInstallJobAsync(JsonElement payload)
+    {
+        var id = ReadPayloadString(payload, "id", "");
+        var url = ReadPayloadString(payload, "url", "");
+        var allowUntrusted = ReadPayloadBool(payload, "allowUntrusted", false);
+        var installPath = ReadPayloadString(payload, "installPath", "").Trim();
+        var useAfterInstall = ReadPayloadBool(payload, "useAfterInstall", true);
+        ExtensionCatalogEntry entry;
+        if (!string.IsNullOrWhiteSpace(url))
+        {
+            var remoteItem = await LoadRemoteCatalogItemAsync(url);
+            entry = new ExtensionCatalogEntry(remoteItem, url, false, "custom_url", new Uri(url).Host, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), "URL 安装", 1);
+        }
+        else
+        {
+            var entries = await LoadExtensionCatalogEntriesAsync(forceRefresh: false);
+            entry = entries.FirstOrDefault(candidate => string.Equals(candidate.Item.Id, id, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"未找到模型目录条目：{id}");
+        }
+
+        var item = entry.Item;
+        if (!string.Equals(item.Type, "model", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(item.InstallHandler, "ollama.pull", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("当前异步安装只支持 Ollama model 条目。");
+        }
+
+        var trusted = entry.Trusted || !string.IsNullOrWhiteSpace(item.Sha256);
+        if (!trusted && !allowUntrusted)
+        {
+            throw new InvalidOperationException("该模型条目未声明 sha256，必须确认 allowUntrusted 后才能安装。");
+        }
+
+        var model = GetOllamaCatalogModel(item);
+        if (string.IsNullOrWhiteSpace(model)) throw new InvalidOperationException("Ollama 条目缺少 artifact.model。");
+        var normalizedInstallPath = NormalizeOllamaModelsPath(installPath);
+        if (!string.IsNullOrWhiteSpace(normalizedInstallPath))
+        {
+            Directory.CreateDirectory(normalizedInstallPath);
+            SaveOllamaModelsPath(normalizedInstallPath);
+        }
+
+        var job = new ExtensionInstallJobState
+        {
+            JobId = Guid.NewGuid().ToString("N"),
+            ItemId = item.Id,
+            Type = item.Type,
+            DisplayName = item.DisplayName,
+            Model = model,
+            InstallPath = normalizedInstallPath,
+            Status = "running",
+            Stage = "pull",
+            Message = "准备拉取 Ollama 模型。",
+            Percent = 0,
+            StartedAt = DateTimeOffset.Now,
+            UpdatedAt = DateTimeOffset.Now,
+            CanCancel = true,
+            UseAfterInstall = useAfterInstall,
+            SourceUrl = item.Artifact?.Url ?? item.Source ?? entry.CatalogSource,
+            Version = item.Version,
+            InstallHandler = item.InstallHandler,
+        };
+        lock (_extensionInstallJobLock)
+        {
+            _extensionInstallJobs[job.JobId] = job;
+        }
+
+        _ = Task.Run(() => RunOllamaInstallJobAsync(job, item));
+        AddWebActivity("info", "模型安装已开始", $"{item.DisplayName} · {model}");
+        return ToWebInstallJob(job);
+    }
+
+    private object CancelModelInstallJob(JsonElement payload)
+    {
+        var jobId = ReadPayloadString(payload, "jobId", "");
+        if (string.IsNullOrWhiteSpace(jobId)) throw new InvalidOperationException("缺少安装任务 ID。");
+        ExtensionInstallJobState? job;
+        lock (_extensionInstallJobLock)
+        {
+            _extensionInstallJobs.TryGetValue(jobId, out job);
+        }
+        if (job is null) throw new InvalidOperationException($"未找到安装任务：{jobId}");
+        if (!job.CanCancel || job.Status is "succeeded" or "failed" or "cancelled")
+        {
+            return ToWebInstallJob(job);
+        }
+        job.Cancellation.Cancel();
+        try { job.Process?.Kill(entireProcessTree: true); } catch { }
+        UpdateInstallJob(job, "cancelled", "paused", "已暂停安装；再次安装同一模型会复用 Ollama 已下载的层。", job.Percent, canCancel: false);
+        AddWebActivity("warning", "模型安装已暂停", $"{job.DisplayName} · {job.Model}");
+        return ToWebInstallJob(job);
+    }
+
+    private async Task<object> RemoveModelAsync(JsonElement payload)
+    {
+        var model = ReadPayloadString(payload, "model", "").Trim();
+        var id = ReadPayloadString(payload, "id", "").Trim();
+        if (string.IsNullOrWhiteSpace(model) && !string.IsNullOrWhiteSpace(id))
+        {
+            var entries = await LoadExtensionCatalogEntriesAsync(forceRefresh: false);
+            var entry = entries.FirstOrDefault(candidate => string.Equals(candidate.Item.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (entry is not null) model = GetOllamaCatalogModel(entry.Item);
+        }
+        if (string.IsNullOrWhiteSpace(model)) throw new InvalidOperationException("缺少 Ollama 模型名。");
+
+        var environment = BuildOllamaEnvironment(GetConfiguredOllamaModelsPath());
+        var ollamaExe = ResolveOllamaExecutablePath();
+        var result = await RunProcessAsync(ollamaExe, $"rm {model}", _ctiHome, environment, timeoutMs: 300000);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr);
+        }
+
+        RemoveModelInstallLock(model, id);
+        AddWebActivity("info", "Ollama 模型已卸载", model);
+        await RestartBridgeAfterModelChangeAsync($"卸载模型 {model}");
+        return new { removed = model };
+    }
+
+    private async Task<object> UseLocalModelAsync(JsonElement payload)
+    {
+        var model = ReadPayloadString(payload, "model", "").Trim();
+        if (string.IsNullOrWhiteSpace(model)) throw new InvalidOperationException("缺少模型名。");
+        SaveLocalModelSelection(model);
+        AddWebActivity("info", "本地 API 模型已切换", model);
+        await RestartBridgeAfterModelChangeAsync($"切换模型 {model}");
+        return GetSettingsSnapshot();
+    }
+
+    private async Task RunOllamaInstallJobAsync(ExtensionInstallJobState job, ExtensionCatalogItem item)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(job.InstallPath))
+            {
+                UpdateInstallJob(job, "running", "prepare", "正在按配置重启本机 Ollama，让模型目录生效。", job.Percent);
+                await RestartManagedOllamaAsync(job.InstallPath);
+            }
+
+            var environment = BuildOllamaEnvironment(job.InstallPath);
+            using var process = new Process();
+            job.Process = process;
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = ResolveOllamaExecutablePath(),
+                WorkingDirectory = Directory.Exists(_ctiHome) ? _ctiHome : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+                CreateNoWindow = true,
+            };
+            process.StartInfo.ArgumentList.Add("pull");
+            process.StartInfo.ArgumentList.Add(job.Model);
+            foreach (var pair in environment) process.StartInfo.Environment[pair.Key] = pair.Value ?? "";
+            process.OutputDataReceived += (_, e) => { if (e.Data is not null) UpdateInstallJobFromOutput(job, e.Data); };
+            process.ErrorDataReceived += (_, e) => { if (e.Data is not null) UpdateInstallJobFromOutput(job, e.Data); };
+            UpdateInstallJob(job, "running", "pull", $"正在拉取 {job.Model}", job.Percent);
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            await process.WaitForExitAsync(job.Cancellation.Token);
+            if (job.Cancellation.IsCancellationRequested) return;
+            if (process.ExitCode != 0)
+            {
+                UpdateInstallJob(job, "failed", "failed", $"ollama pull 失败，exitCode={process.ExitCode}", job.Percent, canCancel: false, exitCode: process.ExitCode);
+                AddWebActivity("error", "模型安装失败", $"{job.DisplayName} · exitCode={process.ExitCode}");
+                return;
+            }
+
+            WriteModelInstallLock(job, item);
+            UpdateInstallJob(job, "succeeded", "completed", "模型安装完成。", 100, canCancel: false, exitCode: 0);
+            AddWebActivity("info", "模型安装完成", $"{job.DisplayName} · {job.Model}");
+            if (job.UseAfterInstall)
+            {
+                SaveLocalModelSelection(job.Model);
+                await RestartBridgeAfterModelChangeAsync($"安装模型 {job.Model}");
+            }
+            else
+            {
+                await PushWebStateFromAnyThreadAsync();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            UpdateInstallJob(job, "cancelled", "paused", "已暂停安装；再次安装会继续复用 Ollama 缓存。", job.Percent, canCancel: false);
+        }
+        catch (Exception ex)
+        {
+            UpdateInstallJob(job, "failed", "failed", ex.Message, job.Percent, canCancel: false);
+            AddWebActivity("error", "模型安装失败", $"{job.DisplayName} · {ex.Message}");
+        }
+        finally
+        {
+            job.Process = null;
+            job.Cancellation.Dispose();
+        }
+    }
+
+    private async Task RestartManagedOllamaAsync(string ollamaModelsPath)
+    {
+        var environment = BuildOllamaEnvironment(ollamaModelsPath);
+        if (File.Exists(_localLlmStopScript))
+        {
+            await RunPowerShellFileAsync(_localLlmStopScript, "", _suiteRoot, 120000, environment);
+        }
+        if (File.Exists(_localLlmStartScript))
+        {
+            await RunPowerShellFileAsync(_localLlmStartScript, "", _suiteRoot, 120000, environment);
+        }
+    }
+
+    private async Task RestartBridgeAfterModelChangeAsync(string reason)
+    {
+        UpdateInstallJobsMessage($"正在重启 Bridge：{reason}");
+        var result = await RunPowerShellFileAsync(_daemonScript, "restart", _skillDir, 120000);
+        AppendCommand("daemon restart", result);
+        await PushWebStateFromAnyThreadAsync();
+    }
+
+    private Task PushWebStateFromAnyThreadAsync()
+    {
+        if (!InvokeRequired) return PushWebStateAsync();
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        BeginInvoke(async () =>
+        {
+            try
+            {
+                await RefreshAllAsync();
+                await PushWebStateAsync();
+                completion.SetResult();
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        return completion.Task;
+    }
+
+    private Dictionary<string, string?> BuildOllamaEnvironment(string? ollamaModelsPath)
+    {
+        var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var path = NormalizeOllamaModelsPath(ollamaModelsPath);
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            env["OLLAMA_MODELS"] = path;
+        }
+        return env;
+    }
+
+    private string ResolveOllamaExecutablePath()
+    {
+        var configured = GetConfig("CTI_OLLAMA_EXE", GetConfig("OLLAMA_EXE", "")).Trim().Trim('"');
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(configured);
+            if (File.Exists(expanded)) return Path.GetFullPath(expanded);
+            throw new InvalidOperationException($"Ollama CLI 路径无效：{expanded}。请修正 CTI_OLLAMA_EXE，或安装 Ollama 后重启控制面板。");
+        }
+
+        var pathResult = ResolveExecutableFromPath("ollama.exe");
+        if (!string.IsNullOrWhiteSpace(pathResult)) return pathResult;
+
+        var roots = new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+        }.Where(root => !string.IsNullOrWhiteSpace(root));
+        foreach (var root in roots)
+        {
+            foreach (var relative in OllamaRelativeExecutableCandidates)
+            {
+                var candidate = Path.Combine(root, relative);
+                if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+            }
+        }
+
+        throw new InvalidOperationException("未找到 Ollama CLI。请安装 Ollama，或在 config.env 中设置 CTI_OLLAMA_EXE=C:\\路径\\ollama.exe，然后重启控制面板。");
+    }
+
+    private static string ResolveExecutableFromPath(string fileName)
+    {
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                var candidate = Path.Combine(dir.Trim().Trim('"'), fileName);
+                if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+            }
+            catch
+            {
+                // Ignore malformed PATH entries.
+            }
+        }
+        return "";
+    }
+
+    private string GetConfiguredOllamaModelsPath()
+        => NormalizeOllamaModelsPath(GetConfig("CTI_OLLAMA_MODELS_DIR", GetConfig("OLLAMA_MODELS", "")));
+
+    private static string NormalizeOllamaModelsPath(string? value)
+    {
+        var trimmed = (value ?? "").Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(trimmed)) return "";
+        var expanded = Environment.ExpandEnvironmentVariables(trimmed);
+        return Path.GetFullPath(expanded);
+    }
+
+    private void SaveOllamaModelsPath(string ollamaModelsPath)
+    {
+        var normalized = NormalizeOllamaModelsPath(ollamaModelsPath);
+        if (string.IsNullOrWhiteSpace(normalized)) return;
+        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+        var lines = ReadEnvFileLines(_configPath);
+        SetOrAppendEnv(lines, "CTI_OLLAMA_MODELS_DIR", normalized);
+        SetOrAppendEnv(lines, "OLLAMA_MODELS", normalized);
+        File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+        LoadConfig();
+    }
+
+    private void SaveLocalModelSelection(string model)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+        var lines = ReadEnvFileLines(_configPath);
+        SetOrAppendEnv(lines, "CTI_LOCAL_AI_KIND", "ollama");
+        SetOrAppendEnv(lines, "CTI_LOCAL_AI_MODEL", model);
+        SetOrAppendEnv(lines, "CTI_OLLAMA_MODEL", model);
+        SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", "true");
+        File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+        LoadConfig();
+    }
+
+    private void WriteModelInstallLock(ExtensionInstallJobState job, ExtensionCatalogItem item)
+    {
+        var lockFile = ReadExtensionInstallLock();
+        lockFile.Entries.RemoveAll(record =>
+            string.Equals(record.Id, item.Id, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(record.Type, item.Type, StringComparison.OrdinalIgnoreCase));
+        lockFile.Entries.Add(new InstalledExtensionRecord
+        {
+            Id = item.Id,
+            Type = item.Type,
+            DisplayName = item.DisplayName,
+            Version = item.Version,
+            InstallHandler = item.InstallHandler,
+            InstalledAt = DateTimeOffset.Now.ToString("O"),
+            SourceUrl = job.SourceUrl,
+            Sha256 = item.Sha256 ?? "",
+            PackagePath = "",
+            ManifestPath = "",
+            LauncherPath = "",
+            Status = "installed",
+        });
+        SaveExtensionInstallLock(lockFile);
+    }
+
+    private void RemoveModelInstallLock(string model, string id)
+    {
+        var lockFile = ReadExtensionInstallLock();
+        lockFile.Entries.RemoveAll(record =>
+            string.Equals(record.Type, "model", StringComparison.OrdinalIgnoreCase)
+            && (string.Equals(record.Id, id, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(record.SourceUrl, model, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(record.DisplayName, model, StringComparison.OrdinalIgnoreCase)));
+        SaveExtensionInstallLock(lockFile);
+    }
+
+    private void UpdateInstallJobFromOutput(ExtensionInstallJobState job, string line)
+    {
+        var normalized = line.Replace('\r', ' ').Trim();
+        if (string.IsNullOrWhiteSpace(normalized)) return;
+        var percent = ParsePercent(normalized);
+        var message = TrimForStatus(normalized, 160);
+        var nextPercent = percent.HasValue ? Math.Max(job.Percent, percent.Value) : job.Percent;
+        UpdateInstallJob(job, "running", "pull", message, nextPercent);
+    }
+
+    private static int? ParsePercent(string text)
+    {
+        var match = Regex.Match(text, @"(?<percent>\d{1,3})(?:\.\d+)?\s*%");
+        if (!match.Success || !int.TryParse(match.Groups["percent"].Value, out var percent)) return null;
+        return Math.Max(0, Math.Min(100, percent));
+    }
+
+    private void UpdateInstallJobsMessage(string message)
+    {
+        lock (_extensionInstallJobLock)
+        {
+            foreach (var job in _extensionInstallJobs.Values.Where(job => job.Status == "succeeded" && job.UseAfterInstall))
+            {
+                job.Message = message;
+                job.Stage = "restart";
+                job.UpdatedAt = DateTimeOffset.Now;
+            }
+        }
+    }
+
+    private void UpdateInstallJob(ExtensionInstallJobState job, string status, string stage, string message, int percent, bool canCancel = true, int? exitCode = null)
+    {
+        lock (_extensionInstallJobLock)
+        {
+            job.Status = status;
+            job.Stage = stage;
+            job.Message = message;
+            job.Percent = Math.Max(0, Math.Min(100, percent));
+            job.CanCancel = canCancel && status == "running";
+            job.ExitCode = exitCode;
+            job.UpdatedAt = DateTimeOffset.Now;
+            if (status is "succeeded" or "failed" or "cancelled") job.CompletedAt = DateTimeOffset.Now;
+            job.RecentLines.Add(message);
+            if (job.RecentLines.Count > 8) job.RecentLines.RemoveRange(0, job.RecentLines.Count - 8);
+        }
+    }
+
+    private static WebExtensionInstallJob ToWebInstallJob(ExtensionInstallJobState job)
+        => new(
+            job.JobId,
+            job.ItemId,
+            job.Type,
+            job.DisplayName,
+            job.Model,
+            job.InstallPath,
+            job.Status,
+            job.Stage,
+            job.Message,
+            job.Percent,
+            job.CanCancel,
+            job.UseAfterInstall,
+            job.ExitCode,
+            job.StartedAt.ToString("O"),
+            job.UpdatedAt.ToString("O"),
+            job.CompletedAt?.ToString("O") ?? "",
+            job.RecentLines.ToArray());
+
+
     private async Task<WebRemoteInstallResult> InstallCatalogEntryAsync(ExtensionCatalogEntry entry, bool allowUntrusted)
     {
         var item = entry.Item;
@@ -4183,7 +4967,7 @@ internal sealed partial class MainForm : Form
             case "ollama.pull":
                 var model = item.Artifact?.Model ?? item.Source;
                 if (string.IsNullOrWhiteSpace(model)) throw new InvalidOperationException("Ollama 条目缺少 artifact.model。");
-                var ollama = await RunProcessAsync("ollama", $"pull {model}", _ctiHome, timeoutMs: 900000);
+                var ollama = await RunProcessAsync(ResolveOllamaExecutablePath(), $"pull {model}", _ctiHome, BuildOllamaEnvironment(GetConfiguredOllamaModelsPath()), timeoutMs: 900000);
                 if (ollama.ExitCode != 0)
                 {
                     throw new InvalidOperationException(string.IsNullOrWhiteSpace(ollama.Stderr) ? ollama.Stdout : ollama.Stderr);
@@ -4611,16 +5395,45 @@ exit $LASTEXITCODE
 
         if (string.Equals(unitId, "service.codex", StringComparison.OrdinalIgnoreCase))
         {
+            var manifest = LoadRuntimeUnitManifestMap().GetValueOrDefault("service.codex");
             switch (action)
             {
                 case "check":
                     await CheckCodexAsync();
                     return _codexStatus.Text;
                 case "update":
-                    await UpdateCodexCliAsync();
+                    if (manifest?.Update is null)
+                    {
+                        throw new InvalidOperationException("Codex CLI 未声明更新策略。");
+                    }
+                    var codexPlan = ResolveRuntimeUpdatePlan(manifest) ?? throw new InvalidOperationException("Codex CLI 当前不可自动更新。");
+                    if (!codexPlan.CanUpdate) throw new InvalidOperationException(codexPlan.Reason);
+                    _codexStatus.Text = "正在更新 Codex CLI...";
+                    await RunUpdatePlanAsync(codexPlan);
                     return _codexStatus.Text;
                 case "openLocation":
-                    OpenPath(_skillDir);
+                    OpenPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"));
+                    return "opened";
+            }
+        }
+
+        if (string.Equals(unitId, "service.feishuCli", StringComparison.OrdinalIgnoreCase))
+        {
+            var manifest = LoadRuntimeUnitManifestMap().GetValueOrDefault("service.feishuCli")
+                ?? throw new InvalidOperationException("飞书 CLI 未声明 runtime manifest。");
+            switch (action)
+            {
+                case "check":
+                    var checkInstallRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
+                    return BuildFeishuCliDetail(checkInstallRoot, ResolveRuntimeVersion(manifest, checkInstallRoot), ResolveRuntimeUpdatePlan(manifest));
+                case "update":
+                    var feishuPlan = ResolveRuntimeUpdatePlan(manifest) ?? throw new InvalidOperationException("飞书 CLI 当前不可自动更新。");
+                    if (!feishuPlan.CanUpdate) throw new InvalidOperationException(feishuPlan.Reason);
+                    await RunUpdatePlanAsync(feishuPlan);
+                    var updatedInstallRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
+                    return BuildFeishuCliDetail(updatedInstallRoot, ResolveRuntimeVersion(manifest, updatedInstallRoot), ResolveRuntimeUpdatePlan(manifest));
+                case "openLocation":
+                    OpenPath(ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd));
                     return "opened";
             }
         }
@@ -4674,6 +5487,15 @@ exit $LASTEXITCODE
                     }
                     await InstallExtensionAsync(manifest.ManifestPath);
                     return "installed";
+                case "update":
+                    var mcpPlan = ResolveManifestUpdatePlan(
+                        manifest.ManifestPath ?? "",
+                        ResolveManifestDirectory(manifest.Cwd, manifest),
+                        FormatManifestSource(manifest.Source, manifest))
+                        ?? throw new InvalidOperationException("当前 MCP 未声明更新策略。");
+                    if (!mcpPlan.CanUpdate) throw new InvalidOperationException(mcpPlan.Reason);
+                    await RunUpdatePlanAsync(mcpPlan);
+                    return "updated";
             }
         }
 
@@ -4694,6 +5516,17 @@ exit $LASTEXITCODE
                 case "install":
                     await InstallExtensionAsync(manifestPath);
                     return "installed";
+                case "update":
+                    var updatePlan = ResolveManifestUpdatePlan(
+                        manifestPath,
+                        BuildExtensionItems().FirstOrDefault(candidate => string.Equals(candidate.ManifestPath, manifestPath, StringComparison.OrdinalIgnoreCase)) is { } extensionItem
+                            ? ExpandManifestValue(extensionItem.Source)
+                            : "",
+                        BuildExtensionItems().FirstOrDefault(candidate => string.Equals(candidate.ManifestPath, manifestPath, StringComparison.OrdinalIgnoreCase))?.Source ?? "")
+                        ?? throw new InvalidOperationException("当前扩展未声明更新策略。");
+                    if (!updatePlan.CanUpdate) throw new InvalidOperationException(updatePlan.Reason);
+                    await RunUpdatePlanAsync(updatePlan);
+                    return "updated";
                 case "openManifest":
                     OpenPath(manifestPath);
                     return "opened";
@@ -4933,6 +5766,11 @@ exit $LASTEXITCODE
 
     private void AddWebActivity(string level, string title, string message)
     {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => AddWebActivity(level, title, message));
+            return;
+        }
         var record = new WebActivityRecord(level, title, MaskSecrets(message), DateTime.Now.ToString("HH:mm:ss"));
         _activities.Add(record);
         if (_activities.Count > 500) _activities.RemoveRange(0, _activities.Count - 500);
@@ -4952,7 +5790,7 @@ exit $LASTEXITCODE
             CreateCardButton("日志", async () => await RunDaemonAsync("logs 120")));
         AddStatusCard(layout, "Codex CLI", _codexStatus, 1,
             CreateCardButton("检查", async () => await CheckCodexAsync()),
-            CreateCardButton("更新", async () => await UpdateCodexCliAsync()),
+            CreateCardButton("更新", async () => await InvokeRuntimeUnitActionAsync("service.codex", "update")),
             CreateCardButton("混合模式", async () => await SetRouterModeAsync("hybrid")),
             CreateCardButton("仅本地", async () => await SetRouterModeAsync("local_only")),
             CreateCardButton("仅 Codex", async () => await SetRouterModeAsync("codex_only")),
@@ -5361,6 +6199,7 @@ exit $LASTEXITCODE
         GetConfig("CTI_REPLY_STYLE_HINT", ""),
         NormalizeLocalAiKind(GetConfig("CTI_LOCAL_AI_KIND", "ollama")),
         GetConfig("CTI_LOCAL_AI_BASE_URL", GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434")),
+        GetConfiguredOllamaModelsPath(),
         GetConfig("CTI_LOCAL_AI_MODEL", GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b")),
         "keep",
         "",
@@ -5368,6 +6207,8 @@ exit $LASTEXITCODE
         !string.IsNullOrWhiteSpace(GetConfig("CTI_LOCAL_AI_API_KEY", "")),
         GetConfig("CTI_LOCAL_AI_TIMEOUT_MS", GetConfig("CTI_OLLAMA_TIMEOUT_MS", "45000")),
         NormalizeCodexModelSource(GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource())),
+        NormalizeCodexRoutingMode(GetConfig("CTI_CODEX_ROUTING_MODE", "manual")),
+        NormalizeCodexApiFallbackChain(GetConfig("CTI_CODEX_API_FALLBACK_CHAIN", "local_api,external_api")),
         GetConfig("CTI_CODEX_BASE_URL", ""),
         GetConfig("CTI_CODEX_MODEL", ""),
         string.Equals(GetConfig("CTI_CODEX_PASS_MODEL", "false"), "true", StringComparison.OrdinalIgnoreCase),
@@ -5411,6 +6252,12 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_KIND", NormalizeLocalAiKind(settings.LocalAiKind));
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_BASE_URL", settings.LocalAiBaseUrl.Trim());
+        if (!string.IsNullOrWhiteSpace(settings.OllamaModelsDir))
+        {
+            var ollamaModelsDir = NormalizeOllamaModelsPath(settings.OllamaModelsDir);
+            SetOrAppendEnv(lines, "CTI_OLLAMA_MODELS_DIR", ollamaModelsDir);
+            SetOrAppendEnv(lines, "OLLAMA_MODELS", ollamaModelsDir);
+        }
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_MODEL", settings.LocalAiModel.Trim());
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_TIMEOUT_MS", NormalizePositiveNumber(settings.LocalAiTimeoutMs, "45000"));
         ApplySecretEnv(lines, "CTI_LOCAL_AI_API_KEY", settings.LocalAiApiKeyAction, settings.LocalAiApiKeyValue);
@@ -5418,16 +6265,18 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_OLLAMA_MODEL", settings.LocalAiModel.Trim());
         SetOrAppendEnv(lines, "CTI_OLLAMA_TIMEOUT_MS", NormalizePositiveNumber(settings.LocalAiTimeoutMs, "45000"));
         SetOrAppendEnv(lines, "CTI_CODEX_MODEL_SOURCE", NormalizeCodexModelSource(settings.CodexModelSource));
+        SetOrAppendEnv(lines, "CTI_CODEX_ROUTING_MODE", NormalizeCodexRoutingMode(settings.CodexRoutingMode));
+        SetOrAppendEnv(lines, "CTI_CODEX_API_FALLBACK_CHAIN", NormalizeCodexApiFallbackChain(settings.CodexApiFallbackChain));
         SetOrAppendEnv(lines, "CTI_CODEX_BASE_URL", settings.CodexBaseUrl.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_MODEL", settings.CodexModel.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", settings.CodexPassModel ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_CODEX_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexReasoningEffort));
-        SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_ENABLED", settings.CodexLocalFallbackEnabled ? "true" : "false");
+        SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_ENABLED", "false");
         SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexLocalFallbackReasoningEffort));
-        SetOrAppendEnv(lines, "CTI_CODEX_FAILURE_FALLBACK_MODE", NormalizeCodexFailureFallbackMode(settings.CodexFailureFallbackMode));
+        SetOrAppendEnv(lines, "CTI_CODEX_FAILURE_FALLBACK_MODE", "none");
         SetOrAppendEnv(lines, "CTI_LOCAL_AGENT_MODE", NormalizeLocalAgentMode(settings.LocalAgentMode));
-        SetOrAppendEnv(lines, "CTI_LOCAL_TOOL_CALL_REQUIRED", settings.LocalToolCallRequired ? "true" : "false");
-        SetOrAppendEnv(lines, "CTI_EXECUTION_REQUIRED_ROUTE", NormalizeExecutionRequiredRoute(settings.ExecutionRequiredRoute));
+        SetOrAppendEnv(lines, "CTI_LOCAL_TOOL_CALL_REQUIRED", "false");
+        SetOrAppendEnv(lines, "CTI_EXECUTION_REQUIRED_ROUTE", "primary");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", settings.MemoryOptimizerEnabled ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(settings.MemoryOptimizerModelSource));
@@ -5703,6 +6552,31 @@ exit $LASTEXITCODE
         return value is "official" or "local_api" or "external_api" ? value : "official";
     }
 
+    private static string NormalizeCodexRoutingMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value == "auto_failover" ? "auto_failover" : "manual";
+    }
+
+    private static string NormalizeCodexApiFallbackChain(string value)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var ordered = new List<string>();
+        foreach (var part in (value ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var source = NormalizeCodexModelSource(part);
+            if (source == "official" && !string.Equals(part, "official", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (seen.Add(source))
+            {
+                ordered.Add(source);
+            }
+        }
+        return ordered.Count > 0 ? string.Join(",", ordered) : "local_api,external_api";
+    }
+
     private static string NormalizeCodexFailureFallbackMode(string value)
     {
         value = (value ?? "").Trim().ToLowerInvariant();
@@ -5961,35 +6835,6 @@ exit $LASTEXITCODE
             degradation,
         });
         if (!updateOnly) AppendCommand("codex version", result);
-    }
-
-    private async Task UpdateCodexCliAsync()
-    {
-        if (!CodexSupportsNpmUpdate())
-        {
-            _codexStatus.Text = string.Join(Environment.NewLine, new[]
-            {
-                "Codex CLI 当前来源不支持面板自动更新",
-                "仅支持 npm 全局安装的 @openai/codex",
-                "请先检查 codex 命令来源。",
-            });
-            AppendLog("Codex CLI 更新跳过：当前 codex 命令不是 npm 全局 @openai/codex。");
-            return;
-        }
-
-        _codexStatus.Text = "正在更新 Codex CLI...";
-        var result = await RunProcessAsync("cmd.exe", "/c npm install -g @openai/codex@latest", _skillDir, timeoutMs: 300000);
-        AppendCommand("更新 Codex CLI", result);
-        await CheckCodexAsync(true);
-        if (result.ExitCode != 0)
-        {
-            _codexStatus.Text = string.Join(Environment.NewLine, new[]
-            {
-                "Codex CLI 更新失败",
-                FirstNonEmptyLine(result.Stderr) ?? FirstNonEmptyLine(result.Stdout) ?? "未知错误",
-                _codexStatus.Text,
-            });
-        }
     }
 
     private async Task CheckLocalLlmAsync(bool updateOnly = false)
@@ -6341,7 +7186,7 @@ exit $LASTEXITCODE
             var mode = passed ? "agent_verified" : "text_only";
             var message = passed
                 ? "本地 API 已返回结构化 tool_calls；可作为受控工具模型候选，仍需运行时执行证据验收。"
-                : "本地 API 在线，但没有返回结构化 tool_calls；执行类任务会转交官方/外部 Codex 或被拒绝。";
+                : "本地 API 在线，但没有返回结构化 tool_calls；新路由不会因此自动转官方 Codex。";
             var result = WriteLocalToolCapabilityResult(kind, baseUrl, model, state, mode, message, endpoint, count, string.Join(", ", names), contentPreview);
             return result;
         }
@@ -9117,23 +9962,6 @@ exit $LASTEXITCODE
             _ => "Ollama",
         };
 
-    private static bool CodexSupportsNpmUpdate()
-    {
-        try
-        {
-            var npmRoot = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "npm");
-            var codexShim = Path.Combine(npmRoot, "codex.ps1");
-            var codexPackage = Path.Combine(npmRoot, "node_modules", "@openai", "codex", "package.json");
-            return File.Exists(codexShim) && File.Exists(codexPackage);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     private static string FormatLastBrainStatus(LocalLlmStatusRecord status)
     {
         var routeLabel = (status.LastRouteLabel ?? "").Trim().ToLowerInvariant();
@@ -9345,7 +10173,13 @@ internal sealed record WebExtensionCatalogSnapshot(
     string Protocol,
     string RefreshedAt,
     int SourceCount,
+    WebExtensionCatalogLayerCounts LayerCounts,
     WebExtensionCatalogItem[] Items);
+
+internal sealed record WebExtensionCatalogLayerCounts(
+    int Seed,
+    int Dynamic,
+    int CustomUrl);
 
 internal sealed record WebExtensionCatalogItem(
     string Id,
@@ -9357,6 +10191,11 @@ internal sealed record WebExtensionCatalogItem(
     string InstallHandler,
     string? ArtifactUrl,
     string CatalogSource,
+    string SourceLayer,
+    string SourceName,
+    string FetchedAt,
+    string RankBasis,
+    int RankOrder,
     bool Trusted,
     string TrustReason,
     bool CanInstall,
@@ -9388,8 +10227,71 @@ internal sealed record WebRemoteInstallResult(
     string ManifestPath,
     string LauncherPath);
 
-internal sealed record ExtensionCatalogEntry(ExtensionCatalogItem Item, string CatalogSource, bool Trusted);
+internal sealed record WebExtensionInstallJob(
+    string JobId,
+    string ItemId,
+    string Type,
+    string DisplayName,
+    string Model,
+    string InstallPath,
+    string Status,
+    string Stage,
+    string Message,
+    int Percent,
+    bool CanCancel,
+    bool UseAfterInstall,
+    int? ExitCode,
+    string StartedAt,
+    string UpdatedAt,
+    string CompletedAt,
+    string[] RecentLines);
+
+internal sealed class ExtensionInstallJobState
+{
+    public string JobId { get; set; } = "";
+    public string ItemId { get; set; } = "";
+    public string Type { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public string Model { get; set; } = "";
+    public string InstallPath { get; set; } = "";
+    public string Status { get; set; } = "pending";
+    public string Stage { get; set; } = "";
+    public string Message { get; set; } = "";
+    public int Percent { get; set; }
+    public bool CanCancel { get; set; }
+    public bool UseAfterInstall { get; set; }
+    public int? ExitCode { get; set; }
+    public string SourceUrl { get; set; } = "";
+    public string Version { get; set; } = "";
+    public string InstallHandler { get; set; } = "";
+    public DateTimeOffset StartedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public List<string> RecentLines { get; } = [];
+    public CancellationTokenSource Cancellation { get; } = new();
+    public Process? Process { get; set; }
+}
+
+internal sealed record ExtensionCatalogEntry(
+    ExtensionCatalogItem Item,
+    string CatalogSource,
+    bool Trusted,
+    string SourceLayer,
+    string SourceName,
+    string FetchedAt,
+    string RankBasis,
+    int RankOrder);
 internal sealed record CatalogInstalledManifest(string Id, string Type, string DisplayName, string Version, string ManifestPath);
+internal sealed record DynamicCatalogCacheSnapshot(string Protocol, string GeneratedAt, int TopN, string[] Providers, CachedExtensionCatalogEntry[] Items);
+internal sealed record CachedExtensionCatalogEntry(
+    ExtensionCatalogItem Item,
+    string CatalogSource,
+    bool Trusted,
+    string SourceLayer,
+    string SourceName,
+    string FetchedAt,
+    string RankBasis,
+    int RankOrder);
 
 internal sealed class ExtensionCatalogItem
 {
@@ -9531,7 +10433,7 @@ internal sealed class PermissionCandidate
     public int MessageCount { get; set; }
 }
 
-internal sealed record WebRuntimeAction(string Id, string Label, bool Enabled);
+internal sealed record WebRuntimeAction(string Id, string Label, bool Enabled, string Reason = "");
 internal sealed record WebRuntimeUnit(
     string UnitId,
     string Id,
@@ -9878,6 +10780,7 @@ internal sealed record SettingsSnapshot(
     string ReplyStyleHint,
     string LocalAiKind = "ollama",
     string LocalAiBaseUrl = "http://127.0.0.1:11434",
+    string OllamaModelsDir = "",
     string LocalAiModel = "qwen2.5-coder:7b",
     string LocalAiApiKeyAction = "keep",
     string LocalAiApiKeyValue = "",
@@ -9885,6 +10788,8 @@ internal sealed record SettingsSnapshot(
     bool LocalAiApiKeySet = false,
     string LocalAiTimeoutMs = "45000",
     string CodexModelSource = "official",
+    string CodexRoutingMode = "manual",
+    string CodexApiFallbackChain = "local_api,external_api",
     string CodexBaseUrl = "",
     string CodexModel = "",
     bool CodexPassModel = false,

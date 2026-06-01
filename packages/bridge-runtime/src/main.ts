@@ -172,6 +172,101 @@ function summarizeCodexFailureMessage(message: string): string {
   return truncatePreview(message, 180) || 'Codex 当前不可用。';
 }
 
+function shouldAutoRetryWorkflowError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error || '')).toLowerCase();
+  if (!message.trim()) return true;
+  if (message.includes('usage limit')) return false;
+  if (message.includes('401 unauthorized') || message.includes('refresh token') || message.includes('authentication token')) return false;
+  if (message.includes('method not allowed') || message.includes('unexpected status 405')) return false;
+  if (message.includes('/v1/responses')) return false;
+  if (message.includes('invalid request parameter')) return false;
+  return true;
+}
+
+type CodexModelSource = 'local_api' | 'external_api' | 'official';
+
+function isCodexApiFailoverError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error || '')).toLowerCase();
+  if (!message.trim()) return false;
+  return [
+    'usage limit',
+    'rate limit',
+    'quota',
+    '429',
+    '401 unauthorized',
+    '403 forbidden',
+    'refresh token',
+    'authentication token',
+    'api key',
+    'method not allowed',
+    'unexpected status 405',
+    '/v1/responses',
+    'invalid request parameter',
+    'econnrefused',
+    'connection refused',
+    'could not connect',
+    'econnreset',
+    'enotfound',
+    'etimedout',
+    'timeout',
+    'fetch failed',
+    'socket hang up',
+    'status 500',
+    'status 502',
+    'status 503',
+    'status 504',
+    '不能作为 codex agent',
+    '不支持 codex agent',
+    '尚未支持该 local-provider',
+    'unsupported codex agent',
+  ].some((needle) => message.includes(needle));
+}
+
+function parseSseChunk(chunk: string): Array<{ type: string; data: string }> {
+  const events: Array<{ type: string; data: string }> = [];
+  for (const line of chunk.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const raw = trimmed.slice(5).trim();
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw) as { type?: unknown; data?: unknown };
+      if (typeof parsed.type !== 'string') continue;
+      events.push({
+        type: parsed.type,
+        data: typeof parsed.data === 'string' ? parsed.data : JSON.stringify(parsed.data ?? ''),
+      });
+    } catch {
+      // Ignore malformed diagnostic chunks.
+    }
+  }
+  return events;
+}
+
+function getBufferedFailoverError(chunks: string[]): string | null {
+  const events = chunks.flatMap(parseSseChunk);
+  const errorEvent = events.find((event) => event.type === 'error');
+  if (!errorEvent?.data) return null;
+  const hasUserVisibleOrToolOutput = events.some((event) => (
+    event.type === 'text'
+    || event.type === 'tool_use'
+    || event.type === 'tool_result'
+    || event.type === 'result'
+  ));
+  return hasUserVisibleOrToolOutput ? null : errorEvent.data;
+}
+
+function isCodexSourceConfigured(config: Config, source: CodexModelSource): boolean {
+  if (source === 'official') return true;
+  if (source === 'local_api') {
+    return !!(config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl);
+  }
+  if (source === 'external_api') {
+    return !!config.codexBaseUrl;
+  }
+  return false;
+}
+
 const TOOL_EXECUTION_PROMPT_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|模型|看一眼|查一下|分析一下|整理.*列表)/i;
 
 function requiresConcreteToolOutput(taskKind: LocalTaskKind, prompt: string): boolean {
@@ -211,6 +306,78 @@ function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistor
   return merged || undefined;
 }
 
+class CodexApiFailoverProvider implements LLMProvider {
+  constructor(
+    private readonly providers: Array<{ source: CodexModelSource; provider: LLMProvider }>,
+  ) {}
+
+  streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
+    const providers = this.providers;
+    return new ReadableStream<string>({
+      start: async (controller) => {
+        const attemptedSources: CodexModelSource[] = [];
+        let lastError: unknown;
+        for (const candidate of providers) {
+          attemptedSources.push(candidate.source);
+          const buffered: string[] = [];
+          try {
+            controller.enqueue(sseEvent('status', {
+              provider: 'codex',
+              modelSource: candidate.source,
+              selectedSource: candidate.source,
+              attemptedSources,
+            }));
+            const stream = candidate.provider.streamChat(params);
+            const reader = stream.getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffered.push(value);
+            }
+            const bufferedFailoverError = getBufferedFailoverError(buffered);
+            if (bufferedFailoverError && isCodexApiFailoverError(bufferedFailoverError)) {
+              lastError = new Error(bufferedFailoverError);
+              controller.enqueue(sseEvent('status', {
+                provider: 'codex',
+                modelSource: candidate.source,
+                selectedSource: candidate.source,
+                attemptedSources,
+                failover: true,
+                error: summarizeCodexFailureMessage(bufferedFailoverError),
+              }));
+              continue;
+            }
+            for (const chunk of buffered) controller.enqueue(chunk);
+            controller.close();
+            return;
+          } catch (error) {
+            lastError = error;
+            if (!isCodexApiFailoverError(error)) throw error;
+            const message = error instanceof Error ? error.message : String(error);
+            controller.enqueue(sseEvent('status', {
+              provider: 'codex',
+              modelSource: candidate.source,
+              selectedSource: candidate.source,
+              attemptedSources,
+              failover: true,
+              error: summarizeCodexFailureMessage(message),
+            }));
+          }
+        }
+        const finalMessage = lastError instanceof Error ? lastError.message : String(lastError || 'Codex API failover exhausted');
+        if (finalMessage.toLowerCase().includes('/v1/responses')) {
+          throw new Error(
+            '本地 API 协议不兼容：当前 Codex SDK 会调用 Responses/WebSocket 接口 `/v1/responses`，' +
+            '但 Ollama 的 OpenAI 兼容层只提供 Chat Completions，无法直接作为 Codex agent 后端。' +
+            ` 原始错误：${truncatePreview(finalMessage, 220)}`,
+          );
+        }
+        throw lastError instanceof Error ? lastError : new Error(finalMessage);
+      },
+    });
+  }
+}
+
 class HubLlmProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
@@ -242,33 +409,36 @@ class HubLlmProvider implements LLMProvider {
     return new ReadableStream<string>({
       start: async (controller) => {
         const workflowRun = this.startObservedWorkflow(params, 'hybrid');
+        const evidence = emptyStreamEvidence();
+        seedExecutionRequirementEvidence(evidence, params);
+        const observedController = createObservedController(controller, evidence);
         let workflowFailed = false;
         try {
         const conservative = decideConservativeRoute(params, this.config);
         if (shouldRunPreCodexLocalFastPath(routerMode)) {
           if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
             try {
-              const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(controller, params, routerMode);
+              const mcpResult = await this.localAgent.handleMcpBridgeFastPathV2(observedController, params, routerMode);
               if (mcpResult.handled) return;
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
-              await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
+              await this.dispatchAfterRouteFailure(observedController, params, conservative, routerMode, message);
               return;
             }
           }
         }
         if (routerMode === 'hybrid') {
-          await this.pipeCodexPrimaryWithFallback(controller, params, conservative, '默认直达 Codex（Codex 主脑）');
+          await this.pipeCodexPrimaryWithFallback(observedController, params, conservative, '默认直达 Codex（Codex 主脑）');
           return;
         }
         if (routerMode === 'local_only') {
-          await this.pipeLocalAgentApiFallback(controller, params, conservative, '当前模式为仅本地 Agent API');
+          await this.pipeLocalAgentApiFallback(observedController, params, conservative, '当前模式为仅本地 Agent API');
           return;
         }
         try {
           const routeAttempt = await this.localProvider.route(params);
           const route = this.applySafetyOverride(routeAttempt.route, conservative);
-          await this.dispatchByRoute(controller, params, route, routerMode, conservative);
+          await this.dispatchByRoute(observedController, params, route, routerMode, conservative);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const current = readLocalLlmStatus(this.config);
@@ -279,15 +449,19 @@ class HubLlmProvider implements LLMProvider {
             serverReachable: false,
             lastCheckAt: new Date().toISOString(),
           });
-          await this.dispatchAfterRouteFailure(controller, params, conservative, routerMode, message);
+          await this.dispatchAfterRouteFailure(observedController, params, conservative, routerMode, message);
         }
         } catch (error) {
           workflowFailed = true;
+          flushWorkflowEvidence(workflowRun.id, evidence);
           failWorkflowRun(workflowRun.id, error);
-          requestWorkflowRetry(workflowRun.id, 'auto');
+          if (shouldAutoRetryWorkflowError(error)) {
+            requestWorkflowRetry(workflowRun.id, 'auto');
+          }
           throw error;
         } finally {
           if (!workflowFailed) {
+            flushWorkflowEvidence(workflowRun.id, evidence);
             completeWorkflowRun(workflowRun.id);
           }
         }
@@ -567,9 +741,7 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
     params: Parameters<LLMProvider['streamChat']>[0],
   ): boolean {
-    if (this.config.codexModelSource !== 'local_api') return false;
-    if (!requiresConcreteToolOutput(conservative.requestKind, params.prompt)) return false;
-    return !shouldTrustLocalApiForExecution(this.config);
+    return false;
   }
 
   private buildLocalApiUnverifiedReply(): string {
@@ -769,6 +941,8 @@ class HubLlmProvider implements LLMProvider {
       lastCheckAt: new Date().toISOString(),
       lastError: '',
     });
+    const localModel = this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel;
+    const localBaseUrl = this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl;
     controller.enqueue(sseEvent('status', {
       provider: summary.provider,
       routeMode: summary.mode,
@@ -776,6 +950,13 @@ class HubLlmProvider implements LLMProvider {
       routeReason: summary.reason,
       compressedPromptChars: summary.compressedPromptChars,
       compressedHistoryChars: summary.compressedHistoryChars,
+      ...(summary.provider === 'local_best_effort'
+        ? {
+            modelSource: 'local_api',
+            ...(localModel ? { model: localModel } : {}),
+            ...(localBaseUrl ? { baseUrl: localBaseUrl } : {}),
+          }
+        : {}),
     }));
     controller.enqueue(sseEvent('text', text));
     controller.enqueue(sseEvent('result', {
@@ -823,6 +1004,9 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
   ];
   const toolingFiles = [
     path.join(SKILL_ROOT, 'src', 'codex-provider.ts'),
+    path.join(SKILL_ROOT, 'src', 'codex-local-cli-provider.ts'),
+    path.join(SKILL_ROOT, 'src', 'local-agent-tool-protocol.ts'),
+    path.join(SKILL_ROOT, 'src', 'local-codex-provider-registry.ts'),
     path.join(SKILL_ROOT, 'src', 'llm-provider.ts'),
     path.join(SKILL_ROOT, 'src', 'main.ts'),
     path.join(SKILL_ROOT, 'src', 'local-llm-provider.ts'),
@@ -845,8 +1029,28 @@ interface StreamEvidence {
   provider?: string;
   codexProfile?: string;
   modelSource?: string;
+  attemptedSources?: string[];
+  selectedSource?: CodexModelSource;
   model?: string;
   baseUrl?: string;
+  requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+  evidenceSatisfied?: boolean;
+  noEvidenceRetryAttempted?: boolean;
+  requiredToolFamilies?: string[];
+  evidenceProtocol?: string;
+  requestedTool?: string;
+  executedTool?: string;
+  jsonToolRetryAttempted?: boolean;
+  jsonToolFallbackUsed?: boolean;
+  shellExitCode?: number;
+  shellDurationMs?: number;
+  tokenUsage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    total_tokens?: number;
+  };
 }
 
 function emptyStreamEvidence(): StreamEvidence {
@@ -859,26 +1063,29 @@ function emptyStreamEvidence(): StreamEvidence {
   };
 }
 
+function seedExecutionRequirementEvidence(evidence: StreamEvidence, params: Parameters<LLMProvider['streamChat']>[0]): void {
+  const requirement = params.executionRequirement;
+  if (!requirement) return;
+  evidence.requiredEvidenceKind = requirement.kind;
+  evidence.evidenceSatisfied = requirement.kind === 'none';
+  evidence.requiredToolFamilies = requirement.requiredToolFamilies;
+  evidence.noEvidenceRetryAttempted = params.noEvidenceRetryAttempted === true;
+}
+
+function readUsageNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return undefined;
+}
+
 function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
-  for (const line of value.split('\n')) {
-    if (!line.startsWith('data: ')) continue;
-    let event: { type?: string; data?: unknown };
-    try {
-      event = JSON.parse(line.slice(6));
-    } catch {
-      continue;
-    }
-    let data: Record<string, unknown> | null = null;
-    if (typeof event.data === 'string') {
-      try {
-        const parsed = JSON.parse(event.data);
-        if (parsed && typeof parsed === 'object') data = parsed as Record<string, unknown>;
-      } catch {
-        data = null;
-      }
-    } else if (event.data && typeof event.data === 'object') {
-      data = event.data as Record<string, unknown>;
-    }
+  for (const event of parseBridgeSseEvents(value)) {
+    const data = event.data && typeof event.data === 'object'
+      ? event.data as Record<string, unknown>
+      : null;
     if (event.type === 'tool_use') {
       evidence.toolUseCount += 1;
       const name = typeof data?.name === 'string' ? data.name.trim() : '';
@@ -891,6 +1098,9 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
         evidence.failedToolResultCount += 1;
       } else {
         evidence.successfulToolResultCount += 1;
+        if (evidence.requiredEvidenceKind && evidence.requiredEvidenceKind !== 'none') {
+          evidence.evidenceSatisfied = true;
+        }
       }
       continue;
     }
@@ -898,10 +1108,97 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       if (typeof data.provider === 'string') evidence.provider = data.provider;
       if (typeof data.codexProfile === 'string') evidence.codexProfile = data.codexProfile;
       if (typeof data.modelSource === 'string') evidence.modelSource = data.modelSource;
+      if (Array.isArray(data.attemptedSources)) evidence.attemptedSources = data.attemptedSources.filter((item): item is string => typeof item === 'string');
+      if (data.selectedSource === 'local_api' || data.selectedSource === 'external_api' || data.selectedSource === 'official') evidence.selectedSource = data.selectedSource;
       if (typeof data.model === 'string') evidence.model = data.model;
       if (typeof data.baseUrl === 'string') evidence.baseUrl = data.baseUrl;
+      if (typeof data.evidenceProtocol === 'string') evidence.evidenceProtocol = data.evidenceProtocol;
+      if (typeof data.requestedTool === 'string') evidence.requestedTool = data.requestedTool;
+      if (typeof data.executedTool === 'string') evidence.executedTool = data.executedTool;
+      if (typeof data.jsonToolRetryAttempted === 'boolean') evidence.jsonToolRetryAttempted = data.jsonToolRetryAttempted;
+      if (typeof data.jsonToolFallbackUsed === 'boolean') evidence.jsonToolFallbackUsed = data.jsonToolFallbackUsed;
+      if (typeof data.shellExitCode === 'number') evidence.shellExitCode = data.shellExitCode;
+      if (typeof data.shellDurationMs === 'number') evidence.shellDurationMs = data.shellDurationMs;
+      if (typeof data.evidenceSatisfied === 'boolean') evidence.evidenceSatisfied = data.evidenceSatisfied;
+      continue;
+    }
+    if (event.type === 'result' && data) {
+      const usage = data.usage && typeof data.usage === 'object'
+        ? data.usage as Record<string, unknown>
+        : null;
+      if (!usage) continue;
+      const inputTokens = readUsageNumber(usage.input_tokens);
+      const outputTokens = readUsageNumber(usage.output_tokens);
+      const cacheReadInputTokens = readUsageNumber(usage.cache_read_input_tokens);
+      const cacheCreationInputTokens = readUsageNumber(usage.cache_creation_input_tokens);
+      if (
+        inputTokens === undefined
+        && outputTokens === undefined
+        && cacheReadInputTokens === undefined
+        && cacheCreationInputTokens === undefined
+      ) {
+        continue;
+      }
+      evidence.tokenUsage = {
+        ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+        ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+        ...(cacheReadInputTokens !== undefined ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
+        ...(cacheCreationInputTokens !== undefined ? { cache_creation_input_tokens: cacheCreationInputTokens } : {}),
+        ...((inputTokens !== undefined || outputTokens !== undefined)
+          ? { total_tokens: (inputTokens || 0) + (outputTokens || 0) }
+          : {}),
+      };
     }
   }
+}
+
+function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
+  const payload: Record<string, unknown> = {
+    toolUseCount: evidence.toolUseCount,
+    toolResultCount: evidence.toolResultCount,
+    successfulToolResultCount: evidence.successfulToolResultCount,
+    failedToolResultCount: evidence.failedToolResultCount,
+    toolNames: evidence.toolNames,
+  };
+  if (evidence.provider) payload.provider = evidence.provider;
+  if (evidence.codexProfile) payload.codexProfile = evidence.codexProfile;
+  if (evidence.modelSource) payload.modelSource = evidence.modelSource;
+  if (evidence.attemptedSources?.length) payload.attemptedSources = evidence.attemptedSources;
+  if (evidence.selectedSource) payload.selectedSource = evidence.selectedSource;
+  if (evidence.model) payload.model = evidence.model;
+  if (evidence.baseUrl) payload.baseUrl = evidence.baseUrl;
+  if (evidence.requiredEvidenceKind) payload.requiredEvidenceKind = evidence.requiredEvidenceKind;
+  if (typeof evidence.evidenceSatisfied === 'boolean') payload.evidenceSatisfied = evidence.evidenceSatisfied;
+  if (typeof evidence.noEvidenceRetryAttempted === 'boolean') payload.noEvidenceRetryAttempted = evidence.noEvidenceRetryAttempted;
+  if (evidence.requiredToolFamilies?.length) payload.requiredToolFamilies = evidence.requiredToolFamilies;
+  if (evidence.evidenceProtocol) payload.evidenceProtocol = evidence.evidenceProtocol;
+  if (evidence.requestedTool) payload.requestedTool = evidence.requestedTool;
+  if (evidence.executedTool) payload.executedTool = evidence.executedTool;
+  if (typeof evidence.jsonToolRetryAttempted === 'boolean') payload.jsonToolRetryAttempted = evidence.jsonToolRetryAttempted;
+  if (typeof evidence.jsonToolFallbackUsed === 'boolean') payload.jsonToolFallbackUsed = evidence.jsonToolFallbackUsed;
+  if (typeof evidence.shellExitCode === 'number') payload.shellExitCode = evidence.shellExitCode;
+  if (typeof evidence.shellDurationMs === 'number') payload.shellDurationMs = evidence.shellDurationMs;
+  if (evidence.tokenUsage) payload.tokenUsage = evidence.tokenUsage;
+  appendWorkflowEvent(runId, 'finalizing', 'execution.evidence', '执行证据已记录', payload);
+}
+
+function createObservedController(
+  controller: ReadableStreamDefaultController<string>,
+  evidence: StreamEvidence,
+): ReadableStreamDefaultController<string> {
+  return {
+    enqueue(value: string) {
+      collectStreamEvidence(value, evidence);
+      controller.enqueue(value);
+    },
+    close() {
+      controller.close();
+    },
+    error(reason?: unknown) {
+      controller.error(reason);
+    },
+    desiredSize: controller.desiredSize,
+  } as ReadableStreamDefaultController<string>;
 }
 
 class ObservedLLMProvider implements LLMProvider {
@@ -936,6 +1233,9 @@ class ObservedLLMProvider implements LLMProvider {
           userDisplayName: params.sourceUserDisplayName,
           messageId: params.sourceMessageId,
         });
+        const evidence = emptyStreamEvidence();
+        seedExecutionRequirementEvidence(evidence, params);
+        const observedController = createObservedController(controller, evidence);
         try {
           appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
           appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话和工作区上下文已准备');
@@ -968,22 +1268,23 @@ class ObservedLLMProvider implements LLMProvider {
           });
           const stream = this.provider.streamChat(params);
           const reader = stream.getReader();
-          const evidence = emptyStreamEvidence();
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            collectStreamEvidence(value, evidence);
-            controller.enqueue(value);
+            observedController.enqueue(value);
           }
-          appendWorkflowEvent(workflowRun.id, 'finalizing', 'execution.evidence', '执行证据已记录', { ...evidence });
+          flushWorkflowEvidence(workflowRun.id, evidence);
           completeWorkflowRun(workflowRun.id);
-          controller.close();
+          observedController.close();
         } catch (error) {
+          flushWorkflowEvidence(workflowRun.id, evidence);
           failWorkflowRun(workflowRun.id, error);
-          requestWorkflowRetry(workflowRun.id, 'auto');
+          if (shouldAutoRetryWorkflowError(error)) {
+            requestWorkflowRetry(workflowRun.id, 'auto');
+          }
           try {
-            controller.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
-            controller.close();
+            observedController.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
+            observedController.close();
           } catch {
             // ignore already closed controller
           }
@@ -1018,12 +1319,21 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
 
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
-    const primaryProfile = config.codexModelSource === 'local_api' ? 'local_primary' : 'primary';
-    const primaryProvider = new CodexProvider(pendingPerms, { profile: primaryProfile });
-    const trustedExecutionProvider = config.codexModelSource === 'local_api'
-      ? new CodexProvider(pendingPerms, { profile: 'primary' })
-      : primaryProvider;
-    return wrapWithLocalHub(primaryProvider, 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }), trustedExecutionProvider);
+    const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
+    const createCodexProvider = (source: CodexModelSource): LLMProvider => source === 'local_api'
+      ? new CodexLocalCliProvider(config)
+      : new CodexProvider(pendingPerms, {
+        profile: source === 'official' ? 'official' : 'external',
+      });
+    const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
+      .filter((source) => isCodexSourceConfigured(config, source));
+    const primaryProvider = config.codexRoutingMode === 'auto_failover'
+      ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
+        source,
+        provider: createCodexProvider(source),
+      })))
+      : createCodexProvider(config.codexModelSource || 'official');
+    return wrapWithLocalHub(primaryProvider, 'codex', null, primaryProvider);
   }
 
   if (runtime === 'auto') {
@@ -1042,12 +1352,21 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       console.log('[claude-to-im] Auto: Claude CLI not found, falling back to Codex');
     }
     const { CodexProvider } = await import('./codex-provider.js');
-    const primaryProfile = config.codexModelSource === 'local_api' ? 'local_primary' : 'primary';
-    const primaryProvider = new CodexProvider(pendingPerms, { profile: primaryProfile });
-    const trustedExecutionProvider = config.codexModelSource === 'local_api'
-      ? new CodexProvider(pendingPerms, { profile: 'primary' })
-      : primaryProvider;
-    return wrapWithLocalHub(primaryProvider, 'codex', new CodexProvider(pendingPerms, { profile: 'local_fallback' }), trustedExecutionProvider);
+    const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
+    const createCodexProvider = (source: CodexModelSource): LLMProvider => source === 'local_api'
+      ? new CodexLocalCliProvider(config)
+      : new CodexProvider(pendingPerms, {
+        profile: source === 'official' ? 'official' : 'external',
+      });
+    const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
+      .filter((source) => isCodexSourceConfigured(config, source));
+    const primaryProvider = config.codexRoutingMode === 'auto_failover'
+      ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
+        source,
+        provider: createCodexProvider(source),
+      })))
+      : createCodexProvider(config.codexModelSource || 'official');
+    return wrapWithLocalHub(primaryProvider, 'codex', null, primaryProvider);
   }
 
   const cliPath = resolveClaudeCliPath();

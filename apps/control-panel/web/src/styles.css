@@ -1447,6 +1447,56 @@ button:disabled {
   max-height: 360px;
 }
 
+.model-install-config {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+}
+
+.model-install-toggle {
+  margin-top: 0;
+}
+
+.install-progress {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.install-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.install-progress p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.install-progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+}
+
+.install-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
 .remote-url-box,
 .remote-preview {
   margin-top: 10px;
@@ -1644,6 +1694,40 @@ button:disabled {
 .ai-strategy-shell {
   display: grid;
   gap: 14px;
+}
+
+.failover-chain-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+}
+
+.failover-chain-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+}
+
+.chain-order-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.chain-order-actions button {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-strong);
+}
+
+.chain-order-actions button:disabled {
+  opacity: 0.4;
 }
 
 .ai-summary-grid {
@@ -1953,6 +2037,36 @@ button:disabled {
 .run-card p {
   margin: 0 0 6px;
   color: var(--text-soft);
+}
+
+.workflow-inline-summary {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.workflow-run-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px 12px;
+  margin: 0 0 8px;
+}
+
+.workflow-run-meta div {
+  min-width: 0;
+}
+
+.workflow-run-meta dt {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.workflow-run-meta dd {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 12px;
 }
 
 .run-card > span,

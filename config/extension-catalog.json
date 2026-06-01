@@ -1,7 +1,133 @@
 {
   "protocol": "extension-catalog/v1",
-  "updatedAt": "2026-05-19",
+  "updatedAt": "2026-05-22",
   "items": [
+    {
+      "id": "ollama-qwen3-coder-next",
+      "type": "model",
+      "displayName": "Qwen3 Coder Next",
+      "version": "q4_K_M",
+      "category": "model.ollama.agent-coding",
+      "description": "Qwen 新一代面向 coding agents 和本地开发的开放权重模型，Ollama latest 约 52GB、256K 上下文；适合高配机器测试本地 agent 主模型。",
+      "source": "qwen3-coder-next:latest",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder-next:latest"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-next-q4km",
+      "type": "model",
+      "displayName": "Qwen3 Coder Next Q4_K_M",
+      "version": "q4_K_M",
+      "category": "model.ollama.agent-coding",
+      "description": "Qwen3 Coder Next 的明确 Q4_K_M 标签，约 52GB；适合希望固定安装版本的本地 agent 用户。",
+      "source": "qwen3-coder-next:q4_K_M",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder-next:q4_K_M"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-next-q8",
+      "type": "model",
+      "displayName": "Qwen3 Coder Next Q8",
+      "version": "q8_0",
+      "category": "model.ollama.agent-coding",
+      "description": "更高精度的 Qwen3 Coder Next Ollama 标签，约 85GB；仅建议内存/显存非常充足时安装。",
+      "source": "qwen3-coder-next:q8_0",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder-next:q8_0"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-next-cloud",
+      "type": "model",
+      "displayName": "Qwen3 Coder Next Cloud",
+      "version": "cloud",
+      "category": "model.ollama.agent-coding.cloud",
+      "description": "Ollama 云端 Qwen3 Coder Next 标签，适合本机跑不动 52GB 本地权重时测试；会使用 Ollama 云服务，不等同本地离线。",
+      "source": "qwen3-coder-next:cloud",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder-next:cloud"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-30b",
+      "type": "model",
+      "displayName": "Qwen3 Coder 30B A3B",
+      "version": "30b-a3b-q4_K_M",
+      "category": "model.ollama.agent-coding",
+      "description": "Qwen 面向 agentic coding 的开放权重代码模型，Ollama 默认 30B 标签约 19GB，适合替代 7B 承接更复杂的本地代码任务；安装后仍需在设置页选择并跑工具调用测试。",
+      "source": "qwen3-coder:30b",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder:30b"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-30b-a3b-q4km",
+      "type": "model",
+      "displayName": "Qwen3 Coder 30B A3B Q4_K_M",
+      "version": "30b-a3b-q4_K_M",
+      "category": "model.ollama.agent-coding",
+      "description": "Qwen3 Coder 30B A3B 的明确量化标签，约 19GB，适合希望固定安装版本而不是使用 latest/30b 别名的本地 agent 用户。",
+      "source": "qwen3-coder:30b-a3b-q4_K_M",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder:30b-a3b-q4_K_M"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-30b-a3b-q8",
+      "type": "model",
+      "displayName": "Qwen3 Coder 30B A3B Q8",
+      "version": "30b-a3b-q8_0",
+      "category": "model.ollama.agent-coding",
+      "description": "更高精度的 Qwen3 Coder 30B A3B Ollama 标签，约 32GB；适合内存/显存更充足时追求更稳输出。",
+      "source": "qwen3-coder:30b-a3b-q8_0",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder:30b-a3b-q8_0"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-480b-cloud",
+      "type": "model",
+      "displayName": "Qwen3 Coder 480B Cloud",
+      "version": "480b-cloud",
+      "category": "model.ollama.agent-coding.cloud",
+      "description": "Ollama 云端 Qwen3 Coder 480B 标签，适合本机跑不动 480B 但想测试最强 Qwen Coder 来源的用户；会使用 Ollama 云服务，不等同本地离线。",
+      "source": "qwen3-coder:480b-cloud",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder:480b-cloud"
+      },
+      "installHandler": "ollama.pull"
+    },
+    {
+      "id": "ollama-qwen3-coder-480b-q4km",
+      "type": "model",
+      "displayName": "Qwen3 Coder 480B A35B Q4_K_M",
+      "version": "480b-a35b-q4_K_M",
+      "category": "model.ollama.agent-coding.large",
+      "description": "Qwen3 Coder 480B A35B 的本地超大模型标签，约 290GB；只建议统一内存或独立推理机非常充足时安装。",
+      "source": "qwen3-coder:480b-a35b-q4_K_M",
+      "artifact": {
+        "kind": "ollama",
+        "model": "qwen3-coder:480b-a35b-q4_K_M"
+      },
+      "installHandler": "ollama.pull"
+    },
     {
       "id": "ollama-qwen2.5-coder-7b",
       "type": "model",

@@ -50,6 +50,11 @@ function Resolve-OllamaCommand {
 $config = Get-ConfigMap -Path $configPath
 $baseUrl = Get-ConfigValue $config 'CTI_OLLAMA_BASE_URL' 'http://127.0.0.1:11434'
 $model = Get-ConfigValue $config 'CTI_OLLAMA_MODEL' 'qwen2.5-coder:7b'
+$ollamaModelsDir = Get-ConfigValue $config 'CTI_OLLAMA_MODELS_DIR' (Get-ConfigValue $config 'OLLAMA_MODELS' '')
+if (-not [string]::IsNullOrWhiteSpace($ollamaModelsDir)) {
+    New-Item -ItemType Directory -Force -Path $ollamaModelsDir | Out-Null
+    $env:OLLAMA_MODELS = $ollamaModelsDir
+}
 
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 
@@ -88,4 +93,5 @@ $process = Start-Process -FilePath $ollama -ArgumentList 'serve' -WorkingDirecto
 Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ASCII
 Write-Output "started: PID=$($process.Id) URL=$baseUrl"
 Write-Output "model: $model"
+if (-not [string]::IsNullOrWhiteSpace($ollamaModelsDir)) { Write-Output "models dir: $ollamaModelsDir" }
 Write-Output "if missing, run: ollama pull $model"
