@@ -208,6 +208,38 @@ describe('JsonFileStore', () => {
     assert.ok(index.items.some((item) => item.classificationSource === 'table_inference'));
   });
 
+  it('persists model-planned memory candidates into the visible knowledge repository', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-model-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+
+    const result = store.persistMemoryWrite({
+      sessionId: 'sess-memory',
+      channelType: 'feishu',
+      chatId: 'oc_chat',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      workingDirectory: '/tmp/test-cwd',
+      text: '重新记一下，这个是STH的git分支名',
+      candidates: [{
+        key: 'STH的git分支名',
+        value: 'st2h_master',
+        text: 'STH的git分支名是 st2h_master',
+        confidence: 0.92,
+        source: 'model',
+      }],
+    });
+
+    assert.equal(result.ok, true);
+    const indexPath = path.join(memoryRoot, '.cti-index', 'knowledge.json');
+    const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as {
+      items: Array<{ key?: string; value?: string; text: string }>;
+    };
+    assert.ok(index.items.some((item) => item.key === 'STH的git分支名' && item.value === 'st2h_master'));
+    assert.equal(index.items.some((item) => item.value?.includes('重新记一下')), false);
+  });
+
   it('retrieves remembered mappings from audit history and ignores failed memory fallbacks', () => {
     const store = new JsonFileStore(makeSettings());
     const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');

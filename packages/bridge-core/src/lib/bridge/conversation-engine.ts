@@ -16,6 +16,7 @@ import type {
   MessageContentBlock,
   RetrievedMemoryContext,
   RetrievedFeishuHistoryContext,
+  MemoryQueryPlan,
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
@@ -92,6 +93,7 @@ export interface ConversationProcessOptions {
   storedUserText?: string;
   historyLimit?: number;
   extraSystemPrompt?: string;
+  memoryPlan?: MemoryQueryPlan;
   memoryUserId?: string;
   memoryUserDisplayName?: string;
   sourceMessageId?: string;
@@ -167,9 +169,33 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- Do not claim that a reminder, scheduled task, or proactive message has been created unless you used the cti-reminder action protocol or the user explicitly asked only for example code.',
   ].join('\n');
 
-  return [baseSystemPrompt?.trim(), bridgeGuardrails, extraSystemPrompt?.trim()]
+  return [baseSystemPrompt?.trim(), bridgeGuardrails, buildReplyPresentationPrompt(getReplyStyleHintFromStore()), extraSystemPrompt?.trim()]
     .filter((part): part is string => !!part)
     .join('\n\n');
+}
+
+function getReplyStyleHintFromStore(): string {
+  const { store } = getBridgeContext();
+  return (
+    store.getSetting('bridge_reply_style_hint')
+    || store.getSetting('reply_style_hint')
+    || process.env.CTI_REPLY_STYLE_HINT
+    || ''
+  ).trim();
+}
+
+function buildReplyPresentationPrompt(replyStyleHint: string): string {
+  const lines = [
+    'Reply presentation contract:',
+    '- Final user-facing replies must follow the configured reply style when one is provided.',
+    '- Progress updates may show user-visible rationale, evidence checked, and current stage, but never hidden chain-of-thought.',
+    '- Final replies should be outcome-first and concise; do not repeat the progress-card rationale unless the user explicitly asks for a detailed walkthrough.',
+  ];
+  if (replyStyleHint) {
+    lines.push(`- Required reply style: ${replyStyleHint}`);
+    lines.push('- Apply this style to the first sentence of the final user-facing reply while preserving truthfulness and safety.');
+  }
+  return lines.join('\n');
 }
 
 function shouldRefreshForToolUse(toolName: string, toolInput: unknown): boolean {
@@ -505,6 +531,7 @@ export async function processMessage(
       userText: options?.storedUserText || text,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       files,
+      memoryPlan: options?.memoryPlan,
     });
     const executionRequirementPrompt = buildExecutionRequirementPrompt(executionRequirement);
     const mergedExtraSystemPrompt = [options?.extraSystemPrompt?.trim(), memoryPrompt]
@@ -544,6 +571,9 @@ export async function processMessage(
       sourceUserId: options?.memoryUserId,
       sourceUserDisplayName: options?.memoryUserDisplayName,
       sourceMessageId: options?.sourceMessageId,
+      replyPresentation: {
+        replyStyleHint: getReplyStyleHintFromStore(),
+      },
       executionRequirement,
       noEvidenceRetryAttempted: attempt === 'no_evidence_retry',
       onRuntimeStatusChange: (status: string) => {
@@ -559,6 +589,7 @@ export async function processMessage(
         sessionId,
         onPermissionRequest,
         attempt === 'initial' && requiresSuccessfulToolEvidence(executionRequirement) ? undefined : onPartialText,
+        onPartialText,
         onToolEvent,
         executionRequirement,
         attempt === 'no_evidence_retry',
@@ -597,6 +628,22 @@ export async function processMessage(
       };
     }
 
+    if (!result.hasError && !result.responseText.trim()) {
+      const blockedText = '未完成：模型没有返回可展示结果。';
+      result = {
+        ...result,
+        responseText: blockedText,
+        hasError: true,
+        errorMessage: '模型没有返回可展示结果。',
+        assistantStorageContent: blockedText,
+        assistantStorageTokenUsage: result.tokenUsage,
+        executionEvidence: {
+          ...result.executionEvidence,
+          evidenceSatisfied: false,
+        },
+      };
+    }
+
     if (result.assistantStorageContent) {
       store.addMessage(sessionId, 'assistant', result.assistantStorageContent, result.assistantStorageTokenUsage ? JSON.stringify(result.assistantStorageTokenUsage) : null);
     }
@@ -618,6 +665,7 @@ async function consumeStream(
   sessionId: string,
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
+  onProgressText?: OnPartialText,
   onToolEvent?: OnToolEvent,
   executionRequirement?: ExecutionRequirement,
   noEvidenceRetryAttempted = false,
@@ -662,6 +710,13 @@ async function consumeStream(
             if (onPartialText) {
               previewText += event.data;
               try { onPartialText(previewText); } catch { /* non-critical */ }
+            }
+            break;
+
+          case 'progress':
+            if (onProgressText && event.data) {
+              previewText += event.data;
+              try { onProgressText(previewText); } catch { /* non-critical */ }
             }
             break;
 

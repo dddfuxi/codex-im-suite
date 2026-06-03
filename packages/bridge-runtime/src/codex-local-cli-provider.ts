@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,7 +19,7 @@ import {
 } from './codex-provider.js';
 import { getLocalCodexProviderAdapter, type LocalCodexProviderAdapter } from './local-codex-provider-registry.js';
 import { McpBridge, type McpManifestRecord, type McpToolInfo } from './mcp-bridge.js';
-import { loadMcpToolCallDefinitions, loadUnityMcpExecuteCodeDefinitions } from './local-agent-tool-registry.js';
+import { loadMcpToolCallDefinitions, loadShellArtifactDefinitions, loadUnityMcpExecuteCodeDefinitions } from './local-agent-tool-registry.js';
 import {
   buildJsonToolProtocolPrompt,
   buildCtiFinalToolResponseEnvelope,
@@ -49,6 +49,59 @@ const MIME_EXT: Record<string, string> = {
   'image/webp': '.webp',
 };
 const MAX_JSON_TOOL_STEPS = 4;
+const DEFAULT_CODEX_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
+
+function resolveCodexExecTimeoutMs(config: Config): number | undefined {
+  const configured = Number(config.bridgeProcessingTimeoutMs);
+  if (Number.isFinite(configured)) {
+    return configured > 0 ? Math.max(1000, Math.floor(configured)) : undefined;
+  }
+  return DEFAULT_CODEX_EXEC_TIMEOUT_MS;
+}
+
+function terminateProcessTree(child: ChildProcessWithoutNullStreams): void {
+  if (process.platform === 'win32' && child.pid) {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    killer.on('error', () => {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+    });
+    return;
+  }
+  try { child.kill('SIGTERM'); } catch { /* ignore */ }
+}
+
+function buildJsonToolCatalogForRequirement(requirement: StreamChatParams['executionRequirement']): Array<JsonToolRequest['tool']> {
+  if (requirement?.kind === 'local_read_required') {
+    return ['list_dir', 'read_file', 'search_files'];
+  }
+  if (requirement?.kind !== 'tool_required' && requirement?.kind !== 'artifact_required') {
+    return ['list_dir', 'read_file', 'search_files'];
+  }
+
+  const families = new Set((requirement.requiredToolFamilies || []).map((family) => family.toLowerCase()));
+  const catalog = new Set<JsonToolRequest['tool']>();
+  const hasSpecificFamily = Array.from(families).some((family) => family !== 'tool');
+  const wantsArtifact = requirement.kind === 'artifact_required' || families.has('artifact');
+
+  if (!hasSpecificFamily || families.has('shell')) catalog.add('shell');
+  if (!hasSpecificFamily || families.has('mcp') || families.has('unity-mcp') || wantsArtifact) catalog.add('mcp_call');
+  if (!hasSpecificFamily || families.has('unity-mcp') || wantsArtifact) catalog.add('unity_mcp_execute_code');
+  if (wantsArtifact) catalog.add('shell_artifact');
+  if (families.has('filesystem') || families.has('read') || families.has('search')) {
+    catalog.add('list_dir');
+    catalog.add('read_file');
+    catalog.add('search_files');
+  }
+
+  return Array.from(catalog);
+}
+
+function isCatalogTool(tool: string, catalog: Array<JsonToolRequest['tool']>): tool is JsonToolRequest['tool'] {
+  return catalog.includes(tool as JsonToolRequest['tool']);
+}
 
 function localModelName(config: Config): string {
   return (config.localAiModel || config.ollamaModel || config.localLlmModel || 'qwen2.5-coder:7b').trim() || 'qwen2.5-coder:7b';
@@ -116,6 +169,7 @@ function rankMcpToolDetails(prompt: string, manifest: McpManifestRecord, tools: 
 function shouldCompleteJsonToolTask(userText: string, request: JsonToolRequest, result: JsonToolResult): boolean {
   if (!result.ok) return true;
   if (request.tool !== 'mcp_call') return true;
+  if (isIdOnlyMcpLookupForRequestedDetails(userText, request, result)) return false;
   const toolName = typeof request.args.tool === 'string' ? request.args.tool : '';
   const toolArgs = request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
     ? request.args.arguments as Record<string, unknown>
@@ -130,6 +184,82 @@ function shouldCompleteJsonToolTask(userText: string, request: JsonToolRequest, 
   if (readOnlyMcpAction) return false;
   if (/(asset|scene|gameobject|prefab|editor|camera|build|material|component|script)/.test(toolName)) return true;
   return true;
+}
+
+function parseJsonToolMcpResult(result: JsonToolResult): Record<string, unknown> | null {
+  const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : {};
+  const rawResult = data.result;
+  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) return rawResult as Record<string, unknown>;
+  if (typeof rawResult !== 'string' || !rawResult.trim()) return null;
+  try {
+    const parsed = JSON.parse(rawResult) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+const DETAIL_REQUEST_RE = /(名称|名字|节点|路径|详情|明细|物体|对象|组件|GameObject|name|path|detail)/iu;
+const ID_ONLY_FIELD_RE = /^(?:id|ids|instanceid|instanceids|objectid|objectids|gameobjectid|gameobjectids|guid|guids|uuid|uuids)$/i;
+const DETAIL_FIELD_RE = /(?:^|[_-])(?:name|path|title|label|displayname|hierarchypath|objectpath|fullpath|filename|scene|component|type)(?:[_-]|$)/i;
+
+function userRequestsObjectDetails(text: string): boolean {
+  return DETAIL_REQUEST_RE.test(text);
+}
+
+function collectMcpResultEvidenceShape(value: unknown, fieldName = '', depth = 0): { hasId: boolean; idSamples: string[]; hasDetail: boolean } {
+  if (depth > 5 || value === null || value === undefined) return { hasId: false, idSamples: [], hasDetail: false };
+  const normalizedField = fieldName.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const isIdField = ID_ONLY_FIELD_RE.test(normalizedField);
+  const isDetailField = DETAIL_FIELD_RE.test(fieldName.replace(/([a-z])([A-Z])/g, '$1_$2'));
+
+  if (typeof value !== 'object') {
+    const text = String(value).trim();
+    return {
+      hasId: isIdField && !!text,
+      idSamples: isIdField && text ? [text] : [],
+      hasDetail: isDetailField && !!text,
+    };
+  }
+
+  const values = Array.isArray(value)
+    ? value.map((item) => ['', item] as const)
+    : Object.entries(value as Record<string, unknown>);
+  return values.reduce((state, [key, child]) => {
+    const childShape = collectMcpResultEvidenceShape(child, key || fieldName, depth + 1);
+    return {
+      hasId: state.hasId || childShape.hasId,
+      idSamples: [...state.idSamples, ...childShape.idSamples].slice(0, 8),
+      hasDetail: state.hasDetail || childShape.hasDetail,
+    };
+  }, { hasId: false, idSamples: [] as string[], hasDetail: false });
+}
+
+function getMcpResultPayload(result: JsonToolResult): Record<string, unknown> {
+  const parsedResult = parseJsonToolMcpResult(result);
+  return parsedResult?.data && typeof parsedResult.data === 'object' && !Array.isArray(parsedResult.data)
+    ? parsedResult.data as Record<string, unknown>
+    : parsedResult || {};
+}
+
+function isIdOnlyMcpLookupForRequestedDetails(userText: string, request: JsonToolRequest, result: JsonToolResult): boolean {
+  if (request.tool !== 'mcp_call') return false;
+  if (!userRequestsObjectDetails(userText)) return false;
+  const payload = getMcpResultPayload(result);
+  const evidenceShape = collectMcpResultEvidenceShape(payload);
+  return evidenceShape.hasId && !evidenceShape.hasDetail;
+}
+
+function buildIdOnlyMcpLookupBlocker(toolHistory: Array<{ request: JsonToolRequest; result: JsonToolResult }>, userText: string): string | null {
+  const idOnlyEntry = toolHistory.find(({ request, result }) => isIdOnlyMcpLookupForRequestedDetails(userText, request, result));
+  if (!idOnlyEntry) return null;
+  const evidenceShape = collectMcpResultEvidenceShape(getMcpResultPayload(idOnlyEntry.result));
+  const idText = evidenceShape.idSamples.length > 0 ? `：${evidenceShape.idSamples.join('、')}` : '';
+  return `未完成：查询工具只返回了对象 ID${idText}，没有返回名称、路径或详情；本轮没有继续读到对象详情，所以不能把 ID 猜成对象详情。`;
 }
 
 function parseMcpToolResultPayload(result: string): { success?: boolean; message?: string; error?: string; code?: string } | null {
@@ -217,7 +347,7 @@ export function parseCodexExecJsonLine(line: string): Record<string, unknown> | 
 }
 
 function extractJsonToolStatus(result: JsonToolResult): Record<string, unknown> {
-  if (result.tool !== 'shell' || !result.data || typeof result.data !== 'object') return {};
+  if ((result.tool !== 'shell' && result.tool !== 'shell_artifact') || !result.data || typeof result.data !== 'object') return {};
   const data = result.data as { exitCode?: unknown; durationMs?: unknown };
   return {
     shellExitCode: typeof data.exitCode === 'number' ? data.exitCode : undefined,
@@ -226,10 +356,10 @@ function extractJsonToolStatus(result: JsonToolResult): Record<string, unknown> 
 }
 
 function buildFailedJsonToolAnswer(result: JsonToolResult): string {
-  if (result.tool === 'shell' && result.data && typeof result.data === 'object') {
+  if ((result.tool === 'shell' || result.tool === 'shell_artifact') && result.data && typeof result.data === 'object') {
     const data = result.data as { command?: unknown; cwd?: unknown; exitCode?: unknown; stdout?: unknown; stderr?: unknown; durationMs?: unknown };
     const lines = [
-      `未完成：${result.error || '本地 shell 工具执行失败'}`,
+      `未完成：${result.error || '本地工具执行失败'}`,
       `命令：${String(data.command || '').trim()}`,
       `工作目录：${String(data.cwd || '').trim()}`,
       `exitCode：${String(data.exitCode ?? '')}`,
@@ -268,12 +398,59 @@ function collectJsonToolHistoryArtifacts(toolHistory: JsonToolHistoryEntry[]): J
   };
 }
 
+function appendProgress(
+  controller: ReadableStreamDefaultController<string>,
+  text: string,
+): void {
+  controller.enqueue(sseEvent('progress', text));
+}
+
+function describeJsonToolRequestForProgress(request: JsonToolRequest): string {
+  if (request.tool === 'mcp_call') {
+    const toolName = String(request.args.tool || 'MCP 工具');
+    const args = request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
+      ? request.args.arguments as Record<string, unknown>
+      : {};
+    const action = typeof args.action === 'string' && args.action.trim() ? ` / ${args.action.trim()}` : '';
+    const target = typeof args.path === 'string' && args.path.trim()
+      ? `，目标路径：${args.path.trim()}`
+      : typeof args.search_pattern === 'string' && args.search_pattern.trim()
+        ? `，搜索关键词：${args.search_pattern.trim()}`
+        : '';
+    return `准备调用 ${toolName}${action}${target}。`;
+  }
+  if (request.tool === 'shell') {
+    return `准备执行命令：${String(request.args.command || '').trim() || '(未指定命令)'}`;
+  }
+  if (request.tool === 'shell_artifact') {
+    const label = String(request.args.displayName || '本地产物工具').trim();
+    return `准备执行${label}并校验生成文件。`;
+  }
+  if (request.tool === 'list_dir') return `准备读取目录：${String(request.args.path || '.').trim()}`;
+  if (request.tool === 'read_file') return `准备读取文件：${String(request.args.path || '').trim()}`;
+  if (request.tool === 'search_files') return `准备搜索文件：${String(request.args.query || '').trim()}`;
+  if (request.tool === 'unity_mcp_execute_code') return '准备通过 Unity MCP 执行受控 Editor 代码。';
+  return `准备执行工具：${request.tool}`;
+}
+
+function describeJsonToolResultForProgress(result: JsonToolResult): string {
+  if (!result.ok) return `工具返回失败：${result.error || '未知错误'}。`;
+  const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : {};
+  const parsed = typeof data.result === 'string' ? parseMcpToolResultPayload(data.result) : null;
+  if (parsed?.message) return `工具返回成功：${String(parsed.message).trim()}`;
+  if (result.tool === 'shell' && typeof data.exitCode === 'number') return `命令执行完成，exitCode=${data.exitCode}。`;
+  return '工具返回成功，继续判断是否已经满足请求。';
+}
+
 export class CodexLocalCliProvider implements LLMProvider {
   private readonly adapter: LocalCodexProviderAdapter;
   private readonly profile: CodexProviderProfile = 'local_primary';
   private readonly mcpBridge: McpBridge;
   private readonly mcpToolCallDefinitions = loadMcpToolCallDefinitions();
   private readonly unityMcpExecuteCodeDefinitions = loadUnityMcpExecuteCodeDefinitions();
+  private readonly shellArtifactDefinitions = loadShellArtifactDefinitions();
 
   constructor(private readonly config: Config) {
     this.adapter = getLocalCodexProviderAdapter(config.localAiKind);
@@ -372,9 +549,15 @@ export class CodexLocalCliProvider implements LLMProvider {
             stdio: ['pipe', 'pipe', 'pipe'],
           });
 
-          const abort = () => {
-            try { child.kill('SIGTERM'); } catch { /* ignore */ }
-          };
+          const timeoutMs = resolveCodexExecTimeoutMs(config);
+          let timedOut = false;
+          const abort = () => terminateProcessTree(child);
+          const timeoutTimer = timeoutMs
+            ? setTimeout(() => {
+              timedOut = true;
+              terminateProcessTree(child);
+            }, timeoutMs)
+            : undefined;
           params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
           const prompt = buildTurnPrompt(params);
@@ -439,8 +622,13 @@ export class CodexLocalCliProvider implements LLMProvider {
             child.on('error', reject);
             child.on('close', (code) => {
               params.abortController?.signal.removeEventListener('abort', abort);
+              if (timeoutTimer) clearTimeout(timeoutTimer);
               const tailEvent = parseCodexExecJsonLine(stdoutRemainder);
               if (tailEvent) handleJsonEvent(tailEvent);
+              if (timedOut) {
+                reject(new Error(`codex exec local provider timed out after ${timeoutMs}ms`));
+                return;
+              }
               if (code === 0) {
                 if (!sawText && fs.existsSync(outputLastMessagePath)) {
                   const text = fs.readFileSync(outputLastMessagePath, 'utf-8').trim();
@@ -482,14 +670,12 @@ export class CodexLocalCliProvider implements LLMProvider {
       workingDirectory,
       this.config.defaultWorkDir,
       this.config.unityProjectPath,
+      process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+      ...this.getShellArtifactAllowedRoots(),
       ...(this.config.allowedWorkspaceRoots || []),
       ...additionalDirectories,
     ].filter((item): item is string => !!item?.trim())));
-    let toolCatalog = params.executionRequirement?.kind === 'tool_required'
-      ? params.executionRequirement.requiredToolFamilies?.includes('unity-mcp')
-        ? ['mcp_call', 'unity_mcp_execute_code', 'shell']
-        : ['shell']
-      : ['list_dir', 'read_file', 'search_files'];
+    const toolCatalog = buildJsonToolCatalogForRequirement(params.executionRequirement);
     const contextText = [params.systemPrompt, params.prompt].filter(Boolean).join('\n');
     const mcpToolCatalog = toolCatalog.includes('mcp_call')
       ? await this.buildMcpToolCatalog(params)
@@ -500,6 +686,7 @@ export class CodexLocalCliProvider implements LLMProvider {
       requirementKind: params.executionRequirement?.kind,
       mcpToolCallDefinitions: this.mcpToolCallDefinitions,
       unityMcpExecuteCodeDefinitions: this.unityMcpExecuteCodeDefinitions,
+      shellArtifactDefinitions: this.shellArtifactDefinitions,
     });
     const buildDeterministicPlan = () => planDeterministicJsonToolRequest(params.prompt, {
       workingDirectory,
@@ -507,6 +694,7 @@ export class CodexLocalCliProvider implements LLMProvider {
       requirementKind: params.executionRequirement?.kind,
       mcpToolCallDefinitions: this.mcpToolCallDefinitions,
       unityMcpExecuteCodeDefinitions: this.unityMcpExecuteCodeDefinitions,
+      shellArtifactDefinitions: this.shellArtifactDefinitions,
     });
     let usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null = null;
     let retryAttempted = false;
@@ -516,19 +704,16 @@ export class CodexLocalCliProvider implements LLMProvider {
     let lastToolResult: JsonToolResult | null = null;
     let taskComplete = false;
     const toolHistory: Array<{ request: JsonToolRequest; result: JsonToolResult }> = [];
+    appendProgress(controller, [
+      '### 处理思路',
+      '已识别为需要真实工具执行的请求，正在读取可用工具和运行上下文。',
+      '',
+    ].join('\n'));
 
     const deterministicPlan = buildDeterministicPlan();
     if (deterministicPlan && toolCatalog.includes(deterministicPlan.request.tool)) {
       request = deterministicPlan.request;
       fallbackToolRequestUsed = true;
-    } else if (deterministicPlan?.request.tool === 'mcp_call' || deterministicPlan?.request.tool === 'unity_mcp_execute_code') {
-      if (!toolCatalog.includes(deterministicPlan.request.tool)) {
-        toolCatalog = [deterministicPlan.request.tool, ...toolCatalog];
-      }
-      if (toolCatalog.includes(deterministicPlan.request.tool)) {
-        request = deterministicPlan.request;
-        fallbackToolRequestUsed = true;
-      }
     }
     if (!request && toolCatalog.includes('mcp_call')) {
       request = buildGenericMcpDiscoveryRequest(params.prompt, mcpToolCatalog);
@@ -536,6 +721,7 @@ export class CodexLocalCliProvider implements LLMProvider {
     }
 
     const requestFromModel = async (step: number): Promise<JsonToolRequest | null> => {
+      appendProgress(controller, `正在让本地 agent 根据真实工具 schema 规划第 ${step + 1} 步。\n`);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         retryAttempted = attempt > 0;
         const repairPrompt = attempt > 0
@@ -579,7 +765,10 @@ export class CodexLocalCliProvider implements LLMProvider {
         usage = mergeUsage(usage, run.usage);
         rawModelText = run.text.trim();
         const parsed = parseJsonToolRequest(rawModelText);
-        if (parsed) return parsed;
+        if (parsed && isCatalogTool(parsed.tool, toolCatalog)) return parsed;
+        if (parsed) {
+          rawModelText = `The previous JSON used tool "${parsed.tool}", but this task only allows: ${toolCatalog.join(', ')}.`;
+        }
       }
       return null;
     };
@@ -588,16 +777,25 @@ export class CodexLocalCliProvider implements LLMProvider {
 
     if (!request) {
       request = buildRuntimeFallbackRequest();
+      if (request && !isCatalogTool(request.tool, toolCatalog)) request = null;
       fallbackToolRequestUsed = !!request;
-    } else if (request.tool === 'shell' && params.executionRequirement?.kind === 'tool_required') {
+    } else if (
+      request.tool === 'shell'
+      && (params.executionRequirement?.kind === 'tool_required' || params.executionRequirement?.kind === 'artifact_required')
+    ) {
       const normalizedRequest = buildRuntimeFallbackRequest();
-      if (normalizedRequest?.tool === 'mcp_call' || normalizedRequest?.tool === 'unity_mcp_execute_code') {
+      if (
+        normalizedRequest
+        && isCatalogTool(normalizedRequest.tool, toolCatalog)
+        && (normalizedRequest.tool === 'mcp_call' || normalizedRequest.tool === 'unity_mcp_execute_code' || normalizedRequest.tool === 'shell_artifact')
+      ) {
         request = normalizedRequest;
         fallbackToolRequestUsed = true;
       }
     }
 
     if (!request) {
+        appendProgress(controller, '没有得到可执行工具计划，准备返回阻塞原因。\n');
         controller.enqueue(sseEvent('status', {
           provider: this.adapter.id,
           codexProfile: this.profile,
@@ -616,8 +814,11 @@ export class CodexLocalCliProvider implements LLMProvider {
     }
 
     for (let step = 0; step < MAX_JSON_TOOL_STEPS && request; step += 1) {
-      const validation = validateJsonToolRequest(request, { workingDirectory, allowedRoots, contextText });
+      const validation = isCatalogTool(request.tool, toolCatalog)
+        ? validateJsonToolRequest(request, { workingDirectory, allowedRoots, contextText })
+        : { ok: false as const, error: `工具 ${request.tool} 不符合本轮要求，可用工具：${toolCatalog.join(', ')}` };
       const toolId = `json-tool-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      appendProgress(controller, `第 ${step + 1} 步：${describeJsonToolRequestForProgress(request)}\n`);
       controller.enqueue(sseEvent('tool_use', {
         id: toolId,
         name: `JsonTool:${request.tool}`,
@@ -632,6 +833,7 @@ export class CodexLocalCliProvider implements LLMProvider {
       }
       lastToolResult = toolResult;
       toolHistory.push({ request, result: toolResult });
+      appendProgress(controller, `${describeJsonToolResultForProgress(toolResult)}\n`);
 
       controller.enqueue(sseEvent('tool_result', {
         tool_use_id: toolId,
@@ -694,6 +896,7 @@ export class CodexLocalCliProvider implements LLMProvider {
         taskComplete = true;
         break;
       }
+      appendProgress(controller, '当前结果还不足以完成请求，继续基于真实返回值规划下一步。\n');
       if (step + 1 >= MAX_JSON_TOOL_STEPS) break;
       request = await requestFromModel(step + 1);
       fallbackToolRequestUsed = false;
@@ -701,12 +904,18 @@ export class CodexLocalCliProvider implements LLMProvider {
     }
 
     if (!lastToolResult) {
+      appendProgress(controller, '没有形成可用工具结果，准备返回阻塞原因。\n');
       controller.enqueue(sseEvent('text', '未完成：本地工具协议未产生可执行结果。'));
       controller.enqueue(sseEvent('result', usage ? { usage } : {}));
       return;
     }
 
-    if (!taskComplete && params.executionRequirement?.kind === 'tool_required') {
+    if (
+      !taskComplete
+      && (params.executionRequirement?.kind === 'tool_required' || params.executionRequirement?.kind === 'artifact_required')
+    ) {
+      const idOnlyBlocker = buildIdOnlyMcpLookupBlocker(toolHistory, params.prompt);
+      appendProgress(controller, '工具只完成了读取或探测，没有完成目标动作，准备返回阻塞原因。\n');
       controller.enqueue(sseEvent('status', {
         provider: this.adapter.id,
         codexProfile: this.profile,
@@ -718,15 +927,18 @@ export class CodexLocalCliProvider implements LLMProvider {
         evidenceProtocol: 'json_tool_request',
         evidenceSatisfied: false,
       }));
-      controller.enqueue(sseEvent('text', '未完成：工具只完成了读取、搜索或状态探测，尚未完成用户要求的实际动作。'));
+      controller.enqueue(sseEvent('text', idOnlyBlocker || '未完成：工具只完成了读取、搜索或状态探测，尚未完成用户要求的实际动作。'));
       controller.enqueue(sseEvent('result', usage ? { usage } : {}));
       return;
     }
 
     const fallbackAnswer = buildVisibleToolOutcomeFallback(params.prompt, toolHistory);
     let generatedAnswer = fallbackAnswer;
+    appendProgress(controller, '\n### 执行结果\n工具动作已经完成，正在整理用户可读结果。\n');
     try {
-      const finalResponsePrompt = buildJsonToolFinalResponsePrompt(params.prompt, toolHistory);
+      const finalResponsePrompt = buildJsonToolFinalResponsePrompt(params.prompt, toolHistory, {
+        replyStyleHint: params.replyPresentation?.replyStyleHint,
+      });
       const run = await this.runCodexExecText({
         params: {
           ...params,
@@ -735,13 +947,20 @@ export class CodexLocalCliProvider implements LLMProvider {
         },
         model,
         promptOverride: finalResponsePrompt,
-        systemPromptAppend: 'You format a final user-visible answer from verified tool history. Follow the prompt exactly.',
+        systemPromptAppend: [
+          'You format a final user-visible answer from verified tool history. Follow the prompt exactly.',
+          params.replyPresentation?.replyStyleHint
+            ? `Required reply style: ${params.replyPresentation.replyStyleHint}`
+            : '',
+        ].filter(Boolean).join('\n'),
         replaceSystemPrompt: true,
       });
       usage = mergeUsage(usage, run.usage);
       generatedAnswer = normalizeGeneratedToolFinalText(run.text, fallbackAnswer);
+      appendProgress(controller, '最终结果已整理完成。\n');
     } catch {
       generatedAnswer = fallbackAnswer;
+      appendProgress(controller, '模型整理未返回合格文本，已切换为结构化结果兜底。\n');
     }
 
     const finalText = buildCtiFinalToolResponseEnvelope(
@@ -818,6 +1037,18 @@ export class CodexLocalCliProvider implements LLMProvider {
     }
   }
 
+  private getShellArtifactAllowedRoots(): string[] {
+    const roots = new Set<string>();
+    for (const definition of this.shellArtifactDefinitions) {
+      if (definition.cwd?.trim()) roots.add(path.resolve(definition.cwd));
+      for (const artifactPath of definition.artifactPaths || []) {
+        if (!artifactPath.trim()) continue;
+        roots.add(path.dirname(path.resolve(artifactPath)));
+      }
+    }
+    return Array.from(roots);
+  }
+
   private async buildMcpToolCatalog(params: StreamChatParams): Promise<JsonToolMcpCatalogEntry[]> {
     const manifests = this.selectMcpCatalogManifests(params);
     const entries: JsonToolMcpCatalogEntry[] = [];
@@ -847,7 +1078,8 @@ export class CodexLocalCliProvider implements LLMProvider {
       selected.push(manifest);
     };
     add(this.mcpBridge.resolveManifestFromPrompt(params.prompt));
-    if (params.executionRequirement?.requiredToolFamilies?.includes('unity-mcp')) {
+    const requiredFamilies = params.executionRequirement?.requiredToolFamilies || [];
+    if (requiredFamilies.includes('unity-mcp') || requiredFamilies.includes('mcp')) {
       add(this.mcpBridge.resolveManifestByHint('unitymcp'));
       add(this.mcpBridge.resolveManifestByHint('unity'));
     }
@@ -924,9 +1156,15 @@ export class CodexLocalCliProvider implements LLMProvider {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
-      const abort = () => {
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      };
+      const timeoutMs = resolveCodexExecTimeoutMs(this.config);
+      let timedOut = false;
+      const abort = () => terminateProcessTree(child);
+      const timeoutTimer = timeoutMs
+        ? setTimeout(() => {
+          timedOut = true;
+          terminateProcessTree(child);
+        }, timeoutMs)
+        : undefined;
       input.params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
       const systemPrompt = input.replaceSystemPrompt
@@ -999,8 +1237,13 @@ export class CodexLocalCliProvider implements LLMProvider {
         child.on('error', reject);
         child.on('close', (code) => {
           input.params.abortController?.signal.removeEventListener('abort', abort);
+          if (timeoutTimer) clearTimeout(timeoutTimer);
           const tailEvent = parseCodexExecJsonLine(stdoutRemainder);
           if (tailEvent) handleJsonEvent(tailEvent);
+          if (timedOut) {
+            reject(new Error(`codex exec local provider timed out after ${timeoutMs}ms`));
+            return;
+          }
           if (code === 0) {
             if (!text && fs.existsSync(outputLastMessagePath)) {
               text = fs.readFileSync(outputLastMessagePath, 'utf-8');

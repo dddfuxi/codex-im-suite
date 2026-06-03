@@ -81,11 +81,11 @@ describe('local agent JSON tool protocol', () => {
     }
   });
 
-  it('builds prompts and eligibility only for local read local_api tasks', () => {
+  it('builds prompts and eligibility for evidence tasks on local_api', () => {
     assert.equal(isJsonToolProtocolEligible({ kind: 'local_read_required' }, 'local_api'), true);
     assert.equal(isJsonToolProtocolEligible({ kind: 'local_read_required' }, 'official'), false);
     assert.equal(isJsonToolProtocolEligible({ kind: 'tool_required' }, 'local_api'), true);
-    assert.equal(isJsonToolProtocolEligible({ kind: 'artifact_required' }, 'local_api'), false);
+    assert.equal(isJsonToolProtocolEligible({ kind: 'artifact_required' }, 'local_api'), true);
 
     const prompt = buildJsonToolProtocolPrompt(
       { kind: 'local_read_required', reason: 'read local state', requiredToolFamilies: ['read'] },
@@ -102,6 +102,14 @@ describe('local agent JSON tool protocol', () => {
     );
     assert.match(shellPrompt, /shell/);
     assert.match(shellPrompt, /unity_mcp_execute_code/);
+
+    const artifactPrompt = buildJsonToolProtocolPrompt(
+      { kind: 'artifact_required', reason: 'create screenshot', requiredToolFamilies: ['artifact'] },
+      ['shell_artifact'],
+      { workingDirectory: 'C:\\unity\\ST3', allowedRoots: ['C:\\unity\\ST3'] },
+    );
+    assert.match(artifactPrompt, /shell_artifact/);
+    assert.match(artifactPrompt, /artifact-producing/);
 
     const mcpPrompt = buildJsonToolProtocolPrompt(
       { kind: 'tool_required', reason: 'switch Unity scene', requiredToolFamilies: ['unity-mcp', 'mcp'] },
@@ -153,20 +161,27 @@ describe('local agent JSON tool protocol', () => {
       },
     }];
 
-    const prompt = buildJsonToolFinalResponsePrompt('切换 Main 场景', history);
+    const prompt = buildJsonToolFinalResponsePrompt('切换 Main 场景', history, {
+      replyStyleHint: '像项目助理，先说结果',
+    });
     assert.match(prompt, /Final answer composer/);
-    assert.match(prompt, /处理思路/);
+    assert.match(prompt, /Required reply style: 像项目助理/);
+    assert.doesNotMatch(prompt, /You MUST include the headings/);
     assert.match(prompt, /Scene loaded successfully/);
     assert.doesNotMatch(prompt, /```cti-final/);
 
     const fallback = buildVisibleToolOutcomeFallback('切换 Main 场景', history);
-    assert.match(fallback, /处理思路/);
+    assert.doesNotMatch(fallback, /处理思路/);
     assert.match(fallback, /Scene loaded successfully/);
     assert.doesNotMatch(fallback, /"success":true/);
 
     const normalized = normalizeGeneratedToolFinalText('```cti-final\n{"kind":"text","text":"**处理思路**\\n- 已根据真实工具结果确认。\\n\\n**执行结果**\\n- 已完成","images":[],"files":[],"reply_mode":"markdown"}\n```', fallback);
     assert.match(normalized, /已完成/);
     assert.doesNotMatch(normalized, /cti-final/);
+
+    const cleaned = normalizeGeneratedToolFinalText('### 处理思路\n已基于真实工具结果确认。\n\n### 执行结果\n- 已成功加载场景。\n\n未完成：无具体 blocker，已成功切换至目标场景。', fallback);
+    assert.match(cleaned, /已成功加载场景/);
+    assert.doesNotMatch(cleaned, /未完成/);
 
     const envelope = buildCtiFinalToolResponseEnvelope(normalized, { images: [], files: [] }, 'markdown');
     assert.match(envelope, /```cti-final/);
@@ -335,6 +350,57 @@ describe('local agent JSON tool protocol', () => {
     assert.equal(mcpPlan?.request.args.manifestHint, 'unitymcp');
     assert.equal(mcpPlan?.request.args.tool, 'manage_camera');
     assert.equal(mcpPlan?.source, 'runtime_deterministic');
+
+    const artifactPlan = planDeterministicJsonToolRequest('截图一下桌面给我看看', {
+      workingDirectory: 'C:\\unity\\ST3',
+      requirementKind: 'artifact_required',
+      shellArtifactDefinitions: [{
+        id: 'test.desktop.screenshot',
+        displayName: 'Desktop Screenshot',
+        match: { regex: ['(桌面|屏幕).*(截图|截屏)|(截图|截屏).*(桌面|屏幕)'] },
+        command: 'echo ok',
+        cwd: 'C:\\unity\\ST3',
+        artifactPaths: ['C:\\Users\\admin\\.claude-to-im\\runtime\\captures\\desktop-latest.png'],
+      }],
+    });
+    assert.equal(artifactPlan?.request.tool, 'shell_artifact');
+    assert.equal(artifactPlan?.request.args.displayName, 'Desktop Screenshot');
+  });
+
+  it('executes a configured artifact request and returns image artifacts', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-json-tool-artifact-'));
+    try {
+      const imagePath = path.join(root, 'desktop.png');
+      const request = parseJsonToolRequest(JSON.stringify({
+        action: 'tool_request',
+        tool: 'shell_artifact',
+        args: {
+          command: `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.argv[1], Buffer.from([0x89,0x50,0x4e,0x47]))" ${JSON.stringify(imagePath)}`,
+          cwd: root,
+          timeoutMs: 5000,
+          artifactPaths: [imagePath],
+          displayName: 'Desktop Screenshot',
+        },
+      }));
+      assert.ok(request);
+
+      const validation = validateJsonToolRequest(request, {
+        workingDirectory: root,
+        allowedRoots: [root],
+      });
+      assert.equal(validation.ok, true);
+
+      const result = executeJsonToolRequest(validation.request!);
+      assert.equal(result.ok, true);
+      assert.equal(result.tool, 'shell_artifact');
+
+      const answer = buildCtiFinalToolAnswer(result);
+      assert.match(answer || '', /```cti-final/);
+      assert.match(answer || '', /"kind":"image"/);
+      assert.match(answer || '', /desktop\.png/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('returns a failed shell result for non-zero exit codes', () => {

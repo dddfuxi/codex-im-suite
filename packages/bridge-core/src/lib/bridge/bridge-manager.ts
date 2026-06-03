@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Bridge Manager — singleton orchestrator for the multi-IM bridge system.
  *
  * Manages adapter lifecycles, routes inbound messages through the
@@ -18,6 +18,9 @@ import type {
   ExtensionCatalogItemSummary,
   FeishuCloudLinkResolveResult,
   FeishuOAuthManualResumeRequest,
+  MemoryWriteCandidate,
+  MemoryWriteIntentDecision,
+  MemoryReplyDecision,
 } from './host.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -35,6 +38,7 @@ import * as broker from './permission-broker.js';
 import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
+import { formatVisibleToolName } from './markdown/feishu.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
@@ -76,6 +80,7 @@ const FINAL_ENVELOPE_STATUS_PATH = path.join(
   'final-envelope-status.json',
 );
 const FEISHU_FILE_UPLOAD_LIMIT_BYTES = 30 * 1024 * 1024;
+const INBOUND_DEDUP_KEY_PREFIX = 'inbound:v1';
 
 type ArtifactUploadMode = 'none' | 'local_http' | 'feishu_docx';
 
@@ -190,6 +195,65 @@ function buildSmallTalkReply(text: string): string {
     if (item.pattern.test(normalized)) return item.reply;
   }
   return '';
+}
+
+function hashDedupParts(parts: string[]): string {
+  return crypto.createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex').slice(0, 32);
+}
+
+function normalizeInboundDedupText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function makeInboundMessageDedupKey(adapter: BaseChannelAdapter, msg: InboundMessage): string | null {
+  const messageId = msg.messageId?.trim();
+  if (!messageId) return null;
+  return `${INBOUND_DEDUP_KEY_PREFIX}:message:${hashDedupParts([
+    adapter.channelType,
+    msg.address.chatId || '',
+    messageId,
+  ])}`;
+}
+
+function makeInboundTextDedupKey(adapter: BaseChannelAdapter, msg: InboundMessage, rawText: string): string | null {
+  const normalizedText = normalizeInboundDedupText(rawText);
+  if (normalizedText.length < 3) return null;
+  return `${INBOUND_DEDUP_KEY_PREFIX}:text:${hashDedupParts([
+    adapter.channelType,
+    msg.address.chatId || '',
+    msg.address.userId || '',
+    normalizedText,
+  ])}`;
+}
+
+function claimInboundForExecution(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  rawText: string,
+  hasAttachments: boolean,
+): { duplicate: boolean; key?: string; reason?: string } {
+  const { store } = getBridgeContext();
+  const messageKey = makeInboundMessageDedupKey(adapter, msg);
+  const textKey = makeInboundTextDedupKey(adapter, msg, rawText);
+
+  if (messageKey && store.checkDedup(messageKey)) {
+    return { duplicate: true, key: messageKey, reason: 'message_id' };
+  }
+  if (textKey && store.checkDedup(textKey)) {
+    return { duplicate: true, key: textKey, reason: 'text_fingerprint' };
+  }
+
+  if (messageKey) store.insertDedup(messageKey);
+  // Feishu media captions can be recovered by history polling as a separate
+  // text-only message id. Only media-backed turns seed the text fingerprint so
+  // an intentional repeated text request is not suppressed by default.
+  if (hasAttachments && textKey) store.insertDedup(textKey);
+  return { duplicate: false };
 }
 
 function extractCtiReminderAction(text: string): ExtractedReminderAction {
@@ -973,6 +1037,130 @@ function applyOutboundAnswerReview(input: AnswerReviewInput): string {
   return input.answerText;
 }
 
+function usableMemoryCandidates(candidates: MemoryWriteCandidate[] | undefined): MemoryWriteCandidate[] {
+  return (candidates || [])
+    .map((candidate) => ({
+      ...candidate,
+      key: candidate.key?.replace(/\s+/g, ' ').trim(),
+      value: candidate.value?.replace(/\s+/g, ' ').trim(),
+      text: candidate.text?.replace(/\s+/g, ' ').trim() || [candidate.key, candidate.value].filter(Boolean).join(' = '),
+    }))
+    .filter((candidate) => !!candidate.text && (!!candidate.value || !!candidate.key));
+}
+
+function formatMemoryWriteReply(ok: boolean, candidates: MemoryWriteCandidate[], error?: string): string {
+  if (!ok) return `这条记忆没有写入成功：${error || '未知错误'}`;
+  const pairs = candidates
+    .filter((candidate) => candidate.key?.trim() && candidate.value?.trim())
+    .slice(0, 6)
+    .map((candidate) => `- ${candidate.key!.trim()}：${candidate.value!.trim()}`);
+  if (pairs.length === 0) return '已记录到记忆仓库。';
+  return ['已记录到记忆仓库：', '', ...pairs].join('\n');
+}
+
+function renderMemoryWriteProgress(steps: string[]): string {
+  return [
+    '### 处理进度',
+    ...steps.map((step) => `- ${step}`),
+  ].join('\n');
+}
+
+async function tryHandleModelPlannedMemoryWrite(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  binding: ChannelBinding,
+  text: string,
+  rawText: string,
+): Promise<boolean> {
+  const context = getBridgeContext();
+  const { store } = context;
+  const persistMemoryWrite = store.persistMemoryWrite?.bind(store);
+  if (typeof persistMemoryWrite !== 'function') return false;
+
+  const workingDirectory = binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined;
+  let decision: MemoryWriteIntentDecision | null = null;
+  if (context.memoryIntents?.classifyMemoryWrite) {
+    try {
+      decision = await context.memoryIntents.classifyMemoryWrite({
+        sessionId: binding.codepilotSessionId,
+        channelType: binding.channelType,
+        chatId: binding.chatId,
+        userId: msg.address.userId,
+        userDisplayName: msg.address.displayName,
+        text: text || rawText,
+        recentMessages: store.getMessages(binding.codepilotSessionId, { limit: 8 }).messages,
+        workingDirectory,
+      });
+    } catch (error) {
+      console.warn('[bridge-manager] Memory write intent classifier failed:', error instanceof Error ? error.message : error);
+    }
+  }
+
+  if (decision && decision.action !== 'write') return false;
+
+  const modelCandidates = decision?.action === 'write' && decision.confidence >= 0.55
+    ? usableMemoryCandidates(decision.candidates)
+    : [];
+  const memoryWrite = persistMemoryWrite({
+    sessionId: binding.codepilotSessionId,
+    channelType: binding.channelType,
+    chatId: binding.chatId,
+    chatDisplayName: binding.displayName || msg.address.displayName || msg.address.chatId,
+    userId: msg.address.userId,
+    userDisplayName: msg.address.displayName,
+    text: text || rawText,
+    workingDirectory,
+    candidates: modelCandidates.length > 0 ? modelCandidates : undefined,
+  });
+  if (memoryWrite.skipped) return false;
+
+  const steps = [
+    decision
+      ? '已让模型判断这条消息属于记忆写入，并整理可保存的信息。'
+      : '模型判定不可用，已使用保守结构化解析检查是否可以写入。',
+    modelCandidates.length > 0
+      ? `已整理 ${modelCandidates.length} 条候选记忆。`
+      : '未拿到模型候选，使用原文中的结构化键值作为候选。',
+    memoryWrite.ok
+      ? '已写入可见记忆仓库并重建知识索引。'
+      : '写入可见记忆仓库时失败，准备返回具体阻塞。',
+  ];
+  adapter.onMessageStart?.(msg.address.chatId);
+  if (typeof adapter.onStreamText === 'function') {
+    try { adapter.onStreamText(msg.address.chatId, renderMemoryWriteProgress(steps)); } catch { /* non-critical */ }
+  }
+
+  const reply = formatMemoryWriteReply(memoryWrite.ok, modelCandidates, memoryWrite.error);
+  const reviewedText = applyOutboundAnswerReview({
+    channelType: adapter.channelType,
+    chatId: msg.address.chatId,
+    userId: msg.address.userId,
+    userDisplayName: msg.address.displayName,
+    messageId: msg.messageId,
+    sessionId: binding.codepilotSessionId,
+    workingDirectory,
+    userText: rawText,
+    answerText: reply,
+    source: 'system',
+  });
+
+  store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
+  store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
+
+  let cardFinalized = false;
+  if (typeof adapter.onStreamEnd === 'function') {
+    try {
+      cardFinalized = await adapter.onStreamEnd(msg.address.chatId, memoryWrite.ok ? 'completed' : 'error', reviewedText);
+    } catch (error) {
+      console.warn('[bridge-manager] Memory write card finalize failed:', error instanceof Error ? error.message : error);
+    }
+  }
+  if (!cardFinalized) {
+    await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
+  }
+  return true;
+}
+
 function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
   const trimmed = text.trim();
   if (!trimmed) return trimmed;
@@ -995,6 +1183,57 @@ function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
     blocker || `未完成：这个请求需要实际 ${domain} 执行结果，本轮没有拿到可用工具输出。`,
     '已拦截通用手动排查步骤；这类请求必须由工具执行链完成，不能把任务退回给用户。',
   ].join('\n');
+}
+
+function sanitizeProgressCardDetail(text: string): string {
+  const normalized = (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/```cti-final[\s\S]*?```/gi, '')
+    .replace(/^\s*#{1,6}\s*处理思路\s*$/gim, '')
+    .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
+    .trim();
+  if (!normalized) return '';
+  return normalized.length > 900 ? `${normalized.slice(0, 897)}...` : normalized;
+}
+
+function buildMemoryDecisionAgentPrompt(memoryDecision: MemoryReplyDecision): string {
+  const plan = memoryDecision.plan;
+  const query = plan.normalizedKey || plan.queryText || '';
+  if (memoryDecision.type === 'direct_reply') {
+    const hit = memoryDecision.hit;
+    return [
+      '本地记忆检索命中（作为 agent 上下文，不是最终回复）：',
+      query ? `- 用户记忆查询：${query}` : '',
+      '- 命中内容：',
+      memoryDecision.text,
+      hit.content?.trim() ? `- 原始片段：\n${hit.content.trim()}` : '',
+      '',
+      '回复要求：',
+      '- 必须由 agent 按当前回复风格整理最终答复，不要把这段上下文原样当作快捷回复。',
+      '- 根据用户实际询问意图回答：如果用户问所有、全部、完整列表或对应表，列出命中的全部结构化项；如果用户只问单个名称，再只回答匹配项。',
+      '- 保留记忆里的原始键和值；不要补充记忆中没有的条目。',
+      '- 如果证据不足，明确说明未找到可靠记忆，不要编造。',
+    ].filter(Boolean).join('\n');
+  }
+  if (memoryDecision.type === 'no_memory_answer') {
+    return [
+      '本地记忆检索结果（作为 agent 上下文，不是最终回复）：',
+      query ? `- 用户记忆查询：${query}` : '',
+      `- 检索结论：${memoryDecision.text}`,
+      '',
+      '回复要求：',
+      '- 必须由 agent 整理最终答复。',
+      '- 根据用户实际询问意图回答，不能因为某个关键词命中就只答一个无关条目。',
+      '- 如果没有可靠记忆命中，直接说明没找到，不要编造。',
+    ].filter(Boolean).join('\n');
+  }
+  return memoryDecision.systemPrompt || '';
+}
+
+function inferProgressEvidenceLabel(text: string): string {
+  if (/(截图|截屏|图片|生成物|文件|产物|artifact|screenshot|capture)/iu.test(text)) return '产物任务';
+  if (/(mcp|unity|命令|执行|运行|工具|切换|加载|创建|修改|删除|读取|搜索|检查)/iu.test(text)) return '工具任务';
+  return '';
 }
 
 function formatBytes(bytes: number): string {
@@ -3297,8 +3536,20 @@ async function handleMessage(
   }
 
   const rawText = msg.text.trim();
-  const hasAttachments = msg.attachments && msg.attachments.length > 0;
+  const hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
   const ownerMessage = isOwnerMessage(msg);
+
+  const inboundClaim = claimInboundForExecution(adapter, msg, rawText, hasAttachments);
+  if (inboundClaim.duplicate) {
+    console.warn('[bridge-manager] Duplicate inbound message ignored:', JSON.stringify({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      messageId: msg.messageId,
+      reason: inboundClaim.reason,
+    }));
+    ack();
+    return;
+  }
 
   // Handle attachment-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
@@ -3600,8 +3851,13 @@ async function handleMessage(
     return;
   }
 
-  if (!hasAttachments && typeof store.persistMemoryWrite === 'function') {
-    const memoryWrite = store.persistMemoryWrite({
+  if (!hasAttachments && await tryHandleModelPlannedMemoryWrite(adapter, msg, binding, text || rawText, rawText)) {
+    ack();
+    return;
+  }
+
+  if (false && !hasAttachments && typeof store.persistMemoryWrite === 'function') {
+    const memoryWrite = store.persistMemoryWrite!({
       sessionId: binding.codepilotSessionId,
       channelType: binding.channelType,
       chatId: binding.chatId,
@@ -3639,6 +3895,7 @@ async function handleMessage(
 
   let memoryRecallExtraSystemPrompt = '';
   let memoryReviewContext: Pick<AnswerReviewInput, 'memoryPlan' | 'memoryHits'> = {};
+  const preExecutionProgressSteps: string[] = [];
   if (!hasAttachments && store.decideMemoryReply) {
     const memoryDecision = store.decideMemoryReply({
       sessionId: binding.codepilotSessionId,
@@ -3650,34 +3907,22 @@ async function handleMessage(
       query: rawText,
       recentHistoryLimit: 0,
     });
-    if (memoryDecision.type === 'direct_reply' || memoryDecision.type === 'no_memory_answer') {
-      const reviewedText = applyOutboundAnswerReview({
-        channelType: adapter.channelType,
-        chatId: msg.address.chatId,
-        userId: msg.address.userId,
-        userDisplayName: msg.address.displayName,
-        messageId: msg.messageId,
-        sessionId: binding.codepilotSessionId,
-        workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
-        userText: rawText,
-        answerText: memoryDecision.text,
-        memoryPlan: memoryDecision.plan,
-        memoryHits: memoryDecision.type === 'direct_reply' ? [memoryDecision.hit] : [],
-        source: 'direct_memory',
-      });
-      store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
-      store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
-      recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
-      recordConversationMemoryEvent(msg, binding, 'assistant', reviewedText);
-      await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
-      ack();
-      return;
-    }
     memoryReviewContext = {
       memoryPlan: memoryDecision.plan,
-      memoryHits: memoryDecision.memory?.hits || [],
+      memoryHits: memoryDecision.type === 'direct_reply'
+        ? [memoryDecision.hit]
+        : memoryDecision.type === 'augment_codex'
+          ? memoryDecision.memory?.hits || []
+          : [],
     };
-    memoryRecallExtraSystemPrompt = memoryDecision.systemPrompt || '';
+    memoryRecallExtraSystemPrompt = buildMemoryDecisionAgentPrompt(memoryDecision);
+    if (memoryDecision.type === 'direct_reply') {
+      preExecutionProgressSteps.push('检索到相关记忆，交给 agent 按记忆证据整理最终回复。');
+    } else if (memoryDecision.type === 'no_memory_answer') {
+      preExecutionProgressSteps.push('已检查本地记忆，没有找到可靠命中，交给 agent 明确收口。');
+    } else if (memoryDecision.memory?.hits?.length) {
+      preExecutionProgressSteps.push('检索到相关记忆上下文，交给 agent 结合当前问题整理。');
+    }
   }
 
   const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
@@ -3892,8 +4137,9 @@ async function handleMessage(
   }
 
   // ── Streaming preview setup ──────────────────────────────────
+  const hasStreamingCards = !feishuDocRequest && typeof adapter.onStreamText === 'function';
   let previewState: StreamingPreviewState | null = null;
-  const caps = feishuDocRequest ? null : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
+  const caps = (feishuDocRequest || hasStreamingCards) ? null : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
   if (caps?.supported) {
     previewState = {
       draftId: generateDraftId(),
@@ -3957,11 +4203,33 @@ async function handleMessage(
   // onStreamText, onToolEvent, and onStreamEnd callbacks.
   // These run in parallel with the existing preview system — Feishu
   // uses cards instead of message edit for streaming.
-  const hasStreamingCards = !feishuDocRequest && typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
+  const progressCardSteps: string[] = [];
+  let providerProgressText = '';
+
+  const renderProgressCardText = (): string => {
+    const steps = progressCardSteps.slice(-8);
+    const lines = [
+      '### 处理进度',
+      ...(steps.length > 0 ? steps : ['已收到请求，正在进入执行链。']).map((item) => `- ${item}`),
+    ];
+    const detail = sanitizeProgressCardDetail(providerProgressText);
+    if (detail) {
+      lines.push('', '### 执行细节', detail);
+    }
+    return lines.join('\n');
+  };
+
+  const emitProgressCardStep = hasStreamingCards ? (step: string) => {
+    const normalized = step.replace(/\s+/g, ' ').trim();
+    if (!normalized) return;
+    if (progressCardSteps[progressCardSteps.length - 1] !== normalized) progressCardSteps.push(normalized);
+    try { adapter.onStreamText!(msg.address.chatId, renderProgressCardText()); } catch { /* non-critical */ }
+  } : undefined;
 
   const onStreamCardText = hasStreamingCards ? (fullText: string) => {
-    try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
+    providerProgressText = fullText;
+    try { adapter.onStreamText!(msg.address.chatId, renderProgressCardText()); } catch { /* non-critical */ }
   } : undefined;
 
   const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
@@ -3975,6 +4243,9 @@ async function handleMessage(
     try {
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
     } catch { /* non-critical */ }
+    const visibleToolName = formatVisibleToolName(toolName || toolCallTracker.get(toolId)?.name || '') || '工具';
+    const statusText = status === 'running' ? '执行中' : status === 'complete' ? '已完成' : '失败';
+    emitProgressCardStep?.(`${visibleToolName}${statusText}。`);
   } : undefined;
 
   // Combined partial text callback: streaming preview + streaming cards
@@ -3982,6 +4253,15 @@ async function handleMessage(
     if (previewOnPartialText) previewOnPartialText(fullText);
     if (onStreamCardText) onStreamCardText(fullText);
   } : undefined;
+
+  emitProgressCardStep?.('已收到请求，正在进入执行链。');
+  emitProgressCardStep?.('正在判断这次需要什么证据、工具或记忆上下文。');
+  emitProgressCardStep?.('会话、权限和工作区上下文已准备。');
+  for (const step of preExecutionProgressSteps) emitProgressCardStep?.(step);
+  const isExplicitMemoryRecall = memoryReviewContext.memoryPlan?.intent === 'explicit_recall';
+  if (!isExplicitMemoryRecall && inferProgressEvidenceLabel(rawText)) {
+    emitProgressCardStep?.(`识别为${inferProgressEvidenceLabel(rawText)}，需要真实执行证据。`);
+  }
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
@@ -4058,6 +4338,7 @@ async function handleMessage(
     const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
       ? buildFeishuCloudResolvedPrompt(rawText, feishuCloudSystemPrompt)
       : basePromptText;
+    emitProgressCardStep?.('正在选择执行器并读取可用工具目录。');
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
@@ -4078,11 +4359,13 @@ async function handleMessage(
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
       extraSystemPrompt: [fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt].filter(Boolean).join('\n\n'),
+      memoryPlan: memoryReviewContext.memoryPlan,
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
+    emitProgressCardStep?.('执行器返回结果，正在校验工具证据和本地产物。');
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
     const responseText = result.responseText
@@ -4097,6 +4380,7 @@ async function handleMessage(
         executionEvidence: result.executionEvidence,
       });
     }
+    emitProgressCardStep?.('最终回复已整理，准备收口同一张卡片。');
     const userFacingResponseText = preparedReply?.text
       ? applyOutboundAnswerReview({
         channelType: adapter.channelType,

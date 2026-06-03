@@ -1,4 +1,4 @@
-import type { FileAttachment } from './host.js';
+import type { FileAttachment, MemoryQueryPlan } from './host.js';
 
 export type ExecutionRequirementKind = 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
 
@@ -12,6 +12,7 @@ export interface ExecutionRequirementInput {
   userText: string;
   workingDirectory?: string;
   files?: FileAttachment[];
+  memoryPlan?: MemoryQueryPlan;
 }
 
 const NONE_REQUIREMENT: ExecutionRequirement = {
@@ -29,10 +30,16 @@ const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*vi
 const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|图片|图像|文件|文档|上传|下载|game\s*view|scene\s*view)/iu;
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
+const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
+const TOOL_DOMAIN_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|GameObject|Assets|Packages|ProjectSettings|场景|节点|组件|物体|对象|层级|Hierarchy)/iu;
 
 export function classifyExecutionRequirement(input: ExecutionRequirementInput): ExecutionRequirement {
   const text = (input.userText || '').trim();
   if (!text) return NONE_REQUIREMENT;
+
+  if (input.memoryPlan?.intent === 'explicit_recall') {
+    return NONE_REQUIREMENT;
+  }
 
   if (MEMORY_RECALL_RE.test(text) && !LOCAL_TARGET_RE.test(text) && !TOOL_REQUIRED_RE.test(text)) {
     return NONE_REQUIREMENT;
@@ -42,11 +49,13 @@ export function classifyExecutionRequirement(input: ExecutionRequirementInput): 
     return NONE_REQUIREMENT;
   }
 
-  if (NAME_LOOKUP_RE.test(text) && !LOCAL_READ_RE.test(text) && !ACTION_VERB_RE.test(text)) {
+  const asksForCurrentToolState = TOOL_DOMAIN_RE.test(text) && INSPECTION_ACTION_RE.test(text);
+
+  if (NAME_LOOKUP_RE.test(text) && !LOCAL_READ_RE.test(text) && !ACTION_VERB_RE.test(text) && !asksForCurrentToolState) {
     return NONE_REQUIREMENT;
   }
 
-  if (TOOL_REQUIRED_RE.test(text)) {
+  if (TOOL_REQUIRED_RE.test(text) || asksForCurrentToolState) {
     return {
       kind: ARTIFACT_RE.test(text) ? 'artifact_required' : 'tool_required',
       reason: 'request asks for a concrete tool, MCP, file, command, or artifact action',

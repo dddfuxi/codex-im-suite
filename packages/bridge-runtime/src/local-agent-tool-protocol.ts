@@ -7,7 +7,7 @@ import { maskSecrets } from './logger.js';
 
 export interface JsonToolRequest {
   action: 'tool_request';
-  tool: 'list_dir' | 'read_file' | 'search_files' | 'shell' | 'mcp_call' | 'unity_mcp_execute_code';
+  tool: 'list_dir' | 'read_file' | 'search_files' | 'shell' | 'shell_artifact' | 'mcp_call' | 'unity_mcp_execute_code';
   args: Record<string, unknown>;
 }
 
@@ -52,6 +52,19 @@ export interface McpToolCallDefinition {
   arguments?: Record<string, unknown>;
 }
 
+export interface ShellArtifactDefinition {
+  id: string;
+  displayName?: string;
+  match?: {
+    keywords?: string[];
+    regex?: string[];
+  };
+  command: string;
+  cwd?: string;
+  timeoutMs?: number;
+  artifactPaths?: string[];
+}
+
 export interface JsonToolMcpCatalogEntry {
   manifestHint: string;
   displayName?: string;
@@ -85,7 +98,7 @@ export type JsonToolValidation =
   | { ok: true; request: JsonToolRequest }
   | { ok: false; error: string };
 
-const SUPPORTED_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'shell', 'mcp_call', 'unity_mcp_execute_code']);
+const SUPPORTED_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'shell', 'shell_artifact', 'mcp_call', 'unity_mcp_execute_code']);
 const MAX_READ_FILE_BYTES = 64 * 1024;
 const MAX_SEARCH_RESULTS = 80;
 const MAX_SHELL_OUTPUT_CHARS = 24 * 1024;
@@ -109,7 +122,8 @@ export function isJsonToolProtocolEligible(
   requirement: { kind: ExecutionRequirementKind } | undefined,
   modelSource: string | undefined,
 ): boolean {
-  return modelSource === 'local_api' && (requirement?.kind === 'local_read_required' || requirement?.kind === 'tool_required');
+  return modelSource === 'local_api'
+    && (requirement?.kind === 'local_read_required' || requirement?.kind === 'tool_required' || requirement?.kind === 'artifact_required');
 }
 
 export function buildJsonToolProtocolPrompt(
@@ -128,6 +142,9 @@ export function buildJsonToolProtocolPrompt(
       : '',
     toolCatalog.includes('shell')
       ? '- Use shell for concrete OS command/tool execution requested by the user, only when no Unity MCP execution is required.'
+      : '',
+    toolCatalog.includes('shell_artifact')
+      ? '- Use shell_artifact only for configured artifact-producing actions such as a desktop screenshot. It must return real local artifact paths.'
       : '',
     toolCatalog.some((tool) => tool === 'list_dir' || tool === 'read_file' || tool === 'search_files')
       ? '- Use list_dir for directory/folder listing, read_file for one small file, search_files for bounded project search.'
@@ -159,6 +176,7 @@ export function buildJsonToolProtocolPrompt(
     '{"action":"tool_request","tool":"read_file","args":{"path":"README.md"}}',
     '{"action":"tool_request","tool":"search_files","args":{"path":".","query":"WorkflowRun","maxResults":20}}',
     '{"action":"tool_request","tool":"shell","args":{"command":"node --version","cwd":"."}}',
+    '{"action":"tool_request","tool":"shell_artifact","args":{"command":"powershell -ExecutionPolicy Bypass -File scripts/capture-desktop-screenshot.ps1","cwd":".","artifactPaths":["C:\\\\Users\\\\admin\\\\.claude-to-im\\\\runtime\\\\captures\\\\desktop-latest.png"]}}',
     '{"action":"tool_request","tool":"mcp_call","args":{"manifestHint":"unitymcp","tool":"manage_camera","arguments":{"action":"screenshot","capture_source":"game_view","include_image":false}}}',
     '{"action":"tool_request","tool":"unity_mcp_execute_code","args":{"code":"return UnityEngine.Application.unityVersion;","compiler":"auto","safety_checks":true}}',
   ].filter(Boolean).join('\n');
@@ -231,18 +249,21 @@ export function buildToolResultPrompt(result: JsonToolResult, originalUserText: 
 export function buildJsonToolFinalResponsePrompt(
   originalUserText: string,
   toolHistory: JsonToolHistoryEntry[],
+  options: { replyStyleHint?: string } = {},
 ): string {
+  const styleHint = options.replyStyleHint?.trim();
   return [
     'Final answer composer for an IM/Feishu user after real tools have already run.',
     '- You are not chatting with the user directly. You are formatting the final answer from the supplied real tool history.',
     '- Answer in Chinese unless the user explicitly asked for another language.',
     '- Output only the final user-facing Markdown body. Do not output JSON, cti-final fences, or protocol names such as JsonTool/tool_request/tool_result.',
-    '- You MUST include the headings "处理思路" and "执行结果".',
-    '- In "处理思路", summarize the goal, what factual evidence you checked, and how the result follows. This is a user-facing rationale, not hidden chain-of-thought.',
-    '- In "执行结果", include the concrete outcome. If the action was not completed, start with "未完成：" and name the exact blocker.',
+    '- The final answer must be outcome-first. Do not include a separate "处理思路" section unless the user explicitly asked for a detailed walkthrough.',
+    '- If the action was not completed, start with "未完成：" and name the exact blocker from the tool history.',
     '- Do not paste raw MCP JSON or logs. Extract meaningful fields such as scene name, path, count, created file, screenshot, or error.',
     '- Keep it concise enough for a Feishu card. Markdown is allowed; use bullets or a small table only when it improves readability.',
     '- If local files or images were produced, mention them briefly; the runtime will attach existing artifacts separately.',
+    styleHint ? `- Required reply style: ${styleHint}` : '',
+    styleHint ? '- Apply the required reply style in the first sentence while preserving truthfulness and not exaggerating the result.' : '',
     '',
     `用户请求：\n${originalUserText}`,
     '',
@@ -263,13 +284,15 @@ export function normalizeGeneratedToolFinalText(text: string, fallbackText: stri
   }
   normalized = normalized.replace(/^```(?:markdown|md)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
   normalized = normalized.replace(/\bJsonTool\b|\btool_request\b|\btool_result\b|\bcti-final\b/gi, '').trim();
+  normalized = normalized
+    .replace(/(?:^|\n)\s*[-*]?\s*未完成[:：]\s*(?:无|没有|none|no)[^\n]*(?=\n|$)/giu, '')
+    .trim();
   return isUsableGeneratedToolFinalText(normalized) ? normalized : fallbackText;
 }
 
 export function isUsableGeneratedToolFinalText(text: string): boolean {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (normalized.length < 20) return false;
-  if (!/处理思路/u.test(normalized) || !/执行结果/u.test(normalized)) return false;
   if (/"success"\s*:\s*true|^\s*\{[\s\S]*\}\s*$/iu.test(text)) return false;
   if (/\b(JsonTool|tool_request|tool_result|cti-final)\b/iu.test(text)) return false;
   if (/how can i assist|how can i help|got it\.?|有什么可以帮忙|请问有什么可以帮/iu.test(normalized)) return false;
@@ -303,6 +326,16 @@ export function buildCtiFinalToolResponseEnvelope(
 }
 
 export function collectJsonToolArtifacts(result: JsonToolResult): JsonToolArtifacts {
+  if (result.tool === 'shell_artifact' && result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
+    const data = result.data as Record<string, unknown>;
+    const explicitArtifacts = collectExistingLocalArtifacts({
+      artifacts: data.artifacts,
+      artifactPaths: data.artifactPaths,
+      images: data.images,
+      files: data.files,
+    });
+    if (explicitArtifacts.images.length > 0 || explicitArtifacts.files.length > 0) return explicitArtifacts;
+  }
   return collectExistingLocalArtifacts(result.data);
 }
 
@@ -316,14 +349,15 @@ export function buildVisibleToolOutcomeFallback(
 
   const outcome = extractReadableOutcome(last);
   const actionSummary = summarizeUserVisibleActions(toolHistory);
-  return [
-    '**处理思路**',
-    `- 根据请求“${compactPromptText(originalUserText, 80)}”判断需要真实工具执行。`,
-    ...actionSummary.map((item) => `- ${item}`),
-    '',
-    '**执行结果**',
-    outcome || '- 已完成，工具返回成功。'
-  ].join('\n');
+  const lines = [
+    outcome || '已完成，工具返回成功。',
+  ];
+  if (actionSummary.length > 0) {
+    lines.push('', '依据：', ...actionSummary.map((item) => `- ${item}`));
+  } else {
+    lines.push('', `依据：已按“${compactPromptText(originalUserText, 80)}”执行真实工具链。`);
+  }
+  return lines.join('\n');
 }
 
 function summarizeToolHistoryForPrompt(toolHistory: JsonToolHistoryEntry[]): string {
@@ -483,7 +517,7 @@ export function buildDeterministicToolAnswer(result: JsonToolResult): string | n
 
 export function buildCtiFinalToolAnswer(result: JsonToolResult): string | null {
   if (!result.ok) return null;
-  const artifacts = collectExistingLocalArtifacts(result.data);
+  const artifacts = collectJsonToolArtifacts(result);
   if (artifacts.images.length === 0 && artifacts.files.length === 0) return null;
   const kind = artifacts.images.length > 0 && artifacts.files.length > 0
     ? 'mixed'
@@ -522,9 +556,11 @@ function buildToolArtifactSummary(
   result: JsonToolResult,
   artifacts: { images: string[]; files: string[] },
 ): string {
-  const data = result.data && typeof result.data === 'object' ? result.data as { server?: unknown; tool?: unknown } : {};
+  const data = result.data && typeof result.data === 'object' ? result.data as { server?: unknown; tool?: unknown; displayName?: unknown } : {};
   const toolLabel = result.tool === 'mcp_call'
     ? `MCP 工具执行完成：${String(data.server || 'unknown')} / ${String(data.tool || 'unknown')}`
+    : result.tool === 'shell_artifact'
+      ? `本地产物工具执行完成：${String(data.displayName || 'artifact')}`
     : `本地工具执行完成：${result.tool}`;
   const lines = [toolLabel];
   if (artifacts.images.length > 0) {
@@ -647,11 +683,12 @@ export function buildFallbackJsonToolRequest(
     requirementKind?: ExecutionRequirementKind;
     mcpToolCallDefinitions?: McpToolCallDefinition[];
     unityMcpExecuteCodeDefinitions?: UnityMcpExecuteCodeDefinition[];
+    shellArtifactDefinitions?: ShellArtifactDefinition[];
   },
 ): JsonToolRequest | null {
   const text = userText.trim();
   if (!text) return null;
-  if (context.requirementKind === 'tool_required') {
+  if (context.requirementKind === 'tool_required' || context.requirementKind === 'artifact_required') {
     const configuredMcpCallRequest = buildConfiguredMcpToolCallRequest(
       text,
       context.mcpToolCallDefinitions || [],
@@ -663,6 +700,12 @@ export function buildFallbackJsonToolRequest(
       context.unityMcpExecuteCodeDefinitions || [],
     );
     if (configuredUnityMcpRequest) return configuredUnityMcpRequest;
+
+    const configuredShellArtifactRequest = buildConfiguredShellArtifactRequest(
+      text,
+      context.shellArtifactDefinitions || [],
+    );
+    if (configuredShellArtifactRequest) return configuredShellArtifactRequest;
 
     const unityCode = extractUnityExecuteCode(text);
     if (unityCode) {
@@ -716,12 +759,13 @@ export function planDeterministicJsonToolRequest(
     requirementKind?: ExecutionRequirementKind;
     mcpToolCallDefinitions?: McpToolCallDefinition[];
     unityMcpExecuteCodeDefinitions?: UnityMcpExecuteCodeDefinition[];
+    shellArtifactDefinitions?: ShellArtifactDefinition[];
   },
 ): DeterministicJsonToolRequestPlan | null {
   const request = buildFallbackJsonToolRequest(userText, context);
   if (!request) return null;
 
-  if (context.requirementKind === 'tool_required') {
+  if (context.requirementKind === 'tool_required' || context.requirementKind === 'artifact_required') {
     if (request.tool === 'mcp_call') {
       return {
         request,
@@ -743,6 +787,13 @@ export function planDeterministicJsonToolRequest(
         reason: 'explicit shell command in user request',
       };
     }
+    if (request.tool === 'shell_artifact') {
+      return {
+        request,
+        source: 'runtime_deterministic',
+        reason: 'configured artifact tool manifest',
+      };
+    }
     return null;
   }
 
@@ -761,6 +812,7 @@ export function planDeterministicJsonToolRequest(
 
 export function validateJsonToolRequest(request: JsonToolRequest, options: JsonToolValidationOptions): JsonToolValidation {
   if (request.tool === 'shell') return validateShellToolRequest(request, options);
+  if (request.tool === 'shell_artifact') return validateShellArtifactToolRequest(request, options);
   if (request.tool === 'mcp_call') return validateMcpCallRequest(request);
   if (request.tool === 'unity_mcp_execute_code') return validateUnityMcpExecuteCodeRequest(request);
 
@@ -817,6 +869,8 @@ export function executeJsonToolRequest(request: JsonToolRequest): JsonToolResult
         return executeSearchFiles(request);
       case 'shell':
         return executeShell(request);
+      case 'shell_artifact':
+        return executeShellArtifact(request);
       case 'mcp_call':
         return { tool: request.tool, ok: false, error: 'mcp_call must be executed by the MCP bridge' };
       case 'unity_mcp_execute_code':
@@ -912,6 +966,40 @@ function validateShellToolRequest(request: JsonToolRequest, options: JsonToolVal
   return { ok: true, request: { ...request, args: { ...request.args, command, cwd, timeoutMs } } };
 }
 
+function validateShellArtifactToolRequest(request: JsonToolRequest, options: JsonToolValidationOptions): JsonToolValidation {
+  const shellValidation = validateShellToolRequest(request, options);
+  if (!shellValidation.ok) return shellValidation;
+
+  const workingDirectory = options.workingDirectory ? path.resolve(options.workingDirectory) : process.cwd();
+  const roots = normalizeAllowedRoots(options.allowedRoots.length > 0 ? options.allowedRoots : [workingDirectory]);
+  const rawArtifactPaths = Array.isArray(request.args.artifactPaths)
+    ? request.args.artifactPaths.filter((item): item is string => typeof item === 'string')
+    : [];
+  const artifactPaths: string[] = [];
+  for (const rawPath of rawArtifactPaths) {
+    const trimmed = rawPath.trim();
+    if (!trimmed) continue;
+    if (isUnsafePath(trimmed)) return { ok: false, error: 'shell_artifact path is not allowed' };
+    const resolved = path.resolve(path.isAbsolute(trimmed) ? trimmed : path.join(workingDirectory, trimmed));
+    if (!isInsideAnyRoot(resolved, roots)) {
+      return { ok: false, error: `shell_artifact path is outside allowed roots: ${resolved}` };
+    }
+    artifactPaths.push(resolved);
+  }
+  if (artifactPaths.length === 0) return { ok: false, error: 'shell_artifact request is missing args.artifactPaths' };
+  return {
+    ok: true,
+    request: {
+      ...shellValidation.request,
+      args: {
+        ...shellValidation.request.args,
+        artifactPaths,
+        displayName: typeof request.args.displayName === 'string' ? request.args.displayName : undefined,
+      },
+    },
+  };
+}
+
 function executeShell(request: JsonToolRequest): JsonToolResult {
   const command = String(request.args.command || '');
   const cwd = String(request.args.cwd || process.cwd());
@@ -945,6 +1033,38 @@ function executeShell(request: JsonToolRequest): JsonToolResult {
     ok: exitCode === 0 && !output.error,
     data: { command, cwd, exitCode, stdout, stderr, durationMs },
     error,
+  };
+}
+
+function executeShellArtifact(request: JsonToolRequest): JsonToolResult {
+  const shellResult = executeShell(request);
+  const artifactPaths = Array.isArray(request.args.artifactPaths)
+    ? request.args.artifactPaths.filter((item): item is string => typeof item === 'string')
+    : [];
+  const artifacts = artifactPaths
+    .map((artifactPath) => path.resolve(artifactPath))
+    .filter((artifactPath) => {
+      try {
+        return fs.statSync(artifactPath).isFile();
+      } catch {
+        return false;
+      }
+    });
+  const data = shellResult.data && typeof shellResult.data === 'object'
+    ? shellResult.data as Record<string, unknown>
+    : {};
+  return {
+    tool: request.tool,
+    ok: shellResult.ok && artifacts.length > 0,
+    data: {
+      ...data,
+      artifactPaths,
+      artifacts,
+      displayName: typeof request.args.displayName === 'string' ? request.args.displayName : undefined,
+    },
+    error: shellResult.ok && artifacts.length === 0
+      ? `shell_artifact did not create expected artifact: ${artifactPaths.join(' | ')}`
+      : shellResult.error,
   };
 }
 
@@ -1097,6 +1217,28 @@ function buildConfiguredMcpToolCallRequest(
         manifestHint: definition.manifestHint,
         tool: definition.tool,
         arguments: definition.arguments || {},
+      },
+    };
+  }
+  return null;
+}
+
+function buildConfiguredShellArtifactRequest(
+  text: string,
+  definitions: ShellArtifactDefinition[],
+): JsonToolRequest | null {
+  for (const definition of definitions) {
+    if (!definition.command.trim()) continue;
+    if (!matchesToolDefinition(text, definition)) continue;
+    return {
+      action: 'tool_request',
+      tool: 'shell_artifact',
+      args: {
+        command: definition.command,
+        cwd: definition.cwd || '.',
+        timeoutMs: definition.timeoutMs,
+        artifactPaths: definition.artifactPaths || [],
+        displayName: definition.displayName || definition.id,
       },
     };
   }

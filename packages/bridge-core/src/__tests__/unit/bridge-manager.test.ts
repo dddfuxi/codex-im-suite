@@ -318,6 +318,214 @@ describe('bridge-manager lifecycle', () => {
     assert.match(sent[0].text, /已完成/);
     assert.equal(sent[0].replyToMessageId, 'om_card');
   });
+
+  it('streams progress card text for tool-required turns without polluting final response', async () => {
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '### 处理思路\n正在规划工具调用。\n' },
+          {
+            type: 'tool_use',
+            data: JSON.stringify({ id: 'tool-1', name: 'JsonTool:shell', input: { command: 'node --version' } }),
+          },
+          {
+            type: 'tool_result',
+            data: JSON.stringify({ tool_use_id: 'tool-1', content: '{"ok":true}', is_error: false }),
+          },
+          { type: 'progress', data: '工具返回成功，正在整理最终结果。\n' },
+          { type: 'text', data: '最终结果：已完成。' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const session = store.createSession('progress-test', '', undefined, process.cwd());
+    const binding = store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_progress',
+      displayName: 'progress-user',
+      codepilotSessionId: session.id,
+      model: '',
+      workingDirectory: process.cwd(),
+    });
+    const previews: string[] = [];
+    const { processMessage } = await import('../../lib/bridge/conversation-engine');
+
+    const result = await processMessage(
+      binding,
+      '运行 node --version',
+      undefined,
+      undefined,
+      undefined,
+      (text) => previews.push(text),
+      undefined,
+      { storedUserText: '运行 node --version' },
+    );
+
+    assert.equal(result.responseText, '最终结果：已完成。');
+    assert.match(previews.join('\n'), /处理思路/);
+    assert.match(previews.join('\n'), /工具返回成功/);
+    assert.doesNotMatch(result.responseText, /处理思路/);
+  });
+
+  it('deduplicates repeated inbound message ids before invoking Codex', async () => {
+    let streamCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const dedupKeys = new Set<string>();
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      checkDedup: (key: string) => dedupKeys.has(key),
+      insertDedup: (key: string) => { dedupKeys.add(key); },
+      cleanupExpiredDedup: () => {},
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          streamCalls++;
+          return createTextStream('只应该处理一次');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const inbound = createInboundMessage('帮我给这张图起名');
+
+    await _testOnly.handleMessage(adapter, inbound);
+    await _testOnly.handleMessage(adapter, inbound);
+
+    assert.equal(streamCalls, 1);
+    assert.equal(sent.length, 1);
+  });
+
+  it('deduplicates recovered media captions even when Feishu gives a new message id', async () => {
+    let streamCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const dedupKeys = new Set<string>();
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      checkDedup: (key: string) => dedupKeys.has(key),
+      insertDedup: (key: string) => { dedupKeys.add(key); },
+      cleanupExpiredDedup: () => {},
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          streamCalls++;
+          return createTextStream('媒体说明只应该处理一次');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const first = {
+      ...createInboundMessage('帮我给上面的制药机起个名'),
+      attachments: [{
+        id: 'img_1',
+        name: 'scene.png',
+        type: 'image/png',
+        size: 8,
+        data: Buffer.from('image').toString('base64'),
+      }],
+    };
+    const recovered = {
+      ...createInboundMessage('帮我给上面的制药机起个名'),
+      messageId: 'm_2',
+    };
+
+    await _testOnly.handleMessage(adapter, first);
+    await _testOnly.handleMessage(adapter, recovered);
+
+    assert.equal(streamCalls, 1);
+    assert.equal(sent.length, 1);
+  });
+
+  it('uses a finalized streaming card as the only Feishu reply surface', async () => {
+    const sent: OutboundMessage[] = [];
+    const cardUpdates: string[] = [];
+    const finalized: Array<{ status: string; text: string }> = [];
+    let previewCapabilityCalls = 0;
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('最终结果：可以命名为 Furniture_CapsuleMachine') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    adapter.getPreviewCapabilities = () => {
+      previewCapabilityCalls++;
+      return { supported: true, privateOnly: false };
+    };
+    adapter.sendPreview = async () => {
+      throw new Error('streaming card turns should not use legacy preview');
+    };
+    adapter.onStreamText = (_chatId, text) => {
+      cardUpdates.push(text);
+    };
+    adapter.onStreamEnd = async (_chatId, status, responseText) => {
+      finalized.push({ status, text: responseText });
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请输出一条最终回复'));
+
+    assert.equal(sent.length, 0);
+    assert.equal(previewCapabilityCalls, 0);
+    assert.ok(cardUpdates.length > 0);
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].status, 'completed');
+    assert.match(finalized[0].text, /最终结果：可以命名为 Furniture_CapsuleMachine/);
+  });
+
+  it('returns a visible blocker when the provider stream completes without final text', async () => {
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const session = store.createSession('empty-result-test', '', undefined, process.cwd());
+    const binding = store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_empty_result',
+      displayName: 'empty-result-user',
+      codepilotSessionId: session.id,
+      model: '',
+      workingDirectory: process.cwd(),
+    });
+    const { processMessage } = await import('../../lib/bridge/conversation-engine');
+
+    const result = await processMessage(binding, '普通问题', undefined, undefined, undefined);
+
+    assert.equal(result.hasError, true);
+    assert.equal(result.responseText, '未完成：模型没有返回可展示结果。');
+    assert.equal(result.errorMessage, '模型没有返回可展示结果。');
+  });
 });
 
 describe('bridge-manager extension install commands', () => {
@@ -1302,14 +1510,12 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(_testOnly.buildSmallTalkReply('你好呀，帮我发布'), '');
   });
 
-  it('answers high-confidence memory decisions without invoking Codex', async () => {
+  it('routes high-confidence memory decisions through the agent with visible progress', async () => {
     const sent: OutboundMessage[] = [];
-    const reviewed: string[] = [];
+    const progressCards: string[] = [];
+    const streamParams: any[] = [];
     const store = {
       ...createStatefulStore({ remote_bridge_enabled: 'true' }),
-      retrieveRelevantMemory: () => {
-        throw new Error('bridge-core should consume the memory reply decision, not reimplement retrieval');
-      },
       decideMemoryReply: () => ({
         type: 'direct_reply' as const,
         text: [
@@ -1340,21 +1546,13 @@ describe('bridge-manager policy helpers', () => {
           allowDirectAnswer: true,
         },
       }),
-      reviewOutboundAnswer: (input: any) => {
-        reviewed.push(input.answerText);
-        return {
-          verdict: 'warn' as const,
-          reasonCodes: ['memory_key_mismatch'],
-          mode: 'observe' as const,
-          createdAt: '2026-05-12T00:00:00.000Z',
-        };
-      },
     };
     initBridgeContext({
       store,
       llm: {
-        streamChat: () => {
-          throw new Error('Codex should not be called for direct memory decisions');
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('agent 整理后的记忆结果：\n`HSScene` == 医院内部场景\n`city3d_citystage_ST2H_Scene` == 外城场景');
         },
       },
       permissions: { resolvePendingPermission: () => false },
@@ -1364,18 +1562,27 @@ describe('bridge-manager policy helpers', () => {
       sent.push(message);
       return { ok: true, messageId: `om_${sent.length}` };
     });
+    (adapter as any).onStreamText = (_chatId: string, text: string) => {
+      progressCards.push(text);
+    };
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
     await _testOnly.handleMessage(adapter, createInboundMessage('常用场景名称', 'ou_1', 'oc_memory'));
 
     assert.equal(sent.length, 1);
-    assert.equal(reviewed.length, 1);
+    assert.equal(streamParams.length, 1);
+    assert.equal(streamParams[0].executionRequirement?.kind, 'none');
+    assert.match(streamParams[0].systemPrompt || '', /本地记忆检索命中/);
+    assert.match(streamParams[0].systemPrompt || '', /HSScene/);
+    assert.match(progressCards.join('\n'), /检索到相关记忆/);
+    assert.match(progressCards.join('\n'), /交给 agent/);
     assert.match(sent[0].text, /HSScene/);
     assert.match(sent[0].text, /医院内部场景/);
   });
 
   it('uses answer review replacement when enforcement is enabled', async () => {
     const sent: OutboundMessage[] = [];
+    const streamParams: any[] = [];
     const store = {
       ...createStatefulStore({ remote_bridge_enabled: 'true' }),
       decideMemoryReply: () => ({
@@ -1414,8 +1621,9 @@ describe('bridge-manager policy helpers', () => {
     initBridgeContext({
       store,
       llm: {
-        streamChat: () => {
-          throw new Error('Codex should not be called for direct memory decisions');
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('项目 HSScene：医院内部场景');
         },
       },
       permissions: { resolvePendingPermission: () => false },
@@ -1430,6 +1638,8 @@ describe('bridge-manager policy helpers', () => {
     await _testOnly.handleMessage(adapter, createInboundMessage('第十三条龙叫啥', 'ou_1', 'oc_memory'));
 
     assert.equal(sent.length, 1);
+    assert.equal(streamParams.length, 1);
+    assert.match(streamParams[0].systemPrompt || '', /本地记忆检索命中/);
     assert.match(sent[0].text, /第十三条龙：雷霆龙/);
     assert.doesNotMatch(sent[0].text, /HSScene/);
   });
@@ -1626,6 +1836,17 @@ function createTextStream(text: string): ReadableStream<string> {
     start(controller) {
       controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: text })}\n\n`);
       controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: '{}' })}\n\n`);
+      controller.close();
+    },
+  });
+}
+
+function createEventStream(events: Array<{ type: string; data: string }>): ReadableStream<string> {
+  return new ReadableStream<string>({
+    start(controller) {
+      for (const event of events) {
+        controller.enqueue(`data: ${JSON.stringify(event)}\n\n`);
+      }
       controller.close();
     },
   });

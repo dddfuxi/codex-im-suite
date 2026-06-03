@@ -70,6 +70,32 @@ interface FeishuCardState {
   throttleTimer: ReturnType<typeof setTimeout> | null;
 }
 
+type FeishuCardKitCompat =
+  | {
+    version: 'v2';
+    card: {
+      create: (payload: unknown) => Promise<{ data?: { card_id?: string } }>;
+      streamContent: (payload: unknown) => Promise<unknown>;
+      update: (payload: unknown) => Promise<unknown>;
+      settings?: {
+        streamingMode?: {
+          set?: (payload: unknown) => Promise<unknown>;
+        };
+      };
+    };
+  }
+  | {
+    version: 'v1';
+    card: {
+      create: (payload: unknown) => Promise<{ data?: { card_id?: string } }>;
+      update: (payload: unknown) => Promise<unknown>;
+      settings: (payload: unknown) => Promise<unknown>;
+    };
+    cardElement: {
+      content: (payload: unknown) => Promise<unknown>;
+    };
+  };
+
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
 const P2P_POLL_INTERVAL_MS = 5000;
@@ -218,7 +244,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const raw =
       getBridgeContext().store.getSetting('bridge_feishu_streaming_card_enabled')
       || process.env.CTI_FEISHU_STREAMING_CARD_ENABLED
-      || 'false';
+      || 'true';
     return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
   }
 
@@ -598,18 +624,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!this.restClient) return false;
 
     try {
-      // Step 1: Create card via CardKit v2
+      const cardKit = this.getCardKitCompat();
+      if (!cardKit) {
+        console.warn('[feishu-adapter] CardKit API is unavailable in this SDK version');
+        return false;
+      }
+
+      // Step 1: Create card via the CardKit API exposed by the installed SDK.
       const cardBody = {
         schema: '2.0',
         config: {
           streaming_mode: true,
+          streaming_config: {
+            print_frequency_ms: { default: 80, pc: 80, android: 80, ios: 80 },
+            print_step: { default: 1, pc: 1, android: 1, ios: 1 },
+          },
           wide_screen_mode: true,
-          summary: { content: '思考中...' },
+          summary: { content: '处理中...' },
         },
         body: {
           elements: [{
             tag: 'markdown',
-            content: '💭 Thinking...',
+            content: '### 处理进度\n- 已收到请求，正在进入执行链。',
             text_align: 'left',
             text_size: 'normal',
             element_id: 'streaming_content',
@@ -617,9 +653,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
-      });
+      const createResp = await this.createCardKitCard(cardKit, cardBody);
       const cardId = createResp?.data?.card_id;
       if (!cardId) {
         console.warn('[feishu-adapter] Card create returned no card_id');
@@ -717,13 +751,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     state.sequence++;
     const seq = state.sequence;
     const cardId = state.cardId;
+    const cardKit = this.getCardKitCompat();
+    if (!cardKit) return;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
-      data: { content, sequence: seq },
-    }).then(() => {
+    this.updateCardKitStreamingContent(cardKit, cardId, content, seq).then(() => {
       state.lastUpdateAt = Date.now();
+      if (seq === 1 || seq % 10 === 0) {
+        console.log(`[feishu-adapter] Streaming card updated: cardId=${cardId}, sequence=${seq}`);
+      }
     }).catch((err: unknown) => {
       console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
     });
@@ -764,18 +800,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
+      const cardKit = this.getCardKitCompat();
+      if (!cardKit) return false;
+
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
-      });
+      await this.setCardKitStreamingMode(cardKit, state.cardId, false, state.sequence);
 
       // Step 2: Build and apply final card
       const statusLabels: Record<string, string> = {
-        completed: '✅ Completed',
-        interrupted: '⚠️ Interrupted',
-        error: '❌ Error',
+        completed: '已完成',
+        interrupted: '已中断',
+        error: '执行失败',
       };
       const elapsedMs = Date.now() - state.startTime;
       const footer = {
@@ -786,10 +822,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
-        path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
-      });
+      await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
       return true;
@@ -819,6 +852,90 @@ export class FeishuAdapter extends BaseChannelAdapter {
    */
   hasActiveCard(chatId: string): boolean {
     return this.activeCards.has(chatId);
+  }
+
+  private getCardKitCompat(): FeishuCardKitCompat | null {
+    const cardkit = (this.restClient as any)?.cardkit;
+    if (cardkit?.v2?.card?.create && cardkit.v2.card.streamContent && cardkit.v2.card.update) {
+      return { version: 'v2', card: cardkit.v2.card };
+    }
+    if (cardkit?.v1?.card?.create && cardkit.v1.card.update && cardkit.v1.card.settings && cardkit.v1.cardElement?.content) {
+      return {
+        version: 'v1',
+        card: cardkit.v1.card,
+        cardElement: cardkit.v1.cardElement,
+      };
+    }
+    return null;
+  }
+
+  private createCardKitCard(cardKit: FeishuCardKitCompat, cardBody: Record<string, unknown>): Promise<{ data?: { card_id?: string } }> {
+    return cardKit.card.create({
+      data: { type: 'card_json', data: JSON.stringify(cardBody) },
+    });
+  }
+
+  private updateCardKitStreamingContent(
+    cardKit: FeishuCardKitCompat,
+    cardId: string,
+    content: string,
+    sequence: number,
+  ): Promise<unknown> {
+    if (cardKit.version === 'v2') {
+      return cardKit.card.streamContent({
+        path: { card_id: cardId },
+        data: { content, sequence },
+      });
+    }
+    return cardKit.cardElement.content({
+      path: { card_id: cardId, element_id: 'streaming_content' },
+      data: { content, sequence },
+    });
+  }
+
+  private setCardKitStreamingMode(
+    cardKit: FeishuCardKitCompat,
+    cardId: string,
+    streamingMode: boolean,
+    sequence: number,
+  ): Promise<unknown> {
+    if (cardKit.version === 'v2' && cardKit.card.settings?.streamingMode?.set) {
+      return cardKit.card.settings.streamingMode.set({
+        path: { card_id: cardId },
+        data: { streaming_mode: streamingMode, sequence },
+      });
+    }
+    if (cardKit.version === 'v1') {
+      return cardKit.card.settings({
+        path: { card_id: cardId },
+        data: {
+          settings: JSON.stringify({ streaming_mode: streamingMode }),
+          sequence,
+        },
+      });
+    }
+    return Promise.resolve();
+  }
+
+  private updateCardKitCard(
+    cardKit: FeishuCardKitCompat,
+    cardId: string,
+    finalCardJson: string,
+    sequence: number,
+  ): Promise<unknown> {
+    if (cardKit.version === 'v2') {
+      return cardKit.card.update({
+        path: { card_id: cardId },
+        data: { type: 'card_json', data: finalCardJson, sequence },
+      });
+    }
+    return cardKit.card.update({
+      path: { card_id: cardId },
+      data: {
+        card: { type: 'card_json', data: finalCardJson },
+        sequence,
+      },
+    });
   }
 
   // ── Streaming adapter interface ────────────────────────────────

@@ -198,6 +198,40 @@ describe('memory routing', () => {
     assert.match(text, /Timeline_ST2H_Scene_01.*timeline场景/s);
   });
 
+  it('keeps all structured mappings when the recall intent asks for all items', () => {
+    const plan = planMemoryQuery('所有的常用场景名发给我');
+    const decision = decideMemoryReply(plan, {
+      summary: 'memory',
+      hits: [{
+        sessionId: 'audit:scene-table-all',
+        channelType: 'feishu',
+        chatId: 'oc_memory',
+        role: 'assistant',
+        source: 'message',
+        sourceType: 'audit',
+        score: 18,
+        confidence: 0.92,
+        answerability: 'structured',
+        quality: 'high',
+        content: [
+          '常用场景名称对应表：',
+          '',
+          '`HSScene` == 医院内部场景',
+          '`city3d_citystage_ST2H_Scene` == 外城场景',
+          '`pve_gunship` == pve场景',
+          '`Timeline_ST2H_Scene_01` == timeline场景',
+        ].join('\n'),
+      }],
+    });
+
+    assert.equal(decision.type, 'direct_reply');
+    const text = decision.type === 'direct_reply' ? decision.text : '';
+    assert.match(text, /HSScene.*医院内部场景/s);
+    assert.match(text, /city3d_citystage_ST2H_Scene.*外城场景/s);
+    assert.match(text, /pve_gunship.*pve场景/s);
+    assert.match(text, /Timeline_ST2H_Scene_01.*timeline场景/s);
+  });
+
   it('direct-answers a named lookup from a matching structured table value', () => {
     const plan = planMemoryQuery('pve关卡场景叫啥');
     const decision = decideMemoryReply(plan, {

@@ -67,6 +67,7 @@ export interface Config {
   localLlmMaxInputChars?: number;
   localLlmMaxOutputTokens?: number;
   localLlmComplexityMode?: string;
+  replyStyleHint?: string;
   defaultModel?: string;
   defaultMode: string;
   // Telegram
@@ -412,6 +413,7 @@ export function loadConfig(): Config {
     localLlmMaxInputChars: localLlmMaxInputChars ?? 6000,
     localLlmMaxOutputTokens: localLlmMaxOutputTokens ?? 768,
     localLlmComplexityMode: env.get("CTI_LOCAL_LLM_COMPLEXITY_MODE") || "conservative",
+    replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
@@ -576,6 +578,7 @@ export function saveConfig(config: Config): void {
   if (config.localLlmMaxOutputTokens !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_MAX_OUTPUT_TOKENS", String(config.localLlmMaxOutputTokens));
   out += formatEnvLine("CTI_LOCAL_LLM_COMPLEXITY_MODE", config.localLlmComplexityMode);
+  out += formatEnvLine("CTI_REPLY_STYLE_HINT", config.replyStyleHint);
   if (config.defaultModel) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
   out += formatEnvLine("CTI_TG_BOT_TOKEN", config.tgBotToken);
@@ -964,6 +967,9 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.defaultModel) {
     m.set("bridge_default_model", config.defaultModel);
     m.set("default_model", config.defaultModel);
+  }
+  if (config.replyStyleHint?.trim()) {
+    m.set("bridge_reply_style_hint", config.replyStyleHint.trim());
   }
   m.set("bridge_default_mode", config.defaultMode);
   if (config.selfOptimizeOnFailure !== undefined) {

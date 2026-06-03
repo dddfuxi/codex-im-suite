@@ -199,6 +199,7 @@ export interface MemoryWriteInput {
   text: string;
   workingDirectory?: string;
   createdAt?: string;
+  candidates?: MemoryWriteCandidate[];
 }
 
 export interface MemoryWriteResult {
@@ -208,6 +209,37 @@ export interface MemoryWriteResult {
   filePath?: string;
   knowledgeRebuilt?: boolean;
   error?: string;
+}
+
+export interface MemoryWriteCandidate {
+  key?: string;
+  value?: string;
+  text: string;
+  confidence?: number;
+  source?: 'model' | 'rule' | 'manual';
+}
+
+export interface MemoryWriteIntentInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userDisplayName?: string;
+  text: string;
+  recentMessages?: Array<{ role: string; content: string }>;
+  workingDirectory?: string;
+}
+
+export interface MemoryWriteIntentDecision {
+  action: 'write' | 'ignore' | 'clarify';
+  confidence: number;
+  reason?: string;
+  candidates?: MemoryWriteCandidate[];
+  clarification?: string;
+}
+
+export interface MemoryIntentHost {
+  classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision>;
 }
 
 export interface MemoryGraphNode {
@@ -539,6 +571,9 @@ export interface StreamChatParams {
   sourceUserId?: string;
   sourceUserDisplayName?: string;
   sourceMessageId?: string;
+  replyPresentation?: {
+    replyStyleHint?: string;
+  };
   executionRequirement?: {
     kind: ExecutionRequirementKind;
     reason: string;

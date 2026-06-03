@@ -168,6 +168,24 @@ function Ensure-NpmPackageVersion {
     }
 }
 
+function Invoke-SuiteNpmBuild {
+    param(
+        [string]$WorkspaceName,
+        [string]$Description
+    )
+
+    Write-Host "build suite $Description"
+    Push-Location $suiteRoot
+    try {
+        npm --workspace $WorkspaceName run build | Out-Host
+    } finally {
+        Pop-Location
+    }
+}
+
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-core' -Description 'bridge-core'
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-runtime' -Description 'bridge-runtime'
+
 Write-Host "sync suite bridge-core -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'src') -Target (Join-Path $liveCore 'src')
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'dist') -Target (Join-Path $liveCore 'dist')

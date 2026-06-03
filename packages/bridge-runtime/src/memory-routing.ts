@@ -326,6 +326,11 @@ function structuredTableTitleMatchesPlan(plan: MemoryQueryPlan, hit: RetrievedMe
   return new RegExp(`${keyPattern}\\s*(?:对应表|列表|清单|[:：])`, 'iu').test(heading);
 }
 
+function wantsCompleteStructuredRecall(plan: MemoryQueryPlan): boolean {
+  return /(所有|全部|全量|完整|都发|全发|列表|清单|对应表|all|full|complete|list)/iu
+    .test(`${plan.queryText || ''} ${plan.normalizedKey || ''}`);
+}
+
 function directReplyText(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): string {
   const pairs = hit.structuredPairs && hit.structuredPairs.length > 0
     ? hit.structuredPairs
@@ -387,7 +392,9 @@ export function decideMemoryReply(
   if (directHit) {
     const exactKeyMatch = structuredKeyMatchesPlan(plan, directHit);
     const tableTitleMatch = structuredTableTitleMatchesPlan(plan, directHit);
-    const matchingPair = !exactKeyMatch && !tableTitleMatch ? findStructuredPairMatch(plan, directHit) : null;
+    const matchingPair = !wantsCompleteStructuredRecall(plan) && !exactKeyMatch && !tableTitleMatch
+      ? findStructuredPairMatch(plan, directHit)
+      : null;
     if (matchingPair) {
       return {
         type: 'direct_reply',

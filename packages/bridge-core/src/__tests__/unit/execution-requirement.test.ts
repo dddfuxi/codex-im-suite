@@ -67,6 +67,33 @@ describe('execution requirement classifier', () => {
     assert.equal(requirement.kind, 'none');
   });
 
+  it('uses explicit memory recall intent instead of scene keyword tool gating', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '所有的常用场景名发给我',
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+      memoryPlan: {
+        intent: 'explicit_recall',
+        queryText: '常用场景名',
+        normalizedKey: '常用场景名',
+        answerMode: 'direct_if_confident',
+        minConfidence: 0.78,
+        allowDirectAnswer: true,
+      },
+    });
+
+    assert.equal(requirement.kind, 'none');
+  });
+
+  it('requires tool evidence for current Unity scene object inspection even when asking for names', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: 'unity场景里找有相机组件的物体\n总结成节点名称发我',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+
+    assert.equal(requirement.kind, 'tool_required');
+    assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
+  });
+
   it('preserves concrete failed tool output instead of replacing it with no-evidence text', () => {
     const requirement = classifyExecutionRequirement({
       userText: 'powershell -ExecutionPolicy Bypass -File "C:\\unity\\ST3\\Game\\Assets\\FXTools\\Cli\\fxtools-cli.ps1" doctor',

@@ -179,3 +179,59 @@ describe('FeishuAdapter reply fallback', () => {
     assert.deepStrictEqual(calls, ['reply', 'create']);
   });
 });
+
+describe('FeishuAdapter CardKit compatibility', () => {
+  beforeEach(() => {
+    setupContext({ bridge_feishu_streaming_card_enabled: 'true' });
+  });
+
+  it('uses CardKit v1 endpoints when the SDK does not expose v2', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async (payload: unknown) => {
+              calls.push(`card.create:${JSON.stringify(payload)}`);
+              return { data: { card_id: 'card_v1' } };
+            },
+            settings: async (payload: unknown) => {
+              calls.push(`card.settings:${JSON.stringify(payload)}`);
+              return { data: {} };
+            },
+            update: async (payload: unknown) => {
+              calls.push(`card.update:${JSON.stringify(payload)}`);
+              return { data: {} };
+            },
+          },
+          cardElement: {
+            content: async (payload: unknown) => {
+              calls.push(`cardElement.content:${JSON.stringify(payload)}`);
+              return { data: {} };
+            },
+          },
+        },
+      },
+      im: {
+        message: {
+          create: async () => ({ data: { message_id: 'om_card' } }),
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_card');
+    adapter.onStreamText('oc_card', '### 处理进度\n- 正在执行');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const finalized = await adapter.finalizeCard('oc_card', 'completed', '已完成');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    assert.ok(calls.some((item) => item.startsWith('card.create:')));
+    assert.ok(calls.some((item) => item.startsWith('cardElement.content:')));
+    assert.ok(calls.some((item) => item.startsWith('card.settings:')));
+    assert.ok(calls.some((item) => item.startsWith('card.update:')));
+    assert.doesNotThrow(() => JSON.stringify(calls));
+  });
+});

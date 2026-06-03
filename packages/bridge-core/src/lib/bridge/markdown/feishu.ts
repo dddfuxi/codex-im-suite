@@ -92,16 +92,31 @@ export function htmlToFeishuMarkdown(html: string): string {
 }
 
 /**
- * Build tool progress markdown lines.
- * Each tool shows an icon based on status: 🔄 Running, ✅ Complete, ❌ Error.
+ * Build user-visible tool progress markdown lines.
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
   const lines = tools.map((tc) => {
-    const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
+    const status = tc.status === 'running' ? '执行中' : tc.status === 'complete' ? '已完成' : '失败';
+    return `- ${status}：${formatVisibleToolName(tc.name)}`;
   });
   return lines.join('\n');
+}
+
+export function formatVisibleToolName(name: string): string {
+  const normalized = (name || '').trim();
+  const lower = normalized.toLowerCase();
+  if (!normalized) return '工具执行';
+  if (lower.includes('shell_artifact')) return '桌面截图';
+  if (lower.includes('manage_camera')) return 'Unity MCP 截图';
+  if (lower.includes('manage_scene')) return 'Unity MCP 场景操作';
+  if (lower.includes('find_gameobjects') || lower.includes('manage_gameobject')) return 'Unity MCP 节点查询';
+  if (lower.includes('read_file')) return '文件读取';
+  if (lower.includes('list_dir')) return '目录读取';
+  if (lower.includes('search_files')) return '文件搜索';
+  if (lower.includes('mcp_call') || lower.includes('unity_mcp')) return 'MCP 工具执行';
+  if (lower.includes('shell')) return '本地命令';
+  return normalized.replace(/^JsonTool:/i, '');
 }
 
 /**
@@ -126,7 +141,24 @@ export function buildStreamingContent(text: string, tools: ToolCallInfo[]): stri
   if (toolMd) {
     content = content ? `${content}\n\n${toolMd}` : toolMd;
   }
-  return content || '💭 Thinking...';
+  return content || '### 处理进度\n- 已收到请求，正在进入执行链。';
+}
+
+/**
+ * Streaming cards show progress while the task is running. Once the same card
+ * is finalized, keep only the user-facing result section if the model provided
+ * a separate rationale + result structure.
+ */
+export function extractStreamingFinalResponse(text: string): string {
+  const normalized = (text || '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+
+  const resultHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?执行结果(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/u;
+  const match = resultHeading.exec(normalized);
+  if (!match) return normalized;
+
+  const resultText = normalized.slice(match.index + match[0].length).trim();
+  return resultText || normalized;
 }
 
 /**
@@ -139,32 +171,48 @@ export function buildFinalCardJson(
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
-  // Main text content
-  let content = preprocessFeishuMarkdown(text);
-  const toolMd = buildToolProgressMarkdown(tools);
-  if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
+  const statusLine = footer?.status ? `**状态：${footer.status}**` : '**状态：已完成**';
+  elements.push({
+    tag: 'markdown',
+    content: statusLine,
+    text_align: 'left',
+    text_size: 'normal',
+  });
+
+  // Main result content. Waiting/progress rationale is stripped before finalizing.
+  let content = preprocessFeishuMarkdown(extractStreamingFinalResponse(text));
+  if (!content.trim()) {
+    content = '未完成：模型没有返回可展示结果。';
   }
 
-  if (content) {
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'markdown',
+    content: `### 最终结果\n${content}`,
+    text_align: 'left',
+    text_size: 'normal',
+  });
+
+  const toolMd = buildToolProgressMarkdown(tools);
+  if (toolMd) {
+    elements.push({ tag: 'hr' });
     elements.push({
       tag: 'markdown',
-      content,
+      content: `### 工具轨迹\n${toolMd}`,
       text_align: 'left',
-      text_size: 'normal',
+      text_size: 'notation',
     });
   }
 
   // Footer
   if (footer) {
     const parts: string[] = [];
-    if (footer.status) parts.push(footer.status);
     if (footer.elapsed) parts.push(footer.elapsed);
     if (parts.length > 0) {
       elements.push({ tag: 'hr' });
       elements.push({
         tag: 'markdown',
-        content: parts.join(' · '),
+        content: `耗时：${parts.join(' · ')}`,
         text_size: 'notation',
       });
     }

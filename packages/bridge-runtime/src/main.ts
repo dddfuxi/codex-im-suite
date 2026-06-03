@@ -19,7 +19,15 @@ import {
 } from 'claude-to-im/src/lib/bridge/runtime-audit.js';
 import './adapters/weixin-adapter.js';
 
-import type { BridgeStore, LLMProvider, RetrievedFeishuHistoryContext, RetrievedMemoryContext } from 'claude-to-im/src/lib/bridge/host.js';
+import type {
+  BridgeStore,
+  LLMProvider,
+  MemoryIntentHost,
+  MemoryWriteIntentDecision,
+  MemoryWriteIntentInput,
+  RetrievedFeishuHistoryContext,
+  RetrievedMemoryContext,
+} from 'claude-to-im/src/lib/bridge/host.js';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';
@@ -130,6 +138,115 @@ function parseBridgeSseEvents(chunk: string): ParsedBridgeSseEvent[] {
     events.push({ type: payload.type, data });
   }
   return events;
+}
+
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  const direct = tryParseJson<Record<string, unknown>>(trimmed);
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct;
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  if (fenced) {
+    const parsed = tryParseJson<Record<string, unknown>>(fenced);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    const parsed = tryParseJson<Record<string, unknown>>(trimmed.slice(start, end + 1));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  }
+  return null;
+}
+
+function normalizeMemoryIntentDecision(payload: Record<string, unknown> | null): MemoryWriteIntentDecision {
+  if (!payload) return { action: 'ignore', confidence: 0, reason: 'invalid_json' };
+  const rawAction = typeof payload.action === 'string' ? payload.action.trim().toLowerCase() : '';
+  const action: MemoryWriteIntentDecision['action'] = rawAction === 'write' || rawAction === 'clarify' ? rawAction : 'ignore';
+  const rawConfidence = typeof payload.confidence === 'number'
+    ? payload.confidence
+    : Number.parseFloat(String(payload.confidence ?? '0'));
+  const candidates = Array.isArray(payload.candidates)
+    ? payload.candidates
+      .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+      .map((item) => ({
+        key: typeof item.key === 'string' ? item.key.trim() : undefined,
+        value: typeof item.value === 'string' ? item.value.trim() : undefined,
+        text: typeof item.text === 'string' ? item.text.trim() : '',
+        confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
+        source: 'model' as const,
+      }))
+      .filter((item) => item.text || item.key || item.value)
+    : [];
+  return {
+    action,
+    confidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
+    reason: typeof payload.reason === 'string' ? payload.reason.slice(0, 160) : undefined,
+    candidates,
+    clarification: typeof payload.clarification === 'string' ? payload.clarification.slice(0, 240) : undefined,
+  };
+}
+
+async function collectProviderText(provider: LLMProvider, params: Parameters<LLMProvider['streamChat']>[0], timeoutMs: number): Promise<string> {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const abortController = params.abortController || new AbortController();
+  const relay = () => abortController.abort();
+  timeout.addEventListener('abort', relay, { once: true });
+  let text = '';
+  try {
+    const reader = provider.streamChat({ ...params, abortController }).getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const event of parseBridgeSseEvents(value)) {
+        if (event.type === 'text' && typeof event.data === 'string') text += event.data;
+        if (event.type === 'error') {
+          throw new Error(typeof event.data === 'string' ? event.data : 'provider error');
+        }
+      }
+    }
+    return text.trim();
+  } finally {
+    timeout.removeEventListener('abort', relay);
+  }
+}
+
+class ProviderMemoryIntentHost implements MemoryIntentHost {
+  constructor(private readonly provider: LLMProvider) {}
+
+  async classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision> {
+    const recent = (input.recentMessages || [])
+      .slice(-8)
+      .map((message) => `${message.role}: ${String(message.content || '').replace(/\s+/g, ' ').slice(0, 420)}`)
+      .join('\n');
+    const prompt = [
+      '判断当前用户消息是否要求写入、更新、覆盖或保存长期记忆。',
+      '只返回 JSON，不要解释，不要输出思考过程。',
+      'JSON schema:',
+      '{"action":"write|ignore|clarify","confidence":0.0,"reason":"short","candidates":[{"key":"记忆键","value":"记忆值","text":"完整事实","confidence":0.0}],"clarification":"optional"}',
+      '规则：',
+      '- 如果用户要求记住、记录、更新某个事实、偏好、命名、路径、分支、配置或对应表，action=write。',
+      '- 如果当前消息使用“这个/它/重新记一下”等指代，可以从最近上下文补全，但候选值必须真实出现在当前消息或最近上下文。',
+      '- 如果缺少可保存的 key 或 value 且无法从最近上下文唯一补全，action=clarify。',
+      '- 普通提问、执行任务、闲聊、工具请求不是记忆写入，action=ignore。',
+      '- candidates 要保留用户原始键和值，不要改写为泛称，不要编造。',
+      '',
+      recent ? `最近上下文:\n${recent}` : '最近上下文: (empty)',
+      '',
+      `当前消息:\n${input.text}`,
+    ].join('\n');
+
+    const text = await collectProviderText(this.provider, {
+      prompt,
+      sessionId: `${input.sessionId}:memory-intent`,
+      forceFreshThread: true,
+      systemPrompt: 'You are a strict JSON classifier for memory-write intent. Return JSON only.',
+      workingDirectory: input.workingDirectory,
+      conversationHistory: [],
+      replyPresentation: { replyStyleHint: '简洁、只给结论' },
+      executionRequirement: { kind: 'none', reason: 'memory intent classification', requiredToolFamilies: [] },
+    }, 25_000);
+    return normalizeMemoryIntentDecision(extractJsonObject(text));
+  }
 }
 
 function extractCodexFatalStreamError(chunk: string): string | null {
@@ -1044,6 +1161,9 @@ interface StreamEvidence {
   jsonToolFallbackUsed?: boolean;
   shellExitCode?: number;
   shellDurationMs?: number;
+  progressCardCreated?: boolean;
+  progressCardFinalized?: boolean;
+  progressCardFallbackReason?: string;
   tokenUsage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -1119,6 +1239,9 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       if (typeof data.jsonToolFallbackUsed === 'boolean') evidence.jsonToolFallbackUsed = data.jsonToolFallbackUsed;
       if (typeof data.shellExitCode === 'number') evidence.shellExitCode = data.shellExitCode;
       if (typeof data.shellDurationMs === 'number') evidence.shellDurationMs = data.shellDurationMs;
+      if (typeof data.progressCardCreated === 'boolean') evidence.progressCardCreated = data.progressCardCreated;
+      if (typeof data.progressCardFinalized === 'boolean') evidence.progressCardFinalized = data.progressCardFinalized;
+      if (typeof data.progressCardFallbackReason === 'string') evidence.progressCardFallbackReason = data.progressCardFallbackReason;
       if (typeof data.evidenceSatisfied === 'boolean') evidence.evidenceSatisfied = data.evidenceSatisfied;
       continue;
     }
@@ -1178,6 +1301,9 @@ function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
   if (typeof evidence.jsonToolFallbackUsed === 'boolean') payload.jsonToolFallbackUsed = evidence.jsonToolFallbackUsed;
   if (typeof evidence.shellExitCode === 'number') payload.shellExitCode = evidence.shellExitCode;
   if (typeof evidence.shellDurationMs === 'number') payload.shellDurationMs = evidence.shellDurationMs;
+  if (typeof evidence.progressCardCreated === 'boolean') payload.progressCardCreated = evidence.progressCardCreated;
+  if (typeof evidence.progressCardFinalized === 'boolean') payload.progressCardFinalized = evidence.progressCardFinalized;
+  if (evidence.progressCardFallbackReason) payload.progressCardFallbackReason = evidence.progressCardFallbackReason;
   if (evidence.tokenUsage) payload.tokenUsage = evidence.tokenUsage;
   appendWorkflowEvent(runId, 'finalizing', 'execution.evidence', '执行证据已记录', payload);
 }
@@ -1669,6 +1795,7 @@ async function main(): Promise<void> {
         userId: input.userId,
       }),
     },
+    memoryIntents: new ProviderMemoryIntentHost(llm),
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         try {

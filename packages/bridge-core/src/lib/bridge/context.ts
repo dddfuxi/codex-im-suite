@@ -17,6 +17,7 @@ import type {
   ExtensionCatalogHost,
   FeishuCloudDocumentHost,
   FeishuOAuthManualHost,
+  MemoryIntentHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -28,6 +29,7 @@ export interface BridgeContext {
   extensions?: ExtensionCatalogHost;
   feishuCloudDocuments?: FeishuCloudDocumentHost;
   feishuOAuth?: FeishuOAuthManualHost;
+  memoryIntents?: MemoryIntentHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

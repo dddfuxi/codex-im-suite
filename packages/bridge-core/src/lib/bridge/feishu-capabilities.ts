@@ -64,7 +64,7 @@ const CAPABILITIES: FeishuCapability[] = [
     label: 'CardKit 流式卡片',
     status: 'partial',
     requiredScopes: ['cardkit:card:write', 'cardkit:card:read', 'im:message:update'],
-    note: '需要 CTI_FEISHU_STREAMING_CARD_ENABLED=true；首版默认关闭，失败会降级为普通最终回复。',
+    note: '默认开启；可用 CTI_FEISHU_STREAMING_CARD_ENABLED=false 关闭，失败会降级为普通最终回复。',
   },
   {
     id: 'card.action',
@@ -204,9 +204,10 @@ export function buildFeishuCapabilityReport(store: SettingsProvider): string {
   );
   const declaredScopes = splitScopes(readSetting(store, 'bridge_feishu_granted_scopes', 'CTI_FEISHU_GRANTED_SCOPES'));
   const declaredScopeSet = new Set(declaredScopes);
-  const streamingCardEnabled = ['1', 'true', 'yes', 'on'].includes(
-    readSetting(store, 'bridge_feishu_streaming_card_enabled', 'CTI_FEISHU_STREAMING_CARD_ENABLED').toLowerCase(),
-  );
+  const streamingCardRaw = readSetting(store, 'bridge_feishu_streaming_card_enabled', 'CTI_FEISHU_STREAMING_CARD_ENABLED');
+  const streamingCardEnabled = streamingCardRaw
+    ? ['1', 'true', 'yes', 'on'].includes(streamingCardRaw.toLowerCase())
+    : true;
 
   const lines = [
     'Feishu Developer Platform Capabilities',

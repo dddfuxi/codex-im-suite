@@ -28,6 +28,7 @@ import type {
   PermissionLinkRecord,
   OutboundRefInput,
   UpsertChannelBindingInput,
+  MemoryWriteCandidate,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
@@ -151,6 +152,92 @@ function inferExplicitMemoryPrefixedLine(text: string): string | null {
   return `事实: ${content}`;
 }
 
+function cleanMemoryWriteText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:请你|麻烦你|帮我|你也|也)?(?:重新|再|更新|覆盖)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*/u, '')
+    .replace(/[，,。.\s]*(?:请你|麻烦你|帮我|你也|也)?(?:重新|再|更新|覆盖)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*$/u, '')
+    .trim();
+}
+
+function cleanMemoryCandidatePart(text: string | undefined): string {
+  return (text || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^`|`$/g, '')
+    .replace(/^[：:，,。.\s]+|[：:，,。.\s]+$/g, '')
+    .trim();
+}
+
+function addMemoryCandidatePair(
+  pairs: Array<{ key: string; value: string }>,
+  seen: Set<string>,
+  key: string | undefined,
+  value: string | undefined,
+): void {
+  const cleanedKey = cleanMemoryCandidatePart(key);
+  const cleanedValue = cleanMemoryCandidatePart(value);
+  if (!cleanedKey || !cleanedValue || isLowValueMemoryText(cleanedValue)) return;
+  const dedupKey = `${cleanedKey.toLowerCase()}\n${cleanedValue.toLowerCase()}`;
+  if (seen.has(dedupKey)) return;
+  seen.add(dedupKey);
+  pairs.push({ key: cleanedKey, value: cleanedValue });
+}
+
+function inferNaturalMemoryPairs(text: string): Array<{ key: string; value: string }> {
+  const normalized = cleanMemoryWriteText(text.replace(/\r\n/g, '\n'));
+  const pairs: Array<{ key: string; value: string }> = [];
+  const seen = new Set<string>();
+  const valueToken = '([A-Za-z0-9][A-Za-z0-9_.\\-/]{1,120})';
+  const keyToken = '([\\u4e00-\\u9fffA-Za-z0-9 _-]{2,80}(?:名称|名字|分支名|git分支名|路径|地址|链接|配置|版本|命令))';
+
+  const valueFirst = new RegExp(`${valueToken}\\s*(?:\\n|\\s+)${keyToken}`, 'iu');
+  const valueFirstMatch = normalized.match(valueFirst);
+  if (valueFirstMatch) addMemoryCandidatePair(pairs, seen, valueFirstMatch[2], valueFirstMatch[1]);
+
+  const keyFirst = new RegExp(`${keyToken}\\s*(?:是|为|叫|=|==|:|：)\\s*${valueToken}`, 'iu');
+  const keyFirstMatch = normalized.match(keyFirst);
+  if (keyFirstMatch) addMemoryCandidatePair(pairs, seen, keyFirstMatch[1], keyFirstMatch[2]);
+
+  return pairs;
+}
+
+function normalizeMemoryWriteCandidates(
+  candidates: MemoryWriteCandidate[] | undefined,
+): Array<{ key: string; value: string }> {
+  const pairs: Array<{ key: string; value: string }> = [];
+  const seen = new Set<string>();
+
+  for (const candidate of candidates || []) {
+    addMemoryCandidatePair(pairs, seen, candidate.key, candidate.value);
+    if ((!candidate.key || !candidate.value) && candidate.text) {
+      for (const pair of inferStructuredMemories(candidate.text)) {
+        addMemoryCandidatePair(pairs, seen, pair.key, pair.value);
+      }
+      for (const pair of inferNaturalMemoryPairs(candidate.text)) {
+        addMemoryCandidatePair(pairs, seen, pair.key, pair.value);
+      }
+    }
+  }
+
+  return pairs;
+}
+
+function extractMemoryAliases(text: string): string[] {
+  const firstLine = (text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || text).replace(/\s+/g, ' ');
+  const aliases = new Set<string>();
+  for (const match of firstLine.matchAll(/[A-Z][A-Z0-9_]{1,12}(?=项目|[\s，,。；;、]|$)/giu)) {
+    aliases.add(match[0].trim());
+  }
+  for (const match of firstLine.matchAll(/[\u4e00-\u9fffA-Za-z0-9]{1,8}项目/giu)) {
+    aliases.add(match[0].trim());
+  }
+  return Array.from(aliases).filter((alias) => alias.length <= 16);
+}
+
 // Lock entry
 
 interface LockEntry {
@@ -210,6 +297,7 @@ interface MemoryWriteInput {
   text: string;
   workingDirectory?: string;
   createdAt?: string;
+  candidates?: MemoryWriteCandidate[];
 }
 
 interface MemoryWriteResult {
@@ -1517,19 +1605,45 @@ export class JsonFileStore implements BridgeStore {
     return true;
   }
 
-  private persistExplicitMemoryWrite(event: ConversationMemoryEvent, text: string): MemoryWriteResult {
+  private persistExplicitMemoryWrite(
+    event: ConversationMemoryEvent,
+    text: string,
+    candidates?: MemoryWriteCandidate[],
+  ): MemoryWriteResult {
     if (event.role !== 'user') return { ok: false, skipped: true, error: 'not_user_message' };
     const plan = planMemoryQuery(text);
-    if (plan.intent !== 'memory_write') return { ok: false, skipped: true, error: 'not_memory_write' };
+    const candidatePairs = normalizeMemoryWriteCandidates(candidates);
+    if (plan.intent !== 'memory_write' && candidatePairs.length === 0) return { ok: false, skipped: true, error: 'not_memory_write' };
     const memoryRoot = this.settings.get('bridge_memory_repo_dir');
     if (!memoryRoot) return { ok: false, error: 'bridge_memory_repo_dir is not configured' };
 
-    const pairs = inferStructuredMemories(text);
-    const title = plan.normalizedKey || text.slice(0, 40);
+    const structuredPairs = inferStructuredMemories(text);
+    const hasModelCandidatePairs = candidatePairs.length > 0;
+    const naturalPairs = !hasModelCandidatePairs && structuredPairs.length === 0
+      ? inferNaturalMemoryPairs(text)
+      : [];
+    const pairSeen = new Set<string>();
+    const pairs: Array<{ key: string; value: string }> = [];
+    for (const pair of [...candidatePairs, ...structuredPairs, ...naturalPairs]) {
+      addMemoryCandidatePair(pairs, pairSeen, pair.key, pair.value);
+    }
+    const cleanedText = cleanMemoryWriteText(text) || text;
+    const firstContentLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || cleanedText;
+    const cleanedTitle = cleanMemoryWriteText(firstContentLine) || cleanedText;
+    const bodyText = /\r?\n/.test(text) ? text : cleanedText;
+    const title = hasModelCandidatePairs
+      ? (candidatePairs[0]?.key || plan.normalizedKey || cleanedText.slice(0, 40))
+      : (
+        plan.normalizedKey && plan.normalizedKey.length <= 60 && !/[=\r\n]/.test(plan.normalizedKey)
+          ? plan.normalizedKey
+          : cleanedTitle.slice(0, 40)
+      );
     const dir = path.join(memoryRoot, EXPLICIT_MEMORY_DIR);
     const filePath = path.join(dir, `${slugForFileName(title)}.md`);
     const createdAt = event.createdAt || now();
-    const aliases = Array.from(new Set((text.match(/\bSTH\b|\bST2H\b|H项目/giu) || []).map((value) => value.trim())));
+    const aliases = !hasModelCandidatePairs
+      ? extractMemoryAliases(text)
+      : [];
     const frontmatter = [
       '---',
       'schema: codex-im-suite/explicit-memory/v1',
@@ -1545,10 +1659,10 @@ export class JsonFileStore implements BridgeStore {
     const body: string[] = [
       `# ${title}`,
       '',
-      text,
+      bodyText,
       '',
     ];
-    const prefixedLine = inferExplicitMemoryPrefixedLine(text);
+    const prefixedLine = inferExplicitMemoryPrefixedLine(bodyText);
     if (prefixedLine) {
       body.push(prefixedLine, '');
     }
@@ -1604,7 +1718,7 @@ export class JsonFileStore implements BridgeStore {
       text: input.text,
       workingDirectory: input.workingDirectory,
       createdAt: input.createdAt || now(),
-    }, this.sanitizePersistedText(input.text || ''));
+    }, this.sanitizePersistedText(input.text || ''), input.candidates);
   }
 
   recordMemoryEvent(event: ConversationMemoryEvent): void {

@@ -47,6 +47,20 @@ function parseSSEChunks(chunks: string[]): Array<{ type: string; data: string }>
 }
 
 describe('CodexProvider', () => {
+  it('adds explicit reply style context to normal Codex turns', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const prompt = buildTurnPrompt({
+      prompt: '看一下项目状态',
+      sessionId: 'style-session',
+      replyPresentation: {
+        replyStyleHint: '像项目助理，先说结果，再说一句影响',
+      },
+    });
+
+    assert.match(prompt, /Bridge reply style/);
+    assert.match(prompt, /Required custom reply style: 像项目助理/);
+  });
+
   it('builds Codex client options from explicit API settings without leaking unrelated env', async () => {
     const oldBaseUrl = process.env.CTI_CODEX_BASE_URL;
     const oldApiKey = process.env.CTI_CODEX_API_KEY;
@@ -209,6 +223,7 @@ describe('CodexProvider', () => {
       localApiKey: process.env.CTI_LOCAL_AI_API_KEY,
       localModel: process.env.CTI_LOCAL_AI_MODEL,
       localHome: process.env.CTI_CODEX_LOCAL_PRIMARY_HOME,
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
       codeHome: process.env.CODEX_HOME,
       openAiKey: process.env.OPENAI_API_KEY,
       codexApiKey: process.env.CODEX_API_KEY,
@@ -216,18 +231,45 @@ describe('CodexProvider', () => {
       ctiCodexBaseUrl: process.env.CTI_CODEX_BASE_URL,
     };
     const tempHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-local-primary-${Date.now()}`)));
+    const globalHome = await import('node:os').then(os => import('node:path').then(path => path.join(os.tmpdir(), `cti-codex-global-${Date.now()}`)));
     process.env.CTI_LOCAL_AI_KIND = 'ollama';
     process.env.CTI_LOCAL_AI_BASE_URL = 'http://127.0.0.1:11434';
     delete process.env.CTI_LOCAL_AI_API_KEY;
     process.env.CTI_LOCAL_AI_MODEL = 'qwen3:14b';
     process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = tempHome;
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
     process.env.OPENAI_API_KEY = 'paid-openai-secret';
     process.env.CODEX_API_KEY = 'paid-codex-secret';
     process.env.CTI_CODEX_API_KEY = 'paid-cti-codex-secret';
     process.env.CTI_CODEX_BASE_URL = 'https://paid.example.test/v1';
     try {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      fs.mkdirSync(path.join(globalHome, 'plugins', 'broken-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(globalHome, 'plugins', 'broken-plugin', 'plugin.json'), '{}', 'utf-8');
+      fs.writeFileSync(path.join(globalHome, 'config.toml'), [
+        'personality = "pragmatic"',
+        'notify = ["some-plugin-hook"]',
+        '',
+        '[plugins."broken@openai-curated"]',
+        'enabled = true',
+        '',
+        '[marketplaces.openai-curated]',
+        'source_type = "git"',
+        'source = "https://example.invalid/plugins.git"',
+        '',
+        '[desktop]',
+        'localeOverride = "zh-CN"',
+        '',
+        '[memories]',
+        'use_memories = true',
+        '',
+        "[projects.'C:\\\\unity\\\\ST3']",
+        'trust_level = "trusted"',
+      ].join('\n'), 'utf-8');
       const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
       const options = buildCodexClientOptionsForTest('local_primary');
+      const bridgeConfig = fs.readFileSync(path.join(tempHome, 'config.toml'), 'utf-8');
 
       assert.equal(options.profile, 'local_primary');
       assert.equal(options.apiKey, undefined);
@@ -240,9 +282,18 @@ describe('CodexProvider', () => {
       assert.equal(options.env.CTI_CODEX_API_KEY, undefined);
       assert.equal(options.env.CTI_CODEX_BASE_URL, undefined);
       assert.equal(process.env.CODEX_HOME, tempHome);
+      assert.equal(fs.existsSync(path.join(tempHome, 'plugins')), false);
+      assert.ok(!bridgeConfig.includes('[plugins.'));
+      assert.ok(!bridgeConfig.includes('[marketplaces.'));
+      assert.ok(!bridgeConfig.includes('personality ='));
+      assert.ok(!bridgeConfig.includes('notify ='));
+      assert.ok(!bridgeConfig.includes('[desktop]'));
+      assert.ok(!bridgeConfig.includes('[memories]'));
+      assert.ok(bridgeConfig.includes("[projects.'C:\\\\unity\\\\ST3']"));
     } finally {
       const fs = await import('node:fs');
       fs.rmSync(tempHome, { recursive: true, force: true });
+      fs.rmSync(globalHome, { recursive: true, force: true });
       if (saved.localKind === undefined) delete process.env.CTI_LOCAL_AI_KIND;
       else process.env.CTI_LOCAL_AI_KIND = saved.localKind;
       if (saved.localBaseUrl === undefined) delete process.env.CTI_LOCAL_AI_BASE_URL;
@@ -253,6 +304,8 @@ describe('CodexProvider', () => {
       else process.env.CTI_LOCAL_AI_MODEL = saved.localModel;
       if (saved.localHome === undefined) delete process.env.CTI_CODEX_LOCAL_PRIMARY_HOME;
       else process.env.CTI_CODEX_LOCAL_PRIMARY_HOME = saved.localHome;
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
       if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = saved.codeHome;
       if (saved.openAiKey === undefined) delete process.env.OPENAI_API_KEY;

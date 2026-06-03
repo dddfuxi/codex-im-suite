@@ -133,6 +133,31 @@ describe('workflow status store', () => {
     assert.ok(readWorkflowStatus().runs.some((item) => item.id === run.id));
   });
 
+  it('retries transient Windows file locks while writing workflow status', () => {
+    const originalRenameSync = fs.renameSync;
+    let attempts = 0;
+    (fs as unknown as { renameSync: typeof fs.renameSync }).renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error('resource busy or locked') as NodeJS.ErrnoException;
+        error.code = 'EBUSY';
+        throw error;
+      }
+      return originalRenameSync(oldPath, newPath);
+    }) as typeof fs.renameSync;
+    try {
+      const run = startWorkflowRun({
+        sessionId: 'session-ebusy',
+        prompt: 'write status while another reader is active',
+      });
+
+      assert.ok(readWorkflowStatus().runs.some((item) => item.id === run.id));
+      assert.equal(attempts, 2);
+    } finally {
+      (fs as unknown as { renameSync: typeof fs.renameSync }).renameSync = originalRenameSync;
+    }
+  });
+
   it('keeps execution summary on failed runs when no token usage was reported', () => {
     const run = startWorkflowRun({
       sessionId: 'session-telemetry-failed',

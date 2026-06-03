@@ -48,6 +48,9 @@ export interface WorkflowExecutionSummary {
   jsonToolFallbackUsed?: boolean;
   shellExitCode?: number;
   shellDurationMs?: number;
+  progressCardCreated?: boolean;
+  progressCardFinalized?: boolean;
+  progressCardFallbackReason?: string;
 }
 
 export interface WorkflowTokenUsage {
@@ -121,6 +124,7 @@ const MAX_RUNS = 80;
 const MAX_EVENTS_PER_RUN = 80;
 const DEFAULT_MAX_AUTO_ATTEMPTS = 1;
 const MAX_RECOVERY_PROMPT_CHARS = 12_000;
+const FILE_WRITE_RETRY_DELAYS_MS = [20, 50, 100, 200, 400];
 
 function getStatusPathInternal(): string {
   const ctiHome = process.env.CTI_HOME?.trim() || CTI_HOME;
@@ -216,6 +220,39 @@ function readStringList(value: unknown): string[] | undefined {
   return items.length > 0 ? Array.from(new Set(items)) : undefined;
 }
 
+function getFsErrorCode(error: unknown): string {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : '';
+}
+
+function isRetryableWindowsFileLock(error: unknown): boolean {
+  const code = getFsErrorCode(error);
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES';
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function retryLockedFileOperation<T>(operation: () => T): T {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= FILE_WRITE_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return operation();
+    } catch (error) {
+      if (!isRetryableWindowsFileLock(error) || attempt >= FILE_WRITE_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+      lastError = error;
+      sleepSync(FILE_WRITE_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastError;
+}
+
 function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExecutionSummary | undefined {
   if (!data) return undefined;
   const source = data.execution && typeof data.execution === 'object'
@@ -245,6 +282,9 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     jsonToolFallbackUsed: readBooleanField(source.jsonToolFallbackUsed),
     shellExitCode: readNumberField(source.shellExitCode),
     shellDurationMs: readNumberField(source.shellDurationMs),
+    progressCardCreated: readBooleanField(source.progressCardCreated),
+    progressCardFinalized: readBooleanField(source.progressCardFinalized),
+    progressCardFallbackReason: readStringField(source.progressCardFallbackReason),
   };
   return Object.values(execution).some((value) => value !== undefined) ? execution : undefined;
 }
@@ -314,19 +354,18 @@ export function readWorkflowStatus(): WorkflowStatusFile {
 function writeWorkflowStatus(next: WorkflowStatusFile): WorkflowStatusFile {
   const statusPath = getStatusPathInternal();
   fs.mkdirSync(path.dirname(statusPath), { recursive: true });
-  const tmp = `${statusPath}.tmp`;
+  const tmp = `${statusPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const serialized = JSON.stringify({ ...next, updatedAt: nowIso() }, null, 2);
-  fs.writeFileSync(tmp, serialized, 'utf-8');
+  retryLockedFileOperation(() => fs.writeFileSync(tmp, serialized, 'utf-8'));
   try {
-    fs.renameSync(tmp, statusPath);
+    retryLockedFileOperation(() => fs.renameSync(tmp, statusPath));
   } catch (error) {
-    const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
-    if (code !== 'EPERM' && code !== 'EACCES') {
+    if (!isRetryableWindowsFileLock(error)) {
       throw error;
     }
-    fs.writeFileSync(statusPath, serialized, 'utf-8');
+    retryLockedFileOperation(() => fs.writeFileSync(statusPath, serialized, 'utf-8'));
     try {
-      fs.unlinkSync(tmp);
+      retryLockedFileOperation(() => fs.unlinkSync(tmp));
     } catch {
       // ignore cleanup failure
     }

@@ -36,6 +36,7 @@ const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
 const FINAL_REPLY_FENCE = 'cti-final';
 const SHARED_CODEX_HOME_PATHS = ['skills', 'plugins', 'vendor_imports', 'rules'];
+const LOCAL_CODEX_HOME_BLOCKED_PATHS = ['plugins', path.join('.tmp', 'plugins')];
 const STATE_DB_PATTERNS = [
   /^state_\d+\.sqlite(?:-shm|-wal)?$/i,
   /^logs_\d+\.sqlite(?:-shm|-wal)?$/i,
@@ -257,13 +258,32 @@ function syncFileIfNewer(sourcePath: string, targetPath: string): void {
   }
 }
 
-function sanitizeCodexConfig(content: string, reasoningEffort: string): string {
+function getSharedCodexHomePaths(profile: CodexProviderProfile): string[] {
+  if (profile === 'local_primary' || profile === 'local_fallback') {
+    return SHARED_CODEX_HOME_PATHS.filter((relativePath) => relativePath !== 'plugins');
+  }
+  return SHARED_CODEX_HOME_PATHS;
+}
+
+function removeLocalCodexPluginState(bridgeHome: string, profile: CodexProviderProfile): void {
+  if (profile !== 'local_primary' && profile !== 'local_fallback') return;
+  for (const relativePath of LOCAL_CODEX_HOME_BLOCKED_PATHS) {
+    try {
+      fs.rmSync(path.join(bridgeHome, relativePath), { recursive: true, force: true });
+    } catch {
+      // best effort; local agent must not depend on plugin sync state
+    }
+  }
+}
+
+function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: CodexProviderProfile = 'primary'): string {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const topLevel: string[] = [];
   const sections: string[] = [];
   let skipSection = false;
   let inTopLevel = true;
   const inheritGlobalMcp = process.env.CTI_CODEX_INHERIT_GLOBAL_MCP === 'true';
+  const isolateLocalAgent = profile === 'local_primary' || profile === 'local_fallback';
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -271,13 +291,20 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string): string {
       const sectionName = trimmed.slice(1, -1).trim();
       const isFeatureSection = sectionName === 'features' || sectionName.startsWith('features.');
       const isMcpSection = sectionName === 'mcp_servers' || sectionName.startsWith('mcp_servers.');
-      skipSection = isFeatureSection || (!inheritGlobalMcp && isMcpSection);
+      const isPluginSection = sectionName === 'plugins' || sectionName.startsWith('plugins.');
+      const isMarketplaceSection = sectionName === 'marketplaces' || sectionName.startsWith('marketplaces.');
+      const isDesktopSection = sectionName === 'desktop' || sectionName.startsWith('desktop.');
+      const isMemoriesSection = sectionName === 'memories' || sectionName.startsWith('memories.');
+      skipSection = isFeatureSection
+        || (!inheritGlobalMcp && isMcpSection)
+        || (isolateLocalAgent && (isPluginSection || isMarketplaceSection || isDesktopSection || isMemoriesSection));
       inTopLevel = false;
       if (!skipSection) sections.push(line);
       continue;
     }
     if (skipSection) continue;
     if (inTopLevel && /^model\s*=/.test(trimmed)) continue;
+    if (isolateLocalAgent && inTopLevel && /^(personality|notify)\s*=/.test(trimmed)) continue;
     if (trimmed.startsWith('model_reasoning_effort')) continue;
     (inTopLevel ? topLevel : sections).push(line);
   }
@@ -326,17 +353,18 @@ export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
   fs.mkdirSync(path.join(bridgeHome, 'archived_sessions'), { recursive: true });
   fs.mkdirSync(path.join(bridgeHome, 'tmp'), { recursive: true });
   resetBridgeStateDatabases(bridgeHome);
+  removeLocalCodexPluginState(bridgeHome, profile);
 
   syncFileIfNewer(path.join(globalHome, 'auth.json'), path.join(bridgeHome, 'auth.json'));
 
-  for (const relativePath of SHARED_CODEX_HOME_PATHS) {
+  for (const relativePath of getSharedCodexHomePaths(profile)) {
     ensureSharedPath(path.join(globalHome, relativePath), path.join(bridgeHome, relativePath));
   }
 
   const globalConfigPath = path.join(globalHome, 'config.toml');
   const bridgeConfigPath = path.join(bridgeHome, 'config.toml');
   const bridgeConfig = fs.existsSync(globalConfigPath)
-    ? sanitizeCodexConfig(fs.readFileSync(globalConfigPath, 'utf-8'), reasoningEffort)
+    ? sanitizeCodexConfig(fs.readFileSync(globalConfigPath, 'utf-8'), reasoningEffort, profile)
     : `model_reasoning_effort = "${reasoningEffort}"\n`;
   fs.writeFileSync(bridgeConfigPath, bridgeConfig, 'utf-8');
 
@@ -395,11 +423,15 @@ function truncateText(text: string, maxLen: number): string {
   return normalized.length > maxLen ? `${normalized.slice(0, maxLen - 3)}...` : normalized;
 }
 
-function getReplyStyleHint(): string {
-  return (process.env.CTI_REPLY_STYLE_HINT || '').trim();
+function getReplyStyleHint(params?: StreamChatParams): string {
+  return (
+    params?.replyPresentation?.replyStyleHint
+    || process.env.CTI_REPLY_STYLE_HINT
+    || ''
+  ).trim();
 }
 
-function buildBridgeReplyGuardrails(): string {
+function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
   const lines = [
     'Bridge reply contract:',
     '- User-facing reply must be concise and outcome-first.',
@@ -436,7 +468,7 @@ function buildBridgeReplyGuardrails(): string {
     '- Never output a naked JSON object outside the fenced result block.',
     `- Example:\n\`\`\`${FINAL_REPLY_FENCE}\n{"kind":"text","text":"对应关系再发你一次：\\n| Key | Label |\\n|---|---|\\n| \`ITEM_A\` | 标签A |","images":[],"files":[],"reply_mode":"markdown"}\n\`\`\``,
   ];
-  const styleHint = getReplyStyleHint();
+  const styleHint = getReplyStyleHint(params);
   if (styleHint) {
     lines.push(`- Required custom reply style: ${styleHint}`);
     lines.push('- Apply the custom reply style in the very first sentence of the user-facing reply.');
@@ -529,7 +561,7 @@ export function buildTurnPrompt(params: StreamChatParams): string {
   if (systemPrompt) {
     sections.push(`System instructions:\n${systemPrompt}`);
   }
-  sections.push(`Bridge reply style:\n${buildBridgeReplyGuardrails()}`);
+  sections.push(`Bridge reply style:\n${buildBridgeReplyGuardrails(params)}`);
   if (historyEntries.length > 0) {
     sections.push(`Conversation context:\n${historyEntries.join('\n')}`);
   }

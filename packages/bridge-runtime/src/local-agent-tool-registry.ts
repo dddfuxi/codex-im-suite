@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { McpToolCallDefinition, UnityMcpExecuteCodeDefinition } from './local-agent-tool-protocol.js';
+import type { McpToolCallDefinition, ShellArtifactDefinition, UnityMcpExecuteCodeDefinition } from './local-agent-tool-protocol.js';
 
 interface LocalAgentToolManifest {
   id?: string;
@@ -25,6 +25,12 @@ interface LocalAgentToolManifest {
     tool?: string;
     arguments?: Record<string, unknown>;
   };
+  shellArtifact?: {
+    command?: string;
+    cwd?: string;
+    timeoutMs?: number;
+    artifactPaths?: string[];
+  };
 }
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -44,6 +50,21 @@ function getSuiteRoot(): string {
 
 function getCtiHome(): string {
   return process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
+}
+
+function expandManifestValue(value: string | undefined): string | undefined {
+  if (!value) return value;
+  const replacements: Record<string, string> = {
+    CTI_HOME: getCtiHome(),
+    SUITE_ROOT: getSuiteRoot(),
+    RUNTIME_ROOT,
+    USERPROFILE: os.homedir(),
+  };
+  return value.replace(/\$\{([A-Z0-9_]+)\}/g, (match, name: string) => replacements[name] || match);
+}
+
+function expandManifestValues(values: string[]): string[] {
+  return values.map((value) => expandManifestValue(value) || value);
 }
 
 function manifestDirs(): string[] {
@@ -109,6 +130,37 @@ export function loadMcpToolCallDefinitions(): McpToolCallDefinition[] {
           manifestHint,
           tool,
           arguments: parsed.mcp?.arguments || {},
+        });
+      } catch {
+        continue;
+      }
+    }
+  }
+  return definitions;
+}
+
+export function loadShellArtifactDefinitions(): ShellArtifactDefinition[] {
+  const definitions: ShellArtifactDefinition[] = [];
+  for (const dir of manifestDirs()) {
+    for (const name of fs.readdirSync(dir).filter((item) => item.endsWith('.json')).sort()) {
+      const fullPath = path.join(dir, name);
+      try {
+        const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf-8')) as LocalAgentToolManifest;
+        if (parsed.enabled === false) continue;
+        if (parsed.type !== 'shell_artifact') continue;
+        const command = parsed.shellArtifact?.command || '';
+        const artifactPaths = Array.isArray(parsed.shellArtifact?.artifactPaths)
+          ? parsed.shellArtifact.artifactPaths.filter((item): item is string => typeof item === 'string')
+          : [];
+        if (!parsed.id || !command.trim() || artifactPaths.length === 0) continue;
+        definitions.push({
+          id: parsed.id,
+          displayName: parsed.displayName,
+          match: parsed.match,
+          command: expandManifestValue(command) || command,
+          cwd: expandManifestValue(parsed.shellArtifact?.cwd),
+          timeoutMs: parsed.shellArtifact?.timeoutMs,
+          artifactPaths: expandManifestValues(artifactPaths),
         });
       } catch {
         continue;
