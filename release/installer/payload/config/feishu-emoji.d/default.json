@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "description": "Feishu reaction catalog used by codex-im-suite. emojiType values are passed to Feishu messageReaction.create; aliases guide model hints and user shorthand.",
+  "emojis": [
+    {
+      "emojiType": "SMILE",
+      "aliases": ["微笑", "笑", "smile"],
+      "fallbackEmoji": "🙂",
+      "tones": ["friendly"],
+      "intents": ["greeting", "ack"]
+    },
+    {
+      "emojiType": "THUMBSUP",
+      "aliases": ["赞", "点赞", "like", "thumbs_up", "+1"],
+      "fallbackEmoji": "👍",
+      "tones": ["positive"],
+      "intents": ["agree", "done"]
+    },
+    {
+      "emojiType": "OK",
+      "aliases": ["OK", "ok", "好", "可以"],
+      "fallbackEmoji": "👌",
+      "tones": ["positive"],
+      "intents": ["ack", "done"]
+    },
+    {
+      "emojiType": "LAUGH",
+      "aliases": ["大笑", "笑哭", "laugh"],
+      "fallbackEmoji": "😂",
+      "tones": ["playful"],
+      "intents": ["joke"]
+    },
+    {
+      "emojiType": "BLUSH",
+      "aliases": ["脸红", "害羞", "blush"],
+      "fallbackEmoji": "😊",
+      "tones": ["warm"],
+      "intents": ["thanks"]
+    },
+    {
+      "emojiType": "THINKING",
+      "aliases": ["思考", "想想", "thinking"],
+      "fallbackEmoji": "🤔",
+      "tones": ["thinking"],
+      "intents": ["question"]
+    },
+    {
+      "emojiType": "EYES",
+      "aliases": ["眼睛", "看看", "eyes"],
+      "fallbackEmoji": "👀",
+      "tones": ["curious"],
+      "intents": ["watching"]
+    },
+    {
+      "emojiType": "LOVE",
+      "aliases": ["爱心", "心", "heart", "love"],
+      "fallbackEmoji": "❤️",
+      "tones": ["warm"],
+      "intents": ["thanks"]
+    },
+    {
+      "emojiType": "FIRE",
+      "aliases": ["火", "厉害", "fire"],
+      "fallbackEmoji": "🔥",
+      "tones": ["excited"],
+      "intents": ["praise"]
+    },
+    {
+      "emojiType": "DONE",
+      "aliases": ["完成", "搞定", "check", "done"],
+      "fallbackEmoji": "✅",
+      "tones": ["done"],
+      "intents": ["done"]
+    },
+    {
+      "emojiType": "BULL",
+      "aliases": ["牛", "厉害了", "bull"],
+      "fallbackEmoji": "👍",
+      "tones": ["positive"],
+      "intents": ["praise"]
+    }
+  ]
+}

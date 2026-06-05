@@ -6,7 +6,19 @@
 
 ## 1. 项目收口
 
-- 2026-06-05 Feishu 流式卡片视觉强化：按“精致渐进”方向优化 CardKit streaming card 的通用展示，不针对具体请求写死。等待态仍只显示当前一步用户可见动作，但标题改为紫色强调，并追加“依据确认 / 工具完成 / 结果生成”阶段轨迹；完成态卡片 header 改用回答正文标题或首行摘要，不再显示固定“处理完成 / 最终结果”，正文直接呈现结果，工具轨迹作为辅助区，底部只用 `✅` / `×` 加耗时表达完成状态。出站仍剥离等待态“处理思路”和内部工具协议，工具名继续转为通用可见标签。
+- 2026-06-05 SearXNG 搜索 MCP 扩展目录项：在线扩展目录新增 `mcp-searxng`，作为可由控制面板安装的外部 MCP，默认通过 `mcp.npm` 拉起 `mcp-searxng`，并在生成的 MCP manifest 中声明 `SEARXNG_URL=http://127.0.0.1:8888`、中英文搜索别名和 `mcp.web.search` 分类。`scripts/register-external-mcps.ps1` 同步支持把 stdio MCP manifest 的 `env` 字段转成 `codex mcp add --env KEY=VALUE`，让 SearXNG URL 这类扩展配置随注册生效；这一步只提供面板安装入口，不内置 SearXNG 服务，也不新增飞书搜索意图硬编码。
+
+- 2026-06-05 群聊首醒排队反馈与本地 API 重启链路修复：定位到群聊共享 session lock，上一条消息卡在 provider 冷启动或本地模型失败时，下一条群消息会先排队而未进入 `handleMessage`，导致长时间无可见反馈；bridge-manager 现在在同一 session 已有未完成任务时先回复“已收到，按顺序处理”，最终回复仍按原执行顺序生成。控制面板 `settings.saveAndRestartBridge` 现在在目标路由包含 `local_api` 时先准备本地 API 后端再重启 Bridge；Ollama 通过既有启动脚本复用/启动服务并继承模型目录，避免只写配置但 `127.0.0.1:11434` 没有服务导致飞书仍报 `No running Ollama server detected`。
+
+- 2026-06-05 Feishu Emoji 学习与表达增强：新增 `config/feishu-emoji.d` 数据驱动 reaction catalog，并在 `suite.manifest.json` 和 live 同步脚本中声明/复制该目录；Feishu adapter 的 `[微笑]`、`[赞]`、`[火]` 等 reaction hint 现在通过 catalog 解析，未知但合法的 `emoji_type` 仍可透传，失败时保持可见正文或 Unicode fallback，不吞消息。新增 `CTI_HOME\data\feishu-emoji-profile.json` 记录入站 reaction、出站 reaction 成功/失败和 chat/user 偏好，bridge-manager 会把 catalog 示例和已学习偏好注入轻量聊天 prompt；真实表情包仍只复用已记录 `file_key`，不伪造资源。
+- 2026-06-05 Feishu reaction 默认微笑收口：定位到 bridge-manager 身份 prompt、conversation-engine 展示契约和 catalog 示例都把 `[微笑]` 放在首位，模型会照抄成固定微笑回复。现在 prompt 明确要求按实际意图选择 reaction，不能默认 `SMILE`，中性、正式、阻塞或不明确时不加表情；catalog 示例改为 `emojiType + intent + aliases`，不再输出可直接复制的 `[微笑]` 模板。新增单测覆盖 adapter prompt 和 provider system prompt，避免默认微笑回归。
+- 2026-06-05 Feishu 表情包语义用法增强：`CTI_HOME\data\feishu-stickers.json` 的真实表情包资源簿扩展 `usage/avoidWhen/examples`，用户回复表情包说明“叫什么、表示什么、适合什么时候用”时会结构化写回同一 `file_key`。bridge-manager 会把已学习的表情包名称、含义、语气和适用场景通过 `getStickerPresentationPrompt()` 注入轻量聊天 prompt，鼓励模型使用 `[表情包:别名]` 做精确选择；裸 `[表情包]` 现在优先选择有语义标注的候选，不再因为最近收到一个未知表情包就机械发送。
+- 2026-06-05 Feishu 普通图片-only 意图推断：修复用户只发图片时 provider prompt 固定为 `Describe this image.`，导致图片消息被回复成看图识字/图片描述的问题。现在普通图片-only 消息会以通用方式提示模型把图片当作对话消息载体，先结合图片内容和聊天上下文推断沟通意图与期望动作，再回应这个意图；只有用户明确要求描述或转写时才做纯 OCR。新增 bridge-manager 单测覆盖图片-only prompt，避免回退到图片描述默认值。
+- 2026-06-05 Feishu P2P 回复图片上下文修复：定位到私聊历史轮询补捞会把 `parent_id/upper_message_id/root_id/thread_id` 丢掉，导致“回复上一张图继续分析”只能看到当前文本，看不到被回复图片。现在轮询恢复消息会保留这些 reply 元数据，沿用既有被回复消息附件补取链路，把原图作为本轮 provider attachment 传入模型；新增 Feishu adapter 单测覆盖历史轮询恢复的文本回复能自动带入上文图片。
+- 2026-06-05 控制面板会话列表远端历史计数修复：确认 `feishu-history-index.json` 已包含远端同步记录，但 WebView 会话列表只展示本地 session 消息数，导致私聊/群聊看起来“条数变少”或误标为“仅本地”。现在列表和详情同时返回 `localMessageCount` 与 `remoteMessageCount`，来源标签按“当前远端可见 / 本地绑定 / 已同步远端历史”统一推导；前端优先展示远端历史条数，并在本地消息数不同时同时显示本地条数。
+- 2026-06-05 Feishu 近期媒体上下文回捞：针对“继续分析 / 一步一步讲 / 这题怎么解”等无附件跟进消息，bridge-manager 会先判断当前短句是否引用上文媒体，再从同一会话本地历史的 `<!--files:...-->` 附件记录中回捞最近图片作为本轮 provider attachment，并注入 `Recent conversation media context`。这样用户不必每次显式回复原图；如果历史里没有可用图片，仍由模型明确说明缺少上下文。
+
+- 2026-06-05 Feishu 流式卡片视觉强化：按“精致渐进”方向优化 CardKit streaming card 的通用展示，不针对具体请求写死。等待态仍只显示当前一步用户可见动作，但标题改为紫色强调，并追加“依据确认 / 工具完成 / 结果生成”阶段轨迹；完成态卡片 header 改用回答正文标题或首行摘要，不再显示固定“处理完成 / 最终结果”，正文直接呈现结果，工具轨迹作为辅助区，底部只用 `✅` / `×` 加耗时表达完成状态。最终正文会清理模型自己独立成行输出的 `✅`、`✔`、`☑`、`❌` 或 `×`，避免正文和底部重复显示状态；只有清理状态符后仍存在正文内容时，首行才会被提取为标题，轻量表情回复会保留正文并生成短摘要标题。出站仍剥离等待态“处理思路”和内部工具协议，工具名继续转为通用可见标签。
 
 - 2026-06-05 截图类 artifact 证据兜底修复：定位到 `截个图给我`、`刚刚摆的 prefab 摆截图给我` 这类请求会被正确判为 `artifact_required`，但 official Codex 因额度/登录失败或没有调用工具时，最终被出站证据闸门替换成 `tool_use=0` 的通用未完成文案。`config/local-agent-tools.d` 的工具匹配现在支持 `contextualRegex + contextRegex`，Unity Game View 截图 manifest 可在 Unity 工作区语境中识别短句截图，也可直接识别 prefab/场景截图请求；Codex 主模型失败后，如果 runtime 已能从 manifest 得出确定性 JSON 工具计划，会直接用本地受控工具协议执行该产物工具，不再依赖模型重新猜工具，也不把 provider 失败包装成内部证据计数。
 - 2026-06-04 Feishu 身份注入与回复风格保存入口修复：渠道助手身份 prompt 现在放在 system prompt 最前部，避免后续 provider 截断长系统提示时丢失飞书应用名，导致自我介绍重新自称 Codex；已有飞书应用名时，模型回答“你是谁 / 自我介绍 / 你叫什么”必须优先使用该渠道名，只有用户询问底层引擎时才说明 Codex。控制面板“回复风格快捷设置”和“自定义整理”卡片内新增明确保存按钮，“本地 AI 整理”成功后同步清除前端未保存状态，避免用户找不到自定义保存入口。

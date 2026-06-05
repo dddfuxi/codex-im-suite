@@ -1,0 +1,19 @@
+{
+  "id": "fxtools.doctor",
+  "displayName": "FXTools Doctor",
+  "enabled": true,
+  "type": "unity_mcp_execute_code",
+  "match": {
+    "keywords": ["fxtools", "doctor"],
+    "regex": [
+      "fxtools-cli\\.ps1[\\\"']?\\s+doctor",
+      "FXToolsAgentCommandRouter\\.Execute[\\s\\S]*command\\s*=\\s*[\\\"']doctor[\\\"']"
+    ]
+  },
+  "unityMcp": {
+    "tool": "execute_code",
+    "compiler": "auto",
+    "safety_checks": true,
+    "codeTemplate": "var response = FXToolsAgentCommandRouter.Execute(new FXToolsAgentOptions { command = \"doctor\" });\nreturn FXToolsAgentJson.ToJson(response, true);"
+  }
+}

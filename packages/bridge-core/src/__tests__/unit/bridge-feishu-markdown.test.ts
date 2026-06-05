@@ -86,6 +86,125 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(content, /JsonTool|shell_artifact/);
   });
 
+  it('removes model completion marks from the final body while keeping footer status', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '我是小虾米呀，在这个飞书聊天里主要帮你处理 Unity、文件、脚本、本地工具和一些自动化任务。',
+      '你直接说要查什么、改什么或生成什么，我会尽量直接动手做完再回你结果。',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '48.4s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+    };
+    const elements = card.body?.elements || [];
+    const main = String(elements[0]?.content || '');
+    const content = elements.map((element) => element.content || '').join('\n');
+    const footer = elements.find((element) => String(element.content || '').includes('耗时'));
+
+    assert.equal(card.header?.title?.content, '自我介绍');
+    assert.match(main, /我是小虾米呀/);
+    assert.doesNotMatch(main, /✅\s*$/);
+    assert.match(String(footer?.content || ''), /✅/);
+    assert.match(content, /耗时：48\.4s/);
+  });
+
+  it('keeps lightweight reply text in the final body when only a status mark follows', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '收到满月脸啦，小虾米在这儿呢~',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '35.5s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+    };
+    const elements = card.body?.elements || [];
+    const main = String(elements[0]?.content || '');
+    const footer = elements.find((element) => String(element.content || '').includes('耗时'));
+
+    assert.equal(card.header?.title?.content, '表情回复');
+    assert.match(main, /收到满月脸啦，小虾米在这儿呢~/);
+    assert.doesNotMatch(main, /^\s*✅\s*$/);
+    assert.doesNotMatch(main, /✅/);
+    assert.match(String(footer?.content || ''), /✅/);
+  });
+
+  it('ignores reaction hints when summarizing final card titles', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '[表情] 收到满月脸啦，小虾米在这儿呢~',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '35.5s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const main = String(card.body?.elements?.[0]?.content || '');
+
+    assert.equal(card.header?.title?.content, '表情回复');
+    assert.doesNotMatch(String(card.header?.title?.content || ''), /表情\]/);
+    assert.match(main, /\[表情\] 收到满月脸啦/);
+    assert.doesNotMatch(main, /✅/);
+  });
+
+  it('keeps checklist marks inside the final body', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '处理结果',
+      '- ✅ 已完成测试',
+      '- 已同步 live',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '2.0s' })) as {
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const main = String(card.body?.elements?.[0]?.content || '');
+
+    assert.match(main, /- ✅ 已完成测试/);
+    assert.doesNotMatch(main, /✅\s*$/);
+  });
+
+  it('extracts explicit titles only when the remaining body has content', () => {
+    const titled = JSON.parse(buildFinalCardJson([
+      '摘要标题',
+      '正文内容',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '1.0s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    assert.equal(titled.header?.title?.content, '摘要标题');
+    assert.equal(titled.body?.elements?.[0]?.content, '正文内容');
+
+    const untitled = JSON.parse(buildFinalCardJson([
+      '摘要标题',
+      '',
+      '✅',
+    ].join('\n'), [], { status: '已完成', elapsed: '1.0s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    assert.equal(untitled.header?.title?.content, '摘要标题');
+    assert.equal(untitled.body?.elements?.[0]?.content, '摘要标题');
+  });
+
+  it('removes trailing failure marks from the final body while keeping failed footer', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '未完成',
+      '缺少必要授权，暂时无法继续。',
+      '',
+      '×',
+    ].join('\n'), [], { status: '执行失败', elapsed: '3.6s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const main = String(card.body?.elements?.[0]?.content || '');
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.equal(card.header?.title?.content, '未完成');
+    assert.doesNotMatch(main, /×\s*$/);
+    assert.match(content, /×/);
+    assert.match(content, /耗时：3\.6s/);
+  });
+
   it('keeps final cards non-empty when the provider returns no visible result', () => {
     const card = JSON.parse(buildFinalCardJson('', [], { status: '执行失败', elapsed: '36.7s' })) as {
       body?: { elements?: Array<{ content?: string }> };

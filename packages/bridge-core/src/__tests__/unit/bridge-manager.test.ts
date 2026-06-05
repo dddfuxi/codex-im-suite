@@ -111,6 +111,32 @@ describe('bridge-manager session locks', () => {
     assert.deepStrictEqual(order, [1, 2], 'Should continue after error');
   });
 
+  it('sends a visible queued acknowledgement before a locked turn starts', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('ok') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `queued-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.notifyQueuedBehindActiveTurn(adapter, {
+      ...createInboundMessage('下一条', 'ou_1', 'oc_group'),
+      messageId: 'om_queued',
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_1', chatType: 'group' },
+    });
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].replyToMessageId, 'om_queued');
+    assert.match(sent[0].text, /已收到/);
+    assert.match(sent[0].text, /按顺序/);
+  });
+
   it('cleans up completed locks', async () => {
     const { locks, processWithSessionLock } = createSessionLocks();
 
@@ -1563,8 +1589,10 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(streamParams.length, 1);
     assert.match(streamParams[0].systemPrompt || '', /小虾米/);
     assert.match(streamParams[0].systemPrompt || '', /Do not replace that name with "Codex"/);
-    assert.match(streamParams[0].systemPrompt || '', /\[微笑\]/);
-    assert.match(streamParams[0].systemPrompt || '', /\[表情包\]/);
+    assert.match(streamParams[0].systemPrompt || '', /Do not default to SMILE/);
+    assert.match(streamParams[0].systemPrompt || '', /Choose reaction hints by actual intent/);
+    assert.doesNotMatch(streamParams[0].systemPrompt || '', /\[微笑\]/);
+    assert.match(streamParams[0].systemPrompt || '', /\[表情包:alias\]/);
     assert.equal(memoryDecisionCalls, 0);
     assert.equal(memoryWriteClassifierCalls, 0);
   });
@@ -1689,6 +1717,99 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].prompt, /轻量聊天消息/);
     assert.match(streamParams[0].prompt, /聊天语气信号/);
     assert.match(streamParams[0].prompt, /不要写成“图片里是/);
+  });
+
+  it('treats image-only messages as implicit user requests instead of image descriptions', async () => {
+    const sent: OutboundMessage[] = [];
+    const streamParams: StreamChatParams[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('解：设最小正方形边长为 2。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_1', 'oc_image_math'),
+      attachments: [{
+        id: 'img_math',
+        name: 'math-question.png',
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      }],
+    });
+
+    assert.equal(streamParams.length, 1);
+    assert.equal(streamParams[0].files?.length, 1);
+    assert.doesNotMatch(streamParams[0].prompt, /Describe this image/);
+    assert.match(streamParams[0].prompt, /message carrier/i);
+    assert.match(streamParams[0].prompt, /communicative intent/i);
+    assert.match(streamParams[0].prompt, /likely action/i);
+    assert.match(streamParams[0].prompt, /Do not merely describe, caption, or OCR/i);
+  });
+
+  it('reattaches recent conversation images for follow-up messages that refer back to prior media', async (t) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-recent-media-'));
+    const previousIdleFreshMs = process.env.CTI_SESSION_IDLE_FRESH_MS;
+    process.env.CTI_SESSION_IDLE_FRESH_MS = String(365 * 24 * 60 * 60 * 1000);
+    t.after(() => {
+      if (previousIdleFreshMs === undefined) delete process.env.CTI_SESSION_IDLE_FRESH_MS;
+      else process.env.CTI_SESSION_IDLE_FRESH_MS = previousIdleFreshMs;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    });
+    const sent: OutboundMessage[] = [];
+    const streamParams: StreamChatParams[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('按上一张图继续分析。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_1', 'oc_recent_media'),
+      address: { channelType: 'feishu', chatId: 'oc_recent_media', userId: 'ou_1', chatType: 'p2p' },
+      attachments: [{
+        id: 'img_math',
+        name: 'math-question.png',
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      }],
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('继续一步一步分析给我解题思路', 'ou_1', 'oc_recent_media'),
+      address: { channelType: 'feishu', chatId: 'oc_recent_media', userId: 'ou_1', chatType: 'p2p' },
+    });
+
+    assert.equal(streamParams.length, 2);
+    assert.equal(streamParams[1].files?.length, 1);
+    assert.equal(streamParams[1].files?.[0]?.name, 'math-question.png');
+    assert.match(streamParams[1].prompt, /继续一步一步分析/);
+    assert.match(streamParams[1].systemPrompt || '', /recent conversation media/i);
   });
 
   it('does not apply no-tool-evidence interception to sticker chat replies', async () => {

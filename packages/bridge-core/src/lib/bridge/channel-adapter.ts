@@ -103,6 +103,12 @@ export abstract class BaseChannelAdapter {
    */
   getAssistantIdentity?(): AdapterAssistantIdentity | null;
 
+  /** Optional channel-specific presentation hints for model prompts. */
+  getEmojiPresentationPrompt?(chatId?: string, userId?: string): string;
+
+  /** Optional channel-specific sticker library hints for model prompts. */
+  getStickerPresentationPrompt?(chatId?: string, userId?: string): string;
+
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;
 

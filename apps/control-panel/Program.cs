@@ -865,7 +865,9 @@ internal sealed partial class MainForm : Form
                 SaveSettingsFromDialog(ReadSettingsPayload(payload));
                 return GetSettingsSnapshot();
             case "settings.saveAndRestartBridge":
-                SaveSettingsFromDialog(ReadSettingsPayload(payload));
+                var settingsForRestart = ReadSettingsPayload(payload);
+                SaveSettingsFromDialog(settingsForRestart);
+                await EnsureLocalApiReadyForSettingsAsync(settingsForRestart);
                 await RestartBridgeAsync();
                 return GetSettingsSnapshot();
             case "history.syncAll":
@@ -1419,7 +1421,7 @@ internal sealed partial class MainForm : Form
                 .Where(item => !IsSessionDeleted(item, deletedSessions))
                 .OrderByDescending(item => item.LastUpdatedAt)
                 .Take(160)
-                .Select(item => new WebSessionItem(item.DisplayName, item.ChannelType, item.ChatType, item.ChatId, item.SessionId, item.Source, item.LocalMessageCount, item.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "", item.Summary))
+                .Select(item => new WebSessionItem(item.DisplayName, item.ChannelType, item.ChatType, item.ChatId, item.SessionId, item.Source, item.LocalMessageCount, item.RemoteMessageCount, item.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "", item.Summary))
                 .ToArray();
         }
         catch (Exception ex)
@@ -1601,6 +1603,7 @@ internal sealed partial class MainForm : Form
             entry.Source,
             entry.HasLocalBinding,
             entry.LocalMessageCount,
+            entry.RemoteMessageCount,
             entry.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
             entry.Summary,
             entry.Messages.Select(message => new WebConversationMessage(
@@ -6286,6 +6289,37 @@ exit $LASTEXITCODE
         LoadConfig();
     }
 
+    private static bool SettingsRouteIncludesLocalApi(SettingsSnapshot settings)
+    {
+        if (NormalizeCodexModelSource(settings.CodexModelSource) == "local_api") return true;
+        if (NormalizeCodexRoutingMode(settings.CodexRoutingMode) != "auto_failover") return false;
+        return NormalizeCodexApiFallbackChain(settings.CodexApiFallbackChain)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(item => string.Equals(item, "local_api", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task EnsureLocalApiReadyForSettingsAsync(SettingsSnapshot settings)
+    {
+        if (!SettingsRouteIncludesLocalApi(settings)) return;
+
+        var kind = NormalizeLocalAiKind(settings.LocalAiKind);
+        if (kind == "ollama")
+        {
+            await StartLocalLlmAsync();
+            return;
+        }
+
+        var apiKey = ResolveSecretForTest("CTI_LOCAL_AI_API_KEY", settings.LocalAiApiKeyAction, settings.LocalAiApiKeyValue);
+        var probe = await ProbeLocalLlmAsync(
+            settings.LocalAiBaseUrl.Trim(),
+            settings.LocalAiModel.Trim(),
+            kind,
+            apiKey);
+        AppendLog(probe.Ok
+            ? $"本地 API 预检通过：{probe.Message}"
+            : $"本地 API 预检未通过：{probe.Message}");
+    }
+
     private async Task<object> TestLocalAiSettingsAsync(JsonElement payload)
     {
         var settings = ReadSettingsPayload(payload);
@@ -8337,6 +8371,8 @@ exit $LASTEXITCODE
         {
             var chatId = pair.Key;
             if (entries.Any(entry => string.Equals(entry.ChatId, chatId, StringComparison.OrdinalIgnoreCase))) continue;
+            feishuHistoryIndex.TryGetValue(chatId, out var historyRecord);
+            var remoteMessageCount = Math.Max(0, historyRecord?.MessageCount ?? 0);
             entries.Add(new ConversationEntry
             {
                 BindingKey = "",
@@ -8347,12 +8383,13 @@ exit $LASTEXITCODE
                 SessionId = "",
                 WorkingDirectory = "",
                 SdkSessionId = "",
-                LastUpdatedAt = ParseDateTime(pair.Value?.LastMessageAt) ?? ParseDateTime(pair.Value?.UpdatedAt),
+                LastUpdatedAt = ConversationHistoryDisplay.MaxDateTime(ParseDateTime(pair.Value?.LastMessageAt), ParseDateTime(pair.Value?.UpdatedAt), ConversationHistoryDisplay.ResolveRemoteLatestAt(historyRecord)),
                 Summary = "仅本地会话索引",
                 Messages = [],
                 Source = "仅本地索引",
                 HasLocalBinding = false,
                 LocalMessageCount = 0,
+                RemoteMessageCount = remoteMessageCount,
                 RemoteLoaded = false,
             });
         }
@@ -8365,8 +8402,10 @@ exit $LASTEXITCODE
             .Where(entry => string.Equals(entry.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(entry.ChatId))
             .GroupBy(entry => entry.ChatId, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.OrderByDescending(entry => entry.LastUpdatedAt ?? DateTime.MinValue).First(), StringComparer.OrdinalIgnoreCase);
+        var feishuHistoryIndex = LoadFeishuHistoryIndex();
 
         var merged = new List<ConversationEntry>();
+        var visibleRemoteChatIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             var remoteChats = await FetchFeishuRemoteChatsAsync();
@@ -8375,7 +8414,10 @@ exit $LASTEXITCODE
             {
                 if (string.IsNullOrWhiteSpace(chat.ChatId)) continue;
                 remoteChatIds.Add(chat.ChatId);
+                visibleRemoteChatIds.Add(chat.ChatId);
                 localByChatId.TryGetValue(chat.ChatId, out var local);
+                feishuHistoryIndex.TryGetValue(chat.ChatId, out var historyRecord);
+                var remoteMessageCount = Math.Max(local?.RemoteMessageCount ?? 0, Math.Max(0, historyRecord?.MessageCount ?? 0));
                 merged.Add(new ConversationEntry
                 {
                     BindingKey = local?.BindingKey ?? "",
@@ -8386,18 +8428,22 @@ exit $LASTEXITCODE
                     SessionId = local?.SessionId ?? "",
                     WorkingDirectory = local?.WorkingDirectory ?? "",
                     SdkSessionId = local?.SdkSessionId ?? "",
-                    LastUpdatedAt = chat.LastUpdatedAt ?? local?.LastUpdatedAt,
+                    LastUpdatedAt = ConversationHistoryDisplay.MaxDateTime(chat.LastUpdatedAt, local?.LastUpdatedAt, ConversationHistoryDisplay.ResolveRemoteLatestAt(historyRecord)),
                     Summary = local?.Summary ?? "远端飞书会话",
                     Messages = local?.Messages ?? [],
                     Source = local is null ? "远端" : "远端 + 本地绑定",
                     HasLocalBinding = local is not null,
                     LocalMessageCount = local?.Messages.Count ?? 0,
+                    RemoteMessageCount = remoteMessageCount,
                     RemoteLoaded = false,
                 });
             }
 
             foreach (var local in localEntries)
             {
+                feishuHistoryIndex.TryGetValue(local.ChatId, out var historyRecord);
+                local.RemoteMessageCount = Math.Max(local.RemoteMessageCount, Math.Max(0, historyRecord?.MessageCount ?? 0));
+                local.LastUpdatedAt = ConversationHistoryDisplay.MaxDateTime(local.LastUpdatedAt, ConversationHistoryDisplay.ResolveRemoteLatestAt(historyRecord));
                 if (!string.Equals(local.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(local.ChatId) || !remoteChatIds.Contains(local.ChatId))
                 {
                     local.Source = string.Equals(local.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
@@ -8421,6 +8467,18 @@ exit $LASTEXITCODE
             merged.AddRange(localEntries);
         }
 
+        foreach (var entry in merged)
+        {
+            var isFeishu = string.Equals(entry.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase);
+            if (isFeishu && !string.IsNullOrWhiteSpace(entry.ChatId))
+            {
+                feishuHistoryIndex.TryGetValue(entry.ChatId, out var historyRecord);
+                entry.RemoteMessageCount = Math.Max(entry.RemoteMessageCount, Math.Max(0, historyRecord?.MessageCount ?? 0));
+                entry.LastUpdatedAt = ConversationHistoryDisplay.MaxDateTime(entry.LastUpdatedAt, ConversationHistoryDisplay.ResolveRemoteLatestAt(historyRecord));
+            }
+            entry.Source = ConversationHistoryDisplay.ResolveSource(isFeishu, visibleRemoteChatIds.Contains(entry.ChatId), entry.HasLocalBinding, entry.RemoteMessageCount);
+        }
+
         return merged.OrderByDescending(entry => entry.LastUpdatedAt ?? DateTime.MinValue).ToList();
     }
 
@@ -8434,6 +8492,8 @@ exit $LASTEXITCODE
         var sessionId = binding?.CodepilotSessionId ?? session?.Id ?? "";
         var messages = LoadConversationMessages(sessionId);
         var chatId = binding?.ChatId ?? "";
+        feishuHistoryIndex.TryGetValue(chatId, out var historyRecord);
+        var remoteMessageCount = Math.Max(0, historyRecord?.MessageCount ?? 0);
         var resolvedDisplayName = ResolveConversationDisplayName(binding, session, feishuChatIndex, feishuHistoryIndex, chatId, sessionId);
         return new ConversationEntry
         {
@@ -8445,12 +8505,13 @@ exit $LASTEXITCODE
             SessionId = sessionId,
             WorkingDirectory = binding?.WorkingDirectory ?? session?.WorkingDirectory ?? "",
             SdkSessionId = binding?.SdkSessionId ?? session?.SdkSessionId ?? "",
-            LastUpdatedAt = ParseDateTime(binding?.UpdatedAt) ?? ReadMessageFileTimestamp(sessionId),
+            LastUpdatedAt = ConversationHistoryDisplay.MaxDateTime(ParseDateTime(binding?.UpdatedAt), ReadMessageFileTimestamp(sessionId), ConversationHistoryDisplay.ResolveRemoteLatestAt(historyRecord)),
             Summary = BuildConversationSummary(messages),
             Messages = messages,
             Source = "仅本地",
             HasLocalBinding = !string.IsNullOrWhiteSpace(bindingKey),
             LocalMessageCount = messages.Count,
+            RemoteMessageCount = remoteMessageCount,
             RemoteLoaded = false,
         };
     }
@@ -8500,6 +8561,7 @@ exit $LASTEXITCODE
         var indexedMessages = await BuildIndexedFeishuHistoryMessagesAsync(rawMessages, 400);
         entry.Messages = indexedMessages;
         entry.Summary = BuildConversationSummary(indexedMessages);
+        entry.RemoteMessageCount = Math.Max(entry.RemoteMessageCount, rawMessages.Count);
         entry.RemoteLoaded = true;
         return entry;
     }
@@ -10348,6 +10410,7 @@ internal sealed record WebSessionItem(
     string SessionId,
     string Source,
     int LocalMessageCount,
+    int RemoteMessageCount,
     string LastUpdatedAt,
     string Summary);
 internal sealed record WebSessionDetail(
@@ -10361,6 +10424,7 @@ internal sealed record WebSessionDetail(
     string Source,
     bool HasLocalBinding,
     int LocalMessageCount,
+    int RemoteMessageCount,
     string LastUpdatedAt,
     string Summary,
     WebConversationMessage[] Messages,
@@ -10645,6 +10709,44 @@ internal sealed class ChannelBindingRecord
     public string? UpdatedAt { get; set; }
 }
 
+internal static class ConversationHistoryDisplay
+{
+    public static string ResolveSource(bool isFeishu, bool remoteVisible, bool hasLocalBinding, int remoteMessageCount)
+    {
+        if (!isFeishu) return "仅本地";
+        if (remoteVisible && hasLocalBinding) return "远端 + 本地绑定";
+        if (remoteVisible) return "远端";
+        if (remoteMessageCount > 0 && hasLocalBinding) return "远端历史 + 本地绑定";
+        if (remoteMessageCount > 0) return "远端历史索引";
+        return hasLocalBinding ? "仅本地绑定（远端当前不可见）" : "仅本地索引";
+    }
+
+    public static DateTime? ResolveRemoteLatestAt(FeishuHistorySyncRecord? record)
+        => ParseUnixMsOrIso(record?.LatestMessageTime) ?? ParseUnixMsOrIso(record?.LastSyncAt);
+
+    public static DateTime? MaxDateTime(params DateTime?[] values)
+    {
+        var max = values
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .DefaultIfEmpty(DateTime.MinValue)
+            .Max();
+        return max == DateTime.MinValue ? null : max;
+    }
+
+    private static DateTime? ParseUnixMsOrIso(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var value = raw.Trim();
+        if (long.TryParse(value, out var unix))
+        {
+            try { return DateTimeOffset.FromUnixTimeMilliseconds(unix).LocalDateTime; }
+            catch { }
+        }
+        return DateTimeOffset.TryParse(value, out var parsed) ? parsed.LocalDateTime : null;
+    }
+}
+
 internal sealed class FeishuChatIndexRecord
 {
     public string? ChatId { get; set; }
@@ -10741,6 +10843,7 @@ internal sealed class ConversationEntry
     public string Source { get; set; } = "";
     public bool HasLocalBinding { get; set; }
     public int LocalMessageCount { get; set; }
+    public int RemoteMessageCount { get; set; }
     public bool RemoteLoaded { get; set; }
     public List<ConversationMessageView> Messages { get; set; } = [];
     public override string ToString()

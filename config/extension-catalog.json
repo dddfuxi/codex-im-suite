@@ -311,6 +311,56 @@
       "installHandler": "mcp.uvx"
     },
     {
+      "id": "mcp-searxng",
+      "type": "mcp",
+      "displayName": "SearXNG Search MCP",
+      "version": "1.1.0",
+      "category": "mcp.web.search",
+      "description": "开源 SearXNG 搜索 MCP，提供网页搜索和 URL 读取能力；需要已有 SearXNG 服务，并启用 JSON API。默认连接 http://127.0.0.1:8888。",
+      "source": "mcp-searxng",
+      "artifact": {
+        "kind": "npm",
+        "packageName": "mcp-searxng"
+      },
+      "installHandler": "mcp.npm",
+      "manifestTemplate": {
+        "id": "mcp-searxng",
+        "displayName": "SearXNG Search MCP",
+        "type": "stdio",
+        "version": "${VERSION}",
+        "compatibility": {
+          "protocol": "extension-manifest/v1",
+          "suite": ">=0.2.0 <1.0.0"
+        },
+        "category": "mcp.web.search",
+        "optional": true,
+        "installState": "external",
+        "source": "npm:mcp-searxng",
+        "aliases": [
+          "searxng",
+          "searxng mcp",
+          "web search",
+          "web-search",
+          "internet search",
+          "联网搜索",
+          "网页搜索",
+          "网络搜索",
+          "新闻搜索"
+        ],
+        "enabled": true,
+        "launcher": "${LAUNCHER_PATH}",
+        "registerName": "mcp-searxng",
+        "cwd": "${PACKAGE_DIR}",
+        "env": {
+          "SEARXNG_URL": "http://127.0.0.1:8888"
+        },
+        "healthCheck": {
+          "kind": "codex-mcp-list"
+        },
+        "description": "SearXNG-backed web search MCP. Requires an existing SearXNG instance with JSON format enabled."
+      }
+    },
+    {
       "id": "project-architecture-diagram",
       "type": "skill",
       "displayName": "Project Architecture Diagram",

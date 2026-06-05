@@ -253,6 +253,7 @@ type SessionItem = {
   sessionId: string;
   source: string;
   localMessageCount: number;
+  remoteMessageCount: number;
   lastUpdatedAt: string;
   summary: string;
 };
@@ -292,6 +293,7 @@ type SessionDetail = {
   source: string;
   hasLocalBinding: boolean;
   localMessageCount: number;
+  remoteMessageCount: number;
   lastUpdatedAt: string;
   summary: string;
   messages: ConversationMessage[];
@@ -1119,6 +1121,14 @@ function getSessionTypeLabel(item: { chatType?: string; channelType?: string }) 
   if (isPrivateSession(item)) return '私聊';
   if (isGroupSession(item)) return '群聊';
   return item.channelType || '会话';
+}
+
+function formatSessionMessageCount(item: { localMessageCount?: number; remoteMessageCount?: number }) {
+  const local = item.localMessageCount ?? 0;
+  const remote = item.remoteMessageCount ?? 0;
+  if (remote > 0 && local > 0 && remote !== local) return `远端 ${remote} 条 · 本地 ${local} 条`;
+  if (remote > 0) return `远端 ${remote} 条`;
+  return `${local} 条`;
 }
 
 function getSessionDisplayTitle(item: { displayName?: string; chatId?: string; sessionId?: string; chatType?: string; channelType?: string }) {
@@ -3768,7 +3778,7 @@ function SessionsPage({
                 <button key={key} className={selectedSessionKey === key ? 'session-row active' : 'session-row'} onClick={() => void openSessionDetail(key)}>
                   <div className="session-primary">
                     <strong>{getSessionDisplayTitle(item)}</strong>
-                    <span>{getSessionTypeLabel(item)} · {item.source} · {item.localMessageCount} 条 · {item.lastUpdatedAt || '未知时间'}</span>
+                    <span>{getSessionTypeLabel(item)} · {item.source} · {formatSessionMessageCount(item)} · {item.lastUpdatedAt || '未知时间'}</span>
                     <p>{item.summary || '暂无摘要'}</p>
                   </div>
                   <code>{item.displayName || item.chatId || item.sessionId || '-'}</code>

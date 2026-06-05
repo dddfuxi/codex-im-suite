@@ -238,7 +238,7 @@ export function buildFinalCardJson(
   const elements: Array<Record<string, unknown>> = [];
 
   // Main result content. Waiting/progress rationale is stripped before finalizing.
-  let content = preprocessFeishuMarkdown(extractStreamingFinalResponse(text));
+  let content = stripStandaloneCompletionMarkLines(preprocessFeishuMarkdown(extractStreamingFinalResponse(text)));
   if (!content.trim()) {
     content = '未完成：模型没有返回可展示结果。';
   }
@@ -288,20 +288,65 @@ export function buildFinalCardJson(
 }
 
 function extractFinalCardTitleAndBody(content: string): { title: string; body: string } {
-  const normalized = content.replace(/\r\n/g, '\n').trim();
+  const normalized = stripStandaloneCompletionMarkLines(content.replace(/\r\n/g, '\n')).trim();
   const heading = /^(?:#{1,6}\s+|\*\*)?(.{2,48}?)(?:\*\*)?\s*[:：]?\s*\n+([\s\S]+)$/u.exec(normalized);
   if (heading && !/[。！？.!?]$/u.test(heading[1].trim())) {
-    return {
-      title: sanitizeFinalCardTitle(heading[1]),
-      body: heading[2].trim() || normalized,
-    };
+    const body = stripStandaloneCompletionMarkLines(heading[2]).trim();
+    if (hasSubstantiveFinalBody(body)) {
+      return {
+        title: summarizeFinalCardTitle(heading[1]),
+        body,
+      };
+    }
   }
 
   const firstLine = normalized.split('\n').map((line) => line.trim()).find(Boolean) || '';
   return {
-    title: sanitizeFinalCardTitle(firstLine || '回复'),
+    title: summarizeFinalCardTitle(normalized || firstLine || '回复'),
     body: normalized,
   };
+}
+
+function stripStandaloneCompletionMarkLines(content: string): string {
+  return (content || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter((line) => !/^\s*[✅✔☑❌×]+\s*$/u.test(line))
+    .join('\n')
+    .trim();
+}
+
+function hasSubstantiveFinalBody(content: string): boolean {
+  return stripStandaloneCompletionMarkLines(content)
+    .split('\n')
+    .some((line) => line.trim().length > 0);
+}
+
+function summarizeFinalCardTitle(content: string): string {
+  const cleaned = sanitizeFinalCardTitle(stripFeishuInlineHintText(content));
+  if (!cleaned) return '回复';
+
+  if (/自我介绍|^我是|能帮你|可以帮你|主要帮你|帮你处理|陪你聊天/u.test(cleaned)) {
+    return '自我介绍';
+  }
+  if (/表情|满月脸|收到|在这儿|在这里|嘿|哈哈|啦|呢|呀|~|～/u.test(cleaned)) {
+    return '表情回复';
+  }
+  if (/^(?:已|已经)?(?:完成|处理|修复|更新|生成|同步|检查|整理|创建|删除|恢复)/u.test(cleaned)) {
+    return '处理结果';
+  }
+  if (/失败|未完成|报错|错误|阻塞/u.test(cleaned)) {
+    return '未完成';
+  }
+
+  const firstClause = cleaned.split(/[。！？.!?；;，,]/u).map((part) => part.trim()).find(Boolean) || cleaned;
+  return [...firstClause].slice(0, 16).join('') || '回复';
+}
+
+function stripFeishuInlineHintText(text: string): string {
+  return (text || '')
+    .replace(/^\s*\[(?:微笑|赞|OK|BULL|牛|表情|表情包|sticker|飞书表情包)(?::|：)?[^\]\r\n]{0,180}\]\s*/iu, '')
+    .trim();
 }
 
 function sanitizeFinalCardTitle(title: string): string {
@@ -311,7 +356,7 @@ function sanitizeFinalCardTitle(title: string): string {
     .replace(/\s+/g, ' ')
     .trim();
   if (!cleaned) return '回复';
-  return [...cleaned].slice(0, 28).join('');
+  return [...cleaned].slice(0, 48).join('');
 }
 
 function formatCompletionMark(status: string): string {

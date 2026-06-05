@@ -18,6 +18,7 @@ import type {
   ExtensionCatalogItemSummary,
   FeishuCloudLinkResolveResult,
   FeishuOAuthManualResumeRequest,
+  FileAttachment,
   MemoryWriteCandidate,
   MemoryWriteIntentDecision,
   MemoryReplyDecision,
@@ -1288,6 +1289,59 @@ function getInboundMessageKind(msg: InboundMessage, rawData: Record<string, any>
   return undefined;
 }
 
+function shouldAttachRecentConversationMedia(text: string): boolean {
+  const normalized = text.normalize('NFKC').trim().toLowerCase();
+  if (!normalized) return false;
+  const hasMediaReference = /(这|那|上|刚|前|原|题目|图|图片|照片|截图|画面|表情包|附件|它|这个|那个|上一[张个条]|刚才|前面|上面|原图|题图|题目图|the|this|that|above|previous|last|image|picture|photo|screenshot|attachment)/iu.test(normalized);
+  const hasFollowUpAction = /(继续|分析|看|读|识别|解|算|讲|说明|判断|推理|一步|步骤|思路|按|根据|基于|照着|再来|接着|continue|analy[sz]e|solve|explain|read|identify|based on|use)/iu.test(normalized);
+  if (hasMediaReference && hasFollowUpAction) return true;
+  return normalized.length <= 40
+    && /(继续|接着|再来|一步一步|思路|怎么解|帮我看|看一下|分析一下|讲一下|这题|这个呢|它呢|what about this|continue)/iu.test(normalized);
+}
+
+function parseStoredFileAttachments(content: string): Array<{ id?: string; name?: string; type?: string; size?: number; filePath?: string }> {
+  const match = content.match(/^<!--files:([\s\S]*?)-->/);
+  if (!match) return [];
+  try {
+    const parsed = JSON.parse(match[1]);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadRecentConversationImageAttachments(
+  messages: Array<{ role: string; content: string }>,
+  limit = 1,
+): FileAttachment[] {
+  const files: FileAttachment[] = [];
+  const seen = new Set<string>();
+  for (let index = messages.length - 1; index >= 0 && files.length < limit; index -= 1) {
+    const message = messages[index];
+    if (message.role !== 'user') continue;
+    for (const item of parseStoredFileAttachments(message.content).reverse()) {
+      if (files.length >= limit) break;
+      const filePath = typeof item.filePath === 'string' ? item.filePath : '';
+      const type = typeof item.type === 'string' ? item.type : '';
+      if (!filePath || !type.toLowerCase().startsWith('image/')) continue;
+      const resolved = path.resolve(filePath);
+      if (seen.has(resolved) || !fs.existsSync(resolved)) continue;
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > FEISHU_FILE_UPLOAD_LIMIT_BYTES) continue;
+      files.push({
+        id: typeof item.id === 'string' && item.id ? item.id : path.basename(resolved),
+        name: typeof item.name === 'string' && item.name ? item.name : path.basename(resolved),
+        type,
+        size: stat.size,
+        data: fs.readFileSync(resolved).toString('base64'),
+        filePath: resolved,
+      });
+      seen.add(resolved);
+    }
+  }
+  return files;
+}
+
 function buildStickerChatPrompt(rawText: string, hasVisualReference: boolean): string {
   const text = rawText.trim();
   return [
@@ -1301,9 +1355,21 @@ function buildStickerChatPrompt(rawText: string, hasVisualReference: boolean): s
   ].join('\n');
 }
 
-function buildAdapterAssistantIdentityPrompt(adapter: BaseChannelAdapter): string {
+function buildImageOnlyIntentPrompt(): string {
+  return [
+    'The user sent one or more images without a written instruction.',
+    'Treat the image as a message carrier in the conversation, not as an object to describe by default.',
+    'Infer the user\'s communicative intent and the likely action they expect from the image content plus chat context, then respond to that intent.',
+    'Do not merely describe, caption, or OCR the image unless the user explicitly asks for description or transcription.',
+    'If the intended action is genuinely ambiguous, ask one concise clarification question.',
+  ].join('\n');
+}
+
+function buildAdapterAssistantIdentityPrompt(adapter: BaseChannelAdapter, address?: { chatId?: string; userId?: string }): string {
   const identity = adapter.getAssistantIdentity?.();
   const displayName = identity?.displayName?.trim();
+  const emojiPrompt = adapter.getEmojiPresentationPrompt?.(address?.chatId, address?.userId);
+  const stickerPrompt = adapter.getStickerPresentationPrompt?.(address?.chatId, address?.userId);
   const lines = [
     'Channel assistant identity:',
     displayName
@@ -1314,10 +1380,12 @@ function buildAdapterAssistantIdentityPrompt(adapter: BaseChannelAdapter): strin
       ? `- If the user asks who you are, asks for a self-introduction, or asks your name, answer that you are "${displayName}" in this chat. Do not replace that name with "Codex".`
       : '- If the user asks who you are, asks for a self-introduction, or asks your name, introduce yourself using the channel bot/app display name first when available. Do not lead with "Codex" as your name.',
     '- Mention Codex only when the user specifically asks about the underlying engine, implementation, or execution backend.',
-    '- For light chat, confirmations, greetings, and sticker reactions on Feishu, you may start the final reply with a native reaction hint such as `[微笑]`, `[赞]`, `[OK]`, or with `[表情包]` when a previously received sticker would fit. Use these sparingly and only when it improves the chat tone.',
+    '- For light chat, confirmations, greetings, and sticker reactions on Feishu, you may start the final reply with a native reaction hint or `[表情包:alias]` only when it matches the actual intent and improves the chat tone. Choose reaction hints by actual intent; do not default to SMILE, and use no hint when none fits.',
     '- Do not put reaction or sticker hints on formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
+    emojiPrompt,
+    stickerPrompt,
   ];
-  return lines.join('\n');
+  return lines.filter((line): line is string => Boolean(line)).join('\n');
 }
 
 function formatBytes(bytes: number): string {
@@ -3163,6 +3231,19 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
   return current;
 }
 
+async function notifyQueuedBehindActiveTurn(adapter: BaseChannelAdapter, msg: InboundMessage): Promise<void> {
+  try {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '已收到，上一条消息还在处理；我会按顺序继续回复这条。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+  } catch {
+    // Queue acknowledgement is best-effort and must not block the real turn.
+  }
+}
+
 /**
  * Start the bridge system.
  * Checks feature flags, registers enabled adapters, starts polling loops.
@@ -3452,6 +3533,9 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
+          if (state.sessionLocks.has(binding.codepilotSessionId)) {
+            void notifyQueuedBehindActiveTurn(adapter, msg);
+          }
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
           processWithSessionLock(binding.codepilotSessionId, () =>
@@ -3924,7 +4008,7 @@ async function handleMessage(
 
   const binding = router.resolve(msg.address);
   const adapterIdentity = adapter.getAssistantIdentity?.() ?? null;
-  const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter);
+  const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter, msg.address);
   let processingCardStarted = false;
   const startProcessingCard = () => {
     if (processingCardStarted) return;
@@ -4133,8 +4217,26 @@ async function handleMessage(
   );
   const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const isStickerMessage = isFeishuStickerMessageKind(inboundMessageKind);
-  const executionEvidenceAttachments = hasAttachments && !isStickerMessage ? msg.attachments : undefined;
-  const providerAttachments = hasAttachments ? msg.attachments : undefined;
+  const currentMessageEvidenceAttachments = hasAttachments && !isStickerMessage ? msg.attachments : undefined;
+  const recentConversationAttachments = !hasAttachments && shouldAttachRecentConversationMedia(text || rawText)
+    ? loadRecentConversationImageAttachments(store.getMessages(effectiveBinding.codepilotSessionId, { limit: 12 }).messages, 1)
+    : [];
+  const executionEvidenceAttachments = currentMessageEvidenceAttachments ?? (
+    recentConversationAttachments.length > 0 ? recentConversationAttachments : undefined
+  );
+  const providerAttachments = hasAttachments
+    ? msg.attachments
+    : recentConversationAttachments.length > 0
+      ? recentConversationAttachments
+      : undefined;
+  const recentConversationMediaPrompt = recentConversationAttachments.length > 0
+    ? [
+      'Recent conversation media context:',
+      '- The image attachment(s) on this turn were recovered from earlier messages in the same chat because the current user message appears to refer back to prior media.',
+      '- Treat them as the referenced conversation context. Do not ask the user to resend the image unless the attached media is insufficient or unreadable.',
+      '- If multiple interpretations are possible, state the assumption briefly and answer the user request.',
+    ].join('\n')
+    : '';
   const uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
     workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
@@ -4162,7 +4264,7 @@ async function handleMessage(
     feishuDocRequest: Boolean(feishuDocRequest),
     executionRequirement: uiExecutionRequirement,
     messageKind: inboundMessageKind,
-    hasAttachments: Boolean(executionEvidenceAttachments?.length),
+    hasAttachments: Boolean(executionEvidenceAttachments?.length || recentConversationAttachments.length),
     hasMemoryProgress: preExecutionProgressSteps.length > 0,
     textLength: (text || rawText || '').length,
   });
@@ -4309,7 +4411,7 @@ async function handleMessage(
       ? buildFeishuDocumentRewritePrompt(directFeishuDocSourceMarkdown, rawText)
       : isStickerMessage
         ? buildStickerChatPrompt(text || rawText, Boolean(providerAttachments?.length))
-        : (text || (providerAttachments?.length ? 'Describe this image.' : ''));
+        : (text || (providerAttachments?.length ? buildImageOnlyIntentPrompt() : ''));
     let fastPathOptions = getFastPathOptions(rawText);
     const providerMemoryMode: engine.ConversationProcessOptions['memoryMode'] = memoryRecallExtraSystemPrompt
       ? 'recall'
@@ -4404,7 +4506,7 @@ async function handleMessage(
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
       memoryMode: providerMemoryMode,
-      extraSystemPrompt: [adapterIdentityPrompt, fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt].filter(Boolean).join('\n\n'),
+      extraSystemPrompt: [adapterIdentityPrompt, fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt, recentConversationMediaPrompt].filter(Boolean).join('\n\n'),
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
@@ -5036,6 +5138,7 @@ export const _testOnly = {
   isFeishuDocumentListRequest,
   isFeishuDocGenerationRequestStrict,
   selectReplySurfaceMode,
+  notifyQueuedBehindActiveTurn,
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
   buildSmallTalkReply,

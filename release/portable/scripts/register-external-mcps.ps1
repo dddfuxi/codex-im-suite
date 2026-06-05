@@ -50,6 +50,15 @@ foreach ($entry in $manifestsById.Values) {
     if ($item.healthCheck -and $item.healthCheck.url) {
         $healthUrl = Expand-SuiteValue -Value ([string]$item.healthCheck.url) -SuiteRoot $suiteRoot -Config $config
     }
+    $envArgs = @()
+    if ($item.env) {
+        foreach ($property in $item.env.PSObject.Properties) {
+            $key = [string]$property.Name
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            $value = Expand-SuiteValue -Value ([string]$property.Value) -SuiteRoot $suiteRoot -Config $config
+            $envArgs += @('--env', "$key=$value")
+        }
+    }
 
     if ($item.type -eq 'http') {
         $url = if ($healthUrl) { $healthUrl } else { $launcher }
@@ -75,7 +84,7 @@ foreach ($entry in $manifestsById.Values) {
     if ($existing -match ("(?m)^" + [regex]::Escape($name) + "\s")) {
         codex mcp remove $name | Out-Host
     }
-    codex mcp add $name -- powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher | Out-Host
+    codex mcp add $name @envArgs -- powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher | Out-Host
 }
 
 codex mcp list | Out-Host

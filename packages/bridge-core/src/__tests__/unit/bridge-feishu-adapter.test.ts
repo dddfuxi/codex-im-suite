@@ -716,6 +716,163 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.match(inbound?.text || '', /已记录语义的飞书表情包/);
     assert.match(inbound?.text || '', /通常意图：疑惑、问对方干嘛/);
   });
+
+  it('stores sticker usage guidance from a user explanation', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_sticker',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: '1710000000000',
+      },
+    });
+    await adapter.consumeOne();
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_annotation',
+        parent_id: 'om_sticker',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'text',
+        content: JSON.stringify({ text: '这个表情包叫干嘛猫，表示疑惑，适合在别人突然丢奇怪需求时吐槽用' }),
+        create_time: '1710000001000',
+      },
+    });
+    await adapter.consumeOne();
+
+    const store = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), 'utf8'));
+    assert.equal(store.stickers[0].label, '干嘛猫');
+    assert.equal(store.stickers[0].intent, '疑惑');
+    assert.equal(store.stickers[0].usage, '别人突然丢奇怪需求时吐槽用');
+    assert.ok(store.stickers[0].aliases.includes('干嘛猫'));
+  });
+
+  it('builds a sticker presentation prompt from learned meanings and usage', () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-06-05T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['干嘛猫'],
+        label: '干嘛猫',
+        description: '白猫配字“干嘛……”',
+        intent: '表达疑惑或轻微吐槽',
+        tone: '轻松吐槽',
+        usage: '别人突然丢奇怪需求时使用',
+        chatId: 'oc_chat',
+        firstSeenAt: '2026-06-05T00:00:00.000Z',
+        lastSeenAt: '2026-06-05T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_chat');
+
+    assert.match(prompt, /干嘛猫/);
+    assert.match(prompt, /表达疑惑或轻微吐槽/);
+    assert.match(prompt, /别人突然丢奇怪需求时使用/);
+    assert.match(prompt, /\[表情包:干嘛猫\]/);
+    assert.doesNotMatch(prompt, /sticker_file_key/);
+  });
+});
+
+describe('FeishuAdapter p2p reply media recovery', () => {
+  beforeEach(() => {
+    setupContext();
+    useTempCtiHome();
+  });
+
+  it('keeps reply metadata from history-polled p2p messages so replied images are attached', async () => {
+    const adapter = new FeishuAdapter() as any;
+
+    adapter.running = true;
+    adapter.resolveChatDisplayName = async () => 'private chat';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.fetchMessagePage = async () => ({
+      items: [
+        {
+          message_id: 'om_followup',
+          parent_id: 'om_image',
+          chat_id: 'oc_p2p',
+          create_time: '2000',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: '一步一步分析给我解题思路' }) },
+          sender: { id: 'ou_user', id_type: 'open_id', sender_type: 'user' },
+        },
+      ],
+      hasMore: false,
+      nextPageToken: '',
+    });
+    adapter.restClient = {
+      im: {
+        message: {
+          get: async ({ path: requestPath }: any) => {
+            assert.equal(requestPath.message_id, 'om_image');
+            return {
+              data: {
+                items: [
+                  {
+                    message_id: 'om_image',
+                    chat_id: 'oc_p2p',
+                    create_time: '1000',
+                    msg_type: 'image',
+                    body: { content: JSON.stringify({ image_key: 'img_previous' }) },
+                  },
+                ],
+              },
+            };
+          },
+        },
+        messageResource: {
+          get: async ({ path: requestPath }: any) => {
+            assert.equal(requestPath.message_id, 'om_image');
+            assert.equal(requestPath.file_key, 'img_previous');
+            return {
+              getReadableStream: () => Readable.from([Buffer.from('previous-image')]),
+            };
+          },
+        },
+      },
+    };
+
+    await adapter.pollSingleP2pChat({
+      chatId: 'oc_p2p',
+      chatType: 'p2p',
+      displayName: 'private chat',
+      lastMessageAt: '1000',
+      updatedAt: '1000',
+    });
+
+    const inbound = await adapter.consumeOne();
+
+    assert.ok(inbound);
+    assert.equal(inbound.text, '一步一步分析给我解题思路');
+    assert.equal(inbound.attachments?.length, 1);
+    assert.equal(inbound.attachments?.[0]?.name, 'img_previous.png');
+    assert.equal(inbound.raw?.feishuReplyTo?.messageId, 'om_image');
+    assert.equal(inbound.raw?.feishuReplyTo?.attachmentCount, 1);
+  });
 });
 
 describe('FeishuAdapter message reactions', () => {
@@ -765,6 +922,59 @@ describe('FeishuAdapter message reactions', () => {
     assert.match(calls[1], /\\"text\\":\\"收到~\\"/);
   });
 
+  it('does not let bare sticker hints prefer a newer unannotated sticker over a learned one', async () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'unannotated_recent',
+          aliases: ['最近', '默认', '表情包'],
+          chatId: 'oc_group',
+          firstSeenAt: '2026-06-05T00:00:00.000Z',
+          lastSeenAt: '2026-06-05T00:02:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'learned_sticker',
+          aliases: ['干嘛猫'],
+          label: '干嘛猫',
+          intent: '表达疑惑',
+          usage: '别人突然丢奇怪需求时使用',
+          chatId: 'oc_group',
+          firstSeenAt: '2026-06-05T00:00:00.000Z',
+          lastSeenAt: '2026-06-05T00:01:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 这需求有点突然',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.match(calls[0], /\\"file_key\\":\\"learned_sticker\\"/);
+    assert.doesNotMatch(calls[0], /unannotated_recent/);
+  });
+
   it('turns a leading bracketed Feishu emoji hint into a message reaction and strips it from text', async () => {
     const adapter = new FeishuAdapter() as any;
     const calls: string[] = [];
@@ -798,6 +1008,74 @@ describe('FeishuAdapter message reactions', () => {
     assert.match(calls[0], /"emoji_type":"BULL"/);
     assert.match(calls[1], /\\"text\\":\\"收到~\\"/);
     assert.doesNotMatch(calls[1], /\[牛\]/);
+  });
+
+  it('resolves data-driven Feishu emoji aliases and records outbound profile usage', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        messageReaction: {
+          create: async (payload: unknown) => {
+            calls.push(`reaction:${JSON.stringify(payload)}`);
+            return { data: { reaction_id: 'react_1' } };
+          },
+        },
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[火] 这个方案可以',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.match(calls[0], /"emoji_type":"FIRE"/);
+    assert.match(calls[1], /\\"text\\":\\"这个方案可以\\"/);
+
+    const profile = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-emoji-profile.json'), 'utf8'));
+    assert.equal(profile.emojis[0].emojiType, 'FIRE');
+    assert.equal(profile.emojis[0].chatId, 'oc_group');
+    assert.equal(profile.emojis[0].userId, 'ou_user');
+    assert.equal(profile.emojis[0].outboundSuccessCount, 1);
+  });
+
+  it('learns inbound Feishu reaction events without routing a chat message', async () => {
+    const adapter = new FeishuAdapter() as any;
+
+    adapter.handleReactionCreatedEvent({
+      event: {
+        message: { chat_id: 'oc_group' },
+        operator: { operator_id: { open_id: 'ou_user' } },
+        reaction: { reaction_type: { emoji_type: 'THUMBSUP' } },
+      },
+    });
+
+    const profile = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-emoji-profile.json'), 'utf8'));
+    assert.equal(profile.emojis[0].emojiType, 'THUMBSUP');
+    assert.equal(profile.emojis[0].chatId, 'oc_group');
+    assert.equal(profile.emojis[0].userId, 'ou_user');
+    assert.equal(profile.emojis[0].inboundCount, 1);
+    assert.equal(await adapter.consumeOne(), null);
+  });
+
+  it('builds reaction presentation prompt without defaulting to smile', () => {
+    const adapter = new FeishuAdapter() as any;
+
+    const prompt = adapter.getEmojiPresentationPrompt('oc_group', 'ou_user');
+
+    assert.match(prompt, /Do not default to SMILE/);
+    assert.match(prompt, /Choose reaction hints by actual intent/);
+    assert.doesNotMatch(prompt, /Catalog examples:.*\[微笑/s);
   });
 
   it('strips a Markdown Feishu emoji hint and uses visible emoji fallback when reaction fails', async () => {

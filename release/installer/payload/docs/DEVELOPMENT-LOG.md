@@ -1,11 +1,76 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-05-20
+更新时间：2026-06-05
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
 ## 1. 项目收口
 
+- 2026-06-05 SearXNG 搜索 MCP 扩展目录项：在线扩展目录新增 `mcp-searxng`，作为可由控制面板安装的外部 MCP，默认通过 `mcp.npm` 拉起 `mcp-searxng`，并在生成的 MCP manifest 中声明 `SEARXNG_URL=http://127.0.0.1:8888`、中英文搜索别名和 `mcp.web.search` 分类。`scripts/register-external-mcps.ps1` 同步支持把 stdio MCP manifest 的 `env` 字段转成 `codex mcp add --env KEY=VALUE`，让 SearXNG URL 这类扩展配置随注册生效；这一步只提供面板安装入口，不内置 SearXNG 服务，也不新增飞书搜索意图硬编码。
+
+- 2026-06-05 群聊首醒排队反馈与本地 API 重启链路修复：定位到群聊共享 session lock，上一条消息卡在 provider 冷启动或本地模型失败时，下一条群消息会先排队而未进入 `handleMessage`，导致长时间无可见反馈；bridge-manager 现在在同一 session 已有未完成任务时先回复“已收到，按顺序处理”，最终回复仍按原执行顺序生成。控制面板 `settings.saveAndRestartBridge` 现在在目标路由包含 `local_api` 时先准备本地 API 后端再重启 Bridge；Ollama 通过既有启动脚本复用/启动服务并继承模型目录，避免只写配置但 `127.0.0.1:11434` 没有服务导致飞书仍报 `No running Ollama server detected`。
+
+- 2026-06-05 Feishu Emoji 学习与表达增强：新增 `config/feishu-emoji.d` 数据驱动 reaction catalog，并在 `suite.manifest.json` 和 live 同步脚本中声明/复制该目录；Feishu adapter 的 `[微笑]`、`[赞]`、`[火]` 等 reaction hint 现在通过 catalog 解析，未知但合法的 `emoji_type` 仍可透传，失败时保持可见正文或 Unicode fallback，不吞消息。新增 `CTI_HOME\data\feishu-emoji-profile.json` 记录入站 reaction、出站 reaction 成功/失败和 chat/user 偏好，bridge-manager 会把 catalog 示例和已学习偏好注入轻量聊天 prompt；真实表情包仍只复用已记录 `file_key`，不伪造资源。
+- 2026-06-05 Feishu reaction 默认微笑收口：定位到 bridge-manager 身份 prompt、conversation-engine 展示契约和 catalog 示例都把 `[微笑]` 放在首位，模型会照抄成固定微笑回复。现在 prompt 明确要求按实际意图选择 reaction，不能默认 `SMILE`，中性、正式、阻塞或不明确时不加表情；catalog 示例改为 `emojiType + intent + aliases`，不再输出可直接复制的 `[微笑]` 模板。新增单测覆盖 adapter prompt 和 provider system prompt，避免默认微笑回归。
+- 2026-06-05 Feishu 表情包语义用法增强：`CTI_HOME\data\feishu-stickers.json` 的真实表情包资源簿扩展 `usage/avoidWhen/examples`，用户回复表情包说明“叫什么、表示什么、适合什么时候用”时会结构化写回同一 `file_key`。bridge-manager 会把已学习的表情包名称、含义、语气和适用场景通过 `getStickerPresentationPrompt()` 注入轻量聊天 prompt，鼓励模型使用 `[表情包:别名]` 做精确选择；裸 `[表情包]` 现在优先选择有语义标注的候选，不再因为最近收到一个未知表情包就机械发送。
+- 2026-06-05 Feishu 普通图片-only 意图推断：修复用户只发图片时 provider prompt 固定为 `Describe this image.`，导致图片消息被回复成看图识字/图片描述的问题。现在普通图片-only 消息会以通用方式提示模型把图片当作对话消息载体，先结合图片内容和聊天上下文推断沟通意图与期望动作，再回应这个意图；只有用户明确要求描述或转写时才做纯 OCR。新增 bridge-manager 单测覆盖图片-only prompt，避免回退到图片描述默认值。
+- 2026-06-05 Feishu P2P 回复图片上下文修复：定位到私聊历史轮询补捞会把 `parent_id/upper_message_id/root_id/thread_id` 丢掉，导致“回复上一张图继续分析”只能看到当前文本，看不到被回复图片。现在轮询恢复消息会保留这些 reply 元数据，沿用既有被回复消息附件补取链路，把原图作为本轮 provider attachment 传入模型；新增 Feishu adapter 单测覆盖历史轮询恢复的文本回复能自动带入上文图片。
+- 2026-06-05 控制面板会话列表远端历史计数修复：确认 `feishu-history-index.json` 已包含远端同步记录，但 WebView 会话列表只展示本地 session 消息数，导致私聊/群聊看起来“条数变少”或误标为“仅本地”。现在列表和详情同时返回 `localMessageCount` 与 `remoteMessageCount`，来源标签按“当前远端可见 / 本地绑定 / 已同步远端历史”统一推导；前端优先展示远端历史条数，并在本地消息数不同时同时显示本地条数。
+- 2026-06-05 Feishu 近期媒体上下文回捞：针对“继续分析 / 一步一步讲 / 这题怎么解”等无附件跟进消息，bridge-manager 会先判断当前短句是否引用上文媒体，再从同一会话本地历史的 `<!--files:...-->` 附件记录中回捞最近图片作为本轮 provider attachment，并注入 `Recent conversation media context`。这样用户不必每次显式回复原图；如果历史里没有可用图片，仍由模型明确说明缺少上下文。
+
+- 2026-06-05 Feishu 流式卡片视觉强化：按“精致渐进”方向优化 CardKit streaming card 的通用展示，不针对具体请求写死。等待态仍只显示当前一步用户可见动作，但标题改为紫色强调，并追加“依据确认 / 工具完成 / 结果生成”阶段轨迹；完成态卡片 header 改用回答正文标题或首行摘要，不再显示固定“处理完成 / 最终结果”，正文直接呈现结果，工具轨迹作为辅助区，底部只用 `✅` / `×` 加耗时表达完成状态。最终正文会清理模型自己独立成行输出的 `✅`、`✔`、`☑`、`❌` 或 `×`，避免正文和底部重复显示状态；只有清理状态符后仍存在正文内容时，首行才会被提取为标题，轻量表情回复会保留正文并生成短摘要标题。出站仍剥离等待态“处理思路”和内部工具协议，工具名继续转为通用可见标签。
+
+- 2026-06-05 截图类 artifact 证据兜底修复：定位到 `截个图给我`、`刚刚摆的 prefab 摆截图给我` 这类请求会被正确判为 `artifact_required`，但 official Codex 因额度/登录失败或没有调用工具时，最终被出站证据闸门替换成 `tool_use=0` 的通用未完成文案。`config/local-agent-tools.d` 的工具匹配现在支持 `contextualRegex + contextRegex`，Unity Game View 截图 manifest 可在 Unity 工作区语境中识别短句截图，也可直接识别 prefab/场景截图请求；Codex 主模型失败后，如果 runtime 已能从 manifest 得出确定性 JSON 工具计划，会直接用本地受控工具协议执行该产物工具，不再依赖模型重新猜工具，也不把 provider 失败包装成内部证据计数。
+- 2026-06-04 Feishu 身份注入与回复风格保存入口修复：渠道助手身份 prompt 现在放在 system prompt 最前部，避免后续 provider 截断长系统提示时丢失飞书应用名，导致自我介绍重新自称 Codex；已有飞书应用名时，模型回答“你是谁 / 自我介绍 / 你叫什么”必须优先使用该渠道名，只有用户询问底层引擎时才说明 Codex。控制面板“回复风格快捷设置”和“自定义整理”卡片内新增明确保存按钮，“本地 AI 整理”成功后同步清除前端未保存状态，避免用户找不到自定义保存入口。
+- 2026-06-04 记忆与短期历史改为按需参与：定位到普通聊天会先跑一次 `MemoryIntentHost.classifyMemoryWrite`，再进入真正 provider 回复，且两次调用都携带较长历史上下文，导致“自我介绍一下”等轻量消息明显变慢。bridge-core 现在只在显式“记住 / 记录 / 这个表示...”类写入请求时调用记忆写入分类器，只在明确“记得 / 回忆 / 搜索记忆”类请求时走 `MemoryReplyDecision`，工具、Unity/MCP、文件等执行类任务按 `memoryMode=augment` 少量补充上下文；普通聊天默认 `memoryMode=off`，仍走正常 API 模型生成但不预跑记忆工具。bridge-runtime 同步收紧短期历史保留窗口和归档读取上限，避免每轮都把过长历史塞进思考前上下文。
+- 2026-06-04 Feishu 自然聊天与 reaction hint 收口：移除 bridge-core 对问候、自我介绍等普通聊天的本地硬编码秒答，轻量消息仍可使用 `ReplySurfaceMode=light_status` 的等待表面，但最终内容统一由配置的 provider/API 模型生成。Feishu 出站的 `[微笑]`、`[赞]`、`[OK]`、`[BULL]` 等已知 reaction hint 现在覆盖普通文本、Markdown card 和 streaming final card；adapter 会先尝试添加原生 reaction，失败或缺少可回复源消息时剥离 hint 并用对应 Unicode emoji 兜底，避免把 `[微笑]` 这类发送指令展示给用户。
+- 2026-06-04 Feishu 机器人身份与原生表情表达优化：Feishu adapter 启动时从 `/bot/v3/info` 提取机器人 `name/app_name/i18n_name`，bridge-core 将其作为通道助手身份注入 provider；用户问“你是谁 / 自我介绍”时优先使用飞书应用名，不再默认自称 Codex。轻量聊天和表情包接话的 system prompt 也明确允许模型偶尔使用 `[微笑]`、`[赞]`、`[OK]`、`[BULL]` 或 `[表情包]` hint，adapter 命中后转成飞书原生 reaction 或已收到过的真实 sticker，正式工具结果和阻塞不主动加表情。
+- 2026-06-04 Feishu 表情包轻量聊天收口：`sticker` 入站即使通过 `file_key` 下载到了表情包图片，也默认按聊天语气事件处理，不进入 workflow card 或工具证据链；下载到的图片可作为 provider 视觉语气参考，让模型判断表情包情绪和玩笑意味后自然接话，但最终回复不能写成图片说明报告。`messageKind=feishu_sticker_image` 作为结构化路由信号，避免附件存在导致误入 `artifact_required`。
+- 2026-06-04 Feishu 表情包出站证据拦截修复：表情包轻量聊天回复不再被“无真实工具证据”硬拦截。出站假完成拦截现在以本轮 `ExecutionRequirement` 为边界，只有 `local_read_required/tool_required/artifact_required` 任务才要求成功 `tool_result`；`feishu_sticker_*` 消息即使 adapter 原始说明或模型轻聊回复里出现“图片 / 已收到”，也会按聊天回复发送，不替换成 `tool_use=0` 的未完成卡片。
+- 2026-06-04 Feishu 表情包语义与轻量回复收口：`sticker` 入站新增 `messageKind=feishu_sticker_unknown|feishu_sticker_known`，并把 `feishu-stickers.json` 里的 `label/description/intent/tone/aliases` 语义档案作为 agent 上下文注入。`ExecutionRequirement` 现在优先识别结构化 sticker 事件，未知或已标注表情包都不会因为平台说明里的“图片 / 图案 / 下载”误判为 `artifact_required`；真正图片附件、截图、Unity/MCP 和文件产物请求仍保留工具证据门槛。Feishu 展示新增 `ReplySurfaceMode`：工具链继续走完整 workflow card，表情包和普通轻量消息改为延迟极短“正在回复…”状态，快速完成时不建卡，避免每次都显示工具选择和证据判断。
+- 2026-06-04 Feishu 表情包语义识别修复：确认飞书官方 `sticker` 入站只返回 `file_key`，且不支持机器人下载表情包图片；未知表情包不再让 agent 误以为已看到图案，而是明确注入“未标注语义、不能凭 file_key 猜图案/意图”的上下文。`feishu-stickers.json` 扩展 `label/description/intent/tone/annotationConfidence` 语义档案，用户回复表情包或紧接着说明“这个表情包表示/叫/意思是...”时会写回同一 `file_key`，后续再次收到该表情包时把已学图案和意图交给 agent。新增单测覆盖未知表情包防幻觉、已学语义注入、用户解释后学习。
+- 2026-06-04 Feishu 真实表情包出站：在入站 `sticker` 表情包解析基础上新增 `CTI_HOME\data\feishu-stickers.json` 通用资源簿，按 `file_key`、chat、user、message 和别名记录最近可复用表情包。模型最终回复可用 `[表情包]`、`[表情包:别名]` 或 `[sticker:file_key]` 作为用户不可见 hint，Feishu adapter 在命中真实资源时先发送原生 `msg_type=sticker`，再发送或渲染剥离 hint 的正文；未命中时保留普通文本，避免模型编造表情包资源。新增 adapter 单测覆盖 final card sticker、普通文本 sticker 和入站 sticker 记录。
+- 2026-06-03 Feishu 打字机与表情包修复：streaming card 的当前思考动作改为 adapter 侧增量刷新，题头立即出现，灰色正文按小步补齐；新步骤到来会取消上一轮打字并刷新为新标题/正文。`[微笑]` 等 reaction hint 不再只处理 plain text，final streaming card 也会先给原用户消息添加飞书原生 reaction，再从最终卡正文剥离 hint；新增 `微笑 -> SMILE` 等常见映射。入站 `sticker` 表情包不再被 `Unsupported message type: sticker` 丢弃，会转成“用户发送了一个飞书表情包，file_key=...”的可见文本和 raw metadata 交给 agent。
+- 2026-06-03 Feishu 思考卡片单步刷新与表情 reaction：等待态 streaming card 从“思考路径列表 / 工具轨迹”改为单步刷新，卡片只显示当前思考动作的简短标题和灰色小字正文，新的 provider progress、记忆证据、工具事件或收口阶段会替换上一条内容，不再累计固定流程文案。普通文本出站新增通用 reaction hint，模型可用 `[牛] 收到~` 这类开头提示让 Feishu adapter 先给被回复消息添加原生 reaction，再发送剥离 hint 的正文；reaction 失败时保留原文发送，避免吞结果。
+- 2026-06-03 控制面板系统蓝图遮挡修复：系统蓝图的处理面板不再作为右侧小窗占用第二列，改为蓝图下方的行内处理区；蓝图链路区域增加横向滚动保护，避免在窄窗口或中等宽度下挤压到操作按钮和后续面板。
+- 2026-06-03 Feishu 流式卡片视觉与思考路径优化：去掉 bridge-core 在每轮开始时无条件推送的“已收到请求 / 正在判断 / 会话权限 / 读取工具目录”固定流程，改为“思考路径”卡片，展示模型/provider progress、记忆证据、工具事件和 agent 收口这些用户可见阶段；CardKit 首卡 skeleton 也改为更简洁的“正在思考”。最终卡不再额外加“最终结果”标题，正文直接呈现结果，工具轨迹、状态和耗时统一放到底部小字号辅助栏，继续剥离等待态思路和内部协议名。
+- 2026-06-03 控制面板系统蓝图交互重构：总览页蓝图从纵向展示卡片改为“主链路 / 辅助能力 / 处理面板”的两段式导航，节点卡片只负责快速识别状态与入口，选中节点后的处理面板统一承载主动作、跳转入口和不可用原因；同步补充桌面布局与窄屏折叠样式，并更新架构文档，保持蓝图仍只复用现有运行单元动作，不引入新的运行时链路。
+- 2026-06-03 遗留编码与临时分支清理：删除 `bridge-manager` 中三个 `if (false && ...)` 临时禁用分支，记忆写入继续只走模型意图分类后的可见记忆仓库落库，飞书文档继续走 agent rewrite + 文档生成链路，Unity MCP 前置诊断只注入 agent 上下文、不再保留早停直答。新增 `source-encoding` 源码扫描器并接入 runtime 测试与 `scripts/update-architecture-docs.ps1`，覆盖 bridge-core、bridge-runtime、控制面板和脚本中的 BOM、`U+FFFD`、典型 mojibake、长问号串和临时死分支；检测器样本需放入 `cti-encoding-allow-start/end`。同时移除 `Program.cs`、`feishu-cloud-documents.ts`、`store.ts` 和两个脚本的 UTF-8 BOM。历史乱码修复入口保留 `dry-run / -Apply / -Restore`，并补齐文件级 `unresolved/error` 报告，遇到 Windows 锁定或备份失败不会中断整轮修复。
+- 2026-06-03 Feishu 重复执行与单卡片出站修复：定位到切换 Codex / bridge 重启后，Feishu p2p 历史补捞可能把同一条图片说明恢复成新 `messageId`，再加上同一 `messageId` 的重复事件，导致一条用户消息进入多轮 workflow 并生成多张卡片。`bridge-manager` 现在在执行链入口做持久入站去重，同一 channel/chat/messageId 只执行一次；带附件的媒体说明文字会额外写入短期文本指纹，挡住 caption 被补捞为新消息的重复执行。支持 Feishu streaming card 的请求也不再同时启用旧 preview 出站，最终只保留同一张 streaming card 的完成态结果。
+- 2026-06-03 记忆写入改为模型计划落库：修复 Feishu 中“记一下 / 重新记一下 / 这个是……”这类记忆写入只收到“记住了”但控制面板记忆页不可见的问题。bridge-core 现在通过 `MemoryIntentHost` 让模型结合当前消息和最近上下文输出结构化 `MemoryWriteCandidate`，再由 runtime store 写入 `data/explicit-memories/*.md` 并重建 `knowledge.json` / 关系图；模型未给出可落库候选时不会假装成功。显式写入也会走 Feishu streaming card 的用户可见处理进度，最终卡只展示写入结果。store 侧保留表格/键值解析作为保守兜底，并把项目别名提取限制在首行说明，避免把结构化表格里的 prefab、scene id 或路径片段误当作项目别名。
+- 2026-06-03 记忆回忆证据门槛修复：线上复现“所有的常用场景名发给我”进入 agent 后被 `tool_required` 拦截，原因是 `ExecutionRequirement` 只看用户文本，看到“场景”就误判为 Unity/MCP 工具任务。现在 `MemoryQueryPlan` 会从 `bridge-manager` 传入 `conversation-engine`，显式记忆回忆直接按记忆证据链处理，不再触发工具证据重试或“本轮没有检测到真实工具执行成功记录”；进度卡片也不会把记忆查询标成工具任务。
+
+- 2026-06-03 本地 Codex agent 卡死收口：定位到 live 请求停在 `engine_started/executing` 的根因是 `codex exec --oss --local-provider ollama` 子进程无硬超时，Windows 下还会形成 `cmd -> node -> codex.exe` 进程树；当 Codex CLI 插件同步或本地模型过程不退出时，Feishu streaming card 会一直停在处理中。`codex-local-cli-provider` 现在给普通本地 turn 和工具后终答整理都加整轮超时，默认 5 分钟，可由 `CTI_BRIDGE_PROCESSING_TIMEOUT_MS` 覆盖；超时或 abort 时 Windows 使用进程树终止。同时 local primary / fallback 的 `CODEX_HOME` 不再共享全局 `plugins`，生成本地 `config.toml` 时剥离插件、marketplace、desktop、memories、personality 和 notify 配置，并清理旧 local HOME 的插件同步状态，避免桌面插件市场缓存、坏 manifest 或桌面 profile 配置拖住本地 agent。
+- 2026-06-03 记忆检索改为 agent 路由：高置信结构化记忆命中不再由 bridge-core 快捷直答，统一转成 agent system prompt，经 `conversation-engine` 和 provider 生成最终回复，再走出站 review。记忆终答会按用户真实询问意图整理：问“所有 / 全部 / 列表 / 对应表”时保留命中的完整结构化项，单项查询才收窄到匹配项，避免“所有常用场景名”只回一个键值。Feishu streaming card 现在会在默认处理路线中展示“判断证据/工具/记忆上下文”，并在记忆命中或未命中时展示“交给 agent 整理/收口”的用户可见阶段；这不是隐藏思考链，不写入最终回复或会话历史。
+- 2026-06-03 MCP 终答防幻觉收口：确认 `find_gameobjects` 只返回 `instanceIDs` 时，工具成功不等于已经拿到节点名称。JSON 工具协议现在会按用户请求的信息粒度校验 MCP 结果；当用户要求名称、路径或对象详情，但工具结果只有对象 ID、分页和计数时，不允许终答整理模型把 ID 猜成对象详情，必须继续读取详情或以“未完成：具体阻塞”收口。新增本地 API 回归测试覆盖“模型声称 Main Camera、真实工具历史只有 instanceIDs”的场景，并把同类 ID-only 规则收敛为通用 MCP 结果结构校验。
+- 2026-06-02 Windows 状态文件与 CardKit 兼容加固：`workflow-runs.json` 写入改为唯一临时文件，并对 Windows 常见 `EBUSY/EPERM/EACCES` 短暂锁做统一重试，避免面板、bridge 和重试服务读写交错时因为资源忙导致请求中断。Feishu streaming card 不再固定访问 SDK 的 `cardkit.v2`，而是按已安装 SDK 暴露的 CardKit v2/v1 能力选择创建、内容流式更新、关闭 streaming 和最终卡更新接口；当前 `@larksuiteoapi/node-sdk` 只有 `cardkit.v1` 时会走 `card.create`、`cardElement.content`、`card.settings` 和 `card.update`。
+- 2026-06-02 Unity/MCP 证据分类与空结果收口：`ExecutionRequirement` 的命名查询豁免不再覆盖“Unity/MCP/场景/节点/组件/物体 + 查找/列出/统计/总结/读取”等当前状态检查请求，这类请求会进入 `tool_required` 并要求真实工具结果；单纯询问记忆里的场景名称仍可保持 `none`。provider 流结束但没有任何可见最终文本时，bridge-core 会返回“未完成：模型没有返回可展示结果。”并把 streaming card 收成带正文的失败结果卡，避免再次出现“状态已完成但结果为空”。
+- 2026-06-02 回复风格与 Feishu 卡片收口：`CTI_REPLY_STYLE_HINT` 现在会进入 bridge store，并通过 `replyPresentation.replyStyleHint` 显式传给普通 Codex、Codex CLI 本地 API 和工具后终答整理层。JSON 工具完成后的最终回复不再强制固定“处理思路 / 执行结果”模板，而是按设置里的语气生成结果优先的用户可见 Markdown；等待态 CardKit streaming card 仍可展示用户可见处理依据和阶段结果，最终同一张卡会替换为结果正文优先、底部附状态 / 工具轨迹 / 耗时的结构化卡片。新增源码级 UTF-8/mojibake 回归扫描，覆盖 bridge-core、bridge-runtime 和控制面板关键用户可见回复链路。
+- 2026-06-02 本地 API artifact 工具协议补齐：`artifact_required` 现在和 `tool_required/local_read_required` 一样进入 JSON 工具协议，`requiredToolFamilies=artifact` 会暴露 MCP/Unity MCP 产物动作和新增 `shell_artifact` 工具族。`config/local-agent-tools.d/*.json` 支持 `shellArtifact` manifest，声明安全命令、工作目录、超时、产物路径和验证规则；内置 Windows 桌面截图 manifest 通过 runtime 脚本生成真实 PNG，并由 `cti-final.images` 交给 Feishu 附件链路发送。Unity Game View 截图仍优先命中 `mcp_tool_call` manifest，不被桌面截图命令抢走。
+- 2026-06-02 Feishu 进度卡片改为 workflow 驱动：bridge-core 在 workflow 授权后立即使用 CardKit JSON 2.0 streaming card 展示“收到请求、识别证据、选择工具、执行中、整理结果”等用户可见工作轨迹，provider `progress` 和工具事件只作为内容补充；最终仍关闭同一张卡的 streaming mode 并替换为最终结果。卡片工具名会映射为“桌面截图 / Unity MCP 截图 / 文件读取”等通用标签，不显示 `JsonTool`、`shell_artifact` 等内部协议名。
+- 2026-06-02 JSON 工具产物抽取收窄：`shell_artifact` 只信任工具结果里的显式 `artifacts/artifactPaths/images/files` 字段，不再递归扫描 `command` 文本，避免把 `node.exe`、PowerShell 脚本路径等命令依赖误当作用户附件。Workflow schema 预留 `progressCardCreated/progressCardFinalized/progressCardFallbackReason`，Feishu adapter 记录 card create、stream update、finalize 和 fallback 日志。
+- 2026-06-01 本地 API 等待态进度卡片：JSON 工具协议执行 `tool_required` / `local_read_required` 时会发出 `progress` SSE 事件，bridge-core 将其用于 Feishu streaming card 的持续 Markdown 更新，展示用户可见的“处理思路 / 阶段结果”。`progress` 不写入最终回复正文或会话历史；最终结果仍由本地模型基于真实工具历史生成 Markdown/`cti-final`，出站层继续校验真实 `tool_result` 与附件路径。
+- 2026-06-01 Feishu streaming card 默认启用：`CTI_FEISHU_STREAMING_CARD_ENABLED` 现在默认开启，live 配置已改为 `true`。处理中的卡片会先显示等待态和 progress，完成后同一卡片关闭 streaming mode 并更新为最终结果；若终答包含“处理思路 / 执行结果”，最终卡片只保留“执行结果”后的内容，避免把等待态思路跟最终回复重复发送。
+- 2026-06-01 live 同步构建闭环：`scripts/sync-live-skill.ps1` 在复制 live skill 前会先构建 `packages/bridge-core` 和 `packages/bridge-runtime`，避免源码已同步但 live `dist/daemon.mjs` 仍停在旧 bundle，导致 Feishu streaming card 等运行行为没有真实生效。
+- 2026-06-01 本地 API 工具族约束：JSON 工具协议会把 `requiredToolFamilies` 映射为允许工具目录，并在模型输出后再次校验工具名。MCP / Unity MCP 任务不能再被本地模型改写成 `shell` 命令假完成；如果模型请求的工具族不符合本轮要求，会要求重试或返回明确未完成阻塞。终答整理层同时清理“未完成：无具体 blocker”这类自相矛盾尾句。
+- 2026-05-30 本地 API 工具回归修正：`local_api` 的 `tool_required` / `local_read_required` 不再把所有工具请求都先交给本地模型生成 JSON。runtime 会先按用户原文、允许工作区和 `config/local-agent-tools.d` manifest 生成可验证的确定性工具计划；只有模糊请求才让模型输出 JSON。Workflow 顶层 `execution` 同步记录 `toolUseCount`、`toolResultCount`、`successfulToolResultCount`、`failedToolResultCount` 和 `toolNames`，控制面板证据摘要显示工具计数，便于确认 `tool_required` 是否真的出现成功 `tool_result`。
+- 2026-06-01 本地 API MCP 动作 manifest 化：JSON 工具协议新增 `mcp_call`，`config/local-agent-tools.d/*.json` 可声明任意 MCP manifest、tool 和参数模板。`Unitymcp截一个game图` 这类自然语言请求不再依赖本地模型临场写 JSON，而是由 manifest 匹配到 Unity MCP `manage_camera` Game view 截图动作，workflow 会出现 `JsonTool:mcp_call` 和成功 `tool_result`。该机制可继续扩展到其他 MCP 动作，不在 provider 里写死单条中文请求。
+- 2026-06-01 本地 API MCP schema 多步规划补齐：模糊 MCP 任务不再停留在单步 JSON 请求或 manifest 快捷命中。runtime 会从 MCP `tools/list` 读取工具说明和输入 schema，按用户请求挑选相关工具注入本地模型，让模型先搜索/读取真实 path、id 或 name，再基于 `tool_result` 继续规划下一次 `tool_request`，最多执行受控多步工具循环。该修复用于 `unitymcp切换hsscene场景` 这类需要先解析资产再执行动作的任务，不在 provider 中写死场景名、中文请求或具体路径。
+- 2026-06-01 本地 API 工具后终答生成：JSON 工具协议完成真实工具动作后，不再把原始 MCP JSON 或运行时验证摘要直接发给用户。runtime 会把用户原文和真实工具历史交给本地模型生成面向飞书卡片的 Markdown/`cti-final` 终答，可展示简短“处理思路 / 执行结果”，但不暴露内部推理链、`JsonTool` 协议或原始 `tool_result` JSON。工具证据仍完整保留在 workflow 事件里，用于审计和控制面板复核。
+- 2026-06-01 本地 API 工具产物回传收口：JSON 工具协议成功后会从 `JsonToolResult` 递归提取真实存在的本地图片和文件路径，并优先生成 `cti-final.images/files` 结果块。明确工具、MCP、文件、命令、截图或生成物任务禁止降级成快问快答；没有真实工具证据时继续按“未完成”阻塞，成功截图/导出则走 Feishu 图片或文件附件发送链路。
+- 2026-05-30 出站限流配置化：delivery layer 的每聊天发送限流改为读取 `bridge_delivery_rate_limit_max_messages` / `bridge_delivery_rate_limit_window_ms`，默认仍为 20 条/分钟，`max_messages<=0` 可禁用本地限流。单测显式关闭该限流，避免全量测试因同一 mock chat 连续发消息而被生产限流睡眠阻塞。
+- 2026-05-29 本地 agent 执行证据误判修正：`ExecutionRequirement` 现在以用户原文而不是注入后的 provider prompt 做分类，避免飞书云文档上下文里的“不要截图/导出”等安全提示把普通总结误判成 `artifact_required`；`pve关卡场景叫啥` 这类名字/记忆查询不再因“场景”二字强制工具证据，仍由记忆/主模型正常回答。`cti-final` 结果块会先进入出站路径校验，再决定是否拦截缺失本地文件，避免通用 no-evidence 文案覆盖更具体的“路径不存在”阻塞。
+- 2026-05-29 记忆直答和内部工具泄漏兜底：结构化记忆表现在支持按 value/描述反查 key，类似 `pve关卡场景叫啥` 会从“`pve_gunship` == pve场景”这类高置信表项直接回复，不再退给本地模型自由生成。出站答案审查新增 `internal_tool_leakage`，如果本地模型泄漏内部工具协议错误，发送前会先用本轮 `memoryPlan + memoryHits` 重新组织高置信记忆答案；没有可重组答案时才替换成不含内部工具名的短阻塞，避免把执行器内部状态暴露给飞书用户。
+- 2026-05-22 通用自更新协议第一版：新增 `runtime-manifest/v1` 和 `config/runtime.d`，把 `service.bridge`、`service.codex`、`service.feishuCli`、`service.localLlm` 收口成声明式运行单元。控制面板不再只对 Codex CLI 写死更新逻辑，服务页与扩展页统一改走 `update` 块解析、来源判定、白名单模板执行和 post-check 刷新。
+- 2026-05-22 live 面板更新体验修正：`suite_live_sync` 在 live 控制面板内触发时，宿主会先安排当前面板退出后的自动重开，避免同步脚本替换 `dist/control-panel` 时把面板直接关掉后没有新窗口；服务页同时补齐运行单元动态版本显示，Bridge / 飞书 CLI / 本地 Agent API 读取 live `package.json`，Codex CLI 读取 npm 全局 `@openai/codex` 版本。
+- 2026-05-22 运行单元状态口径修正：飞书 CLI / Codex CLI 这类可更新工具在“已同步 / 已是最新版本 / 无需更新”时改显示为正常，不再因为“当前没有可更新动作”被误标成待处理；只有来源未知、无法判断最新版本或确实有待处理更新时才显示待处理。
+- 2026-05-22 飞书 CLI 更新来源诊断落地：`packages/bridge-runtime/scripts/install-codex.sh` 在复制安装时写入 `.cti-install.json`，记录 `installKind`、`installedAt`、`sourceRoot`、`installScript`。面板优先用元数据判断 `skill_codex_copy`，历史安装再按 live 路径、`.git` 仓库和 `sourceRootHint` 回退推断；仍无法确认时禁用自动更新并显示“来源未知”。
+- 2026-05-22 manifest 校验扩展到 runtime：`scripts/validate-extension-manifests.ps1` 现在同时校验 `extension-manifest/v1`、`runtime-manifest/v1` 和可选 `update` 块，约束 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种更新模板，避免面板或脚本绕过白名单执行任意命令。
+- 2026-05-22 本地 JSON 工具失败回传修正：`local_api` 通过 JSON 工具协议真实执行 shell/list_dir 但返回失败时，bridge-core 不再把 provider 给出的 stderr、exitCode 或路径阻塞原因覆盖成笼统“没有工具证据”；只有完全没有成功工具证据且模型仍假完成时才使用通用拦截文本。
+- 2026-05-22 本地 JSON 工具协议接入 Unity MCP：`tool_required` 且需要 Unity MCP 时，工具目录会优先暴露 `unity_mcp_execute_code`，runtime 通过 `McpBridge.callHttpTool(unityMCP, "execute_code", ...)` 在 Unity Editor 内执行 C#。具体工具别名改由 `config/local-agent-tools.d/*.json` 声明匹配规则和 C# 模板，provider 主逻辑不写死某个工具名；当前仅用 manifest 注册 FXTools Doctor 作为一个普通别名。
+- 2026-05-22 在线扩展目录三层化：控制面板目录页从“本地种子 + 远端精选 URL”升级为“静态种子 + 动态排行榜源 + 用户自定义 URL”。动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自 Top 5，缓存到 `runtime/extension-catalog-dynamic-cache.json`，并在条目上展示来源层、抓取时间、排行依据和名次。相同 `type + id` 冲突时按 `custom_url > seed > dynamic` 覆盖，动态刷新失败时回退最近缓存。
+- 2026-05-22 Qwen 本地模型目录更新：扩展目录补入 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder-next:q8_0`、`qwen3-coder-next:cloud`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3-coder:480b-cloud` 和 `qwen3-coder:480b-a35b-q4_K_M`，设置页“本地 API -> 模型”改为读取在线目录生成候选列表，同时保留手动输入任意 Ollama 模型名。`local-model-capabilities.json` 的推荐列表同步把 Qwen3 Coder Next 和 Qwen3 Coder 30B 放到本地代码 agent 候选前列；live 同步脚本现在同步 `config/extension-catalog.json`，避免运行版面板缺少目录种子。
+- 2026-05-22 Ollama 模型安装管理补齐：控制面板新增异步模型安装 job，在线目录里的 Ollama 模型安装会显示进度、支持暂停、配置 `CTI_OLLAMA_MODELS_DIR` / `OLLAMA_MODELS` 安装目录、完成后自动设为本地 API 模型并重启 Bridge；已安装模型可在扩展页直接使用或卸载。设置页新增“已安装模型”下拉，读取在线目录和 Ollama `/api/tags`，不再只靠手动输入模型名。
 - 2026-05-19 优化直接提醒自然语言解析：`五点半提醒我替换pve场景的背景图`、`下午五点半提醒我...`、`明天上午九点提醒我...`、`晚上8点15分提醒我...` 这类请求会走可复用时间短语解析层，命中 bridge-core 的高置信 reminder fast-path，创建 `data/todos/direct-reminders/*.md` 并重建 `.cti-index/reminders.json`，避免 Codex 文本回复“收到”但面板没有待办记录。
 - 2026-05-11 修正 Feishu 入站权限模型：`bridge_feishu_allowed_users` 不再作为 adapter 层会话白名单，任何用户都可以进入普通会话；兼容配置里的 allowed users 只再映射为 `Viewer` 角色，危险动作继续由 `Viewer / Operator / Owner` 门禁控制。
 - 2026-05-11 重整记忆召回链路：移除 `常用场景名称` 这类单词条快路径，改为 `MemoryQueryPlan -> RetrievedMemoryHit 元数据 -> MemoryReplyDecision`。明确回忆类请求只有高置信结构化命中才直答；模糊召回受限交给 Codex；普通任务只注入记忆上下文。`audit.json` 已发结果、profile、知识索引和会话历史统一带来源、置信度、可回答性和质量标记，错误兜底不再写入或召回为有效记忆。
@@ -46,7 +111,7 @@
 - 移除 `packages/bridge-runtime/tools/ControlPanel` 和 `packages/bridge-runtime/tools/Installer` 旧副本，避免面板和安装器源码入口混淆。
 - 将 suite 版本提升到 `0.2.0`，并在 `suite.manifest.json` 中声明 `extension-manifest/v1`。
 - 给 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 补齐统一扩展字段：`version`、`compatibility`、`category`、`optional`、`installState`、`source` 和 `aliases`。
-- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest。
+- 新增 `scripts/validate-extension-manifests.ps1`，构建和 MCP 注册前都会先校验扩展 manifest；截至 2026-05-22 该脚本也同时校验 `config/runtime.d` 和 `update` 协议。
 - 新增在线扩展目录 v1：`config/extension-catalog.json` 作为本地种子，`CTI_EXTENSION_CATALOG_URLS` 可追加远端精选目录；控制面板“扩展”页支持目录搜索、HTTPS URL 预览、本机安装和移除记录。
 - 扩展安装内容固定落在 `C:\Users\admin\.claude-to-im\extensions`，并生成用户 manifest overlay；`mcp-bridge`、控制面板、`install-suite-skills.ps1` 和 `register-external-mcps.ps1` 已合并读取 suite manifest 与用户 overlay。
 - 在线安装 handler 收口为 `skill.copy`、`mcp.npm`、`mcp.uvx`、`mcp.zip`、`ollama.pull`、`manifest.record`、`codex-plugin.record`；无 `sha256` 的 URL 预览会标记为不可信，远程 Control API 安装和移除要求 Owner。
@@ -77,7 +142,7 @@
 - 会话页新增详情抽屉，支持直接查看完整消息流、复制摘要和复制消息文本，不再强依赖旧 WinForms 会话查看器。
 - 会话详情抽屉补齐图片和附件查看：宿主会读取 Feishu 原始消息资源键，下载图片/文件到本机 `runtime/control-panel-media` 缓存，并通过 WebView2 虚拟域 `control-panel-media.local` 给前端加载。前端展示图片缩略图、附件名称、大小、MIME、路径和下载状态，不再把图片简单显示成占位文本。
 - 会话详情新增“刷新详情”，会绕过宿主详情缓存重新读取历史和附件；旧索引只要图片/文件消息缺少资源键，也会触发会话级远端重同步，避免长期停留在 `[图片]` 占位。
-- 会话详情对旧本地消息增加只读显示修复：检测到 `鍖/涓/妫/杩/€` 等典型 UTF-8 被 GBK 错读的 mojibake 时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
+- 会话详情对旧本地消息增加只读显示修复：检测到典型 UTF-8 被 GBK 错读的 mojibake 特征时，使用 Windows 936 代码页还原后展示，不改写原始历史 JSON。
 - 会话详情新增运行历程回溯：按 `sessionId` / `chatId` 关联 workflow run，展示 executor、阶段、状态、prompt 摘要和事件时间线，便于排查一次请求是否卡在授权、路由、执行、收尾或回传阶段。
 - 飞书图片出站收紧：不再从最近 assistant 历史消息里自动捞旧图片随新回答发送；只有当前 `cti-final.images` 或当前回复文本明确出现的本地图片路径会被发送，避免 Unity 截图任务失败时重复发旧截图。
 - 回复风格快捷预设改为点击即保存到 `CTI_REPLY_STYLE_HINT`，避免前端临时状态被后续 `state.refresh` 用旧配置覆盖。
@@ -259,6 +324,8 @@
 
 - `extension-manifest/v1` 由 `suite.manifest.json` 声明。
 - MCP / skill / plugin manifest 使用统一字段管理版本、兼容范围、分类、安装状态和来源。
+- `runtime-manifest/v1` 由 `suite.manifest.json` 声明，内建服务 manifest 存放在 `config/runtime.d`。
+- `update` 块当前只允许 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种模板；宿主负责把模板映射成固定命令。
 - MCP 快路径按 manifest 的 `aliases`、`displayName`、`id` 动态匹配目标，不再在本地执行器里维护固定 MCP 名称列表。
 
 最近重点修复：
@@ -426,8 +493,23 @@
 
 ## 9. 当前未发布改动提示
 
+- 2026-05-20 workflow 运行记录新增任务级 `execution` / `tokenUsage` 摘要：runtime 会从流式 `status/result` 事件汇总模型来源、模型名和 token 用量写回 `workflow-runs.json` 顶层；控制面板在“执行器 -> 最近 Workflow”和“会话详情 -> 运行历程”同步展示模型、来源、总 token、输入/输出 token，并在有值时显示 cache token。
+- 2026-05-21 针对 live workflow 自旋补了两层防护：一是 `workflow-runs.json` 在 Windows 上被占用时，runtime 不再只依赖 `renameSync` 覆盖文件，而是回退为直接写目标文件；二是对 `usage limit`、鉴权失效、`405 Method Not Allowed`、`/v1/responses` 这类确定性失败，workflow 不再自动排 `auto_retry`，避免一条消息失败后持续自旋重跑。
+- 2026-05-21 workflow 面板补齐时间与可视范围：执行器页“最近 Workflow”从最近 12 条扩大到最近 40 条，并直接显示开始时间和耗时；会话详情“运行历程”新增开始、结束和耗时字段，方便区分短失败、长执行和断点续跑中的 run。
+- 2026-05-21 修复 workflow 单测污染 live 运行记录：`workflow-status` 状态文件路径改为按调用时读取 `CTI_HOME`，单测每次运行都切到临时目录，避免 `session-stale-auto-retry`、`session-recoverable` 这类测试 run 再写进 `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json` 干扰真实面板。
+- 2026-05-21 Codex CLI 模型来源改为“Codex agent + API 来源链”：新增 `CTI_CODEX_ROUTING_MODE=manual|auto_failover` 与 `CTI_CODEX_API_FALLBACK_CHAIN`；手动本地 API 模式只使用 `local_primary` profile，清理 `OPENAI_API_KEY` / `CODEX_API_KEY` / `CTI_CODEX_API_KEY` 等付费侧环境变量，不再因工具探测或旧安全兜底键自动转官方 Codex。`codex-local-fallback` 从用户可选执行器移除，`@local` / `@本地` 改为选择 `codex` 的本地模型来源；自动切换只在模型/API 层失败后按链尝试，默认链为 `local_api,external_api`，官方 Codex 必须显式加入才会被调用。控制面板“运行策略”新增“自动切换”与可排序来源链，并隐藏旧本地 Agent API 兜底控件。
+- 2026-05-21 Codex API 自动切换修复：Codex provider 如果把 `/v1/responses`、405、鉴权或额度问题包装成 SSE `error` 事件，`CodexApiFailoverProvider` 现在也会识别为模型/API 层失败并继续尝试链内下一个已配置来源；未配置 `CTI_CODEX_BASE_URL` 的 `external_api` 会被跳过，避免把外部 API 空配置误当成官方 Codex。若链内只剩 Ollama，本地失败会明确提示“Ollama Chat Completions 不支持 Codex SDK 需要的 Responses/WebSocket `/v1/responses` 接口”。
+- 2026-05-21 控制面板 live 产物同步修正：重新运行 `scripts/build-packages.ps1` 发布 `release\artifacts\control-panel`，再同步 live skill 并重启面板/Bridge；总览页系统蓝图的 AI 执行节点同步改为“Codex agent + 模型来源/自动切换链”口径，不再显示“本地兜底”作为备援。
+- 2026-05-21 本地模型 provider registry 接入 Codex CLI：`local_api` 不再走 `@openai/codex-sdk` 的 `/v1/responses`，而是按 `CTI_LOCAL_AI_KIND` 选择 adapter；当前 `ollama` 和 `lmstudio` 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，模型名来自配置，不写死 `qwen2.5-coder:7b`。`vllm`、`openai-compatible` 和 `custom` 当前标记为仅 Chat Completions，手动本地 API 会明确阻断，自动链只继续尝试链中后续已配置来源。Workflow 会记录实际 adapter、模型、来源和 Codex CLI JSONL token usage，控制面板本地 API 区显示 provider 是否支持 Codex agent。
+- 2026-05-21 Agent 工具证据验收升级：`bridge-core` 新增 `ExecutionRequirement` 分类，本地目录/文件读取、Unity/MCP/Blender、截图和产物任务会在进入 provider 前注入明确工具规范。非 `none` 请求如果第一次没有成功 `tool_result`，同一模型来源自动重试一次；仍无证据时返回“未完成：本轮没有检测到真实工具执行成功记录”。Workflow 顶层记录证据要求、是否满足和是否已重试，控制面板“最近 Workflow”和“运行历程”同步显示证据状态。
+- 2026-05-21 本地模型 JSON 工具协议落地：`local_api` 的本地读取类任务不再只依赖 Codex OSS 模型自发产生 `command_execution`，而是先让本地模型输出严格 `tool_request` JSON，runtime 校验并执行 `list_dir/read_file/search_files` 只读工具，再基于真实 `JsonToolResult` 做确定性最终化，避免只读任务再消耗一次本地模型总结调用。若本地模型两次都没有输出 JSON，runtime 仅对可保守推断的只读目标补全白名单工具请求。Workflow 新增 `evidenceProtocol=json_tool_request`、`requestedTool`、`executedTool`、`jsonToolRetryAttempted`、`jsonToolFallbackUsed`，面板同步显示 JSON 工具协议证据状态；该失败不触发切官方 Codex。
+- 2026-05-22 本地模型 JSON 工具协议扩展到 shell：`local_api` 的 `tool_required` 请求也进入 JSON 工具协议，支持模型或 runtime 保守补全 `{"tool":"shell"}` 请求。runtime 会校验 shell `cwd` 在允许根内，执行用户明确要求的命令，记录 stdout/stderr/exitCode/duration，并把 `shellExitCode` / `shellDurationMs` 写入 workflow 摘要和控制面板证据展示。命令失败、路径不唯一或协议失败仍属于工具失败，不触发官方 Codex 自动切换。
+
 截至本记录生成时，工作区仍有以下近期代码改动，发布前应按目标分支选择发布入口：
 
 - 如果只是更新本机运行副本，使用 `publish-backup.ps1`。
 - 如果准备合入 `main`，先使用 `prepare-main-release.ps1` 完成主干发布预检。
 - 当前重点改动是扩展 manifest v1、主干发布预检脚本、版本治理说明和控制面板运营信息展示。
+
+- 2026-05-26 控制面板模型安装交互补齐：修复 WebView/Control API 的目录选择弹窗没有绑定宿主窗口导致“选择目录”无响应或弹到背后的问题；设置页增加本地草稿保护，后台 `state` 推送不再覆盖尚未保存的模型来源、路径和 API 配置；在线目录的 Ollama 安装任务不再只显示 `running` 状态，失败、暂停、完成都会保留任务摘要、进度和最近输出，避免安装失败后一秒钟看起来又变回“未安装”。
+- 2026-05-26 控制面板 Ollama CLI 路径解析补齐：在线目录安装/卸载 Ollama 模型不再直接依赖面板进程 PATH 中存在 `ollama`，会优先读取 `CTI_OLLAMA_EXE` / `OLLAMA_EXE`，再查 PATH 和常见 Windows 安装目录；找不到时返回明确的“未找到 Ollama CLI”阻塞提示，避免底层 `系统找不到指定的文件` 泄漏到用户侧。

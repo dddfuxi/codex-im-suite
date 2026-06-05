@@ -1,0 +1,30 @@
+{
+  "id": "artifact.desktop_screenshot.windows",
+  "enabled": true,
+  "type": "shell_artifact",
+  "displayName": "Desktop Screenshot",
+  "match": {
+    "keywords": [
+      "截图",
+      "桌面",
+      "屏幕",
+      "screenshot",
+      "desktop",
+      "screen"
+    ],
+    "regex": [
+      "(桌面|屏幕).*(截图|截屏|capture|screenshot)",
+      "(截图|截屏|capture|screenshot).*(桌面|屏幕)",
+      "(desktop|screen).*(screenshot|capture)",
+      "(screenshot|capture).*(desktop|screen)"
+    ]
+  },
+  "shellArtifact": {
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${RUNTIME_ROOT}\\scripts\\capture-desktop-screenshot.ps1\" -OutputPath \"${CTI_HOME}\\runtime\\captures\\desktop-latest.png\"",
+    "cwd": "${RUNTIME_ROOT}",
+    "timeoutMs": 15000,
+    "artifactPaths": [
+      "${CTI_HOME}\\runtime\\captures\\desktop-latest.png"
+    ]
+  }
+}

@@ -97,7 +97,8 @@
     "skillManifestDir": "./config/skills.d",
     "pluginManifestDir": "./config/plugins.d",
     "runtimeManifestDir": "./config/runtime.d",
-    "localAgentToolManifestDir": "./config/local-agent-tools.d"
+    "localAgentToolManifestDir": "./config/local-agent-tools.d",
+    "feishuEmojiCatalogDir": "./config/feishu-emoji.d"
   },
   "extensions": {
     "skills": {

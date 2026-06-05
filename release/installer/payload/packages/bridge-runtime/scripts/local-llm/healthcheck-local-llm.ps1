@@ -7,7 +7,7 @@ function Get-ConfigMap {
     param([string]$Path)
     $map = @{}
     if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Missing config: $Path"
+        return $map
     }
     foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
         $trimmed = $line.Trim()
@@ -20,27 +20,32 @@ function Get-ConfigMap {
     return $map
 }
 
-$config = Get-ConfigMap -Path $configPath
-$baseUrl = if ($config.ContainsKey('CTI_LOCAL_LLM_BASE_URL')) { $config['CTI_LOCAL_LLM_BASE_URL'] } else { 'http://127.0.0.1:8080' }
-
-$targets = @(
-    "$baseUrl/health",
-    "$baseUrl/v1/models",
-    $baseUrl
-)
-
-foreach ($target in $targets) {
-    try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $target -TimeoutSec 5
-        Write-Output "online: $target ($($response.StatusCode))"
-        exit 0
-    } catch {
-        $status = $_.Exception.Response.StatusCode.value__ 2>$null
-        if ($status -in 400, 401, 403, 404, 405, 406) {
-            Write-Output "online: $target ($status)"
-            exit 0
-        }
-    }
+function Get-ConfigValue {
+    param(
+        [hashtable]$Map,
+        [string]$Key,
+        [string]$Fallback
+    )
+    if ($Map.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace($Map[$Key])) { return $Map[$Key] }
+    return $Fallback
 }
 
-throw "offline: $baseUrl"
+$config = Get-ConfigMap -Path $configPath
+$baseUrl = Get-ConfigValue $config 'CTI_OLLAMA_BASE_URL' 'http://127.0.0.1:11434'
+$model = Get-ConfigValue $config 'CTI_OLLAMA_MODEL' 'qwen2.5-coder:7b'
+
+try {
+    $response = Invoke-RestMethod -Uri "$($baseUrl.TrimEnd('/'))/api/tags" -Method Get -TimeoutSec 5
+    $models = @($response.models | ForEach-Object { if ($_.name) { $_.name } elseif ($_.model) { $_.model } })
+    if ($models -contains $model) {
+        Write-Output "online: $baseUrl"
+        Write-Output "model available: $model"
+        exit 0
+    }
+    Write-Output "online: $baseUrl"
+    Write-Output "model missing: $model"
+    Write-Output "available: $($models -join ', ')"
+    exit 2
+} catch {
+    throw "offline: $baseUrl | $($_.Exception.Message)"
+}

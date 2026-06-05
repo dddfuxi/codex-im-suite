@@ -34,6 +34,22 @@
       "description"
     ]
   },
+  "runtimeProtocol": {
+    "version": "1.0.0",
+    "id": "runtime-manifest/v1",
+    "requiredFields": [
+      "id",
+      "displayName",
+      "kind",
+      "category",
+      "enabled",
+      "installState",
+      "source",
+      "cwd",
+      "version",
+      "description"
+    ]
+  },
   "packages": {
     "contracts": {
       "path": "./packages/contracts",
@@ -79,7 +95,10 @@
   "config": {
     "mcpManifestDir": "./config/mcp.d",
     "skillManifestDir": "./config/skills.d",
-    "pluginManifestDir": "./config/plugins.d"
+    "pluginManifestDir": "./config/plugins.d",
+    "runtimeManifestDir": "./config/runtime.d",
+    "localAgentToolManifestDir": "./config/local-agent-tools.d",
+    "feishuEmojiCatalogDir": "./config/feishu-emoji.d"
   },
   "extensions": {
     "skills": {

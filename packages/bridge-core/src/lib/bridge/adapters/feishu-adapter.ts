@@ -47,6 +47,11 @@ import {
   buildPermissionButtonCard,
   formatElapsed,
 } from '../markdown/feishu.js';
+import {
+  buildFeishuEmojiPrompt,
+  normalizeFeishuEmojiType,
+  resolveFeishuEmojiHint,
+} from './feishu-emoji-catalog.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -59,52 +64,6 @@ type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'st
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
-
-const FEISHU_REACTION_ALIASES: Record<string, string> = {
-  牛: 'BULL',
-  bull: 'BULL',
-  BULL: 'BULL',
-  赞: 'THUMBSUP',
-  like: 'THUMBSUP',
-  thumbs_up: 'THUMBSUP',
-  THUMBSUP: 'THUMBSUP',
-  '+1': 'THUMBSUP',
-  ok: 'OK',
-  OK: 'OK',
-  微笑: 'SMILE',
-  笑: 'SMILE',
-  smile: 'SMILE',
-  大笑: 'LAUGH',
-  laugh: 'LAUGH',
-  脸红: 'BLUSH',
-  blush: 'BLUSH',
-  思考: 'THINKING',
-  thinking: 'THINKING',
-  眼睛: 'EYES',
-  eyes: 'EYES',
-  爱心: 'LOVE',
-  love: 'LOVE',
-  heart: 'LOVE',
-  火: 'FIRE',
-  fire: 'FIRE',
-  完成: 'DONE',
-  done: 'DONE',
-  check: 'DONE',
-};
-
-const FEISHU_REACTION_FALLBACK_EMOJI: Record<string, string> = {
-  SMILE: '\u{1F642}',
-  THUMBSUP: '\u{1F44D}',
-  OK: '\u{1F44C}',
-  LAUGH: '\u{1F602}',
-  BLUSH: '\u{1F60A}',
-  THINKING: '\u{1F914}',
-  EYES: '\u{1F440}',
-  LOVE: '\u2764\uFE0F',
-  FIRE: '\u{1F525}',
-  DONE: '\u2705',
-  BULL: '\u{1F44D}',
-};
 
 interface FeishuReactionHint {
   raw: string;
@@ -124,16 +83,17 @@ function extractFeishuReactionHint(text: string): FeishuReactionHint | null {
   if (!match) return null;
   const raw = match[1].trim();
   if (/^(?:表情包|sticker|飞书表情包)(?::|：|$)/iu.test(raw)) return null;
-  const alias = FEISHU_REACTION_ALIASES[raw] || FEISHU_REACTION_ALIASES[raw.toLowerCase()];
-  if (alias) {
+  const catalogEntry = resolveFeishuEmojiHint(raw);
+  if (catalogEntry) {
     return {
       raw,
-      emojiType: alias,
+      emojiType: catalogEntry.emojiType,
       remainingText: match[2].trimStart(),
-      fallbackEmoji: FEISHU_REACTION_FALLBACK_EMOJI[alias],
+      fallbackEmoji: catalogEntry.fallbackEmoji,
     };
   }
-  if (/^[A-Za-z0-9_+-]{1,40}$/.test(raw)) return { raw, emojiType: raw.toUpperCase(), remainingText: match[2].trimStart() };
+  const emojiType = normalizeFeishuEmojiType(raw);
+  if (emojiType) return { raw, emojiType, remainingText: match[2].trimStart() };
   return null;
 }
 
@@ -227,6 +187,14 @@ function getFeishuStickerStorePath(): string {
   );
 }
 
+function getFeishuEmojiProfilePath(): string {
+  return path.join(
+    process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+    'data',
+    'feishu-emoji-profile.json',
+  );
+}
+
 interface FeishuStickerRecord {
   fileKey: string;
   aliases: string[];
@@ -234,6 +202,9 @@ interface FeishuStickerRecord {
   description?: string;
   intent?: string;
   tone?: string;
+  usage?: string;
+  avoidWhen?: string;
+  examples?: string[];
   annotationConfidence?: number;
   annotationUpdatedAt?: string;
   learnedFromMessageId?: string;
@@ -261,6 +232,26 @@ interface ParsedFeishuStickerContent {
   description?: string;
   intent?: string;
   tone?: string;
+  usage?: string;
+}
+
+interface FeishuEmojiProfileEntry {
+  emojiType: string;
+  aliases: string[];
+  chatId?: string;
+  userId?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  inboundCount: number;
+  outboundSuccessCount: number;
+  outboundFailureCount: number;
+  disabled?: boolean;
+}
+
+interface FeishuEmojiProfileStore {
+  version: 1;
+  updatedAt: string;
+  emojis: FeishuEmojiProfileEntry[];
 }
 
 function formatBytesForDocument(bytes: number): string {
@@ -500,6 +491,156 @@ export class FeishuAdapter extends BaseChannelAdapter {
     fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
   }
 
+  private readEmojiProfileStore(): FeishuEmojiProfileStore {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(getFeishuEmojiProfilePath(), 'utf8')) as Partial<FeishuEmojiProfileStore>;
+      const emojis = Array.isArray(parsed.emojis) ? parsed.emojis : [];
+      return {
+        version: 1,
+        updatedAt: parsed.updatedAt || '',
+        emojis: emojis
+          .map((item) => this.sanitizeEmojiProfileEntry(item as FeishuEmojiProfileEntry))
+          .filter((item): item is FeishuEmojiProfileEntry => Boolean(item))
+          .slice(0, 240),
+      };
+    } catch {
+      return { version: 1, updatedAt: '', emojis: [] };
+    }
+  }
+
+  private writeEmojiProfileStore(store: FeishuEmojiProfileStore): void {
+    const storePath = getFeishuEmojiProfilePath();
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
+  }
+
+  private sanitizeEmojiProfileEntry(record: FeishuEmojiProfileEntry): FeishuEmojiProfileEntry | null {
+    const emojiType = normalizeFeishuEmojiType(String(record.emojiType || ''));
+    if (!emojiType) return null;
+    return {
+      emojiType,
+      aliases: (Array.isArray(record.aliases) ? record.aliases : [])
+        .map((item) => String(item || '').trim())
+        .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
+        .slice(0, 20),
+      chatId: typeof record.chatId === 'string' ? record.chatId : undefined,
+      userId: typeof record.userId === 'string' ? record.userId : undefined,
+      firstSeenAt: record.firstSeenAt || new Date().toISOString(),
+      lastSeenAt: record.lastSeenAt || record.firstSeenAt || new Date().toISOString(),
+      inboundCount: Math.max(0, Number(record.inboundCount) || 0),
+      outboundSuccessCount: Math.max(0, Number(record.outboundSuccessCount) || 0),
+      outboundFailureCount: Math.max(0, Number(record.outboundFailureCount) || 0),
+      disabled: record.disabled === true,
+    };
+  }
+
+  private rememberEmojiUsage(input: {
+    emojiType: string;
+    chatId?: string;
+    userId?: string;
+    alias?: string;
+    direction: 'inbound' | 'outbound';
+    outcome?: 'success' | 'failure';
+  }): void {
+    const emojiType = normalizeFeishuEmojiType(input.emojiType);
+    if (!emojiType) return;
+    const now = new Date().toISOString();
+    const store = this.readEmojiProfileStore();
+    let record = store.emojis.find((item) => item.emojiType === emojiType
+      && (item.chatId || '') === (input.chatId || '')
+      && (item.userId || '') === (input.userId || ''));
+    if (!record) {
+      record = {
+        emojiType,
+        aliases: [],
+        chatId: input.chatId,
+        userId: input.userId,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        inboundCount: 0,
+        outboundSuccessCount: 0,
+        outboundFailureCount: 0,
+      };
+      store.emojis.push(record);
+    }
+    if (input.alias?.trim()) {
+      record.aliases = Array.from(new Set([...(record.aliases || []), input.alias.trim()])).slice(0, 20);
+    }
+    if (input.direction === 'inbound') record.inboundCount += 1;
+    if (input.direction === 'outbound' && input.outcome === 'success') record.outboundSuccessCount += 1;
+    if (input.direction === 'outbound' && input.outcome === 'failure') record.outboundFailureCount += 1;
+    record.lastSeenAt = now;
+    store.updatedAt = now;
+    store.emojis = store.emojis
+      .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
+      .slice(0, 240);
+    try {
+      this.writeEmojiProfileStore(store);
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to persist emoji profile:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  getEmojiPresentationPrompt(chatId?: string, userId?: string): string {
+    const catalogHint = buildFeishuEmojiPrompt();
+    const store = this.readEmojiProfileStore();
+    const preferred = store.emojis
+      .filter((item) => !item.disabled)
+      .filter((item) => !chatId || !item.chatId || item.chatId === chatId)
+      .filter((item) => !userId || !item.userId || item.userId === userId)
+      .sort((a, b) => {
+        const score = (entry: FeishuEmojiProfileEntry) => entry.inboundCount + entry.outboundSuccessCount - entry.outboundFailureCount;
+        return score(b) - score(a) || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0);
+      })
+      .slice(0, 6)
+      .map((item) => {
+        const alias = item.aliases?.[0] ? `/${item.aliases[0]}` : '';
+        return `[${item.emojiType}${alias}]`;
+      })
+      .join(', ');
+    return [
+      'Feishu emoji presentation:',
+      catalogHint ? `- Catalog examples: ${catalogHint}.` : '',
+      preferred ? `- Learned preferences for this chat/user: ${preferred}. Prefer these in light chat when they fit.` : '',
+      '- Choose reaction hints by actual intent. Do not default to SMILE; use no reaction hint when the tone is neutral, formal, blocked, or unclear.',
+      '- Use reaction hints sparingly but naturally for greetings, acknowledgements, praise, jokes, and sticker-style banter.',
+      '- If a reaction hint fails, the adapter will keep or fallback the visible text; never rely on the hint as the only meaning.',
+    ].filter(Boolean).join('\n');
+  }
+
+  getStickerPresentationPrompt(chatId?: string): string {
+    const store = this.readStickerStore();
+    const annotated = store.stickers
+      .filter((item) => this.hasStickerAnnotation(item))
+      .filter((item) => !chatId || !item.chatId || item.chatId === chatId)
+      .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
+        || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
+      .slice(0, 8);
+    if (annotated.length === 0) {
+      return [
+        'Feishu sticker library:',
+        '- No semantically annotated stickers are available for this chat yet.',
+        '- If the user explains a sticker meaning by replying to it, the adapter will store the meaning and usage for future selection.',
+        '- Avoid bare `[表情包]` unless the user explicitly asks for any sticker; prefer text or a reaction hint when no matching sticker is known.',
+      ].join('\n');
+    }
+    const lines = annotated.map((item) => {
+      const alias = item.label?.trim() || item.aliases?.find((name) => !/^(?:最近|默认|表情包)$/u.test(name)) || '表情包';
+      const parts = [
+        item.intent?.trim() ? `meaning=${item.intent.trim()}` : '',
+        item.tone?.trim() ? `tone=${item.tone.trim()}` : '',
+        item.usage?.trim() ? `use=${item.usage.trim()}` : '',
+      ].filter(Boolean).join('; ');
+      return `- [表情包:${alias}] ${parts || item.description?.trim() || 'known sticker'}`;
+    });
+    return [
+      'Feishu sticker library:',
+      ...lines,
+      '- Choose a sticker only when its meaning and usage match the reply. Prefer `[表情包:alias]` over bare `[表情包]`.',
+      '- Do not mention sticker file keys to the user.',
+    ].join('\n');
+  }
+
   private isUnsafeStickerSemanticText(value: unknown): boolean {
     if (typeof value !== 'string') return false;
     const text = value.trim();
@@ -511,9 +652,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private sanitizeStickerRecord(record: FeishuStickerRecord): FeishuStickerRecord {
     const cleaned: FeishuStickerRecord = { ...record };
-    for (const key of ['label', 'description', 'intent', 'tone'] as const) {
+    for (const key of ['label', 'description', 'intent', 'tone', 'usage', 'avoidWhen'] as const) {
       if (this.isUnsafeStickerSemanticText(cleaned[key])) delete cleaned[key];
     }
+    cleaned.examples = (Array.isArray(cleaned.examples) ? cleaned.examples : [])
+      .map((item) => String(item || '').trim())
+      .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
+      .slice(0, 8);
     cleaned.aliases = (Array.isArray(cleaned.aliases) ? cleaned.aliases : [])
       .map((item) => String(item || '').trim())
       .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
@@ -568,14 +713,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (looksLikeFeishuStickerFileKey(normalized)) return normalized;
     const store = this.readStickerStore();
     const alias = normalized || '最近';
-    const byAlias = store.stickers
-      .filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase()))
-      .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
-        || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const genericTarget = /^(?:最近|默认|表情包|sticker|飞书表情包)$/iu.test(alias);
+    const compareStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+      Number(b.chatId === chatId) - Number(a.chatId === chatId)
+      || (genericTarget ? Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a)) : 0)
+      || (Number(b.useCount || 0) - Number(a.useCount || 0))
+      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const byAlias = (genericTarget
+      ? store.stickers
+      : store.stickers.filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
+      .sort(compareStickerCandidate);
     const fallback = store.stickers
       .slice()
-      .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
-        || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+      .sort(compareStickerCandidate);
     return (byAlias[0] || fallback[0])?.fileKey || null;
   }
 
@@ -593,6 +743,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
     if (!normalized || normalized.length > 240 || /^[/?#]/.test(normalized)) return null;
     if (/[?？]$/.test(normalized)) return null;
+    const labelMatch = /(?:表情包|表情|sticker|这个|刚才|上个|上一个|this|previous).{0,12}(?:叫|名称是|名字是|name|label)\s*[:：]?\s*([^，,。；;]{2,32})/iu.exec(normalized);
+    const intentMatch = /(?:表示|代表|意思是|含义是|means?|meaning)\s*[:：]?\s*([^，,。；;]{2,80})/iu.exec(normalized);
+    const toneMatch = /(?:语气是|tone)\s*[:：]?\s*([^，,。；;]{2,60})/iu.exec(normalized);
+    const usageMatch = /(?:适合(?:在|用于)?|用于|用来|usage|use when)\s*[:：]?\s*(?:在)?([^。；;]{2,120})/iu.exec(normalized);
+    if (labelMatch || intentMatch || toneMatch || usageMatch) {
+      const label = labelMatch?.[1]?.trim();
+      const intent = intentMatch?.[1]?.trim();
+      const tone = toneMatch?.[1]?.trim();
+      const usage = usageMatch?.[1]?.trim();
+      return {
+        label,
+        description: intent || usage || label || normalized,
+        intent: intent || usage || label,
+        tone: tone || (usage && usage.length <= 40 ? usage : undefined),
+        usage,
+        annotationConfidence: 0.82,
+      };
+    }
     const match = normalized.match(/(?:表情包|表情|sticker).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu)
       || normalized.match(/(?:这个|刚才|上个|上一个|this|previous).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu);
     if (!match) return null;
@@ -629,12 +797,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     target.description = annotation.description || target.description;
     target.intent = annotation.intent || target.intent;
     target.tone = annotation.tone || target.tone;
+    target.usage = annotation.usage || target.usage;
+    target.avoidWhen = annotation.avoidWhen || target.avoidWhen;
+    target.examples = Array.from(new Set([...(target.examples || []), ...(annotation.examples || [])])).slice(0, 8);
     target.annotationConfidence = annotation.annotationConfidence;
     target.annotationUpdatedAt = now;
     target.learnedFromMessageId = input.messageId;
     target.lastSeenAt = now;
     target.userId = input.userId || target.userId;
-    const aliasSource = [target.label, target.intent, target.description]
+    const aliasSource = [target.label, target.intent, target.description, target.usage]
       .filter((item): item is string => !!item?.trim())
       .flatMap((item) => item.split(/[，,、;；\s]+/).map((part) => part.trim()).filter((part) => part.length >= 2 && part.length <= 24));
     target.aliases = Array.from(new Set([...(target.aliases || []), ...aliasSource])).slice(0, 20);
@@ -658,7 +829,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       record.label?.trim()
       || record.description?.trim()
       || record.intent?.trim()
-      || record.tone?.trim(),
+      || record.tone?.trim()
+      || record.usage?.trim(),
     );
   }
 
@@ -670,6 +842,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         record.description?.trim() ? `描述：${record.description.trim()}` : '',
         record.intent?.trim() ? `通常意图：${record.intent.trim()}` : '',
         record.tone?.trim() ? `语气：${record.tone.trim()}` : '',
+        record.usage?.trim() ? `适用场景：${record.usage.trim()}` : '',
       ].filter(Boolean).join('；');
       return [
         `用户发送了一个已记录语义的飞书表情包${keyPart}。`,
@@ -761,6 +934,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const dispatcher = new lark.EventDispatcher({}).register({
         'im.message.receive_v1': async (data) => {
           await this.handleIncomingEvent(data as FeishuMessageEventData);
+        },
+        'im.message.reaction.created_v1': async (data) => {
+          this.handleReactionCreatedEvent(data);
         },
         'card.action.trigger': (async (data: unknown) => {
           return await this.handleCardAction(data);
@@ -878,6 +1054,49 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } else {
       this.queue.push(msg);
     }
+  }
+
+  private handleReactionCreatedEvent(data: unknown): void {
+    const event = (data as { event?: unknown })?.event ?? data;
+    const reactionType = this.readNestedString(event, [
+      ['reaction', 'reaction_type', 'emoji_type'],
+      ['reaction_type', 'emoji_type'],
+      ['emoji_type'],
+    ]);
+    const emojiType = reactionType ? normalizeFeishuEmojiType(reactionType) : null;
+    if (!emojiType) return;
+    const chatId = this.readNestedString(event, [
+      ['message', 'chat_id'],
+      ['chat_id'],
+    ]);
+    const userId = this.readNestedString(event, [
+      ['operator', 'operator_id', 'open_id'],
+      ['operator', 'operator_id', 'user_id'],
+      ['sender', 'sender_id', 'open_id'],
+      ['user_id'],
+      ['open_id'],
+    ]);
+    this.rememberEmojiUsage({
+      emojiType,
+      chatId,
+      userId,
+      direction: 'inbound',
+    });
+  }
+
+  private readNestedString(value: unknown, paths: string[][]): string | undefined {
+    for (const segments of paths) {
+      let current: unknown = value;
+      for (const segment of segments) {
+        if (!current || typeof current !== 'object') {
+          current = undefined;
+          break;
+        }
+        current = (current as Record<string, unknown>)[segment];
+      }
+      if (typeof current === 'string' && current.trim()) return current.trim();
+    }
+    return undefined;
   }
 
   // ── Typing indicator (Openclaw-style reaction) ─────────────
@@ -1248,7 +1467,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (!stickerHint && reactionHint) {
         const textWithoutHint = stripFeishuReactionHintText(visibleFinalText, reactionHint);
         const reactionAdded = state.sourceMessageId
-          ? await this.addMessageReaction(state.sourceMessageId, reactionHint.emojiType)
+          ? await this.addMessageReaction(state.sourceMessageId, reactionHint.emojiType, {
+            chatId,
+            alias: reactionHint.raw,
+          })
           : false;
         if (reactionAdded) {
           finalResponseText = textWithoutHint || '收到~';
@@ -1439,7 +1661,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (reactionHint) {
       const textWithoutHint = stripFeishuReactionHintText(text, reactionHint);
       const reactionAdded = message.replyToMessageId
-        ? await this.addMessageReaction(message.replyToMessageId, reactionHint.emojiType)
+        ? await this.addMessageReaction(message.replyToMessageId, reactionHint.emojiType, {
+          chatId: message.address.chatId,
+          userId: message.address.userId,
+          alias: reactionHint.raw,
+        })
         : false;
       if (reactionAdded) {
         text = textWithoutHint || '收到~';
@@ -1502,14 +1728,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return result;
   }
 
-  private async addMessageReaction(messageId: string, emojiType: string): Promise<boolean> {
+  private async addMessageReaction(
+    messageId: string,
+    emojiType: string,
+    usage?: { chatId?: string; userId?: string; alias?: string },
+  ): Promise<boolean> {
     try {
       const res = await this.restClient!.im.messageReaction.create({
         path: { message_id: messageId },
         data: { reaction_type: { emoji_type: emojiType } },
       });
-      return Boolean((res as any)?.data?.reaction_id) || !((res as any)?.code);
+      const ok = Boolean((res as any)?.data?.reaction_id) || !((res as any)?.code);
+      this.rememberEmojiUsage({
+        emojiType,
+        chatId: usage?.chatId,
+        userId: usage?.userId,
+        alias: usage?.alias,
+        direction: 'outbound',
+        outcome: ok ? 'success' : 'failure',
+      });
+      return ok;
     } catch (err) {
+      this.rememberEmojiUsage({
+        emojiType,
+        chatId: usage?.chatId,
+        userId: usage?.userId,
+        alias: usage?.alias,
+        direction: 'outbound',
+        outcome: 'failure',
+      });
       const code = (err as { code?: number })?.code;
       if (code !== 99991400 && code !== 99991403) {
         console.warn('[feishu-adapter] Message reaction failed:', err instanceof Error ? err.message : err);
@@ -2332,6 +2579,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
         message: {
           message_id: item.message_id,
+          root_id: item.root_id,
+          parent_id: item.parent_id,
+          thread_id: item.thread_id,
+          upper_message_id: item.upper_message_id,
           chat_id: item.chat_id,
           chat_type: chat.chatType || 'p2p',
           message_type: item.msg_type,
