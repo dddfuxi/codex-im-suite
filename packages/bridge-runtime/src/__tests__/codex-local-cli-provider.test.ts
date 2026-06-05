@@ -90,7 +90,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
         workingDirectory: root,
         additionalDirectories: [root],
         permissionMode: 'acceptEdits',
-        executionRequirement: { kind: 'none', reason: 'plain chat' },
+        executionRequirement: { kind: 'none', reason: 'plain chat', requiredToolFamilies: [] },
       }));
       const elapsed = Date.now() - startedAt;
       const error = events.find((event) => event.type === 'error')?.data as string | undefined;
@@ -152,7 +152,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
 
       const shellToolUse = shellEvents.find((event) => event.type === 'tool_use')?.data as { name?: string } | undefined;
       const shellToolResult = shellEvents.find((event) => event.type === 'tool_result')?.data as { is_error?: boolean; content?: string } | undefined;
-      const shellStatus = shellEvents.findLast((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean } | undefined;
+      const shellStatus = [...shellEvents].reverse().find((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean } | undefined;
       const shellProgress = shellEvents.filter((event) => event.type === 'progress').map((event) => String(event.data || '')).join('');
 
       assert.equal(shellToolUse?.name, 'JsonTool:shell');
@@ -163,7 +163,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.match(shellProgress, /处理思路/);
       assert.match(shellProgress, /准备执行命令/);
       assert.match(shellProgress, /执行结果/);
-      const shellText = shellEvents.findLast((event) => event.type === 'text')?.data;
+      const shellText = [...shellEvents].reverse().find((event) => event.type === 'text')?.data;
       assert.match(String(shellText || ''), /这个我处理好了/);
 
       const readEvents = await runProvider({
@@ -180,7 +180,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       });
       const readToolUse = readEvents.find((event) => event.type === 'tool_use')?.data as { name?: string } | undefined;
       const readToolResult = readEvents.find((event) => event.type === 'tool_result')?.data as { is_error?: boolean; content?: string } | undefined;
-      const readStatus = readEvents.findLast((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean } | undefined;
+      const readStatus = [...readEvents].reverse().find((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean } | undefined;
       const readProgress = readEvents.filter((event) => event.type === 'progress').map((event) => String(event.data || '')).join('');
 
       assert.equal(readToolUse?.name, 'JsonTool:list_dir');
@@ -264,7 +264,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       const events = parseSseChunks(chunks);
       const toolUse = events.find((event) => event.type === 'tool_use')?.data as { name?: string; input?: Record<string, unknown> } | undefined;
       const toolResult = events.find((event) => event.type === 'tool_result')?.data as { is_error?: boolean; content?: string } | undefined;
-      const status = events.findLast((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean; requestedTool?: string } | undefined;
+      const status = [...events].reverse().find((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; jsonToolFallbackUsed?: boolean; requestedTool?: string } | undefined;
       const text = events.find((event) => event.type === 'text')?.data as string | undefined;
       const progress = events.filter((event) => event.type === 'progress').map((event) => String(event.data || '')).join('');
 
@@ -339,7 +339,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       const events = parseSseChunks(chunks);
       const toolUse = events.find((event) => event.type === 'tool_use')?.data as { name?: string; input?: Record<string, unknown> } | undefined;
       const toolResult = events.find((event) => event.type === 'tool_result')?.data as { is_error?: boolean; content?: string } | undefined;
-      const status = events.findLast((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; requestedTool?: string; executedTool?: string } | undefined;
+      const status = [...events].reverse().find((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; requestedTool?: string; executedTool?: string } | undefined;
       const text = events.find((event) => event.type === 'text')?.data as string | undefined;
 
       assert.equal(toolUse?.name, 'JsonTool:shell_artifact');
@@ -613,7 +613,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
   it('rejects shell plans when the execution requirement only allows MCP tools', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-json-tool-mcp-family-'));
     try {
-      const provider = new CodexLocalCliProvider(makeConfig(root)) as unknown as CodexLocalCliProvider & {
+      const provider = new CodexLocalCliProvider(makeConfig(root)) as unknown as {
         runJsonToolProtocol: (
           controller: ReadableStreamDefaultController<string>,
           params: Record<string, unknown>,

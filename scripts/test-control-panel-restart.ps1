@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $programPath = Join-Path $root "apps\control-panel\Program.cs"
 $webPath = Join-Path $root "apps\control-panel\web\src\main.tsx"

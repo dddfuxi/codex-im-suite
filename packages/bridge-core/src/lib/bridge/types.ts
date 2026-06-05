@@ -43,6 +43,8 @@ export interface InboundMessage {
   address: ChannelAddress;
   /** Plain text content of the message */
   text: string;
+  /** Structured adapter event kind for non-text messages that still need agent handling. */
+  messageKind?: string;
   /** Timestamp of the message (ISO string or unix epoch ms) */
   timestamp: number;
   /** If this is a callback query (inline button press), the callback data */

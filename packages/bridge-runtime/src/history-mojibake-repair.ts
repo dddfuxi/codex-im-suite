@@ -34,6 +34,7 @@ export interface HistoryMojibakeFileReport {
   changed: boolean;
   unresolved: boolean;
   backupPath?: string;
+  error?: string;
 }
 
 export interface HistoryMojibakeRepairReport {
@@ -220,6 +221,11 @@ function writeBackup(target: RepairTarget, raw: string, backupRoot: string, mani
   return backupPath;
 }
 
+function formatFileError(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error || 'unknown error');
+}
+
 function rebuildMemoryArtifacts(
   memoryRoot: string | undefined,
   enabledReminderChannels: string[] | undefined,
@@ -265,7 +271,15 @@ export function runHistoryMojibakeRepair(options: HistoryMojibakeRepairOptions =
     let raw = '';
     try {
       raw = fs.readFileSync(target.path, 'utf-8');
-    } catch {
+    } catch (error) {
+      files.push({
+        path: target.path,
+        kind: target.kind,
+        hits: 0,
+        changed: false,
+        unresolved: true,
+        error: formatFileError(error),
+      });
       continue;
     }
     const hits = countLikelyMojibake(raw);
@@ -273,8 +287,20 @@ export function runHistoryMojibakeRepair(options: HistoryMojibakeRepairOptions =
     const { text, repair } = repairFileContent(raw, target);
     let backupPath: string | undefined;
     if (apply && repair.changed && text !== raw) {
-      backupPath = writeBackup(target, raw, backupRoot, manifest);
-      fs.writeFileSync(target.path, text, 'utf-8');
+      try {
+        backupPath = writeBackup(target, raw, backupRoot, manifest);
+        fs.writeFileSync(target.path, text, 'utf-8');
+      } catch (error) {
+        files.push({
+          path: target.path,
+          kind: target.kind,
+          hits,
+          changed: false,
+          unresolved: true,
+          error: formatFileError(error),
+        });
+        continue;
+      }
     }
     files.push({
       path: target.path,

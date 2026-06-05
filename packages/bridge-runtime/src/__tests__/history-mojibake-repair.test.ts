@@ -82,4 +82,36 @@ describe('history mojibake repair', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('keeps reporting when a repair target cannot be backed up or written', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mojibake-repair-blocked-'));
+    const ctiHome = path.join(root, 'cti-home');
+    const memoryRoot = path.join(root, 'memory');
+    const backupRoot = path.join(root, 'backup-root-is-file');
+    fs.mkdirSync(memoryRoot, { recursive: true });
+    fs.writeFileSync(backupRoot, 'not a directory', 'utf-8');
+    const notePath = path.join(memoryRoot, 'todo.md');
+    fs.writeFileSync(notePath, `待办: ${GB_MOJIBAKE_CHINESE}提醒`, 'utf-8');
+
+    try {
+      const applied = runHistoryMojibakeRepair({
+        ctiHome,
+        memoryRoot,
+        backupRoot,
+        apply: true,
+        generatedAt: '2026-04-30T00:00:00.000Z',
+      });
+
+      assert.equal(applied.mode, 'apply');
+      assert.equal(applied.repairedFileCount, 0);
+      assert.equal(applied.unresolvedFileCount, 1);
+      assert.equal(applied.files.length, 1);
+      assert.equal(applied.files[0].path, notePath);
+      assert.equal(applied.files[0].unresolved, true);
+      assert.match(applied.files[0].error || '', /EEXIST|ENOTDIR|not a directory/i);
+      assert.match(fs.readFileSync(notePath, 'utf-8'), new RegExp(GB_MOJIBAKE_CHINESE));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

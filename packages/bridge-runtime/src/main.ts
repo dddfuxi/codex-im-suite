@@ -57,6 +57,14 @@ import {
   readLocalModelCapabilityProfile,
   shouldTrustLocalApiForExecution,
 } from './local-model-capability.js';
+import {
+  planDeterministicJsonToolRequest,
+} from './local-agent-tool-protocol.js';
+import {
+  loadMcpToolCallDefinitions,
+  loadShellArtifactDefinitions,
+  loadUnityMcpExecuteCodeDefinitions,
+} from './local-agent-tool-registry.js';
 import { sseEvent } from './sse-utils.js';
 import {
   inferRequestedExecutorId,
@@ -917,6 +925,13 @@ class HubLlmProvider implements LLMProvider {
         message,
       );
       if (handledByLocalToolFallback) return;
+      const handledByConfiguredToolFallback = await this.tryConfiguredJsonToolFallbackAfterCodexFailure(
+        controller,
+        params,
+        conservative,
+        message,
+      );
+      if (handledByConfiguredToolFallback) return;
       if (!this.isLocalAgentApiFallbackEnabled()) {
         throw new Error(`Codex 主模型失败，备用模型未启用：${summarizeCodexFailureMessage(message)}`);
       }
@@ -981,6 +996,55 @@ class HubLlmProvider implements LLMProvider {
       fallbackReason: primaryFailure,
     });
     return false;
+  }
+
+  private async tryConfiguredJsonToolFallbackAfterCodexFailure(
+    controller: ReadableStreamDefaultController<string>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    primaryFailure: string,
+  ): Promise<boolean> {
+    const requirement = params.executionRequirement;
+    if (requirement?.kind !== 'tool_required' && requirement?.kind !== 'artifact_required') return false;
+    const contextText = [params.systemPrompt || '', params.prompt || ''].filter(Boolean).join('\n');
+    const plan = planDeterministicJsonToolRequest(params.prompt, {
+      workingDirectory: params.workingDirectory,
+      contextText,
+      requirementKind: requirement.kind,
+      mcpToolCallDefinitions: loadMcpToolCallDefinitions(),
+      unityMcpExecuteCodeDefinitions: loadUnityMcpExecuteCodeDefinitions(),
+      shellArtifactDefinitions: loadShellArtifactDefinitions(),
+    });
+    if (!plan) return false;
+
+    try {
+      const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
+      await this.pipeFallbackStream(controller, params, {
+        mode: getLocalRouterMode(this.config),
+        taskKind: conservative.requestKind,
+        decision: 'escalate_codex',
+        provider: 'codex_local_fallback',
+        reason: `主 Codex API 失败，使用已匹配的本地工具动作兜底：${plan.reason}；${summarizeCodexFailureMessage(primaryFailure)}`,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: primaryFailure,
+      }, new CodexLocalCliProvider(this.config));
+      return true;
+    } catch (error) {
+      const fallbackFailure = error instanceof Error ? error.message : String(error);
+      appendLocalLlmRouteSummary(this.config, {
+        timestamp: new Date().toISOString(),
+        mode: getLocalRouterMode(this.config),
+        taskKind: conservative.requestKind,
+        decision: 'escalate_codex',
+        provider: 'codex_local_fallback',
+        reason: `已匹配本地工具动作，但兜底执行失败：${truncatePreview(fallbackFailure, 180)}`,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+        fallbackReason: primaryFailure,
+      });
+      return false;
+    }
   }
 
   private isDeterministicReadOnlyFallbackCandidate(prompt: string): boolean {

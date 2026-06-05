@@ -29,7 +29,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
-import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { AdapterAssistantIdentity, BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -39,6 +39,7 @@ import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { formatVisibleToolName } from './markdown/feishu.js';
+import { classifyExecutionRequirement, isFeishuStickerMessageKind, type ExecutionRequirement } from './execution-requirement.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
@@ -143,17 +144,6 @@ const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|
 const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
 const MCP_ENTRY_CLARIFICATION_REPLY_PATTERN = /(?:请(?:先)?(?:明确|指定).{0,12}(?:MCP|Unity MCP).{0,12}(?:入口|目标)|可用\s*MCP\s*入口|例如[:：].{0,80}(?:Unity MCP|Unity Prefab MCP|Blender MCP|Fetch MCP))/i;
 const TASK_INTENT_PATTERN = /(帮我|麻烦|请|需要|能不能|可以帮|处理|执行|运行|启动|停止|重启|发布|同步|安装|升级|修|修复|改|修改|替换|检查|排查|诊断|看一下|看一眼|查一下|找一下|分析|整理|总结|汇总|生成|创建|写|删除|添加|上传|下载|截图|回溯|记忆|记得|历史|权限|报错|异常|失败|为什么|怎么回事|哪里|怎么|如何|unity|mcp|codex|claude|bridge|飞书|面板|文件|代码|仓库|commit|push|git)/i;
-const SMALL_TALK_PATTERNS: Array<{ pattern: RegExp; reply: string }> = [
-  { pattern: /^(你好|你好呀|嗨|哈喽|hello|hi|hey)[呀啊~～！!。\s]*$/i, reply: '你好呀，我在呢～今天想闲聊也行，有事也可以直接丢给我。' },
-  { pattern: /^(在吗|在不在|人在吗|你在吗)[？?\s]*$/i, reply: '在的，我看到消息啦。' },
-  { pattern: /^(早|早上好|早安)[呀啊~～！!。\s]*$/i, reply: '早呀，今天我在这边陪你盯着。' },
-  { pattern: /^(晚安|睡啦|睡了)[呀啊~～！!。\s]*$/i, reply: '晚安，好好休息。' },
-  { pattern: /^(谢谢|谢啦|感谢|辛苦了|辛苦)[呀啊~～！!。\s]*$/i, reply: '不客气～有上下文我会顺手记住，后面提到也能帮你接上。' },
-  { pattern: /^(好的|好嘞|收到|ok|嗯|嗯嗯|行|可以)[呀啊~～！!。\s]*$/i, reply: '收到啦。' },
-  { pattern: /^(哈哈|哈哈哈|笑死|可以可以)[哈呀啊~～！!。\s]*$/i, reply: '哈哈，我懂。' },
-  { pattern: /^(能聊天吗|可以聊天吗|你能闲聊吗|你是机器人吗|你是谁)[？?\s]*$/i, reply: '可以闲聊的，我不是只会跑工具；只是你明确让我处理事情时，我才会进入执行模式。' },
-  { pattern: /^(聊会儿|陪我聊聊|随便聊聊|闲聊一下)[呀啊~～！!。\s]*$/i, reply: '可以呀，我在。你随便说，我会按聊天来接，不会一上来就当任务跑。' },
-];
 
 interface CtiReminderAction {
   title: string;
@@ -183,17 +173,19 @@ function isMemoryRecallRequestText(text: string): boolean {
   return /(记忆|还记得|你还记得|上次|之前|历史|对应表)/.test(normalized);
 }
 
+function isExplicitMemoryWriteRequestText(text: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /(?:记住|记一下|记录一下|帮我记|写入记忆|保存到记忆|长期记忆|以后(?:就)?(?:叫|称呼|记作)|这个(?:表情包|表情|图|词|名字)?.{0,16}(?:表示|代表|意思是|叫|名称是|语气是|用来))/u.test(normalized);
+}
+
 function containsOutsourcedToolReply(text: string): boolean {
   return OUTSOURCED_TOOL_REPLY_PATTERN.test(text) || MCP_ENTRY_CLARIFICATION_REPLY_PATTERN.test(text);
 }
 
-function buildSmallTalkReply(text: string): string {
-  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-  if (!normalized || normalized.length > 24) return '';
-  if (TASK_INTENT_PATTERN.test(normalized)) return '';
-  for (const item of SMALL_TALK_PATTERNS) {
-    if (item.pattern.test(normalized)) return item.reply;
-  }
+function buildSmallTalkReply(_text: string, _identity?: AdapterAssistantIdentity | null): string {
+  // Natural chat should go through the configured provider so identity, tone,
+  // Feishu reaction/sticker hints, and current context stay model-driven.
   return '';
 }
 
@@ -1060,7 +1052,7 @@ function formatMemoryWriteReply(ok: boolean, candidates: MemoryWriteCandidate[],
 
 function renderMemoryWriteProgress(steps: string[]): string {
   return [
-    '### 处理进度',
+    '### 思考路径',
     ...steps.map((step) => `- ${step}`),
   ].join('\n');
 }
@@ -1072,6 +1064,8 @@ async function tryHandleModelPlannedMemoryWrite(
   text: string,
   rawText: string,
 ): Promise<boolean> {
+  if (!isExplicitMemoryWriteRequestText(text || rawText)) return false;
+
   const context = getBridgeContext();
   const { store } = context;
   const persistMemoryWrite = store.persistMemoryWrite?.bind(store);
@@ -1158,6 +1152,7 @@ async function tryHandleModelPlannedMemoryWrite(
   if (!cardFinalized) {
     await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
   }
+  adapter.onMessageEnd?.(msg.address.chatId);
   return true;
 }
 
@@ -1234,6 +1229,95 @@ function inferProgressEvidenceLabel(text: string): string {
   if (/(截图|截屏|图片|生成物|文件|产物|artifact|screenshot|capture)/iu.test(text)) return '产物任务';
   if (/(mcp|unity|命令|执行|运行|工具|切换|加载|创建|修改|删除|读取|搜索|检查)/iu.test(text)) return '工具任务';
   return '';
+}
+
+function buildInitialProgressStep(userText: string, requirement: ExecutionRequirement): string {
+  const text = userText || '';
+  if (requirement.kind === 'local_read_required') {
+    return '看起来你要查本地资料，我先读取相关文件和目录。';
+  }
+  if (requirement.kind === 'artifact_required') {
+    if (/(unity|unitymcp|unity mcp|game\s*view|scene\s*view|场景)/iu.test(text)) {
+      return '看起来你要拿 Unity 画面或产物，我先调用对应工具获取真实结果。';
+    }
+    return '看起来你要生成或获取产物，我先调用对应工具拿到真实输出。';
+  }
+  if (requirement.kind === 'tool_required') {
+    if (/(unity|unitymcp|unity mcp|场景|节点|物体|对象|prefab)/iu.test(text)) {
+      return '看起来你要查 Unity 场景或对象，我先调用 Unity/MCP 获取真实信息。';
+    }
+    if (/(mcp|blender)/iu.test(text)) {
+      return '看起来你要使用外部工具，我先调用对应 MCP 获取真实结果。';
+    }
+    return '看起来这个请求需要实际执行，我先调用对应工具核对结果。';
+  }
+  return '正在根据这条消息整理可展示回复。';
+}
+
+type ReplySurfaceMode = 'workflow_card' | 'light_status' | 'direct_reply';
+
+interface ReplySurfaceModeInput {
+  supportsStreamingCards: boolean;
+  feishuDocRequest: boolean;
+  executionRequirement: ExecutionRequirement;
+  messageKind?: string;
+  hasAttachments: boolean;
+  hasMemoryProgress: boolean;
+  textLength: number;
+}
+
+function selectReplySurfaceMode(input: ReplySurfaceModeInput): ReplySurfaceMode {
+  if (isFeishuStickerMessageKind(input.messageKind)) {
+    return input.supportsStreamingCards ? 'light_status' : 'direct_reply';
+  }
+  if (input.feishuDocRequest || input.executionRequirement.kind !== 'none' || input.hasMemoryProgress || input.hasAttachments) {
+    return input.supportsStreamingCards ? 'workflow_card' : 'direct_reply';
+  }
+  if (!input.supportsStreamingCards) return 'direct_reply';
+  return input.textLength <= 280 ? 'light_status' : 'direct_reply';
+}
+
+function getInboundMessageKind(msg: InboundMessage, rawData: Record<string, any> | null | undefined): string | undefined {
+  const direct = typeof msg.messageKind === 'string' ? msg.messageKind : '';
+  if (direct) return direct;
+  const rawKind = typeof rawData?.messageKind === 'string' ? rawData.messageKind : '';
+  if (rawKind) return rawKind;
+  const stickerKnown = rawData?.sticker?.known;
+  if (stickerKnown === true) return 'feishu_sticker_known';
+  if (stickerKnown === false) return 'feishu_sticker_unknown';
+  return undefined;
+}
+
+function buildStickerChatPrompt(rawText: string, hasVisualReference: boolean): string {
+  const text = rawText.trim();
+  return [
+    text || '用户发送了一个飞书表情包。',
+    '',
+    '这是一条轻量聊天消息。请把表情包当作聊天语气信号来理解，再像普通聊天一样简短自然地回应。',
+    hasVisualReference
+      ? '可以根据表情包画面判断情绪、态度或玩笑语气，但最终回复要直接接话，不要写成“图片里是……”的说明报告。'
+      : '如果没有可用图片或已学习语义，只能根据上下文轻量回应，不要凭 file_key 猜具体图案。',
+    '只有用户明确要求解释表情包时，才展开说明图案、文字或含义。',
+  ].join('\n');
+}
+
+function buildAdapterAssistantIdentityPrompt(adapter: BaseChannelAdapter): string {
+  const identity = adapter.getAssistantIdentity?.();
+  const displayName = identity?.displayName?.trim();
+  const lines = [
+    'Channel assistant identity:',
+    displayName
+      ? `- Your user-facing name in this channel is "${displayName}".`
+      : '- Use the platform bot/app display name as your user-facing name if it is known from channel context.',
+    identity?.platform ? `- Current platform: ${identity.platform}.` : `- Current platform: ${adapter.channelType}.`,
+    displayName
+      ? `- If the user asks who you are, asks for a self-introduction, or asks your name, answer that you are "${displayName}" in this chat. Do not replace that name with "Codex".`
+      : '- If the user asks who you are, asks for a self-introduction, or asks your name, introduce yourself using the channel bot/app display name first when available. Do not lead with "Codex" as your name.',
+    '- Mention Codex only when the user specifically asks about the underlying engine, implementation, or execution backend.',
+    '- For light chat, confirmations, greetings, and sticker reactions on Feishu, you may start the final reply with a native reaction hint such as `[微笑]`, `[赞]`, `[OK]`, or with `[表情包]` when a previously received sticker would fit. Use these sparingly and only when it improves the chat tone.',
+    '- Do not put reaction or sticker hints on formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
+  ];
+  return lines.join('\n');
 }
 
 function formatBytes(bytes: number): string {
@@ -1545,6 +1629,7 @@ function verifyPreparedReplyExecution(
   context: {
     userText: string;
     executionEvidence: ExecutionEvidence;
+    executionRequirement: ExecutionRequirement;
   },
 ): PreparedBridgeReplyPayload {
   const missingImages = payload.images.filter((item) => !existingLocalFile(item));
@@ -1576,7 +1661,8 @@ function verifyPreparedReplyExecution(
   }
 
   if (
-    requiresExecutionEvidenceForReply(context.userText, payload.text)
+    context.executionRequirement.kind !== 'none'
+    && requiresExecutionEvidenceForReply(context.userText, payload.text)
     && context.executionEvidence.successfulToolResultCount <= 0
   ) {
     return {
@@ -3476,6 +3562,8 @@ async function handleMessage(
       unionId?: string;
       chatType?: string;
     };
+    messageKind?: string;
+    sticker?: { known?: boolean };
   } | undefined;
 
   // Update lastMessageAt for this adapter
@@ -3835,12 +3923,25 @@ async function handleMessage(
   }
 
   const binding = router.resolve(msg.address);
+  const adapterIdentity = adapter.getAssistantIdentity?.() ?? null;
+  const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter);
+  let processingCardStarted = false;
+  const startProcessingCard = () => {
+    if (processingCardStarted) return;
+    processingCardStarted = true;
+    adapter.onMessageStart?.(msg.address.chatId);
+  };
+  const endProcessingCard = () => {
+    if (!processingCardStarted) return;
+    processingCardStarted = false;
+    adapter.onMessageEnd?.(msg.address.chatId);
+  };
   if (!hasAttachments && await tryHandleNaturalDirectReminder(adapter, msg, binding, rawText)) {
     ack();
     return;
   }
 
-  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText) : '';
+  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
   if (smallTalkReply) {
     store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
     store.addMessage(binding.codepilotSessionId, 'assistant', smallTalkReply);
@@ -3856,47 +3957,10 @@ async function handleMessage(
     return;
   }
 
-  if (false && !hasAttachments && typeof store.persistMemoryWrite === 'function') {
-    const memoryWrite = store.persistMemoryWrite!({
-      sessionId: binding.codepilotSessionId,
-      channelType: binding.channelType,
-      chatId: binding.chatId,
-      chatDisplayName: binding.displayName || msg.address.displayName || msg.address.chatId,
-      userId: msg.address.userId,
-      userDisplayName: msg.address.displayName,
-      text: text || rawText,
-      workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
-    });
-    if (!memoryWrite.skipped) {
-      const reply = memoryWrite.ok
-        ? '记住了。'
-        : `这条记忆没有写入成功：${memoryWrite.error || '未知错误'}`;
-      const reviewedText = applyOutboundAnswerReview({
-        channelType: adapter.channelType,
-        chatId: msg.address.chatId,
-        userId: msg.address.userId,
-        userDisplayName: msg.address.displayName,
-        messageId: msg.messageId,
-        sessionId: binding.codepilotSessionId,
-        workingDirectory: binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined,
-        userText: rawText,
-        answerText: reply,
-        source: 'system',
-      });
-      store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
-      store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
-      recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
-      recordConversationMemoryEvent(msg, binding, 'assistant', reviewedText);
-      await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
-      ack();
-      return;
-    }
-  }
-
   let memoryRecallExtraSystemPrompt = '';
   let memoryReviewContext: Pick<AnswerReviewInput, 'memoryPlan' | 'memoryHits'> = {};
   const preExecutionProgressSteps: string[] = [];
-  if (!hasAttachments && store.decideMemoryReply) {
+  if (!hasAttachments && isMemoryRecallRequestText(rawText) && store.decideMemoryReply) {
     const memoryDecision = store.decideMemoryReply({
       sessionId: binding.codepilotSessionId,
       channelType: binding.channelType,
@@ -3927,6 +3991,7 @@ async function handleMessage(
 
   const turnWorkspaceOverride = detectWorkspaceOverrideFromText(rawText, ownerMessage);
   if (turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory && !ownerMessage) {
+    endProcessingCard();
     await deliver(adapter, {
       address: msg.address,
       text: buildOwnerRequiredMessage(msg),
@@ -3979,6 +4044,7 @@ async function handleMessage(
       if (resolved.status === 'resolved' && resolved.systemPrompt) {
         feishuCloudSystemPrompt = resolved.systemPrompt;
       } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
+        endProcessingCard();
         await deliver(adapter, {
           address: msg.address,
           text: buildFeishuCloudBlockerMessage(resolved),
@@ -3996,6 +4062,7 @@ async function handleMessage(
 
   if (directCommandRequest) {
     if (directCommandRequest.mutating && !isOwnerMessage(msg)) {
+      endProcessingCard();
       await deliver(adapter, {
         address: msg.address,
         text: buildOwnerRequiredMessage(msg),
@@ -4018,6 +4085,7 @@ async function handleMessage(
         // best effort
       }
     }
+    endProcessingCard();
     await deliverResponse(adapter, msg.address, result.text, effectiveBinding.codepilotSessionId, msg.messageId);
     ack();
     return;
@@ -4030,6 +4098,7 @@ async function handleMessage(
       store.addMessage(effectiveBinding.codepilotSessionId, 'assistant', summary);
       recordConversationMemoryEvent(msg, effectiveBinding, 'user', rawText);
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', summary);
+      endProcessingCard();
       await deliverResponse(
         adapter,
         msg.address,
@@ -4043,67 +4112,6 @@ async function handleMessage(
       return;
     }
   }
-
-  if (false && directFeishuDocRequest) {
-    const history = store.getMessages(effectiveBinding.codepilotSessionId, { limit: 20 }).messages;
-    const latestAssistant = [...history]
-      .reverse()
-      .find((entry) => entry.role === 'assistant');
-    const markdown = extractAssistantMarkdown(latestAssistant?.content ?? '');
-
-    if (!markdown) {
-      await deliver(adapter, {
-        address: msg.address,
-        text: '当前会话里没有可整理成飞书文档的上一条回复。先让我产出一段总结或正文，再让我生成飞书文档。',
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      }, { sessionId: effectiveBinding.codepilotSessionId });
-      ack();
-      return;
-    }
-
-    const createDoc = (adapter as BaseChannelAdapter & {
-      createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
-    }).createDocumentFromMarkdown!;
-
-    if (typeof createDoc !== 'function') {
-      await deliver(adapter, {
-        address: msg.address,
-        text: '当前飞书通道还没有加载文档创建能力。',
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      }, { sessionId: effectiveBinding.codepilotSessionId });
-      ack();
-      return;
-    }
-
-    try {
-      const docInfo = await createDoc.call(adapter, markdown, {
-        title: buildFeishuDocTitleFromSession(),
-      });
-      await deliver(adapter, {
-        address: msg.address,
-        text: `已生成飞书文档《${docInfo.title}》\n${docInfo.url}`,
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      }, { sessionId: effectiveBinding.codepilotSessionId });
-    } catch (err) {
-      const caught = err as { message?: string };
-      const errorMessage = caught.message || String(err);
-      await deliver(adapter, {
-        address: msg.address,
-        text: `飞书文档创建失败：${errorMessage}`,
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      }, { sessionId: effectiveBinding.codepilotSessionId });
-    }
-
-    ack();
-    return;
-  }
-
-  // Notify adapter that message processing is starting (e.g., typing indicator)
-  adapter.onMessageStart?.(msg.address.chatId);
 
   // Create an AbortController so /stop can cancel this task externally
   const taskAbort = new AbortController();
@@ -4123,6 +4131,17 @@ async function handleMessage(
       ? { title: undefined, scopeText: '上一条回复整理' }
       : undefined
   );
+  const inboundMessageKind = getInboundMessageKind(msg, rawData);
+  const isStickerMessage = isFeishuStickerMessageKind(inboundMessageKind);
+  const executionEvidenceAttachments = hasAttachments && !isStickerMessage ? msg.attachments : undefined;
+  const providerAttachments = hasAttachments ? msg.attachments : undefined;
+  const uiExecutionRequirement = classifyExecutionRequirement({
+    userText: text || rawText,
+    workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
+    files: executionEvidenceAttachments,
+    memoryPlan: memoryReviewContext.memoryPlan,
+    messageKind: inboundMessageKind,
+  });
 
   if (directFeishuDocRequest && !directFeishuDocSourceMarkdown) {
     progressPulse?.stop();
@@ -4137,9 +4156,24 @@ async function handleMessage(
   }
 
   // ── Streaming preview setup ──────────────────────────────────
-  const hasStreamingCards = !feishuDocRequest && typeof adapter.onStreamText === 'function';
+  const supportsStreamingCards = !feishuDocRequest && typeof adapter.onStreamText === 'function';
+  const replySurfaceMode = selectReplySurfaceMode({
+    supportsStreamingCards,
+    feishuDocRequest: Boolean(feishuDocRequest),
+    executionRequirement: uiExecutionRequirement,
+    messageKind: inboundMessageKind,
+    hasAttachments: Boolean(executionEvidenceAttachments?.length),
+    hasMemoryProgress: preExecutionProgressSteps.length > 0,
+    textLength: (text || rawText || '').length,
+  });
+  const hasStreamingCards = replySurfaceMode === 'workflow_card';
+  const hasLightStatusCard = replySurfaceMode === 'light_status';
+  if (hasStreamingCards) {
+    // Notify adapter that message processing is starting only for full workflow cards.
+    startProcessingCard();
+  }
   let previewState: StreamingPreviewState | null = null;
-  const caps = (feishuDocRequest || hasStreamingCards) ? null : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
+  const caps = (feishuDocRequest || supportsStreamingCards) ? null : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
   if (caps?.supported) {
     previewState = {
       draftId: generateDraftId(),
@@ -4206,18 +4240,25 @@ async function handleMessage(
   const toolCallTracker = new Map<string, ToolCallInfo>();
   const progressCardSteps: string[] = [];
   let providerProgressText = '';
+  let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  let lightStatusCardStarted = false;
+  const clearLightStatusTimer = () => {
+    if (lightStatusTimer) {
+      clearTimeout(lightStatusTimer);
+      lightStatusTimer = null;
+    }
+  };
+  if (hasLightStatusCard && typeof adapter.onStreamText === 'function') {
+    lightStatusTimer = setTimeout(() => {
+      lightStatusTimer = null;
+      lightStatusCardStarted = true;
+      try { adapter.onStreamText!(msg.address.chatId, '正在回复…'); } catch { /* non-critical */ }
+    }, 1200);
+  }
 
   const renderProgressCardText = (): string => {
-    const steps = progressCardSteps.slice(-8);
-    const lines = [
-      '### 处理进度',
-      ...(steps.length > 0 ? steps : ['已收到请求，正在进入执行链。']).map((item) => `- ${item}`),
-    ];
     const detail = sanitizeProgressCardDetail(providerProgressText);
-    if (detail) {
-      lines.push('', '### 执行细节', detail);
-    }
-    return lines.join('\n');
+    return progressCardSteps[progressCardSteps.length - 1] || detail || '正在根据这条消息判断下一步。';
   };
 
   const emitProgressCardStep = hasStreamingCards ? (step: string) => {
@@ -4244,8 +4285,8 @@ async function handleMessage(
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
     } catch { /* non-critical */ }
     const visibleToolName = formatVisibleToolName(toolName || toolCallTracker.get(toolId)?.name || '') || '工具';
-    const statusText = status === 'running' ? '执行中' : status === 'complete' ? '已完成' : '失败';
-    emitProgressCardStep?.(`${visibleToolName}${statusText}。`);
+    const statusText = status === 'running' ? '正在执行' : status === 'complete' ? '已返回结果' : '执行失败';
+    emitProgressCardStep?.(`${visibleToolName} ${statusText}。`);
   } : undefined;
 
   // Combined partial text callback: streaming preview + streaming cards
@@ -4254,13 +4295,10 @@ async function handleMessage(
     if (onStreamCardText) onStreamCardText(fullText);
   } : undefined;
 
-  emitProgressCardStep?.('已收到请求，正在进入执行链。');
-  emitProgressCardStep?.('正在判断这次需要什么证据、工具或记忆上下文。');
-  emitProgressCardStep?.('会话、权限和工作区上下文已准备。');
   for (const step of preExecutionProgressSteps) emitProgressCardStep?.(step);
   const isExplicitMemoryRecall = memoryReviewContext.memoryPlan?.intent === 'explicit_recall';
-  if (!isExplicitMemoryRecall && inferProgressEvidenceLabel(rawText)) {
-    emitProgressCardStep?.(`识别为${inferProgressEvidenceLabel(rawText)}，需要真实执行证据。`);
+  if (hasStreamingCards && !isExplicitMemoryRecall && !isFeishuStickerMessageKind(inboundMessageKind) && inferProgressEvidenceLabel(rawText)) {
+    emitProgressCardStep?.(`识别为${inferProgressEvidenceLabel(rawText)}，需要结合真实执行证据。`);
   }
 
   try {
@@ -4269,8 +4307,25 @@ async function handleMessage(
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
     const basePromptText = directFeishuDocRequest
       ? buildFeishuDocumentRewritePrompt(directFeishuDocSourceMarkdown, rawText)
-      : (text || (hasAttachments ? 'Describe this image.' : ''));
+      : isStickerMessage
+        ? buildStickerChatPrompt(text || rawText, Boolean(providerAttachments?.length))
+        : (text || (providerAttachments?.length ? 'Describe this image.' : ''));
     let fastPathOptions = getFastPathOptions(rawText);
+    const providerMemoryMode: engine.ConversationProcessOptions['memoryMode'] = memoryRecallExtraSystemPrompt
+      ? 'recall'
+      : uiExecutionRequirement.kind !== 'none'
+        ? 'augment'
+        : 'off';
+    if (
+      providerMemoryMode === 'off'
+      && typeof fastPathOptions.historyLimit !== 'number'
+      && !providerAttachments?.length
+    ) {
+      fastPathOptions = {
+        ...fastPathOptions,
+        historyLimit: 4,
+      };
+    }
     if (memoryRecallExtraSystemPrompt) {
       fastPathOptions = {
         ...fastPathOptions,
@@ -4322,23 +4377,13 @@ async function handleMessage(
         ...fastPathOptions,
         extraSystemPrompt: [fastPathOptions.extraSystemPrompt, precheckPrompt].filter(Boolean).join('\n\n'),
       };
-      if (false && !unityMcpCheck.ok) {
-        await deliver(adapter, {
-          address: msg.address,
-          text: appendReplyEndMarker(`Unity MCP 前置检查失败，已自动尝试拉起但仍未连通。\n\n${unityMcpCheck.summary}`),
-          parseMode: 'plain',
-          replyToMessageId: msg.messageId,
-        }, { sessionId: effectiveBinding.codepilotSessionId });
-        ack();
-        return;
-      }
     }
 
     recordConversationMemoryEvent(msg, effectiveBinding, 'user', text || rawText);
     const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
       ? buildFeishuCloudResolvedPrompt(rawText, feishuCloudSystemPrompt)
       : basePromptText;
-    emitProgressCardStep?.('正在选择执行器并读取可用工具目录。');
+    emitProgressCardStep?.(buildInitialProgressStep(rawText, uiExecutionRequirement));
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
@@ -4355,17 +4400,19 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, {
+    }, taskAbort.signal, providerAttachments, onPartialText, onToolEvent, {
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
-      extraSystemPrompt: [fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt].filter(Boolean).join('\n\n'),
+      memoryMode: providerMemoryMode,
+      extraSystemPrompt: [adapterIdentityPrompt, fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt].filter(Boolean).join('\n\n'),
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
+      messageKind: inboundMessageKind,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
-    emitProgressCardStep?.('执行器返回结果，正在校验工具证据和本地产物。');
+    emitProgressCardStep?.('agent 已返回内容，正在核对证据和可展示结果。');
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
     const responseText = result.responseText
@@ -4378,9 +4425,10 @@ async function handleMessage(
       preparedReply = verifyPreparedReplyExecution(preparedReply, {
         userText: rawText,
         executionEvidence: result.executionEvidence,
+        executionRequirement: uiExecutionRequirement,
       });
     }
-    emitProgressCardStep?.('最终回复已整理，准备收口同一张卡片。');
+    emitProgressCardStep?.('正在整理为最终回复。');
     const userFacingResponseText = preparedReply?.text
       ? applyOutboundAnswerReview({
         channelType: adapter.channelType,
@@ -4407,7 +4455,8 @@ async function handleMessage(
     // onStreamEnd awaits any in-flight card creation and returns true if a card
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
-    if (hasStreamingCards && adapter.onStreamEnd) {
+    clearLightStatusTimer();
+    if ((hasStreamingCards || lightStatusCardStarted) && adapter.onStreamEnd) {
       try {
         const status = result.hasError ? 'error' : 'completed';
         cardFinalized = await adapter.onStreamEnd(
@@ -4605,6 +4654,7 @@ async function handleMessage(
     throw err;
   } finally {
     progressPulse?.stop();
+    clearLightStatusTimer();
 
     // Clean up preview state
     if (previewState) {
@@ -4616,7 +4666,7 @@ async function handleMessage(
     }
 
     // If task was aborted and streaming card is still active, finalize as interrupted
-    if (hasStreamingCards && adapter.onStreamEnd && taskAbort.signal.aborted) {
+    if ((hasStreamingCards || lightStatusCardStarted) && adapter.onStreamEnd && taskAbort.signal.aborted) {
       try {
         await adapter.onStreamEnd(msg.address.chatId, 'interrupted', '');
       } catch { /* best effort */ }
@@ -4985,6 +5035,7 @@ export const _testOnly = {
   getPermissionRoleForMessage,
   isFeishuDocumentListRequest,
   isFeishuDocGenerationRequestStrict,
+  selectReplySurfaceMode,
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
   buildSmallTalkReply,

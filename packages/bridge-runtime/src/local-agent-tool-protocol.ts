@@ -34,6 +34,8 @@ export interface UnityMcpExecuteCodeDefinition {
   match?: {
     keywords?: string[];
     regex?: string[];
+    contextualRegex?: string[];
+    contextRegex?: string[];
   };
   codeTemplate: string;
   compiler?: 'auto' | 'roslyn' | 'codedom';
@@ -46,6 +48,8 @@ export interface McpToolCallDefinition {
   match?: {
     keywords?: string[];
     regex?: string[];
+    contextualRegex?: string[];
+    contextRegex?: string[];
   };
   manifestHint: string;
   tool: string;
@@ -58,6 +62,8 @@ export interface ShellArtifactDefinition {
   match?: {
     keywords?: string[];
     regex?: string[];
+    contextualRegex?: string[];
+    contextRegex?: string[];
   };
   command: string;
   cwd?: string;
@@ -692,18 +698,21 @@ export function buildFallbackJsonToolRequest(
     const configuredMcpCallRequest = buildConfiguredMcpToolCallRequest(
       text,
       context.mcpToolCallDefinitions || [],
+      context,
     );
     if (configuredMcpCallRequest) return configuredMcpCallRequest;
 
     const configuredUnityMcpRequest = buildConfiguredUnityMcpExecuteCodeRequest(
       text,
       context.unityMcpExecuteCodeDefinitions || [],
+      context,
     );
     if (configuredUnityMcpRequest) return configuredUnityMcpRequest;
 
     const configuredShellArtifactRequest = buildConfiguredShellArtifactRequest(
       text,
       context.shellArtifactDefinitions || [],
+      context,
     );
     if (configuredShellArtifactRequest) return configuredShellArtifactRequest;
 
@@ -1186,10 +1195,11 @@ function extractUnityExecuteCode(text: string): string | null {
 function buildConfiguredUnityMcpExecuteCodeRequest(
   text: string,
   definitions: UnityMcpExecuteCodeDefinition[],
+  context?: { workingDirectory?: string; contextText?: string },
 ): JsonToolRequest | null {
   for (const definition of definitions) {
     if (!definition.codeTemplate.trim()) continue;
-    if (!matchesUnityMcpDefinition(text, definition)) continue;
+    if (!matchesUnityMcpDefinition(text, definition, context)) continue;
     return {
       action: 'tool_request',
       tool: 'unity_mcp_execute_code',
@@ -1206,10 +1216,11 @@ function buildConfiguredUnityMcpExecuteCodeRequest(
 function buildConfiguredMcpToolCallRequest(
   text: string,
   definitions: McpToolCallDefinition[],
+  context?: { workingDirectory?: string; contextText?: string },
 ): JsonToolRequest | null {
   for (const definition of definitions) {
     if (!definition.manifestHint.trim() || !definition.tool.trim()) continue;
-    if (!matchesToolDefinition(text, definition)) continue;
+    if (!matchesToolDefinition(text, definition, context)) continue;
     return {
       action: 'tool_request',
       tool: 'mcp_call',
@@ -1226,10 +1237,11 @@ function buildConfiguredMcpToolCallRequest(
 function buildConfiguredShellArtifactRequest(
   text: string,
   definitions: ShellArtifactDefinition[],
+  context?: { workingDirectory?: string; contextText?: string },
 ): JsonToolRequest | null {
   for (const definition of definitions) {
     if (!definition.command.trim()) continue;
-    if (!matchesToolDefinition(text, definition)) continue;
+    if (!matchesToolDefinition(text, definition, context)) continue;
     return {
       action: 'tool_request',
       tool: 'shell_artifact',
@@ -1245,13 +1257,18 @@ function buildConfiguredShellArtifactRequest(
   return null;
 }
 
-function matchesUnityMcpDefinition(text: string, definition: UnityMcpExecuteCodeDefinition): boolean {
-  return matchesToolDefinition(text, definition);
+function matchesUnityMcpDefinition(
+  text: string,
+  definition: UnityMcpExecuteCodeDefinition,
+  context?: { workingDirectory?: string; contextText?: string },
+): boolean {
+  return matchesToolDefinition(text, definition, context);
 }
 
 function matchesToolDefinition(
   text: string,
-  definition: { match?: { keywords?: string[]; regex?: string[] } },
+  definition: { match?: { keywords?: string[]; regex?: string[]; contextualRegex?: string[]; contextRegex?: string[] } },
+  context?: { workingDirectory?: string; contextText?: string },
 ): boolean {
   const match = definition.match || {};
   const lowerText = text.toLowerCase();
@@ -1262,6 +1279,31 @@ function matchesToolDefinition(
       if (new RegExp(pattern, 'iu').test(text)) return true;
     } catch {
       continue;
+    }
+  }
+  const contextualRegex = (match.contextualRegex || []).map((item) => item.trim()).filter(Boolean);
+  const contextRegex = (match.contextRegex || []).map((item) => item.trim()).filter(Boolean);
+  if (contextualRegex.length > 0 && contextRegex.length > 0) {
+    const contextText = [
+      context?.workingDirectory || '',
+      context?.contextText || '',
+    ].filter(Boolean).join('\n');
+    if (contextText) {
+      const textMatched = contextualRegex.some((pattern) => {
+        try {
+          return new RegExp(pattern, 'iu').test(text);
+        } catch {
+          return false;
+        }
+      });
+      const contextMatched = textMatched && contextRegex.some((pattern) => {
+        try {
+          return new RegExp(pattern, 'iu').test(contextText);
+        } catch {
+          return false;
+        }
+      });
+      if (contextMatched) return true;
     }
   }
   return false;

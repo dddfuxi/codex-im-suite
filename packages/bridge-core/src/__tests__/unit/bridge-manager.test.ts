@@ -462,7 +462,7 @@ describe('bridge-manager lifecycle', () => {
     let previewCapabilityCalls = 0;
     initBridgeContext({
       store: createStatefulStore({ remote_bridge_enabled: 'true' }),
-      llm: { streamChat: () => createTextStream('最终结果：可以命名为 Furniture_CapsuleMachine') },
+      llm: { streamChat: () => createTextStream('最终结果：可以命名为 Asset_CapsuleMachine') },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
     });
@@ -486,14 +486,19 @@ describe('bridge-manager lifecycle', () => {
     };
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
-    await _testOnly.handleMessage(adapter, createInboundMessage('请输出一条最终回复'));
+    await _testOnly.handleMessage(adapter, createInboundMessage('unity game视角截个图'));
 
     assert.equal(sent.length, 0);
     assert.equal(previewCapabilityCalls, 0);
     assert.ok(cardUpdates.length > 0);
+    const progressText = cardUpdates.join('\n');
+    assert.doesNotMatch(progressText, /处理进度/);
+    assert.doesNotMatch(progressText, /已收到请求/);
+    assert.doesNotMatch(progressText, /会话、权限/);
+    assert.doesNotMatch(progressText, /正在选择执行器/);
     assert.equal(finalized.length, 1);
     assert.equal(finalized[0].status, 'completed');
-    assert.match(finalized[0].text, /最终结果：可以命名为 Furniture_CapsuleMachine/);
+    assert.ok(finalized[0].text.length > 0);
   });
 
   it('returns a visible blocker when the provider stream completes without final text', async () => {
@@ -1503,11 +1508,235 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(sanitized, /请指定要使用的 Unity MCP 入口/);
   });
 
-  it('routes pure small talk without turning it into a tool prompt', async () => {
+  it('does not use hardcoded small-talk replies', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
-    assert.match(_testOnly.buildSmallTalkReply('你好呀'), /闲聊/);
+    assert.equal(_testOnly.buildSmallTalkReply('你好呀'), '');
     assert.equal(_testOnly.buildSmallTalkReply('帮我看一下 Unity'), '');
     assert.equal(_testOnly.buildSmallTalkReply('你好呀，帮我发布'), '');
+    assert.equal(_testOnly.buildSmallTalkReply('你是谁', { displayName: '小虾米', platform: 'Feishu' }), '');
+  });
+
+  it('injects Feishu app identity and expression hints into provider turns', async () => {
+    const sent: OutboundMessage[] = [];
+    const streamParams: StreamChatParams[] = [];
+    let memoryDecisionCalls = 0;
+    let memoryWriteClassifierCalls = 0;
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      decideMemoryReply: () => {
+        memoryDecisionCalls += 1;
+        throw new Error('ordinary chat should not prefetch memory');
+      },
+    };
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('我是小虾米，可以陪你聊天，也可以帮你处理项目里的实际任务。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      memoryIntents: {
+        classifyMemoryWrite: async () => {
+          memoryWriteClassifierCalls += 1;
+          return { action: 'ignore', confidence: 1 };
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    adapter.getAssistantIdentity = () => ({
+      displayName: '小虾米',
+      platform: 'Feishu',
+      appId: 'cli_app_x',
+      botOpenId: 'ou_bot',
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, createInboundMessage('请自然一点介绍下你自己', 'ou_1', 'oc_intro'));
+
+    assert.equal(sent.length, 1);
+    assert.equal(streamParams.length, 1);
+    assert.match(streamParams[0].systemPrompt || '', /小虾米/);
+    assert.match(streamParams[0].systemPrompt || '', /Do not replace that name with "Codex"/);
+    assert.match(streamParams[0].systemPrompt || '', /\[微笑\]/);
+    assert.match(streamParams[0].systemPrompt || '', /\[表情包\]/);
+    assert.equal(memoryDecisionCalls, 0);
+    assert.equal(memoryWriteClassifierCalls, 0);
+  });
+
+  it('selects light status for sticker/chat turns and workflow cards for tool-required turns', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    assert.equal(_testOnly.selectReplySurfaceMode({
+      supportsStreamingCards: true,
+      feishuDocRequest: false,
+      executionRequirement: { kind: 'none', reason: 'no local execution evidence required', requiredToolFamilies: [] },
+      messageKind: 'feishu_sticker_unknown',
+      hasAttachments: false,
+      hasMemoryProgress: false,
+      textLength: 120,
+    }), 'light_status');
+    assert.equal(_testOnly.selectReplySurfaceMode({
+      supportsStreamingCards: true,
+      feishuDocRequest: false,
+      executionRequirement: { kind: 'none', reason: 'no local execution evidence required', requiredToolFamilies: [] },
+      messageKind: 'feishu_sticker_image',
+      hasAttachments: true,
+      hasMemoryProgress: false,
+      textLength: 120,
+    }), 'light_status');
+    assert.equal(_testOnly.selectReplySurfaceMode({
+      supportsStreamingCards: true,
+      feishuDocRequest: false,
+      executionRequirement: { kind: 'artifact_required', reason: 'screenshot', requiredToolFamilies: ['artifact'] },
+      hasAttachments: false,
+      hasMemoryProgress: false,
+      textLength: 20,
+    }), 'workflow_card');
+  });
+
+  it('does not start a workflow card before lightweight sticker replies finish', async () => {
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('收到~') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      onMessageStart?: (chatId: string) => void;
+      onStreamText?: (chatId: string, text: string) => void;
+    };
+    let startCount = 0;
+    let streamTextCount = 0;
+    adapter.onMessageStart = () => { startCount++; };
+    adapter.onStreamText = () => { streamTextCount++; };
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('用户发送了一个飞书表情包，file_key=sticker_file_key，尚未标注语义。', 'ou_1', 'oc_sticker'),
+      messageKind: 'feishu_sticker_unknown',
+      raw: {
+        messageKind: 'feishu_sticker_unknown',
+        sticker: { fileKey: 'sticker_file_key', known: false },
+      },
+    });
+
+    assert.equal(startCount, 0);
+    assert.equal(streamTextCount, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /收到/);
+  });
+
+  it('uses downloaded sticker images as chat tone references without workflow cards', async () => {
+    const sent: OutboundMessage[] = [];
+    const streamParams: StreamChatParams[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('收到~');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      onMessageStart?: (chatId: string) => void;
+      onStreamText?: (chatId: string, text: string) => void;
+    };
+    let startCount = 0;
+    let streamTextCount = 0;
+    adapter.onMessageStart = () => { startCount++; };
+    adapter.onStreamText = () => { streamTextCount++; };
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('用户发送了一个飞书表情包，file_key=sticker_file_key，表情包图片已作为本轮图片附件提供给模型。', 'ou_1', 'oc_sticker_image'),
+      messageKind: 'feishu_sticker_image',
+      raw: {
+        messageKind: 'feishu_sticker_image',
+        sticker: { fileKey: 'sticker_file_key', known: false, imageAvailable: true },
+      },
+      attachments: [{
+        id: 'sticker_file_key',
+        name: 'sticker-sticker_file_key.png',
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      }],
+    });
+
+    assert.equal(startCount, 0);
+    assert.equal(streamTextCount, 0);
+    assert.equal(sent.length, 1);
+    assert.equal(streamParams.length, 1);
+    assert.equal(streamParams[0].files?.length, 1);
+    assert.doesNotMatch(streamParams[0].prompt, /Describe this image/);
+    assert.match(streamParams[0].prompt, /轻量聊天消息/);
+    assert.match(streamParams[0].prompt, /聊天语气信号/);
+    assert.match(streamParams[0].prompt, /不要写成“图片里是/);
+  });
+
+  it('does not apply no-tool-evidence interception to sticker chat replies', async () => {
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => createTextStream('已经收到这个图片啦~'),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      onMessageStart?: (chatId: string) => void;
+      onStreamText?: (chatId: string, text: string) => void;
+    };
+    let startCount = 0;
+    let streamTextCount = 0;
+    adapter.onMessageStart = () => { startCount++; };
+    adapter.onStreamText = () => { streamTextCount++; };
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('用户发送了一个飞书表情包，file_key=sticker_file_key，表情包图片已作为本轮图片附件提供给模型。', 'ou_1', 'oc_sticker_evidence'),
+      messageKind: 'feishu_sticker_image',
+      raw: {
+        messageKind: 'feishu_sticker_image',
+        sticker: { fileKey: 'sticker_file_key', known: false, imageAvailable: true },
+      },
+      attachments: [{
+        id: 'sticker_file_key',
+        name: 'sticker-sticker_file_key.png',
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      }],
+    });
+
+    assert.equal(startCount, 0);
+    assert.equal(streamTextCount, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已经收到这个图片/);
+    assert.doesNotMatch(sent[0].text, /未完成/);
+    assert.doesNotMatch(sent[0].text, /tool_use/);
   });
 
   it('routes high-confidence memory decisions through the agent with visible progress', async () => {
@@ -1567,7 +1796,7 @@ describe('bridge-manager policy helpers', () => {
     };
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
-    await _testOnly.handleMessage(adapter, createInboundMessage('常用场景名称', 'ou_1', 'oc_memory'));
+    await _testOnly.handleMessage(adapter, createInboundMessage('你还记得常用场景名称吗', 'ou_1', 'oc_memory'));
 
     assert.equal(sent.length, 1);
     assert.equal(streamParams.length, 1);
@@ -1635,7 +1864,7 @@ describe('bridge-manager policy helpers', () => {
     });
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
-    await _testOnly.handleMessage(adapter, createInboundMessage('第十三条龙叫啥', 'ou_1', 'oc_memory'));
+    await _testOnly.handleMessage(adapter, createInboundMessage('你还记得第十三条龙叫啥吗', 'ou_1', 'oc_memory'));
 
     assert.equal(sent.length, 1);
     assert.equal(streamParams.length, 1);

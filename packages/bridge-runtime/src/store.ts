@@ -1,4 +1,4 @@
-﻿/**
+/**
  * JSON file-backed BridgeStore implementation.
  *
  * Uses in-memory Maps as cache with write-through persistence
@@ -55,12 +55,13 @@ const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
 const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
 const ANSWER_REVIEW_AUDIT_PATH = path.join(DATA_DIR, 'answer-review-audit.json');
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
-const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '80', 10) || 80);
-const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '32000', 10) || 32000);
-const KEEP_RECENT_MESSAGES = Math.max(12, Number.parseInt(process.env.CTI_HISTORY_KEEP_RECENT || '24', 10) || 24);
+const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '36', 10) || 36);
+const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '12000', 10) || 12000);
+const KEEP_RECENT_MESSAGES = Math.max(8, Number.parseInt(process.env.CTI_HISTORY_KEEP_RECENT || '12', 10) || 12);
 const SUMMARY_REFRESH_EVERY = Math.max(6, Number.parseInt(process.env.CTI_SUMMARY_REFRESH_EVERY || '12', 10) || 12);
 const MEMORY_MAX_HITS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_MAX_HITS || '6', 10) || 6);
 const MEMORY_MAX_CHARS = Math.max(600, Number.parseInt(process.env.CTI_MEMORY_MAX_CHARS || '2200', 10) || 2200);
+const MEMORY_ARCHIVE_MAX_FILES = Math.max(0, Number.parseInt(process.env.CTI_MEMORY_ARCHIVE_MAX_FILES || '5', 10) || 5);
 const MEMORY_MIN_SCORE = Number.parseFloat(process.env.CTI_MEMORY_MIN_SCORE || '6') || 6;
 const MEMORY_PROFILE_MAX_ITEMS = Math.max(6, Number.parseInt(process.env.CTI_MEMORY_PROFILE_MAX_ITEMS || '24', 10) || 24);
 const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_PROFILE_EVENT_MIN_CHARS || '2', 10) || 2);
@@ -540,7 +541,8 @@ export class JsonFileStore implements BridgeStore {
 
     const files = fs.readdirSync(archiveDir)
       .filter((name) => name.endsWith('.json'))
-      .sort((left, right) => right.localeCompare(left));
+      .sort((left, right) => right.localeCompare(left))
+      .slice(0, MEMORY_ARCHIVE_MAX_FILES);
 
     const collected: BridgeMessage[] = [];
     for (const name of files) {

@@ -14,6 +14,13 @@ import type {
   UploadedFileLink,
 } from './types.js';
 
+export interface AdapterAssistantIdentity {
+  displayName?: string;
+  platform?: string;
+  appId?: string;
+  botOpenId?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -89,6 +96,12 @@ export abstract class BaseChannelAdapter {
    * Returns true if authorized, false otherwise.
    */
   abstract isAuthorized(userId: string, chatId: string): boolean;
+
+  /**
+   * Return platform-native assistant identity when known.
+   * Used only as user-visible persona context; adapters may return partial data.
+   */
+  getAssistantIdentity?(): AdapterAssistantIdentity | null;
 
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;

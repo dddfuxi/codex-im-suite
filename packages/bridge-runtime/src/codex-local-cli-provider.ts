@@ -229,14 +229,16 @@ function collectMcpResultEvidenceShape(value: unknown, fieldName = '', depth = 0
   const values = Array.isArray(value)
     ? value.map((item) => ['', item] as const)
     : Object.entries(value as Record<string, unknown>);
-  return values.reduce((state, [key, child]) => {
+  type EvidenceShape = { hasId: boolean; idSamples: string[]; hasDetail: boolean };
+  const initial: EvidenceShape = { hasId: false, idSamples: [], hasDetail: false };
+  return values.reduce<EvidenceShape>((state, [key, child]) => {
     const childShape = collectMcpResultEvidenceShape(child, key || fieldName, depth + 1);
     return {
       hasId: state.hasId || childShape.hasId,
       idSamples: [...state.idSamples, ...childShape.idSamples].slice(0, 8),
       hasDetail: state.hasDetail || childShape.hasDetail,
     };
-  }, { hasId: false, idSamples: [] as string[], hasDetail: false });
+  }, initial);
 }
 
 function getMcpResultPayload(result: JsonToolResult): Record<string, unknown> {

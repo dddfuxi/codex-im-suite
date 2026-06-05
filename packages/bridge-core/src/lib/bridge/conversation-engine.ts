@@ -92,11 +92,13 @@ interface InternalConversationResult extends ConversationResult {
 export interface ConversationProcessOptions {
   storedUserText?: string;
   historyLimit?: number;
+  memoryMode?: 'auto' | 'off' | 'recall' | 'augment';
   extraSystemPrompt?: string;
   memoryPlan?: MemoryQueryPlan;
   memoryUserId?: string;
   memoryUserDisplayName?: string;
   sourceMessageId?: string;
+  messageKind?: string;
 }
 
 function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRetryAttempted = false): ConversationResult['executionEvidence'] {
@@ -117,10 +119,10 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
 }
 
 const MUTATING_COMMAND_RE = /\b(git\s+(pull|rebase|merge|checkout|switch|reset|clean|stash(?:\s+(?:pop|apply))?)|npm\s+(install|update|uninstall)|pnpm\s+(install|update|add|remove)|yarn\s+(install|add|remove)|mkdir|rmdir|rm|mv|cp|touch|del|copy|move-item|remove-item|copy-item|new-item|set-content|add-content)\b/i;
-const DEFAULT_HISTORY_LIMIT = Math.max(8, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_LIMIT || '24', 10) || 24);
-const DEFAULT_HISTORY_MAX_CHARS = Math.max(1200, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_MAX_CHARS || '4200', 10) || 4200);
-const DEFAULT_HISTORY_MESSAGE_MAX_CHARS = Math.max(120, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_MESSAGE_MAX_CHARS || '420', 10) || 420);
-const DEFAULT_MEMORY_PROMPT_MAX_CHARS = Math.max(240, Number.parseInt(process.env.CTI_MEMORY_PROMPT_MAX_CHARS || '1200', 10) || 1200);
+const DEFAULT_HISTORY_LIMIT = Math.max(4, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_LIMIT || '8', 10) || 8);
+const DEFAULT_HISTORY_MAX_CHARS = Math.max(800, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_MAX_CHARS || '1800', 10) || 1800);
+const DEFAULT_HISTORY_MESSAGE_MAX_CHARS = Math.max(80, Number.parseInt(process.env.CTI_CONTEXT_HISTORY_MESSAGE_MAX_CHARS || '220', 10) || 220);
+const DEFAULT_MEMORY_PROMPT_MAX_CHARS = Math.max(160, Number.parseInt(process.env.CTI_MEMORY_PROMPT_MAX_CHARS || '600', 10) || 600);
 const MAX_STORED_TOOL_RESULT_CHARS = Math.max(160, Number.parseInt(process.env.CTI_STORED_TOOL_RESULT_CHARS || '320', 10) || 320);
 const MAX_STORED_TEXT_CHARS = Math.max(400, Number.parseInt(process.env.CTI_STORED_TEXT_CHARS || '4000', 10) || 4000);
 
@@ -169,7 +171,14 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- Do not claim that a reminder, scheduled task, or proactive message has been created unless you used the cti-reminder action protocol or the user explicitly asked only for example code.',
   ].join('\n');
 
-  return [baseSystemPrompt?.trim(), bridgeGuardrails, buildReplyPresentationPrompt(getReplyStyleHintFromStore()), extraSystemPrompt?.trim()]
+  return [
+    // Channel identity and turn-specific context must stay near the front
+    // because downstream providers may trim long system prompts.
+    extraSystemPrompt?.trim(),
+    baseSystemPrompt?.trim(),
+    bridgeGuardrails,
+    buildReplyPresentationPrompt(getReplyStyleHintFromStore()),
+  ]
     .filter((part): part is string => !!part)
     .join('\n\n');
 }
@@ -190,6 +199,11 @@ function buildReplyPresentationPrompt(replyStyleHint: string): string {
     '- Final user-facing replies must follow the configured reply style when one is provided.',
     '- Progress updates may show user-visible rationale, evidence checked, and current stage, but never hidden chain-of-thought.',
     '- Final replies should be outcome-first and concise; do not repeat the progress-card rationale unless the user explicitly asks for a detailed walkthrough.',
+    '- On Feishu, you may make lightweight replies more lively by starting the final visible result with a native reaction hint such as `[微笑]`, `[赞]`, `[OK]`, `[BULL]`, or with `[表情包]` / `[表情包:alias]` when a previously received sticker would fit. The bridge will add the reaction or send a real Feishu sticker when available, then remove this hint from the visible text.',
+    '- Use Feishu reaction/sticker hints only for casual chat, acknowledgements, greetings, playful sticker replies, and short emotional responses. Do not add them to formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
+    '- Do not invent sticker file_key values. If a sticker hint cannot be resolved by the bridge, the visible text must still stand on its own.',
+    '- Feishu sticker messages may include an image attachment when the bridge can download the sticker resource. If the inbound text says a sticker image is attached, inspect that image first to identify the visual content and intent.',
+    '- If the inbound text says the Feishu sticker is not semantically annotated and no sticker image attachment is available, do not claim you can see its image, caption, or intent. Ask the user to explain the sticker meaning or use any learned sticker semantics provided in the message context.',
   ];
   if (replyStyleHint) {
     lines.push(`- Required reply style: ${replyStyleHint}`);
@@ -386,6 +400,18 @@ function buildRetrievedMemoryPrompt(
   return truncatePromptText(text, maxChars);
 }
 
+function shouldRetrieveMemoryForTurn(
+  mode: ConversationProcessOptions['memoryMode'],
+  executionRequirement: ExecutionRequirement,
+  memoryPlan?: MemoryQueryPlan,
+): boolean {
+  if (mode === 'off') return false;
+  if (mode === 'recall') return true;
+  if (memoryPlan?.intent === 'explicit_recall') return true;
+  if (mode === 'augment') return true;
+  return executionRequirement.kind !== 'none';
+}
+
 /**
  * Process an inbound message: send to Claude, consume the response stream,
  * save to DB, and return the result.
@@ -483,8 +509,12 @@ export async function processMessage(
     }
 
     // Load conversation history for context
-    const historyLimit = options?.historyLimit && options.historyLimit > 0 ? options.historyLimit : DEFAULT_HISTORY_LIMIT;
-    const { messages: recentMsgs } = store.getMessages(sessionId, { limit: historyLimit });
+    const historyLimit = typeof options?.historyLimit === 'number'
+      ? Math.max(0, Math.floor(options.historyLimit))
+      : DEFAULT_HISTORY_LIMIT;
+    const recentMsgs = historyLimit > 0
+      ? store.getMessages(sessionId, { limit: historyLimit }).messages
+      : [];
     const historyMsgs = recentMsgs.slice(0, -1).map(m => ({
       role: m.role as 'user' | 'assistant',
       content: m.content,
@@ -504,21 +534,35 @@ export async function processMessage(
       historyTotalMaxChars,
       historyMessageMaxChars,
     );
-    const retrievedMemory = store.retrieveRelevantMemory({
-      sessionId,
-      channelType: binding.channelType,
-      chatId: binding.chatId,
-      userId: options?.memoryUserId,
-      userDisplayName: options?.memoryUserDisplayName,
+    const executionRequirement = classifyExecutionRequirement({
+      userText: options?.storedUserText || text,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
-      query: text,
-      recentHistoryLimit: historyLimit,
+      files,
+      memoryPlan: options?.memoryPlan,
+      messageKind: options?.messageKind,
     });
-    const retrievedFeishuHistory = binding.channelType === 'feishu' && store.retrieveRelevantFeishuHistory
+    const shouldRetrieveMemory = shouldRetrieveMemoryForTurn(
+      options?.memoryMode || 'auto',
+      executionRequirement,
+      options?.memoryPlan,
+    );
+    const retrievedMemory = shouldRetrieveMemory
+      ? store.retrieveRelevantMemory({
+        sessionId,
+        channelType: binding.channelType,
+        chatId: binding.chatId,
+        userId: options?.memoryUserId,
+        userDisplayName: options?.memoryUserDisplayName,
+        workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+        query: text,
+        recentHistoryLimit: historyLimit,
+      })
+      : null;
+    const retrievedFeishuHistory = shouldRetrieveMemory && binding.channelType === 'feishu' && store.retrieveRelevantFeishuHistory
       ? store.retrieveRelevantFeishuHistory({
         chatId: binding.chatId,
         query: text,
-        limit: 4,
+        limit: options?.memoryMode === 'recall' ? 4 : 2,
       })
       : null;
     const memoryPromptMaxChars = parseSettingInt(
@@ -527,12 +571,6 @@ export async function processMessage(
       240,
     );
     const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, retrievedFeishuHistory, memoryPromptMaxChars);
-    const executionRequirement = classifyExecutionRequirement({
-      userText: options?.storedUserText || text,
-      workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
-      files,
-      memoryPlan: options?.memoryPlan,
-    });
     const executionRequirementPrompt = buildExecutionRequirementPrompt(executionRequirement);
     const mergedExtraSystemPrompt = [options?.extraSystemPrompt?.trim(), memoryPrompt]
       .filter((part): part is string => !!part)
@@ -655,6 +693,10 @@ export async function processMessage(
     store.setSessionRuntimeStatus(sessionId, 'idle');
   }
 }
+
+export const _testOnly = {
+  buildBridgeScopedSystemPrompt,
+};
 
 /**
  * Consume an SSE stream and extract response data.

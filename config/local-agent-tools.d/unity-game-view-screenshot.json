@@ -6,7 +6,18 @@
   "match": {
     "regex": [
       "(?:unity\\s*mcp|unitymcp|unity).*(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view)",
-      "(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view).*(?:unity\\s*mcp|unitymcp|unity)"
+      "(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view).*(?:unity\\s*mcp|unitymcp|unity)",
+      "(?:prefab|预制体|场景|GameObject|gameobject|节点|刚刚摆|摆).*(?:截(?:图|一张|一个)?|截图|screenshot|capture|发图|给我图)",
+      "(?:截(?:图|一张|一个)?|截图|screenshot|capture|发图|给我图).*(?:prefab|预制体|场景|GameObject|gameobject|节点|刚刚摆|摆)"
+    ],
+    "contextualRegex": [
+      "^(?:截(?:图|个图|一张|一个)?|截屏|截图|拍(?:一张|个)?|发(?:张|个)?图|screenshot|capture)(?:给我|一下|看看|吧|呗|\\s|[。！？!?.])*$"
+    ],
+    "contextRegex": [
+      "(?:^|[\\\\/])Assets(?:[\\\\/]|$)",
+      "(?:^|[\\\\/])ProjectSettings(?:[\\\\/]|$)",
+      "(?:^|[\\\\/])Packages(?:[\\\\/]|$)",
+      "unityProjectPath|Unity|unity|unitymcp|Unity MCP|场景|GameObject|prefab|预制体"
     ]
   },
   "mcp": {

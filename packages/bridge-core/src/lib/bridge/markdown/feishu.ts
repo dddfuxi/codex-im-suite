@@ -97,10 +97,16 @@ export function htmlToFeishuMarkdown(html: string): string {
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
   const lines = tools.map((tc) => {
-    const status = tc.status === 'running' ? '执行中' : tc.status === 'complete' ? '已完成' : '失败';
-    return `- ${status}：${formatVisibleToolName(tc.name)}`;
+    const status = formatToolStatus(tc.status);
+    return `${status} · ${formatVisibleToolName(tc.name)}`;
   });
   return lines.join('\n');
+}
+
+function formatToolStatus(status: ToolCallInfo['status']): string {
+  if (status === 'running') return '<font color="blue">进行中</font>';
+  if (status === 'complete') return '<font color="green">已完成</font>';
+  return '<font color="red">失败</font>';
 }
 
 export function formatVisibleToolName(name: string): string {
@@ -131,17 +137,75 @@ export function formatElapsed(ms: number): string {
   return `${min}m ${remSec}s`;
 }
 
+function extractStreamingStepLines(text: string): string[] {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/^\s*[-•]\s*/, '').trim())
+    .filter(Boolean)
+    .filter((line) => !/^(?:#{1,6}\s*)?(?:处理进度|处理思路|执行细节|工具阶段结果)\s*[:：]?\s*$/u.test(line))
+    .filter((line) => !/^[-_]{3,}$/.test(line));
+}
+
+function escapeFeishuInlineMarkdown(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function inferStreamingStepTitle(step: string, tools: ToolCallInfo[]): string {
+  const text = `${step} ${tools.map((tool) => tool.name).join(' ')}`.toLowerCase();
+  if (/证据|依据|截图|文件|目录|搜索|查找|读取|capture|read_file|list_dir|search_files/u.test(text)) return '确认证据';
+  if (/工具|执行|命令|mcp|unity|shell|tool/u.test(text)) return '调用工具';
+  if (/记忆|上下文|历史|会话|memory|context/u.test(text)) return '整理上下文';
+  if (/整理|回复|收口|结果|final|answer/u.test(text)) return '整理回复';
+  return '理解请求';
+}
+
+function formatStreamingStageRail(title: string): string {
+  const stages = [
+    { label: '依据确认', color: title === '确认证据' ? 'purple' : 'grey' },
+    { label: '工具完成', color: title === '调用工具' ? 'purple' : 'grey' },
+    { label: '结果生成', color: title === '整理回复' ? 'purple' : 'grey' },
+  ];
+  return stages.map((stage) => `<font color="${stage.color}">${stage.label}</font>`).join(' · ');
+}
+
+export function buildStreamingStepContent(step: string, tools: ToolCallInfo[] = []): string {
+  const currentStep = step.trim() || '正在根据这条消息判断下一步。';
+  const title = inferStreamingStepTitle(currentStep, tools);
+  return buildStreamingStepContentWithTitle(title, currentStep);
+}
+
+function buildStreamingStepContentWithTitle(title: string, step: string): string {
+  return [
+    `<font color="purple">**${title}**</font>`,
+    `<font color="grey">${escapeFeishuInlineMarkdown(step)}</font>`,
+    '',
+    formatStreamingStageRail(title),
+  ].join('\n');
+}
+
+export function getStreamingCurrentStep(text: string, tools: ToolCallInfo[]): string {
+  const steps = extractStreamingStepLines(text);
+  const activeTool = tools.find((tool) => tool.status === 'running') || tools[tools.length - 1];
+  return steps[steps.length - 1]
+    || (activeTool ? `正在根据 ${formatVisibleToolName(activeTool.name)} 的状态推进。` : '正在根据这条消息判断下一步。');
+}
+
+export function buildStreamingTypewriterContent(text: string, tools: ToolCallInfo[], visibleChars: number): string {
+  const currentStep = getStreamingCurrentStep(text, tools);
+  const visibleStep = [...currentStep].slice(0, Math.max(0, visibleChars)).join('');
+  return buildStreamingStepContentWithTitle(inferStreamingStepTitle(currentStep, tools), visibleStep);
+}
+
 /**
  * Build the body elements array for a streaming card update.
- * Combines main text content with tool progress.
+ * Shows one current user-visible planning step, refreshed as new progress arrives.
  */
 export function buildStreamingContent(text: string, tools: ToolCallInfo[]): string {
-  let content = text || '';
-  const toolMd = buildToolProgressMarkdown(tools);
-  if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
-  }
-  return content || '### 处理进度\n- 已收到请求，正在进入执行链。';
+  return buildStreamingStepContent(getStreamingCurrentStep(text, tools), tools);
 }
 
 /**
@@ -153,9 +217,11 @@ export function extractStreamingFinalResponse(text: string): string {
   const normalized = (text || '').replace(/\r\n/g, '\n').trim();
   if (!normalized) return '';
 
-  const resultHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?执行结果(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/u;
+  const resultHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:执行结果|最终结果)(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/u;
   const match = resultHeading.exec(normalized);
-  if (!match) return normalized;
+  if (!match) {
+    return normalized.replace(/^\s*(?:#{1,6}\s*)?(?:\*\*)?最终结果(?:\*\*)?\s*[:：]?\s*/u, '').trim() || normalized;
+  }
 
   const resultText = normalized.slice(match.index + match[0].length).trim();
   return resultText || normalized;
@@ -171,24 +237,16 @@ export function buildFinalCardJson(
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
-  const statusLine = footer?.status ? `**状态：${footer.status}**` : '**状态：已完成**';
-  elements.push({
-    tag: 'markdown',
-    content: statusLine,
-    text_align: 'left',
-    text_size: 'normal',
-  });
-
   // Main result content. Waiting/progress rationale is stripped before finalizing.
   let content = preprocessFeishuMarkdown(extractStreamingFinalResponse(text));
   if (!content.trim()) {
     content = '未完成：模型没有返回可展示结果。';
   }
+  const titledContent = extractFinalCardTitleAndBody(content);
 
-  elements.push({ tag: 'hr' });
   elements.push({
     tag: 'markdown',
-    content: `### 最终结果\n${content}`,
+    content: titledContent.body,
     text_align: 'left',
     text_size: 'normal',
   });
@@ -198,7 +256,7 @@ export function buildFinalCardJson(
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'markdown',
-      content: `### 工具轨迹\n${toolMd}`,
+      content: `<font color="grey">**工具轨迹**</font>\n${toolMd}`,
       text_align: 'left',
       text_size: 'notation',
     });
@@ -207,22 +265,80 @@ export function buildFinalCardJson(
   // Footer
   if (footer) {
     const parts: string[] = [];
-    if (footer.elapsed) parts.push(footer.elapsed);
+    parts.push(formatCompletionMark(footer.status));
+    if (footer.elapsed) parts.push(`耗时：${footer.elapsed}`);
     if (parts.length > 0) {
       elements.push({ tag: 'hr' });
       elements.push({
         tag: 'markdown',
-        content: `耗时：${parts.join(' · ')}`,
+        content: `<font color="grey">${parts.join(' · ')}</font>`,
         text_size: 'notation',
       });
     }
   }
 
+  const header = buildFinalCardHeader(footer?.status || '', titledContent.title);
+
   return JSON.stringify({
     schema: '2.0',
     config: { wide_screen_mode: true },
+    header,
     body: { elements },
   });
+}
+
+function extractFinalCardTitleAndBody(content: string): { title: string; body: string } {
+  const normalized = content.replace(/\r\n/g, '\n').trim();
+  const heading = /^(?:#{1,6}\s+|\*\*)?(.{2,48}?)(?:\*\*)?\s*[:：]?\s*\n+([\s\S]+)$/u.exec(normalized);
+  if (heading && !/[。！？.!?]$/u.test(heading[1].trim())) {
+    return {
+      title: sanitizeFinalCardTitle(heading[1]),
+      body: heading[2].trim() || normalized,
+    };
+  }
+
+  const firstLine = normalized.split('\n').map((line) => line.trim()).find(Boolean) || '';
+  return {
+    title: sanitizeFinalCardTitle(firstLine || '回复'),
+    body: normalized,
+  };
+}
+
+function sanitizeFinalCardTitle(title: string): string {
+  const cleaned = title
+    .replace(/^[-*>\s#]+/u, '')
+    .replace(/[*_`~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '回复';
+  return [...cleaned].slice(0, 28).join('');
+}
+
+function formatCompletionMark(status: string): string {
+  return /失败|未完成|中断|error|interrupted/i.test(status || '') ? '×' : '✅';
+}
+
+function buildFinalCardHeader(status: string, title: string): Record<string, unknown> {
+  const normalized = status.trim();
+  if (/失败|未完成|error/i.test(normalized)) {
+    return {
+      title: { tag: 'plain_text', content: title || '回复' },
+      template: 'red',
+      padding: '12px 12px 12px 12px',
+    };
+  }
+  if (/中断|interrupted/i.test(normalized)) {
+    return {
+      title: { tag: 'plain_text', content: title || '回复' },
+      template: 'orange',
+      padding: '12px 12px 12px 12px',
+    };
+  }
+  return {
+    title: { tag: 'plain_text', content: title || '回复' },
+    template: 'purple',
+    padding: '12px 12px 12px 12px',
+  };
 }
 
 /**

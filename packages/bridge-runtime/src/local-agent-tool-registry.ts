@@ -13,6 +13,8 @@ interface LocalAgentToolManifest {
   match?: {
     keywords?: string[];
     regex?: string[];
+    contextualRegex?: string[];
+    contextRegex?: string[];
   };
   unityMcp?: {
     tool?: string;

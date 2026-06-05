@@ -13,6 +13,7 @@ export interface ExecutionRequirementInput {
   workingDirectory?: string;
   files?: FileAttachment[];
   memoryPlan?: MemoryQueryPlan;
+  messageKind?: string;
 }
 
 const NONE_REQUIREMENT: ExecutionRequirement = {
@@ -33,9 +34,25 @@ const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
 const TOOL_DOMAIN_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|GameObject|Assets|Packages|ProjectSettings|场景|节点|组件|物体|对象|层级|Hierarchy)/iu;
 
+export function isFeishuStickerMessageKind(messageKind?: string): boolean {
+  return messageKind === 'feishu_sticker_unknown'
+    || messageKind === 'feishu_sticker_known'
+    || messageKind === 'feishu_sticker_image';
+}
+
+function isGeneratedFeishuStickerSemanticEvent(text: string): boolean {
+  return /file_key=/i.test(text)
+    && /飞书表情包/u.test(text)
+    && /(尚未标注语义|已记录语义)/u.test(text);
+}
+
 export function classifyExecutionRequirement(input: ExecutionRequirementInput): ExecutionRequirement {
   const text = (input.userText || '').trim();
   if (!text) return NONE_REQUIREMENT;
+
+  if (isFeishuStickerMessageKind(input.messageKind) || isGeneratedFeishuStickerSemanticEvent(text)) {
+    return NONE_REQUIREMENT;
+  }
 
   if (input.memoryPlan?.intent === 'explicit_recall') {
     return NONE_REQUIREMENT;

@@ -40,6 +40,9 @@ import {
   buildCardContent,
   buildPostContent,
   buildStreamingContent,
+  buildStreamingTypewriterContent,
+  getStreamingCurrentStep,
+  extractStreamingFinalResponse,
   buildFinalCardJson,
   buildPermissionButtonCard,
   formatElapsed,
@@ -57,10 +60,118 @@ type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'st
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
+const FEISHU_REACTION_ALIASES: Record<string, string> = {
+  牛: 'BULL',
+  bull: 'BULL',
+  BULL: 'BULL',
+  赞: 'THUMBSUP',
+  like: 'THUMBSUP',
+  thumbs_up: 'THUMBSUP',
+  THUMBSUP: 'THUMBSUP',
+  '+1': 'THUMBSUP',
+  ok: 'OK',
+  OK: 'OK',
+  微笑: 'SMILE',
+  笑: 'SMILE',
+  smile: 'SMILE',
+  大笑: 'LAUGH',
+  laugh: 'LAUGH',
+  脸红: 'BLUSH',
+  blush: 'BLUSH',
+  思考: 'THINKING',
+  thinking: 'THINKING',
+  眼睛: 'EYES',
+  eyes: 'EYES',
+  爱心: 'LOVE',
+  love: 'LOVE',
+  heart: 'LOVE',
+  火: 'FIRE',
+  fire: 'FIRE',
+  完成: 'DONE',
+  done: 'DONE',
+  check: 'DONE',
+};
+
+const FEISHU_REACTION_FALLBACK_EMOJI: Record<string, string> = {
+  SMILE: '\u{1F642}',
+  THUMBSUP: '\u{1F44D}',
+  OK: '\u{1F44C}',
+  LAUGH: '\u{1F602}',
+  BLUSH: '\u{1F60A}',
+  THINKING: '\u{1F914}',
+  EYES: '\u{1F440}',
+  LOVE: '\u2764\uFE0F',
+  FIRE: '\u{1F525}',
+  DONE: '\u2705',
+  BULL: '\u{1F44D}',
+};
+
+interface FeishuReactionHint {
+  raw: string;
+  emojiType: string;
+  remainingText: string;
+  fallbackEmoji?: string;
+}
+
+interface FeishuStickerHint {
+  raw: string;
+  target: string;
+  remainingText: string;
+}
+
+function extractFeishuReactionHint(text: string): FeishuReactionHint | null {
+  const match = /^\s*\[([^\]\r\n]{1,40})\]\s*([\s\S]*)$/u.exec(text || '');
+  if (!match) return null;
+  const raw = match[1].trim();
+  if (/^(?:表情包|sticker|飞书表情包)(?::|：|$)/iu.test(raw)) return null;
+  const alias = FEISHU_REACTION_ALIASES[raw] || FEISHU_REACTION_ALIASES[raw.toLowerCase()];
+  if (alias) {
+    return {
+      raw,
+      emojiType: alias,
+      remainingText: match[2].trimStart(),
+      fallbackEmoji: FEISHU_REACTION_FALLBACK_EMOJI[alias],
+    };
+  }
+  if (/^[A-Za-z0-9_+-]{1,40}$/.test(raw)) return { raw, emojiType: raw.toUpperCase(), remainingText: match[2].trimStart() };
+  return null;
+}
+
+function extractFeishuStickerHint(text: string): FeishuStickerHint | null {
+  const match = /^\s*\[((?:表情包|sticker|飞书表情包)(?:(?:[:：])([^\]\r\n]{1,180}))?)\]\s*([\s\S]*)$/iu.exec(text || '');
+  if (!match) return null;
+  return {
+    raw: match[1].trim(),
+    target: (match[2] || '最近').trim(),
+    remainingText: match[3].trimStart(),
+  };
+}
+
+function looksLikeFeishuStickerFileKey(value: string): boolean {
+  const trimmed = value.trim();
+  return /^(?:file_v\d+_[A-Za-z0-9_-]+|[0-9a-f]{8}-[0-9a-f-]{20,})$/i.test(trimmed);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripFeishuReactionHintText(text: string, hint: FeishuReactionHint): string {
+  return hint.remainingText
+    || text.replace(new RegExp(`^\\s*\\[${escapeRegExp(hint.raw)}\\]\\s*`, 'u'), '').trim();
+}
+
+function applyReactionFallbackText(originalText: string, hint: FeishuReactionHint, textWithoutHint: string): string {
+  const body = textWithoutHint.trim();
+  if (!hint.fallbackEmoji) return originalText;
+  return `${hint.fallbackEmoji} ${body || '收到~'}`.trim();
+}
+
 /** State for an active CardKit v2 streaming card. */
 interface FeishuCardState {
   cardId: string;
   messageId: string;
+  sourceMessageId?: string;
   sequence: number;
   startTime: number;
   toolCalls: ToolCallInfo[];
@@ -68,6 +179,8 @@ interface FeishuCardState {
   pendingText: string | null;
   lastUpdateAt: number;
   throttleTimer: ReturnType<typeof setTimeout> | null;
+  typewriterTimer: ReturnType<typeof setTimeout> | null;
+  typewriterKey: string;
 }
 
 type FeishuCardKitCompat =
@@ -98,12 +211,57 @@ type FeishuCardKitCompat =
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
+const CARD_TYPEWRITER_INTERVAL_MS = 70;
+const CARD_TYPEWRITER_STEP_CHARS = 2;
 const P2P_POLL_INTERVAL_MS = 5000;
 const FEISHU_CHAT_INDEX_PATH = path.join(
   process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
   'data',
   'feishu-chat-index.json',
 );
+function getFeishuStickerStorePath(): string {
+  return path.join(
+    process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+    'data',
+    'feishu-stickers.json',
+  );
+}
+
+interface FeishuStickerRecord {
+  fileKey: string;
+  aliases: string[];
+  label?: string;
+  description?: string;
+  intent?: string;
+  tone?: string;
+  annotationConfidence?: number;
+  annotationUpdatedAt?: string;
+  learnedFromMessageId?: string;
+  chatId?: string;
+  userId?: string;
+  messageId?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  useCount: number;
+}
+
+interface FeishuStickerStore {
+  version: 1;
+  updatedAt: string;
+  stickers: FeishuStickerRecord[];
+}
+
+interface ParsedFeishuStickerContent {
+  fileKey: string | null;
+  text: string;
+  known: boolean;
+  messageKind: 'feishu_sticker_unknown' | 'feishu_sticker_known' | 'feishu_sticker_image';
+  imageAvailable?: boolean;
+  label?: string;
+  description?: string;
+  intent?: string;
+  tone?: string;
+}
 
 function formatBytesForDocument(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '未知';
@@ -226,6 +384,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private restClient: lark.Client | null = null;
   private seenMessageIds = new Map<string, boolean>();
   private botOpenId: string | null = null;
+  private botDisplayName: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
@@ -246,6 +405,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || process.env.CTI_FEISHU_STREAMING_CARD_ENABLED
       || 'true';
     return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+  }
+
+  getAssistantIdentity(): { displayName?: string; platform: string; appId?: string; botOpenId?: string } {
+    const store = getBridgeContext().store;
+    return {
+      displayName: this.botDisplayName || store.getSetting('bridge_feishu_bot_name') || store.getSetting('bridge_feishu_app_name') || undefined,
+      platform: 'Feishu',
+      appId: store.getSetting('bridge_feishu_app_id') || undefined,
+      botOpenId: this.botOpenId || undefined,
+    };
   }
 
   private async resolveChatDisplayName(chatId: string, fallbackChatType?: string): Promise<string> {
@@ -309,6 +478,210 @@ export class FeishuAdapter extends BaseChannelAdapter {
       lastMessageAt: createTime,
       lastSenderId: sender.sender_id?.open_id || sender.sender_id?.user_id || sender.sender_id?.union_id || '',
     });
+  }
+
+  private readStickerStore(): FeishuStickerStore {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(getFeishuStickerStorePath(), 'utf8')) as Partial<FeishuStickerStore>;
+      const stickers = Array.isArray(parsed.stickers) ? parsed.stickers.filter((item) => item?.fileKey) : [];
+      return {
+        version: 1,
+        updatedAt: parsed.updatedAt || '',
+        stickers: stickers.map((item) => this.sanitizeStickerRecord(item as FeishuStickerRecord)),
+      };
+    } catch {
+      return { version: 1, updatedAt: '', stickers: [] };
+    }
+  }
+
+  private writeStickerStore(store: FeishuStickerStore): void {
+    const storePath = getFeishuStickerStorePath();
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
+  }
+
+  private isUnsafeStickerSemanticText(value: unknown): boolean {
+    if (typeof value !== 'string') return false;
+    const text = value.trim();
+    if (!text) return false;
+    // cti-encoding-allow-start
+    return /\uFFFD|�|\?{3,}|锟|Ã|Â|鈥|鐚|鐤|琛ㄦ儏|鎰忔|鍚嶇О|璇皵/u.test(text);
+    // cti-encoding-allow-end
+  }
+
+  private sanitizeStickerRecord(record: FeishuStickerRecord): FeishuStickerRecord {
+    const cleaned: FeishuStickerRecord = { ...record };
+    for (const key of ['label', 'description', 'intent', 'tone'] as const) {
+      if (this.isUnsafeStickerSemanticText(cleaned[key])) delete cleaned[key];
+    }
+    cleaned.aliases = (Array.isArray(cleaned.aliases) ? cleaned.aliases : [])
+      .map((item) => String(item || '').trim())
+      .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
+      .slice(0, 20);
+    return cleaned;
+  }
+
+  private rememberSticker(input: {
+    fileKey: string;
+    chatId: string;
+    userId?: string;
+    messageId: string;
+    aliases?: string[];
+  }): void {
+    const fileKey = input.fileKey.trim();
+    if (!fileKey) return;
+    const now = new Date().toISOString();
+    const store = this.readStickerStore();
+    const aliases = new Set(['最近', '默认', '表情包', ...(input.aliases || [])].map((item) => item.trim()).filter(Boolean));
+    let record = store.stickers.find((item) => item.fileKey === fileKey);
+    if (!record) {
+      record = {
+        fileKey,
+        aliases: [],
+        chatId: input.chatId,
+        userId: input.userId,
+        messageId: input.messageId,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        useCount: 0,
+      };
+      store.stickers.push(record);
+    }
+    record.chatId = input.chatId;
+    record.userId = input.userId;
+    record.messageId = input.messageId;
+    record.lastSeenAt = now;
+    record.aliases = Array.from(new Set([...(record.aliases || []), ...aliases])).slice(0, 20);
+    store.stickers = store.stickers
+      .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
+      .slice(0, 80);
+    store.updatedAt = now;
+    try {
+      this.writeStickerStore(store);
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to persist sticker store:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private resolveStickerFileKey(target: string, chatId?: string): string | null {
+    const normalized = target.trim();
+    if (looksLikeFeishuStickerFileKey(normalized)) return normalized;
+    const store = this.readStickerStore();
+    const alias = normalized || '最近';
+    const byAlias = store.stickers
+      .filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase()))
+      .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
+        || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const fallback = store.stickers
+      .slice()
+      .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
+        || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    return (byAlias[0] || fallback[0])?.fileKey || null;
+  }
+
+  private markStickerUsed(fileKey: string): void {
+    const store = this.readStickerStore();
+    const record = store.stickers.find((item) => item.fileKey === fileKey);
+    if (!record) return;
+    record.useCount = (record.useCount || 0) + 1;
+    record.lastSeenAt = new Date().toISOString();
+    store.updatedAt = record.lastSeenAt;
+    try { this.writeStickerStore(store); } catch { /* best effort */ }
+  }
+
+  private extractStickerAnnotationFromText(text: string): Partial<FeishuStickerRecord> | null {
+    const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
+    if (!normalized || normalized.length > 240 || /^[/?#]/.test(normalized)) return null;
+    if (/[?？]$/.test(normalized)) return null;
+    const match = normalized.match(/(?:表情包|表情|sticker).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu)
+      || normalized.match(/(?:这个|刚才|上个|上一个|this|previous).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu);
+    if (!match) return null;
+    const value = match[1]?.trim().replace(/^["'“”‘’]+|["'“”‘’。.,，、]+$/g, '');
+    if (!value || value.length < 2) return null;
+    return {
+      label: value.length <= 24 ? value : undefined,
+      description: value,
+      intent: value,
+      tone: value.length <= 40 ? value : undefined,
+      annotationConfidence: 0.72,
+    };
+  }
+
+  private rememberStickerAnnotationFromText(input: {
+    chatId: string;
+    userId?: string;
+    messageId: string;
+    replyToMessageId?: string | null;
+    text: string;
+  }): boolean {
+    const annotation = this.extractStickerAnnotationFromText(input.text);
+    if (!annotation) return false;
+    const store = this.readStickerStore();
+    const now = new Date().toISOString();
+    const target = store.stickers.find((item) => input.replyToMessageId && item.messageId === input.replyToMessageId)
+      || store.stickers
+        .filter((item) => item.chatId === input.chatId && !this.hasStickerAnnotation(item))
+        .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))[0];
+    if (!target) return false;
+    const lastSeen = Date.parse(target.lastSeenAt || '');
+    if (Number.isFinite(lastSeen) && Date.now() - lastSeen > 10 * 60 * 1000 && !input.replyToMessageId) return false;
+    target.label = annotation.label || target.label;
+    target.description = annotation.description || target.description;
+    target.intent = annotation.intent || target.intent;
+    target.tone = annotation.tone || target.tone;
+    target.annotationConfidence = annotation.annotationConfidence;
+    target.annotationUpdatedAt = now;
+    target.learnedFromMessageId = input.messageId;
+    target.lastSeenAt = now;
+    target.userId = input.userId || target.userId;
+    const aliasSource = [target.label, target.intent, target.description]
+      .filter((item): item is string => !!item?.trim())
+      .flatMap((item) => item.split(/[，,、;；\s]+/).map((part) => part.trim()).filter((part) => part.length >= 2 && part.length <= 24));
+    target.aliases = Array.from(new Set([...(target.aliases || []), ...aliasSource])).slice(0, 20);
+    store.updatedAt = now;
+    try {
+      this.writeStickerStore(store);
+      return true;
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to persist sticker annotation:', err instanceof Error ? err.message : err);
+      return false;
+    }
+  }
+
+  private getStickerRecord(fileKey: string | null): FeishuStickerRecord | null {
+    if (!fileKey) return null;
+    return this.readStickerStore().stickers.find((item) => item.fileKey === fileKey) || null;
+  }
+
+  private hasStickerAnnotation(record: FeishuStickerRecord | null): boolean {
+    return !!record && Boolean(
+      record.label?.trim()
+      || record.description?.trim()
+      || record.intent?.trim()
+      || record.tone?.trim(),
+    );
+  }
+
+  private buildStickerSemanticText(fileKey: string | null, record: FeishuStickerRecord | null): string {
+    const keyPart = fileKey ? `，file_key=${fileKey}` : '';
+    if (record && this.hasStickerAnnotation(record)) {
+      const parts = [
+        record.label?.trim() ? `图案/名称：${record.label.trim()}` : '',
+        record.description?.trim() ? `描述：${record.description.trim()}` : '',
+        record.intent?.trim() ? `通常意图：${record.intent.trim()}` : '',
+        record.tone?.trim() ? `语气：${record.tone.trim()}` : '',
+      ].filter(Boolean).join('；');
+      return [
+        `用户发送了一个已记录语义的飞书表情包${keyPart}。`,
+        `表情包语义：${parts}。`,
+        '请按上述语义理解用户意图；不要把 file_key 当成图像内容。'
+      ].join('\n');
+    }
+    return [
+      `用户发送了一个尚未标注语义的飞书表情包${keyPart}。`,
+      '飞书事件只提供 file_key，且不支持机器人下载表情包图片；当前不能可靠识别图案、文字和意图。',
+      '请不要凭 file_key 猜测含义。若用户正在用表情表达态度，只能把它视为未知表情包；可以请用户说明这个表情包代表什么，以便后续记录。'
+    ].join('\n');
   }
 
   private getPreferredPrivateUserId(sender: FeishuMessageEventData['sender']): string {
@@ -640,12 +1013,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
             print_step: { default: 1, pc: 1, android: 1, ios: 1 },
           },
           wide_screen_mode: true,
-          summary: { content: '处理中...' },
+          summary: { content: '正在思考' },
         },
         body: {
           elements: [{
             tag: 'markdown',
-            content: '### 处理进度\n- 已收到请求，正在进入执行链。',
+            content: buildStreamingContent('', []),
             text_align: 'left',
             text_size: 'normal',
             element_id: 'streaming_content',
@@ -689,6 +1062,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       this.activeCards.set(chatId, {
         cardId,
         messageId,
+        sourceMessageId: replyToMessageId,
         sequence: 0,
         startTime: Date.now(),
         toolCalls: [],
@@ -696,6 +1070,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
         pendingText: null,
         lastUpdateAt: 0,
         throttleTimer: null,
+        typewriterTimer: null,
+        typewriterKey: '',
       });
 
       console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
@@ -746,7 +1122,40 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
 
-    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    const sourceText = state.pendingText || '';
+    const currentStep = getStreamingCurrentStep(sourceText, state.toolCalls);
+    const toolKey = state.toolCalls.map((tool) => `${tool.id}:${tool.name}:${tool.status}`).join('|');
+    const typewriterKey = `${currentStep}\u0000${toolKey}`;
+    if (state.typewriterKey === typewriterKey && state.typewriterTimer) return;
+
+    if (state.typewriterTimer) {
+      clearTimeout(state.typewriterTimer);
+      state.typewriterTimer = null;
+    }
+    state.typewriterKey = typewriterKey;
+
+    const totalChars = [...currentStep].length;
+    const runTypewriter = (visibleChars: number) => {
+      const latest = this.activeCards.get(chatId);
+      if (!latest || latest.typewriterKey !== typewriterKey) return;
+      const content = buildStreamingTypewriterContent(sourceText, latest.toolCalls, visibleChars);
+      this.flushCardContent(chatId, content);
+      if (visibleChars < totalChars) {
+        latest.typewriterTimer = setTimeout(
+          () => runTypewriter(Math.min(totalChars, visibleChars + CARD_TYPEWRITER_STEP_CHARS)),
+          CARD_TYPEWRITER_INTERVAL_MS,
+        );
+      } else {
+        latest.typewriterTimer = null;
+      }
+    };
+
+    runTypewriter(0);
+  }
+
+  private flushCardContent(chatId: string, content: string): void {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient) return;
 
     state.sequence++;
     const seq = state.sequence;
@@ -798,6 +1207,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       clearTimeout(state.throttleTimer);
       state.throttleTimer = null;
     }
+    if (state.typewriterTimer) {
+      clearTimeout(state.typewriterTimer);
+      state.typewriterTimer = null;
+    }
 
     try {
       const cardKit = this.getCardKitCompat();
@@ -811,7 +1224,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const statusLabels: Record<string, string> = {
         completed: '已完成',
         interrupted: '已中断',
-        error: '执行失败',
+        error: '未完成',
       };
       const elapsedMs = Date.now() - state.startTime;
       const footer = {
@@ -819,7 +1232,31 @@ export class FeishuAdapter extends BaseChannelAdapter {
         elapsed: formatElapsed(elapsedMs),
       };
 
-      const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
+      let finalResponseText = responseText;
+      const visibleFinalText = extractStreamingFinalResponse(responseText);
+      const stickerHint = extractFeishuStickerHint(visibleFinalText);
+      if (stickerHint) {
+        const fileKey = this.resolveStickerFileKey(stickerHint.target, chatId);
+        if (fileKey) {
+          const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId);
+          if (stickerResult.ok) {
+            finalResponseText = stickerHint.remainingText || '收到~';
+          }
+        }
+      }
+      const reactionHint = extractFeishuReactionHint(visibleFinalText);
+      if (!stickerHint && reactionHint) {
+        const textWithoutHint = stripFeishuReactionHintText(visibleFinalText, reactionHint);
+        const reactionAdded = state.sourceMessageId
+          ? await this.addMessageReaction(state.sourceMessageId, reactionHint.emojiType)
+          : false;
+        if (reactionAdded) {
+          finalResponseText = textWithoutHint || '收到~';
+        } else {
+          finalResponseText = applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
+        }
+      }
+      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer);
 
       state.sequence++;
       await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
@@ -843,6 +1280,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!state) return;
     if (state.throttleTimer) {
       clearTimeout(state.throttleTimer);
+    }
+    if (state.typewriterTimer) {
+      clearTimeout(state.typewriterTimer);
     }
     this.activeCards.delete(chatId);
   }
@@ -975,6 +1415,38 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     let text = message.text;
+    const stickerHint = (
+      !message.feishuCardJson
+      && (!message.inlineButtons || message.inlineButtons.length === 0)
+      && message.parseMode !== 'HTML'
+    ) ? extractFeishuStickerHint(text) : null;
+    if (stickerHint) {
+      const fileKey = this.resolveStickerFileKey(stickerHint.target, message.address.chatId);
+      if (fileKey) {
+        const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId);
+        if (stickerResult.ok) {
+          text = stickerHint.remainingText;
+          if (!text.trim()) return stickerResult;
+        }
+      }
+    }
+    const reactionHint = (
+      !message.feishuCardJson
+      && (!message.inlineButtons || message.inlineButtons.length === 0)
+      && message.parseMode !== 'HTML'
+    ) ? extractFeishuReactionHint(text) : null;
+
+    if (reactionHint) {
+      const textWithoutHint = stripFeishuReactionHintText(text, reactionHint);
+      const reactionAdded = message.replyToMessageId
+        ? await this.addMessageReaction(message.replyToMessageId, reactionHint.emojiType)
+        : false;
+      if (reactionAdded) {
+        text = textWithoutHint || '收到~';
+      } else {
+        text = applyReactionFallbackText(text, reactionHint, textWithoutHint);
+      }
+    }
 
     // Convert HTML to markdown for Feishu rendering (e.g. command responses)
     if (message.parseMode === 'HTML') {
@@ -1028,6 +1500,51 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Plain text send failed:', JSON.stringify({ chatId: message.address.chatId, error: result.error }));
     }
     return result;
+  }
+
+  private async addMessageReaction(messageId: string, emojiType: string): Promise<boolean> {
+    try {
+      const res = await this.restClient!.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      return Boolean((res as any)?.data?.reaction_id) || !((res as any)?.code);
+    } catch (err) {
+      const code = (err as { code?: number })?.code;
+      if (code !== 99991400 && code !== 99991403) {
+        console.warn('[feishu-adapter] Message reaction failed:', err instanceof Error ? err.message : err);
+      }
+      return false;
+    }
+  }
+
+  private async sendStickerMessage(chatId: string, fileKey: string, replyToMessageId?: string): Promise<SendResult> {
+    try {
+      const content = JSON.stringify({ file_key: fileKey });
+      const res = replyToMessageId
+        ? await this.restClient!.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { msg_type: 'sticker', content },
+        })
+        : await this.restClient!.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'sticker',
+            content,
+          },
+        });
+      if (res?.data?.message_id) {
+        this.markStickerUsed(fileKey);
+        return { ok: true, messageId: res.data.message_id };
+      }
+      return { ok: false, error: res?.msg || 'Feishu sticker send failed' };
+    } catch (err) {
+      if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
+        return this.sendStickerMessage(chatId, fileKey);
+      }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   private async sendRawInteractiveCard(
@@ -1409,14 +1926,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Track last message ID per chat for typing indicator
     this.lastIncomingMessageId.set(chatId, msg.message_id);
+    const replyTargetMessageId = this.getReplyTargetMessageId(msg);
 
     // Extract content based on message type
     const messageType = msg.message_type;
     let text = '';
     const attachments: FileAttachment[] = [];
+    let stickerInfo: ParsedFeishuStickerContent | null = null;
 
     if (messageType === 'text') {
       text = this.parseTextContent(msg.content);
+      this.rememberStickerAnnotationFromText({
+        chatId,
+        userId,
+        messageId: msg.message_id,
+        replyToMessageId: replyTargetMessageId,
+        text,
+      });
     } else if (messageType === 'image') {
       // [P1] Download image with failure fallback
       console.log('[feishu-adapter] Image message received, content:', msg.content);
@@ -1461,6 +1987,25 @@ export class FeishuAdapter extends BaseChannelAdapter {
             });
           } catch { /* best effort */ }
         }
+      }
+    } else if (messageType === 'sticker') {
+      stickerInfo = this.parseStickerContent(msg.content);
+      text = stickerInfo.text;
+      if (stickerInfo.fileKey) {
+        const stickerFileKey = stickerInfo.fileKey;
+        const attachment = await this.downloadResource(msg.message_id, stickerFileKey, 'image');
+        if (attachment) {
+          attachment.name = `sticker-${stickerFileKey}.png`;
+          attachments.push(attachment);
+          stickerInfo = this.withStickerImageContext(stickerInfo);
+          text = stickerInfo.text;
+        }
+        this.rememberSticker({
+          fileKey: stickerFileKey,
+          chatId,
+          userId,
+          messageId: msg.message_id,
+        });
       }
     } else if (messageType === 'post') {
       // [P2] Extract text and image keys from rich text (post) messages
@@ -1507,8 +2052,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
         unionId: sender.sender_id?.union_id,
         chatType: msg.chat_type,
       },
+      ...(stickerInfo ? { sticker: stickerInfo } : {}),
+      ...(stickerInfo ? { messageKind: stickerInfo.messageKind } : {}),
     };
-    const replyTargetMessageId = this.getReplyTargetMessageId(msg);
     if (replyTargetMessageId) {
       rawMetadata = {
         ...(rawMetadata || {}),
@@ -1593,6 +2139,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       messageId: msg.message_id,
       address,
       text: text.trim(),
+      messageKind: stickerInfo?.messageKind,
       timestamp,
       raw: rawMetadata,
       attachments: attachments.length > 0 ? attachments : undefined,
@@ -1637,6 +2184,40 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch {
       return null;
     }
+  }
+
+  private parseStickerContent(content: string): ParsedFeishuStickerContent {
+    const fileKey = this.extractFileKey(content);
+    const record = this.getStickerRecord(fileKey);
+    return {
+      fileKey,
+      text: this.buildStickerSemanticText(fileKey, record),
+      known: this.hasStickerAnnotation(record),
+      messageKind: this.hasStickerAnnotation(record) ? 'feishu_sticker_known' : 'feishu_sticker_unknown',
+      label: record?.label,
+      description: record?.description,
+      intent: record?.intent,
+      tone: record?.tone,
+    };
+  }
+
+  private withStickerImageContext(stickerInfo: ParsedFeishuStickerContent): ParsedFeishuStickerContent {
+    const parts = [
+      stickerInfo.label?.trim() ? `历史名称：${stickerInfo.label.trim()}` : '',
+      stickerInfo.description?.trim() ? `历史描述：${stickerInfo.description.trim()}` : '',
+      stickerInfo.intent?.trim() ? `历史意图：${stickerInfo.intent.trim()}` : '',
+      stickerInfo.tone?.trim() ? `历史语气：${stickerInfo.tone.trim()}` : '',
+    ].filter(Boolean).join('；');
+    return {
+      ...stickerInfo,
+      imageAvailable: true,
+      messageKind: 'feishu_sticker_image',
+      text: [
+        `用户发送了一个飞书表情包，file_key=${stickerInfo.fileKey || 'unknown'}，表情包图片已作为本轮图片附件提供给模型。`,
+        parts ? `已有语义档案可作为参考：${parts}。` : '',
+        '请先根据图片附件识别图案、文字和表达意图；不要只凭 file_key 猜测。若图片无法识别，再说明不确定并可请用户补充含义。',
+      ].filter(Boolean).join('\n'),
+    };
   }
 
   /**
@@ -3339,13 +3920,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
         signal: AbortSignal.timeout(10_000),
       });
       const botData: any = await botRes.json();
-      if (botData?.bot?.open_id) {
-        this.botOpenId = botData.bot.open_id;
-        this.botIds.add(botData.bot.open_id);
+      const botInfo = botData?.data?.bot || botData?.bot || botData?.data || {};
+      const displayName = [
+        botInfo.name,
+        botInfo.app_name,
+        botInfo.i18n_name?.zh_cn,
+        botInfo.i18n_name?.en_us,
+        botInfo.bot_name,
+        botData?.data?.app_name,
+        botData?.app_name,
+      ].map((item) => typeof item === 'string' ? item.trim() : '').find(Boolean);
+      if (displayName) {
+        this.botDisplayName = displayName;
+      }
+      const openId = botInfo.open_id || botInfo.openId || botData?.bot?.open_id;
+      if (openId) {
+        this.botOpenId = String(openId);
+        this.botIds.add(String(openId));
       }
       // Also record app_id-based IDs if available
-      if (botData?.bot?.bot_id) {
-        this.botIds.add(botData.bot.bot_id);
+      const botId = botInfo.bot_id || botInfo.botId || botData?.bot?.bot_id;
+      if (botId) {
+        this.botIds.add(String(botId));
       }
       if (!this.botOpenId) {
         console.warn('[feishu-adapter] Could not resolve bot open_id');

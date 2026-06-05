@@ -1,54 +1,90 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { scanSourceEncoding } from '../source-encoding.js';
+
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(currentDir, '..', '..', '..', '..');
 
-const scannedFiles = [
-  'packages/bridge-core/src/lib/bridge/markdown/feishu.ts',
-  'packages/bridge-core/src/lib/bridge/adapters/feishu-adapter.ts',
-  'packages/bridge-core/src/lib/bridge/bridge-manager.ts',
-  'packages/bridge-core/src/lib/bridge/conversation-engine.ts',
-  'packages/bridge-runtime/src/local-agent-tool-protocol.ts',
-  'packages/bridge-runtime/src/codex-local-cli-provider.ts',
-  'packages/bridge-runtime/src/codex-provider.ts',
-  'apps/control-panel/web/src/main.tsx',
-  'apps/control-panel/Program.cs',
+const sourceIncludePaths = [
+  'packages/bridge-core/src/lib',
+  'packages/bridge-runtime/src',
+  'apps/control-panel',
+  'scripts',
 ];
 
-const suspiciousCodePoints = new Set([
-  0xfffd, // replacement character
-  0x20ac, // €
-  0x9239, // 鈹
-  0x9365, // 鍥
-  0x93c4, // 鏄
-  0x951b, // 锛
-  0x7039, // 瀹
-  0x95c6, // 閆
-  0x6b55, // 歕
-]);
-
-function stripAllowedMojibakeDetectorSamples(file: string, text: string): string {
-  if (!file.endsWith('apps/control-panel/Program.cs')) return text;
-  return text.replace(/private static int MojibakeScore\(string text\)[\s\S]*?private static string\? TryRepairUtf8ReadAsGbk/u, 'private static string? TryRepairUtf8ReadAsGbk');
-}
-
 describe('source encoding hygiene', () => {
-  it('keeps user-visible bridge reply/card source free of mojibake markers', () => {
-    const hits: string[] = [];
-    for (const relativePath of scannedFiles) {
-      const absolutePath = path.join(repoRoot, relativePath);
-      const text = stripAllowedMojibakeDetectorSamples(relativePath, fs.readFileSync(absolutePath, 'utf8'));
-      for (let index = 0; index < text.length; index += 1) {
-        if (!suspiciousCodePoints.has(text.charCodeAt(index))) continue;
-        const line = text.slice(0, index).split(/\n/u).length;
-        hits.push(`${relativePath}:${line}`);
-        break;
+  it('keeps user-visible bridge/runtime/control-panel sources free of mojibake markers', () => {
+    const issues = scanSourceEncoding({
+      rootDir: repoRoot,
+      includePaths: sourceIncludePaths,
+    });
+
+    assert.deepEqual(issues, []);
+  });
+
+  it('does not keep temporary disabled branches in bridge/runtime sources', () => {
+    const checkedFiles: string[] = [];
+    const visit = (absolutePath: string) => {
+      const stat = fs.statSync(absolutePath);
+      if (stat.isDirectory()) {
+        if (['__tests__', 'dist', 'node_modules'].includes(path.basename(absolutePath))) return;
+        for (const entry of fs.readdirSync(absolutePath)) visit(path.join(absolutePath, entry));
+        return;
       }
-    }
+      if (!/\.(?:ts|tsx)$/i.test(absolutePath)) return;
+      checkedFiles.push(absolutePath);
+    };
+    visit(path.join(repoRoot, 'packages/bridge-core/src/lib'));
+    visit(path.join(repoRoot, 'packages/bridge-runtime/src'));
+
+    const hits = checkedFiles
+      .map((file) => ({
+        file: path.relative(repoRoot, file).replace(/\\/g, '/'),
+        text: fs.readFileSync(file, 'utf8'),
+      }))
+      .filter((item) => /\bif\s*\(\s*false\s*&&/u.test(item.text))
+      .map((item) => item.file);
+
     assert.deepEqual(hits, []);
+  });
+
+  it('detects common encoding regressions and respects explicit allow blocks', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-source-encoding-'));
+    const sampleDir = path.join(root, 'src');
+    fs.mkdirSync(sampleDir, { recursive: true });
+
+    try {
+      fs.writeFileSync(path.join(sampleDir, 'bom.ts'), Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from('export const value = 1;\n')]));
+      fs.writeFileSync(path.join(sampleDir, 'replacement.ts'), `export const text = "broken ${String.fromCharCode(0xfffd)}";\n`, 'utf8');
+      fs.writeFileSync(path.join(sampleDir, 'question.ts'), 'export const text = "????????";\n', 'utf8');
+      fs.writeFileSync(path.join(sampleDir, 'mojibake.ts'), `export const text = "${String.fromCharCode(0x9358, 0x56e7)}";\n`, 'utf8');
+      fs.writeFileSync(path.join(sampleDir, 'allowed.ts'), [
+        '// cti-encoding-allow-start',
+        `export const detectorSample = "${String.fromCharCode(0x9358, 0x56e7)}";`,
+        '// cti-encoding-allow-end',
+      ].join('\n'), 'utf8');
+
+      const issues = scanSourceEncoding({
+        rootDir: root,
+        includePaths: ['src'],
+      });
+
+      assert.deepEqual(
+        issues.map((issue) => `${issue.file}:${issue.kind}`).sort(),
+        [
+          'src/bom.ts:utf8-bom',
+          'src/mojibake.ts:mojibake-token',
+          'src/question.ts:long-question-run',
+          'src/replacement.ts:replacement-character',
+        ],
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

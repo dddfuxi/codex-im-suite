@@ -84,6 +84,36 @@ describe('execution requirement classifier', () => {
     assert.equal(requirement.kind, 'none');
   });
 
+  it('does not require tool evidence for Feishu sticker semantic events', () => {
+    const unknown = classifyExecutionRequirement({
+      userText: [
+        '用户发送了一个尚未标注语义的飞书表情包，file_key=v3_unknown。',
+        '飞书事件只提供 file_key，且不支持机器人下载表情包图片；当前不能可靠识别图案、文字和意图。',
+      ].join('\n'),
+      messageKind: 'feishu_sticker_unknown',
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+    });
+    assert.equal(unknown.kind, 'none');
+
+    const known = classifyExecutionRequirement({
+      userText: [
+        '用户发送了一个已记录语义的飞书表情包，file_key=v3_known。',
+        '表情包语义：图案/名称：称赞表情；通常意图：表达称赞、认可。',
+      ].join('\n'),
+      messageKind: 'feishu_sticker_known',
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+    });
+    assert.equal(known.kind, 'none');
+
+    const imageBacked = classifyExecutionRequirement({
+      userText: '用户发送了一个飞书表情包，file_key=v3_image，表情包图片已作为本轮图片附件提供给模型。',
+      messageKind: 'feishu_sticker_image',
+      files: [{ id: 'img', name: 'sticker.png', type: 'image/png', size: 4, data: 'AAAA' }],
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+    });
+    assert.equal(imageBacked.kind, 'none');
+  });
+
   it('requires tool evidence for current Unity scene object inspection even when asking for names', () => {
     const requirement = classifyExecutionRequirement({
       userText: 'unity场景里找有相机组件的物体\n总结成节点名称发我',

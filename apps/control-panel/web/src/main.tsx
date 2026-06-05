@@ -2489,20 +2489,24 @@ function OverviewPage({
       <section className="panel panel-span-2">
         <SectionHeader title="系统蓝图" />
         <p className="panel-intro">这张图按普通用户路径展示一次请求如何流转，专业诊断细节仍保留在各功能页。</p>
-        <InteractiveSystemBlueprint
-          nodes={systemBlueprint}
-          selectedNodeId={selectedBlueprintNode?.id ?? ''}
-          onSelect={setSelectedBlueprintNodeId}
-        />
-        {selectedBlueprintNode && (
-          <BlueprintActionPanel
-            node={selectedBlueprintNode}
-            runtimeUnits={runtimeUnits}
-            onRunAction={(action) => void runBlueprintAction(action)}
-            onNavigate={navigate}
-            pending={pending}
-          />
-        )}
+        <div className="blueprint-board">
+          <div className="blueprint-stream">
+            <InteractiveSystemBlueprint
+              nodes={systemBlueprint}
+              selectedNodeId={selectedBlueprintNode?.id ?? ''}
+              onSelect={setSelectedBlueprintNodeId}
+            />
+          </div>
+          {selectedBlueprintNode && (
+            <BlueprintActionPanel
+              node={selectedBlueprintNode}
+              runtimeUnits={runtimeUnits}
+              onRunAction={(action) => void runBlueprintAction(action)}
+              onNavigate={navigate}
+              pending={pending}
+            />
+          )}
+        </div>
       </section>
       <section className="metric-strip">
         <Metric label="扩展启用" value={`${state.extensions.enabled}/${state.extensions.total}`} />
@@ -2559,6 +2563,22 @@ function uniqueBlueprintActions(actions: BlueprintAction[]) {
     seen.add(key);
     return true;
   });
+}
+
+type BlueprintActionBucket = 'jump' | 'refresh' | 'process';
+
+function classifyBlueprintAction(action: BlueprintAction): BlueprintActionBucket {
+  if (action.kind === 'navigate') return 'jump';
+  const token = `${action.label} ${action.actionId ?? ''} ${action.command ?? ''} ${action.description ?? ''}`.toLowerCase();
+  if (action.actionId === 'openLocation') return 'jump';
+  if (/(check|status|refresh|reload|sync|update)/.test(token)) return 'refresh';
+  return 'process';
+}
+
+function blueprintBucketLabel(bucket: BlueprintActionBucket) {
+  if (bucket === 'jump') return '跳转';
+  if (bucket === 'refresh') return '刷新';
+  return '处理';
 }
 
 function InteractiveSystemBlueprint({
@@ -2624,12 +2644,17 @@ function BlueprintActionPanel({
   onNavigate: (targetPage: PageId, targetUnitId?: string) => void;
   pending: Record<string, boolean>;
 }) {
-  const actions = uniqueBlueprintActions([
-    ...(node.primaryAction ? [node.primaryAction] : []),
-    ...(node.secondaryActions ?? []),
-  ]);
   const primaryKey = node.primaryAction ? blueprintActionKey(node.primaryAction) : '';
   const busy = pending['runtime.invokeAction'] || pending['state.refresh'] || pending['memory.status'] || pending['memory.checkReminders'];
+  const secondaryActions = uniqueBlueprintActions(node.secondaryActions ?? []).filter((action) => blueprintActionKey(action) !== primaryKey);
+  const groupedActions = secondaryActions.reduce<Record<BlueprintActionBucket, BlueprintAction[]>>(
+    (groups, action) => {
+      const bucket = classifyBlueprintAction(action);
+      groups[bucket].push(action);
+      return groups;
+    },
+    { jump: [], refresh: [], process: [] },
+  );
 
   return (
     <aside className={`blueprint-action-panel ${node.status}`}>
@@ -2638,21 +2663,50 @@ function BlueprintActionPanel({
         <strong>{userStatusLabel(node.status)}</strong>
         <p>{node.helpText || node.detail}</p>
       </div>
-      <div className="blueprint-action-buttons">
-        {actions.map((action) => {
-          const resolved = resolveBlueprintAction(action, runtimeUnits);
-          const isPrimary = primaryKey === blueprintActionKey(action);
+      <div className="blueprint-action-stack">
+        {node.primaryAction && (() => {
+          const resolved = resolveBlueprintAction(node.primaryAction, runtimeUnits);
           return (
-            <MiniButton
-              key={action.id}
-              label={action.label}
-              icon={actionIcon(action.kind === 'navigate' ? 'openLocation' : action.actionId || action.command || action.id)}
-              onClick={() => onRunAction(action)}
-              pending={busy && isPrimary}
-              disabled={!resolved.enabled}
-            />
+            <div className="blueprint-primary-action">
+              <MiniButton
+                label={node.primaryAction.label}
+                icon={actionIcon(node.primaryAction.kind === 'navigate' ? 'openLocation' : node.primaryAction.actionId || node.primaryAction.command || node.primaryAction.id)}
+                onClick={() => onRunAction(node.primaryAction!)}
+                pending={busy}
+                disabled={!resolved.enabled}
+                title={resolved.reason ? `${node.primaryAction.label}：${resolved.reason}` : node.primaryAction.label}
+              />
+              {resolved.reason && <small>{resolved.reason}</small>}
+            </div>
           );
-        })}
+        })()}
+        <div className="blueprint-action-groups">
+          {(['jump', 'refresh', 'process'] as BlueprintActionBucket[]).map((bucket) => {
+            const actions = groupedActions[bucket];
+            if (actions.length === 0) return null;
+            return (
+              <div key={bucket} className="blueprint-action-group">
+                <span>{blueprintBucketLabel(bucket)}</span>
+                <div className="blueprint-action-buttons">
+                  {actions.map((action) => {
+                    const resolved = resolveBlueprintAction(action, runtimeUnits);
+                    return (
+                      <MiniButton
+                        key={action.id}
+                        label={action.label}
+                        icon={actionIcon(action.kind === 'navigate' ? 'openLocation' : action.actionId || action.command || action.id)}
+                        onClick={() => onRunAction(action)}
+                        pending={busy && action.kind !== 'navigate'}
+                        disabled={!resolved.enabled}
+                        title={resolved.reason ? `${action.label}：${resolved.reason}` : action.label}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
         {node.targetPage && (
           <MiniButton
             label="查看详情"
@@ -5220,7 +5274,8 @@ function SettingsPage({
 
   const summarize = async () => {
     const result = await run('settings.summarizeReplyStyle', { text: requestText });
-    update('replyStyleHint', String(result ?? ''));
+    setSettings((current) => ({ ...current, replyStyleHint: String(result ?? '') }));
+    setSettingsDirty(false);
   };
 
   const testLocalAi = async () => {
@@ -5472,7 +5527,10 @@ function SettingsPage({
         </div>
       </section>
       <section className="panel">
-        <SectionHeader title="回复风格快捷设置" />
+        <SectionHeader
+          title="回复风格快捷设置"
+          action={<MiniButton label="保存自定义" icon={<CheckCircle2 size={14} />} onClick={() => void saveSettings(false)} pending={pending['settings.save']} />}
+        />
         <div className="preset-wall">
           <button className={!activePreset && settings.replyStyleHint.trim() ? 'preset-chip active' : 'preset-chip'} disabled>
             自定义
@@ -5489,7 +5547,10 @@ function SettingsPage({
         </label>
       </section>
       <section className="panel">
-        <SectionHeader title="自定义整理" />
+        <SectionHeader
+          title="自定义整理"
+          action={<MiniButton label="保存整理结果" icon={<CheckCircle2 size={14} />} onClick={() => void saveSettings(false)} pending={pending['settings.save']} />}
+        />
         <label className="stack-field">
           <span>原始要求</span>
           <textarea className="text-area compact" value={requestText} onChange={(event) => setRequestText(event.target.value)} placeholder="例如：回复像项目助理，先说结果，再说一句影响，不要解释思考过程。" />

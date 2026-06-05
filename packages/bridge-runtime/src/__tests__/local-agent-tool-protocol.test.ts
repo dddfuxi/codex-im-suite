@@ -351,6 +351,59 @@ describe('local agent JSON tool protocol', () => {
     assert.equal(mcpPlan?.request.args.tool, 'manage_camera');
     assert.equal(mcpPlan?.source, 'runtime_deterministic');
 
+    const prefabScreenshotPlan = planDeterministicJsonToolRequest('刚刚摆的prefab摆截图给我', {
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+      requirementKind: 'artifact_required',
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot',
+        match: {
+          regex: [
+            '(?:prefab|预制体|场景).*(?:截图|截个图|screenshot)',
+            '(?:截图|截个图|screenshot).*(?:prefab|预制体|场景)',
+          ],
+        },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot', capture_source: 'game_view', include_image: false },
+      }],
+    });
+    assert.equal(prefabScreenshotPlan?.request.tool, 'mcp_call');
+    assert.equal(prefabScreenshotPlan?.request.args.tool, 'manage_camera');
+
+    const shortUnityScreenshotPlan = planDeterministicJsonToolRequest('截个图给我', {
+      workingDirectory: 'C:\\unity\\ST3\\Game',
+      contextText: '当前绑定工作区：C:\\unity\\ST3\\Game\\Assets',
+      requirementKind: 'artifact_required',
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot.contextual',
+        match: {
+          contextualRegex: ['^(?:截(?:图|个图|一张)?|截图)(?:给我|一下|看看|吧|呗|\\s|[。！？!?.])*$'],
+          contextRegex: ['(?:^|[\\\\/])Assets(?:[\\\\/]|$)', 'Unity|unity|unitymcp'],
+        },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot', capture_source: 'game_view', include_image: false },
+      }],
+    });
+    assert.equal(shortUnityScreenshotPlan?.request.tool, 'mcp_call');
+
+    const shortNonUnityScreenshotPlan = planDeterministicJsonToolRequest('截个图给我', {
+      workingDirectory: 'C:\\Users\\admin\\Documents\\New project\\codex-im-suite',
+      contextText: '当前绑定工作区：C:\\Users\\admin\\Documents\\New project\\codex-im-suite',
+      requirementKind: 'artifact_required',
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot.contextual',
+        match: {
+          contextualRegex: ['^(?:截(?:图|个图|一张)?|截图)(?:给我|一下|看看|吧|呗|\\s|[。！？!?.])*$'],
+          contextRegex: ['(?:^|[\\\\/])Assets(?:[\\\\/]|$)', 'Unity|unity|unitymcp'],
+        },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot', capture_source: 'game_view', include_image: false },
+      }],
+    });
+    assert.equal(shortNonUnityScreenshotPlan, null);
+
     const artifactPlan = planDeterministicJsonToolRequest('截图一下桌面给我看看', {
       workingDirectory: 'C:\\unity\\ST3',
       requirementKind: 'artifact_required',
