@@ -171,6 +171,7 @@ export interface AnswerReviewInput {
     toolResultCount: number;
     successfulToolResultCount: number;
     failedToolResultCount: number;
+    failedToolErrors?: string[];
     toolNames: string[];
     permissionRequestCount: number;
     requiredEvidenceKind?: ExecutionRequirementKind;
@@ -578,6 +579,7 @@ export interface StreamChatParams {
     kind: ExecutionRequirementKind;
     reason: string;
     requiredToolFamilies: string[];
+    strictToolEvidence?: boolean;
   };
   noEvidenceRetryAttempted?: boolean;
 }

@@ -40,7 +40,11 @@ import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { formatVisibleToolName } from './markdown/feishu.js';
-import { classifyExecutionRequirement, isFeishuStickerMessageKind, type ExecutionRequirement } from './execution-requirement.js';
+import {
+  classifyExecutionRequirement,
+  isFeishuStickerMessageKind,
+  type ExecutionRequirement,
+} from './execution-requirement.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
@@ -1226,43 +1230,12 @@ function buildMemoryDecisionAgentPrompt(memoryDecision: MemoryReplyDecision): st
   return memoryDecision.systemPrompt || '';
 }
 
-function inferProgressEvidenceLabel(text: string): string {
-  if (/(截图|截屏|图片|生成物|文件|产物|artifact|screenshot|capture)/iu.test(text)) return '产物任务';
-  if (/(mcp|unity|命令|执行|运行|工具|切换|加载|创建|修改|删除|读取|搜索|检查)/iu.test(text)) return '工具任务';
-  return '';
-}
-
-function buildInitialProgressStep(userText: string, requirement: ExecutionRequirement): string {
-  const text = userText || '';
-  if (requirement.kind === 'local_read_required') {
-    return '看起来你要查本地资料，我先读取相关文件和目录。';
-  }
-  if (requirement.kind === 'artifact_required') {
-    if (/(unity|unitymcp|unity mcp|game\s*view|scene\s*view|场景)/iu.test(text)) {
-      return '看起来你要拿 Unity 画面或产物，我先调用对应工具获取真实结果。';
-    }
-    return '看起来你要生成或获取产物，我先调用对应工具拿到真实输出。';
-  }
-  if (requirement.kind === 'tool_required') {
-    if (/(unity|unitymcp|unity mcp|场景|节点|物体|对象|prefab)/iu.test(text)) {
-      return '看起来你要查 Unity 场景或对象，我先调用 Unity/MCP 获取真实信息。';
-    }
-    if (/(mcp|blender)/iu.test(text)) {
-      return '看起来你要使用外部工具，我先调用对应 MCP 获取真实结果。';
-    }
-    return '看起来这个请求需要实际执行，我先调用对应工具核对结果。';
-  }
-  return '正在根据这条消息整理可展示回复。';
-}
-
 type ReplySurfaceMode = 'workflow_card' | 'light_status' | 'direct_reply';
 
 interface ReplySurfaceModeInput {
   supportsStreamingCards: boolean;
   feishuDocRequest: boolean;
-  executionRequirement: ExecutionRequirement;
   messageKind?: string;
-  hasAttachments: boolean;
   hasMemoryProgress: boolean;
   textLength: number;
 }
@@ -1271,7 +1244,7 @@ function selectReplySurfaceMode(input: ReplySurfaceModeInput): ReplySurfaceMode 
   if (isFeishuStickerMessageKind(input.messageKind)) {
     return input.supportsStreamingCards ? 'light_status' : 'direct_reply';
   }
-  if (input.feishuDocRequest || input.executionRequirement.kind !== 'none' || input.hasMemoryProgress || input.hasAttachments) {
+  if (input.feishuDocRequest || input.hasMemoryProgress) {
     return input.supportsStreamingCards ? 'workflow_card' : 'direct_reply';
   }
   if (!input.supportsStreamingCards) return 'direct_reply';
@@ -1380,7 +1353,7 @@ function buildAdapterAssistantIdentityPrompt(adapter: BaseChannelAdapter, addres
       ? `- If the user asks who you are, asks for a self-introduction, or asks your name, answer that you are "${displayName}" in this chat. Do not replace that name with "Codex".`
       : '- If the user asks who you are, asks for a self-introduction, or asks your name, introduce yourself using the channel bot/app display name first when available. Do not lead with "Codex" as your name.',
     '- Mention Codex only when the user specifically asks about the underlying engine, implementation, or execution backend.',
-    '- For light chat, confirmations, greetings, and sticker reactions on Feishu, you may start the final reply with a native reaction hint or `[表情包:alias]` only when it matches the actual intent and improves the chat tone. Choose reaction hints by actual intent; do not default to SMILE, and use no hint when none fits.',
+    '- For light chat, confirmations, greetings, and sticker reactions on Feishu, you may start the final reply with a native reaction hint or sticker hint only when it matches the actual intent and improves the chat tone. Use `[表情包:alias]` only with aliases listed in the Feishu sticker library prompt; use bare `[表情包]` only when the user asks for any sticker or a different sticker and no listed alias fits. Choose reaction hints by actual intent; do not default to SMILE, and use no hint when none fits.',
     '- Do not put reaction or sticker hints on formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
     emojiPrompt,
     stickerPrompt,
@@ -1689,6 +1662,9 @@ function buildNoExecutionEvidenceReply(reason: string, evidence: ExecutionEviden
   if (evidence.toolNames.length > 0) {
     details.push(`工具：${evidence.toolNames.slice(0, 6).join('、')}`);
   }
+  if (evidence.failedToolErrors?.length) {
+    details.push(`失败原因：${evidence.failedToolErrors.slice(0, 3).join('；')}`);
+  }
   return appendReplyEndMarker(details.join('\n'));
 }
 
@@ -1698,6 +1674,7 @@ function verifyPreparedReplyExecution(
     userText: string;
     executionEvidence: ExecutionEvidence;
     executionRequirement: ExecutionRequirement;
+    messageKind?: string;
   },
 ): PreparedBridgeReplyPayload {
   const missingImages = payload.images.filter((item) => !existingLocalFile(item));
@@ -1729,7 +1706,7 @@ function verifyPreparedReplyExecution(
   }
 
   if (
-    context.executionRequirement.kind !== 'none'
+    !isFeishuStickerMessageKind(context.messageKind)
     && requiresExecutionEvidenceForReply(context.userText, payload.text)
     && context.executionEvidence.successfulToolResultCount <= 0
   ) {
@@ -4244,7 +4221,6 @@ async function handleMessage(
     memoryPlan: memoryReviewContext.memoryPlan,
     messageKind: inboundMessageKind,
   });
-
   if (directFeishuDocRequest && !directFeishuDocSourceMarkdown) {
     progressPulse?.stop();
     await deliver(adapter, {
@@ -4262,18 +4238,12 @@ async function handleMessage(
   const replySurfaceMode = selectReplySurfaceMode({
     supportsStreamingCards,
     feishuDocRequest: Boolean(feishuDocRequest),
-    executionRequirement: uiExecutionRequirement,
     messageKind: inboundMessageKind,
-    hasAttachments: Boolean(executionEvidenceAttachments?.length || recentConversationAttachments.length),
     hasMemoryProgress: preExecutionProgressSteps.length > 0,
     textLength: (text || rawText || '').length,
   });
   const hasStreamingCards = replySurfaceMode === 'workflow_card';
   const hasLightStatusCard = replySurfaceMode === 'light_status';
-  if (hasStreamingCards) {
-    // Notify adapter that message processing is starting only for full workflow cards.
-    startProcessingCard();
-  }
   let previewState: StreamingPreviewState | null = null;
   const caps = (feishuDocRequest || supportsStreamingCards) ? null : (adapter.getPreviewCapabilities?.(msg.address.chatId) ?? null);
   if (caps?.supported) {
@@ -4344,6 +4314,7 @@ async function handleMessage(
   let providerProgressText = '';
   let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
   let lightStatusCardStarted = false;
+  let workflowCardStarted = hasStreamingCards;
   const clearLightStatusTimer = () => {
     if (lightStatusTimer) {
       clearTimeout(lightStatusTimer);
@@ -4358,24 +4329,39 @@ async function handleMessage(
     }, 1200);
   }
 
-  const renderProgressCardText = (): string => {
-    const detail = sanitizeProgressCardDetail(providerProgressText);
-    return progressCardSteps[progressCardSteps.length - 1] || detail || '正在根据这条消息判断下一步。';
+  const ensureWorkflowCard = (): boolean => {
+    if (isFeishuStickerMessageKind(inboundMessageKind)) return false;
+    if (!supportsStreamingCards || typeof adapter.onStreamText !== 'function') return false;
+    clearLightStatusTimer();
+    if (!workflowCardStarted) {
+      workflowCardStarted = true;
+      startProcessingCard();
+    }
+    return true;
   };
 
-  const emitProgressCardStep = hasStreamingCards ? (step: string) => {
+  const renderProgressCardText = (): string => {
+    const detail = sanitizeProgressCardDetail(providerProgressText);
+    return progressCardSteps[progressCardSteps.length - 1] || detail || '正在处理当前请求。';
+  };
+
+  const emitProgressCardStep = supportsStreamingCards ? (step: string) => {
     const normalized = step.replace(/\s+/g, ' ').trim();
     if (!normalized) return;
+    if (!ensureWorkflowCard()) return;
     if (progressCardSteps[progressCardSteps.length - 1] !== normalized) progressCardSteps.push(normalized);
     try { adapter.onStreamText!(msg.address.chatId, renderProgressCardText()); } catch { /* non-critical */ }
   } : undefined;
 
-  const onStreamCardText = hasStreamingCards ? (fullText: string) => {
+  const onStreamCardText = supportsStreamingCards ? (fullText: string) => {
     providerProgressText = fullText;
+    if (!sanitizeProgressCardDetail(providerProgressText)) return;
+    if (!ensureWorkflowCard()) return;
     try { adapter.onStreamText!(msg.address.chatId, renderProgressCardText()); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+  const onToolEvent = supportsStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+    if (!ensureWorkflowCard()) return;
     if (toolName) {
       toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
     } else {
@@ -4387,6 +4373,8 @@ async function handleMessage(
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
     } catch { /* non-critical */ }
     const visibleToolName = formatVisibleToolName(toolName || toolCallTracker.get(toolId)?.name || '') || '工具';
+    const providerDetail = sanitizeProgressCardDetail(providerProgressText);
+    if (providerDetail && /^(?:MCP 工具执行|工具执行)$/u.test(visibleToolName)) return;
     const statusText = status === 'running' ? '正在执行' : status === 'complete' ? '已返回结果' : '执行失败';
     emitProgressCardStep?.(`${visibleToolName} ${statusText}。`);
   } : undefined;
@@ -4398,10 +4386,6 @@ async function handleMessage(
   } : undefined;
 
   for (const step of preExecutionProgressSteps) emitProgressCardStep?.(step);
-  const isExplicitMemoryRecall = memoryReviewContext.memoryPlan?.intent === 'explicit_recall';
-  if (hasStreamingCards && !isExplicitMemoryRecall && !isFeishuStickerMessageKind(inboundMessageKind) && inferProgressEvidenceLabel(rawText)) {
-    emitProgressCardStep?.(`识别为${inferProgressEvidenceLabel(rawText)}，需要结合真实执行证据。`);
-  }
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
@@ -4485,8 +4469,8 @@ async function handleMessage(
     const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
       ? buildFeishuCloudResolvedPrompt(rawText, feishuCloudSystemPrompt)
       : basePromptText;
-    emitProgressCardStep?.(buildInitialProgressStep(rawText, uiExecutionRequirement));
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
+      emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
         permissionType: perm.toolName,
@@ -4502,7 +4486,7 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, providerAttachments, onPartialText, onToolEvent, {
+    }, taskAbort.signal, providerAttachments, onPartialText, onStreamCardText, onToolEvent, {
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
       memoryMode: providerMemoryMode,
@@ -4514,7 +4498,9 @@ async function handleMessage(
       messageKind: inboundMessageKind,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
-    emitProgressCardStep?.('agent 已返回内容，正在核对证据和可展示结果。');
+    if (workflowCardStarted) {
+      emitProgressCardStep?.('agent 已返回内容，正在核对证据和可展示结果。');
+    }
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
     const responseText = result.responseText
@@ -4528,9 +4514,12 @@ async function handleMessage(
         userText: rawText,
         executionEvidence: result.executionEvidence,
         executionRequirement: uiExecutionRequirement,
+        messageKind: inboundMessageKind,
       });
     }
-    emitProgressCardStep?.('正在整理为最终回复。');
+    if (workflowCardStarted) {
+      emitProgressCardStep?.('正在整理为最终回复。');
+    }
     const userFacingResponseText = preparedReply?.text
       ? applyOutboundAnswerReview({
         channelType: adapter.channelType,
@@ -4558,7 +4547,7 @@ async function handleMessage(
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
     clearLightStatusTimer();
-    if ((hasStreamingCards || lightStatusCardStarted) && adapter.onStreamEnd) {
+    if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd) {
       try {
         const status = result.hasError ? 'error' : 'completed';
         cardFinalized = await adapter.onStreamEnd(
@@ -4768,7 +4757,7 @@ async function handleMessage(
     }
 
     // If task was aborted and streaming card is still active, finalize as interrupted
-    if ((hasStreamingCards || lightStatusCardStarted) && adapter.onStreamEnd && taskAbort.signal.aborted) {
+    if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd && taskAbort.signal.aborted) {
       try {
         await adapter.onStreamEnd(msg.address.chatId, 'interrupted', '');
       } catch { /* best effort */ }

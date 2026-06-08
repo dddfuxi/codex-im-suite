@@ -290,10 +290,40 @@ export function normalizeGeneratedToolFinalText(text: string, fallbackText: stri
   }
   normalized = normalized.replace(/^```(?:markdown|md)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
   normalized = normalized.replace(/\bJsonTool\b|\btool_request\b|\btool_result\b|\bcti-final\b/gi, '').trim();
+  const stripped = stripGeneratedRationaleSections(normalized);
+  normalized = stripped.text;
   normalized = normalized
     .replace(/(?:^|\n)\s*[-*]?\s*未完成[:：]\s*(?:无|没有|none|no)[^\n]*(?=\n|$)/giu, '')
     .trim();
+  if (stripped.extractedResult && isSafeShortGeneratedToolFinalText(normalized)) return normalized;
   return isUsableGeneratedToolFinalText(normalized) ? normalized : fallbackText;
+}
+
+function stripGeneratedRationaleSections(text: string): { text: string; extractedResult: boolean } {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return { text: '', extractedResult: false };
+  const resultHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:执行结果|最终结果|结果)(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/u;
+  const resultMatch = resultHeading.exec(normalized);
+  if (resultMatch) {
+    const resultText = normalized.slice(resultMatch.index + resultMatch[0].length).trim();
+    if (resultText) return { text: resultText, extractedResult: true };
+  }
+  return {
+    text: normalized
+    .replace(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?处理思路(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/gu, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim(),
+    extractedResult: false,
+  };
+}
+
+function isSafeShortGeneratedToolFinalText(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length < 2) return false;
+  if (/"success"\s*:\s*true|^\s*\{[\s\S]*\}\s*$/iu.test(text)) return false;
+  if (/\b(JsonTool|tool_request|tool_result|cti-final)\b/iu.test(text)) return false;
+  if (/how can i assist|how can i help|got it\.?|有什么可以帮忙|请问有什么可以帮/iu.test(normalized)) return false;
+  return true;
 }
 
 export function isUsableGeneratedToolFinalText(text: string): boolean {

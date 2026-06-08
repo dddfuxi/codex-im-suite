@@ -87,7 +87,7 @@ function buildJsonToolCatalogForRequirement(requirement: StreamChatParams['execu
   const wantsArtifact = requirement.kind === 'artifact_required' || families.has('artifact');
 
   if (!hasSpecificFamily || families.has('shell')) catalog.add('shell');
-  if (!hasSpecificFamily || families.has('mcp') || families.has('unity-mcp') || wantsArtifact) catalog.add('mcp_call');
+  if (!hasSpecificFamily || families.has('mcp') || families.has('unity-mcp') || families.has('web-search') || wantsArtifact) catalog.add('mcp_call');
   if (!hasSpecificFamily || families.has('unity-mcp') || wantsArtifact) catalog.add('unity_mcp_execute_code');
   if (wantsArtifact) catalog.add('shell_artifact');
   if (families.has('filesystem') || families.has('read') || families.has('search')) {
@@ -275,7 +275,32 @@ function parseMcpToolResultPayload(result: string): { success?: boolean; message
   }
 }
 
-function buildGenericMcpDiscoveryRequest(prompt: string, catalog: JsonToolMcpCatalogEntry[]): JsonToolRequest | null {
+function buildGenericMcpDiscoveryRequest(
+  prompt: string,
+  catalog: JsonToolMcpCatalogEntry[],
+  requiredToolFamilies: string[] = [],
+): JsonToolRequest | null {
+  const familySet = new Set(requiredToolFamilies.map((family) => family.trim().toLowerCase()).filter(Boolean));
+  if (familySet.has('web-search')) {
+    const searchEntry = catalog.find((entry) => {
+      const haystack = `${entry.displayName || ''} ${entry.tool} ${entry.title || ''} ${entry.description || ''}`.toLowerCase();
+      return /\b(search|query|find)\b|搜索|web/.test(haystack);
+    });
+    if (searchEntry) {
+      return {
+        action: 'tool_request',
+        tool: 'mcp_call',
+        args: {
+          manifestHint: searchEntry.manifestHint,
+          tool: searchEntry.tool,
+          arguments: {
+            query: prompt.trim(),
+            pageno: 1,
+          },
+        },
+      };
+    }
+  }
   if (!/(切换|加载|打开|load|open|switch).*(场景|scene)|(?:场景|scene).*(切换|加载|打开|load|open|switch)/i.test(prompt)) return null;
   if (/\.unity\b/i.test(prompt)) return null;
   const hasAssetSearch = catalog.some((entry) => entry.tool === 'manage_asset');
@@ -302,6 +327,38 @@ function buildGenericMcpDiscoveryRequest(prompt: string, catalog: JsonToolMcpCat
       },
     },
   };
+}
+
+function normalizeMcpFamilyTerms(manifest: McpManifestRecord): string {
+  return [
+    manifest.id,
+    manifest.displayName,
+    manifest.category,
+    manifest.source,
+    ...(manifest.aliases || []),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function isWebSearchMcpManifest(manifest: McpManifestRecord): boolean {
+  const category = String(manifest.category || '').trim().toLowerCase();
+  if (category === 'mcp.web.search' || category === 'web.search') return true;
+  const terms = normalizeMcpFamilyTerms(manifest);
+  return /(^|\s|\.|-)web(\.|-| )?search(\s|$)/.test(terms);
+}
+
+function isUnityMcpManifest(manifest: McpManifestRecord): boolean {
+  const terms = normalizeMcpFamilyTerms(manifest);
+  return /(^|\s|\.|-)unity(\s|\.|-|mcp|$)|unitymcp/.test(terms);
+}
+
+function isMcpManifestCompatibleWithFamilies(manifest: McpManifestRecord | null, requiredFamilies: string[] = []): boolean {
+  if (!manifest) return false;
+  const families = new Set(requiredFamilies.map((family) => family.trim().toLowerCase()).filter(Boolean));
+  const specificFamilies = Array.from(families).filter((family) => family !== 'mcp' && family !== 'tool');
+  if (specificFamilies.length === 0) return true;
+  if (families.has('web-search') && !isWebSearchMcpManifest(manifest)) return false;
+  if (families.has('unity-mcp') && !isUnityMcpManifest(manifest)) return false;
+  return true;
 }
 
 function extractAgentMessageText(item: Record<string, unknown>): string {
@@ -400,11 +457,58 @@ function collectJsonToolHistoryArtifacts(toolHistory: JsonToolHistoryEntry[]): J
   };
 }
 
+function compactProgressText(value: string, maxLength = 84): string {
+  const compacted = value.replace(/\s+/g, ' ').trim();
+  if (!compacted) return '';
+  return [...compacted].length > maxLength
+    ? `${[...compacted].slice(0, Math.max(0, maxLength - 1)).join('')}…`
+    : compacted;
+}
+
+function requiredFamilySet(requirement: StreamChatParams['executionRequirement']): Set<string> {
+  return new Set((requirement?.requiredToolFamilies || []).map((family) => family.trim().toLowerCase()).filter(Boolean));
+}
+
+function describeJsonToolTaskStart(
+  prompt: string,
+  requirement: StreamChatParams['executionRequirement'],
+  toolCatalog: Array<JsonToolRequest['tool']>,
+  mcpToolCatalog: JsonToolMcpCatalogEntry[],
+): string {
+  const families = requiredFamilySet(requirement);
+  const task = compactProgressText(prompt, 72);
+  const availableMcpTools = mcpToolCatalog.map((entry) => entry.tool).filter(Boolean).slice(0, 3).join('、');
+  if (families.has('web-search')) {
+    return `这类请求需要实时网页或新闻证据，正在匹配可用搜索工具${availableMcpTools ? `（${availableMcpTools}）` : ''}：${task}`;
+  }
+  if (families.has('unity-mcp')) {
+    return `这类请求需要读取或操作 Unity 当前状态，正在匹配可用 MCP 工具${availableMcpTools ? `（${availableMcpTools}）` : ''}：${task}`;
+  }
+  if (requirement?.kind === 'artifact_required' || families.has('artifact')) {
+    return `这类请求需要生成可验证的本地产物，正在匹配产物工具和允许路径：${task}`;
+  }
+  if (requirement?.kind === 'local_read_required' || families.has('read') || families.has('filesystem')) {
+    return `这类请求需要读取本地文件证据，正在匹配目录、文件或搜索工具：${task}`;
+  }
+  if (families.has('shell')) {
+    return `这类请求需要执行明确的本地命令，正在校验命令和工作目录：${task}`;
+  }
+  return `这类请求需要真实工具证据，正在匹配可用工具${toolCatalog.length ? `（${toolCatalog.join('、')}）` : ''}：${task}`;
+}
+
 function appendProgress(
   controller: ReadableStreamDefaultController<string>,
   text: string,
 ): void {
   controller.enqueue(sseEvent('progress', text));
+}
+
+function firstStringField(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
 }
 
 function describeJsonToolRequestForProgress(request: JsonToolRequest): string {
@@ -413,6 +517,8 @@ function describeJsonToolRequestForProgress(request: JsonToolRequest): string {
     const args = request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
       ? request.args.arguments as Record<string, unknown>
       : {};
+    const query = firstStringField(args, ['query', 'q', 'search', 'keyword', 'keywords', 'search_pattern', 'term']);
+    if (query) return `准备调用 ${toolName} 检索：${compactProgressText(query)}`;
     const action = typeof args.action === 'string' && args.action.trim() ? ` / ${args.action.trim()}` : '';
     const target = typeof args.path === 'string' && args.path.trim()
       ? `，目标路径：${args.path.trim()}`
@@ -440,6 +546,11 @@ function describeJsonToolResultForProgress(result: JsonToolResult): string {
   const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
     ? result.data as Record<string, unknown>
     : {};
+  const toolName = String(data.tool || result.tool || '').toLowerCase();
+  if (/\b(search|query|find)\b|搜索|web/.test(toolName)) {
+    const resultText = typeof data.result === 'string' ? compactProgressText(data.result, 64) : '';
+    return `搜索工具已返回结果${resultText ? `：${resultText}` : ''}。`;
+  }
   const parsed = typeof data.result === 'string' ? parseMcpToolResultPayload(data.result) : null;
   if (parsed?.message) return `工具返回成功：${String(parsed.message).trim()}`;
   if (result.tool === 'shell' && typeof data.exitCode === 'number') return `命令执行完成，exitCode=${data.exitCode}。`;
@@ -706,11 +817,7 @@ export class CodexLocalCliProvider implements LLMProvider {
     let lastToolResult: JsonToolResult | null = null;
     let taskComplete = false;
     const toolHistory: Array<{ request: JsonToolRequest; result: JsonToolResult }> = [];
-    appendProgress(controller, [
-      '### 处理思路',
-      '已识别为需要真实工具执行的请求，正在读取可用工具和运行上下文。',
-      '',
-    ].join('\n'));
+    appendProgress(controller, `${describeJsonToolTaskStart(params.prompt, params.executionRequirement, toolCatalog, mcpToolCatalog)}\n`);
 
     const deterministicPlan = buildDeterministicPlan();
     if (deterministicPlan && toolCatalog.includes(deterministicPlan.request.tool)) {
@@ -718,12 +825,16 @@ export class CodexLocalCliProvider implements LLMProvider {
       fallbackToolRequestUsed = true;
     }
     if (!request && toolCatalog.includes('mcp_call')) {
-      request = buildGenericMcpDiscoveryRequest(params.prompt, mcpToolCatalog);
+      request = buildGenericMcpDiscoveryRequest(
+        params.prompt,
+        mcpToolCatalog,
+        params.executionRequirement?.requiredToolFamilies,
+      );
       fallbackToolRequestUsed = !!request;
     }
 
     const requestFromModel = async (step: number): Promise<JsonToolRequest | null> => {
-      appendProgress(controller, `正在让本地 agent 根据真实工具 schema 规划第 ${step + 1} 步。\n`);
+      appendProgress(controller, `正在让本地 agent 根据真实工具 schema 规划第 ${step + 1} 步，不直接猜测结果。\n`);
       for (let attempt = 0; attempt < 2; attempt += 1) {
         retryAttempted = attempt > 0;
         const repairPrompt = attempt > 0
@@ -829,7 +940,7 @@ export class CodexLocalCliProvider implements LLMProvider {
 
       let toolResult: JsonToolResult;
       if (validation.ok) {
-        toolResult = await this.executeValidatedJsonToolRequest(validation.request);
+        toolResult = await this.executeValidatedJsonToolRequest(validation.request, params.executionRequirement?.requiredToolFamilies || []);
       } else {
         toolResult = { tool: request.tool, ok: false, error: validation.error };
       }
@@ -936,7 +1047,7 @@ export class CodexLocalCliProvider implements LLMProvider {
 
     const fallbackAnswer = buildVisibleToolOutcomeFallback(params.prompt, toolHistory);
     let generatedAnswer = fallbackAnswer;
-    appendProgress(controller, '\n### 执行结果\n工具动作已经完成，正在整理用户可读结果。\n');
+    appendProgress(controller, '工具链已返回可用结果，正在整理成可直接发送的回复。\n');
     try {
       const finalResponsePrompt = buildJsonToolFinalResponsePrompt(params.prompt, toolHistory, {
         replyStyleHint: params.replyPresentation?.replyStyleHint,
@@ -974,7 +1085,7 @@ export class CodexLocalCliProvider implements LLMProvider {
     controller.enqueue(sseEvent('result', usage ? { usage } : {}));
   }
 
-  private async executeValidatedJsonToolRequest(request: JsonToolRequest): Promise<JsonToolResult> {
+  private async executeValidatedJsonToolRequest(request: JsonToolRequest, requiredFamilies: string[] = []): Promise<JsonToolResult> {
     if (request.tool !== 'mcp_call' && request.tool !== 'unity_mcp_execute_code') return executeJsonToolRequest(request);
 
     const startedAt = Date.now();
@@ -989,6 +1100,13 @@ export class CodexLocalCliProvider implements LLMProvider {
       if (!manifest) {
         return { tool: request.tool, ok: false, error: `MCP manifest is not configured: ${manifestHint || '(empty)'}` };
       }
+      if (!isMcpManifestCompatibleWithFamilies(manifest, request.tool === 'mcp_call' ? requiredFamilies : [])) {
+        return {
+          tool: request.tool,
+          ok: false,
+          error: `MCP manifest is not compatible with this turn's required tool families: ${manifest.id}`,
+        };
+      }
       const toolName = request.tool === 'mcp_call'
         ? String(request.args.tool || '')
         : 'execute_code';
@@ -1002,9 +1120,9 @@ export class CodexLocalCliProvider implements LLMProvider {
           compiler: request.args.compiler === 'roslyn' || request.args.compiler === 'codedom' ? request.args.compiler : 'auto',
           safety_checks: request.args.safety_checks !== false,
         };
-      const result = await this.mcpBridge.callHttpTool(manifest, toolName, args);
-      const parsedResult = parseMcpToolResultPayload(result);
-      if (parsedResult && parsedResult.success === false) {
+      const result = await this.mcpBridge.callTool(manifest, toolName, args);
+      const parsedResult = parseMcpToolResultPayload(result.content);
+      if (!result.ok || (parsedResult && parsedResult.success === false)) {
         return {
           tool: request.tool,
           ok: false,
@@ -1012,22 +1130,22 @@ export class CodexLocalCliProvider implements LLMProvider {
             server: manifest.id,
             tool: toolName,
             args,
-            result,
+            result: result.content,
             durationMs: Date.now() - startedAt,
           },
-          error: parsedResult.error || parsedResult.message || `MCP tool ${toolName} reported success=false`,
+          error: result.error || parsedResult?.error || parsedResult?.message || `MCP tool ${toolName} reported failure`,
         };
       }
       return {
         tool: request.tool,
         ok: true,
         data: {
-          server: manifest.id,
-          tool: toolName,
-          args,
-          result,
-          durationMs: Date.now() - startedAt,
-        },
+            server: manifest.id,
+            tool: toolName,
+            args,
+            result: result.content,
+            durationMs: Date.now() - startedAt,
+          },
       };
     } catch (error) {
       return {
@@ -1056,7 +1174,7 @@ export class CodexLocalCliProvider implements LLMProvider {
     const entries: JsonToolMcpCatalogEntry[] = [];
     for (const manifest of manifests) {
       try {
-        const tools = await this.mcpBridge.listHttpToolDetails(manifest);
+        const tools = await this.mcpBridge.listToolDetails(manifest);
         entries.push(...rankMcpToolDetails(params.prompt, manifest, tools).map((tool) => ({
           manifestHint: manifest.id,
           displayName: manifest.displayName,
@@ -1075,19 +1193,28 @@ export class CodexLocalCliProvider implements LLMProvider {
   private selectMcpCatalogManifests(params: StreamChatParams): McpManifestRecord[] {
     const selected: McpManifestRecord[] = [];
     const add = (manifest: McpManifestRecord | null) => {
-      if (!manifest || manifest.enabled === false || manifest.type !== 'http') return;
+      if (!manifest || manifest.enabled === false) return;
       if (selected.some((item) => item.id === manifest.id)) return;
       selected.push(manifest);
     };
-    add(this.mcpBridge.resolveManifestFromPrompt(params.prompt));
     const requiredFamilies = params.executionRequirement?.requiredToolFamilies || [];
-    if (requiredFamilies.includes('unity-mcp') || requiredFamilies.includes('mcp')) {
+    const hasSpecificFamily = requiredFamilies.some((family) => !['mcp', 'tool'].includes(family.trim().toLowerCase()));
+    const promptManifest = this.mcpBridge.resolveManifestFromPrompt(params.prompt);
+    if (isMcpManifestCompatibleWithFamilies(promptManifest, requiredFamilies)) add(promptManifest);
+    if (requiredFamilies.includes('web-search')) {
+      for (const manifest of this.mcpBridge.listManifests()) {
+        if (isWebSearchMcpManifest(manifest)) add(manifest);
+      }
+    }
+    if (requiredFamilies.includes('unity-mcp') || (requiredFamilies.includes('mcp') && !hasSpecificFamily)) {
       add(this.mcpBridge.resolveManifestByHint('unitymcp'));
       add(this.mcpBridge.resolveManifestByHint('unity'));
     }
-    for (const manifest of this.mcpBridge.listManifests()) {
-      if (selected.length >= 3) break;
-      if (manifest.type === 'http' && manifest.enabled !== false) add(manifest);
+    if (!hasSpecificFamily) {
+      for (const manifest of this.mcpBridge.listManifests()) {
+        if (selected.length >= 3) break;
+        if (manifest.enabled !== false) add(manifest);
+      }
     }
     return selected;
   }

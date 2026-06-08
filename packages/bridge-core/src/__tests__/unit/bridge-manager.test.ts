@@ -50,6 +50,20 @@ function createSessionLocks() {
   return { locks, processWithSessionLock };
 }
 
+async function withStrictToolRouting<T>(fn: () => Promise<T> | T): Promise<T> {
+  const previous = process.env.CTI_STRICT_TOOL_ROUTING;
+  process.env.CTI_STRICT_TOOL_ROUTING = 'true';
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CTI_STRICT_TOOL_ROUTING;
+    } else {
+      process.env.CTI_STRICT_TOOL_ROUTING = previous;
+    }
+  }
+}
+
 describe('bridge-manager session locks', () => {
   it('serializes same-session operations', async () => {
     const { processWithSessionLock } = createSessionLocks();
@@ -387,6 +401,7 @@ describe('bridge-manager lifecycle', () => {
       undefined,
       undefined,
       undefined,
+      undefined,
       (text) => previews.push(text),
       undefined,
       { storedUserText: '运行 node --version' },
@@ -482,6 +497,7 @@ describe('bridge-manager lifecycle', () => {
   });
 
   it('uses a finalized streaming card as the only Feishu reply surface', async () => {
+    await withStrictToolRouting(async () => {
     const sent: OutboundMessage[] = [];
     const cardUpdates: string[] = [];
     const finalized: Array<{ status: string; text: string }> = [];
@@ -525,6 +541,91 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(finalized.length, 1);
     assert.equal(finalized[0].status, 'completed');
     assert.ok(finalized[0].text.length > 0);
+    });
+  });
+
+  it('upgrades to workflow cards when real provider progress arrives even when strict routing is disabled', async () => {
+    delete process.env.CTI_STRICT_TOOL_ROUTING;
+    const sent: OutboundMessage[] = [];
+    const cardUpdates: string[] = [];
+    const finalized: Array<{ status: string; text: string }> = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在连接 Unity MCP 并准备 Game view 截图。' },
+          {
+            type: 'tool_use',
+            data: JSON.stringify({ id: 'tool-1', name: 'Unity MCP 截图', input: {} }),
+          },
+          {
+            type: 'tool_result',
+            data: JSON.stringify({ tool_use_id: 'tool-1', content: '{"ok":true,"path":"C:/tmp/game.png"}', is_error: false }),
+          },
+          { type: 'text', data: '```cti-final\n{"kind":"text","text":"截图完成。","images":[],"files":[],"reply_mode":"plain"}\n```' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    adapter.onStreamText = (_chatId, text) => {
+      cardUpdates.push(text);
+    };
+    adapter.onStreamEnd = async (_chatId, status, responseText) => {
+      finalized.push({ status, text: responseText });
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('unitygame视角截个图'));
+
+    assert.equal(sent.length, 0);
+    assert.ok(cardUpdates.length > 0);
+    assert.match(cardUpdates.join('\n'), /Unity|截图|工具/);
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].status, 'completed');
+  });
+
+  it('does not pre-create workflow cards from tool-like wording without real progress events', async () => {
+    delete process.env.CTI_STRICT_TOOL_ROUTING;
+    const sent: OutboundMessage[] = [];
+    const cardUpdates: string[] = [];
+    const finalized: Array<{ status: string; text: string }> = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'text', data: '```cti-final\n{"kind":"text","text":"我现在没有拿到截图结果。","images":[],"files":[],"reply_mode":"plain"}\n```' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    adapter.onStreamText = (_chatId, text) => {
+      cardUpdates.push(text);
+    };
+    adapter.onStreamEnd = async (_chatId, status, responseText) => {
+      finalized.push({ status, text: responseText });
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('unitygame视角截个图'));
+
+    assert.equal(cardUpdates.length, 0);
+    assert.equal(finalized.length, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /没有拿到截图结果/);
   });
 
   it('returns a visible blocker when the provider stream completes without final text', async () => {
@@ -1597,32 +1698,32 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(memoryWriteClassifierCalls, 0);
   });
 
-  it('selects light status for sticker/chat turns and workflow cards for tool-required turns', async () => {
+  it('selects light status by default and reserves workflow cards for real bridge progress', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     assert.equal(_testOnly.selectReplySurfaceMode({
       supportsStreamingCards: true,
       feishuDocRequest: false,
-      executionRequirement: { kind: 'none', reason: 'no local execution evidence required', requiredToolFamilies: [] },
       messageKind: 'feishu_sticker_unknown',
-      hasAttachments: false,
       hasMemoryProgress: false,
       textLength: 120,
     }), 'light_status');
     assert.equal(_testOnly.selectReplySurfaceMode({
       supportsStreamingCards: true,
       feishuDocRequest: false,
-      executionRequirement: { kind: 'none', reason: 'no local execution evidence required', requiredToolFamilies: [] },
       messageKind: 'feishu_sticker_image',
-      hasAttachments: true,
       hasMemoryProgress: false,
       textLength: 120,
     }), 'light_status');
     assert.equal(_testOnly.selectReplySurfaceMode({
       supportsStreamingCards: true,
       feishuDocRequest: false,
-      executionRequirement: { kind: 'artifact_required', reason: 'screenshot', requiredToolFamilies: ['artifact'] },
-      hasAttachments: false,
       hasMemoryProgress: false,
+      textLength: 20,
+    }), 'light_status');
+    assert.equal(_testOnly.selectReplySurfaceMode({
+      supportsStreamingCards: true,
+      feishuDocRequest: false,
+      hasMemoryProgress: true,
       textLength: 20,
     }), 'workflow_card');
   });

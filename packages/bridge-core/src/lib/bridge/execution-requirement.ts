@@ -6,6 +6,7 @@ export interface ExecutionRequirement {
   kind: ExecutionRequirementKind;
   reason: string;
   requiredToolFamilies: string[];
+  strictToolEvidence?: boolean;
 }
 
 export interface ExecutionRequirementInput {
@@ -22,6 +23,10 @@ const NONE_REQUIREMENT: ExecutionRequirement = {
   requiredToolFamilies: [],
 };
 
+function strictToolRoutingEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.CTI_STRICT_TOOL_ROUTING || '');
+}
+
 const MEMORY_RECALL_RE = /(记得|记不记得|之前.*说过|回忆|历史里|聊天记录里|记录|偏好)/iu;
 const EXPLANATION_RE = /^(解释|说明|介绍|讲一下|说一下|为什么|怎么理解|原理|区别|方案|计划|总结|分析一下)/iu;
 const NAME_LOOKUP_RE = /(叫啥|叫什么|名字|名称|是哪一个|叫作|叫做)/iu;
@@ -33,6 +38,100 @@ const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
 const TOOL_DOMAIN_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|GameObject|Assets|Packages|ProjectSettings|场景|节点|组件|物体|对象|层级|Hierarchy)/iu;
+const STRICT_EVIDENCE_FAMILIES = new Set(['artifact', 'filesystem', 'shell', 'unity-mcp', 'blender']);
+
+export interface ToolResultQuality {
+  ok: boolean;
+  errorSummary?: string;
+}
+
+function truncateEvidenceText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function readStringField(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function readBooleanFailure(record: Record<string, unknown>): string {
+  for (const key of ['ok', 'success', 'successful', 'completed']) {
+    const value = record[key];
+    if (value === false) return `${key}=false`;
+  }
+  for (const key of ['failed', 'error']) {
+    const value = record[key];
+    if (value === true) return `${key}=true`;
+  }
+  const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : '';
+  if (status && /^(error|failed|failure|blocked|unavailable|timeout|timed_out)$/i.test(status)) {
+    return `status=${status}`;
+  }
+  return '';
+}
+
+function summarizeStructuredFailure(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const record = value as Record<string, unknown>;
+  const booleanFailure = readBooleanFailure(record);
+  const directError = readStringField(record, ['error', 'stderr']);
+  if (directError) return directError;
+  const directMessage = readStringField(record, ['message', 'reason']);
+  if (booleanFailure && directMessage) return directMessage;
+  const data = record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+    ? summarizeStructuredFailure(record.data)
+    : '';
+  if (data) return data;
+  const result = record.result && typeof record.result === 'object' && !Array.isArray(record.result)
+    ? summarizeStructuredFailure(record.result)
+    : '';
+  if (result) return result;
+  return booleanFailure;
+}
+
+export function classifyToolResultQuality(content: unknown, isError?: boolean): ToolResultQuality {
+  const raw = typeof content === 'string' ? content.trim() : '';
+  if (isError === true) {
+    return { ok: false, errorSummary: truncateEvidenceText(raw || 'tool_result is_error=true', 220) };
+  }
+  if (!raw) return { ok: true };
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const structuredFailure = summarizeStructuredFailure(parsed);
+    if (structuredFailure) {
+      return { ok: false, errorSummary: truncateEvidenceText(structuredFailure, 220) };
+    }
+  } catch {
+    // Plain-text tool output is handled below.
+  }
+
+  return { ok: true };
+}
+
+function shouldRequireStrictToolEvidence(kind: ExecutionRequirementKind, families: string[]): boolean {
+  if (kind === 'none') return false;
+  if (kind === 'artifact_required' || kind === 'local_read_required') return true;
+  return families.some((family) => STRICT_EVIDENCE_FAMILIES.has(family));
+}
+
+function makeExecutionRequirement(
+  kind: ExecutionRequirementKind,
+  reason: string,
+  requiredToolFamilies: string[],
+): ExecutionRequirement {
+  return {
+    kind,
+    reason,
+    requiredToolFamilies,
+    strictToolEvidence: shouldRequireStrictToolEvidence(kind, requiredToolFamilies),
+  };
+}
 
 export function isFeishuStickerMessageKind(messageKind?: string): boolean {
   return messageKind === 'feishu_sticker_unknown'
@@ -46,7 +145,10 @@ function isGeneratedFeishuStickerSemanticEvent(text: string): boolean {
     && /(尚未标注语义|已记录语义)/u.test(text);
 }
 
-export function classifyExecutionRequirement(input: ExecutionRequirementInput): ExecutionRequirement {
+function classifyExecutionRequirementInternal(
+  input: ExecutionRequirementInput,
+  options: { respectStrictToolRouting: boolean },
+): ExecutionRequirement {
   const text = (input.userText || '').trim();
   if (!text) return NONE_REQUIREMENT;
 
@@ -73,22 +175,35 @@ export function classifyExecutionRequirement(input: ExecutionRequirementInput): 
   }
 
   if (TOOL_REQUIRED_RE.test(text) || asksForCurrentToolState) {
-    return {
-      kind: ARTIFACT_RE.test(text) ? 'artifact_required' : 'tool_required',
-      reason: 'request asks for a concrete tool, MCP, file, command, or artifact action',
-      requiredToolFamilies: inferToolFamilies(text, input.files),
-    };
+    const kind = ARTIFACT_RE.test(text) ? 'artifact_required' : 'tool_required';
+    if (options.respectStrictToolRouting && !strictToolRoutingEnabled()) {
+      return NONE_REQUIREMENT;
+    }
+    const requirement = makeExecutionRequirement(
+      kind,
+      'request asks for a concrete tool, MCP, file, command, or artifact action',
+      inferToolFamilies(text, input.files),
+    );
+    return requirement;
   }
 
   if (LOCAL_READ_RE.test(text) && (LOCAL_TARGET_RE.test(text) || !!input.workingDirectory)) {
-    return {
-      kind: 'local_read_required',
-      reason: 'request asks for factual local filesystem or workspace information',
-      requiredToolFamilies: ['shell', 'read', 'search'],
-    };
+    if (options.respectStrictToolRouting && !strictToolRoutingEnabled()) {
+      return NONE_REQUIREMENT;
+    }
+    const requirement = makeExecutionRequirement(
+      'local_read_required',
+      'request asks for factual local filesystem or workspace information',
+      ['shell', 'read', 'search'],
+    );
+    return requirement;
   }
 
   return NONE_REQUIREMENT;
+}
+
+export function classifyExecutionRequirement(input: ExecutionRequirementInput): ExecutionRequirement {
+  return classifyExecutionRequirementInternal(input, { respectStrictToolRouting: true });
 }
 
 function inferToolFamilies(text: string, files?: FileAttachment[]): string[] {
@@ -108,6 +223,17 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
   const families = requirement.requiredToolFamilies.length
     ? requirement.requiredToolFamilies.join(', ')
     : 'appropriate tool';
+  if (requirement.strictToolEvidence === false) {
+    return [
+      'Execution evidence preference for this turn:',
+      `- Requirement: ${requirement.kind}.`,
+      `- Reason: ${requirement.reason}.`,
+      `- Preferred tool families: ${families}.`,
+      '- Prefer a real tool when it is available.',
+      '- If the preferred tool path is unavailable, you may still answer using the best available model knowledge, but do not claim that a tool succeeded.',
+      '- When possible, include source names, dates, and uncertainty instead of fabricating tool evidence.',
+    ].join('\n');
+  }
   return [
     'Execution evidence requirement for this turn:',
     `- Requirement: ${requirement.kind}.`,
@@ -129,7 +255,7 @@ export function buildNoEvidenceRetryPrompt(requirement: ExecutionRequirement): s
 }
 
 export function requiresSuccessfulToolEvidence(requirement: ExecutionRequirement): boolean {
-  return requirement.kind !== 'none';
+  return requirement.kind !== 'none' && requirement.strictToolEvidence !== false;
 }
 
 export function isExecutionEvidenceSatisfied(
@@ -140,6 +266,24 @@ export function isExecutionEvidenceSatisfied(
   return evidence.successfulToolResultCount > 0;
 }
 
+function ctiFinalDeclaresArtifacts(responseText: string): boolean {
+  const matches = responseText.matchAll(/(?:^|\n)\s*```cti-final\s*\n([\s\S]*?)\n\s*```/gi);
+  for (const match of matches) {
+    try {
+      const parsed = JSON.parse(match[1].trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      const record = parsed as Record<string, unknown>;
+      const images = Array.isArray(record.images) ? record.images : [];
+      const files = Array.isArray(record.files) ? record.files : [];
+      if (images.some((item) => typeof item === 'string' && item.trim())) return true;
+      if (files.some((item) => typeof item === 'string' && item.trim())) return true;
+    } catch {
+      // Malformed cti-final should not bypass missing-evidence replacement.
+    }
+  }
+  return false;
+}
+
 export function shouldReplaceWithNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
   evidence: { toolResultCount: number; successfulToolResultCount: number },
@@ -148,7 +292,7 @@ export function shouldReplaceWithNoExecutionEvidenceText(
   if (!requiresSuccessfulToolEvidence(requirement)) return false;
   if (isExecutionEvidenceSatisfied(requirement, evidence)) return false;
 
-  if (/```cti-final\b/i.test(responseText)) {
+  if (ctiFinalDeclaresArtifacts(responseText)) {
     return false;
   }
 
@@ -161,7 +305,7 @@ export function shouldReplaceWithNoExecutionEvidenceText(
 
 export function buildNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
-  evidence: { toolUseCount: number; toolResultCount: number; successfulToolResultCount: number; toolNames: string[] },
+  evidence: { toolUseCount: number; toolResultCount: number; successfulToolResultCount: number; toolNames: string[]; failedToolErrors?: string[] },
 ): string {
   const lines = [
     '未完成：本轮没有检测到真实工具执行成功记录。',
@@ -170,5 +314,6 @@ export function buildNoExecutionEvidenceText(
     `本轮工具证据：tool_use=${evidence.toolUseCount}，tool_result=${evidence.toolResultCount}，成功结果=${evidence.successfulToolResultCount}。`,
   ];
   if (evidence.toolNames.length > 0) lines.push(`工具：${evidence.toolNames.slice(0, 6).join('、')}`);
+  if (evidence.failedToolErrors?.length) lines.push(`失败原因：${evidence.failedToolErrors.slice(0, 3).join('；')}`);
   return lines.join('\n');
 }

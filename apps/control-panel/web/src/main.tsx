@@ -161,12 +161,6 @@ type SettingsState = {
   codexModel: string;
   codexPassModel: boolean;
   codexReasoningEffort: string;
-  codexLocalFallbackEnabled: boolean;
-  codexLocalFallbackReasoningEffort: string;
-  codexFailureFallbackMode: 'none' | 'local_agent' | string;
-  localAgentMode: 'text_only' | 'agent_verified' | string;
-  localToolCallRequired: boolean;
-  executionRequiredRoute: 'primary' | 'codex_or_external' | 'refuse' | string;
   memoryOptimizerEnabled: boolean;
   memoryOptimizerIntervalDays: string;
   memoryOptimizerModelSource: 'codex_primary' | 'local_ai' | 'external_api' | string;
@@ -180,7 +174,7 @@ type AiStrategy = 'official' | 'local_api' | 'external_api' | 'auto_failover';
 type CodexSource = 'local_api' | 'external_api' | 'official';
 
 const CODEX_SOURCE_LABELS: Record<CodexSource, string> = {
-  local_api: '本地 API',
+  local_api: '本地模型 API',
   external_api: '外部 API',
   official: '官方 Codex',
 };
@@ -202,7 +196,7 @@ function inferAiStrategy(settings: SettingsState): AiStrategy {
 }
 
 function strategyLabel(strategy: AiStrategy): string {
-  if (strategy === 'local_api') return '本地 API';
+  if (strategy === 'local_api') return '本地模型 API';
   if (strategy === 'external_api') return '外部 API';
   if (strategy === 'auto_failover') return '自动切换';
   return '官方 Codex';
@@ -961,12 +955,6 @@ const fallbackState: PanelState = {
     codexModel: '',
     codexPassModel: false,
     codexReasoningEffort: 'low',
-    codexLocalFallbackEnabled: false,
-    codexLocalFallbackReasoningEffort: 'minimal',
-    codexFailureFallbackMode: 'none',
-    localAgentMode: 'text_only',
-    localToolCallRequired: false,
-    executionRequiredRoute: 'primary',
     memoryOptimizerEnabled: false,
     memoryOptimizerIntervalDays: '7',
     memoryOptimizerModelSource: 'codex_primary',
@@ -1131,6 +1119,11 @@ function formatSessionMessageCount(item: { localMessageCount?: number; remoteMes
   return `${local} 条`;
 }
 
+function isLocalModelSourceActive(settings: SettingsState): boolean {
+  const strategy = inferAiStrategy(settings);
+  return strategy === 'local_api' || (strategy === 'auto_failover' && parseCodexChain(settings.codexApiFallbackChain).includes('local_api'));
+}
+
 function getSessionDisplayTitle(item: { displayName?: string; chatId?: string; sessionId?: string; chatType?: string; channelType?: string }) {
   const rawName = item.displayName?.trim();
   const fallback = rawName || item.chatId || item.sessionId || '未命名会话';
@@ -1284,9 +1277,10 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
   const bridgeService = findService(state, 'bridge');
   const codexService = findService(state, 'codex');
   const localService = findService(state, 'localLlm');
+  const localModelActive = isLocalModelSourceActive(state.settings);
   const bridgeStatus = toUserStatus(bridgeService?.status, false);
   const codexStatus = toUserStatus(codexService?.status, false);
-  const localStatus = toUserStatus(localService?.status);
+  const localStatus = localModelActive ? toUserStatus(localService?.status) : 'disabled';
   const aiStatus = codexStatus === 'normal'
     ? 'normal'
     : localStatus === 'normal'
@@ -1362,17 +1356,19 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
       detail: codexStatus === 'normal'
         ? `Codex agent 可用，${activeExecutors || 1} 个执行入口处于可用状态。`
         : localStatus === 'normal'
-          ? 'Codex 需要检查；本地 API 可作为 Codex CLI 的模型来源或自动切换来源。'
-          : 'Codex 和本地 API 都需要检查。',
+          ? 'Codex 需要检查；本地模型 API 可作为 Codex CLI 的模型来源或自动切换来源。'
+          : localModelActive
+            ? 'Codex 和本地模型 API 都需要检查。'
+            : 'Codex 需要检查；当前未启用本地模型来源。',
       status: aiStatus,
-      helpText: 'AI 执行负责把用户请求交给 Codex；本地 API 可作为 Codex CLI 的模型来源。',
+      helpText: 'AI 执行负责把用户请求交给同一个 Codex agent；本地模型 API 和外部 API 只是可切换的模型来源。',
       targetPage: 'settings',
       targetUnitId: 'ai',
       primaryAction: runtimeAction('ai-check-codex', '检查 Codex', 'service.codex', 'check', '确认 Codex CLI 和路由状态。'),
       secondaryActions: [
         runtimeAction('ai-update-codex', '更新 Codex', 'service.codex', 'update', '仅在 Codex CLI 支持 npm 更新时可用。'),
-        runtimeAction('ai-check-local', '检查本地 API', 'service.localLlm', 'check', '检查本地模型 API 是否可用。'),
-        runtimeAction('ai-start-local', '启动本地 API', 'service.localLlm', 'start', '启动本地模型 API。'),
+        runtimeAction('ai-check-local', '检查本地模型', 'service.localLlm', 'check', '检查本地模型 API 是否可用。'),
+        runtimeAction('ai-start-local', '启动本地模型', 'service.localLlm', 'start', '启动本地模型 API。'),
         navigateAction('ai-open-settings', '设置 AI', 'settings', 'ai', '调整 Codex 模型来源和自动切换链。'),
       ],
     },
@@ -5220,10 +5216,6 @@ function SettingsPage({
           codexModel: '',
           codexPassModel: false,
           codexReasoningEffort: 'low',
-          codexLocalFallbackEnabled: false,
-          codexFailureFallbackMode: 'none',
-          localToolCallRequired: false,
-          executionRequiredRoute: 'primary',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
         };
@@ -5237,11 +5229,6 @@ function SettingsPage({
           codexModel: '',
           codexPassModel: true,
           codexReasoningEffort: 'low',
-          codexLocalFallbackEnabled: false,
-          codexFailureFallbackMode: 'none',
-          codexLocalFallbackReasoningEffort: current.codexLocalFallbackReasoningEffort || 'minimal',
-          localToolCallRequired: false,
-          executionRequiredRoute: 'primary',
           codexApiKeyAction: clearCodexKey,
           codexApiKeyValue: '',
         };
@@ -5251,21 +5238,13 @@ function SettingsPage({
           ...current,
           codexRoutingMode: 'auto_failover',
           codexApiFallbackChain: formatCodexChain(current.codexApiFallbackChain || 'local_api,external_api'),
-          codexLocalFallbackEnabled: false,
-          codexFailureFallbackMode: 'none',
           codexPassModel: true,
-          localToolCallRequired: false,
-          executionRequiredRoute: 'primary',
         };
       }
       return {
         ...current,
         codexModelSource: 'external_api',
         codexRoutingMode: 'manual',
-        codexLocalFallbackEnabled: false,
-        codexFailureFallbackMode: 'none',
-        localToolCallRequired: false,
-        executionRequiredRoute: 'primary',
         codexPassModel: true,
         codexReasoningEffort: current.codexReasoningEffort || 'low',
       };
@@ -5372,13 +5351,13 @@ function SettingsPage({
             </div>
           </div>
           {aiStrategy === 'official' && (
-            <p className="field-hint">使用官方 Codex 登录态和默认模型。主模型失败时默认直接暴露错误，不会悄悄切到弱备用模型。</p>
+            <p className="field-hint">使用官方 Codex 登录态和默认模型。除非选择自动切换，否则不会自动改用其他模型来源。</p>
           )}
           {aiStrategy === 'local_api' && (
             <>
               <div className="path-grid">
                 <label className="stack-field">
-                  <span>本地主模型服务</span>
+                  <span>本地模型服务</span>
                   <select value={settings.localAiKind} onChange={(event) => applyLocalAiKind(event.target.value)}>
                     <option value="ollama">Ollama</option>
                     <option value="lmstudio">LM Studio</option>
@@ -5457,9 +5436,9 @@ function SettingsPage({
                   </div>
                 );
               })}
-              <p className="field-hint">自动切换只在模型/API 请求失败后按顺序尝试；官方 Codex 不会默认加入，勾选后才可能消耗官方流量。</p>
+              <p className="field-hint">自动切换只在模型/API 请求失败后按顺序尝试链内来源；官方 Codex 不会默认加入，勾选后才可能消耗官方流量。</p>
               {fallbackChain.includes('local_api') && (
-                <p className="field-hint">本地 API provider：{localAiLabel(settings.localAiKind)} · {localAiCapabilityLabel(settings.localAiKind)}。</p>
+                <p className="field-hint">本地模型 provider：{localAiLabel(settings.localAiKind)} · {localAiCapabilityLabel(settings.localAiKind)}。</p>
               )}
             </div>
           )}
@@ -5494,11 +5473,11 @@ function SettingsPage({
             <div className="path-grid">
               <div className="settings-subhead">本地 API（模型来源）</div>
               <label className="stack-field">
-                <span>本地 Agent API Timeout(ms)</span>
+                <span>本地模型 API Timeout(ms)</span>
                 <input value={settings.localAiTimeoutMs} onChange={(event) => update('localAiTimeoutMs', event.target.value)} />
               </label>
               <label className="stack-field">
-                <span>本地 Agent API Key · {settings.localAiApiKeySet ? `已设置 ${settings.localAiApiKeyMasked}` : '未设置'}</span>
+                <span>本地模型 API Key · {settings.localAiApiKeySet ? `已设置 ${settings.localAiApiKeyMasked}` : '未设置'}</span>
                 <select value={settings.localAiApiKeyAction} onChange={(event) => update('localAiApiKeyAction', event.target.value as SettingsState['localAiApiKeyAction'])}>
                   <option value="keep">保持不变</option>
                   <option value="set">设置新值</option>
@@ -5507,7 +5486,7 @@ function SettingsPage({
               </label>
               {settings.localAiApiKeyAction === 'set' && (
                 <label className="stack-field">
-                  <span>本地 Agent API Key 新值</span>
+                  <span>本地模型 API Key 新值</span>
                   <input type="password" value={settings.localAiApiKeyValue} onChange={(event) => update('localAiApiKeyValue', event.target.value)} />
                 </label>
               )}

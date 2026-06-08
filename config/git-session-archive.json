@@ -1,0 +1,30 @@
+{
+  "schema": "git-session-archive/v1",
+  "tool": {
+    "id": "entireio-cli",
+    "repository": "https://github.com/entireio/cli.git",
+    "version": "v0.7.5",
+    "binary": ".codex-tools/bin/entire.exe",
+    "sourceCache": ".codex-tools/src/entireio-cli"
+  },
+  "scope": {
+    "installMode": "project-local",
+    "gitConfigScope": "local",
+    "hooksPath": ".githooks",
+    "modifiesGlobalGitConfig": false,
+    "modifiesGlobalCodexConfig": false
+  },
+  "policy": {
+    "strategy": "manual-commit",
+    "pushSessions": false,
+    "autoCommit": true,
+    "autoPush": false,
+    "autoMerge": true,
+    "autoMergeTargetBranch": "codex/dev",
+    "requireCleanBaseline": true,
+    "validationCommands": [
+      "git diff --check"
+    ],
+    "telemetry": false
+  }
+}

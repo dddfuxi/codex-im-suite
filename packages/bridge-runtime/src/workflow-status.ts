@@ -40,6 +40,7 @@ export interface WorkflowExecutionSummary {
   toolResultCount?: number;
   successfulToolResultCount?: number;
   failedToolResultCount?: number;
+  failedToolErrors?: string[];
   toolNames?: string[];
   evidenceProtocol?: string;
   requestedTool?: string;
@@ -274,6 +275,7 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     toolResultCount: readNumberField(source.toolResultCount),
     successfulToolResultCount: readNumberField(source.successfulToolResultCount),
     failedToolResultCount: readNumberField(source.failedToolResultCount),
+    failedToolErrors: readStringList(source.failedToolErrors),
     toolNames: readStringList(source.toolNames),
     evidenceProtocol: readStringField(source.evidenceProtocol),
     requestedTool: readStringField(source.requestedTool),

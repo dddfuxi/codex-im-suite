@@ -1,12 +1,38 @@
 # codex-im-suite 开发记录
 
-更新时间：2026-06-05
+- 2026-06-08 项目内 Git 会话存档安装：新增 `config/git-session-archive.json`、`.githooks/`、`scripts/install-git-session-archive.ps1` 和 `scripts/complete-git-session-archive.ps1`，把 `entireio/cli` 固定版本构建到当前仓库 `.codex-tools\bin`，并通过 `git config --local core.hooksPath .githooks` 只在本项目启用 hooks。策略保持 `manual-commit`，关闭 telemetry、自动 session push 和自动 push；非 `codex/dev` 分支在会话结束时，如果会话基线干净、检查通过且无冲突，会自动提交并合并到 `codex/dev`。其他项目需要时必须在对应项目重新安装。
+
+更新时间：2026-06-08
 
 本文记录当前项目已经完成的主要改造和后续维护注意事项。详细架构见 [PROJECT-ARCHITECTURE.md](./PROJECT-ARCHITECTURE.md)。
 
+- 2026-06-08 本地模型语义收口：本地模型 / 外部 API 统一作为 Codex agent 的模型来源，不再作为独立本地 agent 兜底。执行器目录移除 `local-tool-agent` 用户可选入口，控制面板统一展示为“本地模型 API”，且仅在手动选择 `local_api` 或自动切换链包含 `local_api` 时检查该服务；旧 `CTI_CODEX_LOCAL_FALLBACK_*`、`CTI_CODEX_FAILURE_FALLBACK_MODE`、`CTI_LOCAL_AGENT_MODE`、`CTI_LOCAL_TOOL_CALL_REQUIRED` 和 `CTI_EXECUTION_REQUIRED_ROUTE` 不再作为主策略入口或设置项。
+
+- 2026-06-08 Unity MCP 健康检查收口：控制面板和 bridge-runtime 的 HTTP MCP 健康判断统一按 manifest 执行。`healthCheck.kind=mcp-http-resource` 会先完成 MCP initialize，再读取声明的 `resourceUri` 并按 `successRegex/failureRegex` 判定；普通 `healthCheck.kind=http` 只证明 endpoint 或 MCP protocol 可达，不会再因为 manifest 名称、显示名或 `/mcp` URL 像 Unity 就隐式读取 `mcpforunity://instances`。Unity MCP 当前通过 manifest 声明读取 `mcpforunity://instances`，只有 `instance_count > 0` 才算真正健康；新增 runtime 和控制面板回归测试覆盖资源成功、资源为 0、以及未声明资源检查时不做 Unity 特例。
+
+- 2026-06-08 Feishu 进度卡自然文案回归：本地 JSON 工具协议不再向 `progress` SSE 固定输出 `处理思路 / 执行结果` 分节，也不再依赖“正在组织上下文”式等待模板；runtime 会按 `ExecutionRequirement`、工具族、MCP schema 参数和真实 `tool_result` 生成当前任务相关的自然阶段文案。联网搜索请求会显示“实时网页或新闻证据”“调用搜索工具”和实际 query，Feishu workflow card 在已有 provider 细节时不会再被泛化 `JsonTool:mcp_call` 工具事件覆盖。终答整理层也会在封装 `cti-final` 前剥离模型偶发的旧式“处理思路 / 执行结果”模板，只保留可展示结果。新增回归覆盖 shell、本地读取、Unity MCP 多步、artifact 和 `web-search` MCP 搜索链路，继续通过 UTF-8/mojibake 扫描。
+
+- 2026-06-06 Unity MCP 健康检查去虚报：定位到 CLI 侧无法使用 Unity MCP 时，控制面板仍显示正常的原因是只验证 HTTP/MCP initialize 或响应里存在 `instances/contents/text` 字段，没有要求真实 Unity Editor session。现在 MCP manifest 支持通用 `mcp-http-resource` 健康检查，控制面板和 runtime 会按 manifest 声明读取 MCP resource 并校验成功/失败条件；Unity MCP 改为读取 `mcpforunity://instances`，`instance_count=0` 会显示为未连接而不是正常。根 launcher 也改为 initialize 后继续读取 instances，且不再回退到固定 Unity 工程路径。
+
 ## 1. 项目收口
 
-- 2026-06-05 SearXNG 搜索 MCP 扩展目录项：在线扩展目录新增 `mcp-searxng`，作为可由控制面板安装的外部 MCP，默认通过 `mcp.npm` 拉起 `mcp-searxng`，并在生成的 MCP manifest 中声明 `SEARXNG_URL=http://127.0.0.1:8888`、中英文搜索别名和 `mcp.web.search` 分类。`scripts/register-external-mcps.ps1` 同步支持把 stdio MCP manifest 的 `env` 字段转成 `codex mcp add --env KEY=VALUE`，让 SearXNG URL 这类扩展配置随注册生效；这一步只提供面板安装入口，不内置 SearXNG 服务，也不新增飞书搜索意图硬编码。
+- 2026-06-06 Feishu 表情包通用轮换：定位到裸 `[表情包]` hint 被解析成“最近”，再叠加 `useCount` 降序，导致越发越偏同一个表情包；同时模型生成的未知具体别名会被适配器兜底到任意表情包，造成“说换了但仍发旧图”。现在裸 `[表情包]` 走通用轮换，优先同 chat、已标注语义、低使用次数和更久未发的候选；只有显式 `[表情包:最近]` 才固定选择最近收到的表情包；具体 `[表情包:别名]` 必须命中已记录 alias，否则只剥离 hint 并发送剩余文本，不再 fallback 到任意表情包。发送记录新增 `lastUsedAt`，与 `lastSeenAt` 分开，避免“收到”和“发出”互相污染排序。
+
+- 2026-06-06 Feishu 表情包-only 状态卡收口：定位到模型已返回 `cti-final`，但正文只有 `[表情包]` hint，bridge 在末尾追加的完成标记 `✅` 被表情包发送后残留为唯一正文；最终卡片渲染会剥离独立完成标记，于是误判成“模型没有返回可展示结果”。现在 Feishu adapter 在 sticker/reaction hint 已成功执行且剩余文本只有状态标记时，会把卡片收口为通用动作结果（如“表情包已发送。”或“已回应。”），普通消息发送路径也不会再额外发送单独的 `✅` 文本。
+
+- 2026-06-06 Feishu workflow 进度卡改为事件驱动：撤回 UI 层“进度展示用执行意图”预分类，不再因为用户文字像 Unity/MCP、截图、本地文件或命令就预先创建 workflow card。默认先走轻量状态；只有桥接前置检查、provider `progress` SSE、真实 `tool_use/tool_result`、权限等待或已有 workflow 检查点出现时，才自动升级为 workflow card，并继续用同一张卡收口。正文 token 流不再触发 workflow，表情包结构化消息也不会被误升级。
+
+- 2026-06-06 SearXNG 扩展目录项撤回：`mcp-searxng` 依赖用户自备 SearXNG 服务和 JSON API，无法做到“安装即用”，且在默认路由收回给 AgentCLI 后不应作为面板推荐入口误导用户。在线扩展目录已移除该 seed；`web-search` 仅保留为兼容的通用 MCP family，不会在默认模式下由 bridge-core 预先触发。
+
+- 2026-06-06 工具失败证据可见性修复：定位到外部工具连接失败时，Feishu 最终卡片只显示 `成功结果=0`，没有展示 MCP 返回的真实网络或配置阻塞原因，容易和后续兜底回答混淆。现在 `bridge-core` 和 `bridge-runtime` 会从通用 `tool_result` 错误内容提取最多 3 条 `failedToolErrors`，写入 ConversationResult 和 workflow execution 摘要；no-evidence 拦截、出站假完成拦截和控制面板运行记录都能显示具体失败原因。该修复不针对单个 MCP 写特例，适用于任意 shell、MCP 或 JSON 工具协议失败。
+
+- 2026-06-06 MCP 调用结果质量修复：`McpBridge.callTool()` 不再把 MCP `tools/call` 响应压平成普通字符串，而是保留 `{ ok, content, error }`；HTTP 和 stdio MCP 返回标准 `isError=true` 或结构化错误字段时，JSON 工具协议会得到 `ok=false`，Feishu 工具轨迹显示失败，`successfulToolResultCount` 不会增加。该判断来自 MCP 协议和结构化结果字段，不按用户请求、工具名或具体错误文案写特例。
+
+- 2026-06-06 AgentCLI 工具路由默认权交还模型：默认关闭 bridge-core 对 MCP、本地文件、Unity/Blender、新闻/时效信息等请求的自动 `tool_required/local_read_required/artifact_required` 强制分类，改由 Codex CLI / agentcli 自己判断是否调用工具。桥接层保留出站真实性收口：声明的本地产物路径必须真实存在；没有成功工具记录时不能声称已经执行、创建、修改或完成。旧的强制工具门槛仅作为兼容开关 `CTI_STRICT_TOOL_ROUTING=true` 保留。
+
+- 2026-06-06 执行证据门槛通用化：`ExecutionRequirement` 新增 `strictToolEvidence`，由工具族是否涉及本地状态、shell、文件、产物、Unity/Blender 等可验证执行面决定是否硬性要求成功 `tool_result`。非严格工具族仍会优先尝试 manifest/MCP 工具，但工具不可用时允许官方/外部模型基于自身能力回答，且不能声称工具成功。`codex-local-cli-provider` 的 MCP discovery fallback 改为读取 `requiredToolFamilies`，不再在 provider 层维护另一套“网页/新闻/头条”句式判断。
+
+- 2026-06-05 联网搜索执行链路修复：定位到外部时效信息请求没有被 `ExecutionRequirement` 映射到可用工具族，官方 Codex 又默认隔离全局 MCP，最终被出站审查替换成 `tool_use=0` 的未完成卡片。现在新增通用 `web-search` 工具族，相关请求会进入本地 JSON 工具协议；`mcp-bridge` 补齐 stdio MCP 的 `tools/list` / `tools/call` JSON-RPC 调用，provider 会按 MCP manifest 的 category/aliases/schema 发现搜索工具，不针对单个 MCP 或具体中文句式写死。若底层搜索服务未启动或 JSON API 不可用，飞书会得到真实 MCP 调用失败原因，而不是假完成或空工具证据。
 
 - 2026-06-05 群聊首醒排队反馈与本地 API 重启链路修复：定位到群聊共享 session lock，上一条消息卡在 provider 冷启动或本地模型失败时，下一条群消息会先排队而未进入 `handleMessage`，导致长时间无可见反馈；bridge-manager 现在在同一 session 已有未完成任务时先回复“已收到，按顺序处理”，最终回复仍按原执行顺序生成。控制面板 `settings.saveAndRestartBridge` 现在在目标路由包含 `local_api` 时先准备本地 API 后端再重启 Bridge；Ollama 通过既有启动脚本复用/启动服务并继承模型目录，避免只写配置但 `127.0.0.1:11434` 没有服务导致飞书仍报 `No running Ollama server detected`。
 

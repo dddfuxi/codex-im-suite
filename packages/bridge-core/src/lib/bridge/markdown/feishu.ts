@@ -340,7 +340,7 @@ function summarizeFinalCardTitle(content: string): string {
   }
 
   const firstClause = cleaned.split(/[。！？.!?；;，,]/u).map((part) => part.trim()).find(Boolean) || cleaned;
-  return [...firstClause].slice(0, 16).join('') || '回复';
+  return firstClause || '回复';
 }
 
 function stripFeishuInlineHintText(text: string): string {

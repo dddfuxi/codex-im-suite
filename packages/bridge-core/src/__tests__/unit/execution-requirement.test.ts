@@ -3,49 +3,99 @@ import assert from 'node:assert/strict';
 
 import {
   buildExecutionRequirementPrompt,
+  classifyToolResultQuality,
   classifyExecutionRequirement,
   isExecutionEvidenceSatisfied,
   shouldReplaceWithNoExecutionEvidenceText,
+  buildNoExecutionEvidenceText,
 } from '../../lib/bridge/execution-requirement.js';
 
-describe('execution requirement classifier', () => {
-  it('classifies clean Chinese local read and command requests', () => {
-    const readRequirement = classifyExecutionRequirement({
-      userText: '看一下工作目录',
-      workingDirectory: 'C:\\unity\\ST3',
-    });
-    assert.equal(readRequirement.kind, 'local_read_required');
+function withStrictToolRouting<T>(fn: () => T): T {
+  const previous = process.env.CTI_STRICT_TOOL_ROUTING;
+  process.env.CTI_STRICT_TOOL_ROUTING = 'true';
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.CTI_STRICT_TOOL_ROUTING;
+    else process.env.CTI_STRICT_TOOL_ROUTING = previous;
+  }
+}
 
-    const commandRequirement = classifyExecutionRequirement({
-      userText: 'powershell -NoProfile -Command "Write-Output ok"',
-      workingDirectory: 'C:\\unity\\ST3',
+describe('execution requirement classifier', () => {
+  it('classifies tool result quality from structured protocol fields instead of text phrases', () => {
+    const protocolError = classifyToolResultQuality('plain diagnostic text', true);
+    assert.equal(protocolError.ok, false);
+    assert.match(protocolError.errorSummary || '', /plain diagnostic text/);
+
+    const structuredError = classifyToolResultQuality(JSON.stringify({
+      ok: false,
+      message: 'backend unavailable',
+    }), false);
+    assert.equal(structuredError.ok, false);
+    assert.equal(structuredError.errorSummary, 'backend unavailable');
+
+    const plainText = classifyToolResultQuality('Error searching returned no usable data', false);
+    assert.equal(plainText.ok, true);
+  });
+
+  it('classifies clean Chinese local read and command requests', () => {
+    withStrictToolRouting(() => {
+      const readRequirement = classifyExecutionRequirement({
+        userText: '看一下工作目录',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
+      assert.equal(readRequirement.kind, 'local_read_required');
+
+      const commandRequirement = classifyExecutionRequirement({
+        userText: 'powershell -NoProfile -Command "Write-Output ok"',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
+      assert.equal(commandRequirement.kind, 'tool_required');
+      assert.ok(commandRequirement.requiredToolFamilies.includes('shell'));
     });
-    assert.equal(commandRequirement.kind, 'tool_required');
-    assert.ok(commandRequirement.requiredToolFamilies.includes('shell'));
   });
 
   it('requires tool evidence for local directory listing requests', () => {
-    const requirement = classifyExecutionRequirement({
-      userText: '你能看一眼本地工作目录Game里都有哪些文件夹吗',
-      workingDirectory: 'C:\\unity\\ST3',
-    });
+    withStrictToolRouting(() => {
+      const requirement = classifyExecutionRequirement({
+        userText: '你能看一眼本地工作目录Game里都有哪些文件夹吗',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
 
-    assert.equal(requirement.kind, 'local_read_required');
-    assert.deepEqual(requirement.requiredToolFamilies, ['shell', 'read', 'search']);
-    assert.match(buildExecutionRequirementPrompt(requirement), /must call an appropriate real tool/i);
-    assert.equal(isExecutionEvidenceSatisfied(requirement, { successfulToolResultCount: 0 }), false);
-    assert.equal(isExecutionEvidenceSatisfied(requirement, { successfulToolResultCount: 1 }), true);
+      assert.equal(requirement.kind, 'local_read_required');
+      assert.deepEqual(requirement.requiredToolFamilies, ['shell', 'read', 'search']);
+      assert.match(buildExecutionRequirementPrompt(requirement), /must call an appropriate real tool/i);
+      assert.equal(isExecutionEvidenceSatisfied(requirement, { successfulToolResultCount: 0 }), false);
+      assert.equal(isExecutionEvidenceSatisfied(requirement, { successfulToolResultCount: 1 }), true);
+    });
   });
 
   it('requires artifact evidence for Unity screenshot tasks', () => {
-    const requirement = classifyExecutionRequirement({
-      userText: 'unity game视角截个图',
-      workingDirectory: 'C:\\unity\\ST3\\Game',
-    });
+    withStrictToolRouting(() => {
+      const requirement = classifyExecutionRequirement({
+        userText: 'unity game视角截个图',
+        workingDirectory: 'C:\\unity\\ST3\\Game',
+      });
 
-    assert.equal(requirement.kind, 'artifact_required');
-    assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
-    assert.ok(requirement.requiredToolFamilies.includes('artifact'));
+      assert.equal(requirement.kind, 'artifact_required');
+      assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
+      assert.ok(requirement.requiredToolFamilies.includes('artifact'));
+    });
+  });
+
+  it('does not auto-route time-sensitive questions into MCP tools without an explicit tool request', () => {
+    const headlineRequirement = classifyExecutionRequirement({
+      userText: '查一下今天的三个头条',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.equal(headlineRequirement.kind, 'none');
+    assert.equal(isExecutionEvidenceSatisfied(headlineRequirement, { successfulToolResultCount: 0 }), true);
+
+    const localRequirement = classifyExecutionRequirement({
+      userText: '查一下工作目录',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.equal(localRequirement.kind, 'none');
   });
 
   it('does not require tool evidence for ordinary explanations', () => {
@@ -115,37 +165,78 @@ describe('execution requirement classifier', () => {
   });
 
   it('requires tool evidence for current Unity scene object inspection even when asking for names', () => {
-    const requirement = classifyExecutionRequirement({
-      userText: 'unity场景里找有相机组件的物体\n总结成节点名称发我',
-      workingDirectory: 'C:\\unity\\ST3',
-    });
+    withStrictToolRouting(() => {
+      const requirement = classifyExecutionRequirement({
+        userText: 'unity场景里找有相机组件的物体\n总结成节点名称发我',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
 
-    assert.equal(requirement.kind, 'tool_required');
-    assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
+      assert.equal(requirement.kind, 'tool_required');
+      assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
+    });
   });
 
   it('preserves concrete failed tool output instead of replacing it with no-evidence text', () => {
-    const requirement = classifyExecutionRequirement({
-      userText: 'powershell -ExecutionPolicy Bypass -File "C:\\unity\\ST3\\Game\\Assets\\FXTools\\Cli\\fxtools-cli.ps1" doctor',
-      workingDirectory: 'C:\\unity\\ST3',
+    withStrictToolRouting(() => {
+      const requirement = classifyExecutionRequirement({
+        userText: 'powershell -ExecutionPolicy Bypass -File "C:\\unity\\ST3\\Game\\Assets\\FXTools\\Cli\\fxtools-cli.ps1" doctor',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
+
+      assert.equal(requirement.kind, 'tool_required');
+      assert.equal(
+        shouldReplaceWithNoExecutionEvidenceText(
+          requirement,
+          { toolResultCount: 1, successfulToolResultCount: 0 },
+          '未完成：shell command exited with code 1\nstderr:\nCannot locate Unity.exe.',
+        ),
+        false,
+      );
+      assert.equal(
+        shouldReplaceWithNoExecutionEvidenceText(
+          requirement,
+          { toolResultCount: 0, successfulToolResultCount: 0 },
+          '检查好了。',
+        ),
+        true,
+      );
+    });
+  });
+
+  it('does not let cti-final bypass missing required tool evidence', () => {
+    withStrictToolRouting(() => {
+      const requirement = classifyExecutionRequirement({
+        userText: 'powershell -NoProfile -Command "Write-Output ok"',
+        workingDirectory: 'C:\\unity\\ST3',
+      });
+
+      assert.equal(
+        shouldReplaceWithNoExecutionEvidenceText(
+          requirement,
+          { toolResultCount: 0, successfulToolResultCount: 0 },
+          '```cti-final\n{"kind":"text","text":"今天三个头条是 A、B、C。","images":[],"files":[],"reply_mode":"markdown"}\n```',
+        ),
+        true,
+      );
+    });
+  });
+
+  it('includes failed tool reasons in no-evidence blockers', () => {
+    const requirement = {
+      kind: 'tool_required' as const,
+      reason: 'compatibility test requirement',
+      requiredToolFamilies: ['mcp'],
+    };
+
+    const text = buildNoExecutionEvidenceText(requirement, {
+      toolUseCount: 1,
+      toolResultCount: 1,
+      successfulToolResultCount: 0,
+      failedToolErrors: ['Network Error: fetch failed. Check if the configured service URL is correct.'],
+      toolNames: ['JsonTool:mcp_call'],
     });
 
-    assert.equal(requirement.kind, 'tool_required');
-    assert.equal(
-      shouldReplaceWithNoExecutionEvidenceText(
-        requirement,
-        { toolResultCount: 1, successfulToolResultCount: 0 },
-        '未完成：shell command exited with code 1\nstderr:\nCannot locate Unity.exe.',
-      ),
-      false,
-    );
-    assert.equal(
-      shouldReplaceWithNoExecutionEvidenceText(
-        requirement,
-        { toolResultCount: 0, successfulToolResultCount: 0 },
-        '检查好了。',
-      ),
-      true,
-    );
+    assert.match(text, /失败原因：Network Error: fetch failed/);
+    assert.match(text, /JsonTool:mcp_call/);
   });
 });

@@ -39,12 +39,6 @@ export interface Config {
   codexPassModel?: boolean;
   codexReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   codexInheritGlobalMcp?: boolean;
-  codexLocalFallbackEnabled?: boolean;
-  codexLocalFallbackReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
-  codexFailureFallbackMode?: 'none' | 'local_agent';
-  localAgentMode?: 'text_only' | 'agent_verified';
-  localToolCallRequired?: boolean;
-  executionRequiredRoute?: 'primary' | 'codex_or_external' | 'refuse';
   memoryOptimizerEnabled?: boolean;
   memoryOptimizerIntervalDays?: number;
   memoryOptimizerModelSource?: 'codex_primary' | 'local_ai' | 'external_api';
@@ -301,10 +295,6 @@ export function loadConfig(): Config {
   const codexReasoningEffort = ["minimal", "low", "medium", "high", "xhigh"].includes(rawCodexReasoningEffort)
     ? rawCodexReasoningEffort as NonNullable<Config["codexReasoningEffort"]>
     : undefined;
-  const rawCodexLocalFallbackReasoningEffort = (env.get("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT") || "").trim().toLowerCase();
-  const codexLocalFallbackReasoningEffort = ["minimal", "low", "medium", "high", "xhigh"].includes(rawCodexLocalFallbackReasoningEffort)
-    ? rawCodexLocalFallbackReasoningEffort as NonNullable<Config["codexLocalFallbackReasoningEffort"]>
-    : "minimal";
   const rawCodexModelSource = (env.get("CTI_CODEX_MODEL_SOURCE") || "").trim().toLowerCase();
   const codexModelSource = (["official", "local_api", "external_api"].includes(rawCodexModelSource)
     ? rawCodexModelSource
@@ -315,14 +305,6 @@ export function loadConfig(): Config {
   const codexApiFallbackChain = Array.from(new Set(rawCodexApiFallbackChain
     .map((item) => item.trim().toLowerCase())
     .filter((item): item is 'local_api' | 'external_api' | 'official' => item === "local_api" || item === "external_api" || item === "official")));
-  const rawCodexFailureFallbackMode = (env.get("CTI_CODEX_FAILURE_FALLBACK_MODE") || "").trim().toLowerCase();
-  const codexFailureFallbackMode = (rawCodexFailureFallbackMode === "local_agent" ? "local_agent" : "none") as NonNullable<Config["codexFailureFallbackMode"]>;
-  const rawLocalAgentMode = (env.get("CTI_LOCAL_AGENT_MODE") || "").trim().toLowerCase();
-  const localAgentMode = (rawLocalAgentMode === "agent_verified" ? "agent_verified" : "text_only") as NonNullable<Config["localAgentMode"]>;
-  const rawExecutionRequiredRoute = (env.get("CTI_EXECUTION_REQUIRED_ROUTE") || "").trim().toLowerCase();
-  const executionRequiredRoute = (["primary", "codex_or_external", "refuse"].includes(rawExecutionRequiredRoute)
-    ? rawExecutionRequiredRoute
-    : "codex_or_external") as NonNullable<Config["executionRequiredRoute"]>;
   const memoryOptimizerIntervalDays = env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS")
     ? Number(env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS"))
     : 7;
@@ -375,12 +357,6 @@ export function loadConfig(): Config {
     codexPassModel: env.has("CTI_CODEX_PASS_MODEL") ? env.get("CTI_CODEX_PASS_MODEL") === "true" : undefined,
     codexReasoningEffort,
     codexInheritGlobalMcp: env.has("CTI_CODEX_INHERIT_GLOBAL_MCP") ? env.get("CTI_CODEX_INHERIT_GLOBAL_MCP") === "true" : false,
-    codexLocalFallbackEnabled: env.has("CTI_CODEX_LOCAL_FALLBACK_ENABLED") ? env.get("CTI_CODEX_LOCAL_FALLBACK_ENABLED") === "true" : false,
-    codexLocalFallbackReasoningEffort,
-    codexFailureFallbackMode,
-    localAgentMode,
-    localToolCallRequired: env.has("CTI_LOCAL_TOOL_CALL_REQUIRED") ? env.get("CTI_LOCAL_TOOL_CALL_REQUIRED") !== "false" : true,
-    executionRequiredRoute,
     memoryOptimizerEnabled: env.has("CTI_MEMORY_OPTIMIZER_ENABLED") ? env.get("CTI_MEMORY_OPTIMIZER_ENABLED") === "true" : false,
     memoryOptimizerIntervalDays: Number.isFinite(memoryOptimizerIntervalDays) ? Math.max(1, Math.floor(memoryOptimizerIntervalDays)) : 7,
     memoryOptimizerModelSource,
@@ -537,14 +513,6 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_CODEX_REASONING_EFFORT", config.codexReasoningEffort);
   if (config.codexInheritGlobalMcp !== undefined)
     out += formatEnvLine("CTI_CODEX_INHERIT_GLOBAL_MCP", String(config.codexInheritGlobalMcp));
-  if (config.codexLocalFallbackEnabled !== undefined)
-    out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_ENABLED", String(config.codexLocalFallbackEnabled));
-  out += formatEnvLine("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", config.codexLocalFallbackReasoningEffort);
-  out += formatEnvLine("CTI_CODEX_FAILURE_FALLBACK_MODE", config.codexFailureFallbackMode);
-  out += formatEnvLine("CTI_LOCAL_AGENT_MODE", config.localAgentMode);
-  if (config.localToolCallRequired !== undefined)
-    out += formatEnvLine("CTI_LOCAL_TOOL_CALL_REQUIRED", String(config.localToolCallRequired));
-  out += formatEnvLine("CTI_EXECUTION_REQUIRED_ROUTE", config.executionRequiredRoute);
   if (config.memoryOptimizerEnabled !== undefined)
     out += formatEnvLine("CTI_MEMORY_OPTIMIZER_ENABLED", String(config.memoryOptimizerEnabled));
   if (config.memoryOptimizerIntervalDays !== undefined)
@@ -888,18 +856,6 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_codex_reasoning_effort", config.codexReasoningEffort);
   }
   m.set("bridge_codex_inherit_global_mcp", String(config.codexInheritGlobalMcp === true));
-  if (config.codexLocalFallbackEnabled !== undefined) {
-    m.set("bridge_codex_local_fallback_enabled", String(config.codexLocalFallbackEnabled));
-  }
-  if (config.codexLocalFallbackReasoningEffort) {
-    m.set("bridge_codex_local_fallback_reasoning_effort", config.codexLocalFallbackReasoningEffort);
-  }
-  if (config.codexFailureFallbackMode) {
-    m.set("bridge_codex_failure_fallback_mode", config.codexFailureFallbackMode);
-  }
-  m.set("bridge_local_agent_mode", config.localAgentMode || "text_only");
-  m.set("bridge_local_tool_call_required", String(config.localToolCallRequired !== false));
-  m.set("bridge_execution_required_route", config.executionRequiredRoute || "codex_or_external");
   m.set("bridge_memory_optimizer_enabled", String(config.memoryOptimizerEnabled === true));
   m.set("bridge_memory_optimizer_interval_days", String(config.memoryOptimizerIntervalDays ?? 7));
   m.set("bridge_memory_optimizer_model_source", config.memoryOptimizerModelSource || "codex_primary");

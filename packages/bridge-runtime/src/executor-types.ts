@@ -10,8 +10,7 @@ export type ExecutorCapability =
   | 'file_write'
   | 'mcp_ops'
   | 'image_input'
-  | 'artifact_delivery'
-  | 'local_tool_agent';
+  | 'artifact_delivery';
 
 export interface ExecutorHealthCheck {
   kind: 'command' | 'http' | 'runtime_status' | 'none';

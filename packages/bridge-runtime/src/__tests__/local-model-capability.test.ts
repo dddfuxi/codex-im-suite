@@ -22,9 +22,6 @@ const baseConfig: Config = {
   localAiBaseUrl: 'http://127.0.0.1:11434',
   localAiModel: 'qwen3:14b',
   localAiTimeoutMs: 10000,
-  localAgentMode: 'agent_verified',
-  localToolCallRequired: true,
-  executionRequiredRoute: 'codex_or_external',
 };
 
 describe('local model capability probing', () => {
@@ -88,10 +85,7 @@ describe('local model capability probing', () => {
     assert.equal(shouldTrustLocalApiForExecution(baseConfig), false);
   });
 
-  it('allows explicit unsafe override when tool-call requirement is disabled', () => {
-    assert.equal(shouldTrustLocalApiForExecution({
-      ...baseConfig,
-      localToolCallRequired: false,
-    }), true);
+  it('does not trust local execution without a passed capability probe', () => {
+    assert.equal(shouldTrustLocalApiForExecution(baseConfig), false);
   });
 });

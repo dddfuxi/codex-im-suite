@@ -596,7 +596,9 @@ export class LocalAgentProvider {
         args.attachments = attachments;
       }
 
-      const resultText = await this.mcpBridge.callHttpTool(manifest, toolName, args);
+      const result = await this.mcpBridge.callHttpTool(manifest, toolName, args);
+      if (!result.ok) throw new Error(result.error || result.content || `${toolName} failed`);
+      const resultText = result.content;
       const parsed = parseIgnisToolPayload(resultText);
       this.updateIgnisSessionState(params.sessionId, parsed);
       let finalPayload = parsed;
@@ -684,11 +686,12 @@ export class LocalAgentProvider {
     const submitStatus = getIgnisStatus(submittedPayload);
     if (submitStatus && isIgnisTerminalStatus(submitStatus)) return { payload: submittedPayload, timedOut: false };
     try {
-      const waitText = await this.mcpBridge.callHttpTool(manifest, 'ignis_wait', {
+      const waitResult = await this.mcpBridge.callHttpTool(manifest, 'ignis_wait', {
         turn_id: turnId,
         timeout_ms: IGNIS_GENERATION_WAIT_MS,
       });
-      return { payload: parseIgnisToolPayload(waitText), timedOut: false };
+      if (!waitResult.ok) throw new Error(waitResult.error || waitResult.content || 'ignis_wait failed');
+      return { payload: parseIgnisToolPayload(waitResult.content), timedOut: false };
     } catch (error) {
       return {
         timedOut: true,
@@ -1226,7 +1229,7 @@ export class LocalAgentProvider {
         return { handled: true };
       }
       const result = await this.mcpBridge.callHttpTool(manifest, parsedCall.toolName, parsedCall.args);
-      this.emitTerminalResponse(controller, params.sessionId, truncateText(result, 3000), false);
+      this.emitTerminalResponse(controller, params.sessionId, truncateText(result.content, 3000), !result.ok);
       return { handled: true };
     }
 
@@ -1993,9 +1996,9 @@ export class LocalAgentProvider {
         return { handled: true };
       }
       const result = await this.mcpBridge.callHttpTool(manifest, parsedCall.toolName, parsedCall.args);
-      const text = truncateText(result, 3000);
-      this.recordMcpBridgeSummary(mode, 'answer_local', 'tool_request', text, true);
-      this.emitTerminalResponse(controller, params.sessionId, text, false);
+      const text = truncateText(result.content, 3000);
+      this.recordMcpBridgeSummary(mode, result.ok ? 'answer_local' : 'refuse_local', 'tool_request', text, result.ok);
+      this.emitTerminalResponse(controller, params.sessionId, text, !result.ok);
       return { handled: true };
     }
 

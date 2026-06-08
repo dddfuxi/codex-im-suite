@@ -769,7 +769,7 @@ internal sealed partial class MainForm : Form
                     {
                         BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
                         BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
-                        BuildServiceItem("localLlm", "本地 Agent API", _localLlmStatus.Text),
+                        BuildServiceItem("localLlm", "本地模型 API", _localLlmStatus.Text),
                         BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
                         BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
                     };
@@ -1066,7 +1066,7 @@ internal sealed partial class MainForm : Form
         {
             BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
             BuildServiceItem("codex", "Codex CLI", _codexStatus.Text),
-            BuildServiceItem("localLlm", "本地 Agent API", _localLlmStatus.Text),
+            BuildServiceItem("localLlm", "本地模型 API", _localLlmStatus.Text),
             BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
             BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
         };
@@ -1547,12 +1547,6 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "codexModel", current.CodexModel),
             ReadPayloadBool(payload, "codexPassModel", current.CodexPassModel),
             NormalizeCodexReasoningEffort(ReadPayloadString(payload, "codexReasoningEffort", current.CodexReasoningEffort)),
-            ReadPayloadBool(payload, "codexLocalFallbackEnabled", current.CodexLocalFallbackEnabled),
-            NormalizeCodexReasoningEffort(ReadPayloadString(payload, "codexLocalFallbackReasoningEffort", current.CodexLocalFallbackReasoningEffort)),
-            NormalizeCodexFailureFallbackMode(ReadPayloadString(payload, "codexFailureFallbackMode", current.CodexFailureFallbackMode)),
-            NormalizeLocalAgentMode(ReadPayloadString(payload, "localAgentMode", current.LocalAgentMode)),
-            ReadPayloadBool(payload, "localToolCallRequired", current.LocalToolCallRequired),
-            NormalizeExecutionRequiredRoute(ReadPayloadString(payload, "executionRequiredRoute", current.ExecutionRequiredRoute)),
             ReadPayloadBool(payload, "memoryOptimizerEnabled", current.MemoryOptimizerEnabled),
             NormalizePositiveNumber(ReadPayloadString(payload, "memoryOptimizerIntervalDays", current.MemoryOptimizerIntervalDays), "7"),
             NormalizeMemoryOptimizerModelSource(ReadPayloadString(payload, "memoryOptimizerModelSource", current.MemoryOptimizerModelSource)),
@@ -3632,14 +3626,14 @@ internal sealed partial class MainForm : Form
             BuildLocalLlmRuntimeUnit(GetRuntimeManifestOrFallback(
                 runtimeManifests,
                 "service.localLlm",
-                "本地 Agent API",
+                "本地模型 API",
                 "service",
                 "local-ai",
                 "installed",
                 _localLlmReadmePath,
                 Path.GetDirectoryName(_localLlmStartScript) ?? "",
                 "",
-                "本地 / 自托管 OpenAI-compatible 后端，仅用于明确小活、只读问题和 Codex 不可用时的保守兜底。")),
+                "本地或自托管 OpenAI-compatible 模型后端，用作 Codex agent 的可选模型来源。")),
         };
 
         foreach (var manifest in _manifests)
@@ -3653,7 +3647,7 @@ internal sealed partial class MainForm : Form
             var actions = new List<WebRuntimeAction>
             {
                 new("check", "检查", true),
-                new("start", IsUnityMcp(manifest) ? "修复" : "启动", manifest.Enabled != false && hasLauncher),
+                new("start", "启动", manifest.Enabled != false && hasLauncher),
                 new("stop", "停止", manifest.Enabled != false),
                 new("install", "安装", canInstall),
             };
@@ -5801,7 +5795,7 @@ exit $LASTEXITCODE
         AddStatusCard(layout, "MCP 清单", _mcpStatus, 2,
             CreateCardButton("注册全部", async () => await RegisterAllMcpsAsync()),
             CreateCardButton("刷新", async () => await RefreshAllAsync()));
-        AddStatusCard(layout, "本地 Agent API", _localLlmStatus, 3,
+        AddStatusCard(layout, "本地模型 API", _localLlmStatus, 3,
             CreateCardButton("启动", async () => await StartLocalLlmAsync()),
             CreateCardButton("停止", async () => await StopLocalLlmAsync()),
             CreateCardButton("检查", async () => await CheckLocalLlmAsync()),
@@ -6216,12 +6210,6 @@ exit $LASTEXITCODE
         GetConfig("CTI_CODEX_MODEL", ""),
         string.Equals(GetConfig("CTI_CODEX_PASS_MODEL", "false"), "true", StringComparison.OrdinalIgnoreCase),
         NormalizeCodexReasoningEffort(GetConfig("CTI_CODEX_REASONING_EFFORT", "low")),
-        string.Equals(GetConfig("CTI_CODEX_LOCAL_FALLBACK_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase),
-        NormalizeCodexReasoningEffort(GetConfig("CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", "minimal")),
-        NormalizeCodexFailureFallbackMode(GetConfig("CTI_CODEX_FAILURE_FALLBACK_MODE", "none")),
-        NormalizeLocalAgentMode(GetConfig("CTI_LOCAL_AGENT_MODE", "text_only")),
-        !string.Equals(GetConfig("CTI_LOCAL_TOOL_CALL_REQUIRED", "true"), "false", StringComparison.OrdinalIgnoreCase),
-        NormalizeExecutionRequiredRoute(GetConfig("CTI_EXECUTION_REQUIRED_ROUTE", "codex_or_external")),
         string.Equals(GetConfig("CTI_MEMORY_OPTIMIZER_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase),
         NormalizePositiveNumber(GetConfig("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", "7"), "7"),
         NormalizeMemoryOptimizerModelSource(GetConfig("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", "codex_primary")),
@@ -6274,12 +6262,6 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_CODEX_MODEL", settings.CodexModel.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", settings.CodexPassModel ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_CODEX_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexReasoningEffort));
-        SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_ENABLED", "false");
-        SetOrAppendEnv(lines, "CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexLocalFallbackReasoningEffort));
-        SetOrAppendEnv(lines, "CTI_CODEX_FAILURE_FALLBACK_MODE", "none");
-        SetOrAppendEnv(lines, "CTI_LOCAL_AGENT_MODE", NormalizeLocalAgentMode(settings.LocalAgentMode));
-        SetOrAppendEnv(lines, "CTI_LOCAL_TOOL_CALL_REQUIRED", "false");
-        SetOrAppendEnv(lines, "CTI_EXECUTION_REQUIRED_ROUTE", "primary");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", settings.MemoryOptimizerEnabled ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(settings.MemoryOptimizerModelSource));
@@ -6382,9 +6364,6 @@ exit $LASTEXITCODE
             modelSource = settings.CodexModelSource,
             passModel = settings.CodexPassModel,
             reasoningEffort = effort,
-            localFallbackEnabled = settings.CodexLocalFallbackEnabled,
-            failureFallbackMode = settings.CodexFailureFallbackMode,
-            localFallbackReasoningEffort = NormalizeCodexReasoningEffort(settings.CodexLocalFallbackReasoningEffort),
             apiKeySet = !string.IsNullOrWhiteSpace(apiKey),
         };
     }
@@ -6609,24 +6588,6 @@ exit $LASTEXITCODE
             }
         }
         return ordered.Count > 0 ? string.Join(",", ordered) : "local_api,external_api";
-    }
-
-    private static string NormalizeCodexFailureFallbackMode(string value)
-    {
-        value = (value ?? "").Trim().ToLowerInvariant();
-        return value == "local_agent" ? "local_agent" : "none";
-    }
-
-    private static string NormalizeLocalAgentMode(string value)
-    {
-        value = (value ?? "").Trim().ToLowerInvariant();
-        return value == "agent_verified" ? "agent_verified" : "text_only";
-    }
-
-    private static string NormalizeExecutionRequiredRoute(string value)
-    {
-        value = (value ?? "").Trim().ToLowerInvariant();
-        return value is "primary" or "codex_or_external" or "refuse" ? value : "codex_or_external";
     }
 
     private static string NormalizeMemoryOptimizerModelSource(string value)
@@ -6873,17 +6834,28 @@ exit $LASTEXITCODE
 
     private async Task CheckLocalLlmAsync(bool updateOnly = false)
     {
-        var enabled = !string.Equals(GetConfig("CTI_OLLAMA_ENABLED", GetConfig("CTI_LOCAL_LLM_ENABLED", "true")), "false", StringComparison.OrdinalIgnoreCase);
-        var routerMode = GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid");
         var kind = NormalizeLocalAiKind(GetConfig("CTI_LOCAL_AI_KIND", "ollama"));
         var baseUrl = GetConfig("CTI_LOCAL_AI_BASE_URL", GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434"));
         var model = GetConfig("CTI_LOCAL_AI_MODEL", GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b"));
         var apiKey = GetConfig("CTI_LOCAL_AI_API_KEY", "");
 
+        if (!IsLocalAiModelSourceActive())
+        {
+            _localLlmStatus.Text = string.Join(Environment.NewLine, new[]
+            {
+                "未启用",
+                model,
+                "Codex 当前未选择 local_api",
+            });
+            if (!updateOnly) AppendLog("本地模型 API 未参与当前 Codex 模型来源。");
+            return;
+        }
+
+        var enabled = !string.Equals(GetConfig("CTI_OLLAMA_ENABLED", GetConfig("CTI_LOCAL_LLM_ENABLED", "true")), "false", StringComparison.OrdinalIgnoreCase);
         if (!enabled)
         {
             _localLlmStatus.Text = $"未启用{Environment.NewLine}{model}";
-            if (!updateOnly) AppendLog("本地 Agent API 未启用。");
+            if (!updateOnly) AppendLog("本地模型 API 未启用。");
             return;
         }
 
@@ -6895,20 +6867,34 @@ exit $LASTEXITCODE
             model,
             $"类型: {LocalAiKindToLabel(kind)}",
             $"服务: {baseUrl}",
-            $"角色: {(routerMode == "local_only" ? "本地主力" : "只读兜底")}",
-            $"模式 {RouterModeToLabel(stats.RouterMode ?? routerMode)}",
-            "范围: 小活 / 只读 / 记忆检索",
-            $"本地 {stats.RouteHits} / 升级 {stats.EscalationCount}",
-            $"执行 {stats.ExecutionCount} / 失败 {stats.ExecutionFailures}",
-            $"兜底 {stats.LocalOnlyAnswers} / 拒答 {stats.LocalRefusals}",
+            "角色: Codex 模型来源",
+            $"路由: {CodexRoutingModeToLabel(NormalizeCodexRoutingMode(GetConfig("CTI_CODEX_ROUTING_MODE", "manual")))}",
+            "范围: 由 Codex agent 统一规划和执行",
+            $"最近模型路由 {stats.RouteHits}",
+            $"本地工具执行 {stats.ExecutionCount} / 失败 {stats.ExecutionFailures}",
             FormatLocalLlmLastStatus(stats),
         });
 
         if (!updateOnly)
         {
-            AppendLog($"本地 Agent API 检查：{(ok ? "通过" : "失败")} | {message}");
+            AppendLog($"本地模型 API 检查：{(ok ? "通过" : "失败")} | {message}");
         }
     }
+
+    private bool IsLocalAiModelSourceActive()
+    {
+        var source = NormalizeCodexModelSource(GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource()));
+        var mode = NormalizeCodexRoutingMode(GetConfig("CTI_CODEX_ROUTING_MODE", "manual"));
+        if (mode == "manual") return source == "local_api";
+        return NormalizeCodexApiFallbackChain(GetConfig("CTI_CODEX_API_FALLBACK_CHAIN", "local_api,external_api"))
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(item => string.Equals(item, "local_api", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string CodexRoutingModeToLabel(string? mode)
+        => string.Equals(mode, "auto_failover", StringComparison.OrdinalIgnoreCase)
+            ? "自动切换"
+            : "手动选择";
 
     private async Task RefreshBuildInfoAsync()
     {
@@ -7433,12 +7419,13 @@ exit $LASTEXITCODE
         var status = ReadLocalLlmStatus();
         var lines = new List<string>
         {
-            $"当前模式: {RouterModeToLabel(status.RouterMode ?? GetConfig("CTI_LOCAL_LLM_ROUTER_MODE", "hybrid"))}",
-            $"最近本地命中: {status.RouteHits}",
+            $"当前模型来源: {NormalizeCodexModelSource(GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource()))}",
+            $"当前路由: {CodexRoutingModeToLabel(NormalizeCodexRoutingMode(GetConfig("CTI_CODEX_ROUTING_MODE", "manual")))}",
+            $"最近本地模型路由: {status.RouteHits}",
             $"最近升级 Codex: {status.EscalationCount}",
-            $"最近本地执行: {status.ExecutionCount}",
+            $"最近本地工具执行: {status.ExecutionCount}",
             $"最近执行失败: {status.ExecutionFailures}",
-            $"最近本地 Agent 兜底: {status.LocalOnlyAnswers}",
+            $"最近本地直答记录: {status.LocalOnlyAnswers}",
             $"最近本地拒答: {status.LocalRefusals}",
             "",
             "最近路由摘要:",
@@ -7464,7 +7451,7 @@ exit $LASTEXITCODE
         }
 
         lines.Add("");
-        lines.Add("最近本地执行摘要:");
+        lines.Add("最近本地工具执行摘要:");
         var executions = status.RecentExecutions ?? [];
         if (executions.Count == 0)
         {
@@ -7482,7 +7469,7 @@ exit $LASTEXITCODE
 
         using var dialog = new Form
         {
-            Text = "最近路由摘要",
+            Text = "本地模型路由",
             Width = 920,
             Height = 620,
             StartPosition = FormStartPosition.CenterParent,
@@ -7501,6 +7488,8 @@ exit $LASTEXITCODE
         dialog.Controls.Add(box);
         dialog.ShowDialog(this);
     }
+
+
 
     private void OpenSelectedMcpPath()
     {
@@ -7789,9 +7778,6 @@ exit $LASTEXITCODE
     private static bool IsHostManagedMcp(McpManifest manifest)
         => string.Equals(manifest.Type, "http", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsUnityMcp(McpManifest manifest)
-        => Regex.IsMatch($"{manifest.Id} {manifest.DisplayName} {manifest.Category} {manifest.Source}", "unity", RegexOptions.IgnoreCase);
-
     private async Task<(bool Success, string Message)> RunManifestHealthCheckAsync(McpManifest manifest)
     {
         if (manifest.HealthCheck is null || string.IsNullOrWhiteSpace(manifest.HealthCheck.Kind))
@@ -7806,9 +7792,7 @@ exit $LASTEXITCODE
             if (string.IsNullOrWhiteSpace(url)) return (false, "healthCheck.url 为空");
             if (url.EndsWith("/mcp", StringComparison.OrdinalIgnoreCase))
             {
-                return IsUnityMcp(manifest)
-                    ? await RunUnityMcpHttpHealthCheckAsync(url)
-                    : await RunGenericMcpHttpHealthCheckAsync(url);
+                return await McpHttpHealthChecks.RunGenericAsync(url);
             }
             try
             {
@@ -7836,6 +7820,19 @@ exit $LASTEXITCODE
             }
         }
 
+        if (kind == "mcp-http-resource")
+        {
+            var url = ExpandManifestValue(manifest.HealthCheck.Url);
+            if (string.IsNullOrWhiteSpace(url)) return (false, "healthCheck.url 为空");
+            var resourceUri = manifest.HealthCheck.ResourceUri ?? "";
+            if (string.IsNullOrWhiteSpace(resourceUri)) return (false, "healthCheck.resourceUri 为空");
+            return await McpHttpHealthChecks.RunResourceAsync(
+                url,
+                resourceUri,
+                manifest.HealthCheck.SuccessRegex,
+                manifest.HealthCheck.FailureRegex);
+        }
+
         if (kind == "codex-mcp-list")
         {
             var name = !string.IsNullOrWhiteSpace(manifest.RegisterName) ? manifest.RegisterName! : manifest.Id ?? "";
@@ -7847,135 +7844,6 @@ exit $LASTEXITCODE
         }
 
         return (false, $"未知 healthCheck.kind: {manifest.HealthCheck.Kind}");
-    }
-
-    private static async Task<(bool Success, string Message)> RunGenericMcpHttpHealthCheckAsync(string url)
-    {
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
-            using var initRequest = BuildMcpInitializeRequest(url, "codex-im-suite-control-panel");
-            using var initResponse = await client.SendAsync(initRequest);
-            var initBody = await initResponse.Content.ReadAsStringAsync();
-            if (!initResponse.IsSuccessStatusCode)
-            {
-                return (false, $"MCP endpoint 在线但 initialize 失败 HTTP {(int)initResponse.StatusCode} {initResponse.ReasonPhrase} | {url} | {TrimForStatus(initBody)}");
-            }
-            if (!TryReadMcpSessionId(initResponse, out _))
-            {
-                return (true, $"MCP protocol 在线 | initialize HTTP {(int)initResponse.StatusCode} | {url}");
-            }
-            return (true, $"MCP protocol 在线 | initialize OK | {url}");
-        }
-        catch (TaskCanceledException)
-        {
-            return (false, $"MCP initialize 超时 | {url}");
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
-        {
-            return (false, $"MCP endpoint HTTP {(int)ex.StatusCode.Value} | {url} | {ex.Message}");
-        }
-        catch (Exception ex)
-        {
-            return (false, $"MCP endpoint 连接失败 | {url} | {ex.Message}");
-        }
-    }
-
-    private static async Task<(bool Success, string Message)> RunUnityMcpHttpHealthCheckAsync(string url)
-    {
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
-            using var initRequest = BuildMcpInitializeRequest(url, "codex-im-suite-control-panel");
-            using var initResponse = await client.SendAsync(initRequest);
-            var initBody = await initResponse.Content.ReadAsStringAsync();
-            if (!initResponse.IsSuccessStatusCode)
-            {
-                return (false, $"MCP endpoint 在线但 initialize 失败 HTTP {(int)initResponse.StatusCode} {initResponse.ReasonPhrase} | {url} | {TrimForStatus(initBody)}");
-            }
-            if (!TryReadMcpSessionId(initResponse, out var sessionId))
-            {
-                return (false, $"MCP initialize 成功但缺少 mcp-session-id | {url}");
-            }
-
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-            using var instancesRequest = new HttpRequestMessage(HttpMethod.Post, url);
-            instancesRequest.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream");
-            instancesRequest.Headers.TryAddWithoutValidation("mcp-session-id", sessionId);
-            instancesRequest.Content = new StringContent(
-                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"mcpforunity://instances\"}}",
-                Encoding.UTF8,
-                "application/json");
-
-            using var instancesResponse = await client.SendAsync(instancesRequest, cts.Token);
-            var instancesBody = await instancesResponse.Content.ReadAsStringAsync(cts.Token);
-            var decoded = DecodeSsePayload(instancesBody);
-            if (!instancesResponse.IsSuccessStatusCode)
-            {
-                return (false, $"MCP protocol 在线，但 Unity instances 读取失败 HTTP {(int)instancesResponse.StatusCode} {instancesResponse.ReasonPhrase} | {TrimForStatus(decoded)}");
-            }
-            if (Regex.IsMatch(decoded, "Unity session not available|No Unity instance|not available|unavailable", RegexOptions.IgnoreCase))
-            {
-                return (false, $"MCP protocol 在线，但 Unity Editor session 不可用 | {TrimForStatus(decoded)}");
-            }
-            if (Regex.IsMatch(decoded, "Name@|instances|mcpforunity://instances|contents|text", RegexOptions.IgnoreCase))
-            {
-                return (true, $"MCP + Unity session 可用 | {SummarizeUnityInstances(decoded)}");
-            }
-            return (false, $"MCP protocol 在线，但 Unity instances 响应不可识别 | {TrimForStatus(decoded)}");
-        }
-        catch (TaskCanceledException)
-        {
-            return (false, $"MCP endpoint 在线可能正常，但 Unity session 读取超时 | {url}");
-        }
-        catch (HttpRequestException ex) when (ex.StatusCode.HasValue)
-        {
-            return (false, $"MCP endpoint HTTP {(int)ex.StatusCode.Value} | {url} | {ex.Message}");
-        }
-        catch (Exception ex)
-        {
-            return (false, $"MCP endpoint 连接失败 | {url} | {ex.Message}");
-        }
-    }
-
-    private static HttpRequestMessage BuildMcpInitializeRequest(string url, string clientName)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Post, url);
-        request.Headers.TryAddWithoutValidation("Accept", "application/json, text/event-stream");
-        request.Content = new StringContent(
-            $"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{clientName}\",\"version\":\"0.0.0\"}}}}}}",
-            Encoding.UTF8,
-            "application/json");
-        return request;
-    }
-
-    private static bool TryReadMcpSessionId(HttpResponseMessage response, out string sessionId)
-    {
-        sessionId = "";
-        if (!response.Headers.TryGetValues("mcp-session-id", out var values)) return false;
-        sessionId = values.FirstOrDefault() ?? "";
-        return !string.IsNullOrWhiteSpace(sessionId);
-    }
-
-    private static string DecodeSsePayload(string body)
-    {
-        if (string.IsNullOrWhiteSpace(body)) return "";
-        var dataLines = body.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries)
-            .Where(line => line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
-            .Select(line => line["data:".Length..].Trim())
-            .ToArray();
-        return dataLines.Length == 0 ? body : string.Join("\n", dataLines);
-    }
-
-    private static string SummarizeUnityInstances(string body)
-    {
-        var compact = TrimForStatus(body);
-        var names = Regex.Matches(body, @"[A-Za-z0-9_\- .]+@[a-fA-F0-9]{4,}")
-            .Select(match => match.Value.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(4)
-            .ToArray();
-        return names.Length > 0 ? string.Join(", ", names) : compact;
     }
 
     private static string TrimForStatus(string text)
@@ -10032,9 +9900,9 @@ exit $LASTEXITCODE
             return routeLabel switch
             {
                 "codex_primary" => "Codex 主脑",
-                "codex_local_fallback" => "本地 Agent 兜底",
+                "codex_local_fallback" => "本地模型来源",
                 "local_explicit_task" => "本地辅助执行",
-                "local_fallback_no_codex" => "本地兜底",
+                "local_fallback_no_codex" => "本地模型来源",
                 "local_refused_out_of_scope" => "本地拒绝（超范围）",
                 _ => "暂无记录",
             };
@@ -10044,9 +9912,9 @@ exit $LASTEXITCODE
         return provider switch
         {
             "codex" or "codex_only" => "Codex 主脑",
-            "codex_local_fallback" => "本地 Agent 兜底",
+            "codex_local_fallback" => "本地模型来源",
             "local" => "本地辅助执行",
-            "local_best_effort" => "本地兜底",
+            "local_best_effort" => "本地模型来源",
             "refuse_local" => "本地拒绝（超范围）",
             _ => "暂无记录",
         };
@@ -10555,6 +10423,9 @@ internal sealed class McpHealthCheck
 {
     public string? Kind { get; set; }
     public string? Url { get; set; }
+    public string? ResourceUri { get; set; }
+    public string? SuccessRegex { get; set; }
+    public string? FailureRegex { get; set; }
 }
 
 internal sealed class McpServiceState
@@ -10897,12 +10768,6 @@ internal sealed record SettingsSnapshot(
     string CodexModel = "",
     bool CodexPassModel = false,
     string CodexReasoningEffort = "low",
-    bool CodexLocalFallbackEnabled = false,
-    string CodexLocalFallbackReasoningEffort = "minimal",
-    string CodexFailureFallbackMode = "none",
-    string LocalAgentMode = "text_only",
-    bool LocalToolCallRequired = true,
-    string ExecutionRequiredRoute = "codex_or_external",
     bool MemoryOptimizerEnabled = false,
     string MemoryOptimizerIntervalDays = "7",
     string MemoryOptimizerModelSource = "codex_primary",

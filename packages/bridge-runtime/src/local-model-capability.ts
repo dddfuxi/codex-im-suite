@@ -207,8 +207,7 @@ export function isLocalToolCallingVerified(config: Config): boolean {
 }
 
 export function shouldTrustLocalApiForExecution(config: Config): boolean {
-  if (config.localToolCallRequired === false) return true;
-  return config.localAgentMode === 'agent_verified' && isLocalToolCallingVerified(config);
+  return isLocalToolCallingVerified(config);
 }
 
 export async function probeLocalModelCapabilities(config: Config): Promise<LocalModelCapabilityProfile> {

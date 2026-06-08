@@ -23,19 +23,52 @@ function Invoke-McpInitialize {
         -TimeoutSec $TimeoutSec
 }
 
+function Invoke-McpReadResource {
+    param([string]$Url, [string]$SessionId, [string]$ResourceUri, [int]$TimeoutSec)
+    $body = @{
+        jsonrpc = '2.0'
+        id = 2
+        method = 'resources/read'
+        params = @{ uri = $ResourceUri }
+    } | ConvertTo-Json -Depth 10 -Compress
+    return Invoke-WebRequest `
+        -Uri $Url `
+        -Method Post `
+        -Headers @{ Accept = 'application/json, text/event-stream'; 'mcp-session-id' = $SessionId } `
+        -ContentType 'application/json' `
+        -Body $body `
+        -UseBasicParsing `
+        -TimeoutSec $TimeoutSec
+}
+
 function Test-Endpoint {
     param([string]$Url, [int]$TimeoutSec)
     try {
         $resp = Invoke-McpInitialize -Url $Url -TimeoutSec $TimeoutSec
         $sessionId = $resp.Headers['mcp-session-id']
-        if ($sessionId) {
-            return "MCP initialize OK HTTP $($resp.StatusCode)"
+        if (-not $sessionId) {
+            throw "MCP initialize OK HTTP $($resp.StatusCode), but missing mcp-session-id"
         }
-        return "MCP initialize OK HTTP $($resp.StatusCode), but missing mcp-session-id"
+
+        $resourceUri = 'mcpforunity://instances'
+        $resourceResp = Invoke-McpReadResource -Url $Url -SessionId $sessionId -ResourceUri $resourceUri -TimeoutSec $TimeoutSec
+        $content = [string]$resourceResp.Content
+        $countMatch = [regex]::Match($content, '\\?"instance_count\\?"\s*:\s*(\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($countMatch.Success) {
+            $instanceCount = [int]$countMatch.Groups[1].Value
+            if ($instanceCount -gt 0) {
+                return "MCP initialize OK HTTP $($resp.StatusCode); Unity instances OK count=$instanceCount"
+            }
+            throw "MCP protocol OK but Unity Editor session is not connected (instance_count=0)"
+        }
+        if ($content -match '[A-Za-z0-9_\- .]+@[a-fA-F0-9]{4,}') {
+            return "MCP initialize OK HTTP $($resp.StatusCode); Unity instance visible"
+        }
+        throw "MCP protocol OK but Unity instances response is not recognizable: $($content.Substring(0, [Math]::Min(240, $content.Length)))"
     }
     catch {
         if ($_.Exception.Response) {
-            return "HTTP $([int]$_.Exception.Response.StatusCode)"
+            throw "HTTP $([int]$_.Exception.Response.StatusCode)"
         }
         throw
     }
@@ -83,7 +116,12 @@ function Stop-UnityMcpHelper {
 function Start-UnityMcpHelper {
     param([string]$Project)
     if ([string]::IsNullOrWhiteSpace($Project)) {
-        $Project = 'C:\unity\ST3\Game'
+        $current = (Get-Location).Path
+        if (Test-Path -LiteralPath (Join-Path $current 'ProjectSettings\ProjectVersion.txt')) {
+            $Project = $current
+        } else {
+            throw "Unity project path is not configured. Set CTI_UNITY_PROJECT_PATH or run this launcher from a Unity project root."
+        }
     }
     $terminalScript = Join-Path $Project 'Library\MCPForUnity\TerminalScripts\mcp-terminal.cmd'
     $autostartRequest = Join-Path $Project 'Library\MCPForUnity\http-autostart.request'

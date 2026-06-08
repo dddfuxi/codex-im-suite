@@ -23,6 +23,7 @@ export interface AnswerReviewInput {
     toolResultCount: number;
     successfulToolResultCount: number;
     failedToolResultCount: number;
+    failedToolErrors?: string[];
     toolNames: string[];
     permissionRequestCount: number;
     requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';

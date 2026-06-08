@@ -1,5 +1,15 @@
 # codex-im-suite
 
+## 项目内 Git 会话存档
+
+本仓库启用了项目内 Git 会话存档，用于把 Codex/AI 维护过程和 Git commit 关联留痕。安装入口只写当前仓库的 `.git/config`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.ps1
+```
+
+该脚本会把 `entireio/cli` 固定版本构建到 `.codex-tools\bin\entire.exe`，并设置 `core.hooksPath=.githooks`。`.codex-tools` 是本仓库本地工具缓存，不提交、不全局安装；其他项目需要同样能力时，应在对应项目内单独安装。默认策略是 `manual-commit`，会话结束时只在非 `codex/dev` 分支、会话开始基线干净、检查通过且无冲突时，自动提交本轮改动并合并到 `codex/dev`；不自动 push。
+
 `codex-im-suite` 是飞书桥接、Codex 执行层、本地辅助模型、MCP、Skill、控制面板和 Windows 打包流程的统一开发与发布目录。
 
 当前目标很明确：
@@ -108,21 +118,21 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 默认是 `Codex CLI agent + 可选模型 API 来源链`：
 
-- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli`、历史兼容且默认禁用的 `local-tool-agent` 和实验性的 `codex-oss-ollama`；本地 API 通过 `codex` 的模型来源接入，不再作为独立兜底执行器。
+- 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和实验性的 `codex-oss-ollama`；本地 API 与外部 API 都通过 `codex` 的模型来源接入，不再作为独立本地 agent 或兜底执行器。
 - 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor，“节点”页可查看本机 node 与 fake remote node 的能力清单。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 设置页的“Codex CLI 模型来源”可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
 - 本地 API 现在作为 Codex CLI 的普通模型来源接入，不再因为工具探测未通过或旧本地兜底键自动转官方 Codex；`ollama` / `lmstudio` 会通过 provider registry 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，不会走 Codex SDK 的 `/v1/responses`。`vllm`、`openai-compatible` 和 `custom` 在未接入 Codex CLI OSS agent 前只显示为 Chat Completions 能力，不能伪装执行。
 - 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 工具轨迹 / 耗时的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
 - 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
-- 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 失败后允许走 runtime 自己的受控工具兜底；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
+- 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 模型来源失败后允许走 runtime 自己的受控工具补执行；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
 - bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
 - live 同步会校验运行副本里的 `@openai/codex-sdk` 版本，避免 package 已更新但 live `node_modules` 仍停在旧 Codex CLI，导致新旧 `CODEX_HOME` 状态库迁移不兼容。
 - 每轮回复都会记录执行证据；如果模型声称已生成图片、创建文件、执行命令或完成 Unity/MCP 当前状态检查，但没有成功工具记录，或 `cti-final` 声明的本地文件路径不存在，bridge 会在发送前改成“未完成”并提示已拦截可能的假完成。若 provider 没有返回任何可展示最终文本，Feishu 最终卡片也会显示“未完成：模型没有返回可展示结果。”，不会只留下空白完成状态。
 - `hybrid` 模式下 MCP 状态、工具和可用性询问默认先走 Codex；只有 `local_only` 或 Codex 不可用后才使用本地 MCP 动态状态兜底，不再返回硬编码入口列表。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
-- 本地模型只作为 agent API 后端和少数内部测试/整理入口使用；普通飞书消息不再走本地模型直答。
+- 本地模型只作为 Codex agent 的可选模型来源、模型能力检测和少数内部测试/整理入口使用；普通飞书消息不再走独立本地模型直答。
 - 记忆关键词不再触发本地直答；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。只有 `quality=high` 的高置信结构化命中才由记忆层直接回复，关系图候选和其他低确定性结果只注入主执行链。
 - 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
@@ -139,7 +149,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.
 
 控制面板“扩展”页支持三层在线目录、HTTPS URL 预览和本机安装。目录由静态种子、动态排行榜源、自定义 URL 叠加而成；动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自前 5 项，并在条目上显示来源、抓取时间和排行依据。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
 
-扩展目录内的本地工具模型候选包括 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后可在设置页“本地 API -> 已安装模型”下拉中选择并“应用并重启”，也仍可手动输入任意 Ollama 模型名。扩展页会把 Ollama `/api/tags` 中已安装但不在目录里的模型补成“本机已安装”条目，支持直接使用或 `ollama rm` 卸载。默认 `qwen2.5-coder:7b` 只按文本 / 总结兜底使用。
+扩展目录内的本地工具模型候选包括 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后可在设置页“本地 API -> 已安装模型”下拉中选择并“应用并重启”，也仍可手动输入任意 Ollama 模型名。扩展页会把 Ollama `/api/tags` 中已安装但不在目录里的模型补成“本机已安装”条目，支持直接使用或 `ollama rm` 卸载。默认 `qwen2.5-coder:7b` 只作为文本 / 总结能力基线，不宣称稳定工具执行能力。
 
 ```powershell
 CTI_EXTENSION_CATALOG_URLS=https://example.com/codex-im-suite/catalog.json

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 import type { Config } from './config.js';
 
@@ -11,6 +11,9 @@ type McpType = 'http' | 'stdio';
 interface McpHealthCheck {
   kind?: string;
   url?: string;
+  resourceUri?: string;
+  successRegex?: string;
+  failureRegex?: string;
 }
 
 interface ExtensionCompatibility {
@@ -71,6 +74,12 @@ export interface McpToolInfo {
   title?: string;
   description?: string;
   inputSchema?: unknown;
+}
+
+export interface McpToolCallResult {
+  ok: boolean;
+  content: string;
+  error?: string;
 }
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -159,6 +168,21 @@ function parseSseJson<T>(rawText: string): T {
     return JSON.parse(rawText) as T;
   }
   return JSON.parse(dataLines[dataLines.length - 1]) as T;
+}
+
+function compactStatusText(value: string, maxLength = 260): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+}
+
+function formatMcpResourceResult(result: unknown): string {
+  if (result && typeof result === 'object' && Array.isArray((result as { contents?: unknown }).contents)) {
+    const texts = ((result as { contents?: Array<{ text?: unknown }> }).contents || [])
+      .map((item) => typeof item?.text === 'string' ? item.text : '')
+      .filter(Boolean);
+    if (texts.length > 0) return texts.join('\n');
+  }
+  return JSON.stringify(result);
 }
 
 function isPathWithin(baseDir: string, targetDir: string): boolean {
@@ -285,6 +309,57 @@ function formatMcpToolPayload(payload: unknown): string {
   return JSON.stringify(payload, null, 2);
 }
 
+function getManifestCwd(manifest: McpManifestRecord, config: Config): string {
+  const cwd = expandManifestValue(manifest.cwd, config);
+  if (cwd && fs.existsSync(cwd)) return cwd;
+  return getSuiteRoot();
+}
+
+async function terminateChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (process.platform === 'win32' && child.pid) {
+    await new Promise<void>((resolve) => {
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      const timer = setTimeout(resolve, 2000);
+      killer.on('close', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      killer.on('error', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+  try {
+    child.stdin.destroy();
+  } catch {
+    // ignore best-effort shutdown errors
+  }
+  if (!child.killed) {
+    try {
+      child.kill();
+    } catch {
+      // ignore best-effort shutdown errors
+    }
+  }
+  try { child.stdout.destroy(); } catch { /* ignore best-effort shutdown errors */ }
+  try { child.stderr.destroy(); } catch { /* ignore best-effort shutdown errors */ }
+}
+
+function waitForChildClose(child: ChildProcessWithoutNullStreams, timeoutMs = 1500): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 export class McpBridge {
   constructor(private readonly config: Config) {}
 
@@ -391,6 +466,24 @@ export class McpBridge {
 
     if (manifest.type === 'http') {
       const url = expandManifestValue(manifest.healthCheck?.url || '', this.config);
+      if (manifest.healthCheck?.kind === 'mcp-http-resource' || manifest.healthCheck?.resourceUri) {
+        const resourceUri = manifest.healthCheck?.resourceUri || '';
+        if (!url) return { ok: false, message: 'manifest 未配置 http healthCheck.url' };
+        if (!resourceUri) return { ok: false, message: 'manifest 未配置 mcp resource healthCheck.resourceUri' };
+        try {
+          const result = await this.sendHttpRequest<unknown>(manifest, 'resources/read', { uri: resourceUri });
+          const text = formatMcpResourceResult(result);
+          if (manifest.healthCheck?.failureRegex && new RegExp(manifest.healthCheck.failureRegex, 'i').test(text)) {
+            return { ok: false, message: `MCP protocol 在线，但资源健康检查未通过 | ${resourceUri} | ${compactStatusText(text)}` };
+          }
+          if (manifest.healthCheck?.successRegex && !new RegExp(manifest.healthCheck.successRegex, 'i').test(text)) {
+            return { ok: false, message: `MCP protocol 在线，但资源健康检查未满足成功条件 | ${resourceUri} | ${compactStatusText(text)}` };
+          }
+          return { ok: true, message: `MCP resource 健康检查通过 | ${resourceUri} | ${compactStatusText(text)}` };
+        } catch (error) {
+          return { ok: false, message: `MCP resource 健康检查失败 | ${resourceUri} | ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
       if (!url) return { ok: false, message: 'manifest 未配置 http healthCheck.url' };
       try {
         const response = await fetch(url, { method: 'GET' });
@@ -425,7 +518,7 @@ export class McpBridge {
       return { ok: false, message: workspaceValidation.message };
     }
     const launcher = expandManifestValue(manifest.launcher, this.config);
-    const cwd = expandManifestValue(manifest.cwd, this.config) || getSuiteRoot();
+    const cwd = getManifestCwd(manifest, this.config);
     if (!launcher || !fs.existsSync(launcher)) {
       return { ok: false, message: `launcher 不存在: ${launcher}` };
     }
@@ -441,7 +534,7 @@ export class McpBridge {
       return { ok: false, message: workspaceValidation.message };
     }
     const launcher = expandManifestValue(manifest.stopLauncher || '', this.config);
-    const cwd = expandManifestValue(manifest.cwd, this.config) || getSuiteRoot();
+    const cwd = getManifestCwd(manifest, this.config);
     if (!launcher || !fs.existsSync(launcher)) {
       return { ok: false, message: `stopLauncher 不存在: ${launcher}` };
     }
@@ -468,21 +561,192 @@ export class McpBridge {
     return (await this.listHttpToolDetails(manifest)).map((tool) => tool.name);
   }
 
-  async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<string> {
+  async listToolDetails(manifest: McpManifestRecord): Promise<McpToolInfo[]> {
+    if (manifest.type === 'http') return this.listHttpToolDetails(manifest);
+    return this.listStdioToolDetails(manifest);
+  }
+
+  async listTools(manifest: McpManifestRecord): Promise<string[]> {
+    return (await this.listToolDetails(manifest)).map((tool) => tool.name);
+  }
+
+  async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
     const workspaceValidation = this.validateManifestWorkspace(manifest);
     if (!workspaceValidation.ok) {
       throw new Error(workspaceValidation.message);
     }
-    const result = await this.sendHttpRequest<{ content?: unknown; structuredContent?: unknown; structured_content?: unknown }>(manifest, 'tools/call', {
+    const result = await this.sendHttpRequest<{ isError?: boolean; content?: unknown; structuredContent?: unknown; structured_content?: unknown; error?: unknown }>(manifest, 'tools/call', {
       name: toolName,
       arguments: args,
     });
     const payload = result.content ?? result.structuredContent ?? result.structured_content ?? result;
-    return formatMcpToolPayload(payload);
+    const content = formatMcpToolPayload(payload);
+    const error = typeof result.error === 'string' ? result.error : undefined;
+    return { ok: result.isError !== true && !error, content, ...(error ? { error } : {}) };
+  }
+
+  async callTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+    if (manifest.type === 'http') return this.callHttpTool(manifest, toolName, args);
+    return this.callStdioTool(manifest, toolName, args);
+  }
+
+  private async listStdioToolDetails(manifest: McpManifestRecord): Promise<McpToolInfo[]> {
+    const result = await this.sendStdioRequest<{ tools?: Array<{ name?: string; title?: string; description?: string; inputSchema?: unknown }> }>(
+      manifest,
+      'tools/list',
+      {},
+    );
+    return (result.tools || [])
+      .map((tool) => ({
+        name: String(tool.name || '').trim(),
+        title: typeof tool.title === 'string' ? tool.title : undefined,
+        description: typeof tool.description === 'string' ? tool.description : undefined,
+        inputSchema: tool.inputSchema,
+      }))
+      .filter((tool) => tool.name);
+  }
+
+  private async callStdioTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+    const result = await this.sendStdioRequest<{ isError?: boolean; content?: unknown; structuredContent?: unknown; structured_content?: unknown; error?: unknown }>(
+      manifest,
+      'tools/call',
+      { name: toolName, arguments: args },
+    );
+    const payload = result.content ?? result.structuredContent ?? result.structured_content ?? result;
+    const content = formatMcpToolPayload(payload);
+    const error = typeof result.error === 'string' ? result.error : undefined;
+    return { ok: result.isError !== true && !error, content, ...(error ? { error } : {}) };
   }
 
   private expandEnvMap(values: Record<string, string>): Record<string, string> {
     return Object.fromEntries(Object.entries(values).map(([key, value]) => [key, expandManifestValue(value, this.config)]));
+  }
+
+  private async sendStdioRequest<T>(manifest: McpManifestRecord, method: string, params: Record<string, unknown>): Promise<T> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
+    const launcher = expandManifestValue(manifest.launcher, this.config);
+    if (!launcher || !fs.existsSync(launcher)) {
+      throw new Error(`stdio MCP launcher 不存在: ${launcher}`);
+    }
+    const cwd = getManifestCwd(manifest, this.config);
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', launcher], {
+      cwd,
+      env: { ...process.env, ...(manifest.env ? this.expandEnvMap(manifest.env) : {}) },
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    let nextId = 1;
+    let markStartupReady: (() => void) | null = null;
+    const startupReady = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        markStartupReady = null;
+        resolve();
+      }, 1000);
+      markStartupReady = () => {
+        clearTimeout(timer);
+        markStartupReady = null;
+        resolve();
+      };
+    });
+    const pending = new Map<number, {
+      resolve: (value: unknown) => void;
+      reject: (error: Error) => void;
+    }>();
+
+    const parseOutput = () => {
+      for (;;) {
+        const newline = stdout.indexOf('\n');
+        if (newline < 0) break;
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        if (!line) continue;
+        let message: McpJsonRpcResponse<unknown> | null = null;
+        try {
+          message = JSON.parse(line) as McpJsonRpcResponse<unknown>;
+        } catch {
+          continue;
+        }
+        const id = typeof message.id === 'number' ? message.id : null;
+        if (id === null) continue;
+        const target = pending.get(id);
+        if (!target) continue;
+        pending.delete(id);
+        if ('error' in message) {
+          target.reject(new Error(message.error?.message || `MCP ${method} 返回错误`));
+        } else {
+          target.resolve(message.result);
+        }
+      }
+    };
+
+    const call = (rpcMethod: string, rpcParams: Record<string, unknown> | undefined): Promise<unknown> => {
+      const id = nextId;
+      nextId += 1;
+      const payload = { jsonrpc: '2.0', id, method: rpcMethod, params: rpcParams || {} };
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+          if (error) {
+            pending.delete(id);
+            reject(error);
+          }
+        });
+      });
+    };
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+      if (markStartupReady) markStartupReady();
+      parseOutput();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      for (const target of pending.values()) target.reject(error);
+      pending.clear();
+    });
+    child.on('close', (code) => {
+      if (pending.size === 0) return;
+      const message = stderr || stdout || `stdio MCP exited with code ${code ?? 1}`;
+      for (const target of pending.values()) target.reject(new Error(message.trim()));
+      pending.clear();
+    });
+
+    const operation = async (): Promise<T> => {
+      await startupReady;
+      await call('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'codex-im-suite-local-agent', version: '0.1.0' },
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`);
+      return await call(method, params) as T;
+    };
+
+    const timeoutMs = 30000;
+    let hardTimer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      hardTimer = setTimeout(() => {
+        reject(new Error(`MCP stdio request timed out: ${method}${stderr ? ` | stderr: ${stderr.slice(0, 400)}` : ''}`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([operation(), timeout]);
+    } finally {
+      if (hardTimer) clearTimeout(hardTimer);
+      for (const target of pending.values()) {
+        target.reject(new Error(`MCP stdio request closed: ${method}`));
+      }
+      pending.clear();
+      await terminateChild(child);
+      await waitForChildClose(child);
+    }
   }
 
   private async sendHttpRequest<T>(manifest: McpManifestRecord, method: string, params: Record<string, unknown>): Promise<T> {

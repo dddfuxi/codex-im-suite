@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { initBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
 import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
 import 'claude-to-im/src/lib/bridge/adapters/index.js';
+import { classifyToolResultQuality } from 'claude-to-im/src/lib/bridge/execution-requirement.js';
 import {
   initializeBridgeRuntimeAudit,
   recordBridgeRuntimeExit,
@@ -557,7 +558,7 @@ class HubLlmProvider implements LLMProvider {
           return;
         }
         if (routerMode === 'local_only') {
-          await this.pipeLocalAgentApiFallback(observedController, params, conservative, '当前模式为仅本地 Agent API');
+          await this.pipeLocalAgentApiFallback(observedController, params, conservative, '当前模式为仅本地模型 API');
           return;
         }
         try {
@@ -705,7 +706,7 @@ class HubLlmProvider implements LLMProvider {
       return;
     }
 
-    await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由失败，切换本地 Agent API：${reason}`);
+    await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由失败，切换本地模型 API：${reason}`);
   }
 
   private async dispatchByRoute(
@@ -736,13 +737,13 @@ class HubLlmProvider implements LLMProvider {
           });
           return;
         }
-        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由要求直答，改用本地 Agent API：${route.reason}`);
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由要求直答，改用本地模型 API：${route.reason}`);
         return;
       }
 
       case 'escalate_codex': {
         if (mode === 'local_only') {
-          await this.pipeLocalAgentApiFallback(controller, params, conservative, `当前仅本地模式，使用本地 Agent API：${route.reason}`);
+          await this.pipeLocalAgentApiFallback(controller, params, conservative, `当前仅本地模式，使用本地模型 API：${route.reason}`);
           return;
         }
 
@@ -775,26 +776,25 @@ class HubLlmProvider implements LLMProvider {
           return;
         }
 
-        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由拒绝直答，使用本地 Agent API：${route.reason}`);
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由拒绝直答，使用本地模型 API：${route.reason}`);
       }
     }
   }
 
   private isLocalAgentApiFallbackEnabled(): boolean {
-    return this.config.codexFailureFallbackMode === 'local_agent'
-      && this.config.codexLocalFallbackEnabled === true;
+    return false;
   }
 
   private buildAgentFallbackUnavailableReply(primaryFailure: string, localFailure?: string): string {
     const parts = [
-      `主 Codex API 与本地 Agent API 都不可用。主 API：${summarizeCodexFailureMessage(primaryFailure)}`,
+      `主 Codex API 与本地模型 API 都不可用。主 API：${summarizeCodexFailureMessage(primaryFailure)}`,
     ];
     if (localFailure) {
-      parts.push(`本地 Agent API：${truncatePreview(localFailure, 180)}`);
+      parts.push(`本地模型 API：${truncatePreview(localFailure, 180)}`);
     } else if (!this.isLocalAgentApiFallbackEnabled()) {
-      parts.push('本地 Agent API 兜底已关闭。');
+      parts.push('本地模型 API 未启用。');
     } else if (!this.localAgentFallbackProvider) {
-      parts.push('本地 Agent API provider 未初始化。');
+      parts.push('本地模型 API provider 未初始化。');
     }
     return parts.join(' ');
   }
@@ -854,7 +854,7 @@ class HubLlmProvider implements LLMProvider {
         taskKind: conservative.requestKind,
         decision: 'refuse_local',
         provider: 'codex_local_fallback',
-        reason: `本地 Agent API 兜底失败：${reason}`,
+        reason: `本地模型 API 模型来源失败：${reason}`,
         compressedPromptChars: 0,
         compressedHistoryChars: 0,
         fallbackReason: localFailure,
@@ -886,8 +886,21 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
     reason: string,
   ): Promise<void> {
+    if (params.executionRequirement?.requiredToolFamilies?.includes('web-search')) {
+      const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
+      await this.pipeFallbackStream(controller, params, {
+        mode: 'hybrid',
+        taskKind: 'tool_request',
+        decision: 'escalate_codex',
+        provider: 'codex_local_fallback',
+        reason: `${reason}；当前请求匹配到非严格工具证据族，优先尝试本地 MCP 工具协议`,
+        compressedPromptChars: 0,
+        compressedHistoryChars: 0,
+      }, new CodexLocalCliProvider(this.config));
+      return;
+    }
     const useTrustedExecutionProvider = this.shouldAvoidLocalPrimaryForExecution(conservative, params);
-    if (useTrustedExecutionProvider && this.config.executionRequiredRoute === 'refuse') {
+    if (useTrustedExecutionProvider) {
       this.emitLocalSuccess(controller, params.sessionId, this.buildLocalApiUnverifiedReply(), undefined, {
         mode: 'hybrid',
         taskKind: conservative.requestKind,
@@ -899,9 +912,7 @@ class HubLlmProvider implements LLMProvider {
       });
       return;
     }
-    const provider = useTrustedExecutionProvider && this.config.executionRequiredRoute !== 'primary'
-      ? this.trustedExecutionProvider
-      : this.fallbackProvider;
+    const provider = this.fallbackProvider;
     const executionReason = useTrustedExecutionProvider
       ? `${reason}；本地 API 未通过工具调用探测，执行类任务改交官方/外部 Codex`
       : reason;
@@ -933,7 +944,7 @@ class HubLlmProvider implements LLMProvider {
       );
       if (handledByConfiguredToolFallback) return;
       if (!this.isLocalAgentApiFallbackEnabled()) {
-        throw new Error(`Codex 主模型失败，备用模型未启用：${summarizeCodexFailureMessage(message)}`);
+        throw new Error(`Codex 主模型失败，自动切换链未启用可用来源：${summarizeCodexFailureMessage(message)}`);
       }
       if (this.localAgent.canHandleMcpBridgeFastPathV2(params)) {
         try {
@@ -955,10 +966,10 @@ class HubLlmProvider implements LLMProvider {
         }
       }
       if (requiresConcreteToolOutput(conservative.requestKind, params.prompt)) {
-        await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地 Agent API 继续工具任务：${message}`, message);
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地模型 API 继续工具任务：${message}`, message);
         return;
       }
-      await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地 Agent API：${message}`, message);
+      await this.pipeLocalAgentApiFallback(controller, params, conservative, `主 Codex API 失败，切换本地模型 API：${message}`, message);
     }
   }
 
@@ -1206,6 +1217,7 @@ interface StreamEvidence {
   toolResultCount: number;
   successfulToolResultCount: number;
   failedToolResultCount: number;
+  failedToolErrors: string[];
   toolNames: string[];
   provider?: string;
   codexProfile?: string;
@@ -1243,6 +1255,7 @@ function emptyStreamEvidence(): StreamEvidence {
     toolResultCount: 0,
     successfulToolResultCount: 0,
     failedToolResultCount: 0,
+    failedToolErrors: [],
     toolNames: [],
   };
 }
@@ -1278,8 +1291,13 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
     }
     if (event.type === 'tool_result') {
       evidence.toolResultCount += 1;
-      if (data?.is_error) {
+      const resultQuality = classifyToolResultQuality(data?.content, data?.is_error === true);
+      if (!resultQuality.ok) {
         evidence.failedToolResultCount += 1;
+        const errorSummary = resultQuality.errorSummary;
+        if (errorSummary && !evidence.failedToolErrors.includes(errorSummary)) {
+          evidence.failedToolErrors = [...evidence.failedToolErrors, errorSummary].slice(0, 3);
+        }
       } else {
         evidence.successfulToolResultCount += 1;
         if (evidence.requiredEvidenceKind && evidence.requiredEvidenceKind !== 'none') {
@@ -1345,6 +1363,7 @@ function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
     toolResultCount: evidence.toolResultCount,
     successfulToolResultCount: evidence.successfulToolResultCount,
     failedToolResultCount: evidence.failedToolResultCount,
+    failedToolErrors: evidence.failedToolErrors,
     toolNames: evidence.toolNames,
   };
   if (evidence.provider) payload.provider = evidence.provider;
@@ -1451,8 +1470,6 @@ class ObservedLLMProvider implements LLMProvider {
             executorId: selection.executor.id,
             fallbackExecutorIds: selection.fallbackExecutorIds,
             codexModelSource: configuredModelSource,
-            codexFailureFallbackMode: this.config.codexFailureFallbackMode || 'none',
-            codexLocalFallbackEnabled: this.config.codexLocalFallbackEnabled === true,
             localAiModel: this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel,
             localAiBaseUrl: this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl,
           });
@@ -1488,21 +1505,8 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
   const wrapWithLocalHub = (
     provider: LLMProvider,
     primaryExecutorId: string,
-    localAgentFallbackProvider: LLMProvider | null = null,
-    trustedExecutionProvider: LLMProvider = provider,
   ): LLMProvider => {
-    if ((config.ollamaEnabled ?? config.localLlmEnabled) !== true) return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
-    const localProvider = new OllamaProvider(config);
-    return new HubLlmProvider(
-      config,
-      store,
-      localProvider,
-      new LocalAgentProvider(config, pendingPerms, localProvider),
-      provider,
-      localAgentFallbackProvider,
-      primaryExecutorId,
-      trustedExecutionProvider,
-    );
+    return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
   };
 
   const runtime = config.runtime;
@@ -1523,7 +1527,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
         provider: createCodexProvider(source),
       })))
       : createCodexProvider(config.codexModelSource || 'official');
-    return wrapWithLocalHub(primaryProvider, 'codex', null, primaryProvider);
+    return wrapWithLocalHub(primaryProvider, 'codex');
   }
 
   if (runtime === 'auto') {
@@ -1556,7 +1560,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
         provider: createCodexProvider(source),
       })))
       : createCodexProvider(config.codexModelSource || 'official');
-    return wrapWithLocalHub(primaryProvider, 'codex', null, primaryProvider);
+    return wrapWithLocalHub(primaryProvider, 'codex');
   }
 
   const cliPath = resolveClaudeCliPath();

@@ -195,6 +195,17 @@ function validateExtensionManifest(filePath, allowedTypes, directoryLabel) {
     if (type === "http" && !String(manifest.healthCheck?.url || "")) {
       addError(`${filePath}: HTTP MCP manifest must declare healthCheck.url`);
     }
+    if (type === "http" && String(manifest.healthCheck?.kind || "") === "mcp-http-resource") {
+      if (!String(manifest.healthCheck?.resourceUri || "")) {
+        addError(`${filePath}: mcp-http-resource healthCheck must declare resourceUri`);
+      }
+      if (!String(manifest.healthCheck?.successRegex || "")) {
+        addError(`${filePath}: mcp-http-resource healthCheck must declare successRegex`);
+      }
+      if (!String(manifest.healthCheck?.failureRegex || "")) {
+        addError(`${filePath}: mcp-http-resource healthCheck must declare failureRegex`);
+      }
+    }
   }
 
   if (type === "skill") {

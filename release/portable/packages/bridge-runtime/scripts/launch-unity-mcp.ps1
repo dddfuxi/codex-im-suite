@@ -130,17 +130,6 @@ function Resolve-UnityProjectPath {
     if ($env:CTI_DEFAULT_WORKDIR) { $candidates.Add($env:CTI_DEFAULT_WORKDIR) }
     $candidates.Add((Get-Location).Path)
 
-    $fallbackRoots = @('C:\unity', 'D:\unity', 'F:\unity')
-    foreach ($root in $fallbackRoots) {
-        if (-not (Test-Path $root)) { continue }
-        $projects = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue
-        foreach ($proj in $projects) {
-            $candidates.Add($proj.FullName)
-            $gameSub = Join-Path $proj.FullName 'Game'
-            $candidates.Add($gameSub)
-        }
-    }
-
     foreach ($candidate in $candidates) {
         if (Test-UnityProjectPath $candidate) { return $candidate }
     }

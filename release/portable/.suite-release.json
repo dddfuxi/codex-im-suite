@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-06-05 17:53:14",
-    "releaseRunId":  "077461d1fdd04486a1826759f86b72f9",
+    "generatedAt":  "2026-06-08 16:39:32",
+    "releaseRunId":  "d27802e9780f40b3a67ef5c659aeddb9",
     "targetName":  "portable artifact",
     "targetRole":  "generated portable artifact",
     "suite":  {
@@ -9,34 +9,34 @@
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/dev",
-                  "commit":  "009a5b3",
+                  "commit":  "d90f126",
                   "dirty":  true
               },
     "manifest":  {
                      "Count":  15,
-                     "Hash":  "D4C49AE4C5FB"
+                     "Hash":  "8F63123ED19D"
                  },
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "317703CC4DE6",
+                  "Hash":  "A70179620A4B",
                   "Length":  1906147,
-                  "Modified":  "2026-06-05 17:52:37"
+                  "Modified":  "2026-06-08 16:39:11"
               },
     "content":  {
                     "runtime.package":  "43E79CE167A5",
-                    "runtime.dist":  "05A4E5DFF5C5",
-                    "runtime.scripts":  "DAE01DB14D96",
+                    "runtime.dist":  "D3BD3AB77BEE",
+                    "runtime.scripts":  "C375DD0B064E",
                     "runtime.configExample":  "1E930F55894D",
                     "runtime.skill":  "867CAED0153F",
                     "core.package":  "1745A29789EC",
-                    "core.dist":  "DADEA8E7D79E",
+                    "core.dist":  "09BD090BD12A",
                     "suite.manifest":  "10DA54CABAAA",
-                    "config.manifests":  "D4C49AE4C5FB",
+                    "config.manifests":  "8F63123ED19D",
                     "extensions.skills":  "3D657A104715",
-                    "release.scripts":  "E89548A4CED6",
-                    "docs":  "E6F2293FC368",
-                    "panel.exe":  "317703CC4DE6",
-                    "panel.wwwroot":  "C84895F876CC"
+                    "release.scripts":  "B1BE5F24E9BA",
+                    "docs":  "8ECC87F50961",
+                    "panel.exe":  "A70179620A4B",
+                    "panel.wwwroot":  "0716C3A5DB5F"
                 }
 }

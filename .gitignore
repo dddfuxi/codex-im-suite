@@ -10,6 +10,7 @@ obj/
 
 # Runtime / logs
 .claude-to-im/
+.codex-tools/
 logs/
 runtime/
 

@@ -160,9 +160,9 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.match(shellToolResult?.content || '', /cti-tool-required-ok/);
       assert.equal(shellStatus?.evidenceSatisfied, true);
       assert.equal(shellStatus?.jsonToolFallbackUsed, true);
-      assert.match(shellProgress, /处理思路/);
+      assert.doesNotMatch(shellProgress, /处理思路|执行结果|正在组织上下文/);
       assert.match(shellProgress, /准备执行命令/);
-      assert.match(shellProgress, /执行结果/);
+      assert.match(shellProgress, /命令执行完成/);
       const shellText = [...shellEvents].reverse().find((event) => event.type === 'text')?.data;
       assert.match(String(shellText || ''), /这个我处理好了/);
 
@@ -189,6 +189,7 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.equal(readStatus?.evidenceSatisfied, true);
       assert.equal(readStatus?.jsonToolFallbackUsed, true);
       assert.match(readProgress, /准备读取目录/);
+      assert.doesNotMatch(readProgress, /处理思路|执行结果|正在组织上下文/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -277,12 +278,12 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.equal(status?.jsonToolFallbackUsed, true);
       assert.match(text || '', /```cti-final/);
       assert.match(text || '', /"kind":"image"/);
-      assert.match(text || '', /处理思路/);
+      assert.doesNotMatch(text || '', /处理思路/);
       assert.match(text || '', /"images":\[/);
       assert.match(text || '', /screenshot\.png/);
-      assert.match(progress, /处理思路/);
+      assert.doesNotMatch(progress, /处理思路|执行结果|正在组织上下文/);
       assert.match(progress, /manage_camera/);
-      assert.match(progress, /执行结果/);
+      assert.match(progress, /截图|图片|工具/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -498,13 +499,102 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.deepEqual(toolUses.map((event) => event.input?.tool), ['manage_asset', 'manage_scene']);
       assert.equal(toolResults.length, 2);
       assert.match(text || '', /```cti-final/);
-      assert.match(text || '', /处理思路/);
+      assert.doesNotMatch(text || '', /处理思路/);
       assert.match(text || '', /Loaded scene HSScene/);
       assert.doesNotMatch(text || '', /"success":true/);
-      assert.match(progress, /处理思路/);
+      assert.doesNotMatch(progress, /处理思路|执行结果|正在组织上下文/);
       assert.match(progress, /manage_asset/);
       assert.match(progress, /manage_scene/);
-      assert.match(progress, /执行结果/);
+      assert.match(progress, /继续基于真实返回值规划下一步/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses MCP search schemas directly for web-search requirements', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-json-tool-web-search-'));
+    try {
+      const provider = new CodexLocalCliProvider(makeConfig(root)) as unknown as {
+        buildMcpToolCatalog: () => Promise<unknown[]>;
+        executeValidatedJsonToolRequest: (request: unknown) => Promise<unknown>;
+        runCodexExecText: (input: { promptOverride?: string }) => Promise<{ text: string; usage: null }>;
+        runJsonToolProtocol: (
+          controller: ReadableStreamDefaultController<string>,
+          params: Record<string, unknown>,
+          model: string,
+          baseUrl: string,
+        ) => Promise<void>;
+      };
+      provider.buildMcpToolCatalog = async () => [
+        {
+          manifestHint: 'mcp-web-search',
+          displayName: 'Web Search MCP',
+          tool: 'web_search',
+          description: 'Search current web pages and news.',
+          inputSchema: { properties: { query: { type: 'string' }, pageno: { type: 'number' } } },
+        },
+      ];
+      provider.executeValidatedJsonToolRequest = async (request: unknown) => {
+        const args = (request as { args?: { manifestHint?: string; tool?: string; arguments?: Record<string, unknown> } }).args;
+        assert.equal(args?.manifestHint, 'mcp-web-search');
+        assert.equal(args?.tool, 'web_search');
+        assert.equal(args?.arguments?.query, '查一下今天的三个头条');
+        return {
+          tool: 'mcp_call',
+          ok: true,
+          data: {
+            server: 'mcp-web-search',
+            tool: 'web_search',
+            args: args?.arguments,
+            result: '1. Headline A\n2. Headline B\n3. Headline C',
+            durationMs: 12,
+          },
+        };
+      };
+      provider.runCodexExecText = async ({ promptOverride }) => {
+        assert.match(promptOverride || '', /Final answer composer/);
+        return {
+          text: '今天三个头条是：Headline A、Headline B、Headline C。',
+          usage: null,
+        };
+      };
+
+      const chunks: string[] = [];
+      const controller = {
+        enqueue: (chunk: string) => chunks.push(chunk),
+      } as unknown as ReadableStreamDefaultController<string>;
+      await provider.runJsonToolProtocol(controller, {
+        sessionId: 'test-session-web-search',
+        prompt: '查一下今天的三个头条',
+        workingDirectory: root,
+        additionalDirectories: [root],
+        permissionMode: 'acceptEdits',
+        executionRequirement: {
+          kind: 'tool_required',
+          reason: 'request asks for current web information',
+          requiredToolFamilies: ['web-search', 'mcp'],
+        },
+      }, 'qwen-test', 'http://127.0.0.1:11434');
+
+      const events = parseSseChunks(chunks);
+      const toolUse = events.find((event) => event.type === 'tool_use')?.data as { name?: string; input?: Record<string, unknown> } | undefined;
+      const toolResult = events.find((event) => event.type === 'tool_result')?.data as { is_error?: boolean; content?: string } | undefined;
+      const status = [...events].reverse().find((event) => event.type === 'status')?.data as { evidenceSatisfied?: boolean; requestedTool?: string } | undefined;
+      const text = events.find((event) => event.type === 'text')?.data as string | undefined;
+
+      assert.equal(toolUse?.name, 'JsonTool:mcp_call');
+      assert.equal(toolUse?.input?.tool, 'web_search');
+      assert.equal(toolResult?.is_error, false);
+      assert.match(toolResult?.content || '', /Headline A/);
+      assert.equal(status?.requestedTool, 'mcp_call');
+      assert.equal(status?.evidenceSatisfied, true);
+      assert.match(text || '', /```cti-final/);
+      assert.match(text || '', /Headline A/);
+      const progress = events.filter((event) => event.type === 'progress').map((event) => String(event.data || '')).join('');
+      assert.doesNotMatch(progress, /处理思路|执行结果|正在组织上下文/);
+      assert.match(progress, /查一下今天的三个头条/);
+      assert.match(progress, /web_search/);
+      assert.match(progress, /网页|新闻|联网|搜索|结果/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

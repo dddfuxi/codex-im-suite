@@ -26,6 +26,7 @@ import {
   buildNoEvidenceRetryPrompt,
   buildNoExecutionEvidenceText,
   classifyExecutionRequirement,
+  classifyToolResultQuality,
   isExecutionEvidenceSatisfied,
   requiresSuccessfulToolEvidence,
   shouldReplaceWithNoExecutionEvidenceText,
@@ -75,6 +76,7 @@ export interface ConversationResult {
     toolResultCount: number;
     successfulToolResultCount: number;
     failedToolResultCount: number;
+    failedToolErrors?: string[];
     toolNames: string[];
     permissionRequestCount: number;
     requiredEvidenceKind?: ExecutionRequirement['kind'];
@@ -107,6 +109,7 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
     toolResultCount: 0,
     successfulToolResultCount: 0,
     failedToolResultCount: 0,
+    failedToolErrors: [],
     toolNames: [],
     permissionRequestCount: 0,
     ...(requirement ? {
@@ -199,10 +202,10 @@ function buildReplyPresentationPrompt(replyStyleHint: string): string {
     '- Final user-facing replies must follow the configured reply style when one is provided.',
     '- Progress updates may show user-visible rationale, evidence checked, and current stage, but never hidden chain-of-thought.',
     '- Final replies should be outcome-first and concise; do not repeat the progress-card rationale unless the user explicitly asks for a detailed walkthrough.',
-    '- On Feishu, you may make lightweight replies more lively by starting the final visible result with a native reaction hint or `[表情包:alias]` when it fits the actual intent. The bridge will add the reaction or send a real Feishu sticker when available, then remove this hint from the visible text.',
+    '- On Feishu, you may make lightweight replies more lively by starting the final visible result with a native reaction hint or sticker hint when it fits the actual intent. Use `[表情包:alias]` only when the alias is explicitly listed in the Feishu sticker library prompt; if the user asks for any sticker or a different sticker and no listed alias fits, use bare `[表情包]`.',
     '- Choose reaction hints by actual intent. Do not default to SMILE; use no hint when the tone is neutral, formal, blocked, or unclear.',
     '- Use Feishu reaction/sticker hints only for casual chat, acknowledgements, greetings, playful sticker replies, and short emotional responses. Do not add them to formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
-    '- Do not invent sticker file_key values. If a sticker hint cannot be resolved by the bridge, the visible text must still stand on its own.',
+    '- Do not invent sticker aliases or sticker file_key values. If a sticker hint cannot be resolved by the bridge, the visible text must still stand on its own.',
     '- Feishu sticker messages may include an image attachment when the bridge can download the sticker resource. If the inbound text says a sticker image is attached, inspect that image first to identify the visual content and intent.',
     '- If the inbound text says the Feishu sticker is not semantically annotated and no sticker image attachment is available, do not claim you can see its image, caption, or intent. Ask the user to explain the sticker meaning or use any learned sticker semantics provided in the message context.',
   ];
@@ -424,6 +427,7 @@ export async function processMessage(
   abortSignal?: AbortSignal,
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
+  onProgressText?: OnPartialText,
   onToolEvent?: OnToolEvent,
   options?: ConversationProcessOptions,
 ): Promise<ConversationResult> {
@@ -628,7 +632,7 @@ export async function processMessage(
         sessionId,
         onPermissionRequest,
         attempt === 'initial' && requiresSuccessfulToolEvidence(executionRequirement) ? undefined : onPartialText,
-        onPartialText,
+        onProgressText,
         onToolEvent,
         executionRequirement,
         attempt === 'no_evidence_retry',
@@ -795,11 +799,12 @@ async function consumeStream(
           case 'tool_result': {
             try {
               const resultData = JSON.parse(event.data);
+              const resultQuality = classifyToolResultQuality(resultData.content, resultData.is_error);
               const newBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,
                 content: resultData.content,
-                is_error: resultData.is_error || false,
+                is_error: !resultQuality.ok,
               };
               if (seenToolResultIds.has(resultData.tool_use_id)) {
                 const idx = contentBlocks.findIndex(
@@ -810,8 +815,15 @@ async function consumeStream(
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
                 executionEvidence.toolResultCount += 1;
-                if (resultData.is_error) {
+                if (!resultQuality.ok) {
                   executionEvidence.failedToolResultCount += 1;
+                  const errorSummary = resultQuality.errorSummary;
+                  if (errorSummary && !(executionEvidence.failedToolErrors || []).includes(errorSummary)) {
+                    executionEvidence.failedToolErrors = [
+                      ...(executionEvidence.failedToolErrors || []),
+                      errorSummary,
+                    ].slice(0, 3);
+                  }
                 } else {
                   executionEvidence.successfulToolResultCount += 1;
                 }
@@ -824,7 +836,7 @@ async function consumeStream(
                   onToolEvent(
                     resultData.tool_use_id,
                     '', // name not available in tool_result, adapter tracks by id
-                    resultData.is_error ? 'error' : 'complete',
+                    resultQuality.ok ? 'complete' : 'error',
                   );
                 } catch { /* non-critical */ }
               }

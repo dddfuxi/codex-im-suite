@@ -435,6 +435,176 @@ describe('FeishuAdapter CardKit compatibility', () => {
     assert.doesNotMatch(cardUpdate, /\[表情包\]/);
   });
 
+  it('finalizes sticker-only card replies as a sent action instead of an empty-result failure', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_card',
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_v1' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push(`card.update:${JSON.stringify(payload)}`);
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`message.reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_card', 'om_user');
+    const finalized = await adapter.finalizeCard('oc_card', 'completed', '[表情包]\n✅');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    assert.ok(calls.some((item) => /"msg_type":"sticker"/.test(item)));
+    const cardUpdate = calls.find((item) => item.startsWith('card.update:')) || '';
+    assert.match(cardUpdate, /表情包已发送/);
+    assert.doesNotMatch(cardUpdate, /模型没有返回可展示结果/);
+    assert.doesNotMatch(cardUpdate, /\[表情包\]/);
+  });
+
+  it('rotates bare sticker hints across stored Feishu stickers instead of always reusing the most-used one', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_often_used',
+          aliases: ['最近', '默认', '表情包'],
+          chatId: 'oc_card',
+          firstSeenAt: '2026-06-06T07:00:00.000Z',
+          lastSeenAt: '2026-06-06T07:10:00.000Z',
+          lastUsedAt: '2026-06-06T07:20:00.000Z',
+          useCount: 5,
+        },
+        {
+          fileKey: 'sticker_fresh_choice',
+          aliases: ['最近', '默认', '表情包'],
+          chatId: 'oc_card',
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_v1' } }),
+            settings: async () => ({ data: {} }),
+            update: async () => ({ data: {} }),
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`message.reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_card', 'om_user');
+    const finalized = await adapter.finalizeCard('oc_card', 'completed', '[表情包] 换一个~');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    const stickerCall = calls
+      .filter((item) => item.startsWith('message.reply:'))
+      .map((item) => JSON.parse(item.slice('message.reply:'.length)) as { data?: { content?: string; msg_type?: string } })
+      .find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_fresh_choice');
+  });
+
+  it('does not send an arbitrary sticker when a final card requests an unknown sticker alias', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_known_only',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_card',
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        useCount: 6,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_v1' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push(`card.update:${JSON.stringify(payload)}`);
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`message.reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_card', 'om_user');
+    const finalized = await adapter.finalizeCard('oc_card', 'completed', '[表情包:微笑] 换一个~');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    assert.ok(!calls.some((item) => /"msg_type":"sticker"/.test(item)));
+    const cardUpdate = calls.find((item) => item.startsWith('card.update:')) || '';
+    assert.match(cardUpdate, /换一个~/);
+    assert.doesNotMatch(cardUpdate, /\[表情包:微笑\]/);
+  });
+
   it('streams thinking text as incremental typewriter updates', async () => {
     const adapter = new FeishuAdapter() as any;
     const contents: string[] = [];
@@ -922,6 +1092,47 @@ describe('FeishuAdapter message reactions', () => {
     assert.match(calls[1], /\\"text\\":\\"收到~\\"/);
   });
 
+  it('does not send a separate status-mark text after a sticker-only plain reply', async () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_group',
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包]\n✅',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /"msg_type":"sticker"/);
+    assert.doesNotMatch(calls[0], /\\"text\\":\\"✅\\"/);
+  });
+
   it('does not let bare sticker hints prefer a newer unannotated sticker over a learned one', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
     fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
@@ -973,6 +1184,48 @@ describe('FeishuAdapter message reactions', () => {
     assert.equal(result.ok, true);
     assert.match(calls[0], /\\"file_key\\":\\"learned_sticker\\"/);
     assert.doesNotMatch(calls[0], /unannotated_recent/);
+  });
+
+  it('does not send an arbitrary sticker for unknown sticker aliases in plain replies', async () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_known_only',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_group',
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        useCount: 9,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:大笑] 换一个~',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls[0], /"msg_type":"sticker"/);
+    assert.match(calls[0], /\\"text\\":\\"换一个~\\"/);
+    assert.doesNotMatch(calls[0], /\[表情包:大笑\]/);
   });
 
   it('turns a leading bracketed Feishu emoji hint into a message reaction and strips it from text', async () => {

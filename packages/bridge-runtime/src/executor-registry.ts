@@ -6,7 +6,7 @@ import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 import type { Config } from './config.js';
 import { readLocalModelCapabilityProfile } from './local-model-capability.js';
 import { resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
-import { getLocalRouterMode, readLocalLlmStatus } from './local-llm-status.js';
+import { readLocalLlmStatus } from './local-llm-status.js';
 import type {
   ExecutorCapability,
   ExecutorManifest,
@@ -51,19 +51,19 @@ export function buildToolSandboxPolicy(config: Config): ToolSandboxPolicy {
 
 export function buildExecutorManifests(config: Config): ExecutorManifest[] {
   const localStatus = readLocalLlmStatus(config);
-  const localAiKind = config.localAiKind || 'ollama';
   const localModel = config.localAiModel || config.ollamaModel || config.localLlmModel || localStatus.model || 'qwen2.5-coder:7b';
   const localBaseUrl = config.localAiBaseUrl || config.ollamaBaseUrl || config.localLlmBaseUrl || localStatus.baseUrl || 'http://127.0.0.1:11434';
   const localCapabilities = readLocalModelCapabilityProfile(config);
   const codexModelSource = config.codexModelSource || ((config.codexBaseUrl || config.codexModel || config.codexApiKey) ? 'external_api' : 'official');
   const codexRoutingMode = config.codexRoutingMode || 'manual';
   const codexDisplayName = codexModelSource === 'local_api'
-    ? `Codex CLI (本地 API 主模型: ${localModel})`
+    ? `Codex CLI (本地模型 API: ${localModel})`
     : codexModelSource === 'external_api'
       ? `Codex CLI (外部 API: ${config.codexModel || '未指定模型'})`
       : codexRoutingMode === 'auto_failover'
         ? `Codex CLI (auto failover: ${(config.codexApiFallbackChain || ['local_api', 'external_api']).join(' -> ')})`
         : 'Codex CLI / SDK';
+
   return [
     {
       id: 'codex',
@@ -73,7 +73,7 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       riskLevel: 'workspace_write',
       enabled: isCodexEnabled(config),
       priority: config.runtime === 'codex' ? 100 : 80,
-      description: '默认主脑执行器，负责复杂仓库修改、多步任务和工具调用。',
+      description: '默认 Codex agent 执行器，负责仓库修改、多步任务和工具调用；本地 API / 外部 API 只是它的模型来源。',
       healthCheck: { kind: 'runtime_status', target: 'codex' },
       configSchema: {
         modelSource: codexModelSource,
@@ -81,11 +81,6 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
         baseUrl: codexModelSource === 'local_api' ? localBaseUrl : config.codexBaseUrl,
         routingMode: codexRoutingMode,
         fallbackChain: config.codexApiFallbackChain || ['local_api', 'external_api'],
-        failureFallbackMode: config.codexFailureFallbackMode || 'none',
-        localFallbackEnabled: false,
-        localAgentMode: config.localAgentMode || 'text_only',
-        localToolCallRequired: false,
-        executionRequiredRoute: 'primary',
         localToolCallingState: localCapabilities.toolCallingState,
         localToolCallingMessage: localCapabilities.message,
         localExecutionTrusted: true,
@@ -104,33 +99,14 @@ export function buildExecutorManifests(config: Config): ExecutorManifest[] {
       healthCheck: { kind: 'command', target: 'claude --version' },
     },
     {
-      id: 'local-tool-agent',
-      displayName: `Local Tool Agent (${localModel})`,
-      kind: 'agent',
-      capabilities: ['chat', 'repo_query', 'file_read', 'file_write', 'mcp_ops', 'local_tool_agent'],
-      riskLevel: 'workspace_write',
-      enabled: false,
-      priority: getLocalRouterMode(config) === 'local_only' ? 90 : 55,
-      description: '历史兼容执行器；普通用户消息不再走本地模型直答或本地工具直答。',
-      healthCheck: { kind: 'http', target: localBaseUrl },
-      configSchema: {
-        provider: localAiKind,
-        model: localModel,
-        toolCallingState: localCapabilities.toolCallingState,
-        toolCallingMessage: localCapabilities.message,
-        routerMode: getLocalRouterMode(config),
-        sandbox: buildToolSandboxPolicy(config),
-      },
-    },
-    {
       id: 'codex-oss-ollama',
       displayName: `Codex OSS Ollama (${localModel})`,
       kind: 'cli',
       capabilities: ['chat', 'repo_query', 'file_read'],
       riskLevel: 'read_only',
       enabled: isCodexOssOllamaEnabled(config),
-      priority: getLocalRouterMode(config) === 'local_only' ? 75 : 45,
-      description: '实验性本地 Codex OSS 执行器，使用 Ollama，只允许只读问题和记忆检索兜底。',
+      priority: 45,
+      description: '实验性 Codex OSS Ollama 只读入口；主要模型切换应通过 Codex CLI 模型来源 local_api 完成。',
       healthCheck: { kind: 'http', target: localBaseUrl },
       configSchema: {
         provider: 'ollama',

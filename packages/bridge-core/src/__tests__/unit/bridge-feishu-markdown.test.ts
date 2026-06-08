@@ -86,6 +86,21 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(content, /JsonTool|shell_artifact/);
   });
 
+  it('keeps generated final card titles complete instead of clipping to a short prefix', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '今天（2026-06-06）的金融新闻',
+      '',
+      '1. 美股大跌，科技股领跌。',
+      '2. 黄金回落，美元指数波动。',
+    ].join('\n'), [], { status: '已完成', elapsed: '48.7s' })) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+
+    assert.equal(card.header?.title?.content, '今天（2026-06-06）的金融新闻');
+    assert.match(String(card.body?.elements?.[0]?.content || ''), /美股大跌/);
+  });
+
   it('removes model completion marks from the final body while keeping footer status', () => {
     const card = JSON.parse(buildFinalCardJson([
       '我是小虾米呀，在这个飞书聊天里主要帮你处理 Unity、文件、脚本、本地工具和一些自动化任务。',

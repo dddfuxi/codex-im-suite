@@ -21,8 +21,11 @@
     "CTI_UNITY_MCP_ENDPOINT": "http://127.0.0.1:8081/mcp"
   },
   "healthCheck": {
-    "kind": "http",
-    "url": "http://127.0.0.1:8081/mcp"
+    "kind": "mcp-http-resource",
+    "url": "http://127.0.0.1:8081/mcp",
+    "resourceUri": "mcpforunity://instances",
+    "successRegex": "\\\\?\"instance_count\\\\?\"\\s*:\\s*[1-9][0-9]*",
+    "failureRegex": "\\\\?\"instance_count\\\\?\"\\s*:\\s*0|Unity session not available|No Unity instance|unavailable"
   },
   "description": "Unity Editor HTTP MCP endpoint"
 }

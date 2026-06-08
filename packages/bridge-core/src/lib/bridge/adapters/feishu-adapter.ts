@@ -102,7 +102,7 @@ function extractFeishuStickerHint(text: string): FeishuStickerHint | null {
   if (!match) return null;
   return {
     raw: match[1].trim(),
-    target: (match[2] || '最近').trim(),
+    target: (match[2] || '表情包').trim(),
     remainingText: match[3].trimStart(),
   };
 }
@@ -119,6 +119,18 @@ function escapeRegExp(text: string): string {
 function stripFeishuReactionHintText(text: string, hint: FeishuReactionHint): string {
   return hint.remainingText
     || text.replace(new RegExp(`^\\s*\\[${escapeRegExp(hint.raw)}\\]\\s*`, 'u'), '').trim();
+}
+
+function stripStandaloneStatusMarks(text: string): string {
+  return String(text || '')
+    .replace(/^\s*(?:✅|✔|☑|❌|×)\s*$/gmu, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function meaningfulHintRemainder(text: string, fallback: string): string {
+  const remaining = String(text || '').trim();
+  return stripStandaloneStatusMarks(remaining) ? remaining : fallback;
 }
 
 function applyReactionFallbackText(originalText: string, hint: FeishuReactionHint, textWithoutHint: string): string {
@@ -213,6 +225,7 @@ interface FeishuStickerRecord {
   messageId?: string;
   firstSeenAt: string;
   lastSeenAt: string;
+  lastUsedAt?: string;
   useCount: number;
 }
 
@@ -621,7 +634,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
         'Feishu sticker library:',
         '- No semantically annotated stickers are available for this chat yet.',
         '- If the user explains a sticker meaning by replying to it, the adapter will store the meaning and usage for future selection.',
-        '- Avoid bare `[表情包]` unless the user explicitly asks for any sticker; prefer text or a reaction hint when no matching sticker is known.',
+        '- Do not use `[表情包:alias]` because no sticker aliases are available yet.',
+        '- If the user explicitly asks for any sticker or a different sticker, use bare `[表情包]`; otherwise prefer text or a reaction hint.',
       ].join('\n');
     }
     const lines = annotated.map((item) => {
@@ -636,7 +650,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return [
       'Feishu sticker library:',
       ...lines,
-      '- Choose a sticker only when its meaning and usage match the reply. Prefer `[表情包:alias]` over bare `[表情包]`.',
+      '- Choose a sticker only when its meaning and usage match the reply. Use `[表情包:alias]` only with an alias listed above.',
+      '- If no listed alias matches and the user explicitly asks for any sticker or a different sticker, use bare `[表情包]`.',
       '- Do not mention sticker file keys to the user.',
     ].join('\n');
   }
@@ -714,15 +729,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const store = this.readStickerStore();
     const alias = normalized || '最近';
     const genericTarget = /^(?:最近|默认|表情包|sticker|飞书表情包)$/iu.test(alias);
-    const compareStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+    const wantsRecent = /^最近$/u.test(alias);
+    const compareCommon = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
       Number(b.chatId === chatId) - Number(a.chatId === chatId)
-      || (genericTarget ? Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a)) : 0)
+      || Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a));
+    const compareRecentStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+      compareCommon(a, b)
+      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const compareRotatingStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+      compareCommon(a, b)
+      || (Number(a.useCount || 0) - Number(b.useCount || 0))
+      || ((Date.parse(a.lastUsedAt || '') || 0) - (Date.parse(b.lastUsedAt || '') || 0))
+      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const compareSpecificStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+      compareCommon(a, b)
       || (Number(b.useCount || 0) - Number(a.useCount || 0))
       || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
+    const compareStickerCandidate = wantsRecent
+      ? compareRecentStickerCandidate
+      : genericTarget
+        ? compareRotatingStickerCandidate
+        : compareSpecificStickerCandidate;
     const byAlias = (genericTarget
       ? store.stickers
       : store.stickers.filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
       .sort(compareStickerCandidate);
+    if (!genericTarget) return byAlias[0]?.fileKey || null;
     const fallback = store.stickers
       .slice()
       .sort(compareStickerCandidate);
@@ -734,8 +766,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const record = store.stickers.find((item) => item.fileKey === fileKey);
     if (!record) return;
     record.useCount = (record.useCount || 0) + 1;
-    record.lastSeenAt = new Date().toISOString();
-    store.updatedAt = record.lastSeenAt;
+    record.lastUsedAt = new Date().toISOString();
+    store.updatedAt = record.lastUsedAt;
     try { this.writeStickerStore(store); } catch { /* best effort */ }
   }
 
@@ -1459,8 +1491,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         if (fileKey) {
           const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId);
           if (stickerResult.ok) {
-            finalResponseText = stickerHint.remainingText || '收到~';
+            finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '表情包已发送。');
           }
+        } else {
+          finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '收到~');
         }
       }
       const reactionHint = extractFeishuReactionHint(visibleFinalText);
@@ -1473,7 +1507,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           })
           : false;
         if (reactionAdded) {
-          finalResponseText = textWithoutHint || '收到~';
+          finalResponseText = meaningfulHintRemainder(textWithoutHint, '已回应。');
         } else {
           finalResponseText = applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
         }
@@ -1648,8 +1682,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId);
         if (stickerResult.ok) {
           text = stickerHint.remainingText;
-          if (!text.trim()) return stickerResult;
+          if (!stripStandaloneStatusMarks(text)) return stickerResult;
         }
+      } else {
+        text = stickerHint.remainingText || '收到~';
       }
     }
     const reactionHint = (
