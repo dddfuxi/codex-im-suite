@@ -477,7 +477,7 @@ function extractJsonObject(raw: string): string {
 }
 
 function toTaskKind(value: string | undefined, fallback: LocalTaskKind): LocalTaskKind {
-  const valid: LocalTaskKind[] = ['chat', 'explain', 'summarize', 'config_help', 'command_draft', 'script_draft', 'code_explain', 'tool_request', 'repo_query', 'unity_like', 'blender_like', 'doc_like'];
+  const valid: LocalTaskKind[] = ['chat', 'light_chat', 'explain', 'summarize', 'config_help', 'command_draft', 'script_draft', 'code_explain', 'tool_request', 'repo_query', 'unity_like', 'blender_like', 'doc_like'];
   return valid.includes(value as LocalTaskKind) ? (value as LocalTaskKind) : fallback;
 }
 

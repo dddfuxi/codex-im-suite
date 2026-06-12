@@ -72,6 +72,71 @@ async function withFakeMcpHttpServer(resourceText: string, run: (url: string, ca
   }
 }
 
+async function withFakeToolMcpHttpServer(run: (url: string, calls: { initializes: number; toolLists: number; toolCalls: number }) => Promise<void>) {
+  const calls = { initializes: 0, toolLists: 0, toolCalls: 0 };
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.on('data', (chunk) => { body += chunk.toString(); });
+    request.on('end', () => {
+      const payload = body ? JSON.parse(body) as { id?: string | number; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } : {};
+      response.setHeader('Content-Type', 'application/json');
+      if (payload.method === 'initialize') {
+        calls.initializes += 1;
+        response.setHeader('mcp-session-id', 'cached-session');
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            serverInfo: { name: 'fake-tool-mcp', version: '1.0.0' },
+          },
+        }));
+        return;
+      }
+      if (payload.method === 'notifications/initialized') {
+        response.statusCode = 202;
+        response.end('');
+        return;
+      }
+      if (payload.method === 'tools/list') {
+        calls.toolLists += 1;
+        assert.equal(request.headers['mcp-session-id'], 'cached-session');
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            tools: [{ name: 'demo_tool', description: 'Demo tool', inputSchema: { type: 'object' } }],
+          },
+        }));
+        return;
+      }
+      if (payload.method === 'tools/call') {
+        calls.toolCalls += 1;
+        assert.equal(request.headers['mcp-session-id'], 'cached-session');
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            content: [{ type: 'text', text: `called ${payload.params?.name || ''}` }],
+          },
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'unknown method' }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  try {
+    await run(`http://127.0.0.1:${address.port}/mcp`, calls);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
 describe('McpBridge manifest discovery', () => {
   it('loads bundled suite manifests and user overlay manifests', () => {
     const previousSuiteRoot = process.env.CODEX_IM_SUITE_ROOT;
@@ -373,6 +438,31 @@ describe('McpBridge manifest discovery', () => {
       assert.equal(health.ok, true);
       assert.equal(calls.resourceReads, 0);
       assert.doesNotMatch(health.message, /instance_count|mcpforunity:\/\/instances/);
+    });
+  });
+
+  it('reuses HTTP MCP sessions and caches tools/list discovery briefly', async () => {
+    await withFakeToolMcpHttpServer(async (url, calls) => {
+      const bridge = new McpBridge(baseConfig);
+      const manifest = {
+        id: 'fake-http-tool',
+        displayName: 'Fake HTTP Tool MCP',
+        type: 'http' as const,
+        healthCheck: { kind: 'http', url },
+        manifestPath: 'fake-http-tool.json',
+      };
+
+      const firstTools = await bridge.listToolDetails(manifest);
+      const secondTools = await bridge.listToolDetails(manifest);
+      const result = await bridge.callTool(manifest, 'demo_tool', { value: 1 });
+
+      assert.deepEqual(firstTools.map((tool) => tool.name), ['demo_tool']);
+      assert.deepEqual(secondTools.map((tool) => tool.name), ['demo_tool']);
+      assert.equal(result.ok, true);
+      assert.match(result.content, /called demo_tool/);
+      assert.equal(calls.initializes, 1);
+      assert.equal(calls.toolLists, 1);
+      assert.equal(calls.toolCalls, 1);
     });
   });
 });

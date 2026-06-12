@@ -52,6 +52,7 @@ export interface WorkflowExecutionSummary {
   progressCardCreated?: boolean;
   progressCardFinalized?: boolean;
   progressCardFallbackReason?: string;
+  promptProfile?: string;
 }
 
 export interface WorkflowTokenUsage {
@@ -287,6 +288,7 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     progressCardCreated: readBooleanField(source.progressCardCreated),
     progressCardFinalized: readBooleanField(source.progressCardFinalized),
     progressCardFallbackReason: readStringField(source.progressCardFallbackReason),
+    promptProfile: readStringField(source.promptProfile),
   };
   return Object.values(execution).some((value) => value !== undefined) ? execution : undefined;
 }

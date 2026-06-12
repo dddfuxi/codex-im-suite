@@ -9,7 +9,7 @@ import {
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities.js';
 
 describe('Feishu streaming card markdown', () => {
-  it('uses only the result section when finalizing a progress card', () => {
+  it('keeps the user-visible rationale and result sections when finalizing a progress card', () => {
     const text = [
       '# 处理思路',
       '先确认 MCP 服务，再读取可用工具。',
@@ -18,15 +18,38 @@ describe('Feishu streaming card markdown', () => {
       '- 可用工具 12 个。',
     ].join('\n');
 
-    assert.equal(extractStreamingFinalResponse(text), '- 可用工具 12 个。');
+    const finalText = extractStreamingFinalResponse(text);
+    assert.notEqual(finalText, '- 可用工具 12 个。');
+    assert.match(finalText, /^# .+/m);
+    assert.match(finalText, /\n\n# .+\n- /);
 
     const card = JSON.parse(buildFinalCardJson(text, [], null)) as {
       body?: { elements?: Array<{ content?: string }> };
     };
     const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
-    assert.match(content, /可用工具 12 个/);
-    assert.doesNotMatch(content, /状态：已完成/);
-    assert.doesNotMatch(content, /处理思路/);
+    assert.match(content, /^# .+/m);
+    assert.match(content, /- .*12/);
+  });
+
+  it('preserves rationale headings in the finalized card body when both rationale and result are present', () => {
+    const text = [
+      '**处理思路**',
+      '- 先确认 MCP 服务，再读取可用工具。',
+      '',
+      '**执行结果**',
+      '- 可用工具 12 个。',
+    ].join('\n');
+
+    const finalText = extractStreamingFinalResponse(text);
+    assert.notEqual(finalText, '- 可用工具 12 个。');
+    assert.match(finalText, /^\*\*.+\*\*/m);
+
+    const card = JSON.parse(buildFinalCardJson(text, [], null)) as {
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+    assert.match(content, /^\*\*.+\*\*/m);
+    assert.match(content, /\n\n\*\*.+\*\*\n- /);
   });
 
   it('reports streaming cards as enabled by default', () => {
@@ -84,6 +107,28 @@ describe('Feishu streaming card markdown', () => {
     assert.match(content, /耗时：1\.2s/);
     assert.equal(footer?.text_size, 'notation');
     assert.doesNotMatch(content, /JsonTool|shell_artifact/);
+  });
+
+  it('renders model and token usage in the final card footer when provided', () => {
+    const card = JSON.parse(buildFinalCardJson('处理结果\n已完成。', [], { status: '已完成', elapsed: '1.2s' }, {
+      provider: 'codex',
+      modelSource: 'official',
+      model: 'gpt-5',
+      tokenUsage: {
+        input_tokens: 12345,
+        output_tokens: 678,
+        cache_read_input_tokens: 2048,
+        cache_creation_input_tokens: 128,
+      },
+    })) as {
+      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+    };
+    const footer = (card.body?.elements || []).find((element) => String(element.content || '').includes('Token'));
+
+    assert.equal(footer?.text_size, 'notation');
+    assert.match(String(footer?.content || ''), /模型：gpt-5 \(official\)/);
+    assert.match(String(footer?.content || ''), /Token：输入 12,345 \/ 输出 678/);
+    assert.match(String(footer?.content || ''), /Cache：读 2,048 \/ 写 128/);
   });
 
   it('keeps generated final card titles complete instead of clipping to a short prefix', () => {

@@ -61,6 +61,9 @@ export interface Config {
   localLlmMaxInputChars?: number;
   localLlmMaxOutputTokens?: number;
   localLlmComplexityMode?: string;
+  lightChatFastPathEnabled?: boolean;
+  lightChatHistoryLimit?: number;
+  lightChatMaxInputChars?: number;
   replyStyleHint?: string;
   defaultModel?: string;
   defaultMode: string;
@@ -247,6 +250,12 @@ export function loadConfig(): Config {
   const localLlmRouterTimeoutMs = env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS"))
     : undefined;
+  const lightChatHistoryLimit = env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT")
+    ? Number(env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT"))
+    : undefined;
+  const lightChatMaxInputChars = env.get("CTI_LIGHT_CHAT_MAX_INPUT_CHARS")
+    ? Number(env.get("CTI_LIGHT_CHAT_MAX_INPUT_CHARS"))
+    : undefined;
   const localLlmMaxInputChars = env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS")
     ? Number(env.get("CTI_LOCAL_LLM_MAX_INPUT_CHARS"))
     : undefined;
@@ -389,6 +398,11 @@ export function loadConfig(): Config {
     localLlmMaxInputChars: localLlmMaxInputChars ?? 6000,
     localLlmMaxOutputTokens: localLlmMaxOutputTokens ?? 768,
     localLlmComplexityMode: env.get("CTI_LOCAL_LLM_COMPLEXITY_MODE") || "conservative",
+    lightChatFastPathEnabled: env.has("CTI_LIGHT_CHAT_FAST_PATH_ENABLED")
+      ? env.get("CTI_LIGHT_CHAT_FAST_PATH_ENABLED") === "true"
+      : true,
+    lightChatHistoryLimit: Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
+    lightChatMaxInputChars: Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
@@ -541,6 +555,12 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_MAX_HISTORY_ITEMS", String(config.localLlmRouterMaxHistoryItems));
   if (config.localLlmRouterTimeoutMs !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS", String(config.localLlmRouterTimeoutMs));
+  if (config.lightChatFastPathEnabled !== undefined)
+    out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_ENABLED", String(config.lightChatFastPathEnabled));
+  if (config.lightChatHistoryLimit !== undefined)
+    out += formatEnvLine("CTI_LIGHT_CHAT_HISTORY_LIMIT", String(config.lightChatHistoryLimit));
+  if (config.lightChatMaxInputChars !== undefined)
+    out += formatEnvLine("CTI_LIGHT_CHAT_MAX_INPUT_CHARS", String(config.lightChatMaxInputChars));
   if (config.localLlmMaxInputChars !== undefined)
     out += formatEnvLine("CTI_LOCAL_LLM_MAX_INPUT_CHARS", String(config.localLlmMaxInputChars));
   if (config.localLlmMaxOutputTokens !== undefined)
@@ -910,6 +930,15 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (typeof config.localLlmRouterTimeoutMs === "number" && Number.isFinite(config.localLlmRouterTimeoutMs)) {
     m.set("bridge_local_llm_router_timeout_ms", String(Math.max(1000, Math.floor(config.localLlmRouterTimeoutMs))));
+  }
+  if (config.lightChatFastPathEnabled !== undefined) {
+    m.set("bridge_light_chat_fast_path_enabled", String(config.lightChatFastPathEnabled));
+  }
+  if (typeof config.lightChatHistoryLimit === "number" && Number.isFinite(config.lightChatHistoryLimit)) {
+    m.set("bridge_light_chat_history_limit", String(Math.max(0, Math.floor(config.lightChatHistoryLimit))));
+  }
+  if (typeof config.lightChatMaxInputChars === "number" && Number.isFinite(config.lightChatMaxInputChars)) {
+    m.set("bridge_light_chat_max_input_chars", String(Math.max(80, Math.floor(config.lightChatMaxInputChars))));
   }
   if (typeof config.localLlmMaxInputChars === "number" && Number.isFinite(config.localLlmMaxInputChars)) {
     m.set("bridge_local_llm_max_input_chars", String(Math.max(1200, Math.floor(config.localLlmMaxInputChars))));

@@ -5,10 +5,12 @@ import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 
 import type { Config } from '../config.js';
 import {
+  buildLightChatParams,
   buildLocalRoutePrompt,
   createCompressedParams,
   decideConservativeRoute,
   getLocalRouterMode,
+  isLightChatCandidate,
   parseLocalRoutePayload,
   shouldRunPreCodexLocalFastPath,
 } from '../local-llm-router.js';
@@ -60,6 +62,64 @@ describe('shouldRunPreCodexLocalFastPath', () => {
 });
 
 describe('decideConservativeRoute', () => {
+  it('identifies short Feishu light chat as a lightweight chat task', () => {
+    const decision = decideConservativeRoute(makeParams('在呢', {
+      permissionMode: 'acceptEdits',
+      systemPrompt: [
+        'Channel assistant identity:',
+        'Feishu emoji presentation:',
+        'Feishu sticker library:',
+        'Bridge channel context (authoritative):',
+        'MCP, Unity, workspace, files, commands, and artifacts are available for real tasks.',
+      ].join('\n'),
+      conversationHistory: [
+        { role: 'user', content: '前面一句普通闲聊' },
+        { role: 'assistant', content: '我在' },
+        { role: 'user', content: '小虾米' },
+      ],
+    }), baseConfig);
+
+    assert.equal(decision.requestKind, 'light_chat');
+    assert.equal(decision.preferredDecision, 'answer_local');
+    assert.equal(decision.useLocal, true);
+    assert.equal(decision.canFastPath, true);
+  });
+
+  it('does not classify tool-like or attachment turns as light chat', () => {
+    assert.equal(isLightChatCandidate(makeParams('帮我执行 git status'), baseConfig), false);
+    assert.equal(isLightChatCandidate(makeParams('看一下这张图里是什么', {
+      files: [{ id: 'file-1', name: 'image.png', type: 'image/png', size: 12, data: 'AAAA' }],
+    }), baseConfig), false);
+    assert.equal(isLightChatCandidate(makeParams('帮我检查 Unity MCP 为什么连不上'), baseConfig), false);
+  });
+
+  it('builds a light chat prompt profile without long tool context', () => {
+    const params = makeParams('收到啦', {
+      systemPrompt: [
+        'Channel assistant identity: 小虾米',
+        'Feishu emoji presentation: do not default to SMILE',
+        'Feishu sticker library: [表情包:收到]',
+        'Bridge channel context (authoritative): includes MCP, Unity, workspace, commands and artifacts',
+        'Reply presentation contract: concise',
+      ].join('\n'),
+      conversationHistory: [
+        { role: 'user', content: '第一条历史' },
+        { role: 'assistant', content: '第二条历史' },
+        { role: 'user', content: '第三条历史' },
+      ],
+    });
+
+    const light = buildLightChatParams(params, baseConfig);
+
+    assert.equal(light.conversationHistory?.length, 2);
+    assert.match(light.systemPrompt || '', /Channel assistant identity/);
+    assert.match(light.systemPrompt || '', /Feishu emoji presentation/);
+    assert.match(light.systemPrompt || '', /Feishu sticker library/);
+    assert.match(light.systemPrompt || '', /Light chat reply contract/);
+    assert.doesNotMatch(light.systemPrompt || '', /Bridge channel context/);
+    assert.doesNotMatch(light.systemPrompt || '', /MCP|Unity|workspace|artifacts/i);
+  });
+
   it('routes simple command generation to local model', () => {
     const decision = decideConservativeRoute(makeParams('给我一条 PowerShell 命令，递归查找 .meta 文件。只返回命令。'), baseConfig);
     assert.equal(decision.useLocal, true);

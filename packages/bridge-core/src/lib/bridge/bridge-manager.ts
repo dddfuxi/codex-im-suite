@@ -4554,6 +4554,7 @@ async function handleMessage(
           msg.address.chatId,
           status,
           userFacingResponseText,
+          result.runSummary,
         );
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);

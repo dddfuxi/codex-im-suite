@@ -41,6 +41,74 @@ function Get-ChangedLines {
     }
 }
 
+function Test-GitLfsAvailable {
+    Push-Location $suiteRoot
+    try {
+        & git lfs version *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Test-RepoUsesGitLfs {
+    Push-Location $suiteRoot
+    try {
+        $tracked = @(& git lfs ls-files --all --name-only 2>$null)
+        return ($LASTEXITCODE -eq 0 -and $tracked.Count -gt 0)
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Get-GitPushRemote {
+    Push-Location $suiteRoot
+    try {
+        $upstream = (& git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>$null)
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($upstream -join '').Trim())) {
+            $full = ($upstream -join '').Trim()
+            $parts = $full.Split('/', 2)
+            if ($parts.Length -eq 2 -and -not [string]::IsNullOrWhiteSpace($parts[0])) {
+                return $parts[0]
+            }
+        }
+
+        $remotes = @(& git remote 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $remotes.Count -gt 0) {
+            return [string]$remotes[0]
+        }
+
+        return 'origin'
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+function Sync-GitLfsBeforePush {
+    if (-not (Test-GitLfsAvailable)) {
+        Write-Host 'git-lfs is unavailable; skipping LFS pre-push sync'
+        return
+    }
+
+    if (-not (Test-RepoUsesGitLfs)) {
+        return
+    }
+
+    $remote = Get-GitPushRemote
+    if ([string]::IsNullOrWhiteSpace($remote)) {
+        $remote = 'origin'
+    }
+
+    Write-Host "syncing Git LFS objects to remote '$remote' before git push..."
+    & git lfs push $remote --all
+    if ($LASTEXITCODE -ne 0) {
+        throw "git lfs push failed ($LASTEXITCODE)"
+    }
+}
+
 function Get-DiffSnippet {
     Push-Location $suiteRoot
     try {
@@ -347,6 +415,7 @@ try {
             git commit -m $summary.Subject -m $summary.Body
         }
     }
+    Sync-GitLfsBeforePush
     git push
 }
 finally {

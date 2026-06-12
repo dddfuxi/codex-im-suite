@@ -1272,6 +1272,167 @@ button:disabled {
   background: var(--panel-muted);
 }
 
+.feishu-sticker-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.sticker-library-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(132px, 180px) minmax(160px, 240px);
+  gap: 10px;
+  align-items: center;
+}
+
+.sticker-library-toolbar select,
+.sticker-editor-grid input,
+.sticker-editor-grid textarea,
+.alias-merge-box input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font: inherit;
+}
+
+.sticker-library-toolbar select,
+.sticker-editor-grid input,
+.alias-merge-box input {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.sticker-editor-grid textarea {
+  min-height: 72px;
+  resize: vertical;
+  padding: 8px 10px;
+}
+
+.feishu-sticker-list {
+  display: grid;
+  gap: 10px;
+}
+
+.feishu-sticker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-strong);
+}
+
+.feishu-sticker-row.disabled {
+  opacity: 0.72;
+  background: var(--panel-muted);
+}
+
+.sticker-row-main,
+.sticker-row-actions,
+.sticker-row-title > div,
+.sticker-diagnostics {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sticker-row-title {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.sticker-row-title strong,
+.sticker-row-title span,
+.sticker-alias-row,
+.sticker-semantic-grid span,
+.sticker-diagnostics code,
+.sticker-diagnostics span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sticker-row-title > div > span,
+.sticker-alias-row,
+.sticker-semantic-grid,
+.sticker-diagnostics {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.sticker-alias-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.sticker-alias-row code {
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.sticker-semantic-grid,
+.sticker-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.sticker-semantic-grid span,
+.sticker-editor-grid label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sticker-semantic-grid strong,
+.sticker-editor-grid label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.sticker-semantic-grid strong {
+  color: var(--text);
+}
+
+.sticker-editor-grid .wide,
+.sticker-editor-grid .toggle-line {
+  grid-column: 1 / -1;
+}
+
+.sticker-editor-grid .toggle-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sticker-editor-grid .toggle-line input {
+  width: 16px;
+  height: 16px;
+}
+
+.sticker-diagnostics {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+
+.sticker-diagnostics summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.alias-merge-box {
+  display: grid;
+  gap: 8px;
+}
+
 .advanced-diagnostics {
   padding: 0;
 }
@@ -2063,6 +2224,7 @@ button:disabled {
 }
 
 .run-timeline-block,
+.message-run-block,
 .run-timeline,
 .event-list,
 .attachment-grid {
@@ -2165,12 +2327,27 @@ button:disabled {
   background: var(--panel-muted);
 }
 
+.message-run-block {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel-muted));
+}
+
 .run-card header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 6px;
+}
+
+.run-card-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .run-card p {
@@ -2414,6 +2591,8 @@ button:disabled {
   .memory-tree-layout,
   .memory-branches,
   .memory-visual-grid,
+  .sticker-library-toolbar,
+  .feishu-sticker-row,
   .permissions-layout,
   .permission-filter-row,
   .settings-layout,
@@ -2428,6 +2607,11 @@ button:disabled {
 
   .memory-optimizer-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sticker-semantic-grid,
+  .sticker-editor-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .memory-quick-actions {
@@ -2566,6 +2750,10 @@ button:disabled {
   .memory-radar,
   .memory-pipeline,
   .memory-optimizer-summary,
+  .sticker-library-toolbar,
+  .feishu-sticker-row,
+  .sticker-semantic-grid,
+  .sticker-editor-grid,
   .optimizer-draft-head,
   .blueprint-action-panel,
   .memory-tree-layout,

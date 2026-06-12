@@ -205,6 +205,24 @@ export interface ToolCallInfo {
   status: 'running' | 'complete' | 'error';
 }
 
+export interface RunTokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface RunSummary {
+  provider?: string;
+  modelSource?: string;
+  selectedSource?: string;
+  model?: string;
+  codexProfile?: string;
+  baseUrl?: string;
+  tokenUsage?: RunTokenUsage;
+}
+
 // ── Config ─────────────────────────────────────────────────────
 
 /** Platform-specific message length limits */

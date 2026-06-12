@@ -376,7 +376,8 @@ describe('bridge-manager lifecycle', () => {
           },
           { type: 'progress', data: '工具返回成功，正在整理最终结果。\n' },
           { type: 'text', data: '最终结果：已完成。' },
-          { type: 'result', data: '{}' },
+          { type: 'status', data: JSON.stringify({ provider: 'codex', modelSource: 'official', model: 'gpt-5' }) },
+          { type: 'result', data: JSON.stringify({ usage: { input_tokens: 100, output_tokens: 20 } }) },
         ]),
       },
       permissions: { resolvePendingPermission: () => false },
@@ -407,6 +408,10 @@ describe('bridge-manager lifecycle', () => {
       { storedUserText: '运行 node --version' },
     );
 
+    assert.equal(result.runSummary.model, 'gpt-5');
+    assert.equal(result.runSummary.modelSource, 'official');
+    assert.equal(result.runSummary.tokenUsage?.input_tokens, 100);
+    assert.equal(result.runSummary.tokenUsage?.output_tokens, 20);
     assert.equal(result.responseText, '最终结果：已完成。');
     assert.match(previews.join('\n'), /处理思路/);
     assert.match(previews.join('\n'), /工具返回成功/);

@@ -86,6 +86,7 @@ describe('workflow status store', () => {
       jsonToolFallbackUsed: true,
       shellExitCode: 0,
       shellDurationMs: 1234,
+      promptProfile: 'light_chat',
       tokenUsage: {
         input_tokens: 90,
         output_tokens: 34,
@@ -116,6 +117,7 @@ describe('workflow status store', () => {
     assert.equal(completed?.execution?.jsonToolFallbackUsed, true);
     assert.equal(completed?.execution?.shellExitCode, 0);
     assert.equal(completed?.execution?.shellDurationMs, 1234);
+    assert.equal(completed?.execution?.promptProfile, 'light_chat');
     assert.equal(completed?.tokenUsage?.input_tokens, 90);
     assert.equal(completed?.tokenUsage?.output_tokens, 34);
     assert.equal(completed?.tokenUsage?.total_tokens, 124);

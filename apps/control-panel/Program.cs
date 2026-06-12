@@ -97,6 +97,7 @@ internal sealed partial class MainForm : Form
     private readonly string _bridgeRuntimeAuditPath;
     private readonly string _mediaCacheDir;
     private readonly string _feishuChatIndexPath;
+    private readonly string _feishuStickerStorePath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
     private readonly string _webDiagnosticsLogPath;
@@ -201,6 +202,7 @@ internal sealed partial class MainForm : Form
         _bridgeRuntimeAuditPath = Path.Combine(_ctiHome, "runtime", "bridge-runtime-audit.json");
         _mediaCacheDir = Path.Combine(_ctiHome, "runtime", "control-panel-media");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
+        _feishuStickerStorePath = Path.Combine(_dataDir, "feishu-stickers.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
         _webDiagnosticsLogPath = Path.Combine(_ctiHome, "runtime", "control-panel-webview.log");
@@ -549,6 +551,8 @@ internal sealed partial class MainForm : Form
             || string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "settings.save", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "settings.saveAndRestartBridge", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.updateFeishuSticker", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.mergeFeishuStickerAliases", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
         {
             return "operator";
@@ -885,6 +889,12 @@ internal sealed partial class MainForm : Form
                 return BuildKnowledgeIndexStatus();
             case "memory.search":
                 return SearchKnowledgeIndex(payload);
+            case "memory.feishuStickers":
+                return FeishuStickerLibrary.Read(_feishuStickerStorePath);
+            case "memory.updateFeishuSticker":
+                return FeishuStickerLibrary.Update(_feishuStickerStorePath, ReadFeishuStickerUpdatePayload(payload));
+            case "memory.mergeFeishuStickerAliases":
+                return FeishuStickerLibrary.MergeAliases(_feishuStickerStorePath, ReadFeishuStickerAliasMergePayload(payload));
             case "memory.archiveItem":
                 return ArchiveKnowledgeItem(payload);
             case "memory.archives":
@@ -1494,6 +1504,15 @@ internal sealed partial class MainForm : Form
             : fallback;
     }
 
+    private static string? ReadPayloadOptionalString(JsonElement payload, string name)
+    {
+        return payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
     private static int ReadPayloadInt(JsonElement payload, string name, int fallback)
     {
         return payload.ValueKind == JsonValueKind.Object
@@ -1515,6 +1534,73 @@ internal sealed partial class MainForm : Form
                 _ => fallback,
             }
             : fallback;
+    }
+
+    private static bool? ReadPayloadOptionalBool(JsonElement payload, string name)
+    {
+        if (payload.ValueKind != JsonValueKind.Object || !payload.TryGetProperty(name, out var value)) return null;
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null,
+        };
+    }
+
+    private static string[] ReadPayloadStringArray(JsonElement payload, string name)
+    {
+        if (payload.ValueKind != JsonValueKind.Object || !payload.TryGetProperty(name, out var value)) return [];
+        if (value.ValueKind == JsonValueKind.Array)
+        {
+            return value.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString()?.Trim() ?? "")
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .ToArray();
+        }
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            return (value.GetString() ?? "")
+                .Split([',', '，', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .ToArray();
+        }
+        return [];
+    }
+
+    private static JsonElement ReadPayloadObject(JsonElement payload, string name)
+    {
+        return payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.Object
+            ? value
+            : payload;
+    }
+
+    private static FeishuStickerUpdateRequest ReadFeishuStickerUpdatePayload(JsonElement payload)
+    {
+        var source = ReadPayloadObject(payload, "sticker");
+        return new FeishuStickerUpdateRequest
+        {
+            FileKey = ReadPayloadString(source, "fileKey", ReadPayloadString(payload, "fileKey", "")).Trim(),
+            Label = ReadPayloadOptionalString(source, "label"),
+            Description = ReadPayloadOptionalString(source, "description"),
+            Intent = ReadPayloadOptionalString(source, "intent"),
+            Tone = ReadPayloadOptionalString(source, "tone"),
+            Usage = ReadPayloadOptionalString(source, "usage"),
+            AvoidWhen = ReadPayloadOptionalString(source, "avoidWhen"),
+            Disabled = ReadPayloadOptionalBool(source, "disabled") ?? ReadPayloadOptionalBool(payload, "disabled"),
+            DisabledReason = ReadPayloadOptionalString(source, "disabledReason") ?? ReadPayloadOptionalString(payload, "disabledReason"),
+        };
+    }
+
+    private static FeishuStickerAliasMergeRequest ReadFeishuStickerAliasMergePayload(JsonElement payload)
+    {
+        return new FeishuStickerAliasMergeRequest
+        {
+            FileKey = ReadPayloadString(payload, "fileKey", "").Trim(),
+            Aliases = ReadPayloadStringArray(payload, "aliases"),
+        };
     }
 
     private SettingsSnapshot ReadSettingsPayload(JsonElement payload)

@@ -41,6 +41,7 @@ import {
   compressConversationHistory,
   compressPromptText,
   createCompressedParams,
+  buildLightChatParams,
   decideConservativeRoute,
   getLocalRouterMode,
   shouldRunPreCodexLocalFastPath,
@@ -59,6 +60,14 @@ import {
   shouldTrustLocalApiForExecution,
 } from './local-model-capability.js';
 import {
+  buildCtiFinalToolResponseEnvelope,
+  buildVisibleToolOutcomeFallback,
+  collectJsonToolArtifacts,
+  executeJsonToolRequest,
+  parseJsonToolRequest,
+  validateJsonToolRequest,
+  type JsonToolRequest,
+  type JsonToolResult,
   planDeterministicJsonToolRequest,
 } from './local-agent-tool-protocol.js';
 import {
@@ -66,7 +75,9 @@ import {
   loadShellArtifactDefinitions,
   loadUnityMcpExecuteCodeDefinitions,
 } from './local-agent-tool-registry.js';
+import { buildManifestCodexSlimParams } from './manifest-codex-slim.js';
 import { sseEvent } from './sse-utils.js';
+import { McpBridge, type McpManifestRecord } from './mcp-bridge.js';
 import {
   inferRequestedExecutorId,
   readSessionExecutorDefaults,
@@ -504,6 +515,255 @@ class CodexApiFailoverProvider implements LLMProvider {
   }
 }
 
+class ManifestSlimCodexProvider implements LLMProvider {
+  private readonly mcpBridge: McpBridge;
+
+  constructor(
+    private readonly config: Config,
+    private readonly provider: LLMProvider,
+  ) {
+    this.mcpBridge = new McpBridge(config);
+  }
+
+  streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
+    const slim = buildManifestCodexSlimParams(params, {
+      defaultWorkDir: this.config.defaultWorkDir,
+      unityProjectPath: this.config.unityProjectPath,
+      allowedWorkspaceRoots: this.config.allowedWorkspaceRoots,
+      mcpToolCallDefinitions: loadMcpToolCallDefinitions(),
+      unityMcpExecuteCodeDefinitions: loadUnityMcpExecuteCodeDefinitions(),
+      shellArtifactDefinitions: loadShellArtifactDefinitions(),
+    });
+    if (!slim.plan) return this.provider.streamChat(params);
+
+    return new ReadableStream<string>({
+      start: async (controller) => {
+        appendLocalLlmRouteSummary(this.config, {
+          timestamp: new Date().toISOString(),
+          mode: getLocalRouterMode(this.config),
+          taskKind: 'tool_request',
+          decision: 'escalate_codex',
+          provider: 'codex',
+          reason: `配置型 manifest 命中，压缩上下文后交给 Codex 主链路规划 JSON 工具请求：${slim.plan!.reason}`,
+          compressedPromptChars: 0,
+          compressedHistoryChars: slim.compressedHistoryChars,
+        });
+        try {
+          const chunks = await this.collectProviderChunks(this.provider.streamChat(slim.params));
+          const planned = this.selectCodexToolRequest(chunks, slim.plan!.request);
+          const validation = validateJsonToolRequest(planned.request, {
+            workingDirectory: params.workingDirectory || this.config.defaultWorkDir,
+            allowedRoots: this.getAllowedRoots(params),
+            contextText: [slim.params.systemPrompt || '', params.prompt || ''].filter(Boolean).join('\n'),
+          });
+          const executableRequest = validation.ok ? validation.request : planned.request;
+          const toolId = `manifest-codex-tool-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          controller.enqueue(sseEvent('tool_use', {
+            id: toolId,
+            name: `JsonTool:${executableRequest.tool}`,
+            input: executableRequest.args,
+          }));
+          const toolResult = validation.ok
+            ? await this.executeValidatedJsonToolRequest(executableRequest, slim.params.executionRequirement?.requiredToolFamilies || [])
+            : { tool: executableRequest.tool, ok: false, error: validation.error } as JsonToolResult;
+          controller.enqueue(sseEvent('tool_result', {
+            tool_use_id: toolId,
+            content: JSON.stringify(toolResult, null, 2),
+            is_error: !toolResult.ok,
+          }));
+          controller.enqueue(sseEvent('status', {
+            provider: 'codex',
+            codexProfile: 'official',
+            modelSource: this.config.codexModelSource || 'official',
+            requiredEvidenceKind: slim.params.executionRequirement?.kind,
+            evidenceProtocol: 'json_tool_request',
+            requestedTool: executableRequest.tool,
+            executedTool: validation.ok ? executableRequest.tool : undefined,
+            jsonToolFallbackUsed: planned.fallbackUsed,
+            evidenceSatisfied: toolResult.ok,
+          }));
+          const finalBody = toolResult.ok
+            ? buildVisibleToolOutcomeFallback(params.prompt, [{ request: executableRequest, result: toolResult }])
+            : this.buildFailedToolAnswer(toolResult);
+          const finalText = buildCtiFinalToolResponseEnvelope(
+            finalBody,
+            collectJsonToolArtifacts(toolResult),
+            'markdown',
+          );
+          controller.enqueue(sseEvent('text', finalText));
+          const usage = this.extractUsageFromChunks(chunks);
+          controller.enqueue(sseEvent('result', usage ? { usage } : {}));
+          controller.close();
+        } catch (error) {
+          controller.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
+          controller.close();
+        }
+      },
+    });
+  }
+
+  private async collectProviderChunks(stream: ReadableStream<string>): Promise<string[]> {
+    const chunks: string[] = [];
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return chunks;
+  }
+
+  private selectCodexToolRequest(
+    chunks: string[],
+    fallbackRequest: JsonToolRequest,
+  ): { request: JsonToolRequest; fallbackUsed: boolean } {
+    const text = chunks
+      .flatMap(parseSseChunk)
+      .filter((event) => event.type === 'text')
+      .map((event) => event.data)
+      .join('\n')
+      .trim();
+    const parsed = parseJsonToolRequest(text);
+    if (parsed && this.isSameManifestToolBoundary(parsed, fallbackRequest)) {
+      return { request: parsed, fallbackUsed: false };
+    }
+    return { request: fallbackRequest, fallbackUsed: true };
+  }
+
+  private isSameManifestToolBoundary(candidate: JsonToolRequest, expected: JsonToolRequest): boolean {
+    if (candidate.tool !== expected.tool) return false;
+    if (candidate.tool === 'mcp_call') {
+      return String(candidate.args.manifestHint || '').trim().toLowerCase() === String(expected.args.manifestHint || '').trim().toLowerCase()
+        && String(candidate.args.tool || '').trim() === String(expected.args.tool || '').trim();
+    }
+    if (candidate.tool === 'unity_mcp_execute_code') return true;
+    if (candidate.tool === 'shell_artifact') {
+      return String(candidate.args.command || '').trim() === String(expected.args.command || '').trim();
+    }
+    return false;
+  }
+
+  private extractUsageFromChunks(chunks: string[]): Record<string, unknown> | null {
+    for (const event of chunks.flatMap(parseSseChunk).reverse()) {
+      if (event.type !== 'result') continue;
+      try {
+        const parsed = JSON.parse(event.data) as { usage?: unknown };
+        if (parsed.usage && typeof parsed.usage === 'object') return parsed.usage as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  private getAllowedRoots(params: Parameters<LLMProvider['streamChat']>[0]): string[] {
+    return [
+      params.workingDirectory,
+      this.config.defaultWorkDir,
+      this.config.unityProjectPath,
+      ...(this.config.allowedWorkspaceRoots || []),
+    ].filter((item): item is string => !!item && item.trim().length > 0);
+  }
+
+  private async executeValidatedJsonToolRequest(request: JsonToolRequest, requiredFamilies: string[] = []): Promise<JsonToolResult> {
+    if (request.tool !== 'mcp_call' && request.tool !== 'unity_mcp_execute_code') return executeJsonToolRequest(request);
+
+    const startedAt = Date.now();
+    try {
+      const manifestHint = request.tool === 'mcp_call' ? String(request.args.manifestHint || '') : 'unityMCP';
+      const manifest = this.mcpBridge.resolveManifestByHint(manifestHint)
+        || (request.tool === 'unity_mcp_execute_code'
+          ? this.mcpBridge.resolveManifestByHint('Unity MCP') || this.mcpBridge.resolveManifestByHint('unity')
+          : null);
+      if (!manifest) {
+        return { tool: request.tool, ok: false, error: `MCP manifest is not configured: ${manifestHint || '(empty)'}` };
+      }
+      if (!this.isMcpManifestCompatibleWithFamilies(manifest, request.tool === 'mcp_call' ? requiredFamilies : [])) {
+        return {
+          tool: request.tool,
+          ok: false,
+          error: `MCP manifest is not compatible with this turn's required tool families: ${manifest.id}`,
+        };
+      }
+      const toolName = request.tool === 'mcp_call' ? String(request.args.tool || '') : 'execute_code';
+      const args = request.tool === 'mcp_call'
+        ? request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
+          ? request.args.arguments as Record<string, unknown>
+          : {}
+        : {
+          action: 'execute',
+          code: String(request.args.code || ''),
+          compiler: request.args.compiler === 'roslyn' || request.args.compiler === 'codedom' ? request.args.compiler : 'auto',
+          safety_checks: request.args.safety_checks !== false,
+        };
+      const result = await this.mcpBridge.callTool(manifest, toolName, args);
+      const parsedResult = this.parseMcpToolResultPayload(result.content);
+      const data = {
+        server: manifest.id,
+        tool: toolName,
+        args,
+        result: result.content,
+        durationMs: Date.now() - startedAt,
+      };
+      if (!result.ok || (parsedResult && parsedResult.success === false)) {
+        return {
+          tool: request.tool,
+          ok: false,
+          data,
+          error: result.error || parsedResult?.error || parsedResult?.message || `MCP tool ${toolName} reported failure`,
+        };
+      }
+      return { tool: request.tool, ok: true, data };
+    } catch (error) {
+      return {
+        tool: request.tool,
+        ok: false,
+        data: { durationMs: Date.now() - startedAt },
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private parseMcpToolResultPayload(result: string): { success?: boolean; message?: string; error?: string; code?: string } | null {
+    try {
+      const parsed = JSON.parse(result) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as { success?: boolean; message?: string; error?: string; code?: string }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeMcpFamilyTerms(manifest: McpManifestRecord): string {
+    return [
+      manifest.id,
+      manifest.displayName,
+      manifest.category,
+      manifest.source,
+      ...(manifest.aliases || []),
+    ].filter(Boolean).join(' ').toLowerCase();
+  }
+
+  private isMcpManifestCompatibleWithFamilies(manifest: McpManifestRecord | null, requiredFamilies: string[] = []): boolean {
+    if (!manifest) return false;
+    const families = new Set(requiredFamilies.map((family) => family.trim().toLowerCase()).filter(Boolean));
+    const specificFamilies = Array.from(families).filter((family) => family !== 'mcp' && family !== 'tool');
+    if (specificFamilies.length === 0) return true;
+    const terms = this.normalizeMcpFamilyTerms(manifest);
+    if (families.has('web-search') && !/(^|\s|\.|-)web(\.|-| )?search(\s|$)/.test(terms)) return false;
+    if (families.has('unity-mcp') && !/(^|\s|\.|-)unity(\s|\.|-|mcp|$)|unitymcp/.test(terms)) return false;
+    return true;
+  }
+
+  private buildFailedToolAnswer(result: JsonToolResult): string {
+    return [
+      `未完成：${result.error || '工具执行失败，但没有返回更具体的错误。'}`,
+      `工具：${result.tool}`,
+    ].join('\n');
+  }
+}
+
 class HubLlmProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
@@ -554,6 +814,10 @@ class HubLlmProvider implements LLMProvider {
           }
         }
         if (routerMode === 'hybrid') {
+          if (conservative.requestKind === 'light_chat' && conservative.useLocal) {
+            await this.pipeLightChatFastPath(observedController, params, conservative, routerMode);
+            return;
+          }
           await this.pipeCodexPrimaryWithFallback(observedController, params, conservative, '默认直达 Codex（Codex 主脑）');
           return;
         }
@@ -692,6 +956,40 @@ class HubLlmProvider implements LLMProvider {
       : null;
 
     return formatMemoryContext(memory, feishuHistory);
+  }
+
+  private async pipeLightChatFastPath(
+    controller: ReadableStreamDefaultController<string>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    mode: ReturnType<typeof getLocalRouterMode>,
+  ): Promise<void> {
+    const lightParams = buildLightChatParams(params, this.config);
+    try {
+      await this.pipeFallbackStream(controller, lightParams, {
+        mode,
+        taskKind: 'light_chat',
+        decision: 'answer_local',
+        provider: 'local_best_effort',
+        reason: 'light_chat_fast_path',
+        compressedPromptChars: lightParams.prompt.length,
+        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
+        promptProfile: 'light_chat',
+      }, this.localProvider);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.pipeFallbackStream(controller, lightParams, {
+        mode,
+        taskKind: 'light_chat',
+        decision: 'escalate_codex',
+        provider: 'codex',
+        reason: `light_chat_fast_path_failed; fallback with light prompt: ${truncatePreview(message, 160)}`,
+        compressedPromptChars: lightParams.prompt.length,
+        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
+        promptProfile: 'light_chat',
+        fallbackReason: message,
+      }, this.fallbackProvider);
+    }
   }
 
   private async dispatchAfterRouteFailure(
@@ -1091,6 +1389,7 @@ class HubLlmProvider implements LLMProvider {
       routeReason: summary.reason,
       compressedPromptChars: summary.compressedPromptChars,
       compressedHistoryChars: summary.compressedHistoryChars,
+      ...(summary.promptProfile ? { promptProfile: summary.promptProfile } : {}),
     }));
     try {
       const stream = provider.streamChat(params);
@@ -1240,6 +1539,7 @@ interface StreamEvidence {
   progressCardCreated?: boolean;
   progressCardFinalized?: boolean;
   progressCardFallbackReason?: string;
+  promptProfile?: string;
   tokenUsage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -1324,6 +1624,7 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       if (typeof data.progressCardCreated === 'boolean') evidence.progressCardCreated = data.progressCardCreated;
       if (typeof data.progressCardFinalized === 'boolean') evidence.progressCardFinalized = data.progressCardFinalized;
       if (typeof data.progressCardFallbackReason === 'string') evidence.progressCardFallbackReason = data.progressCardFallbackReason;
+      if (typeof data.promptProfile === 'string') evidence.promptProfile = data.promptProfile;
       if (typeof data.evidenceSatisfied === 'boolean') evidence.evidenceSatisfied = data.evidenceSatisfied;
       continue;
     }
@@ -1387,6 +1688,7 @@ function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
   if (typeof evidence.progressCardCreated === 'boolean') payload.progressCardCreated = evidence.progressCardCreated;
   if (typeof evidence.progressCardFinalized === 'boolean') payload.progressCardFinalized = evidence.progressCardFinalized;
   if (evidence.progressCardFallbackReason) payload.progressCardFallbackReason = evidence.progressCardFallbackReason;
+  if (evidence.promptProfile) payload.promptProfile = evidence.promptProfile;
   if (evidence.tokenUsage) payload.tokenUsage = evidence.tokenUsage;
   appendWorkflowEvent(runId, 'finalizing', 'execution.evidence', '执行证据已记录', payload);
 }
@@ -1506,8 +1808,20 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
     provider: LLMProvider,
     primaryExecutorId: string,
   ): LLMProvider => {
-    return new ObservedLLMProvider(config, store, provider, primaryExecutorId);
+    return new HubLlmProvider(
+      config,
+      store,
+      new OllamaProvider(config),
+      new LocalAgentProvider(config, pendingPerms),
+      provider,
+      null,
+      primaryExecutorId,
+      provider,
+    );
   };
+  const wrapCodexMainProvider = (provider: LLMProvider): LLMProvider => (
+    new ManifestSlimCodexProvider(config, wrapWithLocalHub(provider, 'codex'))
+  );
 
   const runtime = config.runtime;
 
@@ -1527,7 +1841,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
         provider: createCodexProvider(source),
       })))
       : createCodexProvider(config.codexModelSource || 'official');
-    return wrapWithLocalHub(primaryProvider, 'codex');
+    return wrapCodexMainProvider(primaryProvider);
   }
 
   if (runtime === 'auto') {
@@ -1560,7 +1874,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
         provider: createCodexProvider(source),
       })))
       : createCodexProvider(config.codexModelSource || 'official');
-    return wrapWithLocalHub(primaryProvider, 'codex');
+    return wrapCodexMainProvider(primaryProvider);
   }
 
   const cliPath = resolveClaudeCliPath();

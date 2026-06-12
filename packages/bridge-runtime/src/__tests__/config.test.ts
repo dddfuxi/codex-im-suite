@@ -226,6 +226,9 @@ describe('configToSettings', () => {
       localLlmMaxInputChars: 5000,
       localLlmMaxOutputTokens: 768,
       localLlmComplexityMode: 'conservative',
+      lightChatFastPathEnabled: true,
+      lightChatHistoryLimit: 2,
+      lightChatMaxInputChars: 280,
     });
     assert.equal(m.get('bridge_ollama_enabled'), 'true');
     assert.equal(m.get('bridge_ollama_base_url'), 'http://127.0.0.1:11434');
@@ -245,6 +248,9 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_local_llm_max_input_chars'), '5000');
     assert.equal(m.get('bridge_local_llm_max_output_tokens'), '768');
     assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
+    assert.equal(m.get('bridge_light_chat_fast_path_enabled'), 'true');
+    assert.equal(m.get('bridge_light_chat_history_limit'), '2');
+    assert.equal(m.get('bridge_light_chat_max_input_chars'), '280');
   });
 
   it('maps generic local AI and Codex API settings without exposing secrets in normal settings', () => {

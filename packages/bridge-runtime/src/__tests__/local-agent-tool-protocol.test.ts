@@ -18,6 +18,7 @@ import {
   executeJsonToolRequest,
   isJsonToolProtocolEligible,
   parseJsonToolRequest,
+  planConfiguredJsonToolRequest,
   planDeterministicJsonToolRequest,
   validateJsonToolRequest,
 } from '../local-agent-tool-protocol.js';
@@ -187,6 +188,21 @@ describe('local agent JSON tool protocol', () => {
     assert.match(envelope, /```cti-final/);
     assert.match(envelope, /"reply_mode":"markdown"/);
     assert.match(envelope, /已完成/);
+  });
+
+  it('keeps user-visible rationale sections in normalized final text', () => {
+    const fallback = '已根据真实工具结果完成。';
+    const normalized = normalizeGeneratedToolFinalText([
+      '**处理思路**',
+      '- 已根据真实工具结果确认目标场景路径。',
+      '',
+      '**执行结果**',
+      '- 已成功切换到 Main 场景。',
+    ].join('\n'), fallback);
+
+    assert.match(normalized, /处理思路/);
+    assert.match(normalized, /执行结果/);
+    assert.match(normalized, /Main 场景/);
   });
 
   it('can build a deterministic final answer from list_dir results', () => {
@@ -418,6 +434,45 @@ describe('local agent JSON tool protocol', () => {
     });
     assert.equal(artifactPlan?.request.tool, 'shell_artifact');
     assert.equal(artifactPlan?.request.args.displayName, 'Desktop Screenshot');
+  });
+
+  it('plans configured manifest tools before an execution requirement is assigned', () => {
+    const plan = planConfiguredJsonToolRequest('unitygame screenshot please', {
+      workingDirectory: 'C:\\unity\\ST3',
+      contextText: 'workingDirectory=C:\\unity\\ST3\nunityProjectPath=C:\\unity\\ST3\\Game',
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot',
+        match: { regex: ['unity.*(?:game|screenshot)'] },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot', capture_source: 'game_view', include_image: false },
+      }],
+    });
+
+    assert.equal(plan?.request.tool, 'mcp_call');
+    assert.equal(plan?.request.args.manifestHint, 'unitymcp');
+    assert.equal(plan?.request.args.tool, 'manage_camera');
+    assert.equal(plan?.reason, 'configured MCP tool action manifest');
+  });
+
+  it('plans configured manifest tools with unordered keyword groups', () => {
+    const plan = planConfiguredJsonToolRequest('unitygame视角截个图', {
+      workingDirectory: 'C:\\unity\\ST3',
+      contextText: 'workingDirectory=C:\\unity\\ST3\nunityProjectPath=C:\\unity\\ST3\\Game',
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot',
+        match: {
+          keywordGroups: [['unity', 'game', '截']],
+        },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot', capture_source: 'game_view', include_image: false },
+      }],
+    });
+
+    assert.equal(plan?.request.tool, 'mcp_call');
+    assert.equal(plan?.request.args.manifestHint, 'unitymcp');
+    assert.equal(plan?.request.args.tool, 'manage_camera');
   });
 
   it('executes a configured artifact request and returns image artifacts', () => {

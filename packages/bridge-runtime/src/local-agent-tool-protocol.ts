@@ -33,6 +33,7 @@ export interface UnityMcpExecuteCodeDefinition {
   displayName?: string;
   match?: {
     keywords?: string[];
+    keywordGroups?: string[][];
     regex?: string[];
     contextualRegex?: string[];
     contextRegex?: string[];
@@ -47,6 +48,7 @@ export interface McpToolCallDefinition {
   displayName?: string;
   match?: {
     keywords?: string[];
+    keywordGroups?: string[][];
     regex?: string[];
     contextualRegex?: string[];
     contextRegex?: string[];
@@ -61,6 +63,7 @@ export interface ShellArtifactDefinition {
   displayName?: string;
   match?: {
     keywords?: string[];
+    keywordGroups?: string[][];
     regex?: string[];
     contextualRegex?: string[];
     contextRegex?: string[];
@@ -290,7 +293,9 @@ export function normalizeGeneratedToolFinalText(text: string, fallbackText: stri
   }
   normalized = normalized.replace(/^```(?:markdown|md)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
   normalized = normalized.replace(/\bJsonTool\b|\btool_request\b|\btool_result\b|\bcti-final\b/gi, '').trim();
-  const stripped = stripGeneratedRationaleSections(normalized);
+  const stripped = hasUserVisibleRationaleSections(normalized)
+    ? { text: normalized, extractedResult: false }
+    : stripGeneratedRationaleSections(normalized);
   normalized = stripped.text;
   normalized = normalized
     .replace(/(?:^|\n)\s*[-*]?\s*未完成[:：]\s*(?:无|没有|none|no)[^\n]*(?=\n|$)/giu, '')
@@ -315,6 +320,13 @@ function stripGeneratedRationaleSections(text: string): { text: string; extracte
     .trim(),
     extractedResult: false,
   };
+}
+
+function hasUserVisibleRationaleSections(text: string): boolean {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return false;
+  return /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?处理思路(?:\*\*)?/u.test(normalized)
+    && /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?执行结果(?:\*\*)?/u.test(normalized);
 }
 
 function isSafeShortGeneratedToolFinalText(text: string): boolean {
@@ -849,6 +861,46 @@ export function planDeterministicJsonToolRequest(
   return null;
 }
 
+export function planConfiguredJsonToolRequest(
+  userText: string,
+  context: {
+    workingDirectory?: string;
+    contextText?: string;
+    mcpToolCallDefinitions?: McpToolCallDefinition[];
+    unityMcpExecuteCodeDefinitions?: UnityMcpExecuteCodeDefinition[];
+    shellArtifactDefinitions?: ShellArtifactDefinition[];
+  },
+): DeterministicJsonToolRequestPlan | null {
+  const mcpRequest = buildConfiguredMcpToolCallRequest(userText, context.mcpToolCallDefinitions || [], context);
+  if (mcpRequest) {
+    return {
+      request: mcpRequest,
+      source: 'runtime_deterministic',
+      reason: 'configured MCP tool action manifest',
+    };
+  }
+
+  const unityCodeRequest = buildConfiguredUnityMcpExecuteCodeRequest(userText, context.unityMcpExecuteCodeDefinitions || [], context);
+  if (unityCodeRequest) {
+    return {
+      request: unityCodeRequest,
+      source: 'runtime_deterministic',
+      reason: 'configured Unity MCP manifest',
+    };
+  }
+
+  const shellArtifactRequest = buildConfiguredShellArtifactRequest(userText, context.shellArtifactDefinitions || [], context);
+  if (shellArtifactRequest) {
+    return {
+      request: shellArtifactRequest,
+      source: 'runtime_deterministic',
+      reason: 'configured artifact tool manifest',
+    };
+  }
+
+  return null;
+}
+
 export function validateJsonToolRequest(request: JsonToolRequest, options: JsonToolValidationOptions): JsonToolValidation {
   if (request.tool === 'shell') return validateShellToolRequest(request, options);
   if (request.tool === 'shell_artifact') return validateShellArtifactToolRequest(request, options);
@@ -1297,13 +1349,21 @@ function matchesUnityMcpDefinition(
 
 function matchesToolDefinition(
   text: string,
-  definition: { match?: { keywords?: string[]; regex?: string[]; contextualRegex?: string[]; contextRegex?: string[] } },
+  definition: { match?: { keywords?: string[]; keywordGroups?: string[][]; regex?: string[]; contextualRegex?: string[]; contextRegex?: string[] } },
   context?: { workingDirectory?: string; contextText?: string },
 ): boolean {
   const match = definition.match || {};
   const lowerText = text.toLowerCase();
   const keywords = (match.keywords || []).map((item) => item.trim().toLowerCase()).filter(Boolean);
   if (keywords.length > 0 && keywords.every((keyword) => lowerText.includes(keyword))) return true;
+  for (const group of match.keywordGroups || []) {
+    const normalizedGroup = (Array.isArray(group) ? group : [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean);
+    if (normalizedGroup.length > 0 && normalizedGroup.every((keyword) => lowerText.includes(keyword))) {
+      return true;
+    }
+  }
   for (const pattern of match.regex || []) {
     try {
       if (new RegExp(pattern, 'iu').test(text)) return true;

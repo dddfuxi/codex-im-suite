@@ -14,6 +14,7 @@ export interface LocalLlmRouteSummary {
   reason: string;
   compressedPromptChars: number;
   compressedHistoryChars: number;
+  promptProfile?: string;
   fallbackReason?: string;
 }
 

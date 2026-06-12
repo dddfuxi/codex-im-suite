@@ -6,6 +6,7 @@ import type { LocalRouterMode } from './local-llm-status.js';
 export type LocalRouterDecisionType = 'answer_local' | 'escalate_codex' | 'refuse_local';
 export type LocalTaskKind =
   | 'chat'
+  | 'light_chat'
   | 'explain'
   | 'summarize'
   | 'config_help'
@@ -57,6 +58,8 @@ const DEFAULT_ROUTER_HISTORY_ITEMS = 6;
 const DEFAULT_ROUTER_PROMPT_CHARS = 2200;
 const DEFAULT_ROUTER_HISTORY_CHARS = 2600;
 const MAX_HISTORY_ENTRY_CHARS = 320;
+const DEFAULT_LIGHT_CHAT_MAX_INPUT_CHARS = 280;
+const DEFAULT_LIGHT_CHAT_HISTORY_LIMIT = 2;
 
 const HARD_EXCLUDE_PATTERNS: PatternRule[] = [
   { pattern: /\b(unity|timeline|prefab|mcp for unity|unity mcp)\b/i, reason: '涉及 Unity 或 Unity MCP', taskKind: 'unity_like' },
@@ -157,8 +160,90 @@ function totalHistoryChars(params: StreamChatParams): number {
   return (params.conversationHistory || []).reduce((sum, item) => sum + item.content.length, 0);
 }
 
+function getLightChatMaxInputChars(config: Config): number {
+  const raw = config.lightChatMaxInputChars ?? DEFAULT_LIGHT_CHAT_MAX_INPUT_CHARS;
+  return Math.max(80, Math.min(1200, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_LIGHT_CHAT_MAX_INPUT_CHARS));
+}
+
+function getLightChatHistoryLimit(config: Config): number {
+  const raw = config.lightChatHistoryLimit ?? DEFAULT_LIGHT_CHAT_HISTORY_LIMIT;
+  return Math.max(0, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_LIGHT_CHAT_HISTORY_LIMIT));
+}
+
 function looksLikeExecutionIntent(text: string): boolean {
   return /(执行|运行|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
+}
+
+function extractSystemSection(systemPrompt: string | undefined, heading: string): string {
+  const text = systemPrompt || '';
+  if (!text.trim()) return '';
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(?:^|\\n)(${escaped}[\\s\\S]*?)(?=\\n[A-Z][^\\n]{0,80}:|$)`, 'u');
+  return pattern.exec(text)?.[1]?.trim() || '';
+}
+
+function hasFeishuLightContext(params: StreamChatParams): boolean {
+  const context = [params.systemPrompt, params.prompt].filter(Boolean).join('\n');
+  return /Feishu|飞书|表情包|sticker|reaction|emoji|轻量聊天|light[_ -]?status/i.test(context);
+}
+
+function hasLightChatTone(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  if (normalized.length <= 24) return true;
+  return /(收到|好的|好呀|可以|在呢|谢谢|哈哈|嘿嘿|早|晚安|辛苦|赞|OK|ok|嗯|哦|嗨|hello|hi|表情包|sticker)/iu.test(normalized);
+}
+
+export function isLightChatCandidate(params: StreamChatParams, config: Config): boolean {
+  if (config.lightChatFastPathEnabled === false) return false;
+  const prompt = (params.prompt || '').trim();
+  if (!prompt) return false;
+  if (prompt.length > getLightChatMaxInputChars(config)) return false;
+  if (params.files && params.files.length > 0) return false;
+  const requirement = params.executionRequirement;
+  if (requirement && requirement.kind !== 'none') return false;
+
+  const combinedInput = prompt;
+  for (const rule of HARD_EXCLUDE_PATTERNS) {
+    if (rule.pattern.test(combinedInput)) return false;
+  }
+  if (looksLikeExecutionIntent(combinedInput)) return false;
+  if (/(执行|运行|命令|文件|读取|搜索|截图|图片|附件|MCP|Unity|Blender|发布|报错|错误|阻塞|日志|git\s+(?:status|pull|fetch|branch|log)|Feishu doc|飞书文档|docx|sheets|base)/iu.test(combinedInput)) {
+    return false;
+  }
+  return hasFeishuLightContext(params) && hasLightChatTone(prompt);
+}
+
+export function buildLightChatParams(params: StreamChatParams, config: Config): StreamChatParams {
+  const identity = extractSystemSection(params.systemPrompt, 'Channel assistant identity:');
+  const emoji = extractSystemSection(params.systemPrompt, 'Feishu emoji presentation:');
+  const stickers = extractSystemSection(params.systemPrompt, 'Feishu sticker library:');
+  const replyStyle = params.replyPresentation?.replyStyleHint?.trim();
+  const systemPrompt = [
+    identity,
+    emoji,
+    stickers,
+    'Light chat reply contract:',
+    '- Reply as a natural Feishu chat message.',
+    '- Keep the reply concise and emotionally appropriate.',
+    '- Prefer semantically matching sticker hints when the sticker library supports them.',
+    '- Do not explain sticker or reaction sending intentions.',
+    '- Do not include formal delivery, command output, file paths, or diagnostic process text.',
+    replyStyle ? `- Required reply style: ${replyStyle}` : '',
+  ].filter(Boolean).join('\n\n');
+  const historyLimit = getLightChatHistoryLimit(config);
+  const history = historyLimit > 0
+    ? (params.conversationHistory || []).slice(-historyLimit).map((item) => ({
+        role: item.role,
+        content: truncateText(item.content, 160),
+      }))
+    : [];
+  return {
+    ...params,
+    systemPrompt,
+    conversationHistory: history,
+    executionRequirement: { kind: 'none', reason: 'light chat does not require tool evidence', requiredToolFamilies: [] },
+  };
 }
 
 export function decideConservativeRoute(params: StreamChatParams, config: Config): ConservativeRouteDecision {
@@ -179,6 +264,19 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
     canFastPath: false,
     ...patch,
   });
+
+  if (isLightChatCandidate(params, config)) {
+    return fallback({
+      useLocal: true,
+      allowLocalFallback: true,
+      requestKind: 'light_chat',
+      reason: 'Feishu light chat fast path',
+      preferredDecision: 'answer_local',
+      compressedPrompt: truncateText(params.prompt || '', getLightChatMaxInputChars(config)),
+      compressedHistory: '',
+      canFastPath: true,
+    });
+  }
 
   if (config.localLlmEnabled !== true) {
     return fallback({ requestKind: 'chat', reason: '本地模型未启用' });
@@ -256,7 +354,7 @@ export function buildLocalRoutePrompt(params: StreamChatParams, config: Config):
     '你是本地模型路由中枢。你不直接给用户最终答案，你只负责判断是否本地回答、是否需要升级到更强模型，以及压缩上下文。',
     '只允许输出一个严格 JSON 对象，不要输出 Markdown，不要解释，不要多余文本。',
     '允许的 decision: answer_local | escalate_codex | refuse_local',
-    '允许的 taskKind: chat | explain | summarize | config_help | command_draft | script_draft | code_explain | tool_request | repo_query | unity_like | blender_like | doc_like',
+    '允许的 taskKind: chat | light_chat | explain | summarize | config_help | command_draft | script_draft | code_explain | tool_request | repo_query | unity_like | blender_like | doc_like',
     '如果请求涉及真实执行、真实查询仓库状态、改代码、写文件、运行 Unity、操作 Blender、MCP 工具、飞书文档创建/删除、发布、图片附件理解，应优先 decision=escalate_codex 或 refuse_local。',
     '如果是简单解释、配置说明、日志总结、命令草案、小脚本草案、代码片段解释，可以 decision=answer_local。',
     '如果用户只是让你解释一条错误文本，即使里面出现 git 或 FETCH_HEAD，只要不是要求真实查仓库状态，也可以 answer_local。',
@@ -305,7 +403,7 @@ function extractJsonObject(raw: string): string {
 }
 
 function toTaskKind(value: string | undefined, fallback: LocalTaskKind = 'chat'): LocalTaskKind {
-  const valid: LocalTaskKind[] = ['chat', 'explain', 'summarize', 'config_help', 'command_draft', 'script_draft', 'code_explain', 'tool_request', 'repo_query', 'unity_like', 'blender_like', 'doc_like'];
+  const valid: LocalTaskKind[] = ['chat', 'light_chat', 'explain', 'summarize', 'config_help', 'command_draft', 'script_draft', 'code_explain', 'tool_request', 'repo_query', 'unity_like', 'blender_like', 'doc_like'];
   return valid.includes(value as LocalTaskKind) ? (value as LocalTaskKind) : fallback;
 }
 

@@ -82,8 +82,21 @@ export interface McpToolCallResult {
   error?: string;
 }
 
+interface HttpMcpSession {
+  endpoint: string;
+  sessionId: string;
+  expiresAt: number;
+}
+
+interface HttpMcpToolCacheEntry {
+  expiresAt: number;
+  tools: McpToolInfo[];
+}
+
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME_ROOT = path.resolve(MODULE_DIR, '..');
+const HTTP_MCP_SESSION_TTL_MS = 5 * 60_000;
+const HTTP_MCP_TOOL_CACHE_TTL_MS = 30_000;
 
 function getSuiteRoot(): string {
   const candidates = [
@@ -361,6 +374,9 @@ function waitForChildClose(child: ChildProcessWithoutNullStreams, timeoutMs = 15
 }
 
 export class McpBridge {
+  private readonly httpSessions = new Map<string, HttpMcpSession>();
+  private readonly httpToolDetailsCache = new Map<string, HttpMcpToolCacheEntry>();
+
   constructor(private readonly config: Config) {}
 
   private validateManifestWorkspace(manifest: McpManifestRecord): McpHealthStatus {
@@ -546,8 +562,14 @@ export class McpBridge {
     if (!workspaceValidation.ok) {
       throw new Error(workspaceValidation.message);
     }
+    const endpoint = this.getHttpEndpoint(manifest);
+    const cacheKey = `${manifest.id}|${endpoint}`;
+    const cached = this.httpToolDetailsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.tools.map((tool) => ({ ...tool }));
+    }
     const result = await this.sendHttpRequest<{ tools?: Array<{ name?: string; title?: string; description?: string; inputSchema?: unknown }> }>(manifest, 'tools/list', {});
-    return (result.tools || [])
+    const tools = (result.tools || [])
       .map((tool) => ({
         name: String(tool.name || '').trim(),
         title: typeof tool.title === 'string' ? tool.title : undefined,
@@ -555,6 +577,11 @@ export class McpBridge {
         inputSchema: tool.inputSchema,
       }))
       .filter((tool) => tool.name);
+    this.httpToolDetailsCache.set(cacheKey, {
+      expiresAt: Date.now() + HTTP_MCP_TOOL_CACHE_TTL_MS,
+      tools,
+    });
+    return tools.map((tool) => ({ ...tool }));
   }
 
   async listHttpTools(manifest: McpManifestRecord): Promise<string[]> {
@@ -749,9 +776,16 @@ export class McpBridge {
     }
   }
 
-  private async sendHttpRequest<T>(manifest: McpManifestRecord, method: string, params: Record<string, unknown>): Promise<T> {
+  private getHttpEndpoint(manifest: McpManifestRecord): string {
     const endpoint = expandManifestValue(manifest.healthCheck?.url || manifest.launcher || '', this.config);
     if (!endpoint) throw new Error('HTTP MCP 缺少 endpoint');
+    return endpoint;
+  }
+
+  private async getHttpSession(manifest: McpManifestRecord, endpoint: string, forceRefresh = false): Promise<HttpMcpSession> {
+    const cacheKey = `${manifest.id}|${endpoint}`;
+    const cached = this.httpSessions.get(cacheKey);
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) return cached;
 
     const initResponse = await fetch(endpoint, {
       method: 'POST',
@@ -790,6 +824,28 @@ export class McpBridge {
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
     });
 
+    const session = {
+      endpoint,
+      sessionId,
+      expiresAt: Date.now() + HTTP_MCP_SESSION_TTL_MS,
+    };
+    this.httpSessions.set(cacheKey, session);
+    return session;
+  }
+
+  private async sendHttpRequestOnce<T>(
+    manifest: McpManifestRecord,
+    endpoint: string,
+    method: string,
+    params: Record<string, unknown>,
+    forceNewSession = false,
+  ): Promise<T> {
+    const session = await this.getHttpSession(manifest, endpoint, forceNewSession);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      'mcp-session-id': session.sessionId,
+    };
     const response = await fetch(endpoint, {
       method: 'POST',
       headers,
@@ -808,5 +864,17 @@ export class McpBridge {
       throw new Error(payload.error?.message || `MCP ${method} 返回错误`);
     }
     return payload.result;
+  }
+
+  private async sendHttpRequest<T>(manifest: McpManifestRecord, method: string, params: Record<string, unknown>): Promise<T> {
+    const endpoint = this.getHttpEndpoint(manifest);
+    try {
+      return await this.sendHttpRequestOnce<T>(manifest, endpoint, method, params);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/session|mcp-session-id|missing session/i.test(message)) throw error;
+      this.httpSessions.delete(`${manifest.id}|${endpoint}`);
+      return await this.sendHttpRequestOnce<T>(manifest, endpoint, method, params, true);
+    }
   }
 }

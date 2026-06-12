@@ -425,6 +425,7 @@ type WorkflowRun = {
     jsonToolFallbackUsed?: boolean;
     shellExitCode?: number;
     shellDurationMs?: number;
+    promptProfile?: string;
   };
   tokenUsage?: {
     input_tokens?: number;
@@ -436,7 +437,15 @@ type WorkflowRun = {
   recovery?: {
     kind: 'recoverable' | 'not_recoverable';
     reason: string;
-    input?: { prompt?: string; workingDirectory?: string; model?: string; permissionMode?: string; channelType?: string; chatId?: string };
+    input?: {
+      prompt?: string;
+      workingDirectory?: string;
+      model?: string;
+      permissionMode?: string;
+      channelType?: string;
+      chatId?: string;
+      messageId?: string;
+    };
     runtimeRunId?: string;
     markedAt: string;
   };
@@ -582,6 +591,35 @@ type MemoryOptimizationStatus = {
   draftCount: number;
   recentError?: string;
   drafts: MemoryOptimizationDraft[];
+};
+
+type FeishuStickerLibraryItem = {
+  fileKey: string;
+  aliases: string[];
+  chatId: string;
+  userId: string;
+  label: string;
+  description: string;
+  intent: string;
+  tone: string;
+  usage: string;
+  avoidWhen: string;
+  examples: string[];
+  annotationConfidence: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastUsedAt: string;
+  useCount: number;
+  disabled: boolean;
+  disabledReason: string;
+  lastEditedAt: string;
+};
+
+type FeishuStickerLibrarySnapshot = {
+  schema: string;
+  storePath: string;
+  updatedAt: string;
+  stickers: FeishuStickerLibraryItem[];
 };
 
 type UserFacingStatus = 'normal' | 'attention' | 'disabled';
@@ -1786,6 +1824,107 @@ function canRetryWorkflow(run: WorkflowRun) {
     && run.status !== 'succeeded'
     && run.status !== 'retry_pending'
     && run.status !== 'retrying';
+}
+
+type WorkflowRunLink = {
+  run: WorkflowRun;
+  linkReason: 'message_id' | 'time_window';
+};
+
+type ConversationTimeline = {
+  messageRuns: Map<string, WorkflowRunLink[]>;
+  unlinkedRuns: WorkflowRunLink[];
+};
+
+function conversationMessageKey(message: ConversationMessage) {
+  return message.messageId || `${message.index}-${message.createdAt}`;
+}
+
+function parseConversationTime(value?: string) {
+  if (!value) return Number.NaN;
+  const direct = Date.parse(value);
+  if (Number.isFinite(direct)) return direct;
+  const normalized = value.includes('T') ? value : value.replace(' ', 'T');
+  const fallback = Date.parse(normalized);
+  return Number.isFinite(fallback) ? fallback : Number.NaN;
+}
+
+function normalizeComparableText(value?: string) {
+  return (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function textOverlapScore(left?: string, right?: string) {
+  const a = normalizeComparableText(left);
+  const b = normalizeComparableText(right);
+  if (!a || !b) return 0;
+  if (a.includes(b) || b.includes(a)) return 40;
+  const tokens = Array.from(new Set(a.split(/[^\p{L}\p{N}_-]+/u).filter((token) => token.length >= 2)));
+  if (tokens.length === 0) return 0;
+  const matched = tokens.filter((token) => b.includes(token)).length;
+  return Math.min(30, Math.round((matched / tokens.length) * 30));
+}
+
+function workflowRunMessageId(run: WorkflowRun) {
+  return run.recovery?.input?.messageId?.trim() || '';
+}
+
+function buildConversationTimeline(messages: ConversationMessage[], runs: WorkflowRun[] = []): ConversationTimeline {
+  const byMessageId = new Map<string, ConversationMessage>();
+  const chronologicalMessages = [...messages].sort((left, right) => {
+    const leftTime = parseConversationTime(left.createdAt);
+    const rightTime = parseConversationTime(right.createdAt);
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+    return left.index - right.index;
+  });
+  for (const message of chronologicalMessages) {
+    if (message.messageId) byMessageId.set(message.messageId, message);
+  }
+
+  const messageRuns = new Map<string, WorkflowRunLink[]>();
+  const unlinkedRuns: WorkflowRunLink[] = [];
+  const addLink = (message: ConversationMessage, link: WorkflowRunLink) => {
+    const key = conversationMessageKey(message);
+    messageRuns.set(key, [...(messageRuns.get(key) ?? []), link]);
+  };
+
+  for (const run of runs) {
+    const exactMessageId = workflowRunMessageId(run);
+    const exactMessage = exactMessageId ? byMessageId.get(exactMessageId) : undefined;
+    if (exactMessage) {
+      addLink(exactMessage, { run, linkReason: 'message_id' });
+      continue;
+    }
+
+    const runStartedAt = parseConversationTime(run.startedAt);
+    if (!Number.isFinite(runStartedAt)) {
+      unlinkedRuns.push({ run, linkReason: 'time_window' });
+      continue;
+    }
+
+    let best: { message: ConversationMessage; score: number } | undefined;
+    for (const message of chronologicalMessages) {
+      const messageTime = parseConversationTime(message.createdAt);
+      if (!Number.isFinite(messageTime)) continue;
+      const distanceMs = runStartedAt - messageTime;
+      if (distanceMs < -30_000 || distanceMs > 10 * 60_000) continue;
+      const roleBonus = /user|human|member/i.test(message.role || message.senderType) ? 20 : 0;
+      const proximityScore = Math.max(0, 30 - Math.floor(Math.abs(distanceMs) / 20_000));
+      const score = proximityScore + roleBonus + textOverlapScore(run.promptPreview, message.content);
+      if (!best || score > best.score) best = { message, score };
+    }
+
+    if (best && best.score >= 25) {
+      addLink(best.message, { run, linkReason: 'time_window' });
+    } else {
+      unlinkedRuns.push({ run, linkReason: 'time_window' });
+    }
+  }
+
+  for (const links of messageRuns.values()) {
+    links.sort((left, right) => parseConversationTime(left.run.startedAt) - parseConversationTime(right.run.startedAt));
+  }
+  unlinkedRuns.sort((left, right) => parseConversationTime(right.run.startedAt) - parseConversationTime(left.run.startedAt));
+  return { messageRuns, unlinkedRuns };
 }
 
 function permissionKey(item: { channelType: string; userId: string }) {
@@ -3800,6 +3939,102 @@ function SessionsPage({
   );
 }
 
+function WorkflowRunCard({
+  runItem,
+  run,
+  pending,
+  refreshDetail,
+  linkReason,
+}: {
+  runItem: WorkflowRun;
+  run: PageProps['run'];
+  pending: Record<string, boolean>;
+  refreshDetail: () => void | Promise<void> | undefined;
+  linkReason?: WorkflowRunLink['linkReason'];
+}) {
+  return (
+    <article className="run-card">
+      <header>
+        <strong>{runItem.executorId || '未选择执行器'}</strong>
+        <div className="run-card-status">
+          {linkReason && (
+            <StatusPill
+              status={linkReason === 'message_id' ? 'ok' : 'idle'}
+              label={linkReason === 'message_id' ? '消息 ID 匹配' : '按时间匹配'}
+            />
+          )}
+          <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
+        </div>
+      </header>
+      <p>{runItem.promptPreview || runItem.id}</p>
+      <dl className="workflow-run-meta">
+        <div>
+          <dt>开始</dt>
+          <dd>{formatWorkflowTimestamp(runItem.startedAt)}</dd>
+        </div>
+        <div>
+          <dt>结束</dt>
+          <dd>{runItem.endedAt ? formatWorkflowTimestamp(runItem.endedAt) : '进行中'}</dd>
+        </div>
+        <div>
+          <dt>耗时</dt>
+          <dd>{workflowDurationSummary(runItem)}</dd>
+        </div>
+        <div>
+          <dt>模型</dt>
+          <dd>{workflowModelLabel(runItem)}</dd>
+        </div>
+        <div>
+          <dt>来源</dt>
+          <dd>{workflowModelSourceLabel(runItem)}</dd>
+        </div>
+        {runItem.execution?.promptProfile && (
+          <div>
+            <dt>Profile</dt>
+            <dd>{runItem.execution.promptProfile}</dd>
+          </div>
+        )}
+        <div>
+          <dt>Token</dt>
+          <dd>{workflowTokenSummary(runItem)}</dd>
+        </div>
+        <div>
+          <dt>证据</dt>
+          <dd>{workflowEvidenceSummaryV2(runItem)}</dd>
+        </div>
+        {workflowCacheTokenSummary(runItem) && (
+          <div>
+            <dt>Cache</dt>
+            <dd>{workflowCacheTokenSummary(runItem)}</dd>
+          </div>
+        )}
+      </dl>
+      {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
+        <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
+      )}
+      <span>{runItem.id}</span>
+      <div className="command-band tight">
+        <MiniButton
+          label="重试"
+          icon={<RotateCw size={14} />}
+          onClick={() => void run('workflow.retryRun', { id: runItem.id }).then(() => refreshDetail())}
+          pending={pending['workflow.retryRun']}
+          disabled={!canRetryWorkflow(runItem)}
+        />
+      </div>
+      <div className="event-list">
+        {(runItem.events ?? []).map((event) => (
+          <div key={event.id} className="event-row">
+            <time>{event.at || '-'}</time>
+            <strong>{event.stage}</strong>
+            <span>{event.message || event.type}</span>
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
 const SessionDetailPane = memo(function SessionDetailPane({
   detail,
   run,
@@ -3829,10 +4064,11 @@ const SessionDetailPane = memo(function SessionDetailPane({
     const copied = [...detail.messages];
     return messageSortOrder === 'desc' ? copied.reverse() : copied;
   }, [detail, messageSortOrder]);
-  const orderedRuns = useMemo(() => {
-    if (!detail?.workflowRuns) return [];
-    return [...detail.workflowRuns].reverse();
-  }, [detail]);
+  const conversationTimeline = useMemo(
+    () => buildConversationTimeline(detail?.messages ?? [], detail?.workflowRuns ?? []),
+    [detail],
+  );
+  const unlinkedRuns = conversationTimeline.unlinkedRuns;
 
   return (
     <aside className={drawerOpen ? 'panel detail-drawer open' : 'panel detail-drawer'}>
@@ -3919,82 +4155,6 @@ const SessionDetailPane = memo(function SessionDetailPane({
             <dt>消息数</dt><dd>{detail.messages.length}</dd>
             <dt>运行记录</dt><dd>{detail.workflowRuns?.length ?? 0}</dd>
           </dl>
-          <section className="run-timeline-block">
-            <div className="subsection-title">
-              <Activity size={15} />
-              <strong>运行历程</strong>
-            </div>
-            <div className="run-timeline">
-              {orderedRuns.map((runItem) => (
-                <article key={runItem.id} className="run-card">
-                  <header>
-                    <strong>{runItem.executorId || '未选择执行器'}</strong>
-                    <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
-                  </header>
-                  <p>{runItem.promptPreview || runItem.id}</p>
-                  <dl className="workflow-run-meta">
-                    <div>
-                      <dt>开始</dt>
-                      <dd>{formatWorkflowTimestamp(runItem.startedAt)}</dd>
-                    </div>
-                    <div>
-                      <dt>结束</dt>
-                      <dd>{runItem.endedAt ? formatWorkflowTimestamp(runItem.endedAt) : '进行中'}</dd>
-                    </div>
-                    <div>
-                      <dt>耗时</dt>
-                      <dd>{workflowDurationSummary(runItem)}</dd>
-                    </div>
-                    <div>
-                      <dt>模型</dt>
-                      <dd>{workflowModelLabel(runItem)}</dd>
-                    </div>
-                    <div>
-                      <dt>来源</dt>
-                      <dd>{workflowModelSourceLabel(runItem)}</dd>
-                    </div>
-                    <div>
-                      <dt>Token</dt>
-                      <dd>{workflowTokenSummary(runItem)}</dd>
-                    </div>
-                    <div>
-                      <dt>证据</dt>
-                      <dd>{workflowEvidenceSummaryV2(runItem)}</dd>
-                    </div>
-                    {workflowCacheTokenSummary(runItem) && (
-                      <div>
-                        <dt>Cache</dt>
-                        <dd>{workflowCacheTokenSummary(runItem)}</dd>
-                      </div>
-                    )}
-                  </dl>
-                  {(runItem.recovery?.reason || runItem.retry?.lastError || runItem.error) && (
-                    <p>{runItem.recovery?.reason || runItem.retry?.lastError || runItem.error}</p>
-                  )}
-                  <span>{runItem.id}</span>
-                  <div className="command-band tight">
-                    <MiniButton
-                      label="重试"
-                      icon={<RotateCw size={14} />}
-                      onClick={() => void run('workflow.retryRun', { id: runItem.id }).then(() => refreshDetail())}
-                      pending={pending['workflow.retryRun']}
-                      disabled={!canRetryWorkflow(runItem)}
-                    />
-                  </div>
-                  <div className="event-list">
-                    {(runItem.events ?? []).map((event) => (
-                      <div key={event.id} className="event-row">
-                        <time>{event.at || '-'}</time>
-                        <strong>{event.stage}</strong>
-                        <span>{event.message || event.type}</span>
-                      </div>
-                    ))}
-                  </div>
-                </article>
-              ))}
-              {orderedRuns.length === 0 && <div className="empty-inline">暂无关联 workflow run。</div>}
-            </div>
-          </section>
           <div className="message-stream">
             {orderedMessages.map((message) => (
               <article key={`${message.index}-${message.createdAt}`} className="message-card">
@@ -4031,10 +4191,49 @@ const SessionDetailPane = memo(function SessionDetailPane({
                     ))}
                   </div>
                 )}
+                {(conversationTimeline.messageRuns.get(conversationMessageKey(message)) ?? []).length > 0 && (
+                  <section className="message-run-block">
+                    <div className="subsection-title">
+                      <Activity size={15} />
+                      <strong>这条消息触发的运行历程</strong>
+                    </div>
+                    <div className="run-timeline">
+                      {(conversationTimeline.messageRuns.get(conversationMessageKey(message)) ?? []).map((link) => (
+                        <WorkflowRunCard
+                          key={link.run.id}
+                          runItem={link.run}
+                          run={run}
+                          pending={pending}
+                          refreshDetail={refreshDetail}
+                          linkReason={link.linkReason}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                )}
               </article>
             ))}
             {orderedMessages.length === 0 && <div className="empty-inline">这条会话暂无可展示消息，可能是远端历史同步失败或本地索引缺少消息内容。</div>}
           </div>
+          <section className="run-timeline-block">
+            <div className="subsection-title">
+              <Activity size={15} />
+              <strong>未归并到具体消息的运行记录</strong>
+            </div>
+            <div className="run-timeline">
+              {unlinkedRuns.map((link) => (
+                <WorkflowRunCard
+                  key={link.run.id}
+                  runItem={link.run}
+                  run={run}
+                  pending={pending}
+                  refreshDetail={refreshDetail}
+                  linkReason={undefined}
+                />
+              ))}
+              {unlinkedRuns.length === 0 && <div className="empty-inline">所有 workflow run 都已归并到对应消息。</div>}
+            </div>
+          </section>
         </div>
       ) : (
         <div className="empty-inline">{detailLoading ? '加载中…' : detailError || '点击左侧会话后，在这里查看完整消息流。'}</div>
@@ -4335,6 +4534,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
   const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(state.memory.optimization);
   const [selectedOptimizationActions, setSelectedOptimizationActions] = useState<string[]>([]);
+  const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', updatedAt: '', stickers: [] });
+  const [stickerQuery, setStickerQuery] = useState('');
+  const [stickerStatusFilter, setStickerStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
+  const [stickerChatFilter, setStickerChatFilter] = useState('all');
+  const [editingStickerKey, setEditingStickerKey] = useState('');
+  const [editingSticker, setEditingSticker] = useState<Partial<FeishuStickerLibraryItem>>({});
+  const [aliasDrafts, setAliasDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
   const runRef = useRef(run);
 
@@ -4379,6 +4585,14 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const refreshArchives = async () => {
     const next = await run('memory.archives') as KnowledgeArchiveSnapshot;
     setArchives(next);
+  };
+
+  const refreshStickerLibrary = async () => {
+    const next = await run('memory.feishuStickers') as FeishuStickerLibrarySnapshot;
+    setStickerLibrary({
+      ...next,
+      stickers: Array.isArray(next.stickers) ? next.stickers : [],
+    });
   };
 
   const refreshOptimization = async () => {
@@ -4476,6 +4690,66 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     await refreshArchives();
   };
 
+  const beginEditSticker = (item: FeishuStickerLibraryItem) => {
+    setEditingStickerKey(item.fileKey);
+    setEditingSticker({
+      label: item.label,
+      description: item.description,
+      intent: item.intent,
+      tone: item.tone,
+      usage: item.usage,
+      avoidWhen: item.avoidWhen,
+      disabled: item.disabled,
+      disabledReason: item.disabledReason,
+    });
+  };
+
+  const updateStickerDraft = (key: keyof FeishuStickerLibraryItem, value: string | boolean) => {
+    setEditingSticker((current) => ({ ...current, [key]: value }));
+  };
+
+  const saveSticker = async (fileKey: string) => {
+    setError('');
+    const next = await run('memory.updateFeishuSticker', {
+      sticker: {
+        fileKey,
+        label: editingSticker.label ?? '',
+        description: editingSticker.description ?? '',
+        intent: editingSticker.intent ?? '',
+        tone: editingSticker.tone ?? '',
+        usage: editingSticker.usage ?? '',
+        avoidWhen: editingSticker.avoidWhen ?? '',
+        disabled: editingSticker.disabled === true,
+        disabledReason: editingSticker.disabledReason ?? '',
+      },
+    }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+    setEditingStickerKey('');
+    setEditingSticker({});
+  };
+
+  const toggleStickerDisabled = async (item: FeishuStickerLibraryItem) => {
+    setError('');
+    const disabled = !item.disabled;
+    const next = await run('memory.updateFeishuSticker', {
+      sticker: {
+        fileKey: item.fileKey,
+        disabled,
+        disabledReason: disabled ? (item.disabledReason || '控制面板禁用') : '',
+      },
+    }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+  };
+
+  const mergeStickerAliases = async (fileKey: string) => {
+    const aliases = (aliasDrafts[fileKey] || '').trim();
+    if (!aliases) return;
+    setError('');
+    const next = await run('memory.mergeFeishuStickerAliases', { fileKey, aliases }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+    setAliasDrafts((current) => ({ ...current, [fileKey]: '' }));
+  };
+
   const search = async (nextOffset = searchMeta.offset) => {
     setError('');
     try {
@@ -4507,6 +4781,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   useEffect(() => {
     void refreshArchives();
     void refreshOptimization();
+    void refreshStickerLibrary();
   }, []);
   useEffect(() => {
     const draft = (optimization?.drafts ?? []).find((item) => item.status === 'draft');
@@ -4539,6 +4814,36 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const pendingDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft');
   const appliedDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'applied');
   const selectedActionCount = pendingDraft ? selectedOptimizationActions.length : 0;
+  const stickerChatOptions = useMemo(() => {
+    return Array.from(new Set(stickerLibrary.stickers.map((item) => item.chatId).filter(Boolean))).sort();
+  }, [stickerLibrary.stickers]);
+  const visibleStickers = useMemo(() => {
+    const queryText = stickerQuery.trim().toLowerCase();
+    return stickerLibrary.stickers.filter((item) => {
+      if (stickerStatusFilter === 'enabled' && item.disabled) return false;
+      if (stickerStatusFilter === 'disabled' && !item.disabled) return false;
+      if (stickerChatFilter !== 'all' && item.chatId !== stickerChatFilter) return false;
+      if (!queryText) return true;
+      const haystack = [
+        item.label,
+        item.description,
+        item.intent,
+        item.tone,
+        item.usage,
+        item.avoidWhen,
+        item.chatId,
+        ...item.aliases,
+        ...item.examples,
+      ].join('\n').toLowerCase();
+      return haystack.includes(queryText);
+    });
+  }, [stickerLibrary.stickers, stickerQuery, stickerStatusFilter, stickerChatFilter]);
+  const stickerStats = useMemo(() => {
+    const total = stickerLibrary.stickers.length;
+    const disabled = stickerLibrary.stickers.filter((item) => item.disabled).length;
+    const annotated = stickerLibrary.stickers.filter((item) => item.label || item.intent || item.tone || item.usage).length;
+    return { total, enabled: total - disabled, disabled, annotated };
+  }, [stickerLibrary.stickers]);
   const memoryRelationGroups = useMemo(() => buildMemoryRelationGroups(selectedMemory, reminders), [selectedMemory, reminders]);
   const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
     {
@@ -4694,6 +4999,126 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         {searchMeta.totalMatched > items.length && (
           <div className="detail-meta">当前已显示 {items.length} / {searchMeta.totalMatched} 条。结果过多时，请用搜索或来源筛选缩小范围。</div>
         )}
+      </section>
+
+      <section className="panel feishu-sticker-panel">
+        <SectionHeader
+          title="Feishu 表情包库"
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerLibrary()} pending={pending['memory.feishuStickers']} />}
+        />
+        <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；禁用项不会进入提示词、语义匹配或裸表情包候选。</p>
+        <div className="memory-optimizer-summary">
+          <Metric label="表情包" value={String(stickerStats.total)} compact />
+          <Metric label="启用" value={String(stickerStats.enabled)} compact />
+          <Metric label="禁用" value={String(stickerStats.disabled)} compact />
+          <Metric label="已标注" value={String(stickerStats.annotated)} compact />
+        </div>
+        <div className="sticker-library-toolbar">
+          <div className="filter-row">
+            <Search size={14} />
+            <input
+              value={stickerQuery}
+              onChange={(event) => setStickerQuery(event.target.value)}
+              placeholder="搜索名称、别名、意图、语气、用法或群聊"
+            />
+          </div>
+          <select value={stickerStatusFilter} onChange={(event) => setStickerStatusFilter(event.target.value as 'all' | 'enabled' | 'disabled')}>
+            <option value="all">全部状态</option>
+            <option value="enabled">仅启用</option>
+            <option value="disabled">仅禁用</option>
+          </select>
+          <select value={stickerChatFilter} onChange={(event) => setStickerChatFilter(event.target.value)}>
+            <option value="all">全部 chat</option>
+            {stickerChatOptions.map((chatId) => <option key={chatId} value={chatId}>{chatId}</option>)}
+          </select>
+        </div>
+        <div className="feishu-sticker-list">
+          {visibleStickers.map((item) => {
+            const isEditing = editingStickerKey === item.fileKey;
+            const title = item.label || item.aliases[0] || '未命名表情包';
+            return (
+              <article key={item.fileKey} className={item.disabled ? 'feishu-sticker-row disabled' : 'feishu-sticker-row'}>
+                <div className="sticker-row-main">
+                  <div className="sticker-row-title">
+                    <span className="blueprint-icon"><ImageIcon size={18} /></span>
+                    <div>
+                      <strong>{title}</strong>
+                      <span>{item.intent || item.tone || item.usage || '未标注语义'}</span>
+                    </div>
+                    <StatusPill status={item.disabled ? 'warning' : 'ok'} label={item.disabled ? '已禁用' : '启用'} />
+                  </div>
+                  <div className="sticker-alias-row">
+                    {item.aliases.length > 0 ? item.aliases.slice(0, 12).map((alias) => <code key={alias}>{alias}</code>) : <span>暂无别名</span>}
+                  </div>
+                  {isEditing ? (
+                    <div className="sticker-editor-grid">
+                      <label>名称<input value={String(editingSticker.label ?? '')} onChange={(event) => updateStickerDraft('label', event.target.value)} /></label>
+                      <label>意图<input value={String(editingSticker.intent ?? '')} onChange={(event) => updateStickerDraft('intent', event.target.value)} /></label>
+                      <label>语气<input value={String(editingSticker.tone ?? '')} onChange={(event) => updateStickerDraft('tone', event.target.value)} /></label>
+                      <label>用法<input value={String(editingSticker.usage ?? '')} onChange={(event) => updateStickerDraft('usage', event.target.value)} /></label>
+                      <label>避免场景<input value={String(editingSticker.avoidWhen ?? '')} onChange={(event) => updateStickerDraft('avoidWhen', event.target.value)} /></label>
+                      <label>禁用原因<input value={String(editingSticker.disabledReason ?? '')} onChange={(event) => updateStickerDraft('disabledReason', event.target.value)} /></label>
+                      <label className="wide">描述<textarea value={String(editingSticker.description ?? '')} onChange={(event) => updateStickerDraft('description', event.target.value)} /></label>
+                      <label className="toggle-line">
+                        <input type="checkbox" checked={editingSticker.disabled === true} onChange={(event) => updateStickerDraft('disabled', event.target.checked)} />
+                        禁用这条语义
+                      </label>
+                    </div>
+                  ) : (
+                    <div className="sticker-semantic-grid">
+                      <span><strong>描述</strong>{item.description || '-'}</span>
+                      <span><strong>语气</strong>{item.tone || '-'}</span>
+                      <span><strong>用法</strong>{item.usage || '-'}</span>
+                      <span><strong>避免</strong>{item.avoidWhen || '-'}</span>
+                    </div>
+                  )}
+                  <details className="sticker-diagnostics">
+                    <summary>诊断字段</summary>
+                    <code>{item.fileKey}</code>
+                    <span>chat: {item.chatId || '-'}</span>
+                    <span>使用 {item.useCount} 次，最近收到 {item.lastSeenAt || '-'}，最近发送 {item.lastUsedAt || '-'}</span>
+                    <span>置信度 {Math.round((item.annotationConfidence || 0) * 100)}%，最近编辑 {item.lastEditedAt || '-'}</span>
+                  </details>
+                </div>
+                <div className="sticker-row-actions">
+                  {isEditing ? (
+                    <>
+                      <MiniButton label="保存" icon={<CheckCircle2 size={14} />} onClick={() => void saveSticker(item.fileKey)} pending={pending['memory.updateFeishuSticker']} />
+                      <MiniButton label="取消" icon={<X size={14} />} onClick={() => { setEditingStickerKey(''); setEditingSticker({}); }} />
+                    </>
+                  ) : (
+                    <>
+                      <MiniButton label="编辑" icon={<Settings size={14} />} onClick={() => beginEditSticker(item)} />
+                      <MiniButton
+                        label={item.disabled ? '恢复' : '禁用'}
+                        icon={item.disabled ? <CheckCircle2 size={14} /> : <Trash2 size={14} />}
+                        onClick={() => void toggleStickerDisabled(item)}
+                        pending={pending['memory.updateFeishuSticker']}
+                      />
+                    </>
+                  )}
+                  <div className="alias-merge-box">
+                    <input
+                      value={aliasDrafts[item.fileKey] || ''}
+                      onChange={(event) => setAliasDrafts((current) => ({ ...current, [item.fileKey]: event.target.value }))}
+                      placeholder="合并别名，逗号或换行分隔"
+                    />
+                    <MiniButton
+                      label="合并"
+                      icon={<ArrowDownUp size={14} />}
+                      onClick={() => void mergeStickerAliases(item.fileKey)}
+                      pending={pending['memory.mergeFeishuStickerAliases']}
+                      disabled={!String(aliasDrafts[item.fileKey] || '').trim()}
+                    />
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+          {visibleStickers.length === 0 && (
+            <div className="empty-inline">当前筛选下没有可管理的表情包。收到或导入表情包后，这里会显示可编辑的语义档案。</div>
+          )}
+        </div>
       </section>
 
       <section className="memory-visual-grid">

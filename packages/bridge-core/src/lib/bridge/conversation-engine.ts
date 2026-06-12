@@ -8,7 +8,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { ChannelBinding } from './types.js';
+import type { ChannelBinding, RunSummary } from './types.js';
 import type {
   FileAttachment,
   SSEEvent,
@@ -63,6 +63,7 @@ export type OnToolEvent = (toolId: string, toolName: string, status: 'running' |
 export interface ConversationResult {
   responseText: string;
   tokenUsage: TokenUsage | null;
+  runSummary: RunSummary;
   hasError: boolean;
   errorMessage: string;
   /** Permission request events that were forwarded during streaming */
@@ -118,6 +119,48 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
       noEvidenceRetryAttempted,
       requiredToolFamilies: requirement.requiredToolFamilies,
     } : {}),
+  };
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function readOptionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeTokenUsage(value: unknown): RunSummary['tokenUsage'] | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  const input = readOptionalNumber(source.input_tokens);
+  const output = readOptionalNumber(source.output_tokens);
+  const cacheRead = readOptionalNumber(source.cache_read_input_tokens);
+  const cacheCreation = readOptionalNumber(source.cache_creation_input_tokens);
+  const total = readOptionalNumber(source.total_tokens)
+    ?? (input !== undefined || output !== undefined ? (input || 0) + (output || 0) : undefined);
+  const usage: NonNullable<RunSummary['tokenUsage']> = {};
+  if (input !== undefined) usage.input_tokens = input;
+  if (output !== undefined) usage.output_tokens = output;
+  if (cacheRead !== undefined) usage.cache_read_input_tokens = cacheRead;
+  if (cacheCreation !== undefined) usage.cache_creation_input_tokens = cacheCreation;
+  if (total !== undefined) usage.total_tokens = total;
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+function mergeRunSummary(target: RunSummary, data: unknown): RunSummary {
+  if (!data || typeof data !== 'object') return target;
+  const source = data as Record<string, unknown>;
+  const tokenUsage = normalizeTokenUsage(source.usage ?? source.tokenUsage);
+  return {
+    ...target,
+    ...(readOptionalString(source.provider) ? { provider: readOptionalString(source.provider) } : {}),
+    ...(readOptionalString(source.modelSource) ? { modelSource: readOptionalString(source.modelSource) } : {}),
+    ...(readOptionalString(source.selectedSource) ? { selectedSource: readOptionalString(source.selectedSource) } : {}),
+    ...(readOptionalString(source.model) ? { model: readOptionalString(source.model) } : {}),
+    ...(readOptionalString(source.codexProfile) ? { codexProfile: readOptionalString(source.codexProfile) } : {}),
+    ...(readOptionalString(source.baseUrl) ? { baseUrl: readOptionalString(source.baseUrl) } : {}),
+    ...(tokenUsage ? { tokenUsage } : {}),
   };
 }
 
@@ -441,6 +484,7 @@ export async function processMessage(
     return {
       responseText: '',
       tokenUsage: null,
+      runSummary: {},
       hasError: true,
       errorMessage: 'Session is busy processing another request',
       permissionRequests: [],
@@ -724,6 +768,7 @@ async function consumeStream(
   /** Monotonically accumulated text for streaming preview — never resets on tool_use. */
   let previewText = '';
   let tokenUsage: TokenUsage | null = null;
+  let runSummary: RunSummary = {};
   let hasError = false;
   let errorMessage = '';
   const seenToolResultIds = new Set<string>();
@@ -869,6 +914,7 @@ async function consumeStream(
           case 'status': {
             try {
               const statusData = JSON.parse(event.data);
+              runSummary = mergeRunSummary(runSummary, statusData);
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
                 store.updateSdkSessionId(sessionId, statusData.session_id);
@@ -899,6 +945,7 @@ async function consumeStream(
             try {
               const resultData = JSON.parse(event.data);
               if (resultData.usage) tokenUsage = resultData.usage;
+              runSummary = mergeRunSummary(runSummary, resultData);
               if (resultData.is_error) hasError = true;
               if (resultData.session_id) {
                 capturedSdkSessionId = resultData.session_id;
@@ -952,6 +999,10 @@ async function consumeStream(
     return {
       responseText,
       tokenUsage,
+      runSummary: {
+        ...runSummary,
+        ...(tokenUsage ? { tokenUsage: normalizeTokenUsage(tokenUsage) } : {}),
+      },
       hasError,
       errorMessage,
       permissionRequests,
@@ -994,6 +1045,10 @@ async function consumeStream(
     return {
       responseText: '',
       tokenUsage,
+      runSummary: {
+        ...runSummary,
+        ...(tokenUsage ? { tokenUsage: normalizeTokenUsage(tokenUsage) } : {}),
+      },
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
       permissionRequests,

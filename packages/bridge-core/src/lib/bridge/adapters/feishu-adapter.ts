@@ -26,6 +26,7 @@ import type {
   OutboundMention,
   OutboundMessage,
   SendResult,
+  RunSummary,
   UploadedFileLink,
 } from '../types.js';
 import type { FileAttachment } from '../types.js';
@@ -220,6 +221,9 @@ interface FeishuStickerRecord {
   annotationConfidence?: number;
   annotationUpdatedAt?: string;
   learnedFromMessageId?: string;
+  disabled?: boolean;
+  disabledReason?: string;
+  lastEditedAt?: string;
   chatId?: string;
   userId?: string;
   messageId?: string;
@@ -597,16 +601,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
   getEmojiPresentationPrompt(chatId?: string, userId?: string): string {
     const catalogHint = buildFeishuEmojiPrompt();
     const store = this.readEmojiProfileStore();
+    const preferenceScore = (entry: FeishuEmojiProfileEntry): number => {
+      const inboundPreference = entry.inboundCount * 4;
+      const recentSuccessSignal = Math.min(entry.outboundSuccessCount, 2) * 0.25;
+      const failurePenalty = entry.outboundFailureCount * 2;
+      const smilePenalty = entry.emojiType === 'SMILE' && entry.inboundCount <= 0 ? 10 : 0;
+      return inboundPreference + recentSuccessSignal - failurePenalty - smilePenalty;
+    };
     const preferred = store.emojis
       .filter((item) => !item.disabled)
       .filter((item) => !chatId || !item.chatId || item.chatId === chatId)
       .filter((item) => !userId || !item.userId || item.userId === userId)
-      .sort((a, b) => {
-        const score = (entry: FeishuEmojiProfileEntry) => entry.inboundCount + entry.outboundSuccessCount - entry.outboundFailureCount;
-        return score(b) - score(a) || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0);
-      })
+      .map((item) => ({ item, score: preferenceScore(item) }))
+      .filter(({ item, score }) => score > 0 && (item.emojiType !== 'SMILE' || item.inboundCount > 0))
+      .sort((a, b) => b.score - a.score || (Date.parse(b.item.lastSeenAt || '') || 0) - (Date.parse(a.item.lastSeenAt || '') || 0))
       .slice(0, 6)
-      .map((item) => {
+      .map(({ item }) => {
         const alias = item.aliases?.[0] ? `/${item.aliases[0]}` : '';
         return `[${item.emojiType}${alias}]`;
       })
@@ -614,9 +624,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return [
       'Feishu emoji presentation:',
       catalogHint ? `- Catalog examples: ${catalogHint}.` : '',
-      preferred ? `- Learned preferences for this chat/user: ${preferred}. Prefer these in light chat when they fit.` : '',
+      preferred ? `- Learned preferences for this chat/user: ${preferred}. Treat these as weak tie-breakers after intent matching.` : '',
+      '- Sticker hints have priority over reaction hints when a listed sticker semantically fits the light-chat reply.',
       '- Choose reaction hints by actual intent. Do not default to SMILE; use no reaction hint when the tone is neutral, formal, blocked, or unclear.',
-      '- Use reaction hints sparingly but naturally for greetings, acknowledgements, praise, jokes, and sticker-style banter.',
+      '- Use reaction hints as a fallback for greetings, acknowledgements, praise, jokes, and sticker-style banter when no sticker fits.',
       '- If a reaction hint fails, the adapter will keep or fallback the visible text; never rely on the hint as the only meaning.',
     ].filter(Boolean).join('\n');
   }
@@ -624,6 +635,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   getStickerPresentationPrompt(chatId?: string): string {
     const store = this.readStickerStore();
     const annotated = store.stickers
+      .filter((item) => !item.disabled)
       .filter((item) => this.hasStickerAnnotation(item))
       .filter((item) => !chatId || !item.chatId || item.chatId === chatId)
       .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
@@ -650,9 +662,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return [
       'Feishu sticker library:',
       ...lines,
-      '- Choose a sticker only when its meaning and usage match the reply. Use `[表情包:alias]` only with an alias listed above.',
-      '- If no listed alias matches and the user explicitly asks for any sticker or a different sticker, use bare `[表情包]`.',
-      '- Do not mention sticker file keys to the user.',
+      '- Prefer a listed sticker for light chat when its meaning, tone, or usage matches the reply; use `[表情包:alias]` only with an alias listed above.',
+      '- If no listed alias matches but the reply has a clear casual emotion, joke, acknowledgement, or banter tone, use bare `[表情包]` so the adapter can choose the best semantic match.',
+      '- Sticker and reaction hints are invisible action hints. Do not explain that you are sending a sticker, and do not mention sticker file keys to the user.',
     ].join('\n');
   }
 
@@ -667,9 +679,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private sanitizeStickerRecord(record: FeishuStickerRecord): FeishuStickerRecord {
     const cleaned: FeishuStickerRecord = { ...record };
-    for (const key of ['label', 'description', 'intent', 'tone', 'usage', 'avoidWhen'] as const) {
+    for (const key of ['label', 'description', 'intent', 'tone', 'usage', 'avoidWhen', 'disabledReason'] as const) {
       if (this.isUnsafeStickerSemanticText(cleaned[key])) delete cleaned[key];
     }
+    cleaned.disabled = cleaned.disabled === true;
+    cleaned.annotationConfidence = Number.isFinite(Number(cleaned.annotationConfidence))
+      ? Math.max(0, Math.min(1, Number(cleaned.annotationConfidence)))
+      : cleaned.annotationConfidence;
     cleaned.examples = (Array.isArray(cleaned.examples) ? cleaned.examples : [])
       .map((item) => String(item || '').trim())
       .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
@@ -679,6 +695,68 @@ export class FeishuAdapter extends BaseChannelAdapter {
       .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
       .slice(0, 20);
     return cleaned;
+  }
+
+  private tokenizeStickerSemanticText(value: string): Set<string> {
+    const normalized = value.normalize('NFKC').toLowerCase();
+    const tokens = new Set<string>();
+    for (const token of normalized.split(/[^\p{L}\p{N}_+-]+/u)) {
+      const trimmed = token.trim();
+      if (trimmed.length >= 2) tokens.add(trimmed);
+    }
+    const compact = normalized.replace(/[^\p{L}\p{N}]/gu, '');
+    for (let size = 2; size <= 4; size += 1) {
+      for (let index = 0; index + size <= compact.length; index += 1) {
+        tokens.add(compact.slice(index, index + size));
+      }
+    }
+    return tokens;
+  }
+
+  private stickerSemanticText(record: FeishuStickerRecord): string {
+    return [
+      record.label,
+      record.description,
+      record.intent,
+      record.tone,
+      record.usage,
+      record.avoidWhen,
+      ...(record.aliases || []),
+      ...(record.examples || []),
+    ].filter((item): item is string => Boolean(item?.trim())).join(' ');
+  }
+
+  private stickerTextOverlapScore(left: string, right: string): number {
+    const normalizedLeft = left.normalize('NFKC').toLowerCase().trim();
+    const normalizedRight = right.normalize('NFKC').toLowerCase().trim();
+    if (!normalizedLeft || !normalizedRight) return 0;
+    if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 80;
+    const leftTokens = this.tokenizeStickerSemanticText(normalizedLeft);
+    const rightTokens = this.tokenizeStickerSemanticText(normalizedRight);
+    if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+    let score = 0;
+    for (const token of leftTokens) {
+      if (!rightTokens.has(token)) continue;
+      score += token.length >= 4 ? 8 : token.length === 3 ? 5 : 3;
+    }
+    return score;
+  }
+
+  private stickerAvoidsContext(record: FeishuStickerRecord, contextText: string): boolean {
+    return Boolean(record.avoidWhen?.trim() && this.stickerTextOverlapScore(contextText, record.avoidWhen) >= 12);
+  }
+
+  private stickerSemanticScore(record: FeishuStickerRecord, contextText: string, chatId?: string): number {
+    if (record.disabled) return Number.NEGATIVE_INFINITY;
+    if (contextText.trim() && this.stickerAvoidsContext(record, contextText)) return Number.NEGATIVE_INFINITY;
+    const semanticText = this.stickerSemanticText(record);
+    const semanticScore = contextText.trim() ? this.stickerTextOverlapScore(contextText, semanticText) : 0;
+    return semanticScore
+      + (record.chatId === chatId ? 20 : 0)
+      + (this.hasStickerAnnotation(record) ? 16 : 0)
+      + Math.round((Number(record.annotationConfidence) || 0) * 8)
+      - Math.min(Number(record.useCount || 0), 20) * 0.25
+      - Math.max(0, Date.now() - (Date.parse(record.lastUsedAt || '') || 0) < 60 * 60 * 1000 ? 3 : 0);
   }
 
   private rememberSticker(input: {
@@ -723,7 +801,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private resolveStickerFileKey(target: string, chatId?: string): string | null {
+  private resolveStickerFileKey(target: string, chatId?: string, contextText = ''): string | null {
     const normalized = target.trim();
     if (looksLikeFeishuStickerFileKey(normalized)) return normalized;
     const store = this.readStickerStore();
@@ -733,6 +811,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const compareCommon = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
       Number(b.chatId === chatId) - Number(a.chatId === chatId)
       || Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a));
+    const compareSemanticStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
+      this.stickerSemanticScore(b, contextText, chatId) - this.stickerSemanticScore(a, contextText, chatId)
+      || compareCommon(a, b)
+      || (Number(a.useCount || 0) - Number(b.useCount || 0))
+      || ((Date.parse(a.lastUsedAt || '') || 0) - (Date.parse(b.lastUsedAt || '') || 0))
+      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
     const compareRecentStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
       compareCommon(a, b)
       || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
@@ -748,15 +832,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const compareStickerCandidate = wantsRecent
       ? compareRecentStickerCandidate
       : genericTarget
-        ? compareRotatingStickerCandidate
+        ? contextText.trim()
+          ? compareSemanticStickerCandidate
+          : compareRotatingStickerCandidate
         : compareSpecificStickerCandidate;
+    const enabledStickers = store.stickers.filter((item) => !item.disabled);
     const byAlias = (genericTarget
-      ? store.stickers
-      : store.stickers.filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
+      ? enabledStickers
+      : enabledStickers.filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
+      .filter((item) => !contextText.trim() || !this.stickerAvoidsContext(item, contextText))
       .sort(compareStickerCandidate);
     if (!genericTarget) return byAlias[0]?.fileKey || null;
-    const fallback = store.stickers
+    const fallback = enabledStickers
       .slice()
+      .filter((item) => !contextText.trim() || !this.stickerAvoidsContext(item, contextText))
       .sort(compareStickerCandidate);
     return (byAlias[0] || fallback[0])?.fileKey || null;
   }
@@ -1443,6 +1532,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     chatId: string,
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
+    summary?: RunSummary,
   ): Promise<boolean> {
     // Wait for in-flight card creation to complete before finalizing
     const pending = this.cardCreatePromises.get(chatId);
@@ -1487,7 +1577,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const visibleFinalText = extractStreamingFinalResponse(responseText);
       const stickerHint = extractFeishuStickerHint(visibleFinalText);
       if (stickerHint) {
-        const fileKey = this.resolveStickerFileKey(stickerHint.target, chatId);
+        const fileKey = this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
         if (fileKey) {
           const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId);
           if (stickerResult.ok) {
@@ -1512,7 +1602,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           finalResponseText = applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
         }
       }
-      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer);
+      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer, summary);
 
       state.sequence++;
       await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
@@ -1658,9 +1748,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.updateToolProgress(chatId, tools);
   }
 
-  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
+  async onStreamEnd(
+    chatId: string,
+    status: 'completed' | 'interrupted' | 'error',
+    responseText: string,
+    summary?: RunSummary,
+  ): Promise<boolean> {
     if (!this.isStreamingCardEnabled()) return false;
-    return this.finalizeCard(chatId, status, responseText);
+    return this.finalizeCard(chatId, status, responseText, summary);
   }
 
   // ── Send ────────────────────────────────────────────────────
@@ -1677,7 +1772,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       && message.parseMode !== 'HTML'
     ) ? extractFeishuStickerHint(text) : null;
     if (stickerHint) {
-      const fileKey = this.resolveStickerFileKey(stickerHint.target, message.address.chatId);
+      const fileKey = this.resolveStickerFileKey(stickerHint.target, message.address.chatId, stickerHint.remainingText);
       if (fileKey) {
         const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId);
         if (stickerResult.ok) {

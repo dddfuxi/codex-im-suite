@@ -1,4 +1,4 @@
-import type { ToolCallInfo } from '../types.js';
+import type { RunSummary, ToolCallInfo } from '../types.js';
 
 /**
  * Feishu-specific Markdown processing.
@@ -216,6 +216,7 @@ export function buildStreamingContent(text: string, tools: ToolCallInfo[]): stri
 export function extractStreamingFinalResponse(text: string): string {
   const normalized = (text || '').replace(/\r\n/g, '\n').trim();
   if (!normalized) return '';
+  if (hasVisibleRationaleSections(normalized)) return normalized;
 
   const resultHeading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:执行结果|最终结果)(?:\*\*)?\s*[:：]?[ \t]*(?:\n)?/u;
   const match = resultHeading.exec(normalized);
@@ -234,10 +235,11 @@ export function buildFinalCardJson(
   text: string,
   tools: ToolCallInfo[],
   footer: { status: string; elapsed: string } | null,
+  summary?: RunSummary,
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
-  // Main result content. Waiting/progress rationale is stripped before finalizing.
+  // Main result content. Preserve concise user-visible rationale when present.
   let content = stripStandaloneCompletionMarkLines(preprocessFeishuMarkdown(extractStreamingFinalResponse(text)));
   if (!content.trim()) {
     content = '未完成：模型没有返回可展示结果。';
@@ -267,6 +269,7 @@ export function buildFinalCardJson(
     const parts: string[] = [];
     parts.push(formatCompletionMark(footer.status));
     if (footer.elapsed) parts.push(`耗时：${footer.elapsed}`);
+    parts.push(...formatRunSummaryFooterParts(summary));
     if (parts.length > 0) {
       elements.push({ tag: 'hr' });
       elements.push({
@@ -287,8 +290,58 @@ export function buildFinalCardJson(
   });
 }
 
+function formatRunSummaryFooterParts(summary?: RunSummary): string[] {
+  if (!summary) return [];
+  const parts: string[] = [];
+  const modelLabel = formatModelLabel(summary);
+  if (modelLabel) parts.push(`模型：${escapeFeishuInlineMarkdown(modelLabel)}`);
+
+  const usage = summary.tokenUsage;
+  if (usage) {
+    const input = formatTokenCount(usage.input_tokens);
+    const output = formatTokenCount(usage.output_tokens);
+    if (input || output) {
+      parts.push(`Token：输入 ${input || '未知'} / 输出 ${output || '未知'}`);
+    } else {
+      const total = formatTokenCount(usage.total_tokens);
+      if (total) parts.push(`Token：总计 ${total}`);
+    }
+    const cacheRead = formatTokenCount(usage.cache_read_input_tokens);
+    const cacheCreation = formatTokenCount(usage.cache_creation_input_tokens);
+    if (cacheRead || cacheCreation) {
+      parts.push(`Cache：读 ${cacheRead || '0'} / 写 ${cacheCreation || '0'}`);
+    }
+  }
+  return parts;
+}
+
+function formatModelLabel(summary: RunSummary): string {
+  const model = summary.model?.trim();
+  const source = summary.selectedSource?.trim() || summary.modelSource?.trim() || summary.provider?.trim();
+  if (model && source) return `${model} (${source})`;
+  return model || source || '';
+}
+
+function formatTokenCount(value: unknown): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+  return Math.round(value).toLocaleString('en-US');
+}
+
+function hasVisibleRationaleSections(text: string): boolean {
+  const normalized = (text || '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) return false;
+  return /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\u5904\u7406\u601d\u8def(?:\*\*)?/u.test(normalized)
+    && /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\u6267\u884c\u7ed3\u679c(?:\*\*)?/u.test(normalized);
+}
+
 function extractFinalCardTitleAndBody(content: string): { title: string; body: string } {
   const normalized = stripStandaloneCompletionMarkLines(content.replace(/\r\n/g, '\n')).trim();
+  if (hasVisibleRationaleSections(normalized)) {
+    return {
+      title: summarizeFinalCardTitle('????'),
+      body: normalized,
+    };
+  }
   const heading = /^(?:#{1,6}\s+|\*\*)?(.{2,48}?)(?:\*\*)?\s*[:：]?\s*\n+([\s\S]+)$/u.exec(normalized);
   if (heading && !/[。！？.!?]$/u.test(heading[1].trim())) {
     const body = stripStandaloneCompletionMarkLines(heading[2]).trim();

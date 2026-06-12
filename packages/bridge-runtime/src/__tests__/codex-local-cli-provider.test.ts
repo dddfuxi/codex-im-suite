@@ -278,7 +278,8 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       assert.equal(status?.jsonToolFallbackUsed, true);
       assert.match(text || '', /```cti-final/);
       assert.match(text || '', /"kind":"image"/);
-      assert.doesNotMatch(text || '', /处理思路/);
+      assert.ok((text || '').includes('\u5904\u7406\u601d\u8def'));
+      assert.ok((text || '').includes('\u6267\u884c\u7ed3\u679c'));
       assert.match(text || '', /"images":\[/);
       assert.match(text || '', /screenshot\.png/);
       assert.doesNotMatch(progress, /处理思路|执行结果|正在组织上下文/);
@@ -498,8 +499,8 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       const progress = events.filter((event) => event.type === 'progress').map((event) => String(event.data || '')).join('');
       assert.deepEqual(toolUses.map((event) => event.input?.tool), ['manage_asset', 'manage_scene']);
       assert.equal(toolResults.length, 2);
-      assert.match(text || '', /```cti-final/);
-      assert.doesNotMatch(text || '', /处理思路/);
+      assert.ok((text || '').includes('\u5904\u7406\u601d\u8def'));
+      assert.ok((text || '').includes('\u6267\u884c\u7ed3\u679c'));
       assert.match(text || '', /Loaded scene HSScene/);
       assert.doesNotMatch(text || '', /"success":true/);
       assert.doesNotMatch(progress, /处理思路|执行结果|正在组织上下文/);

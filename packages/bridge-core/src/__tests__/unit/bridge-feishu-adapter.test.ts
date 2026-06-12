@@ -552,6 +552,146 @@ describe('FeishuAdapter CardKit compatibility', () => {
     assert.equal(stickerContent.file_key, 'sticker_fresh_choice');
   });
 
+  it('chooses the semantically best sticker for bare sticker hints with reply text', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_praise',
+          aliases: ['表情包', '鼓励'],
+          chatId: 'oc_group',
+          label: '鼓励',
+          intent: '称赞、认可、夸奖',
+          tone: 'positive',
+          usage: '别人完成任务或做得很好时使用',
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_confused',
+          aliases: ['表情包', '疑惑', '吐槽'],
+          chatId: 'oc_group',
+          label: '疑惑吐槽',
+          intent: '表达疑惑、吐槽突然的奇怪需求',
+          tone: 'playful skeptical',
+          usage: '别人突然丢奇怪需求时接话',
+          examples: ['这需求有点突然', '你这是要干嘛'],
+          firstSeenAt: '2026-06-06T05:00:00.000Z',
+          lastSeenAt: '2026-06-06T05:10:00.000Z',
+          lastUsedAt: '2026-06-06T07:20:00.000Z',
+          useCount: 8,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 这需求有点突然',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    const stickerCall = calls
+      .map((item) => JSON.parse(item.slice('reply:'.length)) as { data?: { content?: string; msg_type?: string } })
+      .find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_confused');
+  });
+
+  it('excludes disabled and avoidWhen-matched stickers from bare hint selection', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_disabled',
+          aliases: ['表情包', '疑惑'],
+          chatId: 'oc_group',
+          label: '疑惑',
+          intent: '疑惑、吐槽',
+          usage: '别人突然丢需求时',
+          disabled: true,
+          disabledReason: '误学语义',
+          firstSeenAt: '2026-06-06T05:00:00.000Z',
+          lastSeenAt: '2026-06-06T05:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_avoid',
+          aliases: ['表情包', '吐槽'],
+          chatId: 'oc_group',
+          label: '吐槽',
+          intent: '吐槽奇怪需求',
+          usage: '别人突然丢需求时',
+          avoidWhen: '正式确认',
+          firstSeenAt: '2026-06-06T05:00:00.000Z',
+          lastSeenAt: '2026-06-06T05:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_ok',
+          aliases: ['表情包', '确认'],
+          chatId: 'oc_group',
+          label: '确认',
+          intent: '确认、收到',
+          usage: '轻量确认时',
+          firstSeenAt: '2026-06-06T04:00:00.000Z',
+          lastSeenAt: '2026-06-06T04:10:00.000Z',
+          useCount: 3,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const prompt = adapter.getStickerPresentationPrompt('oc_group');
+    assert.doesNotMatch(prompt, /\[表情包:疑惑\]/);
+
+    const calls: string[] = [];
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 正式确认，收到',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    const stickerCall = calls
+      .map((item) => JSON.parse(item.slice('reply:'.length)) as { data?: { content?: string; msg_type?: string } })
+      .find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_ok');
+  });
+
   it('does not send an arbitrary sticker when a final card requests an unknown sticker alias', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
@@ -1329,6 +1469,46 @@ describe('FeishuAdapter message reactions', () => {
     assert.match(prompt, /Do not default to SMILE/);
     assert.match(prompt, /Choose reaction hints by actual intent/);
     assert.doesNotMatch(prompt, /Catalog examples:.*\[微笑/s);
+  });
+
+  it('does not let SMILE dominate learned reaction preferences from outbound counts', () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-emoji-profile.json'), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-06-06T08:00:00.000Z',
+      emojis: [
+        {
+          emojiType: 'SMILE',
+          aliases: ['微笑'],
+          chatId: 'oc_group',
+          userId: 'ou_user',
+          firstSeenAt: '2026-06-06T01:00:00.000Z',
+          lastSeenAt: '2026-06-06T08:00:00.000Z',
+          inboundCount: 0,
+          outboundSuccessCount: 99,
+          outboundFailureCount: 0,
+        },
+        {
+          emojiType: 'THUMBSUP',
+          aliases: ['赞'],
+          chatId: 'oc_group',
+          userId: 'ou_user',
+          firstSeenAt: '2026-06-06T02:00:00.000Z',
+          lastSeenAt: '2026-06-06T07:00:00.000Z',
+          inboundCount: 2,
+          outboundSuccessCount: 1,
+          outboundFailureCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+
+    const prompt = adapter.getEmojiPresentationPrompt('oc_group', 'ou_user');
+    const learnedLine = prompt.split('\n').find((line: string) => line.includes('Learned preferences')) || '';
+
+    assert.match(prompt, /THUMBSUP/);
+    assert.doesNotMatch(learnedLine, /SMILE/);
   });
 
   it('strips a Markdown Feishu emoji hint and uses visible emoji fallback when reaction fails', async () => {
