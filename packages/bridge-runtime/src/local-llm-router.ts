@@ -218,11 +218,13 @@ export function buildLightChatParams(params: StreamChatParams, config: Config): 
   const identity = extractSystemSection(params.systemPrompt, 'Channel assistant identity:');
   const emoji = extractSystemSection(params.systemPrompt, 'Feishu emoji presentation:');
   const stickers = extractSystemSection(params.systemPrompt, 'Feishu sticker library:');
+  const recentFeishuContext = extractSystemSection(params.systemPrompt, 'Feishu recent conversation context:');
   const replyStyle = params.replyPresentation?.replyStyleHint?.trim();
   const systemPrompt = [
     identity,
     emoji,
     stickers,
+    recentFeishuContext,
     'Light chat reply contract:',
     '- Reply as a natural Feishu chat message.',
     '- Keep the reply concise and emotionally appropriate.',

@@ -348,6 +348,12 @@ interface FeishuMessageListItem {
   };
 }
 
+interface FeishuLightContext {
+  prompt: string;
+  messageCount: number;
+  replyToMessageId?: string;
+}
+
 interface FeishuChatMemberItem {
   member_id?: string;
   member_id_type?: string;
@@ -406,6 +412,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
   private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
   private p2pPollInFlight = false;
+
+  private getLightContextMessageLimit(): number {
+    const raw = getBridgeContext().store.getSetting('bridge_feishu_light_context_limit')
+      || process.env.CTI_FEISHU_LIGHT_CONTEXT_LIMIT
+      || '6';
+    const parsed = Number.parseInt(raw, 10);
+    return Math.max(0, Math.min(Number.isFinite(parsed) ? parsed : 6, 12));
+  }
 
   private isStreamingCardEnabled(): boolean {
     const raw =
@@ -2218,6 +2232,44 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return true;
   }
 
+  async recallMessage(_chatId: string, messageId: string): Promise<SendResult> {
+    const trimmedMessageId = messageId.trim();
+    if (!trimmedMessageId) {
+      return { ok: false, error: '缺少要撤回的飞书消息 ID' };
+    }
+
+    try {
+      if (this.restClient?.im?.message?.delete) {
+        const res = await this.restClient.im.message.delete({
+          path: { message_id: trimmedMessageId },
+        });
+        const code = Number((res as { code?: number | string })?.code ?? 0);
+        if (code !== 0) {
+          return { ok: false, error: String((res as { msg?: string })?.msg || 'Feishu message delete failed') };
+        }
+        return { ok: true, messageId: trimmedMessageId };
+      }
+
+      const { appId, appSecret, baseUrl } = this.getAuthContext();
+      const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+      const response = await fetch(`${baseUrl}/open-apis/im/v1/messages/${encodeURIComponent(trimmedMessageId)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const body = await response.json().catch(() => ({}));
+      const code = Number((body as { code?: number | string })?.code ?? (response.ok ? 0 : response.status));
+      if (!response.ok || code !== 0) {
+        return { ok: false, error: String((body as { msg?: string })?.msg || `Feishu message delete failed: HTTP ${response.status}`) };
+      }
+      return { ok: true, messageId: trimmedMessageId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   // ── Incoming event handler ──────────────────────────────────
 
   private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
@@ -2244,8 +2296,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const msg = data.message;
     const sender = data.sender;
 
-    // [P1] Filter out bot messages to prevent self-triggering loops
-    if (sender.sender_type === 'bot') return;
+    // Filter out app/bot/system events to prevent self-triggering loops.
+    if (this.shouldIgnoreInboundEvent(data)) return;
 
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
@@ -2461,6 +2513,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (historyIntent) {
         try {
           text = await this.buildHistoryAugmentedPromptV2(chatId, msg.message_id, historyIntent);
+          if (historyIntent.responseMode === 'chat') {
+            rawMetadata = {
+              ...(rawMetadata || {}),
+              feishuHistoryContext: {
+                responseMode: historyIntent.responseMode,
+                scopeText: historyIntent.scopeText,
+                prompt: text,
+              },
+            };
+          }
           if (historyIntent.responseMode === 'doc' && historyIntent.docTitle) {
             rawMetadata = {
               ...(rawMetadata || {}),
@@ -2485,6 +2547,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
           };
           this.enqueue(inbound);
           return;
+        }
+      } else {
+        const lightContext = await this.buildLightConversationContext(chatId, msg.message_id, replyTargetMessageId, trimmedUserText);
+        if (lightContext) {
+          rawMetadata = {
+            ...(rawMetadata || {}),
+            feishuConversationContext: lightContext,
+          };
         }
       }
     }
@@ -2538,6 +2608,51 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch { /* best effort */ }
 
     this.enqueue(inbound);
+  }
+
+  private shouldIgnoreInboundEvent(data: FeishuMessageEventData): boolean {
+    const msg = data.message;
+    const senderType = data.sender?.sender_type || '';
+    const messageType = msg?.message_type || '';
+
+    if (!msg?.message_id) return true;
+    if (senderType === 'app' || senderType === 'bot') {
+      try {
+        getBridgeContext().store.insertAuditLog({
+          channelType: 'feishu',
+          chatId: msg.chat_id || '',
+          direction: 'inbound',
+          messageId: msg.message_id,
+          summary: `[FILTERED] Ignored ${senderType || 'unknown'} sender event (${messageType || 'unknown'})`,
+        });
+      } catch { /* best effort */ }
+      return true;
+    }
+    if (messageType === 'system') {
+      try {
+        getBridgeContext().store.insertAuditLog({
+          channelType: 'feishu',
+          chatId: msg.chat_id || '',
+          direction: 'inbound',
+          messageId: msg.message_id,
+          summary: '[FILTERED] Ignored system event',
+        });
+      } catch { /* best effort */ }
+      return true;
+    }
+    if (messageType === 'interactive') {
+      try {
+        getBridgeContext().store.insertAuditLog({
+          channelType: 'feishu',
+          chatId: msg.chat_id || '',
+          direction: 'inbound',
+          messageId: msg.message_id,
+          summary: '[FILTERED] Ignored inbound interactive card event',
+        });
+      } catch { /* best effort */ }
+      return true;
+    }
+    return false;
   }
 
   // ── Content parsing ─────────────────────────────────────────
@@ -2813,7 +2928,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
     const normalized = text.replace(/\s+/g, '');
-    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6)/.test(normalized);
+    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6|\u770b\u4e00\u4e0b|\u770b\u770b|\u770b\u4e0b|\u5728\u8bf4\u4ec0\u4e48|\u8bf4\u4ec0\u4e48|\u5728\u804a\u4ec0\u4e48|\u804a\u4ec0\u4e48|\u4ec0\u4e48\u5185\u5bb9)/.test(normalized);
     const mentionsHistory = /(\u7fa4\u804a|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized);
     const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized);
     const wantsDoc = /(\u98de\u4e66\u6587\u6863|\u6587\u6863\u94fe\u63a5|\u751f\u6210.*\u6587\u6863|\u6574\u7406\u6210.*\u6587\u6863|\u8f93\u51fa\u5230.*\u6587\u6863|\u53d1\u94fe\u63a5|\u56de\u94fe\u63a5)/.test(normalized);
@@ -3787,6 +3902,76 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return `[${timeLabel}] ${resolvedSenderLabel}: ${messageText}`;
+  }
+
+  private async buildLightConversationContext(
+    chatId: string,
+    currentMessageId: string,
+    replyTargetMessageId: string | null,
+    userText: string,
+  ): Promise<FeishuLightContext | null> {
+    const limit = this.getLightContextMessageLimit();
+    if (limit <= 0 || !userText.trim()) return null;
+    const isShortContextualAsk = userText.length <= 80 || /(?:怎么看|咋看|怎么起|起名|这个|上面|刚刚|前面|回复|你觉得|帮.*想)/u.test(userText);
+    if (!replyTargetMessageId && !isShortContextualAsk) return null;
+
+    try {
+      const recentLimit = Math.max(limit + 4, 10);
+      const [recentMessages, memberNames, repliedMessage] = await Promise.all([
+        this.fetchRecentMessages(chatId, recentLimit),
+        this.fetchChatMemberNames(chatId),
+        replyTargetMessageId ? this.fetchMessageById(replyTargetMessageId) : Promise.resolve(null),
+      ]);
+
+      const selected = new Map<string, FeishuMessageListItem>();
+      if (repliedMessage && !repliedMessage.deleted && repliedMessage.msg_type !== 'system') {
+        selected.set(repliedMessage.message_id, repliedMessage);
+      }
+      for (const item of recentMessages) {
+        if (selected.size >= limit + (repliedMessage ? 1 : 0)) break;
+        if (!this.isLightContextHistoryItem(item, currentMessageId)) continue;
+        selected.set(item.message_id, item);
+      }
+
+      const items = [...selected.values()]
+        .filter((item) => this.extractHistoryText(item))
+        .sort((a, b) => (Number.parseInt(a.create_time, 10) || 0) - (Number.parseInt(b.create_time, 10) || 0))
+        .slice(-Math.max(limit, repliedMessage ? limit + 1 : limit));
+      if (items.length === 0) return null;
+
+      const formatted = items
+        .map((item) => {
+          const prefix = replyTargetMessageId && item.message_id === replyTargetMessageId ? '[被回复消息] ' : '';
+          return `${prefix}${this.formatHistoryItem(item, memberNames)}`;
+        })
+        .filter(Boolean)
+        .join('\n');
+      if (!formatted) return null;
+
+      return {
+        prompt: [
+          'Feishu recent conversation context:',
+          '- These are nearby messages from the same Feishu group, provided only to understand the current reply/mention.',
+          '- Use them as chat context for tone, names, and references. Do not claim you searched all history.',
+          '- If the current user asks for an opinion, naming, or a reaction, answer based on this nearby context.',
+          '',
+          formatted,
+        ].join('\n'),
+        messageCount: items.length,
+        replyToMessageId: replyTargetMessageId || undefined,
+      };
+    } catch (err) {
+      console.warn('[feishu-adapter] light conversation context skipped:', err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  private isLightContextHistoryItem(item: FeishuMessageListItem, currentMessageId: string): boolean {
+    if (!item || item.deleted) return false;
+    if (item.message_id === currentMessageId) return false;
+    if (item.msg_type === 'system') return false;
+    if (item.sender?.sender_type === 'app' || item.sender?.sender_type === 'bot') return false;
+    return Boolean(this.extractHistoryText(item));
   }
 
   private getReplyTargetMessageId(msg: FeishuMessageEventData['message']): string | null {

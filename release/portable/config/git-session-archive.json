@@ -17,9 +17,9 @@
   "policy": {
     "strategy": "manual-commit",
     "pushSessions": false,
-    "autoCommit": true,
+    "autoCommit": false,
     "autoPush": false,
-    "autoMerge": true,
+    "autoMerge": false,
     "autoMergeTargetBranch": "codex/dev",
     "requireCleanBaseline": true,
     "validationCommands": [

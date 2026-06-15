@@ -120,6 +120,31 @@ describe('decideConservativeRoute', () => {
     assert.doesNotMatch(light.systemPrompt || '', /MCP|Unity|workspace|artifacts/i);
   });
 
+  it('keeps Feishu recent conversation context in the light chat prompt profile', () => {
+    const params = makeParams('小虾米你怎么看，怎么起名', {
+      systemPrompt: [
+        'Channel assistant identity:',
+        '- Your user-facing name is 小虾米.',
+        'Feishu emoji presentation:',
+        '- Do not default to SMILE.',
+        'Feishu sticker library:',
+        '- No semantically annotated stickers are available.',
+        'Feishu recent conversation context:',
+        '- These are nearby messages from the same Feishu group.',
+        '[06/12 15:20] 苏庆华: 将群名称“万能区域什么都能改小分队”修改为“万能区域什么都能改小王分队”',
+        'Bridge channel context (authoritative):',
+        'MCP, Unity, workspace, files, commands, and artifacts are available for real tasks.',
+      ].join('\n'),
+    });
+
+    const light = buildLightChatParams(params, baseConfig);
+
+    assert.match(light.systemPrompt || '', /Feishu recent conversation context/);
+    assert.match(light.systemPrompt || '', /万能区域什么都能改小王分队/);
+    assert.doesNotMatch(light.systemPrompt || '', /Bridge channel context/);
+    assert.doesNotMatch(light.systemPrompt || '', /MCP|Unity|workspace|artifacts/i);
+  });
+
   it('routes simple command generation to local model', () => {
     const decision = decideConservativeRoute(makeParams('给我一条 PowerShell 命令，递归查找 .meta 文件。只返回命令。'), baseConfig);
     assert.equal(decision.useLocal, true);

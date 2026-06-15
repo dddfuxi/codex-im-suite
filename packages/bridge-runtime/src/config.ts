@@ -401,8 +401,8 @@ export function loadConfig(): Config {
     lightChatFastPathEnabled: env.has("CTI_LIGHT_CHAT_FAST_PATH_ENABLED")
       ? env.get("CTI_LIGHT_CHAT_FAST_PATH_ENABLED") === "true"
       : true,
-    lightChatHistoryLimit: Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
-    lightChatMaxInputChars: Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
+    lightChatHistoryLimit: typeof lightChatHistoryLimit === "number" && Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
+    lightChatMaxInputChars: typeof lightChatMaxInputChars === "number" && Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",

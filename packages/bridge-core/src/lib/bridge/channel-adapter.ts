@@ -78,6 +78,15 @@ export abstract class BaseChannelAdapter {
   }
 
   /**
+   * Recall/delete a previously sent platform message when the channel supports it.
+   * Implementations must only act on platform message IDs already known to belong
+   * to this bot; callers are responsible for that ownership check.
+   */
+  async recallMessage(_chatId: string, _messageId: string): Promise<SendResult> {
+    return { ok: false, error: 'Message recall is not supported by this adapter' };
+  }
+
+  /**
    * Answer a callback query (e.g. Telegram inline button press).
    * Not all platforms support this — default implementation is a no-op.
    */

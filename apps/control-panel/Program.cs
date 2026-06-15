@@ -86,6 +86,7 @@ internal sealed partial class MainForm : Form
     private readonly string _dataDir;
     private readonly string _messagesDir;
     private readonly string _auditJsonPath;
+    private readonly string _outboundRefsPath;
     private readonly string _statusJsonPath;
     private readonly string _mcpServiceStatePath;
     private readonly string _localLlmStatusPath;
@@ -191,6 +192,7 @@ internal sealed partial class MainForm : Form
         _dataDir = Path.Combine(_ctiHome, "data");
         _messagesDir = Path.Combine(_dataDir, "messages");
         _auditJsonPath = Path.Combine(_dataDir, "audit.json");
+        _outboundRefsPath = Path.Combine(_dataDir, "outbound-refs.json");
         _statusJsonPath = Path.Combine(_ctiHome, "runtime", "status.json");
         _mcpServiceStatePath = Path.Combine(_ctiHome, "runtime", "mcp-services.json");
         _localLlmStatusPath = Path.Combine(_ctiHome, "runtime", "local-llm-status.json");
@@ -544,6 +546,7 @@ internal sealed partial class MainForm : Form
             return "owner";
         }
         if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "history.recallBotMessage", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("panel.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("localLlm.", StringComparison.OrdinalIgnoreCase)
@@ -883,6 +886,8 @@ internal sealed partial class MainForm : Form
                 return await BuildSessionItemsAsync();
             case "history.getSessionDetail":
                 return await GetSessionDetailAsync(payload);
+            case "history.recallBotMessage":
+                return await RecallBotMessageAsync(payload);
             case "history.deleteSession":
                 return await DeleteSessionAsync(payload);
             case "memory.status":
@@ -1672,6 +1677,7 @@ internal sealed partial class MainForm : Form
             entry = await LoadConversationDetailAsync(entry);
         }
 
+        var outboundRefs = LoadOutboundRefs(entry.ChatId);
         var detail = new WebSessionDetail(
             entry.DisplayName,
             entry.ChannelType,
@@ -1686,25 +1692,32 @@ internal sealed partial class MainForm : Form
             entry.RemoteMessageCount,
             entry.LastUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
             entry.Summary,
-            entry.Messages.Select(message => new WebConversationMessage(
-                message.Index,
-                message.MessageId,
-                message.Role,
-                message.MsgType,
-                message.SenderId,
-                message.SenderType,
-                message.SenderName,
-                message.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
-                message.Content,
-                message.Attachments.Select(attachment => new WebMessageAttachment(
-                    attachment.Kind,
-                    attachment.Name,
-                    attachment.MimeType,
-                    attachment.Size,
-                    attachment.Path,
-                    attachment.Url,
-                    attachment.ResourceKey,
-                    attachment.Status)).ToArray())).ToArray(),
+            entry.Messages.Select(message =>
+            {
+                var recall = ConversationHistoryDisplay.ResolveRecallState(entry.ChannelType, message.SenderType, message.MessageId, outboundRefs);
+                return new WebConversationMessage(
+                    message.Index,
+                    message.MessageId,
+                    message.Role,
+                    message.MsgType,
+                    message.SenderId,
+                    message.SenderType,
+                    message.SenderName,
+                    message.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
+                    message.Content,
+                    message.Attachments.Select(attachment => new WebMessageAttachment(
+                        attachment.Kind,
+                        attachment.Name,
+                        attachment.MimeType,
+                        attachment.Size,
+                        attachment.Path,
+                        attachment.Url,
+                        attachment.ResourceKey,
+                        attachment.Status)).ToArray(),
+                    recall.CanRecall,
+                    recall.RecallStatus,
+                    recall.RecallError);
+            }).ToArray(),
             BuildFeishuPeople(entry.Messages),
             FindWorkflowRunsForSession(entry.SessionId, entry.ChatId));
         _sessionDetailCache[cacheKey] = detail;
@@ -1717,6 +1730,98 @@ internal sealed partial class MainForm : Form
             }
         }
         return detail;
+    }
+
+    private List<OutboundMessageRefRecord> LoadOutboundRefs(string? chatId = null)
+    {
+        if (!File.Exists(_outboundRefsPath)) return [];
+        try
+        {
+            var refs = JsonSerializer.Deserialize<Dictionary<string, OutboundMessageRefRecord>>(
+                File.ReadAllText(_outboundRefsPath, Encoding.UTF8),
+                WebJsonOptions) ?? new Dictionary<string, OutboundMessageRefRecord>(StringComparer.OrdinalIgnoreCase);
+            return refs.Values
+                .Where(item => string.IsNullOrWhiteSpace(chatId) || string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveOutboundRefs(IEnumerable<OutboundMessageRefRecord> refs)
+    {
+        var map = refs
+            .Where(item => !string.IsNullOrWhiteSpace(item.ChannelType)
+                && !string.IsNullOrWhiteSpace(item.ChatId)
+                && !string.IsNullOrWhiteSpace(item.PlatformMessageId))
+            .GroupBy(item => $"{item.ChannelType}:{item.ChatId}:{item.PlatformMessageId}", StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Last(), StringComparer.OrdinalIgnoreCase);
+        Directory.CreateDirectory(Path.GetDirectoryName(_outboundRefsPath)!);
+        var tmp = _outboundRefsPath + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(map, WebJsonOptions), new UTF8Encoding(false));
+        File.Move(tmp, _outboundRefsPath, overwrite: true);
+    }
+
+    private async Task<object> RecallBotMessageAsync(JsonElement payload)
+    {
+        var channelType = ReadPayloadString(payload, "channelType", "feishu").Trim();
+        var chatId = ReadPayloadString(payload, "chatId", "").Trim();
+        var messageId = ReadPayloadString(payload, "messageId", "").Trim();
+        if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("当前只支持撤回 Feishu 机器人消息。");
+        }
+        if (string.IsNullOrWhiteSpace(chatId) || string.IsNullOrWhiteSpace(messageId))
+        {
+            throw new InvalidOperationException("缺少 chatId 或 messageId。");
+        }
+
+        var refs = LoadOutboundRefs();
+        var target = refs.FirstOrDefault(item =>
+            string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.PlatformMessageId, messageId, StringComparison.OrdinalIgnoreCase));
+        if (target is null)
+        {
+            throw new InvalidOperationException("未找到这条机器人出站消息记录，拒绝撤回未知消息。");
+        }
+        if (!string.IsNullOrWhiteSpace(target.RecalledAt))
+        {
+            return new { ok = true, recalled = true, messageId, status = "already_recalled" };
+        }
+
+        var auth = await FetchFeishuTenantAccessTokenAsync();
+        using var client = new HttpClient();
+        using var request = new HttpRequestMessage(HttpMethod.Delete, $"{auth.BaseUrl}/open-apis/im/v1/messages/{Uri.EscapeDataString(messageId)}");
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", auth.Token);
+        using var response = await client.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        var ok = response.IsSuccessStatusCode;
+        var error = "";
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var code = ReadJsonInt(doc.RootElement, "code");
+            ok = ok && code == 0;
+            error = ReadJsonString(doc.RootElement, "msg");
+        }
+        catch
+        {
+            if (!ok) error = body;
+        }
+
+        target.RecalledAt = ok ? DateTime.UtcNow.ToString("o") : target.RecalledAt;
+        target.RecallError = ok ? "" : string.IsNullOrWhiteSpace(error) ? $"Feishu API 返回 HTTP {(int)response.StatusCode}" : error;
+        target.UpdatedAt = DateTime.UtcNow.ToString("o");
+        SaveOutboundRefs(refs);
+        _sessionDetailCache.Remove($"{chatId}::{target.CodepilotSessionId}");
+        if (!ok)
+        {
+            throw new InvalidOperationException($"撤回失败：{target.RecallError}");
+        }
+        return new { ok = true, recalled = true, messageId, chatId };
     }
 
     private async Task<object> AddFeishuOwnerAsync(JsonElement payload)
@@ -10394,7 +10499,10 @@ internal sealed record WebConversationMessage(
     string SenderName,
     string CreatedAt,
     string Content,
-    WebMessageAttachment[] Attachments);
+    WebMessageAttachment[] Attachments,
+    bool CanRecall,
+    string RecallStatus,
+    string RecallError);
 internal sealed record WebFeishuPerson(
     string UserId,
     string SenderType,
@@ -10402,6 +10510,20 @@ internal sealed record WebFeishuPerson(
     string Role,
     bool IsOwner,
     int MessageCount);
+internal sealed record MessageRecallState(bool CanRecall, string RecallStatus, string RecallError);
+internal sealed class OutboundMessageRefRecord
+{
+    public string ChannelType { get; set; } = "";
+    public string ChatId { get; set; } = "";
+    public string CodepilotSessionId { get; set; } = "";
+    public string PlatformMessageId { get; set; } = "";
+    public string Purpose { get; set; } = "";
+    public string MessageKind { get; set; } = "";
+    public string CreatedAt { get; set; } = "";
+    public string RecalledAt { get; set; } = "";
+    public string RecallError { get; set; } = "";
+    public string UpdatedAt { get; set; } = "";
+}
 internal sealed record WebMessageAttachment(
     string Kind,
     string Name,
@@ -10680,6 +10802,27 @@ internal static class ConversationHistoryDisplay
 
     public static DateTime? ResolveRemoteLatestAt(FeishuHistorySyncRecord? record)
         => ParseUnixMsOrIso(record?.LatestMessageTime) ?? ParseUnixMsOrIso(record?.LastSyncAt);
+
+    public static MessageRecallState ResolveRecallState(
+        string channelType,
+        string senderType,
+        string messageId,
+        IEnumerable<OutboundMessageRefRecord> outboundRefs)
+    {
+        if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(senderType, "app", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(messageId))
+        {
+            return new MessageRecallState(false, "none", "");
+        }
+        var match = outboundRefs.FirstOrDefault(item =>
+            string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.PlatformMessageId, messageId, StringComparison.OrdinalIgnoreCase));
+        if (match is null) return new MessageRecallState(false, "none", "");
+        if (!string.IsNullOrWhiteSpace(match.RecalledAt)) return new MessageRecallState(false, "recalled", "");
+        if (!string.IsNullOrWhiteSpace(match.RecallError)) return new MessageRecallState(true, "failed", match.RecallError);
+        return new MessageRecallState(true, "none", "");
+    }
 
     public static DateTime? MaxDateTime(params DateTime?[] values)
     {

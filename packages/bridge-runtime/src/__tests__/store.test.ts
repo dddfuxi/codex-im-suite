@@ -140,6 +140,38 @@ describe('JsonFileStore', () => {
     assert.equal(messages[1].content, 'msg3');
   });
 
+  it('persists outbound refs and marks bot messages recalled', () => {
+    const store = new JsonFileStore(makeSettings());
+
+    store.insertOutboundRef({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      codepilotSessionId: 'session_1',
+      platformMessageId: 'om_bot_1',
+      purpose: 'response',
+      messageKind: 'card',
+    });
+
+    const reloaded = new JsonFileStore(makeSettings());
+    const refs = reloaded.listOutboundRefs({ channelType: 'feishu', chatId: 'oc_group' });
+    assert.equal(refs.length, 1);
+    assert.equal(refs[0].platformMessageId, 'om_bot_1');
+    assert.equal(refs[0].recalledAt, undefined);
+
+    const updated = reloaded.markOutboundRefRecalled({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      platformMessageId: 'om_bot_1',
+      ok: true,
+    });
+    assert.equal(updated, true);
+
+    const finalRefs = new JsonFileStore(makeSettings()).listOutboundRefs({ platformMessageId: 'om_bot_1' });
+    assert.equal(finalRefs.length, 1);
+    assert.ok(finalRefs[0].recalledAt);
+    assert.equal(finalRefs[0].recallError, undefined);
+  });
+
   it('records per-user chat and global memory profiles for retrieval', () => {
     const store = new JsonFileStore(makeSettings());
     const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');

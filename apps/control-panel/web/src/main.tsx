@@ -263,6 +263,9 @@ type ConversationMessage = {
   createdAt: string;
   content: string;
   attachments?: MessageAttachment[];
+  canRecall?: boolean;
+  recallStatus?: 'none' | 'recalled' | 'failed';
+  recallError?: string;
 };
 
 type MessageAttachment = {
@@ -4159,9 +4162,32 @@ const SessionDetailPane = memo(function SessionDetailPane({
             {orderedMessages.map((message) => (
               <article key={`${message.index}-${message.createdAt}`} className="message-card">
                 <header>
-                  <strong>{message.senderName || message.role}</strong>
-                  <span>{message.msgType || 'message'} · {message.createdAt || '-'}</span>
+                  <div>
+                    <strong>{message.senderName || message.role}</strong>
+                    <span>{message.msgType || 'message'} · {message.createdAt || '-'}</span>
+                  </div>
+                  <div className="message-card-actions">
+                    {message.recallStatus === 'recalled' && <StatusPill status="idle" label="已撤回" />}
+                    {message.recallStatus === 'failed' && <StatusPill status="warning" label="撤回失败" />}
+                    {message.canRecall && (
+                      <MiniButton
+                        label="撤回"
+                        icon={<Trash2 size={14} />}
+                        onClick={() => {
+                          if (!detail) return;
+                          if (!window.confirm('撤回这条机器人消息？撤回后群里将不再显示这条消息。')) return;
+                          void run('history.recallBotMessage', {
+                            channelType: detail.channelType,
+                            chatId: detail.chatId,
+                            messageId: message.messageId,
+                          }).then(() => refreshDetail());
+                        }}
+                        pending={pending['history.recallBotMessage']}
+                      />
+                    )}
+                  </div>
                 </header>
+                {message.recallError && <div className="message-recall-error">{message.recallError}</div>}
                 {message.senderId && (
                   <div className="message-sender-meta">
                     <span>{message.role}</span>

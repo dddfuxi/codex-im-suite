@@ -27,6 +27,9 @@ import type {
   PermissionLinkInput,
   PermissionLinkRecord,
   OutboundRefInput,
+  OutboundRefRecord,
+  OutboundRefFilter,
+  MarkOutboundRefRecalledInput,
   UpsertChannelBindingInput,
   MemoryWriteCandidate,
 } from 'claude-to-im/src/lib/bridge/host.js';
@@ -49,6 +52,7 @@ const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
 const MEMORY_PROFILES_PATH = path.join(DATA_DIR, 'memory-profiles.json');
 const PERMISSION_LINKS_PATH = path.join(DATA_DIR, 'permission-links.json');
+const OUTBOUND_REFS_PATH = path.join(DATA_DIR, 'outbound-refs.json');
 const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
 const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
@@ -325,6 +329,7 @@ export class JsonFileStore implements BridgeStore {
   private feishuChatIndex = new Map<string, FeishuChatIndexRecord>();
   private feishuP2pUserIndex = new Map<string, FeishuP2pUserAliasIndexRecord>();
   private feishuHistoryIndex = new Map<string, FeishuHistoryIndexRecord>();
+  private outboundRefs = new Map<string, OutboundRefRecord>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
   constructor(settingsMap: Map<string, string>) {
@@ -423,6 +428,13 @@ export class JsonFileStore implements BridgeStore {
       this.feishuHistoryIndex.set(key, value);
     }
 
+    const outboundRefs = readJson<Record<string, OutboundRefRecord>>(OUTBOUND_REFS_PATH, {});
+    for (const [key, value] of Object.entries(outboundRefs)) {
+      if (value?.channelType && value?.chatId && value?.platformMessageId) {
+        this.outboundRefs.set(key, value);
+      }
+    }
+
     // Audit
     this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
   }
@@ -481,6 +493,14 @@ export class JsonFileStore implements BridgeStore {
       FEISHU_HISTORY_INDEX_PATH,
       Object.fromEntries(this.feishuHistoryIndex),
     );
+  }
+
+  private persistOutboundRefs(): void {
+    writeJson(OUTBOUND_REFS_PATH, Object.fromEntries(this.outboundRefs));
+  }
+
+  private outboundRefKey(channelType: string, chatId: string, platformMessageId: string): string {
+    return `${channelType}:${chatId}:${platformMessageId}`;
   }
 
   private getFeishuHistoryPath(chatId: string): string {
@@ -2021,8 +2041,49 @@ export class JsonFileStore implements BridgeStore {
     if (changed) this.persistDedup();
   }
 
-  insertOutboundRef(_ref: OutboundRefInput): void {
-    // no-op for file-based store
+  insertOutboundRef(ref: OutboundRefInput): void {
+    const channelType = ref.channelType?.trim();
+    const chatId = ref.chatId?.trim();
+    const platformMessageId = ref.platformMessageId?.trim();
+    if (!channelType || !chatId || !platformMessageId) return;
+    const key = this.outboundRefKey(channelType, chatId, platformMessageId);
+    const existing = this.outboundRefs.get(key);
+    const createdAt = existing?.createdAt || ref.createdAt || now();
+    this.outboundRefs.set(key, {
+      ...existing,
+      ...ref,
+      channelType,
+      chatId,
+      platformMessageId,
+      codepilotSessionId: ref.codepilotSessionId || existing?.codepilotSessionId || '',
+      purpose: ref.purpose || existing?.purpose || 'response',
+      createdAt,
+      updatedAt: now(),
+    });
+    this.persistOutboundRefs();
+  }
+
+  listOutboundRefs(filter: OutboundRefFilter = {}): OutboundRefRecord[] {
+    return [...this.outboundRefs.values()]
+      .filter((ref) => !filter.channelType || ref.channelType === filter.channelType)
+      .filter((ref) => !filter.chatId || ref.chatId === filter.chatId)
+      .filter((ref) => !filter.platformMessageId || ref.platformMessageId === filter.platformMessageId)
+      .filter((ref) => !filter.codepilotSessionId || ref.codepilotSessionId === filter.codepilotSessionId)
+      .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+  }
+
+  markOutboundRefRecalled(input: MarkOutboundRefRecalledInput): boolean {
+    const key = this.outboundRefKey(input.channelType, input.chatId, input.platformMessageId);
+    const existing = this.outboundRefs.get(key);
+    if (!existing) return false;
+    this.outboundRefs.set(key, {
+      ...existing,
+      recalledAt: input.ok ? (input.recalledAt || now()) : existing.recalledAt,
+      recallError: input.ok ? undefined : (input.error || '撤回失败'),
+      updatedAt: now(),
+    });
+    this.persistOutboundRefs();
+    return true;
   }
 
   // Permission Links

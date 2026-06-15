@@ -2205,6 +2205,23 @@ button:disabled {
   margin-bottom: 8px;
 }
 
+.message-card header > div:first-child {
+  min-width: 0;
+}
+
+.message-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.message-recall-error {
+  margin-bottom: 8px;
+  color: var(--warning);
+  font-size: 12px;
+}
+
 .message-sender-meta {
   display: flex;
   flex-wrap: wrap;

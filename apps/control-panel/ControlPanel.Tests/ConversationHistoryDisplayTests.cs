@@ -41,4 +41,49 @@ public sealed class ConversationHistoryDisplayTests
         Assert.NotNull(latest);
         Assert.True(latest!.Value.Year >= 2026);
     }
+
+    [Fact]
+    public void ResolveRecallState_AllowsOnlyKnownBotFeishuMessages()
+    {
+        var recall = ConversationHistoryDisplay.ResolveRecallState(
+            channelType: "feishu",
+            senderType: "app",
+            messageId: "om_bot",
+            outboundRefs:
+            [
+                new OutboundMessageRefRecord
+                {
+                    ChannelType = "feishu",
+                    ChatId = "oc_group",
+                    PlatformMessageId = "om_bot",
+                    Purpose = "response"
+                }
+            ]);
+
+        Assert.True(recall.CanRecall);
+        Assert.Equal("none", recall.RecallStatus);
+    }
+
+    [Fact]
+    public void ResolveRecallState_MarksRecalledAndRejectsUserMessages()
+    {
+        var refs = new[]
+        {
+            new OutboundMessageRefRecord
+            {
+                ChannelType = "feishu",
+                ChatId = "oc_group",
+                PlatformMessageId = "om_bot",
+                RecalledAt = "2026-06-12T08:00:00Z"
+            }
+        };
+
+        var botRecall = ConversationHistoryDisplay.ResolveRecallState("feishu", "app", "om_bot", refs);
+        var userRecall = ConversationHistoryDisplay.ResolveRecallState("feishu", "user", "om_bot", refs);
+
+        Assert.False(botRecall.CanRecall);
+        Assert.Equal("recalled", botRecall.RecallStatus);
+        Assert.False(userRecall.CanRecall);
+        Assert.Equal("none", userRecall.RecallStatus);
+    }
 }

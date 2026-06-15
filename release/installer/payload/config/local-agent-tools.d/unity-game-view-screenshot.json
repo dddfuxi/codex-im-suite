@@ -4,7 +4,13 @@
   "enabled": true,
   "type": "mcp_tool_call",
   "match": {
+    "keywordGroups": [
+      ["unity", "game", "截"],
+      ["unity", "game", "图"],
+      ["unity", "game", "拍"]
+    ],
     "regex": [
+      "(?=.*(?:unity\\s*mcp|unitymcp|unity))(?=.*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view|视角))(?=.*(?:截(?:图|个图|一张|一个)?|截屏|截图|拍(?:一张|个)?|发(?:张|个)?图|screenshot|capture)).*",
       "(?:unity\\s*mcp|unitymcp|unity).*(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view)",
       "(?:截(?:图|一张|一个)?|截图|screenshot|capture).*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view).*(?:unity\\s*mcp|unitymcp|unity)",
       "(?:prefab|预制体|场景|GameObject|gameobject|节点|刚刚摆|摆).*(?:截(?:图|一张|一个)?|截图|screenshot|capture|发图|给我图)",

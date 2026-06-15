@@ -238,6 +238,124 @@ describe('FeishuAdapter reply fallback', () => {
   });
 });
 
+describe('FeishuAdapter light conversation context', () => {
+  beforeEach(() => {
+    setupContext({ bridge_feishu_light_context_limit: '4' });
+  });
+
+  it('builds short group context from the replied message and recent nearby messages', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (messageId: string, text: string, senderId: string, offset: number) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      sender: { id: senderId, sender_type: 'user' },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_su', '苏庆华'],
+      ['ou_liu', '刘丹'],
+    ]);
+    adapter.fetchMessageById = async (messageId: string) => (
+      messageId === 'om_reply'
+        ? makeItem('om_reply', '将群名称“万能区域什么都能改小分队”修改为“万能区域什么都能改小王分队”', 'ou_su', -3000)
+        : null
+    );
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', '@小虾米 你怎么看，怎么起名', 'ou_liu', 0),
+      makeItem('om_reply', '将群名称“万能区域什么都能改小分队”修改为“万能区域什么都能改小王分队”', 'ou_su', -3000),
+      makeItem('om_other', '我真服了', 'ou_su', -1000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      'om_reply',
+      '小虾米你怎么看，怎么起名',
+    );
+
+    assert.ok(context);
+    assert.equal(context.replyToMessageId, 'om_reply');
+    assert.match(context.prompt, /Feishu recent conversation context/);
+    assert.match(context.prompt, /被回复消息/);
+    assert.match(context.prompt, /万能区域什么都能改小王分队/);
+    assert.doesNotMatch(context.prompt, /@小虾米 你怎么看/);
+  });
+});
+
+describe('FeishuAdapter history intent and bot event guards', () => {
+  beforeEach(() => {
+    setupContext();
+  });
+
+  it('recognizes casual requests to look at what today group chat was about', () => {
+    const adapter = new FeishuAdapter() as any;
+
+    const intent = adapter.parseHistoryIntentV2('蠢死了，你看一下今天群聊天记录在说什么再回我');
+
+    assert.ok(intent);
+    assert.equal(intent.responseMode, 'chat');
+    assert.equal(intent.purpose, 'summary');
+    assert.match(intent.scopeText, /今天/);
+  });
+
+  it('ignores app interactive events so bot cards cannot trigger another LLM turn', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    adapter.running = true;
+
+    await adapter.handleIncomingEvent({
+      sender: {
+        sender_type: 'app',
+        sender_id: { app_id: 'cli_app_test' },
+      },
+      message: {
+        message_id: 'om_card',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'interactive',
+        content: JSON.stringify({ title: '未完成', elements: [] }),
+        create_time: String(Date.now()),
+      },
+    });
+
+    assert.equal(queued.length, 0);
+  });
+});
+
+describe('FeishuAdapter recall message', () => {
+  beforeEach(() => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_app_test',
+      bridge_feishu_app_secret: 'secret',
+    });
+  });
+
+  it('recalls a Feishu message through the message delete API', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const deleted: string[] = [];
+    adapter.restClient = {
+      im: {
+        message: {
+          delete: async (input: any) => {
+            deleted.push(input.path.message_id);
+            return { code: 0, msg: 'ok' };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.recallMessage('oc_group', 'om_bot');
+
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(deleted, ['om_bot']);
+  });
+});
+
 describe('FeishuAdapter CardKit compatibility', () => {
   beforeEach(() => {
     useTempCtiHome();

@@ -550,3 +550,6 @@
 
 - 2026-05-26 控制面板模型安装交互补齐：修复 WebView/Control API 的目录选择弹窗没有绑定宿主窗口导致“选择目录”无响应或弹到背后的问题；设置页增加本地草稿保护，后台 `state` 推送不再覆盖尚未保存的模型来源、路径和 API 配置；在线目录的 Ollama 安装任务不再只显示 `running` 状态，失败、暂停、完成都会保留任务摘要、进度和最近输出，避免安装失败后一秒钟看起来又变回“未安装”。
 - 2026-05-26 控制面板 Ollama CLI 路径解析补齐：在线目录安装/卸载 Ollama 模型不再直接依赖面板进程 PATH 中存在 `ollama`，会优先读取 `CTI_OLLAMA_EXE` / `OLLAMA_EXE`，再查 PATH 和常见 Windows 安装目录；找不到时返回明确的“未找到 Ollama CLI”阻塞提示，避免底层 `系统找不到指定的文件` 泄漏到用户侧。
+
+- 2026-06-12 Feishu 群聊轻量上下文：被 @ 或回复触发的短接话现在会补入被回复消息和最近少量同群消息作为 `Feishu recent conversation context`，用于理解“刚刚 / 上面 / 你怎么看 / 怎么起名”等邻近语义；该上下文通过 `extraSystemPrompt` 进入 provider，并被 `light_chat` prompt profile 保留，不再把上下文塞进用户 prompt 导致超过轻聊天长度上限。默认只补 6 条、最多 12 条，可通过 `CTI_FEISHU_LIGHT_CONTEXT_LIMIT` 或 `bridge_feishu_light_context_limit` 调整；这不是全量历史检索，正式“查聊天记录 / 总结群聊”仍走显式历史检索链路。
+- 2026-06-12 Feishu 群聊暴走与撤回能力修复：provider 错误外发新增安全摘要和同 chat 短窗口熔断，拦截 `tool_result` SSE、本地路径、转义 JSON、`tool_use_id` 和高乱码密度内容，错误记忆也只记录可读摘要；Feishu 入站统一忽略 system、interactive、app/bot 和邀请类非人类事件，防止机器人卡片、出站消息或入群事件再次触发 LLM；“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”命中受控历史意图，只用 Feishu 历史索引与格式化片段生成摘要，不再让 Codex 用 Bash/MCP 读取本地历史 JSON；`outbound-refs.json` 现在持久化机器人出站 messageId，控制面板会话详情仅对已记录的 Feishu 机器人消息显示“撤回”，通过 `history.recallBotMessage` 调用 Feishu 消息删除接口并标记已撤回或失败原因。

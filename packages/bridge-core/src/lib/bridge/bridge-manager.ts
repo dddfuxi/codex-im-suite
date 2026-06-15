@@ -2157,6 +2157,88 @@ function buildProgressMessageForBridge(step: 'started' | 'running'): string {
   return '仍在执行，但还没有新的可汇报结果。';
 }
 
+const providerErrorCircuit = new Map<string, { count: number; firstAt: number }>();
+const PROVIDER_ERROR_CIRCUIT_WINDOW_MS = 60_000;
+const PROVIDER_ERROR_CIRCUIT_MAX_NOTICES = 3;
+
+function looksLikeInternalProviderPayload(raw: string): boolean {
+  const text = raw || '';
+  if (!text.trim()) return false;
+  if (/^\s*data:\s*\{/.test(text) && /"type"\s*:\s*"(tool_result|tool_use|status|result)"/.test(text)) return true;
+  if (/"tool_use_id"\s*:/.test(text) || /\btool_result\b/.test(text) || /\btool_use\b/.test(text)) return true;
+  if (/[A-Z]:\\Users\\|\.claude-to-im\\data\\|feishu-history\\|CTI_HOME/i.test(text)) return true;
+  if (/(\\\\[rnt]|\\")/.test(text) && text.length > 300) return true;
+  const mojibakeHits = (text.match(/[\u951F\uFFFD]|[\uE000-\uF8FF]|\u9225|\u9286|\u6D93|\u9359|\u7A0B/g) || []).length;
+  return mojibakeHits >= 4 && text.length > 80;
+}
+
+function compactProviderError(raw: string): string {
+  const trimmed = (raw || '').replace(/\s+/g, ' ').trim();
+  if (!trimmed) return '未完成：模型执行中断，但没有返回可展示的错误原因。';
+  if (looksLikeInternalProviderPayload(trimmed)) {
+    return '未完成：模型执行中断，已拦截一条内部工具结果，避免把调试内容发到群里。请稍后重试。';
+  }
+  const withoutProtocol = trimmed
+    .replace(/^data:\s*/i, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/[{}[\]"\\]{2,}/g, ' ')
+    .trim();
+  const visible = withoutProtocol.length > 180 ? `${withoutProtocol.slice(0, 177)}...` : withoutProtocol;
+  return `未完成：${visible || '模型执行中断。'}`;
+}
+
+function buildSafeProviderErrorMessage(
+  raw: string,
+  _options?: { cardFinalized?: boolean; channelType?: string },
+): string {
+  return compactProviderError(raw);
+}
+
+function shouldSendProviderErrorNotice(input: { channelType: string; chatId: string }): boolean {
+  const key = `${input.channelType}:${input.chatId}`;
+  const nowMs = Date.now();
+  const current = providerErrorCircuit.get(key);
+  if (!current || nowMs - current.firstAt > PROVIDER_ERROR_CIRCUIT_WINDOW_MS) {
+    providerErrorCircuit.set(key, { count: 1, firstAt: nowMs });
+    return true;
+  }
+  current.count += 1;
+  providerErrorCircuit.set(key, current);
+  return current.count <= PROVIDER_ERROR_CIRCUIT_MAX_NOTICES;
+}
+
+function resetProviderErrorCircuitBreaker(): void {
+  providerErrorCircuit.clear();
+}
+
+function extractDelimitedSection(text: string, startMarker: string, endMarker: string): string {
+  const start = text.indexOf(startMarker);
+  if (start < 0) return '';
+  const contentStart = start + startMarker.length;
+  const end = text.indexOf(endMarker, contentStart);
+  return (end >= 0 ? text.slice(contentStart, end) : text.slice(contentStart)).trim();
+}
+
+function buildFeishuHistoryDirectReply(prompt: string): string {
+  const history = extractDelimitedSection(prompt, '=== 群聊历史开始 ===', '=== 群聊历史结束 ===');
+  if (!history) {
+    if (/没有拿到可用于回答的有效消息|没有筛到/.test(prompt)) {
+      return '我查了本地群聊历史索引，这次没有拿到可用于回答的有效消息。可以先同步群聊历史后再让我看。';
+    }
+    return '';
+  }
+  const lines = history
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-12);
+  if (lines.length === 0) return '';
+  return [
+    '我看了今天群聊记录，主要是在聊这些：',
+    ...lines.map((line) => `- ${line.replace(/^\[[^\]]+\]\s*/, '')}`),
+  ].join('\n');
+}
+
 async function startProgressPulse(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
@@ -3617,6 +3699,16 @@ async function handleMessage(
       title: string;
       scopeText: string;
     };
+    feishuConversationContext?: {
+      prompt?: string;
+      messageCount?: number;
+      replyToMessageId?: string;
+    };
+    feishuHistoryContext?: {
+      responseMode?: string;
+      scopeText?: string;
+      prompt?: string;
+    };
     feishuSender?: {
       openId?: string;
       userId?: string;
@@ -4174,6 +4266,28 @@ async function handleMessage(
     }
   }
 
+  if (adapter.channelType === 'feishu' && rawData?.feishuHistoryContext?.responseMode === 'chat') {
+    const directHistoryReply = buildFeishuHistoryDirectReply(rawData.feishuHistoryContext.prompt || text || '');
+    if (directHistoryReply) {
+      store.addMessage(effectiveBinding.codepilotSessionId, 'user', rawText);
+      store.addMessage(effectiveBinding.codepilotSessionId, 'assistant', directHistoryReply);
+      recordConversationMemoryEvent(msg, effectiveBinding, 'user', rawText);
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', directHistoryReply);
+      endProcessingCard();
+      await deliverResponse(
+        adapter,
+        msg.address,
+        appendReplyEndMarker(directHistoryReply),
+        effectiveBinding.codepilotSessionId,
+        msg.messageId,
+        true,
+        'Markdown',
+      );
+      ack();
+      return;
+    }
+  }
+
   // Create an AbortController so /stop can cancel this task externally
   const taskAbort = new AbortController();
   const state = getState();
@@ -4192,6 +4306,7 @@ async function handleMessage(
       ? { title: undefined, scopeText: '上一条回复整理' }
       : undefined
   );
+  const feishuConversationContextPrompt = rawData?.feishuConversationContext?.prompt?.trim() || '';
   const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const isStickerMessage = isFeishuStickerMessageKind(inboundMessageKind);
   const currentMessageEvidenceAttachments = hasAttachments && !isStickerMessage ? msg.attachments : undefined;
@@ -4490,7 +4605,7 @@ async function handleMessage(
       storedUserText: text || rawText,
       historyLimit: fastPathOptions.historyLimit,
       memoryMode: providerMemoryMode,
-      extraSystemPrompt: [adapterIdentityPrompt, fastPathOptions.extraSystemPrompt, feishuCloudSystemPrompt, recentConversationMediaPrompt].filter(Boolean).join('\n\n'),
+      extraSystemPrompt: [adapterIdentityPrompt, fastPathOptions.extraSystemPrompt, feishuConversationContextPrompt, feishuCloudSystemPrompt, recentConversationMediaPrompt].filter(Boolean).join('\n\n'),
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
@@ -4536,10 +4651,16 @@ async function handleMessage(
         executionEvidence: result.executionEvidence,
       })
       : '';
+    const safeProviderErrorText = result.hasError
+      ? buildSafeProviderErrorMessage(result.errorMessage || 'Unknown provider error', {
+        cardFinalized: false,
+        channelType: adapter.channelType,
+      })
+      : '';
     if (userFacingResponseText) {
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', userFacingResponseText);
-    } else if (result.hasError && result.errorMessage) {
-      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', `未完成：${result.errorMessage}`);
+    } else if (safeProviderErrorText) {
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', safeProviderErrorText);
     }
 
     // Finalize streaming card if adapter supports it.
@@ -4553,7 +4674,7 @@ async function handleMessage(
         cardFinalized = await adapter.onStreamEnd(
           msg.address.chatId,
           status,
-          userFacingResponseText,
+          userFacingResponseText || safeProviderErrorText,
           result.runSummary,
         );
       } catch (err) {
@@ -4715,13 +4836,27 @@ async function handleMessage(
         }
       }
     } else if (result.hasError) {
-      const errorResponse: OutboundMessage = {
-        address: msg.address,
-        text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
-        parseMode: 'HTML',
-        replyToMessageId: msg.messageId,
-      };
-      await deliver(adapter, errorResponse);
+      if (!cardFinalized && safeProviderErrorText && shouldSendProviderErrorNotice({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+      })) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: safeProviderErrorText,
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        }, { sessionId: effectiveBinding.codepilotSessionId });
+      } else if (!cardFinalized) {
+        try {
+          store.insertAuditLog({
+            channelType: adapter.channelType,
+            chatId: msg.address.chatId,
+            direction: 'outbound',
+            messageId: '',
+            summary: '[SUPPRESSED] Provider error notice suppressed by circuit breaker',
+          });
+        } catch { /* best effort */ }
+      }
     }
 
     // Persist the actual SDK session ID for future resume.
@@ -5131,6 +5266,9 @@ export const _testOnly = {
   notifyQueuedBehindActiveTurn,
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
+  buildSafeProviderErrorMessage,
+  shouldSendProviderErrorNotice,
+  resetProviderErrorCircuitBreaker,
   buildSmallTalkReply,
   extractCtiReminderAction,
   containsUnverifiedReminderCompletion,

@@ -184,8 +184,64 @@ function Invoke-SuiteNpmBuild {
     }
 }
 
+function Invoke-ControlPanelWebBuild {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'package.json'))) {
+        throw "control-panel web package.json not found: $Path"
+    }
+
+    Write-Host "build suite control-panel web"
+    Push-Location $Path
+    try {
+        if (-not (Test-Path -LiteralPath 'node_modules')) {
+            if (Test-Path -LiteralPath 'package-lock.json') {
+                npm ci | Out-Host
+            } else {
+                npm install | Out-Host
+            }
+            if ($LASTEXITCODE -ne 0) {
+                throw "control-panel web dependency install failed"
+            }
+        }
+        npm run build | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "control-panel web build failed"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-ControlPanelPublish {
+    param([string]$OutputDir)
+
+    $project = Join-Path $suiteControlPanel 'CodexImSuite.ControlPanel.csproj'
+    if (-not (Test-Path -LiteralPath $project)) {
+        throw "control-panel project not found: $project"
+    }
+
+    Write-Host "publish suite control-panel"
+    Clear-RunningProcessInPathForUpdate -Roots @($OutputDir) -Purpose 'control panel publish' -NoForceUpdate:$NoForceUpdate
+    if (Test-Path -LiteralPath $OutputDir) {
+        Remove-PathForUpdate -Path $OutputDir -Purpose 'control panel publish cleanup'
+    }
+    dotnet publish $project -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $OutputDir | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "control-panel publish failed"
+    }
+}
+
 Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-core' -Description 'bridge-core'
 Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-runtime' -Description 'bridge-runtime'
+
+$builtPanelDir = if ($env:CTI_RELEASE_CONTROL_PANEL_DIR) {
+    $env:CTI_RELEASE_CONTROL_PANEL_DIR
+} else {
+    Join-Path $suiteRoot 'release\artifacts\control-panel'
+}
+Invoke-ControlPanelWebBuild -Path (Join-Path $suiteControlPanel 'web')
+Invoke-ControlPanelPublish -OutputDir $builtPanelDir
 
 Write-Host "sync suite bridge-core -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'src') -Target (Join-Path $liveCore 'src')
@@ -251,11 +307,6 @@ if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$builtPanelDir = if ($env:CTI_RELEASE_CONTROL_PANEL_DIR) {
-    $env:CTI_RELEASE_CONTROL_PANEL_DIR
-} else {
-    Join-Path $suiteRoot 'release\artifacts\control-panel'
-}
 $builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'
 $builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'

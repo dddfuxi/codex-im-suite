@@ -79,6 +79,7 @@ Feishu 接收现在是双通道：
 - p2p 私聊有历史轮询补捞兜底，避免私聊事件偶发漏掉。
 - `bridge-manager` 会在进入执行链前做持久入站去重：同一 channel/chat/messageId 只允许执行一次；带附件的媒体说明文字还会写入短期文本指纹，避免 Feishu p2p 历史补捞把同一张图的 caption 当成另一个 messageId 再跑一轮 Codex。
 - 群聊 `require_mention=true` 时，adapter 先读事件自带 `message.mentions`，缺失时再从正文里的飞书 `<at ...>` / post `tag=at` 结构兜底识别 bot mention，避免长连事件缺少 mentions 数组时把真实 @bot 消息误丢弃。
+- adapter 会在 WS 和历史补捞入口统一忽略 `system`、`interactive` 非用户消息、`sender_type=app/bot`、邀请/加群通知等没有明确人类文本的事件；这类事件只进入审计或受控历史索引，不触发 LLM，避免机器人自己的卡片更新、出站消息或入群系统事件再次自触发。
 
 收到消息后进入 `bridge-core` 的消息处理主线：
 
@@ -89,7 +90,7 @@ Feishu 接收现在是双通道：
 5. 记录轻量记忆事件，按 user/chat/global profile 滚动汇总事实、偏好、主题和待跟进项。
 6. 如果消息里包含飞书 Docx、Sheets 或 Base 链接，bridge-core 调用 bridge-runtime 的云文档 host；runtime 先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户 token 读取，并把真实内容作为本轮 system context 注入。缺用户 token 时发送登录授权卡片；`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网回调，用户把飞书授权后的 `code/state` 回调 URL 复制回飞书完成绑定。登录后仍无权限时返回明确阻塞。
 7. Feishu Owner 可用 `/feishu` 查看开放平台能力诊断：本地配置、应用 token 直读能力、OAuth fallback 请求 scope、`CTI_FEISHU_GRANTED_SCOPES` 声明的已开通权限，以及各能力缺口。
-8. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。
+8. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。普通“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”会先命中 Feishu 历史意图，bridge-core 只使用 adapter/store 的历史索引和 `retrieveRelevantFeishuHistory()` 生成受控摘要，不把 `feishu-history/*.json` 路径交给 Codex 自行用 Bash 或 MCP 读取。
 9. 调用运行时 provider。
 10. 解析最终结果块和 `cti-reminder` 动作块。
 11. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
@@ -237,7 +238,7 @@ Executor 目录当前内置四类：
 - 控制面板可按 session 写入默认 executor。
 - 没有显式覆盖时，按 capability、executor priority 和当前真实 provider 偏好做自动选择。
 - 本地 agent 的历史工具边界仍由 `ToolSandboxPolicy` 声明，但不再参与 Codex CLI 模型来源切换；本地 API 作为 Codex 模型来源时承接同等 Codex agent 工具能力。
-- Feishu 轻聊天新增 `light_chat` prompt profile：当 reply surface 为轻量状态、`ExecutionRequirement.kind=none`、无附件/工具/图片理解/文档/仓库意图且输入较短时，runtime 先用本地或低成本 provider 处理；本地不可用时仍回退 official Codex，但只传 assistant 身份、Feishu emoji/sticker 策略、轻量回复契约和最近 0-2 条历史，不再携带 workspace、MCP、Unity、文件产物等长上下文。该路径写入 route summary 和 `WorkflowRun.execution.promptProfile=light_chat`；复杂任务继续走原 Codex / JSON 工具证据链。
+- Feishu 轻聊天新增 `light_chat` prompt profile：当 reply surface 为轻量状态、`ExecutionRequirement.kind=none`、无附件/工具/图片理解/文档/仓库意图且输入较短时，runtime 先用本地或低成本 provider 处理；本地不可用时仍回退 official Codex，但只传 assistant 身份、Feishu emoji/sticker 策略、轻量回复契约、必要的 `Feishu recent conversation context` 和最近 0-2 条历史，不再携带 workspace、MCP、Unity、文件产物等长上下文。该路径写入 route summary 和 `WorkflowRun.execution.promptProfile=light_chat`；复杂任务继续走原 Codex / JSON 工具证据链。
 
 ```mermaid
 flowchart TD
@@ -440,7 +441,7 @@ flowchart TD
 - 直接提醒的创建和推送由 `CTI_DIRECT_REMINDER_ENABLED`、`CTI_DIRECT_REMINDER_PUSH_ENABLED`、`CTI_DIRECT_REMINDER_DECISION_MODE` 和 `CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND` 控制；默认使用 Codex action 判断和 bridge 统一执行。
 - 待办来源会话必须来自 Markdown frontmatter 或结构化字段 `channelType`、`chatId`、`messageId`、`displayName`。来源无法确认时进入“待补来源”状态，不回退 owner 私聊，也不猜测 chatId。
 - 旧规则 Markdown 归档入口为 `scripts/memory/archive-legacy-rules.ps1`，默认 dry-run；显式 `-Apply` 时才移动到 `archive\legacy-rules` 并生成 `AUTHORITATIVE-RULES.md`。
-- `bridge-core` 会在收到普通消息和生成最终回复后写入记忆事件；纯问候、感谢、确认、短接话和已学习表情包接话不再走确定性短回复，也不默认携带完整 Codex 上下文。默认进入 `light_chat` 轻量链路，使用轻量 reply surface、短历史窗口、按需记忆策略和 Feishu 表情表达策略；只有文件、命令、MCP、Unity、Blender、飞书文档、截图/图片理解、发布、错误排障、阻塞或正式交付请求才进入完整工具链。
+- `bridge-core` 会在收到普通消息和生成最终回复后写入记忆事件；纯问候、感谢、确认、短接话和已学习表情包接话不再走确定性短回复，也不默认携带完整 Codex 上下文。Feishu 群聊被 @ 或回复触发时，adapter 会按需补入被回复消息和最近少量同群消息作为 `Feishu recent conversation context`，用于理解“刚刚/上面/你怎么看/怎么起名”等轻量接话，不等同于全量历史检索。默认进入 `light_chat` 轻量链路，使用轻量 reply surface、短历史窗口、按需记忆策略和 Feishu 表情表达策略；只有文件、命令、MCP、Unity、Blender、飞书文档、截图/图片理解、发布、错误排障、阻塞或正式交付请求才进入完整工具链。
 - MCP 工作目录检查，防止误连其他项目。
 - 默认工作区和 Unity 工程路径由配置控制。
 - `workflow-runs.json` 保存最近 workflow run、事件、recovery 和 retry 状态；它是控制面板展示执行历程、手动重试失败 run 和 bridge 重启后自动续跑的事实来源。
@@ -561,6 +562,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 会话区新增 WebView 详情抽屉，宿主通过 `history.getSessionDetail` 返回完整消息流；旧 `ConversationViewerForm` 保留为兼容调试入口。
 - 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
 - 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
+- 会话详情会读取 `data/outbound-refs.json` 中的机器人出站消息引用，只对已确认由本机器人发出的 Feishu `senderType=app` 消息显示“撤回”按钮；`history.recallBotMessage` 只允许撤回匹配到出站引用的 Feishu 消息，成功后标记 `recalledAt`，失败时记录 `recallError` 并在详情页展示。旧消息如果没有出站引用，不会被误判为可撤回。
 - 会话详情读取旧本地消息时仍保留显示层 mojibake 修复；需要改写历史 JSON 或记忆索引时走 `scripts/repair-history-mojibake.ps1 -Apply`，由备份 manifest 承担回滚。
 - 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要、prompt profile、recovery / retry 状态、模型来源、模型名、token / cache 汇总和事件时间线，方便回溯一次飞书请求从接收、路由、执行、重试到交付或失败的运行历程。
 - 执行器页的“最近 Workflow”与会话详情的“运行历程”都只消费 run 顶层摘要字段，不再反向解析 `events[].data` 拼模型、token 或证据信息，避免前端与运行时事件细节耦合。run 顶层 `execution` 会展示 `requiredEvidenceKind`、`evidenceSatisfied`、`noEvidenceRetryAttempted` 和 `requiredToolFamilies`，用于定位模型是否按要求调用了工具。
@@ -621,7 +623,7 @@ HostBridge 命令协议：
 - 扩展：`extension.enable`、`extension.disable`、`extension.remove`、`extension.install`
 - 扩展导入：`extension.detectImport`、`extension.importFromFolder`
 - 在线扩展目录：`extension.catalog.list`、`extension.catalog.refresh`、`extension.remote.preview`、`extension.remote.install`、`extension.remote.remove`
-- 会话：`history.listSessions`、`history.getSessionDetail`、`history.openConversationViewer`
+- 会话：`history.listSessions`、`history.getSessionDetail`、`history.recallBotMessage`、`history.openConversationViewer`
 - 记忆：`memory.status`、`memory.search`、`memory.openSource`、`memory.reminders`、`memory.checkReminders`、`memory.testReminder`、`memory.restoreArchive`、`memory.optimizeStatus`、`memory.optimizePreview`、`memory.optimizeApply`、`memory.optimizeUndo`、`memory.optimizeDiscard`、`memory.optimizeSchedule`
 - 设置与路径：`settings.read`、`settings.save`、`settings.listReplyPresets`、`settings.applyReplyPreset`、`settings.summarizeReplyStyle`、`path.pickFolder`、`path.pickFile`、`path.openAny`
 - 历史消息解析会优先提取 Feishu `text / post / interactive` 内容；卡片消息不再统一显示成 `[卡片消息]` 占位。对旧索引里遗留的卡片占位，控制面板会按 `messageId` 从 `data/audit.json` 回填可见摘要，尽量不要求用户手动全量重同步。
@@ -826,7 +828,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `CTI_CODEX_ROUTING_MODE`：`manual` 或 `auto_failover`，决定手动来源还是自动切换链。
 - `CTI_CODEX_MODEL_SOURCE`：`official`、`local_api` 或 `external_api`，手动模式下决定 Codex CLI 模型来源。
 - `CTI_CODEX_API_FALLBACK_CHAIN`：自动切换模式下的来源顺序，默认 `local_api,external_api`；只有显式包含 `official` 才允许调用官方 Codex。
-- `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用，最多保留 2 条短历史，输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。
+- `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用，最多保留 2 条短历史，输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。`CTI_FEISHU_LIGHT_CONTEXT_LIMIT` / `bridge_feishu_light_context_limit` 控制 Feishu 群聊轻量上下文补捞数量，默认 6 条、最大 12 条，只用于被 @ 或回复触发的短接话上下文。
 - `CTI_CODEX_INHERIT_GLOBAL_MCP`：是否让 bridge Codex 继承桌面全局 `mcp_servers.*`，默认 `false`；普通飞书运行态不依赖桌面 MCP，避免外部 MCP 离线导致主模型失败。
 - `CTI_CODEX_LOCAL_IGNORE_USER_CONFIG`：本地 Codex CLI OSS agent 是否忽略桌面用户配置，默认 `true`；这不会禁用内置 shell/file agent 能力，但会减少插件和全局 provider 配置干扰。
 - `@openai/codex-sdk`：bridge-runtime 的外部可选依赖，当前随 suite 锁定到 `0.132.0`；live 同步会校验运行副本中的实际安装版本。
@@ -861,6 +863,7 @@ Ignis 会话映射：
 - `feishu-p2p-user-index.json`
 - `feishu-history-index.json`
 - `feishu-history`
+- `outbound-refs.json`
 
 记忆策略：
 
@@ -877,6 +880,7 @@ Ignis 会话映射：
 - 待办提醒索引为派生文件：`.cti-index\reminders.json` 保存待发送、已发送、跳过和失败的展示数据，`.cti-index\reminder-state.json` 保存 `pending / sent / failed / skipped` 推送状态和最近结果。控制面板“记忆”页显示提醒时间、来源类型、来源会话、来源片段、跳过原因和飞书测试发送入口。
 - `sourceType=direct` 的提醒来自 `cti-reminder` 或 `/remind`，源文件落在 `data\todos\direct-reminders`；面板会把它和普通 `sourceType=memory` 待办区分展示。
 - Codex CLI 模型/API 不可用时，只有自动切换链中声明的后续来源会被尝试；任务、工具、权限或 MCP 失败不得换模型重跑，也不得降级成教程式回复。
+- Provider 错误外发统一经过安全摘要收口：`tool_result` SSE、`tool_use_id`、本地路径、转义 JSON 和高乱码密度内容不会作为正文发送到 Feishu，也不会写入会话记忆。若已有 workflow/light card，只更新同一张卡为安全未完成摘要；确需补发时只发一条短文本，并按 chat 做短窗口失败熔断，避免错误被切成多条群消息。
 
 ## 8. 结果封装协议
 

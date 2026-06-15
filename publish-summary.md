@@ -1,77 +1,61 @@
 ﻿# Publish Summary
 
-- Time: 2026-06-08 16:39:45
-- Subject: update MCPs; refresh panel; sync suite 2026-06-08 16:39:45
+- Time: 2026-06-15 10:20:09
+- Subject: refresh panel; sync suite 2026-06-15 10:20:09
 - Summary source: fallback-rule
 
 ## Preview
 
-MCP changes:
-- M config/mcp.d/unity-mcp.json
-- M packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/installer/payload/config/mcp.d/unity-mcp.json
-- M release/installer/payload/packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/installer/payload/scripts/launch-unity-mcp.ps1
-- M release/portable/config/mcp.d/unity-mcp.json
-- M release/portable/packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/portable/scripts/launch-unity-mcp.ps1
-- M scripts/launch-unity-mcp.ps1
+MCP changes: none
 
 Control panel changes:
+- M apps/control-panel/ControlPanel.Tests/ConversationHistoryDisplayTests.cs
 - M apps/control-panel/Program.cs
 - M apps/control-panel/web/src/main.tsx
-- ?? apps/control-panel/ControlPanel.Tests/McpHttpHealthChecksTests.cs
-- ?? apps/control-panel/McpHttpHealthChecks.cs
+- M apps/control-panel/web/src/styles.css
+- M release/installer/payload/scripts/sync-live-skill.ps1
+- M release/portable/scripts/sync-live-skill.ps1
 
 Other changes:
-- M .gitignore
-- M AGENTS.md
-- M README.md
-- M config/extension-catalog.json
-- M config/runtime.d/service.local-llm.json
 - M docs/DEVELOPMENT-LOG.md
 - M docs/PROJECT-ARCHITECTURE.md
 - M packages/bridge-core/src/__tests__/unit/bridge-feishu-adapter.test.ts
-- ... and 72 more
+- M packages/bridge-core/src/__tests__/unit/bridge-manager.test.ts
+- M packages/bridge-core/src/lib/bridge/adapters/feishu-adapter.ts
+- M packages/bridge-core/src/lib/bridge/bridge-manager.ts
+- M packages/bridge-core/src/lib/bridge/channel-adapter.ts
+- M packages/bridge-core/src/lib/bridge/delivery-layer.ts
+- ... and 57 more
 
 ## Commit Body
 
-MCP changes:
-- M config/mcp.d/unity-mcp.json
-- M packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/installer/payload/config/mcp.d/unity-mcp.json
-- M release/installer/payload/packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/installer/payload/scripts/launch-unity-mcp.ps1
-- M release/portable/config/mcp.d/unity-mcp.json
-- M release/portable/packages/bridge-runtime/scripts/launch-unity-mcp.ps1
-- M release/portable/scripts/launch-unity-mcp.ps1
-- M scripts/launch-unity-mcp.ps1
-
 Control panel changes:
+- M apps/control-panel/ControlPanel.Tests/ConversationHistoryDisplayTests.cs
 - M apps/control-panel/Program.cs
 - M apps/control-panel/web/src/main.tsx
-- ?? apps/control-panel/ControlPanel.Tests/McpHttpHealthChecksTests.cs
-- ?? apps/control-panel/McpHttpHealthChecks.cs
+- M apps/control-panel/web/src/styles.css
+- M release/installer/payload/scripts/sync-live-skill.ps1
+- M release/portable/scripts/sync-live-skill.ps1
 
 Other suite changes:
-- M .gitignore
-- M AGENTS.md
-- M README.md
-- M config/extension-catalog.json
-- M config/runtime.d/service.local-llm.json
 - M docs/DEVELOPMENT-LOG.md
 - M docs/PROJECT-ARCHITECTURE.md
 - M packages/bridge-core/src/__tests__/unit/bridge-feishu-adapter.test.ts
-- M packages/bridge-core/src/__tests__/unit/bridge-feishu-markdown.test.ts
 - M packages/bridge-core/src/__tests__/unit/bridge-manager.test.ts
-- M packages/bridge-core/src/__tests__/unit/execution-requirement.test.ts
 - M packages/bridge-core/src/lib/bridge/adapters/feishu-adapter.ts
 - M packages/bridge-core/src/lib/bridge/bridge-manager.ts
-- M packages/bridge-core/src/lib/bridge/conversation-engine.ts
-- M packages/bridge-core/src/lib/bridge/execution-requirement.ts
+- M packages/bridge-core/src/lib/bridge/channel-adapter.ts
+- M packages/bridge-core/src/lib/bridge/delivery-layer.ts
 - M packages/bridge-core/src/lib/bridge/host.ts
-- M packages/bridge-core/src/lib/bridge/markdown/feishu.ts
-- M packages/bridge-runtime/mcp.d/unity-mcp.json
-- M packages/bridge-runtime/scripts/register-external-mcps.ps1
-- M packages/bridge-runtime/src/__tests__/codex-local-cli-provider.test.ts
-- ... and 60 more
+- M packages/bridge-runtime/src/__tests__/local-llm-router.test.ts
+- M packages/bridge-runtime/src/__tests__/store.test.ts
+- M packages/bridge-runtime/src/config.ts
+- M packages/bridge-runtime/src/local-llm-router.ts
+- M packages/bridge-runtime/src/main.ts
+- M packages/bridge-runtime/src/store.ts
+- M release/codex-im-suite-portable.zip
+- M release/installer/CodexImSuiteInstaller.dll
+- M release/installer/CodexImSuiteInstaller.exe
+- M release/installer/CodexImSuiteInstaller.pdb
+- M release/installer/payload/.suite-release.json
+- ... and 45 more

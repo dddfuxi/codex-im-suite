@@ -442,6 +442,30 @@ export interface OutboundRefInput {
   codepilotSessionId: string;
   platformMessageId: string;
   purpose: string;
+  messageKind?: string;
+  createdAt?: string;
+}
+
+export interface OutboundRefRecord extends OutboundRefInput {
+  recalledAt?: string;
+  recallError?: string;
+  updatedAt?: string;
+}
+
+export interface OutboundRefFilter {
+  channelType?: string;
+  chatId?: string;
+  platformMessageId?: string;
+  codepilotSessionId?: string;
+}
+
+export interface MarkOutboundRefRecalledInput extends OutboundRefFilter {
+  channelType: string;
+  chatId: string;
+  platformMessageId: string;
+  ok: boolean;
+  error?: string;
+  recalledAt?: string;
 }
 
 /** Input for upserting a channel binding. */
@@ -538,6 +562,8 @@ export interface BridgeStore {
   insertDedup(key: string): void;
   cleanupExpiredDedup(): void;
   insertOutboundRef(ref: OutboundRefInput): void;
+  listOutboundRefs?(filter?: OutboundRefFilter): OutboundRefRecord[];
+  markOutboundRefRecalled?(input: MarkOutboundRefRecalledInput): boolean;
 
   // ── Permission links ──
   insertPermissionLink(link: PermissionLinkInput): void;

@@ -35,7 +35,7 @@ import { JsonFileStore } from './store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
-import { OllamaProvider } from './local-llm-provider.js';
+import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
 import { LocalAgentProvider } from './local-agent-provider.js';
 import {
   compressConversationHistory,
@@ -965,17 +965,26 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
   ): Promise<void> {
     const lightParams = buildLightChatParams(params, this.config);
+    const summary: Omit<LocalLlmRouteSummary, 'timestamp'> = {
+      mode,
+      taskKind: 'light_chat',
+      decision: 'answer_local',
+      provider: 'local_best_effort',
+      reason: 'light_chat_fast_path',
+      compressedPromptChars: lightParams.prompt.length,
+      compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
+      promptProfile: 'light_chat',
+    };
     try {
-      await this.pipeFallbackStream(controller, lightParams, {
-        mode,
-        taskKind: 'light_chat',
-        decision: 'answer_local',
-        provider: 'local_best_effort',
-        reason: 'light_chat_fast_path',
-        compressedPromptChars: lightParams.prompt.length,
-        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
-        promptProfile: 'light_chat',
-      }, this.localProvider);
+      const result = await this.localProvider.complete(
+        this.buildLightChatLocalMessages(lightParams),
+        {
+          temperature: 0.35,
+          maxTokens: Math.min(256, Math.max(96, this.config.localLlmMaxOutputTokens || 160)),
+          timeoutMs: Math.max(5000, Math.min(20000, this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 12000)),
+        },
+      );
+      this.emitLocalSuccess(controller, lightParams.sessionId, result.text, result.usage, summary);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.pipeFallbackStream(controller, lightParams, {
@@ -990,6 +999,21 @@ class HubLlmProvider implements LLMProvider {
         fallbackReason: message,
       }, this.fallbackProvider);
     }
+  }
+
+  private buildLightChatLocalMessages(params: Parameters<LLMProvider['streamChat']>[0]): LocalModelMessage[] {
+    const messages: LocalModelMessage[] = [];
+    const systemPrompt = params.systemPrompt?.trim();
+    if (systemPrompt) {
+      messages.push({ role: 'system', content: systemPrompt });
+    }
+    for (const item of params.conversationHistory || []) {
+      const content = item.content?.trim();
+      if (!content) continue;
+      messages.push({ role: item.role, content });
+    }
+    messages.push({ role: 'user', content: params.prompt });
+    return messages;
   }
 
   private async dispatchAfterRouteFailure(
@@ -1441,6 +1465,7 @@ class HubLlmProvider implements LLMProvider {
       routeReason: summary.reason,
       compressedPromptChars: summary.compressedPromptChars,
       compressedHistoryChars: summary.compressedHistoryChars,
+      ...(summary.promptProfile ? { promptProfile: summary.promptProfile } : {}),
       ...(summary.provider === 'local_best_effort'
         ? {
             modelSource: 'local_api',
@@ -1808,11 +1833,12 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
     provider: LLMProvider,
     primaryExecutorId: string,
   ): LLMProvider => {
+    const localProvider = new OllamaProvider(config);
     return new HubLlmProvider(
       config,
       store,
-      new OllamaProvider(config),
-      new LocalAgentProvider(config, pendingPerms),
+      localProvider,
+      new LocalAgentProvider(config, pendingPerms, localProvider),
       provider,
       null,
       primaryExecutorId,

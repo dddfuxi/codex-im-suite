@@ -8,7 +8,7 @@
 powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.ps1
 ```
 
-该脚本会把 `entireio/cli` 固定版本构建到 `.codex-tools\bin\entire.exe`，并设置 `core.hooksPath=.githooks`。`.codex-tools` 是本仓库本地工具缓存，不提交、不全局安装；其他项目需要同样能力时，应在对应项目内单独安装。默认策略是 `manual-commit`，会话结束时只在非 `codex/dev` 分支、会话开始基线干净、检查通过且无冲突时，自动提交本轮改动并合并到 `codex/dev`；不自动 push。
+该脚本会把 `entireio/cli` 固定版本构建到 `.codex-tools\bin\entire.exe`，并设置 `core.hooksPath=.githooks`。`.codex-tools` 是本仓库本地工具缓存，不提交、不全局安装；其他项目需要同样能力时，应在对应项目内单独安装。默认策略是 `manual-commit`，只做会话和 Git checkpoint 留痕；不自动提交、不自动合并到 `codex/dev`，也不自动 push。
 
 `codex-im-suite` 是飞书桥接、Codex 执行层、本地辅助模型、MCP、Skill、控制面板和 Windows 打包流程的统一开发与发布目录。
 
@@ -17,6 +17,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 开发入口收口到本仓库，不再依赖散落在外部目录的历史副本。
 - 运行版 live skill 可以从本仓库同步生成。
 - 本机备份发布继续先同步、构建、打包，再提交和推送，保证 GitHub 备份与可运行产物一致。
+- 本机备份发布在 `git push` 前会自动执行 Git LFS 预同步；只要仓库里存在 LFS 跟踪文件，就会先向目标 remote 补传缺失对象，避免发布产物已提交但远端缺少 LFS blob 时被 GitHub 预接收钩子拒绝。
 - `main` 主干发布先做协议校验、架构检查和可复现打包，不把本机 live skill 当作主干事实来源。
 
 ## 本次大更新
@@ -123,7 +124,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 设置页的“Codex CLI 模型来源”可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
 - 本地 API 现在作为 Codex CLI 的普通模型来源接入，不再因为工具探测未通过或旧本地兜底键自动转官方 Codex；`ollama` / `lmstudio` 会通过 provider registry 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，不会走 Codex SDK 的 `/v1/responses`。`vllm`、`openai-compatible` 和 `custom` 在未接入 Codex CLI OSS agent 前只显示为 Chat Completions 能力，不能伪装执行。
-- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 工具轨迹 / 耗时的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
+- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
 - 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
 - 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 模型来源失败后允许走 runtime 自己的受控工具补执行；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
 - bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。

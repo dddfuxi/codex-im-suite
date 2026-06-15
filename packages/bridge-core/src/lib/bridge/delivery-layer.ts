@@ -237,6 +237,7 @@ export async function deliver(
           codepilotSessionId: opts.sessionId,
           platformMessageId: result.messageId,
           purpose: message.inlineButtons ? 'permission' : 'response',
+          messageKind: message.feishuCardJson ? 'card' : message.parseMode || 'text',
         });
       } catch { /* best effort */ }
     }
@@ -368,6 +369,7 @@ export async function deliverRendered(
           codepilotSessionId: opts.sessionId,
           platformMessageId: result.messageId,
           purpose: 'response',
+          messageKind: 'rendered',
         });
       } catch { /* best effort */ }
     }

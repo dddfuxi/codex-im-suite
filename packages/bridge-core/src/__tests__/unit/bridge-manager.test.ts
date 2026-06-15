@@ -665,6 +665,36 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager safe error delivery', () => {
+  it('converts raw tool_result stream errors into a short user-safe message', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const raw = 'data: {"type":"tool_result","data":"{\\"tool_use_id\\":\\"item_13\\",\\"content\\":\\"C:\\\\\\\\Users\\\\\\\\admin\\\\\\\\.claude-to-im\\\\\\\\data\\\\\\\\feishu-history\\\\\\\\oc_x.json\\\\n乱码锟斤拷\\"}"}';
+
+    const safe = _testOnly.buildSafeProviderErrorMessage(raw, {
+      cardFinalized: false,
+      channelType: 'feishu',
+    });
+
+    assert.match(safe, /未完成/);
+    assert.match(safe, /内部工具结果/);
+    assert.doesNotMatch(safe, /tool_result/);
+    assert.doesNotMatch(safe, /tool_use_id/);
+    assert.doesNotMatch(safe, /Users/);
+    assert.ok(safe.length < 160);
+  });
+
+  it('suppresses duplicate provider error sends after repeated failures in one chat', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    _testOnly.resetProviderErrorCircuitBreaker();
+
+    const key = { channelType: 'feishu', chatId: 'oc_repeat' };
+    assert.equal(_testOnly.shouldSendProviderErrorNotice(key), true);
+    assert.equal(_testOnly.shouldSendProviderErrorNotice(key), true);
+    assert.equal(_testOnly.shouldSendProviderErrorNotice(key), true);
+    assert.equal(_testOnly.shouldSendProviderErrorNotice(key), false);
+  });
+});
+
 describe('bridge-manager extension install commands', () => {
   beforeEach(() => {
     delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
