@@ -2610,20 +2610,42 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.enqueue(inbound);
   }
 
+  private isSelfSenderType(senderType: string | undefined): boolean {
+    const normalized = (senderType || '').trim().toLowerCase();
+    return normalized === 'app' || normalized === 'bot';
+  }
+
+  private isKnownBotSenderId(senderId: string | undefined): boolean {
+    const normalized = (senderId || '').trim();
+    return !!normalized && this.botIds.has(normalized);
+  }
+
+  private isInboundEventFromSelf(sender: FeishuMessageEventData['sender'] | undefined): boolean {
+    if (!sender) return false;
+    if (this.isSelfSenderType(sender.sender_type)) return true;
+    const senderId = sender.sender_id;
+    return [senderId?.open_id, senderId?.user_id, senderId?.union_id]
+      .some((id) => this.isKnownBotSenderId(id));
+  }
+
+  private isHistoryItemFromSelf(sender: { id?: string; id_type?: string; sender_type?: string } | undefined): boolean {
+    if (!sender) return false;
+    return this.isSelfSenderType(sender.sender_type) || this.isKnownBotSenderId(sender.id);
+  }
   private shouldIgnoreInboundEvent(data: FeishuMessageEventData): boolean {
     const msg = data.message;
     const senderType = data.sender?.sender_type || '';
     const messageType = msg?.message_type || '';
 
     if (!msg?.message_id) return true;
-    if (senderType === 'app' || senderType === 'bot') {
+    if (this.isInboundEventFromSelf(data.sender)) {
       try {
         getBridgeContext().store.insertAuditLog({
           channelType: 'feishu',
           chatId: msg.chat_id || '',
           direction: 'inbound',
           messageId: msg.message_id,
-          summary: `[FILTERED] Ignored ${senderType || 'unknown'} sender event (${messageType || 'unknown'})`,
+          summary: `[FILTERED] Ignored ${senderType || 'known_bot_id'} sender event (${messageType || 'unknown'})`,
         });
       } catch { /* best effort */ }
       return true;
@@ -2802,7 +2824,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const candidates = items
       .filter((item) => !item.deleted)
       .filter((item) => item.msg_type !== 'system')
-      .filter((item) => item.sender?.sender_type !== 'app')
+      .filter((item) => !this.isHistoryItemFromSelf(item.sender))
       .filter((item) => !this.seenMessageIds.has(item.message_id))
       .filter((item) => (Number.parseInt(item.create_time, 10) || 0) > latestKnownTime)
       .sort((a, b) => (Number.parseInt(a.create_time, 10) || 0) - (Number.parseInt(b.create_time, 10) || 0));
@@ -3348,7 +3370,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const historyItems = recentMessages
       .filter((item) => !item.deleted)
       .filter((item) => item.msg_type !== 'system')
-      .filter((item) => item.sender?.sender_type !== 'app')
+      .filter((item) => !this.isHistoryItemFromSelf(item.sender))
       .filter((item) => item.message_id !== currentMessageId)
       .filter((item) => {
         const ts = Number.parseInt(item.create_time, 10);
@@ -3970,7 +3992,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!item || item.deleted) return false;
     if (item.message_id === currentMessageId) return false;
     if (item.msg_type === 'system') return false;
-    if (item.sender?.sender_type === 'app' || item.sender?.sender_type === 'bot') return false;
+    if (this.isHistoryItemFromSelf(item.sender)) return false;
     return Boolean(this.extractHistoryText(item));
   }
 

@@ -1,0 +1,20 @@
+{
+  "id": "mavis-agent",
+  "displayName": "Mavis Agent (Mavis / MiniMax Code)",
+  "kind": "agent",
+  "category": "external-agent",
+  "enabled": false,
+  "installState": "external",
+  "source": "${SUITE_ROOT}\\packages\\bridge-runtime\\src\\mavis-executor-provider.ts",
+  "cwd": "${SUITE_ROOT}",
+  "version": "",
+  "description": "控制面板可观测条目；真实路由来源是 buildExecutorManifests(config)，本文件不参与 selectExecutor。",
+  "executorProtocol": "mavis-cli/v1",
+  "optIn": true,
+  "defaultEnabled": false,
+  "notes": [
+    "本文件仅供控制面板展示 mavis-agent 卡片/健康检查入口，不影响 selectExecutor 真实路由。",
+    "真实路由由 packages/bridge-runtime/src/executor-registry.ts 中的 buildExecutorManifests(config) 根据 Config.mavisEnabled / Config.mavisCliPath 决定。",
+    "本文件 enabled=false 是默认值；用户需要在 config.env 设 CTI_MAVIS_ENABLED=true 且 CTI_MAVIS_CLI_PATH 才会激活。"
+  ]
+}

@@ -79,7 +79,7 @@ Feishu 接收现在是双通道：
 - p2p 私聊有历史轮询补捞兜底，避免私聊事件偶发漏掉。
 - `bridge-manager` 会在进入执行链前做持久入站去重：同一 channel/chat/messageId 只允许执行一次；带附件的媒体说明文字还会写入短期文本指纹，避免 Feishu p2p 历史补捞把同一张图的 caption 当成另一个 messageId 再跑一轮 Codex。
 - 群聊 `require_mention=true` 时，adapter 先读事件自带 `message.mentions`，缺失时再从正文里的飞书 `<at ...>` / post `tag=at` 结构兜底识别 bot mention，避免长连事件缺少 mentions 数组时把真实 @bot 消息误丢弃。
-- adapter 会在 WS 和历史补捞入口统一忽略 `system`、`interactive` 非用户消息、`sender_type=app/bot`、邀请/加群通知等没有明确人类文本的事件；这类事件只进入审计或受控历史索引，不触发 LLM，避免机器人自己的卡片更新、出站消息或入群系统事件再次自触发。
+- adapter 会在 WS 和历史补捞入口统一忽略 `system`、`interactive` 非用户消息、`sender_type=app/bot`、邀请/加群通知等没有明确人类文本的事件；p2p 历史补捞还会按已解析的 bot 身份 ID 过滤 `sender_type` 缺失但 sender id 属于机器人的消息。这类事件只进入审计或受控历史索引，不触发 LLM，避免机器人自己的卡片更新、出站消息或入群系统事件再次自触发。
 
 收到消息后进入 `bridge-core` 的消息处理主线：
 
@@ -231,11 +231,147 @@ Executor 目录当前内置四类：
 - `claude-cli`：可切换 CLI 后端，能力包含对话、代码、仓库查询、文件读写和图片输入。
 - 本地模型不再注册为独立 `local-tool-agent` 执行器；它只作为 `codex` 执行器的 `local_api` 模型来源参与。
 - `codex-oss-ollama`：实验性只读执行器，仅在本地 AI 类型为 Ollama 时可用，声明 `codex exec --oss --local-provider ollama`。
+- `mavis-agent`（截至本次记录新增 — v3.4 设计稿落地）：首个 **external agent executor**。Mavis / MiniMax Code 通过本地 `mavis` CLI 派发任务、轮询结果；opt-in，默认不启用，启用需在 `config.env` 设 `CTI_MAVIS_ENABLED=true` 且 `CTI_MAVIS_CLI_PATH=<path>`。真实路由来源是 `executor-registry.ts:buildExecutorManifests(config)`，依据 `Config.mavisEnabled` 和 `Config.mavisCliPath` 决定 manifest 是否注册；`config/runtime.d/executor.mavis-agent.json` 只供控制面板展示，不参与 `selectExecutor` 路由。
+
+外部 Agent Executor 边界（v3.4）：
+
+- 真分派点：`ExecutorProviderRegistry.resolveForRequest(config, ExecutorRequest, defaultProvider)`。registry 在 `selectExecutor` 之后立刻分派，命中 external executor 时**完全忽略** `defaultProvider`（Codex 主链），与 v1 "构造期替换 fallbackProvider" 无关。
+- `ExecutorRequest` **只**含 `requestedExecutorId` / `preferredExecutorId` / `taskKind` 三个可选字段 + 必需 `sessionId/prompt/workingDirectory/permissionMode/params`。registry **不**接 `sessionDefaultId` 第 4 参；caller（`HubLlmProvider.streamChat`）通过 `resolveRequestedExecutorId(config, prompt, sessionDefaultId)` 把显式 hint、全局默认 executor 和历史 session default 折进 `requestedExecutorId`，优先级为 `@hint > CTI_DEFAULT_EXECUTOR_ID > sessionDefault > auto`。
+- 两阶段错误处理（v3.2 阻断点 ②）：pre-dispatch（probe + `session new` / `communication send`）失败 → 允许回落 Codex；post-dispatch（poll + messages + diff + 终态解析）失败 → 禁止回落；判据 = `binding.mvsSessionId` 非空 + `lastDispatchAt` 已写入。
+- `mavis-session-bindings.json`（`${CTI_HOME}/runtime/`）保存 `bridgeSessionId → mvsSessionId` 续聊映射；24 小时滑动窗口；写盘走 `tmp + rename`；**绝不**记录 secret、token、原始 diff 全文。
+- env 主命名 `CTI_MAVIS_*`（11 条），兼容 alias `MAVIS_*`（11 条，仅在 `loadConfig` 兜底解析）；`saveConfig` 只写主命名，不写 alias。
+
+外部 Agent Executor v3.5 修复（codex 7 轮 review 残留 P1/P2）：
+
+- **P1 #1 真只读门禁**：`mavis-executor-provider.ts:preDispatch` 的 `mavisReadOnly` 检查从「仅 `permissionMode === 'acceptEdits'`」升级为「**capability + permissionMode 双闸**」。`inferCapabilities(params)` 推断出 `file_write` / `mcp_ops` 即抛 `MavisSafetyError('read_only_violation')`；`acceptEdits` 仍保留为 belt-and-braces 显式模式闸。`executor-registry.ts:buildExecutorManifests` 的 `mavisReadOnly` manifest capability 收敛（无 `file_write` / `mcp_ops`）继续作为上游选路闸；`preDispatch` 的 capability 闸是**显式 `@mavis` hint 绕过 manifest 选路后的最后防线**。
+- **P1 #2 sessionId 形态校验**：`mavis-executor-provider.ts:isValidMvsSessionId` 校验 `mavis-cli-client.ts:createSession` 返回的 `sessionId` 必须非空、首字符为字母数字、长度 5-256、整体匹配 `^mvs_[a-zA-Z0-9][a-zA-Z0-9_\-]*$`。`preDispatchNew` 在写 binding 前调用；不合法 → 抛 `MavisSafetyError('dispatch_failed', …)`，**不写 binding**，`provider.binding` 保持 `undefined`，caller 仍可回落 Codex（v3.2 阻断点 ② 的 pre-dispatch 可回落不变）。
+- **P2 #3 `mavisDefaultExecutor` 真生效**：`executor-registry.ts:applyMavisDefaultExecutor(config, sessionId, sessionDefaults)` 是兼容旧开关的纯函数消费方。条件：`config.mavisDefaultExecutor === true` AND `config.mavisEnabled === true` AND `!!config.mavisCliPath` AND 当前 session 无 sticky default → 懒写 `${CTI_HOME}/runtime/executor-session-defaults.json[sessionId] = 'mavis-agent'`，返回 `{ sessionDefaultId: 'mavis-agent', wrote: true }`。后续请求统一交给 `resolveRequestedExecutorId` 判定；显式 `@codex` / `@claude` / `@minimax` 仍能覆盖，`CTI_DEFAULT_EXECUTOR_ID` 会优先于这个历史 sticky default。失败 best-effort（写盘抛错 → `wrote: false` 但 `sessionDefaultId` 仍返回 `'mavis-agent'`，当轮请求不丢）。
+
+外部 Agent Executor v3.6 修复（codex 8 轮 review 新增 P1）：
+
+- **P1 #1 外部 executor 接入 workflow 观测链**：`main.ts:streamExternalDispatch` 在 `ReadableStream.start` 内补上与本地 Codex 链一致的观测生命周期：先 `startObservedWorkflow(params, 'external_agent')`（内部仍按 v3.5 selection 写 `setWorkflowExecutor('mavis-agent', reason)` + `writeExecutorStatus` + `appendWorkflowEvent('executing')`），再创建 `evidence = emptyStreamEvidence()` + `seedExecutionRequirementEvidence(evidence, params)`，所有下游写入都通过 `observedController = createObservedController(controller, evidence)` 完成；post-dispatch 阶段把 `controller.enqueue` 全部换成 `observedController.enqueue`，确保 `tool_use/tool_result/progress/result` SSE 事件被 `collectStreamEvidence` 捕获。fallback 路径在 `streamLocalFallback(observedController, ...)` 之前先 `setWorkflowExecutor(workflowRun.id, this.primaryExecutorId, '外部 executor pre-dispatch 失败，回落 Codex: …')` 再 `appendWorkflowEvent('executing', 'executor.fallback', …)`，面板上能看到「选 mavis-agent → 实际跑 Codex（pre-dispatch 失败回落）」的诚实链路；外层 `finally` 跑 `flushWorkflowEvidence` + `completeWorkflowRun`（fallback 成功时）或 `failWorkflowRun` + `requestWorkflowRetry`（fallback 也抛错时，与 v3.3 auto-retry 规则一致）。判据 = 外部 executor 实际执行时面板能看到 workflow run、executor selection、retry/audit trails 与 `bridge-runtime-audit.json` evidence 与本地链一致。
+- **P1 #2 `mavisReadOnly` 改严格 capability allow-list + 扩 file_write 启发式**：v3.5 的黑名单（`required.includes('file_write') || required.includes('mcp_ops')`）有两个漏洞——一是「未来加新 capability 忘了列」会默默绕过只读；二是 `inferCapabilities` 的 file_write 模式只匹配 `修改|写入|保存|生成文件|edit|patch`，让 `delete package.json` / `create file` / `remove lockfile` / `touch script` / `rm -rf` / `mv old new` / `重命名` / `替换` 等写意图滑过 readOnly 闸。v3.6 在 `executor-registry.ts` 新增导出 `MAVIS_READ_ONLY_ALLOWED_CAPABILITIES: ReadonlySet<ExecutorCapability> = {chat, repo_query, file_read, image_input}` 和 `listMavisReadOnlyForbiddenCapabilities(required)`；`mavis-executor-provider.ts:preDispatch` 把黑名单换成「`forbidden = required.filter(c => !ALLOWED.has(c))`，非空即抛 `read_only_violation`」。同时 `inferCapabilities` 的 file_write 模式扩到 `修改|写入|保存|生成文件|edit|patch|删除|新建|创建|create|delete|remove|drop|erase|trash|unlink|rename|重命名|move|移动|write to|save to|append|追加|insert|插入|put file|replace|替换|update|modify|touch`；短命令 `rm` / `mv` 走第二条带 word boundary 的 regex（`(?<![a-z])(?:rm|mv)\s`）避免误伤 `arm` / `firm`。**仍未解决**：prompt 启发式本质是黑名单/白名单混合，绕路仍有可能；真正严谨的修法是在 `mavis-cli-client.createSession` 加 `readOnly` 字段并让 mavis daemon 端真正启用 sandbox——列为后续 P1 单独修复，本轮先锁住词表和 allow-list 不变量。
+- **判据 / 不变量**：
+  - 任何 capability 不在 `MAVIS_READ_ONLY_ALLOWED_CAPABILITIES` 的推理结果都必须让 `preDispatch` 抛 `read_only_violation`，**不允许**让 mavis CLI 默默接收写意图；测试在 `mavis-executor-provider.test.ts` 与 `executor-registry.test.ts` 各加一条 drift guard（manifest capabilities ⊆ allow-list）防止后续改 manifest 时忘了同步 allow-list。
+  - 外部 executor 执行的 turn 必须经过 `startObservedWorkflow → writeExecutorStatus → flushWorkflowEvidence → complete/failWorkflowRun` 完整链路；`streamExternalDispatch` 不允许再绕过 `startObservedWorkflow`。`streamLocalFallback(observedController, ...)` 的 fallback 路径也允许触发 auto-retry，但失败回收只走 outer `failWorkflowRun + requestWorkflowRetry`，不让 `streamExternalDispatch` 内部产生「未观测的 workflow run」。
+  - 语义点（已确认）：`applyMavisDefaultExecutor` 是旧 `mavisDefaultExecutor` 开关的兼容层；新默认入口是 `CTI_DEFAULT_EXECUTOR_ID`，由面板写入全局 executor 默认值。`@codex` / `@mavis` 等 hint 只覆盖当轮路由，不反向改写全局默认；需要长期切换时走控制面板“设为默认 / 恢复自动”。
+
+外部 Agent Executor v3.7 修复（codex 9 轮 review 新增 P1）：
+
+- **P1 #1 streamUntilFinish 结构化 terminal 状态 + workflow 失败态阻断**：`mavis-executor-provider.ts:streamUntilFinish` 的 timeout / aborted / error / partial_result 分支之前只 `enqueue(sse('error', ...))` 后 `return void`，外层 `main.ts:streamExternalDispatch` 完全感知不到远端失败——外层 `finally` 永远看到 `workflowFailed = false`，跑 `completeWorkflowRun` 写 `status: succeeded`，控制面板 / workflow / 审计会显示成功，但用户实际看到的是错误 SSE。这是 live 前阻断点（v3.6 workflow 外壳补了但终端语义没穿透）。修法选 A：
+  - 新增导出 `MavisStreamResult` 接口和 `MavisTerminalState` union（`finished` / `timeout` / `error` / `aborted` / `partial_result`）。
+  - `streamUntilFinish` 签名改为 `Promise<MavisStreamResult>`，每个 exit path（timeout / error / aborted / messages 拉取失败 / finished-but-no-text / happy path）都返回对应的 `{ terminal, errorCode?, errorShort? }`。
+  - `main.ts:streamExternalDispatch` 的 post-dispatch try 块捕获 `result.terminal`；若不是 `'finished'`，置 `workflowFailed = true` + 构造 `workflowFailureError = new Error('mavis executor 终态失败：${terminal}')`；外层 `finally` 看到 `workflowFailed` 走 `failWorkflowRun(workflowRun.id, workflowFailureError)`，**retryability 决策见 v3.8 段**——v3.8 把 `shouldAutoRetryWorkflowError(workflowFailureError)` 换成了显式 per-terminal map `isMavisTerminalAutoRetryable(terminal)`，**不**调 `completeWorkflowRun`。本句 v3.8 落地前的旧表述是 `failWorkflowRun + shouldAutoRetryWorkflowError 决定 requestWorkflowRetry`，已被 v3.8 覆盖。
+  - happy path（finished + text）返回 `{ terminal: 'finished' }`，workflow 仍然 `completeWorkflowRun`。
+  - judge / 不变量：terminal ∈ {timeout, error, aborted, partial_result} 的 turn 必须在 `workflow-runs.json` 写 `status: failed`，且 `run.error` 包含 `mavis executor 终态失败：<terminal>` 文本——面板从 `run.status` 配合 `run.error.message` 就能区分 terminal 类别。`StreamEvidence` / `flushWorkflowEvidence` 当前**不**写 `terminal` 字段（v3.7 段初版曾提"bridge-runtime-audit.json evidence 必须含 terminal 字段"，codex 10 轮 review 指出当前实现没有该字段，本轮改为只依赖 `workflow-runs.json` 的 status + error 文本，不扩大代码面）。如果以后想让 `bridge-runtime-audit.json` 也带 terminal，那是另一轮小改：扩 `StreamEvidence` + `flushWorkflowEvidence` + 加 unit test。测试在 `mavis-executor-provider.test.ts` 加 `streamUntilFinish — structured terminal state (v3.7 P1 fix)` 6 条 case（finished / timeout / aborted / error / partial_result-messages-throw / partial_result-no-text）；每个 test 用独立 sessionId（`bridge-v37-${n}`）避免 CTI_HOME 跨 test 共享 binding 让 preDispatch 误走 resume path 消费掉预设的 infoResponse。
+- **P2 `mavisReadOnly` 严格 sandbox（残留 P2）**：v3.6 的 allow-list + 扩 keyword 已经覆盖常见 case，但 prompt 启发式仍可能被 `修复 bug` / `实现功能` / `make it work` 这类抽象表达绕过去——`inferCapabilities` 推断不到 file_write / mcp_ops 时只会返回 `chat`，被 allow-list 接受。代码注释已明确「真正严密方案是给 Mavis CLI 传 read-only sandbox」——列为后续 P1 单独修复，与 v3.7 P1 解耦。如果 `mavisReadOnly` 要对外承诺安全，sandbox 应在 live 前补。
+
+外部 Agent Executor v3.8 修复（codex 10 轮 review 新增 P2）：
+
+- **P2 #1 streamExternalDispatch 显式 terminal → retryability map**：`mavis-executor-provider.ts` 新增导出 `MavisTerminalState` → `MAVIS_TERMINAL_AUTO_RETRYABLE: Readonly<Record<MavisTerminalState, boolean>>` 与纯函数 `isMavisTerminalAutoRetryable(terminal)`。`main.ts:streamExternalDispatch` 的 finally 块把 `shouldAutoRetryWorkflowError(workflowFailureError)` 换成 `isMavisTerminalAutoRetryable(terminal)`——`shouldAutoRetryWorkflowError` 是基于 error message 文本的黑名单启发式（usage limit / 401 / 405 / /v1/responses / invalid request parameter），**默认对未知错误返回 true**；v3.7 的 `new Error('mavis executor 终态失败：aborted')` 不在黑名单里，会返回 true 进入 `requestWorkflowRetry(..., 'auto')`，daemon 后续 claim 并重跑已取消的任务。
+  - **map 设计**（每个 terminal 显式决定，不走"未知默认可重试"的隐式逻辑）：
+    - `aborted` → **false**：用户/远端主动取消，重跑会绕过取消意图。
+    - `timeout` → **false**：`streamUntilFinish` 在 hard timeout 时已经 best-effort abort 远端 Mavis session；自动断点续跑会重新派发同一用户 turn，可能制造可见循环，因此只标记失败，交给用户手动 retry。
+    - `error` → **false**：远端 `status: error` 通常是 deterministic 失败（rate limit / content filter / tool exception），auto-retry 浪费 token；用户主动 retry 更安全。
+    - `partial_result` → **false**：status=finished 但 messages 拉取失败或 assistant 无文本，重跑拿到不同部分结果难以合并。
+    - `finished` → **false**：列出仅为完整性，caller 不应该传 finished 进 finally（会被短路到 `completeWorkflowRun`）。
+  - **TypeScript 不变量**：`MAVIS_TERMINAL_AUTO_RETRYABLE` 类型为 `Readonly<Record<MavisTerminalState, boolean>>`，新增 `MavisTerminalState` 成员时忘记更新 map 会**编译期报错**（drift guard 双保险，单元测试也加了一条 runtime 校验）。
+  - **判据 / 不变量**：`streamExternalDispatch` 永远不再调 `shouldAutoRetryWorkflowError` 走"未知默认 true"的隐式路径；retryability 决策必须经过 `isMavisTerminalAutoRetryable(terminal)`。测试：
+    - 单元（`mavis-executor-provider.test.ts`，4 case）：`aborted/timeout/error/partial_result/finished` 各 1 条 + map 完整性 drift guard + 不允许任何 terminal 默认自动重试
+    - 端到端 workflow 层（`hub-llm-provider.test.ts`，2 case）：构造真实 `HubLlmProvider` + mock `MavisExecutorProvider` 让 `streamUntilFinish` 返回 `{terminal: 'aborted'/'timeout'}`，调 `streamChat` 消费 stream，读 `${CTI_HOME}/runtime/workflow-runs.json` 验证 `run.status` 与 `run.retry.status`：
+      - `aborted` → `run.status='failed'` 且 `run.retry.status !== 'auto_pending'/'manual_pending'/'retrying'`
+      - `timeout` → `run.status='failed'` 且 `run.retry.status !== 'auto_pending'/'manual_pending'/'retrying'`
+  - **附带改动**：`main.ts` 末尾加 `isEntryPoint` guard（`import.meta.url === pathToFileURL(process.argv[1]).href`）——只有直接跑 `tsx src/main.ts` 时才调 `main().catch(...)` 启 bridge；test 里 `await import('../main.js')` 不会触发桥接启动。同时 `export { HubLlmProvider }` 让 `hub-llm-provider.test.ts` 能在不破坏生产代码结构的前提下构造 HubLlmProvider 做端到端验证。
+
+外部 Agent Executor v3.9 来源可观测与面板默认来源（2026-06-29）：
+
+- `CTI_DEFAULT_EXECUTOR_ID` 是通用全局默认 executor 配置，可写 `codex`、`claude-cli`、`mavis-agent` 等 registry 已知 executor id；`loadConfig` / `saveConfig` 只接受规范化的小写 id，不为某个外部 agent 写死特例。该配置由控制面板“执行器”页的“设为默认 / 恢复自动”按钮和设置页“AI 执行与模型来源”统一写入。
+- `executor-registry.ts:resolveRequestedExecutorId(config, prompt, sessionDefaultId)` 是唯一请求级 executor 默认解析入口，优先级固定为 `@hint > CTI_DEFAULT_EXECUTOR_ID > sessionDefault > auto`。旧 `executor.setSessionDefault` 和 `mavisDefaultExecutor` 仅作为兼容来源保留；不再要求用户通过命令才能切换长期默认执行器。
+- runtime 在 external dispatch 开始时发送 `status` SSE，包含 `executorId`、`executorName`、`executorKind` 以及 manifest 暴露的模型字段；pre-dispatch 回落 Codex 时会补发 Codex 的来源状态，避免 Feishu 最终卡片误显示为外部 agent 已执行。
+- `StreamEvidence`、`workflow-runs.json.execution` 与 `RunSummary` 现在保留 executor 来源字段。Feishu final card 底部按 `来源：executorName (executorId)` 与 `模型：model` 分开展示；只有模型字段真实存在时才显示模型，避免把 `mavis-agent` 误当成模型名。
+- 控制面板执行器页读取 `executor-status.json.defaultExecutorId` 和配置快照，行内标记当前默认来源，详情区提供“设为默认”和“恢复自动”。设置页标题从“Codex CLI 模型来源”收口为“AI 执行与模型来源”，同页同时处理 executor 来源和 Codex 模型来源。
+
+外部 Agent Executor v3.10 Windows CLI shim（2026-06-30）：
+
+- `mavis-cli-client.ts` 是唯一启动 Mavis CLI 的封装层。Windows 上如果 `CTI_MAVIS_CLI_PATH` 指向 `.cmd` 或 `.bat` shim，client 通过 `ComSpec` 包装为 `cmd.exe /d /s /c <cliPath> ...args`；普通可执行文件和非 Windows 平台仍直接 spawn。这个规则只处理进程启动兼容性，不改变 executor 选择、session binding、secret 记录或 post-dispatch 禁止回落语义。
+- 判据：`mavis.cmd status` 能通过 `createMavisClient(...).status()` 返回 JSON；若后续仍回落 Codex，workflow events 必须记录新的真实 pre-dispatch 错误，而不是 `spawn EINVAL`。
+
+外部 Agent Executor v3.11 Mavis CLI 位置参数（2026-06-30）：
+
+- 当前安装的 Mavis CLI 将 agent 声明为位置参数：`mavis session list [agentId]` 与 `mavis session new [options] <agent>`。`mavis-cli-client.ts` 统一通过 `buildMavisListSessionsArgs` / `buildMavisCreateSessionArgs` 构造这两条命令；禁止在封装层继续拼旧版 `--agent`，否则会在 pre-dispatch 阶段被 CLI 拒绝并回落 Codex。
+- 判据：`createMavisClient(...).listSessions('mavis')` 能读到本机 Mavis 会话；`createSession({ agent:'mavis', from:'root', ... })` 能创建 `mvs_...` 会话并通过 `messages()` 读到 MiniMax 模型返回。Feishu 卡片显示的“来源”永远以最终实际执行链为准：pre-dispatch 回落后显示 Codex，Mavis 接单成功后显示 Mavis。
+
+外部 Agent Executor v3.12 Mavis CLI 状态归一化（2026-06-30）：
+
+- 当前 Mavis CLI 的 `session info/list` 将状态返回为对象（`status.type`），时间字段返回为毫秒时间戳。`mavis-cli-client.ts` 通过 `asMavisStatus` / `asTimestampString` 在封装层归一化为 `started` / `finished` / `error` / `aborted` 等字符串和可 `Date.parse` 的时间；`mavis-executor-provider.ts:streamUntilFinish` 只消费归一化后的字段。
+- 判据：真实 `mvs_...` session 的 `{status:{type:'started'}}` 不得被误读为 `idle`；`finished` 必须能触发 messages 拉取和最终回复，而不是一路轮询到 timeout。
+
+外部 Agent Executor v3.13 Mavis 完成证据与续聊 sender（2026-06-30）：
+
+- `mavis-executor-provider.ts:streamUntilFinish` 轮询时不再只等待 `session.status === 'finished'`。真实 Mavis 会先写入 assistant `msg_type=1` 文本，再延迟刷新 session status；因此 post-dispatch 每轮同时 best-effort 拉取 `messages(limit=50)`，只要本轮 cursor 之后出现 assistant 文本，就把该消息集缓存为完成证据并进入最终 text/diff/result 收口。status 仍负责 `error` / `aborted` / hard timeout，消息窥探失败不改变原轮询路径。
+- 活动时间取 `lastActiveAt` 与 `updatedAt` 中较新的一个，避免 `lastActiveAt` 停在用户消息时间、`updatedAt` 已推进到远端活动时误触 quiet timeout。
+- resume path 在发送新 prompt 前会 best-effort 读取当前 Mavis 会话尾部消息，把 `lastSeenMessageId` / `lastSeenMessageTimestamp` / `lastUserMessageTimestamp` 作为本轮游标基线写入 binding；这样上一轮 timeout 后迟到的 assistant 文本不会在下一轮被误当成本轮回复。
+- 续聊 `communicationSend` 支持通用配置 `CTI_MAVIS_BRIDGE_SESSION_ID`（alias：`MAVIS_BRIDGE_SESSION_ID`，仅 load 兼容；`saveConfig` 只写主命名）。当 bridge daemon 进程没有继承 `$__MAVIS_PARENT_SESSION_ID` 时，用该 Mavis sender session 调 `communication send --from ... --to <mvsSessionId>`；仍禁止传 bridge sessionId。
+- 判据：MiniMax 已在 Mavis messages 中返回 assistant 文本但 status 尚未翻 `finished` 时，Feishu 不得先报“模型没有返回可展示结果”；已有 binding 的下一轮 prompt 不得因缺少 `--from` 回落 Codex。
+
+外部 Agent Executor v3.14 Mavis communication 回复采集（2026-07-01）：
+
+- Mavis 续聊走 `communication send` 后，真实回答不一定落成目标 session 的普通 assistant `msg_type=1` 文本；MiniMax Code 可能先把答复写入 `mavis communication messages --from <targetMvsSessionId> --to <bridgeSenderSessionId>` 的出站记录。即使该出站记录因为源 session 已 archived 而标记 `status=failed`，`content` 仍是本轮应交付给 Feishu 的用户可见结果。
+- `mavis-cli-client.ts` 增加 `communicationMessages({ from, to, limit, status })` 读取封装，参数构造集中在 `buildMavisCommunicationMessagesArgs`。`mavis-executor-provider.ts:streamUntilFinish` 在普通 `messages(limit=50)` 窥探之外，best-effort 拉取 `status=all` 的 communication 出站记录，并按 `from_session === binding.mvsSessionId`、`to_session === CTI_MAVIS_BRIDGE_SESSION_ID`、`command === 'prompt'`、`content` 非空、`lastDispatchAt/lastSeenCommunication*` 之后这几个通用条件过滤。
+- `mavis-session-bindings.json` 新增 `lastSeenCommunicationId` / `lastSeenCommunicationTimestamp` 游标，只记录 id 与时间，不记录 communication 原文、错误栈、secret 或 diff。普通 session message 游标和 communication 游标相互独立，避免上一轮迟到 assistant 或旧 communication 回复被下一轮复用。
+- `quietTimeoutMs` 改为软空闲信号：超过 quiet 窗口只做轮询退避，不再立即 `abort` 并返回 timeout；只有 `hardTimeoutMs` 到达后才 best-effort 发送 `communication abort` 并进入 `terminal=timeout`。这保证 Mavis 已经接单但状态字段停止更新时，Feishu 卡片不会抢先报“模型没有返回可展示结果”。
+- 判据：Mavis UI 已显示 reply/communication send 但 Feishu 卡片为空时，provider 必须能从 communication 出站记录收口为 `text` SSE；同一 binding 的旧 communication id/timestamp 不得被再次交付；quiet timeout 之后、hard timeout 之前到达的 communication 回复仍应完成本轮。
+
+外部 Agent Executor v3.15 Mavis SSE 收口（2026-07-01）：
+
+- `mavis-executor-provider.ts` 的 post-dispatch 结果已经能从普通 session messages / communication 出站记录拿到 `finalText` 后，必须通过 bridge 标准 SSE envelope 外发：`data: {"type":"text","data":"..."}`。禁止在 provider 内手写另一套 `event: text` + `data: {"text":...}` 形状；bridge-core 的 `consumeStream` 只消费统一 envelope，非标准形状会导致 binding 已记录 `lastFinalText`，但 Feishu 最终卡片仍因 `responseText` 为空显示“模型没有返回可展示结果”。
+- Mavis provider 的 `sse(event, data)` 现在统一代理到 `sse-utils.ts:sseEvent`；最终 assistant 文本以字符串 data 发出，`status` / `tool_use` / `tool_result` / `result` 等结构化事件仍由 `sseEvent` 负责 JSON 序列化。新增回归断言 `mavis-executor-provider.test.ts` 中成功文本必须能解析成 bridge 标准 `text` event，避免后续 provider 再绕开统一 SSE 协议。
+
+外部 Agent Executor v3.16 归档 sender 防护（2026-07-01）：
+
+- `mavis-cli-client.ts` 在 `createSession()` / `info()` 的 session 归一化结果中保留 `compressed?: boolean`。Mavis CLI 用该字段表示 session 已归档/压缩；这种 session 仍可能 `status=finished`，但不能作为 `communication send --from` 的可回收件地址。
+- `mavis-executor-provider.ts:preDispatch` 的 resume path 在确认目标 `mvsSessionId` 存在后，会调用 `resolveBridgeSenderForResume()` 校验 `CTI_MAVIS_BRIDGE_SESSION_ID`：缺省时仍沿用旧行为（不传 `from`，交给 Mavis CLI 环境兜底）；配置存在时必须形态合法、`info()` 可读且 `compressed !== true`。若 sender invalid / unavailable / archived，则删除旧 binding 并走 `session new --from root`，不再调用 `communicationSend`。
+- 设计取舍：归档 sender 下强行续聊会让目标 MiniMax/Mavis agent 把 Feishu prompt 当成“来自另一个 Mavis session 的请求”，随后尝试把答案回报给已归档 source，造成长时间等待和“session 已归档、发不出去”的元信息。新建普通 Mavis session 会牺牲旧 target session 的内部连续性，但 bridge 仍会注入必要上下文，且能优先保证 Feishu 用户收到真实可见答案。
+- 判据：配置的 sender 被 Mavis 标记 `compressed: true` 时，provider 不得调用 `communicationSend({ from: archivedSender, ... })`；必须创建新的 `mvs_...` session 并更新 `mavis-session-bindings.json`。测试覆盖归档 sender、`compressed` 归一化和坏 sender 不进入 communication resume。
+
+外部 Agent Executor v3.17 Windows shim argv 防护（2026-07-01）：
+
+- `mavis-cli-client.ts:buildMavisSpawnSpec` 对 Windows `.cmd/.bat` CLI 路径增加可解析 shim 的直连分支：若批处理只设置环境变量并把 `%*` 转发给真实 executable/script（例如 Electron/Node CLI shim），runtime 会读取该 shim，保留 `set KEY=VALUE` 环境变量，然后直接 `spawn(realExe, [script, ...args])`。无法解析的自定义 `.cmd/.bat` 仍回退到旧的 `ComSpec /d /s /c <cliPath> ...args` 路径。
+- 根因：飞书图片/表情 prompt 会包含换行或附件描述；批处理里的 `%*` 会让 Windows shell 对参数做二次解析，可能把多行 prompt 截断，导致 `mavis session new [options] <agent>` 收不到最后的 `agent` 位置参数，pre-dispatch 报 `missing required argument 'agent'` 后诚实回落 Codex。直连真实 exe 后，prompt 仍作为单个 argv 传入，不再经过 batch `%*`。
+- 判据：多行 prompt 通过 `.cmd` shim 时，`buildMavisSpawnSpec` 必须产出真实 executable、script 前缀参数和原始 `hello\r\nworld` argv；只有不可解析 shim 才允许走 `cmd.exe` fallback。测试覆盖可解析 shim、未知 shim fallback 和普通 executable 直连。
+
+外部 Agent Executor v3.18 图片/表情附件桥接（2026-07-01）：
+
+- `mavis-executor-provider.ts` 在 pre-dispatch 阶段统一处理 `StreamChatParams.files` 中的 `image/*` 附件；新建 session 与续聊 `communicationSend` 均调用同一套附件物化逻辑，避免一条路径能看图、另一条路径退化成 file_key 文本。
+- 当前 Mavis CLI 的 `session new --prompt` 和 `communication send --content` 只提供文本入口，没有原生附件参数。因此 bridge 会把图片/表情包落成工作区内 `.codepilot-uploads/mavis-input` 文件，再把绝对本地路径附到 prompt 中，并明确要求 Mavis 使用可用的视觉工具（如 `matrix_describe_images`）读取该路径，而不是根据 file_key 猜测图像内容。
+- 安全边界：如果上游已经提供工作区内 `filePath`，provider 直接复用；如果 `filePath` 指向工作区外但可读，先复制进当前工作区再暴露给 Mavis；如果没有 `filePath`，用 base64 `data` 重建文件。Mavis prompt 中只出现工作区内可读路径，不把任意外部路径直接交给 external agent。
+- 判据：飞书图片/表情包由 `mavis-agent` 执行时，MiniMax Code 端应看到 `Bridge-provided local input files` 与 `Local path: ...`，并能基于真实图片路径调用视觉工具；不能只收到“用户发送了一个飞书表情包，file_key=...”这类纯文本提示。测试覆盖 base64 落盘、工作区路径复用、工作区外路径复制和 resume path 附件传递。
+
+外部 Agent Executor v3.19 可见进度与来源会话连续性（2026-07-01）：
+
+- `bridge-core` 的 `StreamChatParams` 现在携带 `sourceChannelType/sourceChatId/sourceThreadId`，`bridge-manager` 从入站地址传入来源身份；`mavis-session-bindings.json` 继续以 bridge session id 为主键，但 binding 会额外保存通用来源通道 / chat / thread 以及 Feishu 兼容别名。`mavis-session-store.ts:findBindingBySource()` 用这些字段查找最新 binding，不把逻辑写死到某个飞书消息文本或某个 Mavis session。
+- `mavis-executor-provider.ts:preDispatch` 的续接顺序是：先按当前 bridge session id 精确命中，再按来源通道 / chat / thread 续接；若按来源找到旧 binding，会把它迁移到新的 bridge session id 后再 dispatch。这样 live 同步、fingerprint 改变、CodePilot 会话重绑或内部 session id 变化时，同一飞书会话仍优先复用原 Mavis session，避免每段对话都新建上下文。
+- `streamUntilFinish()` 会把 Mavis 轮询到的工具阶段和可展示 `thinking_content` 归一化为脱敏 `progress` SSE；最终 `msg_content` 或 communication 出站正文拆成多个 `text` SSE chunk，并限制最大 chunk 数和小延迟，给 Feishu CardKit 留出可见打字机刷新窗口。该链路只展示用户可见处理过程和工具进展，不外发 secret、原始协议 JSON、未脱敏日志或不适合群聊的调试内容。
+- Feishu workflow card 的等待态会同时保留固定 workflow 步骤和 provider 传来的具体 progress detail；当 Mavis 正在思考或调用工具时，卡片不再被“正在回复...”这类静态文案遮住。测试覆盖 source chat 续接、Mavis progress 外显、最终文本分块和 progress card 步骤/细节并存。
+
+```mermaid
+flowchart TD
+  Hub[HubLlmProvider.streamChat] --> BuildReq[构造 ExecutorRequest<br/>requestedExecutorId = hint ?? defaultExecutor ?? sessionDefault ?? auto]
+  BuildReq --> Reg[ExecutorProviderRegistry.resolveForRequest]
+  Reg --> Sel[selectExecutor via buildExecutorManifests]
+  Sel -->|external executor id| Ext[MavisExecutorProvider.preDispatch]
+  Sel -->|codex/claude/oss-ollama| Default[defaultProvider / Codex 主链]
+  Ext -->|pre-dispatch 失败| Fallback[回落 Codex]
+  Ext -->|pre-dispatch 成功| Post[streamUntilFinish poll + diff]
+  Post -->|status=finished| Emit[emit text / diff / result]
+  Post -->|status=aborted/error/timeout| NoFall[禁止回落<br/>emit error SSE]
+  Fallback --> Default
+```
 
 路由规则：
 
 - `@codex`、`@claude`、`@local`、`@本地`、`@ollama`、`@codex-oss` 显式覆盖当前会话路由；`@local` / `@本地` 现在指向 `codex`，语义是本轮 Codex 使用 `local_api` 模型来源，不再进入独立 `codex-local-fallback` 执行器。
-- 控制面板可按 session 写入默认 executor。
+- 控制面板可写入全局默认 executor；旧 session 默认只作为兼容 fallback，优先级低于全局默认。
 - 没有显式覆盖时，按 capability、executor priority 和当前真实 provider 偏好做自动选择。
 - 本地 agent 的历史工具边界仍由 `ToolSandboxPolicy` 声明，但不再参与 Codex CLI 模型来源切换；本地 API 作为 Codex 模型来源时承接同等 Codex agent 工具能力。
 - Feishu 轻聊天新增 `light_chat` prompt profile：当 reply surface 为轻量状态、`ExecutionRequirement.kind=none`、无附件/工具/图片理解/文档/仓库意图且输入较短时，runtime 先用本地或低成本 provider 处理；本地不可用时仍回退 official Codex，但只传 assistant 身份、Feishu emoji/sticker 策略、轻量回复契约、必要的 `Feishu recent conversation context` 和最近 0-2 条历史，不再携带 workspace、MCP、Unity、文件产物等长上下文。该路径写入 route summary 和 `WorkflowRun.execution.promptProfile=light_chat`；复杂任务继续走原 Codex / JSON 工具证据链。
@@ -322,7 +458,7 @@ flowchart TD
 - Ignis 模型生成如果明确要求拆成 FBX/贴图，会在 GLB 下载完成后调用 `scripts/export-glb-asset-package.ps1`，输出 FBX、贴图、材质映射和 manifest，并通过 `cti-final.files` 回传不超过飞书限制的文件。
 - 本地模型默认仍使用 Ollama，默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`；也可以通过 `CTI_LOCAL_AI_KIND`、`CTI_LOCAL_AI_BASE_URL`、`CTI_LOCAL_AI_MODEL`、`CTI_LOCAL_AI_API_KEY` 和 `CTI_LOCAL_AI_TIMEOUT_MS` 切到 LM Studio、vLLM 或其他 OpenAI-compatible Chat Completions 服务。旧 `llama.cpp` server、GGUF 路径和 `127.0.0.1:8080` 默认地址不再是运行来源。
 - 扩展目录会把 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b` 标为本地工具候选，安装后仍必须先跑工具探测；默认 `qwen2.5-coder:7b` 定位为文本、总结和保守兜底，不宣称可稳定执行工具。
-- 设置页“Codex CLI 模型来源 -> 本地 API -> 模型”会读取控制面板在线扩展目录中的 Ollama 模型条目作为可选候选，并额外显示本机已安装模型下拉；选择后可直接保存并重启 Bridge。用户仍可手动输入任意 Ollama 模型名，避免新增模型时再改运行时路由。
+- 设置页“AI 执行与模型来源 -> Codex 模型来源 -> 本地 API -> 模型”会读取控制面板在线扩展目录中的 Ollama 模型条目作为可选候选，并额外显示本机已安装模型下拉；选择后可直接保存并重启 Bridge。用户仍可手动输入任意 Ollama 模型名，避免新增模型时再改运行时路由。
 - 截至 2026-06-05，`settings.saveAndRestartBridge` 会先保存 `CTI_CODEX_MODEL_SOURCE`、`CTI_CODEX_ROUTING_MODE`、`CTI_CODEX_API_FALLBACK_CHAIN` 和 `CTI_LOCAL_AI_*`。如果手动来源是 `local_api`，或自动切换链包含 `local_api`，宿主会先准备本地 API 后端再重启 Bridge；Ollama 通过 `scripts/local-llm/start-local-llm.ps1` 启动或复用服务并继承模型目录，非 Ollama 本地后端只做健康探测并记录状态。
 - 扩展页的 Ollama 模型安装走控制面板后端 job：`extension.model.install.start` 启动 `ollama pull`，`extension.installJobs` 轮询进度，`extension.model.install.cancel` 暂停当前拉取，`extension.model.remove` 执行 `ollama rm`，`extension.model.use` 写入本地模型配置并重启 Bridge。模型目录通过 `CTI_OLLAMA_MODELS_DIR` / `OLLAMA_MODELS` 持久化，受控启动的 Ollama 进程会继承该目录。
 
@@ -370,7 +506,7 @@ flowchart TD
 - 群聊 reply 时可自动 @ 提问人。
 - 群聊 mention 判定优先使用事件 `mentions`，事件缺字段时再解析正文里的飞书 at 标记，避免“已 @ 机器人但消息未入会话”。
 - Feishu Markdown 默认走 card。
-- Feishu streaming card 等待态只展示当前一步用户可见思考动作：卡片正文由彩色阶段标题、灰色小字正文和通用阶段轨迹组成，随着模型/provider progress、记忆证据、工具事件或收口阶段刷新，不累计历史步骤，不写入最终回复或会话历史。
+- Feishu streaming card 等待态只展示当前一步用户可见思考动作：卡片正文由彩色阶段标题、灰色小字正文和通用阶段轨迹组成，随着模型/provider progress、记忆证据、工具事件或收口阶段刷新，不累计历史步骤，不写入最终回复或会话历史。workflow 固定步骤和 provider 细节可同时展示；当 provider 已给出更具体的进度内容时，不用“正在回复...”这类泛化文案遮住它。
 - Feishu streaming card 会在 adapter 侧做增量刷新：每个新思考动作先显示题头，再逐步补齐灰色正文，形成可见的打字机效果；如果下一步到来，会取消上一轮增量刷新并切到新内容。
 - Feishu adapter 启动时会通过 `/bot/v3/info` 读取机器人身份，保存 `open_id/bot_id` 用于 mention 识别，并提取 `name/app_name/i18n_name` 作为本通道的助手显示名。bridge-core 会把该显示名作为高优先级 system context 注入本轮 provider，并放在 system prompt 前部，避免 provider 截断长系统提示时丢失渠道身份。用户问“你是谁 / 自我介绍”时，机器人以飞书应用名作为自己的名字，`Codex` 只作为底层执行引擎说明，不再默认自称 Codex。普通聊天、自我介绍、问候和确认不再走 bridge-core 本地硬编码秒答，而是统一进入配置的 provider/API 模型，由模型结合通道身份和上下文生成回复。
 - Feishu 群聊和其他共享会话仍按 session lock 串行处理普通消息；截至 2026-06-05，如果同一 session 已有未完成请求，新消息入队时会先发送一条可见确认，说明上一条还在处理且会按顺序继续回复。这条确认不替代最终回复，也不改变 provider 执行顺序。
@@ -418,6 +554,7 @@ flowchart TD
 
 关键能力：
 
+- 默认执行器来源由 `CTI_DEFAULT_EXECUTOR_ID` 控制；面板“执行器”页可把任一已启用 executor 设为默认或恢复自动，设置页“AI 执行与模型来源”也可选择默认 executor。请求级优先级为显式 `@hint` 高于全局默认 executor，高于兼容的 session default，再进入自动选择。
 - Codex CLI 主模型来源由 `CTI_CODEX_MODEL_SOURCE` 控制，可选官方 Codex、本地 API 或外部 API；本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_*`。
 - Codex CLI 模型来源由 `CTI_CODEX_ROUTING_MODE`、`CTI_CODEX_MODEL_SOURCE` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制；本地 API / 外部 API / 官方 Codex 都是同一个 Codex agent 的模型来源。自动切换只在模型/API 层失败后按链尝试，链里没有 `official` 时不会调用官方 Codex。
 - 记忆索引分五层：Markdown 知识库索引、当前会话压缩摘要、按人/按聊天/全局 profile、Feishu 历史片段、`audit.json` 已发结果。运行时按本轮 `memoryMode` 决定是否生成 `MemoryQueryPlan`：普通聊天默认 `off`，不预跑记忆检索；明确回忆请求为 `recall`，工具、Unity/MCP、文件等执行类请求可用 `augment` 少量补充上下文。检索结果会标注来源、置信度、可回答性、质量和结构化 key/value；模型上下文只注入检索命中的少量片段，当前请求始终优先。
@@ -527,12 +664,12 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 通过“设置”弹窗修改非敏感路径配置和回复风格配置。
 - 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
 - WebView 会话列表会合并 `bindings.json`、`sessions.json`、Feishu chat index 和 `feishu-history-index.json`：`localMessageCount` 表示本地 bridge session 消息数，`remoteMessageCount` 表示已同步的飞书远端历史条数；来源标签按远端当前可见、本地绑定和远端历史索引统一推导，避免把已有远端历史误显示成“仅本地”。
-- 查看 workflow run、executor 目录、最近路由选择和会话默认 executor。
+- 查看 workflow run、executor 目录、最近路由选择、全局默认 executor 和兼容的会话默认 executor。
 - 查看节点拓扑、heartbeat、capability inventory 和 fake remote node 状态。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
 - 查看可操作系统蓝图、记忆关系树、记忆整理草稿、索引来源总览、记忆知识库索引状态、监听状态、关键词搜索、来源分组筛选、分页列表和来源片段；专业网格和关系缓存细节默认收进高级诊断。
-- 通过“Codex CLI 模型来源”配置和测试官方 Codex、本地 API 或外部 API 主模型；常用模式只展示策略、服务、模型和地址，高级字段折叠保留。API key 只写入本机 `config.env`，Web 状态只返回是否已设置和掩码。
+- 通过“AI 执行与模型来源”配置默认 executor，并配置和测试官方 Codex、本地 API 或外部 API 主模型；常用模式只展示策略、服务、模型和地址，高级字段折叠保留。API key 只写入本机 `config.env`，Web 状态只返回是否已设置和掩码。
 
 截至 2026-05-16，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
 
@@ -576,7 +713,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 回复风格预设通过 `settings.listReplyPresets` / `settings.applyReplyPreset` / `settings.summarizeReplyStyle` 暴露给 WebView，继续沿用宿主保存语义。
 - WebView 命令入口执行“一键发布”和“主干发布预检”时不再依赖 WinForms 原生确认框；桌面工具栏保留确认框。发布脚本非零退出会作为命令错误返回前端，避免发布失败被误显示为完成。
 - Ollama 状态卡只展示当前 daemon 生命周期内的最近路由；bridge 重启时会清掉旧的 fallback / refusal 瞬时状态，避免把历史 `usage limit` 或旧兜底信息当成当前异常。
-- bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录和会话默认 executor，不再把缺失状态文件误解为辅助器异常。
+- bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录、全局默认 executor 和兼容的会话默认 executor，不再把缺失状态文件误解为辅助器异常。
 - “节点”页通过 `nodes.list` 读取本机 node snapshot。第一阶段固定展示 `local` runtime node 和可关闭的 `fake-remote` node，用于验证多节点控制面模型、capability inventory、heartbeat 和可管理状态；当前页面只读，不向远端 node 下发动作。
 - “总览”页的系统蓝图只用“正常 / 需要处理 / 未启用”展示用户入口、Bridge 收发、AI 执行、MCP/记忆/提醒辅助和最终回复链路；AI 执行节点按“Codex agent + 模型来源/自动切换链”口径解释当前状态，不再把本地 API 展示成独立兜底执行器。当前蓝图已重构为“主链路 / 辅助能力 / 处理面板”的两段式导航：上半部分负责快速定位节点状态与入口，下半部分集中承载主动作、跳转和不可用原因，仍复用 `runtime.invokeAction` 和现有页面跳转来检查状态、启动/重启服务、处理 MCP、刷新记忆或进入设置，避免普通用户先看到内部协议字段。
 - “记忆”页第一屏优先展示关系树，左侧按来源把普通记忆、生成摘要、上下文/索引资料分组；显式记忆和直接提醒默认展开，`AI_BRIDGE_CONTEXT.md`、根目录笔记、文档索引和生成摘要默认降级到折叠分组。右侧围绕选中的知识单元展开对应内容、相关对象、待办提醒、可能冲突和来源文件；树内提供“生成整理草稿”主入口。原始知识单元表、相关对象表、联系表、路径、权重和答案审查 warning 保留在默认收起的高级诊断里。
@@ -826,6 +963,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `CTI_LOCAL_AI_KIND`：`ollama`、`lmstudio`、`vllm`、`openai-compatible` 或 `custom`。
 - `CTI_LOCAL_AI_BASE_URL` / `CTI_LOCAL_AI_MODEL` / `CTI_LOCAL_AI_API_KEY` / `CTI_LOCAL_AI_TIMEOUT_MS`：本地 AI 请求入口、模型、可选 Bearer key 和超时。
 - `CTI_CODEX_ROUTING_MODE`：`manual` 或 `auto_failover`，决定手动来源还是自动切换链。
+- `CTI_DEFAULT_EXECUTOR_ID`：全局默认 executor id。为空时按显式 hint、兼容 session 默认和自动选择；非空时优先于历史会话默认值，低于本轮 `@codex` / `@mavis` 等显式 hint。
 - `CTI_CODEX_MODEL_SOURCE`：`official`、`local_api` 或 `external_api`，手动模式下决定 Codex CLI 模型来源。
 - `CTI_CODEX_API_FALLBACK_CHAIN`：自动切换模式下的来源顺序，默认 `local_api,external_api`；只有显式包含 `official` 才允许调用官方 Codex。
 - `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用，最多保留 2 条短历史，输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。`CTI_FEISHU_LIGHT_CONTEXT_LIMIT` / `bridge_feishu_light_context_limit` 控制 Feishu 群聊轻量上下文补捞数量，默认 6 条、最大 12 条，只用于被 @ 或回复触发的短接话上下文。
@@ -836,7 +974,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `CTI_MEMORY_OPTIMIZER_ENABLED` / `CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS` / `CTI_MEMORY_OPTIMIZER_MODEL_SOURCE`：控制记忆定期整理草稿，默认关闭、7 天、`codex_primary`。
 - `CTI_OLLAMA_*` 保留兼容；未设置 `CTI_LOCAL_AI_*` 时继续作为默认值来源。
 
-旧 `CTI_LOCAL_LLM_SERVER_EXE`、`CTI_LOCAL_LLM_MODEL_PATH`、`CTI_LOCAL_LLM_SERVER_ARGS`、`llama-server.exe` 和 GGUF 路径配置已废弃。`CTI_LOCAL_LLM_*` 中的路由键暂时保留为兼容项；用户可见配置统一通过面板“Codex CLI 模型来源”写入官方 Codex、本地 API、外部 API或自动切换链。
+旧 `CTI_LOCAL_LLM_SERVER_EXE`、`CTI_LOCAL_LLM_MODEL_PATH`、`CTI_LOCAL_LLM_SERVER_ARGS`、`llama-server.exe` 和 GGUF 路径配置已废弃。`CTI_LOCAL_LLM_*` 中的路由键暂时保留为兼容项；用户可见配置统一通过面板“AI 执行与模型来源”写入默认 executor、官方 Codex、本地 API、外部 API或自动切换链。
 
 Ignis 会话映射：
 

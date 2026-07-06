@@ -214,6 +214,9 @@ export interface RunTokenUsage {
 }
 
 export interface RunSummary {
+  executorId?: string;
+  executorName?: string;
+  executorKind?: string;
   provider?: string;
   modelSource?: string;
   selectedSource?: string;

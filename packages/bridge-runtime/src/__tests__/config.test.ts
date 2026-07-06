@@ -271,6 +271,7 @@ describe('configToSettings', () => {
       codexModelSource: 'external_api',
       codexRoutingMode: 'auto_failover',
       codexApiFallbackChain: ['local_api', 'external_api'],
+      defaultExecutorId: 'mavis-agent',
       memoryOptimizerEnabled: true,
       memoryOptimizerIntervalDays: 7,
       memoryOptimizerModelSource: 'codex_primary',
@@ -294,6 +295,7 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_codex_model_source'), 'external_api');
     assert.equal(m.get('bridge_codex_routing_mode'), 'auto_failover');
     assert.equal(m.get('bridge_codex_api_fallback_chain'), 'local_api,external_api');
+    assert.equal(m.get('bridge_default_executor_id'), 'mavis-agent');
     assert.equal(m.has('bridge_codex_local_fallback_enabled'), false);
     assert.equal(m.has('bridge_codex_local_fallback_reasoning_effort'), false);
     assert.equal(m.has('bridge_codex_failure_fallback_mode'), false);
@@ -416,6 +418,8 @@ describe('loadConfig/saveConfig round-trip', () => {
         'CTI_CODEX_REASONING_EFFORT=medium',
         'CTI_CODEX_INHERIT_GLOBAL_MCP=true',
         'CTI_CODEX_MODEL_SOURCE=external_api',
+        'CTI_DEFAULT_EXECUTOR_ID=mavis-agent',
+        'CTI_MAVIS_BRIDGE_SESSION_ID=mvs_parent',
         'CTI_CODEX_LOCAL_FALLBACK_ENABLED=true',
         'CTI_CODEX_LOCAL_FALLBACK_REASONING_EFFORT=low',
         'CTI_CODEX_FAILURE_FALLBACK_MODE=local_agent',
@@ -445,6 +449,8 @@ describe('loadConfig/saveConfig round-trip', () => {
       assert.equal(config.codexReasoningEffort, 'medium');
       assert.equal(config.codexInheritGlobalMcp, true);
       assert.equal(config.codexModelSource, 'external_api');
+      assert.equal(config.defaultExecutorId, 'mavis-agent');
+      assert.equal(config.mavisBridgeSessionId, 'mvs_parent');
       assert.equal('codexLocalFallbackEnabled' in config, false);
       assert.equal('codexLocalFallbackReasoningEffort' in config, false);
       assert.equal('codexFailureFallbackMode' in config, false);

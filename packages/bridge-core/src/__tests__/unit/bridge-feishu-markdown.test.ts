@@ -111,6 +111,8 @@ describe('Feishu streaming card markdown', () => {
 
   it('renders model and token usage in the final card footer when provided', () => {
     const card = JSON.parse(buildFinalCardJson('处理结果\n已完成。', [], { status: '已完成', elapsed: '1.2s' }, {
+      executorId: 'codex',
+      executorName: 'Codex CLI / SDK',
       provider: 'codex',
       modelSource: 'official',
       model: 'gpt-5',
@@ -126,9 +128,26 @@ describe('Feishu streaming card markdown', () => {
     const footer = (card.body?.elements || []).find((element) => String(element.content || '').includes('Token'));
 
     assert.equal(footer?.text_size, 'notation');
+    assert.match(String(footer?.content || ''), /来源：Codex CLI \/ SDK \(codex\)/);
     assert.match(String(footer?.content || ''), /模型：gpt-5 \(official\)/);
     assert.match(String(footer?.content || ''), /Token：输入 12,345 \/ 输出 678/);
     assert.match(String(footer?.content || ''), /Cache：读 2,048 \/ 写 128/);
+  });
+
+  it('renders external executor source without requiring a model label', () => {
+    const card = JSON.parse(buildFinalCardJson('处理结果\n已交给外部执行器。', [], { status: '已完成', elapsed: '2.4s' }, {
+      executorId: 'mavis-agent',
+      executorName: 'Mavis Agent (mavis)',
+      executorKind: 'agent',
+      provider: 'mavis-agent',
+    })) as {
+      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+    };
+    const footer = (card.body?.elements || []).find((element) => String(element.content || '').includes('来源'));
+
+    assert.equal(footer?.text_size, 'notation');
+    assert.match(String(footer?.content || ''), /来源：Mavis Agent \(mavis\) \(mavis-agent\)/);
+    assert.doesNotMatch(String(footer?.content || ''), /模型：/);
   });
 
   it('keeps generated final card titles complete instead of clipping to a short prefix', () => {

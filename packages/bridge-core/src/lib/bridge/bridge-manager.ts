@@ -1196,6 +1196,15 @@ function sanitizeProgressCardDetail(text: string): string {
   return normalized.length > 900 ? `${normalized.slice(0, 897)}...` : normalized;
 }
 
+function buildProgressCardTextForStreaming(step: string | undefined, detailText: string): string {
+  const normalizedStep = (step || '').replace(/\s+/g, ' ').trim();
+  const detail = sanitizeProgressCardDetail(detailText);
+  if (normalizedStep && detail && detail !== normalizedStep) {
+    return `${normalizedStep}\n\n${detail}`;
+  }
+  return normalizedStep || detail || '正在处理当前请求。';
+}
+
 function buildMemoryDecisionAgentPrompt(memoryDecision: MemoryReplyDecision): string {
   const plan = memoryDecision.plan;
   const query = plan.normalizedKey || plan.queryText || '';
@@ -4456,8 +4465,7 @@ async function handleMessage(
   };
 
   const renderProgressCardText = (): string => {
-    const detail = sanitizeProgressCardDetail(providerProgressText);
-    return progressCardSteps[progressCardSteps.length - 1] || detail || '正在处理当前请求。';
+    return buildProgressCardTextForStreaming(progressCardSteps[progressCardSteps.length - 1], providerProgressText);
   };
 
   const emitProgressCardStep = supportsStreamingCards ? (step: string) => {
@@ -4610,6 +4618,8 @@ async function handleMessage(
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
+      sourceChannelType: msg.address.channelType,
+      sourceChatId: msg.address.chatId,
       messageKind: inboundMessageKind,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
@@ -5270,6 +5280,7 @@ export const _testOnly = {
   shouldSendProviderErrorNotice,
   resetProviderErrorCircuitBreaker,
   buildSmallTalkReply,
+  buildProgressCardTextForTest: buildProgressCardTextForStreaming,
   extractCtiReminderAction,
   containsUnverifiedReminderCompletion,
   parseNaturalReminderRequest,

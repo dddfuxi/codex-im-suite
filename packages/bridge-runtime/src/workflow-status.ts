@@ -25,6 +25,9 @@ export interface WorkflowEvent {
 }
 
 export interface WorkflowExecutionSummary {
+  executorId?: string;
+  executorName?: string;
+  executorKind?: string;
   provider?: string;
   codexProfile?: string;
   modelSource?: string;
@@ -261,6 +264,9 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     ? data.execution as Record<string, unknown>
     : data;
   const execution: WorkflowExecutionSummary = {
+    executorId: readStringField(source.executorId),
+    executorName: readStringField(source.executorName),
+    executorKind: readStringField(source.executorKind),
     provider: readStringField(source.provider),
     codexProfile: readStringField(source.codexProfile),
     modelSource: readStringField(source.modelSource),

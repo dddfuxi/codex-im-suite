@@ -79,10 +79,17 @@ import { buildManifestCodexSlimParams } from './manifest-codex-slim.js';
 import { sseEvent } from './sse-utils.js';
 import { McpBridge, type McpManifestRecord } from './mcp-bridge.js';
 import {
-  inferRequestedExecutorId,
+  applyMavisDefaultExecutor,
+  buildExecutorManifests,
   readSessionExecutorDefaults,
+  resolveRequestedExecutorId,
   selectExecutor,
 } from './executor-registry.js';
+import { ExecutorProviderRegistry, type ResolvedDispatch } from './executor-provider-registry.js';
+import type { ExecutorSelection } from './executor-types.js';
+import { createMavisClient } from './mavis-cli-client.js';
+import { MavisExecutorProvider, isMavisTerminalAutoRetryable, type MavisTerminalState } from './mavis-executor-provider.js';
+import { summarizeMavisFailureMessage } from './mavis-failure-summarizer.js';
 import { shouldRetrieveMemoryForPrompt } from './memory-routing.js';
 import { startKnowledgeIndexWatcher } from './knowledge-index-service.js';
 import { startMemoryOptimizerService, type MemoryOptimizerService } from './memory-optimizer.js';
@@ -764,6 +771,43 @@ class ManifestSlimCodexProvider implements LLMProvider {
   }
 }
 
+function buildExecutorSourceStatus(selection: ExecutorSelection): Record<string, unknown> {
+  const executor = selection.executor;
+  const status: Record<string, unknown> = {
+    executorId: executor.id,
+    executorName: executor.displayName,
+    executorKind: executor.kind,
+    provider: executor.id,
+  };
+  const schema = executor.configSchema || {};
+  const model = schema.model;
+  if (typeof model === 'string' && model.trim()) {
+    status.model = model.trim();
+  }
+  const modelSource = schema.modelSource;
+  if (typeof modelSource === 'string' && modelSource.trim()) {
+    status.modelSource = modelSource.trim();
+  }
+  const baseUrl = schema.baseUrl;
+  if (typeof baseUrl === 'string' && baseUrl.trim()) {
+    status.baseUrl = baseUrl.trim();
+  }
+  return status;
+}
+
+function buildExecutorSourceStatusById(config: Config, executorId: string): Record<string, unknown> {
+  const executor = buildExecutorManifests(config).find((item) => item.id === executorId);
+  if (executor) {
+    return buildExecutorSourceStatus({
+      executor,
+      reason: `执行器来源：${executor.displayName}`,
+      explicit: true,
+      fallbackExecutorIds: [],
+    });
+  }
+  return { executorId, executorName: executorId, provider: executorId };
+}
+
 class HubLlmProvider implements LLMProvider {
   constructor(
     private readonly config: Config,
@@ -774,6 +818,13 @@ class HubLlmProvider implements LLMProvider {
     private readonly localAgentFallbackProvider: LLMProvider | null,
     private readonly primaryExecutorId: string,
     private readonly trustedExecutionProvider: LLMProvider = fallbackProvider,
+    // v3.4: external agent dispatch registry. Constructed once at daemon
+    // start in `resolveProvider` and passed in. When the registry picks an
+    // external executor (e.g. `mavis-agent`), `streamChat` routes through
+    // the two-phase pre/post-dispatch flow instead of the local Codex
+    // primary chain. Optional for backward compat with legacy test
+    // harnesses that don't need external dispatch.
+    private readonly executorRegistry?: ExecutorProviderRegistry,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -781,6 +832,21 @@ class HubLlmProvider implements LLMProvider {
     const routerEnabled = (this.config.ollamaEnabled ?? this.config.localLlmEnabled) === true
       && this.config.localLlmRouterEnabled !== false
       && this.config.localLlmForceHub !== false;
+
+    // v3.4: external executor fast-path. If registry is configured and the
+    // user explicitly pinned an external executor (`@mavis`, `@minimax`,
+    // `mavisDefaultExecutor`, or `requestedExecutorId`), bypass the local
+    // routing chain entirely and dispatch to the registered provider.
+    // Errors here are recoverable (pre-dispatch) — we only fall back to
+    // the local chain if the external provider throws BEFORE the prompt
+    // has been accepted. Once `preDispatch` succeeds, post-dispatch
+    // failures are propagated to the user, not retried elsewhere.
+    if (this.executorRegistry) {
+      const dispatch = this.resolveExternalDispatch(params);
+      if (dispatch) {
+        return this.streamExternalDispatch(params, dispatch);
+      }
+    }
 
     if (!routerEnabled || routerMode === 'codex_only') {
       updateLocalLlmStatus(this.config, {
@@ -859,6 +925,226 @@ class HubLlmProvider implements LLMProvider {
     });
   }
 
+  /**
+   * v3.4: resolve whether this turn should go to an external executor.
+   * Returns the dispatch (provider + selection) or `null` if the
+   * selection falls through to the local Codex chain.
+   */
+  private resolveExternalDispatch(
+    params: Parameters<LLMProvider['streamChat']>[0],
+  ): ResolvedDispatch | null {
+    if (!this.executorRegistry) return null;
+    const sessionDefaults = readSessionExecutorDefaults(this.config);
+    // v3.5 P2: mavisDefaultExecutor — lazily persist 'mavis-agent' as the
+    // session default on first turn when CTI_MAVIS_DEFAULT_EXECUTOR=true
+    // AND mavis is enabled AND no sticky default exists yet. Explicit
+    // `@codex` / `@claude` / `@minimax` still override (v3.3 P1 invariant:
+    // `hintedExecutorId ?? sessionDefaultId ?? undefined`).
+    const { sessionDefaultId } = applyMavisDefaultExecutor(
+      this.config,
+      params.sessionId,
+      sessionDefaults,
+    );
+    const requestedExecutorId = resolveRequestedExecutorId(this.config, params.prompt, sessionDefaultId);
+    const request: Parameters<typeof selectExecutor>[1] = {
+      sessionId: params.sessionId,
+      prompt: params.prompt,
+      workingDirectory: params.workingDirectory,
+      permissionMode: params.permissionMode,
+      requestedExecutorId,
+      preferredExecutorId: this.primaryExecutorId,
+      taskKind: 'hybrid',
+      params,
+    };
+    const dispatch = this.executorRegistry.resolveForRequest(
+      this.config,
+      request,
+      this.fallbackProvider,
+    );
+    return dispatch.isExternal ? dispatch : null;
+  }
+
+  /**
+   * v3.4: drive an external executor turn. Two-phase: preDispatch is
+   * recoverable (errors fall back to local Codex chain); streamUntilFinish
+   * is non-recoverable (any failure is emitted as `error` SSE).
+   *
+   * v3.6 P1 fix: the previous implementation skipped the observed workflow
+   * lifecycle that the local Codex chain runs through
+   * (`startObservedWorkflow` → evidence collection → `writeExecutorStatus`
+   * / `setWorkflowExecutor` → `flushWorkflowEvidence` →
+   * `completeWorkflowRun` / `failWorkflowRun`). As a result, whenever
+   * Mavis actually executed, the control panel's workflow run, the
+   * recent-executor routing snapshot, the retry / audit trail, and the
+   * `bridge-runtime-audit.json` evidence were all missing.
+   *
+   * v3.7 P1 fix: even with the v3.6 lifecycle wired in, the terminal-state
+   * path inside `streamUntilFinish` (timeout / aborted / remote_error /
+   * partial_result) only enqueued an error SSE and returned — it never
+   * propagated the failure to the caller. So the outer `finally` always
+   * saw `workflowFailed = false` and ran `completeWorkflowRun`, writing
+   * `status: succeeded` for what was actually a failed turn. That is a
+   * live-pre blocker. Now `streamUntilFinish` returns a
+   * `MavisStreamResult`; this method reads its `terminal` field and
+   * routes to `failWorkflowRun` + optional auto-retry when it is not
+   * `'finished'`.
+   *
+   * v3.8 P2 fix: replaced `shouldAutoRetryWorkflowError(workflowFailureError)`
+   * (a generic text-based heuristic that defaults to `true` for unknown
+   * errors) with `isMavisTerminalAutoRetryable(terminal)` — an explicit
+   * per-terminal map. Without this, an `aborted` turn (user / remote
+   * explicit cancel) would enter `requestWorkflowRetry('auto')` and the
+   * daemon would claim and re-execute the cancelled prompt.
+   */
+  private streamExternalDispatch(
+    params: Parameters<LLMProvider['streamChat']>[0],
+    dispatch: ResolvedDispatch,
+  ): ReadableStream<string> {
+    const provider = dispatch.provider as MavisExecutorProvider;
+    return new ReadableStream<string>({
+      start: async (controller) => {
+        const workflowRun = this.startObservedWorkflow(params, 'external_agent');
+        const evidence = emptyStreamEvidence();
+        seedExecutionRequirementEvidence(evidence, params);
+        const observedController = createObservedController(controller, evidence);
+        observedController.enqueue(sseEvent('status', buildExecutorSourceStatus(dispatch.selection)));
+        let workflowFailed = false;
+        let workflowFailureError: unknown = null;
+        // v3.8: declared at outer scope so `finally` (which lives outside
+        // the post-dispatch `try`) can read it for `isMavisTerminalAutoRetryable`.
+        // Defaults to `'finished'` — only overwritten inside the post-dispatch
+        // try/catch (or by the catch when `streamUntilFinish` itself throws).
+        let terminal: MavisTerminalState = 'finished';
+        try {
+          // Pre-dispatch: probe + createSession / communicationSend.
+          // Any thrown error here is recoverable → fall back to local chain.
+          try {
+            if (typeof provider.preDispatch === 'function') {
+              await provider.preDispatch(params);
+            } else {
+              // Provider doesn't expose preDispatch — treat as pre-dispatch failure.
+              throw new Error('external provider lacks preDispatch');
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const summarized = summarizeMavisFailureMessage(message);
+            updateLocalLlmStatus(this.config, {
+              lastProvider: 'codex_only',
+              lastDecision: 'external_fallback',
+              lastFallbackReason: `外部 executor pre-dispatch 失败，回落 Codex：${summarized}`,
+              lastCheckAt: new Date().toISOString(),
+            });
+            // v3.6: switch the workflow's executor marker so the panel
+            // shows the executor that actually ran. Without this, the
+            // panel would claim "Mavis Agent" while the live output came
+            // from Codex after fallback — a misleading mismatch.
+            setWorkflowExecutor(
+              workflowRun.id,
+              this.primaryExecutorId,
+              `外部 executor pre-dispatch 失败，回落 Codex：${summarized}`,
+            );
+            appendWorkflowEvent(
+              workflowRun.id,
+              'executing',
+              'executor.fallback',
+              `外部 executor 回落本地 Codex：${summarized}`,
+              { fallbackExecutorId: this.primaryExecutorId, originalError: summarized },
+            );
+            observedController.enqueue(sseEvent('status', buildExecutorSourceStatusById(this.config, this.primaryExecutorId)));
+            // Fall back to the local chain by re-entering the standard
+            // path, still routed through the observed controller so the
+            // fallback turn's evidence is collected too.
+            await this.streamLocalFallback(observedController, params, `外部 executor pre-dispatch 失败，回落 Codex：${summarized}`);
+            return;
+          }
+
+          // Post-dispatch: poll + stream until terminal. Any failure here
+          // is non-recoverable — mavis has already taken the prompt.
+          //
+          // v3.7 P1: capture `terminal` from `streamUntilFinish`. When it
+          // is not 'finished' (timeout / aborted / error / partial_result),
+          // the SSE has already been emitted to the user, but the workflow
+          // run still needs to record `status: failed` instead of
+          // `status: succeeded` so the panel / audit / retry queue see
+          // the truth.
+          try {
+            if (typeof provider.streamUntilFinish === 'function' && provider.binding) {
+              const result = await provider.streamUntilFinish(params, provider.binding, observedController);
+              terminal = result?.terminal ?? 'finished';
+            } else {
+              // No streamUntilFinish exposed → fall through to legacy streamChat
+              const stream = provider.streamChat(params);
+              const reader = stream.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                observedController.enqueue(value);
+              }
+            }
+          } catch (error) {
+            const summarized = summarizeMavisFailureMessage(
+              error instanceof Error ? error.message : String(error),
+            );
+            observedController.enqueue(sseEvent('error', summarized));
+            terminal = 'error';
+          }
+          try { observedController.close(); } catch { /* already closed */ }
+          if (terminal !== 'finished') {
+            workflowFailed = true;
+            workflowFailureError = new Error(`mavis executor 终态失败：${terminal}`);
+          }
+        } catch (error) {
+          workflowFailed = true;
+          workflowFailureError = error;
+        } finally {
+          flushWorkflowEvidence(workflowRun.id, evidence);
+          if (workflowFailed) {
+            failWorkflowRun(workflowRun.id, workflowFailureError ?? new Error('external executor failed'));
+            // v3.8 P2 fix: drive auto-retry off the terminal state, NOT
+            // off `shouldAutoRetryWorkflowError(workflowFailureError)`
+            // (a generic text-based heuristic that defaults to true for
+            // unknown errors). An `aborted` turn must NOT be auto-retried
+            // — re-running would re-execute the cancelled prompt. See
+            // `MAVIS_TERMINAL_AUTO_RETRYABLE` for the per-terminal
+            // rationale.
+            if (isMavisTerminalAutoRetryable(terminal)) {
+              requestWorkflowRetry(workflowRun.id, 'auto');
+            }
+          } else {
+            completeWorkflowRun(workflowRun.id);
+          }
+        }
+      },
+    });
+  }
+
+  /**
+   * v3.4: minimal local-chain fallback used when an external pre-dispatch
+   * fails. Mirrors `pipeCodexPrimaryWithFallback` semantics but doesn't
+   * recursively invoke `streamChat` (to avoid infinite recursion if the
+   * external provider keeps failing).
+   */
+  private async streamLocalFallback(
+    controller: ReadableStreamDefaultController<string>,
+    params: Parameters<LLMProvider['streamChat']>[0],
+    reason: string,
+  ): Promise<void> {
+    updateLocalLlmStatus(this.config, {
+      lastProvider: 'codex',
+      lastDecision: 'codex_primary',
+      lastRouteReason: reason,
+      lastCheckAt: new Date().toISOString(),
+    });
+    const stream = this.fallbackProvider.streamChat(params);
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      controller.enqueue(value);
+    }
+    try { controller.close(); } catch { /* already closed */ }
+  }
+
   private startObservedWorkflow(
     params: Parameters<LLMProvider['streamChat']>[0],
     taskKind?: string,
@@ -886,9 +1172,14 @@ class HubLlmProvider implements LLMProvider {
     });
     appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
     appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话、记忆和工作区上下文已准备');
+    // v3.3 P1 必修：@hint 优先于 sessionDefault（hintedExecutorId ?? sessionDefaultId ?? undefined）
+    // v3.4 残留 P2：与 §4.3.2 main.ts 实施片段一致（line 891 之前漏的第二个片段）
     const sessionDefaults = readSessionExecutorDefaults(this.config);
-    const requestedExecutorId = inferRequestedExecutorId(params.prompt) || sessionDefaults[params.sessionId];
-    const selection = selectExecutor(this.config, {
+    const sessionDefaultId = sessionDefaults[params.sessionId];
+    const requestedExecutorId = resolveRequestedExecutorId(this.config, params.prompt, sessionDefaultId);
+    // v3.1: caller 构造完整 ExecutorRequest；registry 不再自己拼装。
+    // v3.2: sessionDefaultId 已折进 requestedExecutorId（不再传第 4 参）。
+    const executorRequest: Parameters<typeof selectExecutor>[1] = {
       sessionId: params.sessionId,
       prompt: params.prompt,
       workingDirectory: params.workingDirectory,
@@ -897,7 +1188,10 @@ class HubLlmProvider implements LLMProvider {
       preferredExecutorId: this.primaryExecutorId,
       taskKind,
       params,
-    }, sessionDefaults[params.sessionId]);
+    };
+    const selection = this.executorRegistry
+      ? this.executorRegistry.resolveForRequest(this.config, executorRequest, this.fallbackProvider).selection
+      : selectExecutor(this.config, executorRequest, sessionDefaultId);
     writeExecutorStatus(this.config, { sessionId: params.sessionId, selection });
     setWorkflowExecutor(workflowRun.id, selection.executor.id, selection.reason);
     appendWorkflowEvent(workflowRun.id, 'executing', 'executor.executing', `执行器开始处理：${selection.executor.displayName}`, {
@@ -1543,6 +1837,9 @@ interface StreamEvidence {
   failedToolResultCount: number;
   failedToolErrors: string[];
   toolNames: string[];
+  executorId?: string;
+  executorName?: string;
+  executorKind?: string;
   provider?: string;
   codexProfile?: string;
   modelSource?: string;
@@ -1632,6 +1929,9 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       continue;
     }
     if (event.type === 'status' && data) {
+      if (typeof data.executorId === 'string') evidence.executorId = data.executorId;
+      if (typeof data.executorName === 'string') evidence.executorName = data.executorName;
+      if (typeof data.executorKind === 'string') evidence.executorKind = data.executorKind;
       if (typeof data.provider === 'string') evidence.provider = data.provider;
       if (typeof data.codexProfile === 'string') evidence.codexProfile = data.codexProfile;
       if (typeof data.modelSource === 'string') evidence.modelSource = data.modelSource;
@@ -1693,6 +1993,9 @@ function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
     toolNames: evidence.toolNames,
   };
   if (evidence.provider) payload.provider = evidence.provider;
+  if (evidence.executorId) payload.executorId = evidence.executorId;
+  if (evidence.executorName) payload.executorName = evidence.executorName;
+  if (evidence.executorKind) payload.executorKind = evidence.executorKind;
   if (evidence.codexProfile) payload.codexProfile = evidence.codexProfile;
   if (evidence.modelSource) payload.modelSource = evidence.modelSource;
   if (evidence.attemptedSources?.length) payload.attemptedSources = evidence.attemptedSources;
@@ -1743,6 +2046,7 @@ class ObservedLLMProvider implements LLMProvider {
     private readonly store: BridgeStore,
     private readonly provider: LLMProvider,
     private readonly primaryExecutorId: string,
+    private readonly executorRegistry?: ExecutorProviderRegistry,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -1775,9 +2079,12 @@ class ObservedLLMProvider implements LLMProvider {
         try {
           appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
           appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话和工作区上下文已准备');
+          // v3.3 P1 必修：@hint 优先于 sessionDefault
+          // v3.4 残留 P2：与 §4.3.2 main.ts 实施片段一致
           const sessionDefaults = readSessionExecutorDefaults(this.config);
-          const requestedExecutorId = inferRequestedExecutorId(params.prompt) || sessionDefaults[params.sessionId];
-          const selection = selectExecutor(this.config, {
+          const sessionDefaultId = sessionDefaults[params.sessionId];
+          const requestedExecutorId = resolveRequestedExecutorId(this.config, params.prompt, sessionDefaultId);
+          const executorRequest: Parameters<typeof selectExecutor>[1] = {
             sessionId: params.sessionId,
             prompt: params.prompt,
             workingDirectory: params.workingDirectory,
@@ -1785,7 +2092,10 @@ class ObservedLLMProvider implements LLMProvider {
             requestedExecutorId,
             preferredExecutorId: this.primaryExecutorId,
             params,
-          }, sessionDefaults[params.sessionId]);
+          };
+          const selection = this.executorRegistry
+            ? this.executorRegistry.resolveForRequest(this.config, executorRequest, this.provider).selection
+            : selectExecutor(this.config, executorRequest, sessionDefaultId);
           writeExecutorStatus(this.config, { sessionId: params.sessionId, selection });
           setWorkflowExecutor(workflowRun.id, selection.executor.id, selection.reason);
           const configuredModelSource = this.config.codexModelSource || (
@@ -1828,7 +2138,48 @@ class ObservedLLMProvider implements LLMProvider {
   }
 }
 
+/**
+ * v3.4: build the executor registry and (optionally) register the
+ * mavis-agent external executor. Returned registry is passed to
+ * `HubLlmProvider` and `ObservedLLMProvider` for two-phase dispatch.
+ */
+function buildExecutorRegistry(config: Config): ExecutorProviderRegistry {
+  const registry = new ExecutorProviderRegistry();
+  if (config.mavisEnabled === true && config.mavisCliPath) {
+    try {
+      const client = createMavisClient({
+        cliPath: config.mavisCliPath,
+        dataDir: config.mavisDataDir,
+        port: config.mavisPort,
+        commandTimeoutMs: 25_000,
+        config,
+      });
+      const provider = new MavisExecutorProvider({
+        client,
+        config,
+        agentName: config.mavisAgentName || 'mavis',
+        pollIntervalMs: config.mavisPollIntervalMs ?? 1500,
+        hardTimeoutMs: config.mavisHardTimeoutMs ?? 480_000,
+        quietTimeoutMs: config.mavisQuietTimeoutMs ?? 90_000,
+        maxDiffBytes: config.mavisMaxDiffBytes ?? 32_000,
+      });
+      registry.register('mavis-agent', provider);
+    } catch (err) {
+      // Construction failure should not break daemon startup; mavis-agent
+      // simply won't be a candidate. Log so operators can see why.
+      // eslint-disable-next-line no-console
+      console.warn(`[bridge-runtime] failed to register mavis-agent: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return registry;
+}
+
 async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
+  // v3.4: registry is built once per daemon start, then injected into
+  // HubLlmProvider / ObservedLLMProvider. External executors (currently
+  // mavis-agent) are registered here based on the live `Config` snapshot.
+  const executorRegistry = buildExecutorRegistry(config);
+
   const wrapWithLocalHub = (
     provider: LLMProvider,
     primaryExecutorId: string,
@@ -1843,6 +2194,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       null,
       primaryExecutorId,
       provider,
+      executorRegistry,
     );
   };
   const wrapCodexMainProvider = (provider: LLMProvider): LLMProvider => (
@@ -2361,9 +2713,36 @@ async function main(): Promise<void> {
   setInterval(() => { /* keepalive */ }, 45_000);
 }
 
-main().catch((err) => {
-  console.error('[claude-to-im] Fatal error:', err instanceof Error ? err.stack || err.message : err);
-  try { recordBridgeRuntimeExit(`fatal: ${err instanceof Error ? err.message : String(err)}`, err); } catch { /* ignore */ }
-  try { writeStatus({ running: false, lastExitReason: `fatal: ${err instanceof Error ? err.message : String(err)}` }); } catch { /* ignore */ }
-  process.exit(1);
-});
+// v3.8: only invoke `main()` when this file is the CLI entry point.
+// Otherwise, dynamic imports from the test suite (`hub-llm-provider.test.ts`
+// for the v3.8 P2 workflow-layer integration test) would start a real
+// bridge, register SIGTERM / unhandledRejection handlers, and pollute
+// global state. The guard compares `import.meta.url` to
+// `pathToFileURL(process.argv[1])` — they match only when the file is
+// run directly (`tsx src/main.ts` or `node dist/main.mjs`).
+import { pathToFileURL } from 'node:url';
+
+const isEntryPoint = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (isEntryPoint) {
+  main().catch((err) => {
+    console.error('[claude-to-im] Fatal error:', err instanceof Error ? err.stack || err.message : err);
+    try { recordBridgeRuntimeExit(`fatal: ${err instanceof Error ? err.message : String(err)}`, err); } catch { /* ignore */ }
+    try { writeStatus({ running: false, lastExitReason: `fatal: ${err instanceof Error ? err.message : String(err)}` }); } catch { /* ignore */ }
+    process.exit(1);
+  });
+}
+
+// v3.8: export `HubLlmProvider` for the v3.8 P2 workflow-layer
+// integration test (`hub-llm-provider.test.ts`). The class itself is
+// runtime-internal; the only consumer outside `main.ts` is the test
+// suite, which `await import('../main.js')`s this module.
+export { HubLlmProvider };

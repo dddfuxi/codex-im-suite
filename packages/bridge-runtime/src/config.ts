@@ -67,6 +67,7 @@ export interface Config {
   replyStyleHint?: string;
   defaultModel?: string;
   defaultMode: string;
+  defaultExecutorId?: string;
   // Telegram
   tgBotToken?: string;
   tgChatId?: string;
@@ -113,10 +114,72 @@ export interface Config {
   autoApprove?: boolean;
   // Prefer minimal bridge/tooling self-repair when the user is blocked by a missing capability
   selfOptimizeOnFailure?: boolean;
+  // ── Mavis external agent executor (v3.4 design) ──
+  // 12 fields; env primary = CTI_MAVIS_*, alias = MAVIS_* (load only).
+  mavisEnabled?: boolean;          // default false (opt-in)
+  mavisCliPath?: string;           // default 'mavis'
+  mavisAgentName?: string;         // default 'mavis'
+  mavisDataDir?: string;           // optional, explicit > env
+  mavisBridgeSessionId?: string;   // optional Mavis sender session for communication send
+  mavisPort?: number;              // optional
+  mavisPollIntervalMs?: number;    // default 1500
+  mavisHardTimeoutMs?: number;     // default 480_000
+  mavisQuietTimeoutMs?: number;    // default 90_000
+  mavisMaxDiffBytes?: number;      // default 32_000
+  mavisReadOnly?: boolean;         // true → drop file_write / mcp_ops capabilities
+  mavisDefaultExecutor?: boolean;  // true → write sessionExecutorDefaults('mavis-agent')
 }
 
 export const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), ".claude-to-im");
 export const CONFIG_PATH = path.join(CTI_HOME, "config.env");
+
+/**
+ * Read a string env var with primary / alias fallback.
+ * Returns the primary value if present, otherwise the alias value, otherwise undefined.
+ * If alias is used, logs a one-time warn recommending the primary name.
+ */
+function readMavisEnv(
+  env: Map<string, string>,
+  primary: string,
+  alias: string,
+): string | undefined {
+  const primaryValue = env.get(primary);
+  if (primaryValue !== undefined) return primaryValue;
+  const aliasValue = env.get(alias);
+  if (aliasValue !== undefined) {
+    // eslint-disable-next-line no-console
+    console.warn(`[config] ${alias} is a compatibility alias; prefer ${primary}`);
+    return aliasValue;
+  }
+  return undefined;
+}
+
+function readMavisBool(
+  env: Map<string, string>,
+  primary: string,
+  alias: string,
+): boolean | undefined {
+  const v = readMavisEnv(env, primary, alias);
+  if (v === undefined) return undefined;
+  return v === 'true';
+}
+
+function readMavisNumber(
+  env: Map<string, string>,
+  primary: string,
+  alias: string,
+): number | undefined {
+  const v = readMavisEnv(env, primary, alias);
+  if (!v) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+export function normalizeExecutorId(value: string | undefined): string | undefined {
+  const normalized = (value || "").trim().toLowerCase();
+  if (!normalized) return undefined;
+  return /^[a-z0-9._-]+$/.test(normalized) ? normalized : undefined;
+}
 
 function parseEnvFile(content: string): Map<string, string> {
   const entries = new Map<string, string>();
@@ -314,6 +377,7 @@ export function loadConfig(): Config {
   const codexApiFallbackChain = Array.from(new Set(rawCodexApiFallbackChain
     .map((item) => item.trim().toLowerCase())
     .filter((item): item is 'local_api' | 'external_api' | 'official' => item === "local_api" || item === "external_api" || item === "official")));
+  const defaultExecutorId = normalizeExecutorId(env.get("CTI_DEFAULT_EXECUTOR_ID"));
   const memoryOptimizerIntervalDays = env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS")
     ? Number(env.get("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS"))
     : 7;
@@ -406,6 +470,7 @@ export function loadConfig(): Config {
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
+    defaultExecutorId,
     tgBotToken: env.get("CTI_TG_BOT_TOKEN") || undefined,
     tgChatId: env.get("CTI_TG_CHAT_ID") || undefined,
     tgAllowedUsers: splitCsv(env.get("CTI_TG_ALLOWED_USERS")),
@@ -466,6 +531,19 @@ export function loadConfig(): Config {
     selfOptimizeOnFailure: env.has("CTI_SELF_OPTIMIZE_ON_FAILURE")
       ? env.get("CTI_SELF_OPTIMIZE_ON_FAILURE") === "true"
       : undefined,
+    // ── Mavis external agent (v3.4) — CTI_MAVIS_* primary, MAVIS_* alias (load only) ──
+    mavisEnabled: readMavisBool(env, "CTI_MAVIS_ENABLED", "MAVIS_ENABLED"),
+    mavisCliPath: readMavisEnv(env, "CTI_MAVIS_CLI_PATH", "MAVIS_CLI_PATH"),
+    mavisAgentName: readMavisEnv(env, "CTI_MAVIS_AGENT_NAME", "MAVIS_AGENT_NAME"),
+    mavisDataDir: readMavisEnv(env, "CTI_MAVIS_DATA_DIR", "MAVIS_DATA_DIR"),
+    mavisBridgeSessionId: readMavisEnv(env, "CTI_MAVIS_BRIDGE_SESSION_ID", "MAVIS_BRIDGE_SESSION_ID"),
+    mavisPort: readMavisNumber(env, "CTI_MAVIS_PORT", "MAVIS_PORT"),
+    mavisPollIntervalMs: readMavisNumber(env, "CTI_MAVIS_POLL_INTERVAL_MS", "MAVIS_POLL_INTERVAL_MS"),
+    mavisHardTimeoutMs: readMavisNumber(env, "CTI_MAVIS_HARD_TIMEOUT_MS", "MAVIS_HARD_TIMEOUT_MS"),
+    mavisQuietTimeoutMs: readMavisNumber(env, "CTI_MAVIS_QUIET_TIMEOUT_MS", "MAVIS_QUIET_TIMEOUT_MS"),
+    mavisMaxDiffBytes: readMavisNumber(env, "CTI_MAVIS_MAX_DIFF_BYTES", "MAVIS_MAX_DIFF_BYTES"),
+    mavisReadOnly: readMavisBool(env, "CTI_MAVIS_READ_ONLY", "MAVIS_READ_ONLY"),
+    mavisDefaultExecutor: readMavisBool(env, "CTI_MAVIS_DEFAULT_EXECUTOR", "MAVIS_DEFAULT_EXECUTOR"),
   };
 }
 
@@ -569,6 +647,7 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_REPLY_STYLE_HINT", config.replyStyleHint);
   if (config.defaultModel) out += formatEnvLine("CTI_DEFAULT_MODEL", config.defaultModel);
   out += formatEnvLine("CTI_DEFAULT_MODE", config.defaultMode);
+  out += formatEnvLine("CTI_DEFAULT_EXECUTOR_ID", normalizeExecutorId(config.defaultExecutorId));
   out += formatEnvLine("CTI_TG_BOT_TOKEN", config.tgBotToken);
   out += formatEnvLine("CTI_TG_CHAT_ID", config.tgChatId);
   out += formatEnvLine(
@@ -652,6 +731,27 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_WEIXIN_MEDIA_ENABLED", String(config.weixinMediaEnabled));
   if (config.selfOptimizeOnFailure !== undefined)
     out += formatEnvLine("CTI_SELF_OPTIMIZE_ON_FAILURE", String(config.selfOptimizeOnFailure));
+  // ── Mavis external agent (v3.4) — write CTI_MAVIS_* ONLY; never write MAVIS_* alias ──
+  if (config.mavisEnabled !== undefined)
+    out += formatEnvLine("CTI_MAVIS_ENABLED", String(config.mavisEnabled));
+  out += formatEnvLine("CTI_MAVIS_CLI_PATH", config.mavisCliPath);
+  out += formatEnvLine("CTI_MAVIS_AGENT_NAME", config.mavisAgentName);
+  out += formatEnvLine("CTI_MAVIS_DATA_DIR", config.mavisDataDir);
+  out += formatEnvLine("CTI_MAVIS_BRIDGE_SESSION_ID", config.mavisBridgeSessionId);
+  if (config.mavisPort !== undefined)
+    out += formatEnvLine("CTI_MAVIS_PORT", String(config.mavisPort));
+  if (config.mavisPollIntervalMs !== undefined)
+    out += formatEnvLine("CTI_MAVIS_POLL_INTERVAL_MS", String(config.mavisPollIntervalMs));
+  if (config.mavisHardTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_MAVIS_HARD_TIMEOUT_MS", String(config.mavisHardTimeoutMs));
+  if (config.mavisQuietTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_MAVIS_QUIET_TIMEOUT_MS", String(config.mavisQuietTimeoutMs));
+  if (config.mavisMaxDiffBytes !== undefined)
+    out += formatEnvLine("CTI_MAVIS_MAX_DIFF_BYTES", String(config.mavisMaxDiffBytes));
+  if (config.mavisReadOnly !== undefined)
+    out += formatEnvLine("CTI_MAVIS_READ_ONLY", String(config.mavisReadOnly));
+  if (config.mavisDefaultExecutor !== undefined)
+    out += formatEnvLine("CTI_MAVIS_DEFAULT_EXECUTOR", String(config.mavisDefaultExecutor));
 
   fs.mkdirSync(CTI_HOME, { recursive: true });
   const tmpPath = CONFIG_PATH + ".tmp";
@@ -879,6 +979,7 @@ export function configToSettings(config: Config): Map<string, string> {
   m.set("bridge_memory_optimizer_enabled", String(config.memoryOptimizerEnabled === true));
   m.set("bridge_memory_optimizer_interval_days", String(config.memoryOptimizerIntervalDays ?? 7));
   m.set("bridge_memory_optimizer_model_source", config.memoryOptimizerModelSource || "codex_primary");
+  m.set("bridge_default_executor_id", normalizeExecutorId(config.defaultExecutorId) || "");
   if (config.ollamaEnabled !== undefined) {
     m.set("bridge_ollama_enabled", String(config.ollamaEnabled));
   }

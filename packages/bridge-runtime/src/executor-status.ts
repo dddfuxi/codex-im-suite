@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { CTI_HOME, type Config } from './config.js';
-import { buildExecutorManifests, readSessionExecutorDefaults } from './executor-registry.js';
+import { buildExecutorManifests, getConfiguredDefaultExecutorId, readSessionExecutorDefaults } from './executor-registry.js';
 import type { ExecutorManifest, ExecutorSelection } from './executor-types.js';
 
 export interface ExecutorRuntimeStatus {
   protocol: 'executor-runtime/v1';
   updatedAt: string;
+  defaultExecutorId?: string;
   executors: ExecutorManifest[];
   sessionDefaults: Record<string, string>;
   lastSelection?: {
@@ -34,6 +35,7 @@ export function makeExecutorStatus(config: Config, selection?: { sessionId: stri
   return {
     protocol: 'executor-runtime/v1',
     updatedAt: nowIso(),
+    defaultExecutorId: getConfiguredDefaultExecutorId(config),
     executors: buildExecutorManifests(config),
     sessionDefaults: readSessionExecutorDefaults(config),
     ...(selection

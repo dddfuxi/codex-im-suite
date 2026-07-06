@@ -1622,6 +1622,7 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "memoryRepo", current.MemoryRepo),
             ReadPayloadString(payload, "additionalDirs", current.AdditionalDirs),
             ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint),
+            NormalizeExecutorId(ReadPayloadString(payload, "defaultExecutorId", current.DefaultExecutorId)),
             NormalizeLocalAiKind(ReadPayloadString(payload, "localAiKind", current.LocalAiKind)),
             ReadPayloadString(payload, "localAiBaseUrl", current.LocalAiBaseUrl),
             ReadPayloadString(payload, "ollamaModelsDir", current.OllamaModelsDir),
@@ -2263,11 +2264,13 @@ internal sealed partial class MainForm : Form
             {
                 protocol = "executor-runtime/v1",
                 updatedAt = "",
+                defaultExecutorId = NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", "")),
                 executors = Array.Empty<object>(),
                 sessionDefaults = defaults,
                 lastSelection = (object?)null,
             };
         }
+        root["defaultExecutorId"] ??= NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", ""));
         root["sessionDefaults"] = defaults.DeepClone();
         return root;
     }
@@ -6385,6 +6388,7 @@ exit $LASTEXITCODE
             GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game")),
         GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", ""),
         GetConfig("CTI_REPLY_STYLE_HINT", ""),
+        NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", "")),
         NormalizeLocalAiKind(GetConfig("CTI_LOCAL_AI_KIND", "ollama")),
         GetConfig("CTI_LOCAL_AI_BASE_URL", GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434")),
         GetConfiguredOllamaModelsPath(),
@@ -6432,6 +6436,7 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", memoryRepo);
         SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", settings.AdditionalDirs.Trim());
         SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
+        SetOrAppendEnv(lines, "CTI_DEFAULT_EXECUTOR_ID", NormalizeExecutorId(settings.DefaultExecutorId));
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_KIND", NormalizeLocalAiKind(settings.LocalAiKind));
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_BASE_URL", settings.LocalAiBaseUrl.Trim());
         if (!string.IsNullOrWhiteSpace(settings.OllamaModelsDir))
@@ -6785,6 +6790,14 @@ exit $LASTEXITCODE
     {
         value = (value ?? "").Trim().ToLowerInvariant();
         return value is "codex_primary" or "local_ai" or "external_api" ? value : "codex_primary";
+    }
+
+    private static string NormalizeExecutorId(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value.Length > 0 && value.All(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.')
+            ? value
+            : "";
     }
 
     private static string NormalizePositiveNumber(string value, string fallback)
@@ -10981,6 +10994,7 @@ internal sealed record SettingsSnapshot(
     string MemoryRepo,
     string AdditionalDirs,
     string ReplyStyleHint,
+    string DefaultExecutorId = "",
     string LocalAiKind = "ollama",
     string LocalAiBaseUrl = "http://127.0.0.1:11434",
     string OllamaModelsDir = "",
@@ -11026,6 +11040,7 @@ internal sealed class SettingsForm : Form
     private readonly Func<string, Task<string>> _summarizeReplyStyleAsync;
     private readonly Action<SettingsSnapshot> _saveSettings;
     private readonly Action<string> _openPath;
+    private string _defaultExecutorId = "";
 
     public SettingsForm(
         SettingsSnapshot settings,
@@ -11196,6 +11211,7 @@ internal sealed class SettingsForm : Form
         _memoryRepo.Text = settings.MemoryRepo;
         _additionalDirs.Text = settings.AdditionalDirs;
         _replyStyleHint.Text = settings.ReplyStyleHint;
+        _defaultExecutorId = settings.DefaultExecutorId;
         _replyStylePreset.SelectedItem = ResolveReplyStylePreset(settings.ReplyStyleHint);
     }
 
@@ -11205,7 +11221,8 @@ internal sealed class SettingsForm : Form
         _unityProject.Text,
         _memoryRepo.Text,
         _additionalDirs.Text,
-        _replyStyleHint.Text);
+        _replyStyleHint.Text,
+        _defaultExecutorId);
 
     private string ResolveReplyStylePreset(string value)
     {

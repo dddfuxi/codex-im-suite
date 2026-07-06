@@ -1599,6 +1599,22 @@ button:disabled {
   min-width: 0;
 }
 
+.runtime-row-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 92px;
+}
+
+.runtime-row-status .status-pill {
+  margin-top: 0;
+}
+
+.executor-source-actions {
+  justify-content: flex-start;
+}
+
 .executor-main-layout .list-panel {
   max-height: min(520px, calc(100vh - 260px));
 }

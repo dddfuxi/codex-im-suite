@@ -1733,6 +1733,15 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(memoryWriteClassifierCalls, 0);
   });
 
+  it('keeps provider progress visible alongside the workflow card step', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const text = _testOnly.buildProgressCardTextForTest(
+      '正在整理回复。',
+      '处理思路：正在识别图片里的题目。',
+    );
+    assert.equal(text, '正在整理回复。\n\n处理思路：正在识别图片里的题目。');
+  });
+
   it('selects light status by default and reserves workflow cards for real bridge progress', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     assert.equal(_testOnly.selectReplySurfaceMode({

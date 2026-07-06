@@ -598,6 +598,9 @@ export interface StreamChatParams {
   sourceUserId?: string;
   sourceUserDisplayName?: string;
   sourceMessageId?: string;
+  sourceChannelType?: string;
+  sourceChatId?: string;
+  sourceThreadId?: string;
   replyPresentation?: {
     replyStyleHint?: string;
   };

@@ -145,6 +145,7 @@ type SettingsState = {
   memoryRepo: string;
   additionalDirs: string;
   replyStyleHint: string;
+  defaultExecutorId: string;
   localAiKind: string;
   localAiBaseUrl: string;
   ollamaModelsDir: string;
@@ -379,6 +380,7 @@ type ExecutorItem = {
 type ExecutorStatus = {
   protocol: string;
   updatedAt: string;
+  defaultExecutorId?: string;
   executors: ExecutorItem[];
   sessionDefaults: Record<string, string>;
   lastSelection?: {
@@ -405,6 +407,9 @@ type WorkflowRun = {
   endedAt?: string;
   error?: string;
   execution?: {
+    executorId?: string;
+    executorName?: string;
+    executorKind?: string;
     provider?: string;
     codexProfile?: string;
     modelSource?: string;
@@ -980,6 +985,7 @@ const fallbackState: PanelState = {
     memoryRepo: '',
     additionalDirs: '',
     replyStyleHint: '',
+    defaultExecutorId: '',
     localAiKind: 'ollama',
     localAiBaseUrl: 'http://127.0.0.1:11434',
     ollamaModelsDir: '',
@@ -1057,7 +1063,7 @@ const fallbackState: PanelState = {
     items: [],
     lastError: '',
   },
-  executors: { protocol: 'executor-runtime/v1', updatedAt: '', executors: [], sessionDefaults: {} },
+  executors: { protocol: 'executor-runtime/v1', updatedAt: '', defaultExecutorId: '', executors: [], sessionDefaults: {} },
   permissions: { protocol: 'cti-permissions/v1', updatedAt: '', subjects: [], candidates: [] },
   paths: { config: '', manifestDir: '', memoryRepo: '', logs: '' },
   activities: [],
@@ -1722,7 +1728,10 @@ function workflowModelLabel(run: WorkflowRun) {
 }
 
 function workflowModelSourceLabel(run: WorkflowRun) {
-  return run.execution?.modelSource || '未知';
+  const executorName = run.execution?.executorName || run.executorId;
+  const executorId = run.execution?.executorId || run.executorId;
+  if (executorName && executorId && executorName !== executorId) return `${executorName} (${executorId})`;
+  return executorName || executorId || run.execution?.provider || run.execution?.modelSource || '未知';
 }
 
 function formatWorkflowTimestamp(value?: string) {
@@ -3050,6 +3059,16 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
   const recentRuns = runs.slice(-40).reverse();
   const [selectedExecutorId, setSelectedExecutorId] = useState('');
   const selectedExecutor = executors.find((executor) => executor.id === selectedExecutorId) ?? executors[0];
+  const defaultExecutorId = (state.executors?.defaultExecutorId || state.settings.defaultExecutorId || '').trim();
+  const defaultExecutor = executors.find((executor) => executor.id === defaultExecutorId);
+
+  const saveDefaultExecutor = async (executorId: string) => {
+    const result = await run('settings.saveAndRestartBridge', {
+      settings: { ...state.settings, defaultExecutorId: executorId },
+    });
+    await run('state.refresh');
+    return result;
+  };
 
   useEffect(() => {
     if (executors.length === 0) {
@@ -3069,6 +3088,7 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
         <p className="detail-copy">执行器是请求路由候选，不是可启动或停止的服务。</p>
         <div className="summary-grid">
           <SummaryFact label="可用执行器" value={`${executors.filter((item) => item.enabled).length}/${executors.length}`} compact />
+          <SummaryFact label="默认执行器" value={defaultExecutor?.displayName || defaultExecutorId || '自动'} compact />
           <SummaryFact label="最近选择" value={lastSelection?.executorId || '-'} compact />
           <SummaryFact label="Workflow" value={`${runs.length}`} compact />
           <SummaryFact label="协议" value={state.executors?.protocol || 'executor-runtime/v1'} compact />
@@ -3087,7 +3107,10 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
                   <strong>{executor.displayName}</strong>
                   <span>{executor.kind} · {executor.riskLevel} · priority {executor.priority}</span>
                 </div>
-                <StatusPill status={executor.enabled ? 'ok' : 'idle'} label={executor.enabled ? '启用' : '停用'} />
+                <div className="runtime-row-status">
+                  {executor.id === defaultExecutorId && <StatusPill status="ok" label="默认" />}
+                  <StatusPill status={executor.enabled ? 'ok' : 'idle'} label={executor.enabled ? '启用' : '停用'} />
+                </div>
               </button>
             ))}
             {executors.length === 0 && <EmptyState icon={<Bot size={28} />} title="暂无执行器状态" text="bridge 运行一次后会写入 executor-status.json。" />}
@@ -3102,6 +3125,22 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
                 <StatusPill status={selectedExecutor.enabled ? 'ok' : 'idle'} label={selectedExecutor.enabled ? '启用' : '停用'} />
               </div>
               <p className="detail-copy">{selectedExecutor.description || '暂无说明。'}</p>
+              <div className="command-band dense executor-source-actions">
+                <MiniButton
+                  label={selectedExecutor.id === defaultExecutorId ? '当前默认' : '设为默认'}
+                  icon={<CheckCircle2 size={14} />}
+                  onClick={() => void saveDefaultExecutor(selectedExecutor.id)}
+                  pending={pending['settings.saveAndRestartBridge']}
+                  disabled={!selectedExecutor.enabled || selectedExecutor.id === defaultExecutorId}
+                />
+                <MiniButton
+                  label="恢复自动"
+                  icon={<X size={14} />}
+                  onClick={() => void saveDefaultExecutor('')}
+                  pending={pending['settings.saveAndRestartBridge']}
+                  disabled={!defaultExecutorId}
+                />
+              </div>
               <dl className="kv">
                 <dt>ID</dt><dd>{selectedExecutor.id}</dd>
                 <dt>类型</dt><dd>{selectedExecutor.kind || '-'}</dd>
@@ -5590,6 +5629,7 @@ function SettingsPage({
   const aiStrategy = inferAiStrategy(settings);
   const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
   const fallbackChain = parseCodexChain(settings.codexApiFallbackChain);
+  const executorOptions = state.executors?.executors ?? [];
   const localModelOptions = useMemo(() => {
     const byModel = new Map<string, ExtensionCatalogItem>();
     for (const item of modelCatalogItems) {
@@ -5774,10 +5814,21 @@ function SettingsPage({
       </section>
       <section className="panel panel-span-2">
         <SectionHeader
-          title="Codex CLI 模型来源"
+          title="AI 执行与模型来源"
           action={<MiniButton label="保存并重启 Bridge" icon={<RotateCw size={14} />} onClick={() => void saveAndRestartBridge()} pending={pending['settings.saveAndRestartBridge']} />}
         />
         <div className="ai-strategy-shell">
+          <label className="stack-field">
+            <span>默认执行器</span>
+            <select value={settings.defaultExecutorId || ''} onChange={(event) => update('defaultExecutorId', event.target.value)}>
+              <option value="">自动选择</option>
+              {executorOptions.map((executor) => (
+                <option key={executor.id} value={executor.id} disabled={!executor.enabled}>
+                  {executor.displayName}{executor.enabled ? '' : '（停用）'}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="stack-field">
             <span>运行策略</span>
             <select value={aiStrategy} onChange={(event) => applyAiStrategy(event.target.value as AiStrategy)}>

@@ -1301,6 +1301,41 @@ describe('FeishuAdapter p2p reply media recovery', () => {
     assert.equal(inbound.raw?.feishuReplyTo?.messageId, 'om_image');
     assert.equal(inbound.raw?.feishuReplyTo?.attachmentCount, 1);
   });
+
+  it('skips history-polled p2p messages sent by the bot identity even when sender_type is missing', async () => {
+    const adapter = new FeishuAdapter() as any;
+
+    adapter.running = true;
+    adapter.botIds.add('ou_bot');
+    adapter.resolveChatDisplayName = async () => 'private chat';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.fetchMessagePage = async () => ({
+      items: [
+        {
+          message_id: 'om_bot_reply',
+          chat_id: 'oc_p2p',
+          create_time: '2000',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'The user sent one or more images without a written instruction.' }) },
+          sender: { id: 'ou_bot', id_type: 'open_id' },
+        },
+      ],
+      hasMore: false,
+      nextPageToken: '',
+    });
+
+    await adapter.pollSingleP2pChat({
+      chatId: 'oc_p2p',
+      chatType: 'p2p',
+      displayName: 'private chat',
+      lastMessageAt: '1000',
+      updatedAt: '1000',
+    });
+
+    assert.equal(adapter.queue.length, 0);
+  });
 });
 
 describe('FeishuAdapter message reactions', () => {

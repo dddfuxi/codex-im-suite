@@ -101,6 +101,9 @@ export interface ConversationProcessOptions {
   memoryUserId?: string;
   memoryUserDisplayName?: string;
   sourceMessageId?: string;
+  sourceChannelType?: string;
+  sourceChatId?: string;
+  sourceThreadId?: string;
   messageKind?: string;
 }
 
@@ -154,6 +157,9 @@ function mergeRunSummary(target: RunSummary, data: unknown): RunSummary {
   const tokenUsage = normalizeTokenUsage(source.usage ?? source.tokenUsage);
   return {
     ...target,
+    ...(readOptionalString(source.executorId) ? { executorId: readOptionalString(source.executorId) } : {}),
+    ...(readOptionalString(source.executorName) ? { executorName: readOptionalString(source.executorName) } : {}),
+    ...(readOptionalString(source.executorKind) ? { executorKind: readOptionalString(source.executorKind) } : {}),
     ...(readOptionalString(source.provider) ? { provider: readOptionalString(source.provider) } : {}),
     ...(readOptionalString(source.modelSource) ? { modelSource: readOptionalString(source.modelSource) } : {}),
     ...(readOptionalString(source.selectedSource) ? { selectedSource: readOptionalString(source.selectedSource) } : {}),
@@ -658,6 +664,9 @@ export async function processMessage(
       sourceUserId: options?.memoryUserId,
       sourceUserDisplayName: options?.memoryUserDisplayName,
       sourceMessageId: options?.sourceMessageId,
+      sourceChannelType: options?.sourceChannelType,
+      sourceChatId: options?.sourceChatId,
+      sourceThreadId: options?.sourceThreadId,
       replyPresentation: {
         replyStyleHint: getReplyStyleHintFromStore(),
       },

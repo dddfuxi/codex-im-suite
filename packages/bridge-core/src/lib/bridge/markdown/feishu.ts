@@ -293,6 +293,8 @@ export function buildFinalCardJson(
 function formatRunSummaryFooterParts(summary?: RunSummary): string[] {
   if (!summary) return [];
   const parts: string[] = [];
+  const sourceLabel = formatExecutionSourceLabel(summary);
+  if (sourceLabel) parts.push(`来源：${escapeFeishuInlineMarkdown(sourceLabel)}`);
   const modelLabel = formatModelLabel(summary);
   if (modelLabel) parts.push(`模型：${escapeFeishuInlineMarkdown(modelLabel)}`);
 
@@ -315,9 +317,17 @@ function formatRunSummaryFooterParts(summary?: RunSummary): string[] {
   return parts;
 }
 
+function formatExecutionSourceLabel(summary: RunSummary): string {
+  const executorName = summary.executorName?.trim();
+  const executorId = summary.executorId?.trim();
+  if (executorName && executorId && executorName !== executorId) return `${executorName} (${executorId})`;
+  if (executorName || executorId) return executorName || executorId || '';
+  return summary.provider?.trim() || '';
+}
+
 function formatModelLabel(summary: RunSummary): string {
   const model = summary.model?.trim();
-  const source = summary.selectedSource?.trim() || summary.modelSource?.trim() || summary.provider?.trim();
+  const source = summary.selectedSource?.trim() || summary.modelSource?.trim();
   if (model && source) return `${model} (${source})`;
   return model || source || '';
 }
