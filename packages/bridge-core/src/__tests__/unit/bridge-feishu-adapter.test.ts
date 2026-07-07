@@ -467,6 +467,121 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(resolved.text, '@刘丹 哈喽呀');
   });
 
+  it('resolves bare at-name text from Feishu chat bot members when the bot has a mentionable open_id', async () => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_app_test',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const adapter = new FeishuAdapter() as any;
+    const originalFetch = globalThis.fetch;
+    const calledUrls: string[] = [];
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calledUrls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [],
+            bots: [
+              { open_id: 'ou_george_bot', name: '乔治', app_name: 'codex小助手' },
+            ],
+            has_more: false,
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { items: [], has_more: false },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const resolved = await adapter.resolveOutboundMentions({
+        address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+        text: '@乔治 打工仔',
+        parseMode: 'Markdown',
+      });
+
+      assert.deepEqual(resolved.mentions, [{ userId: 'ou_george_bot', name: '乔治' }]);
+      assert.ok(calledUrls.some((item) => item.includes('/members/list')));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('does not resolve Feishu chat bots when members/list only exposes app or bot identifiers', async () => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_app_test',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const adapter = new FeishuAdapter() as any;
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [],
+            bots: [
+              { app_id: 'cli_george', bot_id: 'bot_george', name: '乔治' },
+            ],
+            has_more: false,
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { items: [], has_more: false },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const resolved = await adapter.resolveOutboundMentions({
+        address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+        text: '@乔治 打工仔',
+        parseMode: 'Markdown',
+      });
+
+      assert.equal(resolved.mentions, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('does not invent a structured mention when an at-name has multiple chat member matches', async () => {
     const adapter = new FeishuAdapter() as any;
     adapter.fetchChatMemberNames = async () => new Map([
@@ -544,6 +659,82 @@ describe('FeishuAdapter outbound mentions', () => {
     });
 
     assert.equal(JSON.parse(content).text, 'hello');
+  });
+
+  it('sends direct messages to resolved open_id targets without using the current group chat_id', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: any[] = [];
+    adapter.fetchChatMemberNames = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return new Map([
+        ['ou_sumu', '苏木'],
+        ['ou_other', '其他人'],
+      ]);
+    };
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload);
+            return { data: { message_id: 'om_direct' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.sendDirectMessage({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_sender', chatType: 'group' },
+        text: '给苏木私发一条消息：暗号是 12345',
+        timestamp: Date.now(),
+      },
+      targetText: '苏木',
+      text: '暗号是 12345',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.messageId, 'om_direct');
+    assert.equal(result.targetDisplayName, '苏木');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].params.receive_id_type, 'open_id');
+    assert.equal(sent[0].data.receive_id, 'ou_sumu');
+    assert.equal(sent[0].data.msg_type, 'text');
+    assert.equal(JSON.parse(sent[0].data.content).text, '暗号是 12345');
+  });
+
+  it('does not send direct messages when a display name resolves to multiple users', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: any[] = [];
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_a', '苏木'],
+      ['ou_b', '苏木'],
+    ]);
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload);
+            return { data: { message_id: 'om_direct' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.sendDirectMessage({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_sender', chatType: 'group' },
+        text: '给苏木私发一条消息：不要泄露',
+        timestamp: Date.now(),
+      },
+      targetText: '苏木',
+      text: '不要泄露',
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.error || '', /无法确认目标|not resolve/i);
+    assert.equal(sent.length, 0);
   });
 });
 

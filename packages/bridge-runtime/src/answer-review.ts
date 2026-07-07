@@ -42,7 +42,7 @@ export interface AnswerReviewDecision {
   memoryWriteCandidates?: Array<{ key?: string; value?: string; text: string }>;
 }
 
-const PROTOCOL_LEAKAGE_RE = /```(?:cti-final|cti-reminder)|\bcti-final\b|\bcti-reminder\b|"reply_mode"|"kind"\s*:/iu;
+const PROTOCOL_LEAKAGE_RE = /```(?:cti-final|cti-reminder|cti-direct-message)|\bcti-final\b|\bcti-reminder\b|\bcti-direct-message\b|"reply_mode"|"kind"\s*:/iu;
 const INTERNAL_TOOL_LEAKAGE_RE = /\bmulti_agent_v\d+\b|unsupported call:\s*[a-z0-9_.-]+|\btool is not supported in this environment\b|\bavailable tools\b/iu;
 const TOOL_FAKE_COMPLETION_RE = /(已完成|已经完成|记住了|已记住|已经记下|创建好了).*(未拿到|没有拿到|不可用|失败|无法执行|没法执行)|(?:未完成|失败).*(已完成|记住了)/u;
 

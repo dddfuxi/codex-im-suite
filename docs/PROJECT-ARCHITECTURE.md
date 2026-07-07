@@ -93,9 +93,10 @@ Feishu 接收现在是双通道：
 8. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。普通“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”会先命中 Feishu 历史意图，bridge-core 只使用 adapter/store 的历史索引和 `retrieveRelevantFeishuHistory()` 生成受控摘要，不把 `feishu-history/*.json` 路径交给 Codex 自行用 Bash 或 MCP 读取。
 9. 对带有明确可读对象的请求，`ExecutionRequirement` 会在不依赖关键词硬触发的前提下启用低风险主动探查：例如当前工作区、明确路径、文件名、MCP manifest、`config/mcp.d` 等对象会进入 `local_read_required`，让 provider 先做受控读取/列目录/检查；没有明确对象的时效或泛问仍保持普通回答或追问。
 10. 调用运行时 provider。
-11. 解析最终结果块和 `cti-reminder` 动作块。
+11. 解析最终结果块、`cti-reminder` 和 `cti-direct-message` 动作块。
 12. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
-13. 通过 Feishu 原生 reply/card/image 等方式回复。Feishu 出站 mention 统一走结构化 `mentions`，来源包括模型返回的 `cti-final.mentions`，以及 `BaseChannelAdapter.resolveOutboundMentions()` 钩子在最终发送前做的通用解析：FeishuAdapter 会把最终正文中的裸 `@显示名` 按本轮入站原生 mention、本地 Feishu 历史索引里已验证的 `<at user_id=...>显示名</at>`、当前群成员列表和 sender 上下文解析成真实 open_id/user_id；只有唯一命中时才补入 `OutboundMention`，同名多候选或未命中不会伪造原生艾特。若用户文本明确要求“艾特 / mention / 通知 / 叫 / 喊”某个具体目标，而模型最终回复没有结构化 `mentions` 或可见 `@显示名`，bridge-core 会先抽取目标并把回复补成 `@目标` 前缀，再交给同一 resolver 解析；目标抽取会把“让/叫/喊/通知 + 代词/对方/成员”“跟/和 + 人称”“去/来/帮 + 动作”等后续从句当作边界，避免无标点口语里把整句误当显示名，且不绑定具体姓名；解析成功就发送原生 mention，解析失败则提示用户直接点选 TA 或提供准确显示名，不发送普通文本假 @。平台原生 mention 需要可发送的 Feishu mention ID 或 `@所有人`；明显的 `cli_` / app / bot 标识不会进入候选，但机器人或智能体只要历史或结构化结果里存在有效 `ou_` 等 mention ID，也可以被解析为原生 mention。Markdown card 会渲染为 `<at id="..."></at>`，post/text 会渲染为飞书原生 `at` 节点或 `<at user_id="...">`，`replyToMessageId` 只表示引用回复，不再自动推断为艾特发起人；目标含糊的“另一个人 / 别人 / 其他成员”请求会先要求用户给出明确对象，且没有结构化 mention 时任何裸 `@名字` 都会被拦截为澄清回复。Feishu streaming card 只展示“核对可用信息 / 整理成可读回复 / 需要确认 / 遇到阻塞”这类高层状态；工具名、路径、命令、agent 阶段名和原始工具事件只进入审计或最终阻塞摘要，不直接作为进度直播内容。
+13. 如果 Codex 明确请求向某个 Feishu 成员私发消息，bridge-core 只接受 `cti-direct-message` 结构化动作，并要求用户原文存在明确私发/私信/发给某人的授权；FeishuAdapter 会复用入站 mention、历史 `<at>` 映射、群成员列表和 sender 上下文解析目标，只有唯一命中真实用户 ID 时才用 `im.message.create` 的 `open_id/user_id/union_id` 收件人发送一对一消息。源群只回“已私发/未完成原因”，不复述私信正文；目标不唯一、缺少目标或模型只口头声称已私发时都返回阻塞，不用 Bash、临时脚本或手写平台 API 代发。
+14. 通过 Feishu 原生 reply/card/image 等方式回复。Feishu 出站 mention 统一走结构化 `mentions`，来源包括模型返回的 `cti-final.mentions`，以及 `BaseChannelAdapter.resolveOutboundMentions()` 钩子在最终发送前做的通用解析：FeishuAdapter 会把最终正文中的裸 `@显示名` 按本轮入站原生 mention、本地 Feishu 历史索引里已验证的 `<at user_id=...>显示名</at>`、旧群成员列表、新版 `members/list` 的 `users[]/bots[]` 候选和 sender 上下文解析成真实 open_id/user_id；只有唯一命中时才补入 `OutboundMention`，同名多候选或未命中不会伪造原生艾特。若用户文本明确要求“艾特 / mention / 通知 / 叫 / 喊”某个具体目标，而模型最终回复没有结构化 `mentions` 或可见 `@显示名`，bridge-core 会先抽取目标并把回复补成 `@目标` 前缀，再交给同一 resolver 解析；若模型误把飞书历史里的 `@_user_N` 临时占位或字符串型 `cti-final.mentions` 当成可发送 mention，bridge-core 会丢弃非结构化 mentions，并在单个占位符场景用用户明确目标替换后再解析，解析失败提示也使用用户目标名，不把 `_user_N` 当真实成员 ID 外发。目标抽取会把“让/叫/喊/通知 + 代词/对方/成员”“跟/和 + 人称”“去/来/帮 + 动作”等后续从句当作边界，并把“这个机器人 / 智能体 / bot / agent / 应用”等尾部类型词当作说明剥离，避免无标点口语里把整句误当显示名，且不绑定具体姓名。用户问“怎么 at / 为什么不能 at / at 后没反应 / 对方不回复”这类解释或诊断问题时，只把 `@名字` 当示例文本或问题对象，不触发裸 `@显示名` 原生解析、补 @ 或假 @ 拦截；解析成功就发送原生 mention，解析失败则提示用户直接点选 TA 或提供准确显示名，不发送普通文本假 @。平台原生 mention 需要可发送的 Feishu mention ID 或 `@所有人`；明显的 `cli_` / app / bot 标识不会进入候选，`members/list` 里的机器人也只有返回 `open_id/user_id/union_id` 或明确类型 `member_id` 时才会进入候选，不会把 `app_id/bot_id` 伪造成原生 @；机器人或智能体只要历史、结构化结果或群机器人列表里存在有效 `ou_` 等 mention ID，也可以被解析为原生 mention。Markdown card 会渲染为 `<at id="..."></at>`，post/text 会渲染为飞书原生 `at` 节点或 `<at user_id="...">`，`replyToMessageId` 只表示引用回复，不再自动推断为艾特发起人；目标含糊的“另一个人 / 别人 / 其他成员”请求会先要求用户给出明确对象，且没有结构化 mention 时任何裸 `@名字` 都会被拦截为澄清回复。Feishu streaming card 只展示“核对可用信息 / 整理成可读回复 / 需要确认 / 遇到阻塞”这类高层状态；工具名、路径、命令、agent 阶段名和原始工具事件只进入审计或最终阻塞摘要，不直接作为进度直播内容。
 
 ```mermaid
 sequenceDiagram
@@ -122,10 +123,15 @@ sequenceDiagram
   Runtime->>Provider: 按策略选择执行层
   Provider-->>Runtime: 返回 cti-final 或可见结果
   Runtime-->>Core: 返回最终候选回复
-  Core->>Core: 解析结果块、附件声明和 cti-reminder
+  Core->>Core: 解析结果块、附件声明、cti-reminder 和 cti-direct-message
   opt 命中 cti-reminder
     Core->>Runtime: 创建直接提醒
     Runtime-->>Core: 返回 reminder 执行结果
+  end
+  opt 命中 cti-direct-message
+    Core->>Core: 校验用户明确授权并解析 Feishu 私发目标
+    Core->>Sender: 用用户 open_id/user_id/union_id 发送一对一消息
+    Sender-->>Core: 返回私发执行结果
   end
   Core->>Sender: 发送 card、reply、图片或文件
   Sender-->>User: 飞书可见回复
@@ -499,12 +505,15 @@ flowchart TD
 - 图片出站只使用当前回复显式给出的图片路径：`cti-final.images` 或当前可见文本中的本地图片路径。出站层不再扫描最近 assistant 历史消息补发旧图，避免截图/预览任务失败时把历史截图误当成当前结果。
 - 最终结果块解析和出站收口。
 - `cti-reminder` 动作块解析、提醒创建请求转交和伪完成拦截。
+- `cti-direct-message` 动作块解析、Feishu 私发目标解析、私信发送请求转交和伪完成拦截。
 - 运行审计落盘。
 
 关键能力：
 
 - Feishu 群聊原生 reply。
-- 群聊 reply 只表示引用消息，不自动 @ 提问人；原生 @ 必须来自结构化 `mentions`，可由 `cti-final.mentions` 显式提供，或由 Feishu 出站 resolver 按入站原生 mention、本地历史中已验证的 at 标记、群成员列表和 sender 上下文把最终正文里的裸 `@显示名` 解析为唯一真实目标。用户明确要求艾特某个具体目标而模型漏写 `@显示名` 时，bridge-core 会补上可见 `@目标` 后再解析；无标点口语里的后续动作从句会作为目标边界处理，避免把“让他/跟你/帮忙处理”等指令粘进显示名；目标解析不到真实 Feishu mention ID 时，只提示用户补充准确对象，不发送假 @。
+- 群聊 reply 只表示引用消息，不自动 @ 提问人；原生 @ 必须来自结构化 `mentions`，可由 `cti-final.mentions` 显式提供，或由 Feishu 出站 resolver 按入站原生 mention、本地历史中已验证的 at 标记、旧群成员列表、新版 `members/list` 的 `users[]/bots[]` 候选和 sender 上下文把最终正文里的裸 `@显示名` 解析为唯一真实目标。用户明确要求艾特某个具体目标而模型漏写 `@显示名` 时，bridge-core 会补上可见 `@目标` 后再解析；无标点口语里的后续动作从句会作为目标边界处理，避免把“让他/跟你/帮忙处理”等指令粘进显示名；目标解析不到真实 Feishu mention ID 时，只提示用户补充准确对象，不发送假 @；机器人/智能体候选只接受可发送的 `open_id/user_id/union_id` 或明确类型 `member_id`，不会把 `app_id/bot_id/cli_` 当原生 @ ID。
+- “怎么 at / 为什么 at 不了 / at 后不回复”这类解释或诊断型 mention 问题不会触发原生 mention 发送，正文中的 `@名字` 只作为示例或问题对象展示；只有明确执行型“请艾特 / 艾特 X 让他……”才走补 @ 与 resolver。
+- Feishu 私发走 `cti-direct-message` 受控动作：模型只声明目标和正文，bridge-core 校验用户明确授权，FeishuAdapter 复用 mention 候选解析为唯一用户 ID 后调用平台一对一发送；源群只显示成功/失败确认，不回显私信正文。
 - 群聊 mention 判定优先使用事件 `mentions`，事件缺字段时再解析正文里的飞书 at 标记，避免“已 @ 机器人但消息未入会话”。
 - Feishu Markdown 默认走 card。
 - Feishu streaming card 等待态只展示当前一步用户可见思考动作：卡片正文由彩色阶段标题、灰色小字正文和通用阶段轨迹组成，随着模型/provider progress、记忆证据、工具事件或收口阶段刷新，不累计历史步骤，不写入最终回复或会话历史。允许展示经过改写的“处理思路 / 依据 / 正在识别或核对的对象”，但必须过滤工具名、路径、命令、`JsonTool/tool_*`、MCP 原始事件和 `agent` 内部结果块；当 provider 已给出安全且更具体的进度内容时，不用“正在回复...”这类泛化文案遮住它。

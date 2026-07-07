@@ -265,7 +265,7 @@ export function buildJsonToolFinalResponsePrompt(
     'Final answer composer for an IM/Feishu user after real tools have already run.',
     '- You are not chatting with the user directly. You are formatting the final answer from the supplied real tool history.',
     '- Answer in Chinese unless the user explicitly asked for another language.',
-    '- Output only the final user-facing Markdown body. Do not output JSON, cti-final fences, or protocol names such as JsonTool/tool_request/tool_result.',
+    '- Output only the final user-facing Markdown body. Do not output JSON, cti-final/cti-direct-message fences, or protocol names such as JsonTool/tool_request/tool_result.',
     '- The final answer must be outcome-first. Do not include a separate "处理思路" section unless the user explicitly asked for a detailed walkthrough.',
     '- If the action was not completed, start with "未完成：" and name the exact blocker from the tool history.',
     '- Do not paste raw MCP JSON or logs. Extract meaningful fields such as scene name, path, count, created file, screenshot, or error.',
@@ -292,7 +292,7 @@ export function normalizeGeneratedToolFinalText(text: string, fallbackText: stri
     }
   }
   normalized = normalized.replace(/^```(?:markdown|md)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-  normalized = normalized.replace(/\bJsonTool\b|\btool_request\b|\btool_result\b|\bcti-final\b/gi, '').trim();
+  normalized = normalized.replace(/\bJsonTool\b|\btool_request\b|\btool_result\b|\bcti-final\b|\bcti-direct-message\b/gi, '').trim();
   const stripped = hasUserVisibleRationaleSections(normalized)
     ? { text: normalized, extractedResult: false }
     : stripGeneratedRationaleSections(normalized);
@@ -333,7 +333,7 @@ function isSafeShortGeneratedToolFinalText(text: string): boolean {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (normalized.length < 2) return false;
   if (/"success"\s*:\s*true|^\s*\{[\s\S]*\}\s*$/iu.test(text)) return false;
-  if (/\b(JsonTool|tool_request|tool_result|cti-final)\b/iu.test(text)) return false;
+  if (/\b(JsonTool|tool_request|tool_result|cti-final|cti-direct-message)\b/iu.test(text)) return false;
   if (/how can i assist|how can i help|got it\.?|有什么可以帮忙|请问有什么可以帮/iu.test(normalized)) return false;
   return true;
 }
@@ -342,7 +342,7 @@ export function isUsableGeneratedToolFinalText(text: string): boolean {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (normalized.length < 20) return false;
   if (/"success"\s*:\s*true|^\s*\{[\s\S]*\}\s*$/iu.test(text)) return false;
-  if (/\b(JsonTool|tool_request|tool_result|cti-final)\b/iu.test(text)) return false;
+  if (/\b(JsonTool|tool_request|tool_result|cti-final|cti-direct-message)\b/iu.test(text)) return false;
   if (/how can i assist|how can i help|got it\.?|有什么可以帮忙|请问有什么可以帮/iu.test(normalized)) return false;
   return true;
 }

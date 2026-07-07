@@ -32,6 +32,7 @@ import type {
 import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
+import type { DirectMessageRequest, DirectMessageSendResult } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
@@ -169,6 +170,13 @@ function isDefinitelyNonUserMentionId(id: string | undefined): boolean {
     || /^bot_/u.test(normalized);
 }
 
+function inferDirectMessageReceiveIdType(id: string): 'open_id' | 'union_id' | 'user_id' {
+  const normalized = id.trim();
+  if (/^ou_/iu.test(normalized)) return 'open_id';
+  if (/^on_/iu.test(normalized)) return 'union_id';
+  return 'user_id';
+}
+
 function extractVerifiedMentionCandidatesFromText(text: string): FeishuMentionCandidate[] {
   const candidates: FeishuMentionCandidate[] = [];
   const seen = new Set<string>();
@@ -209,6 +217,118 @@ function replaceBareAtTarget(text: string, target: string, replacementName: stri
 
 function getRawObject(value: unknown): Record<string, any> {
   return value && typeof value === 'object' ? value as Record<string, any> : {};
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+function uniqueCleanStrings(values: unknown[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const cleaned = cleanMentionName(value, '');
+    const key = normalizeMentionAlias(cleaned);
+    if (!cleaned || !key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(cleaned);
+  }
+  return result;
+}
+
+function pickFeishuMentionableMemberId(item: FeishuChatMemberListItem, allowLegacyMemberId = false): string {
+  const raw = getRawObject(item);
+  const id = getRawObject(item.id);
+  const user = getRawObject(item.user);
+  const bot = getRawObject(item.bot);
+  const directId = firstNonEmptyString(
+    item.open_id,
+    item.openId,
+    id.open_id,
+    id.openId,
+    user.open_id,
+    user.openId,
+    bot.open_id,
+    bot.openId,
+    item.user_id,
+    item.userId,
+    id.user_id,
+    id.userId,
+    user.user_id,
+    user.userId,
+    bot.user_id,
+    bot.userId,
+    item.union_id,
+    item.unionId,
+    id.union_id,
+    id.unionId,
+    user.union_id,
+    user.unionId,
+    bot.union_id,
+    bot.unionId,
+  );
+  if (directId) return directId;
+
+  const memberId = firstNonEmptyString(item.member_id, item.memberId, raw.memberId);
+  const memberIdType = firstNonEmptyString(item.member_id_type, item.memberIdType, raw.memberIdType).toLowerCase();
+  if (!memberId) return '';
+  if (['open_id', 'user_id', 'union_id'].includes(memberIdType)) return memberId;
+  // 旧 members 接口在请求 member_id_type=open_id 后只给 member_id，可继续作为普通成员候选；
+  // 新 members/list 的 bots[] 若没有类型，只接受明显的 open_id/union_id，避免把 bot_id/app_id 误当原生 @ ID。
+  if (allowLegacyMemberId || /^o[un]_/iu.test(memberId)) return memberId;
+  return '';
+}
+
+function buildFeishuMentionCandidateFromMember(item: FeishuChatMemberListItem, allowLegacyMemberId = false): FeishuMentionCandidate | null {
+  const raw = getRawObject(item);
+  const user = getRawObject(item.user);
+  const bot = getRawObject(item.bot);
+  const i18nName = getRawObject(item.i18n_name);
+  const localizedName = getRawObject(item.localized_name);
+  const userId = pickFeishuMentionableMemberId(item, allowLegacyMemberId);
+  if (!userId || isDefinitelyNonUserMentionId(userId)) return null;
+
+  const aliases = uniqueCleanStrings([
+    item.name,
+    item.user_name,
+    item.userName,
+    item.display_name,
+    item.displayName,
+    item.nickname,
+    item.en_name,
+    item.enName,
+    item.app_name,
+    item.appName,
+    item.bot_name,
+    item.botName,
+    raw.name,
+    raw.displayName,
+    raw.appName,
+    raw.botName,
+    user.name,
+    user.display_name,
+    user.displayName,
+    user.user_name,
+    user.userName,
+    bot.name,
+    bot.app_name,
+    bot.appName,
+    bot.bot_name,
+    bot.botName,
+    i18nName.zh_cn,
+    i18nName.en_us,
+    localizedName.zh_cn,
+    localizedName.en_us,
+  ]);
+  const name = aliases[0] || '';
+  if (!name) return null;
+  return { userId, name, aliases };
 }
 
 function stripFeishuReactionHintText(text: string, hint: FeishuReactionHint): string {
@@ -461,6 +581,36 @@ interface FeishuChatMemberItem {
   member_id?: string;
   member_id_type?: string;
   name?: string;
+}
+
+interface FeishuChatMemberListItem {
+  member_id?: string;
+  memberId?: string;
+  member_id_type?: string;
+  memberIdType?: string;
+  open_id?: string;
+  openId?: string;
+  user_id?: string;
+  userId?: string;
+  union_id?: string;
+  unionId?: string;
+  name?: string;
+  user_name?: string;
+  userName?: string;
+  display_name?: string;
+  displayName?: string;
+  nickname?: string;
+  en_name?: string;
+  enName?: string;
+  app_name?: string;
+  appName?: string;
+  bot_name?: string;
+  botName?: string;
+  id?: { open_id?: string; openId?: string; user_id?: string; userId?: string; union_id?: string; unionId?: string };
+  user?: Record<string, unknown>;
+  bot?: Record<string, unknown>;
+  i18n_name?: Record<string, unknown>;
+  localized_name?: Record<string, unknown>;
 }
 
 interface FeishuChatIndexRecord {
@@ -3069,6 +3219,70 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
   }
 
+  async sendDirectMessage(request: DirectMessageRequest): Promise<DirectMessageSendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+    if (request.sourceMessage.address.channelType !== 'feishu') {
+      return { ok: false, error: '当前来源不是飞书会话，无法解析私发目标' };
+    }
+
+    const targetText = cleanMentionName(request.targetText, '');
+    const body = (request.text || '').trim();
+    if (!targetText || !body) {
+      return { ok: false, error: '私发目标或正文为空' };
+    }
+    if (FEISHU_AT_ALL_ALIASES.has(normalizeMentionAlias(targetText))) {
+      return { ok: false, error: '私发不能使用 @all，请指定单个成员' };
+    }
+
+    const candidates = await this.collectOutboundMentionCandidates({
+      address: request.sourceMessage.address,
+      text: `@${targetText}`,
+      parseMode: 'plain',
+    }, request.sourceMessage);
+    const resolved = this.resolveOutboundMentionTarget(targetText, candidates);
+    if (!resolved?.userId || resolved.atAll) {
+      return { ok: false, error: '无法确认目标，请直接 @ TA 或提供准确显示名' };
+    }
+
+    const receiveIdType = inferDirectMessageReceiveIdType(resolved.userId);
+    const messageText = request.parseMode === 'Markdown'
+      ? preprocessFeishuMarkdown(body)
+      : body;
+    const data = request.parseMode === 'Markdown'
+      ? {
+        receive_id: resolved.userId,
+        msg_type: 'interactive',
+        content: buildCardContent(messageText),
+      }
+      : {
+        receive_id: resolved.userId,
+        msg_type: 'text',
+        content: JSON.stringify({ text: messageText }),
+      };
+
+    try {
+      // 官方 im.message.create 支持 receive_id_type=open_id/user_id/union_id；
+      // 这里不复用当前群 chat_id，避免“私发”退化成群回复。
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: receiveIdType },
+        data,
+      });
+      if (res?.data?.message_id) {
+        return {
+          ok: true,
+          messageId: res.data.message_id,
+          targetUserId: resolved.userId,
+          targetDisplayName: resolved.name || targetText,
+        };
+      }
+      return { ok: false, error: res?.msg || 'Feishu direct message send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Feishu direct message send failed' };
+    }
+  }
+
   private async collectOutboundMentionCandidates(
     message: OutboundMessage,
     sourceMessage?: InboundMessage,
@@ -3098,9 +3312,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     if (message.address.chatId) {
       try {
-        const memberNames = await this.fetchChatMemberNames(message.address.chatId);
-        for (const [memberId, memberName] of memberNames) {
-          addCandidate(memberId, memberName);
+        const mentionCandidates = await this.fetchChatMentionCandidates(message.address.chatId);
+        for (const candidate of mentionCandidates) {
+          addCandidate(candidate.userId, candidate.name, candidate.aliases);
         }
       } catch (err) {
         console.warn('[feishu-adapter] chat member mention lookup skipped:', err instanceof Error ? err.message : err);
@@ -3876,6 +4090,117 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
   }
 
+  private hasFeishuAppCredentials(): boolean {
+    const store = getBridgeContext().store;
+    return !!(store.getSetting('bridge_feishu_app_id') && store.getSetting('bridge_feishu_app_secret'));
+  }
+
+  private async fetchChatMentionCandidates(chatId: string): Promise<FeishuMentionCandidate[]> {
+    const byId = new Map<string, FeishuMentionCandidate>();
+    const errors: unknown[] = [];
+    const addCandidate = (candidate: FeishuMentionCandidate | null) => {
+      if (!candidate) return;
+      const id = (candidate.userId || '').trim();
+      const name = cleanMentionName(candidate.name, '');
+      if (!id || !name || isDefinitelyNonUserMentionId(id)) return;
+      const existing = byId.get(id);
+      const aliases = new Set([
+        ...(existing?.aliases || []),
+        name,
+        ...candidate.aliases.map((item) => cleanMentionName(item, '')).filter(Boolean),
+      ]);
+      byId.set(id, {
+        userId: id,
+        name: existing?.name || name,
+        aliases: [...aliases],
+      });
+    };
+
+    try {
+      const memberNames = await this.fetchChatMemberNames(chatId);
+      for (const [memberId, memberName] of memberNames) {
+        addCandidate({ userId: memberId, name: memberName, aliases: [memberName] });
+      }
+    } catch (err) {
+      errors.push(err);
+    }
+
+    if (this.hasFeishuAppCredentials()) {
+      try {
+        for (const candidate of await this.fetchChatMemberListMentionCandidates(chatId)) {
+          addCandidate(candidate);
+        }
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+
+    if (byId.size === 0 && errors.length > 0) {
+      const firstError = errors[0];
+      throw firstError instanceof Error ? firstError : new Error(String(firstError));
+    }
+    return [...byId.values()];
+  }
+
+  private async fetchChatMemberListMentionCandidates(chatId: string): Promise<FeishuMentionCandidate[]> {
+    const { appId, appSecret, baseUrl } = this.getAuthContext();
+    const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+    const candidates: FeishuMentionCandidate[] = [];
+    let pageToken = '';
+
+    while (true) {
+      const url = new URL(`/open-apis/im/v1/chats/${chatId}/members/list`, baseUrl);
+      url.searchParams.set('member_id_type', 'open_id');
+      url.searchParams.set('page_size', '50');
+      if (pageToken) {
+        url.searchParams.set('page_token', pageToken);
+      }
+
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${tenantAccessToken}`,
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      const payload = await response.json() as {
+        code?: number;
+        msg?: string;
+        data?: {
+          users?: FeishuChatMemberListItem[];
+          bots?: FeishuChatMemberListItem[];
+          items?: FeishuChatMemberListItem[];
+          members?: FeishuChatMemberListItem[];
+          has_more?: boolean;
+          page_token?: string;
+        };
+      };
+
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(`Feishu chats.members.list failed [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
+      }
+
+      // 飞书群成员新版列表会把普通用户和群机器人拆到不同桶；这里统一抽成 mention 候选。
+      const data = payload.data || {};
+      const buckets = [data.users, data.bots, data.items, data.members];
+      for (const bucket of buckets) {
+        if (!Array.isArray(bucket)) continue;
+        for (const item of bucket) {
+          const candidate = buildFeishuMentionCandidateFromMember(item);
+          if (candidate) candidates.push(candidate);
+        }
+      }
+
+      if (!payload.data?.has_more || !payload.data.page_token) {
+        break;
+      }
+      pageToken = payload.data.page_token;
+    }
+
+    return candidates;
+  }
+
   private async fetchChatMemberNames(chatId: string): Promise<Map<string, string>> {
     const { appId, appSecret, baseUrl } = this.getAuthContext();
     const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
@@ -3913,10 +4238,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
 
       for (const item of payload.data?.items ?? []) {
-        const memberId = item.member_id?.trim();
-        const memberName = item.name?.trim();
-        if (memberId && memberName) {
-          names.set(memberId, memberName);
+        const candidate = buildFeishuMentionCandidateFromMember(item, true);
+        if (candidate) {
+          names.set(candidate.userId, candidate.name);
         }
       }
 

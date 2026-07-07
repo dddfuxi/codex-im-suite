@@ -21,6 +21,18 @@ export interface AdapterAssistantIdentity {
   botOpenId?: string;
 }
 
+export interface DirectMessageRequest {
+  sourceMessage: InboundMessage;
+  targetText: string;
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+}
+
+export interface DirectMessageSendResult extends SendResult {
+  targetDisplayName?: string;
+  targetUserId?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -124,6 +136,13 @@ export abstract class BaseChannelAdapter {
    * metadata using platform APIs or cached inbound context.
    */
   resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
+
+  /**
+   * Send a controlled one-to-one message resolved from channel context.
+   * The model only declares intent; adapters own identity resolution and the
+   * platform API call so group replies cannot fake a private delivery.
+   */
+  sendDirectMessage?(_request: DirectMessageRequest): Promise<DirectMessageSendResult>;
 
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;

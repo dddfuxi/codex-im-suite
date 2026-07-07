@@ -76,6 +76,7 @@ const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
 const REMINDER_ACTION_FENCE = 'cti-reminder';
+const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -161,6 +162,19 @@ interface CtiReminderAction {
 interface ExtractedReminderAction {
   action: CtiReminderAction | null;
   text: string;
+}
+
+interface CtiDirectMessageAction {
+  targetText: string;
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+}
+
+interface ExtractedDirectMessageAction {
+  action: CtiDirectMessageAction | null;
+  text: string;
+  hadBlock: boolean;
+  error?: string;
 }
 
 interface ParsedReminderRequest {
@@ -285,6 +299,120 @@ function extractCtiReminderAction(text: string): ExtractedReminderAction {
   } catch {
     return { action: null, text: cleaned };
   }
+}
+
+function getStringField(raw: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function parseDirectMessageParseMode(value: unknown): OutboundMessage['parseMode'] | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'markdown') return 'Markdown';
+  if (normalized === 'html') return 'HTML';
+  if (normalized === 'plain' || normalized === 'text') return 'plain';
+  return undefined;
+}
+
+function extractCtiDirectMessageAction(text: string): ExtractedDirectMessageAction {
+  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${DIRECT_MESSAGE_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
+  const match = text.match(fencePattern);
+  if (!match) {
+    return { action: null, text, hadBlock: false };
+  }
+
+  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
+  try {
+    const parsed = JSON.parse(match[2].trim()) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return { action: null, text: cleaned, hadBlock: true, error: '私发动作不是有效 JSON 对象' };
+    }
+    const raw = parsed as Record<string, unknown>;
+    const targetText = getStringField(raw, ['targetText', 'target', 'to', 'name', 'user', 'displayName']);
+    const body = getStringField(raw, ['text', 'message', 'content', 'body']);
+    if (!targetText || !body) {
+      return { action: null, text: cleaned, hadBlock: true, error: '私发动作缺少 target 或 text' };
+    }
+    return {
+      action: {
+        targetText,
+        text: body,
+        parseMode: parseDirectMessageParseMode(raw.parseMode ?? raw.parse_mode),
+      },
+      text: cleaned,
+      hadBlock: true,
+    };
+  } catch {
+    return { action: null, text: cleaned, hadBlock: true, error: '私发动作 JSON 解析失败' };
+  }
+}
+
+function isExplicitDirectMessageRequestText(text: string): boolean {
+  const normalized = (text || '').normalize('NFKC').replace(/\s+/g, '');
+  if (!normalized) return false;
+  return /(?:私发|私信|单独发|悄悄发|发私聊|DM|directmessage|给.{1,32}发(?:一条)?消息|发(?:一条)?消息给|转告|转发给)/iu.test(normalized);
+}
+
+function containsUnverifiedDirectMessageCompletion(rawReply: string, rawPrompt: string): boolean {
+  if (!isExplicitDirectMessageRequestText(rawPrompt)) return false;
+  const withoutBlocks = stripFinalReplyProtocolArtifacts(rawReply)
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${DIRECT_MESSAGE_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .trim();
+  if (!withoutBlocks) return false;
+  return /(?:已|已经|成功).{0,12}(?:私发|私信|单独发|发给|转发给|转告).{0,24}(?:了|成功|完成|出去)/iu.test(withoutBlocks);
+}
+
+function formatDirectMessageResultText(result: SendResult & { targetDisplayName?: string; targetUserId?: string }, fallbackTarget: string): string {
+  const targetName = (result.targetDisplayName || fallbackTarget || result.targetUserId || '目标用户').trim();
+  if (result.ok) {
+    return `已私发给 ${targetName}。`;
+  }
+  const reason = (result.error || '无法完成私发').replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
+  return `未完成：${reason || '无法完成私发'}`;
+}
+
+async function executeDirectMessageActionFromReply(
+  adapter: BaseChannelAdapter,
+  rawReply: string,
+  msg: InboundMessage,
+  rawPrompt: string,
+): Promise<{ handled: boolean; text: string }> {
+  const extracted = extractCtiDirectMessageAction(rawReply);
+  if (extracted.action) {
+    if (!isExplicitDirectMessageRequestText(rawPrompt)) {
+      return { handled: true, text: '未完成：本轮用户没有明确授权私发消息，已拦截私发动作。' };
+    }
+    if (typeof adapter.sendDirectMessage !== 'function') {
+      return { handled: true, text: '未完成：当前渠道暂不支持 bridge 托管私发。' };
+    }
+    const result = await adapter.sendDirectMessage({
+      sourceMessage: msg,
+      targetText: extracted.action.targetText,
+      text: extracted.action.text,
+      parseMode: extracted.action.parseMode,
+    });
+    return {
+      handled: true,
+      text: formatDirectMessageResultText(result, extracted.action.targetText),
+    };
+  }
+
+  if (extracted.hadBlock) {
+    return { handled: true, text: `未完成：${extracted.error || '私发动作无效'}` };
+  }
+
+  if (containsUnverifiedDirectMessageCompletion(rawReply, rawPrompt)) {
+    return {
+      handled: true,
+      text: '未完成：模型声称已私发，但没有使用 bridge 的 cti-direct-message 动作，已拦截这条伪完成回复。',
+    };
+  }
+
+  return { handled: false, text: rawReply };
 }
 
 function containsUnverifiedReminderCompletion(text: string): boolean {
@@ -1188,7 +1316,7 @@ function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
 function sanitizeProgressCardDetail(text: string): string {
   const normalized = (text || '')
     .replace(/\r\n/g, '\n')
-    .replace(/```cti-final[\s\S]*?```/gi, '')
+    .replace(/```(?:cti-final|cti-direct-message)[\s\S]*?```/gi, '')
     .replace(/^\s*#{1,6}\s*处理思路\s*$/gim, '')
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
@@ -1216,7 +1344,7 @@ function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
   // 进度卡允许展示面向用户改写过的处理思路；这里只拦截会暴露工具名、路径、命令或 agent 内部阶段的细节。
-  if (/(JsonTool|tool_use|tool_result|cti-final|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
+  if (/(JsonTool|tool_use|tool_result|cti-final|cti-direct-message|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
     return true;
   }
   if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
@@ -1577,6 +1705,33 @@ function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' |
   }
 }
 
+function parseEnvelopeMentions(rawMentions: unknown): OutboundMention[] | undefined {
+  if (!Array.isArray(rawMentions)) return undefined;
+  const mentions: OutboundMention[] = [];
+  for (const item of rawMentions) {
+    if (!item || typeof item !== 'object') continue;
+    const raw = item as Record<string, unknown>;
+    const userId = typeof raw.userId === 'string'
+      ? raw.userId.trim()
+      : typeof raw.user_id === 'string'
+        ? raw.user_id.trim()
+        : '';
+    const name = typeof raw.name === 'string'
+      ? raw.name.trim()
+      : typeof raw.user_name === 'string'
+        ? raw.user_name.trim()
+        : '';
+    const atAll = raw.atAll === true || raw.at_all === true;
+    if (!atAll && !userId) continue;
+    mentions.push({
+      ...(userId ? { userId } : {}),
+      ...(name ? { name } : {}),
+      ...(atAll ? { atAll: true } : {}),
+    });
+  }
+  return mentions.length > 0 ? mentions : undefined;
+}
+
 function getPendingSystemActions(): Map<string, PendingSystemAction> {
   const globalState = globalThis as Record<string, unknown>;
   if (!globalState[PENDING_SYSTEM_ACTIONS_KEY]) {
@@ -1631,7 +1786,7 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     images,
     files,
     reply_mode: replyMode,
-    mentions: Array.isArray(raw.mentions) ? raw.mentions as OutboundMention[] : undefined,
+    mentions: parseEnvelopeMentions(raw.mentions),
     reply_to: typeof raw.reply_to === 'string' && raw.reply_to.trim() ? raw.reply_to.trim() : undefined,
   };
 }
@@ -1791,6 +1946,8 @@ function verifyPreparedReplyExecution(
 const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu;
 const FEISHU_OTHER_PERSON_TARGET_RE = /(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人)/iu;
 const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
+const FEISHU_BARE_AT_BOUNDARY_CLASS = '[\\s([{（【]';
+const FEISHU_BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
 const FEISHU_EXPLICIT_MENTION_TARGET_TOKEN = '[@＠]?[\\p{L}\\p{N}_.$·-]{1,64}?';
 const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|处理|吗|呢|吧|啊|呀|哈|哦|噢)';
 const FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE = /(?:让|叫|喊|通知|请|麻烦|要)(?:他|她|它|ta|TA|对方|其|那个人|这个人|该成员)|(?:跟|和)(?:你|我|他|她|它|ta|TA|对方)|(?:去|来|帮|帮忙|帮我)(?:看|看看|处理|回复|聊|聊天|说|问|确认|查|检查|修|改|做|发|转发)/iu;
@@ -1806,6 +1963,36 @@ function hasStructuredMentions(mentions: OutboundMention[] | undefined): boolean
   return Array.isArray(mentions) && mentions.some((mention) => mention?.atAll || !!mention?.userId?.trim());
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeFeishuMentionTargetKey(target: string): string {
+  return (target || '').normalize('NFKC').replace(/^[@＠]+/u, '').replace(/\s+/g, '').trim().toLocaleLowerCase();
+}
+
+function isFeishuPlaceholderMentionTarget(target: string): boolean {
+  return /^_user_\d+$/iu.test(normalizeFeishuMentionTargetKey(target));
+}
+
+function hasBareFeishuTarget(text: string, target: string): boolean {
+  const expected = normalizeFeishuMentionTargetKey(target);
+  if (!expected) return false;
+  return extractBareFeishuAtTargets(text).some((item) => normalizeFeishuMentionTargetKey(item) === expected);
+}
+
+function isFeishuMentionHowToOrDiagnosticRequest(userText: string): boolean {
+  const compact = (userText || '').normalize('NFKC').replace(/\s+/g, '');
+  if (!compact) return false;
+  return /(?:怎么|如何|怎样|咋|教(?:一教|一下)?|教程|方法|做到).{0,32}(?:艾特|@|＠|at|mention|提到|点名)/iu.test(compact)
+    || /(?:艾特|@|＠|at|mention|提到|点名).{0,32}(?:怎么|如何|怎样|为什么|为啥|不行|不能|失败|没反应|不回复|教程|方法)/iu.test(compact)
+    || /(?:不能|不行|失败|没反应|不回复).{0,24}(?:艾特|@|＠|at|mention|提到|点名)/iu.test(compact);
+}
+
+function isFeishuMentionExecutionRequest(userText: string): boolean {
+  return FEISHU_MENTION_ACTION_RE.test(userText) && !isFeishuMentionHowToOrDiagnosticRequest(userText);
+}
+
 function cleanExplicitFeishuMentionTarget(target: string): string {
   let cleaned = target
     .normalize('NFKC')
@@ -1814,6 +2001,8 @@ function cleanExplicitFeishuMentionTarget(target: string): string {
     .trim()
     .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '')
     .replace(/(?:一下|下|一声|看看|看一下|回复一下|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
+    // “机器人/智能体”常是目标类型说明，不是飞书显示名本体；真实目标仍交给 resolver 校验。
+    .replace(/(?:这个|那个|该|对应的)?(?:机器人|智能体|agent|bot|应用)(?:人)?(?:的)?$/iu, '')
     .trim();
   const followup = FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE.exec(cleaned);
   if (followup) {
@@ -1835,9 +2024,15 @@ function extractBareFeishuAtTargets(text: string): string[] {
   return targets;
 }
 
+function replaceBareFeishuAtTarget(text: string, target: string, replacementName: string): string {
+  const safeTarget = escapeRegExp(target);
+  const pattern = new RegExp(`(^|${FEISHU_BARE_AT_BOUNDARY_CLASS})@${safeTarget}(?=$|${FEISHU_BARE_AT_END_BOUNDARY_CLASS})`, 'giu');
+  return text.replace(pattern, (_match, prefix: string) => `${prefix}@${replacementName}`);
+}
+
 function extractExplicitFeishuMentionTargetsFromRequest(userText: string): string[] {
   const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-  if (!FEISHU_MENTION_ACTION_RE.test(normalized)) return [];
+  if (!isFeishuMentionExecutionRequest(normalized)) return [];
 
   const targets = new Map<string, string>();
   const addTarget = (target: string) => {
@@ -1868,7 +2063,7 @@ function hasBareFeishuMentionText(answerText: string): boolean {
 }
 
 function needsExplicitFeishuMentionTarget(userText: string): boolean {
-  if (!FEISHU_MENTION_ACTION_RE.test(userText)) return false;
+  if (!isFeishuMentionExecutionRequest(userText)) return false;
   return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
 }
 
@@ -1880,15 +2075,29 @@ function addRequestedFeishuMentionTarget(
   },
 ): PreparedBridgeReplyPayload {
   if (context.channelType !== 'feishu') return payload;
-  if (hasStructuredMentions(payload.mentions) || hasBareFeishuMentionText(payload.text)) return payload;
+  if (hasStructuredMentions(payload.mentions)) return payload;
 
   const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText);
   if (!target) return payload;
+  if (hasBareFeishuTarget(payload.text, target)) return payload;
+
+  const bareTargets = extractBareFeishuAtTargets(payload.text);
+  const placeholderTargets = bareTargets.filter(isFeishuPlaceholderMentionTarget);
+  if (placeholderTargets.length === 1) {
+    // 模型偶尔会把飞书历史里的 @_user_N 占位符当成可发送 mention。
+    // 用户本轮已给出明确目标时，用真实显示名替换占位符，再交给 resolver 统一校验 ID。
+    return {
+      ...payload,
+      text: replaceBareFeishuAtTarget(payload.text, placeholderTargets[0], target),
+      mentions: undefined,
+    };
+  }
 
   // 用户明确要求“去艾特 X”时，先补成可见 @X，再交给 channel resolver 转成平台原生 mention。
   return {
     ...payload,
     text: `@${target}\n${payload.text.trimStart()}`,
+    mentions: undefined,
   };
 }
 
@@ -1955,7 +2164,10 @@ function enforceResolvedFeishuMentionRequest(
   const explicitTargets = extractExplicitFeishuMentionTargetsFromRequest(context.userText);
   if (explicitTargets.length === 0 || !hasBareFeishuMentionText(payload.text)) return payload;
 
-  const unresolvedTarget = extractBareFeishuAtTargets(payload.text)[0] || explicitTargets[0];
+  const firstBareTarget = extractBareFeishuAtTargets(payload.text)[0] || '';
+  const unresolvedTarget = firstBareTarget && !isFeishuPlaceholderMentionTarget(firstBareTarget)
+    ? firstBareTarget
+    : explicitTargets[0];
   return {
     ...payload,
     text: appendReplyEndMarker(`我没能确认“${unresolvedTarget}”对应的飞书成员，暂时不发普通文本假 @。请在飞书里直接点选 TA，或发我准确的飞书显示名。`),
@@ -4862,9 +5074,14 @@ async function handleMessage(
     }
     const resolvedWorkingDirectory =
       effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
-    const responseText = result.responseText
-      ? await executeReminderActionFromReply(result.responseText, msg, effectiveBinding.codepilotSessionId, rawText)
-      : '';
+    const directMessageAction = result.responseText
+      ? await executeDirectMessageActionFromReply(adapter, result.responseText, msg, rawText)
+      : { handled: false, text: '' };
+    const responseText = directMessageAction.handled
+      ? directMessageAction.text
+      : result.responseText
+        ? await executeReminderActionFromReply(result.responseText, msg, effectiveBinding.codepilotSessionId, rawText)
+        : '';
     let preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
@@ -4879,7 +5096,13 @@ async function handleMessage(
         channelType: adapter.channelType,
         userText: rawText,
       });
-      preparedReply = await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
+      const skipExplanatoryMentionResolution =
+        adapter.channelType === 'feishu'
+        && isFeishuMentionHowToOrDiagnosticRequest(rawText)
+        && !hasStructuredMentions(preparedReply.mentions);
+      preparedReply = skipExplanatoryMentionResolution
+        ? preparedReply
+        : await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,
         userText: rawText,
