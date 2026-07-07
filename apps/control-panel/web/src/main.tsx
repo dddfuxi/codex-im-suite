@@ -263,6 +263,8 @@ type ConversationMessage = {
   senderName: string;
   createdAt: string;
   content: string;
+  cardContent?: string;
+  rawContentPreview?: string;
   attachments?: MessageAttachment[];
   canRecall?: boolean;
   recallStatus?: 'none' | 'recalled' | 'failed';
@@ -1075,6 +1077,7 @@ const commandLabels: Record<string, string> = {
   'live.sync': 'Live 同步',
   'release.publishBackup': '一键发布',
   'release.prepareMainRelease': '主干发布预检',
+  'history.recallBotMessage': '撤回消息',
 };
 const trackedCommands = new Set(Object.keys(commandLabels));
 
@@ -1863,6 +1866,14 @@ function parseConversationTime(value?: string) {
 
 function normalizeComparableText(value?: string) {
   return (value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function shouldShowPlainMessageContent(message: ConversationMessage) {
+  const content = normalizeComparableText(message.content);
+  const cardContent = normalizeComparableText(message.cardContent);
+  if (!content) return false;
+  if (!cardContent) return true;
+  return !content.includes(cardContent);
 }
 
 function textOverlapScore(left?: string, right?: string) {
@@ -4218,8 +4229,13 @@ const SessionDetailPane = memo(function SessionDetailPane({
                           void run('history.recallBotMessage', {
                             channelType: detail.channelType,
                             chatId: detail.chatId,
+                            sessionId: detail.sessionId,
                             messageId: message.messageId,
-                          }).then(() => refreshDetail());
+                            senderType: message.senderType,
+                            senderId: message.senderId,
+                          })
+                            .then(() => refreshDetail())
+                            .catch(() => refreshDetail());
                         }}
                         pending={pending['history.recallBotMessage']}
                       />
@@ -4233,7 +4249,22 @@ const SessionDetailPane = memo(function SessionDetailPane({
                     <code>{message.senderId}</code>
                   </div>
                 )}
-                <pre>{message.content}</pre>
+                {message.cardContent && (
+                  <section className="message-card-content">
+                    <div className="message-card-content-title">
+                      <FileText size={14} />
+                      <strong>卡片内容</strong>
+                    </div>
+                    <pre>{message.cardContent}</pre>
+                    {message.rawContentPreview && (
+                      <details className="message-raw-preview">
+                        <summary>原始卡片摘要</summary>
+                        <code>{message.rawContentPreview}</code>
+                      </details>
+                    )}
+                  </section>
+                )}
+                {shouldShowPlainMessageContent(message) && <pre>{message.content}</pre>}
                 {message.attachments && message.attachments.length > 0 && (
                   <div className="attachment-grid">
                     {message.attachments.map((attachment, index) => (

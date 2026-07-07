@@ -134,6 +134,21 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(content, /JsonTool|shell_artifact/);
   });
 
+  it('does not mark successful summaries as incomplete when the body quotes errors', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '群里刚才主要在调侃群聊就报错这件事。',
+      '后面几个人在说学习一下这个做事方法。',
+    ].join('\n'), [], { status: '已完成', elapsed: '23.2s' })) as {
+      header?: { title?: { content?: string }; template?: string };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.notEqual(card.header?.title?.content, '未完成');
+    assert.equal(card.header?.template, 'purple');
+    assert.match(content, /群聊就报错/);
+  });
+
   it('renders model and token usage in the final card footer when provided', () => {
     const card = JSON.parse(buildFinalCardJson('处理结果\n已完成。', [], { status: '已完成', elapsed: '1.2s' }, {
       executorId: 'codex',

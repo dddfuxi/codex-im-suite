@@ -1193,10 +1193,20 @@ function sanitizeProgressCardDetail(text: string): string {
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
   if (!normalized) return '';
-  const visibleLines = normalized
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line && !isInternalProgressNarration(line));
+  const visibleLines: string[] = [];
+  let suppressFollowingInternalBlock = false;
+  for (const rawLine of normalized.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || suppressFollowingInternalBlock) continue;
+    if (isInternalProgressNarration(line)) {
+      // Agent/provider result headers are often followed by raw answer chunks; do not stream that block as progress.
+      if (/^(?:agent\b|工具|本地命令)/iu.test(line.replace(/^[-*]\s*/, '').trim())) {
+        suppressFollowingInternalBlock = true;
+      }
+      continue;
+    }
+    visibleLines.push(line);
+  }
   const visible = visibleLines.join('\n').trim();
   if (!visible) return '';
   return visible.length > 900 ? `${visible.slice(0, 897)}...` : visible;
@@ -1205,17 +1215,17 @@ function sanitizeProgressCardDetail(text: string): string {
 function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
-  // 进度卡只展示用户可理解的状态，不直播工具名、路径、命令或 agent 内部阶段。
+  // 进度卡允许展示面向用户改写过的处理思路；这里只拦截会暴露工具名、路径、命令或 agent 内部阶段的细节。
   if (/(JsonTool|tool_use|tool_result|cti-final|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
     return true;
   }
   if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
     return true;
   }
-  if (/^(我先|我会|我正在|我继续|我再|我开始|正在|准备|调用|读取|执行|运行|使用|检查|核对|整理|处理思路|执行过程|工具|本地命令)/iu.test(normalized)) {
+  if (/^(?:agent\b|工具|本地命令|调用|执行|运行|使用)/iu.test(normalized)) {
     return true;
   }
-  if (/(正在|准备).{0,24}(读取|调用|执行|运行|检查|核对|整理|搜索|连接|返回|收口)/iu.test(normalized)) {
+  if (/^(?:我先|我会|我正在|我继续|我再|我开始|正在|准备).{0,40}(?:调用|执行|运行|命令|工具|MCP|JsonTool|shell|powershell|pwsh|cmd\s*\/c)/iu.test(normalized)) {
     return true;
   }
   return false;
@@ -1226,6 +1236,7 @@ function normalizeProgressCardStep(step: string | undefined): string {
   if (!normalized) return '';
   if (/授权|确认/u.test(normalized)) return '需要你确认一项权限。';
   if (/失败|报错|错误|不可用/u.test(normalized)) return '有一项信息核对失败，正在收口。';
+  if (/^agent\b/iu.test(normalized)) return '这边在核对可用信息。';
   if (/完成|已返回|返回结果|最终回复|整理为最终|agent 已返回/u.test(normalized)) {
     return '有结果了，正在整理成可读回复。';
   }
@@ -1777,20 +1788,108 @@ function verifyPreparedReplyExecution(
   return payload;
 }
 
-const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|mention|提到|点名)/iu;
+const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu;
 const FEISHU_OTHER_PERSON_TARGET_RE = /(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人)/iu;
+const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
+const FEISHU_EXPLICIT_MENTION_TARGET_TOKEN = '[@＠]?[\\p{L}\\p{N}_.$·-]{1,64}?';
+const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|处理|吗|呢|吧|啊|呀|哈|哦|噢)';
+const FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE = /(?:让|叫|喊|通知|请|麻烦|要)(?:他|她|它|ta|TA|对方|其|那个人|这个人|该成员)|(?:跟|和)(?:你|我|他|她|它|ta|TA|对方)|(?:去|来|帮|帮忙|帮我)(?:看|看看|处理|回复|聊|聊天|说|问|确认|查|检查|修|改|做|发|转发)/iu;
+const FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE = new RegExp(
+  `(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)\\s*(?:一下|下|一声|一下子|给|把|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})${FEISHU_EXPLICIT_MENTION_TARGET_STOP}`,
+  'giu',
+);
+const FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE = new RegExp(
+  `(?:把|给|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)(?:一下|下|一声)?`,
+  'giu',
+);
 function hasStructuredMentions(mentions: OutboundMention[] | undefined): boolean {
   return Array.isArray(mentions) && mentions.some((mention) => mention?.atAll || !!mention?.userId?.trim());
 }
 
+function cleanExplicitFeishuMentionTarget(target: string): string {
+  let cleaned = target
+    .normalize('NFKC')
+    .replace(/^[@＠]+/, '')
+    .replace(/[<>"'`]/g, '')
+    .trim()
+    .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '')
+    .replace(/(?:一下|下|一声|看看|看一下|回复一下|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
+    .trim();
+  const followup = FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE.exec(cleaned);
+  if (followup) {
+    // 中文口语里常省略逗号，如“艾特张三让他看一下”。这里截掉后续动作从句，成员是否真实仍由 Feishu resolver 校验。
+    cleaned = cleaned.slice(0, followup.index).trim();
+  }
+  if (!cleaned || FEISHU_OTHER_PERSON_TARGET_RE.test(cleaned)) return '';
+  if (/^(?:谁|他|她|它|ta|TA|对方|那个人|这个人|某人)$/u.test(cleaned)) return '';
+  return cleaned;
+}
+
+function extractBareFeishuAtTargets(text: string): string[] {
+  const targets: string[] = [];
+  FEISHU_BARE_AT_TARGET_RE.lastIndex = 0;
+  for (const match of (text || '').matchAll(FEISHU_BARE_AT_TARGET_RE)) {
+    const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+    if (target) targets.push(target);
+  }
+  return targets;
+}
+
+function extractExplicitFeishuMentionTargetsFromRequest(userText: string): string[] {
+  const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  if (!FEISHU_MENTION_ACTION_RE.test(normalized)) return [];
+
+  const targets = new Map<string, string>();
+  const addTarget = (target: string) => {
+    const cleaned = cleanExplicitFeishuMentionTarget(target);
+    if (!cleaned) return;
+    targets.set(cleaned.replace(/\s+/g, '').toLocaleLowerCase(), cleaned);
+  };
+
+  for (const target of extractBareFeishuAtTargets(normalized)) {
+    addTarget(target);
+  }
+  FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE)) {
+    addTarget(match[1] || '');
+  }
+  FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE)) {
+    addTarget(match[1] || '');
+  }
+
+  return [...targets.values()];
+}
+
 function hasBareFeishuMentionText(answerText: string): boolean {
   // 飞书原生 mention 必须走结构化 mentions；模糊目标下裸 @名字 只能当作不安全文本处理。
-  return /(?:^|[\s([{（【])@[^\s@,，.。!！?？~～:：;；<>\])）】]{1,64}(?=$|[\s,，.。!！?？~～:：;；])/u.test(answerText);
+  FEISHU_BARE_AT_TARGET_RE.lastIndex = 0;
+  return FEISHU_BARE_AT_TARGET_RE.test(answerText);
 }
 
 function needsExplicitFeishuMentionTarget(userText: string): boolean {
   if (!FEISHU_MENTION_ACTION_RE.test(userText)) return false;
   return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
+}
+
+function addRequestedFeishuMentionTarget(
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    channelType: string;
+    userText: string;
+  },
+): PreparedBridgeReplyPayload {
+  if (context.channelType !== 'feishu') return payload;
+  if (hasStructuredMentions(payload.mentions) || hasBareFeishuMentionText(payload.text)) return payload;
+
+  const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText);
+  if (!target) return payload;
+
+  // 用户明确要求“去艾特 X”时，先补成可见 @X，再交给 channel resolver 转成平台原生 mention。
+  return {
+    ...payload,
+    text: `@${target}\n${payload.text.trimStart()}`,
+  };
 }
 
 async function resolvePreparedOutboundMentions(
@@ -1836,6 +1935,30 @@ function enforceFeishuMentionTargetSafety(
   return {
     ...payload,
     text: appendReplyEndMarker('你要我艾特谁？把对方名字或直接 @ TA 发我，我会用飞书原生 mention 发送。'),
+    parseMode: 'plain',
+    images: [],
+    files: [],
+    mentions: undefined,
+  };
+}
+
+function enforceResolvedFeishuMentionRequest(
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    channelType: string;
+    userText: string;
+  },
+): PreparedBridgeReplyPayload {
+  if (context.channelType !== 'feishu') return payload;
+  if (hasStructuredMentions(payload.mentions)) return payload;
+
+  const explicitTargets = extractExplicitFeishuMentionTargetsFromRequest(context.userText);
+  if (explicitTargets.length === 0 || !hasBareFeishuMentionText(payload.text)) return payload;
+
+  const unresolvedTarget = extractBareFeishuAtTargets(payload.text)[0] || explicitTargets[0];
+  return {
+    ...payload,
+    text: appendReplyEndMarker(`我没能确认“${unresolvedTarget}”对应的飞书成员，暂时不发普通文本假 @。请在飞书里直接点选 TA，或发我准确的飞书显示名。`),
     parseMode: 'plain',
     images: [],
     files: [],
@@ -4752,11 +4875,19 @@ async function handleMessage(
         executionRequirement: uiExecutionRequirement,
         messageKind: inboundMessageKind,
       });
+      preparedReply = addRequestedFeishuMentionTarget(preparedReply, {
+        channelType: adapter.channelType,
+        userText: rawText,
+      });
       preparedReply = await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,
         userText: rawText,
         senderDisplayName: msg.address.displayName,
+      });
+      preparedReply = enforceResolvedFeishuMentionRequest(preparedReply, {
+        channelType: adapter.channelType,
+        userText: rawText,
       });
     }
     if (workflowCardStarted) {

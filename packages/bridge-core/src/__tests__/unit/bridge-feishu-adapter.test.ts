@@ -54,6 +54,23 @@ function setupContext(settings: Record<string, string> = {}) {
   });
 }
 
+function createFeishuTextEvent(messageId: string, text: string) {
+  return {
+    sender: {
+      sender_type: 'user',
+      sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+    },
+    message: {
+      message_id: messageId,
+      chat_id: 'oc_group',
+      chat_type: 'group',
+      message_type: 'text',
+      content: JSON.stringify({ text }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
 function useTempCtiHome(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-test-'));
   process.env.CTI_HOME = dir;
@@ -115,6 +132,124 @@ describe('FeishuAdapter mention detection fallback', () => {
     });
 
     assert.equal(mentioned, true);
+  });
+});
+
+describe('FeishuAdapter bot name wake classification', () => {
+  it('accepts actionable group messages that wake the bot by configured alias', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_name: 'BridgeBot',
+      bridge_feishu_bot_aliases: '小桥, 桥助手',
+    }) as any;
+    const auditLogs: Array<{ summary?: string }> = [];
+    store.insertAuditLog = (entry: { summary?: string }) => auditLogs.push(entry);
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent('om_alias_wake', '小桥 帮我看看这个问题'));
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).text, '小桥 帮我看看这个问题');
+    assert.deepEqual((queued[0] as any).raw?.feishuBotWake, {
+      mode: 'name',
+      state: 'investigate',
+      alias: '小桥',
+      reason: 'actionable_request',
+    });
+    assert.ok(auditLogs.every((entry) => !entry.summary?.includes('not @mentioned')));
+  });
+
+  it('drops third-person bot name mentions that do not ask the bot to respond', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小桥',
+    }) as any;
+    const auditLogs: Array<{ summary?: string }> = [];
+    store.insertAuditLog = (entry: { summary?: string }) => auditLogs.push(entry);
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent('om_third_person', '刚才小桥说的那个方案挺好'));
+
+    assert.equal(queued.length, 0);
+    assert.ok(auditLogs.some((entry) => entry.summary?.includes('bot name mention not actionable')));
+  });
+
+  it('drops corrective native bot mentions that do not need a reply', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    const auditLogs: Array<{ summary?: string }> = [];
+    store.insertAuditLog = (entry: { summary?: string }) => auditLogs.push(entry);
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuTextEvent(
+      'om_corrective_native_bot_mention',
+      '@_user_1 你自己是小虾米啊，干啥呢，以后看清聊天记录再回复',
+    ) as any;
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 0);
+    assert.ok(auditLogs.some((entry) => entry.summary?.includes('bot mention not actionable')));
+  });
+
+  it('drops bot names used as the object of another mention request', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    const auditLogs: Array<{ summary?: string }> = [];
+    store.insertAuditLog = (entry: { summary?: string }) => auditLogs.push(entry);
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuTextEvent('om_name_as_object', '@_user_1 你能at小虾米吗智障') as any;
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_other_bot' }, name: '乔治' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 0);
+    assert.ok(auditLogs.some((entry) => entry.summary?.includes('bot name mention not actionable')));
   });
 });
 
@@ -348,6 +483,51 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(resolved.mentions, undefined);
   });
 
+  it('resolves at-name text from verified Feishu history mention ids when chat members omit the bot', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const home = useTempCtiHome();
+    const historyDir = path.join(home, 'data', 'feishu-history');
+    fs.mkdirSync(historyDir, { recursive: true });
+    fs.writeFileSync(path.join(historyDir, 'oc_other.json'), JSON.stringify([
+      {
+        messageId: 'om_history',
+        chatId: 'oc_other',
+        createTime: '1',
+        msgType: 'interactive',
+        senderId: 'cli_sender',
+        senderType: 'app',
+        senderName: '',
+        text: '<at user_id=ou_george>乔治</at> 你好',
+      },
+    ]), 'utf8');
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_liudan', '刘丹'],
+    ]);
+
+    const resolved = await adapter.resolveOutboundMentions({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@乔治 乔治在不在',
+      parseMode: 'Markdown',
+    });
+
+    assert.deepEqual(resolved.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('does not resolve bot or app member ids as native user mentions', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['cli_agent_app', '小桥'],
+    ]);
+
+    const resolved = await adapter.resolveOutboundMentions({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@小桥 帮我看一下',
+      parseMode: 'Markdown',
+    });
+
+    assert.equal(resolved.mentions, undefined);
+  });
+
   it('does not infer a sender mention from group reply metadata', () => {
     const adapter = new FeishuAdapter() as any;
 
@@ -429,6 +609,18 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     assert.equal(intent.responseMode, 'chat');
     assert.equal(intent.purpose, 'summary');
     assert.match(intent.scopeText, /今天/);
+  });
+
+  it('recognizes group-locative chat summary requests as history intent', () => {
+    const adapter = new FeishuAdapter() as any;
+
+    const intent = adapter.parseHistoryIntentV2('看看群里都在聊什么');
+
+    assert.ok(intent);
+    assert.equal(intent.responseMode, 'chat');
+    assert.equal(intent.purpose, 'summary');
+    assert.equal(intent.limit, 30);
+    assert.match(intent.scopeText, /本群最近消息/);
   });
 
   it('ignores app interactive events so bot cards cannot trigger another LLM turn', async () => {

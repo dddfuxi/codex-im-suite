@@ -1695,7 +1695,14 @@ internal sealed partial class MainForm : Form
             entry.Summary,
             entry.Messages.Select(message =>
             {
-                var recall = ConversationHistoryDisplay.ResolveRecallState(entry.ChannelType, message.SenderType, message.MessageId, outboundRefs);
+                var recall = ConversationHistoryDisplay.ResolveRecallState(
+                    entry.ChannelType,
+                    entry.ChatId,
+                    message.SenderType,
+                    message.SenderId,
+                    message.MessageId,
+                    outboundRefs,
+                    GetFeishuBotAppIds());
                 return new WebConversationMessage(
                     message.Index,
                     message.MessageId,
@@ -1706,6 +1713,8 @@ internal sealed partial class MainForm : Form
                     message.SenderName,
                     message.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "",
                     message.Content,
+                    message.CardContent,
+                    message.RawContentPreview,
                     message.Attachments.Select(attachment => new WebMessageAttachment(
                         attachment.Kind,
                         attachment.Name,
@@ -1732,6 +1741,13 @@ internal sealed partial class MainForm : Form
         }
         return detail;
     }
+
+    private string[] GetFeishuBotAppIds()
+        => SplitConfigList(string.Join(",", [
+                GetConfig("CTI_FEISHU_APP_ID", ""),
+                GetConfig("CTI_FEISHU_BOT_APP_IDS", "")
+            ]))
+            .ToArray();
 
     private List<OutboundMessageRefRecord> LoadOutboundRefs(string? chatId = null)
     {
@@ -1770,6 +1786,9 @@ internal sealed partial class MainForm : Form
         var channelType = ReadPayloadString(payload, "channelType", "feishu").Trim();
         var chatId = ReadPayloadString(payload, "chatId", "").Trim();
         var messageId = ReadPayloadString(payload, "messageId", "").Trim();
+        var senderType = ReadPayloadString(payload, "senderType", "").Trim();
+        var senderId = ReadPayloadString(payload, "senderId", "").Trim();
+        var sessionId = ReadPayloadString(payload, "sessionId", "").Trim();
         if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("当前只支持撤回 Feishu 机器人消息。");
@@ -1780,13 +1799,34 @@ internal sealed partial class MainForm : Form
         }
 
         var refs = LoadOutboundRefs();
-        var target = refs.FirstOrDefault(item =>
-            string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(item.PlatformMessageId, messageId, StringComparison.OrdinalIgnoreCase));
+        var target = ConversationHistoryDisplay.ResolveRecallTarget(
+            channelType,
+            chatId,
+            senderType,
+            senderId,
+            messageId,
+            sessionId,
+            refs,
+            GetFeishuBotAppIds());
         if (target is null)
         {
             throw new InvalidOperationException("未找到这条机器人出站消息记录，拒绝撤回未知消息。");
+        }
+        var targetTracked = refs.Any(item =>
+            string.Equals(item.ChannelType, target.ChannelType, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.ChatId, target.ChatId, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.PlatformMessageId, target.PlatformMessageId, StringComparison.OrdinalIgnoreCase));
+        if (!targetTracked)
+        {
+            refs.Add(target);
+        }
+        if (string.IsNullOrWhiteSpace(target.CodepilotSessionId))
+        {
+            target.CodepilotSessionId = sessionId;
+        }
+        if (string.IsNullOrWhiteSpace(target.CreatedAt))
+        {
+            target.CreatedAt = DateTime.UtcNow.ToString("o");
         }
         if (!string.IsNullOrWhiteSpace(target.RecalledAt))
         {
@@ -1818,6 +1858,10 @@ internal sealed partial class MainForm : Form
         target.UpdatedAt = DateTime.UtcNow.ToString("o");
         SaveOutboundRefs(refs);
         _sessionDetailCache.Remove($"{chatId}::{target.CodepilotSessionId}");
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            _sessionDetailCache.Remove($"{chatId}::{sessionId}");
+        }
         if (!ok)
         {
             throw new InvalidOperationException($"撤回失败：{target.RecallError}");
@@ -9203,18 +9247,24 @@ exit $LASTEXITCODE
             .OrderBy(item => long.TryParse(item.CreateTime, out var parsed) ? parsed : 0L)
             .ToList();
         if (limit > 0 && selected.Count > limit) selected = selected[^limit..];
-        return selected.Select((item, index) => new ConversationMessageView
+        return selected.Select((item, index) =>
         {
-            Index = index + 1,
-            MessageId = item.MessageId,
-            Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
-            MsgType = item.MsgType,
-            SenderId = item.SenderId ?? "",
-            SenderType = item.SenderType ?? "",
-            SenderName = item.SenderName ?? "",
-            CreatedAt = ParseUnixMsOrIso(item.CreateTime),
-            Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
-            Attachments = BuildFeishuAttachmentPlaceholders(item),
+            var display = ConversationHistoryDisplay.ResolveMessageDisplay(item.MsgType, item.RawContent, item.Text);
+            return new ConversationMessageView
+            {
+                Index = index + 1,
+                MessageId = item.MessageId,
+                Role = string.Equals(item.SenderType, "app", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user",
+                MsgType = item.MsgType,
+                SenderId = item.SenderId ?? "",
+                SenderType = item.SenderType ?? "",
+                SenderName = item.SenderName ?? "",
+                CreatedAt = ParseUnixMsOrIso(item.CreateTime),
+                Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {display.Text}"),
+                CardContent = NormalizeDisplayText(display.CardContent),
+                RawContentPreview = display.RawContentPreview,
+                Attachments = BuildFeishuAttachmentPlaceholders(item),
+            };
         }).ToList();
     }
 
@@ -9235,6 +9285,7 @@ exit $LASTEXITCODE
             {
                 downloadBudget--;
             }
+            var display = ConversationHistoryDisplay.ResolveMessageDisplay(item.MsgType, item.RawContent, item.Text);
             messages.Add(new ConversationMessageView
             {
                 Index = index + 1,
@@ -9245,7 +9296,9 @@ exit $LASTEXITCODE
                 SenderType = item.SenderType ?? "",
                 SenderName = item.SenderName ?? "",
                 CreatedAt = ParseUnixMsOrIso(item.CreateTime),
-                Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {item.Text}"),
+                Content = NormalizeDisplayText($"{(string.IsNullOrWhiteSpace(item.SenderName) ? item.SenderId : item.SenderName)}: {display.Text}"),
+                CardContent = NormalizeDisplayText(display.CardContent),
+                RawContentPreview = display.RawContentPreview,
                 Attachments = attachments,
             });
         }
@@ -9264,29 +9317,60 @@ exit $LASTEXITCODE
 
     private List<ConversationAttachmentView> BuildFeishuAttachmentPlaceholders(FeishuIndexedMessageRecord item)
     {
-        if (!IsDirectFeishuResourceMessage(item.MsgType)) return [];
-        if (string.IsNullOrWhiteSpace(item.ResourceKey)) return [];
-        var kind = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
-        var name = !string.IsNullOrWhiteSpace(item.FileName)
-            ? item.FileName!
-            : $"{item.ResourceKey}.{(kind == "image" ? "png" : "bin")}";
-        return [new ConversationAttachmentView(kind, name, GuessMimeType(name), 0, "", "", item.ResourceKey, "未下载")];
+        var attachments = new List<ConversationAttachmentView>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddPlaceholder(string kind, string resourceKey, string name)
+        {
+            if (string.IsNullOrWhiteSpace(resourceKey)) return;
+            var normalizedKind = string.Equals(kind, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+            var effectiveName = !string.IsNullOrWhiteSpace(name)
+                ? name
+                : $"{resourceKey}.{(normalizedKind == "image" ? "png" : "bin")}";
+            if (!seen.Add($"{normalizedKind}:{resourceKey}")) return;
+            attachments.Add(new ConversationAttachmentView(normalizedKind, effectiveName, GuessMimeType(effectiveName), 0, "", "", resourceKey, "未下载"));
+        }
+
+        if (IsDirectFeishuResourceMessage(item.MsgType))
+        {
+            var kind = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+            var name = !string.IsNullOrWhiteSpace(item.FileName)
+                ? item.FileName!
+                : $"{item.ResourceKey}.{(kind == "image" ? "png" : "bin")}";
+            AddPlaceholder(kind, item.ResourceKey, name);
+        }
+
+        foreach (var reference in ConversationHistoryDisplay.ResolveCardResourceReferences(item.MsgType, item.RawContent))
+        {
+            AddPlaceholder(reference.Kind, reference.ResourceKey, reference.Name);
+        }
+
+        return attachments;
     }
 
     private async Task<List<ConversationAttachmentView>> BuildFeishuAttachmentsAsync(FeishuIndexedMessageRecord item, bool allowDownload)
     {
         var placeholders = BuildFeishuAttachmentPlaceholders(item);
         if (placeholders.Count == 0) return [];
-        var first = placeholders[0];
-        var resourceType = string.Equals(item.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
-        var cached = TryGetCachedFeishuResource(item.MessageId, item.ResourceKey, resourceType, first.Name);
-        if (cached is not null) return [cached];
-        if (!allowDownload)
+        var result = new List<ConversationAttachmentView>();
+        foreach (var placeholder in placeholders)
         {
-            return placeholders.Select(attachment => attachment with { Status = "未下载，点击刷新详情会优先加载最近附件" }).ToList();
+            var resourceType = string.Equals(placeholder.Kind, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+            var cached = TryGetCachedFeishuResource(item.MessageId, placeholder.ResourceKey, resourceType, placeholder.Name);
+            if (cached is not null)
+            {
+                result.Add(cached);
+                continue;
+            }
+            if (!allowDownload)
+            {
+                result.Add(placeholder with { Status = "未下载，点击刷新详情会优先加载最近附件" });
+                continue;
+            }
+            var downloaded = await TryDownloadFeishuResourceAsync(item.MessageId, placeholder.ResourceKey, resourceType, placeholder.Name);
+            result.Add(downloaded ?? placeholder with { Status = "下载失败或无权限" });
         }
-        var downloaded = await TryDownloadFeishuResourceAsync(item.MessageId, item.ResourceKey, resourceType, first.Name);
-        return downloaded is not null ? [downloaded] : placeholders.Select(attachment => attachment with { Status = "下载失败或无权限" }).ToList();
+        return result;
     }
 
     private ConversationAttachmentView? TryGetCachedFeishuResource(string messageId, string? resourceKey, string resourceType, string fallbackName)
@@ -10512,6 +10596,8 @@ internal sealed record WebConversationMessage(
     string SenderName,
     string CreatedAt,
     string Content,
+    string CardContent,
+    string RawContentPreview,
     WebMessageAttachment[] Attachments,
     bool CanRecall,
     string RecallStatus,
@@ -10524,6 +10610,8 @@ internal sealed record WebFeishuPerson(
     bool IsOwner,
     int MessageCount);
 internal sealed record MessageRecallState(bool CanRecall, string RecallStatus, string RecallError);
+internal sealed record MessageDisplayState(bool IsCard, string Text, string CardContent, string RawContentPreview);
+internal sealed record CardResourceReference(string Kind, string ResourceKey, string Name);
 internal sealed class OutboundMessageRefRecord
 {
     public string ChannelType { get; set; } = "";
@@ -10816,25 +10904,350 @@ internal static class ConversationHistoryDisplay
     public static DateTime? ResolveRemoteLatestAt(FeishuHistorySyncRecord? record)
         => ParseUnixMsOrIso(record?.LatestMessageTime) ?? ParseUnixMsOrIso(record?.LastSyncAt);
 
+    public static MessageDisplayState ResolveMessageDisplay(string msgType, string rawContent, string fallbackText)
+    {
+        var normalizedType = (msgType ?? "").Trim();
+        var fallback = NormalizeMessageText(fallbackText);
+        if (!string.Equals(normalizedType, "interactive", StringComparison.OrdinalIgnoreCase))
+        {
+            return new MessageDisplayState(false, fallback, "", "");
+        }
+
+        var raw = rawContent?.Trim() ?? "";
+        var parts = new List<string>();
+        var references = new List<string>();
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            TryCollectCardDisplayParts(raw, parts, references);
+        }
+
+        var cardText = NormalizeMessageText(string.Join(Environment.NewLine + Environment.NewLine, DeduplicateTextParts(parts)));
+        var referenceText = NormalizeMessageText(string.Join(Environment.NewLine, references.Select(reference => $"卡片引用: {reference}")));
+        var effectiveCardText = !string.IsNullOrWhiteSpace(cardText) ? cardText : referenceText;
+        var text = !string.IsNullOrWhiteSpace(effectiveCardText) && IsCardPlaceholderText(fallback)
+            ? effectiveCardText
+            : !string.IsNullOrWhiteSpace(fallback)
+                ? fallback
+                : !string.IsNullOrWhiteSpace(effectiveCardText)
+                    ? effectiveCardText
+                    : "[卡片消息]";
+
+        return new MessageDisplayState(
+            true,
+            text,
+            effectiveCardText,
+            BuildRawContentPreview(raw));
+    }
+
+    public static IReadOnlyList<CardResourceReference> ResolveCardResourceReferences(string msgType, string rawContent)
+    {
+        if (!string.Equals((msgType ?? "").Trim(), "interactive", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(rawContent))
+        {
+            return [];
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(rawContent);
+            var references = new List<CardResourceReference>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectCardResourceReferences(document.RootElement, references, seen);
+            return references;
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
     public static MessageRecallState ResolveRecallState(
         string channelType,
+        string chatId,
         string senderType,
         string messageId,
         IEnumerable<OutboundMessageRefRecord> outboundRefs)
+        => ResolveRecallState(channelType, chatId, senderType, "", messageId, outboundRefs, []);
+
+    public static MessageRecallState ResolveRecallState(
+        string channelType,
+        string chatId,
+        string senderType,
+        string senderId,
+        string messageId,
+        IEnumerable<OutboundMessageRefRecord> outboundRefs,
+        IEnumerable<string>? botAppIds = null)
     {
         if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(chatId)
             || !string.Equals(senderType, "app", StringComparison.OrdinalIgnoreCase)
             || string.IsNullOrWhiteSpace(messageId))
         {
             return new MessageRecallState(false, "none", "");
         }
-        var match = outboundRefs.FirstOrDefault(item =>
-            string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(item.PlatformMessageId, messageId, StringComparison.OrdinalIgnoreCase));
+        var match = ResolveRecallTarget(channelType, chatId, senderType, senderId, messageId, "", outboundRefs, botAppIds);
         if (match is null) return new MessageRecallState(false, "none", "");
         if (!string.IsNullOrWhiteSpace(match.RecalledAt)) return new MessageRecallState(false, "recalled", "");
         if (!string.IsNullOrWhiteSpace(match.RecallError)) return new MessageRecallState(true, "failed", match.RecallError);
         return new MessageRecallState(true, "none", "");
+    }
+
+    public static OutboundMessageRefRecord? ResolveRecallTarget(
+        string channelType,
+        string chatId,
+        string senderType,
+        string senderId,
+        string messageId,
+        string codepilotSessionId,
+        IEnumerable<OutboundMessageRefRecord> outboundRefs,
+        IEnumerable<string>? botAppIds = null)
+    {
+        if (!string.Equals(channelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(chatId)
+            || !string.Equals(senderType, "app", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(messageId))
+        {
+            return null;
+        }
+
+        var match = outboundRefs.FirstOrDefault(item =>
+            string.Equals(item.ChannelType, "feishu", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.ChatId, chatId, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(item.PlatformMessageId, messageId, StringComparison.OrdinalIgnoreCase));
+        if (match is not null) return match;
+
+        var isCurrentBotApp = botAppIds is not null
+            && botAppIds.Any(id => string.Equals(id?.Trim(), senderId?.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (!isCurrentBotApp) return null;
+
+        // 旧历史消息可能没有 outbound-refs 记录；只要 senderId 属于当前 bot app，也允许走同一撤回 API。
+        return new OutboundMessageRefRecord
+        {
+            ChannelType = "feishu",
+            ChatId = chatId,
+            CodepilotSessionId = codepilotSessionId,
+            PlatformMessageId = messageId,
+            Purpose = "history",
+            MessageKind = "history",
+        };
+    }
+
+    private static void CollectCardResourceReferences(JsonElement element, List<CardResourceReference> references, HashSet<string> seen)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var fileName = ResolveCardResourceFileName(element);
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (property.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var value = property.Value.GetString() ?? "";
+                        if (IsCardImageResourceProperty(property.Name))
+                        {
+                            AddCardResourceReference(references, seen, "image", value, "");
+                        }
+                        else if (IsCardFileResourceProperty(property.Name))
+                        {
+                            AddCardResourceReference(references, seen, "file", value, fileName);
+                        }
+                    }
+                    CollectCardResourceReferences(property.Value, references, seen);
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    CollectCardResourceReferences(item, references, seen);
+                }
+                break;
+            case JsonValueKind.String:
+                var text = NormalizeMessageText(element.GetString() ?? "");
+                if ((text.StartsWith("{", StringComparison.Ordinal) || text.StartsWith("[", StringComparison.Ordinal))
+                    && text.Length <= 20000)
+                {
+                    try
+                    {
+                        using var nested = JsonDocument.Parse(text);
+                        CollectCardResourceReferences(nested.RootElement, references, seen);
+                    }
+                    catch
+                    {
+                        // 卡片内容里偶尔会出现普通 Markdown/文本，不是 JSON 时跳过即可。
+                    }
+                }
+                break;
+        }
+    }
+
+    private static void AddCardResourceReference(
+        List<CardResourceReference> references,
+        HashSet<string> seen,
+        string kind,
+        string resourceKey,
+        string name)
+    {
+        var key = (resourceKey ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(key)) return;
+        var normalizedKind = string.Equals(kind, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
+        if (!seen.Add($"{normalizedKind}:{key}")) return;
+        references.Add(new CardResourceReference(normalizedKind, key, ResolveCardResourceName(normalizedKind, key, name)));
+    }
+
+    private static string ResolveCardResourceName(string kind, string resourceKey, string name)
+    {
+        var ext = string.Equals(kind, "image", StringComparison.OrdinalIgnoreCase) ? ".png" : ".bin";
+        var effectiveName = NormalizeMessageText(name);
+        if (string.IsNullOrWhiteSpace(effectiveName))
+        {
+            effectiveName = $"{resourceKey}{ext}";
+        }
+        return string.IsNullOrWhiteSpace(Path.GetExtension(effectiveName))
+            ? $"{effectiveName}{ext}"
+            : effectiveName;
+    }
+
+    private static string ResolveCardResourceFileName(JsonElement element)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (property.Value.ValueKind != JsonValueKind.String) continue;
+            if (!IsCardFileNameProperty(property.Name)) continue;
+            var value = NormalizeMessageText(property.Value.GetString() ?? "");
+            if (!string.IsNullOrWhiteSpace(value)) return value;
+        }
+        return "";
+    }
+
+    private static bool IsCardImageResourceProperty(string key)
+        => NormalizeCardPropertyName(key) is "image_key" or "imagekey" or "img_key" or "imgkey";
+
+    private static bool IsCardFileResourceProperty(string key)
+        => NormalizeCardPropertyName(key) is "file_key" or "filekey";
+
+    private static bool IsCardFileNameProperty(string key)
+        => NormalizeCardPropertyName(key) is "file_name" or "filename" or "name";
+
+    private static string NormalizeCardPropertyName(string key)
+        => (key ?? "").Trim().ToLowerInvariant();
+
+    private static bool TryCollectCardDisplayParts(string raw, List<string> parts, List<string> references)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            CollectCardDisplayParts(document.RootElement, parts, references, parentName: "");
+            return true;
+        }
+        catch
+        {
+            var fallback = NormalizeMessageText(raw);
+            if (!string.IsNullOrWhiteSpace(fallback)) parts.Add(fallback);
+            return false;
+        }
+    }
+
+    private static void CollectCardDisplayParts(JsonElement element, List<string> parts, List<string> references, string parentName)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var property in element.EnumerateObject())
+                {
+                    CollectCardProperty(property.Name, property.Value, parts, references);
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    CollectCardDisplayParts(item, parts, references, parentName);
+                }
+                break;
+            case JsonValueKind.String:
+                AddCardString(parentName, element.GetString() ?? "", parts, references);
+                break;
+        }
+    }
+
+    private static void CollectCardProperty(string name, JsonElement value, List<string> parts, List<string> references)
+    {
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            AddCardString(name, value.GetString() ?? "", parts, references);
+            return;
+        }
+
+        CollectCardDisplayParts(value, parts, references, name);
+    }
+
+    private static void AddCardString(string propertyName, string value, List<string> parts, List<string> references)
+    {
+        var text = NormalizeMessageText(value);
+        if (string.IsNullOrWhiteSpace(text)) return;
+
+        var key = (propertyName ?? "").Trim().ToLowerInvariant();
+        if (IsCardReferenceProperty(key))
+        {
+            references.Add(text);
+            return;
+        }
+        if (!IsCardTextProperty(key)) return;
+
+        parts.Add(text);
+
+        // Some Feishu payloads nest card JSON as an escaped string inside content.
+        // Parse it opportunistically so panel history can still show the user-facing card body.
+        if ((text.StartsWith("{", StringComparison.Ordinal) || text.StartsWith("[", StringComparison.Ordinal))
+            && text.Length <= 20000)
+        {
+            TryCollectCardDisplayParts(text, parts, references);
+        }
+    }
+
+    private static bool IsCardTextProperty(string key)
+        => key is "content" or "text" or "title" or "subtitle" or "label" or "placeholder" or "summary" or "alt";
+
+    private static bool IsCardReferenceProperty(string key)
+        => key is "card_id" or "cardid" or "template_id" or "templateid";
+
+    private static IEnumerable<string> DeduplicateTextParts(IEnumerable<string> parts)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var part in parts)
+        {
+            var normalized = NormalizeMessageText(part);
+            if (string.IsNullOrWhiteSpace(normalized)) continue;
+            var comparable = Regex.Replace(normalized, @"\s+", " ").Trim();
+            if (seen.Add(comparable)) yield return normalized;
+        }
+    }
+
+    private static string NormalizeMessageText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        normalized = Regex.Replace(normalized, @"[ \t\f\v]+", " ");
+        normalized = Regex.Replace(normalized, @"\n{3,}", "\n\n");
+        return normalized.Trim();
+    }
+
+    private static bool IsCardPlaceholderText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        var normalized = Regex.Replace(text, @"\s+", " ").Trim();
+        return string.Equals(normalized, "[card message]", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "[卡片消息]", StringComparison.Ordinal)
+            || string.Equals(normalized, "[鍗＄墖娑堟伅]", StringComparison.Ordinal)
+            || normalized.Contains("upgrade", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("升级", StringComparison.Ordinal)
+            || normalized.Contains("鍗＄墖", StringComparison.Ordinal);
+    }
+
+    private static string BuildRawContentPreview(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var preview = Regex.Replace(raw, @"\s+", " ").Trim();
+        return preview.Length <= 800 ? preview : preview[..797] + "...";
     }
 
     public static DateTime? MaxDateTime(params DateTime?[] values)
@@ -10974,6 +11387,8 @@ internal sealed class ConversationMessageView
     public string SenderName { get; set; } = "";
     public DateTime? CreatedAt { get; set; }
     public string Content { get; set; } = "";
+    public string CardContent { get; set; } = "";
+    public string RawContentPreview { get; set; } = "";
     public List<ConversationAttachmentView> Attachments { get; set; } = [];
 }
 

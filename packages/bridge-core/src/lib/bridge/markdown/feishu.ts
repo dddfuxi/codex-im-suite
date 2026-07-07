@@ -519,7 +519,8 @@ function summarizeFinalCardTitle(content: string): string {
   if (/^(?:已|已经)?(?:完成|处理|修复|更新|生成|同步|检查|整理|创建|删除|恢复)/u.test(cleaned)) {
     return '处理结果';
   }
-  if (/失败|未完成|报错|错误|阻塞/u.test(cleaned)) {
+  // 只有负向词直接作为标题/开头时才归为未完成；成功摘要正文里可能只是转述“报错”等聊天内容。
+  if (/^(?:失败|未完成|报错|错误|阻塞)/u.test(cleaned)) {
     return '未完成';
   }
 

@@ -123,10 +123,33 @@ const BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】
 const FEISHU_AT_ALL_ALIASES = new Set(['all', '所有人', '全体成员', '大家']);
 const FEISHU_SENDER_ALIASES = new Set(['我', '俺', '本人', '你', '用户', '发起人', '提问人', '发送者']);
 
+const BOT_NAME_WAKE_INVESTIGATE_RE = /(?:帮|看看|看一下|查|搜索|搜|找|总结|梳理|分析|解释|处理|排查|检查|修|改|写|生成|创建|读取|打开|截图|提醒|记录|记住|发给|转发|同步|部署|运行|测试|构建|发布|瞅|弄|搞|做)/iu;
+const BOT_NAME_WAKE_CHAT_RE = /(?:你觉得|你看|怎么想|在吗|你好|哈喽|hi|hello|说说|聊聊|回复|回答|为什么|怎么|能不能|可不可以|可以|是否|是不是|吗|呢|\?|？)/iu;
+const BOT_NAME_WAKE_MENTION_ACTION_RE = /(?:艾特|@|＠|mention|提到|点名|叫|喊|通知)/iu;
+const BOT_NAME_WAKE_DONE_RE = /^(?:不用回|不用回复|别回|别回复|不用处理|不用管|没事|算了|好了|结束|先这样)/iu;
+const BOT_NAME_WAKE_NARRATIVE_AFTER_RE = /^(?:说的|说过|讲的|讲过|提过|发的|回复的|给的|那个|这个|这些|那些|刚才|之前|上次|前面)/iu;
+const BOT_NAME_WAKE_OTHER_PERSON_BEFORE_RE = /(?:问|问问|叫|喊|找|联系|通知)$/iu;
+const BOT_NAME_WAKE_OTHER_PERSON_AFTER_RE = /^(?:了吗|了没|没有|没|过吗|一下|下)/iu;
+
 interface FeishuMentionCandidate {
   userId: string;
   name: string;
   aliases: string[];
+}
+
+interface FeishuMentionHistoryCache {
+  signature: string;
+  candidates: FeishuMentionCandidate[];
+}
+
+type FeishuBotWakeState = 'chat' | 'investigate' | 'need_info' | 'done';
+
+interface FeishuBotNameWakeClassification {
+  mode: 'name';
+  state: FeishuBotWakeState;
+  alias: string;
+  reason: 'actionable_request' | 'direct_chat' | 'mention_target_missing' | 'done_ack' | 'non_actionable';
+  shouldHandle: boolean;
 }
 
 function cleanMentionName(name: string | undefined, fallback = '用户'): string {
@@ -137,6 +160,32 @@ function cleanMentionName(name: string | undefined, fallback = '用户'): string
 
 function normalizeMentionAlias(name: string | undefined): string {
   return (name || '').replace(/^@+/, '').replace(/\s+/g, '').trim().toLowerCase();
+}
+
+function isDefinitelyNonUserMentionId(id: string | undefined): boolean {
+  const normalized = (id || '').trim().toLowerCase();
+  return /^cli_/u.test(normalized)
+    || /^app_/u.test(normalized)
+    || /^bot_/u.test(normalized);
+}
+
+function extractVerifiedMentionCandidatesFromText(text: string): FeishuMentionCandidate[] {
+  const candidates: FeishuMentionCandidate[] = [];
+  const seen = new Set<string>();
+  const pattern = /<at\s+[^>]*\b(?:user_id|id)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>([\s\S]*?)<\/at>/giu;
+
+  for (const match of text.matchAll(pattern)) {
+    const userId = (match[1] || match[2] || match[3] || '').trim();
+    if (!userId || userId.toLowerCase() === 'all' || isDefinitelyNonUserMentionId(userId)) continue;
+    const name = cleanMentionName(match[4], '');
+    if (!name) continue;
+    const key = `${userId}\u0000${normalizeMentionAlias(name)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({ userId, name, aliases: [name] });
+  }
+
+  return candidates;
 }
 
 function extractBareAtTargets(text: string): string[] {
@@ -237,6 +286,15 @@ const FEISHU_CHAT_INDEX_PATH = path.join(
   'data',
   'feishu-chat-index.json',
 );
+
+function getFeishuHistoryDirPath(): string {
+  return path.join(
+    process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+    'data',
+    'feishu-history',
+  );
+}
+
 function getFeishuStickerStorePath(): string {
   return path.join(
     process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
@@ -455,6 +513,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
+  private mentionHistoryCache: FeishuMentionHistoryCache | null = null;
   private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
   private p2pPollInFlight = false;
 
@@ -2379,6 +2438,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || sender.sender_id?.union_id
       || '';
     const isGroup = msg.chat_type === 'group';
+    let botNameWake: FeishuBotNameWakeClassification | null = null;
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
@@ -2408,18 +2468,41 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention && !this.isBotMentionedFromMessage(msg)) {
-        console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
-        try {
-          getBridgeContext().store.insertAuditLog({
-            channelType: 'feishu',
-            chatId,
-            direction: 'inbound',
-            messageId: msg.message_id,
-            summary: '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)',
-          });
-        } catch { /* best effort */ }
-        return;
+      if (requireMention) {
+        const nativeBotMentioned = this.isBotMentionedFromMessage(msg);
+        // 原生 @ 只证明消息关联到机器人；纠错、转述或让别人操作机器人名时仍可不入队。
+        botNameWake = nativeBotMentioned
+          ? this.classifyNativeBotMentionFromMessage(msg)
+          : this.classifyBotNameWakeFromMessage(msg);
+        if (!nativeBotMentioned && !botNameWake?.shouldHandle) {
+          const summary = botNameWake
+            ? '[FILTERED] Group message dropped: bot name mention not actionable (require_mention=true)'
+            : '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)';
+          console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
+          try {
+            getBridgeContext().store.insertAuditLog({
+              channelType: 'feishu',
+              chatId,
+              direction: 'inbound',
+              messageId: msg.message_id,
+              summary,
+            });
+          } catch { /* best effort */ }
+          return;
+        }
+        if (nativeBotMentioned && botNameWake && !botNameWake.shouldHandle) {
+          console.log('[feishu-adapter] Group message ignored (bot mention not actionable), chatId:', chatId, 'msgId:', msg.message_id);
+          try {
+            getBridgeContext().store.insertAuditLog({
+              channelType: 'feishu',
+              chatId,
+              direction: 'inbound',
+              messageId: msg.message_id,
+              summary: '[FILTERED] Group message dropped: bot mention not actionable (require_mention=true)',
+            });
+          } catch { /* best effort */ }
+          return;
+        }
       }
     }
 
@@ -2559,6 +2642,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
           userId: mention.id.user_id,
           unionId: mention.id.union_id,
         })),
+      } : {}),
+      ...(botNameWake?.shouldHandle ? {
+        feishuBotWake: {
+          mode: botNameWake.mode,
+          state: botNameWake.state,
+          alias: botNameWake.alias,
+          reason: botNameWake.reason,
+        },
       } : {}),
       ...(stickerInfo ? { sticker: stickerInfo } : {}),
       ...(stickerInfo ? { messageKind: stickerInfo.messageKind } : {}),
@@ -2986,6 +3077,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const addCandidate = (userId: string | undefined, name: string | undefined, aliases: string[] = []) => {
       const id = (userId || '').trim();
       const displayName = cleanMentionName(name, '');
+      // 飞书消息 @ 语法面向用户 ID；明显的 app/bot 标识不能进入原生 mention 候选。
+      if (isDefinitelyNonUserMentionId(id)) return;
       if (!id || !displayName) return;
       const existing = byId.get(id);
       const mergedAliases = new Set([
@@ -3001,6 +3094,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
 
     this.addInboundMentionCandidates(sourceMessage, addCandidate);
+    this.addHistoryMentionCandidates(addCandidate);
 
     if (message.address.chatId) {
       try {
@@ -3047,6 +3141,67 @@ export class FeishuAdapter extends BaseChannelAdapter {
         addCandidate(openId || userId || unionId, name, [item.key, item.name, item.user_name].filter(Boolean));
       }
     }
+  }
+
+  private addHistoryMentionCandidates(
+    addCandidate: (userId: string | undefined, name: string | undefined, aliases?: string[]) => void,
+  ): void {
+    for (const candidate of this.readHistoryMentionCandidates()) {
+      addCandidate(candidate.userId, candidate.name, candidate.aliases);
+    }
+  }
+
+  private readHistoryMentionCandidates(): FeishuMentionCandidate[] {
+    const historyDir = getFeishuHistoryDirPath();
+    let files: Array<{ path: string; mtimeMs: number; size: number }> = [];
+
+    try {
+      files = fs.readdirSync(historyDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && /\.json$/i.test(entry.name))
+        .map((entry) => {
+          const filePath = path.join(historyDir, entry.name);
+          const stat = fs.statSync(filePath);
+          return { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
+        })
+        .sort((a, b) => a.path.localeCompare(b.path));
+    } catch {
+      return [];
+    }
+
+    const signature = files.map((file) => `${file.path}:${file.mtimeMs}:${file.size}`).join('|');
+    if (this.mentionHistoryCache?.signature === signature) {
+      return this.mentionHistoryCache.candidates;
+    }
+
+    const byIdAndName = new Map<string, FeishuMentionCandidate>();
+    const add = (candidate: FeishuMentionCandidate) => {
+      const userId = candidate.userId.trim();
+      const name = cleanMentionName(candidate.name, '');
+      if (!userId || !name) return;
+      const key = `${userId}\u0000${normalizeMentionAlias(name)}`;
+      if (byIdAndName.has(key)) return;
+      byIdAndName.set(key, { userId, name, aliases: [name, ...candidate.aliases] });
+    };
+
+    for (const file of files) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file.path, 'utf8')) as unknown;
+        const records = Array.isArray(parsed) ? parsed : [];
+        for (const record of records) {
+          const item = getRawObject(record);
+          if (typeof item.text !== 'string' || !item.text.includes('<at')) continue;
+          for (const candidate of extractVerifiedMentionCandidatesFromText(item.text)) {
+            add(candidate);
+          }
+        }
+      } catch {
+        // 历史索引是辅助候选来源；单个旧文件损坏时跳过，不能影响消息发送。
+      }
+    }
+
+    const candidates = [...byIdAndName.values()];
+    this.mentionHistoryCache = { signature, candidates };
+    return candidates;
   }
 
   private getSourceSenderIds(sourceMessage: InboundMessage | undefined): string[] {
@@ -3167,7 +3322,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
     const normalized = text.replace(/\s+/g, '');
     const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6|\u770b\u4e00\u4e0b|\u770b\u770b|\u770b\u4e0b|\u5728\u8bf4\u4ec0\u4e48|\u8bf4\u4ec0\u4e48|\u5728\u804a\u4ec0\u4e48|\u804a\u4ec0\u4e48|\u4ec0\u4e48\u5185\u5bb9)/.test(normalized);
-    const mentionsHistory = /(\u7fa4\u804a|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized);
+    // "群里/本群/这个群" 也是明确的群历史范围，不要求用户必须说成“群聊记录”。
+    const mentionsHistory = /(\u7fa4\u804a|\u7fa4\u91cc|\u7fa4\u5185|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized);
     const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized);
     const wantsDoc = /(\u98de\u4e66\u6587\u6863|\u6587\u6863\u94fe\u63a5|\u751f\u6210.*\u6587\u6863|\u6574\u7406\u6210.*\u6587\u6863|\u8f93\u51fa\u5230.*\u6587\u6863|\u53d1\u94fe\u63a5|\u56de\u94fe\u63a5)/.test(normalized);
     const actionVerbMatched = /(\u6807\u6ce8|\u91cd\u6807|\u6539\u6807|\u5224\u65ad|\u4fee\u6539|\u7ea0\u6b63|\u6838\u5bf9|\u6821\u5bf9|\u547d\u540d|\u5bf9\u7167)/.test(normalized);
@@ -4772,6 +4928,222 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
       return ids.some((id) => this.botIds.has(id));
     });
+  }
+
+  private getBotNameAliases(): string[] {
+    const store = getBridgeContext().store;
+    const rawAliases = [
+      this.botDisplayName,
+      store.getSetting('bridge_feishu_bot_name'),
+      store.getSetting('bridge_feishu_app_name'),
+      store.getSetting('bridge_feishu_bot_aliases'),
+      process.env.CTI_FEISHU_BOT_ALIASES,
+    ];
+    const aliases: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of rawAliases) {
+      for (const item of String(raw || '').split(/[,，;；、\n\r|]+/u)) {
+        const alias = item.replace(/^@+/, '').trim();
+        // 名字唤醒只接受足够具体的别名，避免单字或空配置在群里误触发。
+        if (Array.from(alias).length < 2) continue;
+        const key = alias.toLocaleLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        aliases.push(alias);
+      }
+    }
+    return aliases.sort((a, b) => Array.from(b).length - Array.from(a).length);
+  }
+
+  private extractBotNameWakeText(
+    message: Pick<FeishuMessageEventData['message'], 'content' | 'message_type'>,
+  ): string {
+    if (!message.content) return '';
+    if (message.message_type === 'text') {
+      return this.parseTextContent(message.content);
+    }
+    if (message.message_type === 'post') {
+      return this.parsePostContent(message.content).extractedText;
+    }
+    return '';
+  }
+
+  private findBotNameAlias(text: string): { alias: string; index: number; length: number } | null {
+    const aliases = this.getBotNameAliases();
+    if (aliases.length === 0) return null;
+
+    for (const alias of aliases) {
+      if (/^[A-Za-z0-9_.-]+$/u.test(alias)) {
+        const match = new RegExp(`(^|[^A-Za-z0-9_])(${escapeRegExp(alias)})(?=$|[^A-Za-z0-9_])`, 'iu').exec(text);
+        if (match) {
+          return {
+            alias,
+            index: match.index + match[1].length,
+            length: match[2].length,
+          };
+        }
+        continue;
+      }
+
+      const index = text.toLocaleLowerCase().indexOf(alias.toLocaleLowerCase());
+      if (index >= 0) {
+        return { alias, index, length: alias.length };
+      }
+    }
+
+    return null;
+  }
+
+  private isDirectBotNameAddress(beforeAlias: string): boolean {
+    const before = beforeAlias.trim();
+    if (!before) return true;
+    if (/[@＠,，:：;；。.!！?？、(（\[]$/u.test(before)) return true;
+    return /(?:^|[\s,，])(?:hey|hi|hello|哈喽|你好|在吗)$/iu.test(before);
+  }
+
+  private isBotNameAsSubject(afterAlias: string): boolean {
+    return /^(?:你|帮|能|可以|可不可以|要不要|来|看|查|搜|找|总结|分析|解释|处理|修|改|写|生成|创建|读取|打开|截图|检查|排查|回复|说|讲|评价|建议|提醒|记录|记住|艾特|@|＠|mention|提到|点名|叫|喊|问|回答|看看|弄|搞|做|发|转发|怎么|为什么|是否|是不是|吗|呢|\?|？)/iu.test(afterAlias);
+  }
+
+  private isBotNameWakeMissingMentionTarget(afterAlias: string): boolean {
+    const remaining = afterAlias.replace(BOT_NAME_WAKE_MENTION_ACTION_RE, '').trim();
+    if (!remaining) return true;
+    return /^(?:一下|下|个人|别人|另一个人|某个人|谁|他|她|ta|TA|对方|那个人|一个人)/u.test(remaining);
+  }
+
+  private isBotNameUsedAsObject(beforeAlias: string): boolean {
+    const before = beforeAlias.replace(/\s+/g, '');
+    if (!before) return false;
+    return /(?:让你|叫你|喊你|要你|问你|请你|你能|你可以|能不能|可不可以|帮我|帮忙|拜托你).{0,16}(?:@|＠|at|艾特|提到|点名|喷|骂|怼|叫|喊|联系|通知|找|问)$/iu.test(before);
+  }
+
+  private isNonActionableBotCorrection(text: string, aliases: string[]): boolean {
+    const compact = text.replace(/\s+/g, '');
+    if (/(?:不用|不要|别|别再|先别).{0,8}(?:回复|处理|管|说话)/u.test(compact)) return true;
+    if (/(?:搞错|搞混|误判|误会|看清(?:楚)?(?:聊天)?记录|不是让你|没让你|不是叫你|没叫你|不是问你|没问你|不是at你|不是@你|不是艾特你)/iu.test(compact)) return true;
+    return aliases.some((alias) => {
+      const safeAlias = escapeRegExp(alias.replace(/\s+/g, ''));
+      return new RegExp(`(?:你自己(?:就)?是|你就是|你已经是)${safeAlias}`, 'iu').test(compact);
+    });
+  }
+
+  private classifyBotNameWakeFromMessage(
+    message: Pick<FeishuMessageEventData['message'], 'content' | 'message_type'>,
+  ): FeishuBotNameWakeClassification | null {
+    return this.classifyBotNameWake(this.extractBotNameWakeText(message));
+  }
+
+  private classifyNativeBotMentionFromMessage(
+    message: Pick<FeishuMessageEventData['message'], 'content' | 'message_type'>,
+  ): FeishuBotNameWakeClassification | null {
+    const aliases = this.getBotNameAliases();
+    const alias = aliases[0] || this.botDisplayName || 'bot';
+    const text = this.extractBotNameWakeText(message)
+      .replace(/<at\b[^>]*>.*?<\/at>/giu, ' ')
+      .replace(/@_user_\d+/giu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return null;
+    if (this.isNonActionableBotCorrection(text, aliases)) {
+      return {
+        mode: 'name',
+        state: 'done',
+        alias,
+        reason: 'non_actionable',
+        shouldHandle: false,
+      };
+    }
+    return null;
+  }
+
+  private classifyBotNameWake(text: string): FeishuBotNameWakeClassification | null {
+    const normalized = (text || '')
+      .replace(/<at\b[^>]*>.*?<\/at>/giu, ' ')
+      .replace(/@_user_\d+/giu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!normalized) return null;
+
+    const match = this.findBotNameAlias(normalized);
+    if (!match) return null;
+
+    const beforeAlias = normalized.slice(0, match.index);
+    const afterAlias = normalized.slice(match.index + match.length);
+    const beforeCompact = beforeAlias.replace(/\s+/g, '');
+    const afterLead = afterAlias.replace(/^[\s,，:：;；。.!！?？、]+/u, '').trim();
+    const directAddress = this.isDirectBotNameAddress(beforeAlias);
+    const nameAsSubject = this.isBotNameAsSubject(afterLead);
+
+    if (this.isBotNameUsedAsObject(beforeCompact) || this.isNonActionableBotCorrection(normalized, [match.alias])) {
+      return {
+        mode: 'name',
+        state: 'done',
+        alias: match.alias,
+        reason: 'non_actionable',
+        shouldHandle: false,
+      };
+    }
+
+    if (BOT_NAME_WAKE_DONE_RE.test(afterLead) && (directAddress || nameAsSubject)) {
+      return {
+        mode: 'name',
+        state: 'done',
+        alias: match.alias,
+        reason: 'done_ack',
+        shouldHandle: false,
+      };
+    }
+
+    const thirdPersonReference = (!directAddress && BOT_NAME_WAKE_NARRATIVE_AFTER_RE.test(afterLead))
+      || (BOT_NAME_WAKE_OTHER_PERSON_BEFORE_RE.test(beforeCompact) && BOT_NAME_WAKE_OTHER_PERSON_AFTER_RE.test(afterLead));
+    if (thirdPersonReference || (!directAddress && !nameAsSubject)) {
+      return {
+        mode: 'name',
+        state: 'done',
+        alias: match.alias,
+        reason: 'non_actionable',
+        shouldHandle: false,
+      };
+    }
+
+    const directedText = directAddress ? `${afterLead} ${normalized}` : afterLead;
+    if (BOT_NAME_WAKE_MENTION_ACTION_RE.test(directedText) && this.isBotNameWakeMissingMentionTarget(afterLead)) {
+      return {
+        mode: 'name',
+        state: 'need_info',
+        alias: match.alias,
+        reason: 'mention_target_missing',
+        shouldHandle: true,
+      };
+    }
+
+    if (BOT_NAME_WAKE_INVESTIGATE_RE.test(directedText)) {
+      return {
+        mode: 'name',
+        state: 'investigate',
+        alias: match.alias,
+        reason: 'actionable_request',
+        shouldHandle: true,
+      };
+    }
+
+    if (BOT_NAME_WAKE_CHAT_RE.test(directedText) || directAddress) {
+      return {
+        mode: 'name',
+        state: 'chat',
+        alias: match.alias,
+        reason: 'direct_chat',
+        shouldHandle: true,
+      };
+    }
+
+    return {
+      mode: 'name',
+      state: 'done',
+      alias: match.alias,
+      reason: 'non_actionable',
+      shouldHandle: false,
+    };
   }
 
   private isBotMentionedFromMessage(

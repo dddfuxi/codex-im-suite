@@ -1946,6 +1946,40 @@ button:disabled {
   font-size: 12px;
 }
 
+.message-card-content {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.message-card-content-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.message-raw-preview {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.message-raw-preview summary {
+  cursor: pointer;
+}
+
+.message-raw-preview code {
+  display: block;
+  margin-top: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .code-block {
   max-height: 320px;
   overflow: auto;
