@@ -91,11 +91,32 @@ describe('execution requirement classifier', () => {
     assert.equal(headlineRequirement.kind, 'none');
     assert.equal(isExecutionEvidenceSatisfied(headlineRequirement, { successfulToolResultCount: 0 }), true);
 
-    const localRequirement = classifyExecutionRequirement({
-      userText: '查一下工作目录',
+    const vagueRequirement = classifyExecutionRequirement({
+      userText: '查一下今天有什么新消息',
       workingDirectory: 'C:\\unity\\ST3',
     });
-    assert.equal(localRequirement.kind, 'none');
+    assert.equal(vagueRequirement.kind, 'none');
+  });
+
+  it('allows low-risk local probing when the request names an available workspace object', () => {
+    const workspaceRequirement = classifyExecutionRequirement({
+      userText: '查一下当前工作目录里有哪些文件夹',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.equal(workspaceRequirement.kind, 'local_read_required');
+    assert.match(workspaceRequirement.reason, /low-risk/i);
+
+    const fileRequirement = classifyExecutionRequirement({
+      userText: '看一下 packages/bridge-core/package.json 里配置了什么',
+      workingDirectory: 'C:\\Users\\admin\\Documents\\New project\\codex-im-suite',
+    });
+    assert.equal(fileRequirement.kind, 'local_read_required');
+
+    const vagueRequirement = classifyExecutionRequirement({
+      userText: '查一下今天有什么新消息',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.equal(vagueRequirement.kind, 'none');
   });
 
   it('does not require tool evidence for ordinary explanations', () => {

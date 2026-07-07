@@ -39,6 +39,9 @@ const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
 const TOOL_DOMAIN_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|GameObject|Assets|Packages|ProjectSettings|场景|节点|组件|物体|对象|层级|Hierarchy)/iu;
 const STRICT_EVIDENCE_FAMILIES = new Set(['artifact', 'filesystem', 'shell', 'unity-mcp', 'blender']);
+const PATH_LIKE_TARGET_RE = /(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu;
+const LOW_RISK_CONTEXT_TARGET_RE = /(工作目录|当前目录|本地目录|项目结构|仓库结构|目录|文件夹|子目录|路径|文件|仓库|workspace|repo|repository|mcp\s*manifest|manifest|config\/mcp\.d|配置目录)/iu;
+const COMMAND_INVOCATION_RE = /(powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+)/iu;
 
 export interface ToolResultQuality {
   ok: boolean;
@@ -133,6 +136,20 @@ function makeExecutionRequirement(
   };
 }
 
+function hasConcreteReadableContextTarget(text: string, input: ExecutionRequirementInput): boolean {
+  if (PATH_LIKE_TARGET_RE.test(text)) return true;
+  if (LOW_RISK_CONTEXT_TARGET_RE.test(text) && !!input.workingDirectory) return true;
+  return false;
+}
+
+function shouldUseLowRiskLocalProbe(text: string, input: ExecutionRequirementInput): boolean {
+  if (!LOCAL_READ_RE.test(text)) return false;
+  if (!hasConcreteReadableContextTarget(text, input)) return false;
+  if (COMMAND_INVOCATION_RE.test(text)) return false;
+  // Mutating verbs still go through the stricter tool/action branches below.
+  return !ACTION_VERB_RE.test(text);
+}
+
 export function isFeishuStickerMessageKind(messageKind?: string): boolean {
   return messageKind === 'feishu_sticker_unknown'
     || messageKind === 'feishu_sticker_known'
@@ -162,6 +179,14 @@ function classifyExecutionRequirementInternal(
 
   if (MEMORY_RECALL_RE.test(text) && !LOCAL_TARGET_RE.test(text) && !TOOL_REQUIRED_RE.test(text)) {
     return NONE_REQUIREMENT;
+  }
+
+  if (shouldUseLowRiskLocalProbe(text, input)) {
+    return makeExecutionRequirement(
+      'local_read_required',
+      'low-risk readable context target is available for proactive inspection',
+      ['shell', 'read', 'search'],
+    );
   }
 
   if (EXPLANATION_RE.test(text) && !LOCAL_READ_RE.test(text) && !TOOL_REQUIRED_RE.test(text)) {

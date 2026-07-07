@@ -117,6 +117,51 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const BARE_AT_TARGET_RE = /(^|[\s([{（【])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
+const BARE_AT_BOUNDARY_CLASS = '[\\s([{（【]';
+const BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
+const FEISHU_AT_ALL_ALIASES = new Set(['all', '所有人', '全体成员', '大家']);
+const FEISHU_SENDER_ALIASES = new Set(['我', '俺', '本人', '你', '用户', '发起人', '提问人', '发送者']);
+
+interface FeishuMentionCandidate {
+  userId: string;
+  name: string;
+  aliases: string[];
+}
+
+function cleanMentionName(name: string | undefined, fallback = '用户'): string {
+  const cleaned = (name || '').replace(/^@+/, '').replace(/[<>"]/g, '').trim();
+  if (!cleaned || /^o[cu]_[A-Za-z0-9_-]+$/u.test(cleaned)) return fallback;
+  return cleaned;
+}
+
+function normalizeMentionAlias(name: string | undefined): string {
+  return (name || '').replace(/^@+/, '').replace(/\s+/g, '').trim().toLowerCase();
+}
+
+function extractBareAtTargets(text: string): string[] {
+  const targets: string[] = [];
+  const seen = new Set<string>();
+  for (const match of String(text || '').matchAll(BARE_AT_TARGET_RE)) {
+    const target = cleanMentionName(match[2], '').trim();
+    const key = normalizeMentionAlias(target);
+    if (!target || !key || seen.has(key)) continue;
+    seen.add(key);
+    targets.push(target);
+  }
+  return targets;
+}
+
+function replaceBareAtTarget(text: string, target: string, replacementName: string): string {
+  const safeTarget = escapeRegExp(target);
+  const pattern = new RegExp(`(^|${BARE_AT_BOUNDARY_CLASS})@${safeTarget}(?=$|${BARE_AT_END_BOUNDARY_CLASS})`, 'gu');
+  return text.replace(pattern, (_match, prefix: string) => `${prefix}@${replacementName}`);
+}
+
+function getRawObject(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' ? value as Record<string, any> : {};
+}
+
 function stripFeishuReactionHintText(text: string, hint: FeishuReactionHint): string {
   return hint.remainingText
     || text.replace(new RegExp(`^\\s*\\[${escapeRegExp(hint.raw)}\\]\\s*`, 'u'), '').trim();
@@ -656,12 +701,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
         || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
       .slice(0, 8);
     if (annotated.length === 0) {
+      const reusableGenericStickerCount = store.stickers.filter((item) => !item.disabled).length;
       return [
         'Feishu sticker library:',
         '- No semantically annotated stickers are available for this chat yet.',
+        reusableGenericStickerCount > 0
+          ? `- 可复用通用表情包：当前有 ${reusableGenericStickerCount} 个真实 sticker file_key 可由 adapter 轮换选择，但还没有可靠语义别名。`
+          : '- No reusable sticker file_key is available yet; the adapter can only send text or reactions until a sticker is received.',
         '- If the user explains a sticker meaning by replying to it, the adapter will store the meaning and usage for future selection.',
-        '- Do not use `[表情包:alias]` because no sticker aliases are available yet.',
-        '- If the user explicitly asks for any sticker or a different sticker, use bare `[表情包]`; otherwise prefer text or a reaction hint.',
+        '- Do not use sticker aliases because no sticker aliases are available yet.',
+        reusableGenericStickerCount > 0
+          ? '- For explicit sticker requests, casual acknowledgements, light teasing, jokes, or banter where a generic sticker fits, start with bare `[表情包]`; otherwise prefer text or a reaction hint.'
+          : '- Do not use bare `[表情包]` until at least one reusable sticker has been received.',
       ].join('\n');
     }
     const lines = annotated.map((item) => {
@@ -1547,6 +1598,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
     summary?: RunSummary,
+    mentions: OutboundMention[] = [],
   ): Promise<boolean> {
     // Wait for in-flight card creation to complete before finalizing
     const pending = this.cardCreatePromises.get(chatId);
@@ -1616,7 +1668,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           finalResponseText = applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
         }
       }
-      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer, summary);
+      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer, summary, mentions);
 
       state.sequence++;
       await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
@@ -1767,9 +1819,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
     summary?: RunSummary,
+    mentions: OutboundMention[] = [],
   ): Promise<boolean> {
     if (!this.isStreamingCardEnabled()) return false;
-    return this.finalizeCard(chatId, status, responseText, summary);
+    return this.finalizeCard(chatId, status, responseText, summary, mentions);
   }
 
   // ── Send ────────────────────────────────────────────────────
@@ -1850,7 +1903,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     if (message.parseMode === 'Markdown') {
-      const result = await this.sendAsCard(message.address.chatId, text, message.replyToMessageId);
+      const result = await this.sendAsCard(message.address.chatId, text, message.replyToMessageId, message.mentions);
       if (result.ok) {
         console.log('[feishu-adapter] Markdown send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
       } else {
@@ -1975,8 +2028,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Send text as an interactive card (schema 2.0 markdown).
    * Used for code blocks and tables — card renders them properly.
    */
-  private async sendAsCard(chatId: string, text: string, replyToMessageId?: string): Promise<SendResult> {
-    const cardContent = buildCardContent(text);
+  private async sendAsCard(
+    chatId: string,
+    text: string,
+    replyToMessageId?: string,
+    mentions: OutboundMention[] = [],
+  ): Promise<SendResult> {
+    const cardContent = buildCardContent(text, mentions);
 
     try {
       const res = replyToMessageId
@@ -2000,21 +2058,26 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch (err) {
       if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
         console.warn('[feishu-adapter] Card reply target missing, retrying as direct chat send');
-        return this.sendAsCard(chatId, text);
+        return this.sendAsCard(chatId, text, undefined, mentions);
       }
       console.warn('[feishu-adapter] Card send error, falling back to post:', err instanceof Error ? err.message : err);
     }
 
     // Fallback to post
-    return this.sendAsPost(chatId, text, replyToMessageId);
+    return this.sendAsPost(chatId, text, replyToMessageId, mentions);
   }
 
   /**
    * Send text as a post message (msg_type: 'post') with md tag.
    * Used for simple text — renders bold, italic, inline code, links.
    */
-  private async sendAsPost(chatId: string, text: string, replyToMessageId?: string): Promise<SendResult> {
-    const postContent = buildPostContent(text);
+  private async sendAsPost(
+    chatId: string,
+    text: string,
+    replyToMessageId?: string,
+    mentions: OutboundMention[] = [],
+  ): Promise<SendResult> {
+    const postContent = buildPostContent(text, mentions);
 
     try {
       const res = replyToMessageId
@@ -2038,24 +2101,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch (err) {
       if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
         console.warn('[feishu-adapter] Post reply target missing, retrying as direct chat send');
-        return this.sendAsPost(chatId, text);
+        return this.sendAsPost(chatId, text, undefined, mentions);
       }
       console.warn('[feishu-adapter] Post send error, falling back to text:', err instanceof Error ? err.message : err);
     }
 
     // Final fallback: plain text
     try {
+      const fallbackMessage: OutboundMessage = {
+        address: { channelType: 'feishu', chatId },
+        text,
+        mentions,
+      };
+      const content = this.buildFeishuTextPayload(text, fallbackMessage);
       const res = replyToMessageId
         ? await this.restClient!.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { msg_type: 'text', content: JSON.stringify({ text }) },
+          data: { msg_type: 'text', content },
         })
         : await this.restClient!.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
             msg_type: 'text',
-            content: JSON.stringify({ text }),
+            content,
           },
         });
       if (res?.data?.message_id) {
@@ -2482,6 +2551,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
         unionId: sender.sender_id?.union_id,
         chatType: msg.chat_type,
       },
+      ...(msg.mentions?.length ? {
+        feishuMentions: msg.mentions.map((mention) => ({
+          key: mention.key,
+          name: mention.name,
+          openId: mention.id.open_id,
+          userId: mention.id.user_id,
+          unionId: mention.id.union_id,
+        })),
+      } : {}),
       ...(stickerInfo ? { sticker: stickerInfo } : {}),
       ...(stickerInfo ? { messageKind: stickerInfo.messageKind } : {}),
     };
@@ -2861,6 +2939,151 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  async resolveOutboundMentions(message: OutboundMessage, sourceMessage?: InboundMessage): Promise<OutboundMessage> {
+    if (message.address.channelType !== 'feishu') return message;
+    if (/<at\s+(?:id|user_id)=/iu.test(message.text)) return message;
+
+    const targets = extractBareAtTargets(message.text);
+    if (targets.length === 0) return message;
+
+    const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
+    const nextMentions: OutboundMention[] = [...(message.mentions || [])];
+    const seenMentionKeys = new Set(nextMentions.map((mention) =>
+      mention.atAll ? '__all__' : (mention.userId || '').trim()
+    ).filter(Boolean));
+
+    let text = message.text;
+    let changed = false;
+    for (const target of targets) {
+      const resolved = this.resolveOutboundMentionTarget(target, candidates);
+      if (!resolved) continue;
+
+      const key = resolved.atAll ? '__all__' : (resolved.userId || '').trim();
+      if (!key || seenMentionKeys.has(key)) continue;
+      seenMentionKeys.add(key);
+      nextMentions.push(resolved);
+      changed = true;
+
+      const canonicalName = cleanMentionName(resolved.name, resolved.atAll ? '所有人' : target);
+      if (normalizeMentionAlias(target) !== normalizeMentionAlias(canonicalName)) {
+        text = replaceBareAtTarget(text, target, canonicalName);
+      }
+    }
+
+    if (!changed && text === message.text) return message;
+    return {
+      ...message,
+      text,
+      mentions: nextMentions.length > 0 ? nextMentions : undefined,
+    };
+  }
+
+  private async collectOutboundMentionCandidates(
+    message: OutboundMessage,
+    sourceMessage?: InboundMessage,
+  ): Promise<FeishuMentionCandidate[]> {
+    const byId = new Map<string, FeishuMentionCandidate>();
+    const addCandidate = (userId: string | undefined, name: string | undefined, aliases: string[] = []) => {
+      const id = (userId || '').trim();
+      const displayName = cleanMentionName(name, '');
+      if (!id || !displayName) return;
+      const existing = byId.get(id);
+      const mergedAliases = new Set([
+        ...(existing?.aliases || []),
+        displayName,
+        ...aliases.map((item) => cleanMentionName(item, '')).filter(Boolean),
+      ]);
+      byId.set(id, {
+        userId: id,
+        name: existing?.name || displayName,
+        aliases: [...mergedAliases],
+      });
+    };
+
+    this.addInboundMentionCandidates(sourceMessage, addCandidate);
+
+    if (message.address.chatId) {
+      try {
+        const memberNames = await this.fetchChatMemberNames(message.address.chatId);
+        for (const [memberId, memberName] of memberNames) {
+          addCandidate(memberId, memberName);
+        }
+      } catch (err) {
+        console.warn('[feishu-adapter] chat member mention lookup skipped:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    const senderIds = this.getSourceSenderIds(sourceMessage);
+    for (const senderId of senderIds) {
+      const existing = byId.get(senderId);
+      if (existing) {
+        addCandidate(senderId, existing.name, [...FEISHU_SENDER_ALIASES]);
+      } else if (sourceMessage?.address.displayName && sourceMessage.address.chatType !== 'group') {
+        addCandidate(senderId, sourceMessage.address.displayName, [...FEISHU_SENDER_ALIASES]);
+      }
+    }
+
+    return [...byId.values()];
+  }
+
+  private addInboundMentionCandidates(
+    sourceMessage: InboundMessage | undefined,
+    addCandidate: (userId: string | undefined, name: string | undefined, aliases?: string[]) => void,
+  ): void {
+    const raw = getRawObject(sourceMessage?.raw);
+    const mentionGroups = [
+      Array.isArray(raw.feishuMentions) ? raw.feishuMentions : [],
+      Array.isArray(raw.message?.mentions) ? raw.message.mentions : [],
+    ];
+
+    for (const mentions of mentionGroups) {
+      for (const mention of mentions) {
+        const item = getRawObject(mention);
+        const id = getRawObject(item.id);
+        const openId = item.openId || item.open_id || id.open_id;
+        const userId = item.userId || item.user_id || id.user_id;
+        const unionId = item.unionId || item.union_id || id.union_id;
+        const name = item.name || item.user_name || item.key;
+        addCandidate(openId || userId || unionId, name, [item.key, item.name, item.user_name].filter(Boolean));
+      }
+    }
+  }
+
+  private getSourceSenderIds(sourceMessage: InboundMessage | undefined): string[] {
+    const raw = getRawObject(sourceMessage?.raw);
+    const sender = getRawObject(raw.feishuSender);
+    const ids = [
+      sender.openId,
+      sender.open_id,
+      sender.userId,
+      sender.user_id,
+      sender.unionId,
+      sender.union_id,
+      sourceMessage?.address.userId,
+    ].map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean);
+    return [...new Set(ids)];
+  }
+
+  private resolveOutboundMentionTarget(target: string, candidates: FeishuMentionCandidate[]): OutboundMention | null {
+    const normalizedTarget = normalizeMentionAlias(target);
+    if (!normalizedTarget) return null;
+    if (FEISHU_AT_ALL_ALIASES.has(normalizedTarget)) {
+      return { atAll: true, name: '所有人' };
+    }
+
+    const matches = candidates.filter((candidate) => {
+      const aliases = [candidate.name, ...candidate.aliases];
+      return aliases.some((alias) => normalizeMentionAlias(alias) === normalizedTarget);
+    });
+    const uniqueById = new Map(matches.map((candidate) => [candidate.userId, candidate]));
+    if (uniqueById.size !== 1) return null;
+    const candidate = [...uniqueById.values()][0];
+    return {
+      userId: candidate.userId,
+      name: candidate.name,
+    };
+  }
+
   private buildOutboundMentionTags(message?: OutboundMessage): string[] {
     if (!message) return [];
     if (/<at\s+user_id=/i.test(message.text)) return [];
@@ -2879,14 +3102,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       pushMention(mention);
     }
 
-    const isGroup = message.address.chatType === 'group';
-    if (isGroup && message.replyToMessageId && message.address.userId) {
-      pushMention({
-        userId: message.address.userId,
-        name: message.address.displayName,
-      });
-    }
-
+    // Reply metadata is only a quote target; native Feishu mentions must be explicit.
     return resolvedMentions.map((mention) => {
       if (mention.atAll) {
         return '<at user_id="all">所有人</at>';

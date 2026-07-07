@@ -238,6 +238,135 @@ describe('FeishuAdapter reply fallback', () => {
   });
 });
 
+describe('FeishuAdapter outbound mentions', () => {
+  beforeEach(() => {
+    setupContext();
+  });
+
+  it('renders structured mentions in markdown cards instead of plain @ text', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: Array<{ msg_type: string; content: string }> = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload.data);
+            return { data: { message_id: 'om_card' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group' },
+      text: '@张三 哈喽呀',
+      parseMode: 'Markdown',
+      mentions: [{ userId: 'ou_target', name: '张三' }],
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(sent[0]?.msg_type, 'interactive');
+    const card = JSON.parse(sent[0]!.content);
+    const content = card.body.elements[0].content;
+    assert.match(content, /<at id="ou_target"><\/at>/);
+    assert.doesNotMatch(content, /@张三/);
+  });
+
+  it('renders structured mentions in post fallback as native at nodes', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: Array<{ msg_type: string; content: string }> = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload.data);
+            return { data: { message_id: 'om_post' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.sendAsPost('oc_group', '@张三 哈喽呀', undefined, [
+      { userId: 'ou_target', name: '张三' },
+    ]);
+
+    assert.equal(result.ok, true);
+    assert.equal(sent[0]?.msg_type, 'post');
+    const post = JSON.parse(sent[0]!.content);
+    const row = post.zh_cn.content[0];
+    assert.deepEqual(row[0], { tag: 'at', user_id: 'ou_target', user_name: '张三' });
+    assert.equal(row[1].text, ' 哈喽呀');
+  });
+
+  it('renders explicit mentions in plain text payloads', () => {
+    const adapter = new FeishuAdapter() as any;
+
+    const content = adapter.buildFeishuTextPayload('hello', {
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: 'hello',
+      mentions: [{ userId: 'ou_target', name: 'Alice' }],
+    });
+
+    assert.equal(JSON.parse(content).text, '<at user_id="ou_target">Alice</at>\nhello');
+  });
+
+  it('resolves bare at-name text from current chat members', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMemberNames = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return new Map([
+        ['ou_liudan', '刘丹'],
+        ['ou_zhangsan', '张三'],
+      ]);
+    };
+
+    const resolved = await adapter.resolveOutboundMentions({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@刘丹 哈喽呀',
+      parseMode: 'Markdown',
+    });
+
+    assert.deepEqual(resolved.mentions, [{ userId: 'ou_liudan', name: '刘丹' }]);
+    assert.equal(resolved.text, '@刘丹 哈喽呀');
+  });
+
+  it('does not invent a structured mention when an at-name has multiple chat member matches', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_a', '刘丹'],
+      ['ou_b', '刘丹'],
+    ]);
+
+    const resolved = await adapter.resolveOutboundMentions({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@刘丹 哈喽呀',
+      parseMode: 'Markdown',
+    });
+
+    assert.equal(resolved.mentions, undefined);
+  });
+
+  it('does not infer a sender mention from group reply metadata', () => {
+    const adapter = new FeishuAdapter() as any;
+
+    const content = adapter.buildFeishuTextPayload('hello', {
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        chatType: 'group',
+        userId: 'ou_sender',
+        displayName: 'Sender',
+      },
+      text: 'hello',
+      replyToMessageId: 'om_source',
+    });
+
+    assert.equal(JSON.parse(content).text, 'hello');
+  });
+});
+
 describe('FeishuAdapter light conversation context', () => {
   beforeEach(() => {
     setupContext({ bridge_feishu_light_context_limit: '4' });
@@ -1220,6 +1349,30 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.match(prompt, /别人突然丢奇怪需求时使用/);
     assert.match(prompt, /\[表情包:干嘛猫\]/);
     assert.doesNotMatch(prompt, /sticker_file_key/);
+  });
+
+  it('describes reusable generic stickers when no semantic sticker is available for the current chat', () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-06-05T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_other_chat',
+        firstSeenAt: '2026-06-05T00:00:00.000Z',
+        lastSeenAt: '2026-06-05T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_current_chat');
+
+    assert.match(prompt, /可复用通用表情包|reusable generic stickers/i);
+    assert.match(prompt, /\[表情包\]/);
+    assert.match(prompt, /轻松|吐槽|玩笑|casual|banter/i);
+    assert.doesNotMatch(prompt, /\[表情包:[^\]]+\]/);
   });
 });
 

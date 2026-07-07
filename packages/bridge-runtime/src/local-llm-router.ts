@@ -83,6 +83,9 @@ const LOCAL_FRIENDLY_PATTERNS: PatternRule[] = [
   { pattern: /(帮我总结|概括一下|提炼一下|简要说明)/i, reason: '总结类请求', taskKind: 'summarize' },
 ];
 
+const READABLE_CONTEXT_OBJECT_RE = /(?:https?:\/\/\S+|[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b|工作目录|当前目录|本地目录|项目结构|仓库结构|目录|文件夹|子目录|路径|文件|仓库|workspace|repo|repository|mcp\s*manifest|manifest|config\/mcp\.d|链接|url)/iu;
+const READABLE_CONTEXT_ACTION_RE = /(?:看一看|看一下|看一眼|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|读一下|读取|打开|搜索|搜一下|查找|总结|概括|分析)/iu;
+
 function normalizeText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
 }
@@ -174,6 +177,10 @@ function looksLikeExecutionIntent(text: string): boolean {
   return /(执行|运行|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
 }
 
+function hasReadableContextObject(text: string): boolean {
+  return READABLE_CONTEXT_ACTION_RE.test(text) && READABLE_CONTEXT_OBJECT_RE.test(text);
+}
+
 function extractSystemSection(systemPrompt: string | undefined, heading: string): string {
   const text = systemPrompt || '';
   if (!text.trim()) return '';
@@ -207,6 +214,7 @@ export function isLightChatCandidate(params: StreamChatParams, config: Config): 
   for (const rule of HARD_EXCLUDE_PATTERNS) {
     if (rule.pattern.test(combinedInput)) return false;
   }
+  if (hasReadableContextObject(combinedInput)) return false;
   if (looksLikeExecutionIntent(combinedInput)) return false;
   if (/(执行|运行|命令|文件|读取|搜索|截图|图片|附件|MCP|Unity|Blender|发布|报错|错误|阻塞|日志|git\s+(?:status|pull|fetch|branch|log)|Feishu doc|飞书文档|docx|sheets|base)/iu.test(combinedInput)) {
     return false;

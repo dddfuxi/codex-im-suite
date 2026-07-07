@@ -1,4 +1,4 @@
-import type { RunSummary, ToolCallInfo } from '../types.js';
+import type { OutboundMention, RunSummary, ToolCallInfo } from '../types.js';
 
 /**
  * Feishu-specific Markdown processing.
@@ -38,7 +38,7 @@ export function preprocessFeishuMarkdown(text: string): string {
  * Renders code blocks, tables, bold, italic, links, inline code properly.
  * Aligned with Openclaw's buildMarkdownCard().
  */
-export function buildCardContent(text: string): string {
+export function buildCardContent(text: string, mentions: OutboundMention[] = []): string {
   return JSON.stringify({
     schema: '2.0',
     config: {
@@ -48,7 +48,7 @@ export function buildCardContent(text: string): string {
       elements: [
         {
           tag: 'markdown',
-          content: text,
+          content: renderFeishuMarkdownMentions(text, mentions),
         },
       ],
     },
@@ -60,12 +60,132 @@ export function buildCardContent(text: string): string {
  * Used for simple text without code blocks or tables.
  * Aligned with Openclaw's buildFeishuPostMessagePayload().
  */
-export function buildPostContent(text: string): string {
+export function buildPostContent(text: string, mentions: OutboundMention[] = []): string {
+  const content = mentions.length > 0
+    ? [buildPostElementsWithMentions(text, mentions)]
+    : [[{ tag: 'md', text }]];
   return JSON.stringify({
     zh_cn: {
-      content: [[{ tag: 'md', text }]],
+      content,
     },
   });
+}
+
+interface NormalizedMention {
+  userId: string;
+  name: string;
+  atAll: boolean;
+}
+
+function normalizeMentions(mentions: OutboundMention[]): NormalizedMention[] {
+  const normalized: NormalizedMention[] = [];
+  const seen = new Set<string>();
+  for (const mention of mentions) {
+    const atAll = mention.atAll === true;
+    const userId = atAll ? 'all' : (mention.userId || '').trim();
+    if (!userId || seen.has(userId)) continue;
+    seen.add(userId);
+    normalized.push({
+      userId,
+      name: (mention.name || (atAll ? '所有人' : '用户')).trim() || (atAll ? '所有人' : '用户'),
+      atAll,
+    });
+  }
+  return normalized;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeAttr(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function mentionTextPattern(mention: NormalizedMention): RegExp {
+  if (mention.atAll) return /@(?:all|所有人)(?=$|[\s,，.。!！?？~～:：;；])/iu;
+  return new RegExp(`@${escapeRegExp(mention.name)}(?=$|[\\s,，.。!！?？~～:：;；])`, 'u');
+}
+
+function renderMarkdownAt(mention: NormalizedMention): string {
+  return `<at id="${escapeAttr(mention.userId)}"></at>`;
+}
+
+function renderPostAt(mention: NormalizedMention): Record<string, string> {
+  return {
+    tag: 'at',
+    user_id: mention.userId,
+    user_name: mention.name,
+  };
+}
+
+function mentionKey(mention: NormalizedMention): string {
+  return mention.atAll ? '__all__' : mention.userId;
+}
+
+interface PostMentionMatch {
+  mention: NormalizedMention;
+  index: number;
+  length: number;
+}
+
+export function renderFeishuMarkdownMentions(text: string, mentions: OutboundMention[] = []): string {
+  const normalizedMentions = normalizeMentions(mentions);
+  if (normalizedMentions.length === 0) return text;
+  if (/<at\s+(?:id|user_id)=/iu.test(text)) return text;
+
+  let rendered = text;
+  const missing: NormalizedMention[] = [];
+  for (const mention of normalizedMentions) {
+    const pattern = mentionTextPattern(mention);
+    if (pattern.test(rendered)) {
+      rendered = rendered.replace(pattern, renderMarkdownAt(mention));
+    } else {
+      missing.push(mention);
+    }
+  }
+
+  if (missing.length === 0) return rendered;
+  const prefix = missing.map(renderMarkdownAt).join(' ');
+  return rendered.trim() ? `${prefix} ${rendered}` : prefix;
+}
+
+function buildPostElementsWithMentions(text: string, mentions: OutboundMention[]): Array<Record<string, string>> {
+  const normalizedMentions = normalizeMentions(mentions);
+  const elements: Array<Record<string, string>> = [];
+  let remaining = text;
+  const found = new Set<string>();
+
+  while (remaining) {
+    let next: PostMentionMatch | null = null;
+    for (const mention of normalizedMentions) {
+      const match = mentionTextPattern(mention).exec(remaining);
+      if (!match || match.index < 0) continue;
+      if (
+        !next
+        || match.index < next.index
+        || (match.index === next.index && match[0].length > next.length)
+      ) {
+        next = { mention, index: match.index, length: match[0].length };
+      }
+    }
+    if (!next) break;
+    const before = remaining.slice(0, next.index);
+    if (before) elements.push({ tag: 'text', text: before });
+    elements.push(renderPostAt(next.mention));
+    found.add(mentionKey(next.mention));
+    remaining = remaining.slice(next.index + next.length);
+  }
+
+  if (remaining) elements.push({ tag: 'text', text: remaining });
+  const missing = normalizedMentions.filter((mention) => !found.has(mentionKey(mention)));
+  const prefix = missing.map(renderPostAt);
+  const combined = [...prefix, ...elements];
+  return combined.length > 0 ? combined : [{ tag: 'text', text }];
 }
 
 /**
@@ -236,6 +356,7 @@ export function buildFinalCardJson(
   tools: ToolCallInfo[],
   footer: { status: string; elapsed: string } | null,
   summary?: RunSummary,
+  mentions: OutboundMention[] = [],
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
@@ -248,7 +369,7 @@ export function buildFinalCardJson(
 
   elements.push({
     tag: 'markdown',
-    content: titledContent.body,
+    content: renderFeishuMarkdownMentions(titledContent.body, mentions),
     text_align: 'left',
     text_size: 'normal',
   });

@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-06-08
+更新时间：2026-07-07
 
 ## 0. 架构文档维护规则
 
@@ -91,10 +91,11 @@ Feishu 接收现在是双通道：
 6. 如果消息里包含飞书 Docx、Sheets 或 Base 链接，bridge-core 调用 bridge-runtime 的云文档 host；runtime 先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户 token 读取，并把真实内容作为本轮 system context 注入。缺用户 token 时发送登录授权卡片；`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网回调，用户把飞书授权后的 `code/state` 回调 URL 复制回飞书完成绑定。登录后仍无权限时返回明确阻塞。
 7. Feishu Owner 可用 `/feishu` 查看开放平台能力诊断：本地配置、应用 token 直读能力、OAuth fallback 请求 scope、`CTI_FEISHU_GRANTED_SCOPES` 声明的已开通权限，以及各能力缺口。
 8. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。普通“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”会先命中 Feishu 历史意图，bridge-core 只使用 adapter/store 的历史索引和 `retrieveRelevantFeishuHistory()` 生成受控摘要，不把 `feishu-history/*.json` 路径交给 Codex 自行用 Bash 或 MCP 读取。
-9. 调用运行时 provider。
-10. 解析最终结果块和 `cti-reminder` 动作块。
-11. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
-12. 通过 Feishu 原生 reply/card/image 等方式回复。
+9. 对带有明确可读对象的请求，`ExecutionRequirement` 会在不依赖关键词硬触发的前提下启用低风险主动探查：例如当前工作区、明确路径、文件名、MCP manifest、`config/mcp.d` 等对象会进入 `local_read_required`，让 provider 先做受控读取/列目录/检查；没有明确对象的时效或泛问仍保持普通回答或追问。
+10. 调用运行时 provider。
+11. 解析最终结果块和 `cti-reminder` 动作块。
+12. 如果 Codex 明确请求创建提醒，bridge-core 只把结构化动作交给 bridge-runtime 的 reminder host 执行，用户看到的是 bridge 执行结果。
+13. 通过 Feishu 原生 reply/card/image 等方式回复。Feishu 出站 mention 统一走结构化 `mentions`，来源包括模型返回的 `cti-final.mentions`，以及 `BaseChannelAdapter.resolveOutboundMentions()` 钩子在最终发送前做的通用解析：FeishuAdapter 会把最终正文中的裸 `@显示名` 按本轮入站原生 mention、当前群成员列表和 sender 上下文解析成真实 open_id/user_id；只有唯一命中时才补入 `OutboundMention`，同名多候选或未命中不会伪造原生艾特。Markdown card 会渲染为 `<at id="..."></at>`，post/text 会渲染为飞书原生 `at` 节点或 `<at user_id="...">`，`replyToMessageId` 只表示引用回复，不再自动推断为艾特发起人；目标含糊的“另一个人 / 别人 / 其他成员”请求会先要求用户给出明确对象，且没有结构化 mention 时任何裸 `@名字` 都会被拦截为澄清回复。Feishu streaming card 只展示“核对可用信息 / 整理成可读回复 / 需要确认 / 遇到阻塞”这类高层状态；工具名、路径、命令、agent 阶段名和原始工具事件只进入审计或最终阻塞摘要，不直接作为进度直播内容。
 
 ```mermaid
 sequenceDiagram
@@ -503,7 +504,7 @@ flowchart TD
 关键能力：
 
 - Feishu 群聊原生 reply。
-- 群聊 reply 时可自动 @ 提问人。
+- 群聊 reply 只表示引用消息，不自动 @ 提问人；原生 @ 必须来自结构化 `mentions`，可由 `cti-final.mentions` 显式提供，或由 Feishu 出站 resolver 按入站原生 mention、群成员列表和 sender 上下文把最终正文里的裸 `@显示名` 解析为唯一真实成员。
 - 群聊 mention 判定优先使用事件 `mentions`，事件缺字段时再解析正文里的飞书 at 标记，避免“已 @ 机器人但消息未入会话”。
 - Feishu Markdown 默认走 card。
 - Feishu streaming card 等待态只展示当前一步用户可见思考动作：卡片正文由彩色阶段标题、灰色小字正文和通用阶段轨迹组成，随着模型/provider progress、记忆证据、工具事件或收口阶段刷新，不累计历史步骤，不写入最终回复或会话历史。workflow 固定步骤和 provider 细节可同时展示；当 provider 已给出更具体的进度内容时，不用“正在回复...”这类泛化文案遮住它。
@@ -513,6 +514,7 @@ flowchart TD
 - Feishu 文本、Markdown card 和 streaming final card 出站都支持通用 reaction hint：普通文本或最终结果开头的 `[表情]` 会先尝试转成被回复消息上的原生 reaction，再发送或渲染剥离 hint 后的正文；对于 `[微笑]`、`[赞]`、`[OK]`、`[BULL]` 等已知 hint，即使 reaction API 不可用、权限失败或没有可回复的源消息，也会剥离 hint 并用对应 Unicode emoji 作为可见兜底，避免把 `[微笑]` 这类内部发送指令展示给用户。未知 reaction 类型失败时保留原文，避免吞掉用户本来想发送的括号文本。provider prompt 会提示模型只在轻量聊天、确认、问候、表情包接话等场景偶尔使用 Feishu 原生 reaction hint，并必须按实际意图选择；不能把 `SMILE` 当默认表情，语气中性、正式、阻塞或不明确时应不加表情。
 - Feishu reaction hint 不再由 adapter 内硬编码别名表维护。开发版 catalog 位于 `config/feishu-emoji.d/*.json`，`suite.manifest.json` 声明 `config.feishuEmojiCatalogDir`，live 同步脚本会复制到运行版 `config\feishu-emoji.d`；每个条目声明 `emojiType`、中英文别名、语气/意图和 Unicode fallback。adapter 加载 catalog 后解析 `[微笑]`、`[火]` 等别名，也允许合法的未知 `emoji_type` 透传给飞书 API；出站成功/失败和入站 reaction 事件会写入 `CTI_HOME\data\feishu-emoji-profile.json`，按 chat/user 统计偏好，再通过 `getEmojiPresentationPrompt()` 注入轻量聊天 prompt。profile 只影响表达选择，不作为工具执行证据，也不能覆盖正式工具结果、阻塞或安全回复的收口规则。
 - Feishu 入站 `sticker` 表情包消息会先按 `file_key` 记录到 `CTI_HOME\data\feishu-stickers.json`，并可尝试通过消息资源接口下载图片作为可复用资料；单独发送表情包默认仍是轻量聊天事件，下载到的表情包图片可以作为 provider 的视觉语气参考，让模型判断情绪、态度或玩笑语气后直接接话，但最终回复不能写成“图片里是……”的说明报告。下载成功时标记 `messageKind=feishu_sticker_image`；下载失败时退回 `messageKind=feishu_sticker_unknown|feishu_sticker_known` 和 `raw.sticker.fileKey` 元数据。任何情况下都禁止只凭 `file_key` 猜图案或意图。
+- Feishu 出站 sticker 仍由模型返回的 `[表情包]` / `[表情包:别名]` hint 触发，adapter 只复用 `feishu-stickers.json` 里真实存在且未禁用的 `file_key`；当当前 chat 没有语义标注但已有可复用通用表情包时，`getStickerPresentationPrompt()` 会提示模型只能用裸 `[表情包]` 让 adapter 轮换选择，不能伪造别名或 file_key。
 - Feishu 普通图片如果没有附带文字指令，bridge-core 不再把 provider prompt 写成 `Describe this image.`。图片-only 消息会被视为一种对话消息载体，模型需要先结合图片内容和会话上下文推断用户的沟通意图与期望动作，再回应这个意图；只有用户明确要求描述/转写时才做纯 OCR、标题化或图像说明。如果真实意图仍不明确，才问一个简短澄清问题。
 - Feishu P2P 私聊 WS 可能漏事件，adapter 会通过历史轮询恢复新消息；恢复消息必须保留 `root_id`、`parent_id`、`thread_id` 和 `upper_message_id` 等 reply 元数据。若用户回复上一条图片、文件或富文本图片继续提问，adapter 会用这些元数据补取被回复消息附件，并把原图作为本轮 provider attachment 传入模型，而不是只给当前文本。
 - Feishu `sticker` 入站会同时写入结构化 `messageKind=feishu_sticker_image|feishu_sticker_unknown|feishu_sticker_known`，并在有历史档案时把 `label/description/intent/tone/aliases` 作为参考上下文注入。`ExecutionRequirement` 和 `ReplySurfaceMode` 优先识别该结构化事件，表情包消息按轻量聊天处理，不会因为说明文本里出现“图片 / 图案 / 下载”或 adapter 下载到了图片附件而误触发 `artifact_required` / workflow card；真正图片附件、截图、Unity/MCP 和文件产物请求仍按原有证据门槛执行。
@@ -967,6 +969,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `CTI_CODEX_MODEL_SOURCE`：`official`、`local_api` 或 `external_api`，手动模式下决定 Codex CLI 模型来源。
 - `CTI_CODEX_API_FALLBACK_CHAIN`：自动切换模式下的来源顺序，默认 `local_api,external_api`；只有显式包含 `official` 才允许调用官方 Codex。
 - `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用，最多保留 2 条短历史，输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。`CTI_FEISHU_LIGHT_CONTEXT_LIMIT` / `bridge_feishu_light_context_limit` 控制 Feishu 群聊轻量上下文补捞数量，默认 6 条、最大 12 条，只用于被 @ 或回复触发的短接话上下文。
+- Feishu 轻聊天 fast path 会排除带明确可读对象的短句，例如 URL、文件路径、当前工作目录、仓库/项目目录、MCP manifest 或附件语义；这些请求即使语气很短，也会交给普通 provider/工具证据链判断，避免把“帮我看一下这个对象”误当闲聊。
 - `CTI_CODEX_INHERIT_GLOBAL_MCP`：是否让 bridge Codex 继承桌面全局 `mcp_servers.*`，默认 `false`；普通飞书运行态不依赖桌面 MCP，避免外部 MCP 离线导致主模型失败。
 - `CTI_CODEX_LOCAL_IGNORE_USER_CONFIG`：本地 Codex CLI OSS agent 是否忽略桌面用户配置，默认 `true`；这不会禁用内置 shell/file agent 能力，但会减少插件和全局 provider 配置干扰。
 - `@openai/codex-sdk`：bridge-runtime 的外部可选依赖，当前随 suite 锁定到 `0.132.0`；live 同步会校验运行副本中的实际安装版本。

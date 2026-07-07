@@ -118,6 +118,13 @@ export abstract class BaseChannelAdapter {
   /** Optional channel-specific sticker library hints for model prompts. */
   getStickerPresentationPrompt?(chatId?: string, userId?: string): string;
 
+  /**
+   * Resolve channel-native mentions before final delivery.
+   * Adapters can turn user-visible text such as "@name" into structured mention
+   * metadata using platform APIs or cached inbound context.
+   */
+  resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
+
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;
 
@@ -173,6 +180,7 @@ export abstract class BaseChannelAdapter {
     _status: 'completed' | 'interrupted' | 'error',
     _responseText: string,
     _summary?: import('./types.js').RunSummary,
+    _mentions?: import('./types.js').OutboundMention[],
   ): Promise<boolean>;
 }
 

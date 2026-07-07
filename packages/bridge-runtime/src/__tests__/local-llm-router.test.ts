@@ -93,6 +93,26 @@ describe('decideConservativeRoute', () => {
     assert.equal(isLightChatCandidate(makeParams('帮我检查 Unity MCP 为什么连不上'), baseConfig), false);
   });
 
+  it('does not fast-path short requests that include concrete readable context objects', () => {
+    const feishuPrompt = [
+      'Channel assistant identity:',
+      'Feishu emoji presentation:',
+      'Feishu sticker library:',
+    ].join('\n');
+
+    assert.equal(isLightChatCandidate(makeParams('可以看一下当前工作目录吗', {
+      systemPrompt: feishuPrompt,
+    }), baseConfig), false);
+
+    assert.equal(isLightChatCandidate(makeParams('帮我看 packages/bridge-core/package.json', {
+      systemPrompt: feishuPrompt,
+    }), baseConfig), false);
+
+    assert.equal(isLightChatCandidate(makeParams('可以看一下这个链接吗 https://example.com/a', {
+      systemPrompt: feishuPrompt,
+    }), baseConfig), false);
+  });
+
   it('builds a light chat prompt profile without long tool context', () => {
     const params = makeParams('收到啦', {
       systemPrompt: [

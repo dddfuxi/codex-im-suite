@@ -591,9 +591,55 @@ describe('bridge-manager lifecycle', () => {
 
     assert.equal(sent.length, 0);
     assert.ok(cardUpdates.length > 0);
-    assert.match(cardUpdates.join('\n'), /Unity|截图|工具/);
+    assert.match(cardUpdates.join('\n'), /核对|整理/);
+    assert.doesNotMatch(cardUpdates.join('\n'), /Unity MCP|工具|tool_use|tool_result|正在连接/);
     assert.equal(finalized.length, 1);
     assert.equal(finalized[0].status, 'completed');
+  });
+
+  it('keeps Feishu progress cards high-level instead of exposing internal tool steps', async () => {
+    const sent: OutboundMessage[] = [];
+    const cardUpdates: string[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '### 处理思路\n我先读取 packages/bridge-core/package.json，然后调用 JsonTool:shell。\n' },
+          {
+            type: 'tool_use',
+            data: JSON.stringify({ id: 'tool-1', name: 'JsonTool:shell', input: { command: 'Get-Content package.json' } }),
+          },
+          {
+            type: 'tool_result',
+            data: JSON.stringify({ tool_use_id: 'tool-1', content: '{"ok":true}', is_error: false }),
+          },
+          { type: 'progress', data: 'agent 已返回内容，正在核对证据和可展示结果。' },
+          { type: 'text', data: '```cti-final\n{"kind":"text","text":"配置看过了。","images":[],"files":[],"reply_mode":"plain"}\n```' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    adapter.onStreamText = (_chatId, text) => {
+      cardUpdates.push(text);
+    };
+    adapter.onStreamEnd = async () => true;
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('帮我看 packages/bridge-core/package.json'));
+
+    assert.equal(sent.length, 0);
+    assert.ok(cardUpdates.length > 0);
+    const progressText = cardUpdates.join('\n');
+    assert.match(progressText, /核对|整理|处理/);
+    assert.doesNotMatch(progressText, /JsonTool|shell|package\.json|Get-Content|tool_use|tool_result/i);
+    assert.doesNotMatch(progressText, /agent 已返回|正在核对证据|正在整理为最终回复|已返回结果|正在执行/);
+    assert.doesNotMatch(progressText, /我先读取|调用/);
   });
 
   it('does not pre-create workflow cards from tool-like wording without real progress events', async () => {
@@ -1727,19 +1773,22 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].systemPrompt || '', /Do not replace that name with "Codex"/);
     assert.match(streamParams[0].systemPrompt || '', /Do not default to SMILE/);
     assert.match(streamParams[0].systemPrompt || '', /Choose reaction hints by actual intent/);
+    assert.match(streamParams[0].systemPrompt || '', /low-risk/i);
+    assert.match(streamParams[0].systemPrompt || '', /bounded/i);
+    assert.match(streamParams[0].systemPrompt || '', /Do not ask the user to restate context/i);
     assert.doesNotMatch(streamParams[0].systemPrompt || '', /\[微笑\]/);
     assert.match(streamParams[0].systemPrompt || '', /\[表情包:alias\]/);
     assert.equal(memoryDecisionCalls, 0);
     assert.equal(memoryWriteClassifierCalls, 0);
   });
 
-  it('keeps provider progress visible alongside the workflow card step', async () => {
+  it('redacts provider progress details behind a high-level workflow card step', async () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
     const text = _testOnly.buildProgressCardTextForTest(
       '正在整理回复。',
       '处理思路：正在识别图片里的题目。',
     );
-    assert.equal(text, '正在整理回复。\n\n处理思路：正在识别图片里的题目。');
+    assert.equal(text, '这边在核对可用信息。');
   });
 
   it('selects light status by default and reserves workflow cards for real bridge progress', async () => {
@@ -2069,8 +2118,8 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(streamParams[0].executionRequirement?.kind, 'none');
     assert.match(streamParams[0].systemPrompt || '', /本地记忆检索命中/);
     assert.match(streamParams[0].systemPrompt || '', /HSScene/);
-    assert.match(progressCards.join('\n'), /检索到相关记忆/);
-    assert.match(progressCards.join('\n'), /交给 agent/);
+    assert.match(progressCards.join('\n'), /核对可用信息/);
+    assert.doesNotMatch(progressCards.join('\n'), /检索到相关记忆|交给 agent/);
     assert.match(sent[0].text, /HSScene/);
     assert.match(sent[0].text, /医院内部场景/);
   });
@@ -2137,6 +2186,119 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].systemPrompt || '', /本地记忆检索命中/);
     assert.match(sent[0].text, /第十三条龙：雷霆龙/);
     assert.doesNotMatch(sent[0].text, /HSScene/);
+  });
+
+  it('does not mention the sender when a Feishu mention request has no explicit target', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('@刘丹 哈喽呀，我是小虾米，来打个招呼~') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你艾特群里另一个人打个招呼', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuConversationContext: {
+          prompt: '[被回复消息] [19:16] 刘丹: @小虾米 你艾特群里另一个人打个招呼',
+        },
+        feishuSender: { openId: 'ou_sender' },
+      },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.doesNotMatch(reply!.text, /@刘丹/);
+    assert.match(reply!.text, /把对方名字|直接 @/);
+    assert.equal(reply!.mentions, undefined);
+  });
+
+  it('blocks any bare at-name reply when a Feishu mention target is ambiguous', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('@刘丹 哈喽呀，小虾米来了~') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你艾特群里另一个人打个招呼', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: 'oc_group',
+        chatType: 'group',
+      },
+      raw: {
+        feishuConversationContext: {
+          prompt: '[被回复消息] [19:16] 刘丹: @小虾米 你艾特群里另一个人打个招呼',
+        },
+        feishuSender: { openId: 'ou_sender' },
+      },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.doesNotMatch(reply!.text, /@刘丹/);
+    assert.match(reply!.text, /把对方名字|直接 @/);
+    assert.equal(reply!.mentions, undefined);
+  });
+
+  it('resolves bare Feishu at-name replies through the channel mention resolver', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('@刘丹 哈喽呀，我来打个招呼~') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => ({
+      ...message,
+      mentions: [{ userId: 'ou_liudan', name: '刘丹' }],
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('随便回一句', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '王五',
+        chatType: 'group',
+      },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.equal(reply!.text, '@刘丹 哈喽呀，我来打个招呼~\n\n✅');
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_liudan', name: '刘丹' }]);
   });
 
   it('extracts cti-reminder action blocks without treating normal task text as reminders', async () => {

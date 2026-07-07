@@ -1193,11 +1193,57 @@ function sanitizeProgressCardDetail(text: string): string {
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
   if (!normalized) return '';
-  return normalized.length > 900 ? `${normalized.slice(0, 897)}...` : normalized;
+  const visibleLines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !isInternalProgressNarration(line));
+  const visible = visibleLines.join('\n').trim();
+  if (!visible) return '';
+  return visible.length > 900 ? `${visible.slice(0, 897)}...` : visible;
+}
+
+function isInternalProgressNarration(line: string): boolean {
+  const normalized = line.replace(/^[-*]\s*/, '').trim();
+  if (!normalized) return true;
+  // 进度卡只展示用户可理解的状态，不直播工具名、路径、命令或 agent 内部阶段。
+  if (/(JsonTool|tool_use|tool_result|cti-final|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
+    return true;
+  }
+  if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
+    return true;
+  }
+  if (/^(我先|我会|我正在|我继续|我再|我开始|正在|准备|调用|读取|执行|运行|使用|检查|核对|整理|处理思路|执行过程|工具|本地命令)/iu.test(normalized)) {
+    return true;
+  }
+  if (/(正在|准备).{0,24}(读取|调用|执行|运行|检查|核对|整理|搜索|连接|返回|收口)/iu.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeProgressCardStep(step: string | undefined): string {
+  const normalized = (step || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (/授权|确认/u.test(normalized)) return '需要你确认一项权限。';
+  if (/失败|报错|错误|不可用/u.test(normalized)) return '有一项信息核对失败，正在收口。';
+  if (/完成|已返回|返回结果|最终回复|整理为最终|agent 已返回/u.test(normalized)) {
+    return '有结果了，正在整理成可读回复。';
+  }
+  if (/检索|记忆|上下文|读取|查看|查询|搜索|工具|命令|MCP|JsonTool|shell|执行|调用|核对|证据/u.test(normalized)) {
+    return '这边在核对可用信息。';
+  }
+  if (isInternalProgressNarration(normalized)) return '这边在核对可用信息。';
+  return normalized;
+}
+
+function describeToolProgressStatus(status: 'running' | 'complete' | 'error'): string {
+  if (status === 'error') return '有一项信息核对失败，正在收口。';
+  if (status === 'complete') return '有结果了，正在整理成可读回复。';
+  return '这边在核对可用信息。';
 }
 
 function buildProgressCardTextForStreaming(step: string | undefined, detailText: string): string {
-  const normalizedStep = (step || '').replace(/\s+/g, ' ').trim();
+  const normalizedStep = normalizeProgressCardStep(step);
   const detail = sanitizeProgressCardDetail(detailText);
   if (normalizedStep && detail && detail !== normalizedStep) {
     return `${normalizedStep}\n\n${detail}`;
@@ -1729,6 +1775,72 @@ function verifyPreparedReplyExecution(
   }
 
   return payload;
+}
+
+const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|mention|提到|点名)/iu;
+const FEISHU_OTHER_PERSON_TARGET_RE = /(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人)/iu;
+function hasStructuredMentions(mentions: OutboundMention[] | undefined): boolean {
+  return Array.isArray(mentions) && mentions.some((mention) => mention?.atAll || !!mention?.userId?.trim());
+}
+
+function hasBareFeishuMentionText(answerText: string): boolean {
+  // 飞书原生 mention 必须走结构化 mentions；模糊目标下裸 @名字 只能当作不安全文本处理。
+  return /(?:^|[\s([{（【])@[^\s@,，.。!！?？~～:：;；<>\])）】]{1,64}(?=$|[\s,，.。!！?？~～:：;；])/u.test(answerText);
+}
+
+function needsExplicitFeishuMentionTarget(userText: string): boolean {
+  if (!FEISHU_MENTION_ACTION_RE.test(userText)) return false;
+  return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
+}
+
+async function resolvePreparedOutboundMentions(
+  adapter: BaseChannelAdapter,
+  sourceMessage: InboundMessage,
+  payload: PreparedBridgeReplyPayload,
+): Promise<PreparedBridgeReplyPayload> {
+  if (typeof adapter.resolveOutboundMentions !== 'function') return payload;
+  try {
+    const resolved = await adapter.resolveOutboundMentions({
+      address: sourceMessage.address,
+      text: payload.text,
+      parseMode: payload.parseMode,
+      mentions: payload.mentions,
+      replyToMessageId: payload.replyTo,
+    }, sourceMessage);
+    return {
+      ...payload,
+      text: resolved.text,
+      mentions: Object.prototype.hasOwnProperty.call(resolved, 'mentions')
+        ? resolved.mentions
+        : payload.mentions,
+    };
+  } catch (err) {
+    console.warn('[bridge-manager] Outbound mention resolution skipped:', err instanceof Error ? err.message : err);
+    return payload;
+  }
+}
+
+function enforceFeishuMentionTargetSafety(
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    channelType: string;
+    userText: string;
+    senderDisplayName?: string;
+  },
+): PreparedBridgeReplyPayload {
+  if (context.channelType !== 'feishu') return payload;
+  if (!needsExplicitFeishuMentionTarget(context.userText)) return payload;
+  if (hasStructuredMentions(payload.mentions)) return payload;
+  if (!hasBareFeishuMentionText(payload.text)) return payload;
+
+  return {
+    ...payload,
+    text: appendReplyEndMarker('你要我艾特谁？把对方名字或直接 @ TA 发我，我会用飞书原生 mention 发送。'),
+    parseMode: 'plain',
+    images: [],
+    files: [],
+    mentions: undefined,
+  };
 }
 
 async function prepareBridgeReplyPayload(
@@ -4469,7 +4581,7 @@ async function handleMessage(
   };
 
   const emitProgressCardStep = supportsStreamingCards ? (step: string) => {
-    const normalized = step.replace(/\s+/g, ' ').trim();
+    const normalized = normalizeProgressCardStep(step);
     if (!normalized) return;
     if (!ensureWorkflowCard()) return;
     if (progressCardSteps[progressCardSteps.length - 1] !== normalized) progressCardSteps.push(normalized);
@@ -4498,8 +4610,7 @@ async function handleMessage(
     const visibleToolName = formatVisibleToolName(toolName || toolCallTracker.get(toolId)?.name || '') || '工具';
     const providerDetail = sanitizeProgressCardDetail(providerProgressText);
     if (providerDetail && /^(?:MCP 工具执行|工具执行)$/u.test(visibleToolName)) return;
-    const statusText = status === 'running' ? '正在执行' : status === 'complete' ? '已返回结果' : '执行失败';
-    emitProgressCardStep?.(`${visibleToolName} ${statusText}。`);
+    emitProgressCardStep?.(describeToolProgressStatus(status));
   } : undefined;
 
   // Combined partial text callback: streaming preview + streaming cards
@@ -4641,6 +4752,12 @@ async function handleMessage(
         executionRequirement: uiExecutionRequirement,
         messageKind: inboundMessageKind,
       });
+      preparedReply = await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
+      preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
+        channelType: adapter.channelType,
+        userText: rawText,
+        senderDisplayName: msg.address.displayName,
+      });
     }
     if (workflowCardStarted) {
       emitProgressCardStep?.('正在整理为最终回复。');
@@ -4686,6 +4803,7 @@ async function handleMessage(
           status,
           userFacingResponseText || safeProviderErrorText,
           result.runSummary,
+          preparedReply?.mentions,
         );
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);

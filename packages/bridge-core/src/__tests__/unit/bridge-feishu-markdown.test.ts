@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 
 import {
   buildFinalCardJson,
+  buildPostContent,
   buildStreamingContent,
   extractStreamingFinalResponse,
 } from '../../lib/bridge/markdown/feishu.js';
@@ -50,6 +51,30 @@ describe('Feishu streaming card markdown', () => {
     const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
     assert.match(content, /^\*\*.+\*\*/m);
     assert.match(content, /\n\n\*\*.+\*\*\n- /);
+  });
+
+  it('renders structured mentions in finalized card markdown', () => {
+    const card = JSON.parse(buildFinalCardJson('@张三 哈喽呀', [], null, undefined, [
+      { userId: 'ou_target', name: '张三' },
+    ])) as {
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(content, /<at id="ou_target"><\/at>/);
+    assert.doesNotMatch(content, /@张三/);
+  });
+
+  it('renders post mentions in text order even when mention metadata order differs', () => {
+    const post = JSON.parse(buildPostContent('@Bob and @Alice', [
+      { userId: 'ou_alice', name: 'Alice' },
+      { userId: 'ou_bob', name: 'Bob' },
+    ]));
+    const row = post.zh_cn.content[0];
+
+    assert.deepEqual(row[0], { tag: 'at', user_id: 'ou_bob', user_name: 'Bob' });
+    assert.deepEqual(row[1], { tag: 'text', text: ' and ' });
+    assert.deepEqual(row[2], { tag: 'at', user_id: 'ou_alice', user_name: 'Alice' });
   });
 
   it('reports streaming cards as enabled by default', () => {
