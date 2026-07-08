@@ -234,6 +234,7 @@ describe('McpBridge manifest discovery', () => {
         id: 'mcp-fetch',
         displayName: 'Fetch MCP',
         type: 'stdio',
+        cwd: process.cwd(),
         registerName: 'mcp-fetch',
         healthCheck: { kind: 'codex-mcp-list' },
         manifestPath: path.join(suiteRoot, 'config', 'mcp.d', 'mcp-fetch.json'),
@@ -274,6 +275,20 @@ describe('McpBridge manifest discovery', () => {
       else process.env.CTI_HOME = previousCtiHome;
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  it('rejects MCP manifests that do not declare cwd', async () => {
+    const health = await new McpBridge(baseConfig).checkHealth({
+      id: 'missing-cwd',
+      displayName: 'Missing Cwd MCP',
+      type: 'stdio',
+      registerName: 'missing-cwd',
+      healthCheck: { kind: 'codex-mcp-list' },
+      manifestPath: 'missing-cwd.json',
+    });
+
+    assert.equal(health.ok, false);
+    assert.match(health.message, /manifest 未声明 cwd/);
   });
 
   it('lists and calls stdio MCP tools from a user overlay launcher', async () => {
@@ -389,6 +404,7 @@ describe('McpBridge manifest discovery', () => {
         id: 'unityMCP',
         displayName: 'Unity MCP',
         type: 'http',
+        cwd: process.cwd(),
         healthCheck: {
           kind: 'mcp-http-resource',
           url,
@@ -410,6 +426,7 @@ describe('McpBridge manifest discovery', () => {
         id: 'unityMCP',
         displayName: 'Unity MCP',
         type: 'http',
+        cwd: process.cwd(),
         healthCheck: {
           kind: 'mcp-http-resource',
           url,
@@ -431,6 +448,7 @@ describe('McpBridge manifest discovery', () => {
         id: 'unityMCP',
         displayName: 'Unity MCP',
         type: 'http',
+        cwd: process.cwd(),
         healthCheck: { kind: 'http', url },
         manifestPath: 'unity-mcp.json',
       });
@@ -448,6 +466,7 @@ describe('McpBridge manifest discovery', () => {
         id: 'fake-http-tool',
         displayName: 'Fake HTTP Tool MCP',
         type: 'http' as const,
+        cwd: process.cwd(),
         healthCheck: { kind: 'http', url },
         manifestPath: 'fake-http-tool.json',
       };

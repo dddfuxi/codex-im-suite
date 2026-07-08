@@ -1,13 +1,21 @@
 {
   "id": "fxtools.doctor",
   "displayName": "FXTools Doctor",
+  "description": "Run the FXTools doctor command through Unity MCP execute_code.",
   "enabled": true,
   "type": "unity_mcp_execute_code",
+  "compatibility": {
+    "protocol": "action-manifest/v1",
+    "suite": ">=0.2.0"
+  },
   "match": {
-    "keywords": ["fxtools", "doctor"],
+    "keywords": [
+      "fxtools",
+      "doctor"
+    ],
     "regex": [
-      "fxtools-cli\\.ps1[\\\"']?\\s+doctor",
-      "FXToolsAgentCommandRouter\\.Execute[\\s\\S]*command\\s*=\\s*[\\\"']doctor[\\\"']"
+      "fxtools-cli\\.ps1[\"']?\\s+doctor",
+      "FXToolsAgentCommandRouter\\.Execute[\\s\\S]*command\\s*=\\s*[\"']doctor[\"']"
     ]
   },
   "unityMcp": {

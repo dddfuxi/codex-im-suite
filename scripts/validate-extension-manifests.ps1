@@ -29,6 +29,7 @@ const strict = process.env.CTI_VALIDATE_STRICT === "true";
 const suiteManifest = JSON.parse(fs.readFileSync(path.join(suiteRoot, "suite.manifest.json"), "utf8"));
 const extensionProtocolId = suiteManifest.extensionProtocol?.id || "extension-manifest/v1";
 const runtimeProtocolId = suiteManifest.runtimeProtocol?.id || "runtime-manifest/v1";
+const actionProtocolId = suiteManifest.actionProtocol?.id || "action-manifest/v1";
 const suiteVersion = String(suiteManifest.version || "");
 const requiredExtensionFields = suiteManifest.extensionProtocol?.requiredFields?.length
   ? suiteManifest.extensionProtocol.requiredFields.map(String)
@@ -36,6 +37,9 @@ const requiredExtensionFields = suiteManifest.extensionProtocol?.requiredFields?
 const requiredRuntimeFields = suiteManifest.runtimeProtocol?.requiredFields?.length
   ? suiteManifest.runtimeProtocol.requiredFields.map(String)
   : ["id", "displayName", "kind", "category", "enabled", "installState", "source", "cwd", "version", "description"];
+const requiredActionFields = suiteManifest.actionProtocol?.requiredFields?.length
+  ? suiteManifest.actionProtocol.requiredFields.map(String)
+  : ["id", "displayName", "description", "enabled", "type", "compatibility"];
 
 const overlayManifestRoot = path.join(ctiHome, "extensions", "manifests");
 const knownDirs = [
@@ -47,10 +51,17 @@ const knownDirs = [
   { path: path.join(overlayManifestRoot, "plugins.d"), types: ["plugin"], label: "plugin overlay", required: false },
 ];
 const runtimeDir = path.join(manifestRoot, "runtime.d");
+const actionDirs = [
+  { path: path.join(manifestRoot, "action-manifests.d"), label: "action", required: true, legacy: false, priority: 100 },
+  { path: path.join(overlayManifestRoot, "action-manifests.d"), label: "action overlay", required: false, legacy: false, priority: 120 },
+  { path: path.join(manifestRoot, "local-agent-tools.d"), label: "legacy local-agent action", required: false, legacy: true, priority: 10 },
+  { path: path.join(overlayManifestRoot, "local-agent-tools.d"), label: "legacy local-agent action overlay", required: false, legacy: true, priority: 30 },
+];
 
 const errors = [];
 const warnings = [];
 const seenIds = new Set();
+const seenActionIds = new Map();
 let checked = 0;
 let enabled = 0;
 let disabled = 0;
@@ -189,6 +200,9 @@ function validateExtensionManifest(filePath, allowedTypes, directoryLabel) {
   }
 
   if (["http", "stdio"].includes(type)) {
+    if (!String(manifest.cwd || "")) {
+      addError(`${filePath}: MCP manifest must declare cwd`);
+    }
     if (!String(manifest.launcher || "")) {
       addError(`${filePath}: MCP manifest must declare launcher`);
     }
@@ -249,6 +263,111 @@ function validateRuntimeManifest(filePath) {
   validateUpdateBlock(manifest, filePath);
 }
 
+function validateRegexList(filePath, fieldName, values) {
+  if (values === undefined) return;
+  if (!Array.isArray(values)) {
+    addError(`${filePath}: ${fieldName} must be an array`);
+    return;
+  }
+  for (const value of values) {
+    if (typeof value !== "string") {
+      addError(`${filePath}: ${fieldName} entries must be strings`);
+      continue;
+    }
+    try {
+      new RegExp(value, "iu");
+    } catch (error) {
+      addError(`${filePath}: invalid ${fieldName} regex '${value}': ${error.message}`);
+    }
+  }
+}
+
+function validateActionManifest(filePath, directoryLabel, legacy, priority) {
+  checked += 1;
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    addError(`${filePath}: JSON parse failed: ${error.message}`);
+    return;
+  }
+
+  const requiredFields = legacy ? ["id", "enabled", "type"] : requiredActionFields;
+  for (const field of requiredFields) {
+    if (!(field in manifest)) {
+      addError(`${filePath}: missing action field '${field}'`);
+    }
+  }
+
+  const id = String(manifest.id || "");
+  if (!id) {
+    addError(`${filePath}: action id must not be empty`);
+  } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    addError(`${filePath}: invalid action id '${id}'`);
+  } else {
+    const idKey = id.toLowerCase();
+    const previous = seenActionIds.get(idKey);
+    if (previous && previous.priority >= priority) {
+      addWarning(`${path.basename(filePath)}: duplicate action id '${id}' ignored by runtime; selected definition: ${previous.filePath}`);
+    } else if (previous) {
+      addWarning(`${path.basename(filePath)}: action id '${id}' overrides previous runtime definition: ${previous.filePath}`);
+      seenActionIds.set(idKey, { filePath, priority });
+    } else {
+      seenActionIds.set(idKey, { filePath, priority });
+    }
+  }
+
+  if (manifest.enabled === false) {
+    disabled += 1;
+  } else {
+    enabled += 1;
+  }
+
+  const type = String(manifest.type || "");
+  if (!["mcp_tool_call", "unity_mcp_execute_code", "shell_artifact"].includes(type)) {
+    addError(`${filePath}: action type '${type}' is invalid for ${directoryLabel}`);
+  }
+
+  if (!legacy && String(manifest.compatibility?.protocol || "") !== actionProtocolId) {
+    addError(`${filePath}: action compatibility.protocol '${String(manifest.compatibility?.protocol || "")}' does not match '${actionProtocolId}'`);
+  }
+
+  if (!legacy) {
+    for (const field of ["displayName", "description"]) {
+      if (!String(manifest[field] || "")) {
+        addError(`${filePath}: action.${field} must not be empty`);
+      }
+    }
+  }
+
+  const match = manifest.match || {};
+  if (match && typeof match === "object" && !Array.isArray(match)) {
+    validateRegexList(filePath, "match.regex", match.regex);
+    validateRegexList(filePath, "match.contextualRegex", match.contextualRegex);
+    validateRegexList(filePath, "match.contextRegex", match.contextRegex);
+  }
+
+  if (type === "mcp_tool_call") {
+    if (!String(manifest.mcp?.manifestHint || "") || !String(manifest.mcp?.tool || "")) {
+      addError(`${filePath}: mcp_tool_call action must declare mcp.manifestHint and mcp.tool`);
+    }
+  }
+  if (type === "unity_mcp_execute_code" && !String(manifest.unityMcp?.codeTemplate || "")) {
+    addError(`${filePath}: unity_mcp_execute_code action must declare unityMcp.codeTemplate`);
+  }
+  if (type === "shell_artifact") {
+    if (!String(manifest.shellArtifact?.command || "")) {
+      addError(`${filePath}: shell_artifact action must declare shellArtifact.command`);
+    }
+    const artifactPaths = Array.isArray(manifest.shellArtifact?.artifactPaths)
+      ? manifest.shellArtifact.artifactPaths.filter((item) => typeof item === "string" && item.trim())
+      : [];
+    if (artifactPaths.length === 0) {
+      addError(`${filePath}: shell_artifact action must declare shellArtifact.artifactPaths`);
+    }
+  }
+}
+
 for (const dir of knownDirs) {
   if (!fs.existsSync(dir.path)) {
     if (dir.required) addError(`manifest directory does not exist: ${dir.path}`);
@@ -256,6 +375,16 @@ for (const dir of knownDirs) {
   }
   for (const entry of fs.readdirSync(dir.path).filter((name) => name.endsWith(".json")).sort()) {
     validateExtensionManifest(path.join(dir.path, entry), dir.types, dir.label);
+  }
+}
+
+for (const dir of actionDirs) {
+  if (!fs.existsSync(dir.path)) {
+    if (dir.required) addError(`action manifest directory does not exist: ${dir.path}`);
+    continue;
+  }
+  for (const entry of fs.readdirSync(dir.path).filter((name) => name.endsWith(".json")).sort()) {
+    validateActionManifest(path.join(dir.path, entry), dir.label, dir.legacy, dir.priority);
   }
 }
 
@@ -284,8 +413,8 @@ if (strict && warnings.length > 0) {
   process.exit(1);
 }
 
-console.log(`extension manifest protocol: ${extensionProtocolId} | runtime protocol: ${runtimeProtocolId} | suite ${suiteVersion}`);
-console.log(`extension/runtime manifests valid: checked=${checked} enabled=${enabled} disabled=${disabled} warnings=${warnings.length}`);
+console.log(`extension manifest protocol: ${extensionProtocolId} | runtime protocol: ${runtimeProtocolId} | action protocol: ${actionProtocolId} | suite ${suiteVersion}`);
+console.log(`extension/runtime/action manifests valid: checked=${checked} enabled=${enabled} disabled=${disabled} warnings=${warnings.length}`);
 '@
 
 $tempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("cti-validate-manifests-" + [guid]::NewGuid().ToString("N") + ".cjs")

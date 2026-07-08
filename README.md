@@ -108,12 +108,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `config/skills.d`：随项目备份的 skill manifest。
 - `config/plugins.d`：随项目备份的 plugin manifest。
 - `config/runtime.d`：内建服务的 runtime manifest，声明服务显示信息、来源路径和 update 策略。
+- `config/action-manifests.d`：通用工具动作 manifest，声明 MCP / Unity MCP / shell artifact 等可验证动作；旧 `config/local-agent-tools.d` 只作为兼容 overlay。
 - `config/extension-catalog.json`：在线扩展目录的静态种子；控制面板还会叠加动态排行榜源和 `CTI_EXTENSION_CATALOG_URLS` 自定义 URL。
 - `extensions/skills`：自定义 skill 的项目内副本。
 - `scripts`：启动、注册、构建、打包、发布、同步脚本。
 - `release`：portable、installer、zip 等发布产物。
 
-控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d` 和 `extensions\manifests\plugins.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
+控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d`、`extensions\manifests\plugins.d` 和 `extensions\manifests\action-manifests.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
 
 ## 当前运行模型
 
@@ -125,7 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 设置页的“AI 执行与模型来源”可选默认 executor；默认 executor 写入 `CTI_DEFAULT_EXECUTOR_ID`，优先级低于显式 `@hint`、高于历史会话默认值。Codex 模型来源仍可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
 - 本地 API 现在作为 Codex CLI 的普通模型来源接入，不再因为工具探测未通过或旧本地兜底键自动转官方 Codex；`ollama` / `lmstudio` 会通过 provider registry 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，不会走 Codex SDK 的 `/v1/responses`。`vllm`、`openai-compatible` 和 `custom` 在未接入 Codex CLI OSS agent 前只显示为 Chat Completions 能力，不能伪装执行。
-- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 来源 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
+- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/action-manifests.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；旧 `config/local-agent-tools.d` 只作为兼容 overlay 读取。模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 来源 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
 - 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
 - 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 模型来源失败后允许走 runtime 自己的受控工具补执行；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
 - bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
@@ -146,6 +147,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.ps1
 ```
+
+该校验会拦截缺少 `cwd` 的 MCP manifest；MCP 启动、健康检查、列工具和调用工具也会使用同一工作区边界，不允许通过省略 `cwd` 绕过路径门禁。
 
 `runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli` 和 `service.localLlm`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`，`service.feishuCli` 会按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
 

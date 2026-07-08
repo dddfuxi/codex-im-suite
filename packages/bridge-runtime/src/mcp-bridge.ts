@@ -382,7 +382,11 @@ export class McpBridge {
   private validateManifestWorkspace(manifest: McpManifestRecord): McpHealthStatus {
     const manifestCwd = expandManifestValue(manifest.cwd, this.config);
     if (!manifestCwd) {
-      return { ok: true, message: 'manifest 未声明 cwd，跳过工作区约束检查' };
+      // MCP manifests are executable boundaries; an implicit cwd would bypass the workspace allow-list.
+      return {
+        ok: false,
+        message: `MCP manifest 未声明 cwd，拒绝跳过工作区约束：${manifest.id || path.basename(manifest.manifestPath || 'unknown')}`,
+      };
     }
 
     const allowedRoots = splitPathList(this.config.allowedWorkspaceRoots?.join(';'));

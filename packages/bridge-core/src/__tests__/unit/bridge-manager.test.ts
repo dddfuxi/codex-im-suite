@@ -2606,6 +2606,97 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
+  it('strips unresolved Feishu placeholder mention text before delivery', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          '{"kind":"text","text":"George, come say something. @_user_1","images":[],"files":[],"reply_mode":"markdown"}',
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => message;
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('ask George to speak', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: 'Liu Dan',
+        chatType: 'group',
+      },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.doesNotMatch(reply!.text, /@?_user_1/);
+    assert.equal(reply!.mentions, undefined);
+  });
+
+  it('treats asking a named Feishu target to speak as an outbound mention request', async () => {
+    const sent: OutboundMessage[] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          '{"kind":"text","text":"George, come say something. @_user_1","images":[],"files":[],"reply_mode":"plain"}',
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return message.text.includes('@George') && !message.text.includes('@_user_1')
+        ? {
+            ...message,
+            mentions: [{ userId: 'ou_george', name: 'George' }],
+          }
+        : message;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('小虾米，让 George 说话', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.ok(resolverInputs.at(-1)?.text.includes('@George'));
+    assert.doesNotMatch(resolverInputs.at(-1)?.text || '', /@_user_1/);
+    assert.doesNotMatch(reply!.text, /@_user_1/);
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: 'George' }]);
+  });
+
   it('keeps pronoun follow-up text out of requested Feishu mention target names', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];

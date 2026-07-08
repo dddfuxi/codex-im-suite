@@ -251,6 +251,78 @@ describe('FeishuAdapter bot name wake classification', () => {
     assert.equal(queued.length, 0);
     assert.ok(auditLogs.some((entry) => entry.summary?.includes('bot name mention not actionable')));
   });
+
+  it('allows actionable native mentions from another Feishu bot or app sender', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuTextEvent('om_bot_to_bot', '@_user_1 请继续检查这个问题') as any;
+    event.sender = {
+      sender_type: 'app',
+      sender_id: { open_id: 'ou_george_bot' },
+    };
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).text, '请继续检查这个问题');
+    assert.equal((queued[0] as any).raw?.feishuSender?.senderType, 'app');
+    assert.equal((queued[0] as any).raw?.feishuBotToBot?.senderType, 'app');
+  });
+
+  it('drops native mentions from bot senders after the bot-to-bot loop budget is exhausted', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+      bridge_feishu_bot_to_bot_max_turns: '1',
+    }) as any;
+    const auditLogs: Array<{ summary?: string }> = [];
+    store.insertAuditLog = (entry: { summary?: string }) => auditLogs.push(entry);
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const makeBotEvent = (messageId: string, text: string) => {
+      const event = createFeishuTextEvent(messageId, `@_user_1 ${text}`) as any;
+      event.sender = {
+        sender_type: 'app',
+        sender_id: { open_id: 'ou_george_bot' },
+      };
+      event.message.mentions = [
+        { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+      ];
+      return event;
+    };
+
+    await adapter.processIncomingEvent(makeBotEvent('om_bot_loop_1', '第一轮继续'));
+    await adapter.processIncomingEvent(makeBotEvent('om_bot_loop_2', '第二轮继续'));
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).messageId, 'om_bot_loop_1');
+    assert.ok(auditLogs.some((entry) => entry.summary?.includes('bot-to-bot loop budget exhausted')));
+  });
 });
 
 describe('FeishuAdapter assistant identity', () => {
@@ -1011,7 +1083,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
     assert.doesNotMatch(cardUpdate, /\[微笑\]/);
   });
 
-  it('turns a final card sticker hint into a real sticker message and removes it from the card body', async () => {
+  it('does not turn a final card bare sticker hint into an arbitrary unannotated sticker', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
     fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
@@ -1058,14 +1130,14 @@ describe('FeishuAdapter CardKit compatibility', () => {
 
     assert.equal(created, true);
     assert.equal(finalized, true);
-    assert.ok(calls.some((item) => /"msg_type":"sticker"/.test(item)));
-    assert.ok(calls.some((item) => /\\"file_key\\":\\"sticker_file_key\\"/.test(item)));
+    assert.ok(!calls.some((item) => /"msg_type":"sticker"/.test(item)));
+    assert.ok(!calls.some((item) => /\\"file_key\\":\\"sticker_file_key\\"/.test(item)));
     const cardUpdate = calls.find((item) => item.startsWith('card.update:')) || '';
     assert.match(cardUpdate, /收到~/);
     assert.doesNotMatch(cardUpdate, /\[表情包\]/);
   });
 
-  it('finalizes sticker-only card replies as a sent action instead of an empty-result failure', async () => {
+  it('finalizes unresolved sticker-only card replies as readable text instead of sending an arbitrary sticker', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
     fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
@@ -1112,14 +1184,14 @@ describe('FeishuAdapter CardKit compatibility', () => {
 
     assert.equal(created, true);
     assert.equal(finalized, true);
-    assert.ok(calls.some((item) => /"msg_type":"sticker"/.test(item)));
+    assert.ok(!calls.some((item) => /"msg_type":"sticker"/.test(item)));
     const cardUpdate = calls.find((item) => item.startsWith('card.update:')) || '';
-    assert.match(cardUpdate, /表情包已发送/);
+    assert.match(cardUpdate, /收到~/);
     assert.doesNotMatch(cardUpdate, /模型没有返回可展示结果/);
     assert.doesNotMatch(cardUpdate, /\[表情包\]/);
   });
 
-  it('rotates bare sticker hints across stored Feishu stickers instead of always reusing the most-used one', async () => {
+  it('does not rotate bare sticker hints across unannotated Feishu stickers', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
     fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
@@ -1174,12 +1246,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
 
     assert.equal(created, true);
     assert.equal(finalized, true);
-    const stickerCall = calls
-      .filter((item) => item.startsWith('message.reply:'))
-      .map((item) => JSON.parse(item.slice('message.reply:'.length)) as { data?: { content?: string; msg_type?: string } })
-      .find((item) => item.data?.msg_type === 'sticker');
-    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
-    assert.equal(stickerContent.file_key, 'sticker_fresh_choice');
+    assert.ok(!calls.some((item) => /"msg_type":"sticker"/.test(item)));
   });
 
   it('chooses the semantically best sticker for bare sticker hints with reply text', async () => {
@@ -1734,7 +1801,7 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.doesNotMatch(prompt, /sticker_file_key/);
   });
 
-  it('describes reusable generic stickers when no semantic sticker is available for the current chat', () => {
+  it('does not suggest bare generic stickers when no semantic sticker is available for the current chat', () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
     fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
       version: 1,
@@ -1752,9 +1819,10 @@ describe('FeishuAdapter sticker inbound', () => {
 
     const prompt = adapter.getStickerPresentationPrompt('oc_current_chat');
 
-    assert.match(prompt, /可复用通用表情包|reusable generic stickers/i);
-    assert.match(prompt, /\[表情包\]/);
-    assert.match(prompt, /轻松|吐槽|玩笑|casual|banter/i);
+    assert.match(prompt, /No semantically annotated stickers are available/);
+    assert.match(prompt, /Do not use bare/);
+    assert.doesNotMatch(prompt, /reusable generic stickers/i);
+    assert.doesNotMatch(prompt, /start with bare/);
     assert.doesNotMatch(prompt, /\[表情包:[^\]]+\]/);
   });
 });
@@ -1880,7 +1948,7 @@ describe('FeishuAdapter message reactions', () => {
     setupContext();
   });
 
-  it('turns a sticker hint into a real Feishu sticker message', async () => {
+  it('does not turn a bare sticker hint into an arbitrary unannotated Feishu sticker message', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
     fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
       version: 1,
@@ -1916,12 +1984,12 @@ describe('FeishuAdapter message reactions', () => {
     });
 
     assert.equal(result.ok, true);
-    assert.match(calls[0], /"msg_type":"sticker"/);
-    assert.match(calls[0], /\\"file_key\\":\\"sticker_file_key\\"/);
-    assert.match(calls[1], /\\"text\\":\\"收到~\\"/);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls[0], /"msg_type":"sticker"/);
+    assert.match(calls[0], /\\"text\\":\\"收到~\\"/);
   });
 
-  it('does not send a separate status-mark text after a sticker-only plain reply', async () => {
+  it('falls back to readable text for unresolved sticker-only plain replies', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
     fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
       version: 1,
@@ -1958,7 +2026,7 @@ describe('FeishuAdapter message reactions', () => {
 
     assert.equal(result.ok, true);
     assert.equal(calls.length, 1);
-    assert.match(calls[0], /"msg_type":"sticker"/);
+    assert.doesNotMatch(calls[0], /"msg_type":"sticker"/);
     assert.doesNotMatch(calls[0], /\\"text\\":\\"✅\\"/);
   });
 

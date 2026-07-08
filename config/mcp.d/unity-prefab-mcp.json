@@ -15,6 +15,7 @@
   "aliases": ["prefab", "prefab mcp", "unity prefab mcp", "预制体 mcp"],
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-prefab-mcp.ps1",
+  "cwd": "${CTI_UNITY_PROJECT_PATH}",
   "registerName": "unityPrefabMCP",
   "env": {
     "UNITY_MCP_HOST": "127.0.0.1",

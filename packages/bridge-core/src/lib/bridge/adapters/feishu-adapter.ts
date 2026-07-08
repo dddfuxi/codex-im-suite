@@ -66,6 +66,8 @@ type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'st
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
+const FEISHU_BOT_TO_BOT_LOOP_TTL_MS = 5 * 60 * 1000;
+const FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT = 2;
 
 interface FeishuReactionHint {
   raw: string;
@@ -507,6 +509,7 @@ type FeishuMessageEventData = {
       open_id?: string;
       union_id?: string;
       user_id?: string;
+      app_id?: string;
     };
     sender_type: string;
     tenant_key?: string;
@@ -664,6 +667,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private cardCreatePromises = new Map<string, Promise<boolean>>();
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
   private mentionHistoryCache: FeishuMentionHistoryCache | null = null;
+  private botToBotLoopState = new Map<string, { count: number; updatedAt: number }>();
   private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
   private p2pPollInFlight = false;
 
@@ -681,6 +685,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || process.env.CTI_FEISHU_STREAMING_CARD_ENABLED
       || 'true';
     return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+  }
+
+  private isBotToBotReplyEnabled(): boolean {
+    const raw =
+      getBridgeContext().store.getSetting('bridge_feishu_bot_to_bot_enabled')
+      || process.env.CTI_FEISHU_BOT_TO_BOT_ENABLED
+      || 'true';
+    return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+  }
+
+  private getBotToBotMaxTurns(): number {
+    const raw =
+      getBridgeContext().store.getSetting('bridge_feishu_bot_to_bot_max_turns')
+      || process.env.CTI_FEISHU_BOT_TO_BOT_MAX_TURNS
+      || String(FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT);
+    const parsed = Number.parseInt(raw, 10);
+    return Math.max(0, Math.min(Number.isFinite(parsed) ? parsed : FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT, 8));
   }
 
   getAssistantIdentity(): { displayName?: string; platform: string; appId?: string; botOpenId?: string } {
@@ -910,18 +931,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
         || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
       .slice(0, 8);
     if (annotated.length === 0) {
-      const reusableGenericStickerCount = store.stickers.filter((item) => !item.disabled).length;
       return [
         'Feishu sticker library:',
         '- No semantically annotated stickers are available for this chat yet.',
-        reusableGenericStickerCount > 0
-          ? `- 可复用通用表情包：当前有 ${reusableGenericStickerCount} 个真实 sticker file_key 可由 adapter 轮换选择，但还没有可靠语义别名。`
-          : '- No reusable sticker file_key is available yet; the adapter can only send text or reactions until a sticker is received.',
+        '- The adapter may know raw sticker file_keys, but raw file_keys are not reliable semantics and must not be used for generic sticker selection.',
         '- If the user explains a sticker meaning by replying to it, the adapter will store the meaning and usage for future selection.',
         '- Do not use sticker aliases because no sticker aliases are available yet.',
-        reusableGenericStickerCount > 0
-          ? '- For explicit sticker requests, casual acknowledgements, light teasing, jokes, or banter where a generic sticker fits, start with bare `[表情包]`; otherwise prefer text or a reaction hint.'
-          : '- Do not use bare `[表情包]` until at least one reusable sticker has been received.',
+        '- Do not use bare `[表情包]` until at least one sticker has a reliable meaning, tone, or usage annotation for semantic matching.',
       ].join('\n');
     }
     const lines = annotated.map((item) => {
@@ -1020,6 +1036,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return Boolean(record.avoidWhen?.trim() && this.stickerTextOverlapScore(contextText, record.avoidWhen) >= 12);
   }
 
+  private stickerSemanticMatchScore(record: FeishuStickerRecord, contextText: string): number {
+    if (!this.hasStickerAnnotation(record)) return 0;
+    if (!contextText.trim() || this.stickerAvoidsContext(record, contextText)) return 0;
+    return this.stickerTextOverlapScore(contextText, this.stickerSemanticText(record));
+  }
+
   private stickerSemanticScore(record: FeishuStickerRecord, contextText: string, chatId?: string): number {
     if (record.disabled) return Number.NEGATIVE_INFINITY;
     if (contextText.trim() && this.stickerAvoidsContext(record, contextText)) return Number.NEGATIVE_INFINITY;
@@ -1111,6 +1133,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
           : compareRotatingStickerCandidate
         : compareSpecificStickerCandidate;
     const enabledStickers = store.stickers.filter((item) => !item.disabled);
+    if (genericTarget) {
+      const genericCandidates = enabledStickers
+        .filter((item) => this.stickerSemanticMatchScore(item, contextText) >= 6)
+        .sort(compareSemanticStickerCandidate);
+      // 裸 [表情包] 只能表示“按语义帮我选”，不能退化成随机/最近使用的 file_key 轮换。
+      return genericCandidates[0]?.fileKey || null;
+    }
     const byAlias = (genericTarget
       ? enabledStickers
       : enabledStickers.filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
@@ -2056,7 +2085,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           if (!stripStandaloneStatusMarks(text)) return stickerResult;
         }
       } else {
-        text = stickerHint.remainingText || '收到~';
+        text = meaningfulHintRemainder(stickerHint.remainingText, '收到~');
       }
     }
     const reactionHint = (
@@ -2574,7 +2603,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const msg = data.message;
     const sender = data.sender;
 
-    // Filter out app/bot/system events to prevent self-triggering loops.
+    // 先过滤当前 bot 自己、系统和卡片事件；其他 bot/app 发送的原生 @ 会在群聊门禁里受控放行。
     if (this.shouldIgnoreInboundEvent(data)) return;
 
     // Dedup by message_id
@@ -2588,6 +2617,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || sender.sender_id?.union_id
       || '';
     const isGroup = msg.chat_type === 'group';
+    const isOtherBotSender = this.isInboundEventFromOtherBot(sender);
+    let botToBotTurn: { chainCount: number; maxTurns: number; senderType: string } | null = null;
     let botNameWake: FeishuBotNameWakeClassification | null = null;
 
     // Authorization check
@@ -2616,9 +2647,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
 
+      if (isOtherBotSender) {
+        if (!this.isBotToBotReplyEnabled()) {
+          this.insertInboundFilterAudit(chatId, msg.message_id, '[FILTERED] Group message dropped: bot-to-bot replies disabled');
+          return;
+        }
+        const nativeBotMentioned = this.isBotMentionedFromMessage(msg);
+        if (!nativeBotMentioned) {
+          this.insertInboundFilterAudit(chatId, msg.message_id, '[FILTERED] Group bot/app message dropped: current bot not natively mentioned');
+          return;
+        }
+        botNameWake = this.classifyNativeBotMentionFromMessage(msg);
+        if (botNameWake && !botNameWake.shouldHandle) {
+          this.insertInboundFilterAudit(chatId, msg.message_id, '[FILTERED] Group bot/app message dropped: bot mention not actionable');
+          return;
+        }
+        botToBotTurn = this.consumeBotToBotLoopBudget(chatId, msg.message_id, sender.sender_type);
+        if (!botToBotTurn) return;
+      } else {
+        this.resetBotToBotLoop(chatId);
+      }
+
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention) {
+      if (requireMention && !isOtherBotSender) {
         const nativeBotMentioned = this.isBotMentionedFromMessage(msg);
         // 原生 @ 只证明消息关联到机器人；纠错、转述或让别人操作机器人名时仍可不入队。
         botNameWake = nativeBotMentioned
@@ -2654,6 +2706,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
           return;
         }
       }
+    } else if (isOtherBotSender) {
+      this.insertInboundFilterAudit(chatId, msg.message_id, '[FILTERED] Non-group bot/app message dropped');
+      return;
     }
 
     // Track last message ID per chat for typing indicator
@@ -2782,8 +2837,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
         openId: sender.sender_id?.open_id,
         userId: sender.sender_id?.user_id,
         unionId: sender.sender_id?.union_id,
+        appId: sender.sender_id?.app_id,
+        senderType: sender.sender_type,
         chatType: msg.chat_type,
       },
+      ...(botToBotTurn ? {
+        feishuBotToBot: botToBotTurn,
+      } : {}),
       ...(msg.mentions?.length ? {
         feishuMentions: msg.mentions.map((mention) => ({
           key: mention.key,
@@ -2929,7 +2989,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.enqueue(inbound);
   }
 
-  private isSelfSenderType(senderType: string | undefined): boolean {
+  private isBotOrAppSenderType(senderType: string | undefined): boolean {
     const normalized = (senderType || '').trim().toLowerCase();
     return normalized === 'app' || normalized === 'bot';
   }
@@ -2941,16 +3001,72 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private isInboundEventFromSelf(sender: FeishuMessageEventData['sender'] | undefined): boolean {
     if (!sender) return false;
-    if (this.isSelfSenderType(sender.sender_type)) return true;
     const senderId = sender.sender_id;
-    return [senderId?.open_id, senderId?.user_id, senderId?.union_id]
-      .some((id) => this.isKnownBotSenderId(id));
+    if ([senderId?.open_id, senderId?.user_id, senderId?.union_id]
+      .some((id) => this.isKnownBotSenderId(id))) {
+      return true;
+    }
+    const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
+    return !!appId && (senderId?.app_id || '').trim() === appId;
+  }
+
+  private isInboundEventFromOtherBot(sender: FeishuMessageEventData['sender'] | undefined): boolean {
+    if (!sender || !this.isBotOrAppSenderType(sender.sender_type)) return false;
+    return !this.isInboundEventFromSelf(sender);
   }
 
   private isHistoryItemFromSelf(sender: { id?: string; id_type?: string; sender_type?: string } | undefined): boolean {
     if (!sender) return false;
-    return this.isSelfSenderType(sender.sender_type) || this.isKnownBotSenderId(sender.id);
+    return this.isBotOrAppSenderType(sender.sender_type) || this.isKnownBotSenderId(sender.id);
   }
+
+  private insertInboundFilterAudit(chatId: string, messageId: string, summary: string): void {
+    try {
+      getBridgeContext().store.insertAuditLog({
+        channelType: 'feishu',
+        chatId,
+        direction: 'inbound',
+        messageId,
+        summary,
+      });
+    } catch { /* best effort */ }
+  }
+
+  private consumeBotToBotLoopBudget(
+    chatId: string,
+    messageId: string,
+    senderType: string | undefined,
+  ): { chainCount: number; maxTurns: number; senderType: string } | null {
+    const maxTurns = this.getBotToBotMaxTurns();
+    if (maxTurns <= 0) {
+      this.insertInboundFilterAudit(chatId, messageId, '[FILTERED] Group bot/app message dropped: bot-to-bot loop budget exhausted');
+      return null;
+    }
+
+    const now = Date.now();
+    const existing = this.botToBotLoopState.get(chatId);
+    const currentCount = existing && now - existing.updatedAt <= FEISHU_BOT_TO_BOT_LOOP_TTL_MS
+      ? existing.count
+      : 0;
+    if (currentCount >= maxTurns) {
+      this.insertInboundFilterAudit(chatId, messageId, '[FILTERED] Group bot/app message dropped: bot-to-bot loop budget exhausted');
+      return null;
+    }
+
+    const chainCount = currentCount + 1;
+    this.botToBotLoopState.set(chatId, { count: chainCount, updatedAt: now });
+    // 只记录抽象跳数，不把另一机器人正文或内部消息 ID 透传给模型。
+    return {
+      chainCount,
+      maxTurns,
+      senderType: (senderType || 'bot').trim().toLowerCase() || 'bot',
+    };
+  }
+
+  private resetBotToBotLoop(chatId: string): void {
+    if (chatId) this.botToBotLoopState.delete(chatId);
+  }
+
   private shouldIgnoreInboundEvent(data: FeishuMessageEventData): boolean {
     const msg = data.message;
     const senderType = data.sender?.sender_type || '';

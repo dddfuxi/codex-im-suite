@@ -790,9 +790,6 @@ export class CodexLocalCliProvider implements LLMProvider {
     ].filter((item): item is string => !!item?.trim())));
     const toolCatalog = buildJsonToolCatalogForRequirement(params.executionRequirement);
     const contextText = [params.systemPrompt, params.prompt].filter(Boolean).join('\n');
-    const mcpToolCatalog = toolCatalog.includes('mcp_call')
-      ? await this.buildMcpToolCatalog(params)
-      : [];
     const buildRuntimeFallbackRequest = (): JsonToolRequest | null => buildFallbackJsonToolRequest(params.prompt, {
       workingDirectory,
       contextText,
@@ -809,6 +806,14 @@ export class CodexLocalCliProvider implements LLMProvider {
       unityMcpExecuteCodeDefinitions: this.unityMcpExecuteCodeDefinitions,
       shellArtifactDefinitions: this.shellArtifactDefinitions,
     });
+    const deterministicPlan = buildDeterministicPlan();
+    const deterministicRequestAllowed = !!deterministicPlan && toolCatalog.includes(deterministicPlan.request.tool);
+    // Configured action manifests are already a narrower contract than MCP schema
+    // discovery. Do not touch external MCP servers when a deterministic request is
+    // enough to satisfy the turn.
+    const mcpToolCatalog = !deterministicRequestAllowed && toolCatalog.includes('mcp_call')
+      ? await this.buildMcpToolCatalog(params)
+      : [];
     let usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null = null;
     let retryAttempted = false;
     let fallbackToolRequestUsed = false;
@@ -819,8 +824,7 @@ export class CodexLocalCliProvider implements LLMProvider {
     const toolHistory: Array<{ request: JsonToolRequest; result: JsonToolResult }> = [];
     appendProgress(controller, `${describeJsonToolTaskStart(params.prompt, params.executionRequirement, toolCatalog, mcpToolCatalog)}\n`);
 
-    const deterministicPlan = buildDeterministicPlan();
-    if (deterministicPlan && toolCatalog.includes(deterministicPlan.request.tool)) {
+    if (deterministicRequestAllowed) {
       request = deterministicPlan.request;
       fallbackToolRequestUsed = true;
     }

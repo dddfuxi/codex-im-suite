@@ -1722,6 +1722,7 @@ function parseEnvelopeMentions(rawMentions: unknown): OutboundMention[] | undefi
         ? raw.user_name.trim()
         : '';
     const atAll = raw.atAll === true || raw.at_all === true;
+    if (!atAll && (isFeishuPlaceholderMentionTarget(userId) || isFeishuPlaceholderMentionTarget(name))) continue;
     if (!atAll && !userId) continue;
     mentions.push({
       ...(userId ? { userId } : {}),
@@ -1959,6 +1960,12 @@ const FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE = new RegExp(
   `(?:把|给|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)(?:一下|下|一声)?`,
   'giu',
 );
+const FEISHU_THIRD_PARTY_SPEAK_TARGET_RE = new RegExp(
+  `(?:让|叫|喊|请|找|通知|麻烦)\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:出来\\s*)?(?:说话|发言|回复|回应|回(?:复)?一下|吱一声|看(?:一)?下|处理(?:一)?下)`,
+  'giu',
+);
+const FEISHU_PLACEHOLDER_MENTION_TEXT_RE = /(^|[^\p{L}\p{N}_])@?_user_\d+(?=$|[^\p{L}\p{N}_])/giu;
+
 function hasStructuredMentions(mentions: OutboundMention[] | undefined): boolean {
   return Array.isArray(mentions) && mentions.some((mention) => mention?.atAll || !!mention?.userId?.trim());
 }
@@ -1990,7 +1997,17 @@ function isFeishuMentionHowToOrDiagnosticRequest(userText: string): boolean {
 }
 
 function isFeishuMentionExecutionRequest(userText: string): boolean {
-  return FEISHU_MENTION_ACTION_RE.test(userText) && !isFeishuMentionHowToOrDiagnosticRequest(userText);
+  return (FEISHU_MENTION_ACTION_RE.test(userText) || hasFeishuThirdPartySpeakTarget(userText))
+    && !isFeishuMentionHowToOrDiagnosticRequest(userText);
+}
+
+function hasFeishuThirdPartySpeakTarget(userText: string): boolean {
+  FEISHU_THIRD_PARTY_SPEAK_TARGET_RE.lastIndex = 0;
+  return FEISHU_THIRD_PARTY_SPEAK_TARGET_RE.test(userText);
+}
+
+function isFeishuAmbiguousPronounTarget(target: string): boolean {
+  return /^(?:我|你|他|她|它|ta|TA|对方|那个人|这个人)$/u.test(target.trim());
 }
 
 function cleanExplicitFeishuMentionTarget(target: string): string {
@@ -2044,6 +2061,11 @@ function extractExplicitFeishuMentionTargetsFromRequest(userText: string): strin
   for (const target of extractBareFeishuAtTargets(normalized)) {
     addTarget(target);
   }
+  FEISHU_THIRD_PARTY_SPEAK_TARGET_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_THIRD_PARTY_SPEAK_TARGET_RE)) {
+    const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+    if (target && !isFeishuAmbiguousPronounTarget(target)) addTarget(target);
+  }
   FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE.lastIndex = 0;
   for (const match of normalized.matchAll(FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE)) {
     addTarget(match[1] || '');
@@ -2054,6 +2076,40 @@ function extractExplicitFeishuMentionTargetsFromRequest(userText: string): strin
   }
 
   return [...targets.values()];
+}
+
+function stripFeishuPlaceholderMentionText(text: string): string {
+  if (!text || !/@?_user_\d+/iu.test(text)) return text;
+  return text
+    // @_user_N 是飞书入站 mention 占位符，不是可发送的用户 ID；未解析前一律不能外显给用户。
+    .replace(FEISHU_PLACEHOLDER_MENTION_TEXT_RE, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]+(\r?\n)/g, '$1')
+    .replace(/[ \t]+([,，。！？!?;；:：])/gu, '$1')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+}
+
+function sanitizeFeishuPlaceholderMentions(
+  payload: PreparedBridgeReplyPayload,
+  context: { channelType: string },
+): PreparedBridgeReplyPayload {
+  if (context.channelType !== 'feishu') return payload;
+  const text = stripFeishuPlaceholderMentionText(payload.text);
+  const mentions = (payload.mentions || []).filter((mention) => (
+    mention.atAll
+    || (
+      !isFeishuPlaceholderMentionTarget(mention.userId || '')
+      && !isFeishuPlaceholderMentionTarget(mention.name || '')
+    )
+  ));
+  const nextMentions = mentions.length > 0 ? mentions : undefined;
+  if (text === payload.text && nextMentions === payload.mentions) return payload;
+  return {
+    ...payload,
+    text,
+    mentions: nextMentions,
+  };
 }
 
 function hasBareFeishuMentionText(answerText: string): boolean {
@@ -5096,6 +5152,9 @@ async function handleMessage(
         channelType: adapter.channelType,
         userText: rawText,
       });
+      preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
+        channelType: adapter.channelType,
+      });
       const skipExplanatoryMentionResolution =
         adapter.channelType === 'feishu'
         && isFeishuMentionHowToOrDiagnosticRequest(rawText)
@@ -5103,6 +5162,9 @@ async function handleMessage(
       preparedReply = skipExplanatoryMentionResolution
         ? preparedReply
         : await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
+      preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
+        channelType: adapter.channelType,
+      });
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,
         userText: rawText,

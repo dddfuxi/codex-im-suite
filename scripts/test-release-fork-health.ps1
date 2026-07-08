@@ -120,7 +120,7 @@ Write-Host "Dirty: $($dirtyLines.Count -gt 0)"
 if (-not [string]::IsNullOrWhiteSpace($releaseRunId)) {
     Write-Host "Release run id: $releaseRunId"
 }
-Write-Host "Manifest files: $($sourceManifestSummary.Count) | hash=$($sourceManifestSummary.Hash)"
+Write-Host "Manifest files (extension/runtime/action): $($sourceManifestSummary.Count) | hash=$($sourceManifestSummary.Hash)"
 Write-Host "Control panel: exists=$($sourcePanel.Exists) | hash=$($sourcePanel.Hash) | modified=$($sourcePanel.Modified)"
 Write-Host ''
 

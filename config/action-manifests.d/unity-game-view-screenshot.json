@@ -1,13 +1,30 @@
 {
   "id": "unity.game_view_screenshot",
   "displayName": "Unity Game View Screenshot",
+  "description": "Capture a Unity Game View screenshot through the configured Unity MCP.",
   "enabled": true,
   "type": "mcp_tool_call",
+  "compatibility": {
+    "protocol": "action-manifest/v1",
+    "suite": ">=0.2.0"
+  },
   "match": {
     "keywordGroups": [
-      ["unity", "game", "截"],
-      ["unity", "game", "图"],
-      ["unity", "game", "拍"]
+      [
+        "unity",
+        "game",
+        "截"
+      ],
+      [
+        "unity",
+        "game",
+        "图"
+      ],
+      [
+        "unity",
+        "game",
+        "拍"
+      ]
     ],
     "regex": [
       "(?=.*(?:unity\\s*mcp|unitymcp|unity))(?=.*(?:game|Game|游戏|运行画面|Game\\s*View|game\\s*view|视角))(?=.*(?:截(?:图|个图|一张|一个)?|截屏|截图|拍(?:一张|个)?|发(?:张|个)?图|screenshot|capture)).*",
