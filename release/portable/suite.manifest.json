@@ -50,6 +50,24 @@
       "description"
     ]
   },
+  "actionProtocol": {
+    "version": "1.0.0",
+    "id": "action-manifest/v1",
+    "manifestDirs": [
+      "./config/action-manifests.d"
+    ],
+    "legacyManifestDirs": [
+      "./config/local-agent-tools.d"
+    ],
+    "requiredFields": [
+      "id",
+      "displayName",
+      "description",
+      "enabled",
+      "type",
+      "compatibility"
+    ]
+  },
   "packages": {
     "contracts": {
       "path": "./packages/contracts",
@@ -97,7 +115,8 @@
     "skillManifestDir": "./config/skills.d",
     "pluginManifestDir": "./config/plugins.d",
     "runtimeManifestDir": "./config/runtime.d",
-    "localAgentToolManifestDir": "./config/local-agent-tools.d",
+    "actionManifestDir": "./config/action-manifests.d",
+    "legacyLocalAgentToolManifestDir": "./config/local-agent-tools.d",
     "feishuEmojiCatalogDir": "./config/feishu-emoji.d"
   },
   "extensions": {
@@ -111,6 +130,10 @@
     },
     "mcps": {
       "manifestDir": "./config/mcp.d"
+    },
+    "actions": {
+      "manifestDir": "./config/action-manifests.d",
+      "legacyManifestDir": "./config/local-agent-tools.d"
     }
   },
   "release": {

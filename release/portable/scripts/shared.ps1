@@ -115,21 +115,156 @@ function Get-ReleaseContentHash {
     }
 }
 
+function Normalize-ReleaseManifestPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ''
+    }
+
+    $value = $Path.Trim().Replace('\', '/')
+    while ($value.StartsWith('./')) {
+        $value = $value.Substring(2)
+    }
+    return $value.TrimStart('/').TrimEnd('/')
+}
+
+function Add-ReleaseManifestDirectory {
+    param(
+        [System.Collections.Generic.List[string]]$Directories,
+        [hashtable]$Seen,
+        [object]$Value
+    )
+
+    foreach ($item in @($Value)) {
+        $normalized = Normalize-ReleaseManifestPath -Path ([string]$item)
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            continue
+        }
+
+        $key = $normalized.ToLowerInvariant()
+        if (-not $Seen.ContainsKey($key)) {
+            $Seen[$key] = $true
+            $Directories.Add($normalized) | Out-Null
+        }
+    }
+}
+
+function Get-ReleaseManifestRelativeDirectories {
+    param([string]$Root)
+
+    $directories = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    $suiteManifestPath = Join-Path $Root 'suite.manifest.json'
+
+    if (Test-Path -LiteralPath $suiteManifestPath -PathType Leaf) {
+        $manifest = Get-Content -LiteralPath $suiteManifestPath -Encoding UTF8 -Raw | ConvertFrom-Json
+        Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.extensionProtocol.manifestDirs
+        Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.actionProtocol.manifestDirs
+        Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.actionProtocol.legacyManifestDirs
+
+        if ($null -ne $manifest.config) {
+            foreach ($property in $manifest.config.PSObject.Properties) {
+                if ($property.Name -match 'ManifestDirs?$') {
+                    Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $property.Value
+                }
+            }
+        }
+
+        return $directories.ToArray()
+    }
+
+    # Live skill copies extension manifests to top-level *.d directories while
+    # runtime/action manifests stay under config. Discover both layouts so the
+    # release fingerprint stays sensitive even when suite.manifest.json is not
+    # present in the target.
+    $knownManifestDirs = @(
+        'mcp.d',
+        'skills.d',
+        'plugins.d',
+        'runtime.d',
+        'action-manifests.d',
+        'local-agent-tools.d'
+    )
+    foreach ($baseRelative in @('', 'config')) {
+        $base = if ([string]::IsNullOrWhiteSpace($baseRelative)) { $Root } else { Join-Path $Root $baseRelative }
+        if (-not (Test-Path -LiteralPath $base -PathType Container)) {
+            continue
+        }
+
+        Get-ChildItem -LiteralPath $base -Filter '*.d' -Directory |
+            Where-Object { ($knownManifestDirs -contains $_.Name) -or ($_.Name -like '*manifest*.d') } |
+            ForEach-Object {
+                $relative = if ([string]::IsNullOrWhiteSpace($baseRelative)) { $_.Name } else { "$baseRelative/$($_.Name)" }
+                Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $relative
+            }
+    }
+
+    return $directories.ToArray()
+}
+
+function Get-ReleaseManifestFileEntries {
+    param([string]$Root)
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($relativeDir in @(Get-ReleaseManifestRelativeDirectories -Root $Root)) {
+        $physicalDir = Join-Path $Root ($relativeDir.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $physicalDir -PathType Container)) {
+            continue
+        }
+
+        $canonicalDir = $relativeDir
+        if (($canonicalDir -notlike 'config/*') -and ($canonicalDir -match '^[^/]+\.d$')) {
+            $canonicalDir = "config/$canonicalDir"
+        }
+
+        $physicalRoot = (Get-Item -LiteralPath $physicalDir).FullName.TrimEnd('\', '/')
+        Get-ChildItem -LiteralPath $physicalDir -Filter '*.json' -File |
+            Sort-Object FullName |
+            ForEach-Object {
+                $fileRelative = $_.FullName.Substring($physicalRoot.Length).TrimStart('\', '/').Replace('\', '/')
+                $entries.Add([pscustomobject]@{
+                    FullName = $_.FullName
+                    CanonicalPath = "$canonicalDir/$fileRelative"
+                }) | Out-Null
+            }
+    }
+
+    return $entries.ToArray()
+}
+
+function Get-ReleaseManifestHash {
+    param([object[]]$Entries)
+
+    if ($Entries.Count -eq 0) {
+        return '<empty>'
+    }
+
+    $lines = @($Entries |
+        Sort-Object CanonicalPath |
+        ForEach-Object { "$($_.CanonicalPath)`n$(Get-ReleaseFileHash -Path $_.FullName)" })
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '')).Substring(0, 12)
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 function Get-ReleaseManifestSummary {
     param([string]$Root)
 
-    $configRoot = Join-Path $Root 'config'
-    $manifestFiles = @()
-    foreach ($name in @('mcp.d', 'skills.d', 'plugins.d')) {
-        $dir = Join-Path $configRoot $name
-        if (Test-Path -LiteralPath $dir) {
-            $manifestFiles += @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File)
-        }
-    }
+    $manifestFiles = @(Get-ReleaseManifestFileEntries -Root $Root)
+    $directories = @($manifestFiles |
+        ForEach-Object { (Split-Path -Parent $_.CanonicalPath).Replace('\', '/') } |
+        Sort-Object -Unique)
 
     return [pscustomobject]@{
         Count = $manifestFiles.Count
-        Hash = Get-ReleaseContentHash -Paths @($configRoot)
+        Hash = Get-ReleaseManifestHash -Entries $manifestFiles
+        Directories = $directories
     }
 }
 
@@ -239,6 +374,9 @@ function Get-SuiteReleaseExpectedContentMap {
         $map['runtime.scripts'] = Get-ReleaseContentHash -Paths $runtimeScriptPaths
         $map['runtime.configExample'] = Get-ReleaseFileHash -Path (Join-Path $runtimeRoot 'config.env.example')
         $map['runtime.skill'] = Get-ReleaseFileHash -Path (Join-Path $runtimeRoot 'SKILL.md')
+        if ($Layout -eq 'LiveRuntime') {
+            $map['runtime.manifests'] = (Get-ReleaseManifestSummary -Root $SuiteRoot).Hash
+        }
         $map['panel.exe'] = Get-ReleaseFileHash -Path (Join-Path $panelRoot 'CodexImSuiteControlPanel.exe')
         $map['panel.wwwroot'] = Get-ReleaseContentHash -Paths @((Join-Path $panelRoot 'wwwroot'))
     }
@@ -276,6 +414,7 @@ function Get-SuiteReleaseActualContentMap {
         $map['runtime.scripts'] = Get-ReleaseContentHash -Paths @((Join-Path $TargetRoot 'scripts'))
         $map['runtime.configExample'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'config.env.example')
         $map['runtime.skill'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'SKILL.md')
+        $map['runtime.manifests'] = (Get-ReleaseManifestSummary -Root $TargetRoot).Hash
         $map['panel.exe'] = Get-ReleaseFileHash -Path (Join-Path $TargetRoot 'dist\control-panel\CodexImSuiteControlPanel.exe')
         $map['panel.wwwroot'] = Get-ReleaseContentHash -Paths @((Join-Path $TargetRoot 'dist\control-panel\wwwroot'))
         return $map

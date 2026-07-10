@@ -1,8 +1,13 @@
 {
   "id": "artifact.desktop_screenshot.windows",
+  "displayName": "Desktop Screenshot",
+  "description": "Capture the current Windows desktop as a local image artifact.",
   "enabled": true,
   "type": "shell_artifact",
-  "displayName": "Desktop Screenshot",
+  "compatibility": {
+    "protocol": "action-manifest/v1",
+    "suite": ">=0.2.0"
+  },
   "match": {
     "keywords": [
       "截图",

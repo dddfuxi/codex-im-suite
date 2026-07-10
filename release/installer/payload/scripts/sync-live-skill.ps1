@@ -17,7 +17,7 @@ $suiteMcpManifests = Join-Path $suiteRoot 'config\mcp.d'
 $suiteSkillManifests = Join-Path $suiteRoot 'config\skills.d'
 $suitePluginManifests = Join-Path $suiteRoot 'config\plugins.d'
 $suiteRuntimeManifests = Join-Path $suiteRoot 'config\runtime.d'
-$suiteLocalAgentToolManifests = Join-Path $suiteRoot 'config\local-agent-tools.d'
+$suiteActionManifests = Join-Path $suiteRoot 'config\action-manifests.d'
 $suiteFeishuEmojiCatalog = Join-Path $suiteRoot 'config\feishu-emoji.d'
 $suiteExtensionCatalog = Join-Path $suiteRoot 'config\extension-catalog.json'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
@@ -268,7 +268,7 @@ Copy-ExistingDirectory -Source $suiteMcpManifests -Target (Join-Path $liveRuntim
 Copy-ExistingDirectory -Source $suiteSkillManifests -Target (Join-Path $liveRuntime 'skills.d')
 Copy-ExistingDirectory -Source $suitePluginManifests -Target (Join-Path $liveRuntime 'plugins.d')
 Copy-ExistingDirectory -Source $suiteRuntimeManifests -Target (Join-Path $liveRuntime 'config\runtime.d')
-Copy-ExistingDirectory -Source $suiteLocalAgentToolManifests -Target (Join-Path $liveRuntime 'config\local-agent-tools.d')
+Copy-ExistingDirectory -Source $suiteActionManifests -Target (Join-Path $liveRuntime 'config\action-manifests.d')
 Copy-ExistingDirectory -Source $suiteFeishuEmojiCatalog -Target (Join-Path $liveRuntime 'config\feishu-emoji.d')
 Copy-ExistingFile -Source $suiteExtensionCatalog -Target (Join-Path $liveRuntime 'config\extension-catalog.json')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
@@ -305,6 +305,12 @@ Write-Host "remove live legacy tools mirror"
 $liveToolsDir = Join-Path $liveRuntime 'tools'
 if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
+}
+
+Write-Host "remove live legacy local-agent tool manifests"
+$liveLegacyLocalAgentToolManifestDir = Join-Path $liveRuntime 'config\local-agent-tools.d'
+if (Test-Path -LiteralPath $liveLegacyLocalAgentToolManifestDir) {
+    Remove-Item -LiteralPath $liveLegacyLocalAgentToolManifestDir -Recurse -Force
 }
 
 $builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'

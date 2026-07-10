@@ -16,6 +16,7 @@
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-ignis-mcp.ps1",
   "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-ignis-mcp.ps1",
+  "cwd": "${SUITE_ROOT}",
   "registerName": "ignisMCP",
   "env": {
     "IGNIS_MCP_PORT": "8787"

@@ -10,7 +10,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 
 该脚本会把 `entireio/cli` 固定版本构建到 `.codex-tools\bin\entire.exe`，并设置 `core.hooksPath=.githooks`。`.codex-tools` 是本仓库本地工具缓存，不提交、不全局安装；其他项目需要同样能力时，应在对应项目内单独安装。默认策略是 `manual-commit`，只做会话和 Git checkpoint 留痕；不自动提交、不自动合并到 `codex/dev`，也不自动 push。
 
-`codex-im-suite` 是飞书桥接、Codex 执行层、本地辅助模型、MCP、Skill、控制面板和 Windows 打包流程的统一开发与发布目录。
+`codex-im-suite` 是飞书桥接、Codex 执行层、本地模型来源、MCP、Skill、控制面板和 Windows 打包流程的统一开发与发布目录。
 
 当前目标很明确：
 
@@ -32,7 +32,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
-- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆”页默认用关系树解释记忆、资源、提醒、冲突和来源的联系，左侧按普通记忆、生成摘要、上下文/索引资料分组，避免 `AI_BRIDGE_CONTEXT.md` 这类系统上下文混入普通记忆列表；高级诊断里仍可查看原始网格、索引来源总览和监听状态。
+- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆”页默认用关系树解释记忆、资源、提醒、冲突和来源的联系，左侧按普通记忆、受控上下文/索引资料分组，避免 `AI_BRIDGE_CONTEXT.md` 这类系统上下文混入普通记忆列表；高级诊断里仍可查看原始网格、索引来源总览和监听状态。
 - 记忆一键整理：面板“记忆”页新增整理草稿入口，草稿保存到 `.cti-index\memory-optimization-drafts`，用户只能应用已勾选动作；显式记忆和直接提醒可默认勾选，文档/索引类来源默认需要人工确认。归档项可从 `archive\knowledge-units` 单条恢复，已应用草稿可撤销归档动作；定期整理默认关闭，开启后只生成待确认草稿，不自动覆盖。
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种白名单更新模板。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
 - Workflow 契约适配：`workflow-runs.json` 继续作为本地事实来源，runtime 额外提供共享 `WorkflowRunContract` 映射，统一 checkpoint、trace event、recovery 和 delivery 字段。
-- Codex CLI 模型来源收口：设置页支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源；本地 API 通过 Codex agent 接入，执行类和本地读取类任务统一走工具证据验收，缺少成功工具结果会同源重试一次，仍失败则返回“未完成”，不会因为工具证据缺失自动改交官方模型。
+- AI 执行来源收口：设置页支持选择默认 executor 来源，执行器页可一键设为默认或恢复自动；Codex 内部仍支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源。Feishu 最终卡片底部会分开展示“来源”（executor/provider）与“模型 / token”，便于确认本轮到底由 Codex、Claude CLI 还是外部 agent 执行。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
 ## 快速入口
@@ -78,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 节点 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，总览页用系统蓝图解释飞书入口、Bridge、AI 执行、辅助能力和最终回复的流转，点击蓝图节点会打开处理面板，可检查状态、启动/重启服务、处理 MCP 或跳到设置/记忆/扩展页；节点页展示本机 runtime node 与 fake remote node 的能力清单，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页默认用关系树和“记忆整理”草稿面板查看、优化记忆，专业网格、索引路径、相关对象、联系权重和需要检查的回复折叠在高级诊断里，设置页支持目录选择、拖拽回填、回复风格快捷预设和 Codex CLI 模型来源配置；扩展页的在线模型安装会显示 Ollama 拉取进度、支持暂停、卸载、选择模型目录，并可在完成后自动设为本地 API 模型和重启 Bridge。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 节点 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，总览页用系统蓝图解释飞书入口、Bridge、AI 执行、辅助能力和最终回复的流转，点击蓝图节点会打开处理面板，可检查状态、启动/重启服务、处理 MCP 或跳到设置/记忆/扩展页；节点页展示本机 runtime node 与 fake remote node 的能力清单，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页默认用关系树和“记忆整理”草稿面板查看、优化记忆，专业网格、索引路径、相关对象、联系权重和需要检查的回复折叠在高级诊断里，设置页支持目录选择、拖拽回填、回复风格快捷预设和“AI 执行与模型来源”配置；执行器页可查看和切换默认 executor 来源；扩展页的在线模型安装会显示 Ollama 拉取进度、支持暂停、卸载、选择模型目录，并可在完成后自动设为本地 API 模型和重启 Bridge。
 
 Control API 默认只监听本机：
 
@@ -108,23 +108,25 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `config/skills.d`：随项目备份的 skill manifest。
 - `config/plugins.d`：随项目备份的 plugin manifest。
 - `config/runtime.d`：内建服务的 runtime manifest，声明服务显示信息、来源路径和 update 策略。
+- `config/action-manifests.d`：通用工具动作 manifest，声明 MCP / Unity MCP / shell artifact 等可验证动作；旧 `config/local-agent-tools.d` 只作为兼容 overlay。
 - `config/extension-catalog.json`：在线扩展目录的静态种子；控制面板还会叠加动态排行榜源和 `CTI_EXTENSION_CATALOG_URLS` 自定义 URL。
 - `extensions/skills`：自定义 skill 的项目内副本。
 - `scripts`：启动、注册、构建、打包、发布、同步脚本。
 - `release`：portable、installer、zip 等发布产物。
 
-控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d` 和 `extensions\manifests\plugins.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
+控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d`、`extensions\manifests\plugins.d` 和 `extensions\manifests\action-manifests.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
 
 ## 当前运行模型
 
-默认是 `Codex CLI agent + 可选模型 API 来源链`：
+默认是 `自动 executor 选择 + Codex CLI agent 模型来源链`：
 
 - 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和实验性的 `codex-oss-ollama`；本地 API 与外部 API 都通过 `codex` 的模型来源接入，不再作为独立本地 agent 或兜底执行器。
-- 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态和会话默认 executor，“节点”页可查看本机 node 与 fake remote node 的能力清单。
+- 外部 Agent Executor（截至 2026-06-27 新增）：`mavis-agent` 是首个 opt-in external agent executor，通过本地 `mavis` CLI 派发任务、轮询结果；Windows `.cmd/.bat` shim 会在可解析时直连真实 executable/script，避免飞书图片/表情的多行 prompt 被 batch `%*` 二次解析后丢失 agent 参数。**默认不启用**——在 `config.env` 设 `CTI_MAVIS_ENABLED=true` 且 `CTI_MAVIS_CLI_PATH=<path>` 才激活；如果 live daemon 没继承 Mavis 父会话环境，续聊发送可补 `CTI_MAVIS_BRIDGE_SESSION_ID=<mvs_...>`，但该 sender 若已被 Mavis 标记为归档/压缩，runtime 会自动放弃续聊通信并创建新的 Mavis session，避免 MiniMax 把 Feishu 请求误当成“回报给归档 source”的任务。续聊结果会同时采集普通 session assistant 文本与 Mavis communication 出站回复，避免 MiniMax 已作答但 Feishu 卡片显示无结果。图片和表情包会先落成当前工作区内的本地文件，再以绝对路径交给 Mavis 使用视觉工具读取，避免 external agent 只收到 file_key 文本。Mavis 工具阶段和可展示处理思路会作为 `progress` SSE 显示在 Feishu streaming card 中，最终正文会拆成多个 `text` chunk 形成打字机效果；binding 也会保存来源通道 / chat / thread，bridge 内部 session id 变化时仍能按同一飞书会话续接 Mavis 上下文。用户可用 `@mavis` / `@minimax` / `@minimax-code` 显式选择该 executor，也可在控制面板设为全局默认 executor；`selectExecutor` 之外的"真分派"由 `ExecutorProviderRegistry` 在 `selectExecutor` 之后立刻接管 external executor，不走本地 Codex 路由链。两阶段错误处理：pre-dispatch 失败可回落 Codex，post-dispatch 失败禁止回落，避免 mavis 已接单后重复执行。详细设计见 `docs/ai-agent-talk-mavis-executor.md`（v3.4）。
+- 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态，并通过按钮设置或清除全局默认 executor；“节点”页可查看本机 node 与 fake remote node 的能力清单。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
-- 设置页的“Codex CLI 模型来源”可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
+- 设置页的“AI 执行与模型来源”可选默认 executor；默认 executor 写入 `CTI_DEFAULT_EXECUTOR_ID`，优先级低于显式 `@hint`、高于历史会话默认值。Codex 模型来源仍可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。
 - 本地 API 现在作为 Codex CLI 的普通模型来源接入，不再因为工具探测未通过或旧本地兜底键自动转官方 Codex；`ollama` / `lmstudio` 会通过 provider registry 生成 `codex exec --oss --local-provider <provider> --model <CTI_LOCAL_AI_MODEL>`，不会走 Codex SDK 的 `/v1/responses`。`vllm`、`openai-compatible` 和 `custom` 在未接入 Codex CLI OSS agent 前只显示为 Chat Completions 能力，不能伪装执行。
-- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/local-agent-tools.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先直接回复，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
+- 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/action-manifests.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；旧 `config/local-agent-tools.d` 只作为兼容 overlay 读取。模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先使用轻量 reply surface / prompt profile，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 来源 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
 - 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
 - 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 模型来源失败后允许走 runtime 自己的受控工具补执行；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
 - bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
@@ -133,8 +135,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `hybrid` 模式下 MCP 状态、工具和可用性询问默认先走 Codex；只有 `local_only` 或 Codex 不可用后才使用本地 MCP 动态状态兜底，不再返回硬编码入口列表。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
-- 本地模型只作为 Codex agent 的可选模型来源、模型能力检测和少数内部测试/整理入口使用；普通飞书消息不再走独立本地模型直答。
-- 记忆关键词不再触发本地直答；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。只有 `quality=high` 的高置信结构化命中才由记忆层直接回复，关系图候选和其他低确定性结果只注入主执行链。
+- 本地模型只作为 Codex agent 的可选模型来源、轻量 prompt profile、模型能力检测和少数内部测试/整理入口使用；普通飞书消息不再绕过 agent 生成独立最终回复。本地轻量路由的当前 decision 名称为 `use_local_profile`，旧 `answer_local` 只作为历史 payload 兼容输入。
+- 记忆关键词不再触发快捷最终回复；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。`quality=high` 的高置信结构化命中会作为 `high_confidence_evidence` 注入 agent system prompt，由 agent 按当前问题整理最终回复；关系图候选和其他低确定性结果只注入主执行链。
 - 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
@@ -145,6 +147,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.ps1
 ```
+
+该校验会拦截缺少 `cwd` 的 MCP manifest；MCP 启动、健康检查、列工具和调用工具也会使用同一工作区边界，不允许通过省略 `cwd` 绕过路径门禁。
 
 `runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli` 和 `service.localLlm`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`，`service.feishuCli` 会按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
 
@@ -250,7 +254,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\repair-history-mojibake.ps1 -
 powershell -ExecutionPolicy Bypass -File .\scripts\repair-history-mojibake.ps1 -Restore C:\Users\admin\.claude-to-im\backups\mojibake-repair\<stamp>\manifest.json
 ```
 
-修复器会扫描 `data\messages`、`data\message-archives`、`data\feishu-history`、Feishu/记忆相关索引和记忆 Markdown，识别典型 UTF-8 被 GBK、Latin-1 或替换字符错读后的文本。运行时的 Feishu 历史检索、Markdown 知识索引和待办提醒派生也会先修复或跳过仍无法确认的坏文本，避免继续把乱码喂给 Codex 记忆上下文或提醒推送。
+修复器会扫描 `data\messages`、`data\message-archives`、`data\feishu-history`、Feishu/记忆相关索引、记忆 Markdown，以及记忆仓库 `data\im` / `data\projects` 下的长期 JSON 资产，识别典型 UTF-8 被 GBK、Latin-1 或替换字符错读后的文本。运行时的 Feishu 历史检索、Markdown 知识索引和待办提醒派生也会先修复或跳过仍无法确认的坏文本，避免继续把乱码喂给 Codex 记忆上下文、表情包语义或提醒推送。
 
 待办主动提醒默认关闭。启用前，记忆 Markdown 里的待办需要带来源会话和提醒时间，例如：
 
@@ -307,7 +311,7 @@ CTI_FEISHU_CLOUD_MAX_RECORDS=500
 CTI_FEISHU_CLOUD_MAX_SHEETS=5
 ```
 
-`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，bridge 会启动本机 `127.0.0.1:${CTI_FEISHU_OAUTH_CALLBACK_PORT}` 回调监听，授权卡片会打开飞书官方 `authen/v1/index` 免登授权页；如果用户在运行 bridge 的同一台 Windows 机器浏览器里完成授权，会自动回调、保存 user token、回复“已收到，正在处理中。”并续跑原始云文档问题。如果用户在手机或另一台电脑打开授权页，`127.0.0.1` 指向用户自己的设备，无法自动连到 bridge，此时需要把浏览器地址栏里的完整 `code/state` 回调 URL 复制回飞书，bridge 会走同一套校验和续跑逻辑。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
+`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥，也不会替应用自动开通权限；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。后台新增权限、事件或回调后，必须创建版本、管理员审核发布，并重启 bridge；`admin:app.*` 应用管理员权限只能用于管理员身份诊断，不能替代云文档、消息、卡片、成员或资源 API scope。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，bridge 会启动本机 `127.0.0.1:${CTI_FEISHU_OAUTH_CALLBACK_PORT}` 回调监听，授权卡片会打开飞书官方 `authen/v1/index` 免登授权页；如果用户在运行 bridge 的同一台 Windows 机器浏览器里完成授权，会自动回调、保存 user token、回复“已收到，正在处理中。”并续跑原始云文档问题。如果用户在手机或另一台电脑打开授权页，`127.0.0.1` 指向用户自己的设备，无法自动连到 bridge，此时需要把浏览器地址栏里的完整 `code/state` 回调 URL 复制回飞书，bridge 会走同一套校验和续跑逻辑。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
 
 本轮权限映射按飞书开放平台服务端 API 文档整理：Docx 读取走 `docx/v1/documents/:document_id/raw_content`，Sheets 先 `sheets/query` 再读范围，Base 读取 tables / fields / records。遇到 401/403 或飞书权限错误码时，bridge 会同时提示“用户没有文档访问权限”和对应 API 所需 scope，避免只给 404/空总结。若已有 user token 因新开通 Sheets/Drive scope 而过期失配，bridge 会重新发送授权卡片刷新 token；刷新后仍失败才按文档权限或开放平台权限阻断处理。
 

@@ -15,6 +15,7 @@
   "aliases": ["picture", "picture mcp", "picturemcp", "图片 mcp"],
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-picture-mcp.ps1",
+  "cwd": "${SUITE_ROOT}",
   "registerName": "pictureMCP",
   "healthCheck": {
     "kind": "codex-mcp-list"
