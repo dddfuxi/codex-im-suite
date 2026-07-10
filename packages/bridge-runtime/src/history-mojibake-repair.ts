@@ -16,7 +16,7 @@ import {
 export { hasLikelyMojibake, repairLikelyMojibakeText } from './mojibake.js';
 
 export type HistoryMojibakeRepairMode = 'scan' | 'apply';
-export type HistoryMojibakeTargetKind = 'cti-json' | 'memory-markdown' | 'generated-index';
+export type HistoryMojibakeTargetKind = 'cti-json' | 'memory-json' | 'memory-markdown' | 'generated-index';
 
 export interface HistoryMojibakeRepairOptions {
   ctiHome?: string;
@@ -145,6 +145,15 @@ function collectTargets(ctiHome?: string, memoryRoot?: string): RepairTarget[] {
   }
 
   if (memoryRoot) {
+    // Long-lived structured memory can hold user-visible Chinese too, for example
+    // Feishu sticker semantics and project facts. Keep this bounded to durable
+    // memory domains instead of recursively rewriting every JSON artifact.
+    for (const dir of [
+      path.join(memoryRoot, 'data', 'im'),
+      path.join(memoryRoot, 'data', 'projects'),
+    ]) {
+      for (const filePath of enumerateFiles(dir, (item) => /\.json$/i.test(item), isSkippableMemoryDir)) add(filePath, 'memory-json');
+    }
     for (const filePath of enumerateFiles(memoryRoot, (item) => /\.md$/i.test(item), isSkippableMemoryDir)) add(filePath, 'memory-markdown');
     add(path.join(memoryRoot, '.cti-index', 'knowledge.json'), 'generated-index');
     add(path.join(memoryRoot, '.cti-index', 'reminders.json'), 'generated-index');
@@ -185,7 +194,7 @@ function repairJsonValue(value: unknown): { value: unknown; changed: boolean; un
 }
 
 function repairFileContent(raw: string, target: RepairTarget): { text: string; repair: MojibakeTextRepair } {
-  if ((target.kind === 'cti-json' || target.kind === 'generated-index') && /\.json$/i.test(target.path)) {
+  if ((target.kind === 'cti-json' || target.kind === 'memory-json' || target.kind === 'generated-index') && /\.json$/i.test(target.path)) {
     try {
       const parsed = JSON.parse(raw) as unknown;
       const repaired = repairJsonValue(parsed);

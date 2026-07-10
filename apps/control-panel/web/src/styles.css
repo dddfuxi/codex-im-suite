@@ -1330,6 +1330,26 @@ button:disabled {
   background: var(--panel-muted);
 }
 
+.sticker-preview {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  flex: 0 0 56px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  color: var(--text-muted);
+}
+
+.sticker-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
 .sticker-row-main,
 .sticker-row-actions,
 .sticker-row-title > div,
@@ -2031,6 +2051,21 @@ button:disabled {
   color: var(--text-muted);
   font-size: 13px;
   line-height: 1.55;
+}
+
+.project-fact-hint {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  color: var(--text-muted);
+}
+
+.project-fact-hint strong {
+  color: var(--text);
 }
 
 .settings-subhead {

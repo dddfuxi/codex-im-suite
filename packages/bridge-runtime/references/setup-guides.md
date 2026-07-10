@@ -110,6 +110,8 @@ Enter comma-separated IDs. Leave empty to allow all servers the bot is in.
 ### Phase 1: Permissions + Bot capability
 
 > Complete Phase 1 and publish before moving to Phase 2. Feishu requires a published version for permissions to take effect, and the bridge service needs active permissions to establish its WebSocket connection.
+>
+> Feishu permissions are external platform prerequisites. The bridge can only call APIs covered by scopes already enabled in the Developer Console, released as an app version, and approved by the tenant admin. Adding scopes to `CTI_FEISHU_GRANTED_SCOPES` is only a local diagnostic declaration; it does not grant platform permissions.
 
 **Step A — Batch-add required permissions**
 
@@ -142,6 +144,8 @@ Enter comma-separated IDs. Leave empty to allow all servers the bot is in.
 
 If the batch import UI is not available, add each scope manually via the search box.
 
+For cloud documents, add the matching Drive/Docx/Sheets/Base scopes as well. `admin:app.admin_id:readonly` and `admin:app.admin:check` only help diagnose whether a user is an app admin; they do not grant message, card, member, resource, or document access.
+
 **Step B — Enable the bot**
 
 1. Go to **"Add Features"** → enable **"Bot"**
@@ -158,6 +162,8 @@ If the batch import UI is not available, add each scope manually via the search 
 ### Phase 2: Event subscription (requires running bridge)
 
 > The bridge service must be running before configuring events. Feishu validates the WebSocket connection when saving event subscription — if the bridge is not running, you'll get "未检测到应用连接信息" (connection not detected) error.
+>
+> Event and callback changes also require a new app version and tenant admin approval. If message receive, card buttons, reminder completion, or OAuth login cards do not work, verify the event/callback publication state before changing code.
 
 **Step D — Start the bridge service**
 
@@ -180,6 +186,8 @@ Run `/claude-to-im start` in Claude Code. This establishes the WebSocket long co
 3. After approval, the bot can receive and respond to messages
 
 > **Ongoing rule:** Any change to permissions, events, or capabilities requires a new version publish + admin approval.
+>
+> After approval, restart the bridge so it reloads configuration and capability diagnostics.
 
 ### Upgrading from a previous version
 

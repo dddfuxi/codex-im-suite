@@ -44,12 +44,14 @@ import {
   buildLightChatParams,
   decideConservativeRoute,
   getLocalRouterMode,
+  LOCAL_PROFILE_DECISION,
   shouldRunPreCodexLocalFastPath,
   type LocalRouteProtocolResult,
   type LocalTaskKind,
 } from './local-llm-router.js';
 import {
   appendLocalLlmRouteSummary,
+  buildLocalProfileHitPatch,
   clearLocalLlmTransientStatus,
   readLocalLlmStatus,
   updateLocalLlmStatus,
@@ -1262,7 +1264,7 @@ class HubLlmProvider implements LLMProvider {
     const summary: Omit<LocalLlmRouteSummary, 'timestamp'> = {
       mode,
       taskKind: 'light_chat',
-      decision: 'answer_local',
+      decision: LOCAL_PROFILE_DECISION,
       provider: 'local_best_effort',
       reason: 'light_chat_fast_path',
       compressedPromptChars: lightParams.prompt.length,
@@ -1318,7 +1320,7 @@ class HubLlmProvider implements LLMProvider {
     reason: string,
   ): Promise<void> {
     if (mode !== 'local_only') {
-      await this.pipeCodexPrimaryWithFallback(controller, params, conservative, `本地辅助失败，升级 Codex：${reason}`);
+      await this.pipeCodexPrimaryWithFallback(controller, params, conservative, `本地轻量模型或受控能力失败，升级 Codex：${reason}`);
       return;
     }
 
@@ -1333,7 +1335,7 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
   ): Promise<void> {
     switch (route.decision) {
-      case 'answer_local': {
+      case LOCAL_PROFILE_DECISION: {
         const executed = await this.localAgent.handleRoutedExecution(controller, params, {
           mode,
           conservative,
@@ -1353,7 +1355,7 @@ class HubLlmProvider implements LLMProvider {
           });
           return;
         }
-        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由要求直答，改用本地模型 API：${route.reason}`);
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由选择轻量模型来源，改用本地模型 API：${route.reason}`);
         return;
       }
 
@@ -1392,7 +1394,7 @@ class HubLlmProvider implements LLMProvider {
           return;
         }
 
-        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由拒绝直答，使用本地模型 API：${route.reason}`);
+        await this.pipeLocalAgentApiFallback(controller, params, conservative, `本地路由拒绝当前轻量 profile，使用本地模型 API：${route.reason}`);
       }
     }
   }
@@ -1602,7 +1604,7 @@ class HubLlmProvider implements LLMProvider {
       allowLocalFallback: true,
       highRisk: false,
       canFastPath: true,
-      preferredDecision: 'answer_local' as const,
+      preferredDecision: LOCAL_PROFILE_DECISION,
       reason: `Codex 主模型失败，尝试受控只读工具兜底：${conservative.reason}`,
     };
     if (!this.localAgent.canHandleFastPath(params, safeConservative)) return false;
@@ -1736,7 +1738,7 @@ class HubLlmProvider implements LLMProvider {
   ): void {
     const current = readLocalLlmStatus(this.config);
     const patch = summary.provider === 'local_best_effort'
-      ? { localOnlyAnswers: current.localOnlyAnswers + 1 }
+      ? buildLocalProfileHitPatch(current, 1)
       : summary.provider === 'refuse_local'
         ? { localRefusals: current.localRefusals + 1 }
         : { routeHits: current.routeHits + 1 };
@@ -2564,6 +2566,7 @@ async function main(): Promise<void> {
             dueAt: input.dueAt,
             timezone: input.timezone,
             target: input.target,
+            notifyTargets: input.notifyTargets,
             sourcePrompt: input.sourcePrompt,
             createdByMessageId: input.createdByMessageId,
           });
@@ -2573,6 +2576,7 @@ async function main(): Promise<void> {
             title: created.reminder.title,
             dueAt: created.reminder.dueAt,
             target: created.reminder.target,
+            notifyTargets: created.reminder.notifyTargets,
             message: 'direct reminder created',
           };
         } catch (error) {
@@ -2654,7 +2658,7 @@ async function main(): Promise<void> {
         createWeixinPushProvider(),
       ],
     });
-    console.log(`[claude-to-im] Todo reminder index: enabled=${todoPushEnabled}, channels=${todoPushChannels.join(',')}`);
+    console.log(`[claude-to-im] Todo reminder index: memory=${todoPushEnabled}, direct=${directReminderPushEnabled}, channels=${todoPushChannels.join(',')}`);
   }
   const heartbeatTimer = setInterval(() => {
     touchBridgeRuntimeHeartbeat();

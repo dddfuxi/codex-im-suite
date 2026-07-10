@@ -30,6 +30,21 @@
 5. For Feishu: confirm the app has been approved and event subscriptions are configured
 6. Check logs for incoming message events: `/claude-to-im logs 200`
 
+## Feishu permissions, events, and cloud documents
+
+**Symptoms**: Feishu messages arrive partially, card buttons do nothing, streaming cards are not updated, mentions/member lookup fails, attachments cannot be read, or Docx/Sheets/Base links return empty or permission errors.
+
+**Steps**:
+
+1. In Feishu Developer Console, verify the needed API permissions are enabled for the correct token type: application identity (`tenant_access_token`) or user identity (`user_access_token`).
+2. Create a new app version and wait for tenant admin approval. Permission, event, callback, and bot capability changes do not become effective just because they are checked in the console.
+3. For inbound messages, verify Events & Callbacks uses long connection mode and includes `im.message.receive_v1`.
+4. For card buttons and reminder completion, verify callback `card.action.trigger` is configured, saved while the bridge is connected, then published and approved.
+5. For cloud documents, verify both Open Platform scopes and document resource authorization. The app/user token must have Docx/Drive/Sheets/Base scopes, and the document must be shared with the app or the requesting user.
+6. Restart the bridge after platform changes, then run `/feishu` as an owner to compare declared `CTI_FEISHU_GRANTED_SCOPES`, actual API probes, OAuth scopes, and missing capabilities.
+
+**Important**: `admin:app.admin_id:readonly` and `admin:app.admin:check` only support app-admin diagnostics. They do not grant message, card, member, attachment, or document permissions.
+
 ## Permission timeout
 
 **Symptoms**: Claude Code session starts but times out waiting for tool approval.

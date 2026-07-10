@@ -75,4 +75,7 @@ test('instructs Feishu turns to decide intent state without exposing tool proces
   assert.match(prompt, /Bots and app agents may be mentioned only when the bridge can resolve a valid mention ID/i);
   assert.match(prompt, /If the user explicitly asks you to mention someone/i);
   assert.match(prompt, /do not refuse only because the target is a bot or app agent/i);
+  assert.match(prompt, /current sender/i);
+  assert.match(prompt, /我\/发起人/);
+  assert.match(prompt, /cti-direct-message/);
 });

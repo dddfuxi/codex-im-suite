@@ -165,7 +165,7 @@ describe('todo reminders', () => {
       enabledChannels: ['feishu'],
       generatedAt: '2026-04-29T09:00:00.000Z',
     }).reminders[0];
-    const deliveries: Array<{ chatId: string; text: string; dedupKey?: string; feishuCardJson?: string }> = [];
+    const deliveries: Array<{ chatId: string; text: string; dedupKey?: string; feishuCardJson?: string; mentions?: unknown[] }> = [];
     const provider = createFeishuPushProvider({
       enabled: true,
       deliver: async (input) => {
@@ -174,6 +174,7 @@ describe('todo reminders', () => {
           text: input.text,
           dedupKey: input.dedupKey,
           feishuCardJson: input.feishuCardJson,
+          mentions: input.mentions,
         });
         return { ok: true, messageId: 'om_1', cardId: 'card_1' };
       },
@@ -186,9 +187,32 @@ describe('todo reminders', () => {
     assert.equal(deliveries[0].chatId, 'oc_123');
     assert.match(deliveries[0].text, /待办提醒/);
     assert.match(deliveries[0].text, /整理主动推送方案/);
+    assert.doesNotMatch(deliveries[0].text, /来源：/);
     assert.equal(deliveries[0].dedupKey, `todo-reminder:${reminder.id}`);
     assert.match(deliveries[0].feishuCardJson || '', /reminder:complete:/);
     assert.match(deliveries[0].feishuCardJson || '', new RegExp(reminder.id));
+  });
+
+  it('passes structured notify targets to Feishu reminder delivery', async () => {
+    const reminder = buildReminderIndexFromKnowledge(makeIndex([
+      makeTodo('提交文件 @2026-04-29 18:30 channelType: feishu chatId: oc_123 notifyTargets: ' + encodeURIComponent(JSON.stringify([{ userId: 'ou_liudan', name: '刘丹' }]))),
+    ]), {
+      enabledChannels: ['feishu'],
+      generatedAt: '2026-04-29T09:00:00.000Z',
+    }).reminders[0];
+    const deliveries: Array<{ mentions?: unknown[]; text: string }> = [];
+    const provider = createFeishuPushProvider({
+      enabled: true,
+      deliver: async (input) => {
+        deliveries.push({ mentions: input.mentions, text: input.text });
+        return { ok: true, messageId: 'om_1' };
+      },
+    });
+
+    await provider.sendReminder(reminder);
+
+    assert.deepEqual(deliveries[0].mentions, [{ userId: 'ou_liudan', name: '刘丹' }]);
+    assert.match(deliveries[0].text, /提交文件/);
   });
 
   it('creates direct reminders as markdown-backed pending reminder records', () => {
@@ -201,9 +225,11 @@ describe('todo reminders', () => {
         target: {
           channelType: 'feishu',
           chatId: 'oc_123',
+          chatType: 'group',
           displayName: '当前会话',
           messageId: 'om_1',
         },
+        notifyTargets: [{ userId: 'ou_liudan', name: '刘丹' }],
         sourcePrompt: '帮我设置个代办，两分钟后给我发消息提醒我看电脑',
         createdAt: '2026-04-29T11:40:00.000Z',
         createdByMessageId: 'om_1',
@@ -216,15 +242,20 @@ describe('todo reminders', () => {
       const markdown = fs.readFileSync(result.filePath, 'utf-8');
       assert.match(markdown, /channelType: feishu/);
       assert.match(markdown, /chatId: oc_123/);
-      assert.match(markdown, /createdBy: direct-fast-path/);
+      assert.match(markdown, /chatType: group/);
+      assert.match(markdown, /notifyTargets:/);
+      assert.match(markdown, /createdBy: agent-action/);
       assert.match(markdown, /待办: 看电脑 @2026-04-29 19:42 状态: 未完成/);
 
       const index = readReminderIndex(memoryRoot);
       assert.equal(index?.reminderCount, 1);
       assert.equal(index?.reminders[0].sourceType, 'direct');
+      assert.equal(index?.reminders[0].target.chatType, 'group');
+      assert.deepEqual(index?.reminders[0].notifyTargets, [{ userId: 'ou_liudan', name: '刘丹' }]);
 
       const state = readReminderDeliveryState(memoryRoot);
       assert.equal(state.deliveries[result.reminder.id]?.status, 'pending');
+      assert.equal(state.deliveries[result.reminder.id]?.chatType, 'group');
       assert.equal(state.deliveries[result.reminder.id]?.attempts, 0);
     } finally {
       fs.rmSync(memoryRoot, { recursive: true, force: true });

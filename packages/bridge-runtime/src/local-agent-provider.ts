@@ -26,9 +26,11 @@ import type {
   LocalRouteProtocolResult,
   LocalTaskKind,
 } from './local-llm-router.js';
+import { LOCAL_PROFILE_DECISION } from './local-llm-router.js';
 import {
   appendLocalLlmRouteSummary,
   appendLocalLlmExecutionSummary,
+  buildLocalProfileHitPatch,
   readLocalLlmStatus,
   type LocalLlmExecutionSummary,
   type LocalRouterMode,
@@ -1142,14 +1144,14 @@ export class LocalAgentProvider {
       timestamp: new Date().toISOString(),
       mode,
       taskKind: 'tool_request',
-      decision: success ? 'answer_local' : 'refuse_local',
+      decision: success ? LOCAL_PROFILE_DECISION : 'refuse_local',
       provider: success ? 'local' : 'refuse_local',
       reason: truncateText(text, 240),
       compressedPromptChars: 0,
       compressedHistoryChars: 0,
     }, {
       routeHits: current.routeHits + 1,
-      localOnlyAnswers: current.localOnlyAnswers + (mode === 'local_only' && success ? 1 : 0),
+      ...buildLocalProfileHitPatch(current, mode === 'local_only' && success ? 1 : 0),
       localRefusals: current.localRefusals + (success ? 0 : 1),
     });
     appendLocalLlmExecutionSummary(this.config, {
@@ -1897,7 +1899,7 @@ export class LocalAgentProvider {
       fallbackReason: fallbackReason || undefined,
     }, {
       routeHits: current.routeHits + 1,
-      localOnlyAnswers: current.localOnlyAnswers + (context.mode === 'local_only' ? 1 : 0),
+      ...buildLocalProfileHitPatch(current, context.mode === 'local_only' ? 1 : 0),
       lastError: fallbackReason ? fallbackReason : '',
     });
   }
@@ -1921,7 +1923,7 @@ export class LocalAgentProvider {
     const hasExplicitTarget = manifest !== null;
     if (!hasExplicitTarget && (intent === 'status' || intent === 'list_tools')) {
       const text = this.buildGenericMcpHelpReply();
-      this.recordMcpBridgeSummary(mode, 'answer_local', 'tool_request', text, true);
+      this.recordMcpBridgeSummary(mode, LOCAL_PROFILE_DECISION, 'tool_request', text, true);
       this.emitTerminalResponse(controller, params.sessionId, text, false);
       return { handled: true };
     }
@@ -1950,7 +1952,7 @@ export class LocalAgentProvider {
       const text = start.ok
         ? `${manifest.displayName || manifest.id} 启动检查完成。\n${health.message}`
         : `${manifest.displayName || manifest.id} 启动失败：${start.message}`;
-      this.recordMcpBridgeSummary(mode, start.ok ? 'answer_local' : 'refuse_local', 'tool_request', text, start.ok);
+      this.recordMcpBridgeSummary(mode, start.ok ? LOCAL_PROFILE_DECISION : 'refuse_local', 'tool_request', text, start.ok);
       this.emitTerminalResponse(controller, params.sessionId, text, !start.ok);
       return { handled: true };
     }
@@ -1960,7 +1962,7 @@ export class LocalAgentProvider {
       const text = stop.ok
         ? `${manifest.displayName || manifest.id} 已停止。`
         : `${manifest.displayName || manifest.id} 停止失败：${stop.message}`;
-      this.recordMcpBridgeSummary(mode, stop.ok ? 'answer_local' : 'refuse_local', 'tool_request', text, stop.ok);
+      this.recordMcpBridgeSummary(mode, stop.ok ? LOCAL_PROFILE_DECISION : 'refuse_local', 'tool_request', text, stop.ok);
       this.emitTerminalResponse(controller, params.sessionId, text, !stop.ok);
       return { handled: true };
     }
@@ -1968,7 +1970,7 @@ export class LocalAgentProvider {
     if (intent === 'list_tools') {
       if (manifest.type !== 'http') {
         const text = `${manifest.displayName || manifest.id} 当前是 stdio MCP。第一版本地桥接已支持启动和健康检查，但还没有直接读取工具列表。`;
-        this.recordMcpBridgeSummary(mode, 'answer_local', 'tool_request', text, true);
+        this.recordMcpBridgeSummary(mode, LOCAL_PROFILE_DECISION, 'tool_request', text, true);
         this.emitTerminalResponse(controller, params.sessionId, text, false);
         return { handled: true };
       }
@@ -1976,7 +1978,7 @@ export class LocalAgentProvider {
       const text = tools.length > 0
         ? `${manifest.displayName || manifest.id} 可用工具：\n${tools.join('\n')}`
         : `${manifest.displayName || manifest.id} 没有返回工具列表。`;
-      this.recordMcpBridgeSummary(mode, 'answer_local', 'tool_request', text, true);
+      this.recordMcpBridgeSummary(mode, LOCAL_PROFILE_DECISION, 'tool_request', text, true);
       this.emitTerminalResponse(controller, params.sessionId, text, false);
       return { handled: true };
     }
@@ -1997,14 +1999,14 @@ export class LocalAgentProvider {
       }
       const result = await this.mcpBridge.callHttpTool(manifest, parsedCall.toolName, parsedCall.args);
       const text = truncateText(result.content, 3000);
-      this.recordMcpBridgeSummary(mode, result.ok ? 'answer_local' : 'refuse_local', 'tool_request', text, result.ok);
+      this.recordMcpBridgeSummary(mode, result.ok ? LOCAL_PROFILE_DECISION : 'refuse_local', 'tool_request', text, result.ok);
       this.emitTerminalResponse(controller, params.sessionId, text, !result.ok);
       return { handled: true };
     }
 
     const health = await this.mcpBridge.checkHealth(manifest);
     const text = `${manifest.displayName || manifest.id} 状态：${health.message}`;
-    this.recordMcpBridgeSummary(mode, health.ok ? 'answer_local' : 'refuse_local', 'tool_request', text, health.ok);
+    this.recordMcpBridgeSummary(mode, health.ok ? LOCAL_PROFILE_DECISION : 'refuse_local', 'tool_request', text, health.ok);
     this.emitTerminalResponse(controller, params.sessionId, text, !health.ok && mode === 'local_only');
     return { handled: true };
   }
@@ -2044,7 +2046,7 @@ export class LocalAgentProvider {
 
   private recordMcpBridgeSummary(
     mode: LocalRouterMode,
-    decision: 'answer_local' | 'refuse_local',
+    decision: typeof LOCAL_PROFILE_DECISION | 'refuse_local',
     taskKind: LocalTaskKind,
     text: string,
     success: boolean,
@@ -2055,13 +2057,13 @@ export class LocalAgentProvider {
       mode,
       taskKind,
       decision,
-      provider: decision === 'answer_local' ? 'local' : 'refuse_local',
+      provider: decision === LOCAL_PROFILE_DECISION ? 'local' : 'refuse_local',
       reason: truncateText(text, 240),
       compressedPromptChars: 0,
       compressedHistoryChars: 0,
     }, {
       routeHits: current.routeHits + 1,
-      localOnlyAnswers: current.localOnlyAnswers + (mode === 'local_only' && success ? 1 : 0),
+      ...buildLocalProfileHitPatch(current, mode === 'local_only' && success ? 1 : 0),
       localRefusals: current.localRefusals + (success ? 0 : 1),
     });
     appendLocalLlmExecutionSummary(this.config, {

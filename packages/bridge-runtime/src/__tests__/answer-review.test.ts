@@ -14,9 +14,9 @@ describe('answer review', () => {
         intent: 'explicit_recall',
         queryText: '第十三条龙叫啥@小虾米',
         normalizedKey: '第十三条龙',
-        answerMode: 'direct_if_confident',
+        answerMode: 'evidence_if_confident',
         minConfidence: 0.78,
-        allowDirectAnswer: true,
+        allowHighConfidenceEvidence: true,
       },
       memoryHits: [{
         sessionId: 'knowledge-index:dragon',
@@ -74,9 +74,9 @@ describe('answer review', () => {
         intent: 'explicit_recall',
         queryText: 'pve关卡场景叫啥',
         normalizedKey: 'pve关卡场景',
-        answerMode: 'direct_if_confident',
+        answerMode: 'evidence_if_confident',
         minConfidence: 0.78,
-        allowDirectAnswer: true,
+        allowHighConfidenceEvidence: true,
       },
       memoryHits: [{
         sessionId: 'knowledge-index:scene',

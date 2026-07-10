@@ -11,9 +11,9 @@ public sealed class FeishuStickerLibraryTests
     public void Read_ReturnsSanitizedStickerRecords()
     {
         var root = CreateTempRoot();
-        var storePath = Path.Combine(root, "data", "feishu-stickers.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(storePath)!);
-        File.WriteAllText(storePath, JsonSerializer.Serialize(new
+        var artifacts = new MemoryArtifactStore(root);
+        Directory.CreateDirectory(Path.GetDirectoryName(artifacts.FeishuStickerStorePath)!);
+        File.WriteAllText(artifacts.FeishuStickerStorePath, JsonSerializer.Serialize(new
         {
             version = 1,
             updatedAt = "2026-06-06T08:00:00.000Z",
@@ -35,9 +35,10 @@ public sealed class FeishuStickerLibraryTests
             },
         }), new UTF8Encoding(false));
 
-        var snapshot = FeishuStickerLibrary.Read(storePath);
+        var snapshot = FeishuStickerLibrary.Read(artifacts);
 
         Assert.Equal("codex-im-suite/feishu-sticker-library/v1", snapshot.Schema);
+        Assert.Equal(artifacts.FeishuStickerStorePath, snapshot.StorePath);
         Assert.Single(snapshot.Stickers);
         Assert.Equal("疑惑猫", snapshot.Stickers[0].Label);
         Assert.Equal(["表情包", "疑惑"], snapshot.Stickers[0].Aliases);
@@ -49,9 +50,9 @@ public sealed class FeishuStickerLibraryTests
     public void Update_EditsSemanticFieldsAndPreservesUtf8()
     {
         var root = CreateTempRoot();
-        var storePath = WriteSampleStore(root);
+        var artifacts = WriteSampleStore(root);
 
-        var snapshot = FeishuStickerLibrary.Update(storePath, new FeishuStickerUpdateRequest
+        var snapshot = FeishuStickerLibrary.Update(artifacts, new FeishuStickerUpdateRequest
         {
             FileKey = "sticker_1",
             Label = "干嘛猫",
@@ -69,17 +70,21 @@ public sealed class FeishuStickerLibraryTests
         Assert.True(item.Disabled);
         Assert.Equal("先禁用确认", item.DisabledReason);
         Assert.False(string.IsNullOrWhiteSpace(item.LastEditedAt));
-        Assert.DoesNotContain('\uFEFF', File.ReadAllText(storePath, Encoding.UTF8));
-        Assert.Contains("干嘛猫", File.ReadAllText(storePath, Encoding.UTF8));
+        Assert.DoesNotContain('\uFEFF', File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
+        Assert.Contains("干嘛猫", File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
+        using var document = JsonDocument.Parse(File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
+        var sticker = document.RootElement.GetProperty("stickers")[0];
+        Assert.Equal("manual", sticker.GetProperty("annotationSource").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(sticker.GetProperty("annotationVerifiedAt").GetString()));
     }
 
     [Fact]
     public void MergeAliases_DeduplicatesAndTrimsAliases()
     {
         var root = CreateTempRoot();
-        var storePath = WriteSampleStore(root);
+        var artifacts = WriteSampleStore(root);
 
-        var snapshot = FeishuStickerLibrary.MergeAliases(storePath, new FeishuStickerAliasMergeRequest
+        var snapshot = FeishuStickerLibrary.MergeAliases(artifacts, new FeishuStickerAliasMergeRequest
         {
             FileKey = "sticker_1",
             Aliases = ["疑惑", "干嘛猫", "  吐槽  ", ""],
@@ -97,11 +102,11 @@ public sealed class FeishuStickerLibraryTests
         return root;
     }
 
-    private static string WriteSampleStore(string root)
+    private static MemoryArtifactStore WriteSampleStore(string root)
     {
-        var storePath = Path.Combine(root, "data", "feishu-stickers.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(storePath)!);
-        File.WriteAllText(storePath, JsonSerializer.Serialize(new
+        var artifacts = new MemoryArtifactStore(root);
+        Directory.CreateDirectory(Path.GetDirectoryName(artifacts.FeishuStickerStorePath)!);
+        File.WriteAllText(artifacts.FeishuStickerStorePath, JsonSerializer.Serialize(new
         {
             version = 1,
             updatedAt = "2026-06-06T08:00:00.000Z",
@@ -120,6 +125,6 @@ public sealed class FeishuStickerLibraryTests
                 },
             },
         }), new UTF8Encoding(false));
-        return storePath;
+        return artifacts;
     }
 }

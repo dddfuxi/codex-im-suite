@@ -141,7 +141,6 @@ type ExtensionItem = {
 type SettingsState = {
   defaultWorkDir: string;
   allowedRoots: string;
-  unityProject: string;
   memoryRepo: string;
   additionalDirs: string;
   replyStyleHint: string;
@@ -605,6 +604,9 @@ type MemoryOptimizationStatus = {
 
 type FeishuStickerLibraryItem = {
   fileKey: string;
+  mediaPath: string;
+  previewUrl: string;
+  mediaMimeType: string;
   aliases: string[];
   chatId: string;
   userId: string;
@@ -628,6 +630,7 @@ type FeishuStickerLibraryItem = {
 type FeishuStickerLibrarySnapshot = {
   schema: string;
   storePath: string;
+  mediaDir: string;
   updatedAt: string;
   stickers: FeishuStickerLibraryItem[];
 };
@@ -983,7 +986,6 @@ const fallbackState: PanelState = {
   settings: {
     defaultWorkDir: '',
     allowedRoots: '',
-    unityProject: '',
     memoryRepo: '',
     additionalDirs: '',
     replyStyleHint: '',
@@ -4630,7 +4632,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
   const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(state.memory.optimization);
   const [selectedOptimizationActions, setSelectedOptimizationActions] = useState<string[]>([]);
-  const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', updatedAt: '', stickers: [] });
+  const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', mediaDir: '', updatedAt: '', stickers: [] });
   const [stickerQuery, setStickerQuery] = useState('');
   const [stickerStatusFilter, setStickerStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
   const [stickerChatFilter, setStickerChatFilter] = useState('all');
@@ -5136,10 +5138,12 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
               <article key={item.fileKey} className={item.disabled ? 'feishu-sticker-row disabled' : 'feishu-sticker-row'}>
                 <div className="sticker-row-main">
                   <div className="sticker-row-title">
-                    <span className="blueprint-icon"><ImageIcon size={18} /></span>
+                    <span className="sticker-preview">
+                      {item.previewUrl ? <img src={item.previewUrl} alt={title} /> : <ImageIcon size={18} />}
+                    </span>
                     <div>
                       <strong>{title}</strong>
-                      <span>{item.intent || item.tone || item.usage || '未标注语义'}</span>
+                      <span>{item.intent || item.tone || item.usage || (item.previewUrl ? '已缓存图片，未标注语义' : '未标注语义')}</span>
                     </div>
                     <StatusPill status={item.disabled ? 'warning' : 'ok'} label={item.disabled ? '已禁用' : '启用'} />
                   </div>
@@ -5171,6 +5175,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                   <details className="sticker-diagnostics">
                     <summary>诊断字段</summary>
                     <code>{item.fileKey}</code>
+                    <span>media: {item.mediaPath || '-'}</span>
                     <span>chat: {item.chatId || '-'}</span>
                     <span>使用 {item.useCount} 次，最近收到 {item.lastSeenAt || '-'}，最近发送 {item.lastUsedAt || '-'}</span>
                     <span>置信度 {Math.round((item.annotationConfidence || 0) * 100)}%，最近编辑 {item.lastEditedAt || '-'}</span>
@@ -5838,9 +5843,12 @@ function SettingsPage({
         <div className="path-grid">
           <PathField label="默认工作目录" value={settings.defaultWorkDir} onChange={(value) => update('defaultWorkDir', value)} run={run} />
           <TokenPathField label="允许根目录" value={settings.allowedRoots} onChange={(value) => update('allowedRoots', value)} run={run} />
-          <PathField label="Unity 工程" value={settings.unityProject} onChange={(value) => update('unityProject', value)} run={run} />
           <PathField label="记忆仓库" value={settings.memoryRepo} onChange={(value) => update('memoryRepo', value)} run={run} />
           <TokenPathField label="Codex 附加目录" value={settings.additionalDirs} onChange={(value) => update('additionalDirs', value)} run={run} />
+        </div>
+        <div className="project-fact-hint">
+          <strong>项目事实</strong>
+          <span>Unity 工程、常用场景、素材目录这类长期事实不再作为全局路径字段保存；需要时请通过记忆记录到项目事实，机器人会在后续对话中按记忆检索使用。</span>
         </div>
       </section>
       <section className="panel panel-span-2">

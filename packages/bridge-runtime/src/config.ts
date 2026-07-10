@@ -252,11 +252,11 @@ function getDefaultMemoryRepoDir(): string {
   return process.platform === "win32" ? "E:\\cli-md" : path.join(CTI_HOME, "memory-repo");
 }
 
-function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string, unityProjectPath?: string): string {
+function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string): string {
   const fallback = getDefaultMemoryRepoDir();
   const configured = rawMemoryRepoDir && rawMemoryRepoDir.trim() ? rawMemoryRepoDir.trim() : fallback;
   const normalized = path.resolve(configured);
-  if (isSameOrChildPath(normalized, defaultWorkDir) || isSameOrChildPath(normalized, unityProjectPath)) {
+  if (isSameOrChildPath(normalized, defaultWorkDir)) {
     return fallback;
   }
   return normalized;
@@ -345,7 +345,7 @@ export function loadConfig(): Config {
     splitPathList(env.get("CTI_ALLOWED_WORKSPACE_ROOTS")),
     codexAdditionalDirectories,
   );
-  const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir, unityProjectPath);
+  const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir);
   const ollamaEnabled = env.has("CTI_OLLAMA_ENABLED")
     ? env.get("CTI_OLLAMA_ENABLED") === "true"
     : (env.has("CTI_LOCAL_LLM_ENABLED") ? env.get("CTI_LOCAL_LLM_ENABLED") === "true" : true);

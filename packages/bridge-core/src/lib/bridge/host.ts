@@ -6,7 +6,7 @@
  * interfaces to use the bridge.
  */
 
-import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
+import type { ChannelAddress, ChannelBinding, ChannelType, OutboundMention } from './types.js';
 
 // ── Bridge-local types (replacing @/types imports) ────────────
 
@@ -93,7 +93,7 @@ export interface MemoryRetrievalQuery {
 }
 
 export type MemoryQueryIntent = 'explicit_recall' | 'memory_write' | 'context_augment' | 'none';
-export type MemoryAnswerMode = 'direct_if_confident' | 'augment_only' | 'none';
+export type MemoryAnswerMode = 'evidence_if_confident' | 'augment_only' | 'none';
 export type MemoryHitSourceType = 'knowledge' | 'profile' | 'audit' | 'chat' | 'session' | 'workdir';
 export type MemoryHitAnswerability = 'structured' | 'summary' | 'none';
 export type MemoryHitQuality = 'high' | 'medium' | 'low';
@@ -104,7 +104,7 @@ export interface MemoryQueryPlan {
   normalizedKey?: string;
   answerMode: MemoryAnswerMode;
   minConfidence: number;
-  allowDirectAnswer: boolean;
+  allowHighConfidenceEvidence: boolean;
 }
 
 export interface RetrievedMemoryHit {
@@ -132,7 +132,7 @@ export interface RetrievedMemoryContext {
 
 export type MemoryReplyDecision =
   | {
-    type: 'direct_reply';
+    type: 'high_confidence_evidence';
     text: string;
     hit: RetrievedMemoryHit;
     plan: MemoryQueryPlan;
@@ -165,7 +165,7 @@ export interface AnswerReviewInput {
   answerText: string;
   memoryPlan?: MemoryQueryPlan;
   memoryHits?: RetrievedMemoryHit[];
-  source?: 'direct_memory' | 'codex' | 'local' | 'system';
+  source?: 'memory_evidence' | 'codex' | 'local' | 'system';
   executionEvidence?: {
     toolUseCount: number;
     toolResultCount: number;
@@ -628,6 +628,7 @@ export interface DirectReminderCreateInput {
   dueAt: string;
   timezone?: string;
   target: ChannelAddress;
+  notifyTargets?: OutboundMention[];
   sourcePrompt?: string;
   createdByMessageId?: string;
   sessionId?: string;
@@ -639,6 +640,7 @@ export interface DirectReminderCreateResult {
   title?: string;
   dueAt?: string;
   target?: ChannelAddress;
+  notifyTargets?: OutboundMention[];
   message?: string;
   error?: string;
 }

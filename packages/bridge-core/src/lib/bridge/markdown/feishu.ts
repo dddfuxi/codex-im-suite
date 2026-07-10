@@ -218,7 +218,7 @@ export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
   const lines = tools.map((tc) => {
     const status = formatToolStatus(tc.status);
-    return `${status} · ${formatVisibleToolName(tc.name)}`;
+    return `${status} · ${formatVisibleToolCall(tc)}`;
   });
   return lines.join('\n');
 }
@@ -233,6 +233,7 @@ export function formatVisibleToolName(name: string): string {
   const normalized = (name || '').trim();
   const lower = normalized.toLowerCase();
   if (!normalized) return '工具执行';
+  if (lower === 'bash' || lower === 'shell' || lower === 'powershell') return '本地命令';
   if (lower.includes('shell_artifact')) return '桌面截图';
   if (lower.includes('manage_camera')) return 'Unity MCP 截图';
   if (lower.includes('manage_scene')) return 'Unity MCP 场景操作';
@@ -243,6 +244,58 @@ export function formatVisibleToolName(name: string): string {
   if (lower.includes('mcp_call') || lower.includes('unity_mcp')) return 'MCP 工具执行';
   if (lower.includes('shell')) return '本地命令';
   return normalized.replace(/^JsonTool:/i, '');
+}
+
+function formatVisibleToolCall(tool: ToolCallInfo): string {
+  const name = (tool.name || '').trim();
+  const lower = name.toLowerCase();
+  if (lower === 'bash' || lower === 'shell' || lower === 'powershell') {
+    return summarizeShellToolInput(tool.input) || '执行本地命令';
+  }
+  return formatVisibleToolName(name);
+}
+
+function summarizeShellToolInput(input: unknown): string | null {
+  const command = readStringField(input, 'command');
+  if (!command) return null;
+  return summarizeShellCommand(command);
+}
+
+function readStringField(input: unknown, key: string): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const value = (input as Record<string, unknown>)[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function summarizeShellCommand(command: string): string {
+  const normalized = command.replace(/\s+/g, ' ').trim();
+  const lower = normalized.toLowerCase();
+  if (!lower) return '执行本地命令';
+
+  // Show intent, not the raw command. This keeps final cards useful without leaking local paths.
+  if (/sync-live-skill\.ps1/u.test(lower)) return '同步 live skill';
+  if (/daemon\.ps1/u.test(lower) && /\brestart\b/u.test(lower)) return '重启 bridge 服务';
+  if (/daemon\.ps1/u.test(lower) && /\bstatus\b/u.test(lower)) return '检查 bridge 状态';
+  if (/doctor-suite-targets\.ps1/u.test(lower)) return '检查 suite/live 目标';
+  if (/update-architecture-docs\.ps1/u.test(lower)) return '检查架构文档';
+  if (/status\.json|bridge-runtime-audit\.json/u.test(lower)) return '读取状态文件';
+  if (/bridge\.log|\.log\b/u.test(lower)) return '查看日志';
+  if (/\bgit\s+status\b/u.test(lower)) return '检查 Git 状态';
+  if (/\bgit\s+diff\b/u.test(lower)) return '查看代码变更';
+  if (/\bgit\s+(?:show|log)\b/u.test(lower)) return '查看 Git 记录';
+  if (/\bnpm\b[\s\S]{0,120}\brun\b[\s\S]{0,120}\btest|(?:^|[\s;&|])node\s+--test\b|\bdotnet\s+test\b|\bpnpm\b[\s\S]{0,120}\btest\b|\byarn\b[\s\S]{0,120}\btest\b/u.test(lower)) {
+    return '运行测试';
+  }
+  if (/\bnpm\b[\s\S]{0,120}\brun\b[\s\S]{0,120}\bbuild|\bpnpm\b[\s\S]{0,120}\bbuild\b|\byarn\b[\s\S]{0,120}\bbuild\b|\btsc\b|\bvite\s+build\b|\bdotnet\s+(?:build|publish)\b/u.test(lower)) {
+    return '构建项目';
+  }
+  if (/\brg\b|\bgrep\b|\bfindstr\b|\bselect-string\b/u.test(lower)) return '搜索文件';
+  if (/\bget-content\b|\bcat\b|\btype\b|\btail\b|\bhead\b|\bsed\b/u.test(lower)) return '读取文件';
+  if (/\bget-childitem\b|(?:^|[\s;&|])ls(?:\s|$)|(?:^|[\s;&|])dir(?:\s|$)/u.test(lower)) return '查看目录';
+  if (/\bremove-item\b|\bdel\b|\brm\b/u.test(lower)) return '清理文件';
+  if (/\bcopy-item\b|\bcopy\b|\bcp\b/u.test(lower)) return '复制文件';
+  if (/\bmove-item\b|\bmove\b|\bmv\b/u.test(lower)) return '移动文件';
+  return '执行本地命令';
 }
 
 /**
@@ -360,12 +413,13 @@ export function buildFinalCardJson(
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
-  // Main result content. Preserve concise user-visible rationale when present.
+  // Main result content stays result-first; detailed rationale is folded below.
   let content = stripStandaloneCompletionMarkLines(preprocessFeishuMarkdown(extractStreamingFinalResponse(text)));
   if (!content.trim()) {
     content = '未完成：模型没有返回可展示结果。';
   }
-  const titledContent = extractFinalCardTitleAndBody(content);
+  const splitContent = splitFinalCardContentForDisplay(content);
+  const titledContent = extractFinalCardTitleAndBody(splitContent.result || content);
 
   elements.push({
     tag: 'markdown',
@@ -374,15 +428,18 @@ export function buildFinalCardJson(
     text_size: 'normal',
   });
 
+  const executionDetailBlocks: string[] = [];
+  if (splitContent.detail) {
+    executionDetailBlocks.push(renderFeishuMarkdownMentions(splitContent.detail, mentions));
+  }
   const toolMd = buildToolProgressMarkdown(tools);
   if (toolMd) {
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      content: `<font color="grey">**工具轨迹**</font>\n${toolMd}`,
-      text_align: 'left',
-      text_size: 'notation',
-    });
+    executionDetailBlocks.push(`<font color="grey">**工具轨迹**</font>\n${toolMd}`);
+  }
+
+  const executionDetailPanel = buildExecutionDetailPanel(executionDetailBlocks);
+  if (executionDetailPanel) {
+    elements.push(executionDetailPanel);
   }
 
   // Footer
@@ -409,6 +466,62 @@ export function buildFinalCardJson(
     header,
     body: { elements },
   });
+}
+
+interface FinalCardContentSplit {
+  result: string;
+  detail: string;
+}
+
+const FINAL_RESULT_SECTION_RE = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:执行结果|最终结果)(?:\*\*)?\s*[:：]?[ \t]*(?:\n|$)/gu;
+const FINAL_DETAIL_HEADING_RE = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:处理思路|处理依据|执行过程|执行细节|工具计划|工具阶段结果|依据)(?:\*\*)?\s*[:：]?/u;
+
+function splitFinalCardContentForDisplay(content: string): FinalCardContentSplit {
+  const normalized = stripStandaloneCompletionMarkLines((content || '').replace(/\r\n/g, '\n')).trim();
+  if (!normalized) return { result: '', detail: '' };
+
+  FINAL_RESULT_SECTION_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FINAL_RESULT_SECTION_RE)) {
+    const index = match.index ?? -1;
+    if (index < 0) continue;
+    const before = normalized.slice(0, index).trim();
+    const after = normalized.slice(index + match[0].length).trim();
+    if (!before || !after) continue;
+    if (!FINAL_DETAIL_HEADING_RE.test(before)) continue;
+    if (!hasSubstantiveFinalBody(after)) continue;
+    return {
+      result: stripStandaloneCompletionMarkLines(after).trim(),
+      detail: before,
+    };
+  }
+
+  return { result: normalized, detail: '' };
+}
+
+function buildExecutionDetailPanel(blocks: string[]): Record<string, unknown> | null {
+  const content = blocks
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  if (!content) return null;
+
+  // Feishu Card JSON 2.0 supports collapsible_panel; keep evidence/process
+  // details collapsed by default so the final answer remains result-first.
+  return {
+    tag: 'collapsible_panel',
+    expanded: false,
+    header: {
+      title: { tag: 'plain_text', content: '执行过程' },
+      template: 'default',
+      padding: '8px 12px 8px 12px',
+    },
+    elements: [{
+      tag: 'markdown',
+      content,
+      text_align: 'left',
+      text_size: 'notation',
+    }],
+  };
 }
 
 function formatRunSummaryFooterParts(summary?: RunSummary): string[] {
@@ -469,7 +582,7 @@ function extractFinalCardTitleAndBody(content: string): { title: string; body: s
   const normalized = stripStandaloneCompletionMarkLines(content.replace(/\r\n/g, '\n')).trim();
   if (hasVisibleRationaleSections(normalized)) {
     return {
-      title: summarizeFinalCardTitle('????'),
+      title: summarizeFinalCardTitle('执行结果'),
       body: normalized,
     };
   }

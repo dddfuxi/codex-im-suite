@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  buildToolProgressMarkdown,
   buildFinalCardJson,
   buildPostContent,
   buildStreamingContent,
@@ -10,7 +11,39 @@ import {
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities.js';
 
 describe('Feishu streaming card markdown', () => {
-  it('keeps the user-visible rationale and result sections when finalizing a progress card', () => {
+  it('renders Bash tool traces as safe user-visible action summaries', () => {
+    const markdown = buildToolProgressMarkdown([
+      {
+        id: 'read-status',
+        name: 'Bash',
+        status: 'complete',
+        input: {
+          command: "Get-Content -LiteralPath 'C:\\Users\\admin\\.claude-to-im\\runtime\\status.json' -Encoding UTF8",
+        },
+      },
+      {
+        id: 'test-core',
+        name: 'Bash',
+        status: 'complete',
+        input: { command: 'npm run test:core' },
+      },
+      {
+        id: 'sync-live',
+        name: 'Bash',
+        status: 'complete',
+        input: { command: 'powershell -ExecutionPolicy Bypass -File .\\scripts\\sync-live-skill.ps1' },
+      },
+    ]);
+
+    assert.match(markdown, /读取状态文件/);
+    assert.match(markdown, /运行测试/);
+    assert.match(markdown, /同步 live skill/);
+    assert.doesNotMatch(markdown, /Bash/);
+    assert.doesNotMatch(markdown, /Get-Content|npm run|powershell/i);
+    assert.doesNotMatch(markdown, /C:\\Users\\admin/);
+  });
+
+  it('moves user-visible rationale into a collapsed execution detail panel when finalizing a progress card', () => {
     const text = [
       '# 处理思路',
       '先确认 MCP 服务，再读取可用工具。',
@@ -25,14 +58,31 @@ describe('Feishu streaming card markdown', () => {
     assert.match(finalText, /\n\n# .+\n- /);
 
     const card = JSON.parse(buildFinalCardJson(text, [], null)) as {
-      body?: { elements?: Array<{ content?: string }> };
+      body?: {
+        elements?: Array<{
+          tag?: string;
+          content?: string;
+          expanded?: boolean;
+          header?: { title?: { content?: string } };
+          elements?: Array<{ content?: string }>;
+        }>;
+      };
     };
-    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
-    assert.match(content, /^# .+/m);
-    assert.match(content, /- .*12/);
+    const elements = card.body?.elements || [];
+    const main = String(elements[0]?.content || '');
+    const detailPanel = elements.find((element) => element.tag === 'collapsible_panel');
+    const detail = (detailPanel?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(main, /- .*12/);
+    assert.doesNotMatch(main, /处理思路/);
+    assert.doesNotMatch(main, /先确认 MCP/);
+    assert.equal(detailPanel?.expanded, false);
+    assert.equal(detailPanel?.header?.title?.content, '执行过程');
+    assert.match(detail, /处理思路/);
+    assert.match(detail, /先确认 MCP/);
   });
 
-  it('preserves rationale headings in the finalized card body when both rationale and result are present', () => {
+  it('preserves rationale headings inside the collapsed execution detail panel', () => {
     const text = [
       '**处理思路**',
       '- 先确认 MCP 服务，再读取可用工具。',
@@ -46,11 +96,25 @@ describe('Feishu streaming card markdown', () => {
     assert.match(finalText, /^\*\*.+\*\*/m);
 
     const card = JSON.parse(buildFinalCardJson(text, [], null)) as {
-      body?: { elements?: Array<{ content?: string }> };
+      body?: {
+        elements?: Array<{
+          tag?: string;
+          content?: string;
+          expanded?: boolean;
+          elements?: Array<{ content?: string }>;
+        }>;
+      };
     };
-    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
-    assert.match(content, /^\*\*.+\*\*/m);
-    assert.match(content, /\n\n\*\*.+\*\*\n- /);
+    const elements = card.body?.elements || [];
+    const main = String(elements[0]?.content || '');
+    const detailPanel = elements.find((element) => element.tag === 'collapsible_panel');
+    const detail = (detailPanel?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(main, /可用工具 12 个/);
+    assert.doesNotMatch(main, /处理思路/);
+    assert.equal(detailPanel?.expanded, false);
+    assert.match(detail, /^\*\*.+\*\*/m);
+    assert.doesNotMatch(detail, /执行结果/);
   });
 
   it('renders structured mentions in finalized card markdown', () => {
@@ -113,7 +177,7 @@ describe('Feishu streaming card markdown', () => {
       { id: 'tool-1', name: 'JsonTool:shell_artifact', status: 'complete' },
     ], { status: '已完成', elapsed: '1.2s' })) as {
       header?: { title?: { content?: string }; template?: string };
-      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+      body?: { elements?: Array<{ tag?: string; content?: string; text_size?: string; elements?: Array<{ content?: string }> }> };
     };
     const elements = card.body?.elements || [];
     const content = elements.map((element) => element.content || '').join('\n');
@@ -125,13 +189,18 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(content, /最终结果/);
     assert.doesNotMatch(content, /处理完成/);
     assert.doesNotMatch(content, /状态：已完成[\s\S]*这个我处理好了/);
-    assert.match(content, /工具轨迹/);
-    assert.match(content, /桌面截图/);
-    assert.match(content, /<font color="green">已完成<\/font>/);
+    const detailPanel = elements.find((element) => element.tag === 'collapsible_panel') as
+      | { elements?: Array<{ content?: string }> }
+      | undefined;
+    const detail = (detailPanel?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(detail, /工具轨迹/);
+    assert.match(detail, /桌面截图/);
+    assert.match(detail, /<font color="green">已完成<\/font>/);
     assert.match(content, /✅/);
     assert.match(content, /耗时：1\.2s/);
     assert.equal(footer?.text_size, 'notation');
-    assert.doesNotMatch(content, /JsonTool|shell_artifact/);
+    assert.doesNotMatch(detail, /JsonTool|shell_artifact/);
   });
 
   it('does not mark successful summaries as incomplete when the body quotes errors', () => {
@@ -181,7 +250,7 @@ describe('Feishu streaming card markdown', () => {
       executorKind: 'agent',
       provider: 'mavis-agent',
     })) as {
-      body?: { elements?: Array<{ content?: string; text_size?: string }> };
+      body?: { elements?: Array<{ tag?: string; content?: string; text_size?: string; elements?: Array<{ content?: string }> }> };
     };
     const footer = (card.body?.elements || []).find((element) => String(element.content || '').includes('来源'));
 

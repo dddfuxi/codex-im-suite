@@ -33,6 +33,56 @@ export interface DirectMessageSendResult extends SendResult {
   targetUserId?: string;
 }
 
+export type ConversationTargetKind = 'chat' | 'user';
+
+export interface ConversationTargetResolveRequest {
+  sourceMessage: InboundMessage;
+  targetText?: string;
+  targetId?: string;
+  targetKind?: ConversationTargetKind | 'any';
+}
+
+export interface ResolvedConversationTarget {
+  kind: ConversationTargetKind;
+  id: string;
+  displayName: string;
+  chatType?: string;
+  userId?: string;
+}
+
+export interface ConversationTargetResolveResult {
+  ok: boolean;
+  target?: ResolvedConversationTarget;
+  error?: string;
+  candidates?: Array<{ id: string; displayName: string; kind: ConversationTargetKind; chatType?: string }>;
+}
+
+export interface ConversationMessageRequest {
+  sourceMessage: InboundMessage;
+  target: ResolvedConversationTarget;
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+}
+
+export interface ConversationMessageSendResult extends SendResult {
+  targetDisplayName?: string;
+  targetId?: string;
+  targetKind?: ConversationTargetKind;
+}
+
+export interface OutboundMentionResolutionCandidate {
+  name: string;
+  aliases?: string[];
+}
+
+export interface OutboundMentionResolutionInspection {
+  target: string;
+  status: 'resolved' | 'ambiguous' | 'not_found' | 'lookup_failed';
+  searchedSources: string[];
+  candidates: OutboundMentionResolutionCandidate[];
+  error?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -131,6 +181,30 @@ export abstract class BaseChannelAdapter {
   getStickerPresentationPrompt?(chatId?: string, userId?: string): string;
 
   /**
+   * Store channel-native sticker semantics learned from a model or user.
+   * Adapters should treat user-supplied explanations as evidence, not as
+   * trusted sendable semantics, until a vision/manual source verifies them.
+   * The adapter owns platform identifiers and persistence; callers should pass
+   * only sanitized meaning fields plus the source message context.
+   */
+  recordStickerAnnotation?(_input: {
+    fileKey: string;
+    chatId: string;
+    userId?: string;
+    learnedFromMessageId?: string;
+    label?: string;
+    description?: string;
+    intent?: string;
+    tone?: string;
+    usage?: string;
+    avoidWhen?: string;
+    aliases?: string[];
+    examples?: string[];
+    annotationConfidence?: number;
+    source?: 'vision' | 'user' | 'manual';
+  }): boolean;
+
+  /**
    * Resolve channel-native mentions before final delivery.
    * Adapters can turn user-visible text such as "@name" into structured mention
    * metadata using platform APIs or cached inbound context.
@@ -138,11 +212,34 @@ export abstract class BaseChannelAdapter {
   resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
 
   /**
+   * Explain how a channel-native mention target was resolved or why it was not.
+   * Used after normal resolution fails so blockers can say what was searched
+   * without exposing platform IDs or raw API payloads.
+   */
+  inspectOutboundMentionTarget?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _target: string,
+  ): Promise<OutboundMentionResolutionInspection>;
+
+  /**
    * Send a controlled one-to-one message resolved from channel context.
    * The model only declares intent; adapters own identity resolution and the
    * platform API call so group replies cannot fake a private delivery.
    */
   sendDirectMessage?(_request: DirectMessageRequest): Promise<DirectMessageSendResult>;
+
+  /**
+   * Resolve a cross-conversation target before sending. This lets bridge-manager
+   * show the human-readable name and platform ID to the owner for confirmation.
+   */
+  resolveConversationTarget?(_request: ConversationTargetResolveRequest): Promise<ConversationTargetResolveResult>;
+
+  /**
+   * Send to a previously resolved and owner-confirmed conversation target.
+   * Callers must not invoke this before confirmation.
+   */
+  sendConversationMessage?(_request: ConversationMessageRequest): Promise<ConversationMessageSendResult>;
 
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;

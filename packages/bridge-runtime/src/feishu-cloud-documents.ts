@@ -455,9 +455,10 @@ function buildSystemPrompt(sections: string[], truncated: boolean, tokenSource: 
     ? '- The following content was read through the Feishu application tenant token.'
     : '- The following content was read through the requesting Feishu user OAuth token.';
   return [
-    'Feishu cloud document context (authoritative for this turn):',
+    'Feishu cloud document evidence prompt (agent context, not a final reply):',
     sourceLine,
-    '- Use this content as source material when answering the user request.',
+    '- Use this content as source evidence when the agent answers the current user request.',
+    '- Do not copy this evidence prompt verbatim into the final reply.',
     '- Do not fetch, browse, curl, or otherwise access the original Feishu cloud document URLs again in this turn.',
     '- If the user asks to view, summarize, or analyze the document, answer from this context instead of saying the link is private, unavailable, or requires public sharing.',
     truncated ? '- Content was truncated by bridge limits; mention truncation if it affects completeness.' : '',

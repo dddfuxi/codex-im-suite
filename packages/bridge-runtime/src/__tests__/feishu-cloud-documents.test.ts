@@ -73,6 +73,9 @@ describe('Feishu cloud document links', () => {
 
     assert.equal(result.status, 'resolved');
     assert.match(result.systemPrompt || '', /真实飞书文档正文/);
+    assert.match(result.systemPrompt || '', /Feishu cloud document evidence prompt/);
+    assert.match(result.systemPrompt || '', /agent context, not a final reply/);
+    assert.doesNotMatch(result.systemPrompt || '', /authoritative for this turn/);
   });
 
   it('tries the Feishu tenant access token before requesting a user access token', async () => {

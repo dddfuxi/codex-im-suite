@@ -495,6 +495,34 @@ describe('loadConfig/saveConfig round-trip', () => {
     }
   });
 
+  it('keeps memory repository independent from legacy Unity project path', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-repo-config-'));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-repo-work-'));
+    const unityProject = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-repo-unity-'));
+    const memoryRepo = path.join(unityProject, 'memory-artifacts');
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        `CTI_DEFAULT_WORKDIR=${workDir}`,
+        `CTI_UNITY_PROJECT_PATH=${unityProject}`,
+        `CTI_MEMORY_REPO_DIR=${memoryRepo}`,
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?memory-repo-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.memoryRepoDir, path.resolve(memoryRepo));
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+      fs.rmSync(workDir, { recursive: true, force: true });
+      fs.rmSync(unityProject, { recursive: true, force: true });
+    }
+  });
+
   it('loads Feishu OAuth and cloud document env config', async () => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-cloud-config-'));
     const previousCtiHome = process.env.CTI_HOME;

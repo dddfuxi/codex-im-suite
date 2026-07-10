@@ -40,6 +40,8 @@ export interface LocalLlmRuntimeStatus {
   routeMisses: number;
   routeFailures: number;
   escalationCount: number;
+  localProfileHits: number;
+  /** @deprecated Historical status field kept for existing live status files and older control panels. */
   localOnlyAnswers: number;
   localRefusals: number;
   executionCount: number;
@@ -126,6 +128,7 @@ export function makeDefaultLocalLlmStatus(config: Config): LocalLlmRuntimeStatus
     routeMisses: 0,
     routeFailures: 0,
     escalationCount: 0,
+    localProfileHits: 0,
     localOnlyAnswers: 0,
     localRefusals: 0,
     executionCount: 0,
@@ -147,20 +150,54 @@ function isDeprecatedLlamaStatus(status: Partial<LocalLlmRuntimeStatus>): boolea
     || /\.gguf$/i.test(model);
 }
 
+function toNonNegativeInteger(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0;
+}
+
+function normalizeLocalProfileCounters(status: LocalLlmRuntimeStatus): LocalLlmRuntimeStatus {
+  const value = Math.max(
+    toNonNegativeInteger(status.localProfileHits),
+    toNonNegativeInteger(status.localOnlyAnswers),
+  );
+  return {
+    ...status,
+    localProfileHits: value,
+    localOnlyAnswers: value,
+  };
+}
+
+export function buildLocalProfileHitPatch(
+  current: Pick<LocalLlmRuntimeStatus, 'localProfileHits' | 'localOnlyAnswers'> | { localProfileHits?: number; localOnlyAnswers?: number },
+  increment = 1,
+): Pick<LocalLlmRuntimeStatus, 'localProfileHits' | 'localOnlyAnswers'> {
+  const base = Math.max(
+    toNonNegativeInteger(current.localProfileHits),
+    toNonNegativeInteger(current.localOnlyAnswers),
+  );
+  const next = base + Math.max(0, Math.floor(Number.isFinite(increment) ? increment : 0));
+  return {
+    localProfileHits: next,
+    localOnlyAnswers: next,
+  };
+}
+
 function normalizeRuntimeSource(
   status: LocalLlmRuntimeStatus,
   config?: Config,
 ): LocalLlmRuntimeStatus {
+  const normalized = normalizeLocalProfileCounters(status);
   const desiredBaseUrl = config?.localAiBaseUrl || config?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
   const desiredModel = config?.localAiModel || config?.ollamaModel || DEFAULT_OLLAMA_MODEL;
-  if (!isDeprecatedLlamaStatus(status)) return status;
+  if (!isDeprecatedLlamaStatus(normalized)) return normalized;
   return {
-    ...status,
+    ...normalized,
     baseUrl: desiredBaseUrl,
     model: desiredModel,
     serverReachable: undefined,
     lastCheckAt: undefined,
-    lastError: status.lastError || '已忽略旧 llama.cpp 状态，等待 Ollama 健康检查刷新。',
+    lastError: normalized.lastError || '已忽略旧 llama.cpp 状态，等待 Ollama 健康检查刷新。',
   };
 }
 

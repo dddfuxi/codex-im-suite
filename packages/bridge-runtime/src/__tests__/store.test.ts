@@ -325,7 +325,7 @@ describe('JsonFileStore', () => {
     assert.equal(memory.hits[0].structuredPairs?.length, 4);
   });
 
-  it('decides direct memory replies for non-scene structured recall keys', () => {
+  it('decides high-confidence memory evidence for non-scene structured recall keys', () => {
     const store = new JsonFileStore(makeSettings());
     const session = store.createSession('test', 'model', undefined, '/tmp/test-cwd');
     store.upsertChannelBinding({
@@ -355,9 +355,9 @@ describe('JsonFileStore', () => {
       recentHistoryLimit: 0,
     });
 
-    assert.equal(decision.type, 'direct_reply');
-    assert.match(decision.type === 'direct_reply' ? decision.text : '', /部署命令/);
-    assert.match(decision.type === 'direct_reply' ? decision.text : '', /npm run build/);
+    assert.equal(decision.type, 'high_confidence_evidence');
+    assert.match(decision.type === 'high_confidence_evidence' ? decision.text : '', /部署命令/);
+    assert.match(decision.type === 'high_confidence_evidence' ? decision.text : '', /npm run build/);
   });
 
   it('prefers exact structured knowledge keys over noisy same-chat recall history', () => {
@@ -401,10 +401,10 @@ describe('JsonFileStore', () => {
       recentHistoryLimit: 0,
     });
 
-    assert.equal(decision.type, 'direct_reply');
-    assert.match(decision.type === 'direct_reply' ? decision.text : '', /第十三条龙/);
-    assert.match(decision.type === 'direct_reply' ? decision.text : '', /雷霆龙/);
-    assert.doesNotMatch(decision.type === 'direct_reply' ? decision.text : '', /HSScene/);
+    assert.equal(decision.type, 'high_confidence_evidence');
+    assert.match(decision.type === 'high_confidence_evidence' ? decision.text : '', /第十三条龙/);
+    assert.match(decision.type === 'high_confidence_evidence' ? decision.text : '', /雷霆龙/);
+    assert.doesNotMatch(decision.type === 'high_confidence_evidence' ? decision.text : '', /HSScene/);
   });
 
   it('retrieves reverse memory graph context for related knowledge', () => {

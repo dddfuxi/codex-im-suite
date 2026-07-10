@@ -58,7 +58,12 @@ export type OnPartialText = (fullText: string) => void;
  * Callback invoked when tool_use or tool_result SSE events arrive.
  * Used by bridge-manager to forward tool progress to adapters for real-time display.
  */
-export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
+export type OnToolEvent = (
+  toolId: string,
+  toolName: string,
+  status: 'running' | 'complete' | 'error',
+  toolInput?: unknown,
+) => void;
 
 export interface ConversationResult {
   responseText: string;
@@ -105,6 +110,7 @@ export interface ConversationProcessOptions {
   sourceChatId?: string;
   sourceThreadId?: string;
   messageKind?: string;
+  hasPreResolvedEvidence?: boolean;
 }
 
 function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRetryAttempted = false): ConversationResult['executionEvidence'] {
@@ -223,8 +229,9 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- Default execution posture: prioritize solving the task with concrete attempts. Do not retreat to generic refusal when a safe, bounded troubleshooting step can be executed immediately.',
     '- Reminder action protocol: when the user clearly asks to create a future reminder, do not use schtasks, Register-ScheduledTask, temporary PowerShell scripts, or direct platform APIs. Instead output one fenced ```cti-reminder JSON block with title, dueAt, timezone, target="current_chat", and sourcePrompt. The bridge will create and send the reminder.',
     '- Do not claim that a reminder, scheduled task, or proactive message has been created unless you used the cti-reminder action protocol or the user explicitly asked only for example code.',
-    '- Direct-message action protocol: when a Feishu user explicitly asks you to privately/directly message a named person, do not use Bash, PowerShell, temporary scripts, hand-written platform API calls, or ordinary text to fake the send. Instead output one fenced ```cti-direct-message JSON block with target and text. The bridge will resolve the target from Feishu context and send the private message.',
-    '- Do not claim a private/direct message has been sent unless you used the cti-direct-message action protocol and the bridge reports success. If the target is not explicit or may match multiple people, ask for a direct @ mention or exact display name.',
+    '- Direct-message action protocol: when a Feishu user explicitly asks you to privately/directly message an explicit person, the current sender (我/发起人/发送者), or a specific chat/session/group id, do not use Bash, PowerShell, temporary scripts, hand-written platform API calls, or ordinary text to fake the send. Instead output one fenced ```cti-direct-message JSON block with target or targetId, optional targetType ("user" or "chat"), and text. The bridge will resolve the target from Feishu context. Cross-chat/session-id sends are owner-only and the bridge will ask the owner to confirm the resolved name and id before sending.',
+    '- If a Feishu user only asks whether you can private-message them, answer that bridge-managed private delivery is supported when there is a clear target and message content; ask for the missing content instead of saying the current configuration is unsupported.',
+    '- Do not claim a private/direct/cross-chat message has been sent unless you used the cti-direct-message action protocol and the bridge reports success. If the target is not explicit or may match multiple people, ask for a direct @ mention, exact display name, exact chat name, or platform id.',
   ].join('\n');
 
   return [
@@ -257,15 +264,15 @@ function buildReplyPresentationPrompt(replyStyleHint: string): string {
     '- Progress updates should stay high-level and user-readable. Do not expose tool names, file paths, raw commands, agent phase names, or step-by-step internal execution status.',
     '- Do not narrate tool process or dump intermediate流水 to the user. When investigation is needed, do the checks and only answer with the result; mention blockers only when they change what the user can do next.',
     '- Final replies should be outcome-first and concise; do not repeat the progress-card rationale unless the user explicitly asks for a detailed walkthrough.',
-    '- On Feishu, when a real mention is needed, reflect on who should be mentioned from the explicit name, replied message, or unique group-member match. Use either structured cti-final mentions with real IDs, or an exact visible @display-name when the target is explicit; the bridge will resolve @display-name through Feishu context before sending. Do not put bare strings or Feishu @_user_N placeholders in cti-final.mentions. If the target is vague such as "someone else" or "another person", ask for the exact person instead of guessing from the sender or replied-message header.',
+    '- On Feishu, when a real mention is needed, reflect on who should be mentioned from an explicit display name or native mention evidence. Use either structured cti-final mentions with real IDs, or an exact visible @display-name when the target is explicit; the bridge will resolve @display-name through Feishu context before sending. Do not put bare strings, Feishu @_user_N placeholders, or relationship descriptions such as "your owner/developer/maintainer" in cti-final.mentions. If the target is vague or relational, answer naturally or ask for the exact person instead of guessing from the sender or replied-message header.',
     '- On Feishu, native mentions require a bridge-resolvable Feishu mention ID or @all. Bots and app agents may be mentioned only when the bridge can resolve a valid mention ID from Feishu context or structured cti-final mentions; otherwise say the target cannot be confirmed and use a plain name only when helpful.',
     '- If the user explicitly asks you to mention someone, do the mention once when the target is explicit and resolvable. Do not refuse only because the target is a bot or app agent, and do not speculate about whether that other agent will react to the notification.',
-    '- If the user asks to private-message someone, use cti-direct-message with the intended target and private text; the visible group result should be only a success/failure confirmation, not the private content.',
+    '- If the user asks to private-message someone, the current sender, or another Feishu chat/session/group id, use cti-direct-message with the intended target/targetId and private text; the visible source chat result should be only a confirmation prompt or success/failure confirmation, not the private content.',
     '- On Feishu, you may make lightweight replies more lively by starting the final visible result with a native reaction hint or sticker hint when it fits the actual intent. Use `[表情包:alias]` only when the alias is explicitly listed in the Feishu sticker library prompt; use bare `[表情包]` only when that prompt says semantic sticker selection is available. If no reliable semantic sticker fits, prefer text or a reaction hint.',
     '- Choose reaction hints by actual intent. Do not default to SMILE; use no hint when the tone is neutral, formal, blocked, or unclear.',
     '- Use Feishu reaction/sticker hints only for casual chat, acknowledgements, greetings, playful sticker replies, and short emotional responses. Do not add them to formal tool results, blockers, file paths, command output, or safety-sensitive replies.',
     '- Do not invent sticker aliases or sticker file_key values. If a sticker hint cannot be resolved by the bridge, the visible text must still stand on its own.',
-    '- Feishu sticker messages may include an image attachment when the bridge can download the sticker resource. If the inbound text says a sticker image is attached, inspect that image first to identify the visual content and intent.',
+    '- Feishu sticker messages may include an image attachment only when the memory repository already has media for that sticker file_key. If the inbound text says a sticker image is attached, inspect that image first to identify the visual content and intent.',
     '- If the inbound text says the Feishu sticker is not semantically annotated and no sticker image attachment is available, do not claim you can see its image, caption, or intent. Ask the user to explain the sticker meaning or use any learned sticker semantics provided in the message context.',
   ];
   if (replyStyleHint) {
@@ -605,6 +612,7 @@ export async function processMessage(
       files,
       memoryPlan: options?.memoryPlan,
       messageKind: options?.messageKind,
+      hasPreResolvedEvidence: options?.hasPreResolvedEvidence,
     });
     const shouldRetrieveMemory = shouldRetrieveMemoryForTurn(
       options?.memoryMode || 'auto',
@@ -854,7 +862,7 @@ async function consumeStream(
                 shouldRefreshSession = true;
               }
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
+                try { onToolEvent(toolData.id, toolData.name, 'running', toolData.input); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;

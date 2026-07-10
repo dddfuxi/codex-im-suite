@@ -17,7 +17,7 @@ export interface AnswerReviewInput {
   answerText: string;
   memoryPlan?: MemoryQueryPlan;
   memoryHits?: RetrievedMemoryHit[];
-  source?: 'direct_memory' | 'codex' | 'local' | 'system';
+  source?: 'memory_evidence' | 'codex' | 'local' | 'system';
   executionEvidence?: {
     toolUseCount: number;
     toolResultCount: number;
@@ -108,7 +108,7 @@ function recomposeMemoryReplacement(input: AnswerReviewInput): string | undefine
     summary: '',
     hits: memoryHits,
   });
-  if (decision.type !== 'direct_reply') return undefined;
+  if (decision.type !== 'high_confidence_evidence') return undefined;
   const text = decision.text.trim();
   return text && !INTERNAL_TOOL_LEAKAGE_RE.test(text) ? text : undefined;
 }

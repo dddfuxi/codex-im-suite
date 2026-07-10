@@ -15,6 +15,7 @@ export interface ExecutionRequirementInput {
   files?: FileAttachment[];
   memoryPlan?: MemoryQueryPlan;
   messageKind?: string;
+  hasPreResolvedEvidence?: boolean;
 }
 
 const NONE_REQUIREMENT: ExecutionRequirement = {
@@ -143,6 +144,7 @@ function hasConcreteReadableContextTarget(text: string, input: ExecutionRequirem
 }
 
 function shouldUseLowRiskLocalProbe(text: string, input: ExecutionRequirementInput): boolean {
+  if (input.hasPreResolvedEvidence) return false;
   if (!LOCAL_READ_RE.test(text)) return false;
   if (!hasConcreteReadableContextTarget(text, input)) return false;
   if (COMMAND_INVOCATION_RE.test(text)) return false;
@@ -213,6 +215,7 @@ function classifyExecutionRequirementInternal(
   }
 
   if (LOCAL_READ_RE.test(text) && (LOCAL_TARGET_RE.test(text) || !!input.workingDirectory)) {
+    if (input.hasPreResolvedEvidence) return NONE_REQUIREMENT;
     if (options.respectStrictToolRouting && !strictToolRoutingEnabled()) {
       return NONE_REQUIREMENT;
     }

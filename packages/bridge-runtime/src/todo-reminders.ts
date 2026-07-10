@@ -12,8 +12,15 @@ export type ReminderProviderState = 'ok' | 'disabled' | 'unsupported' | 'error';
 export interface ReminderTarget {
   channelType: string;
   chatId: string;
+  chatType?: string;
   displayName?: string;
   messageId?: string;
+}
+
+export interface ReminderNotifyTarget {
+  userId?: string;
+  name?: string;
+  atAll?: boolean;
 }
 
 export interface TodoReminder {
@@ -28,6 +35,7 @@ export interface TodoReminder {
   createdByMessageId?: string;
   skipReason?: string;
   target: ReminderTarget;
+  notifyTargets?: ReminderNotifyTarget[];
   source: {
     path: string;
     snippet: string;
@@ -51,6 +59,7 @@ export interface ReminderDeliveryRecord {
   status: 'pending' | 'sent' | 'failed' | 'skipped';
   channelType: string;
   chatId: string;
+  chatType?: string;
   dueAt?: string;
   messageId?: string;
   cardId?: string;
@@ -102,6 +111,7 @@ export interface ReminderDeliverInput {
   dedupKey?: string;
   sessionId?: string;
   feishuCardJson?: string;
+  mentions?: ReminderNotifyTarget[];
 }
 
 export interface FeishuPushProviderOptions {
@@ -141,6 +151,7 @@ export interface DirectReminderInput {
   dueAt: string;
   timezone?: string;
   target: ReminderTarget;
+  notifyTargets?: ReminderNotifyTarget[];
   sourcePrompt?: string;
   createdAt?: string;
   createdByMessageId?: string;
@@ -348,6 +359,7 @@ export function createFeishuPushProvider(options: FeishuPushProviderOptions): Re
         parseMode: 'plain',
         dedupKey: `todo-reminder:${reminder.id}`,
         feishuCardJson: buildFeishuReminderCardJson(reminder),
+        mentions: reminder.notifyTargets,
       });
       return result;
     },
@@ -377,9 +389,11 @@ export function createDirectReminder(memoryRoot: string, input: DirectReminderIn
     '---',
     'channelType: ' + input.target.channelType,
     'chatId: ' + input.target.chatId,
+    input.target.chatType ? 'chatType: ' + input.target.chatType : '',
     input.target.messageId ? 'messageId: ' + input.target.messageId : '',
     input.target.displayName ? 'displayName: ' + input.target.displayName : '',
-    'createdBy: direct-fast-path',
+    input.notifyTargets?.length ? 'notifyTargets: ' + encodeURIComponent(JSON.stringify(input.notifyTargets)) : '',
+    'createdBy: agent-action',
     input.createdByMessageId ? 'createdByMessageId: ' + input.createdByMessageId : '',
     'createdAt: ' + createdAt,
     'sourceType: direct',
@@ -414,6 +428,7 @@ export function createDirectReminder(memoryRoot: string, input: DirectReminderIn
     status: 'pending',
     channelType: reminder.target.channelType,
     chatId: reminder.target.chatId,
+    chatType: reminder.target.chatType,
     dueAt: reminder.dueAt,
     attempts: 0,
   };
@@ -510,17 +525,15 @@ export function completeReminder(memoryRoot: string, input: ReminderCompleteInpu
 }
 
 function formatReminderMessage(reminder: TodoReminder): string {
+  const snippet = cleanReminderDisplaySnippet(reminder.source.snippet);
   const lines = [
     `待办提醒：${reminder.title}`,
   ];
   if (reminder.dueAt) {
     lines.push(`时间：${formatLocalDateTime(reminder.dueAt)}`);
   }
-  if (reminder.source.path) {
-    lines.push(`来源：${reminder.source.path}`);
-  }
-  if (reminder.source.snippet) {
-    lines.push('', reminder.source.snippet);
+  if (snippet) {
+    lines.push('', snippet);
   }
   return lines.join('\n');
 }
@@ -532,7 +545,8 @@ function buildFeishuReminderCardJson(reminder: TodoReminder): string {
     `**来源**：${reminder.sourceType === 'direct' ? '直接提醒' : '记忆待办'}`,
     reminder.target.displayName ? `**会话**：${escapeFeishuCardText(reminder.target.displayName)}` : '',
   ].filter(Boolean).join('\n');
-  const snippet = reminder.source.snippet ? `\n\n${escapeFeishuCardText(reminder.source.snippet)}` : '';
+  const displaySnippet = cleanReminderDisplaySnippet(reminder.source.snippet);
+  const snippet = displaySnippet ? `\n\n${escapeFeishuCardText(displaySnippet)}` : '';
   return JSON.stringify({
     config: {
       wide_screen_mode: true,
@@ -581,6 +595,13 @@ function escapeFeishuCardText(value: string): string {
   }[char] || char));
 }
 
+function cleanReminderDisplaySnippet(snippet: string): string {
+  return (snippet || '')
+    .replace(/\b(?:channelType|chatId|chatType|messageId|displayName|notifyTargets)\s*[:：]\s*[^\s,，;；]+/giu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function repairReminderText(text: string): string | null {
   const repaired = repairLikelyMojibakeText(text);
   return repaired.unresolved ? null : repaired.text;
@@ -626,6 +647,7 @@ function buildReminderFromTodo(item: KnowledgeItem, enabledChannels: Set<string>
     createdByMessageId: sourceMetadata?.createdByMessageId,
     skipReason: skipReason || undefined,
     target,
+    notifyTargets: parseReminderNotifyTargets(sourceMetadata, metadataText),
     source: {
       path: item.source.path,
       snippet,
@@ -636,7 +658,7 @@ function buildReminderFromTodo(item: KnowledgeItem, enabledChannels: Set<string>
 }
 
 function parseSourceType(item: KnowledgeItem, metadata: Record<string, string> | undefined): TodoReminder['sourceType'] {
-  if (metadata?.sourceType === 'direct' || metadata?.createdBy === 'direct-fast-path') return 'direct';
+  if (metadata?.sourceType === 'direct' || metadata?.createdBy === 'direct-fast-path' || metadata?.createdBy === 'agent-action') return 'direct';
   if (item.source.path.toLowerCase().includes(`${path.sep}direct-reminders${path.sep}`.toLowerCase())) return 'direct';
   return 'memory';
 }
@@ -665,9 +687,54 @@ function parseReminderTargetFromMetadata(metadata: Record<string, string> | unde
   return {
     channelType: readInlineField(text, 'channelType') || metadata?.channelType || '',
     chatId: readInlineField(text, 'chatId') || metadata?.chatId || '',
+    chatType: readInlineField(text, 'chatType') || metadata?.chatType || undefined,
     messageId: readInlineField(text, 'messageId') || metadata?.messageId || undefined,
     displayName: readInlineField(text, 'displayName') || metadata?.displayName || undefined,
   };
+}
+
+function parseReminderNotifyTargets(
+  metadata: Record<string, string> | undefined,
+  text: string,
+): ReminderNotifyTarget[] | undefined {
+  const raw = readInlineField(text, 'notifyTargets') || metadata?.notifyTargets || '';
+  if (!raw) return undefined;
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  try {
+    const parsed = JSON.parse(decoded) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const targets = parsed
+      .map((item): ReminderNotifyTarget | null => {
+        if (!item || typeof item !== 'object') return null;
+        const rawTarget = item as Record<string, unknown>;
+        const userId = typeof rawTarget.userId === 'string'
+          ? rawTarget.userId.trim()
+          : typeof rawTarget.user_id === 'string'
+            ? rawTarget.user_id.trim()
+            : '';
+        const name = typeof rawTarget.name === 'string'
+          ? rawTarget.name.trim()
+          : typeof rawTarget.user_name === 'string'
+            ? rawTarget.user_name.trim()
+            : '';
+        const atAll = rawTarget.atAll === true || rawTarget.at_all === true;
+        if (!atAll && !userId) return null;
+        return {
+          ...(userId ? { userId } : {}),
+          ...(name ? { name } : {}),
+          ...(atAll ? { atAll: true } : {}),
+        };
+      })
+      .filter((item): item is ReminderNotifyTarget => Boolean(item));
+    return targets.length > 0 ? targets : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readInlineField(text: string, key: string): string {
@@ -678,7 +745,7 @@ function readInlineField(text: string, key: string): string {
 function cleanReminderTitle(text: string): string {
   return text
     .replace(/(?:@|提醒时间\s*[:：]\s*)\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}/gu, '')
-    .replace(/\b(?:channelType|chatId|messageId|displayName)\s*[:：]\s*[^\s,，;；]+/giu, '')
+    .replace(/\b(?:channelType|chatId|chatType|messageId|displayName|notifyTargets)\s*[:：]\s*[^\s,，;；]+/giu, '')
     .replace(/状态\s*[:：]\s*[^\s,，;；]+/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -739,6 +806,7 @@ function recordCompletionState(
     status: previous?.status || reminder.status,
     channelType: reminder.target.channelType,
     chatId: reminder.target.chatId,
+    chatType: reminder.target.chatType,
     dueAt: reminder.dueAt,
     messageId: previous?.messageId,
     cardId: previous?.cardId,
@@ -768,6 +836,7 @@ function makeDeliveryRecord(
     status,
     channelType: reminder.target.channelType,
     chatId: reminder.target.chatId,
+    chatType: reminder.target.chatType,
     dueAt: reminder.dueAt,
     messageId,
     cardId,

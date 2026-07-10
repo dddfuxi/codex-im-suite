@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import { initBridgeContext } from '../../lib/bridge/context.js';
 import { FeishuAdapter } from '../../lib/bridge/adapters/feishu-adapter.js';
 import type { BridgeStore } from '../../lib/bridge/host.js';
+import { MemoryArtifactStore } from '../../lib/bridge/memory-artifact-store.js';
 
 function createMockStore(settings: Record<string, string> = {}) {
   return {
@@ -71,10 +72,41 @@ function createFeishuTextEvent(messageId: string, text: string) {
   };
 }
 
+function createFeishuInteractiveEvent(messageId: string, content: unknown) {
+  return {
+    sender: {
+      sender_type: 'app',
+      sender_id: { open_id: 'ou_other_bot', app_id: 'cli_other_bot' },
+    },
+    message: {
+      message_id: messageId,
+      chat_id: 'oc_group',
+      chat_type: 'group',
+      message_type: 'interactive',
+      content: JSON.stringify(content),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
 function useTempCtiHome(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-test-'));
   process.env.CTI_HOME = dir;
+  process.env.CTI_MEMORY_REPO_DIR = path.join(dir, 'memory-repo');
+  fs.mkdirSync(path.join(dir, 'memory-repo', 'data', 'im', 'feishu', 'stickers'), { recursive: true });
   return dir;
+}
+
+function getTestFeishuStickerStorePath(ctiHome = process.env.CTI_HOME!): string {
+  return path.join(ctiHome, 'memory-repo', 'data', 'im', 'feishu', 'stickers', 'stickers.json');
+}
+
+function writeTestStickerMedia(fileKey: string, data: Buffer): string {
+  const mediaDir = path.join(process.env.CTI_MEMORY_REPO_DIR!, 'data', 'im', 'feishu', 'stickers', 'media');
+  fs.mkdirSync(mediaDir, { recursive: true });
+  const mediaPath = path.join(mediaDir, MemoryArtifactStore.stableFileName(fileKey, '.png'));
+  fs.writeFileSync(mediaPath, data);
+  return mediaPath;
 }
 
 describe('FeishuAdapter authorization', () => {
@@ -109,6 +141,25 @@ describe('FeishuAdapter mention detection fallback', () => {
     const mentioned = adapter.isBotMentionedFromMessage({
       content: JSON.stringify({
         text: '<at user_id="ou_bot">Codex</at> 帮我看一下',
+      }),
+      mentions: undefined,
+    });
+
+    assert.equal(mentioned, true);
+  });
+
+  it('detects bot mention from interactive card markdown when mentions array is missing', () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+
+    const mentioned = adapter.isBotMentionedFromMessage({
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '<at id="ou_bot"></at> 帮我看一下' },
+          ],
+        },
       }),
       mentions: undefined,
     });
@@ -283,6 +334,291 @@ describe('FeishuAdapter bot name wake classification', () => {
     assert.equal((queued[0] as any).text, '请继续检查这个问题');
     assert.equal((queued[0] as any).raw?.feishuSender?.senderType, 'app');
     assert.equal((queued[0] as any).raw?.feishuBotToBot?.senderType, 'app');
+  });
+
+  it('allows actionable interactive cards from another Feishu bot when they mention the current bot', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuInteractiveEvent('om_bot_card_mention', {
+      schema: '2.0',
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: '<at id="ou_current_bot"></at> 跟乔治说句话，尽量发普通文本，别发卡片。',
+          },
+          { tag: 'markdown', content: '已完成 · 3.4s' },
+        ],
+      },
+    });
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).text, '跟乔治说句话，尽量发普通文本，别发卡片。 已完成 · 3.4s');
+    assert.equal((queued[0] as any).raw?.feishuSender?.senderType, 'app');
+    assert.equal((queued[0] as any).raw?.feishuBotToBot?.senderType, 'app');
+  });
+
+  it('passes interactive card image resources to the agent when Feishu only returns an upgrade placeholder', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => ({
+            getReadableStream: () => Readable.from([Buffer.from('card-image')]),
+          }),
+        },
+      },
+    };
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuInteractiveEvent('om_bot_card_image', {
+      title: null,
+      elements: [[
+        { tag: 'img', image_key: 'img_card_preview' },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      ]],
+    }) as any;
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.doesNotMatch((queued[0] as any).text, /请升级/);
+    assert.match((queued[0] as any).text, /卡片正文未随事件返回/);
+    assert.equal((queued[0] as any).attachments?.length, 1);
+    assert.equal((queued[0] as any).attachments?.[0]?.name, 'img_card_preview.png');
+    assert.deepEqual((queued[0] as any).raw?.feishuInteractiveCard?.imageKeys, ['img_card_preview']);
+    assert.equal((queued[0] as any).raw?.feishuInteractiveCard?.downloadedAttachmentCount, 1);
+  });
+
+  it('keeps a readable card boundary when interactive card image resources cannot be downloaded', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => {
+            throw new Error('resource not available');
+          },
+        },
+      },
+    };
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuInteractiveEvent('om_bot_card_image_failed', {
+      title: null,
+      elements: [[
+        { tag: 'img', image_key: 'img_card_preview' },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      ]],
+    }) as any;
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.doesNotMatch((queued[0] as any).text, /请升级/);
+    assert.match((queued[0] as any).text, /卡片正文未随事件返回/);
+    assert.match((queued[0] as any).text, /图片资源暂时下载失败/);
+    assert.equal((queued[0] as any).attachments?.length ?? 0, 0);
+    assert.deepEqual((queued[0] as any).raw?.feishuInteractiveCard?.imageKeys, ['img_card_preview']);
+    assert.equal((queued[0] as any).raw?.feishuInteractiveCard?.downloadedAttachmentCount, 0);
+  });
+
+  it('records Feishu resource API errors when another app card image cannot be downloaded', async () => {
+    setupContext({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+      bridge_feishu_app_id: 'cli_current_bot',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const originalFetch = globalThis.fetch;
+    const calledUrls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calledUrls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/messages/om_bot_card_cross_app/resources/img_cross_app_preview')) {
+        return new Response(JSON.stringify({ code: 14005, msg: 'Resource Has Been Deleted' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/images/img_cross_app_preview')) {
+        return new Response(JSON.stringify({ code: 234008, msg: 'The app is not the resource sender.' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.botIds.add('ou_current_bot');
+      adapter.resolveChatDisplayName = async () => '群聊';
+      adapter.persistChatIndex = () => {};
+      adapter.syncIndexedChatHistory = async () => {};
+      adapter.restClient = {
+        im: {
+          messageResource: {
+            get: async () => {
+              const error: Record<string, unknown> = {
+                code: 14005,
+                msg: 'Resource Has Been Deleted',
+              };
+              error.self = error;
+              throw error;
+            },
+          },
+        },
+      };
+      const queued: unknown[] = [];
+      adapter.enqueue = (message: unknown) => queued.push(message);
+      const event = createFeishuInteractiveEvent('om_bot_card_cross_app', {
+        elements: [[
+          { tag: 'img', image_key: 'img_cross_app_preview' },
+          { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+        ]],
+      }) as any;
+      event.message.mentions = [
+        { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+      ];
+
+      await adapter.processIncomingEvent(event);
+
+      assert.equal(queued.length, 1);
+      assert.match((queued[0] as any).text, /卡片正文未随事件返回/);
+      assert.match((queued[0] as any).text, /图片资源暂时下载失败/);
+      assert.doesNotMatch((queued[0] as any).text, /Resource Has Been Deleted/);
+      assert.doesNotMatch((queued[0] as any).text, /The app is not the resource sender/);
+      assert.equal((queued[0] as any).attachments?.length ?? 0, 0);
+      assert.ok(calledUrls.some((item) => item.includes('/messages/om_bot_card_cross_app/resources/img_cross_app_preview')));
+      assert.ok(calledUrls.some((item) => item.includes('/images/img_cross_app_preview')));
+      const failures = (queued[0] as any).raw?.feishuInteractiveCard?.resourceDownloadFailures;
+      assert.equal(failures?.[0]?.code, 14005);
+      assert.equal(failures?.[0]?.msg, 'Resource Has Been Deleted');
+      assert.equal(failures?.[1]?.code, 234008);
+      assert.equal(failures?.[1]?.msg, 'The app is not the resource sender.');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('parses escaped interactive body content before building the agent evidence', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    adapter.resolveChatDisplayName = async () => '群聊';
+    adapter.persistChatIndex = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => {
+            throw new Error('resource not available');
+          },
+        },
+      },
+    };
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const nestedCard = {
+      title: '表情回复',
+      elements: [[
+        { tag: 'markdown', content: '真正正文：请三个机器人各回一句确认。' },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '查看详情' },
+          value: { trace: 'not user visible' },
+        },
+        { tag: 'img', image_key: 'img_nested_preview', alt: { tag: 'plain_text', content: '图片说明：疑惑表情' } },
+        { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+      ]],
+      summary: { content: '机器人确认请求' },
+    };
+    const event = createFeishuInteractiveEvent('om_bot_card_nested_body', {
+      body: {
+        content: JSON.stringify(nestedCard),
+      },
+    }) as any;
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.match((queued[0] as any).text, /表情回复/);
+    assert.match((queued[0] as any).text, /真正正文：请三个机器人各回一句确认/);
+    assert.match((queued[0] as any).text, /查看详情/);
+    assert.match((queued[0] as any).text, /机器人确认请求/);
+    assert.match((queued[0] as any).text, /图片说明：疑惑表情/);
+    assert.doesNotMatch((queued[0] as any).text, /\{\"title\"/);
+    assert.doesNotMatch((queued[0] as any).text, /请升级/);
+    assert.deepEqual((queued[0] as any).raw?.feishuInteractiveCard?.imageKeys, ['img_nested_preview']);
+    assert.match((queued[0] as any).raw?.feishuInteractiveCard?.visibleText, /真正正文/);
+    assert.match((queued[0] as any).raw?.feishuInteractiveCard?.rawPreview, /body/);
   });
 
   it('drops native mentions from bot senders after the bot-to-bot loop budget is exhausted', async () => {
@@ -670,6 +1006,28 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(resolved.mentions, undefined);
   });
 
+  it('inspects unresolved mention targets with related group member candidates', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return [
+        { userId: 'ou_liudan', name: '刘丹', aliases: ['刘丹'] },
+        { userId: 'ou_liudan_bot', name: '刘丹助手', aliases: ['刘丹机器人'] },
+      ];
+    };
+
+    const inspection = await adapter.inspectOutboundMentionTarget({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@刘丹起床',
+      parseMode: 'Markdown',
+    }, undefined, '刘丹起床');
+
+    assert.equal(inspection.status, 'ambiguous');
+    assert.deepEqual(inspection.candidates.map((item: any) => item.name), ['刘丹']);
+    assert.ok(inspection.searchedSources.some((item: string) => item.includes('群成员')));
+    assert.ok(inspection.searchedSources.some((item: string) => item.includes('群机器人')));
+  });
+
   it('resolves at-name text from verified Feishu history mention ids when chat members omit the bot', async () => {
     const adapter = new FeishuAdapter() as any;
     const home = useTempCtiHome();
@@ -775,6 +1133,54 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(JSON.parse(sent[0].data.content).text, '暗号是 12345');
   });
 
+  it('sends direct messages to the current group sender when target is me and member lookup is unavailable', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: any[] = [];
+    adapter.fetchChatMemberNames = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return new Map();
+    };
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload);
+            return { data: { message_id: 'om_direct_me' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.sendDirectMessage({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: {
+          channelType: 'feishu',
+          chatId: 'oc_group',
+          userId: 'ou_sender',
+          displayName: '项目群',
+          chatType: 'group',
+        },
+        text: '小虾米，给我私发一句测试',
+        timestamp: Date.now(),
+        raw: {
+          feishuSender: { openId: 'ou_sender', senderType: 'user' },
+        },
+      },
+      targetText: '我',
+      text: '测试消息',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.messageId, 'om_direct_me');
+    assert.equal(result.targetDisplayName, '发起人');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].params.receive_id_type, 'open_id');
+    assert.equal(sent[0].data.receive_id, 'ou_sender');
+    assert.equal(sent[0].data.msg_type, 'text');
+    assert.equal(JSON.parse(sent[0].data.content).text, '测试消息');
+  });
+
   it('does not send direct messages when a display name resolves to multiple users', async () => {
     const adapter = new FeishuAdapter() as any;
     const sent: any[] = [];
@@ -807,6 +1213,106 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(result.ok, false);
     assert.match(result.error || '', /无法确认目标|not resolve/i);
     assert.equal(sent.length, 0);
+  });
+
+  it('resolves cross-chat targets from known Feishu channel bindings', async () => {
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: {
+        ...createMockStore(),
+        listChannelBindings: (channelType?: string) => channelType === 'feishu' || !channelType
+          ? [
+            {
+              id: 'binding_target',
+              channelType: 'feishu',
+              chatId: 'oc_target_group',
+              displayName: '项目讨论群',
+              chatType: 'group',
+              codepilotSessionId: 'session_target',
+              sdkSessionId: '',
+              workingDirectory: process.cwd(),
+              model: '',
+              mode: 'code',
+              active: true,
+              createdAt: '2026-07-10T00:00:00.000Z',
+              updatedAt: '2026-07-10T00:00:00.000Z',
+            },
+          ] as any
+          : [],
+      } as unknown as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+
+    const byId = await adapter.resolveConversationTarget({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: { channelType: 'feishu', chatId: 'oc_source', userId: 'ou_owner', chatType: 'group' },
+        text: '发到会话 oc_target_group',
+        timestamp: Date.now(),
+      },
+      targetId: 'oc_target_group',
+      targetKind: 'chat',
+    });
+    const byName = await adapter.resolveConversationTarget({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: { channelType: 'feishu', chatId: 'oc_source', userId: 'ou_owner', chatType: 'group' },
+        text: '发到项目讨论群',
+        timestamp: Date.now(),
+      },
+      targetText: '项目讨论群',
+      targetKind: 'chat',
+    });
+
+    assert.equal(byId.ok, true);
+    assert.equal(byId.target.displayName, '项目讨论群');
+    assert.equal(byId.target.id, 'oc_target_group');
+    assert.equal(byId.target.kind, 'chat');
+    assert.equal(byName.ok, true);
+    assert.equal(byName.target.id, 'oc_target_group');
+  });
+
+  it('sends cross-chat messages by chat_id without using the source chat id', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sent: any[] = [];
+    adapter.restClient = {
+      im: {
+        message: {
+          create: async (payload: any) => {
+            sent.push(payload);
+            return { data: { message_id: 'om_cross_chat' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.sendConversationMessage({
+      sourceMessage: {
+        messageId: 'om_source',
+        address: { channelType: 'feishu', chatId: 'oc_source', userId: 'ou_owner', chatType: 'group' },
+        text: '发到会话 oc_target_group',
+        timestamp: Date.now(),
+      },
+      target: {
+        kind: 'chat',
+        id: 'oc_target_group',
+        displayName: '项目讨论群',
+        chatType: 'group',
+      },
+      text: '跨群正文',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.messageId, 'om_cross_chat');
+    assert.equal(result.targetDisplayName, '项目讨论群');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].params.receive_id_type, 'chat_id');
+    assert.equal(sent[0].data.receive_id, 'oc_target_group');
+    assert.equal(sent[0].data.msg_type, 'text');
+    assert.equal(JSON.parse(sent[0].data.content).text, '跨群正文');
   });
 });
 
@@ -856,6 +1362,189 @@ describe('FeishuAdapter light conversation context', () => {
     assert.match(context.prompt, /万能区域什么都能改小王分队/);
     assert.doesNotMatch(context.prompt, /@小虾米 你怎么看/);
   });
+
+  it('marks a likely nearby context message for short reply commands without native reply metadata', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (messageId: string, text: string, senderId: string, offset: number) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      sender: { id: senderId, sender_type: 'user' },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_su', '苏庆华'],
+      ['ou_liu', '刘丹'],
+    ]);
+    adapter.fetchMessageById = async () => null;
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', '@小虾米 回复一下', 'ou_liu', 0),
+      makeItem('om_question', '你后台连的 Codex 客户端还是 CLI？', 'ou_su', -1000),
+      makeItem('om_note', '那玩意是装在 Codex 里的', 'ou_liu', -4000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      null,
+      '回复一下',
+    );
+
+    assert.ok(context);
+    assert.equal(context.replyToMessageId, undefined);
+    assert.match(context.prompt, /可能关联上文/);
+    assert.match(context.prompt, /你后台连的 Codex 客户端还是 CLI/);
+    assert.doesNotMatch(context.prompt, /@小虾米 回复一下/);
+  });
+
+  it('keeps nearby bot messages and native mention signals for short deictic questions', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (messageId: string, text: string, senderId: string, senderType: string, offset: number) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      sender: { id: senderId, sender_type: senderType },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_liu', '刘丹'],
+      ['cli_other_bot', '大虾米'],
+    ]);
+    adapter.fetchMessageById = async () => null;
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', '@大虾米 @小虾米 他这是咋回事', 'ou_liu', 'user', 0),
+      makeItem('om_bot_result', '我重新查了一遍，还是没有“大世界分支”。', 'cli_other_bot', 'app', -1000),
+      makeItem('om_human_note', '显然他不想出来', 'ou_liu', 'user', -3000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      null,
+      '他这是咋回事',
+      [
+        { key: '@_user_1', name: '大虾米', id: { open_id: 'ou_big' } },
+        { key: '@_user_2', name: '小虾米', id: { open_id: 'ou_small' } },
+      ],
+    );
+
+    assert.ok(context);
+    assert.match(context.prompt, /Current message reference signals/);
+    assert.match(context.prompt, /native mentions in current message/);
+    assert.match(context.prompt, /大虾米/);
+    assert.match(context.prompt, /小虾米/);
+    assert.match(context.prompt, /可能关联上文/);
+    assert.match(context.prompt, /大世界分支/);
+  });
+
+  it('extracts visible interactive card text for short light context', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (
+      messageId: string,
+      msgType: string,
+      content: unknown,
+      senderId: string,
+      senderType: string,
+      offset: number,
+    ) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: msgType,
+      body: { content: typeof content === 'string' ? JSON.stringify({ text: content }) : JSON.stringify(content) },
+      sender: { id: senderId, sender_type: senderType },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_liu', '刘丹'],
+      ['cli_other_bot', '乔治'],
+    ]);
+    adapter.fetchMessageById = async () => null;
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', 'text', '@小虾米 这是什么情况', 'ou_liu', 'user', 0),
+      makeItem('om_card', 'interactive', {
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '构建失败：缺少飞书消息读取权限' },
+            { tag: 'markdown', content: '已完成 · 3.4s' },
+          ],
+        },
+      }, 'cli_other_bot', 'app', -1000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      null,
+      '这是什么情况',
+      [
+        { key: '@_user_1', name: '小虾米', id: { open_id: 'ou_small' } },
+      ],
+    );
+
+    assert.ok(context);
+    assert.match(context.prompt, /构建失败：缺少飞书消息读取权限/);
+    assert.doesNotMatch(context.prompt, /\[卡片消息\]/);
+  });
+
+  it('uses a card resource boundary instead of Feishu upgrade placeholder in short light context', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (
+      messageId: string,
+      msgType: string,
+      content: unknown,
+      senderId: string,
+      senderType: string,
+      offset: number,
+    ) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: msgType,
+      body: { content: typeof content === 'string' ? JSON.stringify({ text: content }) : JSON.stringify(content) },
+      sender: { id: senderId, sender_type: senderType },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_liu', '刘丹'],
+      ['cli_other_bot', '乔治'],
+    ]);
+    adapter.fetchMessageById = async () => null;
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', 'text', '@小虾米 这是什么情况', 'ou_liu', 'user', 0),
+      makeItem('om_card', 'interactive', {
+        title: null,
+        elements: [[
+          { tag: 'img', image_key: 'img_card_preview' },
+          { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+        ]],
+      }, 'cli_other_bot', 'app', -1000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      null,
+      '这是什么情况',
+      [
+        { key: '@_user_1', name: '小虾米', id: { open_id: 'ou_small' } },
+      ],
+    );
+
+    assert.ok(context);
+    assert.doesNotMatch(context.prompt, /请升级至最新版本客户端/);
+    assert.match(context.prompt, /卡片消息/);
+    assert.match(context.prompt, /图片资源/);
+  });
 });
 
 describe('FeishuAdapter history intent and bot event guards', () => {
@@ -886,7 +1575,7 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     assert.match(intent.scopeText, /本群最近消息/);
   });
 
-  it('ignores app interactive events so bot cards cannot trigger another LLM turn', async () => {
+  it('ignores app interactive events without a native mention so bot cards cannot trigger another LLM turn', async () => {
     const adapter = new FeishuAdapter() as any;
     const queued: unknown[] = [];
     adapter.enqueue = (message: unknown) => queued.push(message);
@@ -908,6 +1597,391 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     });
 
     assert.equal(queued.length, 0);
+  });
+
+  it('indexes escaped interactive card body as visible card evidence for history summaries', async () => {
+    const store = createMockStore() as any;
+    const upserts: Array<{ messages: Array<{ text: string; msgType: string }> }> = [];
+    store.getFeishuHistorySyncStatus = () => [];
+    store.upsertFeishuHistoryMessages = (data: { messages: Array<{ text: string; msgType: string }> }) => {
+      upserts.push(data);
+      return null;
+    };
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMemberNames = async () => new Map([['cli_other_bot', '乔治']]);
+    adapter.fetchMessagePage = async () => ({
+      items: [{
+        message_id: 'om_history_card',
+        chat_id: 'oc_group',
+        create_time: '1710000000000',
+        msg_type: 'interactive',
+        body: {
+          content: JSON.stringify({
+            body: {
+              content: JSON.stringify({
+                title: '表情回复',
+                elements: [[
+                  { tag: 'markdown', content: '真正正文：机器人确认请求' },
+                  { tag: 'button', text: { tag: 'plain_text', content: '查看详情' } },
+                  { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+                ]],
+              }),
+            },
+          }),
+        },
+        sender: { id: 'cli_other_bot', sender_type: 'app' },
+      }],
+      hasMore: false,
+      nextPageToken: '',
+    });
+
+    await adapter.syncIndexedChatHistory('oc_group', 'group', '群聊', true);
+
+    assert.equal(upserts.length, 1);
+    assert.equal(upserts[0].messages[0].msgType, 'interactive');
+    assert.match(upserts[0].messages[0].text, /表情回复/);
+    assert.match(upserts[0].messages[0].text, /真正正文：机器人确认请求/);
+    assert.match(upserts[0].messages[0].text, /查看详情/);
+    assert.doesNotMatch(upserts[0].messages[0].text, /\{\"title\"/);
+    assert.doesNotMatch(upserts[0].messages[0].text, /请升级/);
+  });
+
+  it('harvests sticker messages from indexed chat history into the sticker library', async () => {
+    const ctiHome = useTempCtiHome();
+    const store = createMockStore() as any;
+    const upserts: Array<{ messages: Array<{ text: string; msgType: string }> }> = [];
+    store.getFeishuHistorySyncStatus = () => [];
+    store.upsertFeishuHistoryMessages = (data: { messages: Array<{ text: string; msgType: string }> }) => {
+      upserts.push(data);
+      return null;
+    };
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    const downloaded: string[] = [];
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.downloadResource = async (_messageId: string, fileKey: string) => {
+      downloaded.push(fileKey);
+      return {
+        id: fileKey,
+        name: `${fileKey}.png`,
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from(fileKey).toString('base64'),
+      };
+    };
+    adapter.fetchMessagePage = async () => ({
+      items: [
+        {
+          message_id: 'om_history_sticker_1',
+          chat_id: 'oc_group',
+          create_time: '1710000000000',
+          msg_type: 'sticker',
+          body: { content: JSON.stringify({ file_key: 'sticker_history_1' }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        },
+        {
+          message_id: 'om_history_sticker_2',
+          chat_id: 'oc_group',
+          create_time: '1710000001000',
+          msg_type: 'sticker',
+          body: { content: JSON.stringify({ file_key: 'sticker_history_2' }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        },
+      ],
+      hasMore: false,
+      nextPageToken: '',
+    });
+
+    await adapter.syncIndexedChatHistory('oc_group', 'group', '群聊', true);
+
+    const stickerStore = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(ctiHome), 'utf8'));
+    assert.deepEqual(stickerStore.stickers.map((item: any) => item.fileKey).sort(), ['sticker_history_1', 'sticker_history_2']);
+    assert.deepEqual(downloaded.sort(), ['sticker_history_1', 'sticker_history_2']);
+    assert.ok(fs.existsSync(path.join(
+      ctiHome,
+      'memory-repo',
+      'data',
+      'im',
+      'feishu',
+      'stickers',
+      'media',
+      MemoryArtifactStore.stableFileName('sticker_history_1', '.png'),
+    )));
+    assert.equal(upserts.length, 1);
+    assert.equal(upserts[0].messages[0].msgType, 'sticker');
+    assert.match(upserts[0].messages[0].text, /飞书表情包/);
+  });
+
+  it('attaches harvested sticker library candidates for explicit sticker send requests', async () => {
+    useTempCtiHome();
+    const store = createMockStore({ bridge_feishu_bot_aliases: '小虾米' }) as any;
+    store.getFeishuHistorySyncStatus = () => [];
+    store.upsertFeishuHistoryMessages = () => null;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+    adapter.resolveChatDisplayName = async () => '群聊';
+    adapter.persistChatIndex = () => {};
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.downloadResource = async (_messageId: string, fileKey: string) => ({
+      id: fileKey,
+      name: `${fileKey}.png`,
+      type: 'image/png',
+      size: 4,
+      data: Buffer.from(fileKey).toString('base64'),
+    });
+    adapter.fetchMessagePage = async () => ({
+      items: [
+        {
+          message_id: 'om_history_sticker_1',
+          chat_id: 'oc_group',
+          create_time: '1710000000000',
+          msg_type: 'sticker',
+          body: { content: JSON.stringify({ file_key: 'sticker_praise_candidate' }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        },
+        {
+          message_id: 'om_history_sticker_2',
+          chat_id: 'oc_group',
+          create_time: '1710000001000',
+          msg_type: 'sticker',
+          body: { content: JSON.stringify({ file_key: 'sticker_confused_candidate' }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        },
+      ],
+      hasMore: false,
+      nextPageToken: '',
+    });
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: 'om_explicit_sticker_request',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@_user_1 发一个夸人的表情包' }),
+        create_time: String(Date.now()),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_bot' }, name: '小虾米' },
+        ],
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.ok(inbound);
+    assert.equal(inbound.attachments?.length, 2);
+    assert.deepEqual(
+      inbound.attachments?.map((item: any) => item.id).sort(),
+      ['sticker_confused_candidate', 'sticker_praise_candidate'],
+    );
+    assert.match((inbound.raw as any)?.feishuStickerLibraryContext?.prompt || '', /candidate sticker images/i);
+    assert.match((inbound.raw as any)?.feishuStickerLibraryContext?.prompt || '', /sticker_praise_candidate/);
+    assert.match((inbound.raw as any)?.feishuStickerLibraryContext?.prompt || '', /合适/);
+  });
+
+  it('backfills older indexed history pages before building sticker send candidates', async () => {
+    useTempCtiHome();
+    const store = createMockStore({ bridge_feishu_bot_aliases: '小虾米' }) as any;
+    store.getFeishuHistorySyncStatus = () => [{ latestMessageTime: '2000', messageCount: 2 }];
+    store.upsertFeishuHistoryMessages = () => null;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+    adapter.resolveChatDisplayName = async () => '群聊';
+    adapter.persistChatIndex = () => {};
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.downloadResource = async (_messageId: string, fileKey: string) => ({
+      id: fileKey,
+      name: `${fileKey}.png`,
+      type: 'image/png',
+      size: 4,
+      data: Buffer.from(fileKey).toString('base64'),
+    });
+    adapter.fetchMessagePage = async (_chatId: string, pageToken: string) => {
+      if (pageToken === 'older') {
+        return {
+          items: [{
+            message_id: 'om_older_sticker',
+            chat_id: 'oc_group',
+            create_time: '1000',
+            msg_type: 'sticker',
+            body: { content: JSON.stringify({ file_key: 'sticker_older_candidate' }) },
+            sender: { id: 'ou_sender', sender_type: 'user' },
+          }],
+          hasMore: false,
+          nextPageToken: '',
+        };
+      }
+      return {
+        items: [{
+          message_id: 'om_recent_text',
+          chat_id: 'oc_group',
+          create_time: '1500',
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: '旧文本' }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        }],
+        hasMore: true,
+        nextPageToken: 'older',
+      };
+    };
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: 'om_explicit_older_sticker_request',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@_user_1 发一个合适的表情包' }),
+        create_time: String(Date.now()),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_bot' }, name: '小虾米' },
+        ],
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.ok(inbound);
+    assert.deepEqual(inbound.attachments?.map((item: any) => item.id), ['sticker_older_candidate']);
+    assert.match((inbound.raw as any)?.feishuStickerLibraryContext?.prompt || '', /sticker_older_candidate/);
+  });
+
+  it('uses the sticker history backfill marker until the indexed history watermark changes', async () => {
+    const ctiHome = useTempCtiHome();
+    let latestMessageTime = '2000';
+    const store = createMockStore({ bridge_feishu_bot_aliases: '小虾米' }) as any;
+    store.getFeishuHistorySyncStatus = () => [{ latestMessageTime, messageCount: 2 }];
+    store.upsertFeishuHistoryMessages = () => null;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+    adapter.resolveChatDisplayName = async () => '群聊';
+    adapter.persistChatIndex = () => {};
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.downloadResource = async (_messageId: string, fileKey: string) => ({
+      id: fileKey,
+      name: `${fileKey}.png`,
+      type: 'image/png',
+      size: 4,
+      data: Buffer.from(fileKey).toString('base64'),
+    });
+    let fullSyncCalls = 0;
+    let activeSyncIsFull = false;
+    const originalSyncIndexedChatHistory = adapter.syncIndexedChatHistory.bind(adapter);
+    adapter.syncIndexedChatHistory = async (...args: any[]) => {
+      activeSyncIsFull = args[3] === true;
+      if (activeSyncIsFull) fullSyncCalls += 1;
+      try {
+        return await originalSyncIndexedChatHistory(...args);
+      } finally {
+        activeSyncIsFull = false;
+      }
+    };
+    let fetchPageCalls = 0;
+    adapter.fetchMessagePage = async () => {
+      fetchPageCalls += 1;
+      if (!activeSyncIsFull) {
+        return {
+          items: [{
+            message_id: `om_text_${fetchPageCalls}`,
+            chat_id: 'oc_group',
+            create_time: String(1000 + fetchPageCalls),
+            msg_type: 'text',
+            body: { content: JSON.stringify({ text: '普通聊天上下文' }) },
+            sender: { id: 'ou_sender', sender_type: 'user' },
+          }],
+          hasMore: false,
+          nextPageToken: '',
+        };
+      }
+      return {
+        items: [{
+          message_id: `om_sticker_${fetchPageCalls}`,
+          chat_id: 'oc_group',
+          create_time: String(1000 + fetchPageCalls),
+          msg_type: 'sticker',
+          body: { content: JSON.stringify({ file_key: `sticker_backfill_${fetchPageCalls}` }) },
+          sender: { id: 'ou_sender', sender_type: 'user' },
+        }],
+        hasMore: false,
+        nextPageToken: '',
+      };
+    };
+    const sendExplicitStickerRequest = (messageId: string) => adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: messageId,
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@_user_1 发一个合适的表情包' }),
+        create_time: String(Date.now()),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_bot' }, name: '小虾米' },
+        ],
+      },
+    });
+
+    await sendExplicitStickerRequest('om_explicit_backfill_once_1');
+    await adapter.consumeOne();
+    assert.equal(fullSyncCalls, 1);
+    let stickerStore = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(ctiHome), 'utf8'));
+    assert.equal(stickerStore.historyBackfills?.oc_group?.latestMessageTime, '2000');
+    assert.equal(stickerStore.historyBackfills?.oc_group?.candidateCount, 1);
+
+    await sendExplicitStickerRequest('om_explicit_backfill_once_2');
+    await adapter.consumeOne();
+    assert.equal(fullSyncCalls, 1);
+
+    latestMessageTime = '3000';
+    await sendExplicitStickerRequest('om_explicit_backfill_changed_3');
+    await adapter.consumeOne();
+    assert.equal(fullSyncCalls, 2);
+    stickerStore = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(ctiHome), 'utf8'));
+    assert.equal(stickerStore.historyBackfills?.oc_group?.latestMessageTime, '3000');
+    assert.equal(stickerStore.historyBackfills?.oc_group?.candidateCount, 2);
   });
 });
 
@@ -1086,7 +2160,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
   it('does not turn a final card bare sticker hint into an arbitrary unannotated sticker', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -1140,7 +2214,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
   it('finalizes unresolved sticker-only card replies as readable text instead of sending an arbitrary sticker', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -1194,7 +2268,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
   it('does not rotate bare sticker hints across unannotated Feishu stickers', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [
@@ -1252,7 +2326,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
   it('chooses the semantically best sticker for bare sticker hints with reply text', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [
@@ -1264,6 +2338,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           intent: '称赞、认可、夸奖',
           tone: 'positive',
           usage: '别人完成任务或做得很好时使用',
+          annotationSource: 'manual',
           firstSeenAt: '2026-06-06T06:00:00.000Z',
           lastSeenAt: '2026-06-06T06:10:00.000Z',
           useCount: 0,
@@ -1277,6 +2352,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           tone: 'playful skeptical',
           usage: '别人突然丢奇怪需求时接话',
           examples: ['这需求有点突然', '你这是要干嘛'],
+          annotationSource: 'manual',
           firstSeenAt: '2026-06-06T05:00:00.000Z',
           lastSeenAt: '2026-06-06T05:10:00.000Z',
           lastUsedAt: '2026-06-06T07:20:00.000Z',
@@ -1313,10 +2389,569 @@ describe('FeishuAdapter CardKit compatibility', () => {
     assert.equal(stickerContent.file_key, 'sticker_confused');
   });
 
+  it('uses an annotated sticker for a bare sticker hint even when the reply text is lightweight', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_unknown',
+          aliases: ['表情包'],
+          chatId: 'oc_group',
+          firstSeenAt: '2026-06-06T05:00:00.000Z',
+          lastSeenAt: '2026-06-06T05:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_welcome',
+          aliases: ['表情包', '来啦'],
+          chatId: 'oc_group',
+          label: '来啦',
+          intent: '轻松回应、打招呼、表示我来了',
+          tone: 'friendly playful',
+          usage: '用户让发个表情或轻松接话时使用',
+          annotationSource: 'manual',
+          annotationConfidence: 0.9,
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 来啦~',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    const stickerCall = calls.find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_welcome');
+  });
+
+  it('uses an annotated sticker for explicit generic light replies even without text overlap', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_unannotated_recent',
+          aliases: ['\u8868\u60c5\u5305'],
+          chatId: 'oc_group',
+          firstSeenAt: '2026-06-06T07:00:00.000Z',
+          lastSeenAt: '2026-06-06T07:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_generic_annotated',
+          aliases: ['\u8868\u60c5\u5305', 'hello'],
+          chatId: 'oc_group',
+          label: 'friendly wave',
+          intent: 'friendly greeting and casual acknowledgement',
+          tone: 'friendly playful',
+          usage: 'use for light chat and casual replies',
+          annotationSource: 'manual',
+          annotationConfidence: 0.86,
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_v1' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push({ kind: 'card.update', payload });
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push({ kind: 'message.reply', payload });
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_group', 'om_user');
+    const finalized = await adapter.finalizeCard('oc_group', 'completed', '[\u8868\u60c5\u5305] \u6765\u5566\u6765\u5566~');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    const stickerCall = calls
+      .map((item) => item.payload as { data?: { content?: string; msg_type?: string } })
+      .find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_generic_annotated');
+  });
+
+  it('does not use a mismatched annotated fallback when the reply has a clear sticker meaning', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_mocking_clown',
+        aliases: ['表情包', '小丑'],
+        chatId: 'oc_group',
+        label: '小丑吐槽',
+        intent: '嘲讽、尴尬、反讽、整活',
+        tone: 'mocking sarcastic',
+        usage: '别人自嘲或吐槽离谱场面时使用',
+        annotationConfidence: 0.9,
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 真棒呀',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.ok(!calls.some((item) => item.data?.msg_type === 'sticker'));
+  });
+
+  it('does not let exact sticker file keys bypass trusted semantic records', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'file_v2_user_claim_only',
+          aliases: ['表情包', '真棒'],
+          chatId: 'oc_group',
+          label: '真棒',
+          intent: '用户口头说是真棒',
+          annotationSource: 'user',
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'file_v2_low_confidence',
+          aliases: ['表情包', '不确定'],
+          chatId: 'oc_group',
+          label: '不确定',
+          intent: '画面太模糊，无法确认语义',
+          annotationSource: 'vision',
+          annotationConfidence: 0.2,
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const userOnlyResult = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_user_claim_only] 不拿未核验解释乱发。',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+    const lowConfidenceResult = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_low_confidence] 看不清就先文字回复。',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(userOnlyResult.ok, true);
+    assert.equal(lowConfidenceResult.ok, true);
+    assert.ok(!calls.some((item) => item.data?.msg_type === 'sticker'));
+  });
+
+  it('does not auto-send legacy source-less sticker semantics without verification', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'file_v2_legacy_source_less',
+        aliases: ['表情包', '真棒'],
+        chatId: 'oc_group',
+        label: '真棒',
+        intent: '表示真棒、点赞',
+        tone: 'positive playful',
+        usage: '夸人时使用',
+        annotationConfidence: 0.9,
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_legacy_source_less] 这个旧语义没有来源，先不自动发。',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.ok(!calls.some((item) => item.data?.msg_type === 'sticker'));
+  });
+
+  it('does not auto-send vision sticker semantics when confidence is missing', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'file_v2_vision_without_confidence',
+        aliases: ['表情包', '轻松'],
+        chatId: 'oc_group',
+        label: '轻松表情',
+        intent: '轻松回应',
+        tone: 'casual',
+        usage: '轻松接话时使用',
+        annotationSource: 'vision',
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_group');
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_vision_without_confidence] 缺置信度不自动发。',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.match(prompt, /No semantically annotated stickers are available/);
+    assert.equal(result.ok, true);
+    assert.ok(!calls.some((item) => item.data?.msg_type === 'sticker'));
+  });
+
+  it('does not auto-send stored sticker semantics that are only generic words', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'file_v2_generic_words',
+        aliases: ['表情包'],
+        chatId: 'oc_group',
+        label: '表情包',
+        description: '一张表情包',
+        intent: '发个表情包',
+        usage: '用于回复聊天',
+        annotationSource: 'manual',
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_group');
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_generic_words] 泛泛语义不自动发。',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.match(prompt, /No semantically annotated stickers are available/);
+    assert.equal(result.ok, true);
+    assert.ok(!calls.some((item) => item.data?.msg_type === 'sticker'));
+  });
+
+  it('allows exact sticker file keys only after trusted visual or manual semantics exist', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'file_v2_trusted_sticker',
+        aliases: ['表情包', '来啦'],
+        chatId: 'oc_group',
+        label: '轻松出现',
+        intent: '轻松回应、打招呼、表示我来了',
+        tone: 'friendly playful',
+        usage: '用户让随便发个表情包或轻松接话时使用',
+        annotationSource: 'vision',
+        annotationConfidence: 0.82,
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:file_v2_trusted_sticker] 来啦~',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    const stickerCall = calls.find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'file_v2_trusted_sticker');
+  });
+
+  it('falls back to direct chat sticker send when reply-scoped sticker send fails during card finalization', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_generic_annotated',
+        aliases: ['表情包', 'hello'],
+        chatId: 'oc_group',
+        label: 'friendly wave',
+        intent: 'friendly greeting and casual acknowledgement',
+        tone: 'friendly playful',
+        usage: 'use for light chat and casual replies',
+        annotationSource: 'manual',
+        annotationConfidence: 0.86,
+        firstSeenAt: '2026-06-06T06:00:00.000Z',
+        lastSeenAt: '2026-06-06T06:10:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_v1' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push({ kind: 'card.update', payload });
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push({ kind: 'message.reply', payload });
+            if ((payload as { data?: { msg_type?: string } })?.data?.msg_type !== 'sticker') {
+              return { data: { message_id: 'om_card' } };
+            }
+            throw Object.assign(new Error('reply sticker not accepted'), { code: 230001 });
+          },
+          create: async (payload: unknown) => {
+            calls.push({ kind: 'message.create', payload });
+            return { data: { message_id: 'om_sticker_direct' } };
+          },
+        },
+      },
+    };
+
+    const created = await adapter._doCreateStreamingCard('oc_group', 'om_user');
+    const finalized = await adapter.finalizeCard('oc_group', 'completed', '[表情包] 好呀，给你一个~');
+
+    assert.equal(created, true);
+    assert.equal(finalized, true);
+    const replyStickerCall = calls.find((item) =>
+      item.kind === 'message.reply' && item.payload?.data?.msg_type === 'sticker'
+    );
+    assert.equal(replyStickerCall?.payload?.data?.msg_type, 'sticker');
+    const directStickerCall = calls.find((item) => item.kind === 'message.create');
+    assert.equal(directStickerCall?.payload?.data?.receive_id, 'oc_group');
+    assert.equal(directStickerCall?.payload?.data?.msg_type, 'sticker');
+    const stickerContent = JSON.parse(String(directStickerCall?.payload?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_generic_annotated');
+  });
+
+  it('matches colloquial Chinese particles before falling back to generic annotated stickers', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [
+        {
+          fileKey: 'sticker_high_confidence_party',
+          aliases: ['表情包', '开心', '应援'],
+          chatId: 'oc_group',
+          label: '开心应援',
+          intent: '表达开心、加油、庆祝、赞同或活跃气氛',
+          tone: '兴奋、可爱、热闹',
+          usage: '对方完成好事、需要鼓励、想活跃气氛或表达支持时使用',
+          annotationSource: 'vision',
+          annotationConfidence: 0.95,
+          firstSeenAt: '2026-06-06T06:00:00.000Z',
+          lastSeenAt: '2026-06-06T06:10:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_arrived_wave',
+          aliases: ['表情包', '挥手', '打招呼', '我来了'],
+          chatId: 'oc_group',
+          label: '挥手打招呼',
+          intent: '打招呼、表示我来了、轻松回应或缓和气氛',
+          tone: '可爱、友好、轻松',
+          usage: '开场问候、轻松接话、表示收到或弱弱出现时使用',
+          annotationSource: 'vision',
+          annotationConfidence: 0.78,
+          firstSeenAt: '2026-06-06T05:00:00.000Z',
+          lastSeenAt: '2026-06-06T05:10:00.000Z',
+          useCount: 0,
+        },
+      ],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(payload);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包] 来啦来啦~',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    const stickerCall = calls.find((item) => item.data?.msg_type === 'sticker');
+    const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
+    assert.equal(stickerContent.file_key, 'sticker_arrived_wave');
+  });
+
   it('excludes disabled and avoidWhen-matched stickers from bare hint selection', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [
@@ -1327,6 +2962,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           label: '疑惑',
           intent: '疑惑、吐槽',
           usage: '别人突然丢需求时',
+          annotationSource: 'manual',
           disabled: true,
           disabledReason: '误学语义',
           firstSeenAt: '2026-06-06T05:00:00.000Z',
@@ -1341,6 +2977,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           intent: '吐槽奇怪需求',
           usage: '别人突然丢需求时',
           avoidWhen: '正式确认',
+          annotationSource: 'manual',
           firstSeenAt: '2026-06-06T05:00:00.000Z',
           lastSeenAt: '2026-06-06T05:10:00.000Z',
           useCount: 0,
@@ -1352,6 +2989,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           label: '确认',
           intent: '确认、收到',
           usage: '轻量确认时',
+          annotationSource: 'manual',
           firstSeenAt: '2026-06-06T04:00:00.000Z',
           lastSeenAt: '2026-06-06T04:10:00.000Z',
           useCount: 3,
@@ -1392,7 +3030,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
   it('does not send an arbitrary sticker when a final card requests an unknown sticker alias', async () => {
     const ctiHome = useTempCtiHome();
     fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(ctiHome, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -1519,11 +3157,13 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.equal((inbound?.raw as any)?.sticker?.known, false);
     assert.equal(inbound?.messageKind, 'feishu_sticker_unknown');
     assert.equal((inbound?.raw as any)?.messageKind, 'feishu_sticker_unknown');
-    const store = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), 'utf8'));
+    const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
     assert.equal(store.stickers[0].fileKey, 'sticker_file_key');
   });
 
-  it('downloads sticker resources as image attachments before falling back to semantic profiles', async () => {
+  it('downloads missing sticker media once into memory and reuses it as image context', async () => {
+    let downloadCount = 0;
+    const mediaData = Buffer.from('downloaded-sticker-image');
     const adapter = new FeishuAdapter() as any;
     adapter.resolveChatDisplayName = async () => '私聊';
     adapter.persistChatIndex = () => {};
@@ -1532,9 +3172,13 @@ describe('FeishuAdapter sticker inbound', () => {
     adapter.restClient = {
       im: {
         messageResource: {
-          get: async () => ({
-            getReadableStream: () => Readable.from([Buffer.from([0x89, 0x50, 0x4e, 0x47])]),
-          }),
+          get: async (payload: any) => {
+            downloadCount += 1;
+            assert.equal(payload.params.type, 'image');
+            return {
+              getReadableStream: () => Readable.from([mediaData]),
+            };
+          },
         },
       },
     };
@@ -1556,17 +3200,258 @@ describe('FeishuAdapter sticker inbound', () => {
 
     const inbound = await adapter.consumeOne();
     assert.ok(inbound);
+    assert.equal(downloadCount, 1);
     assert.equal(inbound?.messageKind, 'feishu_sticker_image');
     assert.equal((inbound?.raw as any)?.sticker?.imageAvailable, true);
-    assert.match(inbound?.text || '', /图片已作为本轮图片附件提供给模型/);
-    assert.equal(inbound?.attachments?.length, 1);
     assert.equal(inbound?.attachments?.[0]?.type, 'image/png');
-    assert.match(inbound?.attachments?.[0]?.name || '', /^sticker-sticker_file_key\.png$/);
+    assert.equal(inbound?.attachments?.[0]?.data, mediaData.toString('base64'));
+
+    const mediaPath = path.join(
+      process.env.CTI_MEMORY_REPO_DIR!,
+      'data',
+      'im',
+      'feishu',
+      'stickers',
+      'media',
+      MemoryArtifactStore.stableFileName('sticker_file_key', '.png'),
+    );
+    assert.equal(fs.readFileSync(mediaPath).toString('utf8'), mediaData.toString('utf8'));
+
+    adapter.restClient.im.messageResource.get = async () => {
+      throw new Error('cached sticker media should be reused');
+    };
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_sticker_again',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: '1710000001000',
+      },
+    });
+    const second = await adapter.consumeOne();
+    assert.equal(second?.messageKind, 'feishu_sticker_image');
+    assert.equal(second?.attachments?.[0]?.data, mediaData.toString('base64'));
+  });
+
+  it('does not repeatedly retry sticker media downloads after Feishu rejects the resource', async () => {
+    let downloadCount = 0;
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => {
+            downloadCount += 1;
+            throw new Error('Feishu rejected sticker resource');
+          },
+        },
+      },
+    };
+
+    const createStickerEvent = (messageId: string) => ({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: messageId,
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: '1710000000000',
+      },
+    });
+
+    await adapter.processIncomingEvent(createStickerEvent('om_sticker_1'));
+    await adapter.processIncomingEvent(createStickerEvent('om_sticker_2'));
+
+    const first = await adapter.consumeOne();
+    const second = await adapter.consumeOne();
+    assert.equal(downloadCount, 1);
+    assert.equal(first?.messageKind, 'feishu_sticker_unknown');
+    assert.equal(second?.messageKind, 'feishu_sticker_unknown');
+    assert.equal(first?.attachments?.length || 0, 0);
+    assert.equal(second?.attachments?.length || 0, 0);
+    const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
+    assert.match(store.stickers[0].mediaDownloadFailedAt, /^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('uses stored memory sticker media as image attachments', async () => {
+    const mediaData = Buffer.from('stored-sticker-image');
+    writeTestStickerMedia('sticker_file_key', mediaData);
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => {
+            throw new Error('sticker resources should come from memory media');
+          },
+        },
+      },
+    };
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: 'om_sticker_file_fallback',
+        chat_id: 'oc_p2p',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: String(Date.now()),
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.equal(inbound?.messageKind, 'feishu_sticker_image');
+    assert.match(inbound?.text || '', /记忆仓库中已有该表情包图片/);
+    assert.equal(inbound?.attachments?.[0]?.type, 'image/png');
+    assert.equal(inbound?.attachments?.[0]?.data, mediaData.toString('base64'));
+  });
+
+  it('routes group sticker replies to known bot outbound messages without a fresh mention', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_group_policy: 'open',
+    }) as unknown as BridgeStore & {
+      listOutboundRefs: BridgeStore['listOutboundRefs'];
+    };
+    store.listOutboundRefs = (filter = {}) => {
+      if (
+        filter.channelType === 'feishu'
+        && filter.chatId === 'oc_group'
+        && filter.platformMessageId === 'om_bot_reply'
+      ) {
+        return [{
+          channelType: 'feishu',
+          chatId: 'oc_group',
+          codepilotSessionId: 'session_1',
+          platformMessageId: 'om_bot_reply',
+          purpose: 'reply',
+          messageKind: 'assistant',
+          createdAt: '2026-07-10T00:00:00.000Z',
+        }];
+      }
+      return [];
+    };
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '项目群';
+    adapter.persistChatIndex = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        message: {
+          get: async () => ({ data: { items: [] } }),
+        },
+        messageResource: {
+          get: async () => {
+            throw new Error('sticker media unavailable');
+          },
+        },
+      },
+    };
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: 'om_sticker_reply',
+        parent_id: 'om_bot_reply',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: String(Date.now()),
+      },
+    });
+
+    const inbound = await Promise.race([
+      adapter.consumeOne(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 50)),
+    ]);
+
+    assert.ok(inbound, 'sticker reply to a known bot message should enter the bridge queue');
+    assert.equal(inbound.messageKind, 'feishu_sticker_unknown');
+    assert.equal((inbound.raw as any)?.feishuReplyTo?.messageId, 'om_bot_reply');
+    assert.equal((inbound.raw as any)?.sticker?.fileKey, 'sticker_file_key');
+  });
+
+  it('reuses stored sticker media for repeated sticker file keys without Feishu downloads', async () => {
+    let downloadCount = 0;
+    writeTestStickerMedia('sticker_file_key', Buffer.from('cached-sticker-image'));
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '群聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        messageResource: {
+          get: async () => {
+            downloadCount += 1;
+            throw new Error('sticker resources should not be downloaded');
+          },
+        },
+      },
+    };
+
+    const createStickerEvent = (messageId: string) => ({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: messageId,
+        chat_id: 'oc_p2p',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: String(Date.now()),
+      },
+    });
+
+    await adapter.processIncomingEvent(createStickerEvent('om_sticker_1'));
+    await adapter.processIncomingEvent(createStickerEvent('om_sticker_2'));
+
+    const first = await adapter.consumeOne();
+    const second = await adapter.consumeOne();
+
+    assert.equal(downloadCount, 0);
+    assert.equal(first?.messageKind, 'feishu_sticker_image');
+    assert.equal(second?.messageKind, 'feishu_sticker_image');
+    assert.equal(first?.attachments?.[0]?.data, second?.attachments?.[0]?.data);
   });
 
   it('uses learned sticker semantics when a sticker file_key has a profile', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: '2026-06-04T00:00:00.000Z',
       stickers: [{
@@ -1576,6 +3461,7 @@ describe('FeishuAdapter sticker inbound', () => {
         description: '猫脸旁边带“干嘛……”文字',
         intent: '表达疑惑、询问对方要做什么',
         tone: '轻松、吐槽',
+        annotationSource: 'manual',
         firstSeenAt: '2026-06-04T00:00:00.000Z',
         lastSeenAt: '2026-06-04T00:00:00.000Z',
         useCount: 0,
@@ -1614,9 +3500,55 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.equal((inbound?.raw as any)?.sticker?.intent, '表达疑惑、询问对方要做什么');
   });
 
+  it('treats source-less sticker profiles as unverified inbound evidence', async () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-06-04T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['疑问猫'],
+        label: '疑问猫',
+        description: '猫脸旁边带“干嘛……”文字',
+        intent: '表达疑惑、询问对方要做什么',
+        tone: '轻松、吐槽',
+        firstSeenAt: '2026-06-04T00:00:00.000Z',
+        lastSeenAt: '2026-06-04T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_sticker',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_file_key' }),
+        create_time: '1710000000000',
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.ok(inbound);
+    assert.equal(inbound?.messageKind, 'feishu_sticker_unknown');
+    assert.equal((inbound?.raw as any)?.sticker?.known, false);
+    assert.match(inbound?.text || '', /待核验/);
+    assert.doesNotMatch(inbound?.text || '', /已记录语义的飞书表情包/);
+  });
+
   it('drops mojibake sticker profile fields instead of injecting unsafe semantics', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: '2026-06-04T00:00:00.000Z',
       stickers: [{
@@ -1659,7 +3591,7 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.doesNotMatch(inbound?.text || '', /\?\?\?|鐤戦棶|鐚劯/);
   });
 
-  it('learns sticker semantics from a user explanation replying to the sticker', async () => {
+  it('stores sticker semantics from a user explanation as unverified evidence', async () => {
     const adapter = new FeishuAdapter() as any;
     adapter.resolveChatDisplayName = async () => '私聊';
     adapter.persistChatIndex = () => {};
@@ -1699,10 +3631,13 @@ describe('FeishuAdapter sticker inbound', () => {
     });
     await adapter.consumeOne();
 
-    const store = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), 'utf8'));
+    const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
     assert.equal(store.stickers[0].fileKey, 'sticker_file_key');
-    assert.equal(store.stickers[0].description, '疑惑、问对方干嘛');
-    assert.equal(store.stickers[0].intent, '疑惑、问对方干嘛');
+    assert.equal(store.stickers[0].annotationSource, 'user');
+    assert.equal(store.stickers[0].description, undefined);
+    assert.equal(store.stickers[0].intent, undefined);
+    assert.equal(store.stickers[0].userAnnotation.description, '疑惑、问对方干嘛');
+    assert.equal(store.stickers[0].userAnnotation.intent, '疑惑、问对方干嘛');
 
     await adapter.processIncomingEvent({
       sender: {
@@ -1720,8 +3655,143 @@ describe('FeishuAdapter sticker inbound', () => {
     });
 
     const inbound = await adapter.consumeOne();
-    assert.match(inbound?.text || '', /已记录语义的飞书表情包/);
-    assert.match(inbound?.text || '', /通常意图：疑惑、问对方干嘛/);
+    assert.match(inbound?.text || '', /尚未标注语义的飞书表情包/);
+    assert.doesNotMatch(inbound?.text || '', /通常意图：疑惑、问对方干嘛/);
+  });
+
+  it('keeps user sticker explanations as evidence and asks the agent to inspect cached media', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    writeTestStickerMedia('sticker_file_key', Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-07-10T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['最近', '默认', '表情包'],
+        chatId: 'oc_chat',
+        userId: 'ou_user',
+        messageId: 'om_sticker',
+        mediaCachedAt: '2026-07-10T00:00:00.000Z',
+        firstSeenAt: '2026-07-10T00:00:00.000Z',
+        lastSeenAt: '2026-07-10T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_annotation',
+        parent_id: 'om_sticker',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'text',
+        content: JSON.stringify({ text: '这个表情包表示真棒' }),
+        create_time: '1710000001000',
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
+    assert.equal(store.stickers[0].intent, undefined);
+    assert.equal(store.stickers[0].userAnnotation.intent, '真棒');
+    assert.equal(store.stickers[0].annotationSource, 'user');
+    assert.equal(inbound?.messageKind, 'feishu_sticker_image');
+    assert.equal(inbound?.attachments?.length, 1);
+    assert.match(inbound?.text || '', /用户说法/);
+    assert.match(inbound?.text || '', /以图片内容为主/);
+    assert.equal((inbound?.raw as any)?.sticker?.fileKey, 'sticker_file_key');
+    assert.equal((inbound?.raw as any)?.sticker?.imageAvailable, true);
+    assert.equal((inbound?.raw as any)?.sticker?.userAnnotation?.intent, '真棒');
+  });
+
+  it('does not present user-only sticker annotations as trusted sendable semantics', () => {
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-07-10T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'sticker_file_key',
+        aliases: ['真棒'],
+        label: '真棒',
+        description: '用户说这是表示真棒的表情包',
+        intent: '真棒',
+        annotationSource: 'user',
+        chatId: 'oc_chat',
+        firstSeenAt: '2026-07-10T00:00:00.000Z',
+        lastSeenAt: '2026-07-10T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_chat');
+
+    assert.match(prompt, /No semantically annotated stickers are available/);
+    assert.doesNotMatch(prompt, /真棒/);
+    assert.doesNotMatch(prompt, /\[表情包:真棒\]/);
+  });
+
+  it('downgrades legacy text-taught sticker records to user evidence', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    writeTestStickerMedia('legacy_sticker_file_key', Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
+      version: 1,
+      updatedAt: '2026-07-10T00:00:00.000Z',
+      stickers: [{
+        fileKey: 'legacy_sticker_file_key',
+        aliases: ['最近', '默认', '表情包', '真棒的意思'],
+        label: '真棒的意思',
+        description: '真棒的意思',
+        intent: '真棒的意思',
+        tone: '真棒的意思',
+        annotationConfidence: 0.72,
+        chatId: 'oc_chat',
+        userId: 'ou_user',
+        messageId: 'om_original_sticker',
+        learnedFromMessageId: 'om_user_claim',
+        mediaCachedAt: '2026-07-10T00:00:00.000Z',
+        firstSeenAt: '2026-07-10T00:00:00.000Z',
+        lastSeenAt: '2026-07-10T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+
+    const prompt = adapter.getStickerPresentationPrompt('oc_chat');
+    assert.match(prompt, /No semantically annotated stickers are available/);
+    assert.doesNotMatch(prompt, /真棒/);
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user' },
+      },
+      message: {
+        message_id: 'om_sticker_again',
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'legacy_sticker_file_key' }),
+        create_time: '1710000002000',
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.equal(inbound?.messageKind, 'feishu_sticker_image');
+    assert.equal(inbound?.attachments?.length, 1);
+    assert.match(inbound?.text || '', /用户曾提供待核验说法：真棒的意思/);
+    assert.match(inbound?.text || '', /用图片内容交叉核验/);
+    assert.doesNotMatch(inbound?.text || '', /已有语义档案可作为参考：历史名称：真棒/);
   });
 
   it('stores sticker usage guidance from a user explanation', async () => {
@@ -1764,16 +3834,19 @@ describe('FeishuAdapter sticker inbound', () => {
     });
     await adapter.consumeOne();
 
-    const store = JSON.parse(fs.readFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), 'utf8'));
-    assert.equal(store.stickers[0].label, '干嘛猫');
-    assert.equal(store.stickers[0].intent, '疑惑');
-    assert.equal(store.stickers[0].usage, '别人突然丢奇怪需求时吐槽用');
-    assert.ok(store.stickers[0].aliases.includes('干嘛猫'));
+    const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
+    assert.equal(store.stickers[0].annotationSource, 'user');
+    assert.equal(store.stickers[0].label, undefined);
+    assert.equal(store.stickers[0].intent, undefined);
+    assert.equal(store.stickers[0].usage, undefined);
+    assert.equal(store.stickers[0].userAnnotation.label, '干嘛猫');
+    assert.equal(store.stickers[0].userAnnotation.intent, '疑惑');
+    assert.equal(store.stickers[0].userAnnotation.usage, '别人突然丢奇怪需求时吐槽用');
   });
 
   it('builds a sticker presentation prompt from learned meanings and usage', () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: '2026-06-05T00:00:00.000Z',
       stickers: [{
@@ -1784,6 +3857,7 @@ describe('FeishuAdapter sticker inbound', () => {
         intent: '表达疑惑或轻微吐槽',
         tone: '轻松吐槽',
         usage: '别人突然丢奇怪需求时使用',
+        annotationSource: 'manual',
         chatId: 'oc_chat',
         firstSeenAt: '2026-06-05T00:00:00.000Z',
         lastSeenAt: '2026-06-05T00:00:00.000Z',
@@ -1803,7 +3877,7 @@ describe('FeishuAdapter sticker inbound', () => {
 
   it('does not suggest bare generic stickers when no semantic sticker is available for the current chat', () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: '2026-06-05T00:00:00.000Z',
       stickers: [{
@@ -1950,7 +4024,7 @@ describe('FeishuAdapter message reactions', () => {
 
   it('does not turn a bare sticker hint into an arbitrary unannotated Feishu sticker message', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -1991,7 +4065,7 @@ describe('FeishuAdapter message reactions', () => {
 
   it('falls back to readable text for unresolved sticker-only plain replies', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -2032,7 +4106,7 @@ describe('FeishuAdapter message reactions', () => {
 
   it('does not let bare sticker hints prefer a newer unannotated sticker over a learned one', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [
@@ -2050,6 +4124,7 @@ describe('FeishuAdapter message reactions', () => {
           label: '干嘛猫',
           intent: '表达疑惑',
           usage: '别人突然丢奇怪需求时使用',
+          annotationSource: 'manual',
           chatId: 'oc_group',
           firstSeenAt: '2026-06-05T00:00:00.000Z',
           lastSeenAt: '2026-06-05T00:01:00.000Z',
@@ -2085,7 +4160,7 @@ describe('FeishuAdapter message reactions', () => {
 
   it('does not send an arbitrary sticker for unknown sticker aliases in plain replies', async () => {
     fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
-    fs.writeFileSync(path.join(process.env.CTI_HOME!, 'data', 'feishu-stickers.json'), JSON.stringify({
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: new Date().toISOString(),
       stickers: [{
@@ -2123,6 +4198,53 @@ describe('FeishuAdapter message reactions', () => {
     assert.doesNotMatch(calls[0], /"msg_type":"sticker"/);
     assert.match(calls[0], /\\"text\\":\\"换一个~\\"/);
     assert.doesNotMatch(calls[0], /\[表情包:大笑\]/);
+  });
+
+  it('does not send stickers from user-only semantic aliases in plain replies', async () => {
+    fs.mkdirSync(path.join(process.env.CTI_HOME!, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_user_claim_only',
+        aliases: ['最近', '默认', '表情包', '真棒'],
+        description: '用户说这是表示真棒的表情包',
+        intent: '真棒',
+        annotationSource: 'user',
+        chatId: 'oc_group',
+        messageId: 'om_original_sticker',
+        learnedFromMessageId: 'om_user_claim',
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        useCount: 9,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: string[] = [];
+
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: unknown) => {
+            calls.push(`reply:${JSON.stringify(payload)}`);
+            return { data: { message_id: 'om_reply' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user' },
+      text: '[表情包:真棒] 可以，先按事实核对',
+      parseMode: 'plain',
+      replyToMessageId: 'om_user',
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls[0], /"msg_type":"sticker"/);
+    assert.match(calls[0], /\\"text\\":\\"可以，先按事实核对\\"/);
+    assert.doesNotMatch(calls[0], /\[表情包:真棒\]/);
   });
 
   it('turns a leading bracketed Feishu emoji hint into a message reaction and strips it from text', async () => {

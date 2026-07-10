@@ -8,11 +8,15 @@ namespace ClaudeToImControlPanel;
 internal sealed record FeishuStickerLibrarySnapshot(
     string Schema,
     string StorePath,
+    string MediaDir,
     string UpdatedAt,
     IReadOnlyList<FeishuStickerLibraryItem> Stickers);
 
 internal sealed record FeishuStickerLibraryItem(
     string FileKey,
+    string MediaPath,
+    string PreviewUrl,
+    string MediaMimeType,
     IReadOnlyList<string> Aliases,
     string ChatId,
     string UserId,
@@ -27,6 +31,9 @@ internal sealed record FeishuStickerLibraryItem(
     string FirstSeenAt,
     string LastSeenAt,
     string LastUsedAt,
+    string MediaCachedAt,
+    string MediaDownloadFailedAt,
+    string MediaDownloadError,
     int UseCount,
     bool Disabled,
     string DisabledReason,
@@ -63,23 +70,33 @@ internal static class FeishuStickerLibrary
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
-    public static FeishuStickerLibrarySnapshot Read(string storePath)
+    public static FeishuStickerLibrarySnapshot Read(MemoryArtifactStore artifacts)
+        => Read(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath);
+
+    public static FeishuStickerLibrarySnapshot Update(MemoryArtifactStore artifacts, FeishuStickerUpdateRequest request)
+        => Update(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request);
+
+    public static FeishuStickerLibrarySnapshot MergeAliases(MemoryArtifactStore artifacts, FeishuStickerAliasMergeRequest request)
+        => MergeAliases(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request);
+
+    private static FeishuStickerLibrarySnapshot Read(string storePath, string mediaDir)
     {
         var root = ReadStore(storePath);
         var stickers = ReadStickerArray(root)
             .OfType<JsonObject>()
             .Where(item => !string.IsNullOrWhiteSpace(ReadString(item, "fileKey")))
-            .Select(ToItem)
+            .Select(item => ToItem(item, mediaDir))
             .OrderByDescending(item => item.LastSeenAt)
             .ToArray();
         return new FeishuStickerLibrarySnapshot(
             Schema,
             Path.GetFullPath(storePath),
+            string.IsNullOrWhiteSpace(mediaDir) ? "" : Path.GetFullPath(mediaDir),
             ReadString(root, "updatedAt"),
             stickers);
     }
 
-    public static FeishuStickerLibrarySnapshot Update(string storePath, FeishuStickerUpdateRequest request)
+    private static FeishuStickerLibrarySnapshot Update(string storePath, string mediaDir, FeishuStickerUpdateRequest request)
     {
         var root = ReadStore(storePath);
         var sticker = FindSticker(root, request.FileKey);
@@ -90,15 +107,20 @@ internal static class FeishuStickerLibrary
         SetString(sticker, "tone", request.Tone);
         SetString(sticker, "usage", request.Usage);
         SetString(sticker, "avoidWhen", request.AvoidWhen);
+        if (HasSemanticUpdate(request))
+        {
+            sticker["annotationSource"] = "manual";
+            sticker["annotationVerifiedAt"] = now;
+        }
         if (request.Disabled.HasValue) sticker["disabled"] = request.Disabled.Value;
         SetString(sticker, "disabledReason", request.DisabledReason);
         sticker["lastEditedAt"] = now;
         root["updatedAt"] = now;
         WriteStore(storePath, root);
-        return Read(storePath);
+        return Read(storePath, mediaDir);
     }
 
-    public static FeishuStickerLibrarySnapshot MergeAliases(string storePath, FeishuStickerAliasMergeRequest request)
+    private static FeishuStickerLibrarySnapshot MergeAliases(string storePath, string mediaDir, FeishuStickerAliasMergeRequest request)
     {
         var root = ReadStore(storePath);
         var sticker = FindSticker(root, request.FileKey);
@@ -114,7 +136,7 @@ internal static class FeishuStickerLibrary
         sticker["lastEditedAt"] = now;
         root["updatedAt"] = now;
         WriteStore(storePath, root);
-        return Read(storePath);
+        return Read(storePath, mediaDir);
     }
 
     private static JsonObject ReadStore(string storePath)
@@ -157,9 +179,17 @@ internal static class FeishuStickerLibrary
         return sticker ?? throw new InvalidOperationException("未找到指定表情包。");
     }
 
-    private static FeishuStickerLibraryItem ToItem(JsonObject item)
-        => new(
-            FileKey: ReadString(item, "fileKey"),
+    private static FeishuStickerLibraryItem ToItem(JsonObject item, string mediaDir)
+    {
+        var fileKey = ReadString(item, "fileKey");
+        var mediaPath = ResolveStickerMediaPath(mediaDir, fileKey);
+        var mediaMimeType = string.IsNullOrWhiteSpace(mediaPath) ? "" : GuessImageMimeType(mediaPath);
+        var previewUrl = BuildPreviewUrl(mediaPath, mediaMimeType);
+        return new(
+            FileKey: fileKey,
+            MediaPath: mediaPath,
+            PreviewUrl: previewUrl,
+            MediaMimeType: mediaMimeType,
             Aliases: ReadStringArray(item, "aliases").Distinct(StringComparer.OrdinalIgnoreCase).Take(20).ToArray(),
             ChatId: ReadString(item, "chatId"),
             UserId: ReadString(item, "userId"),
@@ -174,10 +204,41 @@ internal static class FeishuStickerLibrary
             FirstSeenAt: ReadString(item, "firstSeenAt"),
             LastSeenAt: ReadString(item, "lastSeenAt"),
             LastUsedAt: ReadString(item, "lastUsedAt"),
+            MediaCachedAt: ReadString(item, "mediaCachedAt"),
+            MediaDownloadFailedAt: ReadString(item, "mediaDownloadFailedAt"),
+            MediaDownloadError: ReadString(item, "mediaDownloadError"),
             UseCount: ReadInt(item, "useCount"),
             Disabled: ReadBool(item, "disabled"),
             DisabledReason: ReadString(item, "disabledReason"),
             LastEditedAt: ReadString(item, "lastEditedAt"));
+    }
+
+    private static string ResolveStickerMediaPath(string mediaDir, string fileKey)
+    {
+        if (string.IsNullOrWhiteSpace(mediaDir) || string.IsNullOrWhiteSpace(fileKey)) return "";
+        var pngPath = Path.Combine(mediaDir, MemoryArtifactStore.StableFileName(fileKey, ".png"));
+        if (File.Exists(pngPath)) return Path.GetFullPath(pngPath);
+        return "";
+    }
+
+    private static string GuessImageMimeType(string path)
+        => Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".bmp" => "image/bmp",
+            _ => "image/png",
+        };
+
+    private static string BuildPreviewUrl(string mediaPath, string mediaMimeType)
+    {
+        if (string.IsNullOrWhiteSpace(mediaPath) || !File.Exists(mediaPath)) return "";
+        var info = new FileInfo(mediaPath);
+        if (info.Length <= 0 || info.Length > 8 * 1024 * 1024) return "";
+        var bytes = File.ReadAllBytes(mediaPath);
+        return $"data:{mediaMimeType};base64,{Convert.ToBase64String(bytes)}";
+    }
 
     private static string[] ReadStringArray(JsonObject item, string key)
     {
@@ -199,6 +260,14 @@ internal static class FeishuStickerLibrary
 
     private static bool ReadBool(JsonObject item, string key)
         => item[key] is JsonValue value && value.TryGetValue<bool>(out var result) && result;
+
+    private static bool HasSemanticUpdate(FeishuStickerUpdateRequest request)
+        => request.Label is not null
+           || request.Description is not null
+           || request.Intent is not null
+           || request.Tone is not null
+           || request.Usage is not null
+           || request.AvoidWhen is not null;
 
     private static void SetString(JsonObject item, string key, string? value)
     {

@@ -114,7 +114,7 @@ export function planMemoryQuery(prompt: string): MemoryQueryPlan {
       queryText,
       answerMode: 'none',
       minConfidence: 1,
-      allowDirectAnswer: false,
+      allowHighConfidenceEvidence: false,
     };
   }
 
@@ -125,7 +125,7 @@ export function planMemoryQuery(prompt: string): MemoryQueryPlan {
       normalizedKey: extractNormalizedKey(queryText, true),
       answerMode: 'augment_only',
       minConfidence: 0.7,
-      allowDirectAnswer: false,
+      allowHighConfidenceEvidence: false,
     };
   }
 
@@ -135,9 +135,9 @@ export function planMemoryQuery(prompt: string): MemoryQueryPlan {
       intent: 'explicit_recall',
       queryText,
       normalizedKey: extractNormalizedKey(queryText, true),
-      answerMode: 'direct_if_confident',
+      answerMode: 'evidence_if_confident',
       minConfidence: 0.78,
-      allowDirectAnswer: true,
+      allowHighConfidenceEvidence: true,
     };
   }
 
@@ -148,7 +148,7 @@ export function planMemoryQuery(prompt: string): MemoryQueryPlan {
       normalizedKey: extractNormalizedKey(queryText, false),
       answerMode: 'augment_only',
       minConfidence: 0.55,
-      allowDirectAnswer: false,
+      allowHighConfidenceEvidence: false,
     };
   }
 
@@ -157,7 +157,7 @@ export function planMemoryQuery(prompt: string): MemoryQueryPlan {
     queryText,
     answerMode: 'none',
     minConfidence: 1,
-    allowDirectAnswer: false,
+    allowHighConfidenceEvidence: false,
   };
 }
 
@@ -166,7 +166,7 @@ export function shouldRetrieveMemoryForPrompt(prompt: string): boolean {
   return plan.intent === 'explicit_recall' || plan.intent === 'memory_write' || plan.intent === 'context_augment';
 }
 
-export function shouldDirectAnswerFromMemory(_prompt: string): boolean {
+export function shouldUseMemoryEvidenceFromPrompt(_prompt: string): boolean {
   return false;
 }
 
@@ -331,7 +331,7 @@ function wantsCompleteStructuredRecall(plan: MemoryQueryPlan): boolean {
     .test(`${plan.queryText || ''} ${plan.normalizedKey || ''}`);
 }
 
-function directReplyText(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): string {
+function structuredEvidenceText(plan: MemoryQueryPlan, hit: RetrievedMemoryHit): string {
   const pairs = hit.structuredPairs && hit.structuredPairs.length > 0
     ? hit.structuredPairs
     : inferStructuredMemories(hit.content);
@@ -379,9 +379,9 @@ export function decideMemoryReply(
       return rightStructured - leftStructured || hitConfidence(right) - hitConfidence(left) || right.score - left.score;
     });
 
-  const directHit = hits.find((hit) => {
+  const evidenceHit = hits.find((hit) => {
     const confidence = hitConfidence(hit);
-    return plan.allowDirectAnswer
+    return plan.allowHighConfidenceEvidence
       && confidence >= plan.minConfidence
       && hit.answerability === 'structured'
       && hit.quality === 'high'
@@ -389,32 +389,33 @@ export function decideMemoryReply(
       && !!(hit.structuredValue || inferStructuredMemory(hit.content)?.value);
   });
 
-  if (directHit) {
-    const exactKeyMatch = structuredKeyMatchesPlan(plan, directHit);
-    const tableTitleMatch = structuredTableTitleMatchesPlan(plan, directHit);
+  if (evidenceHit) {
+    const exactKeyMatch = structuredKeyMatchesPlan(plan, evidenceHit);
+    const tableTitleMatch = structuredTableTitleMatchesPlan(plan, evidenceHit);
     const matchingPair = !wantsCompleteStructuredRecall(plan) && !exactKeyMatch && !tableTitleMatch
-      ? findStructuredPairMatch(plan, directHit)
+      ? findStructuredPairMatch(plan, evidenceHit)
       : null;
     if (matchingPair) {
       return {
-        type: 'direct_reply',
-        text: directReplyText(plan, {
-          ...directHit,
+        type: 'high_confidence_evidence',
+        text: structuredEvidenceText(plan, {
+          ...evidenceHit,
           structuredKey: matchingPair.key,
           structuredValue: matchingPair.value,
           structuredPairs: [matchingPair],
         }),
-        hit: directHit,
+        hit: evidenceHit,
         plan,
       };
     }
-    const inferred = directHit.structuredValue ? null : inferStructuredMemory(directHit.content);
+    const inferred = evidenceHit.structuredValue ? null : inferStructuredMemory(evidenceHit.content);
     const hit = inferred
-      ? { ...directHit, structuredKey: directHit.structuredKey || inferred.key, structuredValue: inferred.value }
-      : directHit;
+      ? { ...evidenceHit, structuredKey: evidenceHit.structuredKey || inferred.key, structuredValue: inferred.value }
+      : evidenceHit;
     return {
-      type: 'direct_reply',
-      text: directReplyText(plan, hit),
+      type: 'high_confidence_evidence',
+      // This text is structured evidence for the agent/review layer, not a bridge-core shortcut reply.
+      text: structuredEvidenceText(plan, hit),
       hit,
       plan,
     };

@@ -83,6 +83,44 @@ describe('history mojibake repair', () => {
     }
   });
 
+  it('repairs long-lived Feishu sticker memory JSON artifacts', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-sticker-mojibake-repair-'));
+    const ctiHome = path.join(root, 'cti-home');
+    const memoryRoot = path.join(root, 'memory');
+    const stickerPath = path.join(memoryRoot, 'data', 'im', 'feishu', 'stickers', 'stickers.json');
+    fs.mkdirSync(path.dirname(stickerPath), { recursive: true });
+    fs.writeFileSync(stickerPath, JSON.stringify({
+      version: 1,
+      stickers: [
+        {
+          fileKey: 'v3_test',
+          label: GB_MOJIBAKE_CHINESE,
+          description: '干净表情包说明',
+        },
+      ],
+    }, null, 2), 'utf-8');
+
+    try {
+      const applied = runHistoryMojibakeRepair({
+        ctiHome,
+        memoryRoot,
+        apply: true,
+        generatedAt: '2026-04-30T00:00:00.000Z',
+      });
+
+      assert.equal(applied.repairedFileCount, 1);
+      assert.equal(applied.files[0].kind, 'memory-json');
+      const repaired = JSON.parse(fs.readFileSync(stickerPath, 'utf-8')) as {
+        stickers: Array<{ label?: string; description?: string }>;
+      };
+      assert.equal(repaired.stickers[0].label, '中文');
+      assert.equal(repaired.stickers[0].description, '干净表情包说明');
+      assert.doesNotMatch(JSON.stringify(repaired), new RegExp(GB_MOJIBAKE_CHINESE));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps reporting when a repair target cannot be backed up or written', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mojibake-repair-blocked-'));
     const ctiHome = path.join(root, 'cti-home');

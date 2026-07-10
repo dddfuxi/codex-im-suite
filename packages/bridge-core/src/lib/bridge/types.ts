@@ -203,6 +203,8 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** Raw tool input used only for safe, user-visible progress summaries. */
+  input?: unknown;
 }
 
 export interface RunTokenUsage {

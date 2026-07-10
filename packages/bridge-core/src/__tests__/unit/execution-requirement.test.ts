@@ -146,9 +146,9 @@ describe('execution requirement classifier', () => {
         intent: 'explicit_recall',
         queryText: '常用场景名',
         normalizedKey: '常用场景名',
-        answerMode: 'direct_if_confident',
+        answerMode: 'evidence_if_confident',
         minConfidence: 0.78,
-        allowDirectAnswer: true,
+        allowHighConfidenceEvidence: true,
       },
     });
 
@@ -177,7 +177,7 @@ describe('execution requirement classifier', () => {
     assert.equal(known.kind, 'none');
 
     const imageBacked = classifyExecutionRequirement({
-      userText: '用户发送了一个飞书表情包，file_key=v3_image，表情包图片已作为本轮图片附件提供给模型。',
+      userText: '用户发送了一个飞书表情包，file_key=v3_image，记忆仓库中已有该表情包图片，并已作为本轮图片附件提供给模型。',
       messageKind: 'feishu_sticker_image',
       files: [{ id: 'img', name: 'sticker.png', type: 'image/png', size: 4, data: 'AAAA' }],
       workingDirectory: 'C:\\unity\\ST3\\Game',

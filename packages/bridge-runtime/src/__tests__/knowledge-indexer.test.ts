@@ -93,7 +93,7 @@ describe('knowledge indexer', () => {
     assert.equal(index.items.some((item) => item.text.includes('scene identifiers')), false);
   });
 
-  it('searches by keyword and type without requiring direct reply routing', () => {
+  it('searches by keyword and type without requiring high-confidence evidence routing', () => {
     const index = buildKnowledgeIndexFromMarkdown({
       memoryRoot: 'E:\\cli-md',
       files: [{

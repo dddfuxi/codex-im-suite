@@ -3,7 +3,9 @@ import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 import type { Config } from './config.js';
 import type { LocalRouterMode } from './local-llm-status.js';
 
-export type LocalRouterDecisionType = 'answer_local' | 'escalate_codex' | 'refuse_local';
+export const LOCAL_PROFILE_DECISION = 'use_local_profile' as const;
+const LEGACY_LOCAL_ANSWER_DECISION = 'answer_local';
+export type LocalRouterDecisionType = typeof LOCAL_PROFILE_DECISION | 'escalate_codex' | 'refuse_local';
 export type LocalTaskKind =
   | 'chat'
   | 'light_chat'
@@ -189,6 +191,59 @@ function extractSystemSection(systemPrompt: string | undefined, heading: string)
   return pattern.exec(text)?.[1]?.trim() || '';
 }
 
+const LIGHT_CHAT_SECTION_BOUNDARIES = [
+  'Channel assistant identity:',
+  'Feishu inbound actor context:',
+  'Feishu actor context:',
+  'Feishu current message context:',
+  'Feishu emoji presentation:',
+  'Feishu sticker library:',
+  'Feishu recent conversation context:',
+  'Bridge channel context (authoritative):',
+  'Reply presentation contract:',
+  'Feishu cloud document evidence prompt (agent context, not a final reply):',
+  'Feishu group history evidence prompt（作为 agent 上下文，不是最终回复）：',
+  'Memory recall request policy:',
+];
+
+function findSystemHeadingStart(text: string, heading: string): number {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`(?:^|\\n)${escaped}`, 'u').exec(text);
+  if (!match) return -1;
+  return match.index + (match[0].startsWith('\n') ? 1 : 0);
+}
+
+function extractSystemSectionUntilHeadings(
+  systemPrompt: string | undefined,
+  heading: string,
+  boundaryHeadings: string[],
+): string {
+  const text = systemPrompt || '';
+  if (!text.trim()) return '';
+  const start = findSystemHeadingStart(text, heading);
+  if (start < 0) return '';
+  let end = text.length;
+  const afterHeading = text.slice(start + heading.length);
+  for (const boundary of boundaryHeadings) {
+    if (boundary === heading) continue;
+    const boundaryStart = findSystemHeadingStart(afterHeading, boundary);
+    if (boundaryStart >= 0) end = Math.min(end, start + heading.length + boundaryStart);
+  }
+  return text.slice(start, end).trim();
+}
+
+function extractFirstSystemSectionUntilHeadings(
+  systemPrompt: string | undefined,
+  headings: string[],
+  boundaryHeadings: string[],
+): string {
+  for (const heading of headings) {
+    const section = extractSystemSectionUntilHeadings(systemPrompt, heading, boundaryHeadings);
+    if (section) return section;
+  }
+  return '';
+}
+
 function hasFeishuLightContext(params: StreamChatParams): boolean {
   const context = [params.systemPrompt, params.prompt].filter(Boolean).join('\n');
   return /Feishu|飞书|表情包|sticker|reaction|emoji|轻量聊天|light[_ -]?status/i.test(context);
@@ -224,12 +279,20 @@ export function isLightChatCandidate(params: StreamChatParams, config: Config): 
 
 export function buildLightChatParams(params: StreamChatParams, config: Config): StreamChatParams {
   const identity = extractSystemSection(params.systemPrompt, 'Channel assistant identity:');
+  const actorContext = extractFirstSystemSectionUntilHeadings(params.systemPrompt, [
+    'Feishu inbound actor context:',
+    'Feishu actor context:',
+    'Feishu current message context:',
+  ], LIGHT_CHAT_SECTION_BOUNDARIES);
   const emoji = extractSystemSection(params.systemPrompt, 'Feishu emoji presentation:');
   const stickers = extractSystemSection(params.systemPrompt, 'Feishu sticker library:');
   const recentFeishuContext = extractSystemSection(params.systemPrompt, 'Feishu recent conversation context:');
   const replyStyle = params.replyPresentation?.replyStyleHint?.trim();
   const systemPrompt = [
     identity,
+    // Actor context is small but important: it tells the agent who spoke, how the bot was woken,
+    // and when quoted/third-person bot talk should be treated as context instead of a command.
+    actorContext,
     emoji,
     stickers,
     recentFeishuContext,
@@ -281,7 +344,7 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
       allowLocalFallback: true,
       requestKind: 'light_chat',
       reason: 'Feishu light chat fast path',
-      preferredDecision: 'answer_local',
+      preferredDecision: LOCAL_PROFILE_DECISION,
       compressedPrompt: truncateText(params.prompt || '', getLightChatMaxInputChars(config)),
       compressedHistory: '',
       canFastPath: true,
@@ -342,7 +405,7 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
         allowLocalFallback,
         requestKind: rule.taskKind || 'chat',
         reason: rule.reason,
-        preferredDecision: preferLocal ? 'answer_local' : 'escalate_codex',
+        preferredDecision: preferLocal ? LOCAL_PROFILE_DECISION : 'escalate_codex',
         readOnlyDraftOnly: rule.taskKind === 'command_draft',
         executionIntent,
         canFastPath: preferLocal && executionIntent,
@@ -361,13 +424,13 @@ export function buildLocalRoutePrompt(params: StreamChatParams, config: Config):
   const compressedHistory = compressConversationHistory(params, config);
   const mode = getLocalRouterMode(config);
   return [
-    '你是本地模型路由中枢。你不直接给用户最终答案，你只负责判断是否本地回答、是否需要升级到更强模型，以及压缩上下文。',
+    '你是本地模型路由中枢。你不直接给用户最终答案，你只负责判断是否选择本地轻量模型 profile、是否需要升级到更强模型，以及压缩上下文。',
     '只允许输出一个严格 JSON 对象，不要输出 Markdown，不要解释，不要多余文本。',
-    '允许的 decision: answer_local | escalate_codex | refuse_local',
+    `允许的 decision: ${LOCAL_PROFILE_DECISION} | escalate_codex | refuse_local`,
     '允许的 taskKind: chat | light_chat | explain | summarize | config_help | command_draft | script_draft | code_explain | tool_request | repo_query | unity_like | blender_like | doc_like',
     '如果请求涉及真实执行、真实查询仓库状态、改代码、写文件、运行 Unity、操作 Blender、MCP 工具、飞书文档创建/删除、发布、图片附件理解，应优先 decision=escalate_codex 或 refuse_local。',
-    '如果是简单解释、配置说明、日志总结、命令草案、小脚本草案、代码片段解释，可以 decision=answer_local。',
-    '如果用户只是让你解释一条错误文本，即使里面出现 git 或 FETCH_HEAD，只要不是要求真实查仓库状态，也可以 answer_local。',
+    `如果是简单解释、配置说明、日志总结、命令草案、小脚本草案、代码片段解释，可以 decision=${LOCAL_PROFILE_DECISION}；这里表示选择本地模型 profile/source，不表示绕过 agent 或工具证据。`,
+    `如果用户只是让你解释一条错误文本，即使里面出现 git 或 FETCH_HEAD，只要不是要求真实查仓库状态，也可以选择 ${LOCAL_PROFILE_DECISION}。`,
     `当前运行模式: ${mode}`,
     '',
     '输出 JSON 字段必须包含：',
@@ -418,7 +481,11 @@ function toTaskKind(value: string | undefined, fallback: LocalTaskKind = 'chat')
 }
 
 function toDecision(value: string | undefined): LocalRouterDecisionType {
-  if (value === 'answer_local' || value === 'escalate_codex' || value === 'refuse_local') return value;
+  // Backward compatibility: older router prompts/models may still emit the
+  // historical token. Normalize it at the boundary so new code never treats it
+  // as a content direct-reply decision.
+  if (value === LEGACY_LOCAL_ANSWER_DECISION) return LOCAL_PROFILE_DECISION;
+  if (value === LOCAL_PROFILE_DECISION || value === 'escalate_codex' || value === 'refuse_local') return value;
   throw new Error('路由 decision 非法');
 }
 

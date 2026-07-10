@@ -198,6 +198,83 @@ public sealed class ConversationHistoryDisplayTests
     }
 
     [Fact]
+    public void ResolveMessageDisplay_StripsFeishuUpgradePlaceholderFromInteractiveFallback()
+    {
+        var display = ConversationHistoryDisplay.ResolveMessageDisplay(
+            msgType: "interactive",
+            rawContent: "",
+            fallbackText: "表情回复 请升级至最新版本客户端，以查看内容");
+
+        Assert.True(display.IsCard);
+        Assert.Equal("表情回复", display.Text);
+        Assert.Equal("表情回复", display.CardContent);
+        Assert.DoesNotContain("请升级", display.Text);
+        Assert.DoesNotContain("请升级", display.CardContent);
+    }
+
+    [Fact]
+    public void ResolveMessageDisplay_ShowsReadableFallbackForPureFeishuUpgradePlaceholder()
+    {
+        var display = ConversationHistoryDisplay.ResolveMessageDisplay(
+            msgType: "interactive",
+            rawContent: "",
+            fallbackText: "请升级至最新版本客户端，以查看内容");
+
+        Assert.True(display.IsCard);
+        Assert.Contains("卡片正文暂不可解析", display.Text);
+        Assert.Contains("卡片正文暂不可解析", display.CardContent);
+        Assert.DoesNotContain("请升级", display.Text);
+        Assert.DoesNotContain("请升级", display.CardContent);
+    }
+
+    [Fact]
+    public void ResolveMessageDisplay_RemovesFeishuUpgradePlaceholderFromRawCardParts()
+    {
+        const string rawCard = """
+        {
+          "title": "自我介绍",
+          "elements": [
+            { "tag": "text", "text": "请升级至最新版客户端，以查看内容" }
+          ]
+        }
+        """;
+
+        var display = ConversationHistoryDisplay.ResolveMessageDisplay(
+            msgType: "interactive",
+            rawContent: rawCard,
+            fallbackText: "[卡片消息]");
+
+        Assert.True(display.IsCard);
+        Assert.Equal("自我介绍", display.Text);
+        Assert.Equal("自我介绍", display.CardContent);
+        Assert.DoesNotContain("请升级", display.Text);
+        Assert.DoesNotContain("请升级", display.CardContent);
+    }
+
+    [Fact]
+    public void ResolveMessageDisplay_ParsesEscapedInteractiveBodyWithoutShowingRawJson()
+    {
+        const string rawMessageItem = """
+        {
+          "body": {
+            "content": "{\"title\":\"表情回复\",\"elements\":[{\"tag\":\"text\",\"text\":\"请升级至最新版本客户端，以查看内容\"}]}"
+          }
+        }
+        """;
+
+        var display = ConversationHistoryDisplay.ResolveMessageDisplay(
+            msgType: "interactive",
+            rawContent: rawMessageItem,
+            fallbackText: "[卡片消息]");
+
+        Assert.True(display.IsCard);
+        Assert.Equal("表情回复", display.Text);
+        Assert.Equal("表情回复", display.CardContent);
+        Assert.DoesNotContain("{\"title\"", display.CardContent);
+        Assert.DoesNotContain("请升级", display.CardContent);
+    }
+
+    [Fact]
     public void ResolveCardResourceReferences_ExtractsNestedInteractiveImageKeys()
     {
         const string rawCard = """

@@ -98,7 +98,6 @@ internal sealed partial class MainForm : Form
     private readonly string _bridgeRuntimeAuditPath;
     private readonly string _mediaCacheDir;
     private readonly string _feishuChatIndexPath;
-    private readonly string _feishuStickerStorePath;
     private readonly string _feishuHistoryDir;
     private readonly string _feishuHistoryIndexPath;
     private readonly string _webDiagnosticsLogPath;
@@ -204,7 +203,6 @@ internal sealed partial class MainForm : Form
         _bridgeRuntimeAuditPath = Path.Combine(_ctiHome, "runtime", "bridge-runtime-audit.json");
         _mediaCacheDir = Path.Combine(_ctiHome, "runtime", "control-panel-media");
         _feishuChatIndexPath = Path.Combine(_dataDir, "feishu-chat-index.json");
-        _feishuStickerStorePath = Path.Combine(_dataDir, "feishu-stickers.json");
         _feishuHistoryDir = Path.Combine(_dataDir, "feishu-history");
         _feishuHistoryIndexPath = Path.Combine(_dataDir, "feishu-history-index.json");
         _webDiagnosticsLogPath = Path.Combine(_ctiHome, "runtime", "control-panel-webview.log");
@@ -895,11 +893,11 @@ internal sealed partial class MainForm : Form
             case "memory.search":
                 return SearchKnowledgeIndex(payload);
             case "memory.feishuStickers":
-                return FeishuStickerLibrary.Read(_feishuStickerStorePath);
+                return FeishuStickerLibrary.Read(GetMemoryArtifactStore());
             case "memory.updateFeishuSticker":
-                return FeishuStickerLibrary.Update(_feishuStickerStorePath, ReadFeishuStickerUpdatePayload(payload));
+                return FeishuStickerLibrary.Update(GetMemoryArtifactStore(), ReadFeishuStickerUpdatePayload(payload));
             case "memory.mergeFeishuStickerAliases":
-                return FeishuStickerLibrary.MergeAliases(_feishuStickerStorePath, ReadFeishuStickerAliasMergePayload(payload));
+                return FeishuStickerLibrary.MergeAliases(GetMemoryArtifactStore(), ReadFeishuStickerAliasMergePayload(payload));
             case "memory.archiveItem":
                 return ArchiveKnowledgeItem(payload);
             case "memory.archives":
@@ -1618,7 +1616,6 @@ internal sealed partial class MainForm : Form
         return new SettingsSnapshot(
             ReadPayloadString(payload, "defaultWorkDir", current.DefaultWorkDir),
             ReadPayloadString(payload, "allowedRoots", current.AllowedRoots),
-            ReadPayloadString(payload, "unityProject", current.UnityProject),
             ReadPayloadString(payload, "memoryRepo", current.MemoryRepo),
             ReadPayloadString(payload, "additionalDirs", current.AdditionalDirs),
             ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint),
@@ -6252,7 +6249,6 @@ exit $LASTEXITCODE
         _memoryRepo.Text = ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
             GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
-            GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game"),
             appendLog: true);
         AppendLog($"已读取配置：{_configPath}");
     }
@@ -6425,11 +6421,9 @@ exit $LASTEXITCODE
     private SettingsSnapshot GetSettingsSnapshot() => new(
         GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
         GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3"),
-        GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game"),
         ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
-            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
-            GetConfig("CTI_UNITY_PROJECT_PATH", @"C:\unity\ST3\Game")),
+            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3")),
         GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", ""),
         GetConfig("CTI_REPLY_STYLE_HINT", ""),
         NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", "")),
@@ -6471,12 +6465,11 @@ exit $LASTEXITCODE
 
     private void SaveSettingsFromDialog(SettingsSnapshot settings)
     {
-        var memoryRepo = ResolveEffectiveMemoryRepoPath(settings.MemoryRepo.Trim(), settings.DefaultWorkDir.Trim(), settings.UnityProject.Trim());
+        var memoryRepo = ResolveEffectiveMemoryRepoPath(settings.MemoryRepo.Trim(), settings.DefaultWorkDir.Trim());
         Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
         var lines = ReadEnvFileLines(_configPath);
         SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", settings.DefaultWorkDir.Trim());
         SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", settings.AllowedRoots.Trim());
-        SetOrAppendEnv(lines, "CTI_UNITY_PROJECT_PATH", settings.UnityProject.Trim());
         SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", memoryRepo);
         SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", settings.AdditionalDirs.Trim());
         SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
@@ -7243,7 +7236,6 @@ exit $LASTEXITCODE
         {
             "CTI_DEFAULT_WORKDIR",
             "CTI_ALLOWED_WORKSPACE_ROOTS",
-            "CTI_UNITY_PROJECT_PATH",
             "CTI_MEMORY_REPO_DIR",
             "CTI_CODEX_ADDITIONAL_DIRECTORIES",
             "CTI_REPLY_STYLE_HINT",
@@ -7673,7 +7665,7 @@ exit $LASTEXITCODE
             $"最近升级 Codex: {status.EscalationCount}",
             $"最近本地工具执行: {status.ExecutionCount}",
             $"最近执行失败: {status.ExecutionFailures}",
-            $"最近本地直答记录: {status.LocalOnlyAnswers}",
+            $"最近本地轻量模型记录: {Math.Max(status.LocalProfileHits, status.LocalOnlyAnswers)}",
             $"最近本地拒答: {status.LocalRefusals}",
             "",
             "最近路由摘要:",
@@ -8976,6 +8968,7 @@ exit $LASTEXITCODE
                 var msgType = GetJsonString(item, "msg_type") ?? "";
                 var rawContent = ExtractFeishuBodyContentRaw(item);
                 var itemRaw = item.GetRawText();
+                var indexedRawContent = ResolveFeishuIndexedRawContent(msgType, rawContent, itemRaw);
                 var hasDirectResource = IsDirectFeishuResourceMessage(msgType);
                 var resourceKey = hasDirectResource ? ExtractFeishuResourceKey(rawContent) : "";
                 if (hasDirectResource && string.IsNullOrWhiteSpace(resourceKey))
@@ -8996,7 +8989,7 @@ exit $LASTEXITCODE
                     SenderId = item.TryGetProperty("sender", out var senderEl) ? GetJsonString(senderEl, "id") : "",
                     SenderType = item.TryGetProperty("sender", out senderEl) ? GetJsonString(senderEl, "sender_type") : "",
                     Text = ExtractFeishuMessageText(item),
-                    RawContent = rawContent,
+                    RawContent = indexedRawContent,
                     ResourceKey = resourceKey,
                     ResourceType = ResolveFeishuResourceType(msgType),
                     FileName = fileName,
@@ -9196,10 +9189,8 @@ exit $LASTEXITCODE
     private static bool IsFeishuInteractiveFallbackText(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return true;
-        var trimmed = text.Trim();
-        return string.Equals(trimmed, "[卡片消息]", StringComparison.Ordinal)
-            || trimmed.Contains("请升级至最新版本客户端", StringComparison.Ordinal)
-            || trimmed.Contains("upgrade", StringComparison.OrdinalIgnoreCase);
+        return ConversationHistoryDisplay.IsFeishuCardCompatibilityPlaceholderOnly(text)
+            || ConversationHistoryDisplay.ContainsFeishuCardCompatibilityPlaceholder(text);
     }
 
     private Dictionary<string, string> LoadAuditSummaryByMessageId()
@@ -9228,7 +9219,12 @@ exit $LASTEXITCODE
                 var summary = GetJsonString(item, "summary");
                 if (string.IsNullOrWhiteSpace(messageId) || string.IsNullOrWhiteSpace(summary)) continue;
                 if (summary.StartsWith("[FILTERED]", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(summary, "[卡片消息]", StringComparison.Ordinal)) continue;
+                if (ConversationHistoryDisplay.IsFeishuCardCompatibilityPlaceholderOnly(summary)) continue;
+                if (ConversationHistoryDisplay.ContainsFeishuCardCompatibilityPlaceholder(summary))
+                {
+                    summary = ConversationHistoryDisplay.RemoveFeishuCardCompatibilityPlaceholder(summary);
+                    if (string.IsNullOrWhiteSpace(summary)) continue;
+                }
                 index[messageId] = summary;
             }
         }
@@ -9635,6 +9631,24 @@ exit $LASTEXITCODE
             : content.GetRawText();
     }
 
+    private static string ResolveFeishuIndexedRawContent(string msgType, string rawContent, string itemRaw)
+    {
+        var raw = rawContent?.Trim() ?? "";
+        if (!string.Equals((msgType ?? "").Trim(), "interactive", StringComparison.OrdinalIgnoreCase))
+        {
+            return raw;
+        }
+
+        var parsedRaw = string.IsNullOrWhiteSpace(raw) ? "" : ParseFeishuInteractiveContent(raw);
+        if (!ConversationHistoryDisplay.IsFeishuCardCompatibilityPlaceholderOnly(parsedRaw))
+        {
+            return raw;
+        }
+
+        // 兼容飞书历史接口只把 body.content 返回为“请升级...”的情况；保留整条 item 供面板继续解析附件、image_key 或摘要。
+        return string.IsNullOrWhiteSpace(itemRaw) ? raw : itemRaw;
+    }
+
     private static string ExtractFeishuMessageText(JsonElement item)
     {
         var msgType = GetJsonString(item, "msg_type") ?? "";
@@ -9778,11 +9792,14 @@ exit $LASTEXITCODE
             CollectTextRuns(document.RootElement, parts);
             var merged = string.Join(" ", parts.Where(part => !string.IsNullOrWhiteSpace(part)).Select(part => part.Trim()));
             merged = Regex.Replace(merged, @"\s+", " ").Trim();
-            return string.IsNullOrWhiteSpace(merged) ? "[卡片消息]" : merged;
+            var cleaned = ConversationHistoryDisplay.RemoveFeishuCardCompatibilityPlaceholder(merged);
+            return string.IsNullOrWhiteSpace(cleaned) ? "[卡片消息]" : cleaned;
         }
         catch
         {
-            return Regex.Replace(raw, @"\s+", " ").Trim();
+            var normalized = Regex.Replace(raw, @"\s+", " ").Trim();
+            var cleaned = ConversationHistoryDisplay.RemoveFeishuCardCompatibilityPlaceholder(normalized);
+            return string.IsNullOrWhiteSpace(cleaned) ? "[卡片消息]" : cleaned;
         }
     }
 
@@ -10189,7 +10206,7 @@ exit $LASTEXITCODE
             {
                 "codex_primary" => "Codex 主脑",
                 "codex_local_fallback" => "本地模型来源",
-                "local_explicit_task" => "本地辅助执行",
+                "local_explicit_task" => "本地受控执行",
                 "local_fallback_no_codex" => "本地模型来源",
                 "local_refused_out_of_scope" => "本地拒绝（超范围）",
                 _ => "暂无记录",
@@ -10201,7 +10218,7 @@ exit $LASTEXITCODE
         {
             "codex" or "codex_only" => "Codex 主脑",
             "codex_local_fallback" => "本地模型来源",
-            "local" => "本地辅助执行",
+            "local" => "本地受控执行",
             "local_best_effort" => "本地模型来源",
             "refuse_local" => "本地拒绝（超范围）",
             _ => "暂无记录",
@@ -10252,11 +10269,16 @@ exit $LASTEXITCODE
     private string GetDefaultMemoryRepoPath()
         => OperatingSystem.IsWindows() ? @"E:\cli-md" : Path.Combine(_ctiHome, "memory-repo");
 
-    private string ResolveEffectiveMemoryRepoPath(string configuredPath, string defaultWorkDir, string unityProjectPath, bool appendLog = false)
+    private MemoryArtifactStore GetMemoryArtifactStore()
+        => new(ResolveEffectiveMemoryRepoPath(
+            GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
+            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3")));
+
+    private string ResolveEffectiveMemoryRepoPath(string configuredPath, string defaultWorkDir, bool appendLog = false)
     {
         var fallback = Path.GetFullPath(GetDefaultMemoryRepoPath());
         var normalized = string.IsNullOrWhiteSpace(configuredPath) ? fallback : Path.GetFullPath(configuredPath.Trim());
-        var blockedRoots = new[] { defaultWorkDir, unityProjectPath }
+        var blockedRoots = new[] { defaultWorkDir }
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Select(value => Path.GetFullPath(value.Trim()))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -10815,6 +10837,7 @@ internal sealed class LocalLlmStatusRecord
     public int RouteMisses { get; set; }
     public int RouteFailures { get; set; }
     public int EscalationCount { get; set; }
+    public int LocalProfileHits { get; set; }
     public int LocalOnlyAnswers { get; set; }
     public int LocalRefusals { get; set; }
     public int ExecutionCount { get; set; }
@@ -10891,6 +10914,14 @@ internal sealed class ChannelBindingRecord
 
 internal static class ConversationHistoryDisplay
 {
+    private const string CardBodyUnavailableText = "卡片正文暂不可解析；飞书历史接口未返回完整卡片内容。";
+    private static readonly Regex FeishuCardCompatibilityPlaceholderRegex = new(
+        @"(?:请升级至(?:最新版本|最新版)客户端[，,]?\s*以查看内容|please\s+upgrade\s+.*?(?:client|app).*?(?:view|see).*?content)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex CardMessagePlaceholderRegex = new(
+        @"\[(?:card message|卡片消息|鍗＄墖娑堟伅)\]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     public static string ResolveSource(bool isFeishu, bool remoteVisible, bool hasLocalBinding, int remoteMessageCount)
     {
         if (!isFeishu) return "仅本地";
@@ -10921,21 +10952,32 @@ internal static class ConversationHistoryDisplay
             TryCollectCardDisplayParts(raw, parts, references);
         }
 
-        var cardText = NormalizeMessageText(string.Join(Environment.NewLine + Environment.NewLine, DeduplicateTextParts(parts)));
+        var cardText = RemoveFeishuCardCompatibilityPlaceholder(
+            string.Join(Environment.NewLine + Environment.NewLine, DeduplicateTextParts(parts)));
         var referenceText = NormalizeMessageText(string.Join(Environment.NewLine, references.Select(reference => $"卡片引用: {reference}")));
-        var effectiveCardText = !string.IsNullOrWhiteSpace(cardText) ? cardText : referenceText;
-        var text = !string.IsNullOrWhiteSpace(effectiveCardText) && IsCardPlaceholderText(fallback)
+        var cleanedFallback = RemoveFeishuCardCompatibilityPlaceholder(fallback);
+        var fallbackContainsCompatibilityNoise = ContainsFeishuCardCompatibilityPlaceholder(fallback)
+            || IsCardPlaceholderText(fallback);
+        var effectiveCardText = !string.IsNullOrWhiteSpace(cardText)
+            ? cardText
+            : !string.IsNullOrWhiteSpace(referenceText)
+                ? referenceText
+                : cleanedFallback;
+        var text = !fallbackContainsCompatibilityNoise && !string.IsNullOrWhiteSpace(fallback)
+            ? fallback
+            : !string.IsNullOrWhiteSpace(effectiveCardText)
+                ? effectiveCardText
+                : CardBodyUnavailableText;
+        var cardContent = !string.IsNullOrWhiteSpace(effectiveCardText)
             ? effectiveCardText
-            : !string.IsNullOrWhiteSpace(fallback)
+            : !fallbackContainsCompatibilityNoise && !string.IsNullOrWhiteSpace(fallback)
                 ? fallback
-                : !string.IsNullOrWhiteSpace(effectiveCardText)
-                    ? effectiveCardText
-                    : "[卡片消息]";
+                : CardBodyUnavailableText;
 
         return new MessageDisplayState(
             true,
             text,
-            effectiveCardText,
+            cardContent,
             BuildRawContentPreview(raw));
     }
 
@@ -11193,15 +11235,17 @@ internal static class ConversationHistoryDisplay
         }
         if (!IsCardTextProperty(key)) return;
 
-        parts.Add(text);
-
         // Some Feishu payloads nest card JSON as an escaped string inside content.
-        // Parse it opportunistically so panel history can still show the user-facing card body.
+        // Parse it opportunistically and avoid showing the JSON envelope as card body.
         if ((text.StartsWith("{", StringComparison.Ordinal) || text.StartsWith("[", StringComparison.Ordinal))
             && text.Length <= 20000)
         {
+            var beforeCount = parts.Count + references.Count;
             TryCollectCardDisplayParts(text, parts, references);
+            if (parts.Count + references.Count > beforeCount) return;
         }
+
+        parts.Add(text);
     }
 
     private static bool IsCardTextProperty(string key)
@@ -11231,16 +11275,35 @@ internal static class ConversationHistoryDisplay
         return normalized.Trim();
     }
 
+    public static string RemoveFeishuCardCompatibilityPlaceholder(string text)
+    {
+        var normalized = NormalizeMessageText(text);
+        if (string.IsNullOrWhiteSpace(normalized)) return "";
+
+        // 飞书历史接口对新版交互卡片可能只给客户端兼容占位文案；展示层只清理这类噪声，保留标题/摘要等真实文本。
+        var cleaned = FeishuCardCompatibilityPlaceholderRegex.Replace(normalized, " ");
+        cleaned = CardMessagePlaceholderRegex.Replace(cleaned, " ");
+        cleaned = Regex.Replace(cleaned, @"(^|\n)[ \t，,。；;：:、\-]+", "$1");
+        cleaned = Regex.Replace(cleaned, @"[ \t，,。；;：:、\-]+($|\n)", "$1");
+        return NormalizeMessageText(cleaned);
+    }
+
+    public static bool ContainsFeishuCardCompatibilityPlaceholder(string text)
+        => !string.IsNullOrWhiteSpace(text)
+            && (FeishuCardCompatibilityPlaceholderRegex.IsMatch(text)
+                || CardMessagePlaceholderRegex.IsMatch(text));
+
+    public static bool IsFeishuCardCompatibilityPlaceholderOnly(string text)
+    {
+        var normalized = NormalizeMessageText(text);
+        return string.IsNullOrWhiteSpace(normalized)
+            || (ContainsFeishuCardCompatibilityPlaceholder(normalized)
+                && string.IsNullOrWhiteSpace(RemoveFeishuCardCompatibilityPlaceholder(normalized)));
+    }
+
     private static bool IsCardPlaceholderText(string text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return true;
-        var normalized = Regex.Replace(text, @"\s+", " ").Trim();
-        return string.Equals(normalized, "[card message]", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(normalized, "[卡片消息]", StringComparison.Ordinal)
-            || string.Equals(normalized, "[鍗＄墖娑堟伅]", StringComparison.Ordinal)
-            || normalized.Contains("upgrade", StringComparison.OrdinalIgnoreCase)
-            || normalized.Contains("升级", StringComparison.Ordinal)
-            || normalized.Contains("鍗＄墖", StringComparison.Ordinal);
+        return IsFeishuCardCompatibilityPlaceholderOnly(text);
     }
 
     private static string BuildRawContentPreview(string raw)
@@ -11405,7 +11468,6 @@ internal sealed record ConversationAttachmentView(
 internal sealed record SettingsSnapshot(
     string DefaultWorkDir,
     string AllowedRoots,
-    string UnityProject,
     string MemoryRepo,
     string AdditionalDirs,
     string ReplyStyleHint,
@@ -11445,7 +11507,6 @@ internal sealed class SettingsForm : Form
 {
     private readonly TextBox _workdir = new();
     private readonly TextBox _allowedRoots = new();
-    private readonly TextBox _unityProject = new();
     private readonly TextBox _memoryRepo = new();
     private readonly TextBox _additionalDirs = new();
     private readonly ComboBox _replyStylePreset = new();
@@ -11516,18 +11577,17 @@ internal sealed class SettingsForm : Form
     private Control BuildPathGroup()
     {
         var group = new GroupBox { Text = "路径配置", Dock = DockStyle.Fill };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 5, Padding = new Padding(8) };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 4, Padding = new Padding(8) };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
-        for (var i = 0; i < 5; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        for (var i = 0; i < 4; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         group.Controls.Add(layout);
 
         AddPathRow(layout, 0, "默认工作目录", _workdir, true);
         AddPathRow(layout, 1, "允许仓库根目录", _allowedRoots, false);
-        AddPathRow(layout, 2, "Unity 工程目录", _unityProject, true);
-        AddPathRow(layout, 3, "聊天记忆仓库", _memoryRepo, true);
-        AddPathRow(layout, 4, "Codex 附加目录", _additionalDirs, false);
+        AddPathRow(layout, 2, "聊天记忆仓库", _memoryRepo, true);
+        AddPathRow(layout, 3, "Codex 附加目录", _additionalDirs, false);
         return group;
     }
 
@@ -11622,7 +11682,6 @@ internal sealed class SettingsForm : Form
     {
         _workdir.Text = settings.DefaultWorkDir;
         _allowedRoots.Text = settings.AllowedRoots;
-        _unityProject.Text = settings.UnityProject;
         _memoryRepo.Text = settings.MemoryRepo;
         _additionalDirs.Text = settings.AdditionalDirs;
         _replyStyleHint.Text = settings.ReplyStyleHint;
@@ -11633,7 +11692,6 @@ internal sealed class SettingsForm : Form
     private SettingsSnapshot ReadSnapshot() => new(
         _workdir.Text,
         _allowedRoots.Text,
-        _unityProject.Text,
         _memoryRepo.Text,
         _additionalDirs.Text,
         _replyStyleHint.Text,
