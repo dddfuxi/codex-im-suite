@@ -136,7 +136,17 @@ export interface Config {
 }
 
 export const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), ".claude-to-im");
+export const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 export const CONFIG_PATH = path.join(CTI_HOME, "config.env");
+
+export function resolveSuiteRoot(explicitRoot = process.env.CODEX_IM_SUITE_ROOT): string {
+  const candidates = [explicitRoot, process.cwd()].filter((value): value is string => Boolean(value?.trim()));
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (fs.existsSync(path.join(resolved, 'suite.manifest.json'))) return resolved;
+  }
+  return path.resolve(explicitRoot || process.cwd());
+}
 
 /**
  * Read a string env var with primary / alias fallback.
