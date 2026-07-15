@@ -437,7 +437,7 @@ internal sealed partial class MainForm : Form
             {
                 return Results.BadRequest(new { ok = false, error = "缺少 command。" });
             }
-            if (!AuthorizeControlApi(context, request.Command, out var failure)) return failure;
+            if (!AuthorizeControlApi(context, request.Command, out var failure, request.Payload)) return failure;
             try
             {
                 var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
@@ -479,12 +479,12 @@ internal sealed partial class MainForm : Form
         });
     }
 
-    private bool AuthorizeControlApi(HttpContext context, string command, out IResult failure)
+    private bool AuthorizeControlApi(HttpContext context, string command, out IResult failure, JsonElement payload = default)
     {
         failure = Results.Empty;
         var remoteIp = context.Connection.RemoteIpAddress;
         var isLoopback = remoteIp is null || IPAddress.IsLoopback(remoteIp);
-        var requiredRole = RequiredRoleForControlCommand(command);
+        var requiredRole = RequiredRoleForControlCommand(command, payload);
         if (!isLoopback)
         {
             var token = GetConfig("CTI_CONTROL_API_AUTH_TOKEN", "").Trim();
@@ -530,8 +530,19 @@ internal sealed partial class MainForm : Form
         return Rank(actualRole) >= Rank(requiredRole);
     }
 
-    private static string RequiredRoleForControlCommand(string command)
+    private static string RequiredRoleForControlCommand(string command, JsonElement payload = default)
     {
+        var skillRole = SkillControlCommandPolicy.GetRequiredRole(command);
+        if (!string.IsNullOrWhiteSpace(skillRole)) return skillRole;
+        if (string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
+            && payload.ValueKind == JsonValueKind.Object)
+        {
+            var action = ReadJsonString(payload, "action").Trim().ToLowerInvariant();
+            if (action is "install" or "update" or "enable" or "disable" or "remove" or "rollback")
+            {
+                return "owner";
+            }
+        }
         if (string.Equals(command, "extension.remote.install", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "extension.remote.remove", StringComparison.OrdinalIgnoreCase))
         {
@@ -565,7 +576,7 @@ internal sealed partial class MainForm : Form
 
     private void AddControlApiAudit(HttpContext context, string command, JsonElement payload, bool ok, string error)
     {
-        var role = RequiredRoleForControlCommand(command);
+        var role = RequiredRoleForControlCommand(command, payload);
         var summary = payload.ValueKind == JsonValueKind.Undefined ? "" : payload.GetRawText();
         if (summary.Length > 500) summary = summary[..500] + "...";
         AddWebActivity(ok ? "info" : "error", $"Control API {command}", $"{role} · {context.Connection.RemoteIpAddress} · {(ok ? "ok" : error)} · {MaskSecrets(summary)}");
@@ -981,16 +992,46 @@ internal sealed partial class MainForm : Form
                 return BuildRuntimeUnits();
             case "runtime.invokeAction":
                 return await InvokeRuntimeUnitActionAsync(payload);
+            case "skill.registry.snapshot":
+                return await RunSkillLifecycleCommandAsync("snapshot", payload, includePanelActor: false);
+            case "skill.catalog.search":
+                return await RunSkillLifecycleCommandAsync("search", payload, includePanelActor: false);
+            case "skill.draft.create":
+                return await RunSkillLifecycleCommandAsync("create-draft", payload, includePanelActor: true);
+            case "skill.lifecycle.validate":
+                return await RunSkillLifecycleCommandAsync("validate", payload, includePanelActor: false);
+            case "skill.lifecycle.prepareInstall":
+                return await RunSkillLifecycleCommandAsync("prepare-install", payload, includePanelActor: true);
+            case "skill.lifecycle.confirmInstall":
+                return await RunSkillLifecycleCommandAsync("confirm-install", payload, includePanelActor: true);
+            case "skill.lifecycle.enable":
+                return await RunSkillLifecycleCommandAsync("enable", payload, includePanelActor: true);
+            case "skill.lifecycle.disable":
+                return await RunSkillLifecycleCommandAsync("disable", payload, includePanelActor: true);
+            case "skill.lifecycle.rollback":
+                return await RunSkillLifecycleCommandAsync("rollback", payload, includePanelActor: true);
             case "extension.enable":
+                if (TryGetSkillManifestItem(ReadPayloadString(payload, "manifestPath", ""), out var enabledSkill))
+                {
+                    return await RunSkillLifecycleCommandAsync("enable", JsonSerializer.SerializeToElement(new { id = enabledSkill.Id }), includePanelActor: true);
+                }
                 await SetExtensionEnabledAsync(ReadPayloadString(payload, "manifestPath", ""), true);
                 return "enabled";
             case "extension.disable":
+                if (TryGetSkillManifestItem(ReadPayloadString(payload, "manifestPath", ""), out var disabledSkill))
+                {
+                    return await RunSkillLifecycleCommandAsync("disable", JsonSerializer.SerializeToElement(new { id = disabledSkill.Id }), includePanelActor: true);
+                }
                 await SetExtensionEnabledAsync(ReadPayloadString(payload, "manifestPath", ""), false);
                 return "disabled";
             case "extension.remove":
                 await RemoveExtensionAsync(ReadPayloadString(payload, "manifestPath", ""));
                 return "removed";
             case "extension.install":
+                if (TryGetSkillManifestItem(ReadPayloadString(payload, "manifestPath", ""), out var installSkill))
+                {
+                    return await PrepareSkillManifestInstallAsync(installSkill);
+                }
                 await InstallExtensionAsync(ReadPayloadString(payload, "manifestPath", ""));
                 return "installed";
             case "extension.detectImport":
@@ -1079,6 +1120,8 @@ internal sealed partial class MainForm : Form
         var extensions = ReadExtensionStatus();
         var mcpItems = BuildMcpItems();
         var sessionItems = await BuildSessionItemsAsync();
+        var skillGovernance = await BuildSkillGovernanceStateAsync();
+        var promptSnapshots = BuildPromptSnapshotState();
         var services = new[]
         {
             BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
@@ -1110,6 +1153,8 @@ internal sealed partial class MainForm : Form
                 missingSources = extensions.MissingSources,
                 items = BuildExtensionItems(),
             },
+            skillGovernance,
+            promptSnapshots,
             mcp = new
             {
                 total = mcpItems.Length,
@@ -5847,18 +5892,31 @@ exit $LASTEXITCODE
         if (unitId.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
         {
             var manifestPath = unitId["extension.".Length..];
+            var isSkill = TryGetSkillManifestItem(manifestPath, out var skillItem);
             switch (action)
             {
                 case "enable":
+                    if (isSkill)
+                    {
+                        return await RunSkillLifecycleCommandAsync("enable", JsonSerializer.SerializeToElement(new { id = skillItem.Id }), includePanelActor: true);
+                    }
                     await SetExtensionEnabledAsync(manifestPath, true);
                     return "enabled";
                 case "disable":
+                    if (isSkill)
+                    {
+                        return await RunSkillLifecycleCommandAsync("disable", JsonSerializer.SerializeToElement(new { id = skillItem.Id }), includePanelActor: true);
+                    }
                     await SetExtensionEnabledAsync(manifestPath, false);
                     return "disabled";
                 case "remove":
                     await RemoveExtensionAsync(manifestPath);
                     return "removed";
                 case "install":
+                    if (isSkill)
+                    {
+                        return await PrepareSkillManifestInstallAsync(skillItem);
+                    }
                     await InstallExtensionAsync(manifestPath);
                     return "installed";
                 case "update":
@@ -10018,6 +10076,155 @@ exit $LASTEXITCODE
                 // best effort cleanup
             }
         }
+    }
+
+    private SkillLifecycleGateway CreateSkillLifecycleGateway()
+    {
+        var codexHome = GetConfig(
+            "CODEX_HOME",
+            Environment.GetEnvironmentVariable("CODEX_HOME")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex"));
+        return new SkillLifecycleGateway(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            codexHome,
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+    }
+
+    private async Task<JsonElement> RunSkillLifecycleCommandAsync(string cliCommand, JsonElement payload, bool includePanelActor)
+    {
+        var input = BuildSkillLifecycleInput(payload, includePanelActor);
+        using var document = await CreateSkillLifecycleGateway().RunAsync(cliCommand, input);
+        return document.RootElement.Clone();
+    }
+
+    private JsonObject BuildSkillLifecycleInput(JsonElement payload, bool includePanelActor)
+    {
+        JsonObject input;
+        if (payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            input = new JsonObject();
+        }
+        else if (payload.ValueKind == JsonValueKind.Object)
+        {
+            input = JsonNode.Parse(payload.GetRawText()) as JsonObject ?? new JsonObject();
+        }
+        else
+        {
+            throw new InvalidOperationException("Skill lifecycle 命令 payload 必须是 JSON 对象。");
+        }
+
+        if (includePanelActor)
+        {
+            // 面板 actor 由受控宿主生成，不能信任浏览器 payload 自报身份。
+            input["actor"] = new JsonObject
+            {
+                ["channelType"] = "control_panel",
+                ["chatId"] = "control-panel",
+                ["userId"] = GetConfig("CTI_CONTROL_PANEL_ACTOR_ID", "control-panel"),
+            };
+        }
+        return input;
+    }
+
+    private async Task<object> BuildSkillGovernanceStateAsync()
+    {
+        try
+        {
+            using var document = await CreateSkillLifecycleGateway().ReadSnapshotAsync();
+            return new
+            {
+                available = true,
+                error = "",
+                snapshot = document.RootElement.Clone(),
+            };
+        }
+        catch (Exception error)
+        {
+            return new
+            {
+                available = false,
+                error = TrimForSummary(error.Message, 800),
+                snapshot = (JsonElement?)null,
+            };
+        }
+    }
+
+    private object BuildPromptSnapshotState()
+    {
+        var snapshotPath = Path.Combine(_ctiHome, "runtime", "prompt-snapshots.json");
+        if (!File.Exists(snapshotPath))
+        {
+            return new
+            {
+                available = false,
+                path = snapshotPath,
+                error = "尚未生成 Prompt Snapshot。",
+                data = new
+                {
+                    protocol = "cti-prompt-snapshot-store/v1",
+                    policy = new { maxItems = 100, maxAgeDays = 7 },
+                    snapshots = Array.Empty<object>(),
+                },
+            };
+        }
+
+        try
+        {
+            using var stream = new FileStream(snapshotPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var document = JsonDocument.Parse(stream);
+            return new
+            {
+                available = true,
+                path = snapshotPath,
+                error = "",
+                data = document.RootElement.Clone(),
+            };
+        }
+        catch (Exception error)
+        {
+            return new
+            {
+                available = false,
+                path = snapshotPath,
+                error = $"Prompt Snapshot 读取失败：{TrimForSummary(error.Message, 600)}",
+                data = (JsonElement?)null,
+            };
+        }
+    }
+
+    private bool TryGetSkillManifestItem(string manifestPath, out WebExtensionItem item)
+    {
+        item = BuildExtensionItems().FirstOrDefault(candidate =>
+            string.Equals(candidate.ManifestPath, manifestPath, StringComparison.OrdinalIgnoreCase)
+            && (string.Equals(candidate.ManifestKind, "skill", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(candidate.Type, "skill", StringComparison.OrdinalIgnoreCase)))!;
+        return item is not null;
+    }
+
+    private async Task<JsonElement> PrepareSkillManifestInstallAsync(WebExtensionItem item)
+    {
+        var risk = "low";
+        try
+        {
+            var manifest = LoadManifestNode(item.ManifestPath);
+            var declaredRisk = manifest["risk"]?.GetValue<string?>()?.Trim().ToLowerInvariant();
+            if (declaredRisk is "low" or "medium" or "high") risk = declaredRisk;
+        }
+        catch
+        {
+            // Registry/lifecycle 仍会按真实来源重新判定；这里只保留兼容 manifest 的低风险默认输入。
+        }
+        var payload = JsonSerializer.SerializeToElement(new
+        {
+            id = item.Id,
+            sourceClass = "unknown",
+            source = ExpandManifestValue(item.Source),
+            risk,
+            changeKind = "install",
+        });
+        return await RunSkillLifecycleCommandAsync("prepare-install", payload, includePanelActor: true);
     }
 
     private LarkCliGateway CreateLarkCliGateway()
