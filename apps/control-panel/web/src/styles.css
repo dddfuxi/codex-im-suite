@@ -153,7 +153,22 @@ textarea::placeholder {
 
 .nav-list {
   display: grid;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.nav-group {
+  display: grid;
   gap: 4px;
+}
+
+.nav-group-label {
+  padding: 0 10px 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .nav-item,
@@ -197,6 +212,37 @@ textarea::placeholder {
   color: var(--accent-strong);
   background: var(--panel-strong);
   box-shadow: inset 0 0 0 1px var(--border), var(--panel-shadow);
+}
+
+.domain-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  width: fit-content;
+}
+
+.domain-tab {
+  border: 0;
+  border-radius: 7px;
+  padding: 8px 14px;
+  color: var(--text-soft);
+  background: transparent;
+  cursor: pointer;
+}
+
+.domain-tab:hover {
+  color: var(--text);
+  background: var(--panel-strong);
+}
+
+.domain-tab.active {
+  color: var(--accent-strong);
+  background: var(--panel-strong);
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .sidebar-footer {

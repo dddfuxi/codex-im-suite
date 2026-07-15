@@ -47,6 +47,14 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import {
+  panelNavigation,
+  panelPageMeta,
+  resolveLegacyServiceTab,
+  resolvePageId,
+  type PageId,
+  type ServiceTabId,
+} from './panel-navigation.js';
 import './styles.css';
 
 type StatusKind = 'ok' | 'warning' | 'error' | 'idle';
@@ -962,22 +970,21 @@ declare global {
   }
 }
 
-const navItems = [
-  { id: 'overview', label: '总览', icon: Activity },
-  { id: 'services', label: '服务', icon: Power },
-  { id: 'nodes', label: '节点', icon: PlugZap },
-  { id: 'executors', label: '执行器', icon: Bot },
-  { id: 'permissions', label: '权限', icon: ShieldCheck },
-  { id: 'extensions', label: '扩展', icon: Layers3 },
-  { id: 'release', label: '发布', icon: GitBranch },
-  { id: 'sessions', label: '会话', icon: History },
-  { id: 'memory', label: '记忆', icon: Search },
-  { id: 'settings', label: '设置', icon: Settings },
-  { id: 'logs', label: '日志', icon: Terminal },
-] as const;
-
-type PageId = (typeof navItems)[number]['id'];
-const pageIds = new Set<PageId>(navItems.map((item) => item.id));
+const pageIcons = {
+  overview: Activity,
+  services: Power,
+  sessions: History,
+  architecture: Network,
+  prompts: FileText,
+  memory: Search,
+  skills: Layers3,
+  mcp: PlugZap,
+  modelsPlugins: Bot,
+  permissions: ShieldCheck,
+  release: GitBranch,
+  logs: Terminal,
+  settings: Settings,
+} as const;
 
 const fallbackState: PanelState = {
   generatedAt: '-',
@@ -1115,8 +1122,12 @@ function getInitialTheme(): ThemeMode {
 
 function getInitialPage(): PageId {
   if (typeof window === 'undefined') return 'overview';
-  const hashPage = window.location.hash.replace(/^#\/?/, '') as PageId;
-  return pageIds.has(hashPage) ? hashPage : 'overview';
+  return resolvePageId(window.location.hash);
+}
+
+function getInitialServiceTab(): ServiceTabId {
+  if (typeof window === 'undefined') return 'services';
+  return resolveLegacyServiceTab(window.location.hash);
 }
 
 function createRequestId() {
@@ -1443,9 +1454,9 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
       detail: 'MCP 工具、记忆和提醒会按需参与，不直接抢答普通请求。',
       status: assistStatus,
       helpText: '辅助能力负责扩展工具、检索记忆和发送提醒；异常时可以分别处理。',
-      targetPage: 'extensions',
+      targetPage: 'skills',
       targetUnitId: firstMcpUnitId,
-      primaryAction: navigateAction('assist-open-extensions', '处理辅助能力', 'extensions', firstMcpUnitId, '查看 MCP、Skill 和插件状态。'),
+      primaryAction: navigateAction('assist-open-extensions', '处理辅助能力', 'skills', firstMcpUnitId, '查看 MCP、Skill 和插件状态。'),
       secondaryActions: [
         commandAction('assist-refresh-state', '刷新状态', 'state.refresh', '刷新整个平台状态。'),
         navigateAction('assist-open-memory', '查看记忆', 'memory', 'memory', '打开记忆关系树。'),
@@ -1458,15 +1469,15 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
           detail: mcpUnits.length > 0 ? `${okMcpUnits.length}/${mcpUnits.length} 个 MCP 可用` : '暂未配置 MCP 清单',
           status: mcpStatus,
           helpText: 'MCP 负责连接 Unity、Blender、图片等外部工具。需要处理时优先检查异常 MCP。',
-          targetPage: 'extensions',
+          targetPage: 'mcp',
           targetUnitId: firstMcpUnitId,
           primaryAction: firstMcpUnitId
             ? runtimeAction('mcp-check-first', '检查 MCP', firstMcpUnitId, 'check', '检查选中的 MCP。')
-            : navigateAction('mcp-open-extensions', '处理 MCP', 'extensions', undefined, '查看 MCP 清单。'),
+            : navigateAction('mcp-open-extensions', '处理 MCP', 'mcp', undefined, '查看 MCP 清单。'),
           secondaryActions: [
             ...mcpRuntimeActions,
-            firstMcpUnitId ? runtimeAction('mcp-register', '注册 MCP', firstMcpUnitId, 'register', '把 MCP 清单注册到 Codex。') : navigateAction('mcp-register-help', '查看 MCP', 'extensions'),
-            navigateAction('mcp-open-extensions', '打开扩展页', 'extensions', firstMcpUnitId, '查看所有 MCP。'),
+            firstMcpUnitId ? runtimeAction('mcp-register', '注册 MCP', firstMcpUnitId, 'register', '把 MCP 清单注册到 Codex。') : navigateAction('mcp-register-help', '查看 MCP', 'mcp'),
+            navigateAction('mcp-open-extensions', '打开 MCP 页', 'mcp', firstMcpUnitId, '查看所有 MCP。'),
           ],
         },
         {
@@ -2216,6 +2227,7 @@ function useHostBridge() {
 function App() {
   const { state, activities, pending, sendCommand, clearActivities, debug, pageInstanceId } = useHostBridge();
   const [page, setPage] = useState<PageId>(() => getInitialPage());
+  const [serviceTab, setServiceTab] = useState<ServiceTabId>(() => getInitialServiceTab());
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [runtimeUnits, setRuntimeUnits] = useState<RuntimeUnit[]>([]);
   const [replyPresets, setReplyPresets] = useState<ReplyPresetItem[]>([]);
@@ -2239,6 +2251,18 @@ function App() {
   const runtimeExtensionUnits = useMemo(
     () => runtimeUnits.filter((unit) => !['service', 'tool'].includes(unit.kind)),
     [runtimeUnits],
+  );
+  const runtimeSkillUnits = useMemo(
+    () => runtimeExtensionUnits.filter((unit) => unit.kind === 'skill'),
+    [runtimeExtensionUnits],
+  );
+  const runtimeMcpUnits = useMemo(
+    () => runtimeExtensionUnits.filter((unit) => unit.kind === 'mcp'),
+    [runtimeExtensionUnits],
+  );
+  const runtimeModelPluginUnits = useMemo(
+    () => runtimeExtensionUnits.filter((unit) => unit.kind === 'model' || unit.kind === 'plugin'),
+    [runtimeExtensionUnits],
   );
   const selectedServiceUnit = runtimeServiceUnits.find((unit) => unit.unitId === selectedServiceUnitId) ?? runtimeServiceUnits[0];
   const selectedExtensionUnit = runtimeExtensionUnits.find((unit) => unit.unitId === selectedExtensionUnitId) ?? runtimeExtensionUnits[0];
@@ -2364,7 +2388,10 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    const onHashChange = () => setPage(getInitialPage());
+    const onHashChange = () => {
+      setPage(getInitialPage());
+      setServiceTab(getInitialServiceTab());
+    };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
@@ -2432,7 +2459,7 @@ function App() {
     if (targetPage === 'services' && targetUnitId) {
       setSelectedServiceUnitId(targetUnitId);
     }
-    if (targetPage === 'extensions' && targetUnitId) {
+    if ((targetPage === 'skills' || targetPage === 'mcp' || targetPage === 'modelsPlugins') && targetUnitId) {
       setSelectedExtensionUnitId(targetUnitId);
     }
     setPage(targetPage);
@@ -2449,15 +2476,21 @@ function App() {
           </div>
         </div>
         <nav className="nav-list">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <button key={item.id} className={page === item.id ? 'nav-item active' : 'nav-item'} onClick={() => setPage(item.id)} title={item.label}>
-                <Icon size={17} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+          {panelNavigation.map((group) => (
+            <section className="nav-group" key={group.id} aria-label={group.label}>
+              <div className="nav-group-label">{group.label}</div>
+              {group.pages.map((pageId) => {
+                const Icon = pageIcons[pageId];
+                const label = panelPageMeta[pageId].label;
+                return (
+                  <button key={pageId} className={page === pageId ? 'nav-item active' : 'nav-item'} onClick={() => setPage(pageId)} title={label}>
+                    <Icon size={17} />
+                    <span>{label}</span>
+                  </button>
+                );
+              })}
+            </section>
+          ))}
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={state.suite.gitDirty > 0 ? 'warning' : 'ok'} label={state.suite.gitDirty > 0 ? `${state.suite.gitDirty} 项待提交` : '工作区干净'} />
@@ -2469,7 +2502,7 @@ function App() {
         <header className="topbar">
           <div className="topbar-title">
             <div className="eyebrow">Suite {state.suite.version} · 协议 {state.suite.protocol}</div>
-            <h1>{navItems.find((item) => item.id === page)?.label}</h1>
+            <h1>{panelPageMeta[page].label}</h1>
             <LiveSyncBanner liveSync={state.liveSync} pending={pending['live.sync']} onSync={() => void syncLive()} />
           </div>
           <div className="topbar-actions">
@@ -2528,7 +2561,11 @@ function App() {
           />
         )}
         {page === 'services' && (
-          <ServicesPage
+          <ServiceWorkspacePage
+            activeTab={serviceTab}
+            setActiveTab={setServiceTab}
+            state={state}
+            run={run}
             units={runtimeServiceUnits}
             selectedUnitId={selectedServiceUnit?.unitId ?? ''}
             setSelectedUnitId={setSelectedServiceUnitId}
@@ -2536,13 +2573,37 @@ function App() {
             pending={pending}
           />
         )}
-        {page === 'nodes' && <NodesPage state={state} run={run} pending={pending} />}
-        {page === 'executors' && <ExecutorsPage state={state} run={run} pending={pending} />}
+        {page === 'architecture' && <DomainPlaceholder title="机器人架构" text="八层架构、职责边界和策略归属将在这里集中展示。" icon={<Network size={30} />} />}
+        {page === 'prompts' && <DomainPlaceholder title="提示词注入" text="这里将只读展示 Prompt Snapshot、来源、优先级、脱敏与截断状态。" icon={<FileText size={30} />} />}
         {page === 'permissions' && <PermissionsPage state={state} run={run} pending={pending} />}
-        {page === 'extensions' && (
+        {page === 'skills' && (
           <ExtensionsPage
             state={state}
-            units={runtimeExtensionUnits}
+            units={runtimeSkillUnits}
+            selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
+            setSelectedUnitId={setSelectedExtensionUnitId}
+            invokeAction={invokeRuntimeAction}
+            run={run}
+            refreshUnits={loadRuntimeUnits}
+            pending={pending}
+          />
+        )}
+        {page === 'mcp' && (
+          <ExtensionsPage
+            state={state}
+            units={runtimeMcpUnits}
+            selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
+            setSelectedUnitId={setSelectedExtensionUnitId}
+            invokeAction={invokeRuntimeAction}
+            run={run}
+            refreshUnits={loadRuntimeUnits}
+            pending={pending}
+          />
+        )}
+        {page === 'modelsPlugins' && (
+          <ExtensionsPage
+            state={state}
+            units={runtimeModelPluginUnits}
             selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
             setSelectedUnitId={setSelectedExtensionUnitId}
             invokeAction={invokeRuntimeAction}
@@ -2933,6 +2994,65 @@ function SystemBlueprint({ nodes }: { nodes: SystemBlueprintNode[] }) {
         </React.Fragment>
       ))}
     </div>
+  );
+}
+
+function DomainPlaceholder({ title, text, icon }: { title: string; text: string; icon: React.ReactNode }) {
+  return (
+    <section className="panel">
+      <SectionHeader title={title} />
+      <EmptyState icon={icon} title={title} text={text} />
+    </section>
+  );
+}
+
+function ServiceWorkspacePage({
+  activeTab,
+  setActiveTab,
+  state,
+  run,
+  units,
+  selectedUnitId,
+  setSelectedUnitId,
+  invokeAction,
+  pending,
+}: {
+  activeTab: ServiceTabId;
+  setActiveTab: (value: ServiceTabId) => void;
+  state: PanelState;
+  run: (command: string, payload?: Record<string, unknown>) => Promise<unknown>;
+  units: RuntimeUnit[];
+  selectedUnitId: string;
+  setSelectedUnitId: (value: string) => void;
+  invokeAction: (unit: RuntimeUnit, action: RuntimeAction) => Promise<void>;
+  pending: Record<string, boolean>;
+}) {
+  const tabs: Array<{ id: ServiceTabId; label: string }> = [
+    { id: 'services', label: '服务' },
+    { id: 'nodes', label: '节点' },
+    { id: 'executors', label: '执行器' },
+  ];
+  return (
+    <section className="content-stack">
+      <nav className="domain-tabs" aria-label="服务分区">
+        {tabs.map((tab) => (
+          <button key={tab.id} type="button" className={activeTab === tab.id ? 'domain-tab active' : 'domain-tab'} onClick={() => setActiveTab(tab.id)}>
+            {tab.label}
+          </button>
+        ))}
+      </nav>
+      {activeTab === 'services' && (
+        <ServicesPage
+          units={units}
+          selectedUnitId={selectedUnitId}
+          setSelectedUnitId={setSelectedUnitId}
+          invokeAction={invokeAction}
+          pending={pending}
+        />
+      )}
+      {activeTab === 'nodes' && <NodesPage state={state} run={run} pending={pending} />}
+      {activeTab === 'executors' && <ExecutorsPage state={state} run={run} pending={pending} />}
+    </section>
   );
 }
 
