@@ -688,3 +688,109 @@
 - 2026-06-12 Feishu 群聊暴走与撤回能力修复：provider 错误外发新增安全摘要和同 chat 短窗口熔断，拦截 `tool_result` SSE、本地路径、转义 JSON、`tool_use_id` 和高乱码密度内容，错误记忆也只记录可读摘要；Feishu 入站统一忽略 system、interactive、app/bot 和邀请类非人类事件，防止机器人卡片、出站消息或入群事件再次触发 LLM；“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”命中受控历史意图，只用 Feishu 历史索引与格式化片段生成摘要，不再让 Codex 用 Bash/MCP 读取本地历史 JSON；`outbound-refs.json` 现在持久化机器人出站 messageId，控制面板会话详情仅对已记录的 Feishu 机器人消息显示“撤回”，通过 `history.recallBotMessage` 调用 Feishu 消息删除接口并标记已撤回或失败原因。
 - 2026-07-07 Feishu 名字唤醒与回复状态：群聊 `require_mention=true` 下，没有原生 @ 时会使用 bot displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases` 或 `CTI_FEISHU_BOT_ALIASES` 形成别名，先分类 `chat / investigate / need_info / done` 再决定是否入队；“小桥 帮我看看”这类明确请求会写入 `raw.feishuBotWake` 并进入执行链，“刚才小桥说的那个方案挺好”这类第三人称提及只写过滤审计。`conversation-engine` 的回复契约同步要求 Feishu turn 先判 intent/state，查完只回结果，缺信息才问最小澄清，艾特人必须基于明确姓名、被回复消息或唯一群成员匹配，不再把工具流水、路径、命令或内部协议倒给用户。
 - 2026-07-15 表情包视觉语义防串图：模型返回的 `cti-sticker-annotation` 只有在本轮实际附加了同一 `file_key` 的图片时才可写入 `source=vision`；同轮其他候选图不能为被回复表情包背书，避免错误画面描述进入可信语义库后持续误导后续解释与发送。
+
+## 10. 2026-07-15 Registry 驱动机器人能力治理设计（已确认，待实施）
+
+状态：本节记录用户已逐节确认的目标设计，当前尚未把该设计写入运行逻辑。实施分支为 `codex/agent-capability-registry`。当前架构事实仍以 `docs/PROJECT-ARCHITECTURE.md` 为准；完成对应代码阶段后再同步更新架构事实文档。
+
+### 10.1 目标和原则
+
+- 采用 Registry 驱动能力平面，Agent、控制面板和飞书入口共用同一套 Skill 生命周期、权限、验证与审计规则。
+- 优先复用官方 `skill-creator`、`skill-installer` 和已安装 Skill，不在控制面板或 bridge 中复制第二套创建、下载、安装实现。
+- 只有现有能力不足且当前任务确实需要时，才搜索官方精选或白名单来源；不为填充功能列表主动安装能力。
+- `SKILL.md` 和关联资源是 Skill 事实源；Registry、Memory 和 Prompt Snapshot 都不能覆盖或复制完整 Skill 正文。
+- 控制面板只负责服务编排、状态展示、配置入口和受控动作，不承载桥接或 Skill 安装业务逻辑。
+
+```mermaid
+flowchart LR
+  Gap[Agent 判断能力缺口] --> Registry[Skill Registry]
+  Registry -->|已安装且可用| Use[调用现有 Skill]
+  Registry -->|能力缺失| Search[按来源策略搜索]
+  Search --> Draft[草稿或受控下载]
+  Draft --> Validate[结构、来源、权限和脚本验证]
+  Validate --> Gate{自治与审批门禁}
+  Gate -->|允许自动处理| OfficialAdapter[官方创建或安装适配器]
+  Gate -->|需要确认| Approval[用户或 Owner 审批]
+  Approval --> OfficialAdapter
+  OfficialAdapter --> Installed[CODEX_HOME Skills]
+  Installed --> Snapshot[Prompt Snapshot]
+  Installed --> MemoryIndex[Memory 资产索引]
+```
+
+### 10.2 组件边界
+
+- `packages/bridge-core`：声明平台无关的能力策略、风险等级、审批规则和 Registry 契约；不负责文件下载、目录写入或安装命令。
+- `packages/bridge-runtime`：实现 Skill Lifecycle 编排、Registry 持久化、来源适配、验证、审批、安装、更新、回滚和审计；实际创建和安装通过官方能力适配器执行。
+- `apps/control-panel`：读取 Registry、Prompt Snapshot、Memory 索引和运行状态，并调用 runtime 的受控动作；不直接修改 Skill 目录。
+- `config/skills.d`：项目随包能力声明和发布清单入口；不能被面板硬编码列表替代。
+- `CTI_HOME\extensions\drafts\skills`：机器人自建或下载后尚未安装的 Skill 草稿区。
+- `CODEX_HOME\skills`：本机正式安装 Skill 的事实目录。
+- `extensions/skills`：只在用户明确要求“固化到项目或随套件发布”时，经 Owner 确认后写入。
+
+### 10.3 Skill 生命周期和自治等级
+
+统一状态流为：`能力不足 -> 搜索 -> 草稿/下载 -> 验证 -> 风险判级 -> 审批或自动安装 -> 启用 -> 监控 -> 更新/回滚`。
+
+| 场景 | 处理规则 |
+| --- | --- |
+| 已安装 Skill | 机器人可以自主选择和调用 |
+| 官方精选但尚未安装 | 必须先询问用户是否安装 |
+| 白名单且低风险来源 | 可自动下载、验证、安装和启用，并记录完整审计 |
+| 机器人自建 Skill | 可自动创建草稿、补充资源和运行验证；首次安装、启用必须确认 |
+| 第三方、来源不明或不可信 | 必须由 Owner 确认 |
+| 带安装脚本、高权限或扩大可写目录 | 必须由 Owner 确认 |
+| 仅文档、示例或兼容性更新 | 可自动更新 |
+| 触发条件、权限、脚本或可写目录变化 | 必须重新审批 |
+
+验证失败的 Skill 只保留在草稿或隔离状态；安装和更新采用临时目录、验证、原子替换和可回滚版本。新版本失败时继续使用原版本，不允许半安装状态覆盖可用能力。
+
+### 10.4 Registry、Prompt Snapshot 和 Memory
+
+Registry 只保存资产和治理元数据，包括名称、用途、来源、版本、可信等级、路径、哈希、验证结果、启用状态、审批记录、关联项目、失败摘要和回滚点。Registry 不保存完整 `SKILL.md`。
+
+Prompt Snapshot 是短期、只读的运行证据，按以下来源展示本轮最终拼装结果：
+
+- Agent Kernel：默认行为、人格和执行原则。
+- Policy：角色、权限、风险和审批规则。
+- Identity：当前机器人、用户、群聊和平台身份。
+- Skills：本轮启用的 Skill 及触发原因。
+- Memory Evidence：本轮实际检索命中的记忆片段。
+- Reply Style：飞书卡片、思路展示和回复格式。
+- Result Protocol：文件、图片、提醒等结构化交付规则。
+
+每段 Snapshot 记录来源、优先级、字符数、内容哈希、是否注入、是否截断和截断原因。敏感字段必须脱敏；Snapshot 不保存密钥、token 或完整原始工具日志，并按可配置的时间和数量策略清理。
+
+Memory 页面只保留事实、历史和 Skill 资产的索引/引用。Skill 资产索引不复制正文，不允许 Memory 覆盖 Skill、Policy 或 Prompt 的真实来源。Prompt Snapshot 写入失败只影响观察功能，Memory 索引失败也不能阻止已安装 Skill 被调用。
+
+### 10.5 控制面板四域分区
+
+| 一级分区 | 页面 | 职责 |
+| --- | --- | --- |
+| 运行 | 总览、服务、会话 | bridge、飞书连接、模型来源、工作区和会话状态 |
+| 机器人 | 架构、提示词、记忆 | 八层机器人架构、Prompt Snapshot、Memory 索引 |
+| 能力 | Skills、MCP、模型与插件 | 能力资产、连接和来源目录 |
+| 治理 | 权限、审批、发布、日志、设置 | Owner 门禁、审计、版本发布、诊断和全局配置 |
+
+Skills 页面内部只保留“已安装、草稿、能力目录、审批队列”四类视图。当前杂糅的“扩展”页面拆分后，旧地址只做兼容跳转；同一功能只保留一个正式维护入口。默认页面展示用户可观察的状态、影响范围、权限等级和回滚状态，高级元数据和哈希放入折叠详情。
+
+### 10.6 兼容迁移和失败边界
+
+迁移顺序固定为：先增加 Registry 契约和状态机，再接入官方适配器，然后建立 Prompt Snapshot 和 Memory 资产索引，之后重组面板导航，最后移除确认无调用的重复逻辑。
+
+- 保留现有 Skill 目录、MCP manifest、飞书配置、会话和记忆仓库。
+- 首次启动通过扫描生成 Registry，不搬动或改写已有 `SKILL.md`。
+- 面板不可用不能影响 bridge、飞书入站或已安装 Skill 的正常调用。
+- 外部来源不可用时返回明确阻塞，不生成假安装记录。
+- Registry 写入采用原子替换和备份；安装失败、验证失败和运行异常都必须有隔离或回滚状态。
+- 旧页面和旧动作入口在兼容期映射到统一 runtime 动作，禁止继续维护第二套业务实现。
+
+### 10.7 验收标准
+
+- 已安装 Skill 的现有能力和调用路径保持不变。
+- 能力不足时才搜索外部 Skill；未安装的官方精选会询问用户。
+- 白名单低风险 Skill、自建 Skill、第三方 Skill 和高风险 Skill 分别遵守已确认的自治规则。
+- 面板不存在第二套 Skill 创建、安装、权限判断或来源判定逻辑。
+- Prompt 页面可以追踪每段注入来源、优先级和截断情况。
+- Memory 页面只展示索引和引用，不保存完整 Skill 正文。
+- Registry、生命周期、权限、迁移、回滚和面板导航具备单元测试、集成测试或端到端验证。
+- 构建、架构文档检查、live skill 同步、bridge 重启、`status.json`、`bridge-runtime-audit.json` 和飞书长连接复核全部通过后才交付。
