@@ -6,6 +6,20 @@ import test from 'node:test';
 
 import { initBridgeContext } from '../../lib/bridge/context';
 import { _testOnly } from '../../lib/bridge/conversation-engine';
+import type { PromptSnapshotRecord } from '../../lib/bridge/host';
+
+test('prompt snapshot observation failures never interrupt the chat path', () => {
+  const snapshot: PromptSnapshotRecord = {
+    protocol: 'cti-prompt-snapshot/v1',
+    sessionId: 'session-1',
+    createdAt: '2026-07-15T05:00:00.000Z',
+    totalChars: 0,
+    sections: [],
+  };
+  assert.doesNotThrow(() => _testOnly.recordPromptSnapshotSafely({
+    recordPromptSnapshot: () => { throw new Error('disk locked'); },
+  }, snapshot));
+});
 
 test('puts channel identity before long base system prompt', () => {
   initBridgeContext({

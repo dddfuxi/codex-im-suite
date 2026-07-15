@@ -18,6 +18,8 @@ import type {
   RetrievedMemoryContext,
   RetrievedFeishuHistoryContext,
   MemoryQueryPlan,
+  BridgeStore,
+  PromptSnapshotRecord,
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
@@ -35,6 +37,8 @@ import {
 } from './execution-requirement.js';
 import { getAgentPolicyPromptLines } from './agent-architecture.js';
 import { createBridgeMemoryArtifactStore } from './memory-artifact-store.js';
+import { composePromptSections, type ComposedBridgePrompt, type PromptSection } from './prompt-composer.js';
+import { createPromptSnapshot } from './prompt-snapshot.js';
 
 export interface PermissionRequestInfo {
   permissionRequestId: string;
@@ -252,7 +256,11 @@ const DEFAULT_MEMORY_PROMPT_MAX_CHARS = Math.max(160, Number.parseInt(process.en
 const MAX_STORED_TOOL_RESULT_CHARS = Math.max(160, Number.parseInt(process.env.CTI_STORED_TOOL_RESULT_CHARS || '320', 10) || 320);
 const MAX_STORED_TEXT_CHARS = Math.max(400, Number.parseInt(process.env.CTI_STORED_TEXT_CHARS || '4000', 10) || 4000);
 
-function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt?: string, extraSystemPrompt?: string): string {
+function buildBridgeScopedPrompt(
+  binding: ChannelBinding,
+  baseSystemPrompt?: string,
+  leadingSections: readonly PromptSection[] = [],
+): ComposedBridgePrompt {
   const { store } = getBridgeContext();
   const additionalDirectories = splitWorkspacePathList(store.getSetting('bridge_default_additional_directories'));
   const allowedWorkspaceRoots = splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
@@ -308,16 +316,33 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- Do not claim a private/direct/cross-chat message has been sent unless you used the cti-direct-message action protocol and the bridge reports success. If the target is not explicit or may match multiple people, ask for a direct @ mention, exact display name, exact chat name, or platform id.',
   ].join('\n');
 
-  return [
-    // Channel identity and turn-specific context must stay near the front
-    // because downstream providers may trim long system prompts.
-    extraSystemPrompt?.trim(),
-    baseSystemPrompt?.trim(),
-    bridgeGuardrails,
-    buildReplyPresentationPrompt(getReplyStyleHintFromStore()),
-  ]
-    .filter((part): part is string => !!part)
-    .join('\n\n');
+  return composePromptSections([
+    ...leadingSections,
+    { id: 'session.base', kind: 'base', source: 'session.system_prompt', priority: 40, content: baseSystemPrompt || '' },
+    { id: 'bridge.policy', kind: 'policy', source: 'agent-architecture', priority: 50, content: bridgeGuardrails },
+    { id: 'reply.style', kind: 'style', source: 'bridge.reply_style', priority: 60, content: buildReplyPresentationPrompt(getReplyStyleHintFromStore()) },
+  ]);
+}
+
+function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt?: string, extraSystemPrompt?: string): string {
+  return buildBridgeScopedPrompt(binding, baseSystemPrompt, extraSystemPrompt?.trim() ? [{
+    id: 'channel.extra',
+    kind: 'identity',
+    source: 'channel.extra_system_prompt',
+    priority: 10,
+    content: extraSystemPrompt,
+  }] : []).text;
+}
+
+function recordPromptSnapshotSafely(
+  store: Pick<BridgeStore, 'recordPromptSnapshot'>,
+  snapshot: PromptSnapshotRecord,
+): void {
+  try {
+    store.recordPromptSnapshot?.(snapshot);
+  } catch (error) {
+    console.warn('[conversation-engine] Prompt snapshot write failed:', error instanceof Error ? error.message : error);
+  }
 }
 
 function getReplyStyleHintFromStore(): string {
@@ -705,9 +730,6 @@ export async function processMessage(
     );
     const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, retrievedFeishuHistory, memoryPromptMaxChars);
     const executionRequirementPrompt = buildExecutionRequirementPrompt(executionRequirement);
-    const mergedExtraSystemPrompt = [options?.extraSystemPrompt?.trim(), memoryPrompt]
-      .filter((part): part is string => !!part)
-      .join('\n\n');
     const additionalDirectories = splitWorkspacePathList(store.getSetting('bridge_default_additional_directories'));
 
     const abortController = new AbortController();
@@ -720,18 +742,36 @@ export async function processMessage(
     }
 
     const runAttempt = async (attempt: 'initial' | 'no_evidence_retry'): Promise<InternalConversationResult> => {
-      const attemptPrompt = [
-        mergedExtraSystemPrompt,
-        executionRequirementPrompt,
-        attempt === 'no_evidence_retry' ? buildNoEvidenceRetryPrompt(executionRequirement) : '',
-      ].filter(Boolean).join('\n\n');
+      const retryPrompt = attempt === 'no_evidence_retry' ? buildNoEvidenceRetryPrompt(executionRequirement) : '';
+      const composedPrompt = buildBridgeScopedPrompt(binding, session?.system_prompt || undefined, [
+        { id: 'channel.extra', kind: 'identity', source: 'channel.extra_system_prompt', priority: 10, content: options?.extraSystemPrompt || '' },
+        { id: 'memory.evidence', kind: 'memory', source: 'memory.retrieval', priority: 20, content: memoryPrompt },
+        { id: 'execution.requirement', kind: 'execution', source: 'capability_router', priority: 30, content: executionRequirementPrompt },
+        { id: 'execution.retry', kind: 'execution', source: 'capability_router.retry', priority: 31, content: retryPrompt },
+      ]);
+      const snapshotSections = options?.priorityTurnContext?.trim()
+        ? [...composedPrompt.sections, {
+          id: 'priority.context',
+          kind: 'priority_context' as const,
+          source: 'adapter.priority_turn_context',
+          priority: 5,
+          content: options.priorityTurnContext,
+          injected: true,
+        }]
+        : composedPrompt.sections;
+      recordPromptSnapshotSafely(store, createPromptSnapshot({
+        sessionId,
+        sections: snapshotSections,
+        maxSectionChars: parseSettingInt(store.getSetting('bridge_prompt_snapshot_section_max_chars'), 8_000, 256),
+        maxSnapshotChars: parseSettingInt(store.getSetting('bridge_prompt_snapshot_max_chars'), 40_000, 1_000),
+      }));
       const stream = llm.streamChat({
       prompt: text,
       sessionId,
       sdkSessionId: attempt === 'initial' ? binding.sdkSessionId || undefined : undefined,
       forceFreshThread: attempt === 'initial' ? !binding.sdkSessionId : true,
       model: effectiveModel,
-      systemPrompt: buildBridgeScopedSystemPrompt(binding, session?.system_prompt || undefined, attemptPrompt || undefined),
+      systemPrompt: composedPrompt.text,
       priorityTurnContext: options?.priorityTurnContext,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       additionalDirectories,
@@ -833,6 +873,8 @@ export async function processMessage(
 
 export const _testOnly = {
   buildBridgeScopedSystemPrompt,
+  buildBridgeScopedPrompt,
+  recordPromptSnapshotSafely,
   persistFileAttachmentsForHistory,
 };
 

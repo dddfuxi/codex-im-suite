@@ -33,6 +33,7 @@ import type {
   UpsertChannelBindingInput,
   MemoryWriteCandidate,
   MemoryWriteClassification,
+  PromptSnapshotRecord,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
@@ -47,6 +48,7 @@ import {
   isVisibleMemoryV2SourceToQuery,
 } from './memory-source-policy.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
+import { createPromptSnapshotStore } from './prompt-snapshot-store.js';
 import {
   decideMemoryReply as decideMemoryReplyFromHits,
   inferStructuredMemories,
@@ -1855,6 +1857,12 @@ export class JsonFileStore implements BridgeStore {
       workingDirectory: input.workingDirectory,
       createdAt: input.createdAt || now(),
     }, this.sanitizePersistedText(input.text || ''), input.candidates, input.classification);
+  }
+
+  recordPromptSnapshot(snapshot: PromptSnapshotRecord): void {
+    const maxItems = Math.max(1, Number.parseInt(this.getSetting('bridge_prompt_snapshot_max_items') || '100', 10) || 100);
+    const maxAgeDays = Math.max(1, Number.parseInt(this.getSetting('bridge_prompt_snapshot_retention_days') || '7', 10) || 7);
+    createPromptSnapshotStore({ ctiHome: CTI_HOME, maxItems, maxAgeDays }).record(snapshot);
   }
 
   recordMemoryEvent(event: ConversationMemoryEvent): void {

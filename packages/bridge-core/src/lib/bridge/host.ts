@@ -547,6 +547,7 @@ export interface BridgeStore {
   // ── Messages ──
   addMessage(sessionId: string, role: string, content: string, usage?: string | null): void;
   getMessages(sessionId: string, opts?: { limit?: number }): { messages: BridgeMessage[] };
+  recordPromptSnapshot?(snapshot: PromptSnapshotRecord): void;
   recordMemoryEvent?(event: ConversationMemoryEvent): void;
   persistMemoryWrite?(input: MemoryWriteInput): MemoryWriteResult;
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null;
