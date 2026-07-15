@@ -27,6 +27,7 @@ export interface SkillRegistry {
   readonly draftRoot: string;
   read(): SkillRegistrySnapshot;
   refresh(): SkillRegistrySnapshot;
+  upsert(item: SkillRegistryItem): SkillRegistryItem;
 }
 
 const PROTOCOL = 'cti-skill-registry/v1' as const;
@@ -189,5 +190,17 @@ export function createSkillRegistry(options: SkillRegistryOptions = {}): SkillRe
     return snapshot;
   };
 
-  return { registryPath, draftRoot, read, refresh };
+  const upsert = (item: SkillRegistryItem): SkillRegistryItem => {
+    const snapshot = read();
+    const items = snapshot.items.filter((candidate) => candidate.id !== item.id);
+    items.push(item);
+    atomicWriteSnapshot(registryPath, {
+      protocol: PROTOCOL,
+      generatedAt: now().toISOString(),
+      items: items.sort((left, right) => left.id.localeCompare(right.id)),
+    });
+    return item;
+  };
+
+  return { registryPath, draftRoot, read, refresh, upsert };
 }
