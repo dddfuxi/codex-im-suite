@@ -26,18 +26,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
-- 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务也收口成声明式运行单元；服务页和扩展页共用同一套 `update` 协议与白名单执行模板。
-- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，支持统一服务模块、可点击处理的系统蓝图、权限管理、扩展 / MCP 市场视图、会话详情抽屉、路径拖拽选择、回复风格快捷预设，以及白天 / 夜晚主题和自适应布局。
+- 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务收口成声明式运行单元；服务页和非 Skill 扩展继续复用通用 `update` 协议与白名单执行模板。
+- Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
+- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
-- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆”页默认用关系树解释记忆、资源、提醒、冲突和来源的联系，左侧按普通记忆、受控上下文/索引资料分组，避免 `AI_BRIDGE_CONTEXT.md` 这类系统上下文混入普通记忆列表；高级诊断里仍可查看原始网格、索引来源总览和监听状态。
-- 记忆一键整理：面板“记忆”页新增整理草稿入口，草稿保存到 `.cti-index\memory-optimization-drafts`，用户只能应用已勾选动作；显式记忆和直接提醒可默认勾选，文档/索引类来源默认需要人工确认。归档项可从 `archive\knowledge-units` 单条恢复，已应用草稿可撤销归档动作；定期整理默认关闭，开启后只生成待确认草稿，不自动覆盖。
+- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆索引”页只展示关系、搜索、来源、历史和 Skill 元数据引用，不复制 `SKILL.md` 正文。
+- 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
-- 扩展和 CLI 运维补齐：MCP 状态按健康检查、Codex 注册和托管进程综合判断；支持本地扩展导入、manifest 安装入口，以及 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种白名单更新模板。
+- 能力和 CLI 运维补齐：能力区拆为 Skills、MCP、模型与插件；MCP 状态按健康检查、Codex 注册和托管进程综合判断，Skill 安装只走 lifecycle，其他扩展保留 manifest 和白名单更新模板。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
 - Workflow 契约适配：`workflow-runs.json` 继续作为本地事实来源，runtime 额外提供共享 `WorkflowRunContract` 映射，统一 checkpoint、trace event、recovery 和 delivery 字段。
 - AI 执行来源收口：设置页支持选择默认 executor 来源，执行器页可一键设为默认或恢复自动；Codex 内部仍支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源。Feishu 最终卡片底部会分开展示“来源”（executor/provider）与“模型 / token”，便于确认本轮到底由 Codex、Claude CLI 还是外部 agent 执行。
@@ -78,7 +79,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
 
-开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已不再作为入口发布，若快捷方式仍指向旧名应改到正式入口。主窗口现在按“总览 / 服务 / 节点 / 执行器 / 权限 / 扩展 / 发布 / 会话 / 记忆 / 设置 / 日志”分区；顶部工具区提供刷新、重启面板和发布入口，总览页用系统蓝图解释飞书入口、Bridge、AI 执行、辅助能力和最终回复的流转，点击蓝图节点会打开处理面板，可检查状态、启动/重启服务、处理 MCP 或跳到设置/记忆/扩展页；节点页展示本机 runtime node 与 fake remote node 的能力清单，权限页可管理 Viewer / Operator / Owner，会话页可直接查看完整消息流，记忆页默认用关系树和“记忆整理”草稿面板查看、优化记忆，专业网格、索引路径、相关对象、联系权重和需要检查的回复折叠在高级诊断里，设置页支持目录选择、拖拽回填、回复风格快捷预设和“AI 执行与模型来源”配置；执行器页可查看和切换默认 executor 来源；扩展页的在线模型安装会显示 Ollama 拉取进度、支持暂停、卸载、选择模型目录，并可在完成后自动设为本地 API 模型和重启 Bridge。
+开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已退出发布入口。主窗口按四域组织：运行（总览、服务、会话）、机器人（架构、提示词注入、记忆索引）、能力（Skills、MCP、模型与插件）、治理（权限、发布、日志、设置）。旧 `#extensions` 会进入 Skills，旧节点/执行器地址会进入服务页对应 tab。会话页保留提醒操作，设置页保留记忆整理和归档治理，Memory 只做索引；Skills 页只调用 runtime lifecycle，Prompt 页只展示脱敏只读 Snapshot。
 
 Control API 默认只监听本机：
 
@@ -152,9 +153,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.
 
 `runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli`、`service.localLlm` 和 `tool.larkCli`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`；`tool.larkCli` 通过同一通用模板维护官方 `@larksuite/cli`，控制面板用它执行群列表、消息/成员查看、资源下载、测试发送和受控撤回等人工平台操作。`service.feishuCli` 保留兼容 id，但显示为 Bridge Skill 更新单元，只按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步。官方 CLI 不接管 FeishuAdapter 的 WS、OAuth、@ 判断、自动回复或 Agent 主链，也不得启动 `event consume` 与 live Bridge 竞争。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
 
-控制面板“扩展”页支持三层在线目录、HTTPS URL 预览和本机安装。目录由静态种子、动态排行榜源、自定义 URL 叠加而成；动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自前 5 项，并在条目上显示来源、抓取时间和排行依据。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
+控制面板能力区支持三层在线目录、HTTPS URL 预览和本机状态展示。Skills 页按 Registry 展示已安装、草稿、能力目录和审批队列，并遵守官方精选需用户确认、白名单低风险可自动处理、未知/高风险需 Owner 的规则；MCP、模型和 Plugin 分别保留原有动作。飞书 Owner 仍可用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 进入统一受控链路。精选目录写入：
 
-扩展目录内的本地工具模型候选包括 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后可在设置页“本地 API -> 已安装模型”下拉中选择并“应用并重启”，也仍可手动输入任意 Ollama 模型名。扩展页会把 Ollama `/api/tags` 中已安装但不在目录里的模型补成“本机已安装”条目，支持直接使用或 `ollama rm` 卸载。默认 `qwen2.5-coder:7b` 只作为文本 / 总结能力基线，不宣称稳定工具执行能力。
+模型与插件页的本地工具模型候选包括 `qwen3-coder-next:latest`、`qwen3-coder-next:q4_K_M`、`qwen3-coder:30b`、`qwen3-coder:30b-a3b-q4_K_M`、`qwen3-coder:30b-a3b-q8_0`、`qwen3:14b`、`qwen3:30b`、`qwen3:32b`、`qwen2.5:32b`；安装后可在设置页“本地 API -> 已安装模型”下拉中选择并“应用并重启”，也仍可手动输入任意 Ollama 模型名。页面会把 Ollama `/api/tags` 中已安装但不在目录里的模型补成“本机已安装”条目，支持直接使用或 `ollama rm` 卸载。默认 `qwen2.5-coder:7b` 只作为文本 / 总结能力基线，不宣称稳定工具执行能力。
 
 ```powershell
 CTI_EXTENSION_CATALOG_URLS=https://example.com/codex-im-suite/catalog.json
@@ -169,7 +170,7 @@ CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS=24
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持白天 / 夜晚主题切换、可操作系统蓝图、记忆关系树、统一运行单元动作、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
 
 打包 portable 和 installer：
 

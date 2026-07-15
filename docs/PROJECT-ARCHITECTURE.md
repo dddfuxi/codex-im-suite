@@ -62,6 +62,9 @@ flowchart TD
   Runtime --> Core[packages/bridge-core]
   Runtime --> ProviderLayer[Codex 和本地模型 Provider]
   Runtime --> McpLayer[MCP manifest 和调用层]
+  Runtime --> SkillLifecycle[Skill Registry 和 Lifecycle]
+  SkillLifecycle --> OfficialSkillTools[官方 skill-creator 和 skill-installer]
+  Panel --> SkillLifecycle
   McpLayer --> IgnisPackage[packages/mcp-ignis]
   Core --> FeishuAdapter[Feishu Adapter]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
@@ -126,6 +129,32 @@ flowchart TD
 3. 再拆 Capability Router：把 `ExecutionRequirement`、action manifest、MCP schema discovery 和本地工具族选择收口到同一层。
 4. 再拆 Memory System 与 Scratchpad：长期 sticker/media/knowledge/reminder 与 `.codepilot-uploads`、候选附件、草稿提升保持清晰边界。
 5. 最后收薄 `bridge-manager`：只保留编排、锁、审计、状态、调用各层和错误收口。
+
+### 1.4 Registry 驱动能力治理
+
+Skill 能力治理已按“core 声明策略、runtime 实现生命周期、面板只做受控入口”落地：
+
+```mermaid
+flowchart LR
+  Request[Agent 或面板提出能力需求] --> Registry[Skill Registry]
+  Registry -->|已有可用 Skill| Use[直接使用]
+  Registry -->|能力缺口| SourcePolicy[来源与风险策略]
+  SourcePolicy --> Gate{自治或审批}
+  Gate -->|允许| Lifecycle[Skill Lifecycle]
+  Gate -->|用户或 Owner 确认| Lifecycle
+  Lifecycle --> OfficialTools[官方创建、校验和安装脚本]
+  OfficialTools --> Installed[CODEX_HOME Skills]
+  Lifecycle --> Audit[(生命周期审计与回滚点)]
+  Installed --> PromptSnapshot[Prompt Snapshot]
+  Registry --> MemoryIndex[Memory Skill 元数据索引]
+```
+
+- `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 声明能力缺口判断、来源分类、风险等级和审批动作，不执行下载或写目录。
+- `packages/bridge-runtime/src/skill-registry.ts` 扫描正式安装、禁用目录、草稿和 manifest，持久化到 `CTI_HOME\data\skill-registry.json`；首次扫描不搬动或改写已有 `SKILL.md`。
+- `packages/bridge-runtime/src/skill-lifecycle.ts` 统一创建、验证、审批、安装、启停和回滚；飞书扩展入口与 `skill-lifecycle-cli.mjs` 共用该服务。安装使用 staging、校验、原子替换和 backup，审计写入 `CTI_HOME\data\skill-lifecycle-audit.jsonl`。
+- 已安装 Skill 能满足任务时不会查询外部目录；官方精选未安装需用户确认，白名单低风险来源可自动处理，第三方、未知或高风险变更需要 Owner。
+- `Prompt Composer` 按稳定顺序生成带来源标签的 section；短期只读 Snapshot 写入 `CTI_HOME\runtime\prompt-snapshots.json`，默认最多 100 条、保留 7 天，并记录脱敏、哈希和截断元数据。
+- Memory 只投影 Skill ID、状态、来源类别、风险和真实路径，不读取或复制 `SKILL.md` 正文。
 
 路径职责表：
 
@@ -668,7 +697,9 @@ flowchart TD
 - 记忆检索、Feishu 历史索引、`memory-profiles.json` 轻量画像索引和 Markdown 知识库索引。
 - workflow / executor 观测、运行中请求恢复信息持久化、bridge 重启后的可恢复状态识别和 retry worker。
 - workflow contract adapter：保持 `workflow-runs.json` 落盘格式不变，同时映射到共享 `WorkflowRunContract`，让控制面板和后续 node agent 不再直接耦合内部 JSON 字段。
-- 扩展目录 host：接收 bridge-core 的搜索、URL 预览、准备安装、确认安装和确认移除请求，通过本机 Control API 调用控制面板，不在运行时重新实现安装器。
+- 扩展目录 host：Skill 搜索、准备安装和确认安装转交同一 `SkillLifecycleService`；MCP、模型和 Plugin 等非 Skill 类型继续保留原 Control API 兼容入口。旧 `extension.remote.install` 即使命中 Skill 也会后端转交 lifecycle，不允许绕过来源与审批策略。
+- Skill Registry / Lifecycle：扫描并合并 manifest、草稿、禁用项和正式安装项；通过官方 `skill-creator` / `skill-installer` 脚本执行创建、校验和安装，统一处理审批、审计、原子替换与回滚。
+- Prompt Snapshot Store：接收 bridge-core 生成的脱敏 Snapshot，以原子 JSON 文件保存短期运行证据；Snapshot 写入失败只影响观察能力，不阻断 provider 或消息交付。
 - Feishu OAuth 和云文档 host：先用应用 `tenant_access_token` 读取 Docx / Sheets / Base，应用无权时再使用发起人 OAuth token；保存加密用户 token。callback 模式按需启动公网回调监听，manual 模式使用飞书官方 `authen/v1/authorize` 授权页并让用户把 `code/state` 回调 URL 发回飞书；读取失败时会按具体接口返回需要检查的只读 scope，避免把权限不足伪装成空内容。
 
 关键能力：
@@ -790,14 +821,14 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 查看节点拓扑、heartbeat、capability inventory 和 fake remote node 状态。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
-- 查看可操作系统蓝图、记忆关系树、记忆整理草稿、索引来源总览、记忆知识库索引状态、监听状态、关键词搜索、来源分组筛选、分页列表和来源片段；专业网格和关系缓存细节默认收进高级诊断。
+- 查看可操作系统蓝图、机器人八层架构、Prompt Snapshot、Memory 关系与资产索引；专业网格、关系缓存和运行诊断默认收进高级区域。
 - 通过“AI 执行与模型来源”配置默认 executor，并配置和测试官方 Codex、本地 API 或外部 API 主模型；常用模式只展示策略、服务、模型和地址，高级字段折叠保留。API key 只写入本机 `config.env`，Web 状态只返回是否已设置和掩码。
 
 截至 2026-05-16，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
 
 - Control API 是状态读取、白名单命令分发、会话详情、媒体缓存、workflow/executor/permissions 和本机脚本调用的统一后端。
 - WinForms 负责窗口生命周期、WebView2 Runtime 检测，并启动或连接本机 Control API；桌面壳不再把业务命令硬塞进 WebView 事件。
-- React 前端负责信息架构、导航、状态展示、长任务 pending 状态和活动流。
+- React 前端负责四域信息架构、导航、状态展示、长任务 pending 状态和活动流；一级分区固定为“运行 / 机器人 / 能力 / 治理”。
 - 前端通过 `HostBridge` 自动探测传输层：WebView2 内仍可走 `window.chrome.webview`，普通浏览器走 HTTP API 和 SSE。
 - 前端只能通过 HostBridge 请求后端执行白名单命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
 - Control API 默认只监听 `127.0.0.1:8788`；只有显式配置 `CTI_CONTROL_API_ALLOW_REMOTE=true` 和 `CTI_CONTROL_API_AUTH_TOKEN` 后才允许非本机访问。
@@ -815,8 +846,9 @@ Ignis CLI MCP，定位为创意生成能力包。
 - `/feishu` 能力诊断会展示 `CTI_FEISHUCLI_ENABLED` / `CTI_FEISHUCLI_PATH` 的辅助诊断状态，但 CLI 不参与 `parseHistoryIntentV2()`、原生 @ 判断、WS/p2p 入站、自动回复或 Agent 最终投递。面板人工同步可使用 CLI 更新供用户查看的远端会话/媒体缓存；机器人运行时历史 evidence 仍由 FeishuAdapter 的 OpenAPI / 长连接链路证明。
 - 复制安装的 skill 会在安装目录写入 `.cti-install.json` 保存 `installKind`、`installedAt`、`sourceRoot` 和 `installScript`；历史安装若缺失元数据，宿主会按 live 路径、`.git` 仓库和 `sourceRootHint` 回退推断来源，无法确认时禁用自动更新。
 - `suite_live_sync` 触发自更新时，若当前就是 live 控制面板本体，宿主会先安排面板文件替换后的自动重开；它只保证面板自己恢复，不会把 bridge daemon 的重启偷偷并入“同步”动作。
-- 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
-- 扩展页的 MCP 运行状态按健康检查、Codex 注册和托管进程综合判断；`bundled`、`external` 只作为安装来源展示，不再直接映射成“待处理”状态。
+- 能力区拆为 `Skills / MCP / 模型与插件` 三个正式页面；旧 `#extensions` 映射到 `#skills`，旧 `#nodes` / `#executors` 映射到服务页对应 tab，不继续维护平行页面。
+- Skills 页只调用 `skill.*` lifecycle 命令，展示已安装、草稿、能力目录和审批队列；MCP、模型和 Plugin 仍使用各自现有命令，页面之间不重复数据和动作。
+- MCP 页运行状态按健康检查、Codex 注册和托管进程综合判断；`bundled`、`external` 只作为安装来源展示，不再直接映射成“待处理”状态。
 - HTTP MCP 的面板健康检查不再把裸 `/mcp` 的 406 或 HTTP 可达当作可执行可用；普通 `healthCheck.kind=http` 只证明 endpoint 或 MCP protocol 可达。需要证明后端已连接真实宿主时，manifest 必须声明 `healthCheck.kind=mcp-http-resource`、`resourceUri`、`successRegex` 和 `failureRegex`，控制面板和 runtime 都会先 MCP `initialize`，再读取该资源并按声明条件判断健康。
 - Unity MCP 只是资源级健康检查的一个 manifest 配置实例：它读取 `mcpforunity://instances`，只有 `instance_count > 0` 才显示健康；如果 Unity Editor 没有注册 session，面板和 runtime 都会明确显示 session 不可用、读取失败或超时。Ignis 等非 Unity HTTP MCP 不会因为 URL 或名称相似而读取 Unity 资源。
 - bridge-runtime 的 Unity MCP 执行前预检同样来自 manifest 的资源级健康条件；单纯 HTTP 在线、406 或 initialize 成功但 `instance_count=0` 不再允许进入 Unity 截图、场景刷新或 prefab 操作链路。
@@ -841,9 +873,9 @@ Ignis CLI MCP，定位为创意生成能力包。
 - bridge 启动时会立即写入 `executor-status.json` 的 executor 基线状态；即使还没有新的飞书请求进入 provider，控制面板也能看到执行器目录、全局默认 executor 和兼容的会话默认 executor，不再把缺失状态文件误解为辅助器异常。
 - “节点”页通过 `nodes.list` 读取本机 node snapshot。第一阶段固定展示 `local` runtime node 和可关闭的 `fake-remote` node，用于验证多节点控制面模型、capability inventory、heartbeat 和可管理状态；当前页面只读，不向远端 node 下发动作。
 - “总览”页的系统蓝图只用“正常 / 需要处理 / 未启用”展示用户入口、Bridge 收发、AI 执行、MCP/记忆/提醒辅助和最终回复链路；AI 执行节点按“Codex agent + 模型来源/自动切换链”口径解释当前状态，不再把本地 API 展示成独立兜底执行器。当前蓝图已重构为“主链路 / 辅助能力 / 处理面板”的两段式导航：上半部分负责快速定位节点状态与入口，下半部分集中承载主动作、跳转和不可用原因，仍复用 `runtime.invokeAction` 和现有页面跳转来检查状态、启动/重启服务、处理 MCP、刷新记忆或进入设置，避免普通用户先看到内部协议字段。
-- “记忆”页第一屏优先展示关系树，左侧按来源把 v2 用户记忆、群聊记忆、长期记忆和直接提醒分组；旧 docs、根目录笔记、文档索引和旧显式记忆不会进入知识单元树。右侧围绕选中的知识单元展开对应内容、相关对象、待办提醒、可能冲突和来源文件；树内提供“生成整理草稿”主入口。原始知识单元表、相关对象表、联系表、路径、权重和答案审查 warning 保留在默认收起的高级诊断里。
-- “记忆”页保留默认折叠的索引来源说明，解释面板搜索显示数、`knowledge.json` v2 知识单元数、来源文件分组、默认可整理风险和跳过目录，避免把默认前 40 条搜索结果误解为全部记忆，但不作为主流程界面。
-- “记忆”页新增“记忆整理”面板，通过 `memory.optimizePreview` 生成待确认草稿，用户只能应用已勾选动作；v2 用户记忆、群聊记忆和长期记忆的重复归档可默认勾选，旧文档、根目录笔记、文档索引和生成摘要不再作为整理来源。已应用草稿可通过 `memory.optimizeUndo` 批量恢复归档动作；定期草稿开关只改变 `.cti-index\memory-optimizer-state.json`，不会自动应用。
+- “记忆索引”页第一屏优先展示关系树，左侧按来源展示 v2 用户记忆、群聊记忆、长期记忆和索引引用；右侧展开对应内容、相关对象、提醒关系、冲突和来源文件。原始知识单元表、相关对象表、联系表、路径、权重和答案审查 warning 保留在默认收起的高级诊断里。
+- “记忆索引”页只保留知识/事实、会话/历史、Skill 元数据引用、关系、搜索、来源打开和表情包资产管理；知识单元行不再提供归档动作，Skill 索引固定不含正文。
+- 提醒检查、完成、测试发送和来源打开迁移到“运行 → 会话”；记忆优化草稿、选择动作、应用、撤销、定期整理以及归档恢复/删除迁移到“治理 → 设置”。旧 command 名称保持不变，只调整页面归属。
 - “记忆”页新增“Feishu 表情包库”视图，复用现有 HostBridge `/api/commands` 链路，不新增独立应用。后端通过 `MemoryArtifactStore` 只操作记忆仓库 `data/im/feishu/stickers/stickers.json` 和 `data/im/feishu/stickers/media`，命令包括只读 `memory.feishuStickers`，以及 operator 权限的 `memory.updateFeishuSticker`、`memory.mergeFeishuStickerAliases`；前端可按 chat、启用状态和语义字段搜索，显示本地 sticker 缩略图，编辑名称/描述/意图/语气/用法/避免场景，合并别名并禁用或恢复误学语义。面板按 `isLibraryAsset` 区分“可管理表情包资产”和“仅历史 key 索引记录”，默认隐藏纯历史空 key，统计区和筛选器仍可查看历史 key 数量；`file_key`、media 路径、`mediaCachedAt` 和 `mediaDownloadFailedAt` 只作为折叠诊断字段展示。
 - 记忆仓库路径现在强制落在默认工作目录外；如果 `CTI_MEMORY_REPO_DIR` 指向默认工作目录或其子目录，宿主和运行时都会自动回退到默认记忆仓库。Windows 默认记忆仓库为 `E:\cli-md`。原始 Feishu history、history index、message archives、审计和运行状态继续留在 `CTI_HOME\data` / `CTI_HOME\runtime`；只有主动记录或长期可复用的摘要、语义、表情包和项目事实进入记忆仓库。Codex / agent 工具环境会显式透传解析后的 `CTI_HOME`，历史检索脚本也在 env 缺失时优先发现 `%USERPROFILE%\.claude-to-im\data`，避免把旧 `E:\cli-md\data\messages` 副本当作当前飞书聊天记录。
 - 记忆 Markdown 不再因为关键词命中就绕过 agent。明确“回忆 / 搜索 / 上次 / 记得”类请求和符合记忆键形态的短问题会检索记忆；是否可作为高置信答案证据由通用 `MemoryReplyDecision.type='high_confidence_evidence'` 按结构化命中、质量和置信度判断，不再在 bridge-core 里为单个词条写快路径。agent 终答整理时会继续看用户意图：列表/全量请求输出全部命中的键值，单项查询才输出单个匹配项。其他请求只把相关记忆作为上下文注入主执行链。
@@ -1028,6 +1060,15 @@ flowchart LR
 - `config/skills.d`
 - `extensions/skills`
 - `C:\Users\admin\.claude-to-im\extensions\manifests\skills.d`
+- `CTI_HOME\extensions\drafts\skills`
+- `CODEX_HOME\skills`
+
+运行边界：
+
+- `config/skills.d` 和 suite `extensions/skills` 是随项目发布的声明/备份来源；`CODEX_HOME\skills` 是正式安装事实目录。
+- Registry 文件为 `CTI_HOME\data\skill-registry.json`，损坏时可从 `.bak` 恢复；禁用 Skill 迁移到 `CTI_HOME\extensions\disabled\skills` 后仍保持可见。
+- 自建草稿位于 `CTI_HOME\extensions\drafts\skills`；安装 staging、backup 分别位于 `CTI_HOME\extensions\staging\skills`、`CTI_HOME\extensions\backups\skills`。
+- 面板和飞书只调用 runtime lifecycle，不直接复制目录或拼接安装命令。官方脚本路径从 `CODEX_HOME` 推导，进程调用使用参数数组，不执行 shell 插值。
 
 当前纳入项目备份的 skills：
 
@@ -1146,7 +1187,8 @@ Ignis 会话映射：
 - `memory.status` 会返回 `sourceCoverage`，按 v2 来源路径汇总知识单元数、最近更新时间、来源分组、默认风险和是否可自动整理；`memory.search` 支持 `sourceGroup`、`offset`、`limit`，默认轻量显示但可分页查看完整匹配列表。控制面板直接读取旧 `knowledge.json` 时也会复用 v2 过滤口径，旧残留条目不会显示。
 - 记忆整理草稿包含 `sourceSummary`、动作来源分组、默认勾选和人工复核标记；应用时必须传 `selectedActionIds`，并在 `sourceIndexGeneratedAt` 与当前 `knowledge.json.generatedAt` 不一致时拒绝旧草稿。
 - 归档恢复入口只允许读取 `E:\cli-md\archive\knowledge-units` 内文件，并校验归档记录的源文件仍在记忆仓库内；单条恢复和草稿撤销都会重建知识索引和提醒索引。
-- 待办提醒索引为派生文件：`.cti-index\reminders.json` 保存待发送、已发送、跳过和失败的展示数据，`.cti-index\reminder-state.json` 保存 `pending / sent / failed / skipped` 推送状态和最近结果。控制面板“记忆”页显示提醒时间、来源类型、来源会话、来源片段、跳过原因和飞书测试发送入口。
+- 待办提醒索引为派生文件：`.cti-index\reminders.json` 保存待发送、已发送、跳过和失败的展示数据，`.cti-index\reminder-state.json` 保存 `pending / sent / failed / skipped` 推送状态和最近结果。控制面板“会话”页显示提醒时间、来源类型、来源会话、来源片段、完成和飞书测试发送入口。
+- Memory 页面额外消费控制面板从 Skill Registry 投影出的 `cti-memory-skill-asset-index/v1`；该对象只含引用和治理元数据，`skillBody` 固定为空，不参与长期记忆写入。
 - `sourceType=direct` 的提醒来自 `cti-reminder` 或 `/remind`，源文件落在 `data\todos\direct-reminders`；面板会把它和普通 `sourceType=memory` 待办区分展示。
 - Codex CLI 模型/API 不可用时，只有自动切换链中声明的后续来源会被尝试；任务、工具、权限或 MCP 失败不得换模型重跑，也不得降级成教程式回复。
 - Provider 错误外发统一经过安全摘要收口：`tool_result` SSE、`tool_use_id`、本地路径、转义 JSON 和高乱码密度内容不会作为正文发送到 Feishu，也不会写入会话记忆。若已有 workflow/light card，只更新同一张卡为安全未完成摘要；确需补发时只发一条短文本，并按 chat 做短窗口失败熔断，避免错误被切成多条群消息。
@@ -1214,7 +1256,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish-backup.ps1
 
 本机备份发布脚本职责：
 
-- 构建 package；构建顺序先走 `packages/contracts`，再构建 bridge/runtime/MCP 包，保证共享 DTO 和 schema 先产出。
+- 构建 package；构建顺序先走 `packages/contracts`，再构建 bridge/runtime/MCP 包，保证共享 DTO 和 schema 先产出。`scripts/build-packages.ps1` 不再内联一份只生成 daemon 的 runtime esbuild 配置，而是调用 `packages/bridge-runtime` 自己的 build script，使 `daemon.mjs`、`memory-optimizer-cli.mjs` 和 `skill-lifecycle-cli.mjs` 共享同一构建事实源。
 - 构建控制面板。
 - 用开发版生成 live skill。
 - 组装 portable。

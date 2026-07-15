@@ -689,9 +689,9 @@
 - 2026-07-07 Feishu 名字唤醒与回复状态：群聊 `require_mention=true` 下，没有原生 @ 时会使用 bot displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases` 或 `CTI_FEISHU_BOT_ALIASES` 形成别名，先分类 `chat / investigate / need_info / done` 再决定是否入队；“小桥 帮我看看”这类明确请求会写入 `raw.feishuBotWake` 并进入执行链，“刚才小桥说的那个方案挺好”这类第三人称提及只写过滤审计。`conversation-engine` 的回复契约同步要求 Feishu turn 先判 intent/state，查完只回结果，缺信息才问最小澄清，艾特人必须基于明确姓名、被回复消息或唯一群成员匹配，不再把工具流水、路径、命令或内部协议倒给用户。
 - 2026-07-15 表情包视觉语义防串图：模型返回的 `cti-sticker-annotation` 只有在本轮实际附加了同一 `file_key` 的图片时才可写入 `source=vision`；同轮其他候选图不能为被回复表情包背书，避免错误画面描述进入可信语义库后持续误导后续解释与发送。
 
-## 10. 2026-07-15 Registry 驱动机器人能力治理设计（已确认，待实施）
+## 10. 2026-07-15 Registry 驱动机器人能力治理（已实施并完成 live 复核）
 
-状态：本节记录用户已逐节确认的目标设计，当前尚未把该设计写入运行逻辑。实施分支为 `codex/agent-capability-registry`。当前架构事实仍以 `docs/PROJECT-ARCHITECTURE.md` 为准；完成对应代码阶段后再同步更新架构事实文档。
+状态：实施分支为 `codex/agent-capability-registry`。Registry、官方生命周期适配、飞书/CLI 共用入口、Prompt Snapshot、Memory Skill 元数据索引和控制面板四域分区均已落地；完整测试、构建、live 同步、Bridge 重启、Feishu 长连接与面板 HTTP 状态均已复核。当前架构事实以 `docs/PROJECT-ARCHITECTURE.md` 为准。
 
 ### 10.1 目标和原则
 
@@ -794,3 +794,15 @@ Skills 页面内部只保留“已安装、草稿、能力目录、审批队列�
 - Memory 页面只展示索引和引用，不保存完整 Skill 正文。
 - Registry、生命周期、权限、迁移、回滚和面板导航具备单元测试、集成测试或端到端验证。
 - 构建、架构文档检查、live skill 同步、bridge 重启、`status.json`、`bridge-runtime-audit.json` 和飞书长连接复核全部通过后才交付。
+
+### 10.8 已落地范围与剩余风险
+
+- `bridge-core` 已提供通用能力缺口、来源、风险、审批策略，以及 Prompt Composer / Snapshot 纯函数；没有引入 Node 文件系统依赖。
+- `bridge-runtime` 已实现 Registry、来源策略、官方脚本适配器、Lifecycle、JSON CLI、审批绑定、审计、staging、backup 和 rollback；Skill 安装不再复用通用 `allowUntrusted` 直装路径。
+- 飞书扩展入口和控制面板 `skill.*` 命令共用 lifecycle；MCP、模型和 Plugin 保持旧命令兼容，避免扩大迁移范围。
+- 控制面板已按“运行 / 机器人 / 能力 / 治理”分区；机器人架构读取 core 注册表，Prompt 页只读脱敏 Snapshot，Memory 页只做索引与资产引用。提醒迁移到会话页，记忆优化和归档治理迁移到设置页。
+- Registry 状态轮询只读已落盘文件，不会持续执行 CLI 重写；禁用 Skill 仍可被扫描和展示。
+- 完整打包时发现 `scripts/build-packages.ps1` 的历史 runtime fallback 只重建 `daemon.mjs`，干净工作区会漏掉 memory optimizer 和 Skill lifecycle CLI。现已移除这份重复 esbuild 配置，改为调用 runtime 自身 build script；通过先移走两个 CLI 的 RED 测试确认旧入口无法重建，再用同一测试确认修复后两个产物都会重新生成。
+- live 复核结果：Bridge `running=true`，Feishu WS 为 `connected`，`lastUnhandledError` 为空；live 三个 runtime bundle 和正式控制面板 exe 均已更新。面板 `healthz` 返回成功，`/api/state` 返回 `cti-skill-registry/v1` 与 `cti-memory-skill-asset-index/v1`，19 个 Skill 引用中没有 Skill 正文。
+- 官方 `lark-cli` 已从 `1.0.69` 更新到 `1.0.70`；`doctor`、bot `whoami`、开放平台 endpoint 和 Feishu MCP endpoint 均通过。当前没有用户 OAuth 登录，因此用户私有资源仍需后续显式登录；这不影响 bot 身份和 Bridge 主链。
+- 当前剩余风险是 Browser 插件仍无法挂接 in-app localhost 标签，页面点击级视觉验收不能用插件伪造；本轮已启动 live 正式面板进程，并以 React 测试、TypeScript/Vite 构建、ControlPanel 测试、Release 构建、HTTP 页面资产和 `/api/state` 作为可观察证据。Bridge 新启动日志仅保留 Node `url.parse()` 弃用警告，没有 Skill lifecycle 未处理异常。
