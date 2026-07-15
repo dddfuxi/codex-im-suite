@@ -1122,6 +1122,7 @@ internal sealed partial class MainForm : Form
         var sessionItems = await BuildSessionItemsAsync();
         var skillGovernance = await BuildSkillGovernanceStateAsync();
         var promptSnapshots = BuildPromptSnapshotState();
+        var memorySkillAssets = MemoryArtifactStore.BuildSkillAssetIndex(skillGovernance.Snapshot ?? default);
         var services = new[]
         {
             BuildServiceItem("bridge", "飞书桥接", _bridgeStatus.Text),
@@ -1180,6 +1181,7 @@ internal sealed partial class MainForm : Form
                 sessions = sessionItems.Take(80).ToArray(),
             },
             memory = BuildKnowledgeIndexStatus(),
+            memorySkillAssets,
             memoryReminders = BuildTodoReminderSnapshot(),
             workflow = ListWorkflowRuns(),
             executors = ReadExecutorStatusPayload(),
@@ -10149,26 +10151,16 @@ exit $LASTEXITCODE
         return input;
     }
 
-    private async Task<object> BuildSkillGovernanceStateAsync()
+    private async Task<WebSkillGovernanceState> BuildSkillGovernanceStateAsync()
     {
         try
         {
             using var document = await CreateSkillLifecycleGateway().ReadSnapshotAsync();
-            return new
-            {
-                available = true,
-                error = "",
-                snapshot = document.RootElement.Clone(),
-            };
+            return new WebSkillGovernanceState(true, "", document.RootElement.Clone());
         }
         catch (Exception error)
         {
-            return new
-            {
-                available = false,
-                error = TrimForSummary(error.Message, 800),
-                snapshot = (JsonElement?)null,
-            };
+            return new WebSkillGovernanceState(false, TrimForSummary(error.Message, 800), null);
         }
     }
 
@@ -10642,6 +10634,7 @@ internal sealed class WebCommandRequest
 }
 
 internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
+internal sealed record WebSkillGovernanceState(bool Available, string Error, JsonElement? Snapshot);
 internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
 internal sealed record WebNodeCapability(string Id, string DisplayName, string Category, string Status, string Detail, string Risk);
 internal sealed record WebNodeAgent(

@@ -10,7 +10,6 @@ import {
 } from '@tanstack/react-table';
 import {
   Activity,
-  Archive,
   ArrowDownUp,
   ArrowLeftRight,
   Bell,
@@ -884,6 +883,23 @@ type LiveSyncState = {
   legacyEntryPath?: string;
 };
 
+type SkillAssetIndexSnapshot = {
+  protocol: string;
+  generatedAt: string;
+  items: Array<{
+    id: string;
+    displayName: string;
+    sourceClass: string;
+    state: string;
+    risk: string;
+    enabled: boolean;
+    sourcePath: string;
+    version: string;
+    updatedAt: string;
+    skillBody: null;
+  }>;
+};
+
 type PanelState = {
   generatedAt: string;
   suite: {
@@ -929,6 +945,7 @@ type PanelState = {
   };
   workflow: WorkflowStatus;
   memory: KnowledgeIndexStatus;
+  memorySkillAssets: SkillAssetIndexSnapshot;
   memoryReminders: TodoReminderSnapshot;
   executors: ExecutorStatus;
   permissions: PermissionSnapshot;
@@ -1091,6 +1108,7 @@ const fallbackState: PanelState = {
       drafts: [],
     },
   },
+  memorySkillAssets: { protocol: 'cti-memory-skill-asset-index/v1', generatedAt: '', items: [] },
   memoryReminders: {
     schema: 'codex-im-suite/reminders-panel/v1',
     memoryRoot: '',
@@ -4137,6 +4155,55 @@ function SessionsPage({
           refreshDetail={() => detail ? openSessionDetail(`${detail.chatId}::${detail.sessionId}`, true) : undefined}
         />
       </section>
+      <ReminderPanel initial={state.memoryReminders} run={run} pending={pending} />
+    </section>
+  );
+}
+
+function ReminderPanel({ initial, run, pending }: { initial: TodoReminderSnapshot; run: PageProps['run']; pending: Record<string, boolean> }) {
+  const [reminders, setReminders] = useState(initial);
+  useEffect(() => setReminders(initial), [initial]);
+
+  const refresh = async () => setReminders(await run('memory.checkReminders') as TodoReminderSnapshot);
+  const complete = async (id: string) => {
+    await run('memory.completeReminder', { id });
+    await refresh();
+  };
+  const test = async (id: string) => {
+    await run('memory.testReminder', { id });
+    await refresh();
+  };
+
+  return (
+    <section className="panel">
+      <SectionHeader title="提醒" action={<MiniButton label="检查提醒" icon={<RefreshCw size={14} />} onClick={() => void refresh()} pending={pending['memory.checkReminders']} />} />
+      <div className="summary-grid">
+        <Metric label="主动推送" value={reminders.enabled ? '已开启' : '未开启'} compact />
+        <Metric label="直接提醒" value={reminders.directReminderPushEnabled ? '已开启' : reminders.directReminderEnabled === false ? '未启用' : '未推送'} compact />
+        <Metric label="待发送" value={String(reminders.counts?.pending ?? 0)} compact />
+        <Metric label="已发送" value={String(reminders.counts?.sent ?? 0)} compact />
+        <Metric label="已完成" value={String(reminders.counts?.completed ?? 0)} compact />
+        <Metric label="失败" value={String(reminders.counts?.failed ?? 0)} compact />
+      </div>
+      {reminders.lastError && <div className="inline-notice warning">{reminders.lastError}</div>}
+      <div className="runtime-list compact-list">
+        {(reminders.items ?? []).map((item) => (
+          <article key={item.id} className="runtime-row">
+            <div>
+              <strong>{item.title || '未命名提醒'}</strong>
+              <span>{item.dueAt || '无提醒时间'} · {item.sourceType === 'direct' ? '直接提醒' : '记忆待办'} · {item.target?.displayName || item.target?.chatId || '缺少来源会话'}</span>
+              <p>{item.completedAt || item.delivery?.completedAt ? `已完成：${item.completedAt || item.delivery?.completedAt}` : item.skipReason || item.delivery?.error || item.source?.snippet || '等待到点推送。'}</p>
+            </div>
+            <div className="row-actions">
+              <StatusPill status={reminderStatusKind(item.status)} label={reminderStatusLabel(item.status)} />
+              <MiniButton label="完成" icon={<CheckCircle2 size={14} />} onClick={() => void complete(item.id)} pending={pending['memory.completeReminder']} disabled={item.status === 'completed'} />
+              <MiniButton label="测试发送" icon={<Play size={14} />} onClick={() => void test(item.id)} pending={pending['memory.testReminder']} disabled={item.status === 'completed' || (item.target?.channelType || '').toLowerCase() !== 'feishu' || !item.target?.chatId} />
+              <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.source?.path })} pending={pending['memory.openSource']} />
+            </div>
+          </article>
+        ))}
+        {(reminders.items ?? []).length === 0 && <div className="empty-inline">暂无提醒。自然语言提醒仍由 agent 生成受控动作，不在面板里绕过主链路。</div>}
+      </div>
     </section>
   );
 }
@@ -4769,7 +4836,7 @@ function MemoryRelationTree({
 
 function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps['run']; pending: Record<string, boolean> }) {
   const [status, setStatus] = useState<KnowledgeIndexStatus>(state.memory);
-  const [reminders, setReminders] = useState<TodoReminderSnapshot>(state.memoryReminders);
+  const reminders = state.memoryReminders;
   const [query, setQuery] = useState('');
   const [kind, setKind] = useState<(typeof knowledgeKinds)[number]['id']>('all');
   const [sourceGroup, setSourceGroup] = useState<MemorySourceGroup>('all');
@@ -4777,9 +4844,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [selectedMemoryId, setSelectedMemoryId] = useState('');
   const [items, setItems] = useState<KnowledgeSearchItem[]>([]);
   const [searchMeta, setSearchMeta] = useState({ totalMatched: 0, offset: 0, limit: 200 });
-  const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
-  const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(state.memory.optimization);
-  const [selectedOptimizationActions, setSelectedOptimizationActions] = useState<string[]>([]);
   const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', mediaDir: '', updatedAt: '', stickers: [] });
   const [stickerQuery, setStickerQuery] = useState('');
   const [stickerStatusFilter, setStickerStatusFilter] = useState<'asset' | 'all' | 'enabled' | 'disabled' | 'failed' | 'history'>('asset');
@@ -4788,49 +4852,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [editingSticker, setEditingSticker] = useState<Partial<FeishuStickerLibraryItem>>({});
   const [aliasDrafts, setAliasDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
-  const runRef = useRef(run);
 
   useEffect(() => setStatus(state.memory), [state.memory]);
-  useEffect(() => setOptimization(state.memory.optimization), [state.memory.optimization]);
-  useEffect(() => setReminders(state.memoryReminders), [state.memoryReminders]);
-  useEffect(() => {
-    runRef.current = run;
-  }, [run]);
-  useEffect(() => {
-    let disposed = false;
-    const timer = window.setInterval(() => {
-      void runRef.current('memory.status')
-        .then((next) => {
-          if (!disposed) {
-            const statusNext = next as KnowledgeIndexStatus;
-            setStatus(statusNext);
-            if (statusNext.optimization) setOptimization(statusNext.optimization);
-          }
-        })
-        .catch(() => undefined);
-    }, 5000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, []);
 
   const refreshStatus = async () => {
     setError('');
     const next = await run('memory.status') as KnowledgeIndexStatus;
     setStatus(next);
-    if (next.optimization) setOptimization(next.optimization);
-  };
-
-  const refreshReminders = async () => {
-    setError('');
-    const next = await run('memory.checkReminders') as TodoReminderSnapshot;
-    setReminders(next);
-  };
-
-  const refreshArchives = async () => {
-    const next = await run('memory.archives') as KnowledgeArchiveSnapshot;
-    setArchives(next);
   };
 
   const refreshStickerLibrary = async () => {
@@ -4839,101 +4867,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
       ...next,
       stickers: Array.isArray(next.stickers) ? next.stickers : [],
     });
-  };
-
-  const refreshOptimization = async () => {
-    const next = await run('memory.optimizeStatus') as MemoryOptimizationStatus;
-    setOptimization(next);
-    const draft = (next.drafts ?? []).find((item) => item.status === 'draft');
-    setSelectedOptimizationActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
-  };
-
-  const generateOptimizationDraft = async () => {
-    setError('');
-    const result = await run('memory.optimizePreview', {
-      modelSource: optimization?.modelSource || 'codex_primary',
-    }) as { status?: MemoryOptimizationStatus };
-    if (result.status) {
-      setOptimization(result.status);
-      const draft = (result.status.drafts ?? []).find((item) => item.status === 'draft');
-      setSelectedOptimizationActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
-    }
-    await refreshStatus();
-  };
-
-  const applyOptimizationDraft = async (draft: MemoryOptimizationDraft) => {
-    setError('');
-    if (!window.confirm(`确认应用这份记忆整理草稿？将执行 ${selectedOptimizationActions.length} 个已勾选动作，未勾选动作不会执行，归档项可恢复。`)) return;
-    const result = await run('memory.optimizeApply', {
-      draftId: draft.draftId,
-      selectedActionIds: selectedOptimizationActions,
-    }) as { status?: MemoryOptimizationStatus };
-    if (result.status) setOptimization(result.status);
-    setSelectedOptimizationActions([]);
-    await search();
-    await refreshReminders();
-    await refreshArchives();
-  };
-
-  const undoOptimizationDraft = async (draft: MemoryOptimizationDraft) => {
-    setError('');
-    if (!window.confirm('确认撤销这份已应用草稿？只会自动恢复归档动作，新增/更新动作会标记为需要人工确认。')) return;
-    const result = await run('memory.optimizeUndo', { draftId: draft.draftId }) as { status?: MemoryOptimizationStatus };
-    if (result.status) setOptimization(result.status);
-    await search();
-    await refreshReminders();
-    await refreshArchives();
-  };
-
-  const discardOptimizationDraft = async (draftId: string) => {
-    setError('');
-    const result = await run('memory.optimizeDiscard', { draftId }) as { status?: MemoryOptimizationStatus };
-    if (result.status) setOptimization(result.status);
-    setSelectedOptimizationActions([]);
-  };
-
-  const updateOptimizationSchedule = async (enabled: boolean) => {
-    setError('');
-    const result = await run('memory.optimizeSchedule', {
-      enabled,
-      intervalDays: optimization?.intervalDays || 7,
-      modelSource: optimization?.modelSource || 'codex_primary',
-    }) as { status?: MemoryOptimizationStatus };
-    if (result.status) setOptimization(result.status);
-  };
-
-  const testReminder = async (id: string) => {
-    setError('');
-    await run('memory.testReminder', { id });
-    await refreshReminders();
-  };
-
-  const completeReminder = async (id: string) => {
-    setError('');
-    await run('memory.completeReminder', { id });
-    await refreshReminders();
-  };
-
-  const archiveKnowledgeItem = async (id: string) => {
-    setError('');
-    await run('memory.archiveItem', { id });
-    await search();
-    await refreshReminders();
-    await refreshArchives();
-  };
-
-  const deleteKnowledgeArchive = async (archivePath: string) => {
-    setError('');
-    await run('memory.deleteArchive', { path: archivePath });
-    await refreshArchives();
-  };
-
-  const restoreKnowledgeArchive = async (archivePath: string) => {
-    setError('');
-    await run('memory.restoreArchive', { archivePath });
-    await search();
-    await refreshReminders();
-    await refreshArchives();
   };
 
   const beginEditSticker = (item: FeishuStickerLibraryItem) => {
@@ -5025,16 +4958,8 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   }, [kind, sourceGroup]);
 
   useEffect(() => {
-    void refreshArchives();
-    void refreshOptimization();
     void refreshStickerLibrary();
   }, []);
-  useEffect(() => {
-    const draft = (optimization?.drafts ?? []).find((item) => item.status === 'draft');
-    if (!draft) return;
-    setSelectedOptimizationActions((current) => current.length > 0 ? current : draft.actions.filter((action) => action.defaultSelected !== false).map((action) => action.id));
-  }, [optimization?.drafts?.[0]?.draftId]);
-
   const statusKind: StatusKind = status.lastError
     ? 'error'
     : status.exists
@@ -5056,10 +4981,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const graphNodes = status.memoryGraphPreview?.nodes ?? [];
   const graphEdges = status.memoryGraphPreview?.edges ?? [];
   const selectedMemory = items.find((item) => item.id === selectedMemoryId) ?? pickDefaultMemoryItem(items);
-  const activeOptimizationDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft') ?? (optimization?.drafts ?? [])[0];
-  const pendingDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft');
-  const appliedDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'applied');
-  const selectedActionCount = pendingDraft ? selectedOptimizationActions.length : 0;
   const stickerChatOptions = useMemo(() => {
     return Array.from(new Set(stickerLibrary.stickers.map((item) => item.chatId).filter(Boolean))).sort();
   }, [stickerLibrary.stickers]);
@@ -5168,16 +5089,10 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
       enableSorting: false,
       cell: ({ row }) => (
         <div className="grid-actions">
-          <MiniButton
-            label="归档"
-            icon={<Archive size={14} />}
-            onClick={() => void archiveKnowledgeItem(row.original.id)}
-            pending={pending['memory.archiveItem']}
-          />
           <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: row.original.sourcePath })} pending={pending['memory.openSource']} />
         </div>
       ),
-      size: 190,
+      size: 110,
     },
   ], [pending, run]);
   const nodeColumns = useMemo<Array<ColumnDef<{ id: string; label: string; kind: string }>>>(() => [
@@ -5200,30 +5115,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           action={<MiniButton label="搜索" icon={<Search size={14} />} onClick={() => void search()} pending={pending['memory.search']} />}
         />
         <p className="panel-intro">左侧按来源分开：普通记忆默认展开，上下文文档和索引资料默认折叠；选中一条后，右侧展开它对应到什么、关联了哪些资源、是否带提醒或冲突。</p>
-        <div className="memory-quick-actions">
-          <div>
-            <strong>整理记忆从这里开始</strong>
-            <span>
-              生成整理草稿只做预览，不会直接写回；确认时只执行你勾选的动作。当前{pendingDraft ? `有 1 份待确认草稿，已勾选 ${selectedActionCount} 项。` : appliedDraft ? '最近草稿已应用，可生成新草稿重新扫描。' : '还没有待确认草稿。'}
-            </span>
-          </div>
-          <div className="row-actions">
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => void generateOptimizationDraft()}
-              disabled={pending['memory.optimizePreview']}
-            >
-              <ListChecks size={15} />
-              生成整理草稿
-            </button>
-            <MiniButton
-              label={pendingDraft ? '查看待确认草稿' : appliedDraft ? '查看已应用草稿' : '查看整理区'}
-              icon={<ArrowDownUp size={14} />}
-              onClick={() => document.getElementById('memory-optimizer-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
-            />
-          </div>
-        </div>
         <div className="filter-row">
           <Search size={14} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
@@ -5257,6 +5148,38 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         {searchMeta.totalMatched > items.length && (
           <div className="detail-meta">当前已显示 {items.length} / {searchMeta.totalMatched} 条。结果过多时，请用搜索或来源筛选缩小范围。</div>
         )}
+      </section>
+
+      <section className="panel">
+        <SectionHeader title="Skill 资产索引" />
+        <p className="panel-intro">这里只引用 Registry 元数据和真实来源路径，不读取或复制 SKILL.md 正文。安装、启停、审批和更新统一在“能力 → Skills”中维护。</p>
+        <div className="detail-meta">协议 {state.memorySkillAssets.protocol || '-'} · 索引时间 {state.memorySkillAssets.generatedAt || '-'} · 共 {state.memorySkillAssets.items.length} 项</div>
+        <div className="runtime-list compact-list">
+          {state.memorySkillAssets.items.map((item) => (
+            <article key={item.id} className="runtime-row">
+              <div>
+                <strong>{item.displayName || item.id}</strong>
+                <span>ID {item.id} · 状态 {item.state || '-'} · 来源类别 {item.sourceClass || '-'} · 风险 {item.risk || '-'}</span>
+                <p>{item.version ? `版本 ${item.version} · ` : ''}{item.enabled ? '当前启用' : '当前未启用'}{item.updatedAt ? ` · 更新 ${item.updatedAt}` : ''}</p>
+                <code>{item.sourcePath || '-'}</code>
+              </div>
+              <div className="row-actions">
+                <StatusPill
+                  status={item.risk === 'high' || item.state === 'quarantined' ? 'warning' : item.enabled ? 'ok' : 'idle'}
+                  label={item.state || (item.enabled ? 'enabled' : 'disabled')}
+                />
+                <MiniButton
+                  label="来源"
+                  icon={<ExternalLink size={14} />}
+                  onClick={() => void run('memory.openSource', { path: item.sourcePath })}
+                  pending={pending['memory.openSource']}
+                  disabled={!item.sourcePath}
+                />
+              </div>
+            </article>
+          ))}
+          {state.memorySkillAssets.items.length === 0 && <div className="empty-inline">暂无 Skill 资产引用。Registry 可用后会在这里显示元数据索引。</div>}
+        </div>
       </section>
 
       <section className="panel feishu-sticker-panel">
@@ -5437,125 +5360,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         </section>
       </section>
 
-      <section id="memory-optimizer-panel" className="panel memory-optimizer-panel">
-        <SectionHeader
-          title="记忆整理"
-          action={<MiniButton label="生成整理草稿" icon={<ListChecks size={14} />} onClick={() => void generateOptimizationDraft()} pending={pending['memory.optimizePreview']} />}
-        />
-        <p className="panel-intro">这里是草稿确认区。生成草稿只预览建议；真正写回前，你还要勾选动作并点“确认应用所选”。</p>
-        <div className="memory-optimizer-summary">
-          <Metric label="定期草稿" value={optimization?.enabled ? '已开启' : '未开启'} compact />
-          <Metric label="草稿待确认" value={String(optimization?.draftCount ?? 0)} compact />
-          <Metric label="上次生成" value={optimization?.lastGeneratedAt || '-'} compact />
-          <Metric label="下次计划" value={optimization?.nextRunAt || '-'} compact />
-        </div>
-        {optimization?.recentError && <div className="empty-inline">{optimization.recentError}</div>}
-        <div className="command-band tight">
-          <MiniButton
-            label={optimization?.enabled ? '关闭定期草稿' : '开启每周草稿'}
-            icon={<RefreshCw size={14} />}
-            onClick={() => void updateOptimizationSchedule(!(optimization?.enabled))}
-            pending={pending['memory.optimizeSchedule']}
-          />
-          <MiniButton label="刷新状态" icon={<RefreshCw size={14} />} onClick={() => void refreshOptimization()} pending={pending['memory.optimizeStatus']} />
-        </div>
-        {activeOptimizationDraft ? (
-          <div className="memory-optimizer-draft">
-            <div className="optimizer-draft-head">
-              <div>
-                <strong>{activeOptimizationDraft.summary || '记忆整理草稿'}</strong>
-                <span>{activeOptimizationDraft.generatedAt || '-'} · {activeOptimizationDraft.generatedBy === 'schedule' ? '定期生成' : '手动生成'} · {activeOptimizationDraft.status}</span>
-              </div>
-              <div className="row-actions">
-                <MiniButton
-                  label="确认应用所选"
-                  icon={<CheckCircle2 size={14} />}
-                  onClick={() => void applyOptimizationDraft(activeOptimizationDraft)}
-                  pending={pending['memory.optimizeApply']}
-                  disabled={activeOptimizationDraft.status !== 'draft'}
-                />
-                <MiniButton
-                  label="撤销应用"
-                  icon={<RotateCw size={14} />}
-                  onClick={() => void undoOptimizationDraft(activeOptimizationDraft)}
-                  pending={pending['memory.optimizeUndo']}
-                  disabled={activeOptimizationDraft.status !== 'applied'}
-                />
-                <MiniButton
-                  label="丢弃草稿"
-                  icon={<Trash2 size={14} />}
-                  onClick={() => void discardOptimizationDraft(activeOptimizationDraft.draftId)}
-                  pending={pending['memory.optimizeDiscard']}
-                  disabled={activeOptimizationDraft.status !== 'draft'}
-                />
-              </div>
-            </div>
-            <div className="optimizer-action-list">
-              {(activeOptimizationDraft.actions ?? []).map((action) => {
-                const selected = selectedOptimizationActions.includes(action.id);
-                return (
-                  <label key={action.id} className={selected ? `optimizer-action risk-${action.risk}` : 'optimizer-action excluded'}>
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      disabled={activeOptimizationDraft.status !== 'draft'}
-                      onChange={(event) => {
-                        setSelectedOptimizationActions((current) => event.target.checked
-                          ? [...new Set([...current, action.id])]
-                          : current.filter((id) => id !== action.id));
-                      }}
-                    />
-                    <div>
-                      <strong>{action.title}</strong>
-                      <span>
-                        {action.type === 'add' ? '新增' : action.type === 'update' ? '更新' : '归档'}
-                        {' · '}{memorySourceGroupLabel(action.sourceGroup || 'other')}
-                        {' · '}风险 {action.risk}
-                        {' · '}置信 {Math.round((action.confidence || 0) * 100)}%
-                        {action.requiresManualReview ? ' · 默认不执行' : ' · 默认勾选'}
-                      </span>
-                      <p>{action.reason}</p>
-                      <code>{action.targetPath || action.source?.path || '-'}</code>
-                    </div>
-                  </label>
-                );
-              })}
-              {(activeOptimizationDraft.actions ?? []).length === 0 && <div className="empty-inline">这份草稿没有需要应用的动作。</div>}
-            </div>
-          </div>
-        ) : (
-          <div className="empty-inline">还没有整理草稿。点击“生成整理草稿”后，可以先查看清单，再确认应用所选动作。</div>
-        )}
-      </section>
-
-      <details className="panel advanced-diagnostics memory-source-details">
-        <summary>
-          <span>为什么草稿会包含当前列表没显示的来源？</span>
-          <small>完整索引来源、默认风险和跳过目录。一般不需要展开。</small>
-        </summary>
-        <div className="advanced-diagnostics-body">
-          <section className="diagnostic-section">
-            <p className="panel-intro">
-              整理草稿基于完整索引生成，不只基于当前搜索结果。当前索引共有 {status.itemCount ?? 0} 条知识单元，搜索显示 {items.length} / {searchMeta.totalMatched || status.itemCount || 0} 条。
-            </p>
-            <div className="memory-source-list">
-              {(status.sourceCoverage ?? []).slice(0, 12).map((source) => (
-                <article key={source.sourcePath} className={source.autoSelectable ? 'memory-source-card safe' : 'memory-source-card review'}>
-                  <div>
-                    <strong>{memorySourceGroupLabel(source.sourceGroup)}</strong>
-                    <span>{source.itemCount} 条 · {source.autoSelectable ? '可默认整理' : '默认需人工确认'} · 风险 {source.defaultRisk}</span>
-                    <code>{source.sourcePath}</code>
-                  </div>
-                  <StatusPill status={source.autoSelectable ? 'ok' : 'warning'} label={source.autoSelectable ? '默认可选' : '需确认'} />
-                </article>
-              ))}
-              {(status.sourceCoverage ?? []).length === 0 && <div className="empty-inline">暂无来源覆盖数据，请先刷新记忆索引。</div>}
-            </div>
-            <div className="detail-meta">索引器跳过目录：{(status.skippedDirectories ?? []).join('、') || '.git、.cti-index、archive、node_modules、.obsidian'}。</div>
-          </section>
-        </div>
-      </details>
-
       <details className="panel advanced-diagnostics">
         <summary>
           <span>高级诊断</span>
@@ -5624,66 +5428,6 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           </section>
         </div>
       </details>
-
-      <section className="panel">
-        <SectionHeader
-          title="待办提醒"
-          action={<MiniButton label="检查提醒" icon={<RefreshCw size={14} />} onClick={() => void refreshReminders()} pending={pending['memory.checkReminders']} />}
-        />
-        <div className="summary-grid">
-          <Metric label="主动推送" value={reminders.enabled ? '已开启' : '未开启'} compact />
-          <Metric label="直接提醒" value={reminders.directReminderPushEnabled ? '已开启' : reminders.directReminderEnabled === false ? '未启用' : '未推送'} compact />
-          <Metric label="待发送" value={String(reminders.counts?.pending ?? 0)} compact />
-          <Metric label="已发送" value={String(reminders.counts?.sent ?? 0)} compact />
-          <Metric label="已完成" value={String(reminders.counts?.completed ?? 0)} compact />
-          <Metric label="失败" value={String(reminders.counts?.failed ?? 0)} compact />
-          <Metric label="跳过" value={String(reminders.counts?.skipped ?? 0)} compact />
-        </div>
-        <div className="detail-meta">
-          索引 {reminders.exists ? '已生成' : '未生成'} · 渠道 {(reminders.channels ?? []).join(', ') || 'feishu'} · 间隔 {Math.round((reminders.pollMs ?? 0) / 1000)}s
-        </div>
-        <div className="preset-wall">
-          {(reminders.providers ?? []).map((provider) => (
-            <span key={provider.channelType} className={provider.state === 'ok' ? 'preset-chip active' : 'preset-chip'}>
-              {channelLabel(provider.channelType)} · {provider.state === 'unsupported' ? '未接入' : provider.state === 'ok' ? '可用' : '未开启'}
-            </span>
-          ))}
-        </div>
-        {reminders.lastError && <div className="empty-inline">{reminders.lastError}</div>}
-        <div className="runtime-list compact-list">
-          {(reminders.items ?? []).map((item) => (
-            <article key={item.id} className="runtime-row">
-              <div>
-                <strong>{item.title || '未命名待办'}</strong>
-                <span>
-                  {item.dueAt || '无提醒时间'} · {item.sourceType === 'direct' ? '直接提醒' : '记忆待办'} · {channelLabel(item.target?.channelType)} · {item.target?.displayName || item.target?.chatId || '缺少来源会话'}
-                </span>
-                <p>{item.completedAt || item.delivery?.completedAt ? `已完成：${item.completedAt || item.delivery?.completedAt} · ${item.completionSource || item.delivery?.completionSource || 'panel'}` : item.completionError || item.delivery?.completionError || item.skipReason || item.delivery?.error || item.source?.snippet || '等待到点推送。'}</p>
-                <code>{item.source?.path || '-'}</code>
-              </div>
-              <div className="row-actions">
-                <StatusPill status={reminderStatusKind(item.status)} label={reminderStatusLabel(item.status)} />
-                <MiniButton
-                  label="完成"
-                  icon={<CheckCircle2 size={14} />}
-                  onClick={() => void completeReminder(item.id)}
-                  pending={pending['memory.completeReminder']}
-                  disabled={item.status === 'completed'}
-                />
-                <MiniButton
-                  label="测试发送"
-                  icon={<Play size={14} />}
-                  onClick={() => void testReminder(item.id)}
-                  pending={pending['memory.testReminder']}
-                  disabled={item.status === 'completed' || (item.target?.channelType || '').toLowerCase() !== 'feishu' || !item.target?.chatId}
-                />
-                <MiniButton label="来源" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.source?.path })} pending={pending['memory.openSource']} />
-              </div>
-            </article>
-          ))}
-          {(reminders.items ?? []).length === 0 && <div className="empty-inline">暂无待办提醒。给待办添加提醒时间和来源会话后会在这里出现。</div>}
-        </div>
-      </section>
 
       <details className="panel advanced-diagnostics">
         <summary>
@@ -5769,32 +5513,121 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
         </div>
       </details>
 
-      <section className="panel">
-        <SectionHeader
-          title="知识归档"
-          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshArchives()} pending={pending['memory.archives']} />}
-        />
-        <div className="detail-meta">归档目录 {archives.archiveRoot || '-'}。这里的文件不会进入知识索引，可手动永久删除。</div>
+    </section>
+  );
+}
+
+function MemoryGovernancePanel({ initial, run, pending }: { initial?: MemoryOptimizationStatus; run: PageProps['run']; pending: Record<string, boolean> }) {
+  const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(initial);
+  const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
+  const [selectedActions, setSelectedActions] = useState<string[]>([]);
+  const activeDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft') ?? (optimization?.drafts ?? [])[0];
+
+  const refresh = async () => {
+    const [nextOptimization, nextArchives] = await Promise.all([
+      run('memory.optimizeStatus') as Promise<MemoryOptimizationStatus>,
+      run('memory.archives') as Promise<KnowledgeArchiveSnapshot>,
+    ]);
+    setOptimization(nextOptimization);
+    setArchives(nextArchives);
+    const draft = (nextOptimization.drafts ?? []).find((item) => item.status === 'draft');
+    setSelectedActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
+  };
+
+  useEffect(() => { void refresh(); }, []);
+
+  const generate = async () => {
+    const result = await run('memory.optimizePreview', { modelSource: optimization?.modelSource || 'codex_primary' }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    await refresh();
+  };
+  const apply = async (draft: MemoryOptimizationDraft) => {
+    if (!window.confirm(`应用 ${selectedActions.length} 个已选记忆治理动作？归档项仍可恢复。`)) return;
+    const result = await run('memory.optimizeApply', { draftId: draft.draftId, selectedActionIds: selectedActions }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    await refresh();
+  };
+  const undo = async (draft: MemoryOptimizationDraft) => {
+    const result = await run('memory.optimizeUndo', { draftId: draft.draftId }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    await refresh();
+  };
+  const discard = async (draftId: string) => {
+    const result = await run('memory.optimizeDiscard', { draftId }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+    setSelectedActions([]);
+  };
+  const schedule = async (enabled: boolean) => {
+    const result = await run('memory.optimizeSchedule', {
+      enabled,
+      intervalDays: optimization?.intervalDays || 7,
+      modelSource: optimization?.modelSource || 'codex_primary',
+    }) as { status?: MemoryOptimizationStatus };
+    if (result.status) setOptimization(result.status);
+  };
+  const restore = async (archivePath: string) => {
+    await run('memory.restoreArchive', { archivePath });
+    await refresh();
+  };
+  const remove = async (archivePath: string) => {
+    if (!window.confirm('永久删除这个归档知识单元？该操作不可恢复。')) return;
+    await run('memory.deleteArchive', { path: archivePath });
+    await refresh();
+  };
+
+  return (
+    <section className="panel panel-span-2 memory-governance-panel">
+      <SectionHeader title="数据治理" action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refresh()} pending={pending['memory.optimizeStatus'] || pending['memory.archives']} />} />
+      <p className="panel-intro">记忆整理、归档恢复和定期计划属于治理动作，不在 Memory 索引页直接执行。</p>
+      <div className="summary-grid wide">
+        <Metric label="定期整理" value={optimization?.enabled ? '已启用' : '未启用'} compact />
+        <Metric label="间隔" value={`${optimization?.intervalDays ?? 7} 天`} compact />
+        <Metric label="草稿" value={`${optimization?.draftCount ?? optimization?.drafts?.length ?? 0}`} compact />
+        <Metric label="归档" value={`${archives.items.length}`} compact />
+      </div>
+      <div className="command-band dense">
+        <MiniButton label="生成整理草稿" icon={<BrainCircuit size={14} />} onClick={() => void generate()} pending={pending['memory.optimizePreview']} />
+        <MiniButton label={optimization?.enabled ? '停用定期整理' : '启用定期整理'} icon={<RotateCw size={14} />} onClick={() => void schedule(!optimization?.enabled)} pending={pending['memory.optimizeSchedule']} />
+      </div>
+      {activeDraft && (
+        <div className="detail-stack memory-governance-draft">
+          <div className="detail-summary"><strong>{activeDraft.summary || '记忆治理草稿'}</strong><StatusPill status={activeDraft.status === 'draft' ? 'warning' : 'ok'} label={activeDraft.status} /></div>
+          <div className="optimizer-action-list">
+            {(activeDraft.actions ?? []).map((action) => (
+              <label key={action.id} className={selectedActions.includes(action.id) ? `optimizer-action risk-${action.risk}` : 'optimizer-action excluded'}>
+                <input
+                  type="checkbox"
+                  checked={selectedActions.includes(action.id)}
+                  disabled={activeDraft.status !== 'draft'}
+                  onChange={(event) => setSelectedActions((current) => event.target.checked ? [...new Set([...current, action.id])] : current.filter((id) => id !== action.id))}
+                />
+                <div><strong>{action.title}</strong><span>{action.type} · 风险 {action.risk} · {Math.round((action.confidence || 0) * 100)}%</span><p>{action.reason}</p></div>
+              </label>
+            ))}
+          </div>
+          <div className="command-band dense">
+            <MiniButton label="应用所选" icon={<CheckCircle2 size={14} />} onClick={() => void apply(activeDraft)} pending={pending['memory.optimizeApply']} disabled={activeDraft.status !== 'draft' || selectedActions.length === 0} />
+            <MiniButton label="撤销已应用" icon={<RotateCw size={14} />} onClick={() => void undo(activeDraft)} pending={pending['memory.optimizeUndo']} disabled={activeDraft.status !== 'applied'} />
+            <MiniButton label="丢弃草稿" icon={<Trash2 size={14} />} onClick={() => void discard(activeDraft.draftId)} pending={pending['memory.optimizeDiscard']} disabled={activeDraft.status !== 'draft'} />
+          </div>
+        </div>
+      )}
+      <details className="advanced-settings">
+        <summary>知识归档</summary>
         <div className="runtime-list compact-list">
-          {(archives.items ?? []).map((item) => (
-            <article key={item.archivePath} className="runtime-row">
-              <div>
-                <strong>{item.text || item.itemId || '归档知识单元'}</strong>
-                <span>{knowledgeKindLabel(item.kind)} · {item.archivedAt || '未知时间'}</span>
-                <p>{item.sourcePath || '无来源记录'}</p>
-                <code>{item.archivePath}</code>
-              </div>
+          {archives.items.map((item) => (
+            <article className="runtime-row" key={item.archivePath}>
+              <div><strong>{item.text || item.itemId}</strong><span>{item.archivedAt}</span><code>{item.archivePath}</code></div>
               <div className="row-actions">
-                <StatusPill status="idle" label="已归档" />
-                <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.archivePath })} pending={pending['memory.openSource']} />
-                <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restoreKnowledgeArchive(item.archivePath)} pending={pending['memory.restoreArchive']} />
-                <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteKnowledgeArchive(item.archivePath)} pending={pending['memory.deleteArchive']} />
+                <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.archivePath })} />
+                <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restore(item.archivePath)} pending={pending['memory.restoreArchive']} />
+                <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void remove(item.archivePath)} pending={pending['memory.deleteArchive']} />
               </div>
             </article>
           ))}
-          {(archives.items ?? []).length === 0 && <div className="empty-inline">暂无归档知识单元。</div>}
+          {archives.items.length === 0 && <div className="empty-inline">暂无归档知识单元。</div>}
         </div>
-      </section>
+      </details>
     </section>
   );
 }
@@ -6262,6 +6095,7 @@ function SettingsPage({
           <MiniButton label="记忆仓库" icon={<ExternalLink size={14} />} onClick={() => void run('path.openMemoryRepo')} pending={pending['path.openMemoryRepo']} />
         </div>
       </section>
+      <MemoryGovernancePanel initial={state.memory.optimization} run={run} pending={pending} />
     </section>
   );
 }

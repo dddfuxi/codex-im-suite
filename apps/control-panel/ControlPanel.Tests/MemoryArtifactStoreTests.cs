@@ -6,6 +6,37 @@ namespace CodexImSuite.ControlPanel.Tests;
 public sealed class MemoryArtifactStoreTests
 {
     [Fact]
+    public void BuildSkillMemoryIndex_StoresReferencesWithoutSkillBody()
+    {
+        var skillPath = Path.GetFullPath(Path.Combine(CreateTempRoot(), "skills", "asset-cleaner"));
+        using var registry = System.Text.Json.JsonDocument.Parse($$"""
+        {
+          "protocol": "cti-skill-registry/v1",
+          "generatedAt": "2026-07-15T00:00:00.000Z",
+          "items": [
+            {
+              "id": "asset-cleaner",
+              "displayName": "资产清理",
+              "sourceClass": "installed",
+              "path": {{System.Text.Json.JsonSerializer.Serialize(skillPath)}},
+              "state": "enabled",
+              "risk": "low",
+              "enabled": true,
+              "updatedAt": "2026-07-15T00:00:00.000Z"
+            }
+          ]
+        }
+        """);
+
+        var index = MemoryArtifactStore.BuildSkillAssetIndex(registry.RootElement);
+        var item = Assert.Single(index.Items);
+
+        Assert.Equal("asset-cleaner", item.Id);
+        Assert.Equal(skillPath, item.SourcePath);
+        Assert.Null(item.SkillBody);
+    }
+
+    [Fact]
     public void ResolvesLongTermArtifactPathsUnderMemoryRepository()
     {
         var memoryRoot = CreateTempRoot();
