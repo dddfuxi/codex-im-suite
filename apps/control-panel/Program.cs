@@ -47,6 +47,7 @@ internal sealed partial class MainForm : Form
     private const string MediaHostName = "control-panel-media.local";
     private const string OfficialControlPanelExeName = "CodexImSuiteControlPanel.exe";
     private const string LegacyControlPanelExeName = "ClaudeToImControlPanel.exe";
+    private const string MemoryV2Schema = "codex-im-suite/memory/v2";
     private const uint CodePageGb2312 = 936;
     private static readonly string[] OllamaRelativeExecutableCandidates =
     [
@@ -553,6 +554,7 @@ internal sealed partial class MainForm : Form
             || string.Equals(command, "settings.save", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "settings.saveAndRestartBridge", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.updateFeishuSticker", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.auditFeishuStickers", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.mergeFeishuStickerAliases", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
         {
@@ -894,6 +896,8 @@ internal sealed partial class MainForm : Form
                 return SearchKnowledgeIndex(payload);
             case "memory.feishuStickers":
                 return FeishuStickerLibrary.Read(GetMemoryArtifactStore());
+            case "memory.auditFeishuStickers":
+                return FeishuStickerLibrary.Audit(GetMemoryArtifactStore());
             case "memory.updateFeishuSticker":
                 return FeishuStickerLibrary.Update(GetMemoryArtifactStore(), ReadFeishuStickerUpdatePayload(payload));
             case "memory.mergeFeishuStickerAliases":
@@ -2534,6 +2538,109 @@ internal sealed partial class MainForm : Form
     private string GetKnowledgeArchiveRoot()
         => Path.Combine(_memoryRepo.Text.Trim(), "archive", "knowledge-units");
 
+    private static string MemoryPartitionSegment(string value)
+    {
+        var normalized = (value ?? "").Normalize(NormalizationForm.FormKC).Trim();
+        var safe = Regex.Replace(normalized, @"[\\/:*?""<>|]+", "_");
+        safe = Regex.Replace(safe, @"[\u0000-\u001F]", "");
+        if (safe.Length > 96) safe = safe[..96];
+        if (!string.IsNullOrWhiteSpace(safe)) return safe;
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant()[..20];
+    }
+
+    private static string[] GetRelativePathSegments(string root, string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(root) || string.IsNullOrWhiteSpace(sourcePath)) return [];
+        var fullRoot = Path.GetFullPath(root);
+        var fullSource = Path.GetFullPath(sourcePath);
+        if (!IsPathInside(fullRoot, fullSource)) return [];
+        return Path.GetRelativePath(fullRoot, fullSource)
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static Dictionary<string, string> ReadSourceMetadata(JsonElement source)
+    {
+        if (source.ValueKind != JsonValueKind.Object) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!source.TryGetProperty("metadata", out var metadataElement) || metadataElement.ValueKind != JsonValueKind.Object)
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+        var metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var property in metadataElement.EnumerateObject())
+        {
+            if (property.Value.ValueKind == JsonValueKind.String)
+            {
+                metadata[property.Name] = property.Value.GetString() ?? "";
+            }
+        }
+        return metadata;
+    }
+
+    private static Dictionary<string, string> ReadMarkdownMetadataFile(string filePath)
+    {
+        try
+        {
+            return File.Exists(filePath)
+                ? ParseMarkdownFrontmatter(File.ReadAllText(filePath, Encoding.UTF8))
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static string ClassifyMemoryV2SourceGroup(string root, string sourcePath, IReadOnlyDictionary<string, string> metadata)
+    {
+        if (!sourcePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) return "";
+        if (!metadata.TryGetValue("schema", out var schema) || !string.Equals(schema, MemoryV2Schema, StringComparison.Ordinal)) return "";
+        if (!metadata.TryGetValue("memoryScope", out var scope)) return "";
+
+        var segments = GetRelativePathSegments(root, sourcePath);
+        if (segments.Length < 5 || !segments[0].Equals("data", StringComparison.OrdinalIgnoreCase)
+            || !segments[1].Equals("memory", StringComparison.OrdinalIgnoreCase)
+            || !segments[2].Equals("v2", StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        if (scope.Equals("long_term", StringComparison.OrdinalIgnoreCase))
+        {
+            return segments[3].Equals("long-term", StringComparison.OrdinalIgnoreCase) ? "memory_long_term" : "";
+        }
+
+        if (!metadata.TryGetValue("channelType", out var channelType) || string.IsNullOrWhiteSpace(channelType)) return "";
+        var channelSegment = MemoryPartitionSegment(channelType);
+        if (scope.Equals("user", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!metadata.TryGetValue("userId", out var userId) || string.IsNullOrWhiteSpace(userId)) return "";
+            return segments.Length >= 7
+                   && segments[3].Equals("users", StringComparison.OrdinalIgnoreCase)
+                   && segments[4].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
+                   && segments[5].Equals(MemoryPartitionSegment(userId), StringComparison.OrdinalIgnoreCase)
+                ? "memory_user"
+                : "";
+        }
+        if (scope.Equals("group", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!metadata.TryGetValue("chatId", out var chatId) || string.IsNullOrWhiteSpace(chatId)) return "";
+            return segments.Length >= 7
+                   && segments[3].Equals("groups", StringComparison.OrdinalIgnoreCase)
+                   && segments[4].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
+                   && segments[5].Equals(MemoryPartitionSegment(chatId), StringComparison.OrdinalIgnoreCase)
+                ? "memory_group"
+                : "";
+        }
+        return "";
+    }
+
+    private bool IsIndexableMemoryV2File(string filePath)
+        => !string.IsNullOrWhiteSpace(ClassifyMemoryV2SourceGroup(_memoryRepo.Text.Trim(), filePath, ReadMarkdownMetadataFile(filePath)));
+
+    private bool IsIndexableMemoryV2Item(string sourcePath, JsonElement source)
+        => !string.IsNullOrWhiteSpace(ClassifyMemoryV2SourceGroup(_memoryRepo.Text.Trim(), sourcePath, ReadSourceMetadata(source)));
+
     private sealed class SourceCoverageAccumulator
     {
         public string SourcePath { get; init; } = "";
@@ -2580,23 +2687,23 @@ internal sealed partial class MainForm : Form
         if (string.IsNullOrWhiteSpace(sourcePath)) return "other";
         var root = Path.GetFullPath(_memoryRepo.Text.Trim());
         var fullPath = string.IsNullOrWhiteSpace(sourcePath) ? sourcePath : Path.GetFullPath(sourcePath);
+        var metadata = ReadMarkdownMetadataFile(fullPath);
+        var memoryV2Group = ClassifyMemoryV2SourceGroup(root, fullPath, metadata);
+        if (!string.IsNullOrWhiteSpace(memoryV2Group)) return memoryV2Group;
         var relative = IsPathInside(root, fullPath)
             ? Path.GetRelativePath(root, fullPath)
             : fullPath;
         var normalized = relative.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
-        if (normalized.EndsWith("data/explicit-memories/memory-summary.md", StringComparison.OrdinalIgnoreCase)) return "generated_summary";
-        if (normalized.Contains("data/explicit-memories/", StringComparison.OrdinalIgnoreCase)) return "explicit_memory";
         if (normalized.Contains("data/todos/direct-reminders/", StringComparison.OrdinalIgnoreCase)) return "direct_reminder";
-        if (normalized.Contains("data/documents/document_guide.md", StringComparison.OrdinalIgnoreCase)) return "document_index";
-        if (normalized.StartsWith("docs/", StringComparison.OrdinalIgnoreCase) || normalized.Contains("/docs/", StringComparison.OrdinalIgnoreCase)) return "context_doc";
-        if (!normalized.Contains('/') && normalized.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) return "root_note";
         return "other";
     }
 
     private static bool IsAutoSelectableSourceGroup(string sourceGroup)
-        => string.Equals(sourceGroup, "explicit_memory", StringComparison.OrdinalIgnoreCase)
+        => string.Equals(sourceGroup, "memory_user", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sourceGroup, "memory_group", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(sourceGroup, "memory_long_term", StringComparison.OrdinalIgnoreCase)
             || string.Equals(sourceGroup, "direct_reminder", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(sourceGroup, "generated_summary", StringComparison.OrdinalIgnoreCase);
+            ;
 
     private static bool ShouldSkipKnowledgeDirectory(string path)
     {
@@ -2608,11 +2715,13 @@ internal sealed partial class MainForm : Form
             || string.Equals(name, ".obsidian", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static IEnumerable<string> EnumerateKnowledgeMarkdownFiles(string root)
+    private IEnumerable<string> EnumerateKnowledgeMarkdownFiles(string root)
     {
         if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
+        var memoryV2Root = Path.Combine(root, "data", "memory", "v2");
+        if (!Directory.Exists(memoryV2Root)) yield break;
         var stack = new Stack<string>();
-        stack.Push(root);
+        stack.Push(memoryV2Root);
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
@@ -2628,7 +2737,10 @@ internal sealed partial class MainForm : Form
                 continue;
             }
             foreach (var subdir in subdirs) stack.Push(subdir);
-            foreach (var file in files) yield return file;
+            foreach (var file in files)
+            {
+                if (IsIndexableMemoryV2File(file)) yield return file;
+            }
         }
     }
 
@@ -2680,23 +2792,33 @@ internal sealed partial class MainForm : Form
                     var sourcePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var item in itemsElement.EnumerateArray())
                     {
+                        var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+                            ? sourceElement
+                            : default;
+                        var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+                        if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
+
                         var kind = ReadJsonString(item, "kind");
                         if (!string.IsNullOrWhiteSpace(kind))
                         {
                             kindCounts[kind] = kindCounts.TryGetValue(kind, out var current) ? current + 1 : 1;
                         }
-
-                        if (item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object)
+                        if (ReadJsonBool(item, "conflict"))
                         {
-                            var sourcePath = ReadJsonString(sourceElement, "path");
+                            conflictCount += 1;
+                        }
+
+                        if (source.ValueKind == JsonValueKind.Object)
+                        {
                             if (!string.IsNullOrWhiteSpace(sourcePath))
                             {
                                 sourcePaths.Add(sourcePath);
-                                AddSourceCoverage(sourceCoverage, sourcePath, ReadJsonString(sourceElement, "updatedAt"));
+                                AddSourceCoverage(sourceCoverage, sourcePath, ReadJsonString(source, "updatedAt"));
                             }
                         }
                     }
                     sourceFileCount = sourcePaths.Count;
+                    itemCount = kindCounts.Values.Sum();
                 }
             }
             catch (Exception ex)
@@ -2720,8 +2842,8 @@ internal sealed partial class MainForm : Form
                 watching = ReadJsonBool(statusRoot, "watching") && watcherFresh && IsBridgeRunning();
                 var statusItemCount = ReadJsonInt(statusRoot, "itemCount");
                 var statusConflictCount = ReadJsonInt(statusRoot, "conflictCount");
-                if (statusItemCount > 0) itemCount = statusItemCount;
-                if (statusConflictCount > 0) conflictCount = statusConflictCount;
+                if (!exists && statusItemCount > 0) itemCount = statusItemCount;
+                if (!exists && statusConflictCount > 0) conflictCount = statusConflictCount;
                 generatedAt = ReadJsonString(statusRoot, "generatedAt", generatedAt);
                 lastIndexedAt = ReadJsonString(statusRoot, "lastIndexedAt");
                 lastEventAt = ReadJsonString(statusRoot, "lastEventAt");
@@ -2835,11 +2957,27 @@ internal sealed partial class MainForm : Form
         };
     }
 
-    private static object ReadMemoryGraphPreview(JsonElement root, int limit)
+    private bool IsVisibleMemoryGraphElement(JsonElement element)
+    {
+        if (!element.TryGetProperty("sourcePaths", out var sourcePaths) || sourcePaths.ValueKind != JsonValueKind.Array) return false;
+        var seen = false;
+        foreach (var sourcePathElement in sourcePaths.EnumerateArray())
+        {
+            var sourcePath = sourcePathElement.GetString() ?? "";
+            if (string.IsNullOrWhiteSpace(sourcePath)) return false;
+            var group = ClassifyMemoryV2SourceGroup(_memoryRepo.Text.Trim(), sourcePath, ReadMarkdownMetadataFile(sourcePath));
+            if (string.IsNullOrWhiteSpace(group)) return false;
+            seen = true;
+        }
+        return seen;
+    }
+
+    private object ReadMemoryGraphPreview(JsonElement root, int limit)
     {
         var max = Math.Max(1, limit);
         var nodeSnapshots = root.TryGetProperty("nodes", out var nodesElement) && nodesElement.ValueKind == JsonValueKind.Array
             ? nodesElement.EnumerateArray()
+                .Where(IsVisibleMemoryGraphElement)
                 .Take(max)
                 .Select(node => new
                 {
@@ -2851,6 +2989,7 @@ internal sealed partial class MainForm : Form
             : [];
         var nodeLabels = root.TryGetProperty("nodes", out var allNodesElement) && allNodesElement.ValueKind == JsonValueKind.Array
             ? allNodesElement.EnumerateArray()
+                .Where(IsVisibleMemoryGraphElement)
                 .Select(node => new { id = ReadJsonString(node, "id"), label = ReadJsonString(node, "label") })
                 .Where(node => !string.IsNullOrWhiteSpace(node.id))
                 .ToDictionary(node => node.id, node => node.label, StringComparer.OrdinalIgnoreCase)
@@ -2858,6 +2997,8 @@ internal sealed partial class MainForm : Form
 
         var edges = root.TryGetProperty("edges", out var edgesElement) && edgesElement.ValueKind == JsonValueKind.Array
             ? edgesElement.EnumerateArray()
+                .Where(IsVisibleMemoryGraphElement)
+                .Where(edge => nodeLabels.ContainsKey(ReadJsonString(edge, "from")) && nodeLabels.ContainsKey(ReadJsonString(edge, "to")))
                 .Take(max)
                 .Select(edge => new
                 {
@@ -2971,6 +3112,7 @@ internal sealed partial class MainForm : Form
                 ? sourceElement
                 : default;
             var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+            if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
             var sourceUpdatedAt = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "updatedAt") : "";
             var snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "";
             var sourceGroup = ClassifyMemorySourceGroup(sourcePath);
@@ -3032,6 +3174,7 @@ internal sealed partial class MainForm : Form
             }
 
             var nodesById = nodesElement.EnumerateArray()
+                .Where(IsVisibleMemoryGraphElement)
                 .Select(node => new
                 {
                     id = ReadJsonString(node, "id"),
@@ -3043,6 +3186,7 @@ internal sealed partial class MainForm : Form
             var related = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
             foreach (var edge in edgesElement.EnumerateArray())
             {
+                if (!IsVisibleMemoryGraphElement(edge)) continue;
                 var from = ReadJsonString(edge, "from");
                 var to = ReadJsonString(edge, "to");
                 if (!nodesById.TryGetValue(from, out var fromNode) || !nodesById.TryGetValue(to, out var toNode)) continue;
@@ -3349,6 +3493,11 @@ internal sealed partial class MainForm : Form
         if (!document.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) return default;
         foreach (var item in items.EnumerateArray())
         {
+            var source = item.TryGetProperty("source", out var sourceElement) && sourceElement.ValueKind == JsonValueKind.Object
+                ? sourceElement
+                : default;
+            var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
+            if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
             if (string.Equals(ReadJsonString(item, "id"), id, StringComparison.OrdinalIgnoreCase))
             {
                 return item.Clone();
@@ -6248,7 +6397,7 @@ exit $LASTEXITCODE
         }
         _memoryRepo.Text = ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
-            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
+            GetConfig("CTI_DEFAULT_WORKDIR", GetDefaultWorkDirPath()),
             appendLog: true);
         AppendLog($"已读取配置：{_configPath}");
     }
@@ -6419,11 +6568,11 @@ exit $LASTEXITCODE
             : "official";
 
     private SettingsSnapshot GetSettingsSnapshot() => new(
-        GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3"),
-        GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", @"C:\unity\ST3"),
+        GetConfig("CTI_DEFAULT_WORKDIR", GetDefaultWorkDirPath()),
+        GetConfig("CTI_ALLOWED_WORKSPACE_ROOTS", GetDefaultWorkDirPath()),
         ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
-            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3")),
+            GetConfig("CTI_DEFAULT_WORKDIR", GetDefaultWorkDirPath())),
         GetConfig("CTI_CODEX_ADDITIONAL_DIRECTORIES", ""),
         GetConfig("CTI_REPLY_STYLE_HINT", ""),
         NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", "")),
@@ -10269,10 +10418,13 @@ exit $LASTEXITCODE
     private string GetDefaultMemoryRepoPath()
         => OperatingSystem.IsWindows() ? @"E:\cli-md" : Path.Combine(_ctiHome, "memory-repo");
 
+    private string GetDefaultWorkDirPath()
+        => Path.Combine(_ctiHome, "workspace");
+
     private MemoryArtifactStore GetMemoryArtifactStore()
         => new(ResolveEffectiveMemoryRepoPath(
             GetConfig("CTI_MEMORY_REPO_DIR", GetDefaultMemoryRepoPath()),
-            GetConfig("CTI_DEFAULT_WORKDIR", @"C:\unity\ST3")));
+            GetConfig("CTI_DEFAULT_WORKDIR", GetDefaultWorkDirPath())));
 
     private string ResolveEffectiveMemoryRepoPath(string configuredPath, string defaultWorkDir, bool appendLog = false)
     {

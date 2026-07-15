@@ -137,6 +137,102 @@ async function withFakeToolMcpHttpServer(run: (url: string, calls: { initializes
   }
 }
 
+async function withFakeUnityMcpHttpServer(
+  options: { resourceText: string; dataPath: string },
+  run: (url: string, calls: { resourceReads: number; toolCalls: number }) => Promise<void>,
+) {
+  const calls = { resourceReads: 0, toolCalls: 0 };
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.on('data', (chunk) => { body += chunk.toString(); });
+    request.on('end', () => {
+      const payload = body ? JSON.parse(body) as {
+        id?: string | number;
+        method?: string;
+        params?: { name?: string; arguments?: Record<string, unknown> };
+      } : {};
+      response.setHeader('Content-Type', 'application/json');
+      if (payload.method === 'initialize') {
+        response.setHeader('mcp-session-id', 'unity-session');
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            serverInfo: { name: 'fake-unity-mcp', version: '1.0.0' },
+          },
+        }));
+        return;
+      }
+      if (payload.method === 'notifications/initialized') {
+        response.statusCode = 202;
+        response.end('');
+        return;
+      }
+      if (payload.method === 'tools/list') {
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            tools: [{ name: 'manage_camera', description: 'Camera tools' }],
+          },
+        }));
+        return;
+      }
+      if (payload.method === 'resources/read') {
+        calls.resourceReads += 1;
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            contents: [{ uri: 'mcpforunity://instances', text: options.resourceText }],
+          },
+        }));
+        return;
+      }
+      if (payload.method === 'tools/call') {
+        calls.toolCalls += 1;
+        if (payload.params?.name === 'execute_code') {
+          response.end(JSON.stringify({
+            jsonrpc: '2.0',
+            id: payload.id,
+            result: {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: true,
+                  message: 'Code executed successfully.',
+                  data: { result: options.dataPath, compiler: 'roslyn' },
+                }),
+              }],
+            },
+          }));
+          return;
+        }
+        response.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: payload.id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify({ success: true, message: 'screenshot captured' }) }],
+          },
+        }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ error: 'unknown method' }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  try {
+    await run(`http://127.0.0.1:${address.port}/mcp`, calls);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
 describe('McpBridge manifest discovery', () => {
   it('loads bundled suite manifests and user overlay manifests', () => {
     const previousSuiteRoot = process.env.CODEX_IM_SUITE_ROOT;
@@ -399,7 +495,10 @@ describe('McpBridge manifest discovery', () => {
   });
 
   it('requires configured MCP resource success evidence for HTTP health', async () => {
-    await withFakeMcpHttpServer('{"success":true,"instance_count":1,"instances":[{"name":"Editor@abcd"}]}', async (url) => {
+    await withFakeUnityMcpHttpServer({
+      resourceText: '{"success":true,"instance_count":1,"instances":[{"name":"Editor@abcd"}]}',
+      dataPath: path.join(process.cwd(), 'Assets'),
+    }, async (url) => {
       const health = await new McpBridge(baseConfig).checkHealth({
         id: 'unityMCP',
         displayName: 'Unity MCP',
@@ -457,6 +556,136 @@ describe('McpBridge manifest discovery', () => {
       assert.equal(calls.resourceReads, 0);
       assert.doesNotMatch(health.message, /instance_count|mcpforunity:\/\/instances/);
     });
+  });
+
+  it('rejects a Unity MCP manifest whose cwd does not exist', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mcp-missing-cwd-'));
+    try {
+      const missingProject = path.join(tempRoot, 'MissingProject');
+      const health = await new McpBridge({ ...baseConfig, defaultWorkDir: tempRoot, allowedWorkspaceRoots: [tempRoot] }).checkHealth({
+        id: 'unityMCP',
+        displayName: 'Unity MCP',
+        type: 'http',
+        cwd: missingProject,
+        healthCheck: {
+          kind: 'mcp-http-resource',
+          url: 'http://127.0.0.1:9/mcp',
+          resourceUri: 'mcpforunity://instances',
+        },
+        manifestPath: 'unity-mcp.json',
+      });
+
+      assert.equal(health.ok, false);
+      assert.match(health.message, /MCP 工作目录不存在/);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails Unity MCP health when the connected editor project differs from manifest cwd', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mcp-unity-mismatch-'));
+    try {
+      const configuredProject = path.join(tempRoot, 'ConfiguredGame');
+      fs.mkdirSync(configuredProject, { recursive: true });
+      const actualDataPath = path.join(tempRoot, 'OtherGame', 'Assets');
+      await withFakeUnityMcpHttpServer({
+        resourceText: '{"success":true,"instance_count":1,"instances":[{"name":"OtherGame"}]}',
+        dataPath: actualDataPath,
+      }, async (url) => {
+        const health = await new McpBridge({
+          ...baseConfig,
+          defaultWorkDir: tempRoot,
+          allowedWorkspaceRoots: [tempRoot],
+          unityProjectPath: configuredProject,
+        }).checkHealth({
+          id: 'unityMCP',
+          displayName: 'Unity MCP',
+          type: 'http',
+          cwd: configuredProject,
+          healthCheck: {
+            kind: 'mcp-http-resource',
+            url,
+            resourceUri: 'mcpforunity://instances',
+            successRegex: '\\\\?"instance_count\\\\?"\\s*:\\s*[1-9][0-9]*',
+            failureRegex: '\\\\?"instance_count\\\\?"\\s*:\\s*0',
+          },
+          manifestPath: 'unity-mcp.json',
+        });
+
+        assert.equal(health.ok, false);
+        assert.match(health.message, /Unity MCP 当前连接项目/);
+        assert.match(health.message, /ConfiguredGame/);
+        assert.match(health.message, /OtherGame/);
+      });
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects Unity MCP tool calls against a different connected editor project', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mcp-unity-call-mismatch-'));
+    try {
+      const configuredProject = path.join(tempRoot, 'ConfiguredGame');
+      fs.mkdirSync(configuredProject, { recursive: true });
+      const actualDataPath = path.join(tempRoot, 'OtherGame', 'Assets');
+      await withFakeUnityMcpHttpServer({
+        resourceText: '{"success":true,"instance_count":1,"instances":[{"name":"OtherGame"}]}',
+        dataPath: actualDataPath,
+      }, async (url) => {
+        const bridge = new McpBridge({
+          ...baseConfig,
+          defaultWorkDir: tempRoot,
+          allowedWorkspaceRoots: [tempRoot],
+          unityProjectPath: configuredProject,
+        });
+        await assert.rejects(
+          () => bridge.callTool({
+            id: 'unityMCP',
+            displayName: 'Unity MCP',
+            type: 'http',
+            cwd: configuredProject,
+            healthCheck: { kind: 'mcp-http-resource', url, resourceUri: 'mcpforunity://instances' },
+            manifestPath: 'unity-mcp.json',
+          }, 'manage_camera', { action: 'screenshot' }),
+          /Unity MCP 当前连接项目/,
+        );
+      });
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects Unity MCP tool discovery against a different connected editor project', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mcp-unity-list-mismatch-'));
+    try {
+      const configuredProject = path.join(tempRoot, 'ConfiguredGame');
+      fs.mkdirSync(configuredProject, { recursive: true });
+      const actualDataPath = path.join(tempRoot, 'OtherGame', 'Assets');
+      await withFakeUnityMcpHttpServer({
+        resourceText: '{"success":true,"instance_count":1,"instances":[{"name":"OtherGame"}]}',
+        dataPath: actualDataPath,
+      }, async (url) => {
+        const bridge = new McpBridge({
+          ...baseConfig,
+          defaultWorkDir: tempRoot,
+          allowedWorkspaceRoots: [tempRoot],
+          unityProjectPath: configuredProject,
+        });
+        await assert.rejects(
+          () => bridge.listToolDetails({
+            id: 'unityMCP',
+            displayName: 'Unity MCP',
+            type: 'http',
+            cwd: configuredProject,
+            healthCheck: { kind: 'mcp-http-resource', url, resourceUri: 'mcpforunity://instances' },
+            manifestPath: 'unity-mcp.json',
+          }),
+          /Unity MCP 当前连接项目/,
+        );
+      });
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it('reuses HTTP MCP sessions and caches tools/list discovery briefly', async () => {

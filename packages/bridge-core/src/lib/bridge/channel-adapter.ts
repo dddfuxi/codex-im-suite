@@ -297,6 +297,8 @@ export abstract class BaseChannelAdapter {
     _responseText: string,
     _summary?: import('./types.js').RunSummary,
     _mentions?: import('./types.js').OutboundMention[],
+    _verifiedMediaAction?: import('./types.js').VerifiedMediaAction,
+    _turnContext?: import('./types.js').StreamingCardTurnContext,
   ): Promise<boolean>;
 }
 

@@ -33,6 +33,23 @@ export interface SessionKey {
   chatId: string;
 }
 
+export interface InboundLifecycleControl {
+  /**
+   * Platform lifecycle event that targets a previously received user message.
+   * This is intentionally generic so adapters can map native recall/delete
+   * events without bridge-manager depending on platform-specific payloads.
+   */
+  type: 'message_withdrawn';
+  /** Original platform message ID that should no longer be processed. */
+  targetMessageId: string;
+  reason?: 'recalled' | 'deleted' | 'placeholder' | string;
+  /**
+   * If true, manager may send a pause notice even when the target was still in
+   * an adapter-local queue and therefore has no manager task record yet.
+   */
+  notifyIfUnknown?: boolean;
+}
+
 // ── Messages ───────────────────────────────────────────────────
 
 /** Inbound message from an IM channel */
@@ -53,16 +70,40 @@ export interface InboundMessage {
   callbackMessageId?: string;
   /** Platform-specific raw update object (for adapter-specific handling) */
   raw?: unknown;
+  /** Optional platform lifecycle control message, e.g. Feishu recalled event. */
+  control?: InboundLifecycleControl;
   /** Adapter-specific update ID for deferred offset acknowledgement */
   updateId?: number;
   /** File attachments (images, documents) from the IM channel */
   attachments?: import('./host.js').FileAttachment[];
+  /**
+   * Optional second-stage adapter preparation for agent-only evidence.
+   *
+   * Adapters enqueue the accepted message first, then the bridge awaits this
+   * hook after arming user-visible feedback. Implementations may enrich the
+   * existing address/raw/attachments objects, but must not change the user's
+   * original intent text.
+   */
+  prepareForAgent?: () => Promise<void>;
 }
 
 export interface OutboundMention {
   userId?: string;
   name?: string;
   atAll?: boolean;
+}
+
+/**
+ * A bridge-owned authorization for one platform-native media delivery.
+ *
+ * This is deliberately separate from the user-visible reply text: adapters
+ * must not treat a model-written marker such as `[表情包:file_key]` as proof
+ * that the media is safe to send.
+ */
+export interface VerifiedMediaAction {
+  kind: 'sticker';
+  key: string;
+  provenance: 'turn_attached_model_selection';
 }
 
 /** Outbound message to send to an IM channel */
@@ -81,6 +122,8 @@ export interface OutboundMessage {
   mentions?: OutboundMention[];
   /** Feishu-specific interactive card payload. Non-Feishu adapters ignore it. */
   feishuCardJson?: string;
+  /** Bridge-owned proof for an otherwise gated native-media delivery. */
+  verifiedMediaAction?: VerifiedMediaAction;
 }
 
 /** Inline keyboard button for permission prompts */
@@ -226,6 +269,17 @@ export interface RunSummary {
   codexProfile?: string;
   baseUrl?: string;
   tokenUsage?: RunTokenUsage;
+}
+
+/**
+ * 流式卡片收尾时由 bridge-manager 交给 adapter 的本轮关联信息。
+ * adapter 只将其用于按实际出站消息 ID 回填后续原生回复的上下文，
+ * 不能据此直接执行请求或改变权限判断。
+ */
+export interface StreamingCardTurnContext {
+  codepilotSessionId?: string;
+  sourceMessageId?: string;
+  sourceText?: string;
 }
 
 // ── Config ─────────────────────────────────────────────────────

@@ -148,6 +148,65 @@ describe('Feishu streaming card markdown', () => {
     assert.match(report, /Streaming card enabled: yes/);
   });
 
+  it('reports Feishu CLI as disabled by default and keeps cloud history on the adapter path', () => {
+    const report = buildFeishuCapabilityReport({
+      getSetting: () => '',
+    }, {
+      feishuCliProbe: () => {
+        throw new Error('CLI probe should not run while disabled');
+      },
+    });
+
+    assert.match(report, /Feishu CLI diagnostics/);
+    assert.match(report, /CLI enabled: no/);
+    assert.match(report, /Cloud chat history path: Feishu OpenAPI adapter/);
+    assert.match(report, /CLI is diagnostic only/);
+  });
+
+  it('reports Feishu CLI version and resolved path when diagnostics are enabled', () => {
+    let probedPath = '';
+    const report = buildFeishuCapabilityReport({
+      getSetting: (key) => ({
+        bridge_feishu_cli_enabled: 'true',
+        bridge_feishu_cli_path: 'C:\\Tools\\lark-cli.ps1',
+      } as Record<string, string>)[key] || '',
+    }, {
+      feishuCliProbe: (cliPath) => {
+        probedPath = cliPath;
+        return {
+          ok: true,
+          version: 'lark-cli version 1.0.1',
+          resolvedPath: 'C:\\Tools\\lark-cli.ps1',
+        };
+      },
+    });
+
+    assert.equal(probedPath, 'C:\\Tools\\lark-cli.ps1');
+    assert.match(report, /CLI enabled: yes/);
+    assert.match(report, /CLI path: C:\\Tools\\lark-cli\.ps1/);
+    assert.match(report, /CLI probe: ready/);
+    assert.match(report, /CLI version: lark-cli version 1\.0\.1/);
+  });
+
+  it('reports Feishu CLI blockers without claiming it is connected', () => {
+    const report = buildFeishuCapabilityReport({
+      getSetting: (key) => ({
+        bridge_feishu_cli_enabled: '1',
+        bridge_feishu_cli_path: 'missing-lark-cli',
+      } as Record<string, string>)[key] || '',
+    }, {
+      feishuCliProbe: () => ({
+        ok: false,
+        error: 'command not found',
+      }),
+    });
+
+    assert.match(report, /CLI enabled: yes/);
+    assert.match(report, /CLI probe: blocked/);
+    assert.match(report, /CLI blocker: command not found/);
+    assert.doesNotMatch(report, /CLI probe: ready/);
+  });
+
   it('renders a single polished thinking step with stage accents and a muted body', () => {
     const content = buildStreamingContent('### 处理思路\n正在理解问题。\n正在确认需要截图证据。', [
       { id: 'tool-1', name: 'JsonTool:shell_artifact', status: 'complete' },

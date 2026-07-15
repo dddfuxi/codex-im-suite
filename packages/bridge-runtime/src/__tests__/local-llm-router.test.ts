@@ -113,6 +113,18 @@ describe('decideConservativeRoute', () => {
     }), baseConfig), false);
   });
 
+  it('does not treat a continuation as light chat when priority turn evidence requires real work', () => {
+    const result = isLightChatCandidate(makeParams('继续处理', {
+      systemPrompt: 'Channel assistant identity: 当前是飞书机器人。',
+      priorityTurnContext: [
+        'Feishu recent conversation context:',
+        '[被回复消息] 用户: 请读取当前项目配置并修复报错。',
+      ].join('\n'),
+    }), baseConfig);
+
+    assert.equal(result, false);
+  });
+
   it('builds a light chat prompt profile without long tool context', () => {
     const params = makeParams('收到啦', {
       systemPrompt: [

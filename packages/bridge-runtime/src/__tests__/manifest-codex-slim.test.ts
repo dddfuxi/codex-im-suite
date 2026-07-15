@@ -32,7 +32,7 @@ describe('manifest Codex slim params', () => {
     assert.equal(result.params.sdkSessionId, undefined);
     assert.deepEqual(result.params.conversationHistory, []);
     assert.equal(result.params.executionRequirement?.kind, 'tool_required');
-    assert.deepEqual(result.params.executionRequirement?.requiredToolFamilies, ['mcp']);
+    assert.deepEqual(result.params.executionRequirement?.requiredToolFamilies, ['unity-mcp', 'mcp']);
     assert.equal(result.params.executionRequirement?.strictToolEvidence, true);
     assert.match(result.params.systemPrompt || '', /Manifest-constrained Codex task/);
     assert.match(result.params.systemPrompt || '', /manage_camera/);

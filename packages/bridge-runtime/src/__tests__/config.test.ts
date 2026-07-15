@@ -227,6 +227,9 @@ describe('configToSettings', () => {
       localLlmMaxOutputTokens: 768,
       localLlmComplexityMode: 'conservative',
       lightChatFastPathEnabled: true,
+      lightChatFastPathTimeoutMs: 2000,
+      providerCircuitCooldownMs: 60000,
+      memoryIntentTimeoutMs: 4000,
       lightChatHistoryLimit: 2,
       lightChatMaxInputChars: 280,
     });
@@ -249,6 +252,9 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_local_llm_max_output_tokens'), '768');
     assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
     assert.equal(m.get('bridge_light_chat_fast_path_enabled'), 'true');
+    assert.equal(m.get('bridge_light_chat_fast_path_timeout_ms'), '2000');
+    assert.equal(m.get('bridge_provider_circuit_cooldown_ms'), '60000');
+    assert.equal(m.get('bridge_memory_intent_timeout_ms'), '4000');
     assert.equal(m.get('bridge_light_chat_history_limit'), '2');
     assert.equal(m.get('bridge_light_chat_max_input_chars'), '280');
   });
@@ -271,6 +277,7 @@ describe('configToSettings', () => {
       codexModelSource: 'external_api',
       codexRoutingMode: 'auto_failover',
       codexApiFallbackChain: ['local_api', 'external_api'],
+      codexFailoverCandidateTimeoutMs: 2500,
       defaultExecutorId: 'mavis-agent',
       memoryOptimizerEnabled: true,
       memoryOptimizerIntervalDays: 7,
@@ -295,6 +302,7 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_codex_model_source'), 'external_api');
     assert.equal(m.get('bridge_codex_routing_mode'), 'auto_failover');
     assert.equal(m.get('bridge_codex_api_fallback_chain'), 'local_api,external_api');
+    assert.equal(m.get('bridge_codex_failover_candidate_timeout_ms'), '2500');
     assert.equal(m.get('bridge_default_executor_id'), 'mavis-agent');
     assert.equal(m.has('bridge_codex_local_fallback_enabled'), false);
     assert.equal(m.has('bridge_codex_local_fallback_reasoning_effort'), false);
@@ -520,6 +528,31 @@ describe('loadConfig/saveConfig round-trip', () => {
       fs.rmSync(configDir, { recursive: true, force: true });
       fs.rmSync(workDir, { recursive: true, force: true });
       fs.rmSync(unityProject, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps upload cache outside the default work directory', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-upload-cache-config-'));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-upload-cache-work-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        `CTI_DEFAULT_WORKDIR=${workDir}`,
+        `CTI_UPLOAD_CACHE_DIR=${path.join(workDir, '.codepilot-uploads')}`,
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?upload-cache-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.uploadCacheDir, path.join(configDir, 'runtime', 'uploads'));
+      assert.equal(configToSettings(config).get('bridge_upload_cache_dir'), path.join(configDir, 'runtime', 'uploads'));
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+      fs.rmSync(workDir, { recursive: true, force: true });
     }
   });
 

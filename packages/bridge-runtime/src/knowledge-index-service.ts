@@ -12,6 +12,7 @@ import {
   type KnowledgeKind,
   type KnowledgeSourceFile,
 } from './knowledge-indexer.js';
+import { isIndexableMemoryV2SourceFile, MEMORY_V2_RELATIVE_DIR } from './memory-source-policy.js';
 import {
   buildMemoryGraphFromKnowledgeIndex,
   getMemoryGraphIndexPath,
@@ -60,7 +61,8 @@ function shouldSkipDirectory(name: string): boolean {
 }
 
 function collectMarkdownFiles(root: string, limit = MAX_MARKDOWN_FILES): string[] {
-  if (!fs.existsSync(root)) return [];
+  const memoryV2Root = path.join(root, MEMORY_V2_RELATIVE_DIR);
+  if (!fs.existsSync(memoryV2Root)) return [];
   const files: string[] = [];
   const visit = (dir: string) => {
     if (files.length >= limit) return;
@@ -80,7 +82,7 @@ function collectMarkdownFiles(root: string, limit = MAX_MARKDOWN_FILES): string[
       if (files.length >= limit) return;
     }
   };
-  visit(root);
+  visit(memoryV2Root);
   return files;
 }
 
@@ -95,6 +97,13 @@ function readMarkdownSource(filePath: string): KnowledgeSourceFile | null {
   } catch {
     return null;
   }
+}
+
+function collectIndexableMemorySources(root: string): KnowledgeSourceFile[] {
+  return collectMarkdownFiles(root)
+    .map(readMarkdownSource)
+    .filter((file): file is KnowledgeSourceFile => !!file)
+    .filter((file) => isIndexableMemoryV2SourceFile(root, file));
 }
 
 function makeStatus(
@@ -163,10 +172,7 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
     });
   }
 
-  const markdownFiles = collectMarkdownFiles(root);
-  const sources = markdownFiles
-    .map(readMarkdownSource)
-    .filter((file): file is KnowledgeSourceFile => !!file);
+  const sources = collectIndexableMemorySources(root);
   const index = buildKnowledgeIndexFromMarkdown({
     memoryRoot: root,
     files: sources,
@@ -176,7 +182,7 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
   writeMemoryGraphIndex(root, graph);
   const status = makeStatus(root, {
     exists: true,
-    markdownFileCount: markdownFiles.length,
+    markdownFileCount: sources.length,
     itemCount: index.itemCount,
     conflictCount: index.conflictCount,
     memoryGraphNodeCount: graph.nodeCount,
@@ -190,7 +196,7 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
 
 export function readKnowledgeIndexStatus(memoryRoot: string): KnowledgeIndexStatus {
   const root = path.resolve(memoryRoot);
-  const markdownFileCount = fs.existsSync(root) ? collectMarkdownFiles(root).length : 0;
+  const markdownFileCount = fs.existsSync(root) ? collectIndexableMemorySources(root).length : 0;
   const persisted = readPersistedStatus(root);
   if (persisted) {
     return makeStatus(root, {

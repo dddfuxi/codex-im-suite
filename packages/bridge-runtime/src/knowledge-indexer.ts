@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+  isIndexableMemoryV2SourceFile,
+  isIndexableMemoryV2SourceItem,
+  parseMemorySourceFrontmatter,
+} from './memory-source-policy.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
 
 export type KnowledgeKind = 'fact' | 'conclusion' | 'todo' | 'resource';
@@ -130,19 +135,7 @@ function stripFrontmatter(content: string): string {
 }
 
 function parseFrontmatterMetadata(content: string): Record<string, string> | undefined {
-  const match = content.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u);
-  if (!match) return undefined;
-  const metadata: Record<string, string> = {};
-  for (const rawLine of match[1].split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const separator = line.indexOf(':');
-    if (separator <= 0) continue;
-    const key = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim().replace(/^['"]|['"]$/g, '');
-    if (key && value) metadata[key] = value;
-  }
-  return Object.keys(metadata).length > 0 ? metadata : undefined;
+  return parseMemorySourceFrontmatter(content);
 }
 
 function parseMarkdownTableRows(content: string): Array<{ raw: string; cells: string[] }> {
@@ -307,7 +300,8 @@ function markConflicts(items: KnowledgeItem[]): KnowledgeItem[] {
 }
 
 export function buildKnowledgeIndexFromMarkdown(input: BuildInput): KnowledgeIndex {
-  const items = markConflicts(input.files.flatMap(collectItemsFromFile));
+  const files = input.files.filter((file) => isIndexableMemoryV2SourceFile(input.memoryRoot, file));
+  const items = markConflicts(files.flatMap(collectItemsFromFile));
   return {
     schema: 'codex-im-suite/knowledge-index/v1',
     memoryRoot: input.memoryRoot,
@@ -352,7 +346,18 @@ export function readKnowledgeIndex(memoryRoot: string): KnowledgeIndex | null {
   const indexPath = getKnowledgeIndexPath(memoryRoot);
   try {
     if (!fs.existsSync(indexPath)) return null;
-    return JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as KnowledgeIndex;
+    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as KnowledgeIndex;
+    const root = parsed.memoryRoot || memoryRoot;
+    const items = (parsed.items || []).filter((item) =>
+      isIndexableMemoryV2SourceItem(root, item.source.path, item.source.metadata),
+    );
+    return {
+      ...parsed,
+      memoryRoot: root,
+      itemCount: items.length,
+      conflictCount: items.filter((item) => item.conflict).length,
+      items,
+    };
   } catch {
     return null;
   }

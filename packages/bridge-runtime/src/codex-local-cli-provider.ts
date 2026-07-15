@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 import type { Config } from './config.js';
 import {
   buildTurnPrompt,
@@ -1305,9 +1305,11 @@ export class CodexLocalCliProvider implements LLMProvider {
         : [input.params.systemPrompt, input.systemPromptAppend]
             .filter((part): part is string => !!part?.trim())
             .join('\n\n');
+      const priorityTurnContext = formatPriorityTurnContext(input.params.priorityTurnContext);
       const prompt = input.replaceSystemPrompt
         ? [
           systemPrompt.trim() ? `System instructions:\n${systemPrompt}` : '',
+          priorityTurnContext,
           `Current user request:\n${input.promptOverride.trim()}`,
         ].filter(Boolean).join('\n\n')
         : buildTurnPrompt({

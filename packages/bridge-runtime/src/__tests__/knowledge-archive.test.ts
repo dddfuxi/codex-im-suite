@@ -13,18 +13,40 @@ import {
   restoreKnowledgeArchive,
 } from '../knowledge-archive.js';
 
+function writeMemoryV2Markdown(
+  root: string,
+  relativeParts: string[],
+  frontmatter: string[],
+  bodyLines: string[],
+): string {
+  const sourcePath = path.join(root, 'data', 'memory', 'v2', ...relativeParts);
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.writeFileSync(sourcePath, [
+    '---',
+    'schema: codex-im-suite/memory/v2',
+    ...frontmatter,
+    '---',
+    '',
+    ...bodyLines,
+    '',
+  ].join('\n'), 'utf-8');
+  return sourcePath;
+}
+
 describe('knowledge archive', () => {
   it('moves a knowledge item out of its source markdown into archive', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-'));
     try {
-      const sourcePath = path.join(root, 'notes.md');
-      fs.writeFileSync(sourcePath, [
+      const sourcePath = writeMemoryV2Markdown(root, ['groups', 'feishu', 'oc_123', 'notes.md'], [
+        'memoryScope: group',
+        'channelType: feishu',
+        'chatId: oc_123',
+      ], [
         '# Notes',
         '',
         '待办: 清理面板 @2026-04-30 12:00 状态: 未完成',
         '结论: 保留当前架构。',
-        '',
-      ].join('\n'), 'utf-8');
+      ]);
       rebuildKnowledgeIndex(root);
       const item = readKnowledgeIndex(root)?.items.find((entry) => entry.kind === 'todo');
       assert.ok(item);
@@ -49,8 +71,11 @@ describe('knowledge archive', () => {
   it('restores an archived knowledge unit to its source markdown', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-restore-'));
     try {
-      const sourcePath = path.join(root, 'notes.md');
-      fs.writeFileSync(sourcePath, '事实: 可恢复归档\n', 'utf-8');
+      const sourcePath = writeMemoryV2Markdown(root, ['long-term', 'notes.md'], [
+        'memoryScope: long_term',
+      ], [
+        '事实: 可恢复归档',
+      ]);
       rebuildKnowledgeIndex(root);
       const item = readKnowledgeIndex(root)?.items[0];
       assert.ok(item);
@@ -89,8 +114,11 @@ describe('knowledge archive', () => {
   it('reports a source-missing restore blocker', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-missing-source-'));
     try {
-      const sourcePath = path.join(root, 'notes.md');
-      fs.writeFileSync(sourcePath, '事实: 源文件会消失\n', 'utf-8');
+      const sourcePath = writeMemoryV2Markdown(root, ['long-term', 'notes.md'], [
+        'memoryScope: long_term',
+      ], [
+        '事实: 源文件会消失',
+      ]);
       rebuildKnowledgeIndex(root);
       const item = readKnowledgeIndex(root)?.items[0];
       assert.ok(item);
@@ -112,8 +140,11 @@ describe('knowledge archive', () => {
   it('deletes an archived knowledge unit permanently', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-knowledge-archive-delete-'));
     try {
-      const sourcePath = path.join(root, 'notes.md');
-      fs.writeFileSync(sourcePath, '事实: 可删除归档', 'utf-8');
+      const sourcePath = writeMemoryV2Markdown(root, ['long-term', 'notes.md'], [
+        'memoryScope: long_term',
+      ], [
+        '事实: 可删除归档',
+      ]);
       rebuildKnowledgeIndex(root);
       const item = readKnowledgeIndex(root)?.items[0];
       assert.ok(item);

@@ -41,6 +41,7 @@ import type {
   LLMProvider,
   StreamChatParams,
 } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext } from 'claude-to-im/src/lib/bridge/host.js';
 
 import { CTI_HOME, type Config } from './config.js';
 import { buildToolSandboxPolicy, inferCapabilities, listMavisReadOnlyForbiddenCapabilities, MAVIS_READ_ONLY_ALLOWED_CAPABILITIES } from './executor-registry.js';
@@ -356,7 +357,12 @@ function buildTurnPrompt(params: StreamChatParams): string {
   // mavis daemon treats the content as the user turn. Conversation
   // history is already in mavis (binding.sessionId is the same
   // mavis session), so the daemon has full context.
-  return params.prompt || '';
+  const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
+  if (!priorityTurnContext) return params.prompt || '';
+  return [
+    priorityTurnContext,
+    `Current user request:\n${params.prompt || ''}`,
+  ].join('\n\n');
 }
 
 type SourceAwareStreamChatParams = StreamChatParams & {
@@ -435,16 +441,16 @@ function resolveExistingInputFilePath(filePath: string | undefined, workingDirec
   return resolved;
 }
 
-function materializeMavisInputFiles(params: StreamChatParams, workingDirectory: string): MavisInputFileRef[] {
+function materializeMavisInputFiles(params: StreamChatParams, workingDirectory: string, uploadCacheDir: string): MavisInputFileRef[] {
   const files = params.files?.filter((file) => file.type.toLowerCase().startsWith('image/')) ?? [];
   if (files.length === 0) return [];
 
-  const root = path.join(workingDirectory, '.codepilot-uploads', 'mavis-input');
+  const root = path.join(path.resolve(uploadCacheDir), 'mavis-input');
   fs.mkdirSync(root, { recursive: true });
 
   return files.map((file, index): MavisInputFileRef => {
     const existingPath = resolveExistingInputFilePath(file.filePath, workingDirectory);
-    if (existingPath && isPathInside(workingDirectory, existingPath)) {
+    if (existingPath && (isPathInside(workingDirectory, existingPath) || isPathInside(uploadCacheDir, existingPath))) {
       return {
         id: file.id,
         name: file.name,
@@ -457,9 +463,8 @@ function materializeMavisInputFiles(params: StreamChatParams, workingDirectory: 
     const ext = resolveAttachmentExt(file.name, file.type);
     const name = safeAttachmentName(file.name || `image-${index + 1}${ext}`, ext);
     const localPath = path.join(root, `${Date.now()}-${index + 1}-${name}`);
-    // Keep Mavis inside the selected workspace. If an adapter provides a
-    // readable file outside the workspace, copy it into the bridge upload area
-    // instead of exposing the original path to the external agent.
+    // 外部执行器当前只能收到文本路径；把临时附件复制到 bridge 运行态上传缓存，
+    // 避免把 .codepilot-uploads 长期塞进 Unity/仓库默认工作目录。
     const data = existingPath ? fs.readFileSync(existingPath) : Buffer.from(file.data || '', 'base64');
     fs.writeFileSync(localPath, data);
     return {
@@ -470,6 +475,10 @@ function materializeMavisInputFiles(params: StreamChatParams, workingDirectory: 
       localPath,
     };
   });
+}
+
+function getMavisUploadCacheDir(config: Config): string {
+  return config.uploadCacheDir || path.join(CTI_HOME, 'runtime', 'uploads');
 }
 
 function buildTurnPromptWithInputFiles(params: StreamChatParams, inputFiles: MavisInputFileRef[]): string {
@@ -708,7 +717,7 @@ export class MavisExecutorProvider implements LLMProvider {
         command: 'prompt',
         content: buildTurnPromptWithInputFiles(
           params,
-          materializeMavisInputFiles(params, workingDirectory),
+          materializeMavisInputFiles(params, workingDirectory, getMavisUploadCacheDir(this.opts.config)),
         ),
         // Use a configured Mavis sender when the bridge process does not
         // inherit $__MAVIS_PARENT_SESSION_ID; never pass the bridge sessionId.
@@ -734,7 +743,7 @@ export class MavisExecutorProvider implements LLMProvider {
     const title = buildMavisSessionTitle(params);
     const turnPrompt = buildTurnPromptWithInputFiles(
       params,
-      materializeMavisInputFiles(params, workingDirectory),
+      materializeMavisInputFiles(params, workingDirectory, getMavisUploadCacheDir(this.opts.config)),
     );
     const created = await this.opts.client.createSession({
       agent: this.opts.agentName,

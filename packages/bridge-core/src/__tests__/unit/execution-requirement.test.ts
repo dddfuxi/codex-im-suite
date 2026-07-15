@@ -83,6 +83,37 @@ describe('execution requirement classifier', () => {
     });
   });
 
+  it('requires Unity MCP evidence by default for concrete Unity actions', () => {
+    const previous = process.env.CTI_STRICT_TOOL_ROUTING;
+    delete process.env.CTI_STRICT_TOOL_ROUTING;
+    try {
+      const requirement = classifyExecutionRequirement({
+        userText: '我还是要st4项目的，现在电脑里打开了，你检查一下mcp连接状态，能不能用，能用截一张game视角图给我',
+        workingDirectory: 'C:\\unity\\ST3\\Game',
+      });
+
+      assert.equal(requirement.kind, 'artifact_required');
+      assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'));
+      assert.equal(
+        isExecutionEvidenceSatisfied(requirement, {
+          successfulToolResultCount: 2,
+          toolNames: ['Bash', 'Edit'],
+        }),
+        false,
+      );
+      assert.equal(
+        isExecutionEvidenceSatisfied(requirement, {
+          successfulToolResultCount: 1,
+          toolNames: ['JsonTool:mcp_call'],
+        }),
+        true,
+      );
+    } finally {
+      if (previous === undefined) delete process.env.CTI_STRICT_TOOL_ROUTING;
+      else process.env.CTI_STRICT_TOOL_ROUTING = previous;
+    }
+  });
+
   it('does not auto-route time-sensitive questions into MCP tools without an explicit tool request', () => {
     const headlineRequirement = classifyExecutionRequirement({
       userText: '查一下今天的三个头条',

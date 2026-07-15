@@ -31,7 +31,8 @@ describe('history mojibake repair', () => {
     fs.mkdirSync(historyDir, { recursive: true });
     fs.mkdirSync(memoryRoot, { recursive: true });
     const historyPath = path.join(historyDir, 'oc_123.json');
-    const notePath = path.join(memoryRoot, 'todo.md');
+    const notePath = path.join(memoryRoot, 'data', 'memory', 'v2', 'groups', 'feishu', 'oc_123', 'todo.md');
+    fs.mkdirSync(path.dirname(notePath), { recursive: true });
     fs.writeFileSync(historyPath, JSON.stringify([
       {
         messageId: 'om_1',
@@ -46,7 +47,16 @@ describe('history mojibake repair', () => {
     ], null, 2), 'utf-8');
     fs.writeFileSync(
       notePath,
-      `待办: ${GB_MOJIBAKE_CHINESE}提醒 @2026-04-29 18:30 channelType: feishu chatId: oc_123 状态: 未完成`,
+      [
+        '---',
+        'schema: codex-im-suite/memory/v2',
+        'memoryScope: group',
+        'channelType: feishu',
+        'chatId: oc_123',
+        '---',
+        '',
+        `待办: ${GB_MOJIBAKE_CHINESE}提醒 @2026-04-29 18:30 状态: 未完成`,
+      ].join('\n'),
       'utf-8',
     );
 

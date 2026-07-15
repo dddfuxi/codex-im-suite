@@ -22,12 +22,16 @@ import path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import type {
   ChannelType,
+  ChannelAddress,
   InboundMessage,
+  InboundLifecycleControl,
   OutboundMention,
   OutboundMessage,
   SendResult,
   RunSummary,
+  StreamingCardTurnContext,
   UploadedFileLink,
+  VerifiedMediaAction,
 } from '../types.js';
 import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
@@ -86,6 +90,7 @@ const TYPING_EMOJI = 'Typing';
 const FEISHU_BOT_TO_BOT_LOOP_TTL_MS = 5 * 60 * 1000;
 const FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT = 2;
 const FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE = 0.45;
+const FEISHU_STICKER_MEDIA_DOWNLOAD_RETRY_INTERVAL_MS = 15 * 60 * 1000;
 
 interface FeishuReactionHint {
   raw: string;
@@ -120,7 +125,9 @@ function extractFeishuReactionHint(text: string): FeishuReactionHint | null {
 }
 
 function extractFeishuStickerHint(text: string): FeishuStickerHint | null {
-  const match = /^\s*\[((?:表情包|sticker|飞书表情包)(?:(?:[:：])([^\]\r\n]{1,180}))?)\]\s*([\s\S]*)$/iu.exec(text || '');
+  // 兼容模型偶发输出的“[表情:别名]”。是否真正发送仍由可信语义解析决定，
+  // 因此不会把任意文本标签或未知 file_key 变成可发送的贴纸。
+  const match = /^\s*\[((?:表情包|sticker|飞书表情包|表情)(?:(?:[:：])([^\]\r\n]{1,180}))?)\]\s*([\s\S]*)$/iu.exec(text || '');
   if (!match) return null;
   return {
     raw: match[1].trim(),
@@ -131,7 +138,7 @@ function extractFeishuStickerHint(text: string): FeishuStickerHint | null {
 
 function looksLikeFeishuStickerFileKey(value: string): boolean {
   const trimmed = value.trim();
-  return /^(?:file_v\d+_[A-Za-z0-9_-]+|[0-9a-f]{8}-[0-9a-f-]{20,})$/i.test(trimmed);
+  return /^(?:file_v\d+_[A-Za-z0-9_-]+|v\d+_[A-Za-z0-9]+_[A-Za-z0-9-]+g|[0-9a-f]{8}-[0-9a-f-]{20,})$/i.test(trimmed);
 }
 
 function isExplicitFeishuStickerSendRequest(text: string): boolean {
@@ -174,10 +181,14 @@ const FEISHU_CARD_COMPATIBILITY_PLACEHOLDERS = [
 ];
 const FEISHU_STICKER_LIBRARY_CANDIDATE_LIMIT = 24;
 
+type FeishuMentionCandidateEvidence = 'native_inbound' | 'current_chat' | 'current_sender' | 'history';
+
 interface FeishuMentionCandidate {
   userId: string;
   name: string;
   aliases: string[];
+  /** Sources are attached only while resolving one outbound action. */
+  evidenceSources?: FeishuMentionCandidateEvidence[];
 }
 
 const FEISHU_MENTION_SEARCH_SOURCES = [
@@ -503,6 +514,8 @@ interface FeishuStickerRecord {
   userId?: string;
   messageId?: string;
   mediaCachedAt?: string;
+  mediaMimeType?: string;
+  mediaSize?: number;
   mediaDownloadFailedAt?: string;
   mediaDownloadError?: string;
   firstSeenAt: string;
@@ -574,6 +587,7 @@ interface FeishuStickerLibraryContextEvidence {
   attachedImageCount: number;
   fileKeys: string[];
   attachedFileKeys: string[];
+  preferredFileKey?: string;
   candidates: FeishuStickerLibraryCandidateEvidence[];
 }
 
@@ -642,6 +656,39 @@ const MIME_BY_TYPE: Record<string, string> = {
   video: 'video/mp4',
   media: 'application/octet-stream',
 };
+
+type FeishuMessageRecalledEventData = {
+  event?: unknown;
+  message?: unknown;
+};
+const STICKER_MEDIA_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp'] as const;
+
+function sniffImageMimeType(buffer: Buffer): { mimeType: string; extension: string } | null {
+  if (buffer.length >= 8
+    && buffer[0] === 0x89
+    && buffer[1] === 0x50
+    && buffer[2] === 0x4e
+    && buffer[3] === 0x47
+    && buffer[4] === 0x0d
+    && buffer[5] === 0x0a
+    && buffer[6] === 0x1a
+    && buffer[7] === 0x0a) {
+    return { mimeType: 'image/png', extension: 'png' };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mimeType: 'image/jpeg', extension: 'jpg' };
+  }
+  if (buffer.length >= 6) {
+    const header = buffer.subarray(0, 6).toString('ascii');
+    if (header === 'GIF87a' || header === 'GIF89a') return { mimeType: 'image/gif', extension: 'gif' };
+  }
+  if (buffer.length >= 12
+    && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return { mimeType: 'image/webp', extension: 'webp' };
+  }
+  return null;
+}
 
 interface FeishuHistoryIntent {
   originalPrompt: string;
@@ -915,58 +962,139 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private readStickerStore(): FeishuStickerStore {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(getFeishuStickerStorePath(), 'utf8')) as Partial<FeishuStickerStore>;
-      const stickers = Array.isArray(parsed.stickers) ? parsed.stickers.filter((item) => item?.fileKey) : [];
-      const rawBackfills = parsed.historyBackfills && typeof parsed.historyBackfills === 'object' && !Array.isArray(parsed.historyBackfills)
-        ? parsed.historyBackfills
-        : {};
-      const historyBackfills: Record<string, FeishuStickerHistoryBackfillRecord> = {};
-      for (const [chatId, value] of Object.entries(rawBackfills)) {
-        if (!value || typeof value !== 'object') continue;
-        const record = value as Partial<FeishuStickerHistoryBackfillRecord>;
-        const normalizedChatId = String(record.chatId || chatId).trim();
-        if (!normalizedChatId) continue;
-        historyBackfills[normalizedChatId] = {
-          chatId: normalizedChatId,
-          latestMessageTime: typeof record.latestMessageTime === 'string' ? record.latestMessageTime : undefined,
-          completedAt: typeof record.completedAt === 'string' ? record.completedAt : '',
-          candidateCount: Number.isFinite(Number(record.candidateCount)) ? Number(record.candidateCount) : 0,
-        };
+    const storePath = getFeishuStickerStorePath();
+    for (const candidatePath of [storePath, ...this.listStickerStoreRecoveryPaths(storePath)]) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(candidatePath, 'utf8')) as Partial<FeishuStickerStore>;
+        return this.normalizeStickerStore(parsed);
+      } catch (err) {
+        if (candidatePath === storePath && fs.existsSync(storePath)) {
+          console.warn('[feishu-adapter] sticker store read failed, trying backups:', err instanceof Error ? err.message : err);
+        }
       }
-      return {
-        version: 1,
-        updatedAt: parsed.updatedAt || '',
-        stickers: stickers.map((item) => this.sanitizeStickerRecord(item as FeishuStickerRecord)),
-        historyBackfills,
-      };
-    } catch {
-      return { version: 1, updatedAt: '', stickers: [] };
     }
+    return { version: 1, updatedAt: '', stickers: [] };
+  }
+
+  private listStickerStoreRecoveryPaths(storePath: string): string[] {
+    const dir = path.dirname(storePath);
+    const base = path.basename(storePath);
+    const candidates: string[] = [];
+    const add = (candidatePath: string): void => {
+      if (!candidatePath || candidates.includes(candidatePath)) return;
+      try {
+        if (fs.statSync(candidatePath).isFile()) candidates.push(candidatePath);
+      } catch { /* ignore missing recovery candidate */ }
+    };
+    add(`${storePath}.bak`);
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(`${base}.bak-`)) add(path.join(dir, name));
+      }
+    } catch { /* ignore unreadable sticker store directory */ }
+    try {
+      const backupDir = path.join(dir, 'backup');
+      for (const name of fs.readdirSync(backupDir)) {
+        if (name.toLowerCase().endsWith('.json')) add(path.join(backupDir, name));
+      }
+    } catch { /* ignore missing backup directory */ }
+    return candidates.sort((left, right) => {
+      const leftTime = this.getFileModifiedTime(left);
+      const rightTime = this.getFileModifiedTime(right);
+      return rightTime - leftTime;
+    });
+  }
+
+  private getFileModifiedTime(filePath: string): number {
+    try {
+      return fs.statSync(filePath).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+
+  private normalizeStickerStore(parsed: Partial<FeishuStickerStore>): FeishuStickerStore {
+    const stickers = Array.isArray(parsed.stickers) ? parsed.stickers.filter((item) => item?.fileKey) : [];
+    const rawBackfills = parsed.historyBackfills && typeof parsed.historyBackfills === 'object' && !Array.isArray(parsed.historyBackfills)
+      ? parsed.historyBackfills
+      : {};
+    const historyBackfills: Record<string, FeishuStickerHistoryBackfillRecord> = {};
+    for (const [chatId, value] of Object.entries(rawBackfills)) {
+      if (!value || typeof value !== 'object') continue;
+      const record = value as Partial<FeishuStickerHistoryBackfillRecord>;
+      const normalizedChatId = String(record.chatId || chatId).trim();
+      if (!normalizedChatId) continue;
+      historyBackfills[normalizedChatId] = {
+        chatId: normalizedChatId,
+        latestMessageTime: typeof record.latestMessageTime === 'string' ? record.latestMessageTime : undefined,
+        completedAt: typeof record.completedAt === 'string' ? record.completedAt : '',
+        candidateCount: Number.isFinite(Number(record.candidateCount)) ? Number(record.candidateCount) : 0,
+      };
+    }
+    return {
+      version: 1,
+      updatedAt: parsed.updatedAt || '',
+      stickers: stickers.map((item) => this.sanitizeStickerRecord(item as FeishuStickerRecord)),
+      historyBackfills,
+    };
   }
 
   private writeStickerStore(store: FeishuStickerStore): void {
     const storePath = getFeishuStickerStorePath();
     fs.mkdirSync(path.dirname(storePath), { recursive: true });
-    fs.writeFileSync(storePath, JSON.stringify(store, null, 2), 'utf8');
+    this.snapshotCurrentStickerStore(storePath);
+    const tmpPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), 'utf8');
+    try {
+      // Windows cannot reliably rename over an existing file. The .bak snapshot
+      // above keeps the last valid store recoverable during the short replace gap.
+      if (fs.existsSync(storePath)) fs.rmSync(storePath, { force: true });
+      fs.renameSync(tmpPath, storePath);
+    } finally {
+      try { if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath, { force: true }); } catch { /* best effort cleanup */ }
+    }
   }
 
-  private getStickerCachePath(fileKey: string): string {
-    return path.join(getFeishuStickerCacheDirPath(), MemoryArtifactStore.stableFileName(fileKey, '.png'));
+  private snapshotCurrentStickerStore(storePath: string): void {
+    try {
+      if (!fs.existsSync(storePath)) return;
+      const raw = fs.readFileSync(storePath, 'utf8');
+      this.normalizeStickerStore(JSON.parse(raw) as Partial<FeishuStickerStore>);
+      fs.writeFileSync(`${storePath}.bak`, raw, 'utf8');
+    } catch {
+      // 不把损坏或半写的主库覆盖到备份，避免下一次恢复也只剩空壳记录。
+    }
+  }
+
+  private getStickerCachePath(fileKey: string, extension = '.png'): string {
+    const normalizedExtension = extension.startsWith('.') ? extension : `.${extension}`;
+    return path.join(getFeishuStickerCacheDirPath(), MemoryArtifactStore.stableFileName(fileKey, normalizedExtension));
+  }
+
+  private findStickerCachePath(fileKey: string): string | null {
+    for (const extension of STICKER_MEDIA_EXTENSIONS) {
+      const cachePath = this.getStickerCachePath(fileKey, extension);
+      if (fs.existsSync(cachePath)) return cachePath;
+    }
+    return null;
   }
 
   private readCachedStickerResource(fileKey: string): FileAttachment | null {
     if (!fileKey.trim()) return null;
     try {
-      const cachePath = this.getStickerCachePath(fileKey);
-      if (!fs.existsSync(cachePath)) return null;
+      const cachePath = this.findStickerCachePath(fileKey);
+      if (!cachePath) return null;
       const stat = fs.statSync(cachePath);
       if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_FILE_SIZE) return null;
       const buffer = fs.readFileSync(cachePath);
+      const imageType = sniffImageMimeType(buffer);
+      const fallbackExtension = path.extname(cachePath).replace(/^\./, '').toLowerCase() || 'png';
+      const type = imageType?.mimeType || this.mimeTypeForImageExtension(fallbackExtension) || 'image/png';
+      const extension = imageType?.extension || this.extensionForFeishuResource('image', type);
       return {
         id: fileKey,
-        name: `sticker-${fileKey}.png`,
-        type: 'image/png',
+        name: `sticker-${fileKey}.${extension}`,
+        type,
         size: buffer.length,
         data: buffer.toString('base64'),
         filePath: cachePath,
@@ -977,73 +1105,66 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private writeCachedStickerResource(fileKey: string, attachment: FileAttachment): FileAttachment | null {
-    if (!fileKey.trim() || !attachment.data) return null;
-    try {
-      const cachePath = this.getStickerCachePath(fileKey);
-      fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-      const buffer = Buffer.from(attachment.data, 'base64');
-      if (!buffer.length || buffer.length > MAX_FILE_SIZE) return null;
-      fs.writeFileSync(cachePath, buffer);
-      return this.readCachedStickerResource(fileKey);
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to write sticker cache:', err instanceof Error ? err.message : err);
+  /**
+   * Persist only the first successfully downloaded copy for a file_key in the
+   * configured memory repository. The workspace is never used as sticker
+   * storage, and repeated events reuse this durable copy.
+   */
+  private async downloadAndCacheStickerResource(messageId: string, fileKey: string): Promise<FileAttachment | null> {
+    const existing = this.readCachedStickerResource(fileKey);
+    if (existing) return existing;
+
+    const record = this.getStickerRecord(fileKey);
+    const failedAt = Date.parse(record?.mediaDownloadFailedAt || '');
+    if (Number.isFinite(failedAt) && Date.now() - failedAt < FEISHU_STICKER_MEDIA_DOWNLOAD_RETRY_INTERVAL_MS) {
       return null;
     }
-  }
 
-  private updateStickerMediaState(fileKey: string, patch: Partial<Pick<FeishuStickerRecord,
-    'mediaCachedAt' | 'mediaDownloadFailedAt' | 'mediaDownloadError'
-  >>): void {
-    const normalized = fileKey.trim();
-    if (!normalized) return;
-    const now = new Date().toISOString();
-    const store = this.readStickerStore();
-    let record = store.stickers.find((item) => item.fileKey === normalized);
-    if (!record) {
-      record = {
-        fileKey: normalized,
-        aliases: [],
-        firstSeenAt: now,
-        lastSeenAt: now,
-        useCount: 0,
-      };
-      store.stickers.push(record);
-    }
-    Object.assign(record, patch);
-    if (patch.mediaCachedAt) {
-      delete record.mediaDownloadFailedAt;
-      delete record.mediaDownloadError;
-    }
-    store.updatedAt = now;
-    try {
-      this.writeStickerStore(store);
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to update sticker media state:', err instanceof Error ? err.message : err);
-    }
-  }
-
-  private shouldAttemptStickerMediaDownload(fileKey: string): boolean {
-    const record = this.getStickerRecord(fileKey);
-    return !record?.mediaDownloadFailedAt;
-  }
-
-  private async downloadAndCacheStickerResource(messageId: string, fileKey: string): Promise<FileAttachment | null> {
-    if (!this.shouldAttemptStickerMediaDownload(fileKey)) return null;
     const attachment = await this.downloadResource(messageId, fileKey, 'image');
-    if (!attachment) {
+    if (!attachment?.data || !attachment.type?.toLowerCase().startsWith('image/')) {
       this.updateStickerMediaState(fileKey, {
         mediaDownloadFailedAt: new Date().toISOString(),
         mediaDownloadError: 'Feishu message resource API did not return sticker media',
       });
       return null;
     }
-    const cached = this.writeCachedStickerResource(fileKey, attachment);
-    if (cached) {
-      this.updateStickerMediaState(fileKey, { mediaCachedAt: new Date().toISOString() });
-      return cached;
+
+    try {
+      const buffer = Buffer.from(attachment.data, 'base64');
+      if (!buffer.length || buffer.length > MAX_FILE_SIZE) return null;
+      const imageType = sniffImageMimeType(buffer);
+      const mimeType = imageType?.mimeType || attachment.type || 'image/png';
+      const extension = imageType?.extension || this.extensionForFeishuResource('image', mimeType);
+      const cachePath = this.getStickerCachePath(fileKey, extension);
+      fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+      fs.writeFileSync(cachePath, buffer);
+      this.updateStickerMediaState(fileKey, {
+        mediaCachedAt: new Date().toISOString(),
+        mediaMimeType: mimeType,
+        mediaSize: buffer.length,
+      });
+      return this.readCachedStickerResource(fileKey);
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to cache sticker media in memory repository:', err instanceof Error ? err.message : err);
+      return null;
     }
-    return attachment;
+  }
+
+  private updateStickerMediaState(fileKey: string, patch: Partial<Pick<FeishuStickerRecord,
+    'mediaCachedAt' | 'mediaMimeType' | 'mediaSize' | 'mediaDownloadFailedAt' | 'mediaDownloadError'
+  >>): void {
+    const normalized = fileKey.trim();
+    if (!normalized) return;
+    const store = this.readStickerStore();
+    const record = store.stickers.find((item) => item.fileKey === normalized);
+    if (!record) return;
+    Object.assign(record, patch);
+    if (patch.mediaCachedAt) {
+      delete record.mediaDownloadFailedAt;
+      delete record.mediaDownloadError;
+    }
+    store.updatedAt = new Date().toISOString();
+    this.writeStickerStore(store);
   }
 
   private getStoredStickerResource(fileKey: string): FileAttachment | null {
@@ -1160,10 +1281,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       'Feishu sticker library candidate evidence:',
       `- User request: ${input.requestText}`,
       `- Candidate sticker images from chat history attached for visual inspection: ${attachedList}.`,
+      '- 缺少可靠语义时必须先视觉识别已附加的候选图片，并用 `cti-sticker-candidate-analysis` 写回 label/intent/tone/usage/confidence；不要因为旧语义缺失就直接拒绝发表情包。',
       '- Inspect the attached candidate images before choosing. File keys, old aliases, and user-provided explanations are retrieval evidence, not visual facts.',
-      `- Only send a sticker when it is 合适: the image content or a trusted vision/manual annotation must match the requested tone, scene, and reply timing. Vision confidence below ${FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE} is evidence, not an auto-send signal.`,
+      `- Only send a sticker when it is 合适: the visually inspected image content or a trusted vision/manual annotation must match the requested tone, scene, and reply timing. Vision confidence below ${FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE} is evidence, not an auto-send signal.`,
       '- If a candidate is suitable, put exactly one invisible action hint at the beginning of the final reply, such as `[表情包:file_key]`, then write the visible reply naturally.',
-      '- If no candidate is suitable or the images are unreadable, do not use `[表情包]`; reply with text or a native reaction hint only when appropriate.',
+      '- If every attached candidate is truly unreadable or semantically unsuitable after inspection, do not fake a sticker send; reply naturally with text or a native reaction hint only when appropriate.',
       '- Do not mention file keys, candidate counts, or this evidence prompt to the user unless they explicitly ask for diagnostics.',
       'Candidates:',
       ...candidateLines,
@@ -1182,7 +1304,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
         || Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a))
         || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
       .slice(0, 80);
-
+    const preferredRecord = records.find((record) => this.isStickerReliableForAutoSend(record)) || null;
+    const preferredFileKey = preferredRecord?.fileKey;
     const attachments: FileAttachment[] = [];
     const attachedFileKeys = new Set<string>();
     const candidates: FeishuStickerLibraryCandidateEvidence[] = [];
@@ -1190,8 +1313,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     for (const record of records) {
       let attachment: FileAttachment | null = null;
       if (attachments.length < FEISHU_STICKER_LIBRARY_CANDIDATE_LIMIT) {
-        attachment = this.getStoredStickerResource(record.fileKey);
-        if (!attachment && record.messageId) {
+        // Reuse durable media. If needed, fetch only the one pre-validated
+        // candidate selected for this request; never sweep the whole history.
+        attachment = this.readCachedStickerResource(record.fileKey);
+        if (!attachment && record.fileKey === preferredFileKey && record.messageId) {
           attachment = await this.downloadAndCacheStickerResource(record.messageId, record.fileKey);
         }
         if (attachment?.type?.toLowerCase().startsWith('image/') && !attachedFileKeys.has(record.fileKey)) {
@@ -1220,6 +1345,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         attachedImageCount: attachments.length,
         fileKeys: candidates.map((candidate) => candidate.fileKey),
         attachedFileKeys: attached,
+        preferredFileKey,
         candidates,
       },
     };
@@ -1524,6 +1650,42 @@ export class FeishuAdapter extends BaseChannelAdapter {
     ].filter((item): item is string => Boolean(item?.trim())).join(' ');
   }
 
+  private compactStickerStoreRecords(records: FeishuStickerRecord[]): FeishuStickerRecord[] {
+    const normalized = new Map<string, FeishuStickerRecord>();
+    for (const record of records) {
+      const fileKey = record.fileKey?.trim();
+      if (!fileKey) continue;
+      const existing = normalized.get(fileKey);
+      if (!existing || this.compareStickerRetention(record, existing) < 0) normalized.set(fileKey, record);
+    }
+    return Array.from(normalized.values())
+      .sort((left, right) => this.compareStickerRetention(left, right))
+      .slice(0, 80);
+  }
+
+  private compareStickerRetention(left: FeishuStickerRecord, right: FeishuStickerRecord): number {
+    return this.stickerRetentionScore(right) - this.stickerRetentionScore(left)
+      || (Date.parse(right.lastSeenAt || '') || 0) - (Date.parse(left.lastSeenAt || '') || 0)
+      || (Date.parse(right.annotationUpdatedAt || right.annotationVerifiedAt || '') || 0)
+        - (Date.parse(left.annotationUpdatedAt || left.annotationVerifiedAt || '') || 0)
+      || left.fileKey.localeCompare(right.fileKey);
+  }
+
+  private stickerRetentionScore(record: FeishuStickerRecord): number {
+    let score = 0;
+    // 历史同步会登记大量只有 file_key 的空壳记录；它们可用于水位和审计，
+    // 但绝不能在容量裁剪时挤掉已经有媒体、语义或人工处理痕迹的表情包资产。
+    if (this.hasTrustedStickerSemanticSource(record) && this.hasStickerAnnotation(record)) score += 1000;
+    else if (this.hasStickerAnnotation(record)) score += 700;
+    if (this.stickerUserAnnotationText(record.userAnnotation)) score += 650;
+    if (record.mediaCachedAt || record.mediaMimeType || record.mediaSize || this.findStickerCachePath(record.fileKey)) score += 600;
+    if (record.disabled) score += 500;
+    if (record.mediaDownloadFailedAt || record.mediaDownloadError) score += 250;
+    if (record.lastUsedAt) score += 120;
+    if ((record.aliases || []).some((alias) => !/^(?:最近|默认|表情包)$/u.test(alias))) score += 60;
+    return score;
+  }
+
   private stickerUserAnnotationText(annotation?: FeishuStickerUserAnnotation): string {
     if (!annotation) return '';
     return [
@@ -1618,9 +1780,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     record.messageId = input.messageId;
     record.lastSeenAt = now;
     record.aliases = Array.from(new Set([...(record.aliases || []), ...aliases])).slice(0, 20);
-    store.stickers = store.stickers
-      .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
-      .slice(0, 80);
+    store.stickers = this.compactStickerStoreRecords(store.stickers);
     store.updatedAt = now;
     try {
       this.writeStickerStore(store);
@@ -1700,6 +1860,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return (byAlias[0] || fallback[0])?.fileKey || null;
   }
 
+  /**
+   * The normal sticker resolver only accepts durable, vision/manual semantics.
+   * A one-turn candidate may additionally pass when bridge-manager proves that
+   * this exact key was attached to the turn and selected by the model. The
+   * equality check keeps reply text or a mismatched action from widening that
+   * authorization to another media resource.
+   */
+  private resolveVerifiedStickerFileKey(
+    target: string,
+    verifiedMediaAction?: VerifiedMediaAction,
+  ): string | null {
+    if (
+      verifiedMediaAction?.kind !== 'sticker'
+      || verifiedMediaAction.provenance !== 'turn_attached_model_selection'
+      || verifiedMediaAction.key !== target.trim()
+      || !looksLikeFeishuStickerFileKey(verifiedMediaAction.key)
+    ) {
+      return null;
+    }
+    return verifiedMediaAction.key;
+  }
+
   private markStickerUsed(fileKey: string): void {
     const store = this.readStickerStore();
     const record = store.stickers.find((item) => item.fileKey === fileKey);
@@ -1733,7 +1915,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       };
     }
     const match = normalized.match(/(?:表情包|表情|sticker).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu)
-      || normalized.match(/(?:这个|刚才|上个|上一个|this|previous).{0,12}(?:叫|名称是|名字是|是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu);
+      || normalized.match(/(?:这个|刚才|上个|上一个|this|previous).{0,12}(?:叫|名称是|名字是|表示|代表|意思是|含义是|语气是|用于|用来|means?|meaning|label|name)\s*[:：]?\s*(.+)$/iu);
     if (!match) return null;
     const value = match[1]?.trim().replace(/^["'“”‘’]+|["'“”‘’。.,，、]+$/g, '');
     if (!value || value.length < 2) return null;
@@ -1744,6 +1926,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       tone: value.length <= 40 ? value : undefined,
       annotationConfidence: 0.72,
     };
+  }
+
+  private hasExplicitStickerAnnotationSubject(text: string): boolean {
+    return /(?:表情包|表情|sticker)/iu.test(text.normalize('NFKC'));
   }
 
   private rememberStickerAnnotationFromText(input: {
@@ -1757,6 +1943,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!annotation) return null;
     const target = this.findStickerAnnotationTarget(input);
     if (!target) return null;
+    // 无原生 reply 目标时，只接受显式“表情包/表情/sticker”说明。
+    // 否则普通任务句里的“这个群是干啥的”会被“这个...是...”误当成最近表情包注释。
+    if (!input.replyToMessageId && !this.hasExplicitStickerAnnotationSubject(input.text)) return null;
     const lastSeen = Date.parse(target.lastSeenAt || '');
     if (Number.isFinite(lastSeen) && Date.now() - lastSeen > 10 * 60 * 1000 && !input.replyToMessageId) return null;
     const stored = this.recordStickerAnnotation({
@@ -1799,10 +1988,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     replyToMessageId?: string | null;
   }): FeishuStickerRecord | null {
     const store = this.readStickerStore();
-    return store.stickers.find((item) => input.replyToMessageId && item.messageId === input.replyToMessageId)
-      || store.stickers
-        .filter((item) => item.chatId === input.chatId && !this.hasStickerAnnotation(item))
-        .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))[0]
+    if (input.replyToMessageId) {
+      // 有 reply 目标时必须精确回复到 sticker 原消息，不能退回“最近未标注表情包”。
+      // 飞书里用户常回复机器人卡片继续提任务，这类文本不能被 sticker 学习链抢走。
+      return store.stickers.find((item) => item.messageId === input.replyToMessageId) || null;
+    }
+    return store.stickers
+      .filter((item) => item.chatId === input.chatId && !this.hasStickerAnnotation(item))
+      .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))[0]
       || null;
   }
 
@@ -1893,9 +2086,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       record.chatId = input.chatId || record.chatId;
       record.userId = input.userId || record.userId;
       store.updatedAt = now;
-      store.stickers = store.stickers
-        .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
-        .slice(0, 80);
+      store.stickers = this.compactStickerStoreRecords(store.stickers);
       try {
         this.writeStickerStore(store);
         return true;
@@ -1940,9 +2131,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       .flatMap((item) => item.split(/[，,、;；\s]+/).map((part) => part.trim()).filter((part) => part.length >= 2 && part.length <= 24));
     record.aliases = Array.from(new Set([...(record.aliases || []), ...aliasSource])).slice(0, 20);
     store.updatedAt = now;
-    store.stickers = store.stickers
-      .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
-      .slice(0, 80);
+    store.stickers = this.compactStickerStoreRecords(store.stickers);
     try {
       this.writeStickerStore(store);
       return true;
@@ -2114,6 +2303,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
         'im.message.receive_v1': async (data) => {
           await this.handleIncomingEvent(data as FeishuMessageEventData);
         },
+        'im.message.recalled_v1': async (data) => {
+          await this.handleMessageRecalledEvent(data as FeishuMessageRecalledEventData);
+        },
         'im.message.reaction.created_v1': async (data) => {
           this.handleReactionCreatedEvent(data);
         },
@@ -2233,6 +2425,100 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } else {
       this.queue.push(msg);
     }
+  }
+
+  private removeQueuedInboundByMessageId(messageId: string): InboundMessage | null {
+    const target = messageId.trim();
+    if (!target) return null;
+    const index = this.queue.findIndex((item) => item.messageId === target);
+    if (index < 0) return null;
+    const [removed] = this.queue.splice(index, 1);
+    return removed || null;
+  }
+
+  private isWithdrawnPlaceholderText(text: string): boolean {
+    const normalized = text
+      .normalize('NFKC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\s+/g, '')
+      .trim()
+      .toLowerCase();
+    if (!normalized) return false;
+    // 只识别飞书/IM 客户端生成的完整撤回占位；不要把“为什么撤回”
+    // 这类真实用户问题误当成生命周期事件过滤掉。
+    return normalized === '此消息已撤回'
+      || normalized === '该消息已撤回'
+      || normalized === 'messagewasrecalled'
+      || normalized === 'thismessagewasrecalled'
+      || normalized === 'thismessagehasbeenrecalled'
+      || normalized === 'thismessagehasbeendeleted';
+  }
+
+  private buildLifecycleControlInbound(input: {
+    address: ChannelAddress;
+    targetMessageId: string;
+    reason: InboundLifecycleControl['reason'];
+    notifyIfUnknown?: boolean;
+  }): InboundMessage {
+    const control: InboundLifecycleControl = {
+      type: 'message_withdrawn',
+      targetMessageId: input.targetMessageId,
+      reason: input.reason,
+      notifyIfUnknown: input.notifyIfUnknown,
+    };
+    return {
+      messageId: `${input.targetMessageId}:${input.reason || 'withdrawn'}`,
+      address: input.address,
+      text: '',
+      timestamp: Date.now(),
+      control,
+      raw: { bridgeControl: control },
+    };
+  }
+
+  private async handleMessageRecalledEvent(data: FeishuMessageRecalledEventData): Promise<void> {
+    const event = (data as { event?: unknown })?.event ?? data;
+    const targetMessageId = this.readNestedString(event, [
+      ['message_id'],
+      ['message', 'message_id'],
+      ['message', 'message_id_v2'],
+    ]);
+    if (!targetMessageId) return;
+
+    const removed = this.removeQueuedInboundByMessageId(targetMessageId);
+    const chatId = this.readNestedString(event, [
+      ['chat_id'],
+      ['message', 'chat_id'],
+    ]) || removed?.address.chatId || '';
+    if (!chatId && !removed) return;
+
+    const address: ChannelAddress = removed?.address || {
+      channelType: 'feishu',
+      chatId,
+      userId: this.readNestedString(event, [
+        ['operator', 'operator_id', 'open_id'],
+        ['operator_id', 'open_id'],
+        ['sender', 'sender_id', 'open_id'],
+      ]) || '',
+      chatType: this.readNestedString(event, [
+        ['chat_type'],
+        ['message', 'chat_type'],
+      ]),
+    };
+
+    this.insertInboundFilterAudit(
+      address.chatId,
+      targetMessageId,
+      removed
+        ? '[FILTERED] Feishu message recalled: removed queued inbound task'
+        : '[CONTROL] Feishu message recalled: forwarded lifecycle control',
+    );
+    this.enqueue(this.buildLifecycleControlInbound({
+      address,
+      targetMessageId,
+      reason: 'recalled',
+      notifyIfUnknown: Boolean(removed),
+    }));
   }
 
   private handleReactionCreatedEvent(data: unknown): void {
@@ -2592,6 +2878,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     responseText: string,
     summary?: RunSummary,
     mentions: OutboundMention[] = [],
+    verifiedMediaAction?: VerifiedMediaAction,
+    turnContext?: StreamingCardTurnContext,
   ): Promise<boolean> {
     // Wait for in-flight card creation to complete before finalizing
     const pending = this.cardCreatePromises.get(chatId);
@@ -2636,7 +2924,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const visibleFinalText = extractStreamingFinalResponse(responseText);
       const stickerHint = extractFeishuStickerHint(visibleFinalText);
       if (stickerHint) {
-        const fileKey = this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
+        const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, verifiedMediaAction)
+          || this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
         if (fileKey) {
           const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId);
           if (stickerResult.ok) {
@@ -2666,6 +2955,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       state.sequence++;
       await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
 
+      // 流式卡片在收尾时不会走普通 delivery，因此必须把“卡片消息 ID ->
+      // 原任务 + 最终结果”单独记入出站引用。后续用户原生回复这张卡片时，
+      // 飞书即使只回传卡片资源壳，也能恢复可续办任务，而不是只看到“继续”。
+      this.persistStreamingCardContinuation(chatId, state, status, finalResponseText, turnContext);
+
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
       return true;
     } catch (err) {
@@ -2673,6 +2967,48 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return false;
     } finally {
       this.activeCards.delete(chatId);
+    }
+  }
+
+  private persistStreamingCardContinuation(
+    chatId: string,
+    state: FeishuCardState,
+    status: 'completed' | 'interrupted' | 'error',
+    responseText: string,
+    turnContext?: StreamingCardTurnContext,
+  ): void {
+    const sessionId = turnContext?.codepilotSessionId?.trim() || '';
+    if (!sessionId || !state.messageId) return;
+
+    const sourceText = this.normalizeLightContextAuditSummary(turnContext?.sourceText || '');
+    const resultText = this.normalizeLightContextAuditSummary(extractStreamingFinalResponse(responseText));
+    const continuationContext = [
+      sourceText ? `原始请求：${sourceText}` : '',
+      `上一轮状态：${status === 'completed' ? '已完成' : status === 'interrupted' ? '已中断' : '未完成'}`,
+      resultText ? `上一轮结果：${resultText}` : '',
+    ].filter(Boolean).join('\n');
+    if (!continuationContext) return;
+
+    try {
+      const store = getBridgeContext().store;
+      store.insertOutboundRef({
+        channelType: this.channelType,
+        chatId,
+        codepilotSessionId: sessionId,
+        platformMessageId: state.messageId,
+        purpose: 'streaming_card',
+        messageKind: 'interactive',
+        continuationContext,
+      });
+      store.insertAuditLog({
+        channelType: this.channelType,
+        chatId,
+        direction: 'outbound',
+        messageId: state.messageId,
+        summary: continuationContext.slice(0, 900),
+      });
+    } catch {
+      // 上下文回填是增强能力；卡片已成功展示时不能因本地持久化失败而报发送失败。
     }
   }
 
@@ -2813,9 +3149,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     responseText: string,
     summary?: RunSummary,
     mentions: OutboundMention[] = [],
+    verifiedMediaAction?: VerifiedMediaAction,
+    turnContext?: StreamingCardTurnContext,
   ): Promise<boolean> {
     if (!this.isStreamingCardEnabled()) return false;
-    return this.finalizeCard(chatId, status, responseText, summary, mentions);
+    return this.finalizeCard(chatId, status, responseText, summary, mentions, verifiedMediaAction, turnContext);
   }
 
   // ── Send ────────────────────────────────────────────────────
@@ -2832,7 +3170,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       && message.parseMode !== 'HTML'
     ) ? extractFeishuStickerHint(text) : null;
     if (stickerHint) {
-      const fileKey = this.resolveStickerFileKey(stickerHint.target, message.address.chatId, stickerHint.remainingText);
+      const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, message.verifiedMediaAction)
+        || this.resolveStickerFileKey(stickerHint.target, message.address.chatId, stickerHint.remainingText);
       if (fileKey) {
         const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId);
         if (stickerResult.ok) {
@@ -3403,6 +3742,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // 先过滤当前 bot 自己、系统和没有明确 @ 当前 bot 的卡片事件；
     // 其他 bot/app 发送的原生 @ 会在群聊门禁里受控放行。
     if (this.shouldIgnoreInboundEvent(data)) return;
+    if ((msg as FeishuMessageEventData['message'] & { deleted?: boolean }).deleted) {
+      this.insertInboundFilterAudit(
+        msg.chat_id || '',
+        msg.message_id,
+        '[FILTERED] Feishu message deleted before enqueue',
+      );
+      return;
+    }
 
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
@@ -3410,6 +3757,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const chatId = msg.chat_id;
     const replyTargetMessageId = this.getReplyTargetMessageId(msg);
+    const messageType = msg.message_type;
     // [P2] Complete sender ID fallback chain: open_id > user_id > union_id
     const userId = sender.sender_id?.open_id
       || sender.sender_id?.user_id
@@ -3419,6 +3767,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const isOtherBotSender = this.isInboundEventFromOtherBot(sender);
     let botToBotTurn: { chainCount: number; maxTurns: number; senderType: string } | null = null;
     let botNameWake: FeishuBotNameWakeClassification | null = null;
+    let replyToBotMediaWake: { messageId: string; messageType: string } | null = null;
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
@@ -3471,28 +3820,37 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
       if (requireMention && !isOtherBotSender) {
         const nativeBotMentioned = this.isBotMentionedFromMessage(msg);
-        // 原生 @ 只证明消息关联到机器人；纠错、转述或让别人操作机器人名时仍可不入队。
-        botNameWake = nativeBotMentioned
-          ? this.classifyNativeBotMentionFromMessage(msg)
-          : this.classifyBotNameWakeFromMessage(msg);
-        const replyToKnownBotMessage = (!nativeBotMentioned && !botNameWake?.shouldHandle && replyTargetMessageId)
-          ? await this.isReplyToKnownBotMessage(chatId, replyTargetMessageId)
-          : false;
-        if (!nativeBotMentioned && !botNameWake?.shouldHandle && !replyToKnownBotMessage) {
-          const summary = botNameWake
-            ? '[FILTERED] Group message dropped: bot name mention not actionable (require_mention=true)'
-            : '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)';
-          console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
-          try {
-            getBridgeContext().store.insertAuditLog({
-              channelType: 'feishu',
-              chatId,
-              direction: 'inbound',
-              messageId: msg.message_id,
-              summary,
-            });
-          } catch { /* best effort */ }
-          return;
+        // 群聊主入口仍只信任事件 mentions 中与当前 bot 身份相符的原生 @。
+        // 但用户用飞书原生 reply 给“本 bot 已发送的消息”补发表情包/图片时，
+        // 这是对当前 bot 回合的直接交互；只允许媒体类消息走这个窄口，避免文本别名或普通群聊误触。
+        if (!nativeBotMentioned) {
+          const replyToCurrentBotMedia = Boolean(replyTargetMessageId)
+            && this.isReplyWakeMediaMessageType(messageType)
+            && await this.isReplyToKnownBotMessage(chatId, replyTargetMessageId || '');
+          if (replyToCurrentBotMedia && replyTargetMessageId) {
+            replyToBotMediaWake = {
+              messageId: replyTargetMessageId,
+              messageType,
+            };
+            console.log('[feishu-adapter] Group media reply accepted via bot reply target, chatId:', chatId, 'msgId:', msg.message_id, 'replyTo:', replyTargetMessageId);
+          } else {
+            const summary = '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)';
+            console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
+            try {
+              getBridgeContext().store.insertAuditLog({
+                channelType: 'feishu',
+                chatId,
+                direction: 'inbound',
+                messageId: msg.message_id,
+                summary,
+              });
+            } catch { /* best effort */ }
+            return;
+          }
+        }
+        // 原生 @ 只证明消息关联到当前机器人；纠错、转述或让别人操作机器人名时仍可不入队。
+        if (nativeBotMentioned) {
+          botNameWake = this.classifyNativeBotMentionFromMessage(msg);
         }
         if (nativeBotMentioned && botNameWake && !botNameWake.shouldHandle) {
           console.log('[feishu-adapter] Group message ignored (bot mention not actionable), chatId:', chatId, 'msgId:', msg.message_id);
@@ -3517,7 +3875,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.lastIncomingMessageId.set(chatId, msg.message_id);
 
     // Extract content based on message type
-    const messageType = msg.message_type;
     let text = '';
     const attachments: FileAttachment[] = [];
     let stickerInfo: ParsedFeishuStickerContent | null = null;
@@ -3600,6 +3957,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
           userId,
           messageId: msg.message_id,
         });
+        // Cache one image per unique file_key in the configured memory repo so
+        // the current sticker can be visually understood without workspace copies.
         const attachment = this.getStoredStickerResource(stickerFileKey)
           || await this.downloadAndCacheStickerResource(msg.message_id, stickerFileKey);
         if (attachment) {
@@ -3640,18 +3999,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Strip @mention markers from text
     text = this.stripMentionMarkers(text);
+    if (this.isWithdrawnPlaceholderText(text)) {
+      this.insertInboundFilterAudit(
+        chatId,
+        msg.message_id,
+        '[FILTERED] Feishu 撤回消息占位 dropped before enqueue',
+      );
+      return;
+    }
 
     const timestamp = parseInt(msg.create_time, 10) || Date.now();
-    const displayName = await this.resolveChatDisplayName(chatId, msg.chat_type);
-    this.persistChatIndex(chatId, msg.chat_type, displayName, sender, msg.create_time);
-    if (msg.chat_type === 'p2p') {
-      this.reconcileP2pAliasBinding(chatId, this.getPreferredPrivateUserId(sender), displayName);
-    }
-    try {
-      await this.syncIndexedChatHistory(chatId, msg.chat_type, displayName, false);
-    } catch (err) {
-      console.warn('[feishu-adapter] incremental history sync failed:', err instanceof Error ? err.message : err);
-    }
+    // Use cached metadata synchronously so an accepted message can enter the
+    // bridge queue without waiting for Feishu chat/history network calls.
+    const displayName = this.chatMetaCache.get(chatId)?.displayName || chatId;
     const address = {
       channelType: 'feishu' as const,
       chatId,
@@ -3659,7 +4019,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       displayName,
       chatType: msg.chat_type,
     };
-    let rawMetadata: Record<string, unknown> | undefined = {
+    const rawMetadata: Record<string, any> = {
       feishuSender: {
         openId: sender.sender_id?.open_id,
         userId: sender.sender_id?.user_id,
@@ -3688,6 +4048,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
           reason: botNameWake.reason,
         },
       } : {}),
+      ...(replyToBotMediaWake ? {
+        feishuReplyWake: {
+          reason: 'reply_to_current_bot_media',
+          messageId: replyToBotMediaWake.messageId,
+          messageType: replyToBotMediaWake.messageType,
+        },
+      } : {}),
       ...(stickerInfo ? { sticker: stickerInfo } : {}),
       ...(stickerInfo ? { messageKind: stickerInfo.messageKind } : {}),
       ...(interactiveInfo ? {
@@ -3709,102 +4076,98 @@ export class FeishuAdapter extends BaseChannelAdapter {
       } : {}),
     };
     if (replyTargetMessageId) {
-      rawMetadata = {
-        ...(rawMetadata || {}),
+      Object.assign(rawMetadata, {
         feishuReplyTo: {
           messageId: replyTargetMessageId,
         },
-      };
+      });
       if (attachments.length === 0) {
         const replyAttachments = await this.downloadAttachmentsFromMessageId(replyTargetMessageId);
         if (replyAttachments.length > 0) {
           attachments.push(...replyAttachments);
-          rawMetadata = {
-            ...(rawMetadata || {}),
+          Object.assign(rawMetadata, {
             feishuReplyTo: {
               messageId: replyTargetMessageId,
               attachmentCount: replyAttachments.length,
             },
-          };
+          });
         }
       }
     }
 
     const trimmedUserText = text.trim();
-    if (isGroup && trimmedUserText) {
-      const historyIntent = this.parseHistoryIntentV2(trimmedUserText);
-      if (historyIntent) {
-        try {
-          text = await this.buildHistoryAugmentedPromptV2(chatId, msg.message_id, historyIntent);
-          if (historyIntent.responseMode === 'chat') {
-            rawMetadata = {
-              ...(rawMetadata || {}),
-              feishuHistoryContext: {
+
+    // Start platform evidence hydration immediately, but do not await it in
+    // the event callback. BridgeManager awaits the same promise only after it
+    // has armed the user-visible turn feedback timer.
+    const chatEvidencePreparation = (async () => {
+      const resolvedDisplayName = await this.resolveChatDisplayName(chatId, msg.chat_type);
+      address.displayName = resolvedDisplayName;
+      this.persistChatIndex(chatId, msg.chat_type, resolvedDisplayName, sender, msg.create_time);
+      if (msg.chat_type === 'p2p') {
+        this.reconcileP2pAliasBinding(chatId, this.getPreferredPrivateUserId(sender), resolvedDisplayName);
+      }
+      try {
+        await this.syncIndexedChatHistory(chatId, msg.chat_type, resolvedDisplayName, false);
+      } catch (err) {
+        console.warn('[feishu-adapter] incremental history sync failed:', err instanceof Error ? err.message : err);
+      }
+      return resolvedDisplayName;
+    })();
+
+    const prepareForAgent = async (): Promise<void> => {
+      const resolvedDisplayName = await chatEvidencePreparation;
+      if (isGroup && trimmedUserText) {
+        const historyIntent = this.parseHistoryIntentV2(trimmedUserText);
+        if (historyIntent) {
+          try {
+            const historyPrompt = await this.buildHistoryAugmentedPromptV2(chatId, msg.message_id, historyIntent);
+            if (historyIntent.responseMode === 'chat') {
+              rawMetadata.feishuHistoryContext = {
                 responseMode: historyIntent.responseMode,
                 scopeText: historyIntent.scopeText,
                 originalPrompt: historyIntent.originalPrompt || trimmedUserText,
-                prompt: text,
-              },
-            };
-          }
-          if (historyIntent.responseMode === 'doc' && historyIntent.docTitle) {
-            rawMetadata = {
-              ...(rawMetadata || {}),
-              feishuDocRequest: {
+                prompt: historyPrompt,
+              };
+            }
+            if (historyIntent.responseMode === 'doc' && historyIntent.docTitle) {
+              rawMetadata.feishuDocRequest = {
                 title: historyIntent.docTitle,
                 scopeText: historyIntent.scopeText,
-              } satisfies FeishuDocRequest,
-            };
+              } satisfies FeishuDocRequest;
+            }
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            console.warn('[feishu-adapter] Failed to augment prompt with chat history:', errorMessage);
+            rawMetadata.userVisibleError = this.toHistoryReadErrorMessage(errorMessage);
+            return;
           }
-        } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          console.warn('[feishu-adapter] Failed to augment prompt with chat history:', errorMessage);
-
-          const inbound: InboundMessage = {
-            messageId: msg.message_id,
-            address,
-            text: '',
-            timestamp,
-            raw: {
-              userVisibleError: this.toHistoryReadErrorMessage(errorMessage),
-            },
-          };
-          this.enqueue(inbound);
-          return;
-        }
-      } else {
-        const lightContext = await this.buildLightConversationContext(
-          chatId,
-          msg.message_id,
-          replyTargetMessageId,
-          trimmedUserText,
-          msg.mentions,
-        );
-        if (lightContext) {
-          rawMetadata = {
-            ...(rawMetadata || {}),
-            feishuConversationContext: lightContext,
-          };
+        } else {
+          const lightContext = await this.buildLightConversationContext(
+            chatId,
+            msg.message_id,
+            replyTargetMessageId,
+            trimmedUserText,
+            msg.mentions,
+          );
+          if (lightContext) rawMetadata.feishuConversationContext = lightContext;
         }
       }
-    }
 
-    if (messageType === 'text' && trimmedUserText) {
-      await this.ensureStickerHistoryBackfilledForRequest(chatId, msg.chat_type, displayName, trimmedUserText);
-      const stickerLibraryEvidence = await this.buildStickerLibraryEvidenceForRequest(chatId, trimmedUserText);
-      if (stickerLibraryEvidence) {
-        const existingAttachmentIds = new Set(attachments.map((item) => item.id));
-        for (const attachment of stickerLibraryEvidence.attachments) {
-          if (existingAttachmentIds.has(attachment.id)) continue;
-          attachments.push(attachment);
-          existingAttachmentIds.add(attachment.id);
+      if (messageType === 'text' && trimmedUserText) {
+        await this.ensureStickerHistoryBackfilledForRequest(chatId, msg.chat_type, resolvedDisplayName, trimmedUserText);
+        const stickerLibraryEvidence = await this.buildStickerLibraryEvidenceForRequest(chatId, trimmedUserText);
+        if (stickerLibraryEvidence) {
+          const existingAttachmentIds = new Set(attachments.map((item) => item.id));
+          for (const attachment of stickerLibraryEvidence.attachments) {
+            if (existingAttachmentIds.has(attachment.id)) continue;
+            attachments.push(attachment);
+            existingAttachmentIds.add(attachment.id);
+          }
+          rawMetadata.feishuStickerLibraryContext = stickerLibraryEvidence.context;
         }
-        rawMetadata = {
-          ...(rawMetadata || {}),
-          feishuStickerLibraryContext: stickerLibraryEvidence.context,
-        };
       }
-    }
+    };
 
     if (!text.trim() && attachments.length === 0) return;
 
@@ -3837,7 +4200,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       messageKind: stickerInfo?.messageKind,
       timestamp,
       raw: rawMetadata,
-      attachments: attachments.length > 0 ? attachments : undefined,
+      // Keep the shared array reference so deferred evidence can append a
+      // verified image/file before BridgeManager starts the provider.
+      attachments,
+      prepareForAgent,
     };
 
     // Audit log
@@ -3881,6 +4247,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private isInboundEventFromOtherBot(sender: FeishuMessageEventData['sender'] | undefined): boolean {
     if (!sender || !this.isBotOrAppSenderType(sender.sender_type)) return false;
     return !this.isInboundEventFromSelf(sender);
+  }
+
+  private isReplyWakeMediaMessageType(messageType: string | undefined): boolean {
+    const normalized = (messageType || '').trim().toLowerCase();
+    return normalized === 'sticker' || normalized === 'image';
   }
 
   private isKnownOutboundBotMessage(chatId: string, messageId: string): boolean {
@@ -4195,8 +4566,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       userId: item.sender?.id,
       messageId: item.message_id,
     });
-    if (this.getStoredStickerResource(fileKey)) return;
-    await this.downloadAndCacheStickerResource(item.message_id, fileKey);
   }
 
   private async harvestStickersFromHistory(items: FeishuMessageListItem[], chatId: string): Promise<void> {
@@ -4438,7 +4807,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
-      const exactMatches = this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'exact');
+      const exactMatches = this.preferHighestEvidenceMentionCandidates(
+        this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'exact'),
+      );
       const uniqueExactIds = new Set(exactMatches.map((candidate) => candidate.userId));
       if (uniqueExactIds.size === 1) {
         return {
@@ -4457,7 +4828,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
         };
       }
 
-      const relatedMatches = this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'related');
+      const relatedMatches = this.preferHighestEvidenceMentionCandidates(
+        this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'related'),
+      );
       return {
         target: cleanedTarget,
         status: relatedMatches.length > 0 ? 'ambiguous' : 'not_found',
@@ -4683,7 +5056,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     sourceMessage?: InboundMessage,
   ): Promise<FeishuMentionCandidate[]> {
     const byId = new Map<string, FeishuMentionCandidate>();
-    const addCandidate = (userId: string | undefined, name: string | undefined, aliases: string[] = []) => {
+    const addCandidate = (
+      userId: string | undefined,
+      name: string | undefined,
+      aliases: string[] = [],
+      evidenceSource?: FeishuMentionCandidateEvidence,
+    ) => {
       const id = (userId || '').trim();
       const displayName = cleanMentionName(name, '');
       // 飞书消息 @ 语法面向用户 ID；明显的 app/bot 标识不能进入原生 mention 候选。
@@ -4695,21 +5073,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
         displayName,
         ...aliases.map((item) => cleanMentionName(item, '')).filter(Boolean),
       ]);
+      const evidenceSources = new Set([
+        ...(existing?.evidenceSources || []),
+        ...(evidenceSource ? [evidenceSource] : []),
+      ]);
       byId.set(id, {
         userId: id,
         name: existing?.name || displayName,
         aliases: [...mergedAliases],
+        evidenceSources: [...evidenceSources],
       });
     };
 
-    this.addInboundMentionCandidates(sourceMessage, addCandidate);
-    this.addHistoryMentionCandidates(addCandidate);
+    this.addInboundMentionCandidates(sourceMessage, (userId, name, aliases) =>
+      addCandidate(userId, name, aliases, 'native_inbound'));
+    this.addHistoryMentionCandidates((userId, name, aliases) =>
+      addCandidate(userId, name, aliases, 'history'));
 
     if (message.address.chatId) {
       try {
         const mentionCandidates = await this.fetchChatMentionCandidates(message.address.chatId);
         for (const candidate of mentionCandidates) {
-          addCandidate(candidate.userId, candidate.name, candidate.aliases);
+          addCandidate(candidate.userId, candidate.name, candidate.aliases, 'current_chat');
         }
       } catch (err) {
         console.warn('[feishu-adapter] chat member mention lookup skipped:', err instanceof Error ? err.message : err);
@@ -4724,14 +5109,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     for (const senderId of senderIds) {
       const existing = byId.get(senderId);
       if (existing) {
-        addCandidate(senderId, existing.name, [...FEISHU_SENDER_ALIASES]);
+        addCandidate(senderId, existing.name, [...FEISHU_SENDER_ALIASES], 'current_sender');
       } else if (canUseCurrentSenderAsDmTarget) {
         // 群消息里的 address.displayName 通常是群名；给“我/发起人”私发时，
         // 用本轮 sender ID 精确投递，显示名只在 p2p 或已解析成员名时采用。
         const senderDisplayName = sourceMessage?.address.chatType === 'group'
           ? '发起人'
           : sourceMessage?.address.displayName || '发起人';
-        addCandidate(senderId, senderDisplayName, [...FEISHU_SENDER_ALIASES]);
+        addCandidate(senderId, senderDisplayName, [...FEISHU_SENDER_ALIASES], 'current_sender');
       }
     }
 
@@ -4762,6 +5147,25 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
     }
     return [...byId.values()];
+  }
+
+  /**
+   * A display name can survive in history after a bot/app was recreated with a
+   * new mentionable ID. Resolve same-chat actions from current platform
+   * evidence first; history remains a fallback only when live evidence is
+   * unavailable. Equal-priority IDs deliberately stay ambiguous.
+   */
+  private preferHighestEvidenceMentionCandidates(candidates: FeishuMentionCandidate[]): FeishuMentionCandidate[] {
+    const evidenceRank = (candidate: FeishuMentionCandidate): number => {
+      const sources = candidate.evidenceSources || [];
+      if (sources.includes('native_inbound')) return 40;
+      if (sources.includes('current_chat')) return 30;
+      if (sources.includes('current_sender')) return 20;
+      if (sources.includes('history')) return 10;
+      return 0;
+    };
+    const highestRank = Math.max(...candidates.map(evidenceRank), Number.NEGATIVE_INFINITY);
+    return candidates.filter((candidate) => evidenceRank(candidate) === highestRank);
   }
 
   private toMentionResolutionCandidates(candidates: FeishuMentionCandidate[]): Array<{ name: string; aliases?: string[] }> {
@@ -4886,10 +5290,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return { atAll: true, name: '所有人' };
     }
 
-    const matches = candidates.filter((candidate) => {
+    const matches = this.preferHighestEvidenceMentionCandidates(candidates.filter((candidate) => {
       const aliases = [candidate.name, ...candidate.aliases];
       return aliases.some((alias) => normalizeMentionAlias(alias) === normalizedTarget);
-    });
+    }));
     const uniqueById = new Map(matches.map((candidate) => [candidate.userId, candidate]));
     if (uniqueById.size !== 1) return null;
     const candidate = [...uniqueById.values()][0];
@@ -4981,10 +5385,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
     const normalized = text.replace(/\s+/g, '');
-    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6|\u770b\u4e00\u4e0b|\u770b\u770b|\u770b\u4e0b|\u5728\u8bf4\u4ec0\u4e48|\u8bf4\u4ec0\u4e48|\u5728\u804a\u4ec0\u4e48|\u804a\u4ec0\u4e48|\u4ec0\u4e48\u5185\u5bb9)/.test(normalized);
+    // “上面那条消息/卡片/上文”不是普通轻量指代；这类说法需要按
+    // 飞书云端消息页/本地历史索引回看，避免只拿 reply target 或近邻窗口猜错。
+    const mentionsUpwardHistory = /((上面|上方|前面|上文|前文|上一条|前一条|上条|前条|上几条|前几条).{0,16}(消息|卡片|回复|内容|记录|题目|thread|线程|那条|这条|这一条)|((消息|卡片|回复|内容|记录|题目|thread|线程).{0,16}(上面|上方|前面|上文|前文|上一条|前一条|上条|前条|上几条|前几条)))/u.test(normalized);
+    const wantsUpwardHistory = mentionsUpwardHistory
+      && /(看|查|读|翻|找|回看|漏查|对照|分析|总结|汇总|整理|解释|回答|回复|问|题目)/u.test(normalized);
+    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6|\u770b\u4e00\u4e0b|\u770b\u770b|\u770b\u4e0b|\u5728\u8bf4\u4ec0\u4e48|\u8bf4\u4ec0\u4e48|\u5728\u804a\u4ec0\u4e48|\u804a\u4ec0\u4e48|\u4ec0\u4e48\u5185\u5bb9)/.test(normalized) || wantsUpwardHistory;
     // "群里/本群/这个群" 也是明确的群历史范围，不要求用户必须说成“群聊记录”。
-    const mentionsHistory = /(\u7fa4\u804a|\u7fa4\u91cc|\u7fa4\u5185|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized);
-    const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized);
+    const mentionsHistory = /(\u7fa4\u804a|\u7fa4\u91cc|\u7fa4\u5185|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized) || mentionsUpwardHistory;
+    const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized) || mentionsUpwardHistory;
     const wantsDoc = /(\u98de\u4e66\u6587\u6863|\u6587\u6863\u94fe\u63a5|\u751f\u6210.*\u6587\u6863|\u6574\u7406\u6210.*\u6587\u6863|\u8f93\u51fa\u5230.*\u6587\u6863|\u53d1\u94fe\u63a5|\u56de\u94fe\u63a5)/.test(normalized);
     const actionVerbMatched = /(\u6807\u6ce8|\u91cd\u6807|\u6539\u6807|\u5224\u65ad|\u4fee\u6539|\u7ea0\u6b63|\u6838\u5bf9|\u6821\u5bf9|\u547d\u540d|\u5bf9\u7167)/.test(normalized);
     const targetSpeakerNames = this.extractTargetSpeakerNamesV2(text);
@@ -5025,6 +5434,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       startTimeMs = startOfToday.getTime();
       endTimeMs = startOfTomorrow.getTime();
       scopeText = '\u672c\u7fa4\u4eca\u5929\u7684\u804a\u5929\u8bb0\u5f55';
+    } else if (mentionsUpwardHistory) {
+      scopeText = '本群上方消息';
     }
 
     if (startTimeMs !== undefined && /(\u4e0a\u5348|\u65e9\u4e0a|\u6e05\u6668)/.test(normalized)) {
@@ -6068,7 +6479,62 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return '';
     }
 
-    return `[${timeLabel}] ${resolvedSenderLabel}: ${messageText}`;
+    const localOutboundSummary = this.formatLocalOutboundAuditSummary(item, messageText);
+    return `[${timeLabel}] ${resolvedSenderLabel}: ${messageText}${localOutboundSummary ? `\n  本地已发送内容摘要：${localOutboundSummary}` : ''}`;
+  }
+
+  private formatLocalOutboundAuditSummary(item: FeishuMessageListItem, messageText: string): string {
+    if (!this.isBotOrAppSenderType(item.sender?.sender_type || '')) return '';
+    // 飞书云端历史经常只能返回本机器人 card/image 的资源壳；连续任务需要用本地
+    // outbound audit 里的“已实际发送给用户的摘要”补 evidence，不能让模型只看卡片壳猜。
+    const store = getBridgeContext().store as unknown as {
+      listAuditLogs?: (filter?: {
+        channelType?: string;
+        chatId?: string;
+        direction?: 'inbound' | 'outbound';
+        messageId?: string;
+        limit?: number;
+      }) => Array<{ summary?: string; messageId?: string; chatId?: string; direction?: string; channelType?: string }>;
+      listOutboundRefs?: (filter?: {
+        channelType?: string;
+        chatId?: string;
+        platformMessageId?: string;
+      }) => Array<{ continuationContext?: string; platformMessageId?: string; channelType?: string; chatId?: string }>;
+    };
+    const audit = store.listAuditLogs?.({
+      channelType: 'feishu',
+      chatId: item.chat_id,
+      direction: 'outbound',
+      messageId: item.message_id,
+      limit: 3,
+    })?.find((entry) => entry.messageId === item.message_id && entry.direction === 'outbound' && entry.channelType === 'feishu');
+    const durableContinuation = store.listOutboundRefs?.({
+      channelType: 'feishu',
+      chatId: item.chat_id,
+      platformMessageId: item.message_id,
+    })?.find((entry) => entry.platformMessageId === item.message_id && entry.channelType === 'feishu' && entry.chatId === item.chat_id)
+      ?.continuationContext || '';
+    const summary = this.normalizeLightContextAuditSummary(durableContinuation || audit?.summary || '');
+    if (!summary) return '';
+    const normalizedMessage = messageText.replace(/\s+/g, ' ').trim();
+    if (normalizedMessage && summary.includes(normalizedMessage)) return '';
+    if (!this.isLowInformationHistoryText(normalizedMessage) && normalizedMessage.length >= 80) return '';
+    return summary;
+  }
+
+  private normalizeLightContextAuditSummary(summary: string): string {
+    return summary
+      .replace(/```cti-final\s*/giu, '')
+      .replace(/```\s*$/u, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 900);
+  }
+
+  private isLowInformationHistoryText(text: string): boolean {
+    if (!text) return true;
+    return /^\[(?:卡片消息|图片|文件|语音|视频|飞书表情包|sticker|image|file)[^\]]*\]$/iu.test(text)
+      || /正文未随事件返回|客户端兼容占位|资源 key=/u.test(text);
   }
 
   private async buildLightConversationContext(
@@ -6095,9 +6561,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       ]);
 
       const isShortReplyCommand = this.isShortReplyContextCommand(userText);
+      const hasContinuationTask = this.hasContinuationTaskSignal(userText);
       const includeBotMessages = isShortReplyCommand
         || mentions.length > 0
-        || this.isDeicticLightContextAsk(userText);
+        || this.isDeicticLightContextAsk(userText)
+        || hasContinuationTask;
       const selected = new Map<string, FeishuMessageListItem>();
       const selectionLimit = !replyTargetMessageId && isShortReplyCommand
         ? Math.max(limit + 8, 12)
@@ -6133,10 +6601,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
         .join('\n');
       if (!formatted) return null;
       const referenceSignals = this.formatLightContextReferenceSignals(userText, mentions);
+      const continuationGuidance = hasContinuationTask ? this.formatContinuationTaskGuidance(userText) : [];
 
       return {
         prompt: [
           ...referenceSignals,
+          ...continuationGuidance,
           'Feishu recent conversation context:',
           '- These are nearby messages from the same Feishu group, provided only to understand the current reply/mention.',
           '- Use them as chat context for tone, names, and references. Do not claim you searched all history.',
@@ -6188,6 +6658,38 @@ export class FeishuAdapter extends BaseChannelAdapter {
       mentionLines.length > 0 ? '- native mentions in current message:' : '',
       ...mentionLines,
     ].filter(Boolean);
+  }
+
+  private formatContinuationTaskGuidance(userText: string): string[] {
+    if (!this.hasContinuationTaskSignal(userText)) return [];
+    const metadataClauses = this.extractMetadataLikeClauses(userText);
+    return [
+      'Continuation task guardrails:',
+      '- The current message contains follow-up signals such as “也/继续/同样/按刚刚”. Do not analyze it as a fresh isolated command.',
+      '- First resolve what should continue from the replied message, nearby messages, and local outbound summaries. If the inherited task target or rule is still absent, ask one minimal clarification instead of inventing.',
+      '- Descriptive clauses in the current message are context metadata by default; only write their literal text onto an artifact when the user explicitly asks to add/write/贴/写上 that exact text.',
+      metadataClauses.length > 0
+        ? `- Metadata-like clauses detected in current message: ${metadataClauses.map((item) => `“${item}”`).join('、')}；不要直接当作要写到图片上的文字。`
+        : '',
+      '',
+    ].filter(Boolean);
+  }
+
+  private hasContinuationTaskSignal(userText: string): boolean {
+    const normalized = userText.replace(/\s+/g, '').trim();
+    if (!normalized) return false;
+    const hasContinuation = /(?:也|继续|接着|同样|照着|照旧|沿用|仍然|还是按|按(?:刚刚|刚才|上次|之前|前面|上一轮|原来)|再(?:来|做|改|补|处理|标|标记|标注|命名|取名)?)/u.test(normalized);
+    const hasTaskObject = /(?:这张图|这个图|这图|图片|图上|文件|表|名单|规则|格式|标记|标注|命名|取名|修改|处理|生成|整理|总结)/u.test(normalized);
+    return hasContinuation && hasTaskObject;
+  }
+
+  private extractMetadataLikeClauses(userText: string): string[] {
+    return userText
+      .split(/[，,。；;！!？?\n\r]+/u)
+      .map((part) => part.replace(/\s+/g, '').trim())
+      .filter((part) => part.length >= 3 && part.length <= 40)
+      .filter((part) => /^(?:这(?:个|张|份)?(?:图|图片|文件|表)?|这个|它|其|本(?:图|文件|表)|该(?:图|文件|表)?)(?:是|为|属于|作为|用作).+/u.test(part))
+      .slice(0, 3);
   }
 
   private isShortContextualAskText(userText: string): boolean {
@@ -7346,7 +7848,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     buffer: Buffer,
     mimeTypeOverride?: string,
   ): FileAttachment {
-    const mimeType = mimeTypeOverride || MIME_BY_TYPE[resourceType] || 'application/octet-stream';
+    const sniffed = resourceType === 'image' ? sniffImageMimeType(buffer) : null;
+    const mimeType = sniffed?.mimeType || mimeTypeOverride || MIME_BY_TYPE[resourceType] || 'application/octet-stream';
     const ext = this.extensionForFeishuResource(resourceType, mimeType);
     return {
       id: crypto.randomUUID(),
@@ -7355,6 +7858,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
       size: buffer.length,
       data: buffer.toString('base64'),
     };
+  }
+
+  private mimeTypeForImageExtension(extension: string): string | null {
+    switch (extension.toLowerCase().replace(/^\./, '')) {
+      case 'png': return 'image/png';
+      case 'jpg':
+      case 'jpeg': return 'image/jpeg';
+      case 'gif': return 'image/gif';
+      case 'webp': return 'image/webp';
+      default: return null;
+    }
   }
 
   private extensionForFeishuResource(resourceType: string, mimeType: string): string {

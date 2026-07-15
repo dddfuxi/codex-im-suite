@@ -7,7 +7,7 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink } from './types.js';
+import type { BridgeStatus, ChannelBinding, InboundLifecycleControl, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink, VerifiedMediaAction } from './types.js';
 import type {
   AnswerReviewInput,
   ConversationMemoryEvent,
@@ -20,7 +20,9 @@ import type {
   FeishuOAuthManualResumeRequest,
   FileAttachment,
   MemoryWriteCandidate,
+  MemoryWriteClassification,
   MemoryWriteIntentDecision,
+  MemoryWriteResult,
   MemoryReplyDecision,
 } from './host.js';
 import { execFile } from 'node:child_process';
@@ -35,7 +37,6 @@ import type {
   BaseChannelAdapter,
   ConversationTargetKind,
   ResolvedConversationTarget,
-  OutboundMentionResolutionInspection,
 } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
@@ -51,6 +52,13 @@ import {
   isFeishuStickerMessageKind,
   type ExecutionRequirement,
 } from './execution-requirement.js';
+import {
+  getPermissionApprovalRequiredRole,
+  getSlashCommandRequiredRole,
+  isDangerousUserRequest,
+  isNonAddressableMentionTarget,
+  isSystemAffectingReminderRequest,
+} from './agent-architecture.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
@@ -204,12 +212,6 @@ function isMemoryRecallRequestText(text: string): boolean {
   const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   return /(记忆|还记得|你还记得|上次|之前|历史|对应表)/.test(normalized);
-}
-
-function isExplicitMemoryWriteRequestText(text: string): boolean {
-  const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').trim();
-  if (!normalized) return false;
-  return /(?:记住|记一下|记录一下|帮我记|写入记忆|保存到记忆|长期记忆|以后(?:就)?(?:叫|称呼|记作)|这个(?:表情包|表情|图|词|名字)?.{0,16}(?:表示|代表|意思是|叫|名称是|语气是|用来))/u.test(normalized);
 }
 
 function containsOutsourcedToolReply(text: string): boolean {
@@ -404,12 +406,19 @@ function formatDirectMessageResultText(result: SendResult & { targetDisplayName?
   return `未完成：${reason || '无法完成私发'}`;
 }
 
+interface BridgeActionReplyResult {
+  handled: boolean;
+  text: string;
+  feishuCardJson?: string;
+  bridgeActionToolName?: string;
+}
+
 async function executeDirectMessageActionFromReply(
   adapter: BaseChannelAdapter,
   rawReply: string,
   msg: InboundMessage,
   rawPrompt: string,
-): Promise<{ handled: boolean; text: string; feishuCardJson?: string }> {
+): Promise<BridgeActionReplyResult> {
   const extracted = extractCtiDirectMessageAction(rawReply);
   if (extracted.action) {
     if (!isExplicitDirectMessageRequestText(rawPrompt)) {
@@ -470,6 +479,7 @@ async function executeDirectMessageActionFromReply(
     return {
       handled: true,
       text: formatDirectMessageResultText(result, extracted.action.targetText),
+      bridgeActionToolName: result.ok ? DIRECT_MESSAGE_ACTION_FENCE : undefined,
     };
   }
 
@@ -874,35 +884,7 @@ function shouldNotifyReminderSender(msg: InboundMessage, rawText: string): boole
   return /(?:提醒我|提示我|通知我|告诉我|叫我|给我发|发(?:一条|个)?(?:消息|提醒|信息).{0,8}(?:提醒我|提示我|通知我))/u.test(normalized);
 }
 
-async function resolveBareReminderNotifyTargets(
-  adapter: BaseChannelAdapter,
-  msg: InboundMessage,
-  rawText: string,
-): Promise<OutboundMention[] | undefined> {
-  if (adapter.channelType !== 'feishu' || typeof adapter.resolveOutboundMentions !== 'function') return undefined;
-  const targets = extractBareFeishuAtTargets(rawText)
-    .filter((target) => !isFeishuPlaceholderMentionTarget(target));
-  if (targets.length === 0) return undefined;
-  const resolvedMentions: OutboundMention[] = [];
-  for (const target of targets) {
-    try {
-      const resolved = await adapter.resolveOutboundMentions({
-        address: msg.address,
-        text: `@${target}`,
-        parseMode: 'plain',
-      }, msg);
-      for (const mention of resolved.mentions || []) {
-        resolvedMentions.push(mention);
-      }
-    } catch {
-      // mention resolution is best-effort; unresolved names stay out of native @ to avoid fake mentions
-    }
-  }
-  return uniqueReminderNotifyTargets(resolvedMentions);
-}
-
 async function resolveReminderNotifyTargets(
-  adapter: BaseChannelAdapter,
   msg: InboundMessage,
   rawText: string,
   explicitTargets?: OutboundMention[],
@@ -911,8 +893,6 @@ async function resolveReminderNotifyTargets(
   if (explicit?.length) return explicit;
   const nativeTargets = extractNativeReminderNotifyTargets(msg, rawText);
   if (nativeTargets?.length) return nativeTargets;
-  const bareTargets = await resolveBareReminderNotifyTargets(adapter, msg, rawText);
-  if (bareTargets?.length) return bareTargets;
   if (shouldNotifyReminderSender(msg, rawText)) {
     return uniqueReminderNotifyTargets([{
       userId: msg.address.userId,
@@ -961,14 +941,24 @@ async function executeReminderActionFromReply(
   msg: InboundMessage,
   sessionId: string,
   rawPrompt: string,
-): Promise<string> {
+): Promise<BridgeActionReplyResult> {
   const extracted = extractCtiReminderAction(rawReply);
   const reminders = getBridgeContext().reminders;
   if (extracted.action) {
-    if (!reminders) {
-      return '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。';
+    if (isSystemAffectingReminderRequest(`${rawPrompt}\n${extracted.action.sourcePrompt || ''}`, extracted.action.title)) {
+      if (!isOwnerMessage(msg)) return { handled: true, text: buildOwnerRequiredMessage(msg) };
+      return {
+        handled: true,
+        text: [
+          '未完成：这不是低风险单次提醒，不能通过 cti-reminder 创建系统、文件或命令类定时执行。',
+          '请让 agent 走受控工具/命令链路，并在执行前完成 owner 确认和真实工具证据记录。',
+        ].join('\n'),
+      };
     }
-    const notifyTargets = await resolveReminderNotifyTargets(adapter, msg, rawPrompt, extracted.action.notifyTargets);
+    if (!reminders) {
+      return { handled: true, text: '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。' };
+    }
+    const notifyTargets = await resolveReminderNotifyTargets(msg, rawPrompt, extracted.action.notifyTargets);
     const result = await reminders.createDirectReminder({
       title: extracted.action.title,
       dueAt: extracted.action.dueAt,
@@ -980,72 +970,24 @@ async function executeReminderActionFromReply(
       sessionId,
     });
     await reminders.tickReminders?.();
-    return buildReminderActionResultText(result);
+    return {
+      handled: true,
+      text: buildReminderActionResultText(result),
+      bridgeActionToolName: result.ok ? REMINDER_ACTION_FENCE : undefined,
+    };
   }
 
   if (containsUnverifiedReminderCompletion(rawReply)) {
-    const parsedPrompt = parseNaturalReminderRequest(rawPrompt, getInboundMessageDate(msg), getNaturalReminderParseOptions(msg));
-    if (parsedPrompt && reminders) {
-      const notifyTargets = await resolveReminderNotifyTargets(adapter, msg, rawPrompt);
-      const result = await reminders.createDirectReminder({
-        title: parsedPrompt.title,
-        dueAt: parsedPrompt.dueAt,
-        timezone: 'Asia/Shanghai',
-        target: msg.address,
-        ...(notifyTargets ? { notifyTargets } : {}),
-        sourcePrompt: rawPrompt,
-        createdByMessageId: msg.messageId,
-        sessionId,
-      });
-      await reminders.tickReminders?.();
-      return buildReminderActionResultText(result);
-    }
-    return [
-      '未完成：这条回复声称已经创建提醒或系统计划任务，但没有进入 bridge 的统一提醒系统。',
-      '为避免伪完成，已拦截原回复。请重新发送明确提醒请求，让 Codex 产出 cti-reminder 动作，或使用 /remind 固定格式。',
-    ].join('\n');
+    return {
+      handled: true,
+      text: [
+        '未完成：这条回复声称已经创建提醒或系统计划任务，但没有进入 bridge 的统一提醒系统。',
+        '为避免伪完成，已拦截原回复。请重新发送明确提醒请求，让 Codex 产出 cti-reminder 动作，或使用 /remind 固定格式。',
+      ].join('\n'),
+    };
   }
 
-  return rawReply;
-}
-
-async function tryHandleNaturalDirectReminder(
-  adapter: BaseChannelAdapter,
-  msg: InboundMessage,
-  binding: ChannelBinding,
-  rawText: string,
-): Promise<boolean> {
-  const parsed = parseNaturalReminderRequest(rawText, getInboundMessageDate(msg), getNaturalReminderParseOptions(msg));
-  if (!parsed) return false;
-  if (isScheduledExecutionRequestText(rawText, parsed.title)) return false;
-
-  const reminders = getBridgeContext().reminders;
-  let responseText: string;
-  if (!reminders) {
-    responseText = '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。';
-  } else {
-    const notifyTargets = await resolveReminderNotifyTargets(adapter, msg, rawText);
-    const result = await reminders.createDirectReminder({
-      title: parsed.title,
-      dueAt: parsed.dueAt,
-      timezone: 'Asia/Shanghai',
-      target: msg.address,
-      ...(notifyTargets ? { notifyTargets } : {}),
-      sourcePrompt: rawText,
-      createdByMessageId: msg.messageId,
-      sessionId: binding.codepilotSessionId,
-    });
-    await reminders.tickReminders?.();
-    responseText = buildReminderActionResultText(result);
-  }
-
-  const { store } = getBridgeContext();
-  store.addMessage(binding.codepilotSessionId, 'user', rawText);
-  store.addMessage(binding.codepilotSessionId, 'assistant', responseText);
-  recordConversationMemoryEvent(msg, binding, 'user', rawText);
-  recordConversationMemoryEvent(msg, binding, 'assistant', responseText);
-  await deliverResponse(adapter, msg.address, responseText, binding.codepilotSessionId, msg.messageId);
-  return true;
+  return { handled: false, text: rawReply };
 }
 
 function parseSlashReminderArgs(args: string, now = new Date()): { title: string; dueAt: string } | null {
@@ -1268,51 +1210,6 @@ async function handleConversationSendCallback(
     parseMode: 'plain',
     replyToMessageId: msg.callbackMessageId,
   });
-}
-
-const EXTENSION_DOMAIN_WORD_RE = /(?:model|模型|mcp|插件|plugin|skill|扩展)/i;
-const EXTENSION_INSTALL_HINT_RE = /(?:model|模型|mcp|插件|plugin|skill|扩展|qwen|browser|sequential|memory|fetch|ollama)/i;
-const EXTENSION_QUERY_RE = /[a-zA-Z0-9_.:@/\-\s]{2,}/;
-
-function cleanExtensionQuery(query: string): string {
-  return query
-    .replace(/\b(?:model|plugin|skill|mcp)\b/ig, ' ')
-    .replace(/(?:模型|插件|扩展)/g, ' ')
-    .replace(/[，。,.!?;；:：]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function matchExtensionQuery(text: string, patterns: RegExp[]): string {
-  for (const pattern of patterns) {
-    const match = pattern.exec(text);
-    const query = cleanExtensionQuery(match?.[1] || '');
-    if (query && EXTENSION_QUERY_RE.test(query)) return query;
-  }
-  return '';
-}
-
-function parseNaturalExtensionIntent(text: string): { action: 'search' | 'install'; query: string } | null {
-  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-  if (EXTENSION_DOMAIN_WORD_RE.test(normalized)) {
-    const searchQuery = matchExtensionQuery(normalized, [
-      /(?:搜索|查找|找一下)[^\n]{0,12}(?:model|模型|mcp|插件|plugin|skill|扩展)\s*[:：]?\s*([a-zA-Z0-9_.:@/\-\s]{2,})/i,
-      /(?:搜索|查找|找一下)\s*([a-zA-Z0-9_.:@/\-\s]{2,})\s*(?:model|模型|mcp|插件|plugin|skill|扩展)/i,
-    ]);
-    if (searchQuery) {
-      return { action: 'search', query: searchQuery };
-    }
-  }
-  if (EXTENSION_INSTALL_HINT_RE.test(normalized)) {
-    const installQuery = matchExtensionQuery(normalized, [
-      /(?:安装|装一下|装|加一下)[^\n]{0,12}(?:model|模型|mcp|插件|plugin|skill|扩展)\s*[:：]?\s*([a-zA-Z0-9_.:@/\-\s]{2,})/i,
-      /(?:安装|装一下|装|加一下)\s*([a-zA-Z0-9_.:@/\-\s]{2,})(?:\s*(?:model|模型|mcp|插件|plugin|skill|扩展))?/i,
-    ]);
-    if (installQuery) {
-      return { action: 'install', query: installQuery };
-    }
-  }
-  return null;
 }
 
 async function prepareExtensionInstall(
@@ -1553,37 +1450,46 @@ function usableMemoryCandidates(candidates: MemoryWriteCandidate[] | undefined):
     .filter((candidate) => !!candidate.text && (!!candidate.value || !!candidate.key));
 }
 
-function formatMemoryWriteReply(ok: boolean, candidates: MemoryWriteCandidate[], error?: string): string {
-  if (!ok) return `这条记忆没有写入成功：${error || '未知错误'}`;
-  const pairs = candidates
-    .filter((candidate) => candidate.key?.trim() && candidate.value?.trim())
-    .slice(0, 6)
-    .map((candidate) => `- ${candidate.key!.trim()}：${candidate.value!.trim()}`);
-  if (pairs.length === 0) return '已记录到记忆仓库。';
-  return ['已记录到记忆仓库：', '', ...pairs].join('\n');
+interface PreparedMemoryWrite {
+  decision: MemoryWriteIntentDecision;
+  candidates: MemoryWriteCandidate[];
+  result: MemoryWriteResult;
 }
 
-function renderMemoryWriteProgress(steps: string[]): string {
-  return [
-    '### 思考路径',
-    ...steps.map((step) => `- ${step}`),
-  ].join('\n');
+interface MemoryIntentPreflight {
+  preparedWrite?: PreparedMemoryWrite;
+  temporaryMemory?: MemoryWriteIntentDecision;
+  clarification?: string;
 }
 
-async function tryHandleModelPlannedMemoryWrite(
-  adapter: BaseChannelAdapter,
+function resolveInboundMemoryActorKind(msg: InboundMessage): MemoryWriteClassification['actorKind'] {
+  const raw = msg.raw as Record<string, any> | undefined;
+  const senderType = String(
+    raw?.feishuSender?.senderType
+    || raw?.senderType
+    || raw?.sender?.type
+    || '',
+  ).trim().toLowerCase();
+  if (senderType === 'bot' || senderType === 'app') return 'bot';
+  if (senderType === 'system') return 'system';
+  // Adapters that expose a concrete sender id but no platform sender-type
+  // evidence are treated as human until they opt into a stricter identity tag.
+  return msg.address.userId?.trim() ? 'human' : 'unknown';
+}
+
+/**
+ * Memory classification is a preflight decision only. It may authorize a
+ * durable write, but never owns the user-facing reply: the primary agent
+ * receives the result and must complete the turn through the normal path.
+ */
+async function prepareModelPlannedMemoryWrite(
   msg: InboundMessage,
   binding: ChannelBinding,
   text: string,
   rawText: string,
-): Promise<boolean> {
-  if (!isExplicitMemoryWriteRequestText(text || rawText)) return false;
-
+): Promise<MemoryIntentPreflight | null> {
   const context = getBridgeContext();
   const { store } = context;
-  const persistMemoryWrite = store.persistMemoryWrite?.bind(store);
-  if (typeof persistMemoryWrite !== 'function') return false;
-
   const workingDirectory = binding.workingDirectory || store.getSession(binding.codepilotSessionId)?.working_directory || undefined;
   let decision: MemoryWriteIntentDecision | null = null;
   if (context.memoryIntents?.classifyMemoryWrite) {
@@ -1603,9 +1509,43 @@ async function tryHandleModelPlannedMemoryWrite(
     }
   }
 
-  if (decision && decision.action !== 'write') return false;
+  // A classifier outage or an ambiguous result must never fall back to a
+  // regex/structured-text write. The ordinary agent turn can ask the user.
+  if (!decision || decision.action === 'ignore') return null;
+  if (decision.action === 'clarify') {
+    return {
+      clarification: decision.clarification?.trim()
+        || '这条信息应保存为当前用户记忆、当前群记忆，还是公共长期记忆？',
+    };
+  }
+  if (!decision.scope) {
+    return { clarification: '我还不能唯一判断这条信息的记忆范围。请说明它属于当前用户、当前群，还是公共长期记忆。' };
+  }
 
-  const modelCandidates = decision?.action === 'write' && decision.confidence >= 0.55
+  const classification: MemoryWriteClassification = {
+    scope: decision.scope,
+    actorKind: resolveInboundMemoryActorKind(msg),
+    confidence: decision.confidence,
+    reason: decision.reason,
+  };
+  // Bot/system messages can stay in bounded conversation context, but may
+  // never promote themselves into a user's durable memory partition.
+  if (classification.actorKind !== 'human') {
+    return { clarification: '当前消息的发送者身份不能作为长期记忆来源。请由需要保存该信息的用户明确发送。' };
+  }
+
+  // Temporary memory is the bounded current-session context already persisted
+  // by the normal conversation path. It is never a durable repository write.
+  if (classification.scope === 'temporary') {
+    return { temporaryMemory: decision };
+  }
+
+  const persistMemoryWrite = store.persistMemoryWrite?.bind(store);
+  if (typeof persistMemoryWrite !== 'function') {
+    return { clarification: '当前运行环境没有可用的长期记忆仓库写入服务。请先恢复记忆服务后再确认保存。' };
+  }
+
+  const modelCandidates = decision.confidence >= 0.55
     ? usableMemoryCandidates(decision.candidates)
     : [];
   const memoryWrite = persistMemoryWrite({
@@ -1618,55 +1558,49 @@ async function tryHandleModelPlannedMemoryWrite(
     text: text || rawText,
     workingDirectory,
     candidates: modelCandidates.length > 0 ? modelCandidates : undefined,
+    classification,
   });
-  if (memoryWrite.skipped) return false;
-
-  const steps = [
-    decision
-      ? '已让模型判断这条消息属于记忆写入，并整理可保存的信息。'
-      : '模型判定不可用，已使用保守结构化解析检查是否可以写入。',
-    modelCandidates.length > 0
-      ? `已整理 ${modelCandidates.length} 条候选记忆。`
-      : '未拿到模型候选，使用原文中的结构化键值作为候选。',
-    memoryWrite.ok
-      ? '已写入可见记忆仓库并重建知识索引。'
-      : '写入可见记忆仓库时失败，准备返回具体阻塞。',
-  ];
-  adapter.onMessageStart?.(msg.address.chatId);
-  if (typeof adapter.onStreamText === 'function') {
-    try { adapter.onStreamText(msg.address.chatId, renderMemoryWriteProgress(steps)); } catch { /* non-critical */ }
+  if (memoryWrite.skipped) {
+    return { clarification: `这条信息尚未写入记忆：${memoryWrite.error || '缺少受控写入条件'}。请补充明确范围和可保存事实。` };
   }
+  return { preparedWrite: { decision, candidates: modelCandidates, result: memoryWrite } };
+}
 
-  const reply = formatMemoryWriteReply(memoryWrite.ok, modelCandidates, memoryWrite.error);
-  const reviewedText = applyOutboundAnswerReview({
-    channelType: adapter.channelType,
-    chatId: msg.address.chatId,
-    userId: msg.address.userId,
-    userDisplayName: msg.address.displayName,
-    messageId: msg.messageId,
-    sessionId: binding.codepilotSessionId,
-    workingDirectory,
-    userText: rawText,
-    answerText: reply,
-    source: 'system',
-  });
+function buildPreparedMemoryWriteAgentPrompt(prepared: PreparedMemoryWrite): string {
+  const pairs = prepared.candidates
+    .filter((candidate) => candidate.key?.trim() && candidate.value?.trim())
+    .slice(0, 8)
+    .map((candidate) => `- ${candidate.key!.trim()}：${candidate.value!.trim()}`);
+  const outcome = prepared.result.ok
+    ? '已依据受控意图判定写入记忆仓库。'
+    : `写入失败：${prepared.result.error || '未知错误'}。`;
+  return [
+    'Memory write evidence for this turn:',
+    outcome,
+    pairs.length > 0 ? `已验证候选：\n${pairs.join('\n')}` : '没有可展示的结构化候选。',
+    'Use this as factual turn evidence. Give the user a natural response, do not claim any unverified memory scope or additional write.',
+  ].join('\n');
+}
 
-  store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
-  store.addMessage(binding.codepilotSessionId, 'assistant', reviewedText);
+function buildTemporaryMemoryAgentPrompt(decision: MemoryWriteIntentDecision): string {
+  const pairs = usableMemoryCandidates(decision.candidates)
+    .slice(0, 8)
+    .map((candidate) => `- ${candidate.key?.trim() || '事实'}：${candidate.value?.trim() || candidate.text}`);
+  return [
+    'Temporary memory intent evidence for this turn:',
+    'Keep this only as temporary session context. Do not create a durable user, group, or public long-term memory record.',
+    pairs.length > 0 ? `已验证候选：\n${pairs.join('\n')}` : '没有需要额外展示的结构化候选。',
+    'The normal primary-agent response still owns this turn. Do not claim that a durable memory was saved.',
+  ].join('\n');
+}
 
-  let cardFinalized = false;
-  if (typeof adapter.onStreamEnd === 'function') {
-    try {
-      cardFinalized = await adapter.onStreamEnd(msg.address.chatId, memoryWrite.ok ? 'completed' : 'error', reviewedText);
-    } catch (error) {
-      console.warn('[bridge-manager] Memory write card finalize failed:', error instanceof Error ? error.message : error);
-    }
-  }
-  if (!cardFinalized) {
-    await deliverResponse(adapter, msg.address, reviewedText, binding.codepilotSessionId, msg.messageId, false, 'Markdown');
-  }
-  adapter.onMessageEnd?.(msg.address.chatId);
-  return true;
+function buildMemoryScopeClarificationAgentPrompt(clarification: string): string {
+  return [
+    'Memory intent result for this turn:',
+    'The requested durable-memory scope is ambiguous or cannot be safely promoted.',
+    `Ask the user this minimal clarification: ${clarification}`,
+    'Do not write memory, infer a scope, or claim that anything was saved before the user answers.',
+  ].join('\n');
 }
 
 function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
@@ -1720,6 +1654,31 @@ function sanitizeProgressCardDetail(text: string): string {
   return visible.length > 900 ? `${visible.slice(0, 897)}...` : visible;
 }
 
+/**
+ * Provider text events contain the whole accumulated response, while the
+ * streaming card is an in-place status display. Keep only the newest safe
+ * sentence so each update replaces the previous status instead of replaying
+ * the entire chain of user-visible reasoning.
+ */
+function selectLatestProgressCardDetail(text: string): string {
+  const visible = sanitizeProgressCardDetail(text);
+  if (!visible) return '';
+
+  const latestLine = visible
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1)
+    || '';
+  if (!latestLine) return '';
+
+  // A provider may stream several status updates on one line. Prefer the last
+  // finished sentence, but preserve an unfinished trailing sentence so users
+  // still see current progress during typewriter-style streaming.
+  const sentences = latestLine.match(/[^。！？!?]+(?:[。！？!?]+|$)/gu) || [];
+  return (sentences.at(-1) || latestLine).trim();
+}
+
 function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
@@ -1763,11 +1722,10 @@ function describeToolProgressStatus(status: 'running' | 'complete' | 'error'): s
 
 function buildProgressCardTextForStreaming(step: string | undefined, detailText: string): string {
   const normalizedStep = normalizeProgressCardStep(step);
-  const detail = sanitizeProgressCardDetail(detailText);
-  if (normalizedStep && detail && detail !== normalizedStep) {
-    return `${normalizedStep}\n\n${detail}`;
-  }
-  return normalizedStep || detail || '正在处理当前请求。';
+  const detail = selectLatestProgressCardDetail(detailText);
+  // A single newest sentence is intentionally preferred over a stage label:
+  // the card is updated in place and must not accumulate earlier reasoning.
+  return detail || normalizedStep || '正在处理当前请求。';
 }
 
 function buildMemoryDecisionAgentPrompt(memoryDecision: MemoryReplyDecision): string {
@@ -1823,6 +1781,16 @@ function selectReplySurfaceMode(input: ReplySurfaceModeInput): ReplySurfaceMode 
   }
   if (!input.supportsStreamingCards) return 'plain_delivery';
   return input.textLength <= 280 ? 'light_status' : 'plain_delivery';
+}
+
+function getTurnFeedbackDelayMs(): number {
+  const { store } = getBridgeContext();
+  const raw = store.getSetting('bridge_turn_feedback_delay_ms')
+    || process.env.CTI_TURN_FEEDBACK_DELAY_MS
+    || '250';
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 250;
+  return Math.max(0, Math.min(parsed, 2000));
 }
 
 function getInboundMessageKind(msg: InboundMessage, rawData: Record<string, any> | null | undefined): string | undefined {
@@ -1912,6 +1880,20 @@ function isExplicitStickerSendRequest(text: string): boolean {
   return hasStickerNoun && hasSendIntent;
 }
 
+/**
+ * Generic one-sticker requests may carry a trusted adapter-preferred key, but
+ * that key is only evidence for the agent/renderer. The bridge must not send
+ * it before the provider has judged the full turn; otherwise compound requests
+ * get truncated into a platform media action.
+ */
+function isGenericSingleStickerSendRequest(text: string): boolean {
+  if (!isExplicitStickerSendRequest(text)) return false;
+  const normalized = text.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+  if (/(?:两|二|2|几|多)(?:个|张)?(?:表情包|表情|sticker|贴纸)/iu.test(normalized)) return false;
+  if (/(?:随便|随机)/iu.test(normalized)) return true;
+  return /^(?:(?:请|帮我|给我|来|发|回|回复|整|丢|贴|用|给))*(?:一|1)?(?:个|张)?(?:表情包|表情|sticker|贴纸)(?:吧|呀|啊|呗|喽|嘛|呢|了)?$/iu.test(normalized);
+}
+
 function hasLeadingExpressionHint(text: string): boolean {
   return /^\s*\[[^\]\r\n]{1,40}\]/u.test(text);
 }
@@ -1926,6 +1908,13 @@ function isLightweightStickerFallbackAnswer(text: string): boolean {
 
 function stripLeadingFeishuStickerHint(text: string): string {
   return text.replace(/^\s*\[表情包(?::[^\]\r\n]{1,180})?\]\s*/u, '').trimStart();
+}
+
+function suppressFeishuStickerHintForInboundStickerReply(text: string): string {
+  if (!hasLeadingFeishuStickerHint(text)) return text;
+  // 入站表情包消息的 provider 回复只允许把表情包当语气证据理解；
+  // 即使模型误输出动作 hint，也不能把“用户发来了表情包”的事实误转成“机器人再发一个表情包”。
+  return stripLeadingFeishuStickerHint(text) || '收到这个表情包了。';
 }
 
 function hasLeadingFeishuStickerHint(text: string): boolean {
@@ -1974,6 +1963,8 @@ function buildStickerAnnotationSystemPrompt(fileKey?: string): string {
   return [
     'Feishu sticker semantic annotation:',
     '- If this turn includes a Feishu sticker image attachment, answer the user naturally first.',
+    '- This annotation turn is not a request to send a sticker. Do not start the visible reply with `[表情包]`, `[表情包:file_key]`, or any sticker action unless the current user explicitly asks you to send a sticker.',
+    '- Do not invoke image generation, imagegen, asset creation, or shortcut sticker sending for this annotation turn; only inspect the attached existing sticker image.',
     `- Then append exactly one fenced \`${STICKER_ANNOTATION_FENCE}\` JSON block so the bridge can cache the sticker meaning for future semantic selection.`,
     expectedFileKey ? `- The JSON fileKey must be exactly "${expectedFileKey}".` : '- Use the current sticker fileKey from the user message.',
     '- JSON fields: fileKey, label, description, intent, tone, usage, aliases, confidence.',
@@ -1983,12 +1974,111 @@ function buildStickerAnnotationSystemPrompt(fileKey?: string): string {
   ].join('\n');
 }
 
+function buildStickerAnnotationFallbackPrompt(fileKey: string): string {
+  return [
+    'Generate only machine-readable Feishu sticker semantic metadata for the attached existing sticker image.',
+    `Current sticker fileKey: ${fileKey}`,
+    `Output exactly one fenced \`${STICKER_ANNOTATION_FENCE}\` JSON block and no other text.`,
+    'The JSON must describe visible image facts: fileKey, label, description, intent, tone, usage, aliases, confidence.',
+    'Do not send, choose, create, search, or generate any sticker/image. Do not use `[表情包]` action hints.',
+    'If the image is unreadable, still use the same JSON shape with low confidence and only concrete visible facts.',
+  ].join('\n');
+}
+
+async function collectTextFromLlmSseStream(stream: ReadableStream<string>, maxChars = 6000): Promise<string> {
+  const reader = stream.getReader();
+  let pending = '';
+  let text = '';
+  const consumeBlock = (block: string): void => {
+    for (const line of block.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(line.slice(6)) as { type?: string; data?: string };
+        if (event.type === 'text' && typeof event.data === 'string') {
+          text += event.data;
+          if (text.length > maxChars) text = text.slice(0, maxChars);
+        }
+      } catch {
+        // 忽略无法解析的流片段；兜底标注失败时不会影响用户可见回复。
+      }
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pending += value;
+    let boundary = pending.indexOf('\n\n');
+    while (boundary >= 0) {
+      const block = pending.slice(0, boundary);
+      pending = pending.slice(boundary + 2);
+      consumeBlock(block);
+      boundary = pending.indexOf('\n\n');
+    }
+    if (text.length >= maxChars) break;
+  }
+  if (pending.trim()) consumeBlock(pending);
+  return text;
+}
+
+function hasCurrentStickerImageAttachment(files: FileAttachment[] | undefined, fileKey: string): boolean {
+  const expected = fileKey.trim();
+  if (!expected || !Array.isArray(files)) return false;
+  return files.some((file) => (
+    file?.id === expected
+    && typeof file.type === 'string'
+    && file.type.toLowerCase().startsWith('image/')
+    && Boolean(file.data || file.filePath)
+  ));
+}
+
+async function runInvisibleStickerAnnotationFallback(input: {
+  binding: ChannelBinding;
+  msg: InboundMessage;
+  fileKey: string;
+  files: FileAttachment[];
+  abortSignal: AbortSignal;
+}): Promise<StickerAnnotationPayload | null> {
+  const fileKey = input.fileKey.trim();
+  if (!fileKey || input.abortSignal.aborted || !hasCurrentStickerImageAttachment(input.files, fileKey)) return null;
+  try {
+    const { store, llm } = getBridgeContext();
+    const session = store.getSession(input.binding.codepilotSessionId);
+    const abortController = new AbortController();
+    if (input.abortSignal.aborted) return null;
+    input.abortSignal.addEventListener('abort', () => abortController.abort(), { once: true });
+    // 这是隐藏的、只读的语义补写调用：不走 conversation-engine，避免把机器标注协议写进聊天历史。
+    const stream = llm.streamChat({
+      prompt: buildStickerAnnotationFallbackPrompt(fileKey),
+      sessionId: input.binding.codepilotSessionId,
+      forceFreshThread: true,
+      model: input.binding.model || session?.model || store.getSetting('default_model') || undefined,
+      systemPrompt: buildStickerAnnotationSystemPrompt(fileKey),
+      workingDirectory: input.binding.workingDirectory || session?.working_directory || undefined,
+      permissionMode: 'default',
+      conversationHistory: [],
+      files: input.files,
+      abortController,
+      sourceUserId: input.msg.address.userId,
+      sourceUserDisplayName: input.msg.address.displayName,
+      sourceMessageId: input.msg.messageId,
+      sourceChannelType: input.msg.address.channelType,
+      sourceChatId: input.msg.address.chatId,
+    });
+    const annotationText = await collectTextFromLlmSseStream(stream);
+    return extractStickerAnnotationFromReply(annotationText, fileKey).annotation;
+  } catch (err) {
+    console.warn('[bridge-manager] Invisible sticker annotation fallback failed:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
 function buildStickerCandidateAnalysisSystemPrompt(attachedFileKeys: string[], requestText: string): string {
   const allowed = attachedFileKeys.map((item) => item.trim()).filter(Boolean);
   if (allowed.length === 0) return '';
   return [
     'Feishu sticker candidate vision analysis:',
     '- This turn includes sticker library candidate images attached by the bridge. Inspect the actual images before deciding.',
+    '- This is an existing-sticker analysis turn, not an asset-creation task: do not read or invoke skills, do not call imagegen or any image-generation tool, and do not create, search for, or attach new image files.',
     `- After the visible reply, append exactly one fenced \`${STICKER_CANDIDATE_ANALYSIS_FENCE}\` JSON block. The bridge removes this block before sending.`,
     `- Allowed fileKey values for this turn: ${allowed.join(', ')}`,
     requestText.trim() ? `- User sticker request: ${requestText.trim()}` : '',
@@ -2170,10 +2260,34 @@ interface StickerAnnotationPayload {
 interface StickerCandidateAnalysisResult {
   annotations: StickerAnnotationPayload[];
   selectedFileKey?: string;
+  /** True when the model attempted the hidden analysis protocol, even if invalid. */
+  hasAnalysisBlock: boolean;
   text: string;
 }
 
 type ExecutionEvidence = NonNullable<engine.ConversationResult['executionEvidence']>;
+
+function addBridgeActionExecutionEvidence(
+  executionEvidence: ExecutionEvidence,
+  bridgeActionToolName?: string,
+): ExecutionEvidence {
+  const toolName = bridgeActionToolName?.trim();
+  if (!toolName) return executionEvidence;
+  // cti-* blocks are not provider-side tools. They are model-requested,
+  // bridge-owned actions executed after provider output is parsed. Once the
+  // bridge host reports success, the answer-review/no-evidence guard should
+  // see that real local side effect instead of treating the host result as a
+  // model hallucination.
+  return {
+    ...executionEvidence,
+    toolUseCount: executionEvidence.toolUseCount + 1,
+    toolResultCount: executionEvidence.toolResultCount + 1,
+    successfulToolResultCount: executionEvidence.successfulToolResultCount + 1,
+    toolNames: executionEvidence.toolNames.includes(toolName)
+      ? executionEvidence.toolNames
+      : [...executionEvidence.toolNames, toolName],
+  };
+}
 
 interface PendingSystemAction {
   type: 'shutdown';
@@ -2573,12 +2687,14 @@ function extractStickerCandidateAnalysisFromReply(
 ): StickerCandidateAnalysisResult {
   const allowed = new Set(allowedFileKeys.map((item) => item.trim()).filter(Boolean));
   if (allowed.size === 0) {
-    return { annotations: [], text: stripStickerCandidateAnalysisProtocolArtifacts(text) };
+    return { annotations: [], hasAnalysisBlock: false, text: stripStickerCandidateAnalysisProtocolArtifacts(text) };
   }
   const fencePattern = new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n([\s\S]*?)\n\s*\`\`\``, 'gi');
   const annotationsByFileKey = new Map<string, StickerAnnotationPayload>();
   let selectedFileKey: string | undefined;
+  let hasAnalysisBlock = false;
   for (const match of text.matchAll(fencePattern)) {
+    hasAnalysisBlock = true;
     try {
       const parsed = parseStickerCandidateAnalysisObject(JSON.parse(match[1].trim()), allowed);
       for (const annotation of parsed.annotations) {
@@ -2592,8 +2708,34 @@ function extractStickerCandidateAnalysisFromReply(
   return {
     annotations: [...annotationsByFileKey.values()],
     selectedFileKey,
+    hasAnalysisBlock,
     text: stripStickerCandidateAnalysisProtocolArtifacts(text),
   };
+}
+
+/**
+ * The model may see an attached candidate and choose it correctly while omitting
+ * the machine-only analysis fence. For a generic one-sticker request, that
+ * turn-local visual choice is enough to deliver once, but never enough to
+ * persist reusable sticker semantics. Any supplied analysis block still wins
+ * and must pass the normal confidence checks.
+ */
+function resolveTurnScopedAttachedStickerSelection(
+  userText: string,
+  answerText: string,
+  analysis: StickerCandidateAnalysisResult,
+  attachedFileKeys: string[],
+): string {
+  if (!isGenericSingleStickerSendRequest(userText) || analysis.hasAnalysisBlock) return '';
+  const allowed = new Set(attachedFileKeys.map((item) => item.trim()).filter(Boolean));
+  if (allowed.size === 0) return '';
+  const selected = new Set<string>();
+  const hintPattern = /\[表情包:([A-Za-z0-9_-]{3,160})\]/gu;
+  for (const match of answerText.matchAll(hintPattern)) {
+    const fileKey = (match[1] || '').trim();
+    if (allowed.has(fileKey)) selected.add(fileKey);
+  }
+  return selected.size === 1 ? [...selected][0] : '';
 }
 
 function resolveExplicitPaths(
@@ -2805,6 +2947,27 @@ function getFeishuMentionIntentOptions(adapter: BaseChannelAdapter, msg: Inbound
   };
 }
 
+/**
+ * 当前消息里的飞书原生 mention 只作为 agent evidence 注入上下文。
+ * bridge-manager 不在 provider 前抢跑执行 @，避免把“艾特某人并总结/说明/转述”
+ * 这类复合意图截断成单条平台 mention。
+ */
+function getNativeFeishuMentionEvidence(msg: InboundMessage): OutboundMention[] {
+  const rawData = msg.raw as {
+    feishuMentions?: Array<{ name?: unknown; openId?: unknown; userId?: unknown; unionId?: unknown }>;
+  } | undefined;
+  const nativeMentions = Array.isArray(rawData?.feishuMentions) ? rawData.feishuMentions : [];
+  const uniqueMentions = new Map<string, OutboundMention>();
+  for (const mention of nativeMentions) {
+    const userId = [mention?.openId, mention?.userId, mention?.unionId]
+      .find((candidate): candidate is string => typeof candidate === 'string' && !!candidate.trim())?.trim() || '';
+    if (!userId || isFeishuPlaceholderMentionTarget(userId)) continue;
+    const name = typeof mention?.name === 'string' ? mention.name.trim() : '';
+    uniqueMentions.set(userId, { userId, name: name || userId });
+  }
+  return [...uniqueMentions.values()];
+}
+
 function hasBareFeishuTarget(text: string, target: string): boolean {
   const expected = normalizeFeishuMentionTargetKey(target);
   if (!expected) return false;
@@ -2909,6 +3072,7 @@ function isFeishuAmbiguousPronounTarget(target: string): boolean {
 function isFeishuGenericMentionTarget(target: string): boolean {
   const cleaned = (target || '').normalize('NFKC').replace(/^[@＠]+/u, '').replace(/\s+/g, '').trim();
   if (!cleaned) return true;
+  if (isNonAddressableMentionTarget(cleaned)) return true;
   if (/^(?:我|你|您|他|她|它|ta|TA|对方|那个人|这个人|你们|我们|他们|她们|它们|大家|所有人|全体|某人|别人|其他人|其他成员|群里的人|群成员)$/u.test(cleaned)) return true;
   if (/^(?:一个|一位|一名|某个|某位|某名|任意|随机|另一个|另一位|另一名|下一个|上一个|那位|这位|对应的|胜出的|当前|相关).{0,24}$/u.test(cleaned)) return true;
   // “你的主人 / 自己的开发者 / 这个机器人的维护者”是关系描述，不是飞书可解析的显示名。
@@ -3034,77 +3198,9 @@ function sanitizeFeishuPlaceholderMentions(
   };
 }
 
-function hasBareFeishuMentionText(answerText: string): boolean {
-  // 飞书原生 mention 必须走结构化 mentions；模糊目标下裸 @名字 只能当作不安全文本处理。
-  FEISHU_BARE_AT_TARGET_RE.lastIndex = 0;
-  return FEISHU_BARE_AT_TARGET_RE.test(answerText);
-}
-
 function needsExplicitFeishuMentionTarget(userText: string, options: FeishuMentionIntentOptions = {}): boolean {
   if (!isFeishuMentionExecutionRequest(userText, options)) return false;
   return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
-}
-
-function addRequestedFeishuMentionTarget(
-  payload: PreparedBridgeReplyPayload,
-  context: {
-    channelType: string;
-    userText: string;
-    mentionIntentOptions?: FeishuMentionIntentOptions;
-  },
-): PreparedBridgeReplyPayload {
-  if (context.channelType !== 'feishu') return payload;
-  if (hasStructuredMentions(payload.mentions)) return payload;
-
-  const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText, context.mentionIntentOptions);
-  if (!target) return payload;
-  if (hasBareFeishuTarget(payload.text, target)) return payload;
-
-  const bareTargets = extractBareFeishuAtTargets(payload.text);
-  const placeholderTargets = bareTargets.filter(isFeishuPlaceholderMentionTarget);
-  if (placeholderTargets.length === 1) {
-    // 模型偶尔会把飞书历史里的 @_user_N 占位符当成可发送 mention。
-    // 用户本轮已给出明确目标时，用真实显示名替换占位符，再交给 resolver 统一校验 ID。
-    return {
-      ...payload,
-      text: replaceBareFeishuAtTarget(payload.text, placeholderTargets[0], target),
-      mentions: undefined,
-    };
-  }
-
-  // 用户明确要求“去艾特 X”时，先补成可见 @X，再交给 channel resolver 转成平台原生 mention。
-  return {
-    ...payload,
-    text: `@${target}\n${payload.text.trimStart()}`,
-    mentions: undefined,
-  };
-}
-
-async function resolvePreparedOutboundMentions(
-  adapter: BaseChannelAdapter,
-  sourceMessage: InboundMessage,
-  payload: PreparedBridgeReplyPayload,
-): Promise<PreparedBridgeReplyPayload> {
-  if (typeof adapter.resolveOutboundMentions !== 'function') return payload;
-  try {
-    const resolved = await adapter.resolveOutboundMentions({
-      address: sourceMessage.address,
-      text: payload.text,
-      parseMode: payload.parseMode,
-      mentions: payload.mentions,
-      replyToMessageId: payload.replyTo,
-    }, sourceMessage);
-    return {
-      ...payload,
-      text: resolved.text,
-      mentions: Object.prototype.hasOwnProperty.call(resolved, 'mentions')
-        ? resolved.mentions
-        : payload.mentions,
-    };
-  } catch (err) {
-    console.warn('[bridge-manager] Outbound mention resolution skipped:', err instanceof Error ? err.message : err);
-    return payload;
-  }
 }
 
 function enforceFeishuMentionTargetSafety(
@@ -3117,77 +3213,26 @@ function enforceFeishuMentionTargetSafety(
   },
 ): PreparedBridgeReplyPayload {
   if (context.channelType !== 'feishu') return payload;
-  if (!needsExplicitFeishuMentionTarget(context.userText, context.mentionIntentOptions)) return payload;
   if (hasStructuredMentions(payload.mentions)) return payload;
-  if (!hasBareFeishuMentionText(payload.text)) return payload;
+  if (needsExplicitFeishuMentionTarget(context.userText, context.mentionIntentOptions)) {
+    return {
+      ...payload,
+      text: appendReplyEndMarker('你要我艾特谁？请在飞书消息里直接 @ TA（原生提及）；收到结构化 mention 证据后，我会按上下文处理。'),
+      parseMode: 'plain',
+      images: [],
+      files: [],
+      mentions: undefined,
+    };
+  }
+
+  const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText, context.mentionIntentOptions);
+  if (!target) return payload;
 
   return {
     ...payload,
-    text: appendReplyEndMarker('你要我艾特谁？把对方名字或直接 @ TA 发我，我会用飞书原生 mention 发送。'),
-    parseMode: 'plain',
-    images: [],
-    files: [],
-    mentions: undefined,
-  };
-}
-
-function formatMentionInspectionBlocker(
-  target: string,
-  inspection?: OutboundMentionResolutionInspection | null,
-): string {
-  const searched = inspection?.searchedSources?.length
-    ? `我已查：${inspection.searchedSources.join('、')}。`
-    : '我已尝试查询当前会话可用的 mention 候选。';
-  const candidates = (inspection?.candidates || [])
-    .map((candidate) => candidate.name.trim())
-    .filter(Boolean)
-    .slice(0, 8);
-  const uniqueCandidates = [...new Set(candidates)];
-  const candidateText = uniqueCandidates.length > 0
-    ? `找到的相关候选：${uniqueCandidates.join('、')}。`
-    : '没有找到可唯一匹配的成员或机器人候选。';
-  const lookupFailed = inspection?.status === 'lookup_failed'
-    ? '本次群成员/机器人查询接口返回失败，已只基于本轮和历史 @ 记录收口。'
-    : '';
-  return appendReplyEndMarker([
-    `我没能确认“${target}”对应的飞书成员或机器人（未唯一命中），暂时不发普通文本假 @。`,
-    searched,
-    candidateText,
-    lookupFailed,
-    '请在飞书里直接点选 TA，或发我更准确的飞书显示名。',
-  ].filter(Boolean).join('\n'));
-}
-
-async function enforceResolvedFeishuMentionRequest(
-  payload: PreparedBridgeReplyPayload,
-  context: {
-    adapter: BaseChannelAdapter;
-    sourceMessage: InboundMessage;
-    channelType: string;
-    userText: string;
-    mentionIntentOptions?: FeishuMentionIntentOptions;
-  },
-): Promise<PreparedBridgeReplyPayload> {
-  if (context.channelType !== 'feishu') return payload;
-  if (hasStructuredMentions(payload.mentions)) return payload;
-
-  const explicitTargets = extractExplicitFeishuMentionTargetsFromRequest(context.userText, context.mentionIntentOptions);
-  if (explicitTargets.length === 0 || !hasBareFeishuMentionText(payload.text)) return payload;
-
-  const firstBareTarget = extractBareFeishuAtTargets(payload.text)[0] || '';
-  const unresolvedTarget = firstBareTarget && !isFeishuPlaceholderMentionTarget(firstBareTarget)
-    ? firstBareTarget
-    : explicitTargets[0];
-  const inspection = typeof context.adapter.inspectOutboundMentionTarget === 'function'
-    ? await context.adapter.inspectOutboundMentionTarget({
-        address: context.sourceMessage.address,
-        text: `@${unresolvedTarget}`,
-        parseMode: payload.parseMode,
-      }, context.sourceMessage, unresolvedTarget)
-    : null;
-  return {
-    ...payload,
-    text: formatMentionInspectionBlocker(unresolvedTarget, inspection),
+    // 禁止按显示名查群成员、机器人或历史记录后补原生 @；这类快捷解析
+    // 会把正常消息、规则和格式文本误升级为平台投递动作。
+    text: appendReplyEndMarker(`当前不再按文字自动解析飞书 @，不会查询群成员或机器人来补全“${target}”。请在飞书消息里直接 @ TA（原生提及）；收到结构化 mention 证据后，我会按上下文处理。`),
     parseMode: 'plain',
     images: [],
     files: [],
@@ -3546,6 +3591,7 @@ async function deliverResponse(
   parseModeOverride?: 'plain' | 'Markdown' | 'HTML',
   mentions?: OutboundMention[],
   feishuCardJson?: string,
+  verifiedMediaAction?: VerifiedMediaAction,
 ): Promise<SendResult> {
   const prepared = alreadyPrepared
     ? {
@@ -3590,6 +3636,7 @@ async function deliverResponse(
       replyToMessageId,
       mentions: prepared.mentions,
       feishuCardJson,
+      verifiedMediaAction,
     }, { sessionId });
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
@@ -3600,18 +3647,6 @@ async function deliverResponse(
     replyToMessageId,
     mentions: prepared.mentions,
   }, { sessionId });
-}
-
-interface DirectCommandRequest {
-  command: string;
-  args: string[];
-  display: string;
-  mutating: boolean;
-}
-
-interface DirectCommandResult {
-  ok: boolean;
-  text: string;
 }
 
 interface ProgressPulseController {
@@ -3790,7 +3825,7 @@ function getConfiguredWorkspaceRoots(): string[] {
   return fallback ? [fallback] : [];
 }
 
-function getSt3UnityProjectPath(): string {
+function getConfiguredUnityProjectPath(): string {
   const { store } = getBridgeContext();
   const configured = store.getSetting('bridge_unity_project_path') || process.env.CTI_UNITY_PROJECT_PATH || '';
   return configured.trim() ? path.normalize(configured.trim()) : '';
@@ -4212,64 +4247,6 @@ function buildInboundActorContextPrompt(
   return lines.filter(Boolean).join('\n');
 }
 
-function parseDirectCommandRequest(text: string): DirectCommandRequest | null {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  const lower = normalized.toLowerCase();
-  if (!lower) return null;
-
-  if (/\bgit pull --ff-only\b/.test(lower)) {
-    return { command: 'git', args: ['pull', '--ff-only'], display: 'git pull --ff-only', mutating: true };
-  }
-  if (/\bgit pull\b/.test(lower)) {
-    return { command: 'git', args: ['pull'], display: 'git pull', mutating: true };
-  }
-  if (/\bgit status -sb\b/.test(lower)) {
-    return { command: 'git', args: ['status', '-sb'], display: 'git status -sb', mutating: false };
-  }
-  if (/\bgit status\b/.test(lower)) {
-    return { command: 'git', args: ['status'], display: 'git status', mutating: false };
-  }
-
-  return null;
-}
-
-function formatDirectCommandResult(request: DirectCommandRequest, stdout: string, stderr: string): DirectCommandResult {
-  const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
-  const text = combined || '(无输出)';
-  return {
-    ok: true,
-    text: `${request.display} 执行成功。\n\n\`\`\`text\n${text}\n\`\`\``,
-  };
-}
-
-function formatDirectCommandError(request: DirectCommandRequest, stdout: string, stderr: string, errorMessage: string): DirectCommandResult {
-  const combined = [stderr.trim(), stdout.trim(), errorMessage.trim()].filter(Boolean).join('\n');
-  const text = combined || '命令执行失败';
-  return {
-    ok: false,
-    text: `${request.display} 失败。\n\n\`\`\`text\n${text}\n\`\`\``,
-  };
-}
-
-async function executeDirectCommand(request: DirectCommandRequest, workingDirectory: string): Promise<DirectCommandResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync(request.command, request.args, {
-      cwd: workingDirectory,
-      windowsHide: true,
-      timeout: 120000,
-      maxBuffer: 1024 * 1024 * 4,
-    });
-    return formatDirectCommandResult(request, stdout, stderr);
-  } catch (error) {
-    const err = error as {
-      stdout?: string;
-      stderr?: string;
-      message?: string;
-    };
-    return formatDirectCommandError(request, err.stdout || '', err.stderr || '', err.message || String(error));
-  }
-}
-
 function shouldForceFreshThreadBeforeExecution(text: string): boolean {
   const normalized = text.replace(/\s+/g, ' ').trim().toLowerCase();
   if (!normalized) return false;
@@ -4380,20 +4357,20 @@ function buildUnityMenuActionSystemInstructions(menuPath: string): string {
 function buildUnityScreenshotPolicyInstructions(text: string): string {
   const wantsOverview = /(全览图|横屏|整体布局|全景|overview|panorama|landscape|16:9)/i.test(text);
   const wantsRunGame = /(运行游戏|跑游戏|进入游戏|play mode|game view|运行一下)/i.test(text);
-  const defaultProjectPath = getSt3UnityProjectPath();
+  const defaultProjectPath = getConfiguredUnityProjectPath();
   const projectBinding = defaultProjectPath
     ? `The currently configured Unity project path is ${defaultProjectPath}. Use it unless the owner explicitly names another project path.`
     : 'No Unity project path is configured as a global setting. Use project facts from memory or the user-provided path; if neither identifies a project, report that blocker instead of assuming a default.';
   return [
-    'ST3 screenshot policy:',
+    'Configured Unity project screenshot policy:',
     `1. ${projectBinding}`,
     wantsOverview
       ? '2. The user requested an overview/landscape shot. Use a landscape 16:9 capture and adjust the camera/viewpoint to show the whole requested scene.'
       : '2. The user did not explicitly request an overview. Prefer Game view or the requested camera in portrait orientation.',
     wantsRunGame
-      ? '3. "运行游戏" means entering the playable game entry flow, not opening an art-only preview scene. In ST3, default to the configured game entry scene such as FirstScene/build settings entry unless the user explicitly names another runtime scene.'
+      ? '3. "运行游戏" means entering the playable game entry flow, not opening an art-only preview scene. Default to the configured game entry scene or build settings entry unless the user explicitly names another runtime scene.'
       : '3. If the request names PreviewCamera, Game view, or a scene camera, that source is binding. A Scene View crop or random editor viewport is not a valid success.',
-    '4. Never capture from another already-open Unity project/window as a fallback. If the bound ST3 project is not the active Unity window, switch to the correct project or report the exact blocker.',
+    '4. Never capture from another already-open Unity project/window as a fallback. If the configured Unity project is not the active Unity window, switch to the correct project or report the exact blocker.',
     '5. For Timeline scenes, set the PlayableDirector to the requested time, default to time=0 for first frame, call Evaluate(), then render the camera.',
     '6. Default deliverable is one verified screenshot. Only send multiple screenshots when the user explicitly asks for several, or one image cannot satisfy the requested comparison/coverage.',
     '7. Verify the screenshot is not blank, not mostly one color, and has the requested orientation before reporting completion.',
@@ -4682,75 +4659,33 @@ function buildOwnerRequiredMessage(msg: InboundMessage): string {
   return buildRoleRequiredMessage(msg, 'owner');
 }
 
-const DANGEROUS_CHINESE_ACTION_SOURCE = [
-  '删除',
-  '删掉',
-  '永久删除',
-  '物理删除',
-  '清空',
-  '删库',
-  '重置会话',
-  '清会话',
-  '清记忆',
-  '修改代码',
-  '改代码',
-  '写代码',
-  '提交代码',
-  '提交变更',
-  'git\\s*提交',
-  '关机',
-  '关闭电脑',
-  '关闭屏幕',
-  '关掉屏幕',
-  '熄屏',
-  '锁屏',
-  '锁定屏幕',
-  '重启电脑',
-  '重启机器',
-].join('|');
-
-const DANGEROUS_CHINESE_ACTION_AT_START_RE = new RegExp(`^(?:${DANGEROUS_CHINESE_ACTION_SOURCE})`, 'iu');
-const DANGEROUS_CHINESE_TRANSITIVE_RE = new RegExp(`^(?:把|将).{0,80}(?:${DANGEROUS_CHINESE_ACTION_SOURCE})`, 'iu');
-const LEADING_REQUEST_DIRECTIVE_RE = /^(?:(?:请|帮我|帮忙|麻烦|给我|替我|为我|你|现在|马上|立刻|直接|先|继续|执行|运行|安排|设置|定时|提醒我|提醒一下|叫我|通知我|待会儿|稍后|一会儿|[0-9一二两三四五六七八九十半]+\s*(?:秒|分钟|小时|天)后|今天|明天|后天|今晚|凌晨|早上|上午|中午|下午|晚上)\s*)+/iu;
-const ENGLISH_REQUEST_DIRECTIVE_RE = /^(?:(?:please|pls|run|execute|do|perform|start|schedule|now|later|tonight|tomorrow)\s+)+/iu;
-const DANGEROUS_COMMAND_AT_START_RE = /^(?:git\s+(?:commit|push|pull|rebase|merge|checkout|switch)\b|npm\s+install\b|pnpm\s+install\b|yarn\s+add\b|rm\s+-rf\b|del\s+\/s\b|remove-item\b|icacls\b|takeown\b|chmod\b|chown\b|drop\s+database\b|truncate\b|shutdown\s*\/[srg]\b|\bshutdown\b)/iu;
-const DANGEROUS_ENGLISH_ACTION_AT_START_RE = /^(?:delete|remove|commit|push|pull|rebase|merge|checkout|switch|shutdown|reboot|lock)\b/iu;
-
-function normalizeDangerousRequestText(text: string): string {
-  return text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+function parsePermissionCallbackData(callbackData: string): { action: string; permissionRequestId: string } | null {
+  const parts = callbackData.split(':');
+  if (parts.length < 3 || parts[0] !== 'perm') return null;
+  const action = parts[1];
+  const permissionRequestId = parts.slice(2).join(':').trim();
+  if (!action || !permissionRequestId) return null;
+  return { action, permissionRequestId };
 }
 
-function splitDangerousRequestClauses(text: string): string[] {
-  return text.split(/[。！？!?；;\n\r]+/u).map(part => part.trim()).filter(Boolean);
-}
 
-function stripLeadingRequestDirectives(text: string): string {
-  let remaining = text.trim();
-  for (;;) {
-    const next = remaining
-      .replace(LEADING_REQUEST_DIRECTIVE_RE, '')
-      .replace(ENGLISH_REQUEST_DIRECTIVE_RE, '')
-      .trim();
-    if (next === remaining) return remaining;
-    remaining = next;
-  }
-}
-
-function isDangerousRequestClause(clause: string): boolean {
-  const actionable = stripLeadingRequestDirectives(clause);
-  if (!actionable) return false;
-
-  // 安全门禁只拦“要机器人执行”的危险动作；日志、报错、故事里提到危险词，不应在这里短路。
-  return DANGEROUS_COMMAND_AT_START_RE.test(actionable)
-    || DANGEROUS_ENGLISH_ACTION_AT_START_RE.test(actionable)
-    || DANGEROUS_CHINESE_ACTION_AT_START_RE.test(actionable)
-    || DANGEROUS_CHINESE_TRANSITIVE_RE.test(actionable);
-}
-
-function isDangerousUserRequest(text: string): boolean {
-  const normalized = normalizeDangerousRequestText(text);
-  if (!normalized) return false;
-  return splitDangerousRequestClauses(normalized).some(isDangerousRequestClause);
+async function ensurePermissionApprovalRole(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  callbackData: string,
+  replyToMessageId?: string,
+): Promise<boolean> {
+  const parsed = parsePermissionCallbackData(callbackData);
+  const link = parsed ? getBridgeContext().store.getPermissionLink(parsed.permissionRequestId) : null;
+  const requiredRole = getPermissionApprovalRequiredRole(link);
+  if (hasRole(msg, requiredRole)) return true;
+  await deliver(adapter, {
+    address: msg.address,
+    text: buildRoleRequiredMessage(msg, requiredRole),
+    parseMode: 'plain',
+    replyToMessageId,
+  });
+  return false;
 }
 
 function isScheduledExecutionRequestText(rawText: string, parsedReminderTitle = ''): boolean {
@@ -4760,6 +4695,7 @@ function isScheduledExecutionRequestText(rawText: string, parsedReminderTitle = 
   return /(?:发送|发|私发|转发|上传|下载|运行|执行|启动|停止|重启|关闭|打开).{0,12}(?:文件|命令|脚本|程序|服务|屏幕|应用|电脑|机器|链接|附件)/iu.test(normalized)
     || /(?:文件|命令|脚本|程序|服务|屏幕|应用|电脑|机器|附件).{0,12}(?:发送|私发|转发|上传|下载|运行|执行|启动|停止|重启|关闭|打开)/iu.test(normalized);
 }
+
 
 function isShutdownRequest(text: string): boolean {
   const normalized = text.replace(/\s+/g, '').toLowerCase();
@@ -4866,8 +4802,26 @@ interface ActiveBridgeTask {
   channelType: string;
   chatId: string;
   sessionId: string;
+  sourceMessageId?: string;
+  sourceText?: string;
+  lifecycleTaskKey?: string;
   cardStarted: boolean;
   interruptionFinalized: boolean;
+}
+
+interface MessageLifecycleTask {
+  key: string;
+  adapter: BaseChannelAdapter;
+  channelType: string;
+  chatId: string;
+  sessionId: string;
+  messageId: string;
+  address: InboundMessage['address'];
+  state: 'queued' | 'running';
+  abort?: AbortController;
+  activeTask?: ActiveBridgeTask;
+  cancelled: boolean;
+  pauseNotified: boolean;
 }
 
 interface BridgeManagerState {
@@ -4877,6 +4831,7 @@ interface BridgeManagerState {
   startedAt: string | null;
   loopAborts: Map<string, AbortController>;
   activeTasks: Map<string, ActiveBridgeTask>;
+  messageTasks: Map<string, MessageLifecycleTask>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
   autoStartChecked: boolean;
@@ -4892,6 +4847,7 @@ function getState(): BridgeManagerState {
       startedAt: null,
       loopAborts: new Map(),
       activeTasks: new Map(),
+      messageTasks: new Map(),
       sessionLocks: new Map(),
       autoStartChecked: false,
     };
@@ -4899,6 +4855,9 @@ function getState(): BridgeManagerState {
   // Backfill sessionLocks for states created before this field existed
   if (!g[GLOBAL_KEY].sessionLocks) {
     g[GLOBAL_KEY].sessionLocks = new Map();
+  }
+  if (!g[GLOBAL_KEY].messageTasks) {
+    g[GLOBAL_KEY].messageTasks = new Map();
   }
   return g[GLOBAL_KEY];
 }
@@ -4908,6 +4867,8 @@ const DEFAULT_INTERRUPTED_CARD_TEXT = [
   '如果这次请求已进入可恢复队列，服务恢复后会尝试断点续跑；如果没有后续结果，请重新发送一次。',
 ].join('\n');
 
+const MESSAGE_WITHDRAWN_PAUSED_TEXT = '已暂停：原始消息已被撤回，我不会继续处理这条任务。';
+
 async function finalizeInterruptedTaskCard(task: ActiveBridgeTask, responseText = DEFAULT_INTERRUPTED_CARD_TEXT): Promise<boolean> {
   task.abort.abort();
   if (task.interruptionFinalized) return true;
@@ -4915,7 +4876,11 @@ async function finalizeInterruptedTaskCard(task: ActiveBridgeTask, responseText 
   try {
     // Stop/restart can happen before handleMessage reaches its finally block.
     // Finalize the user-visible card here while the adapter still has REST access.
-    const finalized = await task.adapter.onStreamEnd(task.chatId, 'interrupted', responseText);
+    const finalized = await task.adapter.onStreamEnd(task.chatId, 'interrupted', responseText, undefined, undefined, undefined, {
+      codepilotSessionId: task.sessionId,
+      sourceMessageId: task.sourceMessageId,
+      sourceText: task.sourceText,
+    });
     task.interruptionFinalized = finalized;
     if (finalized) {
       task.adapter.onMessageEnd?.(task.chatId);
@@ -4979,6 +4944,156 @@ async function notifyQueuedBehindActiveTurn(adapter: BaseChannelAdapter, msg: In
   } catch {
     // Queue acknowledgement is best-effort and must not block the real turn.
   }
+}
+
+function makeMessageLifecycleTaskKey(channelType: string, chatId: string, messageId: string): string {
+  return `${channelType}\n${chatId}\n${messageId}`;
+}
+
+function getInboundLifecycleControl(msg: InboundMessage): InboundLifecycleControl | null {
+  const rawControl = msg.control || (msg.raw as { bridgeControl?: InboundLifecycleControl } | undefined)?.bridgeControl;
+  if (!rawControl || rawControl.type !== 'message_withdrawn') return null;
+  const targetMessageId = typeof rawControl.targetMessageId === 'string'
+    ? rawControl.targetMessageId.trim()
+    : '';
+  if (!targetMessageId) return null;
+  return {
+    ...rawControl,
+    targetMessageId,
+  };
+}
+
+function registerMessageLifecycleTask(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  sessionId: string,
+  state: MessageLifecycleTask['state'],
+): MessageLifecycleTask | null {
+  const messageId = msg.messageId?.trim();
+  if (!messageId) return null;
+  const managerState = getState();
+  const key = makeMessageLifecycleTaskKey(adapter.channelType, msg.address.chatId, messageId);
+  const existing = managerState.messageTasks.get(key);
+  if (existing) {
+    existing.state = state;
+    existing.sessionId = sessionId;
+    existing.address = msg.address;
+    return existing;
+  }
+  const task: MessageLifecycleTask = {
+    key,
+    adapter,
+    channelType: adapter.channelType,
+    chatId: msg.address.chatId,
+    sessionId,
+    messageId,
+    address: msg.address,
+    state,
+    cancelled: false,
+    pauseNotified: false,
+  };
+  managerState.messageTasks.set(key, task);
+  return task;
+}
+
+function cleanupMessageLifecycleTask(task: MessageLifecycleTask | null | undefined): void {
+  if (!task) return;
+  const managerState = getState();
+  if (managerState.messageTasks.get(task.key) === task) {
+    managerState.messageTasks.delete(task.key);
+  }
+}
+
+function findMessageLifecycleTask(control: InboundLifecycleControl, msg: InboundMessage): MessageLifecycleTask | null {
+  const managerState = getState();
+  const exact = managerState.messageTasks.get(makeMessageLifecycleTaskKey(
+    msg.address.channelType,
+    msg.address.chatId,
+    control.targetMessageId,
+  ));
+  if (exact) return exact;
+
+  for (const task of managerState.messageTasks.values()) {
+    if (task.messageId !== control.targetMessageId) continue;
+    if (msg.address.chatId && task.chatId !== msg.address.chatId) continue;
+    if (msg.address.channelType && task.channelType !== msg.address.channelType) continue;
+    return task;
+  }
+  return null;
+}
+
+async function notifyMessageLifecyclePaused(task: MessageLifecycleTask, responseText = MESSAGE_WITHDRAWN_PAUSED_TEXT): Promise<void> {
+  if (task.pauseNotified) return;
+  task.pauseNotified = true;
+  try {
+    await deliver(task.adapter, {
+      address: task.address,
+      text: responseText,
+      parseMode: 'plain',
+      replyToMessageId: task.messageId,
+    }, { sessionId: task.sessionId });
+  } catch {
+    // Pause notice is best-effort; cancellation itself must still win.
+  }
+}
+
+async function pauseMessageLifecycleTask(task: MessageLifecycleTask, responseText = MESSAGE_WITHDRAWN_PAUSED_TEXT): Promise<void> {
+  task.cancelled = true;
+  if (task.abort && !task.abort.signal.aborted) task.abort.abort();
+  if (task.activeTask) {
+    const finalized = await finalizeInterruptedTaskCard(task.activeTask, responseText);
+    if (finalized) {
+      task.pauseNotified = true;
+      return;
+    }
+    await notifyMessageLifecyclePaused(task, responseText);
+    // Plain pause notice already reached the user; prevent the task finally
+    // block from replacing it with the generic bridge-stop interruption text.
+    task.activeTask.interruptionFinalized = true;
+    return;
+  }
+  await notifyMessageLifecyclePaused(task, responseText);
+}
+
+async function handleInboundLifecycleControl(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  control: InboundLifecycleControl,
+): Promise<void> {
+  if (control.type !== 'message_withdrawn') return;
+  const task = findMessageLifecycleTask(control, msg);
+  const { store } = getBridgeContext();
+  if (task) {
+    await pauseMessageLifecycleTask(task);
+    store.insertAuditLog({
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[CONTROL] Source message withdrawn; paused task for ${control.targetMessageId}`,
+    });
+    return;
+  }
+
+  if (control.notifyIfUnknown) {
+    try {
+      await deliver(adapter, {
+        address: msg.address,
+        text: MESSAGE_WITHDRAWN_PAUSED_TEXT,
+        parseMode: 'plain',
+        replyToMessageId: control.targetMessageId,
+      });
+    } catch {
+      // Best-effort notice for adapter-local queued messages.
+    }
+  }
+  store.insertAuditLog({
+    channelType: msg.address.channelType,
+    chatId: msg.address.chatId,
+    direction: 'inbound',
+    messageId: msg.messageId,
+    summary: `[CONTROL] Source message withdrawn; no active task for ${control.targetMessageId}`,
+  });
 }
 
 /**
@@ -5244,6 +5359,35 @@ export async function resumeFeishuOAuthRequest(resume: FeishuOAuthManualResumeRe
  * Messages for different sessions are dispatched concurrently;
  * messages for the same session are serialized via session locks.
  */
+const ADAPTER_EMPTY_POLL_BACKOFF_MS = 25;
+
+async function waitForAdapterPollBackoff(signal: AbortSignal, delayMs: number): Promise<void> {
+  if (signal.aborted || delayMs <= 0) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(finish, delayMs);
+    function finish() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    }
+    signal.addEventListener('abort', finish, { once: true });
+  });
+}
+
+async function pollAdapterMessage(
+  adapter: BaseChannelAdapter,
+  signal: AbortSignal,
+  emptyBackoffMs = ADAPTER_EMPTY_POLL_BACKOFF_MS,
+): Promise<InboundMessage | null> {
+  const message = await adapter.consumeOne();
+  if (message || signal.aborted) return message;
+
+  // Some adapters and test doubles use a non-blocking empty poll. Yielding here
+  // prevents a resolved-Promise loop from starving timers and occupying a CPU core.
+  await waitForAdapterPollBackoff(signal, emptyBackoffMs);
+  return null;
+}
+
 function runAdapterLoop(adapter: BaseChannelAdapter): void {
   const state = getState();
   const abort = new AbortController();
@@ -5253,9 +5397,15 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
     while (state.running && adapter.isRunning()) {
       try {
         markBridgeRuntimeStage('adapter_waiting');
-        const msg = await adapter.consumeOne();
+        const msg = await pollAdapterMessage(adapter, abort.signal);
         if (!msg) continue; // Adapter stopped
         markBridgeRuntimeStage('message_received');
+
+        const lifecycleControl = getInboundLifecycleControl(msg);
+        if (lifecycleControl) {
+          await handleInboundLifecycleControl(adapter, msg, lifecycleControl);
+          continue;
+        }
 
         // Callback queries, commands, and numeric permission shortcuts are
         // lightweight — process inline (outside session lock).
@@ -5273,14 +5423,21 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
+          const lifecycleTask = registerMessageLifecycleTask(adapter, msg, binding.codepilotSessionId, 'queued');
           if (state.sessionLocks.has(binding.codepilotSessionId)) {
             void notifyQueuedBehindActiveTurn(adapter, msg);
           }
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
-          processWithSessionLock(binding.codepilotSessionId, () =>
-            handleMessage(adapter, msg),
-          ).catch(err => {
+          processWithSessionLock(binding.codepilotSessionId, async () => {
+            if (lifecycleTask?.cancelled) {
+              await pauseMessageLifecycleTask(lifecycleTask);
+              cleanupMessageLifecycleTask(lifecycleTask);
+              return;
+            }
+            if (lifecycleTask) lifecycleTask.state = 'running';
+            await handleMessage(adapter, msg);
+          }).catch(err => {
             console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
           });
         }
@@ -5352,6 +5509,7 @@ async function handleMessage(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
 ): Promise<void> {
+  const turnStartedAt = Date.now();
   const { store } = getBridgeContext();
   recordBridgeRuntimeInbound(makeInboundSummary({
     messageId: msg.messageId,
@@ -5391,6 +5549,7 @@ async function handleMessage(
       attachedImageCount?: number;
       fileKeys?: string[];
       attachedFileKeys?: string[];
+      preferredFileKey?: string;
     };
     feishuHistoryContext?: {
       responseMode?: string;
@@ -5443,6 +5602,13 @@ async function handleMessage(
     }
   };
 
+  const lifecycleControl = getInboundLifecycleControl(msg);
+  if (lifecycleControl) {
+    await handleInboundLifecycleControl(adapter, msg, lifecycleControl);
+    ack();
+    return;
+  }
+
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
     if (msg.callbackData.startsWith('reminder:complete:')) {
@@ -5462,13 +5628,7 @@ async function handleMessage(
       ack();
       return;
     }
-    if (!hasRole(msg, 'operator')) {
-      await deliver(adapter, {
-        address: msg.address,
-        text: buildRoleRequiredMessage(msg, 'operator'),
-        parseMode: 'plain',
-        replyToMessageId: msg.callbackMessageId,
-      });
+    if (!await ensurePermissionApprovalRole(adapter, msg, msg.callbackData, msg.callbackMessageId)) {
       ack();
       return;
     }
@@ -5487,7 +5647,7 @@ async function handleMessage(
   }
 
   const rawText = msg.text.trim();
-  const hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
+  let hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
   const ownerMessage = isOwnerMessage(msg);
 
   const inboundClaim = claimInboundForExecution(adapter, msg, rawText, hasAttachments);
@@ -5665,10 +5825,11 @@ async function handleMessage(
     if (/^[123]$/.test(normalized)) {
       const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
       if (pendingLinks.length === 1) {
-        if (!hasRole(msg, 'operator')) {
+        const requiredRole = getPermissionApprovalRequiredRole(pendingLinks[0]);
+        if (!hasRole(msg, requiredRole)) {
           await deliver(adapter, {
             address: msg.address,
-            text: buildRoleRequiredMessage(msg, 'operator'),
+            text: buildRoleRequiredMessage(msg, requiredRole),
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
           });
@@ -5714,7 +5875,7 @@ async function handleMessage(
     } else if (rawText !== normalized && /^[123]$/.test(rawText) === false) {
       // Log when normalization changed the text — helps diagnose encoding issues
       const codePoints = [...rawText].map(c => 'U+' + c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0'));
-      console.log(`[bridge-manager] Shortcut candidate raw codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
+      console.log(`[bridge-manager] Normalized inbound text codepoints: ${codePoints.join(' ')} → normalized: "${normalized}"`);
     }
   }
 
@@ -5723,32 +5884,6 @@ async function handleMessage(
     await handleCommand(adapter, msg, rawText);
     ack();
     return;
-  }
-
-  if (adapter.channelType === 'feishu') {
-    // Natural extension shortcuts must inspect only the user's original intent.
-    // Adapter-generated evidence prompts may contain historical phrases such as
-    // "查找 adapter", which are context for the agent rather than a catalog command.
-    const extensionIntentText = rawData?.feishuHistoryContext?.originalPrompt?.trim() || rawText;
-    const extensionIntent = parseNaturalExtensionIntent(extensionIntentText);
-    if (extensionIntent) {
-      if (extensionIntent.action === 'search') {
-        const { extensions } = getBridgeContext();
-        const response = extensions
-          ? renderExtensionSearchResults(extensionIntent.query, await extensions.searchExtensions(extensionIntent.query))
-          : '面板未在线或扩展安装能力不可用。';
-        await deliver(adapter, {
-          address: msg.address,
-          text: response,
-          parseMode: 'plain',
-          replyToMessageId: msg.messageId,
-        });
-      } else {
-        await prepareExtensionInstall(adapter, msg, extensionIntent.query);
-      }
-      ack();
-      return;
-    }
   }
 
   // Sanitize general message text before routing to conversation engine
@@ -5778,11 +5913,21 @@ async function handleMessage(
   }
 
   const binding = router.resolve(msg.address);
+  const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const adapterIdentity = adapter.getAssistantIdentity?.() ?? null;
   const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter, msg.address);
   const feishuMentionIntentOptions = getFeishuMentionIntentOptions(adapter, msg);
   let activeTask: ActiveBridgeTask | null = null;
   let processingCardStarted = false;
+  let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
+  let lightStatusCardStarted = false;
+  let workflowCardStarted = false;
+  const clearLightStatusTimer = () => {
+    if (lightStatusTimer) {
+      clearTimeout(lightStatusTimer);
+      lightStatusTimer = null;
+    }
+  };
   const startProcessingCard = () => {
     if (processingCardStarted) return;
     processingCardStarted = true;
@@ -5790,15 +5935,11 @@ async function handleMessage(
     adapter.onMessageStart?.(msg.address.chatId);
   };
   const endProcessingCard = () => {
+    clearLightStatusTimer();
     if (!processingCardStarted) return;
     processingCardStarted = false;
     adapter.onMessageEnd?.(msg.address.chatId);
   };
-  if (!hasAttachments && await tryHandleNaturalDirectReminder(adapter, msg, binding, rawText)) {
-    ack();
-    return;
-  }
-
   const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
   if (smallTalkReply) {
     store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
@@ -5810,14 +5951,96 @@ async function handleMessage(
     return;
   }
 
-  if (!hasAttachments && await tryHandleModelPlannedMemoryWrite(adapter, msg, binding, text || rawText, rawText)) {
-    ack();
-    return;
+  // Arm user-visible feedback before any model-backed preflight. The delayed
+  // start avoids flashing a card for truly immediate replies, while ensuring
+  // memory, cloud and provider waits cannot leave the user without a signal.
+  if (typeof adapter.onStreamText === 'function') {
+    lightStatusTimer = setTimeout(() => {
+      lightStatusTimer = null;
+      lightStatusCardStarted = true;
+      startProcessingCard();
+      const feedbackElapsedMs = Date.now() - turnStartedAt;
+      console.log(`[bridge-manager] Turn feedback started: messageId=${msg.messageId}, elapsed=${feedbackElapsedMs}ms`);
+      updateBridgeRuntimeActiveRequest(activeRequest, 'feedback_started');
+      try { adapter.onStreamText!(msg.address.chatId, '正在处理…'); } catch { /* non-critical */ }
+    }, getTurnFeedbackDelayMs());
+    lightStatusTimer.unref?.();
   }
 
+  if (msg.prepareForAgent) {
+    const prepareForAgent = msg.prepareForAgent;
+    // The hook is single-use. Clearing it also prevents accidental repeated
+    // platform reads if the same in-memory envelope is inspected again.
+    msg.prepareForAgent = undefined;
+    try {
+      await prepareForAgent();
+    } catch (error) {
+      // Context enrichment is best-effort: keep the original accepted message
+      // moving instead of turning a history/member API outage into silence.
+      console.warn('[bridge-manager] Adapter evidence preparation failed:', error instanceof Error ? error.message : error);
+    }
+    hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
+
+    if (rawData?.userVisibleError) {
+      clearLightStatusTimer();
+      let cardFinalized = false;
+      if (lightStatusCardStarted && adapter.onStreamEnd) {
+        try {
+          cardFinalized = await adapter.onStreamEnd(
+            msg.address.chatId,
+            'error',
+            rawData.userVisibleError,
+          );
+        } catch (error) {
+          console.warn('[bridge-manager] Failed to finalize adapter preparation error card:', error instanceof Error ? error.message : error);
+        }
+      }
+      if (!cardFinalized) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: rawData.userVisibleError,
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        });
+      }
+      endProcessingCard();
+      ack();
+      return;
+    }
+  }
+
+  const memoryIntentPreflight = !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
+    ? await prepareModelPlannedMemoryWrite(
+      msg,
+      binding,
+      text || rawText,
+      rawText,
+    )
+    : null;
+  const preparedMemoryWrite = memoryIntentPreflight?.preparedWrite;
+
   let memoryRecallExtraSystemPrompt = '';
+  const preparedMemoryWriteAgentPrompt = preparedMemoryWrite
+    ? buildPreparedMemoryWriteAgentPrompt(preparedMemoryWrite)
+    : '';
+  const temporaryMemoryAgentPrompt = memoryIntentPreflight?.temporaryMemory
+    ? buildTemporaryMemoryAgentPrompt(memoryIntentPreflight.temporaryMemory)
+    : '';
+  const memoryScopeClarificationAgentPrompt = memoryIntentPreflight?.clarification
+    ? buildMemoryScopeClarificationAgentPrompt(memoryIntentPreflight.clarification)
+    : '';
   let memoryReviewContext: Pick<AnswerReviewInput, 'memoryPlan' | 'memoryHits'> = {};
   const preExecutionProgressSteps: string[] = [];
+  if (preparedMemoryWrite) {
+    preExecutionProgressSteps.push(
+      preparedMemoryWrite.result.ok
+        ? '已完成记忆意图判断和受控写入，交给 agent 生成最终回复。'
+        : '记忆意图已确认，但写入失败，交给 agent 说明实际结果。',
+    );
+  }
+  if (memoryIntentPreflight?.temporaryMemory) {
+    preExecutionProgressSteps.push('已完成记忆意图判断：仅保留为当前会话上下文，不写入长期仓库。');
+  }
   let feishuDocumentMemoryPrompt = '';
   if (adapter.channelType === 'feishu' && isFeishuDocumentListRequest(rawText)) {
     feishuDocumentMemoryPrompt = buildFeishuDocumentMemoryAgentPrompt(renderFeishuDocumentMemoryList(store), rawText);
@@ -5867,6 +6090,18 @@ async function handleMessage(
   const effectiveBinding = turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory
     ? { ...binding, workingDirectory: turnWorkspaceOverride, sdkSessionId: '' }
     : binding;
+  const messageLifecycleTask = registerMessageLifecycleTask(
+    adapter,
+    msg,
+    effectiveBinding.codepilotSessionId,
+    'running',
+  );
+  if (messageLifecycleTask?.cancelled) {
+    await pauseMessageLifecycleTask(messageLifecycleTask);
+    cleanupMessageLifecycleTask(messageLifecycleTask);
+    ack();
+    return;
+  }
   activeRequest = {
     ...activeRequest,
     chatId: msg.address.chatId,
@@ -5890,7 +6125,6 @@ async function handleMessage(
     && !isFeishuDocumentListRequest(rawText)
     && (isFeishuDocGenerationRequest(rawText) || isFeishuDocGenerationRequestStrict(rawText))
     && !rawData?.feishuDocRequest;
-  const directCommandRequest = parseDirectCommandRequest(rawText);
   let feishuCloudSystemPrompt = '';
 
   if (!directFeishuDocRequest && shouldTryFeishuCloudLinkResolve(adapter, rawText)) {
@@ -5924,37 +6158,6 @@ async function handleMessage(
     }
   }
 
-  if (directCommandRequest) {
-    if (directCommandRequest.mutating && !isOwnerMessage(msg)) {
-      endProcessingCard();
-      await deliver(adapter, {
-        address: msg.address,
-        text: buildOwnerRequiredMessage(msg),
-        parseMode: 'plain',
-        replyToMessageId: msg.messageId,
-      });
-      ack();
-      return;
-    }
-    const workingDirectory = effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || '';
-    const result = await executeDirectCommand(directCommandRequest, workingDirectory);
-    store.addMessage(effectiveBinding.codepilotSessionId, 'user', rawText);
-    store.addMessage(effectiveBinding.codepilotSessionId, 'assistant', result.text);
-    recordConversationMemoryEvent(msg, effectiveBinding, 'user', rawText);
-    recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', result.text);
-    if (effectiveBinding.id) {
-      try {
-        store.updateChannelBinding(effectiveBinding.id, { sdkSessionId: '' });
-      } catch {
-        // best effort
-      }
-    }
-    endProcessingCard();
-    await deliverResponse(adapter, msg.address, result.text, effectiveBinding.codepilotSessionId, msg.messageId);
-    ack();
-    return;
-  }
-
   // Create an AbortController so /stop can cancel this task externally
   const taskAbort = new AbortController();
   const state = getState();
@@ -5964,10 +6167,22 @@ async function handleMessage(
     channelType: adapter.channelType,
     chatId: msg.address.chatId,
     sessionId: effectiveBinding.codepilotSessionId,
+    sourceMessageId: msg.messageId,
+    sourceText: rawText,
+    lifecycleTaskKey: messageLifecycleTask?.key,
     cardStarted: false,
     interruptionFinalized: false,
   };
+  if (messageLifecycleTask) {
+    messageLifecycleTask.abort = taskAbort;
+    messageLifecycleTask.activeTask = activeTask;
+  }
   state.activeTasks.set(effectiveBinding.codepilotSessionId, activeTask);
+  if (messageLifecycleTask?.cancelled) {
+    await pauseMessageLifecycleTask(messageLifecycleTask);
+    ack();
+    return;
+  }
   const progressPulse = await startProgressPulse(adapter, msg, effectiveBinding.codepilotSessionId);
   updateBridgeRuntimeActiveRequest(activeRequest, 'engine_started');
   const directFeishuDocSourceMarkdown = directFeishuDocRequest
@@ -5987,13 +6202,15 @@ async function handleMessage(
   const feishuStickerLibraryAttachedFileKeys = Array.isArray(rawData?.feishuStickerLibraryContext?.attachedFileKeys)
     ? rawData.feishuStickerLibraryContext.attachedFileKeys.map((item) => item.trim()).filter(Boolean)
     : [];
+  const feishuStickerLibraryPreferredFileKey = typeof rawData?.feishuStickerLibraryContext?.preferredFileKey === 'string'
+    ? rawData.feishuStickerLibraryContext.preferredFileKey.trim()
+    : '';
   const stickerCandidateAnalysisSystemPrompt = feishuStickerLibraryContextPrompt
     ? buildStickerCandidateAnalysisSystemPrompt(feishuStickerLibraryAttachedFileKeys, rawText)
     : '';
   const feishuHistoryEvidencePrompt = buildFeishuHistoryEvidencePrompt(rawData?.feishuHistoryContext);
   const inboundActorContextPrompt = buildInboundActorContextPrompt(adapter, msg, rawData);
   const assistantMaintainerContextPrompt = buildAssistantMaintainerContextPrompt(adapter, msg);
-  const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const isStickerMessage = isFeishuStickerMessageKind(inboundMessageKind);
   const currentStickerFileKey = typeof rawData?.sticker?.fileKey === 'string'
     ? rawData.sticker.fileKey.trim()
@@ -6126,22 +6343,14 @@ async function handleMessage(
   const toolCallTracker = new Map<string, ToolCallInfo>();
   const progressCardSteps: string[] = [];
   let providerProgressText = '';
-  let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
-  let lightStatusCardStarted = false;
-  let workflowCardStarted = false;
-  const clearLightStatusTimer = () => {
-    if (lightStatusTimer) {
-      clearTimeout(lightStatusTimer);
-      lightStatusTimer = null;
-    }
-  };
-  if (hasLightStatusCard && typeof adapter.onStreamText === 'function') {
+  if (hasLightStatusCard && typeof adapter.onStreamText === 'function' && !lightStatusTimer && !lightStatusCardStarted) {
     lightStatusTimer = setTimeout(() => {
       lightStatusTimer = null;
       lightStatusCardStarted = true;
       if (activeTask) activeTask.cardStarted = true;
       try { adapter.onStreamText!(msg.address.chatId, '正在回复…'); } catch { /* non-critical */ }
-    }, 1200);
+    }, getTurnFeedbackDelayMs());
+    lightStatusTimer.unref?.();
   }
 
   const ensureWorkflowCard = (): boolean => {
@@ -6290,6 +6499,15 @@ async function handleMessage(
     const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
       ? sanitizeFeishuCloudDocumentLinks(rawText) || '请基于已读取的飞书云文档上下文回答当前请求。'
       : basePromptText;
+    // 关联上下文必须走独立通道：Codex 等 provider 会裁剪长 system prompt，
+    // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
+    // 此处仅放当前回合理解所必需的受控 evidence，不混入权限、表情包或记忆写入策略。
+    const priorityTurnContext = [
+      feishuConversationContextPrompt,
+      feishuHistoryEvidencePrompt,
+      feishuDocumentMemoryPrompt,
+      feishuCloudSystemPrompt,
+    ].filter(Boolean).join('\n\n');
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
       updateBridgeRuntimeActiveRequest({
@@ -6311,7 +6529,17 @@ async function handleMessage(
       storedUserText,
       historyLimit: fastPathOptions.historyLimit,
       memoryMode: providerMemoryMode,
+      priorityTurnContext,
       extraSystemPrompt: [
+        // Sticker receive/annotation rules must stay at the retained prefix so
+        // a generated evidence sentence like “用户发送了一个表情包” cannot be
+        // reinterpreted as an outbound sticker-send command.
+        stickerAnnotationSystemPrompt,
+        // The official Codex provider retains a bounded system-prompt prefix.
+        // Put sticker policy/evidence first so generic skills (for example
+        // imagegen) cannot replace a bridge-owned sticker delivery action.
+        feishuStickerLibraryContextPrompt,
+        stickerCandidateAnalysisSystemPrompt,
         adapterIdentityPrompt,
         assistantMaintainerContextPrompt,
         inboundActorContextPrompt,
@@ -6319,11 +6547,11 @@ async function handleMessage(
         feishuConversationContextPrompt,
         feishuHistoryEvidencePrompt,
         feishuDocumentMemoryPrompt,
+        preparedMemoryWriteAgentPrompt,
+        temporaryMemoryAgentPrompt,
+        memoryScopeClarificationAgentPrompt,
         feishuCloudSystemPrompt,
-        feishuStickerLibraryContextPrompt,
-        stickerCandidateAnalysisSystemPrompt,
         recentConversationMediaPrompt,
-        stickerAnnotationSystemPrompt,
       ].filter(Boolean).join('\n\n'),
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryUserId: msg.address.userId,
@@ -6343,12 +6571,45 @@ async function handleMessage(
     const stickerAnnotationResult = result.responseText
       ? extractStickerAnnotationFromReply(result.responseText, currentStickerFileKey)
       : { annotation: null, text: '' };
+    let currentStickerAnnotation = stickerAnnotationResult.annotation;
+    if (
+      !currentStickerAnnotation
+      && !result.hasError
+      && isStickerMessage
+      && currentStickerFileKey
+      && typeof adapter.recordStickerAnnotation === 'function'
+      && hasCurrentStickerImageAttachment(providerAttachments, currentStickerFileKey)
+    ) {
+      currentStickerAnnotation = await runInvisibleStickerAnnotationFallback({
+        binding: effectiveBinding,
+        msg,
+        fileKey: currentStickerFileKey,
+        files: providerAttachments || [],
+        abortSignal: taskAbort.signal,
+      });
+    }
     const stickerCandidateAnalysisResult = stickerAnnotationResult.text
       ? extractStickerCandidateAnalysisFromReply(stickerAnnotationResult.text, feishuStickerLibraryAttachedFileKeys)
-      : { annotations: [], text: '', selectedFileKey: undefined };
-    if (stickerAnnotationResult.annotation && typeof adapter.recordStickerAnnotation === 'function') {
+      : { annotations: [], text: '', selectedFileKey: undefined, hasAnalysisBlock: false };
+    const turnScopedAttachedStickerFileKey = resolveTurnScopedAttachedStickerSelection(
+      rawText,
+      stickerCandidateAnalysisResult.text,
+      stickerCandidateAnalysisResult,
+      feishuStickerLibraryAttachedFileKeys,
+    );
+    // This action is constructed solely from bridge-owned attachment evidence
+    // and an exact model choice. It is never inferred by adapters from reply
+    // text, and it authorizes this one turn only rather than durable semantics.
+    const verifiedStickerAction: VerifiedMediaAction | undefined = (
+      stickerCandidateAnalysisResult.selectedFileKey || turnScopedAttachedStickerFileKey
+    ) ? {
+      kind: 'sticker',
+      key: stickerCandidateAnalysisResult.selectedFileKey || turnScopedAttachedStickerFileKey,
+      provenance: 'turn_attached_model_selection',
+    } : undefined;
+    if (currentStickerAnnotation && typeof adapter.recordStickerAnnotation === 'function') {
       adapter.recordStickerAnnotation({
-        ...stickerAnnotationResult.annotation,
+        ...currentStickerAnnotation,
         chatId: msg.address.chatId,
         userId: msg.address.userId,
         learnedFromMessageId: msg.messageId,
@@ -6370,11 +6631,20 @@ async function handleMessage(
     const directMessageAction = providerVisibleResponseText
       ? await executeDirectMessageActionFromReply(adapter, providerVisibleResponseText, msg, rawText)
       : { handled: false, text: '' };
-    const responseText = directMessageAction.handled
-      ? directMessageAction.text
-      : providerVisibleResponseText
-        ? await executeReminderActionFromReply(adapter, providerVisibleResponseText, msg, effectiveBinding.codepilotSessionId, rawText)
-        : '';
+    let bridgeActionToolName = directMessageAction.bridgeActionToolName;
+    let responseText = directMessageAction.handled ? directMessageAction.text : '';
+    if (!directMessageAction.handled && providerVisibleResponseText) {
+      const reminderAction = await executeReminderActionFromReply(
+        adapter,
+        providerVisibleResponseText,
+        msg,
+        effectiveBinding.codepilotSessionId,
+        rawText,
+      );
+      responseText = reminderAction.text;
+      bridgeActionToolName = reminderAction.bridgeActionToolName;
+    }
+    const responseExecutionEvidence = addBridgeActionExecutionEvidence(result.executionEvidence, bridgeActionToolName);
     let preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
@@ -6384,25 +6654,10 @@ async function handleMessage(
     if (preparedReply && !feishuDocRequest) {
       preparedReply = verifyPreparedReplyExecution(preparedReply, {
         userText: rawText,
-        executionEvidence: result.executionEvidence,
+        executionEvidence: responseExecutionEvidence,
         executionRequirement: uiExecutionRequirement,
         messageKind: inboundMessageKind,
       });
-      preparedReply = addRequestedFeishuMentionTarget(preparedReply, {
-        channelType: adapter.channelType,
-        userText: rawText,
-        mentionIntentOptions: feishuMentionIntentOptions,
-      });
-      preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
-        channelType: adapter.channelType,
-      });
-      const skipExplanatoryMentionResolution =
-        adapter.channelType === 'feishu'
-        && isFeishuMentionHowToOrDiagnosticRequest(rawText)
-        && !hasStructuredMentions(preparedReply.mentions);
-      preparedReply = skipExplanatoryMentionResolution
-        ? preparedReply
-        : await resolvePreparedOutboundMentions(adapter, msg, preparedReply);
       preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
         channelType: adapter.channelType,
       });
@@ -6410,13 +6665,6 @@ async function handleMessage(
         channelType: adapter.channelType,
         userText: rawText,
         senderDisplayName: msg.address.displayName,
-        mentionIntentOptions: feishuMentionIntentOptions,
-      });
-      preparedReply = await enforceResolvedFeishuMentionRequest(preparedReply, {
-        adapter,
-        sourceMessage: msg,
-        channelType: adapter.channelType,
-        userText: rawText,
         mentionIntentOptions: feishuMentionIntentOptions,
       });
     }
@@ -6436,22 +6684,39 @@ async function handleMessage(
         answerText: preparedReply.text,
         ...memoryReviewContext,
         source: 'codex',
-        executionEvidence: result.executionEvidence,
+        executionEvidence: responseExecutionEvidence,
       })
       : '';
-    const deliveryResponseText = adapter.channelType === 'feishu'
-      ? addFeishuStickerHintForExplicitRequest(rawText, userFacingResponseText, stickerCandidateAnalysisResult.selectedFileKey, {
-        allowBareFallback: !stickerCandidateAnalysisSystemPrompt || Boolean(stickerCandidateAnalysisResult.selectedFileKey),
-      })
+    const stickerSafeUserFacingResponseText = adapter.channelType === 'feishu' && isStickerMessage
+      ? suppressFeishuStickerHintForInboundStickerReply(userFacingResponseText)
       : userFacingResponseText;
+    const providerRequestedStickerHint = adapter.channelType === 'feishu'
+      && !isStickerMessage
+      && hasLeadingFeishuStickerHint(userFacingResponseText);
+    const providerSelectedStickerFileKey = stickerCandidateAnalysisResult.selectedFileKey
+      || turnScopedAttachedStickerFileKey
+      || (!isStickerMessage && providerRequestedStickerHint ? feishuStickerLibraryPreferredFileKey : '');
+    const deliveryResponseText = adapter.channelType === 'feishu'
+      ? isStickerMessage
+        ? stickerSafeUserFacingResponseText
+        : addFeishuStickerHintForExplicitRequest(
+          rawText,
+          stickerSafeUserFacingResponseText,
+          providerSelectedStickerFileKey,
+          {
+            allowBareFallback: !stickerCandidateAnalysisSystemPrompt
+              || Boolean(stickerCandidateAnalysisResult.selectedFileKey || turnScopedAttachedStickerFileKey || providerSelectedStickerFileKey),
+          },
+        )
+      : stickerSafeUserFacingResponseText;
     const safeProviderErrorText = result.hasError
       ? buildSafeProviderErrorMessage(result.errorMessage || 'Unknown provider error', {
         cardFinalized: false,
         channelType: adapter.channelType,
       })
       : '';
-    if (userFacingResponseText) {
-      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', userFacingResponseText);
+    if (stickerSafeUserFacingResponseText) {
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', stickerSafeUserFacingResponseText);
     } else if (safeProviderErrorText) {
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', safeProviderErrorText);
     }
@@ -6475,6 +6740,12 @@ async function handleMessage(
           finalText,
           result.runSummary,
           preparedReply?.mentions,
+          verifiedStickerAction,
+          {
+            codepilotSessionId: effectiveBinding.codepilotSessionId,
+            sourceMessageId: msg.messageId,
+            sourceText: storedUserText,
+          },
         );
         if (status === 'interrupted' && activeTask) activeTask.interruptionFinalized = cardFinalized;
       } catch (err) {
@@ -6555,6 +6826,7 @@ async function handleMessage(
           preparedReply?.parseMode,
           preparedReply?.mentions,
           preparedReply?.feishuCardJson,
+          verifiedStickerAction,
         );
       }
       const localImagePaths = Array.from(new Set([
@@ -6696,12 +6968,17 @@ async function handleMessage(
     // If task was aborted and streaming card is still active, finalize as interrupted
     if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd && taskAbort.signal.aborted && !activeTask?.interruptionFinalized) {
       try {
-        const finalized = await adapter.onStreamEnd(msg.address.chatId, 'interrupted', DEFAULT_INTERRUPTED_CARD_TEXT);
+        const finalized = await adapter.onStreamEnd(msg.address.chatId, 'interrupted', DEFAULT_INTERRUPTED_CARD_TEXT, undefined, undefined, undefined, {
+          codepilotSessionId: effectiveBinding.codepilotSessionId,
+          sourceMessageId: msg.messageId,
+          sourceText: rawText,
+        });
         if (activeTask) activeTask.interruptionFinalized = finalized;
       } catch { /* best effort */ }
     }
 
     state.activeTasks.delete(effectiveBinding.codepilotSessionId);
+    cleanupMessageLifecycleTask(messageLifecycleTask);
     // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
     // Commit the offset only after full processing (success or failure)
@@ -6744,6 +7021,17 @@ async function handleCommand(
     return;
   }
 
+  const requiredCommandRole = getSlashCommandRequiredRole(command);
+  if (requiredCommandRole && !hasRole(msg, requiredCommandRole)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildRoleRequiredMessage(msg, requiredCommandRole),
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+
   let response = '';
 
   switch (command) {
@@ -6754,19 +7042,19 @@ async function handleCommand(
         'Send any message to interact with Claude.',
         '',
         '<b>Commands:</b>',
-        '/new [project_or_path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd &lt;project_or_path&gt; - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
+        '/new [project_or_path] - Start new session (operator)',
+        '/bind &lt;session_id&gt; - Bind to existing session (operator)',
+        '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
+        '/mode plan|code|ask - Change mode (operator)',
+        '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
-        '/feishu - Show Feishu developer platform capability and scope diagnostics',
-        '/docs - List generated Feishu documents',
-        '/projects - List available workspaces',
-        '/sessions - List recent sessions',
+        '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
+        '/docs - List generated Feishu documents (operator)',
+        '/projects - List available workspaces (operator)',
+        '/sessions - List recent sessions (operator)',
         '/remind 10分钟后 内容 - Create a bridge-managed reminder',
         '/ext search|install|remove <关键词或URL> - Manage extension catalog',
-        '/stop - Stop current session',
+        '/stop - Stop current session (operator)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
       ].join('\n');
@@ -6781,6 +7069,15 @@ async function handleCommand(
       }
       if (!reminders) {
         response = '未完成：当前 bridge 没有加载统一提醒服务。';
+        break;
+      }
+      if (isSystemAffectingReminderRequest(text, parsed.title)) {
+        response = isOwnerMessage(msg)
+          ? [
+            '未完成：这不是低风险单次提醒，不能通过 /remind 创建系统、文件或命令类定时执行。',
+            '请走受控工具/命令链路，并在执行前完成 owner 确认和真实工具证据记录。',
+          ].join('\n')
+          : buildOwnerRequiredMessage(msg);
         break;
       }
       const binding = router.resolve(msg.address);
@@ -6966,10 +7263,6 @@ async function handleCommand(
     }
 
     case '/perm': {
-      if (!hasRole(msg, 'operator')) {
-        response = escapeHtml(buildRoleRequiredMessage(msg, 'operator'));
-        break;
-      }
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
       const permParts = args.split(/\s+/);
@@ -6977,6 +7270,11 @@ async function handleCommand(
       const permId = permParts.slice(1).join(' ');
       if (!permAction || !permId || !['allow', 'allow_session', 'deny'].includes(permAction)) {
         response = 'Usage: /perm allow|allow_session|deny &lt;permission_id&gt;';
+        break;
+      }
+      const requiredRole = getPermissionApprovalRequiredRole(store.getPermissionLink(permId));
+      if (!hasRole(msg, requiredRole)) {
+        response = escapeHtml(buildRoleRequiredMessage(msg, requiredRole));
         break;
       }
       const callbackData = `perm:${permAction}:${permId}`;
@@ -6993,19 +7291,19 @@ async function handleCommand(
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
-        '/new [project_or_path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd &lt;project_or_path&gt; - Change working directory',
-        '/mode plan|code|ask - Change mode',
-        '/status - Show current status',
+        '/new [project_or_path] - Start new session (operator)',
+        '/bind &lt;session_id&gt; - Bind to existing session (operator)',
+        '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
+        '/mode plan|code|ask - Change mode (operator)',
+        '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
-        '/feishu - Show Feishu developer platform capability and scope diagnostics',
-        '/docs - List generated Feishu documents',
-        '/projects - List available workspaces',
-        '/sessions - List recent sessions',
+        '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
+        '/docs - List generated Feishu documents (operator)',
+        '/projects - List available workspaces (operator)',
+        '/sessions - List recent sessions (operator)',
         '/remind 10分钟后 内容 - Create a bridge-managed reminder',
         '/ext search|install|remove &lt;关键词或URL&gt; - Manage extension catalog',
-        '/stop - Stop current session',
+        '/stop - Stop current session (operator)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
@@ -7077,4 +7375,5 @@ export const _testOnly = {
   extractCtiReminderAction,
   containsUnverifiedReminderCompletion,
   parseNaturalReminderRequest,
+  pollAdapterMessageForTest: pollAdapterMessage,
 };

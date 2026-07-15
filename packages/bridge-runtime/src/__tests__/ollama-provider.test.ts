@@ -80,4 +80,22 @@ describe('OllamaProvider', () => {
 
     assert.deepEqual(tags, ['llama3.1:8b', 'qwen2.5-coder:7b']);
   });
+
+  it('honors a short caller deadline for latency-sensitive requests', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    globalThis.fetch = ((_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }, { once: true });
+    })) as typeof fetch;
+
+    const provider = new OllamaProvider(baseConfig);
+    const pending = provider.complete(
+      [{ role: 'user', content: 'ping' }],
+      { timeoutMs: 250 },
+    );
+    t.mock.timers.tick(5000);
+
+    await assert.rejects(pending, /本地模型超时\(250ms\)/);
+  });
 });

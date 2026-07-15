@@ -1,4 +1,4 @@
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 
 import type { Config } from './config.js';
 import {
@@ -93,6 +93,7 @@ function buildAnswerMessages(
   const route = options.route;
   const prompt = route?.compressedPrompt || compressPromptText(params, config);
   const history = route?.compressedHistory || compressConversationHistory(params, config);
+  const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
   const systemLines = [
     '你是本地低成本代码助手。',
     '你的职责是给出解释、总结、命令草案、小脚本草案和轻量代码说明。',
@@ -115,6 +116,7 @@ function buildAnswerMessages(
   }
 
   const userLines = [
+    priorityTurnContext,
     options.recallContext ? `已命中的相关历史/记忆:\n${options.recallContext}` : '',
     history ? `最近相关上下文:\n${history}` : '',
     `当前请求:\n${prompt}`,
@@ -135,7 +137,9 @@ export class OllamaProvider {
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
     const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
     const endpoint = `${baseUrl}/v1/chat/completions`;
-    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const timeoutMs = options?.timeoutMs !== undefined
+      ? Math.max(250, Math.floor(options.timeoutMs))
+      : Math.max(5000, this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };

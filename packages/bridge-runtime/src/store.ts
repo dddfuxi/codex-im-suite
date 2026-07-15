@@ -32,13 +32,20 @@ import type {
   MarkOutboundRefRecalledInput,
   UpsertChannelBindingInput,
   MemoryWriteCandidate,
+  MemoryWriteClassification,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
 import { CTI_HOME } from './config.js';
 import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReviewInput } from './answer-review.js';
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
-import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext } from './memory-graph.js';
+import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext, type MemoryGraphIndex } from './memory-graph.js';
+import {
+  MEMORY_V2_SCHEMA,
+  memoryPartitionSegment,
+  isVisibleMemoryV2PathToQuery,
+  isVisibleMemoryV2SourceToQuery,
+} from './memory-source-policy.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
 import {
   decideMemoryReply as decideMemoryReplyFromHits,
@@ -72,7 +79,7 @@ const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.C
 const ENGLISH_STOP_TOKENS = new Set(['this', 'that', 'with', 'from', 'then', 'just', 'into', 'them', 'they', 'what', 'when', 'where', 'which', 'have', 'will', 'your', 'about', 'please']);
 const CHINESE_STOP_TOKENS = new Set(['这个', '那个', '现在', '刚才', '继续', '直接', '帮我', '处理', '一下', '看看', '这里', '当前', '应该', '进行', '根据', '然后', '就是', '可以', '能够']);
 const MEMORY_RECALL_RE = /(记得|回忆|历史|上次|之前|以前|刚才|说过|提到|对应表|常用|查一下|找一下|回溯|总结|汇总)/i;
-const EXPLICIT_MEMORY_DIR = 'data/explicit-memories';
+const MEMORY_PARTITION_DIR = path.join('data', 'memory', 'v2');
 
 // Helpers
 
@@ -131,6 +138,32 @@ function slugForFileName(text: string): string {
     .replace(/^-|-$/g, '')
     .slice(0, 48);
   return ascii || 'memory';
+}
+
+function resolveDurableMemoryDirectory(
+  memoryRoot: string,
+  input: Pick<MemoryWriteInput, 'channelType' | 'chatId' | 'userId' | 'classification'>,
+): { dir?: string; error?: string } {
+  const classification = input.classification;
+  if (!classification) return { error: 'memory intent classification is required' };
+  if (classification.actorKind !== 'human') return { error: 'only human-originated messages may write durable memory' };
+  if (classification.confidence < 0.8) return { error: 'memory intent confidence is below the durable-write threshold' };
+
+  const channel = memoryPartitionSegment(input.channelType || 'unknown');
+  switch (classification.scope) {
+    case 'temporary':
+      return { error: 'temporary memory must remain in runtime session context' };
+    case 'user':
+      if (!input.userId?.trim()) return { error: 'user memory requires a verified user id' };
+      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'users', channel, memoryPartitionSegment(input.userId)) };
+    case 'group':
+      if (!input.chatId?.trim()) return { error: 'group memory requires a verified chat id' };
+      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'groups', channel, memoryPartitionSegment(input.chatId)) };
+    case 'long_term':
+      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'long-term') };
+    default:
+      return { error: 'unknown memory partition scope' };
+  }
 }
 
 function escapeMarkdownTableCell(text: string): string {
@@ -231,18 +264,6 @@ function normalizeMemoryWriteCandidates(
   return pairs;
 }
 
-function extractMemoryAliases(text: string): string[] {
-  const firstLine = (text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || text).replace(/\s+/g, ' ');
-  const aliases = new Set<string>();
-  for (const match of firstLine.matchAll(/[A-Z][A-Z0-9_]{1,12}(?=项目|[\s，,。；;、]|$)/giu)) {
-    aliases.add(match[0].trim());
-  }
-  for (const match of firstLine.matchAll(/[\u4e00-\u9fffA-Za-z0-9]{1,8}项目/giu)) {
-    aliases.add(match[0].trim());
-  }
-  return Array.from(aliases).filter((alias) => alias.length <= 16);
-}
-
 // Lock entry
 
 interface LockEntry {
@@ -303,6 +324,7 @@ interface MemoryWriteInput {
   workingDirectory?: string;
   createdAt?: string;
   candidates?: MemoryWriteCandidate[];
+  classification?: MemoryWriteClassification;
 }
 
 interface MemoryWriteResult {
@@ -311,6 +333,7 @@ interface MemoryWriteResult {
   memoryRoot?: string;
   filePath?: string;
   knowledgeRebuilt?: boolean;
+  scope?: MemoryWriteClassification['scope'];
   error?: string;
 }
 
@@ -392,6 +415,7 @@ export class JsonFileStore implements BridgeStore {
     );
     for (const [key, value] of Object.entries(memoryProfiles)) {
       if (value?.scope && value?.key) {
+        if (value.scope === 'global') continue;
         this.memoryProfiles.set(key, {
           ...value,
           topics: Array.isArray(value.topics) ? value.topics : [],
@@ -525,7 +549,9 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private persistMemoryProfiles(): void {
-    writeJson(MEMORY_PROFILES_PATH, Object.fromEntries(this.memoryProfiles));
+    const boundedProfiles = [...this.memoryProfiles].filter(([, profile]) => profile.scope !== 'global');
+    this.memoryProfiles = new Map(boundedProfiles);
+    writeJson(MEMORY_PROFILES_PATH, Object.fromEntries(boundedProfiles));
   }
 
   private loadMessages(sessionId: string): BridgeMessage[] {
@@ -707,33 +733,71 @@ export class JsonFileStore implements BridgeStore {
     }
   }
 
+  private extractCtiFinalVisibleTexts(text: string): string[] {
+    const out: string[] = [];
+    const fence = /```cti-final\s*([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    while ((match = fence.exec(text)) !== null) {
+      const rawJson = (match[1] || '').trim();
+      if (!rawJson) continue;
+      try {
+        const parsed = JSON.parse(rawJson) as { text?: unknown };
+        const visibleText = typeof parsed.text === 'string' ? parsed.text : '';
+        const normalized = this.summarizeMessageContent(visibleText, 4000);
+        if (normalized) out.push(normalized);
+      } catch {
+        // Ignore malformed historical result blocks. The raw text block below
+        // still contributes a safe, shortened fallback.
+      }
+    }
+    return out;
+  }
+
+  private extractStructuredTextBlockForMemory(text: string, maxLen: number): string {
+    const ctiFinalTexts = this.extractCtiFinalVisibleTexts(text);
+    const withoutResultBlocks = text.replace(/```cti-final\s*[\s\S]*?```/g, ' ');
+    const normalText = this.summarizeMessageContent(withoutResultBlocks, Math.min(maxLen, 1200));
+    // The user-visible final answer is the highest quality memory signal.
+    // Keep it before progress chatter so matched excerpts show the answer
+    // instead of "我先查一下..." style process text.
+    return [ctiFinalTexts.join(' | '), normalText].filter(Boolean).join(' | ');
+  }
+
+  private extractPlainMessageTextForMemory(content: string): string {
+    const ctiFinalTexts = this.extractCtiFinalVisibleTexts(content);
+    if (ctiFinalTexts.length > 0) {
+      // 有些历史记录不是 Claude/Codex block 数组，而是直接保存了
+      // ```cti-final``` 文本。检索时仍然只取用户可见 text。
+      return ctiFinalTexts.join(' | ');
+    }
+    return content;
+  }
+
   private extractStructuredMessageText(content: string, maxLen: number): string {
     try {
       const blocks = JSON.parse(content) as Array<Record<string, unknown>>;
+      const finalTexts = blocks
+        .filter((block) => block?.type === 'text')
+        .flatMap((block) => this.extractCtiFinalVisibleTexts(String(block.text || '')));
+      if (finalTexts.length > 0) {
+        // 历史检索需要优先还原用户真正看到的最终答复。
+        // 一旦结构化消息里存在 cti-final，就不要把进度话术、
+        // tool_use 或 tool_result 当成主记忆文本，避免工具日志污染旧答案。
+        return this.summarizeMessageContent(finalTexts.join(' | '), maxLen);
+      }
       const parts: string[] = [];
       const textBudget = Math.max(4000, maxLen);
-      const toolBudget = Math.max(4000, maxLen);
       for (const block of blocks) {
         if (block?.type === 'text') {
-          const text = this.summarizeMessageContent(String(block.text || ''), textBudget);
+          const text = this.extractStructuredTextBlockForMemory(String(block.text || ''), textBudget);
           if (text) parts.push(text);
           continue;
         }
-        if (block?.type === 'tool_use') {
-          const name = String(block.name || '');
-          const input = block.input as { command?: unknown; files?: Array<{ path?: string; kind?: string }> } | undefined;
-          if (name === 'Bash' && typeof input?.command === 'string') {
-            parts.push(`执行命令: ${this.summarizeMessageContent(input.command, 400)}`);
-          } else if (name === 'Edit' && Array.isArray(input?.files)) {
-            parts.push(`文件修改: ${input.files.slice(0, 8).map((file) => `${file.kind}:${file.path}`).join(', ')}`);
-          } else if (name) {
-            parts.push(`工具: ${name}`);
-          }
+        if (block?.type === 'tool_use' || block?.type === 'tool_result') {
+          // 记忆检索的主证据只回答“用户当时看见了什么结论”。
+          // 工具命令和原始结果留给 audit / workflow / compact summary，
+          // 不进入历史问答检索摘要，避免旧路径或日志盖过正文。
           continue;
-        }
-        if (block?.type === 'tool_result') {
-          const text = this.summarizeMessageContent(String(block.content || ''), toolBudget);
-          if (text) parts.push(`工具结果: ${text}`);
         }
       }
       return this.summarizeMessageContent(parts.join(' | '), maxLen);
@@ -915,9 +979,28 @@ export class JsonFileStore implements BridgeStore {
       const searchText = raw;
       return content ? { content, searchText, source: 'message' } : null;
     }
-    const content = this.summarizeMessageContent(message.content, 220);
-    const searchText = this.summarizeMessageContent(message.content, 12000);
+    const memoryText = this.extractPlainMessageTextForMemory(message.content);
+    const content = this.summarizeMessageContent(memoryText, 220);
+    const searchText = this.summarizeMessageContent(memoryText, 12000);
     return content ? { content, searchText, source: 'message' } : null;
+  }
+
+  private summarizeAdjacentAssistantAnswer(messages: BridgeMessage[], index: number): {
+    content: string;
+    searchText: string;
+  } | null {
+    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+      const next = messages[nextIndex];
+      if (!next) break;
+      if (next.role !== 'assistant') break;
+      const summarized = this.summarizeMessageForMemory(next);
+      if (!summarized) continue;
+      return {
+        content: this.summarizeMessageContent(summarized.searchText, 700),
+        searchText: summarized.searchText,
+      };
+    }
+    return null;
   }
 
   private selectMessagesForMemory(
@@ -998,13 +1081,52 @@ export class JsonFileStore implements BridgeStore {
     return `[知识库/${item.kind}/${source}] ${exact}${conflict}`;
   }
 
+  /**
+   * Knowledge indexes are shared implementation artifacts, not permission
+   * boundaries. Enforce the memory partition boundary again before a query can
+   * see an indexed item or graph node.
+   */
+  private isMemorySourceVisibleToQuery(sourcePath: string, memoryRoot: string, query: MemoryRetrievalQuery): boolean {
+    return isVisibleMemoryV2PathToQuery(memoryRoot, sourcePath, query);
+  }
+
+  private isMemoryItemVisibleToQuery(item: KnowledgeItem, memoryRoot: string, query: MemoryRetrievalQuery): boolean {
+    return isVisibleMemoryV2SourceToQuery(memoryRoot, item.source.path, item.source.metadata, query);
+  }
+
+  private filterMemoryGraphForQuery(
+    graph: MemoryGraphIndex,
+    memoryRoot: string,
+    query: MemoryRetrievalQuery,
+  ): MemoryGraphIndex {
+    // A graph node merged from two partitions is ambiguous. Excluding it is
+    // safer than using one user's relation to reveal another user's fact.
+    const nodes = graph.nodes.filter((node) => {
+      const sources = node.sourcePaths || [];
+      return sources.length > 0 && sources.every((source) => this.isMemorySourceVisibleToQuery(source, memoryRoot, query));
+    });
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = graph.edges.filter((edge) => {
+      const sources = edge.sourcePaths || [];
+      return nodeIds.has(edge.from)
+        && nodeIds.has(edge.to)
+        && sources.length > 0
+        && sources.every((source) => this.isMemorySourceVisibleToQuery(source, memoryRoot, query));
+    });
+    return { ...graph, nodeCount: nodes.length, edgeCount: edges.length, nodes, edges };
+  }
+
   private searchKnowledgeIndexForMemory(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
     const memoryRoot = this.settings.get('bridge_memory_repo_dir');
     if (!memoryRoot) return [];
     const index = readKnowledgeIndex(memoryRoot);
     if (!index || index.items.length === 0) return [];
 
-    const hits = searchKnowledgeIndex(index, {
+    const scopedIndex = {
+      ...index,
+      items: index.items.filter((item) => this.isMemoryItemVisibleToQuery(item, memoryRoot, query)),
+    };
+    const hits = searchKnowledgeIndex(scopedIndex, {
       query: query.query,
       limit: MEMORY_RECALL_RE.test(query.query) ? 6 : 4,
     });
@@ -1113,6 +1235,9 @@ export class JsonFileStore implements BridgeStore {
 
     const hits: RetrievedMemoryHit[] = [];
     for (const profile of this.memoryProfiles.values()) {
+      if (profile.scope === 'user' && profile.userId !== query.userId) continue;
+      if (profile.scope === 'chat' && profile.chatId !== query.chatId) continue;
+      if (profile.scope === 'global') continue;
       const text = this.summarizeProfileForMemory(profile);
       if (!text) continue;
       const score = this.scoreMemoryProfile(query, tokens, profile, text);
@@ -1148,6 +1273,7 @@ export class JsonFileStore implements BridgeStore {
     const dedup = new Set<string>();
     for (const entry of this.auditLog) {
       if (entry.direction !== 'outbound') continue;
+      if (entry.channelType !== query.channelType || entry.chatId !== query.chatId) continue;
       const searchText = this.summarizeMessageContent(entry.summary || '', 12000);
       if (!searchText || isLowValueMemoryText(searchText)) continue;
       const contentKey = crypto
@@ -1598,9 +1724,8 @@ export class JsonFileStore implements BridgeStore {
     const text = this.summarizeMessageContent(event.text || '', 800);
     if (!text) return false;
 
-    const rawText = this.sanitizePersistedText(event.text || '');
-    this.persistExplicitMemoryWrite(event, rawText || text);
-
+    // Conversation capture is temporary/profile evidence only. Durable memory
+    // may be promoted exclusively by the classified write path in bridge-core.
     const items = this.extractMemoryProfileItems(text, event.role);
     const hasUsefulItems = items.topics.length > 0 || items.facts.length > 0 || items.pending.length > 0;
     if (!hasUsefulItems && text.length < 12) return false;
@@ -1610,9 +1735,6 @@ export class JsonFileStore implements BridgeStore {
       text,
       createdAt: event.createdAt || now(),
     };
-
-    const globalKey = this.memoryProfileKey('global', event.channelType);
-    this.upsertMemoryProfile('global', globalKey, timestampedEvent, items);
 
     if (event.chatId?.trim()) {
       const chatKey = this.memoryProfileKey('chat', event.channelType, event.chatId);
@@ -1631,46 +1753,44 @@ export class JsonFileStore implements BridgeStore {
     event: ConversationMemoryEvent,
     text: string,
     candidates?: MemoryWriteCandidate[],
+    classification?: MemoryWriteClassification,
   ): MemoryWriteResult {
     if (event.role !== 'user') return { ok: false, skipped: true, error: 'not_user_message' };
-    const plan = planMemoryQuery(text);
-    const candidatePairs = normalizeMemoryWriteCandidates(candidates);
-    if (plan.intent !== 'memory_write' && candidatePairs.length === 0) return { ok: false, skipped: true, error: 'not_memory_write' };
     const memoryRoot = this.settings.get('bridge_memory_repo_dir');
     if (!memoryRoot) return { ok: false, error: 'bridge_memory_repo_dir is not configured' };
+    const partition = resolveDurableMemoryDirectory(memoryRoot, {
+      channelType: event.channelType,
+      chatId: event.chatId,
+      userId: event.userId,
+      classification,
+    });
+    if (!partition.dir) return { ok: false, skipped: true, error: partition.error };
 
-    const structuredPairs = inferStructuredMemories(text);
-    const hasModelCandidatePairs = candidatePairs.length > 0;
-    const naturalPairs = !hasModelCandidatePairs && structuredPairs.length === 0
-      ? inferNaturalMemoryPairs(text)
-      : [];
+    const candidatePairs = normalizeMemoryWriteCandidates(candidates);
+    if (candidatePairs.length === 0) {
+      return { ok: false, skipped: true, error: 'classified durable memory requires structured candidates' };
+    }
+
     const pairSeen = new Set<string>();
     const pairs: Array<{ key: string; value: string }> = [];
-    for (const pair of [...candidatePairs, ...structuredPairs, ...naturalPairs]) {
+    for (const pair of candidatePairs) {
       addMemoryCandidatePair(pairs, pairSeen, pair.key, pair.value);
     }
     const cleanedText = cleanMemoryWriteText(text) || text;
     const firstContentLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || cleanedText;
     const cleanedTitle = cleanMemoryWriteText(firstContentLine) || cleanedText;
     const bodyText = /\r?\n/.test(text) ? text : cleanedText;
-    const title = hasModelCandidatePairs
-      ? (candidatePairs[0]?.key || plan.normalizedKey || cleanedText.slice(0, 40))
-      : (
-        plan.normalizedKey && plan.normalizedKey.length <= 60 && !/[=\r\n]/.test(plan.normalizedKey)
-          ? plan.normalizedKey
-          : cleanedTitle.slice(0, 40)
-      );
-    const dir = path.join(memoryRoot, EXPLICIT_MEMORY_DIR);
+    const title = candidatePairs[0]?.key || cleanedTitle.slice(0, 40);
+    const dir = partition.dir;
     const filePath = path.join(dir, `${slugForFileName(title)}.md`);
     const createdAt = event.createdAt || now();
-    const aliases = !hasModelCandidatePairs
-      ? extractMemoryAliases(text)
-      : [];
     const frontmatter = [
       '---',
-      'schema: codex-im-suite/explicit-memory/v1',
+      `schema: ${MEMORY_V2_SCHEMA}`,
       `createdAt: ${createdAt}`,
       `updatedAt: ${now()}`,
+      `memoryScope: ${classification!.scope}`,
+      `intentConfidence: ${classification!.confidence}`,
       `channelType: ${event.channelType || ''}`,
       `chatId: ${event.chatId || ''}`,
       `userId: ${event.userId || ''}`,
@@ -1687,14 +1807,6 @@ export class JsonFileStore implements BridgeStore {
     const prefixedLine = inferExplicitMemoryPrefixedLine(bodyText);
     if (prefixedLine) {
       body.push(prefixedLine, '');
-    }
-
-    if (aliases.length > 0) {
-      body.push('| key | value |', '| --- | --- |');
-      for (const alias of aliases) {
-        body.push(`| ${escapeMarkdownTableCell(alias)} | ${escapeMarkdownTableCell(title)} |`);
-      }
-      body.push('');
     }
 
     if (pairs.length > 0) {
@@ -1714,6 +1826,7 @@ export class JsonFileStore implements BridgeStore {
         memoryRoot,
         filePath,
         knowledgeRebuilt: true,
+        scope: classification!.scope,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1723,6 +1836,7 @@ export class JsonFileStore implements BridgeStore {
         memoryRoot,
         filePath,
         knowledgeRebuilt: false,
+        scope: classification!.scope,
         error: message,
       };
     }
@@ -1740,7 +1854,7 @@ export class JsonFileStore implements BridgeStore {
       text: input.text,
       workingDirectory: input.workingDirectory,
       createdAt: input.createdAt || now(),
-    }, this.sanitizePersistedText(input.text || ''), input.candidates);
+    }, this.sanitizePersistedText(input.text || ''), input.candidates, input.classification);
   }
 
   recordMemoryEvent(event: ConversationMemoryEvent): void {
@@ -1775,7 +1889,6 @@ export class JsonFileStore implements BridgeStore {
     const metaBySession = this.buildMemorySessionMeta();
     const sameChatHits: RetrievedMemoryHit[] = [];
     const currentSessionHits: RetrievedMemoryHit[] = [];
-    const sameWorkdirHits: RetrievedMemoryHit[] = [];
     const auditHits = this.searchAuditLogForMemory(query, tokens);
     const profileHits = this.searchMemoryProfiles(query, tokens);
     const dedup = new Set<string>();
@@ -1787,29 +1900,35 @@ export class JsonFileStore implements BridgeStore {
       };
 
       const sameChat = meta.channelType === query.channelType && meta.chatId === query.chatId;
-      const sameWorkdir = !!meta.workingDirectory && !!query.workingDirectory
-        && meta.workingDirectory.toLowerCase() === query.workingDirectory.toLowerCase();
       const isCurrentSession = sessionId === query.sessionId;
 
-      if (!sameChat && !sameWorkdir && !isCurrentSession) continue;
+      if (!sameChat && !isCurrentSession) continue;
 
       const messages = this.loadMessages(sessionId);
       const candidates = this.selectMessagesForMemory(isCurrentSession, messages, recentHistoryLimit);
       const archivedCandidates = this.loadArchivedMessagesForMemory(sessionId);
 
-      for (const message of [...candidates, ...archivedCandidates]) {
+      const memoryCandidates = [...candidates, ...archivedCandidates];
+      for (let index = 0; index < memoryCandidates.length; index += 1) {
+        const message = memoryCandidates[index];
         const summarized = this.summarizeMessageForMemory(message);
         if (!summarized) continue;
+        const adjacentAnswer = message.role !== 'assistant'
+          ? this.summarizeAdjacentAssistantAnswer(memoryCandidates, index)
+          : null;
+        const combinedSearchText = adjacentAnswer
+          ? `${summarized.searchText}\n相邻助手回复：${adjacentAnswer.searchText}`
+          : summarized.searchText;
         const contentKey = crypto
           .createHash('sha1')
-          .update(`${summarized.source}:${message.role}:${summarized.searchText}`)
+          .update(`${summarized.source}:${message.role}:${combinedSearchText}`)
           .digest('hex');
         if (dedup.has(contentKey)) continue;
 
         const score = this.scoreMemoryHit(
           query,
           tokens,
-          summarized.searchText,
+          combinedSearchText,
           meta,
           sessionId,
           summarized.source,
@@ -1818,7 +1937,7 @@ export class JsonFileStore implements BridgeStore {
         if (score < MEMORY_MIN_SCORE) continue;
 
         dedup.add(contentKey);
-        const structuredPairs = inferStructuredMemories(summarized.searchText);
+        const structuredPairs = inferStructuredMemories(combinedSearchText);
         const structured = structuredPairs[0] || null;
         const hit: RetrievedMemoryHit = {
           sessionId,
@@ -1831,15 +1950,19 @@ export class JsonFileStore implements BridgeStore {
           score,
           confidence: Math.max(0, Math.min(0.9, score / 18)),
           answerability: structured ? 'structured' : 'summary',
-          quality: isLowValueMemoryText(summarized.searchText) ? 'low' : (structured ? 'high' : 'medium'),
+          quality: isLowValueMemoryText(combinedSearchText) ? 'low' : (structured ? 'high' : 'medium'),
           structuredKey: structured?.key,
           structuredValue: structured?.value,
           structuredPairs,
-          content: this.buildMatchedMemoryExcerpt(summarized.searchText, tokens),
+          content: adjacentAnswer
+            ? [
+              `用户请求：${this.buildMatchedMemoryExcerpt(summarized.searchText, tokens, 220)}`,
+              `相邻助手回复：${adjacentAnswer.content}`,
+            ].join('；')
+            : this.buildMatchedMemoryExcerpt(combinedSearchText, tokens),
         };
         if (sameChat) sameChatHits.push(hit);
         else if (isCurrentSession) currentSessionHits.push(hit);
-        else sameWorkdirHits.push(hit);
       }
     }
 
@@ -1848,7 +1971,6 @@ export class JsonFileStore implements BridgeStore {
       ...graphHits,
       ...sameChatHits,
       ...currentSessionHits,
-      ...sameWorkdirHits,
       ...auditHits,
       ...profileHits,
     ];
@@ -1893,7 +2015,7 @@ export class JsonFileStore implements BridgeStore {
     if (!memoryRoot) return null;
     const graph = readMemoryGraphIndex(memoryRoot);
     if (!graph) return null;
-    const context = searchMemoryGraph(graph, query.query, { limit: MEMORY_MAX_HITS });
+    const context = searchMemoryGraph(this.filterMemoryGraphForQuery(graph, memoryRoot, query), query.query, { limit: MEMORY_MAX_HITS });
     return context.related.length > 0 ? context : null;
   }
 
@@ -2013,6 +2135,25 @@ export class JsonFileStore implements BridgeStore {
     this.persistAudit();
   }
 
+  listAuditLogs(filter: {
+    channelType?: string;
+    chatId?: string;
+    direction?: 'inbound' | 'outbound';
+    messageId?: string;
+    limit?: number;
+  } = {}): Array<AuditLogInput & { id?: string; createdAt?: string }> {
+    const limit = Number.isFinite(filter.limit)
+      ? Math.max(1, Math.min(200, Math.floor(filter.limit as number)))
+      : 50;
+    return [...this.auditLog]
+      .reverse()
+      .filter((entry) => !filter.channelType || entry.channelType === filter.channelType)
+      .filter((entry) => !filter.chatId || entry.chatId === filter.chatId)
+      .filter((entry) => !filter.direction || entry.direction === filter.direction)
+      .filter((entry) => !filter.messageId || entry.messageId === filter.messageId)
+      .slice(0, limit);
+  }
+
   checkDedup(key: string): boolean {
     const ts = this.dedupKeys.get(key);
     if (ts === undefined) return false;
@@ -2091,9 +2232,12 @@ export class JsonFileStore implements BridgeStore {
   insertPermissionLink(link: PermissionLinkInput): void {
     const record: PermissionLinkRecord = {
       permissionRequestId: link.permissionRequestId,
+      channelType: link.channelType,
       chatId: link.chatId,
       messageId: link.messageId,
       resolved: false,
+      toolName: link.toolName,
+      toolInputJson: link.toolInputJson,
       suggestions: link.suggestions,
     };
     this.permissionLinks.set(link.permissionRequestId, record);

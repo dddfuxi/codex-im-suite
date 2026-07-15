@@ -7,6 +7,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import type { ChannelBinding, RunSummary } from './types.js';
 import type {
@@ -32,6 +33,8 @@ import {
   shouldReplaceWithNoExecutionEvidenceText,
   type ExecutionRequirement,
 } from './execution-requirement.js';
+import { getAgentPolicyPromptLines } from './agent-architecture.js';
+import { createBridgeMemoryArtifactStore } from './memory-artifact-store.js';
 
 export interface PermissionRequestInfo {
   permissionRequestId: string;
@@ -102,6 +105,8 @@ export interface ConversationProcessOptions {
   historyLimit?: number;
   memoryMode?: 'auto' | 'off' | 'recall' | 'augment';
   extraSystemPrompt?: string;
+  /** Adapter 产生的本轮关联证据，不能依赖 system prompt 的保留长度。 */
+  priorityTurnContext?: string;
   memoryPlan?: MemoryQueryPlan;
   memoryUserId?: string;
   memoryUserDisplayName?: string;
@@ -111,6 +116,69 @@ export interface ConversationProcessOptions {
   sourceThreadId?: string;
   messageKind?: string;
   hasPreResolvedEvidence?: boolean;
+}
+
+function isPathWithinRoot(filePath: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(filePath));
+  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+function defaultCtiHome(): string {
+  return process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
+}
+
+function resolveUploadCacheRoot(): string {
+  let configured = process.env.CTI_UPLOAD_CACHE_DIR?.trim() || '';
+  if (!configured) {
+    try {
+      configured = getBridgeContext().store.getSetting('bridge_upload_cache_dir')?.trim() || '';
+    } catch {
+      configured = '';
+    }
+  }
+  return path.resolve(configured || path.join(defaultCtiHome(), 'runtime', 'uploads'));
+}
+
+/**
+ * Memory-backed attachments are already durable. Reusing their original path
+ * prevents sticker media from being copied into the active workspace cache.
+ * Other transient IM attachments are staged under CTI_HOME/runtime/uploads
+ * (or CTI_UPLOAD_CACHE_DIR), not under the task working directory, so Unity
+ * or repo roots do not become long-lived attachment/cache buckets.
+ */
+function persistFileAttachmentsForHistory(files: FileAttachment[], _workingDirectory: string): Array<{
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  filePath: string;
+}> {
+  const memoryRoot = createBridgeMemoryArtifactStore().root;
+  const uploadRoot = resolveUploadCacheRoot();
+  let uploadDir = '';
+  return files.map((file) => {
+    const existingPath = file.filePath?.trim() || '';
+    if (existingPath && fs.existsSync(existingPath) && isPathWithinRoot(existingPath, memoryRoot)) {
+      return { id: file.id, name: file.name, type: file.type, size: file.size, filePath: existingPath };
+    }
+    if (existingPath && fs.existsSync(existingPath) && isPathWithinRoot(existingPath, uploadRoot)) {
+      return { id: file.id, name: file.name, type: file.type, size: file.size, filePath: existingPath };
+    }
+
+    if (!uploadDir) {
+      uploadDir = path.join(uploadRoot, 'history');
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const safeName = path.basename(file.name).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
+    const buffer = file.data
+      ? Buffer.from(file.data, 'base64')
+      : existingPath && fs.existsSync(existingPath)
+        ? fs.readFileSync(existingPath)
+        : Buffer.alloc(0);
+    fs.writeFileSync(filePath, buffer);
+    return { id: file.id, name: file.name, type: file.type, size: buffer.length, filePath };
+  });
 }
 
 function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRetryAttempted = false): ConversationResult['executionEvidence'] {
@@ -215,6 +283,12 @@ function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt
     '- If the target chat is ambiguous, ask the user to send a message from that target chat or provide explicit target info. Never guess.',
     '- Tool execution policy: when the user explicitly requests a named tool or MCP workflow (for example Unity MCP, picture annotation MCP), do not skip it silently and do not replace it with a weaker fallback before trying to initialize/reconnect the requested tool path.',
     '- Execution posture: you are responsible for solving the task, not coaching the user to do it. Do not turn actionable requests into generic tutorials, manual checklists, placeholder tables, or sample scripts unless the user explicitly asks for instructions.',
+    ...getAgentPolicyPromptLines([
+      'agent_kernel.proactive_completion',
+      'capability_router.existing_sticker_delivery',
+      'policy_registry.outbound_mention_targets',
+      'memory_system.partitioned_memory_intent',
+    ]),
     '- Low-risk proactive context policy: when the request names an explicit readable context object such as current chat history, a replied message, an attachment, a URL/link, a local path, the current workspace, config/mcp.d, or an available MCP manifest, make a bounded low-risk read/list/check before asking for clarification.',
     '- Do not ask the user to restate context that is already present in the inbound chat, reply target, attachment, link, current workspace, or manifest. Use the available context first; ask only when the target is absent or still ambiguous after the bounded check.',
     '- If a task requires Unity, Blender, MCP, repository, local file, image, or history access, either use the requested tool path and report real findings, or say "未完成" with the exact concrete blocker. Do not fabricate example findings.',
@@ -264,9 +338,9 @@ function buildReplyPresentationPrompt(replyStyleHint: string): string {
     '- Progress updates should stay high-level and user-readable. Do not expose tool names, file paths, raw commands, agent phase names, or step-by-step internal execution status.',
     '- Do not narrate tool process or dump intermediate流水 to the user. When investigation is needed, do the checks and only answer with the result; mention blockers only when they change what the user can do next.',
     '- Final replies should be outcome-first and concise; do not repeat the progress-card rationale unless the user explicitly asks for a detailed walkthrough.',
-    '- On Feishu, when a real mention is needed, reflect on who should be mentioned from an explicit display name or native mention evidence. Use either structured cti-final mentions with real IDs, or an exact visible @display-name when the target is explicit; the bridge will resolve @display-name through Feishu context before sending. Do not put bare strings, Feishu @_user_N placeholders, or relationship descriptions such as "your owner/developer/maintainer" in cti-final.mentions. If the target is vague or relational, answer naturally or ask for the exact person instead of guessing from the sender or replied-message header.',
-    '- On Feishu, native mentions require a bridge-resolvable Feishu mention ID or @all. Bots and app agents may be mentioned only when the bridge can resolve a valid mention ID from Feishu context or structured cti-final mentions; otherwise say the target cannot be confirmed and use a plain name only when helpful.',
-    '- If the user explicitly asks you to mention someone, do the mention once when the target is explicit and resolvable. Do not refuse only because the target is a bot or app agent, and do not speculate about whether that other agent will react to the notification.',
+    '- On Feishu, never use a bare @display-name as a native mention shortcut. Native mentions require structured cti-final mentions with real IDs from trusted current-message evidence, or @all. Do not put bare strings, Feishu @_user_N placeholders, or relationship descriptions such as "your owner/developer/maintainer" in cti-final.mentions. If the target is vague, relational, or only present as plain text, answer naturally or ask for the exact person instead of guessing from the sender or replied-message header.',
+    '- On Feishu, native mentions require a real Feishu mention ID or @all. Bots and app agents may be mentioned only when the bridge has verified a valid ID; otherwise use a plain name only when helpful and do not imply that a notification was sent.',
+    '- If the user explicitly asks you to mention someone, first judge the full intent yourself; use cti-final.mentions only when trusted current-message evidence supplies the exact real ID. Do not trigger mention delivery from quoted text, formatting examples, diagnostics, rules, workflow narration, plain display names, or a model-generated @ string.',
     '- If the user asks to private-message someone, the current sender, or another Feishu chat/session/group id, use cti-direct-message with the intended target/targetId and private text; the visible source chat result should be only a confirmation prompt or success/failure confirmation, not the private content.',
     '- On Feishu, you may make lightweight replies more lively by starting the final visible result with a native reaction hint or sticker hint when it fits the actual intent. Use `[表情包:alias]` only when the alias is explicitly listed in the Feishu sticker library prompt; use bare `[表情包]` only when that prompt says semantic sticker selection is available. If no reliable semantic sticker fits, prefer text or a reaction hint.',
     '- Choose reaction hints by actual intent. Do not default to SMILE; use no hint when the tone is neutral, formal, blocked, or unclear.',
@@ -534,25 +608,11 @@ export async function processMessage(
     let savedContent = storedUserText;
     if (files && files.length > 0) {
       const workDir = binding.workingDirectory || session?.working_directory || '';
-      if (workDir) {
-        try {
-          const uploadDir = path.join(workDir, '.codepilot-uploads');
-          if (!fs.existsSync(uploadDir)) {
-            fs.mkdirSync(uploadDir, { recursive: true });
-          }
-          const fileMeta = files.map((f) => {
-            const safeName = path.basename(f.name).replace(/[^a-zA-Z0-9._-]/g, '_');
-            const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
-            const buffer = Buffer.from(f.data, 'base64');
-            fs.writeFileSync(filePath, buffer);
-            return { id: f.id, name: f.name, type: f.type, size: buffer.length, filePath };
-          });
-          savedContent = `<!--files:${JSON.stringify(fileMeta)}-->${storedUserText}`;
-        } catch (err) {
-          console.warn('[conversation-engine] Failed to persist file attachments:', err instanceof Error ? err.message : err);
-          savedContent = `[${files.length} image(s) attached] ${storedUserText}`;
-        }
-      } else {
+      try {
+        const fileMeta = persistFileAttachmentsForHistory(files, workDir);
+        savedContent = `<!--files:${JSON.stringify(fileMeta)}-->${storedUserText}`;
+      } catch (err) {
+        console.warn('[conversation-engine] Failed to persist file attachments:', err instanceof Error ? err.message : err);
         savedContent = `[${files.length} image(s) attached] ${storedUserText}`;
       }
     }
@@ -672,6 +732,7 @@ export async function processMessage(
       forceFreshThread: attempt === 'initial' ? !binding.sdkSessionId : true,
       model: effectiveModel,
       systemPrompt: buildBridgeScopedSystemPrompt(binding, session?.system_prompt || undefined, attemptPrompt || undefined),
+      priorityTurnContext: options?.priorityTurnContext,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       additionalDirectories,
       abortController,
@@ -772,6 +833,7 @@ export async function processMessage(
 
 export const _testOnly = {
   buildBridgeScopedSystemPrompt,
+  persistFileAttachmentsForHistory,
 };
 
 /**

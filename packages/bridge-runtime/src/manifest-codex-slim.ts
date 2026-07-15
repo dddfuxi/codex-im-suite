@@ -36,6 +36,14 @@ function buildManifestContext(params: StreamChatParams, options: ManifestCodexSl
   ].filter((line) => !line.endsWith('=')).join('\n');
 }
 
+function planTargetsUnityMcp(plan: ManifestPlan): boolean {
+  if (plan.request.tool === 'unity_mcp_execute_code') return true;
+  if (plan.request.tool !== 'mcp_call') return false;
+  const args = plan.request.args as { manifestHint?: unknown; tool?: unknown };
+  const haystack = `${String(args.manifestHint || '')} ${String(args.tool || '')}`.toLowerCase();
+  return /unitymcp|unity\s*mcp|\bunity\b|mcpforunity|manage_(camera|scene|asset|gameobject|components|prefabs|editor)|find_gameobjects|execute_code/.test(haystack);
+}
+
 function buildManifestExecutionRequirement(plan: ManifestPlan): NonNullable<StreamChatParams['executionRequirement']> {
   if (plan.request.tool === 'shell_artifact') {
     return {
@@ -45,7 +53,7 @@ function buildManifestExecutionRequirement(plan: ManifestPlan): NonNullable<Stre
       strictToolEvidence: true,
     };
   }
-  if (plan.request.tool === 'unity_mcp_execute_code') {
+  if (planTargetsUnityMcp(plan)) {
     return {
       kind: 'tool_required',
       reason: `configured Unity MCP manifest selected for Codex main task: ${plan.reason}`,

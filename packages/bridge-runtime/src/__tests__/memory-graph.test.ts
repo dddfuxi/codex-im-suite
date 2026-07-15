@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 
 import { buildKnowledgeIndexFromMarkdown } from '../knowledge-indexer.js';
 import {
@@ -9,12 +10,20 @@ import {
 
 describe('memory graph', () => {
   it('builds forward and reverse links from structured knowledge', () => {
+    const memoryRoot = 'E:\\cli-md';
     const index = buildKnowledgeIndexFromMarkdown({
-      memoryRoot: 'E:\\cli-md',
+      memoryRoot,
       files: [{
-        path: 'E:\\cli-md\\data\\explicit-memories\\dragon.md',
+        path: path.join(memoryRoot, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_1', 'dragon.md'),
         updatedAt: '2026-05-12T00:00:00.000Z',
         content: [
+          '---',
+          'schema: codex-im-suite/memory/v2',
+          'memoryScope: user',
+          'channelType: feishu',
+          'userId: ou_user_1',
+          '---',
+          '',
           '# ST横板雷霆龙商城展示界面',
           '',
           'ST横板 也叫 ST。',

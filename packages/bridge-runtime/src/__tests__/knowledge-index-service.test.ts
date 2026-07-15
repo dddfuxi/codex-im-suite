@@ -21,8 +21,60 @@ describe('knowledge index service realtime status', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it('rebuilds from v2 memory partitions only and rejects legacy markdown', () => {
+    const validDir = path.join(tmpDir, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_1');
+    fs.mkdirSync(validDir, { recursive: true });
+    fs.writeFileSync(path.join(validDir, 'deploy.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v2',
+      'memoryScope: user',
+      'channelType: feishu',
+      'userId: ou_user_1',
+      '---',
+      '',
+      '| key | value |',
+      '| --- | --- |',
+      '| 部署偏好 | 先运行测试 |',
+    ].join('\n'), 'utf-8');
+
+    fs.mkdirSync(path.join(tmpDir, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'docs', 'AI_BRIDGE_CONTEXT.md'), '事实：docs 不应进入长期记忆。', 'utf-8');
+    fs.mkdirSync(path.join(tmpDir, 'data', 'explicit-memories'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'data', 'explicit-memories', 'legacy.md'), '事实：旧显式记忆不应进入长期记忆。', 'utf-8');
+    fs.mkdirSync(path.join(tmpDir, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_2'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_2', 'missing-user.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v2',
+      'memoryScope: user',
+      'channelType: feishu',
+      '---',
+      '',
+      '事实：缺少 userId 的 v2 文件也不能索引。',
+    ].join('\n'), 'utf-8');
+
+    const status = rebuildKnowledgeIndex(tmpDir);
+    const indexPath = path.join(tmpDir, '.cti-index', 'knowledge.json');
+    const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as { items: Array<{ key?: string; text: string; source: { path: string } }> };
+
+    assert.equal(status.markdownFileCount, 1);
+    assert.equal(status.itemCount, 1);
+    assert.equal(index.items.length, 1);
+    assert.equal(index.items[0].key, '部署偏好');
+    assert.equal(index.items.some((item) => item.text.includes('docs')), false);
+    assert.equal(index.items.some((item) => item.text.includes('旧显式记忆')), false);
+  });
+
   it('persists status next to the knowledge index after a rebuild', () => {
-    fs.writeFileSync(path.join(tmpDir, 'notes.md'), '事实：默认只把记忆注入 Codex。', 'utf-8');
+    const validDir = path.join(tmpDir, 'data', 'memory', 'v2', 'long-term');
+    fs.mkdirSync(validDir, { recursive: true });
+    fs.writeFileSync(path.join(validDir, 'notes.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v2',
+      'memoryScope: long_term',
+      '---',
+      '',
+      '事实：默认只把记忆注入 Codex。',
+    ].join('\n'), 'utf-8');
 
     const status = rebuildKnowledgeIndex(tmpDir);
     const statusPath = path.join(tmpDir, '.cti-index', 'status.json');
@@ -60,7 +112,16 @@ describe('knowledge index service realtime status', () => {
       assert.ok(started.watcherStartedAt);
       assert.ok(started.statusUpdatedAt);
 
-      fs.writeFileSync(path.join(tmpDir, 'decision.md'), '结论：状态文件是面板判断实时监听的来源。', 'utf-8');
+      const validDir = path.join(tmpDir, 'data', 'memory', 'v2', 'long-term');
+      fs.mkdirSync(validDir, { recursive: true });
+      fs.writeFileSync(path.join(validDir, 'decision.md'), [
+        '---',
+        'schema: codex-im-suite/memory/v2',
+        'memoryScope: long_term',
+        '---',
+        '',
+        '结论：状态文件是面板判断实时监听的来源。',
+      ].join('\n'), 'utf-8');
       const rebuilt = await watcher.rebuild();
       const persisted = JSON.parse(fs.readFileSync(statusPath, 'utf-8')) as typeof rebuilt;
 

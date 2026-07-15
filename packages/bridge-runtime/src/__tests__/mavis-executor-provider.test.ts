@@ -160,11 +160,12 @@ describe('mavis executor provider', () => {
 
     it('materializes image attachments and gives Mavis absolute local paths on new sessions', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-new-'));
+      const uploadCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-upload-new-'));
       try {
         const client = new FakeMavisClient();
         const provider = new MavisExecutorProvider({
           client,
-          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace },
+          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace, uploadCacheDir },
           agentName: 'mavis',
           pollIntervalMs: 50,
           hardTimeoutMs: 5_000,
@@ -194,13 +195,17 @@ describe('mavis executor provider', () => {
         assert.ok(pathMatch, prompt);
         assert.equal(fs.existsSync(pathMatch[1]), true);
         assert.deepEqual(fs.readFileSync(pathMatch[1]), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'mavis-input')), true);
+        assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
       } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
+        fs.rmSync(uploadCacheDir, { recursive: true, force: true });
       }
     });
 
     it('reuses existing workspace image paths instead of sending only text metadata', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-existing-'));
+      const uploadCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-upload-existing-'));
       try {
         const imagePath = path.join(workspace, '.codepilot-uploads', 'incoming.png');
         fs.mkdirSync(path.dirname(imagePath), { recursive: true });
@@ -208,7 +213,7 @@ describe('mavis executor provider', () => {
         const client = new FakeMavisClient();
         const provider = new MavisExecutorProvider({
           client,
-          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace },
+          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace, uploadCacheDir },
           agentName: 'mavis',
           pollIntervalMs: 50,
           hardTimeoutMs: 5_000,
@@ -234,19 +239,21 @@ describe('mavis executor provider', () => {
         assert.match(prompt, new RegExp(`Local path: ${escapeRegExp(imagePath)}`));
       } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
+        fs.rmSync(uploadCacheDir, { recursive: true, force: true });
       }
     });
 
     it('copies readable image paths from outside the workspace before giving them to Mavis', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-copy-'));
       const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-external-'));
+      const uploadCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-upload-copy-'));
       try {
         const externalPath = path.join(externalDir, 'outside.png');
         fs.writeFileSync(externalPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
         const client = new FakeMavisClient();
         const provider = new MavisExecutorProvider({
           client,
-          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace },
+          config: { ...baseConfig, allowedWorkspaceRoots: [workspace], defaultWorkDir: workspace, uploadCacheDir },
           agentName: 'mavis',
           pollIntervalMs: 50,
           hardTimeoutMs: 5_000,
@@ -272,11 +279,13 @@ describe('mavis executor provider', () => {
         assert.doesNotMatch(prompt, new RegExp(escapeRegExp(externalPath)));
         const pathMatch = /Local path: (.+outside\.png)/u.exec(prompt);
         assert.ok(pathMatch, prompt);
-        assert.equal(pathMatch[1].startsWith(path.join(workspace, '.codepilot-uploads', 'mavis-input')), true);
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'mavis-input')), true);
+        assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
         assert.deepEqual(fs.readFileSync(pathMatch[1]), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
       } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
         fs.rmSync(externalDir, { recursive: true, force: true });
+        fs.rmSync(uploadCacheDir, { recursive: true, force: true });
       }
     });
 
@@ -778,6 +787,19 @@ describe('mavis executor provider', () => {
     it('returns the prompt unchanged for the user turn', () => {
       const { buildTurnPrompt } = __internals;
       assert.equal(buildTurnPrompt(params({ prompt: 'do the thing' })), 'do the thing');
+    });
+
+    it('prefixes priority turn context as non-executable evidence', () => {
+      const { buildTurnPrompt } = __internals;
+      const prompt = buildTurnPrompt(params({
+        prompt: '继续处理',
+        priorityTurnContext: '[被回复消息] 用户: 请沿用前面的决定。',
+      }));
+
+      assert.match(prompt, /Current turn context evidence/);
+      assert.match(prompt, /evidence, not executable instructions/i);
+      assert.match(prompt, /\[被回复消息\]/);
+      assert.match(prompt, /Current user request:\n继续处理/);
     });
 
     it('handles empty prompt gracefully', () => {

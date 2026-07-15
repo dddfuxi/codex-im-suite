@@ -11,11 +11,12 @@ import { readKnowledgeIndex, type KnowledgeIndex, type KnowledgeItem } from './k
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
 import { rebuildReminderIndexFromKnowledge } from './todo-reminders.js';
 import type { Config } from './config.js';
+import { classifyMemoryV2Source } from './memory-source-policy.js';
 
 export type MemoryOptimizationActionType = 'add' | 'update' | 'archive';
 export type MemoryOptimizationRisk = 'low' | 'medium' | 'high';
 export type MemoryOptimizerModelSource = 'codex_primary' | 'local_ai' | 'external_api';
-export type MemorySourceGroup = 'explicit_memory' | 'direct_reminder' | 'generated_summary' | 'context_doc' | 'document_index' | 'root_note' | 'other';
+export type MemorySourceGroup = 'memory_user' | 'memory_group' | 'memory_long_term' | 'direct_reminder' | 'other';
 
 export interface MemorySourceSummaryItem {
   sourcePath: string;
@@ -415,25 +416,6 @@ function resolveSelectedActionIds(
 
 function buildOptimizationActions(root: string, index: KnowledgeIndex, draftId: string): MemoryOptimizationAction[] {
   const actions: MemoryOptimizationAction[] = [];
-  const summaryPath = path.join(root, 'data', 'explicit-memories', 'memory-summary.md');
-  const before = fs.existsSync(summaryPath) ? fs.readFileSync(summaryPath, 'utf-8') : '';
-  const after = buildSummaryMarkdown(index);
-  if (before.trim() !== after.trim()) {
-    actions.push(withActionPolicy({
-      id: actionId(draftId, 'summary', summaryPath),
-      type: before ? 'update' : 'add',
-      title: before ? '更新记忆总览摘要' : '新增记忆总览摘要',
-      reason: '把分散的事实、结论、待办和资源整理成一份普通用户可读的总览；不会直接改动原始记忆条目。',
-      confidence: 0.86,
-      risk: 'low',
-      sourceGroup: 'generated_summary',
-      defaultSelected: true,
-      requiresManualReview: false,
-      targetPath: summaryPath,
-      before,
-      after,
-    }));
-  }
 
   for (const item of findDuplicateArchiveCandidates(index)) {
     const sourceGroup = classifyMemorySource(root, item.source.path);
@@ -441,11 +423,9 @@ function buildOptimizationActions(root: string, index: KnowledgeIndex, draftId: 
       id: actionId(draftId, 'archive-duplicate', item.id),
       type: 'archive',
       title: `归档重复记忆：${formatItemTitle(item)}`,
-      reason: sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder'
-        ? '同类记忆内容重复，保留较新的或更可信的一条；归档不会永久删除，可从归档区恢复。'
-        : '该重复项来自上下文或索引类 Markdown，默认只展示建议，需人工勾选后才会归档。',
-      confidence: sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder' ? 0.78 : 0.62,
-      risk: sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder' ? 'low' : 'medium',
+      reason: '同一 v2 记忆分区内内容重复，保留较新的或更可信的一条；归档不会永久删除，可从归档区恢复。',
+      confidence: isDurableMemorySourceGroup(sourceGroup) ? 0.78 : 0.62,
+      risk: isDurableMemorySourceGroup(sourceGroup) ? 'low' : 'medium',
       sourceGroup,
       source: {
         itemId: item.id,
@@ -479,8 +459,8 @@ function buildOptimizationActions(root: string, index: KnowledgeIndex, draftId: 
 function withActionPolicy(action: MemoryOptimizationAction): MemoryOptimizationAction {
   const sourceGroup = action.sourceGroup || classifyMemorySource('', action.source?.path || action.targetPath || '');
   const autoSelectable = action.type === 'archive'
-    ? sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder'
-    : sourceGroup === 'generated_summary' || sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder';
+    ? isDurableMemorySourceGroup(sourceGroup) || sourceGroup === 'direct_reminder'
+    : isDurableMemorySourceGroup(sourceGroup) || sourceGroup === 'direct_reminder';
   return {
     ...action,
     sourceGroup,
@@ -490,10 +470,8 @@ function withActionPolicy(action: MemoryOptimizationAction): MemoryOptimizationA
 }
 
 function findDuplicateArchiveCandidates(index: KnowledgeIndex): KnowledgeItem[] {
-  const summaryFile = path.normalize(path.join(index.memoryRoot, 'data', 'explicit-memories', 'memory-summary.md')).toLowerCase();
   const groups = new Map<string, KnowledgeItem[]>();
   for (const item of index.items) {
-    if (path.normalize(item.source.path).toLowerCase() === summaryFile) continue;
     const key = `${item.kind}:${normalizeText(item.key || '')}:${normalizeText(item.value || item.text)}`;
     if (!normalizeText(item.value || item.text)) continue;
     groups.set(key, [...(groups.get(key) || []), item]);
@@ -508,10 +486,8 @@ function findDuplicateArchiveCandidates(index: KnowledgeIndex): KnowledgeItem[] 
 }
 
 function findConflictArchiveCandidates(index: KnowledgeIndex): KnowledgeItem[] {
-  const summaryFile = path.normalize(path.join(index.memoryRoot, 'data', 'explicit-memories', 'memory-summary.md')).toLowerCase();
   const groups = new Map<string, KnowledgeItem[]>();
   for (const item of index.items) {
-    if (path.normalize(item.source.path).toLowerCase() === summaryFile) continue;
     if (!item.conflict || !item.key) continue;
     const key = `${item.kind}:${normalizeText(item.key)}`;
     groups.set(key, [...(groups.get(key) || []), item]);
@@ -531,57 +507,6 @@ function compareKnowledgeFreshness(left: KnowledgeItem, right: KnowledgeItem): n
   const leftScore = (Number.isFinite(leftTime) ? leftTime : 0) + left.confidence * 1000;
   const rightScore = (Number.isFinite(rightTime) ? rightTime : 0) + right.confidence * 1000;
   return rightScore - leftScore;
-}
-
-function buildSummaryMarkdown(index: KnowledgeIndex): string {
-  const generatedAt = new Date().toISOString();
-  const summaryFile = path.normalize(path.join(index.memoryRoot, 'data', 'explicit-memories', 'memory-summary.md')).toLowerCase();
-  const byKind = new Map<string, KnowledgeItem[]>();
-  for (const item of index.items) {
-    if (path.normalize(item.source.path).toLowerCase() === summaryFile) continue;
-    byKind.set(item.kind, [...(byKind.get(item.kind) || []), item]);
-  }
-  const facts = pickTopItems(byKind.get('fact') || [], 8);
-  const conclusions = pickTopItems(byKind.get('conclusion') || [], 8);
-  const todos = pickTopItems(byKind.get('todo') || [], 8);
-  const resources = pickTopItems(byKind.get('resource') || [], 8);
-  const lines = [
-    '# 记忆总览摘要',
-    '',
-    '<!-- cti-memory-optimizer: managed summary; edit with care -->',
-    '',
-    `生成时间: ${generatedAt}`,
-    `索引时间: ${index.generatedAt}`,
-    `统计: ${index.itemCount} 条记忆，${index.conflictCount} 条可能冲突。`,
-    '',
-    '## 关键事实',
-    ...formatSummaryItems(facts, '事实'),
-    '',
-    '## 关键结论',
-    ...formatSummaryItems(conclusions, '结论'),
-    '',
-    '## 待办提醒',
-    ...formatSummaryItems(todos, '待办'),
-    '',
-    '## 相关资源',
-    ...formatSummaryItems(resources, '资源'),
-    '',
-  ];
-  return lines.join('\n');
-}
-
-function pickTopItems(items: KnowledgeItem[], limit: number): KnowledgeItem[] {
-  return [...items]
-    .sort(compareKnowledgeFreshness)
-    .slice(0, limit);
-}
-
-function formatSummaryItems(items: KnowledgeItem[], prefix: string): string[] {
-  if (items.length === 0) return [`- ${prefix}: 暂无可整理条目。`];
-  return items.map((item) => {
-    const text = item.key ? `${item.key}: ${item.value || item.text}` : item.text;
-    return `- ${prefix}: ${text}`;
-  });
 }
 
 function summarizeActions(index: KnowledgeIndex, actions: MemoryOptimizationAction[]): string {
@@ -618,21 +543,46 @@ function classifyMemorySource(root: string, sourcePath: string): MemorySourceGro
   const relative = resolvedRoot && normalized.startsWith(resolvedRoot)
     ? path.relative(resolvedRoot, normalized).replace(/\\/g, '/')
     : normalized.replace(/\\/g, '/');
-  if (/data\/explicit-memories\/memory-summary\.md$/i.test(relative)) return 'generated_summary';
-  if (relative.includes('data/explicit-memories/')) return 'explicit_memory';
+  if (root) {
+    const metadata = readSourceMetadata(sourcePath);
+    const classification = classifyMemoryV2Source(root, sourcePath, metadata);
+    if (classification.ok && classification.sourceGroup) return classification.sourceGroup;
+  }
   if (relative.includes('data/todos/direct-reminders/')) return 'direct_reminder';
-  if (relative.includes('data/documents/document_guide.md')) return 'document_index';
-  if (relative.includes('/docs/') || relative.startsWith('docs/')) return 'context_doc';
-  if (/^[^/]+\.md$/i.test(relative)) return 'root_note';
   return 'other';
 }
 
 function isAutoSelectableSource(sourceGroup: MemorySourceGroup): boolean {
-  return sourceGroup === 'explicit_memory' || sourceGroup === 'direct_reminder' || sourceGroup === 'generated_summary';
+  return isDurableMemorySourceGroup(sourceGroup) || sourceGroup === 'direct_reminder';
 }
 
 function defaultRiskForSource(sourceGroup: MemorySourceGroup): MemoryOptimizationRisk {
   return isAutoSelectableSource(sourceGroup) ? 'low' : 'medium';
+}
+
+function isDurableMemorySourceGroup(sourceGroup: MemorySourceGroup): boolean {
+  return sourceGroup === 'memory_user'
+    || sourceGroup === 'memory_group'
+    || sourceGroup === 'memory_long_term';
+}
+
+function readSourceMetadata(sourcePath: string): Record<string, string> | undefined {
+  try {
+    if (!fs.existsSync(sourcePath)) return undefined;
+    const match = fs.readFileSync(sourcePath, 'utf-8').match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u);
+    if (!match) return undefined;
+    const metadata: Record<string, string> = {};
+    for (const rawLine of match[1].split(/\r?\n/)) {
+      const separator = rawLine.indexOf(':');
+      if (separator <= 0) continue;
+      const key = rawLine.slice(0, separator).trim();
+      const value = rawLine.slice(separator + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (key && value) metadata[key] = value;
+    }
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readMemoryOptimizerState(memoryRoot: string): MemoryOptimizerState {

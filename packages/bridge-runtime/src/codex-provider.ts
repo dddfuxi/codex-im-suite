@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { CTI_HOME } from './config.js';
 import { sseEvent } from './sse-utils.js';
@@ -381,6 +381,11 @@ function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): Cod
   process.env.CODEX_HOME = bridgeCodexHome;
   const env = {
     ...toTextEnv(process.env),
+    // Codex tool calls inherit only this explicit environment object.  The
+    // bridge may resolve CTI_HOME from its default path without exporting the
+    // variable globally, so pass it through here to keep memory/history helper
+    // scripts on the active bridge data store instead of legacy fallbacks.
+    CTI_HOME: process.env.CTI_HOME || CTI_HOME,
     CODEX_HOME: bridgeCodexHome,
   };
   return {
@@ -431,6 +436,9 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- Keep only the essential result unless the user explicitly asks for a detailed walkthrough.',
     '- If the task is unfinished or blocked, state the exact blocker briefly instead of narrating your whole investigation.',
     '- Execution posture: you are the worker responsible for solving the request, not a helper giving the user homework.',
+    '- Default posture: proactively satisfy the request. When a safe bounded action can move the task forward, use the available context and safe tools first instead of asking the user to do the check manually.',
+    '- If input is incomplete, infer reasonable safe defaults from the current turn, attachments, workspace, history, and tool evidence; ask only for the smallest missing detail that blocks safe execution.',
+    '- If only part of the task can be completed, keep the useful partial result, explain the exact blocker, and give one concrete next confirmation or option.',
     '- Do not answer executable tasks with generic instructions, suggested manual steps, placeholder tables, or sample scripts unless the user explicitly asks for a tutorial or draft.',
     '- For Unity/Blender/MCP/repository/file tasks, the final answer must be based on real tool output, a real command result, or an explicit blocker from a concrete attempt.',
     '- For a concrete Unity/Prefab/scene request, never answer with "please specify MCP entry" or an MCP entry list if the user already named Unity, Unity MCP, unitymcp, prefab, a scene, or a prefab/object name. Attempt Unity tooling, or report the exact blocker.',
@@ -545,6 +553,7 @@ function selectHistoryEntries(
 export function buildTurnPrompt(params: StreamChatParams): string {
   const sections: string[] = [];
   const systemPrompt = truncateText(params.systemPrompt || '', 4000);
+  const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
   const historyEntries = selectHistoryEntries(params.conversationHistory);
   const userPrompt = params.prompt.trim();
 
@@ -552,6 +561,10 @@ export function buildTurnPrompt(params: StreamChatParams): string {
     sections.push(`System instructions:\n${systemPrompt}`);
   }
   sections.push(`Bridge reply style:\n${buildBridgeReplyGuardrails(params)}`);
+  // 关联证据不受 system prompt 预算影响；它仍在当前请求前，并被明确标记为不可执行证据。
+  if (priorityTurnContext) {
+    sections.push(priorityTurnContext);
+  }
   if (historyEntries.length > 0) {
     sections.push(`Conversation context:\n${historyEntries.join('\n')}`);
   }

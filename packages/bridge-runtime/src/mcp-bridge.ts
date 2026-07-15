@@ -324,8 +324,64 @@ function formatMcpToolPayload(payload: unknown): string {
 
 function getManifestCwd(manifest: McpManifestRecord, config: Config): string {
   const cwd = expandManifestValue(manifest.cwd, config);
-  if (cwd && fs.existsSync(cwd)) return cwd;
-  return getSuiteRoot();
+  if (!cwd) throw new Error(`MCP manifest 未声明 cwd：${manifest.id || path.basename(manifest.manifestPath || 'unknown')}`);
+  const resolved = path.resolve(cwd);
+  if (!fs.existsSync(resolved)) throw new Error(`MCP 工作目录不存在: ${resolved}`);
+  const stat = fs.statSync(resolved);
+  if (!stat.isDirectory()) throw new Error(`MCP 工作目录不是目录: ${resolved}`);
+  return resolved;
+}
+
+function normalizeMcpFamilyTerms(manifest: McpManifestRecord): string {
+  return [
+    manifest.id,
+    manifest.displayName,
+    manifest.category,
+    manifest.source,
+    manifest.registerName,
+    ...(manifest.aliases || []),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function isUnityMcpManifest(manifest: McpManifestRecord): boolean {
+  const terms = normalizeMcpFamilyTerms(manifest);
+  return /(^|\s|\.|-)unity(\s|\.|-|mcp|$)|unitymcp|mcpforunity/.test(terms);
+}
+
+function normalizeComparablePath(value: string): string {
+  return path.resolve(path.normalize(value)).replace(/[\\/]+$/, '');
+}
+
+function pathsEqual(left: string, right: string): boolean {
+  return normalizeComparablePath(left).toLowerCase() === normalizeComparablePath(right).toLowerCase();
+}
+
+function inferUnityProjectRootFromDataPath(rawDataPath: string): string {
+  const normalized = normalizeComparablePath(rawDataPath);
+  return path.basename(normalized).toLowerCase() === 'assets'
+    ? path.dirname(normalized)
+    : normalized;
+}
+
+function extractUnityDataPathFromExecuteCodeResult(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+    const record = parsed as Record<string, unknown>;
+    const data = record.data && typeof record.data === 'object' && !Array.isArray(record.data)
+      ? record.data as Record<string, unknown>
+      : {};
+    const result = typeof data.result === 'string'
+      ? data.result
+      : typeof record.result === 'string'
+        ? record.result
+        : '';
+    return result.trim();
+  } catch {
+    return '';
+  }
 }
 
 async function terminateChild(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -394,6 +450,22 @@ export class McpBridge {
     const unityProjectPath = this.config.unityProjectPath ? path.resolve(this.config.unityProjectPath) : '';
     const userExtensionRoot = path.resolve(getCtiHome(), 'extensions');
     const resolvedCwd = path.resolve(manifestCwd);
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(resolvedCwd);
+    } catch {
+      return {
+        ok: false,
+        message: `MCP 工作目录不存在: ${resolvedCwd}`,
+      };
+    }
+    if (!stat.isDirectory()) {
+      return {
+        ok: false,
+        message: `MCP 工作目录不是目录: ${resolvedCwd}`,
+      };
+    }
 
     const matchesAllowedRoot = allowedRoots.some((root) => isPathWithin(root, resolvedCwd));
     const matchesDefaultWorkDir = defaultWorkDir ? isPathWithin(defaultWorkDir, resolvedCwd) : false;
@@ -480,6 +552,68 @@ export class McpBridge {
     return null;
   }
 
+  private collectAllowedWorkspaceRoots(): string[] {
+    return splitPathList([
+      this.config.defaultWorkDir,
+      this.config.unityProjectPath,
+      ...(this.config.allowedWorkspaceRoots || []),
+      ...(this.config.codexAdditionalDirectories || []),
+    ].filter(Boolean).join(';'));
+  }
+
+  private getManifestExpectedProjectRoot(manifest: McpManifestRecord): string {
+    const manifestCwd = expandManifestValue(manifest.cwd, this.config);
+    if (manifestCwd) return path.resolve(manifestCwd);
+    return this.config.unityProjectPath ? path.resolve(this.config.unityProjectPath) : '';
+  }
+
+  private async probeUnityEditorProjectRoot(manifest: McpManifestRecord): Promise<string> {
+    const result = manifest.type === 'http'
+      ? await this.callHttpToolRaw(manifest, 'execute_code', {
+        action: 'execute',
+        code: 'return UnityEngine.Application.dataPath;',
+        compiler: 'auto',
+        safety_checks: true,
+      })
+      : await this.callStdioToolRaw(manifest, 'execute_code', {
+        action: 'execute',
+        code: 'return UnityEngine.Application.dataPath;',
+        compiler: 'auto',
+        safety_checks: true,
+      });
+    if (!result.ok) {
+      throw new Error(`无法确认当前 Unity Editor 项目：${result.error || result.content || 'execute_code 失败'}`);
+    }
+    const dataPath = extractUnityDataPathFromExecuteCodeResult(result.content);
+    if (!dataPath) {
+      throw new Error(`无法从 Unity MCP execute_code 结果读取 Application.dataPath：${compactStatusText(result.content)}`);
+    }
+    return inferUnityProjectRootFromDataPath(dataPath);
+  }
+
+  private async ensureUnityMcpProjectMatchesManifest(manifest: McpManifestRecord): Promise<void> {
+    if (!isUnityMcpManifest(manifest)) return;
+    const expectedRoot = this.getManifestExpectedProjectRoot(manifest);
+    const actualRoot = await this.probeUnityEditorProjectRoot(manifest);
+    if (expectedRoot && !pathsEqual(actualRoot, expectedRoot)) {
+      throw new Error([
+        'Unity MCP 当前连接项目与 manifest 绑定不一致',
+        `当前 Unity 项目：${actualRoot}`,
+        `manifest 工作目录：${path.resolve(expectedRoot)}`,
+        '请切换到绑定项目，或更新 CTI_UNITY_PROJECT_PATH / CTI_ALLOWED_WORKSPACE_ROOTS 后重启 bridge。',
+      ].join(' | '));
+    }
+    const allowedRoots = this.collectAllowedWorkspaceRoots();
+    if (allowedRoots.length > 0 && !allowedRoots.some((root) => isPathWithin(root, actualRoot))) {
+      throw new Error([
+        'Unity MCP 当前连接项目不在允许工作区内',
+        `当前 Unity 项目：${actualRoot}`,
+        `允许根：${allowedRoots.join(' ; ')}`,
+        '请把该项目加入 CTI_ALLOWED_WORKSPACE_ROOTS / CTI_CODEX_ADDITIONAL_DIRECTORIES，或切换到已允许的 Unity 项目。',
+      ].join(' | '));
+    }
+  }
+
   async checkHealth(manifest: McpManifestRecord): Promise<McpHealthStatus> {
     const workspaceValidation = this.validateManifestWorkspace(manifest);
     if (!workspaceValidation.ok) return workspaceValidation;
@@ -498,6 +632,11 @@ export class McpBridge {
           }
           if (manifest.healthCheck?.successRegex && !new RegExp(manifest.healthCheck.successRegex, 'i').test(text)) {
             return { ok: false, message: `MCP protocol 在线，但资源健康检查未满足成功条件 | ${resourceUri} | ${compactStatusText(text)}` };
+          }
+          try {
+            await this.ensureUnityMcpProjectMatchesManifest(manifest);
+          } catch (error) {
+            return { ok: false, message: error instanceof Error ? error.message : String(error) };
           }
           return { ok: true, message: `MCP resource 健康检查通过 | ${resourceUri} | ${compactStatusText(text)}` };
         } catch (error) {
@@ -566,6 +705,9 @@ export class McpBridge {
     if (!workspaceValidation.ok) {
       throw new Error(workspaceValidation.message);
     }
+    // tools/list 会把可用能力暴露给 agent；Unity MCP 也要先确认当前 Editor
+    // 没有误连到别的项目，避免后续基于错项目继续规划操作。
+    await this.ensureUnityMcpProjectMatchesManifest(manifest);
     const endpoint = this.getHttpEndpoint(manifest);
     const cacheKey = `${manifest.id}|${endpoint}`;
     const cached = this.httpToolDetailsCache.get(cacheKey);
@@ -601,11 +743,7 @@ export class McpBridge {
     return (await this.listToolDetails(manifest)).map((tool) => tool.name);
   }
 
-  async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
-    const workspaceValidation = this.validateManifestWorkspace(manifest);
-    if (!workspaceValidation.ok) {
-      throw new Error(workspaceValidation.message);
-    }
+  private async callHttpToolRaw(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
     const result = await this.sendHttpRequest<{ isError?: boolean; content?: unknown; structuredContent?: unknown; structured_content?: unknown; error?: unknown }>(manifest, 'tools/call', {
       name: toolName,
       arguments: args,
@@ -616,12 +754,26 @@ export class McpBridge {
     return { ok: result.isError !== true && !error, content, ...(error ? { error } : {}) };
   }
 
+  async callHttpTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
+    await this.ensureUnityMcpProjectMatchesManifest(manifest);
+    return this.callHttpToolRaw(manifest, toolName, args);
+  }
+
   async callTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
     if (manifest.type === 'http') return this.callHttpTool(manifest, toolName, args);
     return this.callStdioTool(manifest, toolName, args);
   }
 
   private async listStdioToolDetails(manifest: McpManifestRecord): Promise<McpToolInfo[]> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
+    await this.ensureUnityMcpProjectMatchesManifest(manifest);
     const result = await this.sendStdioRequest<{ tools?: Array<{ name?: string; title?: string; description?: string; inputSchema?: unknown }> }>(
       manifest,
       'tools/list',
@@ -637,7 +789,7 @@ export class McpBridge {
       .filter((tool) => tool.name);
   }
 
-  private async callStdioTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+  private async callStdioToolRaw(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
     const result = await this.sendStdioRequest<{ isError?: boolean; content?: unknown; structuredContent?: unknown; structured_content?: unknown; error?: unknown }>(
       manifest,
       'tools/call',
@@ -647,6 +799,15 @@ export class McpBridge {
     const content = formatMcpToolPayload(payload);
     const error = typeof result.error === 'string' ? result.error : undefined;
     return { ok: result.isError !== true && !error, content, ...(error ? { error } : {}) };
+  }
+
+  private async callStdioTool(manifest: McpManifestRecord, toolName: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
+    const workspaceValidation = this.validateManifestWorkspace(manifest);
+    if (!workspaceValidation.ok) {
+      throw new Error(workspaceValidation.message);
+    }
+    await this.ensureUnityMcpProjectMatchesManifest(manifest);
+    return this.callStdioToolRaw(manifest, toolName, args);
   }
 
   private expandEnvMap(values: Record<string, string>): Record<string, string> {

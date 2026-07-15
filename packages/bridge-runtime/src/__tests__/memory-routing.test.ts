@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   decideMemoryReply,
+  isLowValueMemoryText,
   planMemoryQuery,
   shouldUseMemoryEvidenceFromPrompt,
   shouldRetrieveMemoryForPrompt,
@@ -92,6 +93,17 @@ describe('memory routing', () => {
       }],
     });
     assert.equal(lowValue.type, 'no_memory_answer');
+  });
+
+  it('treats failed history retrieval replies as low-value memory', () => {
+    assert.equal(
+      isLowValueMemoryText('本地记录里没保存到昨天那条完整命名清单，只剩摘要。'),
+      true,
+    );
+    assert.equal(
+      isLowValueMemoryText('完整名字列表没在归档里命中，请把昨天那张图再丢我一下。'),
+      true,
+    );
   });
 
   it('marks generic named lookup questions from structured knowledge as evidence', () => {

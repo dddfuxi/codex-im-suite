@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 
 import type { KnowledgeIndex, KnowledgeItem } from './knowledge-indexer.js';
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
+import { parseMemorySourceFrontmatter } from './memory-source-policy.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
 
 export type ReminderStatus = 'pending' | 'sent' | 'failed' | 'skipped';
@@ -137,6 +138,7 @@ export interface TodoReminderService {
 export interface ReminderBuildOptions {
   enabledChannels?: string[];
   generatedAt?: string;
+  includeDirectReminders?: boolean;
 }
 
 export interface ReminderEvaluationOptions {
@@ -216,7 +218,10 @@ export function createEmptyReminderState(): ReminderDeliveryState {
 
 export function buildReminderIndexFromKnowledge(index: KnowledgeIndex, options: ReminderBuildOptions = {}): ReminderIndex {
   const enabledChannels = new Set((options.enabledChannels || ['feishu']).map((item) => item.toLowerCase()));
-  const reminders = index.items
+  const items = options.includeDirectReminders
+    ? [...index.items, ...buildDirectReminderKnowledgeItems(index.memoryRoot)]
+    : index.items;
+  const reminders = items
     .filter((item) => item.kind === 'todo')
     .map((item) => buildReminderFromTodo(item, enabledChannels))
     .filter((item): item is TodoReminder => !!item);
@@ -232,7 +237,13 @@ export function buildReminderIndexFromKnowledge(index: KnowledgeIndex, options: 
 }
 
 export function rebuildReminderIndexFromKnowledge(memoryRoot: string, knowledgeIndex: KnowledgeIndex, options: ReminderBuildOptions = {}): ReminderIndex {
-  const reminderIndex = buildReminderIndexFromKnowledge(knowledgeIndex, options);
+  const reminderIndex = buildReminderIndexFromKnowledge({
+    ...knowledgeIndex,
+    memoryRoot,
+  }, {
+    ...options,
+    includeDirectReminders: options.includeDirectReminders ?? true,
+  });
   writeReminderIndex(memoryRoot, reminderIndex);
   return reminderIndex;
 }
@@ -301,10 +312,11 @@ export function startTodoReminderService(options: TodoReminderServiceOptions): T
     if (running) return readReminderIndex(options.memoryRoot);
     running = true;
     try {
-      const knowledgeIndex = readJsonFile<KnowledgeIndex>(path.join(options.memoryRoot, '.cti-index', 'knowledge.json'));
-      if (!knowledgeIndex) return null;
+      const knowledgeIndex = readJsonFile<KnowledgeIndex>(path.join(options.memoryRoot, '.cti-index', 'knowledge.json'))
+        ?? createEmptyKnowledgeIndex(options.memoryRoot);
       const reminderIndex = buildReminderIndexFromKnowledge(knowledgeIndex, {
         enabledChannels: options.enabledChannels,
+        includeDirectReminders: true,
       });
       writeReminderIndex(options.memoryRoot, reminderIndex);
       if (options.enabled) {
@@ -405,14 +417,8 @@ export function createDirectReminder(memoryRoot: string, input: DirectReminderIn
   ].filter((line) => line !== '').join('\n');
   fs.writeFileSync(filePath, markdown, 'utf-8');
 
-  const knowledgeStatus = rebuildKnowledgeIndex(root);
-  if (knowledgeStatus.lastError) {
-    throw new Error(knowledgeStatus.lastError);
-  }
-  const knowledgeIndex = readJsonFile<KnowledgeIndex>(path.join(root, '.cti-index', 'knowledge.json'));
-  if (!knowledgeIndex) {
-    throw new Error('知识索引生成失败');
-  }
+  const knowledgeIndex = readJsonFile<KnowledgeIndex>(path.join(root, '.cti-index', 'knowledge.json'))
+    ?? createEmptyKnowledgeIndex(root);
   const index = rebuildReminderIndexFromKnowledge(root, knowledgeIndex, {
     enabledChannels: [input.target.channelType],
   });
@@ -661,6 +667,69 @@ function parseSourceType(item: KnowledgeItem, metadata: Record<string, string> |
   if (metadata?.sourceType === 'direct' || metadata?.createdBy === 'direct-fast-path' || metadata?.createdBy === 'agent-action') return 'direct';
   if (item.source.path.toLowerCase().includes(`${path.sep}direct-reminders${path.sep}`.toLowerCase())) return 'direct';
   return 'memory';
+}
+
+function createEmptyKnowledgeIndex(memoryRoot: string): KnowledgeIndex {
+  return {
+    schema: 'codex-im-suite/knowledge-index/v1',
+    memoryRoot,
+    generatedAt: new Date().toISOString(),
+    itemCount: 0,
+    conflictCount: 0,
+    items: [],
+  };
+}
+
+function getDirectReminderDir(memoryRoot: string): string {
+  return path.join(memoryRoot, 'data', 'todos', 'direct-reminders');
+}
+
+function buildDirectReminderKnowledgeItems(memoryRoot: string): KnowledgeItem[] {
+  const dir = getDirectReminderDir(memoryRoot);
+  if (!fs.existsSync(dir)) return [];
+  const items: KnowledgeItem[] = [];
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.toLowerCase().endsWith('.md')) continue;
+    const filePath = path.join(dir, file);
+    const item = buildDirectReminderKnowledgeItem(filePath);
+    if (item) items.push(item);
+  }
+  return items;
+}
+
+function buildDirectReminderKnowledgeItem(filePath: string): KnowledgeItem | null {
+  try {
+    const stat = fs.statSync(filePath);
+    const markdown = fs.readFileSync(filePath, 'utf-8');
+    const metadata = parseMemorySourceFrontmatter(markdown) || {};
+    const body = markdown.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/u, '');
+    const todoLine = body.split(/\r?\n/).map((line) => line.trim()).find((line) => /^(?:[-*]\s*)?待办\s*[:：]/u.test(line));
+    if (!todoLine) return null;
+    const value = todoLine.replace(/^(?:[-*]\s*)?待办\s*[:：]\s*/u, '').trim();
+    if (!value) return null;
+    const repairedValue = repairReminderText(value);
+    const repairedSnippet = repairReminderText(todoLine);
+    if (!repairedValue || !repairedSnippet) return null;
+    const id = `direct-reminder:${crypto.createHash('sha1').update(path.resolve(filePath).toLowerCase()).digest('hex').slice(0, 16)}`;
+    return {
+      id,
+      kind: 'todo',
+      value: repairedValue,
+      text: repairedValue,
+      confidence: 0.95,
+      conflict: false,
+      classificationReason: 'direct reminder source file',
+      classificationSource: 'prefix',
+      source: {
+        path: filePath,
+        updatedAt: stat.mtime.toISOString(),
+        snippet: repairedSnippet,
+        metadata,
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
 function parseDueAt(text: string): string | undefined {

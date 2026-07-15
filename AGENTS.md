@@ -5,6 +5,7 @@
 ## 1. 基本沟通
 
 - 始终使用中文回复。
+- 在 Windows/PowerShell 中把中文内容交给 Node/Python/CLI 时，禁止用未设置 UTF-8 的管道或 here-string 直接喂 stdin；优先用 UTF-8 文件、Unicode 环境变量或 base64，并在外发前用码点/回读验证没有变成 `?`。
 - 先确认当前修改对象是 `codex-im-suite` 开发版，还是本机 live skill。
 - 默认只修改开发版仓库：`C:\Users\admin\Documents\New project\codex-im-suite`。
 - 遇到同名文件、旧副本或不确定该改哪里时，先看 `suite.manifest.json`，再运行 `scripts/doctor-suite-targets.ps1`；不要把 live skill 或 `release/*` 当成开发主线。
@@ -23,6 +24,14 @@
 - `config/mcp.d`：MCP manifest 唯一来源，面板和注册脚本不能硬编码 MCP 名称。
 - `extensions/skills`：随项目备份的 skill 副本，不等同于本机 live skill。
 - `release`：打包产物目录，不作为源码维护入口，也不要手工修里面的 portable/installer 副本。
+
+## 2.1 机器人架构分层边界
+
+- `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 是机器人分层、策略归属和路径职责分类的第一入口；新增通用 policy、prompt 片段、路径类别或角色门禁时，先在这里声明并补 `bridge-agent-architecture.test.ts`。
+- `bridge-manager.ts` 只保留编排职责：消费入站、调用 context/capability/policy/delivery 入口、串联审计和状态；不要继续把通用角色表、路径表、prompt 规则或平台无关策略内联进 manager。
+- prompt 规则按归属迁移：默认行为和个性属于 Agent Kernel，权限和风险属于 Policy Registry，证据和上下文属于 Context Broker，工具选择属于 Capability Router，最终呈现属于 Delivery Layer。
+- 路径判断必须优先使用统一分类口径：开发仓库、live skill、记忆仓库、运行态数据、临时上传缓存、文档、规则、日志、发布产物各自有边界；不要为了现场问题硬写某个群、机器人名、截图路径或缓存路径。
+- 渐进重构顺序固定为：先建立注册表和测试，再迁移纯函数规则，再迁移上下文构造、能力路由、记忆/暂存提升和交付收口；每一步保持兼容并补单测。
 
 ## 3. 文档收口规则
 
@@ -117,19 +126,36 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - Codex 最终结果优先使用 `cti-final` 结果块协议。
 - 明确要求工具、MCP、文件、命令、截图、生成物或本地产物的任务，禁止降级成快问快答、闲聊短路或本地模型直答；必须进入 workflow / 工具证据链，成功时带真实 `tool_result`，失败时返回具体“未完成”阻塞原因。
 - 工具链成功后，用户可见正文应由 agent/model 基于真实工具历史整理成可读 Markdown/卡片内容；不要把原始 MCP JSON、运行时验证摘要或 `JsonTool/tool_request/tool_result` 协议名直接当最终回复。
+- agent/model 默认采用主动完成姿态：有安全、低风险、受控的上下文读取、工具调用或目标解析可推进任务时，应先尝试完成，而不是把可执行请求退回成教程、泛泛拒绝或让用户手动排查。确实缺少关键信息时只问最小缺口；只能部分完成时保留已验证进展，说明具体阻塞和下一步确认。该规则不能绕过 Owner/Operator 门禁、平台权限、真实工具证据或事实核验。
+- 普通自然语言内容不得再走 provider 前快捷出口：自然语言扩展/模型/skill 搜索、通用表情包请求、自然语言提醒、`git status`/`git pull` 这类命令式文本都必须进入 agent/provider 先判断意图；只有 slash 命令、权限按钮/数字、平台 callback、owner 二次确认、`/remind` 等明确系统入口可以由 bridge-manager 前置处理，并且仍要复用统一角色和风险门禁。
 - 工具或 MCP 产生图片、文件等本地产物时，最终回复必须通过通用 `cti-final.images/files` 声明真实存在的路径，让飞书发送附件；不要只把路径当普通文本发出。
 - Markdown 默认走 Feishu card。
 - 结果块解析失败时，不允许蠢裁剪成半截废话；应走可读兜底。
 - 记忆回捞命中结构化键值时，必须保留原始键和值，不能只发概括词。
+- 所有可处理的纯文本 turn 都必须先经过独立记忆意图分类，再决定忽略、仅保留当前会话、写入用户/群聊/公共长期分区或向用户追问；不得由“记住/记录”等关键词正则、历史文本、显示名或路径直接推断写入范围。分类不明确、低置信、缺少具体事实、来源不是 human 或运行时写入服务不可用时，禁止落长期库，必须让主 agent 以最小问题追问。`temporary` 只进入当前 session 上下文，不得调用持久化写入；任何分类结果都不得绕过主 agent 生成最终回复。
+- IM/bridge 里的“记住/保存/记录”只能通过受控 v2 记忆写入链进入设置的记忆仓库；禁止 agent 使用 `github-memory-protocol`、`~/.codex/memory` / `C:\Users\admin\.codex\memory`、项目 Markdown 或聊天日志替代记忆仓库。只有本轮存在成功的 v2 写入 evidence，最终回复才可以说“已记住/已保存”；否则必须说明未保存并追问最小缺口或报告具体阻塞。
 - 高危 / owner 权限门禁不得只靠危险关键词命中；必须区分“用户当前要求机器人执行”与“报错、日志、卡片资源状态、故事/游戏文本、引用证据里提到危险词”。adapter 生成的诊断边界、飞书资源错误（例如资源已删除）、历史 evidence 和叙事规则只能作为上下文交给 agent，不应触发 owner 快速拒绝。
-- Feishu 出站 @、私发、提醒和工具触发不得为了某个现场截图、某个玩法或某个机器人名写死规则；只能基于本轮 adapter 身份、wake alias、原生 @、结构化 action、权限和真实 resolver/工具证据做通用判断。流程规则、转述别人动作、未来动作和泛指目标应作为上下文交给 agent，而不是触发确定性快捷执行。
-- Feishu 群聊 `require_mention` 下，用户“回复/引用本机器人已发送消息”也是明确唤醒证据；应优先用本地 `outbound-refs` 或被回复消息 sender 证明目标确为当前 bot，再放行文本、图片、表情包等消息进入 agent。不能把所有无 @ 的普通群聊 reply 都放行，也不能让表情包在进入 sticker 语义链前被 `bot not @mentioned` 过滤。
-- Feishu 表情包语义必须事实优先：`source=user` 的用户解释只能写入未核验 `userAnnotation` evidence，不能直接进入可发送的 `label/intent/usage` 主语义，也不能出现在 sticker prompt 候选或显式 `[表情包:别名]` 发送匹配里。只有视觉模型基于真实图片返回的 `source=vision` 标注或人工审核的 `source=manual` 才能作为后续自动发送候选；当用户回复表情包解释含义且本地已有 media 时，必须把图片附件和用户说法一起交给 agent 交叉核验，图片文字/图案/上下文与用户说法冲突时以图片事实为准。
-- Feishu 历史同步和短上下文中的 `sticker` 消息必须进入表情包库并尽量缓存真实图片；用户明确要求“发/回/来个表情包”时，应把当前聊天以来可用的候选表情包图片作为受控 sticker library evidence 注入 agent，由 agent 视觉分析语义和时机后决定是否输出 `[表情包:file_key]`。如果旧本地历史索引里只有 `[sticker]` 且没有 `file_key`，不得凭空恢复图片；显式表情包请求可按 chat 历史水位触发一次远端 full backfill，能从飞书历史页回捞到真实 `file_key` 和图片时再进入候选库，同一水位不应重复全量回扫。候选图片进入 agent 后，应通过隐藏 `cti-sticker-candidate-analysis` 写回看图语义；bridge 只接受本轮真实附加过的候选 `fileKey`，写入 `source=vision`、带有效置信度且达到阈值、并包含具体画面/情绪/用途/语气语义时，才可用精确 `[表情包:file_key]` 发送。“随便发一个”也必须先知道图的大致含义再发，不能因为旧元数据为空就不发，也不能接受模型幻觉出的未附加 `fileKey`。低置信或缺置信度视觉读图、不可读图片、泛泛“这是表情包/用于聊天”语义、未核验用户解释、source-less 旧语义和看起来像平台资源 key 的裸 `file_key` 都只能作为 evidence，不能绕过表情包库的可信语义门禁直接发送。裸 `[表情包]` 不是强制发送：如果回复文本有明确夸赞、安慰、吐槽、疑惑等语义约束但没有可靠匹配，应降级为自然文字或合适 reaction，禁止只因为库里只有一个旧候选就硬发错图。
+- IM 工具权限批准必须读取 pending permission link 里的工具名和输入 evidence 后再判定角色：只读/检索类工具可由 Operator 批准；shell、写文件、删除/移动/发布/安装/系统控制、跨会话发送等具备副作用或高风险的工具必须 Owner 批准。Feishu 卡片按钮、数字快捷回复和 `/perm` 文本命令必须复用同一套风险与角色门禁，不能因为入口不同绕过 Owner。
+- IM slash 命令必须按影响范围声明最低角色：普通聊天、`/whoami` 和低风险 `/remind` 可开放给普通用户；会话、工作目录、模式、状态、历史列表、文档列表和停止会话等运行态管理命令必须至少 Operator；`/feishu` 等平台权限诊断和高危动作必须 Owner。新增 slash 命令时必须接入统一角色门禁或在命令内部写明更严格的结构化 action 门禁，不能靠隐藏快答或关键词绕过。
+- `cti-reminder` 和 `/remind` 只允许创建低风险单次提醒；自然语言提醒必须先进入 agent，由 agent 输出 `cti-reminder` 后才允许 bridge 执行。模型只口头声称“已设置/已创建提醒”但没有动作块时一律按伪完成拦截，不得再用正则从原文补建。关机、关闭屏幕、运行命令、发送文件、安装发布等系统/文件/外部副作用类“定时执行”不得落成普通 reminder。普通用户必须被 Owner 门禁拦截，Owner 也必须走受控工具/命令链和真实工具证据，而不是用提醒伪装完成。
+- Feishu 出站 @、私发、提醒和工具触发不得为了某个现场截图、某个玩法或某个机器人名写死规则；只能基于本轮 adapter 身份、wake alias、原生 @、结构化 action、权限和真实 resolver/工具证据做通用判断。流程规则、转述别人动作、未来动作、广播受众（如“各位飞书机器人”）和格式/规则对象（如“按这个格式”）应作为上下文交给 agent，而不是触发确定性快捷执行、原生 @ 补全或 resolver 检索。
+- Feishu 群聊 `require_mention` 下，主入口只接受原生 @ 当前 bot 的消息：优先按 `message.mentions` 中的 `open_id/user_id/union_id` 与当前 bot 身份精确匹配，飞书长连缺失 `mentions` 时仅允许正文结构化 `<at ...>` / `tag=at` 携带同一身份 ID 作为兼容证据。唯一窄例外是用户用飞书原生 reply/引用“当前 bot 已发送的消息”补发 `sticker` 或 `image`：必须通过本地 `outbound-refs` 或被回复消息 sender 证明确为当前 bot，才可作为本轮媒体交互唤醒并进入表情包/图片识别链。普通文本 reply、回复未知/其他人的消息、文本别名、显示名、其他 bot/app sender 或 @ 其他机器人都不能替代原生 @ 唤醒；这类内容只作为审计或上下文证据，不触发 agent。
+- Feishu 用户明确说“看我上面消息 / 上面那条卡片 / 上文 / 前面消息 / 上几条 / 上一条”并要求查看、分析、回复、总结、对照或纠错时，必须走飞书云端消息页同步与本地历史索引检索，不得只用 `Feishu recent conversation context` 的近邻窗口、reply target 或截图猜测。light context 只服务短指代接话；一旦语义是回看上方消息，就应由 `parseHistoryIntentV2()` 生成受控历史 evidence 后交给 agent。
+- 历史/记忆检索命中旧的用户问题时，必须尝试回捞相邻 assistant 的最终答复；结构化 assistant 消息优先使用 `cti-final.text` 作为用户真正看见的结果。`tool_use`、`tool_result`、命令、路径和原始日志只能作为低权重诊断或执行证据，不能混入主记忆摘要、不能覆盖相邻最终答复，也不能因为 Feishu 云历史缺少 bot 卡片正文就判定聊天记录丢失。旧的“没找到 / 没保存完整清单 / 归档没命中 / 请手动记录”类失败答复只能作为低价值历史，不得和真实映射、命名表或最终答复竞争。
+- Codex / agent 工具环境必须显式携带解析后的 `CTI_HOME`，确保 `memory-repo-retrieval`、Feishu history、message archives 和审计脚本读取当前 bridge runtime 的 `CTI_HOME\data`，不得在 env 缺失时落到旧 `E:\cli-md` 聊天副本。`E:\cli-md` 是长期记忆仓库默认路径，不是原始飞书聊天记录主存储；Windows/PowerShell 读中文 skill、JSON、日志和 Markdown 时必须使用 UTF-8。
+- Feishu CLI / lark-cli 只能作为 `/feishu` 能力诊断或人工 API 调试证据；即使配置了 `CTI_FEISHUCLI_ENABLED=true`，也不得把它当成入站、@ 判断、成员 resolver、云聊天记录同步或消息发送主链路。`service.feishuCli` 只是历史兼容 id 的 Bridge Skill 更新单元，不得因名称恢复 CLI 快捷 provider；飞书云历史必须由 FeishuAdapter 的 OpenAPI / 长连接 evidence 证明。
+- Feishu 表情包语义必须事实优先：`source=user` 的用户解释只能写入未核验 `userAnnotation` evidence，不能直接进入可发送的 `label/intent/usage` 主语义，也不能出现在 sticker prompt 候选或显式 `[表情包:别名]` 发送匹配里。用户解释表情包只允许两类入口：原生 reply 精确指向已记录的 sticker 原消息，或文本显式出现“表情包 / 表情 / sticker”并匹配同群最近未标注 sticker；回复机器人卡片、普通文本任务、历史上下文里的“这个/刚才/上一个/这个群是...”不得退回最近 sticker 兜底学习。当用户回复表情包解释含义且本地已有 media 时，必须把图片附件和用户说法一起交给 agent 交叉核验，图片文字/图案/上下文与用户说法冲突时以图片事实为准。只有视觉模型基于真实图片返回的 `source=vision` 标注或人工审核的 `source=manual` 才能作为后续自动发送候选。
+- Feishu 历史同步和短上下文中的 `sticker` 消息必须按 `file_key` 进入表情包库，但媒体采用最小留存策略：只有记忆仓库 `data/im/feishu/stickers/media` 尚无该键时才从当前消息资源下载一次真实图片并按文件头保存为真实扩展，后续同键只复用；历史同步只登记 key、消息来源和水位，不批量下载、不按旧历史全量回捞。禁止扫描、迁入或写入工作区 `.codepilot-uploads`。如果旧本地历史索引里只有 `[sticker]` 且没有 `file_key`，不得凭空恢复图片。
+- 入站 sticker 标注回合不得被解释成出站 sticker 请求：收到表情包后只能把图片作为语气/语义证据交给 agent，provider prompt 中的 `cti-sticker-annotation` 必须放在可保留前缀并明确禁止 imagegen、生成图和快捷发送。若 provider 主回复漏写隐藏标注，bridge 只能在本轮真实附加同 `file_key` 图片时做一次隐藏、只读的视觉标注补写；该补写只落 `source=vision` 语义，不改变用户可见回复，不批量补旧数据，不触发表情包发送。可见回复里的 `[表情包]` / `[表情包:file_key]` 在入站 sticker 场景必须剥离，防止上下文突然注入表情包后走死回复。
+- 用户要求发表情包时只能复用已有可信视觉/人工语义；如可信候选缺少媒体，最多下载一个已验证候选，绝不能批量回捞，也绝不能用 imagegen 或其他生成图工具替代。候选图片进入 agent 后，应通过隐藏 `cti-sticker-candidate-analysis` 写回看图语义；bridge 只接受本轮真实附加过的候选 `fileKey`，写入 `source=vision`、带有效置信度且达到阈值、并包含具体画面/情绪/用途/语气语义时，才可用精确 `[表情包:file_key]` 发送。对于“发个/来个/随机一个表情包”这类单个通用请求，adapter 可提供可信 `preferredFileKey` 作为候选 evidence，但不得在 provider 前直接投递；只有 AI/provider 明确输出 `[表情包]` 或精确候选动作后，bridge 才能用本轮可信候选补成真实 sticker 交付，禁止进入 imagegen 或生成新图路径。视觉分析约束必须放在 provider 可保留的系统提示前缀，不能因提示截断而失效。低置信或缺置信度视觉读图、不可读图片、泛泛“这是表情包/用于聊天”语义、未核验用户解释、source-less 旧语义和看起来像平台资源 key 的裸 `file_key` 都只能作为 evidence，不能绕过表情包库的可信语义门禁直接发送。裸 `[表情包]` 不是强制发送：如果回复文本有明确夸赞、安慰、吐槽、疑惑等语义约束但没有可靠匹配，应降级为自然文字或合适 reaction，禁止只因为库里只有一个旧候选就硬发错图。
 - Feishu 私发给成员必须走 `cti-direct-message` 受控动作，不允许模型口头声称已私发或手写平台 API。目标可以是明确显示名、原生 mention evidence、历史/群成员唯一候选，或本轮当前发送者（如“我 / 本人 / 发起人 / 发送者”）；群聊成员列表不可用时仍可用本轮 sender open_id/user_id 给当前发送者私发，但不能把群名误当发送者姓名，其他模糊目标必须要求用户提供准确对象。
 - Feishu 跨群、跨会话或按 `chat_id/session_id/targetId` 发送消息必须仍走 `cti-direct-message` 受控动作，但属于 owner-only 操作。bridge 必须先通过 adapter resolver 得到唯一目标，向发起 owner 展示目标名称、类型和平台 ID 并要求确认；确认回调必须来自同一源会话、同一 owner，确认后才调用 adapter 发送。确认卡和源会话结果不得回显待发送正文；目标不唯一、权限不足、确认过期或 resolver 不支持时必须返回未完成，不得让模型口头声称已跨会话发送。
-- Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息或规则说明里出现的 `@名字`，只能作为 evidence prompt 交给 agent 判断；不得触发出站原生 mention 补全、resolver 检索或假 @ 安全拦截。真实当前命令式请求（例如“请艾特某人让他看一下”）仍必须走结构化 mention 解析和权限/候选校验。
+- Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息或规则说明里出现的 `@名字`，只能作为 evidence prompt 交给 agent 判断；不得触发出站原生 mention 补全、resolver 检索或假 @ 安全拦截。真实当前命令式请求（例如“请艾特某人让他看一下”）也必须先进入 agent，由 agent 基于本轮原生 mention evidence 和完整上下文判断是否输出结构化 `cti-final.mentions`，bridge 只负责校验和投递结构化真实 ID，不得在 provider 前快捷执行。
 - Feishu 出站 mention 的目标必须是明确飞书显示名、原生 mention evidence 或结构化 mention；“你自己的主人 / 开发者 / 维护者 / 某个成员 / 相关机器人”这类关系描述和泛称不是可执行目标，不得补 `@目标`、不得触发 resolver/inspector 机械 blocker。若模型输出 `@关系描述`，发送前应移除裸 `@` 并保留文字语义。
+- Feishu 出站不得把裸 `@显示名`、普通显示名或用户文本中的名字交给 resolver 作快捷补全；bridge-manager 只透传 AI/provider 产出的结构化 `mentions`（优先 `cti-final.mentions`）或已受控校验的结构化动作。当前消息即使同时原生 @ 了机器人和目标，也只能作为 agent evidence，不得在 provider 前直接投递；AI 未输出结构化真实 ID 时，后置安全层只能自然说明缺少可投递目标或追问最小缺口，不能查询成员/机器人/历史来补全，也不能覆盖其他正常回复。
+- 显示名解析汇总本轮原生 @、当前群成员/群机器人、当前发送者和历史候选时，必须保留来源等级：本轮原生与当前群平台证据优先，历史只作当前证据缺失时的回退；同一最高等级命中多个不同 ID 才算歧义。禁止让已过期的历史同名记录压制当前群的唯一可原生 @ 身份，也不能为了绕过歧义写死某个机器人名。
+- 对单个通用表情包请求，若本轮确实已向模型附加候选图片、模型只唯一输出其中一个精确 `[表情包:file_key]`，但完全漏写隐藏 `cti-sticker-candidate-analysis` 块，bridge 可一次性投递该真实 sticker；此兜底只证明本轮选择，不得写入长期可信语义或降低后续视觉置信度门槛。
+- 这种一次性表情包许可必须作为 bridge 结构化的 per-turn media action 同时传入普通投递和 streaming card 收尾；adapter 只在动作类型、来源和精确 `file_key` 都与可见 hint 一致时发送，禁止从模型正文、用户文本或不匹配 key 自行推导许可。
 - Feishu 用户问机器人“主人 / 开发者 / 维护者 / 管理员 / owner”是谁时，应基于 bridge 权限库、`CTI_*_OWNER_USERS`、当前发送者角色、adapter bot/app 身份和可用平台管理员 API evidence 生成受控身份上下文交给 agent；不得因为关系词不能 @ 就回答“无法确认”，也不得把 bridge owner 伪称为飞书开放平台开发者，除非有 admin API 证据。
 
 ## 8. 本地模型与 Codex 规则
@@ -150,7 +176,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 
 - MCP 只能从 `config/mcp.d/*.json` 发现。
 - MCP 的 `cwd` 必须命中默认工作区、允许根目录或明确的 Unity 工程路径。
-- Unity 默认项目是 `C:\unity\ST3\Game`。
+- Unity 项目目标必须由当前 `CTI_UNITY_PROJECT_PATH`、MCP manifest `cwd`、允许根目录和项目事实记忆共同确定；不要把历史 `C:\unity\ST3\Game` 当成固定默认项目。执行 Unity MCP 前必须确认当前 Editor `Application.dataPath` 推导出的项目根与配置一致。
 - Ignis 生成能力通过 `config/mcp.d/ignis-mcp.json` 和 `packages/mcp-ignis` 维护，config/token 只允许放在 `C:\Users\admin\.ignis\config.json`，不得写入仓库、release 包或日志。
 - 没有授权时，不要操作其他 Unity 工程或外部项目。
 - 截图、运行游戏、导入资源这类任务不能被降级成“只检查 MCP 在线”。

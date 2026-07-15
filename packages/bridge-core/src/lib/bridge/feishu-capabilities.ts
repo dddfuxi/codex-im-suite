@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process';
+
 import type { SettingsProvider } from './host.js';
 
 type ScopeRequirement = string | string[];
@@ -8,6 +10,19 @@ interface FeishuCapability {
   status: 'ready' | 'partial' | 'manual';
   requiredScopes: ScopeRequirement[];
   note: string;
+}
+
+export interface FeishuCliProbeResult {
+  ok: boolean;
+  version?: string;
+  resolvedPath?: string;
+  error?: string;
+}
+
+export type FeishuCliProbe = (cliPath: string) => FeishuCliProbeResult;
+
+export interface FeishuCapabilityReportOptions {
+  feishuCliProbe?: FeishuCliProbe;
 }
 
 const OAUTH_DEFAULT_SCOPES = [
@@ -158,6 +173,19 @@ function readSetting(store: SettingsProvider, key: string, envKey?: string): str
   return (store.getSetting(key) || (envKey ? process.env[envKey] : '') || '').trim();
 }
 
+function readFirstSetting(store: SettingsProvider, entries: Array<{ key: string; envKey?: string }>): string {
+  for (const entry of entries) {
+    const value = readSetting(store, entry.key, entry.envKey);
+    if (value) return value;
+  }
+  return '';
+}
+
+function parseBoolSetting(raw: string, defaultValue = false): boolean {
+  if (!raw) return defaultValue;
+  return ['1', 'true', 'yes', 'on', 'enabled'].includes(raw.trim().toLowerCase());
+}
+
 function satisfiesRequirement(scopeSet: Set<string>, requirement: ScopeRequirement): boolean {
   if (Array.isArray(requirement)) return requirement.some((scope) => scopeSet.has(scope));
   return scopeSet.has(requirement);
@@ -177,6 +205,87 @@ function formatBool(value: boolean): string {
   return value ? 'yes' : 'no';
 }
 
+function compactLine(value: string | null | undefined, fallback = ''): string {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text || fallback;
+}
+
+function hasPathSeparator(command: string): boolean {
+  return command.includes('\\') || command.includes('/');
+}
+
+function resolveWindowsCommandCandidates(command: string): string[] {
+  if (process.platform !== 'win32' || hasPathSeparator(command) || /\.[a-z0-9]+$/i.test(command)) {
+    return [command];
+  }
+
+  const located = spawnSync('where.exe', [command], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 3000,
+  });
+  const candidates = String(located.stdout || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  // Windows npm 全局命令通常同时存在 .cmd 和 .ps1；优先直接可执行或明确脚本路径，
+  // 避免只凭 PATH 上的裸命令误判 CLI 不存在。
+  return Array.from(new Set(candidates.length > 0 ? candidates : [command]));
+}
+
+function runVersionProbe(command: string): FeishuCliProbeResult {
+  const versionArgs = ['--version'];
+  let executable = command;
+  let args = versionArgs;
+
+  if (process.platform === 'win32' && /\.ps1$/i.test(command)) {
+    executable = 'powershell.exe';
+    args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', command, ...versionArgs];
+  } else if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
+    executable = 'cmd.exe';
+    const quotedCommand = `"${command.replace(/"/g, '""')}"`;
+    args = ['/d', '/s', '/c', `${quotedCommand} --version`];
+  }
+
+  const result = spawnSync(executable, args, {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 3000,
+  });
+  const output = compactLine(`${result.stdout || ''} ${result.stderr || ''}`);
+
+  if (result.error) {
+    return { ok: false, resolvedPath: command, error: compactLine(result.error.message, 'probe failed') };
+  }
+  if (result.status === 0) {
+    return { ok: true, resolvedPath: command, version: output || '(no version output)' };
+  }
+  return {
+    ok: false,
+    resolvedPath: command,
+    error: output || `exit code ${result.status ?? 'unknown'}`,
+  };
+}
+
+function defaultFeishuCliProbe(cliPath: string): FeishuCliProbeResult {
+  const command = cliPath.trim() || 'lark-cli';
+  const candidates = resolveWindowsCommandCandidates(command);
+  const failures: string[] = [];
+
+  for (const candidate of candidates) {
+    const result = runVersionProbe(candidate);
+    if (result.ok) return result;
+    failures.push(`${candidate}: ${result.error || 'probe failed'}`);
+  }
+
+  return {
+    ok: false,
+    resolvedPath: candidates[0] || command,
+    error: failures.join('; ') || 'command not found',
+  };
+}
+
 export function getFeishuRecommendedScopes(): string[] {
   const all = new Set<string>();
   for (const capability of CAPABILITIES) {
@@ -191,7 +300,10 @@ export function getFeishuRecommendedScopes(): string[] {
   return Array.from(all).sort();
 }
 
-export function buildFeishuCapabilityReport(store: SettingsProvider): string {
+export function buildFeishuCapabilityReport(
+  store: SettingsProvider,
+  options: FeishuCapabilityReportOptions = {},
+): string {
   const appId = readSetting(store, 'bridge_feishu_app_id', 'CTI_FEISHU_APP_ID');
   const appSecret = readSetting(store, 'bridge_feishu_app_secret', 'CTI_FEISHU_APP_SECRET');
   const oauthMode = readSetting(store, 'bridge_feishu_oauth_mode', 'CTI_FEISHU_OAUTH_MODE') || 'callback';
@@ -208,6 +320,17 @@ export function buildFeishuCapabilityReport(store: SettingsProvider): string {
   const streamingCardEnabled = streamingCardRaw
     ? ['1', 'true', 'yes', 'on'].includes(streamingCardRaw.toLowerCase())
     : true;
+  const feishuCliEnabledRaw = readFirstSetting(store, [
+    { key: 'bridge_feishu_cli_enabled', envKey: 'CTI_FEISHUCLI_ENABLED' },
+    { key: 'bridge_feishucli_enabled', envKey: 'CTI_FEISHU_CLI_ENABLED' },
+  ]);
+  const feishuCliEnabled = parseBoolSetting(feishuCliEnabledRaw, false);
+  const feishuCliPath = readFirstSetting(store, [
+    { key: 'bridge_feishu_cli_path', envKey: 'CTI_FEISHUCLI_PATH' },
+    { key: 'bridge_feishucli_path', envKey: 'CTI_FEISHU_CLI_PATH' },
+  ]) || 'lark-cli';
+  const feishuCliProbe = options.feishuCliProbe || defaultFeishuCliProbe;
+  const feishuCliProbeResult = feishuCliEnabled ? feishuCliProbe(feishuCliPath) : null;
 
   const lines = [
     'Feishu Developer Platform Capabilities',
@@ -225,8 +348,24 @@ export function buildFeishuCapabilityReport(store: SettingsProvider): string {
     `- Declared opened scopes (CTI_FEISHU_GRANTED_SCOPES): ${declaredScopes.join(', ') || '(not declared)'}`,
     `- Streaming card enabled: ${formatBool(streamingCardEnabled)}`,
     '',
-    'Capability matrix:',
+    'Feishu CLI diagnostics:',
+    `- CLI enabled: ${formatBool(feishuCliEnabled)}`,
+    `- CLI path: ${feishuCliPath}`,
+    '- Cloud chat history path: Feishu OpenAPI adapter',
+    '- CLI is diagnostic only; message receiving, @ 判断, history sync, and replies must not depend on CLI shortcuts.',
   ];
+
+  if (feishuCliProbeResult) {
+    lines.push(`- CLI probe: ${feishuCliProbeResult.ok ? 'ready' : 'blocked'}`);
+    if (feishuCliProbeResult.resolvedPath) lines.push(`- CLI resolved path: ${feishuCliProbeResult.resolvedPath}`);
+    if (feishuCliProbeResult.version) lines.push(`- CLI version: ${feishuCliProbeResult.version}`);
+    if (!feishuCliProbeResult.ok) lines.push(`- CLI blocker: ${feishuCliProbeResult.error || 'unknown'}`);
+  }
+
+  lines.push(
+    '',
+    'Capability matrix:',
+  );
 
   for (const capability of CAPABILITIES) {
     const missing = declaredScopes.length > 0

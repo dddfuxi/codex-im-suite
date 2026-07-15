@@ -167,6 +167,9 @@ describe('local agent JSON tool protocol', () => {
     });
     assert.match(prompt, /Final answer composer/);
     assert.match(prompt, /Required reply style: 像项目助理/);
+    assert.match(prompt, /Convert successful tool evidence into the most helpful completed answer/);
+    assert.match(prompt, /If only part of the request is satisfied, keep the completed part/);
+    assert.match(prompt, /Do not ask the user to manually inspect/);
     assert.doesNotMatch(prompt, /You MUST include the headings/);
     assert.match(prompt, /Scene loaded successfully/);
     assert.doesNotMatch(prompt, /```cti-final/);

@@ -24,19 +24,19 @@ uvx --from mcpforunityserver==<MCPForUnity package.json version> mcp-for-unity -
 8. For screenshot tasks, the requested source is binding. If the user asks for `PreviewCamera`, Game view, or a specific camera, do not substitute a Scene View crop as success. Keep repairing the exact capture path or report the exact blocker.
 9. After screenshot capture, verify the image content. Blank/black/transparent/mostly one-color captures, wrong viewport captures, or Scene View crops for a named camera are failures, not deliverables.
 
-The previous working behavior left this status file:
+Historical ST3 deployments used this status file:
 
 ```text
 C:\unity\ST3\Game\Library\CodexUnityMcpBootstrap.status.txt
 ```
 
-It showed `server_started=True`, `bridge_started=True`, and a verified websocket connection to `ws://127.0.0.1:8081/hub/plugin`. If this regresses, check whether `Assets\Editor\CodexUnityMcpBootstrap.cs` still exists in the Unity project and whether `mcp-for-unity` processes are running.
+It showed `server_started=True`, `bridge_started=True`, and a verified websocket connection to `ws://127.0.0.1:8081/hub/plugin`. Treat it only as old diagnostic context. For the active bridge, derive the Unity project from `CTI_UNITY_PROJECT_PATH` / MCP manifest `cwd`, then check whether `Assets\Editor\CodexUnityMcpBootstrap.cs` exists in that project and whether `mcp-for-unity` processes are running.
 
 ## User-Facing Behavior
 
-- Default bridge work must stay in `C:\unity\ST3`; the Unity project path is `C:\unity\ST3\Game`. Other workspaces are only valid when the configured Feishu owner explicitly requests a path in the current message.
-- For ST3 screenshots, ordinary screenshot requests should prefer portrait Game view or the requested camera. Only explicit overview/landscape requests should produce a 16:9 landscape overview with an adjusted view.
-- Feishu owner-only operations include deleting documents, clearing conversations or memory, changing code, git write operations, writing outside ST3, and approving tool permissions. Use `/whoami` to diagnose the sender ID and configure `CTI_FEISHU_OWNER_USERS`.
+- Default bridge work must follow `CTI_DEFAULT_WORKDIR`; Unity MCP project identity must follow `CTI_UNITY_PROJECT_PATH`, the MCP manifest `cwd`, allowed workspace roots, and project facts memory. Do not hardcode ST3/ST4 in runtime behavior; when the user switches projects, update config and restart bridge.
+- For Unity screenshots, ordinary screenshot requests should prefer portrait Game view or the requested camera. Only explicit overview/landscape requests should produce a 16:9 landscape overview with an adjusted view.
+- Feishu owner-only operations include deleting documents, clearing conversations or memory, changing code, git write operations, writing outside allowed workspace roots, and approving tool permissions. Use `/whoami` to diagnose the sender ID and configure `CTI_FEISHU_OWNER_USERS`.
 - After a bot-created Feishu document succeeds, write a compact memory/index entry under `E:\cli-md\data\documents\index.json` and regenerate `E:\cli-md\data\documents\DOCUMENT_GUIDE.md`. Document list queries should read this index, not full chat history.
 
 - Send short progress updates during long operations.

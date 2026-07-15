@@ -6,6 +6,7 @@ export type BridgeRuntimeStage =
   | 'adapter_waiting'
   | 'message_received'
   | 'message_bound'
+  | 'feedback_started'
   | 'engine_started'
   | 'permission_waiting'
   | 'provider_streaming'

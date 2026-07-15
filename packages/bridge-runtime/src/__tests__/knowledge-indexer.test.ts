@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 
 import {
   buildKnowledgeIndexFromMarkdown,
@@ -8,14 +9,26 @@ import {
 
 const GB_MOJIBAKE_CHINESE = '\u6d93\ue15f\u6783';
 
+function memoryV2Frontmatter(scope: 'user' | 'group' | 'long_term', extra: string[] = []): string {
+  return [
+    '---',
+    'schema: codex-im-suite/memory/v2',
+    `memoryScope: ${scope}`,
+    ...extra,
+    '---',
+    '',
+  ].join('\n');
+}
+
 describe('knowledge indexer', () => {
   it('repairs mojibake before indexing searchable knowledge', () => {
+    const memoryRoot = 'E:\\cli-md';
     const index = buildKnowledgeIndexFromMarkdown({
-      memoryRoot: 'E:\\cli-md',
+      memoryRoot,
       files: [{
-        path: 'E:\\cli-md\\notes.md',
+        path: path.join(memoryRoot, 'data', 'memory', 'v2', 'long-term', 'notes.md'),
         updatedAt: '2026-04-30T10:00:00.000Z',
-        content: `- 事实：HSScene 是 ${GB_MOJIBAKE_CHINESE}场景。`,
+        content: `${memoryV2Frontmatter('long_term')}- 事实：HSScene 是 ${GB_MOJIBAKE_CHINESE}场景。`,
       }],
     });
 
@@ -25,14 +38,83 @@ describe('knowledge indexer', () => {
     assert.equal(searchKnowledgeIndex(index, { query: '中文场景' }).length, 1);
   });
 
-  it('extracts markdown table rows with inferred classifications', () => {
+  it('indexes only v2 memory files with matching schema, scope, and identity boundary', () => {
+    const memoryRoot = 'E:\\cli-md';
+    const validUserFile = path.join(memoryRoot, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_1', 'project.md');
     const index = buildKnowledgeIndexFromMarkdown({
-      memoryRoot: 'E:\\cli-md',
+      memoryRoot,
       files: [
         {
-          path: 'E:\\cli-md\\CodexNotes.md',
+          path: validUserFile,
+          updatedAt: '2026-07-13T10:00:00.000Z',
+          content: [
+            memoryV2Frontmatter('user', [
+              'channelType: feishu',
+              'userId: ou_user_1',
+            ]),
+            '| key | value |',
+            '| --- | --- |',
+            '| 部署偏好 | 先运行测试 |',
+          ].join('\n'),
+        },
+        {
+          path: path.join(memoryRoot, 'docs', 'AI_BRIDGE_CONTEXT.md'),
+          updatedAt: '2026-07-13T10:00:00.000Z',
+          content: '- 事实：docs 里的说明不能进入长期记忆。',
+        },
+        {
+          path: path.join(memoryRoot, 'data', 'explicit-memories', 'legacy.md'),
+          updatedAt: '2026-07-13T10:00:00.000Z',
+          content: '- 事实：旧 explicit memory 不能进入长期记忆。',
+        },
+        {
+          path: path.join(memoryRoot, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_1', 'wrong-schema.md'),
+          updatedAt: '2026-07-13T10:00:00.000Z',
+          content: [
+            '---',
+            'schema: codex-im-suite/partitioned-memory/v1',
+            'memoryScope: user',
+            'channelType: feishu',
+            'userId: ou_user_1',
+            '---',
+            '',
+            '| key | value |',
+            '| --- | --- |',
+            '| 错误旧 schema | 不应索引 |',
+          ].join('\n'),
+        },
+        {
+          path: path.join(memoryRoot, 'data', 'memory', 'v2', 'users', 'feishu', 'ou_user_2', 'mismatch.md'),
+          updatedAt: '2026-07-13T10:00:00.000Z',
+          content: [
+            memoryV2Frontmatter('user', [
+              'channelType: feishu',
+              'userId: ou_user_1',
+            ]),
+            '| key | value |',
+            '| --- | --- |',
+            '| 身份错位 | 不应索引 |',
+          ].join('\n'),
+        },
+      ],
+    });
+
+    assert.equal(index.items.length, 1);
+    assert.equal(index.items[0].key, '部署偏好');
+    assert.equal(index.items[0].value, '先运行测试');
+    assert.equal(index.items[0].source.path, validUserFile);
+  });
+
+  it('extracts markdown table rows with inferred classifications', () => {
+    const memoryRoot = 'E:\\cli-md';
+    const index = buildKnowledgeIndexFromMarkdown({
+      memoryRoot,
+      files: [
+        {
+          path: path.join(memoryRoot, 'data', 'memory', 'v2', 'long-term', 'CodexNotes.md'),
           updatedAt: '2026-04-23T10:00:00.000Z',
           content: [
+            memoryV2Frontmatter('long_term'),
             '# Codex Notes',
             '',
             '## Scene Common Names',
@@ -63,15 +145,19 @@ describe('knowledge indexer', () => {
   });
 
   it('does not classify scene identifier aliases or frontmatter as resources', () => {
+    const memoryRoot = 'E:\\cli-md';
     const index = buildKnowledgeIndexFromMarkdown({
-      memoryRoot: 'E:\\cli-md',
+      memoryRoot,
       files: [
         {
-          path: 'E:\\cli-md\\data\\explicit-memories\\STH.md',
+          path: path.join(memoryRoot, 'data', 'memory', 'v2', 'groups', 'feishu', 'oc_group_1', 'STH.md'),
           updatedAt: '2026-05-11T10:00:00.000Z',
           content: [
             '\uFEFF---',
-            'schema: codex-im-suite/explicit-memory/v1',
+            'schema: codex-im-suite/memory/v2',
+            'memoryScope: group',
+            'channelType: feishu',
+            'chatId: oc_group_1',
             'createdAt: 2026-05-11T09:26:16.228Z',
             '---',
             '',
@@ -94,12 +180,13 @@ describe('knowledge indexer', () => {
   });
 
   it('searches by keyword and type without requiring high-confidence evidence routing', () => {
+    const memoryRoot = 'E:\\cli-md';
     const index = buildKnowledgeIndexFromMarkdown({
-      memoryRoot: 'E:\\cli-md',
+      memoryRoot,
       files: [{
-        path: 'E:\\cli-md\\notes.md',
+        path: path.join(memoryRoot, 'data', 'memory', 'v2', 'long-term', 'notes.md'),
         updatedAt: '2026-04-23T10:00:00.000Z',
-        content: '- 结论：记忆命中默认只注入 Codex，不直接回复。',
+        content: `${memoryV2Frontmatter('long_term')}- 结论：记忆命中默认只注入 Codex，不直接回复。`,
       }],
     });
 

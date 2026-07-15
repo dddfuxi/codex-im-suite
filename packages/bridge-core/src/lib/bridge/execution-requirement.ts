@@ -37,12 +37,14 @@ const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*vi
 const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|图片|图像|文件|文档|上传|下载|game\s*view|scene\s*view)/iu;
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
+const EXPLICIT_INCOMPLETE_REPLY_RE = /(未完成|没有拿到|没拿到|未能|无法|不能|不可用|阻塞|失败|报错|错误|找不到|不存在|未执行|已拒绝)/i;
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
 const TOOL_DOMAIN_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|GameObject|Assets|Packages|ProjectSettings|场景|节点|组件|物体|对象|层级|Hierarchy)/iu;
 const STRICT_EVIDENCE_FAMILIES = new Set(['artifact', 'filesystem', 'shell', 'unity-mcp', 'blender']);
 const PATH_LIKE_TARGET_RE = /(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu;
 const LOW_RISK_CONTEXT_TARGET_RE = /(工作目录|当前目录|本地目录|项目结构|仓库结构|目录|文件夹|子目录|路径|文件|仓库|workspace|repo|repository|mcp\s*manifest|manifest|config\/mcp\.d|配置目录)/iu;
 const COMMAND_INVOCATION_RE = /(powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+)/iu;
+const DEFERRED_REMINDER_INTENT_RE = /(?:(?:\d+\s*)?(?:分钟|小时|天|周|星期|礼拜)后|明天|后天|今天|今晚|上午|下午|晚上|\d{1,2}\s*[点:：]).{0,30}(?:提醒|提示|叫我|告诉我|发消息)|(?:提醒|提示|叫我|告诉我|发消息).{0,30}(?:(?:\d+\s*)?(?:分钟|小时|天|周|星期|礼拜)后|明天|后天|今天|今晚|上午|下午|晚上|\d{1,2}\s*[点:：])/iu;
 
 export interface ToolResultQuality {
   ok: boolean;
@@ -152,6 +154,19 @@ function shouldUseLowRiskLocalProbe(text: string, input: ExecutionRequirementInp
   return !ACTION_VERB_RE.test(text);
 }
 
+function shouldRequireToolEvidenceByDefault(
+  text: string,
+  kind: ExecutionRequirementKind,
+  families: string[],
+): boolean {
+  const familySet = new Set(families.map((family) => family.trim().toLowerCase()).filter(Boolean));
+  if (familySet.has('unity-mcp') || familySet.has('mcp') || familySet.has('web-search')) return true;
+  if (kind === 'artifact_required' && /(截图|截个图|截一张|截屏|图片|图像|game\s*(?:view|视角)|scene\s*view|screenshot|capture)/iu.test(text)) {
+    return true;
+  }
+  return false;
+}
+
 export function isFeishuStickerMessageKind(messageKind?: string): boolean {
   return messageKind === 'feishu_sticker_unknown'
     || messageKind === 'feishu_sticker_known'
@@ -183,6 +198,10 @@ function classifyExecutionRequirementInternal(
     return NONE_REQUIREMENT;
   }
 
+  if (DEFERRED_REMINDER_INTENT_RE.test(text)) {
+    return NONE_REQUIREMENT;
+  }
+
   if (shouldUseLowRiskLocalProbe(text, input)) {
     return makeExecutionRequirement(
       'local_read_required',
@@ -203,13 +222,18 @@ function classifyExecutionRequirementInternal(
 
   if (TOOL_REQUIRED_RE.test(text) || asksForCurrentToolState) {
     const kind = ARTIFACT_RE.test(text) ? 'artifact_required' : 'tool_required';
-    if (options.respectStrictToolRouting && !strictToolRoutingEnabled()) {
+    const families = inferToolFamilies(text, input.files);
+    if (
+      options.respectStrictToolRouting
+      && !strictToolRoutingEnabled()
+      && !shouldRequireToolEvidenceByDefault(text, kind, families)
+    ) {
       return NONE_REQUIREMENT;
     }
     const requirement = makeExecutionRequirement(
       kind,
       'request asks for a concrete tool, MCP, file, command, or artifact action',
-      inferToolFamilies(text, input.files),
+      families,
     );
     return requirement;
   }
@@ -236,7 +260,7 @@ export function classifyExecutionRequirement(input: ExecutionRequirementInput): 
 
 function inferToolFamilies(text: string, files?: FileAttachment[]): string[] {
   const families = new Set<string>();
-  if (/unity|unitymcp|unity mcp|prefab|场景|节点|game\s*view|scene\s*view/iu.test(text)) families.add('unity-mcp');
+  if (/unity|unitymcp|unity mcp|prefab|预制体|场景|节点|game\s*(?:view|视角)|scene\s*view/iu.test(text)) families.add('unity-mcp');
   if (/mcp/iu.test(text)) families.add('mcp');
   if (/blender/iu.test(text)) families.add('blender');
   if (/截图|截个图|截一张|图片|图像/iu.test(text) || (files?.length || 0) > 0) families.add('artifact');
@@ -286,12 +310,52 @@ export function requiresSuccessfulToolEvidence(requirement: ExecutionRequirement
   return requirement.kind !== 'none' && requirement.strictToolEvidence !== false;
 }
 
+function normalizeToolEvidenceName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function hasUnityMcpToolEvidence(toolNames: string[]): boolean {
+  return toolNames.some((name) => {
+    const normalized = normalizeToolEvidenceName(name);
+    return normalized.includes('jsontool:mcp_call')
+      || normalized.includes('jsontool:unity_mcp_execute_code')
+      || normalized.includes('unity')
+      || normalized.includes('mcp')
+      || /(^|[:/._-])(manage_camera|manage_scene|manage_asset|manage_gameobject|find_gameobjects|execute_code|batch_execute)(?:$|[:/._-])/.test(normalized);
+  });
+}
+
+function hasMcpToolEvidence(toolNames: string[]): boolean {
+  return toolNames.some((name) => {
+    const normalized = normalizeToolEvidenceName(name);
+    return normalized.includes('jsontool:mcp_call')
+      || normalized.includes('mcp')
+      || /(^|[:/._-])(web_search|search|fetch|query)(?:$|[:/._-])/.test(normalized);
+  });
+}
+
+function hasRequiredToolFamilyEvidence(
+  requirement: ExecutionRequirement,
+  evidence: { successfulToolResultCount: number; toolNames?: string[] },
+): boolean {
+  if (evidence.successfulToolResultCount <= 0) return false;
+  const toolNames = evidence.toolNames || [];
+  // 兼容老测试 / 老 provider：没有工具名时只能退回计数判断。
+  // 运行时 consumeStream 会填 toolNames，因此实际 IM turn 会按 family 继续校验。
+  if (toolNames.length === 0) return true;
+
+  const families = new Set(requirement.requiredToolFamilies.map((family) => family.trim().toLowerCase()).filter(Boolean));
+  if (families.has('unity-mcp')) return hasUnityMcpToolEvidence(toolNames);
+  if (families.has('mcp') || families.has('web-search')) return hasMcpToolEvidence(toolNames);
+  return true;
+}
+
 export function isExecutionEvidenceSatisfied(
   requirement: ExecutionRequirement,
-  evidence: { successfulToolResultCount: number },
+  evidence: { successfulToolResultCount: number; toolNames?: string[] },
 ): boolean {
   if (!requiresSuccessfulToolEvidence(requirement)) return true;
-  return evidence.successfulToolResultCount > 0;
+  return hasRequiredToolFamilyEvidence(requirement, evidence);
 }
 
 function ctiFinalDeclaresArtifacts(responseText: string): boolean {
@@ -321,6 +385,10 @@ export function shouldReplaceWithNoExecutionEvidenceText(
   if (isExecutionEvidenceSatisfied(requirement, evidence)) return false;
 
   if (ctiFinalDeclaresArtifacts(responseText)) {
+    return false;
+  }
+
+  if (EXPLICIT_INCOMPLETE_REPLY_RE.test(responseText)) {
     return false;
   }
 

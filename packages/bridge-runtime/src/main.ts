@@ -36,6 +36,7 @@ import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-prov
 import { PendingPermissions } from './permission-gateway.js';
 import { setupLogger } from './logger.js';
 import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
+import { ProviderHealthCircuit, type ProviderFailureKind } from './provider-health-circuit.js';
 import { LocalAgentProvider } from './local-agent-provider.js';
 import {
   compressConversationHistory,
@@ -194,6 +195,10 @@ function normalizeMemoryIntentDecision(payload: Record<string, unknown> | null):
   const rawConfidence = typeof payload.confidence === 'number'
     ? payload.confidence
     : Number.parseFloat(String(payload.confidence ?? '0'));
+  const rawScope = typeof payload.scope === 'string' ? payload.scope.trim().toLowerCase() : '';
+  const scope = rawScope === 'temporary' || rawScope === 'user' || rawScope === 'group' || rawScope === 'long_term'
+    ? rawScope
+    : undefined;
   const candidates = Array.isArray(payload.candidates)
     ? payload.candidates
       .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
@@ -209,6 +214,7 @@ function normalizeMemoryIntentDecision(payload: Record<string, unknown> | null):
   return {
     action,
     confidence: Number.isFinite(rawConfidence) ? Math.max(0, Math.min(1, rawConfidence)) : 0,
+    scope,
     reason: typeof payload.reason === 'string' ? payload.reason.slice(0, 160) : undefined,
     candidates,
     clarification: typeof payload.clarification === 'string' ? payload.clarification.slice(0, 240) : undefined,
@@ -227,7 +233,17 @@ async function collectProviderText(provider: LLMProvider, params: Parameters<LLM
       const { done, value } = await reader.read();
       if (done) break;
       for (const event of parseBridgeSseEvents(value)) {
-        if (event.type === 'text' && typeof event.data === 'string') text += event.data;
+        if (event.type === 'text') {
+          // Classifier providers may stream strict JSON either as a plain
+          // string or as an already-parsed object after SSE normalization.
+          // Preserve both forms so the intent decision is not downgraded to
+          // invalid_json/ignore just because the transport parsed it early.
+          if (typeof event.data === 'string') {
+            text += event.data;
+          } else if (event.data && typeof event.data === 'object') {
+            text += JSON.stringify(event.data);
+          }
+        }
         if (event.type === 'error') {
           throw new Error(typeof event.data === 'string' ? event.data : 'provider error');
         }
@@ -240,7 +256,10 @@ async function collectProviderText(provider: LLMProvider, params: Parameters<LLM
 }
 
 class ProviderMemoryIntentHost implements MemoryIntentHost {
-  constructor(private readonly provider: LLMProvider) {}
+  constructor(
+    private readonly provider: LLMProvider,
+    private readonly timeoutMs = 4000,
+  ) {}
 
   async classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision> {
     const recent = (input.recentMessages || [])
@@ -251,9 +270,14 @@ class ProviderMemoryIntentHost implements MemoryIntentHost {
       '判断当前用户消息是否要求写入、更新、覆盖或保存长期记忆。',
       '只返回 JSON，不要解释，不要输出思考过程。',
       'JSON schema:',
-      '{"action":"write|ignore|clarify","confidence":0.0,"reason":"short","candidates":[{"key":"记忆键","value":"记忆值","text":"完整事实","confidence":0.0}],"clarification":"optional"}',
+      '{"action":"write|ignore|clarify","scope":"temporary|user|group|long_term","confidence":0.0,"reason":"short","candidates":[{"key":"记忆键","value":"记忆值","text":"完整事实","confidence":0.0}],"clarification":"optional"}',
       '规则：',
-      '- 如果用户要求记住、记录、更新某个事实、偏好、命名、路径、分支、配置或对应表，action=write。',
+      '- 先判断这是不是记忆操作，再决定范围；不要因为出现“记住”二字直接写入。',
+      '- 只在用户明确要求记住、记录、更新某个事实、偏好、命名、路径、分支、配置或对应表时，action=write。',
+      '- 项目限定映射、命名表、固定键值对应关系也是记忆候选：当用户明确声明“只在某项目/范围生效”“不在其他项目记录里”“等号前是固定名/固定键”等范围证据时，即使没有出现“记住”二字，也按可保存事实判断。',
+      '- 这类项目限定映射若项目/范围清晰且需要跨会话复用，优先 scope=long_term；若项目范围或适用对象不唯一，action=clarify。',
+      '- temporary 只保留当前会话上下文；user 只属于当前用户 ID；group 只属于当前群；long_term 是跨会话公共事实，必须有明确长期/公共/项目范围证据。',
+      '- 不能从消息和最近上下文唯一判断范围、对象或事实时，action=clarify，并给出最小澄清问题。',
       '- 如果当前消息使用“这个/它/重新记一下”等指代，可以从最近上下文补全，但候选值必须真实出现在当前消息或最近上下文。',
       '- 如果缺少可保存的 key 或 value 且无法从最近上下文唯一补全，action=clarify。',
       '- 普通提问、执行任务、闲聊、工具请求不是记忆写入，action=ignore。',
@@ -273,7 +297,7 @@ class ProviderMemoryIntentHost implements MemoryIntentHost {
       conversationHistory: [],
       replyPresentation: { replyStyleHint: '简洁、只给结论' },
       executionRequirement: { kind: 'none', reason: 'memory intent classification', requiredToolFamilies: [] },
-    }, 25_000);
+    }, Math.max(10, Math.floor(this.timeoutMs)));
     return normalizeMemoryIntentDecision(extractJsonObject(text));
   }
 }
@@ -402,6 +426,33 @@ function getBufferedFailoverError(chunks: string[]): string | null {
   return hasUserVisibleOrToolOutput ? null : errorEvent.data;
 }
 
+function hasMeaningfulFailoverOutput(chunks: string[]): boolean {
+  return chunks
+    .flatMap(parseSseChunk)
+    .some((event) => event.type === 'text'
+      || event.type === 'tool_use'
+      || event.type === 'tool_result'
+      || event.type === 'result');
+}
+
+async function readProviderChunkWithDeadline(
+  reader: ReadableStreamDefaultReader<string>,
+  timeoutMs: number,
+): Promise<{ done: boolean; value: string | undefined }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`provider candidate timeout (${timeoutMs}ms)`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function isCodexSourceConfigured(config: Config, source: CodexModelSource): boolean {
   if (source === 'official') return true;
   if (source === 'local_api') {
@@ -455,17 +506,28 @@ function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistor
 class CodexApiFailoverProvider implements LLMProvider {
   constructor(
     private readonly providers: Array<{ source: CodexModelSource; provider: LLMProvider }>,
+    private readonly options: { candidateTimeoutMs?: number } = {},
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
-    const providers = this.providers;
+    return this.streamChatExcluding(params, new Set());
+  }
+
+  streamChatExcluding(
+    params: Parameters<LLMProvider['streamChat']>[0],
+    excludedSources: ReadonlySet<CodexModelSource>,
+  ): ReturnType<LLMProvider['streamChat']> {
+    const providers = this.providers.filter((candidate) => !excludedSources.has(candidate.source));
     return new ReadableStream<string>({
       start: async (controller) => {
         const attemptedSources: CodexModelSource[] = [];
         let lastError: unknown;
+        const candidateTimeoutMs = Math.max(250, Math.floor(this.options.candidateTimeoutMs ?? 2000));
+        candidateLoop:
         for (const candidate of providers) {
           attemptedSources.push(candidate.source);
           const buffered: string[] = [];
+          let reader: ReadableStreamDefaultReader<string> | null = null;
           try {
             controller.enqueue(sseEvent('status', {
               provider: 'codex',
@@ -474,30 +536,48 @@ class CodexApiFailoverProvider implements LLMProvider {
               attemptedSources,
             }));
             const stream = candidate.provider.streamChat(params);
-            const reader = stream.getReader();
+            reader = stream.getReader();
+            const candidateDeadlineAt = Date.now() + candidateTimeoutMs;
             while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
+              const remainingMs = Math.max(1, candidateDeadlineAt - Date.now());
+              const { done, value } = await readProviderChunkWithDeadline(reader, remainingMs);
+              if (done) {
+                for (const chunk of buffered) controller.enqueue(chunk);
+                controller.close();
+                return;
+              }
+              if (value === undefined) continue;
               buffered.push(value);
+              const bufferedFailoverError = getBufferedFailoverError(buffered);
+              if (bufferedFailoverError && isCodexApiFailoverError(bufferedFailoverError)) {
+                lastError = new Error(bufferedFailoverError);
+                controller.enqueue(sseEvent('status', {
+                  provider: 'codex',
+                  modelSource: candidate.source,
+                  selectedSource: candidate.source,
+                  attemptedSources,
+                  failover: true,
+                  error: summarizeCodexFailureMessage(bufferedFailoverError),
+                }));
+                await reader.cancel().catch(() => {});
+                continue candidateLoop;
+              }
+              if (!hasMeaningfulFailoverOutput(buffered)) continue;
+
+              // Once real output exists, commit this candidate and stream it
+              // directly. Switching after visible/tool output could duplicate work.
+              for (const chunk of buffered) controller.enqueue(chunk);
+              while (true) {
+                const next = await reader.read();
+                if (next.done) break;
+                controller.enqueue(next.value);
+              }
+              controller.close();
+              return;
             }
-            const bufferedFailoverError = getBufferedFailoverError(buffered);
-            if (bufferedFailoverError && isCodexApiFailoverError(bufferedFailoverError)) {
-              lastError = new Error(bufferedFailoverError);
-              controller.enqueue(sseEvent('status', {
-                provider: 'codex',
-                modelSource: candidate.source,
-                selectedSource: candidate.source,
-                attemptedSources,
-                failover: true,
-                error: summarizeCodexFailureMessage(bufferedFailoverError),
-              }));
-              continue;
-            }
-            for (const chunk of buffered) controller.enqueue(chunk);
-            controller.close();
-            return;
           } catch (error) {
             lastError = error;
+            if (reader) await reader.cancel().catch(() => {});
             if (!isCodexApiFailoverError(error)) throw error;
             const message = error instanceof Error ? error.message : String(error);
             controller.enqueue(sseEvent('status', {
@@ -811,6 +891,8 @@ function buildExecutorSourceStatusById(config: Config, executorId: string): Reco
 }
 
 class HubLlmProvider implements LLMProvider {
+  private readonly providerHealthCircuit: ProviderHealthCircuit;
+
   constructor(
     private readonly config: Config,
     private readonly store: BridgeStore,
@@ -827,7 +909,12 @@ class HubLlmProvider implements LLMProvider {
     // primary chain. Optional for backward compat with legacy test
     // harnesses that don't need external dispatch.
     private readonly executorRegistry?: ExecutorProviderRegistry,
-  ) {}
+  ) {
+    this.providerHealthCircuit = new ProviderHealthCircuit({
+      failureThreshold: 1,
+      cooldownMs: this.config.providerCircuitCooldownMs ?? 60_000,
+    });
+  }
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
     const routerMode = getLocalRouterMode(this.config);
@@ -1261,6 +1348,7 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
   ): Promise<void> {
     const lightParams = buildLightChatParams(params, this.config);
+    const providerKey = this.getLocalProviderHealthKey();
     const summary: Omit<LocalLlmRouteSummary, 'timestamp'> = {
       mode,
       taskKind: 'light_chat',
@@ -1271,18 +1359,42 @@ class HubLlmProvider implements LLMProvider {
       compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
       promptProfile: 'light_chat',
     };
+    if (!this.providerHealthCircuit.tryAcquire(providerKey)) {
+      await this.pipeFallbackStream(controller, lightParams, {
+        mode,
+        taskKind: 'light_chat',
+        decision: 'escalate_codex',
+        provider: 'codex',
+        reason: 'light_chat_fast_path_skipped; local provider circuit open',
+        compressedPromptChars: lightParams.prompt.length,
+        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
+        promptProfile: 'light_chat',
+        fallbackReason: '本地模型近期不可用，已快速跳过',
+      }, this.fallbackProvider, { excludeCodexSources: new Set<CodexModelSource>(['local_api']) });
+      return;
+    }
     try {
       const result = await this.localProvider.complete(
         this.buildLightChatLocalMessages(lightParams),
         {
           temperature: 0.35,
           maxTokens: Math.min(256, Math.max(96, this.config.localLlmMaxOutputTokens || 160)),
-          timeoutMs: Math.max(5000, Math.min(20000, this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 12000)),
+          timeoutMs: this.config.lightChatFastPathTimeoutMs ?? 2000,
         },
       );
+      this.providerHealthCircuit.recordSuccess(providerKey);
       this.emitLocalSuccess(controller, lightParams.sessionId, result.text, result.usage, summary);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.providerHealthCircuit.recordFailure(providerKey, this.classifyLocalProviderFailure(error));
+      const current = readLocalLlmStatus(this.config);
+      updateLocalLlmStatus(this.config, {
+        routeFailures: current.routeFailures + 1,
+        serverReachable: false,
+        lastCheckAt: new Date().toISOString(),
+        lastError: message,
+        lastFallbackReason: message,
+      });
       await this.pipeFallbackStream(controller, lightParams, {
         mode,
         taskKind: 'light_chat',
@@ -1293,8 +1405,26 @@ class HubLlmProvider implements LLMProvider {
         compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
         promptProfile: 'light_chat',
         fallbackReason: message,
-      }, this.fallbackProvider);
+      }, this.fallbackProvider, { excludeCodexSources: new Set<CodexModelSource>(['local_api']) });
     }
+  }
+
+  private getLocalProviderHealthKey(): string {
+    const kind = this.config.localAiKind || 'ollama';
+    const endpoint = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434')
+      .trim()
+      .replace(/\/+$/, '')
+      .toLowerCase();
+    const model = (this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || '').trim().toLowerCase();
+    return `${kind}:${endpoint}:${model}`;
+  }
+
+  private classifyLocalProviderFailure(error: unknown): ProviderFailureKind {
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    if (/timeout|超时|abort/.test(message)) return 'timeout';
+    if (/fetch failed|econn|connection|socket|enotfound|network/.test(message)) return 'transport';
+    if (/http\s+(?:4\d\d|5\d\d)|model.*(?:not found|missing|不存在)/.test(message)) return 'server';
+    return 'content';
   }
 
   private buildLightChatLocalMessages(params: Parameters<LLMProvider['streamChat']>[0]): LocalModelMessage[] {
@@ -1690,6 +1820,7 @@ class HubLlmProvider implements LLMProvider {
     params: Parameters<LLMProvider['streamChat']>[0],
     summary: Omit<LocalLlmRouteSummary, 'timestamp'>,
     provider: LLMProvider = this.fallbackProvider,
+    options?: { excludeCodexSources?: ReadonlySet<CodexModelSource> },
   ): Promise<void> {
     const current = readLocalLlmStatus(this.config);
     appendLocalLlmRouteSummary(this.config, {
@@ -1698,9 +1829,6 @@ class HubLlmProvider implements LLMProvider {
     }, {
       routeHits: current.routeHits + 1,
       escalationCount: current.escalationCount + 1,
-      serverReachable: true,
-      lastCheckAt: new Date().toISOString(),
-      lastError: '',
     });
     controller.enqueue(sseEvent('status', {
       provider: summary.provider,
@@ -1712,7 +1840,9 @@ class HubLlmProvider implements LLMProvider {
       ...(summary.promptProfile ? { promptProfile: summary.promptProfile } : {}),
     }));
     try {
-      const stream = provider.streamChat(params);
+      const stream = provider instanceof CodexApiFailoverProvider && options?.excludeCodexSources
+        ? provider.streamChatExcluding(params, options.excludeCodexSources)
+        : provider.streamChat(params);
       const reader = stream.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -2219,7 +2349,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
         source,
         provider: createCodexProvider(source),
-      })))
+      })), { candidateTimeoutMs: config.codexFailoverCandidateTimeoutMs })
       : createCodexProvider(config.codexModelSource || 'official');
     return wrapCodexMainProvider(primaryProvider);
   }
@@ -2252,7 +2382,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
         source,
         provider: createCodexProvider(source),
-      })))
+      })), { candidateTimeoutMs: config.codexFailoverCandidateTimeoutMs })
       : createCodexProvider(config.codexModelSource || 'official');
     return wrapCodexMainProvider(primaryProvider);
   }
@@ -2557,7 +2687,7 @@ async function main(): Promise<void> {
         userId: input.userId,
       }),
     },
-    memoryIntents: new ProviderMemoryIntentHost(llm),
+    memoryIntents: new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         try {
@@ -2749,4 +2879,4 @@ if (isEntryPoint) {
 // integration test (`hub-llm-provider.test.ts`). The class itself is
 // runtime-internal; the only consumer outside `main.ts` is the test
 // suite, which `await import('../main.js')`s this module.
-export { HubLlmProvider };
+export { HubLlmProvider, CodexApiFailoverProvider, ProviderMemoryIntentHost };

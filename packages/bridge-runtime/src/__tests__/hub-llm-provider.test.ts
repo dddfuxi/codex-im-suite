@@ -137,6 +137,132 @@ describe('hub-llm-provider dispatch contract', () => {
     if (prevCtiHomeHlp === undefined) delete process.env.CTI_HOME;
     else process.env.CTI_HOME = prevCtiHomeHlp;
   });
+
+  it('skips an unhealthy local light-chat provider after the first transport failure', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    const { readLocalLlmStatus } = await import('../local-llm-status.js');
+    const config: Config = {
+      ...baseConfig,
+      ollamaEnabled: true,
+      localLlmEnabled: true,
+      localLlmRouterEnabled: true,
+      localLlmForceHub: true,
+      localLlmRouterMode: 'hybrid',
+      lightChatFastPathEnabled: true,
+      localAiBaseUrl: 'http://127.0.0.1:11434',
+      localAiModel: 'test-model',
+    };
+    let localCalls = 0;
+    let fallbackCalls = 0;
+    const localProvider = {
+      complete: async () => {
+        localCalls += 1;
+        throw new Error('fetch failed');
+      },
+    };
+    const fallbackProvider = {
+      streamChat: () => {
+        fallbackCalls += 1;
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'Codex 回复' })}\n\n`);
+            controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: '{}' })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const hub = new HubLlmProvider(
+      config,
+      new JsonFileStore(new Map()),
+      localProvider as never,
+      {} as never,
+      fallbackProvider as never,
+      null,
+      'codex',
+      fallbackProvider as never,
+    );
+    const lightParams = {
+      ...params({ prompt: '在呢', permissionMode: 'acceptEdits' }),
+      systemPrompt: [
+        'Channel assistant identity:',
+        'Feishu emoji presentation:',
+        'Feishu sticker library:',
+      ].join('\n'),
+    };
+
+    await collectSse(hub.streamChat(lightParams));
+    await collectSse(hub.streamChat({ ...lightParams, sessionId: `${lightParams.sessionId}-2` }));
+
+    assert.equal(localCalls, 1, 'open circuit must skip repeated local attempts');
+    assert.equal(fallbackCalls, 2);
+    assert.equal(readLocalLlmStatus(config).serverReachable, false, 'Codex fallback must not overwrite local health');
+  });
+
+  it('does not retry the same local target inside the Codex failover chain', async () => {
+    const { HubLlmProvider, CodexApiFailoverProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    const config: Config = {
+      ...baseConfig,
+      ollamaEnabled: true,
+      localLlmEnabled: true,
+      localLlmRouterEnabled: true,
+      localLlmForceHub: true,
+      localLlmRouterMode: 'hybrid',
+      lightChatFastPathEnabled: true,
+      localAiBaseUrl: 'http://127.0.0.1:11434',
+      localAiModel: 'test-model',
+    };
+    let failoverLocalCalls = 0;
+    let officialCalls = 0;
+    const localFastPath = { complete: async () => { throw new Error('fetch failed'); } };
+    const localFailoverProvider: LLMProvider = {
+      streamChat: () => {
+        failoverLocalCalls += 1;
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'error', data: 'fetch failed' })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const officialProvider: LLMProvider = {
+      streamChat: () => {
+        officialCalls += 1;
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'official-ok' })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const fallback = new CodexApiFailoverProvider([
+      { source: 'local_api', provider: localFailoverProvider },
+      { source: 'official', provider: officialProvider },
+    ], { candidateTimeoutMs: 100 });
+    const hub = new HubLlmProvider(
+      config,
+      new JsonFileStore(new Map()),
+      localFastPath as never,
+      {} as never,
+      fallback,
+      null,
+      'codex',
+      fallback,
+    );
+
+    await collectSse(hub.streamChat({
+      ...params({ prompt: '在呢', permissionMode: 'acceptEdits' }),
+      systemPrompt: 'Channel assistant identity:\nFeishu emoji presentation:\nFeishu sticker library:',
+    }));
+
+    assert.equal(failoverLocalCalls, 0, 'a failed local target must not be retried in the same turn');
+    assert.equal(officialCalls, 1);
+  });
+
   it('registry routes @mavis hint to MavisExecutorProvider (not the default Codex chain)', async () => {
     const registry = new ExecutorProviderRegistry();
     const mavisClient = new ScriptedMavisClient({});

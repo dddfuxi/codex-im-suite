@@ -541,7 +541,7 @@ type KnowledgeSearchResponse = {
   limit?: number;
 };
 
-type MemorySourceGroup = 'explicit_memory' | 'direct_reminder' | 'generated_summary' | 'context_doc' | 'document_index' | 'root_note' | 'other' | string;
+type MemorySourceGroup = 'memory_user' | 'memory_group' | 'memory_long_term' | 'direct_reminder' | 'other' | string;
 
 type MemorySourceSummaryItem = {
   sourcePath: string;
@@ -618,9 +618,22 @@ type FeishuStickerLibraryItem = {
   avoidWhen: string;
   examples: string[];
   annotationConfidence: number;
+  annotationSource: string;
+  annotationVerifiedAt: string;
+  hasUserAnnotation: boolean;
+  hasTrustedSemantic: boolean;
+  hasMedia: boolean;
+  isLibraryAsset: boolean;
+  isHistoryOnly: boolean;
+  hasMediaDownloadFailure: boolean;
+  mediaExtensionMismatch: boolean;
+  statusLabel: string;
   firstSeenAt: string;
   lastSeenAt: string;
   lastUsedAt: string;
+  mediaCachedAt: string;
+  mediaDownloadFailedAt: string;
+  mediaDownloadError: string;
   useCount: number;
   disabled: boolean;
   disabledReason: string;
@@ -4352,12 +4365,10 @@ const visualKnowledgeKinds = knowledgeKinds.filter((item) => item.id !== 'all');
 
 const memorySourceGroups = [
   { id: 'all', label: '全部来源' },
-  { id: 'explicit_memory', label: '显式记忆' },
+  { id: 'memory_user', label: '用户记忆' },
+  { id: 'memory_group', label: '群聊记忆' },
+  { id: 'memory_long_term', label: '长期记忆' },
   { id: 'direct_reminder', label: '直接提醒' },
-  { id: 'generated_summary', label: '生成摘要' },
-  { id: 'context_doc', label: '上下文文档' },
-  { id: 'document_index', label: '文档索引' },
-  { id: 'root_note', label: '根目录笔记' },
   { id: 'other', label: '其他来源' },
 ] as const;
 
@@ -4365,16 +4376,19 @@ function memorySourceGroupLabel(group: string) {
   return memorySourceGroups.find((item) => item.id === group)?.label || group || '未知来源';
 }
 
-function memorySourceBucket(group: string) {
+type MemorySourceBucket = 'primary' | 'summary' | 'context';
+
+function memorySourceBucket(group: string): MemorySourceBucket {
   switch (group) {
-    case 'explicit_memory':
+    case 'memory_user':
+    case 'memory_group':
+    case 'memory_long_term':
     case 'direct_reminder':
       return 'primary';
+    // 只把显式声明为摘要类的旧/外部来源放进摘要分区；v2 主记忆不再生成 summary 源。
     case 'generated_summary':
+    case 'memory_summary':
       return 'summary';
-    case 'context_doc':
-    case 'document_index':
-    case 'root_note':
     case 'other':
     default:
       return 'context';
@@ -4634,7 +4648,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [selectedOptimizationActions, setSelectedOptimizationActions] = useState<string[]>([]);
   const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', mediaDir: '', updatedAt: '', stickers: [] });
   const [stickerQuery, setStickerQuery] = useState('');
-  const [stickerStatusFilter, setStickerStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
+  const [stickerStatusFilter, setStickerStatusFilter] = useState<'asset' | 'all' | 'enabled' | 'disabled' | 'failed' | 'history'>('asset');
   const [stickerChatFilter, setStickerChatFilter] = useState('all');
   const [editingStickerKey, setEditingStickerKey] = useState('');
   const [editingSticker, setEditingSticker] = useState<Partial<FeishuStickerLibraryItem>>({});
@@ -4918,8 +4932,14 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const visibleStickers = useMemo(() => {
     const queryText = stickerQuery.trim().toLowerCase();
     return stickerLibrary.stickers.filter((item) => {
-      if (stickerStatusFilter === 'enabled' && item.disabled) return false;
+      const isLibraryAsset = item.isLibraryAsset !== false;
+      const isHistoryOnly = item.isHistoryOnly === true;
+      const hasMediaFailure = item.hasMediaDownloadFailure === true || Boolean(item.mediaDownloadFailedAt || item.mediaDownloadError);
+      if (stickerStatusFilter === 'asset' && !isLibraryAsset) return false;
+      if (stickerStatusFilter === 'enabled' && (item.disabled || !isLibraryAsset)) return false;
       if (stickerStatusFilter === 'disabled' && !item.disabled) return false;
+      if (stickerStatusFilter === 'failed' && !hasMediaFailure) return false;
+      if (stickerStatusFilter === 'history' && !isHistoryOnly) return false;
       if (stickerChatFilter !== 'all' && item.chatId !== stickerChatFilter) return false;
       if (!queryText) return true;
       const haystack = [
@@ -4939,8 +4959,14 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const stickerStats = useMemo(() => {
     const total = stickerLibrary.stickers.length;
     const disabled = stickerLibrary.stickers.filter((item) => item.disabled).length;
-    const annotated = stickerLibrary.stickers.filter((item) => item.label || item.intent || item.tone || item.usage).length;
-    return { total, enabled: total - disabled, disabled, annotated };
+    const trusted = stickerLibrary.stickers.filter((item) => item.hasTrustedSemantic).length;
+    const cached = stickerLibrary.stickers.filter((item) => item.hasMedia).length;
+    const userOnly = stickerLibrary.stickers.filter((item) => item.hasUserAnnotation && !item.hasTrustedSemantic).length;
+    const failed = stickerLibrary.stickers.filter((item) => item.hasMediaDownloadFailure || item.mediaDownloadFailedAt || item.mediaDownloadError).length;
+    const historyOnly = stickerLibrary.stickers.filter((item) => item.isHistoryOnly === true).length;
+    const assets = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false).length;
+    const enabled = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false && !item.disabled).length;
+    return { total, assets, enabled, disabled, trusted, cached, userOnly, failed, historyOnly };
   }, [stickerLibrary.stickers]);
   const memoryRelationGroups = useMemo(() => buildMemoryRelationGroups(selectedMemory, reminders), [selectedMemory, reminders]);
   const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
@@ -5104,12 +5130,16 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           title="Feishu 表情包库"
           action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerLibrary()} pending={pending['memory.feishuStickers']} />}
         />
-        <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；禁用项不会进入提示词、语义匹配或裸表情包候选。</p>
+        <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；默认隐藏仅历史 key 和媒体下载失败的空索引记录。禁用项不会进入提示词、语义匹配或裸表情包候选。</p>
         <div className="memory-optimizer-summary">
-          <Metric label="表情包" value={String(stickerStats.total)} compact />
+          <Metric label="可管理" value={String(stickerStats.assets)} compact />
+          <Metric label="历史 key" value={String(stickerStats.historyOnly)} compact />
           <Metric label="启用" value={String(stickerStats.enabled)} compact />
           <Metric label="禁用" value={String(stickerStats.disabled)} compact />
-          <Metric label="已标注" value={String(stickerStats.annotated)} compact />
+          <Metric label="可信语义" value={String(stickerStats.trusted)} compact />
+          <Metric label="已缓存图" value={String(stickerStats.cached)} compact />
+          <Metric label="仅用户解释" value={String(stickerStats.userOnly)} compact />
+          <Metric label="下载失败" value={String(stickerStats.failed)} compact />
         </div>
         <div className="sticker-library-toolbar">
           <div className="filter-row">
@@ -5120,10 +5150,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
               placeholder="搜索名称、别名、意图、语气、用法或群聊"
             />
           </div>
-          <select value={stickerStatusFilter} onChange={(event) => setStickerStatusFilter(event.target.value as 'all' | 'enabled' | 'disabled')}>
-            <option value="all">全部状态</option>
+          <select value={stickerStatusFilter} onChange={(event) => setStickerStatusFilter(event.target.value as 'asset' | 'all' | 'enabled' | 'disabled' | 'failed' | 'history')}>
+            <option value="asset">可管理资产</option>
+            <option value="all">全部记录</option>
             <option value="enabled">仅启用</option>
             <option value="disabled">仅禁用</option>
+            <option value="failed">媒体失败</option>
+            <option value="history">仅历史 key</option>
           </select>
           <select value={stickerChatFilter} onChange={(event) => setStickerChatFilter(event.target.value)}>
             <option value="all">全部 chat</option>
@@ -5143,9 +5176,9 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                     </span>
                     <div>
                       <strong>{title}</strong>
-                      <span>{item.intent || item.tone || item.usage || (item.previewUrl ? '已缓存图片，未标注语义' : '未标注语义')}</span>
+                      <span>{item.intent || item.tone || item.usage || item.statusLabel || (item.previewUrl ? '已缓存图片，待视觉标注' : '仅历史 key，无媒体')}</span>
                     </div>
-                    <StatusPill status={item.disabled ? 'warning' : 'ok'} label={item.disabled ? '已禁用' : '启用'} />
+                    <StatusPill status={item.disabled || !item.hasTrustedSemantic ? 'warning' : 'ok'} label={item.statusLabel || (item.disabled ? '已禁用' : '启用')} />
                   </div>
                   <div className="sticker-alias-row">
                     {item.aliases.length > 0 ? item.aliases.slice(0, 12).map((alias) => <code key={alias}>{alias}</code>) : <span>暂无别名</span>}
@@ -5176,6 +5209,9 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                     <summary>诊断字段</summary>
                     <code>{item.fileKey}</code>
                     <span>media: {item.mediaPath || '-'}</span>
+                    <span>mediaType: {item.mediaMimeType || '-'}{item.mediaExtensionMismatch ? '（扩展名与真实格式不一致）' : ''}</span>
+                    <span>语义来源: {item.annotationSource || '-'}，核验时间 {item.annotationVerifiedAt || '-'}</span>
+                    <span>媒体缓存 {item.mediaCachedAt || '-'}，下载失败 {item.mediaDownloadFailedAt || item.mediaDownloadError || '-'}</span>
                     <span>chat: {item.chatId || '-'}</span>
                     <span>使用 {item.useCount} 次，最近收到 {item.lastSeenAt || '-'}，最近发送 {item.lastUsedAt || '-'}</span>
                     <span>置信度 {Math.round((item.annotationConfidence || 0) * 100)}%，最近编辑 {item.lastEditedAt || '-'}</span>
@@ -5848,7 +5884,7 @@ function SettingsPage({
         </div>
         <div className="project-fact-hint">
           <strong>项目事实</strong>
-          <span>Unity 工程、常用场景、素材目录这类长期事实不再作为全局路径字段保存；需要时请通过记忆记录到项目事实，机器人会在后续对话中按记忆检索使用。</span>
+          <span>默认工作目录只表示机器人没有更明确目标时的起步项目；允许根目录表示可访问范围。临时图片/附件缓存默认进入 Bridge 运行态 uploads，表情包长期资产进入记忆仓库，不应再落到默认工作目录。Unity 工程、常用场景、素材目录这类长期事实请通过记忆记录到项目事实，机器人会在后续对话中按记忆检索使用。</span>
         </div>
       </section>
       <section className="panel panel-span-2">

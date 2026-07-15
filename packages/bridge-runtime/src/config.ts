@@ -11,6 +11,7 @@ export interface Config {
   allowedWorkspaceRoots?: string[];
   codexAdditionalDirectories?: string[];
   memoryRepoDir?: string;
+  uploadCacheDir?: string;
   unityProjectPath?: string;
   contextHistoryMaxChars?: number;
   contextHistoryMessageMaxChars?: number;
@@ -33,6 +34,7 @@ export interface Config {
   codexModelSource?: 'official' | 'local_api' | 'external_api';
   codexRoutingMode?: 'manual' | 'auto_failover';
   codexApiFallbackChain?: Array<'local_api' | 'external_api' | 'official'>;
+  codexFailoverCandidateTimeoutMs?: number;
   codexBaseUrl?: string;
   codexApiKey?: string;
   codexModel?: string;
@@ -62,6 +64,9 @@ export interface Config {
   localLlmMaxOutputTokens?: number;
   localLlmComplexityMode?: string;
   lightChatFastPathEnabled?: boolean;
+  lightChatFastPathTimeoutMs?: number;
+  providerCircuitCooldownMs?: number;
+  memoryIntentTimeoutMs?: number;
   lightChatHistoryLimit?: number;
   lightChatMaxInputChars?: number;
   replyStyleHint?: string;
@@ -252,6 +257,10 @@ function getDefaultMemoryRepoDir(): string {
   return process.platform === "win32" ? "E:\\cli-md" : path.join(CTI_HOME, "memory-repo");
 }
 
+function getDefaultUploadCacheDir(): string {
+  return path.join(CTI_HOME, "runtime", "uploads");
+}
+
 function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string): string {
   const fallback = getDefaultMemoryRepoDir();
   const configured = rawMemoryRepoDir && rawMemoryRepoDir.trim() ? rawMemoryRepoDir.trim() : fallback;
@@ -260,6 +269,13 @@ function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultW
     return fallback;
   }
   return normalized;
+}
+
+function resolveSafeUploadCacheDir(rawUploadCacheDir: string | undefined, defaultWorkDir: string): string {
+  const fallback = getDefaultUploadCacheDir();
+  const configured = rawUploadCacheDir && rawUploadCacheDir.trim() ? rawUploadCacheDir.trim() : fallback;
+  const normalized = path.resolve(configured);
+  return isSameOrChildPath(normalized, defaultWorkDir) ? fallback : normalized;
 }
 
 export function loadConfig(): Config {
@@ -276,6 +292,7 @@ export function loadConfig(): Config {
   const defaultWorkDir = env.get("CTI_DEFAULT_WORKDIR") || process.cwd();
   const codexAdditionalDirectories = splitPathList(env.get("CTI_CODEX_ADDITIONAL_DIRECTORIES"));
   const rawMemoryRepoDir = env.get("CTI_MEMORY_REPO_DIR") || undefined;
+  const rawUploadCacheDir = env.get("CTI_UPLOAD_CACHE_DIR") || undefined;
   const unityProjectPath = env.get("CTI_UNITY_PROJECT_PATH") || undefined;
   const contextHistoryMaxChars = env.get("CTI_CONTEXT_HISTORY_MAX_CHARS")
     ? Number(env.get("CTI_CONTEXT_HISTORY_MAX_CHARS"))
@@ -304,6 +321,9 @@ export function loadConfig(): Config {
   const localAiTimeoutMs = env.get("CTI_LOCAL_AI_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_AI_TIMEOUT_MS"))
     : undefined;
+  const codexFailoverCandidateTimeoutMs = env.get("CTI_CODEX_FAILOVER_CANDIDATE_TIMEOUT_MS")
+    ? Number(env.get("CTI_CODEX_FAILOVER_CANDIDATE_TIMEOUT_MS"))
+    : undefined;
   const localLlmRouterMaxInputChars = env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS")
     ? Number(env.get("CTI_LOCAL_LLM_ROUTER_MAX_INPUT_CHARS"))
     : undefined;
@@ -312,6 +332,15 @@ export function loadConfig(): Config {
     : undefined;
   const localLlmRouterTimeoutMs = env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS"))
+    : undefined;
+  const lightChatFastPathTimeoutMs = env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS")
+    ? Number(env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS"))
+    : undefined;
+  const providerCircuitCooldownMs = env.get("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS")
+    ? Number(env.get("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS"))
+    : undefined;
+  const memoryIntentTimeoutMs = env.get("CTI_MEMORY_INTENT_TIMEOUT_MS")
+    ? Number(env.get("CTI_MEMORY_INTENT_TIMEOUT_MS"))
     : undefined;
   const lightChatHistoryLimit = env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT")
     ? Number(env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT"))
@@ -346,6 +375,7 @@ export function loadConfig(): Config {
     codexAdditionalDirectories,
   );
   const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir);
+  const uploadCacheDir = resolveSafeUploadCacheDir(rawUploadCacheDir, defaultWorkDir);
   const ollamaEnabled = env.has("CTI_OLLAMA_ENABLED")
     ? env.get("CTI_OLLAMA_ENABLED") === "true"
     : (env.has("CTI_LOCAL_LLM_ENABLED") ? env.get("CTI_LOCAL_LLM_ENABLED") === "true" : true);
@@ -394,6 +424,7 @@ export function loadConfig(): Config {
     allowedWorkspaceRoots,
     codexAdditionalDirectories,
     memoryRepoDir,
+    uploadCacheDir,
     unityProjectPath,
     contextHistoryMaxChars,
     contextHistoryMessageMaxChars,
@@ -424,6 +455,9 @@ export function loadConfig(): Config {
     codexModelSource,
     codexRoutingMode,
     codexApiFallbackChain: codexApiFallbackChain.length > 0 ? codexApiFallbackChain : ["local_api", "external_api"],
+    codexFailoverCandidateTimeoutMs: typeof codexFailoverCandidateTimeoutMs === "number" && Number.isFinite(codexFailoverCandidateTimeoutMs)
+      ? Math.max(250, Math.min(30_000, Math.floor(codexFailoverCandidateTimeoutMs)))
+      : 2000,
     codexBaseUrl: env.get("CTI_CODEX_BASE_URL") || undefined,
     codexApiKey: env.get("CTI_CODEX_API_KEY") || undefined,
     codexModel: env.get("CTI_CODEX_MODEL") || undefined,
@@ -465,6 +499,15 @@ export function loadConfig(): Config {
     lightChatFastPathEnabled: env.has("CTI_LIGHT_CHAT_FAST_PATH_ENABLED")
       ? env.get("CTI_LIGHT_CHAT_FAST_PATH_ENABLED") === "true"
       : true,
+    lightChatFastPathTimeoutMs: typeof lightChatFastPathTimeoutMs === "number" && Number.isFinite(lightChatFastPathTimeoutMs)
+      ? Math.max(250, Math.min(10_000, Math.floor(lightChatFastPathTimeoutMs)))
+      : 2000,
+    providerCircuitCooldownMs: typeof providerCircuitCooldownMs === "number" && Number.isFinite(providerCircuitCooldownMs)
+      ? Math.max(1000, Math.min(10 * 60_000, Math.floor(providerCircuitCooldownMs)))
+      : 60_000,
+    memoryIntentTimeoutMs: typeof memoryIntentTimeoutMs === "number" && Number.isFinite(memoryIntentTimeoutMs)
+      ? Math.max(250, Math.min(15_000, Math.floor(memoryIntentTimeoutMs)))
+      : 4000,
     lightChatHistoryLimit: typeof lightChatHistoryLimit === "number" && Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
     lightChatMaxInputChars: typeof lightChatMaxInputChars === "number" && Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
@@ -565,6 +608,7 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_ALLOWED_WORKSPACE_ROOTS", config.allowedWorkspaceRoots?.join(";"));
   out += formatEnvLine("CTI_CODEX_ADDITIONAL_DIRECTORIES", config.codexAdditionalDirectories?.join(";"));
   out += formatEnvLine("CTI_MEMORY_REPO_DIR", config.memoryRepoDir);
+  out += formatEnvLine("CTI_UPLOAD_CACHE_DIR", config.uploadCacheDir);
   out += formatEnvLine("CTI_UNITY_PROJECT_PATH", config.unityProjectPath);
   if (config.contextHistoryMaxChars !== undefined)
     out += formatEnvLine("CTI_CONTEXT_HISTORY_MAX_CHARS", String(config.contextHistoryMaxChars));
@@ -597,6 +641,8 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_CODEX_MODEL_SOURCE", config.codexModelSource);
   out += formatEnvLine("CTI_CODEX_ROUTING_MODE", config.codexRoutingMode);
   out += formatEnvLine("CTI_CODEX_API_FALLBACK_CHAIN", config.codexApiFallbackChain?.join(","));
+  if (config.codexFailoverCandidateTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_CODEX_FAILOVER_CANDIDATE_TIMEOUT_MS", String(config.codexFailoverCandidateTimeoutMs));
   out += formatEnvLine("CTI_CODEX_BASE_URL", config.codexBaseUrl);
   out += formatEnvLine("CTI_CODEX_API_KEY", config.codexApiKey);
   out += formatEnvLine("CTI_CODEX_MODEL", config.codexModel);
@@ -635,6 +681,12 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_LOCAL_LLM_ROUTER_TIMEOUT_MS", String(config.localLlmRouterTimeoutMs));
   if (config.lightChatFastPathEnabled !== undefined)
     out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_ENABLED", String(config.lightChatFastPathEnabled));
+  if (config.lightChatFastPathTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS", String(config.lightChatFastPathTimeoutMs));
+  if (config.providerCircuitCooldownMs !== undefined)
+    out += formatEnvLine("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS", String(config.providerCircuitCooldownMs));
+  if (config.memoryIntentTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_MEMORY_INTENT_TIMEOUT_MS", String(config.memoryIntentTimeoutMs));
   if (config.lightChatHistoryLimit !== undefined)
     out += formatEnvLine("CTI_LIGHT_CHAT_HISTORY_LIMIT", String(config.lightChatHistoryLimit));
   if (config.lightChatMaxInputChars !== undefined)
@@ -898,6 +950,9 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.memoryRepoDir) {
     m.set("bridge_memory_repo_dir", config.memoryRepoDir);
   }
+  if (config.uploadCacheDir) {
+    m.set("bridge_upload_cache_dir", config.uploadCacheDir);
+  }
   if (config.unityProjectPath) {
     m.set("bridge_unity_project_path", config.unityProjectPath);
   }
@@ -957,6 +1012,9 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   m.set("bridge_codex_routing_mode", config.codexRoutingMode || "manual");
   m.set("bridge_codex_api_fallback_chain", (config.codexApiFallbackChain || ["local_api", "external_api"]).join(","));
+  if (typeof config.codexFailoverCandidateTimeoutMs === "number" && Number.isFinite(config.codexFailoverCandidateTimeoutMs)) {
+    m.set("bridge_codex_failover_candidate_timeout_ms", String(Math.max(250, Math.floor(config.codexFailoverCandidateTimeoutMs))));
+  }
   if (config.codexBaseUrl) {
     m.set("bridge_codex_base_url", config.codexBaseUrl);
   }
@@ -1034,6 +1092,15 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (config.lightChatFastPathEnabled !== undefined) {
     m.set("bridge_light_chat_fast_path_enabled", String(config.lightChatFastPathEnabled));
+  }
+  if (typeof config.lightChatFastPathTimeoutMs === "number" && Number.isFinite(config.lightChatFastPathTimeoutMs)) {
+    m.set("bridge_light_chat_fast_path_timeout_ms", String(Math.max(250, Math.floor(config.lightChatFastPathTimeoutMs))));
+  }
+  if (typeof config.providerCircuitCooldownMs === "number" && Number.isFinite(config.providerCircuitCooldownMs)) {
+    m.set("bridge_provider_circuit_cooldown_ms", String(Math.max(1000, Math.floor(config.providerCircuitCooldownMs))));
+  }
+  if (typeof config.memoryIntentTimeoutMs === "number" && Number.isFinite(config.memoryIntentTimeoutMs)) {
+    m.set("bridge_memory_intent_timeout_ms", String(Math.max(250, Math.floor(config.memoryIntentTimeoutMs))));
   }
   if (typeof config.lightChatHistoryLimit === "number" && Number.isFinite(config.lightChatHistoryLimit)) {
     m.set("bridge_light_chat_history_limit", String(Math.max(0, Math.floor(config.lightChatHistoryLimit))));

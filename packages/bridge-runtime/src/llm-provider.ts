@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
-import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams, type FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
@@ -512,7 +512,11 @@ export class SDKLLMProvider implements LLMProvider {
               queryOptions.pathToClaudeCodeExecutable = cliPath;
             }
 
-            const prompt = buildPrompt(params.prompt, params.files);
+            const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
+            const promptText = priorityTurnContext
+              ? [priorityTurnContext, `Current user request:\n${params.prompt}`].join('\n\n')
+              : params.prompt;
+            const prompt = buildPrompt(promptText, params.files);
             const q = query({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],
               options: queryOptions as Parameters<typeof query>[0]['options'],
