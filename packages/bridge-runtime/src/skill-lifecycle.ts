@@ -82,6 +82,15 @@ function requireGithubUrl(value: string): string {
   return parsed.toString();
 }
 
+function isGithubUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'github.com';
+  } catch {
+    return false;
+  }
+}
+
 function isInside(candidate: string, root: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -167,18 +176,23 @@ export function createSkillLifecycleService(options: SkillLifecycleOptions): Ski
 
   const install = async (input: PrepareSkillInstallInput): Promise<SkillRegistryItem> => {
     const id = requireSkillId(input.id);
-    const source = input.sourceClass === 'self_created' ? path.resolve(input.source) : requireGithubUrl(input.source);
+    const source = input.sourceClass === 'self_created' || (input.sourceClass === 'whitelist' && !isGithubUrl(input.source))
+      ? path.resolve(input.source)
+      : requireGithubUrl(input.source);
     const stageDir = path.join(stagingRoot, id);
     const targetDir = path.join(installedRoot, id);
     safeRemoveDirectory(stageDir, stagingRoot);
     fs.mkdirSync(stagingRoot, { recursive: true });
 
     try {
-      if (input.sourceClass === 'self_created') {
-        const expectedDraft = path.resolve(registry.draftRoot, id);
-        if (source !== expectedDraft || !isInside(source, registry.draftRoot) || !fs.existsSync(path.join(source, 'SKILL.md'))) {
-          throw new Error('自建 Skill 必须来自受控草稿目录。');
+      if (input.sourceClass === 'self_created' || (input.sourceClass === 'whitelist' && !isGithubUrl(source))) {
+        if (input.sourceClass === 'self_created') {
+          const expectedDraft = path.resolve(registry.draftRoot, id);
+          if (source !== expectedDraft || !isInside(source, registry.draftRoot)) {
+            throw new Error('自建 Skill 必须来自受控草稿目录。');
+          }
         }
+        if (!fs.existsSync(path.join(source, 'SKILL.md'))) throw new Error('本地 Skill 来源缺少 SKILL.md。');
         fs.cpSync(source, stageDir, { recursive: true, errorOnExist: true });
       } else {
         await tools.installFromGithub({ url: source, destinationRoot: stagingRoot, name: id });
@@ -318,7 +332,9 @@ export function createSkillLifecycleService(options: SkillLifecycleOptions): Ski
         draftRoot: registry.draftRoot,
         whitelistedSources: [...configuredWhitelist, ...manifestWhitelist],
       });
-      const source = sourceClass === 'self_created' ? path.resolve(input.source) : requireGithubUrl(input.source);
+      const source = sourceClass === 'self_created' || (sourceClass === 'whitelist' && !isGithubUrl(input.source))
+        ? path.resolve(input.source)
+        : requireGithubUrl(input.source);
       const normalized: PrepareSkillInstallInput = { ...input, id, source, sourceClass };
       const installed = fs.existsSync(path.join(installedRoot, normalized.id));
       const action = decideSkillSourcePolicy({ installed, sourceClass: normalized.sourceClass, risk: normalized.risk, changeKind: normalized.changeKind });

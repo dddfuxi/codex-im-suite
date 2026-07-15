@@ -12,6 +12,7 @@ import type {
   ExtensionRemovePrepareInput,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import { CTI_HOME } from './config.js';
+import type { SkillLifecycleService } from './skill-lifecycle.js';
 
 const DEFAULT_CONTROL_API = process.env.CTI_CONTROL_API_PUBLIC_BASE_URL
   || `http://${process.env.CTI_CONTROL_API_HOST || process.env.CTI_CONTROL_API_BIND || '127.0.0.1'}:${process.env.CTI_CONTROL_API_PORT || '8788'}`;
@@ -45,6 +46,7 @@ export interface ExtensionCatalogHostOptions {
   request?: (url: string, body: { command: string; payload: unknown }) => Promise<ControlApiEnvelope<unknown>>;
   nonceFactory?: () => string;
   now?: () => Date;
+  lifecycle?: SkillLifecycleService;
 }
 
 export function createExtensionCatalogHost(options: ExtensionCatalogHostOptions = {}): ExtensionCatalogHost {
@@ -53,6 +55,7 @@ export function createExtensionCatalogHost(options: ExtensionCatalogHostOptions 
   const token = options.token ?? process.env.CTI_CONTROL_API_AUTH_TOKEN ?? '';
   const now = options.now || (() => new Date());
   const nonceFactory = options.nonceFactory || (() => crypto.randomUUID());
+  const lifecycle = options.lifecycle;
   const request = options.request || (async (url, body) => {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -172,9 +175,56 @@ export function createExtensionCatalogHost(options: ExtensionCatalogHostOptions 
       return await command<ExtensionCatalogItemSummary>('extension.remote.preview', { url });
     },
     async prepareInstallAction(input: ExtensionInstallPrepareInput): Promise<ExtensionActionPrepareResult> {
+      if (input.item.type === 'skill' && lifecycle) {
+        const source = input.url || input.item.source;
+        if (!source) return { ok: false, item: input.item, error: 'Skill 缺少可验证来源。' };
+        try {
+          const result = await lifecycle.prepareInstall({
+            id: input.item.id,
+            sourceClass: 'unknown',
+            source,
+            risk: input.item.trusted === false ? 'medium' : 'low',
+            changeKind: input.item.installed ? 'compatibility' : 'install',
+            actor: input.actor,
+          });
+          if ('nonce' in result) {
+            return {
+              ok: true,
+              nonce: `skill:${result.nonce}`,
+              expiresAt: result.expiresAt,
+              item: input.item,
+              message: result.requiredRole === 'owner' ? '等待 Owner 确认安装。' : '等待用户确认安装。',
+            };
+          }
+          return { ok: true, item: input.item, message: `安装已完成：${result.displayName}` };
+        } catch (error) {
+          return { ok: false, item: input.item, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
       return saveAction('install', input);
     },
     async confirmInstallAction(nonce: string, actor: ExtensionActionActor): Promise<ExtensionActionConfirmResult> {
+      if (nonce.startsWith('skill:') && lifecycle) {
+        try {
+          const item = await lifecycle.confirmInstall(nonce.slice('skill:'.length), actor);
+          return {
+            ok: true,
+            status: 'installed',
+            item: {
+              id: item.id,
+              type: 'skill',
+              displayName: item.displayName,
+              version: item.version,
+              source: item.source,
+              installed: true,
+              trusted: item.sourceClass !== 'third_party' && item.sourceClass !== 'unknown',
+            },
+            message: `安装已完成：${item.displayName}`,
+          };
+        } catch (error) {
+          return { ok: false, status: 'failed', message: error instanceof Error ? error.message : String(error) };
+        }
+      }
       const claimed = claimAction(nonce, actor, 'install');
       if ('ok' in claimed && !claimed.ok) return claimed;
       const record = claimed as ExtensionActionRecord;

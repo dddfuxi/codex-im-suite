@@ -105,6 +105,9 @@ import {
   type TodoReminderService,
 } from './todo-reminders.js';
 import { createExtensionCatalogHost } from './extension-catalog-host.js';
+import { createOfficialSkillTools } from './official-skill-tools.js';
+import { createSkillLifecycleService } from './skill-lifecycle.js';
+import { createSkillRegistry } from './skill-registry.js';
 import { createFeishuCloudDocumentHost, FeishuTenantAccessTokenProvider } from './feishu-cloud-documents.js';
 import {
   FeishuOAuthService,
@@ -2675,11 +2678,18 @@ async function main(): Promise<void> {
     console.log(`[claude-to-im] Feishu OAuth callback listening on 127.0.0.1:${config.feishuOAuthCallbackPort ?? 17321}${config.feishuOAuthCallbackPath || '/feishu/oauth/callback'}`);
   }
 
+  // Skill actions from Feishu and the control panel share this single runtime-owned lifecycle.
+  const skillRegistry = createSkillRegistry();
+  const skillLifecycle = createSkillLifecycleService({
+    registry: skillRegistry,
+    tools: createOfficialSkillTools(),
+  });
+
   initBridgeContext({
     store,
     llm,
     permissions: gateway,
-    extensions: createExtensionCatalogHost(),
+    extensions: createExtensionCatalogHost({ lifecycle: skillLifecycle }),
     feishuCloudDocuments,
     feishuOAuth: {
       handleManualCallbackText: async (input) => feishuOAuthService.handleManualCallbackText({

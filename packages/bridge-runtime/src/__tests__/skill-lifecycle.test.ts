@@ -122,6 +122,38 @@ describe('SkillLifecycleService', () => {
     }
   });
 
+  it('installs an exact local source declared by the suite skill manifest', async () => {
+    const paths = fixture();
+    try {
+      const source = path.join(paths.suiteRoot, 'extensions', 'skills', 'bundled-skill');
+      writeSkill(path.dirname(source), 'bundled-skill', 'bundled version');
+      fs.writeFileSync(path.join(paths.suiteRoot, 'config', 'skills.d', 'bundled-skill.json'), JSON.stringify({
+        id: 'bundled-skill',
+        displayName: 'Bundled Skill',
+        type: 'skill',
+        source,
+        enabled: true,
+      }), 'utf8');
+      const registry = createSkillRegistry({ ...paths, now: () => fixedNow });
+      registry.refresh();
+      const service = createSkillLifecycleService({ ...paths, registry, tools: fakeTools(), now: () => fixedNow });
+
+      const installed = await service.prepareInstall({
+        id: 'bundled-skill',
+        sourceClass: 'whitelist',
+        source,
+        risk: 'low',
+        changeKind: 'install',
+        actor,
+      });
+
+      assert.equal('state' in installed ? installed.state : '', 'enabled');
+      assert.match(fs.readFileSync(path.join(paths.codexHome, 'skills', 'bundled-skill', 'SKILL.md'), 'utf8'), /bundled version/u);
+    } finally {
+      fs.rmSync(paths.root, { recursive: true, force: true });
+    }
+  });
+
   it('installs a validated self-created draft only after user confirmation', async () => {
     const paths = fixture();
     try {

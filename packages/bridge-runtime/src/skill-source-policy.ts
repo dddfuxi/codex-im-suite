@@ -36,6 +36,10 @@ function normalizeUrl(value: string): string | null {
   }
 }
 
+function normalizeSourceKey(value: string): string {
+  return normalizeUrl(value) || `file:${path.resolve(value).toLowerCase()}`;
+}
+
 function isInside(candidate: string, root: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -47,10 +51,10 @@ export function resolveSkillSourceClass(input: ResolveSkillSourceClassInput): Sk
   if (localSource === expectedDraft && isInside(localSource, input.draftRoot)) return 'self_created';
 
   const normalized = normalizeUrl(input.source);
-  if (!normalized) return 'unknown';
-  if (/^https:\/\/github\.com\/openai\/skills\/tree\/[^/]+\/skills\/\.curated\/[a-z0-9-]+$/iu.test(normalized)) {
+  if (normalized && /^https:\/\/github\.com\/openai\/skills\/tree\/[^/]+\/skills\/\.curated\/[a-z0-9-]+$/iu.test(normalized)) {
     return 'official_curated';
   }
-  const whitelist = new Set((input.whitelistedSources || []).map(normalizeUrl).filter((value): value is string => Boolean(value)));
-  return whitelist.has(normalized) ? 'whitelist' : 'third_party';
+  const whitelist = new Set((input.whitelistedSources || []).map(normalizeSourceKey));
+  if (whitelist.has(normalizeSourceKey(input.source))) return 'whitelist';
+  return normalized ? 'third_party' : 'unknown';
 }

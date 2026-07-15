@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createExtensionCatalogHost } from '../extension-catalog-host.js';
 import type { ExtensionCatalogItemSummary } from 'claude-to-im/src/lib/bridge/host.js';
+import type { SkillLifecycleService } from '../skill-lifecycle.js';
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-ext-host-'));
 type ControlRequest = { command: string; payload: unknown };
@@ -85,6 +86,64 @@ describe('extension catalog host', () => {
     });
   });
 
+  it('routes skill installation through lifecycle while leaving non-skill extensions on the legacy adapter', async () => {
+    const lifecycleCalls: string[] = [];
+    const lifecycle = makeLifecycle({
+      prepareInstall: async () => {
+        lifecycleCalls.push('prepare');
+        return {
+          nonce: 'skill-nonce',
+          skillId: 'doc-helper',
+          requiredRole: 'user',
+          actor: { channelType: 'feishu', chatId: 'oc_1', userId: 'ou_1' },
+          expiresAt: '2026-05-07T04:10:00.000Z',
+          request: {
+            id: 'doc-helper',
+            sourceClass: 'official_curated',
+            source: 'https://github.com/openai/skills/tree/main/skills/.curated/doc-helper',
+            risk: 'low',
+            changeKind: 'install',
+            actor: { channelType: 'feishu', chatId: 'oc_1', userId: 'ou_1' },
+          },
+        };
+      },
+      confirmInstall: async () => {
+        lifecycleCalls.push('confirm');
+        return makeSkillRegistryItem('doc-helper');
+      },
+    });
+    const host = createExtensionCatalogHost({
+      ctiHome,
+      lifecycle,
+      request: async (_url: string, body: ControlRequest) => {
+        calls.push(body);
+        return { ok: true, data: { id: 'unity-mcp', displayName: 'Unity MCP', type: 'mcp' } };
+      },
+      nonceFactory: () => 'legacy-nonce',
+      now: () => new Date('2026-05-07T04:00:00.000Z'),
+    });
+    const actor = { channelType: 'feishu', chatId: 'oc_1', userId: 'ou_1' };
+
+    const skillPrepared = await host.prepareInstallAction({
+      item: {
+        ...makeItem('doc-helper', 'Doc Helper', 'skill'),
+        source: 'https://github.com/openai/skills/tree/main/skills/.curated/doc-helper',
+      },
+      actor,
+    });
+    assert.equal(skillPrepared.nonce, 'skill:skill-nonce');
+    assert.equal(calls.length, 0);
+    await host.confirmInstallAction('skill:skill-nonce', actor);
+    assert.deepEqual(lifecycleCalls, ['prepare', 'confirm']);
+    assert.equal(calls.length, 0);
+
+    const mcpItem = makeItem('unity-mcp', 'Unity MCP', 'mcp');
+    const mcpPrepared = await host.prepareInstallAction({ item: mcpItem, actor });
+    assert.equal(calls.length, 0);
+    await host.confirmInstallAction(mcpPrepared.nonce || '', actor);
+    assert.equal(calls[0].command, 'extension.remote.install');
+  });
+
   it('rejects expired confirmations before calling Control API', async () => {
     const host = createExtensionCatalogHost({
       ctiHome,
@@ -162,5 +221,31 @@ function makeItem(id: string, displayName: string, type: ExtensionCatalogItemSum
     source: id,
     installed: false,
     canRemove: type === 'plugin',
+  };
+}
+
+function makeSkillRegistryItem(id: string) {
+  return {
+    id,
+    displayName: id,
+    sourceClass: 'official_curated' as const,
+    state: 'enabled' as const,
+    risk: 'low' as const,
+    enabled: true,
+    updatedAt: '2026-05-07T04:00:00.000Z',
+  };
+}
+
+function makeLifecycle(overrides: Partial<SkillLifecycleService>): SkillLifecycleService {
+  return {
+    snapshot: () => ({ protocol: 'cti-skill-registry/v1', generatedAt: '2026-05-07T04:00:00.000Z', items: [] }),
+    search: async () => [],
+    createDraft: async () => makeSkillRegistryItem('draft'),
+    validate: async (id) => makeSkillRegistryItem(id),
+    prepareInstall: async () => makeSkillRegistryItem('installed'),
+    confirmInstall: async () => makeSkillRegistryItem('installed'),
+    setEnabled: async (id, enabled) => ({ ...makeSkillRegistryItem(id), state: enabled ? 'enabled' : 'disabled', enabled }),
+    rollback: async (id) => makeSkillRegistryItem(id),
+    ...overrides,
   };
 }
