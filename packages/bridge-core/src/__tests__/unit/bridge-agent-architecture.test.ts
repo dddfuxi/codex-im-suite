@@ -5,6 +5,7 @@ import {
   AGENT_ARCHITECTURE_LAYER_IDS,
   classifySuitePath,
   compileAgentArchitectureRegistry,
+  decideSkillLifecycleAction,
   getAgentPolicyPromptLines,
   getPermissionApprovalRequiredRole,
   getSlashCommandRequiredRole,
@@ -13,6 +14,7 @@ import {
   isHighRiskPermissionToolName,
   isNonAddressableMentionTarget,
   isSystemAffectingReminderRequest,
+  shouldSearchSkillCatalog,
 } from '../../lib/bridge/agent-architecture.js';
 
 describe('agent architecture registry', () => {
@@ -112,5 +114,22 @@ describe('agent architecture registry', () => {
     assert.equal(isNonAddressableMentionTarget('所有的其他机器人'), true);
     assert.equal(isNonAddressableMentionTarget('按这个格式'), true);
     assert.equal(isNonAddressableMentionTarget('乔治'), false);
+  });
+
+  it('decides skill autonomy from source and risk instead of names', () => {
+    assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'installed', risk: 'low', changeKind: 'none' }), 'use');
+    assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'official_curated', risk: 'low', changeKind: 'install' }), 'confirm_user');
+    assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'whitelist', risk: 'low', changeKind: 'install' }), 'auto_install');
+    assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'self_created', risk: 'low', changeKind: 'install' }), 'confirm_user');
+    assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'third_party', risk: 'medium', changeKind: 'install' }), 'confirm_owner');
+    assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'whitelist', risk: 'high', changeKind: 'permissions' }), 'confirm_owner');
+    assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'third_party', risk: 'medium', changeKind: 'none' }), 'use');
+    assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'whitelist', risk: 'low', changeKind: 'trigger' }), 'confirm_user');
+  });
+
+  it('searches external skills only for a real unmet capability requirement', () => {
+    assert.equal(shouldSearchSkillCatalog({ taskRequiresCapability: false, installedCandidateCount: 0 }), false);
+    assert.equal(shouldSearchSkillCatalog({ taskRequiresCapability: true, installedCandidateCount: 1 }), false);
+    assert.equal(shouldSearchSkillCatalog({ taskRequiresCapability: true, installedCandidateCount: 0 }), true);
   });
 });

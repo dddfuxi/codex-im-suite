@@ -81,6 +81,40 @@ export interface CompiledAgentArchitectureRegistry {
   pathCategoryById: Readonly<Record<SuitePathCategoryId, SuitePathCategory>>;
 }
 
+export type SkillSourceClass = 'installed' | 'official_curated' | 'whitelist' | 'self_created' | 'third_party' | 'unknown';
+export type SkillRiskLevel = 'low' | 'medium' | 'high';
+export type SkillChangeKind = 'none' | 'docs' | 'compatibility' | 'install' | 'enable' | 'trigger' | 'permissions' | 'scripts' | 'write_scope';
+export type SkillLifecycleAction = 'use' | 'auto_update' | 'auto_install' | 'confirm_user' | 'confirm_owner' | 'quarantine';
+
+export interface SkillLifecyclePolicyInput {
+  installed: boolean;
+  sourceClass: SkillSourceClass;
+  risk: SkillRiskLevel;
+  changeKind: SkillChangeKind;
+}
+
+export interface SkillCapabilityGapInput {
+  taskRequiresCapability: boolean;
+  installedCandidateCount: number;
+}
+
+/** External catalog search is allowed only when the current task needs a capability that no installed skill provides. */
+export function shouldSearchSkillCatalog(input: SkillCapabilityGapInput): boolean {
+  return input.taskRequiresCapability && input.installedCandidateCount === 0;
+}
+
+/** Keep lifecycle approval rules platform-independent so Feishu, CLI, and panel callers share one decision. */
+export function decideSkillLifecycleAction(input: SkillLifecyclePolicyInput): SkillLifecycleAction {
+  if (input.risk === 'high' || ['permissions', 'scripts', 'write_scope'].includes(input.changeKind)) return 'confirm_owner';
+  if (input.installed && input.changeKind === 'none') return 'use';
+  if (input.installed && ['docs', 'compatibility'].includes(input.changeKind)) return 'auto_update';
+  if (input.sourceClass === 'third_party' || input.sourceClass === 'unknown') return 'confirm_owner';
+  if (input.changeKind === 'trigger') return 'confirm_user';
+  if (input.sourceClass === 'whitelist' && input.risk === 'low') return 'auto_install';
+  if (input.sourceClass === 'official_curated' || input.sourceClass === 'self_created') return 'confirm_user';
+  return 'quarantine';
+}
+
 export const AGENT_ARCHITECTURE_LAYERS: readonly AgentArchitectureLayer[] = [
   {
     id: 'agent_kernel',
@@ -176,6 +210,14 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     responsibility: 'Require real tool results for local state, artifacts, commands, MCP, Unity, Blender, and filesystem tasks.',
     promptLines: [],
     tags: ['tools', 'evidence', 'routing'],
+  },
+  {
+    id: 'capability_router.skill_catalog_gap_search',
+    layerId: 'capability_router',
+    title: 'Skill Catalog Gap Search',
+    responsibility: 'Search external skill catalogs only for a capability the current task requires and installed skills cannot provide.',
+    promptLines: [],
+    tags: ['capability', 'skills', 'search', 'routing'],
   },
   {
     id: 'capability_router.existing_sticker_delivery',

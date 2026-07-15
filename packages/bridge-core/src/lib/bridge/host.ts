@@ -7,6 +7,7 @@
  */
 
 import type { ChannelAddress, ChannelBinding, ChannelType, OutboundMention } from './types.js';
+import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 
 // ── Bridge-local types (replacing @/types imports) ────────────
 
@@ -755,6 +756,82 @@ export interface ExtensionActionActor {
   chatId: string;
   userId?: string;
   messageId?: string;
+}
+
+export type SkillRegistryState =
+  | 'discovered'
+  | 'draft'
+  | 'validated'
+  | 'approval_pending'
+  | 'installed'
+  | 'enabled'
+  | 'disabled'
+  | 'quarantined';
+
+export interface SkillRegistryValidation {
+  ok: boolean;
+  checkedAt: string;
+  summary: string;
+}
+
+export interface SkillRegistryApproval {
+  required: 'none' | 'user' | 'owner';
+  nonce?: string;
+  expiresAt?: string;
+}
+
+export interface SkillRegistryItem {
+  id: string;
+  displayName: string;
+  version?: string;
+  sourceClass: SkillSourceClass;
+  source?: string;
+  path?: string;
+  contentHash?: string;
+  state: SkillRegistryState;
+  risk: SkillRiskLevel;
+  enabled: boolean;
+  relatedProjects?: string[];
+  validation?: SkillRegistryValidation;
+  approval?: SkillRegistryApproval;
+  failureSummary?: string;
+  rollbackPath?: string;
+  updatedAt: string;
+}
+
+export interface SkillRegistrySnapshot {
+  protocol: 'cti-skill-registry/v1';
+  generatedAt: string;
+  items: SkillRegistryItem[];
+}
+
+export interface SkillLifecycleApprovalRecord {
+  nonce: string;
+  skillId: string;
+  requiredRole: 'user' | 'owner';
+  actor: Pick<ExtensionActionActor, 'channelType' | 'chatId' | 'userId'>;
+  expiresAt: string;
+}
+
+export interface PromptSnapshotSectionRecord {
+  id: string;
+  kind: string;
+  source: string;
+  priority: number;
+  charCount: number;
+  hash: string;
+  injected: boolean;
+  truncated: boolean;
+  truncationReason?: 'section_limit' | 'snapshot_limit' | 'redacted';
+  content: string;
+}
+
+export interface PromptSnapshotRecord {
+  protocol: 'cti-prompt-snapshot/v1';
+  sessionId: string;
+  createdAt: string;
+  totalChars: number;
+  sections: PromptSnapshotSectionRecord[];
 }
 
 export interface ExtensionInstallPrepareInput {
