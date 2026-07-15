@@ -150,7 +150,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\validate-extension-manifests.
 
 该校验会拦截缺少 `cwd` 的 MCP manifest；MCP 启动、健康检查、列工具和调用工具也会使用同一工作区边界，不允许通过省略 `cwd` 绕过路径门禁。
 
-`runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli` 和 `service.localLlm`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`，`service.feishuCli` 保留兼容 id，但显示为 Bridge Skill 更新单元，只按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步；它不是飞书云聊天记录或成员查询 provider。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
+`runtime-manifest/v1` 当前用于 `service.bridge`、`service.codex`、`service.feishuCli`、`service.localLlm` 和 `tool.larkCli`。其中 `service.codex` 通过 `npm_global_package` 更新 npm 全局 `@openai/codex`；`tool.larkCli` 通过同一通用模板维护官方 `@larksuite/cli`，控制面板用它执行群列表、消息/成员查看、资源下载、测试发送和受控撤回等人工平台操作。`service.feishuCli` 保留兼容 id，但显示为 Bridge Skill 更新单元，只按安装来源自动判定走 Git 仓库拉取、复制版重装或开发版 `suite -> live skill` 同步。官方 CLI 不接管 FeishuAdapter 的 WS、OAuth、@ 判断、自动回复或 Agent 主链，也不得启动 `event consume` 与 live Bridge 竞争。复制安装会写入 `.cti-install.json` 保存来源元数据；来源未知时面板会禁用自动更新并说明原因。
 
 控制面板“扩展”页支持三层在线目录、HTTPS URL 预览和本机安装。目录由静态种子、动态排行榜源、自定义 URL 叠加而成；动态层默认定期抓取 `npm / PyPI / GitHub / Hugging Face / Ollama Library / Official MCP Registry` 各自前 5 项，并在条目上显示来源、抓取时间和排行依据。飞书 Owner 也可以用 `/ext search <关键词>`、`/ext install <关键词或id>`、`/ext remove <id>` 搜索和发起确认卡片；移除语义是“移除记录”，不会删除 Ollama 模型本体、OpenAI bundled 插件缓存或外部包管理器内容。精选目录写入：
 

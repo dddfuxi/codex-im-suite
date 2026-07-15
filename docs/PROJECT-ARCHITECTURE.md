@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-07-13
+更新时间：2026-07-15
 
 ## 0. 架构文档维护规则
 
@@ -29,6 +29,7 @@
 flowchart TD
   FeishuUser[飞书用户] --> FeishuBot[飞书机器人]
   FeishuBot --> BridgeCore[bridge-core 消息桥接]
+  BridgeCore --> FeishuPlatform[Feishu 官方 SDK、OpenAPI 与 WS]
   BridgeCore --> BridgeRuntime[bridge-runtime 运行时]
   SharedContracts[packages/contracts 共享契约] --> BridgeRuntime
   SharedContracts --> ControlPanel
@@ -44,6 +45,8 @@ flowchart TD
   AssetPipeline --> BlenderCli[Blender Python 导出 FBX 和贴图]
   BridgeCore --> LocalHistory[(本地历史、Markdown 知识库和记忆索引)]
   ControlPanel[控制面板] --> BridgeRuntime
+  ControlPanel --> LarkCli[官方 lark-cli 人工平台操作]
+  LarkCli --> FeishuPlatform
   ControlPanel --> McpBridge
   Scripts[构建和发布脚本] --> Release[(Portable 和 Installer)]
   Scripts --> LiveSkill[本机 live skill 运行副本]
@@ -147,6 +150,8 @@ Feishu 接收现在是双通道：
 
 - WS 长连是主链路。
 - p2p 私聊有历史轮询补捞兜底，避免私聊事件偶发漏掉。
+- Feishu 平台接入按三层分工：FeishuAdapter 通过官方 Node SDK / OpenAPI 承担实时入站、自动回复、卡片、历史 evidence、用户 OAuth、权限、索引、表情包和 Agent 主链；官方 `lark-cli` 承担配置、身份、doctor/whoami、scope/schema 与控制面板发起的人工平台操作；控制面板只负责白名单编排和展示，不再维护重复的 token 获取、HTTP URL、响应 envelope 或分页实现。
+- 官方 `lark-cli` 不启动 `event consume`，也不接管 WS、私聊补捞、原生 @ 判断、callback 或自动消息发送，避免与 live Bridge 竞争同一事件。bot 身份的 `chat-list` 只覆盖群聊；P2P 和用户私有资源继续使用现有 FeishuAdapter 用户 OAuth 链，不因控制面板接入 CLI 改变。
 - Feishu 开放平台权限、事件和回调是外部前置条件，不是 bridge 能自动开通的运行时能力。消息接收依赖已发布生效的 `im.message.receive_v1` 长连接事件；权限按钮、提醒完成按钮和卡片交互依赖已发布生效的 `card.action.trigger` 回调；Markdown/streaming card、消息更新、资源下载、成员/机器人解析和云文档读取分别依赖对应 IM、CardKit、Drive、Docx、Sheets、Base 或成员 API scope。后台新增 scope、事件、回调或机器人能力后，必须创建版本、管理员审核发布，并重启 bridge 读取新配置。
 - `bridge-manager` 会在进入执行链前做持久入站去重：同一 channel/chat/messageId 只允许执行一次；带附件的媒体说明文字还会写入短期文本指纹，避免 Feishu p2p 历史补捞把同一张图的 caption 当成另一个 messageId 再跑一轮 Codex。
 - 群聊 `require_mention=true` 时，adapter 主入口只接受原生 @ 当前 bot 的事件：先按 `message.mentions` 中的 `open_id/user_id/union_id` 与当前 bot 身份精确匹配；飞书长连缺失 `mentions` 时，仅允许正文内 `<at ...>` / post `tag=at` 所携带的同一身份 ID 作为兼容的原生结构化 @ 证据。纯文本别名、机器人 displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases`、`CTI_FEISHU_BOT_ALIASES`、普通文本回复/引用链及其他 bot/app 的 sender 都不能唤醒。唯一受控例外是用户用飞书原生 reply/引用当前 bot 已发送消息补发 `sticker` 或 `image`：adapter 必须先通过 `outbound-refs` 或被回复消息 sender 证明目标确为当前 bot，才把这类媒体消息作为当前回合交互放行，并在 `raw.feishuReplyWake` 记录唤醒证据。原生 @ 仍会继续过滤纠错、抱怨、无需回复等无需处理的内容；被过滤消息写入统一审计，不触发 LLM。
@@ -805,7 +810,9 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 内建服务运行单元现在从 `config/runtime.d/*.json` 读取，协议由 `suite.manifest.json` 中的 `runtime-manifest/v1` 声明；MCP / skill / plugin 继续走 `config/*.d` 的 `extension-manifest/v1`。
 - 运行单元动作允许按 manifest 暴露安装入口和更新入口；skill、部分 MCP 和内建服务都只能声明白名单模板，宿主据此生成固定命令，不接受前端传入任意 shell。
 - 统一 `update` 协议支持 `npm_global_package`、`skill_git_repo`、`skill_codex_copy`、`suite_live_sync` 四种模板。服务页和扩展页共用同一套可更新判断、禁用原因和 post-check 刷新逻辑。
-- `service.feishuCli` 保留兼容 id，但当前显示为 Bridge Skill 更新单元，只负责 bridge skill / runtime 包的来源诊断与自更新；它不是飞书云聊天记录、成员查询或消息发送 provider。`service.bridge` 继续只负责 daemon 状态、日志和启停，真实飞书云历史、成员、消息和卡片能力都由 FeishuAdapter 通过 Feishu OpenAPI / 长连接事件收口。`/feishu` 能力诊断会单独展示 `CTI_FEISHUCLI_ENABLED` / `CTI_FEISHUCLI_PATH` 的 lark-cli 辅助诊断状态，但该 CLI 只服务人工 API 调试和可用性证据，不参与 `parseHistoryIntentV2()`、@ 判断、历史同步或最终回复投递。
+- `service.feishuCli` 保留兼容 id，但当前显示为 Bridge Skill 更新单元，只负责 bridge skill / runtime 包的来源诊断与自更新；独立的 `tool.larkCli` 对应官方 `@larksuite/cli`，由通用 `npm_global_package` 模板维护版本并用 `version + doctor + whoami` 检查可用性。`service.bridge` 继续只负责 daemon 状态、日志和启停。
+- 控制面板通过受控 `LarkCliGateway` 调用官方 CLI 的固定白名单能力：群列表、消息分页、群成员、消息资源下载、测试文本发送和已确认机器人出站消息撤回。Gateway 不接受任意命令、不暴露 `event consume`，下载只能写入面板媒体缓存的安全相对路径，撤回只在本地确认目标属于机器人出站消息后传递 `--yes`；测试发送为每次动作生成独立幂等键，避免合法重复消息被官方侧去重。
+- `/feishu` 能力诊断会展示 `CTI_FEISHUCLI_ENABLED` / `CTI_FEISHUCLI_PATH` 的辅助诊断状态，但 CLI 不参与 `parseHistoryIntentV2()`、原生 @ 判断、WS/p2p 入站、自动回复或 Agent 最终投递。面板人工同步可使用 CLI 更新供用户查看的远端会话/媒体缓存；机器人运行时历史 evidence 仍由 FeishuAdapter 的 OpenAPI / 长连接链路证明。
 - 复制安装的 skill 会在安装目录写入 `.cti-install.json` 保存 `installKind`、`installedAt`、`sourceRoot` 和 `installScript`；历史安装若缺失元数据，宿主会按 live 路径、`.git` 仓库和 `sourceRootHint` 回退推断来源，无法确认时禁用自动更新。
 - `suite_live_sync` 触发自更新时，若当前就是 live 控制面板本体，宿主会先安排面板文件替换后的自动重开；它只保证面板自己恢复，不会把 bridge daemon 的重启偷偷并入“同步”动作。
 - 扩展页新增“导入本地目录”入口：可选择或拖入本地目录，宿主会先按 `SKILL.md` / `package.json` / 目录名规则识别为 `skill` 或 `mcp`，预览生成的 manifest，再写入 `config/skills.d` 或 `config/mcp.d`。
@@ -814,10 +821,10 @@ Ignis CLI MCP，定位为创意生成能力包。
 - Unity MCP 只是资源级健康检查的一个 manifest 配置实例：它读取 `mcpforunity://instances`，只有 `instance_count > 0` 才显示健康；如果 Unity Editor 没有注册 session，面板和 runtime 都会明确显示 session 不可用、读取失败或超时。Ignis 等非 Unity HTTP MCP 不会因为 URL 或名称相似而读取 Unity 资源。
 - bridge-runtime 的 Unity MCP 执行前预检同样来自 manifest 的资源级健康条件；单纯 HTTP 在线、406 或 initialize 成功但 `instance_count=0` 不再允许进入 Unity 截图、场景刷新或 prefab 操作链路。
 - 会话区新增 WebView 详情抽屉，宿主通过 `history.getSessionDetail` 返回完整消息流；旧 `ConversationViewerForm` 保留为兼容调试入口。
-- 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会按消息资源接口拉取原始资源，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
+- 会话详情现在会解析消息类型、消息 ID 和附件元数据；对飞书图片/文件消息，宿主会通过受控 `LarkCliGateway` 调用官方消息资源下载能力，缓存到 `CTI_HOME\\runtime\\control-panel-media`，并通过 Control API `/media/*` 暴露给前端。前端直接展示图片缩略图和附件状态，不再只显示 `[图片]` 这类占位文本。
 - 会话详情对 Feishu `interactive` 卡片走 `ConversationHistoryDisplay.ResolveMessageDisplay()` 展示解析：宿主从远端历史的 `RawContent` 递归提取 `header.title`、markdown/plain_text、按钮文案和 summary 等用户可见字段，返回 `cardContent` 与 `rawContentPreview` 给 WebView；前端在消息旁以“卡片内容”块展示，不再只依赖 `[卡片消息]` 或客户端升级占位。飞书返回的“请升级至最新版本客户端，以查看内容”只视为客户端兼容噪声：面板会剔除该占位并保留标题/摘要等真实前缀，纯占位时显示“卡片正文暂不可解析”，不会把升级提示当正文。`ResolveCardResourceReferences()` 会递归识别卡片里的 `image_key/imageKey/file_key/fileKey`，复用飞书消息资源下载和缓存链路把卡片内图片/文件作为附件展示。只有旧索引缺少原始卡片 payload 时才退回审计摘要或可解释的不可解析提示。
 - 会话详情支持强制刷新，宿主会绕过详情缓存重新读取会话历史；旧索引中图片/文件消息缺少资源键时，会触发会话级远端重同步。
-- 会话详情会读取 `data/outbound-refs.json` 中的机器人出站消息引用，只对已确认由本机器人发出的 Feishu `senderType=app` 消息显示“撤回”按钮；撤回资格必须同时匹配 channel、当前 chat 和 platform messageId。旧历史消息缺少出站引用时，只有 `senderId` 命中 `CTI_FEISHU_APP_ID` 或 `CTI_FEISHU_BOT_APP_IDS` 的当前机器人 app id 才显示撤回，避免误撤其他应用卡片。`history.recallBotMessage` 与按钮显示复用同一目标解析：已知出站 ref 直接撤回；旧历史当前 bot app 消息会先补一条 `history` 类型追踪记录，再调用 Feishu 消息删除接口。成功后标记 `recalledAt`，失败时记录 `recallError` 并在详情页展示；前端也会显示“撤回消息”执行状态，避免按钮失败静默。
+- 会话详情会读取 `data/outbound-refs.json` 中的机器人出站消息引用，只对已确认由本机器人发出的 Feishu `senderType=app` 消息显示“撤回”按钮；撤回资格必须同时匹配 channel、当前 chat 和 platform messageId。旧历史消息缺少出站引用时，只有 `senderId` 命中 `CTI_FEISHU_APP_ID` 或 `CTI_FEISHU_BOT_APP_IDS` 的当前机器人 app id 才显示撤回，避免误撤其他应用卡片。`history.recallBotMessage` 与按钮显示复用同一目标解析：已知出站 ref 直接撤回；旧历史当前 bot app 消息会先补一条 `history` 类型追踪记录，再通过受控 `LarkCliGateway` 调用官方撤回命令，并在这一已确认边界传递 `--yes`。成功后标记 `recalledAt`，失败时记录 `recallError` 并在详情页展示；前端也会显示“撤回消息”执行状态，避免按钮失败静默。
 - 会话详情读取旧本地消息时仍保留显示层 mojibake 修复；需要改写历史 JSON 或记忆索引时走 `scripts/repair-history-mojibake.ps1 -Apply`，由备份 manifest 承担回滚。
 - 会话详情会按 `sessionId` / `chatId` 关联 `workflow-runs.json`，展示 executor、阶段状态、prompt 摘要、prompt profile、recovery / retry 状态、模型来源、模型名、token / cache 汇总和事件时间线，方便回溯一次飞书请求从接收、路由、执行、重试到交付或失败的运行历程。
 - 执行器页的“最近 Workflow”与会话详情的“运行历程”都只消费 run 顶层摘要字段，不再反向解析 `events[].data` 拼模型、token 或证据信息，避免前端与运行时事件细节耦合。run 顶层 `execution` 会展示 `requiredEvidenceKind`、`evidenceSatisfied`、`noEvidenceRetryAttempted` 和 `requiredToolFamilies`，用于定位模型是否按要求调用了工具。

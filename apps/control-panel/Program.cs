@@ -1834,28 +1834,22 @@ internal sealed partial class MainForm : Form
             return new { ok = true, recalled = true, messageId, status = "already_recalled" };
         }
 
-        var auth = await FetchFeishuTenantAccessTokenAsync();
-        using var client = new HttpClient();
-        using var request = new HttpRequestMessage(HttpMethod.Delete, $"{auth.BaseUrl}/open-apis/im/v1/messages/{Uri.EscapeDataString(messageId)}");
-        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", auth.Token);
-        using var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        var ok = response.IsSuccessStatusCode;
+        var ok = false;
         var error = "";
         try
         {
-            using var doc = JsonDocument.Parse(body);
-            var code = ReadJsonInt(doc.RootElement, "code");
-            ok = ok && code == 0;
-            error = ReadJsonString(doc.RootElement, "msg");
+            // 到达这里前已经完成“仅撤回已记录机器人出站消息”的本地校验；
+            // 当前面板点击即为高风险操作的明确确认，因此只在这一受控边界传递 --yes。
+            await CreateLarkCliGateway().RecallMessageAsync(messageId, userConfirmed: true, _ctiHome);
+            ok = true;
         }
-        catch
+        catch (Exception recallError)
         {
-            if (!ok) error = body;
+            error = recallError.Message;
         }
 
         target.RecalledAt = ok ? DateTime.UtcNow.ToString("o") : target.RecalledAt;
-        target.RecallError = ok ? "" : string.IsNullOrWhiteSpace(error) ? $"Feishu API 返回 HTTP {(int)response.StatusCode}" : error;
+        target.RecallError = ok ? "" : string.IsNullOrWhiteSpace(error) ? "官方 lark-cli 撤回失败。" : error;
         target.UpdatedAt = DateTime.UtcNow.ToString("o");
         SaveOutboundRefs(refs);
         _sessionDetailCache.Remove($"{chatId}::{target.CodepilotSessionId}");
@@ -3925,48 +3919,8 @@ internal sealed partial class MainForm : Form
 
     private async Task<string> SendFeishuTextAsync(string chatId, string text)
     {
-        var appId = GetConfig("CTI_FEISHU_APP_ID", "").Trim();
-        var appSecret = GetConfig("CTI_FEISHU_APP_SECRET", "").Trim();
-        if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
-        {
-            throw new InvalidOperationException("缺少 CTI_FEISHU_APP_ID 或 CTI_FEISHU_APP_SECRET。");
-        }
-        var domain = string.Equals(GetConfig("CTI_FEISHU_DOMAIN", "feishu"), "lark", StringComparison.OrdinalIgnoreCase)
-            ? "https://open.larksuite.com"
-            : "https://open.feishu.cn";
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(12) };
-        var tokenResponse = await client.PostAsJsonAsync($"{domain}/open-apis/auth/v3/tenant_access_token/internal", new
-        {
-            app_id = appId,
-            app_secret = appSecret,
-        });
-        var tokenText = await tokenResponse.Content.ReadAsStringAsync();
-        using var tokenDoc = JsonDocument.Parse(tokenText);
-        var token = ReadJsonString(tokenDoc.RootElement, "tenant_access_token");
-        if (!tokenResponse.IsSuccessStatusCode || string.IsNullOrWhiteSpace(token))
-        {
-            throw new InvalidOperationException($"飞书 token 获取失败：{tokenText}");
-        }
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"{domain}/open-apis/im/v1/messages?receive_id_type=chat_id");
-        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
-        request.Content = JsonContent.Create(new
-        {
-            receive_id = chatId,
-            msg_type = "text",
-            content = JsonSerializer.Serialize(new { text }, WebJsonOptions),
-        });
-        var response = await client.SendAsync(request);
-        var responseText = await response.Content.ReadAsStringAsync();
-        using var responseDoc = JsonDocument.Parse(responseText);
-        var code = ReadJsonInt(responseDoc.RootElement, "code");
-        if (!response.IsSuccessStatusCode || code != 0)
-        {
-            throw new InvalidOperationException($"飞书消息发送失败：{responseText}");
-        }
-        return responseDoc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object
-            ? ReadJsonString(data, "message_id")
-            : "";
+        var idempotencyKey = LarkCliGateway.CreateIdempotencyKey("panel");
+        return await CreateLarkCliGateway().SendTextAsync(chatId, text, idempotencyKey, _ctiHome);
     }
 
     private WebRuntimeUnit[] BuildRuntimeUnits()
@@ -3996,17 +3950,17 @@ internal sealed partial class MainForm : Form
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"),
                 "",
                 "Codex CLI 工具型服务，默认提供检查与工作目录入口，不伪造常驻 daemon 开关。")),
-            BuildFeishuCliRuntimeUnit(GetRuntimeManifestOrFallback(
+            BuildManagedToolRuntimeUnit(GetRuntimeManifestOrFallback(
                 runtimeManifests,
                 "service.feishuCli",
-                "飞书 CLI",
+                "Bridge Skill 更新",
                 "tool",
                 "bridge-skill",
                 "installed",
                 _skillDir,
                 _skillDir,
                 "",
-                "负责桥接 Skill / runtime 包更新，不承担 daemon 启停。")),
+                "历史兼容 id；负责桥接 Skill / runtime 包更新，不承担 daemon 启停。")),
             BuildLocalLlmRuntimeUnit(GetRuntimeManifestOrFallback(
                 runtimeManifests,
                 "service.localLlm",
@@ -4019,6 +3973,18 @@ internal sealed partial class MainForm : Form
                 "",
                 "本地或自托管 OpenAI-compatible 模型后端，用作 Codex agent 的可选模型来源。")),
         };
+
+        // 带 update 声明的外部 CLI 工具由 runtime manifest 自动进入面板，避免以后每接一个官方工具都改 C# 分支。
+        var knownUnitIds = units.Select(unit => unit.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var manifest in runtimeManifests.Values
+                     .Where(item => item.Update is not null && string.Equals(item.Kind, "tool", StringComparison.OrdinalIgnoreCase))
+                     .OrderBy(item => item.DisplayName, StringComparer.OrdinalIgnoreCase))
+        {
+            if (knownUnitIds.Add(manifest.Id))
+            {
+                units.Add(BuildManagedToolRuntimeUnit(manifest));
+            }
+        }
 
         foreach (var manifest in _manifests)
         {
@@ -5798,23 +5764,21 @@ exit $LASTEXITCODE
             }
         }
 
-        if (string.Equals(unitId, "service.feishuCli", StringComparison.OrdinalIgnoreCase))
+        var managedManifest = LoadRuntimeUnitManifestMap().GetValueOrDefault(unitId);
+        if (managedManifest?.Update is not null
+            && !string.Equals(unitId, "service.codex", StringComparison.OrdinalIgnoreCase))
         {
-            var manifest = LoadRuntimeUnitManifestMap().GetValueOrDefault("service.feishuCli")
-                ?? throw new InvalidOperationException("飞书 CLI 未声明 runtime manifest。");
             switch (action)
             {
                 case "check":
-                    var checkInstallRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
-                    return BuildFeishuCliDetail(checkInstallRoot, ResolveRuntimeVersion(manifest, checkInstallRoot), ResolveRuntimeUpdatePlan(manifest));
+                    return await BuildManagedToolCheckDetailAsync(managedManifest);
                 case "update":
-                    var feishuPlan = ResolveRuntimeUpdatePlan(manifest) ?? throw new InvalidOperationException("飞书 CLI 当前不可自动更新。");
-                    if (!feishuPlan.CanUpdate) throw new InvalidOperationException(feishuPlan.Reason);
-                    await RunUpdatePlanAsync(feishuPlan);
-                    var updatedInstallRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
-                    return BuildFeishuCliDetail(updatedInstallRoot, ResolveRuntimeVersion(manifest, updatedInstallRoot), ResolveRuntimeUpdatePlan(manifest));
+                    var managedPlan = ResolveRuntimeUpdatePlan(managedManifest) ?? throw new InvalidOperationException($"{managedManifest.DisplayName} 当前不可自动更新。");
+                    if (!managedPlan.CanUpdate) throw new InvalidOperationException(managedPlan.Reason);
+                    await RunUpdatePlanAsync(managedPlan);
+                    return await BuildManagedToolCheckDetailAsync(managedManifest);
                 case "openLocation":
-                    OpenPath(ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd));
+                    OpenPath(ExpandManifestValue(string.IsNullOrWhiteSpace(managedManifest.Cwd) ? managedManifest.Source : managedManifest.Cwd));
                     return "opened";
             }
         }
@@ -5922,6 +5886,23 @@ exit $LASTEXITCODE
         }
 
         throw new InvalidOperationException($"不支持的运行单元动作：{unitId} / {action}");
+    }
+
+    private async Task<string> BuildManagedToolCheckDetailAsync(RuntimeUnitManifestDefinition manifest)
+    {
+        var installRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
+        var packageRoot = ResolveManagedToolPackageRoot(manifest, installRoot);
+        var version = ResolveRuntimeVersion(manifest, packageRoot, installRoot);
+        var probeText = "";
+        if (string.Equals(manifest.Id, "tool.larkCli", StringComparison.OrdinalIgnoreCase))
+        {
+            var probe = await CreateLarkCliGateway().ProbeAsync(_ctiHome);
+            probeText = probe.Ready
+                ? $"身份: {probe.Identity} | token: {probe.TokenStatus} | 官方诊断: ready"
+                : $"官方诊断: blocked | {TrimForSummary(probe.Detail, 600)}";
+            if (!string.IsNullOrWhiteSpace(probe.Version)) version = probe.Version;
+        }
+        return BuildManagedToolDetail(manifest, installRoot, version, ResolveRuntimeUpdatePlan(manifest), probeText);
     }
 
     private Task<string> RestartControlPanelAsync()
@@ -9036,127 +9017,79 @@ exit $LASTEXITCODE
 
     private async Task<List<ConversationEntry>> FetchFeishuRemoteChatsAsync()
     {
-        var auth = await FetchFeishuTenantAccessTokenAsync();
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+        var gateway = CreateLarkCliGateway();
         var entries = new List<ConversationEntry>();
         string? pageToken = null;
 
         while (true)
         {
-            var url = $"{auth.BaseUrl}/open-apis/im/v1/chats?page_size=50";
-            if (!string.IsNullOrWhiteSpace(pageToken)) url += $"&page_token={Uri.EscapeDataString(pageToken)}";
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {auth.Token}");
-            using var response = await http.SendAsync(request);
-            var payload = await response.Content.ReadAsStringAsync();
-            using var document = JsonDocument.Parse(payload);
-            var root = document.RootElement;
-            var code = root.TryGetProperty("code", out var codeEl) ? codeEl.GetInt32() : response.IsSuccessStatusCode ? 0 : (int)response.StatusCode;
-            if (!response.IsSuccessStatusCode || code != 0)
+            var page = await gateway.ListChatsAsync(50, pageToken, _ctiHome);
+            foreach (var item in page.Items)
             {
-                var msg = root.TryGetProperty("msg", out var msgEl) ? msgEl.GetString() : response.ReasonPhrase;
-                throw new InvalidOperationException($"Feishu chats.list failed [{code}]: {msg}");
-            }
-
-            var data = root.TryGetProperty("data", out var dataEl) ? dataEl : default;
-            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("items", out var itemsEl) && itemsEl.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in itemsEl.EnumerateArray())
+                if (string.IsNullOrWhiteSpace(item.ChatId)) continue;
+                entries.Add(new ConversationEntry
                 {
-                    var chatId = GetJsonString(item, "chat_id");
-                    if (string.IsNullOrWhiteSpace(chatId)) continue;
-                    entries.Add(new ConversationEntry
-                    {
-                        ChannelType = "feishu",
-                        ChatId = chatId,
-                        ChatType = GetJsonString(item, "chat_type") ?? GetJsonString(item, "chat_mode") ?? "",
-                        DisplayName = GetJsonString(item, "name") ?? chatId,
-                        LastUpdatedAt = ParseUnixMsOrIso(GetJsonString(item, "last_message_time")),
-                    });
-                }
+                    ChannelType = "feishu",
+                    ChatId = item.ChatId,
+                    ChatType = item.ChatMode,
+                    DisplayName = string.IsNullOrWhiteSpace(item.Name) ? item.ChatId : item.Name,
+                });
             }
-
-            var hasMore = data.ValueKind == JsonValueKind.Object
-                && data.TryGetProperty("has_more", out var hasMoreEl)
-                && hasMoreEl.ValueKind is JsonValueKind.True or JsonValueKind.False
-                && hasMoreEl.GetBoolean();
-            pageToken = data.ValueKind == JsonValueKind.Object ? GetJsonString(data, "page_token") : null;
-            if (!hasMore || string.IsNullOrWhiteSpace(pageToken)) break;
+            pageToken = page.PageToken;
+            if (!page.HasMore || string.IsNullOrWhiteSpace(pageToken)) break;
         }
 
         return entries;
     }
 
-    private async Task<List<FeishuIndexedMessageRecord>> FetchFeishuRemoteMessagesAsync(string chatId, int limit, string? pageToken = null)
+    private async Task<LarkCliPage<FeishuIndexedMessageRecord>> FetchFeishuRemoteMessagesAsync(string chatId, int limit, string? pageToken = null)
     {
-        var auth = await FetchFeishuTenantAccessTokenAsync();
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-        var url = $"{auth.BaseUrl}/open-apis/im/v1/messages?container_id_type=chat&container_id={Uri.EscapeDataString(chatId)}&sort_type=ByCreateTimeDesc&page_size={Math.Min(50, Math.Max(1, limit))}";
-        if (!string.IsNullOrWhiteSpace(pageToken)) url += $"&page_token={Uri.EscapeDataString(pageToken)}";
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {auth.Token}");
-        using var response = await http.SendAsync(request);
-        var payload = await response.Content.ReadAsStringAsync();
-        using var document = JsonDocument.Parse(payload);
-        var root = document.RootElement;
-        var code = root.TryGetProperty("code", out var codeEl) ? codeEl.GetInt32() : response.IsSuccessStatusCode ? 0 : (int)response.StatusCode;
-        if (!response.IsSuccessStatusCode || code != 0)
-        {
-            var msg = root.TryGetProperty("msg", out var msgEl) ? msgEl.GetString() : response.ReasonPhrase;
-            throw new InvalidOperationException($"Feishu message.list failed [{code}]: {msg}");
-        }
-
+        var page = await CreateLarkCliGateway().ListMessagesAsync(chatId, limit, pageToken, _ctiHome);
         var result = new List<FeishuIndexedMessageRecord>();
-        var data = root.TryGetProperty("data", out var dataEl) ? dataEl : default;
-        if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("items", out var itemsEl) && itemsEl.ValueKind == JsonValueKind.Array)
+        foreach (var item in page.Items)
         {
-            foreach (var item in itemsEl.EnumerateArray())
+            if (item.Deleted) continue;
+            if (string.Equals(item.MessageType, "system", StringComparison.OrdinalIgnoreCase)) continue;
+            var msgType = item.MessageType;
+            var rawContent = item.Content;
+            var itemRaw = JsonSerializer.Serialize(new
             {
-                if (item.TryGetProperty("deleted", out var deletedEl) && deletedEl.ValueKind is JsonValueKind.True) continue;
-                if (string.Equals(GetJsonString(item, "msg_type"), "system", StringComparison.OrdinalIgnoreCase)) continue;
-                var msgType = GetJsonString(item, "msg_type") ?? "";
-                var rawContent = ExtractFeishuBodyContentRaw(item);
-                var itemRaw = item.GetRawText();
-                var indexedRawContent = ResolveFeishuIndexedRawContent(msgType, rawContent, itemRaw);
-                var hasDirectResource = IsDirectFeishuResourceMessage(msgType);
-                var resourceKey = hasDirectResource ? ExtractFeishuResourceKey(rawContent) : "";
-                if (hasDirectResource && string.IsNullOrWhiteSpace(resourceKey))
+                message_id = item.MessageId,
+                chat_id = item.ChatId,
+                create_time = item.CreateTime,
+                msg_type = msgType,
+                content = rawContent,
+                sender = new
                 {
-                    resourceKey = ExtractFeishuResourceKey(itemRaw);
-                }
-                var fileName = hasDirectResource ? ExtractFeishuFileName(rawContent) : "";
-                if (hasDirectResource && string.IsNullOrWhiteSpace(fileName))
-                {
-                    fileName = ExtractFeishuFileName(itemRaw);
-                }
-                result.Add(new FeishuIndexedMessageRecord
-                {
-                    MessageId = GetJsonString(item, "message_id") ?? "",
-                    ChatId = chatId,
-                    CreateTime = GetJsonString(item, "create_time") ?? "",
-                    MsgType = msgType,
-                    SenderId = item.TryGetProperty("sender", out var senderEl) ? GetJsonString(senderEl, "id") : "",
-                    SenderType = item.TryGetProperty("sender", out senderEl) ? GetJsonString(senderEl, "sender_type") : "",
-                    Text = ExtractFeishuMessageText(item),
-                    RawContent = indexedRawContent,
-                    ResourceKey = resourceKey,
-                    ResourceType = ResolveFeishuResourceType(msgType),
-                    FileName = fileName,
-                });
-            }
+                    id = item.SenderId,
+                    id_type = item.SenderIdType,
+                    name = item.SenderName,
+                    sender_type = item.SenderType,
+                },
+            }, WebJsonOptions);
+            var indexedRawContent = ResolveFeishuIndexedRawContent(msgType, rawContent, itemRaw);
+            var hasDirectResource = IsDirectFeishuResourceMessage(msgType);
+            var resourceKey = hasDirectResource ? ExtractFeishuResourceKey(rawContent) : "";
+            if (hasDirectResource && string.IsNullOrWhiteSpace(resourceKey)) resourceKey = ExtractFeishuResourceKey(itemRaw);
+            var fileName = hasDirectResource ? ExtractFeishuFileName(rawContent) : "";
+            if (hasDirectResource && string.IsNullOrWhiteSpace(fileName)) fileName = ExtractFeishuFileName(itemRaw);
+            result.Add(new FeishuIndexedMessageRecord
+            {
+                MessageId = item.MessageId,
+                ChatId = string.IsNullOrWhiteSpace(item.ChatId) ? chatId : item.ChatId,
+                CreateTime = item.CreateTime,
+                MsgType = msgType,
+                SenderId = item.SenderId,
+                SenderType = item.SenderType,
+                SenderName = item.SenderName,
+                Text = ExtractFeishuMessageText(msgType, rawContent),
+                RawContent = indexedRawContent,
+                ResourceKey = resourceKey,
+                ResourceType = ResolveFeishuResourceType(msgType),
+                FileName = fileName,
+            });
         }
-
-        var hasMore = data.ValueKind == JsonValueKind.Object
-            && data.TryGetProperty("has_more", out var hasMoreEl)
-            && hasMoreEl.ValueKind is JsonValueKind.True or JsonValueKind.False
-            && hasMoreEl.GetBoolean();
-        var nextPageToken = data.ValueKind == JsonValueKind.Object ? GetJsonString(data, "page_token") : null;
-        if (result.Count > 0)
-        {
-            result[^1].HasMore = hasMore;
-            result[^1].NextPageToken = nextPageToken;
-        }
-        return result;
+        return page.WithItems<FeishuIndexedMessageRecord>(result);
     }
 
     private async Task SyncAllFeishuHistoryAsync()
@@ -9192,9 +9125,8 @@ exit $LASTEXITCODE
         while (true)
         {
             var page = await FetchFeishuRemoteMessagesAsync(chatId, 50, pageToken);
-            if (page.Count == 0) break;
 
-            foreach (var item in page)
+            foreach (var item in page.Items)
             {
                 if (!string.IsNullOrWhiteSpace(item.SenderId) && speakerNames.TryGetValue(item.SenderId, out var speakerName))
                 {
@@ -9203,15 +9135,14 @@ exit $LASTEXITCODE
                 merged[item.MessageId] = item;
             }
 
-            if (!full)
+            if (!full && page.Items.Count > 0)
             {
-                var hasNewer = page.Any(item => long.TryParse(item.CreateTime, out var parsed) && parsed > latestKnown);
+                var hasNewer = page.Items.Any(item => long.TryParse(item.CreateTime, out var parsed) && parsed > latestKnown);
                 if (!hasNewer) break;
             }
 
-            var marker = page.LastOrDefault();
-            if (marker is null || !marker.HasMore || string.IsNullOrWhiteSpace(marker.NextPageToken)) break;
-            pageToken = marker.NextPageToken;
+            if (!page.HasMore || string.IsNullOrWhiteSpace(page.PageToken)) break;
+            pageToken = page.PageToken;
         }
 
         var ordered = merged.Values
@@ -9259,38 +9190,18 @@ exit $LASTEXITCODE
 
     private async Task<Dictionary<string, string>> FetchFeishuChatMemberNamesAsync(string chatId)
     {
-        var auth = await FetchFeishuTenantAccessTokenAsync();
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
         var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        string? pageToken = null;
-        while (true)
+        var memberPage = await CreateLarkCliGateway().ListMembersAsync(chatId, _ctiHome);
+        if (memberPage.Truncated)
         {
-            var url = $"{auth.BaseUrl}/open-apis/im/v1/chats/{chatId}/members?member_id_type=open_id&page_size=50";
-            if (!string.IsNullOrWhiteSpace(pageToken)) url += $"&page_token={Uri.EscapeDataString(pageToken)}";
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {auth.Token}");
-            using var response = await http.SendAsync(request);
-            var payload = await response.Content.ReadAsStringAsync();
-            using var document = JsonDocument.Parse(payload);
-            var root = document.RootElement;
-            var code = root.TryGetProperty("code", out var codeEl) ? codeEl.GetInt32() : response.IsSuccessStatusCode ? 0 : (int)response.StatusCode;
-            if (!response.IsSuccessStatusCode || code != 0) break;
-            var data = root.TryGetProperty("data", out var dataEl) ? dataEl : default;
-            if (data.ValueKind == JsonValueKind.Object && data.TryGetProperty("items", out var itemsEl) && itemsEl.ValueKind == JsonValueKind.Array)
+            AppendLog($"警告：飞书群成员列表被平台安全策略截断：{chatId}；当前仅使用官方 CLI 返回的可见成员。");
+        }
+        foreach (var member in memberPage.Items)
+        {
+            if (!string.IsNullOrWhiteSpace(member.MemberId) && !string.IsNullOrWhiteSpace(member.Name))
             {
-                foreach (var item in itemsEl.EnumerateArray())
-                {
-                    var memberId = GetJsonString(item, "member_id");
-                    var name = GetJsonString(item, "name");
-                    if (!string.IsNullOrWhiteSpace(memberId) && !string.IsNullOrWhiteSpace(name)) names[memberId] = name;
-                }
+                names[member.MemberId] = member.Name;
             }
-            var hasMore = data.ValueKind == JsonValueKind.Object
-                && data.TryGetProperty("has_more", out var hasMoreEl)
-                && hasMoreEl.ValueKind is JsonValueKind.True or JsonValueKind.False
-                && hasMoreEl.GetBoolean();
-            pageToken = data.ValueKind == JsonValueKind.Object ? GetJsonString(data, "page_token") : null;
-            if (!hasMore || string.IsNullOrWhiteSpace(pageToken)) break;
         }
         return names;
     }
@@ -9555,17 +9466,15 @@ exit $LASTEXITCODE
             var cachePath = Path.Combine(_mediaCacheDir, $"{messageId}-{safeKey}{ext}");
             if (!File.Exists(cachePath) || new FileInfo(cachePath).Length == 0)
             {
-                var auth = await FetchFeishuTenantAccessTokenAsync();
-                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
                 var typeParam = string.Equals(resourceType, "image", StringComparison.OrdinalIgnoreCase) ? "image" : "file";
-                var url = $"{auth.BaseUrl}/open-apis/im/v1/messages/{Uri.EscapeDataString(messageId)}/resources/{Uri.EscapeDataString(resourceKey)}?type={typeParam}";
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {auth.Token}");
-                using var response = await http.SendAsync(request);
-                if (!response.IsSuccessStatusCode) return null;
-                var bytes = await response.Content.ReadAsByteArrayAsync();
-                if (bytes.Length == 0 || bytes.Length > 100 * 1024 * 1024) return null;
-                await File.WriteAllBytesAsync(cachePath, bytes);
+                var outputName = Path.GetFileName(cachePath);
+                await CreateLarkCliGateway().DownloadMessageResourceAsync(
+                    messageId,
+                    resourceKey,
+                    typeParam,
+                    outputName,
+                    _mediaCacheDir);
+                if (!File.Exists(cachePath) || new FileInfo(cachePath).Length is <= 0 or > 104_857_600) return null;
             }
             var mimeType = GuessMimeType(cachePath);
             return BuildLocalAttachment(
@@ -9725,42 +9634,6 @@ exit $LASTEXITCODE
         MessageBox.Show(this, text, "飞书历史同步状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private async Task<(string Token, string BaseUrl)> FetchFeishuTenantAccessTokenAsync()
-    {
-        var appId = GetConfig("CTI_FEISHU_APP_ID", "");
-        var appSecret = GetConfig("CTI_FEISHU_APP_SECRET", "");
-        if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
-        {
-            throw new InvalidOperationException("未配置飞书 App ID / App Secret。");
-        }
-
-        var configuredDomain = GetConfig("CTI_FEISHU_DOMAIN", "https://open.feishu.cn");
-        var baseUrl = configuredDomain.Contains("larksuite", StringComparison.OrdinalIgnoreCase)
-            ? "https://open.larksuite.com"
-            : "https://open.feishu.cn";
-
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/open-apis/auth/v3/tenant_access_token/internal");
-        request.Content = new StringContent(JsonSerializer.Serialize(new
-        {
-            app_id = appId,
-            app_secret = appSecret,
-        }), Encoding.UTF8, "application/json");
-
-        using var response = await http.SendAsync(request);
-        var payload = await response.Content.ReadAsStringAsync();
-        using var document = JsonDocument.Parse(payload);
-        var root = document.RootElement;
-        var token = GetJsonString(root, "tenant_access_token");
-        if (!response.IsSuccessStatusCode || string.IsNullOrWhiteSpace(token))
-        {
-            var msg = GetJsonString(root, "msg") ?? response.ReasonPhrase ?? "unknown error";
-            throw new InvalidOperationException($"获取飞书 tenant_access_token 失败：{msg}");
-        }
-
-        return (token, baseUrl);
-    }
-
     private static string InferFeishuRole(JsonElement item)
     {
         if (item.TryGetProperty("sender", out var sender))
@@ -9807,6 +9680,11 @@ exit $LASTEXITCODE
         }
 
         var content = ExtractFeishuBodyContentRaw(item);
+        return ExtractFeishuMessageText(msgType, content);
+    }
+
+    private static string ExtractFeishuMessageText(string msgType, string content)
+    {
         if (string.IsNullOrWhiteSpace(content)) return $"[{msgType}]";
         if (string.Equals(msgType, "text", StringComparison.OrdinalIgnoreCase))
         {
@@ -10140,6 +10018,42 @@ exit $LASTEXITCODE
                 // best effort cleanup
             }
         }
+    }
+
+    private LarkCliGateway CreateLarkCliGateway()
+        => new(GetConfig("CTI_FEISHUCLI_PROFILE", ""), ExecuteLarkCliCommandAsync);
+
+    private async Task<LarkCliExecutionResult> ExecuteLarkCliCommandAsync(
+        IReadOnlyList<string> arguments,
+        string workingDirectory,
+        int timeoutMs)
+    {
+        var commandPath = ResolveLarkCliCommandPath();
+        // 所有参数均作为 PowerShell 单引号字面量传递，避免消息正文、群名或路径被二次解释。
+        var trailingArgs = string.Join(" ", arguments.Select(QuotePowerShellLiteral));
+        var result = await RunPowerShellFileAsync(
+            commandPath,
+            trailingArgs,
+            string.IsNullOrWhiteSpace(workingDirectory) ? _ctiHome : workingDirectory,
+            timeoutMs);
+        return new LarkCliExecutionResult(result.ExitCode, result.Stdout, result.Stderr);
+    }
+
+    private string ResolveLarkCliCommandPath()
+    {
+        var configured = GetConfig("CTI_FEISHUCLI_PATH", "").Trim();
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return configured;
+        }
+
+        var npmRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm");
+        foreach (var candidate in new[] { "lark-cli.ps1", "lark-cli.cmd", "lark-cli" })
+        {
+            var path = Path.Combine(npmRoot, candidate);
+            if (File.Exists(path)) return path;
+        }
+        return "lark-cli";
     }
 
     private static async Task<ProcessResult> RunPowerShellFileAsync(string scriptPath, string trailingArgs, string workingDirectory, int timeoutMs, Dictionary<string, string?>? environment = null)
@@ -11556,8 +11470,6 @@ internal sealed class FeishuIndexedMessageRecord
     public string ResourceKey { get; set; } = "";
     public string ResourceType { get; set; } = "";
     public string FileName { get; set; } = "";
-    public bool HasMore { get; set; }
-    public string? NextPageToken { get; set; }
 }
 
 internal sealed class StoredContentBlock

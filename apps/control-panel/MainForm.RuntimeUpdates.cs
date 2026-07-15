@@ -222,12 +222,13 @@ internal sealed partial class MainForm
             ]);
     }
 
-    private WebRuntimeUnit BuildFeishuCliRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    private WebRuntimeUnit BuildManagedToolRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var updatePlan = ResolveRuntimeUpdatePlan(manifest);
         var installRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
-        var version = ResolveRuntimeVersion(manifest, installRoot);
-        var detail = BuildFeishuCliDetail(installRoot, version, updatePlan);
+        var packageRoot = ResolveManagedToolPackageRoot(manifest, installRoot);
+        var version = ResolveRuntimeVersion(manifest, packageRoot, installRoot);
+        var detail = BuildManagedToolDetail(manifest, installRoot, version, updatePlan);
         var status = ClassifyManagedToolStatus(installRoot, updatePlan);
         return new WebRuntimeUnit(
             manifest.Id,
@@ -251,14 +252,24 @@ internal sealed partial class MainForm
             ]);
     }
 
-    private string BuildFeishuCliDetail(string installRoot, string version, ResolvedUpdatePlan? updatePlan)
+    private string BuildManagedToolDetail(
+        RuntimeUnitManifestDefinition manifest,
+        string installRoot,
+        string version,
+        ResolvedUpdatePlan? updatePlan,
+        string? runtimeProbe = null)
     {
         var lines = new List<string>
         {
-            Directory.Exists(installRoot) ? "已检测到飞书 CLI / bridge skill 安装目录。" : "未检测到飞书 CLI / bridge skill 安装目录。",
+            Directory.Exists(installRoot) ? $"已检测到 {manifest.DisplayName} 安装目录。" : $"未检测到 {manifest.DisplayName} 安装目录。",
             $"版本: {FormatRuntimeVersionLabel(version)}",
             $"路径: {installRoot}"
         };
+
+        if (!string.IsNullOrWhiteSpace(runtimeProbe))
+        {
+            lines.Add(runtimeProbe.Trim());
+        }
 
         if (updatePlan is null)
         {
@@ -279,6 +290,16 @@ internal sealed partial class MainForm
         }
 
         return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string ResolveManagedToolPackageRoot(RuntimeUnitManifestDefinition manifest, string installRoot)
+    {
+        var packageName = manifest.Update?.PackageName?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(packageName)) return installRoot;
+        return Path.Combine(
+            installRoot,
+            "node_modules",
+            packageName.Replace('/', Path.DirectorySeparatorChar));
     }
 
     private async Task RunUpdatePlanAsync(ResolvedUpdatePlan plan)
