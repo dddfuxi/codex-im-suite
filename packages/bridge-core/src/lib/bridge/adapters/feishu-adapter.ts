@@ -503,6 +503,8 @@ interface FeishuStickerRecord {
   examples?: string[];
   annotationConfidence?: number;
   annotationSource?: 'vision' | 'manual' | 'user';
+  /** 视觉语义实际分析过的媒体 key；必须与 fileKey 一致才可被信任。 */
+  visionMediaFileKey?: string;
   annotationVerifiedAt?: string;
   annotationUpdatedAt?: string;
   userAnnotation?: FeishuStickerUserAnnotation;
@@ -1569,6 +1571,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
     cleaned.annotationSource = cleaned.annotationSource === 'vision' || cleaned.annotationSource === 'manual' || cleaned.annotationSource === 'user'
       ? cleaned.annotationSource
       : undefined;
+    // 旧视觉记录没有“目标 key = 实际分析媒体”的证明时一律降级，避免把历史
+    // 串图结果继续显示为可信语义或参与自动发送。
+    if (cleaned.annotationSource === 'vision' && cleaned.visionMediaFileKey !== cleaned.fileKey) {
+      cleaned.annotationSource = undefined;
+      delete cleaned.label;
+      delete cleaned.description;
+      delete cleaned.intent;
+      delete cleaned.tone;
+      delete cleaned.usage;
+      delete cleaned.avoidWhen;
+      delete cleaned.annotationConfidence;
+      delete cleaned.annotationVerifiedAt;
+    }
     cleaned.disabled = cleaned.disabled === true;
     cleaned.annotationConfidence = Number.isFinite(Number(cleaned.annotationConfidence))
       ? Math.max(0, Math.min(1, Number(cleaned.annotationConfidence)))
@@ -2014,6 +2029,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     examples?: string[];
     annotationConfidence?: number;
     source?: 'vision' | 'user' | 'manual';
+    visionMediaFileKey?: string;
   }): boolean {
     const fileKey = input.fileKey?.trim();
     if (!fileKey) return false;
@@ -2114,6 +2130,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     record.examples = Array.from(new Set([...(record.examples || []), ...annotation.examples])).slice(0, 8);
     record.annotationConfidence = annotation.annotationConfidence ?? record.annotationConfidence;
     record.annotationSource = trustedSource;
+    if (trustedSource === 'vision') {
+      const visualKey = input.visionMediaFileKey?.trim();
+      if (!visualKey || visualKey !== fileKey) return false;
+      record.visionMediaFileKey = visualKey;
+    }
     record.annotationVerifiedAt = now;
     record.annotationUpdatedAt = now;
     record.learnedFromMessageId = input.learnedFromMessageId || record.learnedFromMessageId;
@@ -2169,7 +2190,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private hasTrustedStickerSemanticSource(record: FeishuStickerRecord | null): boolean {
-    return record?.annotationSource === 'vision'
+    return (record?.annotationSource === 'vision' && record.visionMediaFileKey === record.fileKey)
       || record?.annotationSource === 'manual'
       || Boolean(record?.annotationVerifiedAt);
   }
@@ -6793,7 +6814,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const attachments: FileAttachment[] = [];
     const content = item.body?.content || '';
 
-    if (item.msg_type === 'image') {
+    // 飞书原生 sticker 与 image 都由消息资源 API 按 image 下载；回复 sticker
+    // 时必须使用被回复消息自身的 message_id/file_key，不能退回近邻候选图。
+    if (item.msg_type === 'image' || item.msg_type === 'sticker') {
       const fileKey = this.extractFileKey(content);
       if (fileKey) {
         const attachment = await this.downloadResource(item.message_id, fileKey, 'image');

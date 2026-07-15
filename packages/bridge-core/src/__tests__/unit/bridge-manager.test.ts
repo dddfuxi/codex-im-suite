@@ -3603,10 +3603,60 @@ describe('bridge-manager policy helpers', () => {
       aliases: ['又来这套', '无奈吐槽'],
       annotationConfidence: 0.86,
       source: 'vision',
+      visionMediaFileKey: 'sticker_file_key',
     });
     assert.equal(sent.length, 1);
     assert.doesNotMatch(sent[0].text, /cti-sticker-annotation|fileKey|confidence/);
     assert.match(sent[0].text, /懂了/);
+  });
+
+  it('does not persist a sticker annotation when the attached image belongs to a different file key', async () => {
+    const annotations: unknown[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '我无法确认这张表情包的画面。',
+          '```cti-sticker-annotation',
+          JSON.stringify({
+            fileKey: 'sticker_target',
+            label: '不应写入',
+            description: '这不是目标表情包的图片',
+            intent: 'wrong_media',
+            confidence: 0.9,
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' })) as BaseChannelAdapter & {
+      recordStickerAnnotation?: (input: unknown) => boolean;
+    };
+    adapter.recordStickerAnnotation = (input: unknown) => {
+      annotations.push(input);
+      return true;
+    };
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('请分析被回复的表情包', 'ou_1', 'oc_sticker_mismatched_media'),
+      messageKind: 'feishu_sticker_image',
+      raw: {
+        messageKind: 'feishu_sticker_image',
+        sticker: { fileKey: 'sticker_target', known: false, imageAvailable: false },
+      },
+      attachments: [{
+        id: 'sticker_other',
+        name: 'sticker-other.png',
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      }],
+    });
+
+    assert.equal(annotations.length, 0);
   });
 
   it('runs an invisible sticker annotation fallback when the visible reply omits the annotation block', async () => {
@@ -3681,6 +3731,7 @@ describe('bridge-manager policy helpers', () => {
       usage: '用户用表情包互动或轻松确认时使用',
       annotationConfidence: 0.74,
       source: 'vision',
+      visionMediaFileKey: 'sticker_file_key',
     });
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /收到啦/);
@@ -4358,6 +4409,7 @@ describe('bridge-manager policy helpers', () => {
       aliases: ['轻松搞怪', '活跃气氛'],
       annotationConfidence: 0.82,
       source: 'vision',
+      visionMediaFileKey: 'sticker_funny_candidate',
     });
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /^\[表情包:sticker_funny_candidate\]/);

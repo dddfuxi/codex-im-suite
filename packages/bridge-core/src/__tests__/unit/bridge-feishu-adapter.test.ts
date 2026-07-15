@@ -1886,6 +1886,40 @@ describe('FeishuAdapter light conversation context', () => {
   });
 });
 
+describe('FeishuAdapter replied sticker attachments', () => {
+  it('downloads the exact sticker image from a replied message', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const calls: Array<{ messageId: string; fileKey: string; resourceType: string }> = [];
+    adapter.downloadResource = async (messageId: string, fileKey: string, resourceType: string) => {
+      calls.push({ messageId, fileKey, resourceType });
+      return {
+        id: fileKey,
+        name: `${fileKey}.png`,
+        type: 'image/png',
+        size: 4,
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64'),
+      };
+    };
+
+    const attachments = await adapter.downloadAttachmentsFromMessageItem({
+      message_id: 'om_original_sticker',
+      chat_id: 'oc_group',
+      create_time: String(Date.now()),
+      msg_type: 'sticker',
+      body: { content: JSON.stringify({ file_key: 'sticker_original_key' }) },
+      sender: { id: 'ou_other', sender_type: 'user' },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], {
+      messageId: 'om_original_sticker',
+      fileKey: 'sticker_original_key',
+      resourceType: 'image',
+    });
+    assert.equal(attachments[0]?.id, 'sticker_original_key');
+  });
+});
+
 describe('FeishuAdapter history intent and bot event guards', () => {
   beforeEach(() => {
     setupContext();
@@ -2134,6 +2168,7 @@ describe('FeishuAdapter history intent and bot event guards', () => {
         tone: '开心肯定',
         usage: '夸奖别人时使用',
         annotationSource: 'vision',
+        visionMediaFileKey: 'sticker_praise_candidate',
         annotationConfidence: 0.9,
         firstSeenAt: '2026-07-11T00:00:00.000Z',
         lastSeenAt: '2026-07-11T00:00:00.000Z',
@@ -3076,6 +3111,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           label: '不确定',
           intent: '画面太模糊，无法确认语义',
           annotationSource: 'vision',
+          visionMediaFileKey: 'file_v2_low_confidence',
           annotationConfidence: 0.2,
           firstSeenAt: '2026-06-06T06:00:00.000Z',
           lastSeenAt: '2026-06-06T06:10:00.000Z',
@@ -3175,6 +3211,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
         tone: 'casual',
         usage: '轻松接话时使用',
         annotationSource: 'vision',
+        visionMediaFileKey: 'file_v2_vision_without_confidence',
         firstSeenAt: '2026-06-06T06:00:00.000Z',
         lastSeenAt: '2026-06-06T06:10:00.000Z',
         useCount: 0,
@@ -3269,6 +3306,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
         tone: 'friendly playful',
         usage: '用户让随便发个表情包或轻松接话时使用',
         annotationSource: 'vision',
+        visionMediaFileKey: 'file_v2_trusted_sticker',
         annotationConfidence: 0.82,
         firstSeenAt: '2026-06-06T06:00:00.000Z',
         lastSeenAt: '2026-06-06T06:10:00.000Z',
@@ -3317,6 +3355,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
         tone: '开心轻松',
         usage: '轻松闲聊时使用',
         annotationSource: 'vision',
+        visionMediaFileKey: 'file_v2_trusted_laugh',
         annotationConfidence: 0.86,
         firstSeenAt: '2026-06-06T06:00:00.000Z',
         lastSeenAt: '2026-06-06T06:10:00.000Z',
@@ -3436,6 +3475,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           tone: '兴奋、可爱、热闹',
           usage: '对方完成好事、需要鼓励、想活跃气氛或表达支持时使用',
           annotationSource: 'vision',
+          visionMediaFileKey: 'sticker_high_confidence_party',
           annotationConfidence: 0.95,
           firstSeenAt: '2026-06-06T06:00:00.000Z',
           lastSeenAt: '2026-06-06T06:10:00.000Z',
@@ -3450,6 +3490,7 @@ describe('FeishuAdapter CardKit compatibility', () => {
           tone: '可爱、友好、轻松',
           usage: '开场问候、轻松接话、表示收到或弱弱出现时使用',
           annotationSource: 'vision',
+          visionMediaFileKey: 'sticker_arrived_wave',
           annotationConfidence: 0.78,
           firstSeenAt: '2026-06-06T05:00:00.000Z',
           lastSeenAt: '2026-06-06T05:10:00.000Z',
@@ -3711,6 +3752,7 @@ describe('FeishuAdapter sticker inbound', () => {
           label: '挥手打招呼',
           intent: '打招呼、来啦',
           annotationSource: 'vision',
+          visionMediaFileKey: 'trusted_old_sticker',
           annotationConfidence: 0.88,
           annotationVerifiedAt: '2026-07-13T00:00:00.000Z',
           firstSeenAt: '2026-07-13T00:00:00.000Z',
@@ -3859,6 +3901,7 @@ describe('FeishuAdapter sticker inbound', () => {
         tone: '可爱、轻松',
         usage: '开场问候或轻松接话时使用',
         annotationSource: 'vision',
+        visionMediaFileKey: fileKey,
         annotationConfidence: 0.86,
         annotationVerifiedAt: '2026-07-13T00:00:00.000Z',
         firstSeenAt: '2026-07-13T00:00:00.000Z',

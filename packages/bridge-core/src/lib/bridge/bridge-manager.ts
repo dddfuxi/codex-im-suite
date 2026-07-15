@@ -6571,14 +6571,20 @@ async function handleMessage(
     const stickerAnnotationResult = result.responseText
       ? extractStickerAnnotationFromReply(result.responseText, currentStickerFileKey)
       : { annotation: null, text: '' };
-    let currentStickerAnnotation = stickerAnnotationResult.annotation;
+    // 视觉标注只能绑定到本轮实际附加、且 file_key 精确相同的图片。
+    // 表情包候选库可能同时提供其他图片；绝不能让模型把候选图的观察结果写回
+    // 被回复的表情包，否则错误语义会以 source=vision 污染后续回复和发送选择。
+    const hasVerifiedCurrentStickerImage = hasCurrentStickerImageAttachment(providerAttachments, currentStickerFileKey);
+    let currentStickerAnnotation = hasVerifiedCurrentStickerImage
+      ? stickerAnnotationResult.annotation
+      : null;
     if (
       !currentStickerAnnotation
       && !result.hasError
       && isStickerMessage
       && currentStickerFileKey
       && typeof adapter.recordStickerAnnotation === 'function'
-      && hasCurrentStickerImageAttachment(providerAttachments, currentStickerFileKey)
+      && hasVerifiedCurrentStickerImage
     ) {
       currentStickerAnnotation = await runInvisibleStickerAnnotationFallback({
         binding: effectiveBinding,
@@ -6614,6 +6620,7 @@ async function handleMessage(
         userId: msg.address.userId,
         learnedFromMessageId: msg.messageId,
         source: 'vision',
+        visionMediaFileKey: currentStickerFileKey,
       });
     }
     if (stickerCandidateAnalysisResult.annotations.length > 0 && typeof adapter.recordStickerAnnotation === 'function') {
@@ -6624,6 +6631,7 @@ async function handleMessage(
           userId: msg.address.userId,
           learnedFromMessageId: msg.messageId,
           source: 'vision',
+          visionMediaFileKey: annotation.fileKey,
         });
       }
     }

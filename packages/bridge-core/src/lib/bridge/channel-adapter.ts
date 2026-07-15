@@ -202,6 +202,7 @@ export abstract class BaseChannelAdapter {
     examples?: string[];
     annotationConfidence?: number;
     source?: 'vision' | 'user' | 'manual';
+    visionMediaFileKey?: string;
   }): boolean;
 
   /**
