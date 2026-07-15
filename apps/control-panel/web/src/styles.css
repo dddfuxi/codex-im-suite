@@ -416,6 +416,130 @@ textarea::placeholder {
   }
 }
 
+.skill-draft-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.skill-draft-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.skill-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.skill-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  color: var(--text-soft);
+  background: var(--panel-strong);
+  cursor: pointer;
+}
+
+.skill-tab span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.skill-tab.active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.skill-catalog-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.skill-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.skill-card {
+  display: grid;
+  gap: 12px;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-strong);
+}
+
+.skill-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.skill-card h3,
+.skill-card p {
+  margin: 0;
+}
+
+.skill-card small,
+.skill-card p,
+.skill-card dt {
+  color: var(--text-muted);
+}
+
+.skill-card p {
+  min-height: 42px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.skill-card dl {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 5px 8px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.skill-card dd {
+  margin: 0;
+}
+
+.skill-risk {
+  align-self: start;
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: var(--success-text);
+  background: var(--success-bg);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.skill-risk.medium,
+.skill-risk.high {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+
+@media (max-width: 860px) {
+  .skill-draft-grid,
+  .skill-card-grid,
+  .skill-catalog-search {
+    grid-template-columns: 1fr;
+  }
+}
+
 .sidebar-footer {
   margin-top: auto;
   display: grid;

@@ -38,6 +38,58 @@ function fakeTools(options: { failValidation?: boolean } = {}): SkillLifecycleTo
 }
 
 describe('SkillLifecycleService', () => {
+  it('does not search the official catalog when an installed skill already matches', async () => {
+    const paths = fixture();
+    let curatedCalls = 0;
+    try {
+      writeSkill(path.join(paths.codexHome, 'skills'), 'asset-cleaner', 'installed capability');
+      const tools = fakeTools();
+      tools.listCurated = async () => {
+        curatedCalls += 1;
+        return [{ name: 'asset-cleaner-pro', installed: false }];
+      };
+      const service = createSkillLifecycleService({
+        ...paths,
+        registry: createSkillRegistry({ ...paths, now: () => fixedNow }),
+        tools,
+        now: () => fixedNow,
+      });
+
+      const results = await service.search('asset-cleaner');
+
+      assert.equal(curatedCalls, 0);
+      assert.deepEqual(results.map((item) => item.id), ['asset-cleaner']);
+    } finally {
+      fs.rmSync(paths.root, { recursive: true, force: true });
+    }
+  });
+
+  it('searches the official catalog when no installed skill matches', async () => {
+    const paths = fixture();
+    let curatedCalls = 0;
+    try {
+      const tools = fakeTools();
+      tools.listCurated = async () => {
+        curatedCalls += 1;
+        return [{ name: 'asset-cleaner', installed: false }];
+      };
+      const service = createSkillLifecycleService({
+        ...paths,
+        registry: createSkillRegistry({ ...paths, now: () => fixedNow }),
+        tools,
+        now: () => fixedNow,
+      });
+
+      const results = await service.search('asset-cleaner');
+
+      assert.equal(curatedCalls, 1);
+      assert.deepEqual(results.map((item) => item.id), ['asset-cleaner']);
+      assert.equal(results[0]?.sourceClass, 'official_curated');
+    } finally {
+      fs.rmSync(paths.root, { recursive: true, force: true });
+    }
+  });
+
   it('requires user confirmation for an uninstalled official curated skill', async () => {
     const paths = fixture();
     try {

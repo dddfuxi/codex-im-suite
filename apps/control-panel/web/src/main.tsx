@@ -56,8 +56,12 @@ import {
   type ServiceTabId,
 } from './panel-navigation.js';
 import { ArchitecturePage } from './pages/ArchitecturePage.js';
+import { McpPage } from './pages/McpPage.js';
+import { ModelsPluginsPage } from './pages/ModelsPluginsPage.js';
 import { PromptPage } from './pages/PromptPage.js';
+import { SkillsPage } from './pages/SkillsPage.js';
 import type { PromptSnapshotPanelState } from './prompt-view-model.js';
+import type { SkillGovernancePanelState } from './skill-view-model.js';
 import './styles.css';
 
 type StatusKind = 'ok' | 'warning' | 'error' | 'idle';
@@ -777,9 +781,8 @@ type TodoReminderItem = {
   delivery?: { status?: string; messageId?: string; cardId?: string; lastAttemptAt?: string; error?: string; attempts?: number; completedAt?: string; completedByUserId?: string; completionSource?: string; completionError?: string };
 };
 
-type ExtensionKindFilter = 'all' | 'mcp' | 'skill' | 'plugin' | 'extension';
 type ExtensionCatalogFilter = 'all' | 'mcp' | 'skill' | 'plugin' | 'model';
-type ImportKind = '' | 'skill' | 'mcp';
+type ImportKind = '' | 'mcp';
 type McpRuntimeType = 'stdio' | 'http';
 
 type ExtensionImportPreview = {
@@ -901,11 +904,7 @@ type PanelState = {
     missingSources: number;
     items: ExtensionItem[];
   };
-  skillGovernance: {
-    available: boolean;
-    error: string;
-    snapshot: unknown | null;
-  };
+  skillGovernance: SkillGovernancePanelState;
   promptSnapshots: PromptSnapshotPanelState;
   mcp: {
     total: number;
@@ -2272,10 +2271,6 @@ function App() {
     () => runtimeUnits.filter((unit) => !['service', 'tool'].includes(unit.kind)),
     [runtimeUnits],
   );
-  const runtimeSkillUnits = useMemo(
-    () => runtimeExtensionUnits.filter((unit) => unit.kind === 'skill'),
-    [runtimeExtensionUnits],
-  );
   const runtimeMcpUnits = useMemo(
     () => runtimeExtensionUnits.filter((unit) => unit.kind === 'mcp'),
     [runtimeExtensionUnits],
@@ -2604,40 +2599,45 @@ function App() {
         )}
         {page === 'permissions' && <PermissionsPage state={state} run={run} pending={pending} />}
         {page === 'skills' && (
-          <ExtensionsPage
-            state={state}
-            units={runtimeSkillUnits}
-            selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
-            setSelectedUnitId={setSelectedExtensionUnitId}
-            invokeAction={invokeRuntimeAction}
+          <SkillsPage
+            governance={state.skillGovernance}
             run={run}
-            refreshUnits={loadRuntimeUnits}
+            refresh={async () => {
+              await sendCommand('state.refresh');
+              await loadRuntimeUnits();
+            }}
             pending={pending}
           />
         )}
         {page === 'mcp' && (
-          <ExtensionsPage
-            state={state}
-            units={runtimeMcpUnits}
-            selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
-            setSelectedUnitId={setSelectedExtensionUnitId}
-            invokeAction={invokeRuntimeAction}
-            run={run}
-            refreshUnits={loadRuntimeUnits}
-            pending={pending}
-          />
+          <McpPage>
+            <ExtensionsPage
+              mode="mcp"
+              state={state}
+              units={runtimeMcpUnits}
+              selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
+              setSelectedUnitId={setSelectedExtensionUnitId}
+              invokeAction={invokeRuntimeAction}
+              run={run}
+              refreshUnits={loadRuntimeUnits}
+              pending={pending}
+            />
+          </McpPage>
         )}
         {page === 'modelsPlugins' && (
-          <ExtensionsPage
-            state={state}
-            units={runtimeModelPluginUnits}
-            selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
-            setSelectedUnitId={setSelectedExtensionUnitId}
-            invokeAction={invokeRuntimeAction}
-            run={run}
-            refreshUnits={loadRuntimeUnits}
-            pending={pending}
-          />
+          <ModelsPluginsPage>
+            <ExtensionsPage
+              mode="models_plugins"
+              state={state}
+              units={runtimeModelPluginUnits}
+              selectedUnitId={selectedExtensionUnit?.unitId ?? ''}
+              setSelectedUnitId={setSelectedExtensionUnitId}
+              invokeAction={invokeRuntimeAction}
+              run={run}
+              refreshUnits={loadRuntimeUnits}
+              pending={pending}
+            />
+          </ModelsPluginsPage>
         )}
         {page === 'release' && <ReleasePage state={state} run={run} pending={pending} />}
         {page === 'sessions' && (
@@ -3520,6 +3520,7 @@ function PermissionsPage({ state, run, pending }: PageProps) {
 }
 
 function ExtensionsPage({
+  mode,
   state,
   units,
   selectedUnitId,
@@ -3529,6 +3530,7 @@ function ExtensionsPage({
   refreshUnits,
   pending,
 }: {
+  mode: 'mcp' | 'models_plugins';
   state: PanelState;
   units: RuntimeUnit[];
   selectedUnitId: string;
@@ -3538,14 +3540,13 @@ function ExtensionsPage({
   refreshUnits: () => Promise<void>;
   pending: Record<string, boolean>;
 }) {
-  const [kindFilter, setKindFilter] = useState<ExtensionKindFilter>('all');
   const [importPath, setImportPath] = useState('');
   const [importPreview, setImportPreview] = useState<ExtensionImportPreview | null>(null);
   const [importKind, setImportKind] = useState<ImportKind>('');
   const [importRuntimeType, setImportRuntimeType] = useState<McpRuntimeType>('stdio');
   const [catalog, setCatalog] = useState<ExtensionCatalogSnapshot | null>(null);
   const [catalogQuery, setCatalogQuery] = useState('');
-  const [catalogFilter, setCatalogFilter] = useState<ExtensionCatalogFilter>('all');
+  const [catalogFilter, setCatalogFilter] = useState<ExtensionCatalogFilter>(mode === 'mcp' ? 'mcp' : 'all');
   const [catalogLayerFilter, setCatalogLayerFilter] = useState<'all' | 'local' | 'seed' | 'dynamic' | 'custom_url'>('all');
   const [installJobs, setInstallJobs] = useState<ExtensionInstallJob[]>([]);
   const refreshedTerminalInstallJobsRef = useRef<Set<string>>(new Set());
@@ -3553,39 +3554,22 @@ function ExtensionsPage({
   const [useModelAfterInstall, setUseModelAfterInstall] = useState(true);
   const [remoteUrl, setRemoteUrl] = useState('');
   const [remotePreview, setRemotePreview] = useState<RemoteExtensionPreview | null>(null);
-  const filterItems: Array<{ id: ExtensionKindFilter; label: string; count: number }> = useMemo(() => {
-    const counts = {
-      all: units.length,
-      mcp: units.filter((unit) => unit.kind === 'mcp').length,
-      skill: units.filter((unit) => unit.kind === 'skill').length,
-      plugin: units.filter((unit) => unit.kind === 'plugin').length,
-      extension: units.filter((unit) => !['mcp', 'skill', 'plugin'].includes(unit.kind)).length,
-    };
-    return [
-      { id: 'all', label: '全部', count: counts.all },
-      { id: 'mcp', label: 'MCP', count: counts.mcp },
-      { id: 'skill', label: 'Skill', count: counts.skill },
-      { id: 'plugin', label: 'Plugin', count: counts.plugin },
-      { id: 'extension', label: '其他扩展', count: counts.extension },
-    ];
-  }, [units]);
-  const filteredUnits = useMemo(() => {
-    if (kindFilter === 'all') return units;
-    if (kindFilter === 'extension') {
-      return units.filter((unit) => !['mcp', 'skill', 'plugin'].includes(unit.kind));
-    }
-    return units.filter((unit) => unit.kind === kindFilter);
-  }, [kindFilter, units]);
+  const allowedCatalogTypes = useMemo<ExtensionCatalogFilter[]>(
+    () => mode === 'mcp' ? ['mcp'] : ['plugin', 'model'],
+    [mode],
+  );
+  const filteredUnits = units;
   const selected = filteredUnits.find((unit) => unit.unitId === selectedUnitId) ?? filteredUnits[0];
   const filteredCatalogItems = useMemo(() => {
     const query = catalogQuery.trim().toLowerCase();
     return (catalog?.items ?? []).filter((item) => {
+      if (!allowedCatalogTypes.includes(item.type as ExtensionCatalogFilter)) return false;
       if (catalogFilter !== 'all' && item.type !== catalogFilter) return false;
       if (catalogLayerFilter !== 'all' && item.sourceLayer !== catalogLayerFilter) return false;
       if (!query) return true;
       return `${item.id} ${item.displayName} ${item.category} ${item.description} ${item.installHandler} ${item.sourceName} ${item.rankBasis}`.toLowerCase().includes(query);
     });
-  }, [catalog?.items, catalogFilter, catalogLayerFilter, catalogQuery]);
+  }, [allowedCatalogTypes, catalog?.items, catalogFilter, catalogLayerFilter, catalogQuery]);
 
   async function loadCatalog(refresh = false) {
     const snapshot = await run(refresh ? 'extension.catalog.refresh' : 'extension.catalog.list') as ExtensionCatalogSnapshot;
@@ -3599,23 +3583,25 @@ function ExtensionsPage({
 
   useEffect(() => {
     void loadCatalog(false);
-    void loadInstallJobs();
-  }, []);
+    if (mode === 'models_plugins') void loadInstallJobs();
+  }, [mode]);
 
   useEffect(() => {
+    if (mode !== 'models_plugins') return undefined;
     const timer = window.setInterval(() => {
       void loadInstallJobs().catch(() => undefined);
     }, 1200);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
+    if (mode !== 'models_plugins') return;
     const terminalJobs = installJobs.filter((job) => job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled');
     const unseen = terminalJobs.filter((job) => !refreshedTerminalInstallJobsRef.current.has(job.jobId));
     if (unseen.length === 0) return;
     for (const job of unseen) refreshedTerminalInstallJobsRef.current.add(job.jobId);
     void loadCatalog(false).catch(() => undefined);
-  }, [installJobs]);
+  }, [installJobs, mode]);
 
   async function pickImportFolder() {
     const picked = await run('path.pickFolder', { currentPath: importPath }) as string;
@@ -3626,7 +3612,7 @@ function ExtensionsPage({
     if (!importPath.trim()) return;
     const preview = await run('extension.detectImport', { folderPath: importPath.trim() }) as ExtensionImportPreview;
     setImportPreview(preview);
-    setImportKind((preview.detectedKind === 'skill' || preview.detectedKind === 'mcp') ? preview.detectedKind : '');
+    setImportKind('mcp');
     setImportRuntimeType(preview.runtimeType === 'http' ? 'http' : 'stdio');
   }
 
@@ -3634,11 +3620,11 @@ function ExtensionsPage({
     if (!importPreview) return;
     const result = await run('extension.importFromFolder', {
       folderPath: importPath.trim(),
-      kind: importKind || importPreview.detectedKind,
+      kind: 'mcp',
       runtimeType: importRuntimeType,
     }) as { kind?: string; id?: string };
     await refreshUnits();
-    const importedKind = result?.kind || importKind || importPreview.detectedKind;
+    const importedKind = result?.kind || 'mcp';
     const importedId = result?.id || importPreview.id;
     setSelectedUnitId(importedKind === 'mcp' ? `mcp.${importedId}` : `extension.${importPreview.manifestPath}`);
   }
@@ -3676,6 +3662,14 @@ function ExtensionsPage({
   }
 
   async function installCatalogItem(item: ExtensionCatalogItem) {
+    if (item.type === 'skill') {
+      window.alert('Skill 安装必须进入 Skills 页并通过 lifecycle 审批。');
+      return;
+    }
+    if (!allowedCatalogTypes.includes(item.type as ExtensionCatalogFilter)) {
+      window.alert(`当前页面不处理 ${getRuntimeKindLabel(item.type)} 安装。`);
+      return;
+    }
     if (item.type === 'model' && item.installHandler === 'ollama.pull') {
       const confirmed = window.confirm(`安装 Ollama 模型“${item.displayName}”？\n\n模型：${catalogModelName(item)}\n目录：${modelInstallPath.trim() || 'Ollama 默认模型目录'}\n\n安装会显示进度，可暂停；完成后默认会设为本地 API 模型并重启 Bridge。`);
       if (!confirmed) return;
@@ -3735,6 +3729,14 @@ function ExtensionsPage({
 
   async function installRemotePreview() {
     if (!remotePreview) return;
+    if (remotePreview.type === 'skill') {
+      window.alert('远程 Skill 不能从通用 URL 安装；请进入 Skills 页走来源校验和审批。');
+      return;
+    }
+    if (!allowedCatalogTypes.includes(remotePreview.type as ExtensionCatalogFilter)) {
+      window.alert(`当前页面不处理 ${getRuntimeKindLabel(remotePreview.type)} 安装。`);
+      return;
+    }
     if (remotePreview.type === 'model' && remotePreview.installHandler === 'ollama.pull') {
       const confirmed = window.confirm(`从 URL 安装 Ollama 模型“${remotePreview.displayName}”？\n\n来源：${remotePreview.artifactUrl || remotePreview.sourceUrl}`);
       if (!confirmed) return;
@@ -3767,23 +3769,12 @@ function ExtensionsPage({
   return (
     <section className="extensions-layout">
       <section className="panel">
-        <SectionHeader title="扩展总览" />
+        <SectionHeader title={mode === 'mcp' ? 'MCP 管理' : '模型与插件总览'} />
         <div className="summary-grid">
-          <SummaryFact label="全部扩展" value={`${state.extensions.total}`} />
-          <SummaryFact label="MCP" value={`${filterItems.find((item) => item.id === 'mcp')?.count ?? 0}`} />
-          <SummaryFact label="Skill / Plugin" value={`${(filterItems.find((item) => item.id === 'skill')?.count ?? 0) + (filterItems.find((item) => item.id === 'plugin')?.count ?? 0)}`} />
+          <SummaryFact label={mode === 'mcp' ? 'MCP 单元' : '模型 / Plugin'} value={`${units.length}`} />
+          <SummaryFact label="目录条目" value={`${filteredCatalogItems.length}`} />
+          <SummaryFact label="已安装" value={`${filteredCatalogItems.filter((item) => item.installed).length}`} />
           <SummaryFact label="缺依赖" value={`${state.extensions.missingSources}`} />
-        </div>
-        <div className="extension-filter-bar">
-          {filterItems.map((item) => (
-            <button
-              key={item.id}
-              className={kindFilter === item.id ? 'preset-chip active' : 'preset-chip'}
-              onClick={() => setKindFilter(item.id)}
-            >
-              {item.label} <span>{item.count}</span>
-            </button>
-          ))}
         </div>
         <div className="field-block catalog-panel">
           <span>在线目录</span>
@@ -3795,7 +3786,7 @@ function ExtensionsPage({
             <SummaryFact label="动态排行" value={`${catalog?.layerCounts.dynamic ?? 0}`} compact />
             <SummaryFact label="自定义 URL" value={`${catalog?.layerCounts.customUrl ?? 0}`} compact />
           </div>
-          <div className="model-install-config">
+          {mode === 'models_plugins' && <div className="model-install-config">
             <label className="stack-field">
               <span>Ollama 模型安装目录</span>
               <div className="path-input-group">
@@ -3807,13 +3798,13 @@ function ExtensionsPage({
               <input type="checkbox" checked={useModelAfterInstall} onChange={(event) => setUseModelAfterInstall(event.target.checked)} />
               <span>模型安装完成后设为本地 API 模型并自动重启 Bridge</span>
             </label>
-          </div>
+          </div>}
           <div className="command-band dense path-input-group">
-            <input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="搜索扩展、模型、MCP 或 Skill" />
+            <input value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={mode === 'mcp' ? '搜索 MCP' : '搜索模型或 Plugin'} />
             <MiniButton label="刷新目录" icon={<RefreshCw size={14} />} onClick={() => void loadCatalog(true)} pending={pending['extension.catalog.refresh']} />
           </div>
           <div className="preset-wall">
-            {(['all', 'mcp', 'skill', 'plugin', 'model'] as ExtensionCatalogFilter[]).map((item) => (
+            {((mode === 'mcp' ? ['mcp'] : ['all', 'plugin', 'model']) as ExtensionCatalogFilter[]).map((item) => (
               <button key={item} className={catalogFilter === item ? 'preset-chip active' : 'preset-chip'} onClick={() => setCatalogFilter(item)}>
                 {item === 'all' ? '全部' : getRuntimeKindLabel(item)}
               </button>
@@ -3903,19 +3894,25 @@ function ExtensionsPage({
                   <dt>来源</dt><dd>{remotePreview.artifactUrl || remotePreview.sourceUrl}</dd>
                   <dt>说明</dt><dd>{remotePreview.reason}</dd>
                 </dl>
-                <MiniButton label="安装预览项" icon={<Layers3 size={14} />} onClick={() => void installRemotePreview()} pending={pending['extension.remote.install']} />
+                <MiniButton
+                  label={remotePreview.type === 'skill' ? '请到 Skills 页' : '安装预览项'}
+                  icon={<Layers3 size={14} />}
+                  onClick={() => void installRemotePreview()}
+                  pending={pending['extension.remote.install']}
+                  disabled={remotePreview.type === 'skill' || !allowedCatalogTypes.includes(remotePreview.type as ExtensionCatalogFilter)}
+                />
               </div>
             ) : null}
           </div>
         </div>
-        <div className="field-block import-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={handleImportDrop}>
+        {mode === 'mcp' && <div className="field-block import-dropzone" onDragOver={(event) => event.preventDefault()} onDrop={handleImportDrop}>
           <span>导入本地目录</span>
           <div className="command-band dense path-input-group">
             <input value={importPath} onChange={(event) => setImportPath(event.target.value)} placeholder="拖一个 skill / mcp 目录进来，或手动粘贴路径" />
             <MiniButton label="选择目录" icon={<FolderOpen size={14} />} onClick={() => void pickImportFolder()} pending={pending['path.pickFolder']} />
             <MiniButton label="识别" icon={<Search size={14} />} onClick={() => void inspectImportFolder()} pending={pending['extension.detectImport']} disabled={!importPath.trim()} />
           </div>
-          <div className="detail-meta">规则：含 `SKILL.md` 识别为 Skill；目录名或 package.json 名称/描述命中 `mcp` 识别为 MCP。</div>
+          <div className="detail-meta">规则：目录名或 package.json 名称/描述命中 `mcp` 识别为 MCP；本页不会导入 Skill。</div>
           {importPreview ? (
             <div className="detail-stack import-preview-grid">
               <div className="summary-grid">
@@ -3925,7 +3922,6 @@ function ExtensionsPage({
                 <SummaryFact label="可导入" value={importPreview.canImport ? '是' : '否'} compact />
               </div>
               <div className="preset-wall">
-                <button className={(importKind || importPreview.detectedKind) === 'skill' ? 'preset-chip active' : 'preset-chip'} onClick={() => setImportKind('skill')}>Skill</button>
                 <button className={(importKind || importPreview.detectedKind) === 'mcp' ? 'preset-chip active' : 'preset-chip'} onClick={() => setImportKind('mcp')}>MCP</button>
                 {((importKind || importPreview.detectedKind) === 'mcp') && (
                   <>
@@ -3951,7 +3947,7 @@ function ExtensionsPage({
               </div>
             </div>
           ) : null}
-        </div>
+        </div>}
       </section>
       <section className="panel list-panel">
         <SectionHeader title="扩展清单" />

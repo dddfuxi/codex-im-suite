@@ -33,6 +33,22 @@ function createFixture(): { root: string; ctiHome: string; codexHome: string; su
 }
 
 describe('SkillRegistry', () => {
+  it('keeps disabled skills visible when refreshing the registry', () => {
+    const fixture = createFixture();
+    try {
+      writeSkill(path.join(fixture.ctiHome, 'extensions', 'disabled', 'skills'), 'disabled-skill', 'disabled');
+
+      const snapshot = createSkillRegistry({ ...fixture, now: () => fixedNow }).refresh();
+      const item = snapshot.items.find((candidate) => candidate.id === 'disabled-skill');
+
+      assert.equal(item?.state, 'disabled');
+      assert.equal(item?.enabled, false);
+      assert.equal(item?.sourceClass, 'installed');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it('merges manifests, installed skills and drafts without rewriting SKILL.md', () => {
     const fixture = createFixture();
     try {

@@ -68,7 +68,7 @@ function parseSkillName(skillPath: string, fallback: string): string {
 function scanSkillDirectories(
   root: string,
   sourceClass: 'installed' | 'self_created',
-  state: 'enabled' | 'draft',
+  state: 'enabled' | 'disabled' | 'draft',
   now: () => Date,
 ): SkillRegistryItem[] {
   if (!fs.existsSync(root)) return [];
@@ -167,6 +167,7 @@ export function createSkillRegistry(options: SkillRegistryOptions = {}): SkillRe
   const now = options.now || (() => new Date());
   const registryPath = path.join(ctiHome, 'data', 'skill-registry.json');
   const draftRoot = path.join(ctiHome, 'extensions', 'drafts', 'skills');
+  const disabledRoot = path.join(ctiHome, 'extensions', 'disabled', 'skills');
   const installedRoot = path.join(codexHome, 'skills');
 
   const read = (): SkillRegistrySnapshot => readSnapshot(registryPath)
@@ -179,6 +180,7 @@ export function createSkillRegistry(options: SkillRegistryOptions = {}): SkillRe
     const discovered = [
       ...scanManifests(suiteRoot, ctiHome, codexHome, now),
       ...scanSkillDirectories(draftRoot, 'self_created', 'draft', now),
+      ...scanSkillDirectories(disabledRoot, 'installed', 'disabled', now),
       ...scanSkillDirectories(installedRoot, 'installed', 'enabled', now),
     ];
     const snapshot: SkillRegistrySnapshot = {

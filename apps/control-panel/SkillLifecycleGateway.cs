@@ -18,6 +18,9 @@ internal delegate Task<SkillCliExecutionResult> SkillCliCommandExecutor(SkillCli
 
 internal static class SkillControlCommandPolicy
 {
+    public static bool UsesLifecycleForExtensionType(string extensionType)
+        => string.Equals(extensionType?.Trim(), "skill", StringComparison.OrdinalIgnoreCase);
+
     public static string? GetRequiredRole(string command)
         => command switch
         {

@@ -4842,6 +4842,27 @@ internal sealed partial class MainForm : Form
                     ?? throw new InvalidOperationException($"未找到扩展目录条目：{id}");
         }
 
+        if (SkillControlCommandPolicy.UsesLifecycleForExtensionType(entry.Item.Type))
+        {
+            var source = new[] { entry.Item.Source, entry.Item.Artifact?.Url, entry.CatalogSource }
+                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                throw new InvalidOperationException("Skill 目录条目缺少可校验来源，不能进入 lifecycle。");
+            }
+            var lifecyclePayload = JsonSerializer.SerializeToElement(new
+            {
+                id = entry.Item.Id,
+                sourceClass = "unknown",
+                source,
+                risk = entry.Trusted || !string.IsNullOrWhiteSpace(entry.Item.Sha256) ? "low" : "medium",
+                changeKind = "install",
+            });
+            var lifecycleResult = await RunSkillLifecycleCommandAsync("prepare-install", lifecyclePayload, includePanelActor: true);
+            AddWebActivity("info", "Skill 已转交 lifecycle", $"{entry.Item.DisplayName}：未使用通用扩展安装器。");
+            return lifecycleResult;
+        }
+
         var result = await InstallCatalogEntryAsync(entry, allowUntrusted);
         LoadManifests();
         await UpdateMcpManifestStatesAsync();

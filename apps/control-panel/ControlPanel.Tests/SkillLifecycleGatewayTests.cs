@@ -22,6 +22,16 @@ public sealed class SkillLifecycleGatewayTests
         Assert.Equal(expectedRole, SkillControlCommandPolicy.GetRequiredRole(command));
     }
 
+    [Theory]
+    [InlineData("skill", true)]
+    [InlineData("mcp", false)]
+    [InlineData("plugin", false)]
+    [InlineData("model", false)]
+    public void UsesLifecycleForExtensionType_OnlyRoutesSkills(string extensionType, bool expected)
+    {
+        Assert.Equal(expected, SkillControlCommandPolicy.UsesLifecycleForExtensionType(extensionType));
+    }
+
     [Fact]
     public async Task RunAsync_InvokesRuntimeCliAndParsesJson()
     {

@@ -8,7 +8,7 @@ import type {
   SkillRegistryItem,
   SkillRegistrySnapshot,
 } from 'claude-to-im/src/lib/bridge/host.js';
-import type { SkillChangeKind, SkillRiskLevel, SkillSourceClass } from 'claude-to-im/src/lib/bridge/agent-architecture.js';
+import { shouldSearchSkillCatalog, type SkillChangeKind, type SkillRiskLevel, type SkillSourceClass } from 'claude-to-im/src/lib/bridge/agent-architecture.js';
 import { CODEX_HOME, CTI_HOME } from './config.js';
 import type { OfficialSkillListItem, OfficialSkillTools, SkillValidationResult } from './official-skill-tools.js';
 import type { SkillRegistry } from './skill-registry.js';
@@ -281,6 +281,8 @@ export function createSkillLifecycleService(options: SkillLifecycleOptions): Ski
       const local = registry.refresh().items.filter((item) => !normalized
         || item.id.toLowerCase().includes(normalized)
         || item.displayName.toLowerCase().includes(normalized));
+      const installedCandidateCount = local.filter((item) => item.enabled && (item.sourceClass === 'installed' || item.state === 'enabled' || item.state === 'installed')).length;
+      if (!shouldSearchSkillCatalog({ taskRequiresCapability: true, installedCandidateCount })) return local;
       const curated: OfficialSkillListItem[] = await tools.listCurated();
       const existing = new Set(local.map((item) => item.id));
       for (const entry of curated) {
