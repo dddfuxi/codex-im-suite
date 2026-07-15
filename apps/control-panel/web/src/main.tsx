@@ -55,6 +55,9 @@ import {
   type PageId,
   type ServiceTabId,
 } from './panel-navigation.js';
+import { ArchitecturePage } from './pages/ArchitecturePage.js';
+import { PromptPage } from './pages/PromptPage.js';
+import type { PromptSnapshotPanelState } from './prompt-view-model.js';
 import './styles.css';
 
 type StatusKind = 'ok' | 'warning' | 'error' | 'idle';
@@ -898,6 +901,12 @@ type PanelState = {
     missingSources: number;
     items: ExtensionItem[];
   };
+  skillGovernance: {
+    available: boolean;
+    error: string;
+    snapshot: unknown | null;
+  };
+  promptSnapshots: PromptSnapshotPanelState;
   mcp: {
     total: number;
     running: number;
@@ -1000,6 +1009,17 @@ const fallbackState: PanelState = {
   services: [],
   nodes: { schema: 'codex-im-suite/control-plane-state/v1', generatedAt: '', activeNodeId: 'local', nodes: [] },
   extensions: { total: 0, enabled: 0, disabled: 0, missingSources: 0, items: [] },
+  skillGovernance: { available: false, error: '', snapshot: null },
+  promptSnapshots: {
+    available: false,
+    path: '',
+    error: '',
+    data: {
+      protocol: 'cti-prompt-snapshot-store/v1',
+      policy: { maxItems: 100, maxAgeDays: 7 },
+      snapshots: [],
+    },
+  },
   mcp: { total: 0, running: 0, items: [], runtimeStatus: '', details: '' },
   release: { publishSummaryExists: false, releaseNotesExists: false, prepareMainReleaseExists: false, tagScriptExists: false, pendingChanges: [] },
   liveSync: { status: 'unavailable', lastSyncedAt: '', suiteCommit: '', liveCommit: '', summary: 'Live 同步状态不可用', canSync: false, detail: '' },
@@ -2266,6 +2286,7 @@ function App() {
   );
   const selectedServiceUnit = runtimeServiceUnits.find((unit) => unit.unitId === selectedServiceUnitId) ?? runtimeServiceUnits[0];
   const selectedExtensionUnit = runtimeExtensionUnits.find((unit) => unit.unitId === selectedExtensionUnitId) ?? runtimeExtensionUnits[0];
+  const architectureBlueprint = useMemo(() => buildSystemBlueprint(state, runtimeUnits), [state, runtimeUnits]);
 
   const filteredSessions = useMemo(() => {
     const query = sessionQuery.trim().toLowerCase();
@@ -2573,8 +2594,14 @@ function App() {
             pending={pending}
           />
         )}
-        {page === 'architecture' && <DomainPlaceholder title="机器人架构" text="八层架构、职责边界和策略归属将在这里集中展示。" icon={<Network size={30} />} />}
-        {page === 'prompts' && <DomainPlaceholder title="提示词注入" text="这里将只读展示 Prompt Snapshot、来源、优先级、脱敏与截断状态。" icon={<FileText size={30} />} />}
+        {page === 'architecture' && <ArchitecturePage blueprint={architectureBlueprint} />}
+        {page === 'prompts' && (
+          <PromptPage
+            state={state.promptSnapshots}
+            refresh={async () => { await run('state.refresh'); }}
+            openPath={async (path) => { await run('path.openAny', { path }); }}
+          />
+        )}
         {page === 'permissions' && <PermissionsPage state={state} run={run} pending={pending} />}
         {page === 'skills' && (
           <ExtensionsPage
@@ -2994,15 +3021,6 @@ function SystemBlueprint({ nodes }: { nodes: SystemBlueprintNode[] }) {
         </React.Fragment>
       ))}
     </div>
-  );
-}
-
-function DomainPlaceholder({ title, text, icon }: { title: string; text: string; icon: React.ReactNode }) {
-  return (
-    <section className="panel">
-      <SectionHeader title={title} />
-      <EmptyState icon={icon} title={title} text={text} />
-    </section>
   );
 }
 
