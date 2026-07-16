@@ -83,6 +83,68 @@ describe('CodexProvider', () => {
     );
   });
 
+  it('keeps bridge action protocols when a long system prompt exceeds its budget', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const systemPrompt = [
+      'Channel assistant identity: 当前是飞书机器人。',
+      '普通上下文 '.repeat(900),
+      '- Reminder action protocol: output one fenced ```cti-reminder JSON block.',
+      '- Direct-message action protocol: output one fenced ```cti-direct-message JSON block.',
+      '- Future bridge action protocol: output one fenced ```cti-example-action JSON block.',
+    ].join('\n');
+    const prompt = buildTurnPrompt({
+      prompt: '给目标私发测试消息',
+      sessionId: 'critical-protocol-session',
+      systemPrompt,
+    });
+    const systemInstructions = prompt
+      .slice(prompt.indexOf('System instructions:\n') + 'System instructions:\n'.length)
+      .split('\n\nBridge reply style:')[0];
+
+    assert.match(systemInstructions, /Channel assistant identity/);
+    assert.match(systemInstructions, /cti-reminder/);
+    assert.match(systemInstructions, /cti-direct-message/);
+    assert.match(systemInstructions, /cti-example-action/);
+    assert.ok(systemInstructions.length <= 4_000, 'system prompt 必须继续遵守字符预算');
+  });
+
+  it('does not reorder a system prompt that is already within budget', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const prompt = buildTurnPrompt({
+      prompt: '继续',
+      sessionId: 'short-protocol-session',
+      systemPrompt: [
+        'Identity first.',
+        '- Direct-message action protocol: output ```cti-direct-message.',
+        'Style last.',
+      ].join('\n'),
+    });
+    const systemInstructions = prompt
+      .slice(prompt.indexOf('System instructions:\n') + 'System instructions:\n'.length)
+      .split('\n\nBridge reply style:')[0];
+
+    assert.ok(systemInstructions.indexOf('Identity first.') < systemInstructions.indexOf('cti-direct-message'));
+    assert.ok(systemInstructions.indexOf('cti-direct-message') < systemInstructions.indexOf('Style last.'));
+  });
+
+  it('never exceeds the system prompt budget when critical protocols nearly fill it', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const protocolHeadingLength = 'Critical bridge protocols:\n'.length;
+    const protocolPrefix = '- Large action protocol: output ```cti-large ';
+    const protocolLine = protocolPrefix + 'x'.repeat(3_999 - protocolHeadingLength - protocolPrefix.length);
+    const prompt = buildTurnPrompt({
+      prompt: '继续',
+      sessionId: 'large-protocol-session',
+      systemPrompt: ['Identity first.', '普通上下文 '.repeat(900), protocolLine].join('\n'),
+    });
+    const systemInstructions = prompt
+      .slice(prompt.indexOf('System instructions:\n') + 'System instructions:\n'.length)
+      .split('\n\nBridge reply style:')[0];
+
+    assert.match(systemInstructions, /cti-large/);
+    assert.ok(systemInstructions.length <= 4_000, '关键协议接近预算上限时也不能越界');
+  });
+
   it('builds Codex client options from explicit API settings without leaking unrelated env', async () => {
     const oldBaseUrl = process.env.CTI_CODEX_BASE_URL;
     const oldApiKey = process.env.CTI_CODEX_API_KEY;

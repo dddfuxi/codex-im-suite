@@ -1,20 +1,20 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-07-10 22:13:41",
-    "releaseRunId":  "4e95d29b546243caba88d713bc30ae65",
+    "generatedAt":  "2026-07-16 10:37:52",
+    "releaseRunId":  "5a763a168f1c41d58e477c09b2aadee9",
     "targetName":  "portable artifact",
     "targetRole":  "generated portable artifact",
     "suite":  {
                   "name":  "codex-im-suite",
                   "version":  "0.2.0",
                   "extensionProtocol":  "extension-manifest/v1",
-                  "branch":  "codex/dev",
-                  "commit":  "950d632",
+                  "branch":  "codex/agent-capability-registry",
+                  "commit":  "16fe1bf",
                   "dirty":  true
               },
     "manifest":  {
-                     "Count":  23,
-                     "Hash":  "DAB593F2D1B0",
+                     "Count":  24,
+                     "Hash":  "88098E247FED",
                      "Directories":  [
                                          "config/action-manifests.d",
                                          "config/mcp.d",
@@ -26,24 +26,24 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "354919BF70D2",
-                  "Length":  1955299,
-                  "Modified":  "2026-07-10 22:13:30"
+                  "Hash":  "1BC1FAC7569C",
+                  "Length":  2033123,
+                  "Modified":  "2026-07-16 10:37:30"
               },
     "content":  {
                     "runtime.package":  "43E79CE167A5",
-                    "runtime.dist":  "30C4F79A0F62",
-                    "runtime.scripts":  "C375DD0B064E",
-                    "runtime.configExample":  "1E930F55894D",
+                    "runtime.dist":  "3AAD75D271E8",
+                    "runtime.scripts":  "445046122B8F",
+                    "runtime.configExample":  "C877B61CC583",
                     "runtime.skill":  "867CAED0153F",
-                    "core.package":  "1745A29789EC",
-                    "core.dist":  "00BCC247FB54",
+                    "core.package":  "1F5FABDBBC15",
+                    "core.dist":  "0FA80A624473",
                     "suite.manifest":  "C57C90C8A2C6",
-                    "config.manifests":  "D387AEB554D8",
-                    "extensions.skills":  "3D657A104715",
-                    "release.scripts":  "BF5DBC813486",
-                    "docs":  "3676128005D5",
-                    "panel.exe":  "354919BF70D2",
-                    "panel.wwwroot":  "58E5EF2D787D"
+                    "config.manifests":  "E0EE2CBECF11",
+                    "extensions.skills":  "FE81F33BA3AD",
+                    "release.scripts":  "B4419FB3F0C6",
+                    "docs":  "2825BAA05686",
+                    "panel.exe":  "1BC1FAC7569C",
+                    "panel.wwwroot":  "33EF59C47CB7"
                 }
 }

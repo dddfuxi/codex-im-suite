@@ -31,6 +31,7 @@ const MIME_EXT: Record<string, string> = {
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
 const DEFAULT_REASONING_EFFORT = 'low';
 const DEFAULT_CONTEXT_CHAR_BUDGET = 12000;
+const SYSTEM_PROMPT_CHAR_BUDGET = 4000;
 const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
 const FINAL_REPLY_FENCE = 'cti-final';
@@ -418,6 +419,32 @@ function truncateText(text: string, maxLen: number): string {
   return normalized.length > maxLen ? `${normalized.slice(0, maxLen - 3)}...` : normalized;
 }
 
+function truncateSystemPromptPreservingProtocols(text: string, maxLen = SYSTEM_PROMPT_CHAR_BUDGET): string {
+  const normalized = normalizeText(text);
+  if (!normalized || normalized.length <= maxLen) return normalized;
+
+  const lines = text
+    .replace(/<!--files:[\s\S]*?-->/g, '[附带文件]')
+    .split(/\r?\n/)
+    .map(line => normalizeText(line))
+    .filter(Boolean);
+  const protocolLines = [...new Set(lines.filter(line => (
+    /\bprotocol\b/i.test(line) && /```cti-[a-z0-9][a-z0-9-]*/i.test(line)
+  )))];
+  if (protocolLines.length === 0) return truncateText(text, maxLen);
+
+  // 协议可能位于任意 prompt section；先给结构化动作协议保留预算，再裁剪普通上下文。
+  const protocolBlock = ['Critical bridge protocols:', ...protocolLines].join('\n');
+  const separator = '\n\n';
+  if (protocolBlock.length + separator.length >= maxLen) return truncateText(protocolBlock, maxLen);
+
+  const protocolSet = new Set(protocolLines);
+  const regularText = lines.filter(line => !protocolSet.has(line)).join(' ');
+  const regularBudget = maxLen - protocolBlock.length - separator.length;
+  const regularBlock = truncateText(regularText, regularBudget);
+  return regularBlock ? `${regularBlock}${separator}${protocolBlock}` : protocolBlock;
+}
+
 function getReplyStyleHint(params?: StreamChatParams): string {
   return (
     params?.replyPresentation?.replyStyleHint
@@ -552,7 +579,7 @@ function selectHistoryEntries(
 
 export function buildTurnPrompt(params: StreamChatParams): string {
   const sections: string[] = [];
-  const systemPrompt = truncateText(params.systemPrompt || '', 4000);
+  const systemPrompt = truncateSystemPromptPreservingProtocols(params.systemPrompt || '');
   const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
   const historyEntries = selectHistoryEntries(params.conversationHistory);
   const userPrompt = params.prompt.trim();

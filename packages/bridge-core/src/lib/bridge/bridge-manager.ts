@@ -326,6 +326,12 @@ function getStringField(raw: Record<string, unknown>, keys: string[]): string {
   return '';
 }
 
+function getRecordField(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
 function parseDirectMessageParseMode(value: unknown): OutboundMessage['parseMode'] | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim().toLowerCase();
@@ -359,9 +365,16 @@ function extractCtiDirectMessageAction(text: string): ExtractedDirectMessageActi
       return { action: null, text: cleaned, hadBlock: true, error: '私发动作不是有效 JSON 对象' };
     }
     const raw = parsed as Record<string, unknown>;
-    const targetText = getStringField(raw, ['targetText', 'target', 'to', 'name', 'user', 'displayName']);
-    const targetId = getStringField(raw, ['targetId', 'targetID', 'toId', 'toID', 'id', 'chatId', 'chat_id', 'sessionId', 'session_id', 'conversationId', 'conversation_id', 'receiveId', 'receive_id']);
-    const targetKind = parseConversationTargetKind(raw.targetKind ?? raw.target_type ?? raw.targetType ?? raw.kind ?? raw.type);
+    const nestedTarget = getRecordField(raw.target);
+    const targetText = getStringField(raw, ['targetText', 'target', 'to', 'name', 'user', 'displayName'])
+      || (nestedTarget ? getStringField(nestedTarget, ['displayName', 'display_name', 'name', 'label', 'targetText', 'text']) : '');
+    const explicitTargetId = getStringField(raw, ['targetId', 'targetID', 'toId', 'toID', 'id', 'chatId', 'chat_id', 'sessionId', 'session_id', 'conversationId', 'conversation_id', 'receiveId', 'receive_id']);
+    const nestedChatId = nestedTarget ? getStringField(nestedTarget, ['chatId', 'chat_id', 'sessionId', 'session_id', 'conversationId', 'conversation_id']) : '';
+    const nestedUserId = nestedTarget ? getStringField(nestedTarget, ['openId', 'open_id', 'userId', 'user_id', 'unionId', 'union_id', 'id']) : '';
+    // 模型对象同时给出显示名和用户 ID 时，仍按显示名走本轮原生 mention 唯一解析，不能直接信任模型生成的 ID。
+    const targetId = explicitTargetId || nestedChatId || (!targetText ? nestedUserId : '');
+    const targetKind = parseConversationTargetKind(raw.targetKind ?? raw.target_type ?? raw.targetType ?? raw.kind ?? raw.type)
+      || (nestedChatId ? 'chat' : (!targetText && nestedUserId ? 'user' : undefined));
     const body = getStringField(raw, ['text', 'message', 'content', 'body']);
     if ((!targetText && !targetId) || !body) {
       return { action: null, text: cleaned, hadBlock: true, error: '私发动作缺少 target 或 text' };
@@ -6501,8 +6514,10 @@ async function handleMessage(
       : basePromptText;
     // 关联上下文必须走独立通道：Codex 等 provider 会裁剪长 system prompt，
     // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
-    // 此处仅放当前回合理解所必需的受控 evidence，不混入权限、表情包或记忆写入策略。
+    // 此处仅放当前回合理解和结构化投递所必需的受控 evidence，不混入表情包或记忆写入策略。
+    // 原生 mention / sender ID 必须独立保留，否则长 system prompt 会让模型知道动作协议却看不到真实目标。
     const priorityTurnContext = [
+      inboundActorContextPrompt,
       feishuConversationContextPrompt,
       feishuHistoryEvidencePrompt,
       feishuDocumentMemoryPrompt,

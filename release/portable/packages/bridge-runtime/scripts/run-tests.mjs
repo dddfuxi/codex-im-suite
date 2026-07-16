@@ -21,8 +21,16 @@ const result = spawnSync(
   {
     stdio: 'inherit',
     env,
+    // Child-level test timeouts cannot fire if a regression starves the event
+    // loop. The parent watchdog guarantees the suite returns control instead
+    // of leaving a permanent high-CPU Node worker behind.
+    timeout: 120_000,
+    killSignal: 'SIGKILL',
   },
 );
 
 fs.rmSync(tmpHome, { recursive: true, force: true });
+if (result.error) {
+  console.error(`[bridge-runtime tests] child process failed: ${result.error.message}`);
+}
 process.exit(result.status ?? 1);

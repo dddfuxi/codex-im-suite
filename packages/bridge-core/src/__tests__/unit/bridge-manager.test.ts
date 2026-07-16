@@ -1498,6 +1498,44 @@ describe('bridge-manager result block delivery', () => {
     assert.doesNotMatch(sent[0].text, /暗号是 12345|cti-direct-message|"target"|"text"/);
   });
 
+  it('accepts an official-model direct-message target object without bypassing name resolution', async () => {
+    const sent: OutboundMessage[] = [];
+    const directMessages: any[] = [];
+    const response = [
+      '```cti-direct-message',
+      JSON.stringify({
+        target: { open_id: 'ou_target', display_name: '小明' },
+        text: '你好',
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      sendDirectMessage?: (request: any) => Promise<SendResult & { targetDisplayName?: string }>;
+    };
+    adapter.sendDirectMessage = async (request) => {
+      directMessages.push(request);
+      return { ok: true, messageId: 'om_direct_1', targetDisplayName: '小明' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('给小明私发：你好', 'ou_1', 'oc_group'));
+
+    assert.equal(directMessages.length, 1);
+    assert.equal(directMessages[0].targetText, '小明');
+    assert.equal(directMessages[0].text, '你好');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已私发给 小明/);
+  });
+
   it('reports unresolved cti-direct-message targets without leaking the private text', async () => {
     const sent: OutboundMessage[] = [];
     const directMessages: any[] = [];
@@ -4127,6 +4165,47 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].systemPrompt || '', /current message native mentions/i);
     assert.match(streamParams[0].systemPrompt || '', /苏庆华/);
     assert.match(streamParams[0].systemPrompt || '', /小虾米/);
+  });
+
+  it('preserves native Feishu direct-message targets in priority turn context', async () => {
+    const streamParams: StreamChatParams[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream('收到啦');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('给小明私发：你好', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuSender: { openId: 'ou_sender', senderType: 'user', chatType: 'group' },
+        feishuMentions: [
+          { key: '@_user_1', name: '小虾米', openId: 'ou_bot' },
+          { key: '@_user_2', name: '小明', openId: 'ou_target' },
+        ],
+      },
+    });
+
+    assert.equal(streamParams.length, 1);
+    const priorityContext = streamParams[0].priorityTurnContext || '';
+    assert.match(priorityContext, /Feishu inbound actor context/);
+    assert.match(priorityContext, /sender open_id: ou_sender/);
+    assert.match(priorityContext, /小明 \(open_id=ou_target\)/);
   });
 
   it('passes reply and nearby chat evidence through the dedicated priority turn context', async () => {

@@ -32,25 +32,29 @@ description: |
 3. 把检索结果压成短摘要后再交给模型
 4. 不要把整段历史原样塞回 prompt
 
-## 默认仓库位置
+## 默认数据位置
 
-- 桥接记忆仓库默认在 `E:\cli-md`
-- 原始消息在 `E:\cli-md\data\messages`
-- 压缩归档在 `E:\cli-md\data\message-archives`
+- 原始聊天消息、压缩归档、Feishu history 默认在 bridge runtime home：`%USERPROFILE%\.claude-to-im\data`
+- 原始消息：`%CTI_HOME%\data\messages`
+- 压缩归档：`%CTI_HOME%\data\message-archives`
+- Feishu 云历史同步缓存：`%CTI_HOME%\data\feishu-history`
+- 长期记忆仓库默认仍可在 `E:\cli-md`，但它不是原始聊天记录主存储
 
-如果当前环境不是这一路径，优先读取环境变量 `CTI_HOME`。
+如果当前环境不是这一路径，优先读取环境变量 `CTI_HOME`。在 Windows / PowerShell 里读取中文文件时必须显式加 `-Encoding UTF8`，不要把乱码工具输出当成历史事实。
 
 ## 调试脚本
 
 需要人工检查检索结果时，运行：
 
 ```powershell
+$env:CTI_HOME = "$env:USERPROFILE\.claude-to-im"
 node C:\Users\admin\.codex\skills\memory-repo-retrieval\scripts\search-memory.mjs "你的查询"
 ```
 
 可选参数：
 
 ```powershell
+$env:CTI_HOME = "$env:USERPROFILE\.claude-to-im"
 node C:\Users\admin\.codex\skills\memory-repo-retrieval\scripts\search-memory.mjs "Furniture_DrinkCounter" --chat oc_xxx --cwd C:\unity\ST3
 ```
 

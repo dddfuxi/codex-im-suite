@@ -1,6 +1,6 @@
 {
   "id": "service.feishuCli",
-  "displayName": "飞书 CLI",
+  "displayName": "Bridge Skill 更新",
   "kind": "tool",
   "category": "bridge-skill",
   "enabled": true,
@@ -8,7 +8,7 @@
   "source": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
   "cwd": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
   "version": "",
-  "description": "负责桥接 Skill / runtime 包更新，不承担 daemon 启停。",
+  "description": "历史兼容 id；只负责 Bridge Skill / runtime 包来源诊断与自更新。官方飞书 CLI 使用独立 tool.larkCli 单元。",
   "update": {
     "enabled": true,
     "surfaces": [
