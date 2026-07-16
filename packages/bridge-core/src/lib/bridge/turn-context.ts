@@ -152,18 +152,23 @@ function supportingIds(envelope: TurnEvidenceEnvelope, primaryIds: string[]): st
     .filter((id) => !primary.has(id) && id !== 'current-message');
 }
 
+function getNativeReplyReliability(envelope: TurnEvidenceEnvelope, item: TurnEvidenceItem): number {
+  if (item.relation !== 'native_reply') return 0;
+  const contentRecovered = item.metadata?.contentRecovered !== false;
+  const attachmentConfidence = item.messageId
+    ? Math.max(0, ...envelope.evidence
+      .filter((candidate) => candidate.relation === 'reply_attachment' && candidate.metadata?.replyMessageId === item.messageId)
+      .map((candidate) => candidate.confidence))
+    : 0;
+  const contentConfidence = contentRecovered && item.content && item.confidence >= 0.8 ? item.confidence : 0;
+  return Math.max(contentConfidence, attachmentConfidence >= 0.8 ? attachmentConfidence : 0);
+}
+
 export function resolveTurnFocus(envelope: TurnEvidenceEnvelope): TurnFocusDecision {
   const nativeReplies = envelope.evidence.filter((item) => item.relation === 'native_reply');
   const nativeReplyReliability = new Map<string, number>();
   const usableNativeReplies = nativeReplies.filter((item) => {
-    const contentRecovered = item.metadata?.contentRecovered !== false;
-    const attachmentConfidence = item.messageId
-      ? Math.max(0, ...envelope.evidence
-        .filter((candidate) => candidate.relation === 'reply_attachment' && candidate.metadata?.replyMessageId === item.messageId)
-        .map((candidate) => candidate.confidence))
-      : 0;
-    const contentConfidence = contentRecovered && item.content && item.confidence >= 0.8 ? item.confidence : 0;
-    const reliability = Math.max(contentConfidence, attachmentConfidence >= 0.8 ? attachmentConfidence : 0);
+    const reliability = getNativeReplyReliability(envelope, item);
     nativeReplyReliability.set(item.id, reliability);
     return reliability > 0;
   });
@@ -268,7 +273,7 @@ export function validateAgentTurnFocusDecision(
     && item.kind === 'message'
     && ['native_reply', 'likely_context', 'continuation', 'nearby', 'retrieved'].includes(item.relation));
   if (focus === 'current_request' && !primaryEvidenceIds.includes('current-message')) return null;
-  if (focus === 'reply_target' && !primaryEvidence.some((item) => item.relation === 'native_reply')) return null;
+  if (focus === 'reply_target' && !primaryEvidence.some((item) => getNativeReplyReliability(envelope, item) > 0)) return null;
   if (focus === 'continuation' && !hasContinuationEvidence) return null;
   return {
     protocol: TURN_FOCUS_PROTOCOL,

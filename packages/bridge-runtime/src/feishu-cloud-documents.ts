@@ -221,7 +221,7 @@ export function createFeishuCloudDocumentHost(options: {
         };
       } catch (error) {
         if (error instanceof FeishuCloudPermissionError) {
-          if (error.scopeRelated && !input.messageId?.endsWith(':oauth-resume')) {
+          if (error.scopeRelated && !input.authorizationResume) {
             const authorization = await requestAuthorization();
             if (authorization.status !== 'authorized') {
               return buildAuthorizationRequiredResult(authorization);

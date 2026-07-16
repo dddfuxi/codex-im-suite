@@ -3266,7 +3266,11 @@ function validateFeishuStructuredMentions(
 
   for (const mention of payload.mentions) {
     if (mention.atAll) {
-      acceptedMentions.set('at_all', { atAll: true, ...(mention.name ? { name: mention.name } : {}) });
+      // 广播没有可与本轮原生 mention ID 求交集的单一身份，不能复用普通结构化 mention 门禁。
+      // 在引入独立 Owner 广播动作协议前，模型输出的 atAll 一律按未验证目标拒绝。
+      for (const target of [mention.name?.trim(), '所有人', '全体', '大家', 'all']) {
+        if (target) rejectedTargets.add(target);
+      }
       continue;
     }
 
@@ -5481,6 +5485,7 @@ export async function resumeFeishuOAuthRequest(resume: FeishuOAuthManualResumeRe
     timestamp: Date.now(),
     raw: {
       feishuSender: resume.userId ? { openId: resume.userId } : undefined,
+      feishuOAuthResume: { authorized: true, source: 'callback' },
     },
   });
 }
@@ -5701,6 +5706,10 @@ async function handleMessage(
       senderType?: string;
       chatType?: string;
     };
+    feishuOAuthResume?: {
+      authorized?: boolean;
+      source?: 'callback' | 'manual';
+    };
     feishuMentions?: Array<{
       key?: string;
       name?: string;
@@ -5854,6 +5863,10 @@ async function handleMessage(
               },
               text: resume.text,
               timestamp: Date.now(),
+              raw: {
+                feishuSender: resume.userId ? { openId: resume.userId } : undefined,
+                feishuOAuthResume: { authorized: true, source: 'manual' },
+              },
             };
             await handleMessage(adapter, resumeMessage);
           }
@@ -6278,6 +6291,7 @@ async function handleMessage(
         userId: feishuSender?.openId || msg.address.userId,
         userDisplayName: msg.address.displayName,
         messageId: msg.messageId,
+        authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
       });
       if (resolved.status === 'resolved' && resolved.systemPrompt) {
         feishuCloudSystemPrompt = resolved.systemPrompt;
@@ -6600,6 +6614,7 @@ async function handleMessage(
           userId: feishuSender?.openId || msg.address.userId,
           userDisplayName: msg.address.displayName,
           messageId: msg.messageId,
+          authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
         });
         if (resolved.status === 'resolved' && resolved.systemPrompt) {
           feishuCloudSystemPrompt = resolved.systemPrompt;
@@ -6658,7 +6673,6 @@ async function handleMessage(
               ? 'app'
               : 'unknown',
       },
-      workingDirectory: effectiveBinding.workingDirectory || undefined,
       abortSignal: taskAbort.signal,
       platformEvidence: rawData?.feishuConversationContext?.evidence,
       mentions: rawData?.feishuMentions,

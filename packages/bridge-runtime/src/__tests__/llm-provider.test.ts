@@ -289,6 +289,20 @@ describe('Claude structured input evidence receipt', () => {
     assert.equal(data.inputEvidence.protocol, 'cti-input-evidence/v1');
     assert.deepEqual(data.inputEvidence.accepted, [{ id: 'image-1', kind: 'image', mediaType: 'image/png' }]);
   });
+
+  it('does not accept image MIME types that Claude prompt construction drops', async () => {
+    const provider = await import('../llm-provider.js') as Record<string, any>;
+    assert.equal(typeof provider.buildClaudeInputEvidenceReceipt, 'function');
+
+    const receipt = provider.buildClaudeInputEvidenceReceipt([
+      { id: 'image-png', name: 'ok.png', type: 'image/png', size: 4, data: 'AAAA' },
+      { id: 'image-heic', name: 'unsupported.heic', type: 'image/heic', size: 4, data: 'BBBB' },
+    ]);
+
+    assert.deepEqual(receipt?.accepted, [
+      { id: 'image-png', kind: 'image', mediaType: 'image/png' },
+    ]);
+  });
 });
 
 describe('classifier query policy', () => {

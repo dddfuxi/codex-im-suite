@@ -186,7 +186,6 @@ describe('Feishu cloud document links', () => {
         requestUserAuthorization: async (input) => {
           assert.equal(input.resourceClass, 'cloud_document');
           assert.deepEqual(input.requestedScopes, [
-            'auth:user.id:read',
             'docx:document:readonly',
             'offline_access',
           ]);
@@ -214,7 +213,6 @@ describe('Feishu cloud document links', () => {
 
     assert.equal(result.status, 'auth_required');
     assert.deepEqual(requestedScopes, [
-      'auth:user.id:read',
       'docx:document:readonly',
       'offline_access',
     ]);
@@ -455,5 +453,46 @@ describe('Feishu cloud document links', () => {
     assert.equal(authorizationRequested, true);
     assert.match(result.userMessage || '', /重新授权/);
     assert.equal(result.feishuCardJson, '{"config":{"wide_screen_mode":true}}');
+  });
+
+  it('does not start another OAuth request after an authorized resume is still permission denied', async () => {
+    let authorizationRequests = 0;
+    const host = createFeishuCloudDocumentHost({
+      config: {
+        appId: 'cli_xxx',
+        appSecret: 'secret',
+        maxChars: 80000,
+        maxRows: 500,
+        maxRecords: 500,
+        maxSheets: 5,
+      },
+      tokenProvider: {
+        getAccessToken: async () => 'authorized-user-token',
+        requestUserAuthorization: async () => {
+          authorizationRequests += 1;
+          return {
+            status: 'auth_required',
+            userMessage: '不应再次创建授权请求。',
+          };
+        },
+      },
+      fetch: async () => jsonResponse({
+        code: 125403,
+        msg: 'Access denied. One of the following scopes is required: [sheets:spreadsheet:readonly]. The resource is still not shared to the user.',
+      }, 403),
+    });
+
+    const result = await host.resolveFeishuCloudLinks({
+      text: 'summarize https://example.feishu.cn/sheets/shtcn123',
+      channelType: 'feishu',
+      chatId: 'oc_1',
+      userId: 'ou_1',
+      messageId: 'm_1:oauth-callback',
+      authorizationResume: true,
+    } as any);
+
+    assert.equal(result.status, 'permission_denied');
+    assert.equal(authorizationRequests, 0);
+    assert.match(result.userMessage || '', /分享|权限|scope/i);
   });
 });

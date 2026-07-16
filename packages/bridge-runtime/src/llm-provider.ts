@@ -356,6 +356,14 @@ const SUPPORTED_IMAGE_TYPES = new Set<string>([
   'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
 ]);
 
+function getSupportedClaudeImageFiles(files?: FileAttachment[]): FileAttachment[] {
+  return files?.filter((file) => SUPPORTED_IMAGE_TYPES.has(file.type)) || [];
+}
+
+export function buildClaudeInputEvidenceReceipt(files?: FileAttachment[]): ProviderInputEvidenceReceipt | undefined {
+  return buildProviderInputEvidenceReceipt(getSupportedClaudeImageFiles(files), 'claude', ['image']);
+}
+
 /**
  * Build a prompt for query(). When files are present, returns an async
  * iterable that yields a single SDKUserMessage with multi-modal content
@@ -365,8 +373,8 @@ function buildPrompt(
   text: string,
   files?: FileAttachment[],
 ): string | AsyncIterable<{ type: 'user'; message: { role: 'user'; content: unknown[] }; parent_tool_use_id: null; session_id: string }> {
-  const imageFiles = files?.filter(f => SUPPORTED_IMAGE_TYPES.has(f.type));
-  if (!imageFiles || imageFiles.length === 0) return text;
+  const imageFiles = getSupportedClaudeImageFiles(files);
+  if (imageFiles.length === 0) return text;
 
   const contentBlocks: unknown[] = [];
 
@@ -545,7 +553,7 @@ export class SDKLLMProvider implements LLMProvider {
               ? [priorityTurnContext, `Current user request:\n${params.prompt}`].join('\n\n')
               : params.prompt;
             const prompt = buildPrompt(promptText, params.files);
-            const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(params.files, 'claude', ['image']);
+            const inputEvidenceReceipt = buildClaudeInputEvidenceReceipt(params.files);
             state.inputEvidenceReceipt = inputEvidenceReceipt;
             const q = query({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],

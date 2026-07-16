@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-16 合并前安全复审补强：独立代码审查发现 OAuth v3 token 官方响应不保证携带用户 ID，旧实现会在 ID 缺失时跳过身份校验。现在换取 token 后强制调用官方 `GET /open-apis/authen/v1/user_info`，只有 `open_id` 与 state 发起人精确一致才加密保存并恢复任务；查询失败、缺 ID 或账号不一致全部拒绝绑定，防止跨用户 token 串用。按官方权限说明移除不必要的基础 `auth:user.id:read`，保留任务资源 scope 与刷新所需 `offline_access`；callback/manual 恢复统一携带结构化 `authorizationResume`，授权后仍无资源权限时返回真实阻塞，不再次发卡。同步关闭其余审查问题：模型 `atAll/at_all` 广播默认拒绝；“分析这张截图”按真实图片输入证据处理而不是产物任务；Claude receipt 只承认实际支持并传入的 PNG/JPEG/GIF/WebP；解析 Agent 复用确定性 reply 可读性判断，不能提升不可恢复资源壳；classifier host 不再接收工作目录；mention/attachment 已结构化时计为平台 evidence，避免重复自由文本注入。新增对应 RED/GREEN 回归。
+
 - 2026-07-16 Feishu 结构化 mention 字段兼容与 evidence 门禁修复：复盘官方/模型可能交替输出 `userId/user_id/openId/open_id`，确认旧 `cti-final.mentions` 解析只接受 user ID 两种写法，导致 `open_id` 在普通回复和 streaming card 收尾前丢失；同时旧链路只过滤 `_user_N` 占位符，任意模型生成的真实样式 ID 仍可能直接投递。现在 bridge-core 使用统一字段归一化，并把本轮原生 mention 中的 user/open/union ID 建成可信集合；结构化目标只有精确命中该集合才进入 `preparedReply.mentions`，名称优先采用平台 evidence，普通 delivery 与 streaming card `onStreamEnd` 共用同一校验结果。无 evidence 的 ID 会被拒绝并移除正文对应裸 `@`；普通总结保留自然文字，明确艾特请求则返回未投递/需用户原生 @ 的最小缺口，不再显示成看似成功。新增 RED/GREEN 回归覆盖四种字段交叉兼容、伪造 ID、普通文本假 @ 清理和流式卡片 @ 机器人。
 
 - 2026-07-16 Feishu OAuth Token grant 兼容补强：最小 scope Token 不再按 userId 单槽覆盖，而是按用户隔离保存多个 scope grant；读取时选择能覆盖当前任务且 scope 数量最少的 Token。旧版 userId 单键文件继续兼容，首次新授权后迁移；刷新失败只删除对应 grant，不影响同用户其他资源权限。

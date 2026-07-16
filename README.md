@@ -299,13 +299,13 @@ CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
 飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；只有应用身份无法访问且当前任务确实需要读取发起人的私有资源时，才给该发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。普通消息、原生 @、reply、reaction、sticker 和机器人卡片继续走 bot 长连接，不向普通用户索权。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
 
 ```powershell
-CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,drive:drive:readonly,offline_access,auth:user.id:read,sheets:spreadsheet:readonly,sheets:spreadsheet:read,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,drive:drive:readonly,offline_access,sheets:spreadsheet:readonly,sheets:spreadsheet:read,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
 CTI_FEISHU_OAUTH_MODE=manual
 CTI_FEISHU_OAUTH_PUBLIC_BASE_URL=https://bot.example.com
 CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI=http://127.0.0.1:17321/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PATH=/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PORT=17321
-CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,bitable:app:readonly
+CTI_FEISHU_OAUTH_SCOPES=offline_access,docx:document:readonly,sheets:spreadsheet:readonly,bitable:app:readonly
 CTI_FEISHU_CLOUD_MAX_CHARS=80000
 CTI_FEISHU_CLOUD_MAX_ROWS=500
 CTI_FEISHU_CLOUD_MAX_RECORDS=500

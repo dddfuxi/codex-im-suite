@@ -278,7 +278,6 @@ export interface TurnReferenceResolutionInput {
   currentText: string;
   envelope: TurnEvidenceEnvelope;
   deterministicDecision: TurnFocusDecision;
-  workingDirectory?: string;
   /** 主任务取消或 bridge stop 时同步终止解析 Agent。 */
   abortSignal?: AbortSignal;
 }
@@ -391,6 +390,8 @@ export interface FeishuCloudLinkResolveInput {
   userId?: string;
   userDisplayName?: string;
   messageId?: string;
+  /** 当前请求是否由已成功完成的用户 OAuth 授权恢复。 */
+  authorizationResume?: boolean;
 }
 
 export type FeishuCloudLinkResolveStatus =

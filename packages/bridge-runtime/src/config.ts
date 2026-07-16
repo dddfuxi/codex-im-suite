@@ -541,7 +541,6 @@ export function loadConfig(): Config {
     feishuOAuthCallbackPath: env.get("CTI_FEISHU_OAUTH_CALLBACK_PATH") || "/feishu/oauth/callback",
     feishuOAuthScopes: splitCsv(env.get("CTI_FEISHU_OAUTH_SCOPES")) ?? [
       "offline_access",
-      "auth:user.id:read",
       "docx:document:readonly",
       "sheets:spreadsheet:readonly",
       "sheets:spreadsheet:read",

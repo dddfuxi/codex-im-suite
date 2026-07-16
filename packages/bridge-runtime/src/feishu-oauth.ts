@@ -13,6 +13,7 @@ import {
 const execFileAsync = promisify(execFile);
 const FEISHU_OAUTH_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 const FEISHU_TOKEN_URL = 'https://accounts.feishu.cn/oauth/v3/token';
+const FEISHU_USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
 const CLOCK_SKEW_MS = 60 * 1000;
 
 export interface StoredFeishuUserTokens {
@@ -448,11 +449,8 @@ export class FeishuOAuthService {
       return { ok: false, message: '飞书授权已过期或无效，请回到聊天里重新发起。' };
     }
     try {
-      const tokens = await this.exchangeAuthorizationCode(code, state);
-      const returnedUserId = tokens.openId || tokens.userId || tokens.unionId;
-      if (returnedUserId && returnedUserId !== state.userId) {
-        return { ok: false, message: '授权账号与发起请求的飞书用户不一致，已拒绝绑定。' };
-      }
+      const exchangedTokens = await this.exchangeAuthorizationCode(code, state);
+      const tokens = await this.verifyAuthorizedUserIdentity(state.userId, exchangedTokens);
       await this.options.tokenStore.saveTokens(state.userId, tokens);
       const resumes = getPendingRequests(state);
       const pending = this.pending.get(state.state);
@@ -492,11 +490,8 @@ export class FeishuOAuthService {
       return { status: 'error', userMessage: '飞书授权已过期或无效，请重新发送原问题后再授权。' };
     }
     try {
-      const tokens = await this.exchangeAuthorizationCode(parsed.code, state);
-      const returnedUserId = tokens.openId || tokens.userId || tokens.unionId;
-      if (returnedUserId && returnedUserId !== state.userId) {
-        return { status: 'error', userMessage: '授权账号与发起请求的飞书用户不一致，已拒绝绑定。' };
-      }
+      const exchangedTokens = await this.exchangeAuthorizationCode(parsed.code, state);
+      const tokens = await this.verifyAuthorizedUserIdentity(state.userId, exchangedTokens);
       await this.options.tokenStore.saveTokens(state.userId, tokens);
       const resumes = getPendingRequests(state);
       if (resumes.length > 0) {
@@ -599,6 +594,34 @@ export class FeishuOAuthService {
       await this.options.tokenStore.deleteTokens(userId, scopes);
       return null;
     }
+  }
+
+  private async verifyAuthorizedUserIdentity(
+    expectedOpenId: string,
+    tokens: StoredFeishuUserTokens,
+  ): Promise<StoredFeishuUserTokens> {
+    const response = await this.fetchImpl(FEISHU_USER_INFO_URL, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${tokens.accessToken}` },
+    });
+    const payload = await response.json() as any;
+    if (!response.ok || payload.code !== 0) {
+      throw new Error(`飞书授权身份校验失败：${payload.msg || payload.message || `HTTP ${response.status}`}`);
+    }
+    const data = payload.data || payload;
+    const openId = typeof data.open_id === 'string' ? data.open_id.trim() : '';
+    if (!openId) {
+      throw new Error('飞书授权身份校验失败：user_info 未返回 open_id。');
+    }
+    if (openId !== expectedOpenId) {
+      throw new Error('授权账号与发起请求的飞书用户不一致，已拒绝绑定。');
+    }
+    return {
+      ...tokens,
+      openId,
+      unionId: typeof data.union_id === 'string' && data.union_id.trim() ? data.union_id.trim() : undefined,
+      userId: typeof data.user_id === 'string' && data.user_id.trim() ? data.user_id.trim() : undefined,
+    };
   }
 
   private async requestToken(body: Record<string, string>, fallbackScopes: string[]): Promise<StoredFeishuUserTokens> {

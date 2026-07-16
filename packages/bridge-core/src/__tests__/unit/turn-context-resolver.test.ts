@@ -9,6 +9,7 @@ import {
   type TurnEvidenceItem,
 } from '../../lib/bridge/turn-context.js';
 import { formatPriorityTurnContext } from '../../lib/bridge/host.js';
+import { resolveStructuredTurnContext } from '../../lib/bridge/turn-context-broker.js';
 
 function evidence(input: Partial<TurnEvidenceItem> & Pick<TurnEvidenceItem, 'id' | 'kind' | 'relation'>): TurnEvidenceItem {
   return {
@@ -20,6 +21,28 @@ function evidence(input: Partial<TurnEvidenceItem> & Pick<TurnEvidenceItem, 'id'
 }
 
 describe('turn context resolver', () => {
+  it('counts normalized mentions and attachments as platform evidence', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-platform-evidence',
+      channelType: 'feishu',
+      chatId: 'oc_platform_evidence',
+      messageId: 'om_current',
+      currentText: '看一下',
+      mentions: [{ name: '刘丹', openId: 'ou_liudan' }],
+      attachments: [{
+        id: 'image-1',
+        name: '截图.png',
+        type: 'image/png',
+        size: 4,
+        data: 'AAAA',
+      }],
+    });
+
+    assert.equal(resolved.hasPlatformEvidence, true);
+    assert.ok(resolved.envelope.evidence.some((item) => item.relation === 'native_mention'));
+    assert.ok(resolved.envelope.evidence.some((item) => item.relation === 'current_attachment'));
+  });
+
   it('uses the current message when no stronger reference exists', () => {
     const envelope = createTurnEvidenceEnvelope({
       channelType: 'telegram',
@@ -282,6 +305,35 @@ describe('turn context resolver', () => {
       primaryEvidenceIds: ['reply-1'],
       supportingEvidenceIds: ['current-message'],
       confidence: 0.9,
+    }), null);
+  });
+
+  it('rejects parser-agent reply focus when the native reply content was not recovered', () => {
+    const envelope = createTurnEvidenceEnvelope({
+      channelType: 'feishu',
+      chatId: 'oc_unrecovered_reply',
+      messageId: 'om_current',
+      currentText: '这是什么情况',
+      evidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[图片]',
+          messageId: 'om_reply_image',
+          metadata: { contentRecovered: false },
+        }),
+      ],
+    });
+
+    assert.equal(validateAgentTurnFocusDecision(envelope, {
+      focus: 'reply_target',
+      primaryEvidenceIds: ['reply-shell'],
+      supportingEvidenceIds: ['current-message'],
+      confidence: 0.9,
+      reason: '错误地选择了不可读资源壳。',
     }), null);
   });
 

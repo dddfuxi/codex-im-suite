@@ -2,7 +2,6 @@ import type { FeishuOAuthPendingRequest } from './feishu-oauth.js';
 
 export const FEISHU_OAUTH_BASE_SCOPES = [
   'offline_access',
-  'auth:user.id:read',
 ] as const;
 
 export function normalizeFeishuOAuthScopes(scopes: Iterable<string>): string[] {

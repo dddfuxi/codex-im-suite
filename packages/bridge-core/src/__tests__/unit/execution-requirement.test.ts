@@ -150,6 +150,25 @@ describe('execution requirement classifier', () => {
     assert.doesNotMatch(prompt, /call an appropriate real tool/i);
   });
 
+  it('treats an attached screenshot noun as read-only input evidence', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '分析一下这张 Unity 截图里的报错',
+      workingDirectory: 'C:\\unity\\ST3',
+      files: [{
+        id: 'screenshot-1',
+        name: 'unity-error.png',
+        type: 'image/png',
+        size: 128,
+        data: 'aW1hZ2U=',
+      }],
+    });
+
+    assert.equal(requirement.kind, 'input_evidence_required');
+    assert.deepEqual(requirement.requiredInputEvidenceIds, ['screenshot-1']);
+    assert.deepEqual(requirement.requiredInputEvidenceKinds, ['image']);
+    assert.equal(requirement.requiredToolFamilies.length, 0);
+  });
+
   it('keeps image editing and output requests behind artifact evidence', () => {
     const requirement = classifyExecutionRequirement({
       userText: '把这张图里的重点圈出来并保存成一张新图',

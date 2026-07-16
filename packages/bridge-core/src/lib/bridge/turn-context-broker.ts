@@ -36,7 +36,6 @@ export interface ResolveStructuredTurnContextInput {
   messageId: string;
   currentText: string;
   currentActor?: TurnEvidenceActor;
-  workingDirectory?: string;
   abortSignal?: AbortSignal;
   platformEvidence?: TurnEvidenceItem[];
   mentions?: TurnMentionEvidenceInput[];
@@ -147,7 +146,6 @@ export async function resolveStructuredTurnContext(
         currentText: input.currentText,
         envelope,
         deterministicDecision: decision,
-        workingDirectory: input.workingDirectory,
         abortSignal: input.abortSignal,
       });
       const validatedDecision = validateAgentTurnFocusDecision(envelope, rawDecision);
@@ -166,6 +164,10 @@ export async function resolveStructuredTurnContext(
     envelope,
     decision,
     prompt: formatStructuredTurnContext(envelope, decision),
-    hasPlatformEvidence: Boolean(input.platformEvidence?.length),
+    hasPlatformEvidence: Boolean(
+      input.platformEvidence?.length
+      || input.mentions?.length
+      || input.attachments?.length,
+    ),
   };
 }

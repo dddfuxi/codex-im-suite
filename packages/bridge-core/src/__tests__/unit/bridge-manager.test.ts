@@ -5779,6 +5779,53 @@ describe('bridge-manager policy helpers', () => {
     assert.match(sent[0].text, /乔治.*项目情况已经整理完成/);
   });
 
+  it('rejects model-provided atAll in ordinary Feishu delivery', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '@所有人 项目情况已经整理完成。',
+            images: [],
+            files: [],
+            reply_mode: 'plain',
+            mentions: [{ atAll: true, name: '所有人' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('总结一下项目情况', 'ou_sender', 'oc_reject_at_all'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_reject_at_all',
+        userId: 'ou_sender',
+        displayName: '苏庆华',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].mentions, undefined);
+    assert.doesNotMatch(sent[0].text, /@所有人/);
+    assert.match(sent[0].text, /所有人.*项目情况已经整理完成/);
+  });
+
   it('passes a validated open_id bot mention into the streaming card finalization path', async () => {
     const finalized: unknown[][] = [];
     initBridgeContext({
@@ -5836,6 +5883,62 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(finalized.length, 1);
     assert.match(String(finalized[0][2]), /^@乔治机器人/);
     assert.deepEqual(finalized[0][4], [{ userId: 'ou_george_bot', name: '乔治机器人' }]);
+  });
+
+  it('rejects model-provided atAll in streaming card finalization', async () => {
+    const finalized: unknown[][] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在整理结果。' },
+          {
+            type: 'text',
+            data: [
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '@所有人 请查看当前结果。',
+                images: [],
+                files: [],
+                reply_mode: 'markdown',
+                mentions: [{ at_all: true, name: '所有人' }],
+              }),
+              '```',
+            ].join('\n'),
+          },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    (adapter as any).onStreamText = () => {};
+    (adapter as any).onStreamEnd = async (...args: unknown[]) => {
+      finalized.push(args);
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('整理当前结果', 'ou_sender', 'oc_stream_reject_at_all'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_stream_reject_at_all',
+        userId: 'ou_sender',
+        displayName: '苏庆华',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(finalized.length, 1);
+    assert.doesNotMatch(String(finalized[0][2]), /@所有人/);
+    assert.match(String(finalized[0][2]), /所有人.*请查看当前结果/);
+    assert.equal(finalized[0][4], undefined);
   });
 
   it('does not use a hard-coded bot name as Feishu mention invocation without wake evidence', async () => {

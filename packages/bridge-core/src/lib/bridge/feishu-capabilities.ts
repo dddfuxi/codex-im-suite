@@ -27,7 +27,6 @@ export interface FeishuCapabilityReportOptions {
 
 const OAUTH_DEFAULT_SCOPES = [
   'offline_access',
-  'auth:user.id:read',
   'docx:document:readonly',
   'sheets:spreadsheet:readonly',
   'sheets:spreadsheet:read',
@@ -121,7 +120,6 @@ const CAPABILITIES: FeishuCapability[] = [
     status: 'ready',
     requiredScopes: [
       'offline_access',
-      'auth:user.id:read',
       'docx:document:readonly',
       'sheets:spreadsheet:readonly',
       'sheets:spreadsheet:read',
@@ -387,7 +385,6 @@ export function buildFeishuCapabilityReport(
 
   const oauthMissing = missingRequirements(new Set(oauthScopes), [
     'offline_access',
-    'auth:user.id:read',
     'docx:document:readonly',
     'sheets:spreadsheet:readonly',
     'sheets:spreadsheet:read',
