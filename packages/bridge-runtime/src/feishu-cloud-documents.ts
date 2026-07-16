@@ -4,6 +4,10 @@ import type {
   FeishuCloudLinkResolveResult,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import type { FeishuAuthorizationInput, FeishuAuthorizationResult } from './feishu-oauth.js';
+import {
+  FEISHU_OAUTH_BASE_SCOPES,
+  normalizeFeishuOAuthScopes,
+} from './feishu-oauth-governance.js';
 
 const FEISHU_OPEN_API_BASE = 'https://open.feishu.cn';
 const PERMISSION_CODES = new Set([1770032, 1310213, 125403, 99991663]);
@@ -30,7 +34,7 @@ export interface FeishuCloudDocumentConfig {
 }
 
 export interface FeishuCloudAccessTokenProvider {
-  getAccessToken(userId: string): Promise<string | null>;
+  getAccessToken(userId: string, requiredScopes?: string[]): Promise<string | null>;
   requestUserAuthorization(input: FeishuAuthorizationInput): Promise<FeishuAuthorizationResult>;
 }
 
@@ -111,6 +115,16 @@ export function parseFeishuCloudLinks(text: string): FeishuCloudLink[] {
   return links;
 }
 
+export function resolveFeishuCloudOAuthScopes(links: FeishuCloudLink[]): string[] {
+  const scopes = new Set<string>(FEISHU_OAUTH_BASE_SCOPES);
+  for (const link of links) {
+    if (link.type === 'docx') scopes.add('docx:document:readonly');
+    if (link.type === 'sheets') scopes.add('sheets:spreadsheet:readonly');
+    if (link.type === 'base') scopes.add('bitable:app:readonly');
+  }
+  return normalizeFeishuOAuthScopes(scopes);
+}
+
 export function createFeishuCloudDocumentHost(options: {
   config: FeishuCloudDocumentConfig;
   tokenProvider: FeishuCloudAccessTokenProvider;
@@ -124,6 +138,7 @@ export function createFeishuCloudDocumentHost(options: {
       if (links.length === 0) {
         return { status: 'no_links', linkCount: 0 };
       }
+      const requestedScopes = resolveFeishuCloudOAuthScopes(links);
 
       let tenantPermissionError: FeishuCloudPermissionError | null = null;
       let tenantTokenError: Error | null = null;
@@ -167,6 +182,7 @@ export function createFeishuCloudDocumentHost(options: {
       }
 
       const requestAuthorization = () => options.tokenProvider.requestUserAuthorization({
+        resourceClass: 'cloud_document',
         userId: input.userId!,
         chatId: input.chatId,
         channelType: input.channelType,
@@ -174,6 +190,7 @@ export function createFeishuCloudDocumentHost(options: {
         messageId: input.messageId,
         text: input.text,
         linkUrls: links.map((link) => link.url),
+        requestedScopes,
       });
       const buildAuthorizationRequiredResult = (authorization: Extract<FeishuAuthorizationResult, { status: 'auth_required' }>): FeishuCloudLinkResolveResult => ({
         status: 'auth_required',
@@ -181,9 +198,12 @@ export function createFeishuCloudDocumentHost(options: {
         loginUrl: authorization.loginUrl,
         userMessage: authorization.userMessage,
         feishuCardJson: authorization.feishuCardJson,
+        authorizationRequestId: authorization.authorizationRequestId,
+        requestedScopes: authorization.requestedScopes,
+        authorizationCardDisposition: authorization.cardDisposition,
       });
 
-      let accessToken = await options.tokenProvider.getAccessToken(input.userId);
+      let accessToken = await options.tokenProvider.getAccessToken(input.userId, requestedScopes);
       if (!accessToken) {
         const authorization = await requestAuthorization();
         if (authorization.status !== 'authorized') {

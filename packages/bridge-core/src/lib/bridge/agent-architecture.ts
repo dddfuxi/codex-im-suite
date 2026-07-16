@@ -204,6 +204,14 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['context', 'history', 'attachments'],
   },
   {
+    id: 'context_broker.reference_resolution',
+    layerId: 'context_broker',
+    title: 'Structured Reference Resolution',
+    responsibility: 'Normalize current-message, reply, mention, attachment, history, document, and memory evidence into structured records, then resolve one primary reference focus before provider execution.',
+    promptLines: [],
+    tags: ['context', 'evidence', 'reply', 'reference', 'resolution'],
+  },
+  {
     id: 'capability_router.execution_evidence',
     layerId: 'capability_router',
     title: 'Execution Evidence',

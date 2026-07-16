@@ -30,6 +30,9 @@
 - `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 是机器人分层、策略归属和路径职责分类的第一入口；新增通用 policy、prompt 片段、路径类别或角色门禁时，先在这里声明并补 `bridge-agent-architecture.test.ts`。
 - `bridge-manager.ts` 只保留编排职责：消费入站、调用 context/capability/policy/delivery 入口、串联审计和状态；不要继续把通用角色表、路径表、prompt 规则或平台无关策略内联进 manager。
 - prompt 规则按归属迁移：默认行为和个性属于 Agent Kernel，权限和风险属于 Policy Registry，证据和上下文属于 Context Broker，工具选择属于 Capability Router，最终呈现属于 Delivery Layer。
+- `packages/bridge-core/src/lib/bridge/turn-context.ts` 定义当前回合结构化证据协议和纯裁决函数，`turn-context-broker.ts` 负责归一化各来源并按需调用解析 host；current message、原生 reply、mention、附件、近邻、历史、文档和记忆证据必须带 `id/kind/relation/source/confidence`，不得只拼成平台专用自由文本交给模型猜。
+- 每轮先运行确定性 `Reference Resolver`；唯一且可读的原生 reply 直接成为主焦点，普通近邻和 memory 只能作为辅助。图片、文件、卡片资源壳或下载失败占位不算“正文已恢复”，只有真实附件或本地耐久摘要可提升为可靠 reply。只有多个强引用、仅有推测上文或引用内容未可靠恢复时，才调用只输出 JSON、禁用工具的解析 Agent；classifier 必须绕过 executor、manifest、MCP 和本地工具路由，不携带工作目录，并在 stop 时由同一 abort signal 取消。解析结果必须引用本轮真实 evidence ID，且 focus 必须与 primary evidence 的 relation 一致。
+- 只读分析真实附件与生成/编辑输出产物必须分开裁决：前者使用 `cti-input-evidence/v1` 记录 Provider 实际接收的附件 `id/kind/mediaType`，不得再因“图片/文件”等名词强制要求 `tool_use/tool_result`；后者仍使用 `artifact_required` 和真实产物证据。receipt 只能由受控 Provider 运行时状态生成，模型正文、文件名、历史文本或 `cti-final` 声明都不能伪造输入已接收。
 - 路径判断必须优先使用统一分类口径：开发仓库、live skill、记忆仓库、运行态数据、临时上传缓存、文档、规则、日志、发布产物各自有边界；不要为了现场问题硬写某个群、机器人名、截图路径或缓存路径。
 - 渐进重构顺序固定为：先建立注册表和测试，再迁移纯函数规则，再迁移上下文构造、能力路由、记忆/暂存提升和交付收口；每一步保持兼容并补单测。
 
@@ -120,6 +123,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - 排查 Feishu 消息、卡片、成员、群机器人、云文档、附件、提醒完成按钮或 OAuth 失效时，必须先检查飞书开放平台外部前置条件：对应 API 权限是否在“权限管理”开通，权限类型是否匹配应用身份 `tenant_access_token` 或用户身份 `user_access_token`，是否已创建版本并通过管理员审核发布，`im.message.receive_v1` 事件和 `card.action.trigger` 回调是否配置为长连接并发布生效，bridge 是否已重启读取最新配置。不能把缺 scope、未发布、未审批、事件/回调未配置或文档资源未授权误判为代码已坏，也不能伪造平台权限或数据。
 - 飞书应用管理员类权限（如 `admin:app.admin_id:readonly`、`admin:app.admin:check`）只能用于应用管理员身份诊断或门禁辅助，不能替代 IM、CardKit、Drive、Docx、Sheets、Base、成员列表、消息资源等业务 API scope。文档能力必须同时满足开放平台 scope、应用/用户身份 token、文档本身分享/授权和 OAuth redirect 配置；缺任一项时应返回明确阻塞和所需权限，而不是降级成空总结或假装已读取。
 - `/feishu` 能力诊断应作为 Feishu 平台权限和事件回调问题的一线入口：展示本地声明的 `CTI_FEISHU_GRANTED_SCOPES`、实际 token/API probe、OAuth 请求 scope、事件/回调配置提示和能力缺口。`CTI_FEISHU_GRANTED_SCOPES` 只是“后台已开通并发布”的本地声明，不会自动给应用开权限；后台改动后必须发布审批并重启 bridge。
+- Feishu 用户 OAuth 采用“官方协议 + 自定义治理层”：授权页、scope 展示、用户确认、PKCE、Token 获取与刷新必须跟随飞书官方当前协议；bridge 自定义层只负责 sender 身份绑定、每用户加密隔离、任务级最小 scope、授权状态持久化、同一用户 + 同一规范化 scope 授权卡去重、多任务恢复和审计。普通消息、原生 @、reply、reaction、sticker 与 bot 卡片继续走应用身份长连接，禁止向普通用户索取 user OAuth；只有应用身份无法访问且当前任务确实需要读取该用户私有资源时才可发起授权。复用中的授权请求不得重复发卡，也不得把一个用户的 token、state 或等待任务用于另一个用户。
 - Feishu `interactive` 卡片入站、reply/light context 和历史索引必须先生成受控卡片 evidence：递归解析 `body.content`、转义 JSON、标题、markdown、plain_text、按钮、summary、alt、资源 key 和卡片引用，剔除“请升级客户端”兼容占位；他方应用资源被飞书拒绝读取时，错误码只进入 `raw.feishuInteractiveCard.resourceDownloadFailures` / 审计，不得作为用户可见快答正文或绕过 agent 的最终回复。
 - 飞书最终回复默认同时包含用户可见结果与可展示的思考过程；允许展示面向用户整理后的“处理思路 / 依据 / 执行过程 / 结果”，不再默认压缩为只给结论。但禁止泄漏密钥、token、内部协议名、原始工具日志、未脱敏路径、权限票据或其他不适合外发的原始调试细节。
 - 用户等待期间默认通过 Feishu streaming card 展示 `progress` 事件，支持持续更新的富文本处理进度；该内容应优先呈现用户可读的思考过程、判断依据、工具计划、执行进展和阶段结果。允许把模型或执行链的思路整理后外发到进度卡与最终回复正文，但必须做面向用户的重写，不能直接转发内部协议、原始工具日志、密钥、token 或未脱敏调试输出。任务完成后同一张卡片应更新为最终结果；如果候选回复包含“处理思路 / 执行结果”，收尾卡片应保留思考过程和最终结果两部分，而不是只保留结果段。
@@ -153,6 +157,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息或规则说明里出现的 `@名字`，只能作为 evidence prompt 交给 agent 判断；不得触发出站原生 mention 补全、resolver 检索或假 @ 安全拦截。真实当前命令式请求（例如“请艾特某人让他看一下”）也必须先进入 agent，由 agent 基于本轮原生 mention evidence 和完整上下文判断是否输出结构化 `cti-final.mentions`，bridge 只负责校验和投递结构化真实 ID，不得在 provider 前快捷执行。
 - Feishu 出站 mention 的目标必须是明确飞书显示名、原生 mention evidence 或结构化 mention；“你自己的主人 / 开发者 / 维护者 / 某个成员 / 相关机器人”这类关系描述和泛称不是可执行目标，不得补 `@目标`、不得触发 resolver/inspector 机械 blocker。若模型输出 `@关系描述`，发送前应移除裸 `@` 并保留文字语义。
 - Feishu 出站不得把裸 `@显示名`、普通显示名或用户文本中的名字交给 resolver 作快捷补全；bridge-manager 只透传 AI/provider 产出的结构化 `mentions`（优先 `cti-final.mentions`）或已受控校验的结构化动作。当前消息即使同时原生 @ 了机器人和目标，也只能作为 agent evidence，不得在 provider 前直接投递；AI 未输出结构化真实 ID 时，后置安全层只能自然说明缺少可投递目标或追问最小缺口，不能查询成员/机器人/历史来补全，也不能覆盖其他正常回复。
+- Feishu 结构化 mention 的 ID 字段必须统一兼容 `userId/user_id/openId/open_id`（保留 `unionId/union_id` 兼容），但字段归一化不代表可信：普通回复和 streaming card 收尾必须共用同一投递前门禁，只有该 ID 与本轮原生 mention evidence 中任一平台 ID 精确一致时才允许发送。模型生成、历史猜测或显示名补全出的任意 ID 一律拒绝；被拒绝后要移除对应裸 `@` 并保留文字语义，若用户本轮明确要求艾特，则必须明确说明未投递或要求用户原生 @ 目标，不能展示成看似成功。
 - 显示名解析汇总本轮原生 @、当前群成员/群机器人、当前发送者和历史候选时，必须保留来源等级：本轮原生与当前群平台证据优先，历史只作当前证据缺失时的回退；同一最高等级命中多个不同 ID 才算歧义。禁止让已过期的历史同名记录压制当前群的唯一可原生 @ 身份，也不能为了绕过歧义写死某个机器人名。
 - 对单个通用表情包请求，若本轮确实已向模型附加候选图片、模型只唯一输出其中一个精确 `[表情包:file_key]`，但完全漏写隐藏 `cti-sticker-candidate-analysis` 块，bridge 可一次性投递该真实 sticker；此兜底只证明本轮选择，不得写入长期可信语义或降低后续视觉置信度门槛。
 - 这种一次性表情包许可必须作为 bridge 结构化的 per-turn media action 同时传入普通投递和 streaming card 收尾；adapter 只在动作类型、来源和精确 `file_key` 都与可见 hint 一致时发送，禁止从模型正文、用户文本或不匹配 key 自行推导许可。

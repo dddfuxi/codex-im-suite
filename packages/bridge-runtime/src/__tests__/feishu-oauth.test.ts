@@ -38,10 +38,42 @@ describe('Feishu OAuth token store', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('keeps separate minimum-scope token grants for the same Feishu user', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-token-grants-'));
+    try {
+      const store = new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
+        protect: async (value) => `protected:${value}`,
+        unprotect: async (value) => value.replace(/^protected:/, ''),
+      });
+
+      await Promise.all([
+        store.saveTokens('ou_1', {
+          accessToken: 'docx-access',
+          refreshToken: 'docx-refresh',
+          scopes: ['auth:user.id:read', 'docx:document:readonly', 'offline_access'],
+          accessTokenExpiresAt: '2026-05-09T10:00:00.000Z',
+        }),
+        store.saveTokens('ou_1', {
+          accessToken: 'sheets-access',
+          refreshToken: 'sheets-refresh',
+          scopes: ['auth:user.id:read', 'offline_access', 'sheets:spreadsheet:readonly'],
+          accessTokenExpiresAt: '2026-05-09T10:00:00.000Z',
+        }),
+      ]);
+
+      const docx = await store.getTokens('ou_1', ['docx:document:readonly']);
+      const sheets = await store.getTokens('ou_1', ['sheets:spreadsheet:readonly']);
+      assert.equal(docx?.accessToken, 'docx-access');
+      assert.equal(sheets?.accessToken, 'sheets-access');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Feishu OAuth state and refresh', () => {
-  it('builds a manual authorization card without requiring a public callback URL', async () => {
+  it('uses the official OAuth v3 PKCE flow for manual authorization with minimum scopes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-manual-'));
     try {
       const statePath = path.join(dir, 'states.json');
@@ -51,18 +83,19 @@ describe('Feishu OAuth state and refresh', () => {
           appSecret: 'secret',
           mode: 'manual',
           callbackPath: '/feishu/oauth/callback',
-          scopes: ['offline_access', 'docx:document:readonly'],
+          scopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
           waitForAuthorizationMs: 0,
         },
         tokenStore: new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
           protect: async (value) => value,
           unprotect: async (value) => value,
         }),
-        stateStore: new FeishuOAuthStateStore(statePath),
+        stateStore: new FeishuOAuthStateStore(statePath, () => new Date('2026-05-09T09:00:00.000Z')),
         now: () => new Date('2026-05-09T09:00:00.000Z'),
       });
 
       const result = await service.requestUserAuthorization({
+        resourceClass: 'cloud_document',
         userId: 'ou_1',
         chatId: 'oc_1',
         channelType: 'feishu',
@@ -70,19 +103,179 @@ describe('Feishu OAuth state and refresh', () => {
         messageId: 'm_1',
         text: 'summarize https://example.feishu.cn/docx/doccn123',
         linkUrls: ['https://example.feishu.cn/docx/doccn123'],
+        requestedScopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
       });
 
       assert.equal(result.status, 'auth_required');
-      assert.match(result.loginUrl || '', /^https:\/\/open\.feishu\.cn\/open-apis\/authen\/v1\/index\?/);
+      assert.match(result.loginUrl || '', /^https:\/\/accounts\.feishu\.cn\/open-apis\/authen\/v1\/authorize\?/);
       assert.match(result.loginUrl || '', /redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A17321%2Ffeishu%2Foauth%2Fcallback/);
-      assert.doesNotMatch(result.loginUrl || '', /scope=/);
-      assert.doesNotMatch(result.loginUrl || '', /code_challenge=/);
+      assert.deepEqual(new URL(result.loginUrl || '').searchParams.get('scope')?.split(' '), [
+        'auth:user.id:read',
+        'docx:document:readonly',
+        'offline_access',
+      ]);
+      assert.match(result.loginUrl || '', /code_challenge=/);
+      assert.equal(result.cardDisposition, 'send');
+      assert.deepEqual(result.requestedScopes, ['auth:user.id:read', 'docx:document:readonly', 'offline_access']);
       const persistedStates = JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, any>;
       const persistedState = Object.values(persistedStates)[0];
-      assert.equal(persistedState.pendingRequest.text, 'summarize https://example.feishu.cn/docx/doccn123');
-      assert.equal(persistedState.pendingRequest.userDisplayName, 'Liu Dan');
+      assert.equal(persistedState.pendingRequests[0].text, 'summarize https://example.feishu.cn/docx/doccn123');
+      assert.equal(persistedState.pendingRequests[0].userDisplayName, 'Liu Dan');
+      assert.deepEqual(persistedState.requestedScopes, ['auth:user.id:read', 'docx:document:readonly', 'offline_access']);
       assert.match(result.userMessage, /复制浏览器地址栏/);
       assert.match(result.feishuCardJson || '', /复制回调地址/);
+      assert.match(result.feishuCardJson || '', /docx:document:readonly/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('merges same-user same-scope tasks into one pending authorization card', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-oauth-dedupe-'));
+    try {
+      const statePath = path.join(dir, 'states.json');
+      const service = new FeishuOAuthService({
+        config: {
+          appId: 'cli_xxx',
+          appSecret: 'secret',
+          mode: 'manual',
+          callbackPath: '/feishu/oauth/callback',
+          scopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly', 'sheets:spreadsheet:readonly'],
+          waitForAuthorizationMs: 0,
+        },
+        tokenStore: new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
+          protect: async (value) => value,
+          unprotect: async (value) => value,
+        }),
+        stateStore: new FeishuOAuthStateStore(statePath, () => new Date('2026-05-09T09:00:00.000Z')),
+        now: () => new Date('2026-05-09T09:00:00.000Z'),
+      });
+      const baseInput = {
+        resourceClass: 'cloud_document' as const,
+        userId: 'ou_1',
+        chatId: 'oc_1',
+        channelType: 'feishu',
+        userDisplayName: 'Liu Dan',
+        linkUrls: ['https://example.feishu.cn/docx/doccn123'],
+        requestedScopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
+      };
+
+      const first = await service.requestUserAuthorization({
+        ...baseInput,
+        messageId: 'm_1',
+        text: '总结第一个文档',
+      });
+      const second = await service.requestUserAuthorization({
+        ...baseInput,
+        messageId: 'm_2',
+        text: '总结第二个文档',
+      });
+
+      assert.equal(first.status, 'auth_required');
+      assert.equal(second.status, 'auth_required');
+      assert.equal(first.cardDisposition, 'send');
+      assert.equal(second.cardDisposition, 'reuse');
+      assert.equal(second.feishuCardJson, undefined);
+      assert.equal(second.loginUrl, first.loginUrl);
+      assert.equal(second.authorizationRequestId, first.authorizationRequestId);
+      assert.match(second.userMessage, /已合并到现有授权请求/);
+      const states = Object.values(JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, any>);
+      assert.equal(states.length, 1);
+      assert.deepEqual(states[0].pendingRequests.map((item: any) => item.messageId), ['m_1', 'm_2']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent same-user same-scope requests into one authorization card', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-oauth-concurrent-dedupe-'));
+    try {
+      const service = new FeishuOAuthService({
+        config: {
+          appId: 'cli_xxx',
+          appSecret: 'secret',
+          mode: 'manual',
+          callbackPath: '/feishu/oauth/callback',
+          scopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
+          waitForAuthorizationMs: 0,
+        },
+        tokenStore: new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
+          protect: async (value) => value,
+          unprotect: async (value) => value,
+        }),
+        stateStore: new FeishuOAuthStateStore(path.join(dir, 'states.json'), () => new Date('2026-05-09T09:00:00.000Z')),
+        now: () => new Date('2026-05-09T09:00:00.000Z'),
+      });
+      const baseInput = {
+        resourceClass: 'cloud_document' as const,
+        userId: 'ou_1',
+        chatId: 'oc_1',
+        channelType: 'feishu',
+        linkUrls: ['https://example.feishu.cn/docx/doccn123'],
+        requestedScopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
+      };
+
+      const [first, second] = await Promise.all([
+        service.requestUserAuthorization({ ...baseInput, messageId: 'm_1', text: '总结第一个文档' }),
+        service.requestUserAuthorization({ ...baseInput, messageId: 'm_2', text: '总结第二个文档' }),
+      ]);
+
+      assert.equal(first.status, 'auth_required');
+      assert.equal(second.status, 'auth_required');
+      assert.deepEqual([first.cardDisposition, second.cardDisposition].sort(), ['reuse', 'send']);
+      assert.equal(first.authorizationRequestId, second.authorizationRequestId);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves concurrent different-scope authorization states for the same user', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-oauth-concurrent-scopes-'));
+    try {
+      const statePath = path.join(dir, 'states.json');
+      const service = new FeishuOAuthService({
+        config: {
+          appId: 'cli_xxx',
+          appSecret: 'secret',
+          mode: 'manual',
+          callbackPath: '/feishu/oauth/callback',
+          scopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly', 'sheets:spreadsheet:readonly'],
+          waitForAuthorizationMs: 0,
+        },
+        tokenStore: new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
+          protect: async (value) => value,
+          unprotect: async (value) => value,
+        }),
+        stateStore: new FeishuOAuthStateStore(statePath, () => new Date('2026-05-09T09:00:00.000Z')),
+        now: () => new Date('2026-05-09T09:00:00.000Z'),
+      });
+
+      const [docx, sheets] = await Promise.all([
+        service.requestUserAuthorization({
+          resourceClass: 'cloud_document',
+          userId: 'ou_1',
+          chatId: 'oc_1',
+          messageId: 'm_docx',
+          text: '总结文档',
+          linkUrls: ['https://example.feishu.cn/docx/doccn123'],
+          requestedScopes: ['offline_access', 'auth:user.id:read', 'docx:document:readonly'],
+        }),
+        service.requestUserAuthorization({
+          resourceClass: 'cloud_document',
+          userId: 'ou_1',
+          chatId: 'oc_1',
+          messageId: 'm_sheets',
+          text: '总结表格',
+          linkUrls: ['https://example.feishu.cn/sheets/shtcn123'],
+          requestedScopes: ['offline_access', 'auth:user.id:read', 'sheets:spreadsheet:readonly'],
+        }),
+      ]);
+
+      assert.equal(docx.cardDisposition, 'send');
+      assert.equal(sheets.cardDisposition, 'send');
+      assert.notEqual(docx.authorizationRequestId, sheets.authorizationRequestId);
+      const states = Object.values(JSON.parse(fs.readFileSync(statePath, 'utf8')) as Record<string, any>);
+      assert.equal(states.length, 2);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -101,14 +294,26 @@ describe('Feishu OAuth state and refresh', () => {
         redirectUri: 'http://127.0.0.1:17321/feishu/oauth/callback',
         linkHashes: ['abc'],
         expiresAt: '2026-05-09T09:05:00.000Z',
-        pendingRequest: {
-          text: 'summarize https://example.feishu.cn/docx/doc_abc',
-          channelType: 'feishu',
-          chatId: 'oc_1',
-          userId: 'ou_1',
-          userDisplayName: 'Liu Dan',
-          messageId: 'm_1',
-        },
+        requestedScopes: ['auth:user.id:read', 'docx:document:readonly', 'offline_access'],
+        authorizationKey: 'ou_1|auth:user.id:read,docx:document:readonly,offline_access',
+        pendingRequests: [
+          {
+            text: 'summarize https://example.feishu.cn/docx/doc_abc',
+            channelType: 'feishu',
+            chatId: 'oc_1',
+            userId: 'ou_1',
+            userDisplayName: 'Liu Dan',
+            messageId: 'm_1',
+          },
+          {
+            text: 'summarize https://example.feishu.cn/docx/doc_second',
+            channelType: 'feishu',
+            chatId: 'oc_1',
+            userId: 'ou_1',
+            userDisplayName: 'Liu Dan',
+            messageId: 'm_2',
+          },
+        ],
       });
       const tokenStore = new FeishuOAuthTokenStore(path.join(dir, 'tokens.json'), {
         protect: async (value) => `p:${value}`,
@@ -127,21 +332,18 @@ describe('Feishu OAuth state and refresh', () => {
         stateStore,
         now: () => new Date('2026-05-09T09:00:00.000Z'),
         fetch: async (url, init) => {
-          if (String(url).includes('/auth/v3/app_access_token/internal')) {
-            return new Response(JSON.stringify({
-              code: 0,
-              app_access_token: 'app-access-token',
-              expire: 7200,
-            }), { status: 200 });
-          }
-          assert.match(String(url), /\/open-apis\/authen\/v1\/access_token/);
-          assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer app-access-token');
+          assert.equal(String(url), 'https://accounts.feishu.cn/oauth/v3/token');
           assert.match(String(init?.body), /"code":"auth-code"/);
+          assert.match(String(init?.body), /"code_verifier":"verifier"/);
+          assert.match(String(init?.body), /"scope":"auth:user.id:read docx:document:readonly offline_access"/);
           return new Response(JSON.stringify({
             code: 0,
             data: {
               access_token: 'new-access',
+              refresh_token: 'new-refresh',
               expires_in: 7200,
+              refresh_token_expires_in: 2592000,
+              scope: 'offline_access auth:user.id:read docx:document:readonly',
               open_id: 'ou_1',
             },
           }), { status: 200 });
@@ -156,10 +358,11 @@ describe('Feishu OAuth state and refresh', () => {
       assert.equal(result.status, 'bound');
       assert.equal(result.userMessage, '已收到，正在处理中。');
       assert.equal(result.resume?.text, 'summarize https://example.feishu.cn/docx/doc_abc');
+      assert.deepEqual(result.resumes?.map((item) => item.messageId), ['m_1', 'm_2']);
       assert.equal(result.resume?.userDisplayName, 'Liu Dan');
       const stored = await tokenStore.getTokens('ou_1');
       assert.equal(stored?.accessToken, 'new-access');
-      assert.equal(stored?.refreshToken, undefined);
+      assert.equal(stored?.refreshToken, 'new-refresh');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -204,12 +407,19 @@ describe('Feishu OAuth state and refresh', () => {
         stateStore,
         now: () => new Date('2026-05-09T09:00:00.000Z'),
         fetch: async (url, init) => {
-          if (String(url).includes('/auth/v3/app_access_token/internal')) {
-            return new Response(JSON.stringify({ code: 0, app_access_token: 'app-access-token', expire: 7200 }), { status: 200 });
-          }
-          assert.match(String(url), /\/open-apis\/authen\/v1\/access_token/);
-          assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer app-access-token');
-          return new Response(JSON.stringify({ code: 0, data: { access_token: 'new-access', expires_in: 7200, open_id: 'ou_1' } }), { status: 200 });
+          assert.equal(String(url), 'https://accounts.feishu.cn/oauth/v3/token');
+          assert.match(String(init?.body), /"code_verifier":"verifier"/);
+          return new Response(JSON.stringify({
+            code: 0,
+            data: {
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 7200,
+              refresh_token_expires_in: 2592000,
+              scope: 'offline_access auth:user.id:read docx:document:readonly',
+              open_id: 'ou_1',
+            },
+          }), { status: 200 });
         },
       });
       let resumed: any = null;
@@ -256,10 +466,12 @@ describe('Feishu OAuth state and refresh', () => {
       });
 
       const result = await service.requestUserAuthorization({
+        resourceClass: 'cloud_document',
         userId: 'ou_1',
         chatId: 'oc_1',
         messageId: 'm_1',
         linkUrls: ['https://example.feishu.cn/sheets/shtcn123'],
+        requestedScopes: ['offline_access', 'auth:user.id:read', 'sheets:spreadsheet:readonly'],
       });
 
       assert.equal(result.status, 'auth_required');
@@ -321,16 +533,21 @@ describe('Feishu OAuth state and refresh', () => {
         tokenStore,
         stateStore: new FeishuOAuthStateStore(path.join(dir, 'states.json')),
         now: () => new Date('2026-05-09T09:00:00.000Z'),
-        fetch: async () => new Response(JSON.stringify({
-          code: 0,
-          data: {
-            access_token: 'new-access',
-            refresh_token: 'new-refresh',
-            expires_in: 7200,
-            refresh_token_expires_in: 2592000,
-            scope: 'offline_access',
-          },
-        }), { status: 200 }),
+        fetch: async (url, init) => {
+          assert.equal(String(url), 'https://accounts.feishu.cn/oauth/v3/token');
+          assert.match(String(init?.body), /"grant_type":"refresh_token"/);
+          assert.match(String(init?.body), /"scope":"offline_access"/);
+          return new Response(JSON.stringify({
+            code: 0,
+            data: {
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 7200,
+              refresh_token_expires_in: 2592000,
+              scope: 'offline_access',
+            },
+          }), { status: 200 });
+        },
       });
 
       const token = await service.getAccessToken('ou_1');

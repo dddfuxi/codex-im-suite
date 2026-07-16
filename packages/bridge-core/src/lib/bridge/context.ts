@@ -18,6 +18,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuOAuthManualHost,
   MemoryIntentHost,
+  TurnReferenceResolverHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -30,6 +31,7 @@ export interface BridgeContext {
   feishuCloudDocuments?: FeishuCloudDocumentHost;
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
+  turnReferences?: TurnReferenceResolverHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

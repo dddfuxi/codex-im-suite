@@ -25,6 +25,7 @@ import type {
   MemoryWriteResult,
   MemoryReplyDecision,
 } from './host.js';
+import type { TurnEvidenceItem } from './turn-context.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -76,6 +77,7 @@ import {
   renderFeishuDocumentMemoryList,
 } from './feishu-document-memory.js';
 import { buildFeishuCapabilityReport } from './feishu-capabilities.js';
+import { resolveStructuredTurnContext } from './turn-context-broker.js';
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -2351,17 +2353,39 @@ function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' |
   }
 }
 
+const FEISHU_MENTION_ID_FIELDS = [
+  'userId',
+  'user_id',
+  'openId',
+  'open_id',
+  'unionId',
+  'union_id',
+] as const;
+
+/**
+ * 兼容模型协议与飞书原生事件中的常见 ID 字段拼写。
+ * 这里只做字段归一化；ID 是否可信必须在具体投递动作前再与本轮原生 evidence 校验。
+ */
+function readFeishuMentionIds(raw: Record<string, unknown>): string[] {
+  const ids = new Set<string>();
+  for (const field of FEISHU_MENTION_ID_FIELDS) {
+    const value = raw[field];
+    if (typeof value === 'string' && value.trim()) ids.add(value.trim());
+  }
+  return [...ids];
+}
+
+function readFeishuMentionId(raw: Record<string, unknown>): string {
+  return readFeishuMentionIds(raw)[0] || '';
+}
+
 function parseEnvelopeMentions(rawMentions: unknown): OutboundMention[] | undefined {
   if (!Array.isArray(rawMentions)) return undefined;
   const mentions: OutboundMention[] = [];
   for (const item of rawMentions) {
     if (!item || typeof item !== 'object') continue;
     const raw = item as Record<string, unknown>;
-    const userId = typeof raw.userId === 'string'
-      ? raw.userId.trim()
-      : typeof raw.user_id === 'string'
-        ? raw.user_id.trim()
-        : '';
+    const userId = readFeishuMentionId(raw);
     const name = typeof raw.name === 'string'
       ? raw.name.trim()
       : typeof raw.user_name === 'string'
@@ -2967,16 +2991,20 @@ function getFeishuMentionIntentOptions(adapter: BaseChannelAdapter, msg: Inbound
  */
 function getNativeFeishuMentionEvidence(msg: InboundMessage): OutboundMention[] {
   const rawData = msg.raw as {
-    feishuMentions?: Array<{ name?: unknown; openId?: unknown; userId?: unknown; unionId?: unknown }>;
+    feishuMentions?: Array<Record<string, unknown>>;
   } | undefined;
   const nativeMentions = Array.isArray(rawData?.feishuMentions) ? rawData.feishuMentions : [];
   const uniqueMentions = new Map<string, OutboundMention>();
   for (const mention of nativeMentions) {
-    const userId = [mention?.openId, mention?.userId, mention?.unionId]
-      .find((candidate): candidate is string => typeof candidate === 'string' && !!candidate.trim())?.trim() || '';
-    if (!userId || isFeishuPlaceholderMentionTarget(userId)) continue;
+    const ids = readFeishuMentionIds(mention);
     const name = typeof mention?.name === 'string' ? mention.name.trim() : '';
-    uniqueMentions.set(userId, { userId, name: name || userId });
+    for (const userId of ids) {
+      if (isFeishuPlaceholderMentionTarget(userId)) continue;
+      uniqueMentions.set(userId, {
+        userId,
+        ...(name ? { name } : {}),
+      });
+    }
   }
   return [...uniqueMentions.values()];
 }
@@ -3131,6 +3159,12 @@ function replaceBareFeishuAtTarget(text: string, target: string, replacementName
   return text.replace(pattern, (_match, prefix: string) => `${prefix}@${replacementName}`);
 }
 
+function stripBareFeishuAtTarget(text: string, target: string): string {
+  const safeTarget = escapeRegExp(target);
+  const pattern = new RegExp(`(^|${FEISHU_BARE_AT_BOUNDARY_CLASS})@${safeTarget}(?=$|${FEISHU_BARE_AT_END_BOUNDARY_CLASS})`, 'giu');
+  return text.replace(pattern, (_match, prefix: string) => `${prefix}${target}`);
+}
+
 function extractExplicitFeishuMentionTargetsFromRequest(
   userText: string,
   options: FeishuMentionIntentOptions = {},
@@ -3208,6 +3242,69 @@ function sanitizeFeishuPlaceholderMentions(
     ...payload,
     text,
     mentions: nextMentions,
+  };
+}
+
+/**
+ * 结构化 mention 只能消费本轮飞书事件已经提供的原生 ID。
+ * 模型可以选择 evidence，但不能自行创造或通过显示名补全平台身份。
+ */
+function validateFeishuStructuredMentions(
+  payload: PreparedBridgeReplyPayload,
+  context: { channelType: string; message: InboundMessage },
+): PreparedBridgeReplyPayload {
+  if (context.channelType !== 'feishu' || !payload.mentions?.length) return payload;
+
+  const nativeEvidenceById = new Map(
+    getNativeFeishuMentionEvidence(context.message)
+      .filter((mention): mention is OutboundMention & { userId: string } => !!mention.userId?.trim())
+      .map((mention) => [mention.userId.trim(), mention]),
+  );
+  const acceptedMentions = new Map<string, OutboundMention>();
+  const rejectedTargets = new Set<string>();
+  let text = payload.text;
+
+  for (const mention of payload.mentions) {
+    if (mention.atAll) {
+      acceptedMentions.set('at_all', { atAll: true, ...(mention.name ? { name: mention.name } : {}) });
+      continue;
+    }
+
+    const userId = mention.userId?.trim() || '';
+    const nativeEvidence = userId ? nativeEvidenceById.get(userId) : undefined;
+    if (!nativeEvidence) {
+      const rejectedTarget = mention.name?.trim() || userId;
+      if (rejectedTarget) rejectedTargets.add(rejectedTarget);
+      continue;
+    }
+
+    const modelName = mention.name?.trim() || '';
+    const evidenceName = nativeEvidence.name?.trim() || '';
+    if (modelName && evidenceName && modelName !== evidenceName) {
+      text = replaceBareFeishuAtTarget(text, modelName, evidenceName);
+    }
+    acceptedMentions.set(userId, {
+      userId,
+      ...((evidenceName || modelName) ? { name: evidenceName || modelName } : {}),
+    });
+  }
+
+  const acceptedNames = new Set(
+    [...acceptedMentions.values()]
+      .map((mention) => normalizeFeishuMentionTargetKey(mention.name || ''))
+      .filter(Boolean),
+  );
+  for (const target of rejectedTargets) {
+    if (!acceptedNames.has(normalizeFeishuMentionTargetKey(target))) {
+      text = stripBareFeishuAtTarget(text, target);
+    }
+  }
+
+  const mentions = [...acceptedMentions.values()];
+  return {
+    ...payload,
+    text,
+    mentions: mentions.length > 0 ? mentions : undefined,
   };
 }
 
@@ -4105,9 +4202,9 @@ function formatInboundNativeMentions(rawMentions: unknown): string[] {
       if (!raw || typeof raw !== 'object') return '';
       const mention = raw as Record<string, unknown>;
       const name = promptField(mention.name);
-      const openId = promptField(mention.openId);
-      const userId = promptField(mention.userId);
-      const unionId = promptField(mention.unionId);
+      const openId = promptField(mention.openId) || promptField(mention.open_id);
+      const userId = promptField(mention.userId) || promptField(mention.user_id);
+      const unionId = promptField(mention.unionId) || promptField(mention.union_id);
       const key = promptField(mention.key);
       const ids = [
         openId ? `open_id=${openId}` : '',
@@ -4515,6 +4612,27 @@ function buildFeishuCloudBlockerMessage(result: FeishuCloudLinkResolveResult): s
       ? '未完成：当前登录飞书用户也没有这个云文档权限，请让文档所有者分享给你或导出内容。'
       : '未完成：读取飞书云文档失败。';
   return result.userMessage?.trim() || result.error?.trim() || fallback;
+}
+
+function resolveFeishuOAuthCardJson(result: FeishuCloudLinkResolveResult): string | undefined {
+  // 治理层是授权卡去重的最后防线：即使 host 错误回传了旧卡，reuse 也不得再次投递。
+  return result.authorizationCardDisposition === 'reuse' ? undefined : result.feishuCardJson;
+}
+
+function recordFeishuOAuthRequestAudit(
+  msg: InboundMessage,
+  result: FeishuCloudLinkResolveResult,
+): void {
+  if (result.status !== 'auth_required' || !result.authorizationRequestId) return;
+  const disposition = result.authorizationCardDisposition || 'send';
+  const scopes = (result.requestedScopes || []).join(',') || '(unspecified)';
+  getBridgeContext().store.insertAuditLog({
+    channelType: msg.address.channelType,
+    chatId: msg.address.chatId,
+    direction: 'outbound',
+    messageId: msg.messageId,
+    summary: `[FEISHU_OAUTH_REQUEST] requestId=${result.authorizationRequestId} disposition=${disposition} userId=${msg.address.userId || '(unknown)'} scopes=${scopes}`,
+  });
 }
 
 function sanitizeFeishuCloudDocumentLinks(text: string): string {
@@ -5555,6 +5673,11 @@ async function handleMessage(
       prompt?: string;
       messageCount?: number;
       replyToMessageId?: string;
+      evidence?: TurnEvidenceItem[];
+    };
+    feishuReplyTo?: {
+      messageId?: string;
+      attachmentCount?: number;
     };
     feishuStickerLibraryContext?: {
       prompt?: string;
@@ -5715,21 +5838,25 @@ async function handleMessage(
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
         });
-        if (result.status === 'bound' && result.resume?.text?.trim()) {
-          const resume = result.resume;
-          const resumeMessage: InboundMessage = {
-            messageId: `${resume.messageId || msg.messageId}:oauth-resume`,
-            address: {
-              ...msg.address,
-              channelType: resume.channelType || adapter.channelType,
-              chatId: resume.chatId || msg.address.chatId,
-              userId: resume.userId || msg.address.userId,
-              displayName: resume.userDisplayName || msg.address.displayName,
-            },
-            text: resume.text,
-            timestamp: Date.now(),
-          };
-          await handleMessage(adapter, resumeMessage);
+        if (result.status === 'bound') {
+          const resumes = result.resumes?.length ? result.resumes : result.resume ? [result.resume] : [];
+          // 一次官方 OAuth 授权可以解除多个等待任务；逐个恢复以保持原消息 reply 关系和会话隔离。
+          for (const resume of resumes) {
+            if (!resume.text?.trim()) continue;
+            const resumeMessage: InboundMessage = {
+              messageId: `${resume.messageId || msg.messageId}:oauth-resume`,
+              address: {
+                ...msg.address,
+                channelType: resume.channelType || adapter.channelType,
+                chatId: resume.chatId || msg.address.chatId,
+                userId: resume.userId || msg.address.userId,
+                displayName: resume.userDisplayName || msg.address.displayName,
+              },
+              text: resume.text,
+              timestamp: Date.now(),
+            };
+            await handleMessage(adapter, resumeMessage);
+          }
         }
         ack();
         return;
@@ -6156,12 +6283,13 @@ async function handleMessage(
         feishuCloudSystemPrompt = resolved.systemPrompt;
       } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
         endProcessingCard();
+        recordFeishuOAuthRequestAudit(msg, resolved);
         await deliver(adapter, {
           address: msg.address,
           text: buildFeishuCloudBlockerMessage(resolved),
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
-          feishuCardJson: resolved.feishuCardJson,
+          feishuCardJson: resolveFeishuOAuthCardJson(resolved),
         }, { sessionId: effectiveBinding.codepilotSessionId });
         ack();
         return;
@@ -6477,12 +6605,13 @@ async function handleMessage(
           feishuCloudSystemPrompt = resolved.systemPrompt;
         } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
           progressPulse?.stop();
+          recordFeishuOAuthRequestAudit(msg, resolved);
           await deliver(adapter, {
             address: msg.address,
             text: buildFeishuCloudBlockerMessage(resolved),
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
-            feishuCardJson: resolved.feishuCardJson,
+            feishuCardJson: resolveFeishuOAuthCardJson(resolved),
           }, { sessionId: effectiveBinding.codepilotSessionId });
           ack();
           return;
@@ -6512,16 +6641,49 @@ async function handleMessage(
     const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
       ? sanitizeFeishuCloudDocumentLinks(rawText) || '请基于已读取的飞书云文档上下文回答当前请求。'
       : basePromptText;
+    const resolvedTurnContext = await resolveStructuredTurnContext({
+      sessionId: effectiveBinding.codepilotSessionId,
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      messageId: msg.messageId,
+      currentText: rawText,
+      currentActor: {
+        id: msg.address.userId,
+        displayName: msg.address.displayName,
+        type: rawData?.feishuSender?.senderType === 'user'
+          ? 'human'
+          : rawData?.feishuSender?.senderType === 'bot'
+            ? 'bot'
+            : rawData?.feishuSender?.senderType === 'app'
+              ? 'app'
+              : 'unknown',
+      },
+      workingDirectory: effectiveBinding.workingDirectory || undefined,
+      abortSignal: taskAbort.signal,
+      platformEvidence: rawData?.feishuConversationContext?.evidence,
+      mentions: rawData?.feishuMentions,
+      attachments: providerAttachments,
+      replyAttachmentCount: rawData?.feishuReplyTo?.attachmentCount,
+      replyMessageId: rawData?.feishuReplyTo?.messageId,
+      retrievedEvidence: [
+        { id: 'history:feishu', kind: 'history', source: 'local_history', content: feishuHistoryEvidencePrompt },
+        { id: 'document:memory', kind: 'document', source: 'document_retrieval', content: feishuDocumentMemoryPrompt },
+        { id: 'document:cloud', kind: 'document', source: 'document_retrieval', content: feishuCloudSystemPrompt },
+      ],
+      resolver: getBridgeContext().turnReferences,
+    });
+    // Context Broker / 解析 Agent 可能发生异步等待。若 bridge 在此期间已停止，
+    // 任务 signal 会先被置为 aborted；此时不得再启动新的 provider stream。
+    if (taskAbort.signal.aborted) return;
+    const structuredTurnContextPrompt = resolvedTurnContext.prompt;
+    const hasStructuredConversationEvidence = resolvedTurnContext.hasPlatformEvidence;
     // 关联上下文必须走独立通道：Codex 等 provider 会裁剪长 system prompt，
     // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
     // 此处仅放当前回合理解和结构化投递所必需的受控 evidence，不混入表情包或记忆写入策略。
     // 原生 mention / sender ID 必须独立保留，否则长 system prompt 会让模型知道动作协议却看不到真实目标。
     const priorityTurnContext = [
+      structuredTurnContextPrompt,
       inboundActorContextPrompt,
-      feishuConversationContextPrompt,
-      feishuHistoryEvidencePrompt,
-      feishuDocumentMemoryPrompt,
-      feishuCloudSystemPrompt,
     ].filter(Boolean).join('\n\n');
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
@@ -6559,7 +6721,7 @@ async function handleMessage(
         assistantMaintainerContextPrompt,
         inboundActorContextPrompt,
         fastPathOptions.extraSystemPrompt,
-        feishuConversationContextPrompt,
+        hasStructuredConversationEvidence ? '' : feishuConversationContextPrompt,
         feishuHistoryEvidencePrompt,
         feishuDocumentMemoryPrompt,
         preparedMemoryWriteAgentPrompt,
@@ -6683,6 +6845,10 @@ async function handleMessage(
       });
       preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
         channelType: adapter.channelType,
+      });
+      preparedReply = validateFeishuStructuredMentions(preparedReply, {
+        channelType: adapter.channelType,
+        message: msg,
       });
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,

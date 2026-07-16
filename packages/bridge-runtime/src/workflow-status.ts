@@ -35,10 +35,15 @@ export interface WorkflowExecutionSummary {
   selectedSource?: 'local_api' | 'external_api' | 'official';
   model?: string;
   baseUrl?: string;
-  requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+  requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
   evidenceSatisfied?: boolean;
   noEvidenceRetryAttempted?: boolean;
   requiredToolFamilies?: string[];
+  requiredInputEvidenceKinds?: string[];
+  requiredInputEvidenceIds?: string[];
+  acceptedInputEvidenceKinds?: string[];
+  acceptedInputEvidenceIds?: string[];
+  inputEvidenceProvider?: string;
   toolUseCount?: number;
   toolResultCount?: number;
   successfulToolResultCount?: number;
@@ -210,7 +215,7 @@ function readSelectedSource(value: unknown): 'local_api' | 'external_api' | 'off
 }
 
 function readEvidenceKind(value: unknown): WorkflowExecutionSummary['requiredEvidenceKind'] | undefined {
-  return value === 'none' || value === 'local_read_required' || value === 'tool_required' || value === 'artifact_required'
+  return value === 'none' || value === 'input_evidence_required' || value === 'local_read_required' || value === 'tool_required' || value === 'artifact_required'
     ? value
     : undefined;
 }
@@ -278,6 +283,11 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     evidenceSatisfied: readBooleanField(source.evidenceSatisfied),
     noEvidenceRetryAttempted: readBooleanField(source.noEvidenceRetryAttempted),
     requiredToolFamilies: readStringList(source.requiredToolFamilies),
+    requiredInputEvidenceKinds: readStringList(source.requiredInputEvidenceKinds),
+    requiredInputEvidenceIds: readStringList(source.requiredInputEvidenceIds),
+    acceptedInputEvidenceKinds: readStringList(source.acceptedInputEvidenceKinds),
+    acceptedInputEvidenceIds: readStringList(source.acceptedInputEvidenceIds),
+    inputEvidenceProvider: readStringField(source.inputEvidenceProvider),
     toolUseCount: readNumberField(source.toolUseCount),
     toolResultCount: readNumberField(source.toolResultCount),
     successfulToolResultCount: readNumberField(source.successfulToolResultCount),

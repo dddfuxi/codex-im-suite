@@ -4,6 +4,55 @@ import { describe, it } from 'node:test';
 import { buildManifestCodexSlimParams } from '../manifest-codex-slim.js';
 
 describe('manifest Codex slim params', () => {
+  it('never converts classifier evidence text into a manifest tool request', () => {
+    const params = {
+      sessionId: 'classifier-session',
+      prompt: '引用证据里写着：unitygame视角截个图',
+      interactionMode: 'classifier' as const,
+      responseSchema: { type: 'object' },
+      executionRequirement: { kind: 'none' as const, reason: 'turn reference resolution', requiredToolFamilies: [] },
+    };
+
+    const result = buildManifestCodexSlimParams(params, {
+      mcpToolCallDefinitions: [{
+        id: 'test.unity.screenshot',
+        match: { keywordGroups: [['unity', 'game', '截']] },
+        manifestHint: 'unitymcp',
+        tool: 'manage_camera',
+        arguments: { action: 'screenshot' },
+      }],
+    });
+
+    assert.equal(result.plan, null);
+    assert.equal(result.params, params);
+  });
+
+  it('never converts provider input evidence analysis into an artifact manifest request', () => {
+    const params = {
+      sessionId: 'input-evidence-session',
+      prompt: '分析一下图片里的关键信息',
+      files: [{ id: 'image-1', name: 'input.png', type: 'image/png', size: 4, data: 'AAAA' }],
+      executionRequirement: {
+        kind: 'input_evidence_required' as const,
+        reason: 'request depends on provider-accepted structured input evidence',
+        requiredToolFamilies: [],
+        requiredInputEvidenceKinds: ['image' as const],
+        requiredInputEvidenceIds: ['image-1'],
+      },
+    };
+    const result = buildManifestCodexSlimParams(params, {
+      shellArtifactDefinitions: [{
+        id: 'image-artifact',
+        match: { keywords: ['图片'] },
+        command: 'capture-image',
+        artifactPaths: ['output.png'],
+      }],
+    });
+
+    assert.equal(result.plan, null);
+    assert.equal(result.params.executionRequirement?.kind, 'input_evidence_required');
+  });
+
   it('keeps Codex as the executor while replacing broad context with manifest tool boundaries', () => {
     const result = buildManifestCodexSlimParams({
       sessionId: 'test-session',

@@ -10,6 +10,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { ChannelBinding, RunSummary } from './types.js';
+import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from './input-evidence.js';
 import type {
   FileAttachment,
   SSEEvent,
@@ -96,6 +97,11 @@ export interface ConversationResult {
     evidenceSatisfied?: boolean;
     noEvidenceRetryAttempted?: boolean;
     requiredToolFamilies?: string[];
+    requiredInputEvidenceKinds?: InputEvidenceKind[];
+    requiredInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: InputEvidenceKind[];
+    acceptedInputEvidenceIds?: string[];
+    inputEvidenceProvider?: string;
   };
 }
 
@@ -194,11 +200,15 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
     failedToolErrors: [],
     toolNames: [],
     permissionRequestCount: 0,
+    acceptedInputEvidenceKinds: [],
+    acceptedInputEvidenceIds: [],
     ...(requirement ? {
       requiredEvidenceKind: requirement.kind,
       evidenceSatisfied: requirement.kind === 'none',
       noEvidenceRetryAttempted,
       requiredToolFamilies: requirement.requiredToolFamilies,
+      requiredInputEvidenceKinds: requirement.requiredInputEvidenceKinds,
+      requiredInputEvidenceIds: requirement.requiredInputEvidenceIds,
     } : {}),
   };
 }
@@ -1046,6 +1056,18 @@ async function consumeStream(
             try {
               const statusData = JSON.parse(event.data);
               runSummary = mergeRunSummary(runSummary, statusData);
+              const inputEvidenceReceipt = parseProviderInputEvidenceReceipt(statusData.inputEvidence);
+              if (inputEvidenceReceipt) {
+                executionEvidence.inputEvidenceProvider = inputEvidenceReceipt.provider;
+                executionEvidence.acceptedInputEvidenceIds = Array.from(new Set([
+                  ...(executionEvidence.acceptedInputEvidenceIds || []),
+                  ...inputEvidenceReceipt.accepted.map((item) => item.id),
+                ]));
+                executionEvidence.acceptedInputEvidenceKinds = Array.from(new Set([
+                  ...(executionEvidence.acceptedInputEvidenceKinds || []),
+                  ...inputEvidenceReceipt.accepted.map((item) => item.kind),
+                ]));
+              }
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
                 store.updateSdkSessionId(sessionId, statusData.session_id);

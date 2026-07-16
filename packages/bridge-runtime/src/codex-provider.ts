@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { buildProviderInputEvidenceReceipt } from 'claude-to-im/src/lib/bridge/input-evidence.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { CTI_HOME } from './config.js';
 import { sseEvent } from './sse-utils.js';
@@ -131,9 +132,33 @@ export function getReasoningEffort(profile: CodexProviderProfile): 'minimal' | '
 type CodexClientOptions = {
   apiKey?: string;
   baseUrl?: string;
-  config: { model_reasoning_effort: ReturnType<typeof normalizeReasoningEffort> };
+  config: Record<string, unknown> & { model_reasoning_effort: ReturnType<typeof normalizeReasoningEffort> };
   env: Record<string, string>;
 };
+
+const CLASSIFIER_DISABLED_FEATURES = {
+  shell_tool: false,
+  unified_exec: false,
+  apps: false,
+  plugins: false,
+  browser_use: false,
+  browser_use_external: false,
+  computer_use: false,
+  image_generation: false,
+  multi_agent: false,
+  workspace_dependencies: false,
+  skill_mcp_dependency_install: false,
+  standalone_web_search: false,
+  web_search_request: false,
+  request_permissions_tool: false,
+} as const;
+
+const CLASSIFIER_FORBIDDEN_ITEM_TYPES = new Set([
+  'command_execution',
+  'file_change',
+  'mcp_tool_call',
+  'web_search',
+]);
 
 function shouldResumeThreads(): boolean {
   return process.env.CTI_CODEX_RESUME_THREADS === 'true';
@@ -588,12 +613,13 @@ export function buildTurnPrompt(params: StreamChatParams): string {
     sections.push(`System instructions:\n${systemPrompt}`);
   }
   sections.push(`Bridge reply style:\n${buildBridgeReplyGuardrails(params)}`);
-  // 关联证据不受 system prompt 预算影响；它仍在当前请求前，并被明确标记为不可执行证据。
-  if (priorityTurnContext) {
-    sections.push(priorityTurnContext);
-  }
   if (historyEntries.length > 0) {
     sections.push(`Conversation context:\n${historyEntries.join('\n')}`);
+  }
+  // 结构化本轮焦点放在普通历史之后、当前请求之前，避免旧会话与记忆
+  // 在注意力顺序上覆盖原生 reply、mention 或附件关系。
+  if (priorityTurnContext) {
+    sections.push(priorityTurnContext);
   }
   sections.push(`Current user request:\n${userPrompt}`);
   return sections.join('\n\n');
@@ -602,6 +628,7 @@ export function buildTurnPrompt(params: StreamChatParams): string {
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
+  private classifierCodex: CodexInstance | null = null;
 
   /** Maps session IDs to Codex thread IDs for resume. */
   private threadIds = new Map<string, string>();
@@ -641,6 +668,24 @@ export class CodexProvider implements LLMProvider {
     return { sdk: this.sdk, codex: this.codex };
   }
 
+  private async ensureClassifierSDK(): Promise<{ sdk: CodexModule; codex: CodexInstance }> {
+    const { sdk } = await this.ensureSDK();
+    if (!this.classifierCodex) {
+      const clientOptions = buildCodexClientOptions(this.options.profile || 'primary');
+      this.classifierCodex = new sdk.Codex({
+        ...(clientOptions.apiKey ? { apiKey: clientOptions.apiKey } : {}),
+        ...(clientOptions.baseUrl ? { baseUrl: clientOptions.baseUrl } : {}),
+        config: {
+          ...clientOptions.config,
+          model_reasoning_effort: 'minimal',
+          features: CLASSIFIER_DISABLED_FEATURES,
+        },
+        env: clientOptions.env,
+      });
+    }
+    return { sdk, codex: this.classifierCodex };
+  }
+
   streamChat(params: StreamChatParams): ReadableStream<string> {
     const self = this;
 
@@ -649,7 +694,10 @@ export class CodexProvider implements LLMProvider {
         (async () => {
           const tempFiles: string[] = [];
           try {
-            const { codex } = await self.ensureSDK();
+            const classifierMode = params.interactionMode === 'classifier';
+            const { codex } = classifierMode
+              ? await self.ensureClassifierSDK()
+              : await self.ensureSDK();
 
             // Resolve or create thread
             const inMemoryThreadId = self.threadIds.get(params.sessionId);
@@ -660,18 +708,18 @@ export class CodexProvider implements LLMProvider {
             if (!resumeThreads) {
               self.threadIds.delete(params.sessionId);
             }
-            let savedThreadId = (params.forceFreshThread || !resumeThreads)
+            let savedThreadId = (classifierMode || params.forceFreshThread || !resumeThreads)
               ? undefined
               : (inMemoryThreadId || params.sdkSessionId || undefined);
 
             const profile = self.options.profile || 'primary';
-            const approvalPolicy = toApprovalPolicy(params.permissionMode);
+            const approvalPolicy = classifierMode ? 'untrusted' : toApprovalPolicy(params.permissionMode);
             const passModel = shouldPassModelToCodex(profile);
             const modelOverride = getCodexModelOverride(profile);
-            const sandboxMode = getSandboxMode();
+            const sandboxMode = classifierMode ? 'read-only' : getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
-            const workingDirectory = resolveWorkingDirectory(params.workingDirectory);
-            const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
+            const workingDirectory = classifierMode ? undefined : resolveWorkingDirectory(params.workingDirectory);
+            const additionalDirectories = classifierMode ? [] : normalizeAdditionalDirectories(params.additionalDirectories);
             const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
             const modelSource = profile === 'local_primary'
               ? 'local_api'
@@ -701,15 +749,21 @@ export class CodexProvider implements LLMProvider {
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,
               sandboxMode,
-              modelReasoningEffort: getReasoningEffort(self.options.profile || 'primary'),
+              modelReasoningEffort: classifierMode ? 'minimal' : getReasoningEffort(self.options.profile || 'primary'),
+              ...(classifierMode ? {
+                networkAccessEnabled: false,
+                webSearchMode: 'disabled',
+                skipGitRepoCheck: true,
+              } : {}),
             };
 
             // Build input: Codex SDK UserInput supports { type: "text" } and
             // { type: "local_image", path: string }. We write base64 data to
             // temp files so the SDK can read them as local images.
-            const imageFiles = params.files?.filter(
+            const imageFiles = classifierMode ? [] : params.files?.filter(
               f => f.type.startsWith('image/')
             ) ?? [];
+            const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(imageFiles, 'codex', ['image']);
 
             let input: string | Array<Record<string, string>>;
             if (imageFiles.length > 0) {
@@ -744,7 +798,10 @@ export class CodexProvider implements LLMProvider {
 
               let sawAnyEvent = false;
               try {
-                const { events } = await thread.runStreamed(input);
+                const { events } = await thread.runStreamed(input, {
+                  ...(params.responseSchema ? { outputSchema: params.responseSchema } : {}),
+                  ...(params.abortController?.signal ? { signal: params.abortController.signal } : {}),
+                });
 
                 for await (const event of events) {
                   sawAnyEvent = true;
@@ -755,17 +812,32 @@ export class CodexProvider implements LLMProvider {
                   switch (event.type) {
                     case 'thread.started': {
                       const threadId = event.thread_id as string;
-                      self.threadIds.set(params.sessionId, threadId);
+                      if (!classifierMode) self.threadIds.set(params.sessionId, threadId);
 
                       controller.enqueue(sseEvent('status', {
                         session_id: threadId,
+                        ...(inputEvidenceReceipt ? { inputEvidence: inputEvidenceReceipt } : {}),
                       }));
                       break;
                     }
 
                     case 'item.completed': {
                       const item = event.item as Record<string, unknown>;
+                      if (classifierMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                        params.abortController?.abort();
+                        throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                      }
                       self.handleCompletedItem(controller, item);
+                      break;
+                    }
+
+                    case 'item.started':
+                    case 'item.updated': {
+                      const item = event.item as Record<string, unknown>;
+                      if (classifierMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                        params.abortController?.abort();
+                        throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                      }
                       break;
                     }
 
@@ -796,7 +868,7 @@ export class CodexProvider implements LLMProvider {
                       break;
                     }
 
-                    // item.started, item.updated, turn.started — no action needed
+                    // turn.started — no action needed
                   }
                 }
                 break;

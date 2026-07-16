@@ -138,6 +138,58 @@ describe('hub-llm-provider dispatch contract', () => {
     else process.env.CTI_HOME = prevCtiHomeHlp;
   });
 
+  it('routes classifier turns directly to the primary model provider', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    let localCalls = 0;
+    let fallbackCalls = 0;
+    const config: Config = {
+      ...baseConfig,
+      ollamaEnabled: true,
+      localLlmEnabled: true,
+      localLlmRouterEnabled: true,
+      localLlmForceHub: true,
+      localLlmRouterMode: 'hybrid',
+      lightChatFastPathEnabled: true,
+    };
+    const localProvider = {
+      complete: async () => {
+        localCalls += 1;
+        return { text: '{"focus":"current_request"}' };
+      },
+    };
+    const fallbackProvider: LLMProvider = {
+      streamChat: () => {
+        fallbackCalls += 1;
+        return new ReadableStream<string>({ start(controller) { controller.close(); } });
+      },
+    };
+    const hub = new HubLlmProvider(
+      config,
+      new JsonFileStore(new Map()),
+      localProvider as never,
+      {} as never,
+      fallbackProvider,
+      null,
+      'codex',
+      fallbackProvider,
+    );
+
+    await collectSse(hub.streamChat(params({
+      prompt: '继续',
+      interactionMode: 'classifier',
+      responseSchema: { type: 'object' },
+      systemPrompt: [
+        'Channel assistant identity:',
+        'Feishu emoji presentation:',
+        'Feishu sticker library:',
+      ].join('\n'),
+    })));
+
+    assert.equal(localCalls, 0);
+    assert.equal(fallbackCalls, 1);
+  });
+
   it('skips an unhealthy local light-chat provider after the first transport failure', async () => {
     const { HubLlmProvider } = await import('../main.js');
     const { JsonFileStore } = await import('../store.js');

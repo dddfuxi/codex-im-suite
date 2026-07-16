@@ -82,6 +82,17 @@ describe('agent architecture registry', () => {
     assert.match(lines.join('\n'), /clarification/i);
     assert.doesNotMatch(lines.join('\n'), /小虾米|小桥|mavis/iu);
   });
+
+  it('assigns structured turn evidence and reference resolution to the Context Broker', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'context_broker.reference_resolution');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'context_broker');
+    assert.match(policy.responsibility, /structured|evidence|reference/i);
+    assert.ok(policy.tags.includes('reply'));
+    assert.ok(policy.tags.includes('resolution'));
+  });
   it('keeps slash command role gates in the policy registry', () => {
     for (const command of ['/new', '/bind', '/cwd', '/mode', '/status', '/docs', '/projects', '/sessions', '/stop']) {
       assert.equal(getSlashCommandRequiredRole(command), 'operator', command);

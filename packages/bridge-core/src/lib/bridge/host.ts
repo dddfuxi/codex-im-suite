@@ -8,6 +8,12 @@
 
 import type { ChannelAddress, ChannelBinding, ChannelType, OutboundMention } from './types.js';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
+import type { InputEvidenceKind } from './input-evidence.js';
+import type {
+  AgentTurnFocusDecisionInput,
+  TurnEvidenceEnvelope,
+  TurnFocusDecision,
+} from './turn-context.js';
 
 // ── Bridge-local types (replacing @/types imports) ────────────
 
@@ -152,7 +158,7 @@ export type MemoryReplyDecision =
 
 export type AnswerReviewVerdict = 'pass' | 'warn' | 'block' | 'replace';
 export type AnswerReviewMode = 'observe' | 'block_or_replace';
-export type ExecutionRequirementKind = 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+export type ExecutionRequirementKind = 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
 
 export interface AnswerReviewInput {
   channelType: string;
@@ -179,6 +185,11 @@ export interface AnswerReviewInput {
     evidenceSatisfied?: boolean;
     noEvidenceRetryAttempted?: boolean;
     requiredToolFamilies?: string[];
+    requiredInputEvidenceKinds?: InputEvidenceKind[];
+    requiredInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: InputEvidenceKind[];
+    acceptedInputEvidenceIds?: string[];
+    inputEvidenceProvider?: string;
   };
 }
 
@@ -258,6 +269,26 @@ export interface MemoryWriteIntentDecision {
 
 export interface MemoryIntentHost {
   classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision>;
+}
+
+export interface TurnReferenceResolutionInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  currentText: string;
+  envelope: TurnEvidenceEnvelope;
+  deterministicDecision: TurnFocusDecision;
+  workingDirectory?: string;
+  /** 主任务取消或 bridge stop 时同步终止解析 Agent。 */
+  abortSignal?: AbortSignal;
+}
+
+/**
+ * 只在核心裁决器发现冲突或低置信引用时调用的解析 Agent。
+ * Host 只能返回 evidence ID，不能执行工具或直接生成用户回复。
+ */
+export interface TurnReferenceResolverHost {
+  resolveTurnFocus(input: TurnReferenceResolutionInput): Promise<AgentTurnFocusDecisionInput>;
 }
 
 export interface MemoryGraphNode {
@@ -376,6 +407,9 @@ export interface FeishuCloudLinkResolveResult {
   userMessage?: string;
   loginUrl?: string;
   feishuCardJson?: string;
+  authorizationRequestId?: string;
+  requestedScopes?: string[];
+  authorizationCardDisposition?: 'send' | 'reuse';
   error?: string;
 }
 
@@ -410,6 +444,7 @@ export interface FeishuOAuthManualCallbackResult {
   userMessage?: string;
   error?: string;
   resume?: FeishuOAuthManualResumeRequest;
+  resumes?: FeishuOAuthManualResumeRequest[];
 }
 
 export interface FeishuOAuthManualHost {
@@ -648,6 +683,10 @@ export interface StreamChatParams {
   sessionId: string;
   sdkSessionId?: string;
   forceFreshThread?: boolean;
+  /** classifier 模式必须绕过执行器/工具路由，只允许结构化模型输出。 */
+  interactionMode?: 'agent' | 'classifier';
+  /** provider 原生支持时用于约束 classifier 的最终 JSON。 */
+  responseSchema?: unknown;
   model?: string;
   systemPrompt?: string;
   /** 本轮必须优先保留的关联证据，独立于可截断的 systemPrompt。 */
@@ -673,6 +712,8 @@ export interface StreamChatParams {
     kind: ExecutionRequirementKind;
     reason: string;
     requiredToolFamilies: string[];
+    requiredInputEvidenceKinds?: InputEvidenceKind[];
+    requiredInputEvidenceIds?: string[];
     strictToolEvidence?: boolean;
   };
   noEvidenceRetryAttempted?: boolean;

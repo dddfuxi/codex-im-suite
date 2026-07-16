@@ -144,4 +144,31 @@ describe('answer review', () => {
     assert.equal(decision.verdict, 'warn');
     assert.ok(decision.reasonCodes.includes('unsupported_execution_claim'));
   });
+
+  it('accepts image analysis when structured input evidence was accepted', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: '分析一下图片里的关键信息',
+      answerText: '图片分析完成：构建状态成功，当前进度 100%。',
+      executionEvidence: {
+        toolUseCount: 0,
+        toolResultCount: 0,
+        successfulToolResultCount: 0,
+        failedToolResultCount: 0,
+        toolNames: [],
+        permissionRequestCount: 0,
+        requiredEvidenceKind: 'input_evidence_required',
+        evidenceSatisfied: true,
+        requiredInputEvidenceKinds: ['image'],
+        requiredInputEvidenceIds: ['image-1'],
+        acceptedInputEvidenceKinds: ['image'],
+        acceptedInputEvidenceIds: ['image-1'],
+        inputEvidenceProvider: 'codex',
+      },
+    });
+
+    assert.equal(decision.verdict, 'pass');
+    assert.ok(!decision.reasonCodes.includes('unsupported_execution_claim'));
+  });
 });

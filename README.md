@@ -296,7 +296,7 @@ CTI_DIRECT_REMINDER_DECISION_MODE=codex_action
 CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
 ```
 
-飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；如果应用没有该文档访问权限或开放平台 scope 不足，再给发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
+飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；只有应用身份无法访问且当前任务确实需要读取发起人的私有资源时，才给该发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。普通消息、原生 @、reply、reaction、sticker 和机器人卡片继续走 bot 长连接，不向普通用户索权。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
 
 ```powershell
 CTI_FEISHU_GRANTED_SCOPES=im:message,im:message:receive_v1,im:resource,im:message.group_msg,im:message.reactions:write_only,im:message.reactions:read,cardkit:card:write,cardkit:card:read,im:message:update,docx:document,docx:document:readonly,drive:drive,drive:drive:readonly,offline_access,auth:user.id:read,sheets:spreadsheet:readonly,sheets:spreadsheet:read,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
@@ -305,16 +305,18 @@ CTI_FEISHU_OAUTH_PUBLIC_BASE_URL=https://bot.example.com
 CTI_FEISHU_OAUTH_MANUAL_REDIRECT_URI=http://127.0.0.1:17321/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PATH=/feishu/oauth/callback
 CTI_FEISHU_OAUTH_CALLBACK_PORT=17321
-CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,sheets:spreadsheet:read,drive:drive:readonly,bitable:app:readonly,base:table:read,base:field:read,base:record:retrieve
+CTI_FEISHU_OAUTH_SCOPES=offline_access,auth:user.id:read,docx:document:readonly,sheets:spreadsheet:readonly,bitable:app:readonly
 CTI_FEISHU_CLOUD_MAX_CHARS=80000
 CTI_FEISHU_CLOUD_MAX_ROWS=500
 CTI_FEISHU_CLOUD_MAX_RECORDS=500
 CTI_FEISHU_CLOUD_MAX_SHEETS=5
 ```
 
-`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥，也不会替应用自动开通权限；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。后台新增权限、事件或回调后，必须创建版本、管理员审核发布，并重启 bridge；`admin:app.*` 应用管理员权限只能用于管理员身份诊断，不能替代云文档、消息、卡片、成员或资源 API scope。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，bridge 会启动本机 `127.0.0.1:${CTI_FEISHU_OAUTH_CALLBACK_PORT}` 回调监听，授权卡片会打开飞书官方 `authen/v1/index` 免登授权页；如果用户在运行 bridge 的同一台 Windows 机器浏览器里完成授权，会自动回调、保存 user token、回复“已收到，正在处理中。”并续跑原始云文档问题。如果用户在手机或另一台电脑打开授权页，`127.0.0.1` 指向用户自己的设备，无法自动连到 bridge，此时需要把浏览器地址栏里的完整 `code/state` 回调 URL 复制回飞书，bridge 会走同一套校验和续跑逻辑。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
+`CTI_FEISHU_GRANTED_SCOPES` 是本地记录“已经在飞书开放平台开通并发布过的权限”的诊断清单，不是密钥，也不会替应用自动开通权限；Owner 可以在飞书里发 `/feishu` 查看当前能力矩阵、应用 token 直读能力、OAuth fallback 请求 scope 和声明的权限缺口。后台新增权限、事件或回调后，必须创建版本、管理员审核发布，并重启 bridge；`admin:app.*` 应用管理员权限只能用于管理员身份诊断，不能替代云文档、消息、卡片、成员或资源 API scope。OAuth 使用飞书官方授权页 `https://accounts.feishu.cn/open-apis/authen/v1/authorize`、PKCE 和当前 Token 端点 `https://accounts.feishu.cn/oauth/v3/token`；授权页、Token 换取和刷新都只携带当前任务需要的规范化 scope。自定义治理层按飞书 sender 身份隔离加密 token 和 state；同一用户、同一组 scope 的并发或重复任务只发送一张授权卡，后续任务合并到同一授权请求，成功后按原消息逐个恢复并记录审计。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网入口，bridge 会启动本机 `127.0.0.1:${CTI_FEISHU_OAUTH_CALLBACK_PORT}` 回调监听；如果用户在运行 bridge 的同一台 Windows 机器浏览器里完成授权，会自动回调、保存 user token、回复“已收到，正在处理中。”并续跑等待任务。如果用户在手机或另一台电脑打开授权页，`127.0.0.1` 指向用户自己的设备，无法自动连到 bridge，此时需要把浏览器地址栏里的完整 `code/state` 回调 URL 复制回飞书，bridge 会走同一套校验和续跑逻辑。callback 模式才需要 `CTI_FEISHU_OAUTH_PUBLIC_BASE_URL + CTI_FEISHU_OAUTH_CALLBACK_PATH`，且必须和飞书应用后台登记的 OAuth redirect URI 一致。用户 token 保存在 `C:\Users\admin\.claude-to-im\data\feishu-oauth-tokens.json`，Windows 下使用 DPAPI 加密。
 
 本轮权限映射按飞书开放平台服务端 API 文档整理：Docx 读取走 `docx/v1/documents/:document_id/raw_content`，Sheets 先 `sheets/query` 再读范围，Base 读取 tables / fields / records。遇到 401/403 或飞书权限错误码时，bridge 会同时提示“用户没有文档访问权限”和对应 API 所需 scope，避免只给 404/空总结。若已有 user token 因新开通 Sheets/Drive scope 而过期失配，bridge 会重新发送授权卡片刷新 token；刷新后仍失败才按文档权限或开放平台权限阻断处理。
+
+Token 存储按“用户 + scope grant”选择最小覆盖项；同一用户的 Docx、Sheets、Base 授权可以并存，不会因后一次授权覆盖前一份 Token。旧版以 userId 为唯一键的 Token 文件仍可读取，下一次成功授权后会迁移到 grant 格式。
 
 启动 Ignis MCP：
 

@@ -123,6 +123,39 @@ describe('workflow status store', () => {
     assert.equal(completed?.tokenUsage?.total_tokens, 124);
   });
 
+  it('preserves structured input evidence receipts in workflow summaries', () => {
+    const run = startWorkflowRun({
+      sessionId: 'session-input-evidence',
+      prompt: '分析一下图片里的关键信息',
+      channelType: 'feishu',
+      chatId: 'chat-input-evidence',
+    });
+    appendWorkflowEvent(run.id, 'finalizing', 'execution.evidence', '输入证据已记录', {
+      provider: 'codex',
+      requiredEvidenceKind: 'input_evidence_required',
+      evidenceSatisfied: true,
+      requiredInputEvidenceKinds: ['image'],
+      requiredInputEvidenceIds: ['image-1'],
+      acceptedInputEvidenceKinds: ['image'],
+      acceptedInputEvidenceIds: ['image-1'],
+      inputEvidenceProvider: 'codex',
+      toolUseCount: 0,
+      toolResultCount: 0,
+      successfulToolResultCount: 0,
+      failedToolResultCount: 0,
+      toolNames: [],
+    });
+
+    const completed = completeWorkflowRun(run.id);
+    assert.equal(completed?.execution?.requiredEvidenceKind, 'input_evidence_required');
+    assert.equal(completed?.execution?.evidenceSatisfied, true);
+    assert.deepEqual(completed?.execution?.requiredInputEvidenceKinds, ['image']);
+    assert.deepEqual(completed?.execution?.requiredInputEvidenceIds, ['image-1']);
+    assert.deepEqual(completed?.execution?.acceptedInputEvidenceKinds, ['image']);
+    assert.deepEqual(completed?.execution?.acceptedInputEvidenceIds, ['image-1']);
+    assert.equal(completed?.execution?.inputEvidenceProvider, 'codex');
+  });
+
   it('records failed runs with error message', () => {
     const run = startWorkflowRun({
       sessionId: 'session-2',

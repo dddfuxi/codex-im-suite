@@ -75,6 +75,7 @@ import {
   type FeishuInteractiveCardEvidence,
   type FeishuInteractiveCardResourceRef,
 } from '../feishu-interactive-card-evidence.js';
+import type { TurnEvidenceActor, TurnEvidenceItem } from '../turn-context.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -727,6 +728,8 @@ interface FeishuLightContext {
   prompt: string;
   messageCount: number;
   replyToMessageId?: string;
+  /** 平台事实的结构化副本，供 Context Broker 做统一焦点裁决。 */
+  evidence: TurnEvidenceItem[];
 }
 
 interface ParsedFeishuInteractiveContent {
@@ -4102,17 +4105,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
           messageId: replyTargetMessageId,
         },
       });
-      if (attachments.length === 0) {
-        const replyAttachments = await this.downloadAttachmentsFromMessageId(replyTargetMessageId);
-        if (replyAttachments.length > 0) {
-          attachments.push(...replyAttachments);
-          Object.assign(rawMetadata, {
-            feishuReplyTo: {
-              messageId: replyTargetMessageId,
-              attachmentCount: replyAttachments.length,
-            },
-          });
-        }
+      const replyAttachments = await this.downloadAttachmentsFromMessageId(replyTargetMessageId);
+      if (replyAttachments.length > 0) {
+        // 回复附件必须排在当前消息附件之前，Context Broker 才能用
+        // attachmentCount 以平台无关方式标注 reply_attachment 归属。
+        attachments.unshift(...replyAttachments);
+        Object.assign(rawMetadata, {
+          feishuReplyTo: {
+            messageId: replyTargetMessageId,
+            attachmentCount: replyAttachments.length,
+          },
+        });
       }
     }
 
@@ -6623,6 +6626,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (!formatted) return null;
       const referenceSignals = this.formatLightContextReferenceSignals(userText, mentions);
       const continuationGuidance = hasContinuationTask ? this.formatContinuationTaskGuidance(userText) : [];
+      const evidence = this.buildLightContextEvidence(
+        items,
+        replyTargetMessageId || '',
+        likelyContextMessageId,
+        mentions,
+        memberNames,
+      );
 
       return {
         prompt: [
@@ -6640,6 +6650,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         ].filter(Boolean).join('\n'),
         messageCount: items.length,
         replyToMessageId: replyTargetMessageId || undefined,
+        evidence,
       };
     } catch (err) {
       console.warn('[feishu-adapter] light conversation context skipped:', err instanceof Error ? err.message : err);
@@ -6660,6 +6671,85 @@ export class FeishuAdapter extends BaseChannelAdapter {
         unionId: typeof mention.id?.union_id === 'string' ? mention.id.union_id.trim() : '',
       }))
       .filter((mention) => mention.name || mention.key || mention.openId || mention.userId || mention.unionId);
+  }
+
+  private buildLightContextEvidence(
+    items: FeishuMessageListItem[],
+    replyTargetMessageId: string,
+    likelyContextMessageId: string,
+    mentions: FeishuLightContextMention[],
+    memberNames: Map<string, string>,
+  ): TurnEvidenceItem[] {
+    const evidence: TurnEvidenceItem[] = [];
+    for (const item of items) {
+      // 结构化 evidence 必须复用用户可见上下文的同一格式化入口，
+      // 这样流式卡片壳才能继承 outbound-ref / audit 回填的原任务与结果。
+      const rawHistoryText = this.extractHistoryText(item);
+      const localOutboundSummary = this.formatLocalOutboundAuditSummary(item, rawHistoryText);
+      const contentRecovered = !this.isLowInformationHistoryText(rawHistoryText) || Boolean(localOutboundSummary);
+      const content = this.formatHistoryItem(item, memberNames).trim();
+      if (!content) continue;
+      const senderId = item.sender?.id?.trim() || '';
+      const senderType = item.sender?.sender_type?.trim().toLowerCase() || '';
+      const actorType: TurnEvidenceActor['type'] = senderType === 'user'
+        ? 'human'
+        : senderType === 'bot'
+          ? 'bot'
+          : senderType === 'app'
+            ? 'app'
+            : 'unknown';
+      const relation = replyTargetMessageId && item.message_id === replyTargetMessageId
+        ? 'native_reply'
+        : likelyContextMessageId && item.message_id === likelyContextMessageId
+          ? 'likely_context'
+          : 'nearby';
+      evidence.push({
+        id: `message:${item.message_id}`,
+        kind: 'message',
+        relation,
+        source: relation === 'likely_context' ? 'adapter_inference' : 'platform_api',
+        confidence: relation === 'native_reply'
+          ? contentRecovered ? 1 : 0.45
+          : relation === 'likely_context' ? 0.55 : 0.7,
+        content,
+        messageId: item.message_id,
+        timestamp: Number.parseInt(item.create_time, 10) || undefined,
+        actor: {
+          id: senderId || undefined,
+          displayName: (senderId && memberNames.get(senderId)) || undefined,
+          type: actorType,
+        },
+        metadata: {
+          messageType: item.msg_type,
+          contentRecovered,
+        },
+      });
+    }
+
+    mentions.forEach((mention, index) => {
+      const actorId = mention.openId || mention.userId || mention.unionId || mention.key || '';
+      evidence.push({
+        id: `mention:${actorId || index}`,
+        kind: 'mention',
+        relation: 'native_mention',
+        source: 'platform_event',
+        confidence: 1,
+        content: mention.name || mention.key || actorId,
+        actor: {
+          id: actorId || undefined,
+          displayName: mention.name || mention.key || undefined,
+          type: 'unknown',
+        },
+        metadata: {
+          key: mention.key,
+          openId: mention.openId,
+          userId: mention.userId,
+          unionId: mention.unionId,
+        },
+      });
+    });
+
+    return evidence;
   }
 
   private formatLightContextReferenceSignals(userText: string, mentions: FeishuLightContextMention[]): string[] {

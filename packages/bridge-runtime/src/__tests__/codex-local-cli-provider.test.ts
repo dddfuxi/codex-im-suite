@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { CodexLocalCliProvider } from '../codex-local-cli-provider.js';
+import { CodexLocalCliProvider, buildClassifierCodexExecArgs } from '../codex-local-cli-provider.js';
 import type { Config } from '../config.js';
 
 function parseSseChunks(chunks: string[]): Array<{ type: string; data: unknown }> {
@@ -61,6 +61,17 @@ function makeConfig(root: string): Config {
 }
 
 describe('CodexLocalCliProvider JSON tool protocol', () => {
+  it('builds classifier CLI args without user config, tools, or writable sandbox', () => {
+    const args = buildClassifierCodexExecArgs(['exec', '--json'], 'C:\\temp\\schema.json');
+
+    assert.ok(args.includes('--ephemeral'));
+    assert.ok(args.includes('--ignore-user-config'));
+    assert.deepEqual(args.slice(args.indexOf('--sandbox'), args.indexOf('--sandbox') + 2), ['--sandbox', 'read-only']);
+    assert.deepEqual(args.slice(args.indexOf('--output-schema'), args.indexOf('--output-schema') + 2), ['--output-schema', 'C:\\temp\\schema.json']);
+    assert.ok(args.includes('shell_tool'));
+    assert.equal(args.includes('--dangerously-bypass-approvals-and-sandbox'), false);
+  });
+
   it('times out hanging codex exec processes', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-codex-timeout-'));
     const oldPath = process.env.PATH || process.env.Path || '';
@@ -97,6 +108,57 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
 
       assert.ok(elapsed < 5000, `expected timeout to finish quickly, elapsed=${elapsed}`);
       assert.match(error || '', /timed out after 1000ms/);
+    } finally {
+      process.env.PATH = oldPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('emits structured input evidence after the local Codex CLI accepts an image turn', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-codex-image-evidence-'));
+    const oldPath = process.env.PATH || process.env.Path || '';
+    try {
+      const binDir = path.join(root, 'bin');
+      fs.mkdirSync(binDir);
+      const successScript = path.join(binDir, 'success.js');
+      fs.writeFileSync(successScript, [
+        "console.log(JSON.stringify({type:'thread.started',thread_id:'local-image-thread'}));",
+        "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'图片分析完成'}}));",
+        "console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));",
+      ].join('\n'), 'utf-8');
+      if (process.platform === 'win32') {
+        fs.writeFileSync(path.join(binDir, 'codex.cmd'), `@echo off\r\n"${process.execPath}" "${successScript}"\r\n`, 'utf-8');
+        process.env.PATH = `${binDir};${oldPath}`;
+      } else {
+        const codexPath = path.join(binDir, 'codex');
+        fs.writeFileSync(codexPath, `#!/bin/sh\n"${process.execPath}" "${successScript}"\n`, 'utf-8');
+        fs.chmodSync(codexPath, 0o755);
+        process.env.PATH = `${binDir}:${oldPath}`;
+      }
+
+      const provider = new CodexLocalCliProvider(makeConfig(root));
+      const events = await collectStream(provider.streamChat({
+        sessionId: 'local-image-evidence',
+        prompt: '分析这张图片',
+        workingDirectory: root,
+        permissionMode: 'default',
+        files: [{ id: 'image-1', name: 'input.png', type: 'image/png', size: 4, data: 'AAAA' }],
+        executionRequirement: {
+          kind: 'input_evidence_required',
+          reason: 'structured input evidence required',
+          requiredToolFamilies: [],
+          requiredInputEvidenceKinds: ['image'],
+          requiredInputEvidenceIds: ['image-1'],
+        },
+      }));
+
+      const receipt = events
+        .filter((event) => event.type === 'status')
+        .map((event) => event.data as Record<string, any>)
+        .find((data) => data.inputEvidence?.protocol === 'cti-input-evidence/v1');
+      assert.ok(receipt);
+      assert.equal(receipt.inputEvidence.provider, 'ollama');
+      assert.deepEqual(receipt.inputEvidence.accepted, [{ id: 'image-1', kind: 'image', mediaType: 'image/png' }]);
     } finally {
       process.env.PATH = oldPath;
       fs.rmSync(root, { recursive: true, force: true });

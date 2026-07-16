@@ -41,6 +41,34 @@ describe('OllamaProvider', () => {
     assert.equal(result.text, '本地回答');
   });
 
+  it('places structured turn focus after recalled history and immediately before the current request', async () => {
+    let capturedBody = '';
+    globalThis.fetch = (async (_url, init) => {
+      capturedBody = String(init?.body || '');
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '本地回答' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+
+    const provider = new OllamaProvider(baseConfig);
+    await provider.answer({
+      prompt: '继续处理',
+      sessionId: 'local-focus-order',
+      priorityTurnContext: 'Resolved turn focus: reply-1',
+      conversationHistory: [
+        { role: 'user', content: '无关旧问题' },
+        { role: 'assistant', content: '无关旧回答' },
+      ],
+    }, {
+      mode: 'local_only',
+    });
+
+    const body = JSON.parse(capturedBody) as { messages: Array<{ role: string; content: string }> };
+    const userPrompt = body.messages.find((item) => item.role === 'user')?.content || '';
+    assert.ok(userPrompt.indexOf('最近相关上下文') < userPrompt.indexOf('Current turn context evidence'));
+    assert.ok(userPrompt.indexOf('Current turn context evidence') < userPrompt.indexOf('当前请求'));
+  });
+
   it('calls custom OpenAI-compatible local AI endpoint with bearer token', async () => {
     let capturedUrl = '';
     let capturedAuth = '';

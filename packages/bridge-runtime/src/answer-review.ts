@@ -26,10 +26,15 @@ export interface AnswerReviewInput {
     failedToolErrors?: string[];
     toolNames: string[];
     permissionRequestCount: number;
-    requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+    requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
     evidenceSatisfied?: boolean;
     noEvidenceRetryAttempted?: boolean;
     requiredToolFamilies?: string[];
+    requiredInputEvidenceKinds?: string[];
+    requiredInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: string[];
+    acceptedInputEvidenceIds?: string[];
+    inputEvidenceProvider?: string;
   };
 }
 
@@ -86,6 +91,10 @@ function shouldCheckMemoryKeyMismatch(input: AnswerReviewInput): boolean {
 
 function hasUnsupportedExecutionClaim(input: AnswerReviewInput): boolean {
   if (!input.executionEvidence) return false;
+  if (
+    input.executionEvidence.requiredEvidenceKind === 'input_evidence_required'
+    && input.executionEvidence.evidenceSatisfied === true
+  ) return false;
   if (input.executionEvidence.successfulToolResultCount > 0) return false;
   if (
     input.executionEvidence.requiredEvidenceKind

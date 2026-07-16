@@ -89,6 +89,25 @@ export function buildManifestCodexSlimParams(
   params: StreamChatParams,
   options: ManifestCodexSlimOptions,
 ): ManifestCodexSlimResult {
+  if (params.interactionMode === 'classifier') {
+    return {
+      params,
+      plan: null,
+      compressedHistoryChars: 0,
+      compressedSystemPromptChars: 0,
+    };
+  }
+  // Structured user input is already the evidence source. Manifest keyword
+  // matches must not turn read-only image/audio/file analysis into a new
+  // screenshot, generation, or artifact-producing action.
+  if (params.executionRequirement?.kind === 'input_evidence_required') {
+    return {
+      params,
+      plan: null,
+      compressedHistoryChars: 0,
+      compressedSystemPromptChars: 0,
+    };
+  }
   const contextText = buildManifestContext(params, options);
   const plan = planConfiguredJsonToolRequest(params.prompt, {
     workingDirectory: params.workingDirectory || options.workingDirectory,

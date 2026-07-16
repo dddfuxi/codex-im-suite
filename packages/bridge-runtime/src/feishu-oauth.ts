@@ -4,13 +4,15 @@ import http from 'node:http';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import {
+  buildFeishuOAuthAuthorizationKey,
+  mergeFeishuOAuthPendingRequests,
+  normalizeFeishuOAuthScopes,
+} from './feishu-oauth-governance.js';
 
 const execFileAsync = promisify(execFile);
-const FEISHU_OAUTH_V2_AUTHORIZE_URL = 'https://open.feishu.cn/open-apis/authen/v1/authorize';
-const FEISHU_MANUAL_AUTHORIZE_URL = 'https://open.feishu.cn/open-apis/authen/v1/index';
-const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
-const FEISHU_AUTHEN_V1_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v1/access_token';
-const FEISHU_APP_ACCESS_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal';
+const FEISHU_OAUTH_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+const FEISHU_TOKEN_URL = 'https://accounts.feishu.cn/oauth/v3/token';
 const CLOCK_SKEW_MS = 60 * 1000;
 
 export interface StoredFeishuUserTokens {
@@ -25,6 +27,7 @@ export interface StoredFeishuUserTokens {
 }
 
 interface PersistedFeishuUserTokens {
+  boundUserId?: string;
   accessToken: string;
   refreshToken?: string;
   scopes: string[];
@@ -49,8 +52,11 @@ export interface FeishuOAuthState {
   codeVerifier: string;
   redirectUri: string;
   linkHashes: string[];
+  requestedScopes?: string[];
+  authorizationKey?: string;
   expiresAt: string;
   pendingRequest?: FeishuOAuthPendingRequest;
+  pendingRequests?: FeishuOAuthPendingRequest[];
 }
 
 export interface FeishuOAuthPendingRequest {
@@ -75,6 +81,7 @@ export interface FeishuOAuthConfig {
 }
 
 export interface FeishuAuthorizationInput {
+  resourceClass: 'cloud_document';
   userId: string;
   chatId: string;
   channelType?: string;
@@ -82,55 +89,107 @@ export interface FeishuAuthorizationInput {
   messageId?: string;
   text?: string;
   linkUrls: string[];
+  requestedScopes: string[];
 }
 
 export type FeishuAuthorizationResult =
   | { status: 'authorized'; accessToken: string }
-  | { status: 'auth_required'; loginUrl?: string; userMessage: string; feishuCardJson?: string };
+  | {
+      status: 'auth_required';
+      loginUrl?: string;
+      userMessage: string;
+      feishuCardJson?: string;
+      authorizationRequestId?: string;
+      requestedScopes?: string[];
+      cardDisposition?: 'send' | 'reuse';
+    };
 
 export type FeishuManualCallbackResult =
   | { status: 'no_callback' }
-  | { status: 'bound'; userMessage: string; resume?: FeishuOAuthPendingRequest }
+  | { status: 'bound'; userMessage: string; resume?: FeishuOAuthPendingRequest; resumes?: FeishuOAuthPendingRequest[] }
   | { status: 'error'; userMessage: string; error?: string };
 
 export type FeishuOAuthCallbackResult = {
   ok: boolean;
   message: string;
   resume?: FeishuOAuthPendingRequest;
+  resumes?: FeishuOAuthPendingRequest[];
 };
 
 export class FeishuOAuthTokenStore {
+  private mutationTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly filePath: string,
     private readonly protector: TokenProtector = createDefaultTokenProtector(),
   ) {}
 
-  async getTokens(userId: string): Promise<StoredFeishuUserTokens | null> {
+  async getTokens(userId: string, requiredScopes: string[] = []): Promise<StoredFeishuUserTokens | null> {
     const all = await this.readAll();
-    const record = all[userId];
+    const normalizedRequiredScopes = normalizeFeishuOAuthScopes(requiredScopes);
+    const record = Object.entries(all)
+      .filter(([storageKey, candidate]) => candidate.boundUserId === userId || (!candidate.boundUserId && storageKey === userId))
+      .map(([, candidate]) => candidate)
+      .filter((candidate) => {
+        const candidateScopes = new Set(normalizeFeishuOAuthScopes(candidate.scopes || []));
+        return normalizedRequiredScopes.every((scope) => candidateScopes.has(scope));
+      })
+      .sort((left, right) => {
+        const scopeDelta = normalizeFeishuOAuthScopes(left.scopes || []).length - normalizeFeishuOAuthScopes(right.scopes || []).length;
+        if (scopeDelta !== 0) return scopeDelta;
+        return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
+      })[0];
     if (!record) return null;
     return {
-      ...record,
+      accessTokenExpiresAt: record.accessTokenExpiresAt,
+      refreshTokenExpiresAt: record.refreshTokenExpiresAt,
+      scopes: normalizeFeishuOAuthScopes(record.scopes || []),
+      openId: record.openId,
+      unionId: record.unionId,
+      userId: record.userId,
       accessToken: await this.protector.unprotect(record.accessToken),
       refreshToken: record.refreshToken ? await this.protector.unprotect(record.refreshToken) : undefined,
     };
   }
 
   async saveTokens(userId: string, tokens: StoredFeishuUserTokens): Promise<void> {
-    const all = await this.readAll();
-    all[userId] = {
-      ...tokens,
-      accessToken: await this.protector.protect(tokens.accessToken),
-      refreshToken: tokens.refreshToken ? await this.protector.protect(tokens.refreshToken) : undefined,
-      updatedAt: new Date().toISOString(),
-    };
-    await writeJsonAtomic(this.filePath, all);
+    await this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      const normalizedScopes = normalizeFeishuOAuthScopes(tokens.scopes || []);
+      const storageKey = buildTokenGrantStorageKey(userId, normalizedScopes);
+      all[storageKey] = {
+        ...tokens,
+        boundUserId: userId,
+        scopes: normalizedScopes,
+        accessToken: await this.protector.protect(tokens.accessToken),
+        refreshToken: tokens.refreshToken ? await this.protector.protect(tokens.refreshToken) : undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      // 旧版本以 userId 为唯一键；首次新格式写入时移除同用户旧单 grant，其他 scope grant 保留。
+      delete all[userId];
+      await writeJsonAtomic(this.filePath, all);
+    });
   }
 
-  async deleteTokens(userId: string): Promise<void> {
-    const all = await this.readAll();
-    delete all[userId];
-    await writeJsonAtomic(this.filePath, all);
+  async deleteTokens(userId: string, scopes?: string[]): Promise<void> {
+    await this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      if (scopes) {
+        delete all[buildTokenGrantStorageKey(userId, scopes)];
+        if (all[userId]) delete all[userId];
+      } else {
+        for (const [storageKey, record] of Object.entries(all)) {
+          if (record.boundUserId === userId || (!record.boundUserId && storageKey === userId)) delete all[storageKey];
+        }
+      }
+      await writeJsonAtomic(this.filePath, all);
+    });
+  }
+
+  private async enqueueMutation(run: () => Promise<void>): Promise<void> {
+    const current = this.mutationTail.then(run, run);
+    this.mutationTail = current.catch(() => undefined);
+    await current;
   }
 
   private async readAll(): Promise<Record<string, PersistedFeishuUserTokens>> {
@@ -144,35 +203,84 @@ export class FeishuOAuthTokenStore {
 }
 
 export class FeishuOAuthStateStore {
+  private mutationTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly filePath: string,
     private readonly now: () => Date = () => new Date(),
   ) {}
 
   async put(state: FeishuOAuthState): Promise<void> {
-    const all = await this.readAll();
-    all[state.state] = state;
-    await writeJsonAtomic(this.filePath, all);
+    await this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      all[state.state] = state;
+      await writeJsonAtomic(this.filePath, all);
+    });
   }
 
   async consume(stateValue: string, expectedUserId?: string): Promise<FeishuOAuthState | null> {
-    const all = await this.readAll();
-    const state = all[stateValue];
-    if (!state) return null;
-    if (new Date(state.expiresAt).getTime() <= this.now().getTime()) {
+    return this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      const state = all[stateValue];
+      if (!state) return null;
+      if (new Date(state.expiresAt).getTime() <= this.now().getTime()) {
+        delete all[stateValue];
+        await writeJsonAtomic(this.filePath, all);
+        return null;
+      }
+      if (expectedUserId && state.userId !== expectedUserId) return null;
       delete all[stateValue];
       await writeJsonAtomic(this.filePath, all);
-      return null;
-    }
-    if (expectedUserId && state.userId !== expectedUserId) return null;
-    delete all[stateValue];
-    await writeJsonAtomic(this.filePath, all);
-    return state;
+      return state;
+    });
   }
 
   async get(stateValue: string): Promise<FeishuOAuthState | null> {
+    await this.mutationTail.catch(() => undefined);
     const all = await this.readAll();
     return all[stateValue] ?? null;
+  }
+
+  async findActiveByAuthorizationKey(authorizationKey: string): Promise<FeishuOAuthState | null> {
+    return this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      let changed = false;
+      let matched: FeishuOAuthState | null = null;
+      for (const [stateValue, state] of Object.entries(all)) {
+        if (new Date(state.expiresAt).getTime() <= this.now().getTime()) {
+          delete all[stateValue];
+          changed = true;
+          continue;
+        }
+        if (!matched && state.authorizationKey === authorizationKey) matched = state;
+      }
+      if (changed) await writeJsonAtomic(this.filePath, all);
+      return matched;
+    });
+  }
+
+  async mergePendingRequest(
+    stateValue: string,
+    pendingRequest: FeishuOAuthPendingRequest | undefined,
+    linkHashes: string[],
+  ): Promise<FeishuOAuthState | null> {
+    return this.enqueueMutation(async () => {
+      const all = await this.readAll();
+      const state = all[stateValue];
+      if (!state || new Date(state.expiresAt).getTime() <= this.now().getTime()) return null;
+      state.pendingRequests = mergeFeishuOAuthPendingRequests(getPendingRequests(state), pendingRequest);
+      state.linkHashes = Array.from(new Set([...(state.linkHashes || []), ...linkHashes]));
+      delete state.pendingRequest;
+      all[stateValue] = state;
+      await writeJsonAtomic(this.filePath, all);
+      return state;
+    });
+  }
+
+  private async enqueueMutation<T>(run: () => Promise<T>): Promise<T> {
+    const current = this.mutationTail.then(run, run);
+    this.mutationTail = current.then(() => undefined, () => undefined);
+    return current;
   }
 
   private async readAll(): Promise<Record<string, FeishuOAuthState>> {
@@ -192,9 +300,9 @@ interface PendingAuthorization {
 
 export class FeishuOAuthService {
   private readonly pending = new Map<string, PendingAuthorization>();
+  private readonly authorizationLocks = new Map<string, Promise<void>>();
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
-  private cachedAppToken: { token: string; expiresAtMs: number } | null = null;
 
   constructor(private readonly options: {
     config: FeishuOAuthConfig;
@@ -207,18 +315,20 @@ export class FeishuOAuthService {
     this.now = options.now || (() => new Date());
   }
 
-  async getAccessToken(userId: string): Promise<string | null> {
-    const tokens = await this.options.tokenStore.getTokens(userId);
+  async getAccessToken(userId: string, requiredScopes: string[] = []): Promise<string | null> {
+    const tokens = await this.options.tokenStore.getTokens(userId, requiredScopes);
     if (!tokens) return null;
+    const storedScopes = new Set(normalizeFeishuOAuthScopes(tokens.scopes || []));
+    if (normalizeFeishuOAuthScopes(requiredScopes).some((scope) => !storedScopes.has(scope))) return null;
     if (new Date(tokens.accessTokenExpiresAt).getTime() > this.now().getTime() + CLOCK_SKEW_MS) {
       return tokens.accessToken;
     }
     if (!tokens.refreshToken) return null;
     if (tokens.refreshTokenExpiresAt && new Date(tokens.refreshTokenExpiresAt).getTime() <= this.now().getTime()) {
-      await this.options.tokenStore.deleteTokens(userId);
+      await this.options.tokenStore.deleteTokens(userId, tokens.scopes);
       return null;
     }
-    return this.refreshAccessToken(userId, tokens.refreshToken);
+    return this.refreshAccessToken(userId, tokens.refreshToken, tokens.scopes || []);
   }
 
   async requestUserAuthorization(input: FeishuAuthorizationInput): Promise<FeishuAuthorizationResult> {
@@ -231,35 +341,99 @@ export class FeishuOAuthService {
       };
     }
 
-    const state = await this.createState(input);
-    const loginUrl = this.buildAuthorizationUrl(state);
-    const manualMode = this.options.config.mode === 'manual';
-    const card = manualMode ? buildManualAuthorizationCard(loginUrl) : buildAuthorizationCard(loginUrl);
-    const waitMs = Math.max(0, this.options.config.waitForAuthorizationMs);
-    if (waitMs <= 0) {
+    const requestedScopes = normalizeFeishuOAuthScopes(input.requestedScopes);
+    const configuredScopes = new Set(normalizeFeishuOAuthScopes(this.options.config.scopes));
+    const missingConfiguredScopes = requestedScopes.filter((scope) => !configuredScopes.has(scope));
+    if (missingConfiguredScopes.length > 0) {
+      const message = `未完成：当前 OAuth 配置未声明任务所需 scope：${missingConfiguredScopes.join(', ')}。请由 Owner 在飞书开放平台开通并更新 CTI_FEISHU_OAUTH_SCOPES。`;
       return {
         status: 'auth_required',
-        loginUrl,
-        userMessage: manualMode ? buildManualAuthorizationMessage(loginUrl) : buildAuthorizationMessage(loginUrl),
-        feishuCardJson: card,
+        userMessage: message,
+        requestedScopes,
+        cardDisposition: 'send',
+        feishuCardJson: buildConfigurationBlockerCard(message),
       };
     }
-
-    const completed = new Promise<FeishuAuthorizationResult>((resolve) => {
-      this.pending.set(state.state, { userId: input.userId, resolve });
-    });
-    const timeout = new Promise<FeishuAuthorizationResult>((resolve) => {
-      setTimeout(() => {
-        this.pending.delete(state.state);
-        resolve({
+    const authorizationKey = buildFeishuOAuthAuthorizationKey(input.userId, requestedScopes);
+    return this.withAuthorizationKeyLock(authorizationKey, async () => {
+      const existing = await this.options.stateStore.findActiveByAuthorizationKey(authorizationKey);
+      if (existing) {
+        const pendingRequest = toPendingRequest(input);
+        const merged = await this.options.stateStore.mergePendingRequest(
+          existing.state,
+          pendingRequest,
+          hashLinkUrls(input.linkUrls),
+        ) || existing;
+        const loginUrl = this.buildAuthorizationUrl(merged);
+        return {
           status: 'auth_required',
           loginUrl,
-          userMessage: manualMode ? buildManualAuthorizationMessage(loginUrl) : buildAuthorizationMessage(loginUrl),
+          userMessage: '已合并到现有授权请求。完成上一张授权卡后，我会继续处理这项任务。',
+          authorizationRequestId: merged.state,
+          requestedScopes,
+          cardDisposition: 'reuse',
+        };
+      }
+
+      const state = await this.createState(input, requestedScopes, authorizationKey);
+      const loginUrl = this.buildAuthorizationUrl(state);
+      const manualMode = this.options.config.mode === 'manual';
+      const card = manualMode
+        ? buildManualAuthorizationCard(loginUrl, requestedScopes)
+        : buildAuthorizationCard(loginUrl, requestedScopes);
+      const waitMs = Math.max(0, this.options.config.waitForAuthorizationMs);
+      if (waitMs <= 0) {
+        return {
+          status: 'auth_required',
+          loginUrl,
+          userMessage: manualMode
+            ? buildManualAuthorizationMessage(loginUrl, requestedScopes)
+            : buildAuthorizationMessage(loginUrl, requestedScopes),
           feishuCardJson: card,
-        });
-      }, waitMs).unref();
+          authorizationRequestId: state.state,
+          requestedScopes,
+          cardDisposition: 'send',
+        };
+      }
+
+      const completed = new Promise<FeishuAuthorizationResult>((resolve) => {
+        this.pending.set(state.state, { userId: input.userId, resolve });
+      });
+      const timeout = new Promise<FeishuAuthorizationResult>((resolve) => {
+        setTimeout(() => {
+          this.pending.delete(state.state);
+          resolve({
+            status: 'auth_required',
+            loginUrl,
+            userMessage: manualMode
+              ? buildManualAuthorizationMessage(loginUrl, requestedScopes)
+              : buildAuthorizationMessage(loginUrl, requestedScopes),
+            feishuCardJson: card,
+            authorizationRequestId: state.state,
+            requestedScopes,
+            cardDisposition: 'send',
+          });
+        }, waitMs).unref();
+      });
+      return Promise.race([completed, timeout]);
     });
-    return Promise.race([completed, timeout]);
+  }
+
+  private async withAuthorizationKeyLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.authorizationLocks.get(key) || Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => gate, () => gate);
+    this.authorizationLocks.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await run();
+    } finally {
+      release();
+      if (this.authorizationLocks.get(key) === tail) this.authorizationLocks.delete(key);
+    }
   }
 
   async handleOAuthCallback(callbackUrl: URL): Promise<FeishuOAuthCallbackResult> {
@@ -280,13 +454,14 @@ export class FeishuOAuthService {
         return { ok: false, message: '授权账号与发起请求的飞书用户不一致，已拒绝绑定。' };
       }
       await this.options.tokenStore.saveTokens(state.userId, tokens);
+      const resumes = getPendingRequests(state);
       const pending = this.pending.get(state.state);
       if (pending) {
         this.pending.delete(state.state);
         pending.resolve({ status: 'authorized', accessToken: tokens.accessToken });
       }
-      if (state.pendingRequest?.text?.trim()) {
-        return { ok: true, message: '飞书授权成功。已收到，正在处理中。', resume: state.pendingRequest };
+      if (resumes.length > 0) {
+        return { ok: true, message: '飞书授权成功。已收到，正在处理中。', resume: resumes[0], resumes };
       }
       return { ok: true, message: '飞书授权成功，可以回到聊天继续。' };
     } catch (error) {
@@ -323,11 +498,13 @@ export class FeishuOAuthService {
         return { status: 'error', userMessage: '授权账号与发起请求的飞书用户不一致，已拒绝绑定。' };
       }
       await this.options.tokenStore.saveTokens(state.userId, tokens);
-      if (state.pendingRequest?.text?.trim()) {
+      const resumes = getPendingRequests(state);
+      if (resumes.length > 0) {
         return {
           status: 'bound',
           userMessage: '已收到，正在处理中。',
-          resume: state.pendingRequest,
+          resume: resumes[0],
+          resumes,
         };
       }
       return { status: 'bound', userMessage: '飞书授权成功。请回到聊天里重新发送原问题，我会按你的飞书身份读取云文档。' };
@@ -350,7 +527,11 @@ export class FeishuOAuthService {
     return null;
   }
 
-  private async createState(input: FeishuAuthorizationInput): Promise<FeishuOAuthState> {
+  private async createState(
+    input: FeishuAuthorizationInput,
+    requestedScopes: string[],
+    authorizationKey: string,
+  ): Promise<FeishuOAuthState> {
     const stateValue = crypto.randomBytes(24).toString('base64url');
     const state: FeishuOAuthState = {
       state: stateValue,
@@ -359,37 +540,22 @@ export class FeishuOAuthService {
       messageId: input.messageId,
       codeVerifier: crypto.randomBytes(48).toString('base64url'),
       redirectUri: this.getRedirectUri(),
-      linkHashes: input.linkUrls.map((url) => crypto.createHash('sha256').update(url).digest('hex')),
+      linkHashes: hashLinkUrls(input.linkUrls),
+      requestedScopes,
+      authorizationKey,
       expiresAt: new Date(this.now().getTime() + 5 * 60 * 1000).toISOString(),
-      pendingRequest: input.text?.trim()
-        ? {
-          text: input.text,
-          channelType: input.channelType || 'feishu',
-          chatId: input.chatId,
-          userId: input.userId,
-          userDisplayName: input.userDisplayName,
-          messageId: input.messageId,
-        }
-        : undefined,
+      pendingRequests: mergeFeishuOAuthPendingRequests([], toPendingRequest(input)),
     };
     await this.options.stateStore.put(state);
     return state;
   }
 
   private buildAuthorizationUrl(state: FeishuOAuthState): string {
-    if (this.options.config.mode === 'manual') {
-      const url = new URL(FEISHU_MANUAL_AUTHORIZE_URL);
-      url.searchParams.set('redirect_uri', state.redirectUri);
-      url.searchParams.set('app_id', this.options.config.appId!);
-      url.searchParams.set('state', state.state);
-      return url.toString();
-    }
-    const url = new URL(FEISHU_OAUTH_V2_AUTHORIZE_URL);
+    const url = new URL(FEISHU_OAUTH_AUTHORIZE_URL);
     url.searchParams.set('client_id', this.options.config.appId!);
-    url.searchParams.set('app_id', this.options.config.appId!);
     url.searchParams.set('redirect_uri', state.redirectUri);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope', this.options.config.scopes.join(' '));
+    url.searchParams.set('scope', normalizeFeishuOAuthScopes(state.requestedScopes || this.options.config.scopes).join(' '));
     url.searchParams.set('state', state.state);
     url.searchParams.set('code_challenge', pkceChallenge(state.codeVerifier));
     url.searchParams.set('code_challenge_method', 'S256');
@@ -405,9 +571,7 @@ export class FeishuOAuthService {
   }
 
   private async exchangeAuthorizationCode(code: string, state: FeishuOAuthState): Promise<StoredFeishuUserTokens> {
-    if (this.options.config.mode === 'manual') {
-      return this.requestAuthenV1Token(code);
-    }
+    const scopes = normalizeFeishuOAuthScopes(state.requestedScopes || this.options.config.scopes);
     return this.requestToken({
       grant_type: 'authorization_code',
       client_id: this.options.config.appId!,
@@ -415,88 +579,29 @@ export class FeishuOAuthService {
       code,
       redirect_uri: state.redirectUri,
       code_verifier: state.codeVerifier,
-    });
+      ...(scopes.length > 0 ? { scope: scopes.join(' ') } : {}),
+    }, scopes);
   }
 
-  private async requestAuthenV1Token(code: string): Promise<StoredFeishuUserTokens> {
-    const appAccessToken = await this.getAppAccessToken();
-    const response = await this.fetchImpl(FEISHU_AUTHEN_V1_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${appAccessToken}`,
-        'content-type': 'application/json; charset=utf-8',
-      },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        code,
-      }),
-    });
-    const payload = await response.json() as any;
-    if (!response.ok || payload.code !== 0) {
-      throw new Error(payload.msg || payload.message || `HTTP ${response.status}`);
-    }
-    const data = payload.data || payload;
-    const nowMs = this.now().getTime();
-    const accessTtlMs = Number(data.expires_in || data.expire || 7200) * 1000;
-    return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      scopes: this.options.config.scopes,
-      accessTokenExpiresAt: new Date(nowMs + accessTtlMs).toISOString(),
-      refreshTokenExpiresAt: data.refresh_token_expires_in
-        ? new Date(nowMs + Number(data.refresh_token_expires_in) * 1000).toISOString()
-        : undefined,
-      openId: data.open_id || data.user?.open_id,
-      unionId: data.union_id || data.user?.union_id,
-      userId: data.user_id || data.user?.user_id,
-    };
-  }
-
-  private async getAppAccessToken(): Promise<string> {
-    const nowMs = this.now().getTime();
-    if (this.cachedAppToken && this.cachedAppToken.expiresAtMs > nowMs + CLOCK_SKEW_MS) {
-      return this.cachedAppToken.token;
-    }
-    const response = await this.fetchImpl(FEISHU_APP_ACCESS_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({
-        app_id: this.options.config.appId!,
-        app_secret: this.options.config.appSecret!,
-      }),
-    });
-    const payload = await response.json() as any;
-    if (!response.ok || Number(payload.code || 0) !== 0) {
-      throw new Error(payload.msg || payload.message || `HTTP ${response.status}`);
-    }
-    const token = payload.app_access_token || payload.tenant_access_token;
-    if (!token) {
-      throw new Error('飞书未返回 app_access_token。');
-    }
-    this.cachedAppToken = {
-      token: String(token),
-      expiresAtMs: nowMs + Math.max(60, Number(payload.expire || payload.expires_in || 7200)) * 1000,
-    };
-    return this.cachedAppToken.token;
-  }
-
-  private async refreshAccessToken(userId: string, refreshToken: string): Promise<string | null> {
+  private async refreshAccessToken(userId: string, refreshToken: string, scopes: string[]): Promise<string | null> {
     try {
+      const normalizedScopes = normalizeFeishuOAuthScopes(scopes);
       const tokens = await this.requestToken({
         grant_type: 'refresh_token',
         client_id: this.options.config.appId!,
         client_secret: this.options.config.appSecret!,
         refresh_token: refreshToken,
-      });
+        ...(normalizedScopes.length > 0 ? { scope: normalizedScopes.join(' ') } : {}),
+      }, normalizedScopes);
       await this.options.tokenStore.saveTokens(userId, tokens);
       return tokens.accessToken;
     } catch {
-      await this.options.tokenStore.deleteTokens(userId);
+      await this.options.tokenStore.deleteTokens(userId, scopes);
       return null;
     }
   }
 
-  private async requestToken(body: Record<string, string>): Promise<StoredFeishuUserTokens> {
+  private async requestToken(body: Record<string, string>, fallbackScopes: string[]): Promise<StoredFeishuUserTokens> {
     const response = await this.fetchImpl(FEISHU_TOKEN_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -514,7 +619,7 @@ export class FeishuOAuthService {
     return {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
-      scopes: scopeText ? scopeText.split(/\s+/).filter(Boolean) : this.options.config.scopes,
+      scopes: normalizeFeishuOAuthScopes(scopeText ? scopeText.split(/\s+/).filter(Boolean) : fallbackScopes),
       accessTokenExpiresAt: new Date(nowMs + accessTtlMs).toISOString(),
       refreshTokenExpiresAt: refreshTtlMs ? new Date(nowMs + refreshTtlMs).toISOString() : undefined,
       openId: data.open_id || data.user?.open_id,
@@ -538,10 +643,13 @@ export function startFeishuOAuthCallbackServer(
         return;
       }
       const result = await service.handleOAuthCallback(requestUrl);
-      if (result.ok && result.resume && options.onResume) {
-        void Promise.resolve(options.onResume(result.resume)).catch((error) => {
-          console.warn('[feishu-oauth] callback resume error:', error instanceof Error ? error.message : error);
-        });
+      if (result.ok && options.onResume) {
+        const resumes = result.resumes?.length ? result.resumes : result.resume ? [result.resume] : [];
+        for (const resume of resumes) {
+          void Promise.resolve(options.onResume(resume)).catch((error) => {
+            console.warn('[feishu-oauth] callback resume error:', error instanceof Error ? error.message : error);
+          });
+        }
       }
       res.writeHead(result.ok ? 200 : 400, { 'content-type': 'text/html; charset=utf-8' });
       res.end(renderCallbackHtml(result.ok, result.message));
@@ -558,9 +666,10 @@ export function startFeishuOAuthCallbackServer(
   return server;
 }
 
-function buildAuthorizationMessage(loginUrl: string): string {
+function buildAuthorizationMessage(loginUrl: string, requestedScopes: string[]): string {
   return [
     '需要你登录飞书后，我才能安全读取这个云文档。',
+    formatRequestedScopes(requestedScopes),
     '',
     `授权链接：${loginUrl}`,
     '',
@@ -568,9 +677,10 @@ function buildAuthorizationMessage(loginUrl: string): string {
   ].join('\n');
 }
 
-function buildManualAuthorizationMessage(loginUrl: string): string {
+function buildManualAuthorizationMessage(loginUrl: string, requestedScopes: string[]): string {
   return [
     '需要你登录飞书后，我才能安全读取这个云文档。',
+    formatRequestedScopes(requestedScopes),
     '',
     `授权链接：${loginUrl}`,
     '',
@@ -579,7 +689,7 @@ function buildManualAuthorizationMessage(loginUrl: string): string {
   ].join('\n');
 }
 
-function buildAuthorizationCard(loginUrl: string): string {
+function buildAuthorizationCard(loginUrl: string, requestedScopes: string[]): string {
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
@@ -591,7 +701,11 @@ function buildAuthorizationCard(loginUrl: string): string {
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: '这个云文档需要使用你的飞书账号权限读取。点击按钮登录授权后，请回到聊天里重新发送原问题。',
+          content: [
+            '这个云文档需要使用你的飞书账号权限读取。点击按钮登录授权后，请回到聊天里重新发送原问题。',
+            '',
+            formatRequestedScopes(requestedScopes),
+          ].join('\n'),
         },
       },
       {
@@ -618,7 +732,7 @@ function buildAuthorizationCard(loginUrl: string): string {
   });
 }
 
-function buildManualAuthorizationCard(loginUrl: string): string {
+function buildManualAuthorizationCard(loginUrl: string, requestedScopes: string[]): string {
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
@@ -632,6 +746,7 @@ function buildManualAuthorizationCard(loginUrl: string): string {
           tag: 'lark_md',
           content: [
             '这个云文档需要使用你的飞书账号权限读取。',
+            formatRequestedScopes(requestedScopes),
             '点击按钮完成授权后，请把浏览器地址栏里的完整回调地址复制回飞书发送。',
           ].join('\n'),
         },
@@ -658,6 +773,38 @@ function buildManualAuthorizationCard(loginUrl: string): string {
       },
     ],
   });
+}
+
+function formatRequestedScopes(scopes: string[]): string {
+  const normalized = normalizeFeishuOAuthScopes(scopes);
+  return `本次最小权限：${normalized.join('、') || '未声明'}`;
+}
+
+function toPendingRequest(input: FeishuAuthorizationInput): FeishuOAuthPendingRequest | undefined {
+  if (!input.text?.trim()) return undefined;
+  return {
+    text: input.text,
+    channelType: input.channelType || 'feishu',
+    chatId: input.chatId,
+    userId: input.userId,
+    userDisplayName: input.userDisplayName,
+    messageId: input.messageId,
+  };
+}
+
+function getPendingRequests(state: FeishuOAuthState): FeishuOAuthPendingRequest[] {
+  return mergeFeishuOAuthPendingRequests(
+    Array.isArray(state.pendingRequests) ? state.pendingRequests : [],
+    state.pendingRequest,
+  );
+}
+
+function hashLinkUrls(linkUrls: string[]): string[] {
+  return Array.from(new Set(linkUrls.map((url) => crypto.createHash('sha256').update(url).digest('hex'))));
+}
+
+function buildTokenGrantStorageKey(userId: string, scopes: Iterable<string>): string {
+  return `grant:${crypto.createHash('sha256').update(buildFeishuOAuthAuthorizationKey(userId, scopes)).digest('hex')}`;
 }
 
 function buildConfigurationBlockerCard(message: string): string {

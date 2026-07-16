@@ -10,6 +10,10 @@ import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams, type FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
+import {
+  buildProviderInputEvidenceReceipt,
+  type ProviderInputEvidenceReceipt,
+} from 'claude-to-im/src/lib/bridge/input-evidence.js';
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
@@ -417,6 +421,20 @@ export interface StreamState {
    * as assistant text but were followed by a CLI crash.
    */
   lastAssistantText: string;
+  /** Structured attachment receipt emitted only after the provider initializes the turn. */
+  inputEvidenceReceipt?: ProviderInputEvidenceReceipt | null;
+  inputEvidenceReceiptEmitted?: boolean;
+}
+
+/** Claude Agent SDK 的分类器模式：只允许单轮模型输出，不暴露任何工具或工作区。 */
+export function buildClassifierClaudeQueryPolicy(): Record<string, unknown> {
+  return {
+    allowedTools: [],
+    permissionMode: 'plan',
+    cwd: undefined,
+    resume: undefined,
+    maxTurns: 1,
+  };
 }
 
 export class SDKLLMProvider implements LLMProvider {
@@ -443,6 +461,7 @@ export class SDKLLMProvider implements LLMProvider {
 
           try {
             const cleanEnv = buildSubprocessEnv();
+            const classifierMode = params.interactionMode === 'classifier';
 
             // Cross-runtime migration safety: drop non-Claude model names
             // that may linger in session data from a previous Codex runtime.
@@ -462,13 +481,16 @@ export class SDKLLMProvider implements LLMProvider {
             }
 
             const queryOptions: Record<string, unknown> = {
-              cwd: params.workingDirectory,
+              cwd: classifierMode ? undefined : params.workingDirectory,
               model,
-              resume: params.sdkSessionId || undefined,
+              resume: classifierMode ? undefined : params.sdkSessionId || undefined,
               abortController: params.abortController,
-              permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
+              permissionMode: classifierMode
+                ? 'plan'
+                : (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
+              ...(classifierMode ? buildClassifierClaudeQueryPolicy() : {}),
               stderr: (data: string) => {
                 stderrBuf += data;
                 if (stderrBuf.length > MAX_STDERR) {
@@ -480,6 +502,12 @@ export class SDKLLMProvider implements LLMProvider {
                   input: Record<string, unknown>,
                   opts: { toolUseID: string; suggestions?: string[] },
                 ): Promise<PermissionResult> => {
+                  if (classifierMode) {
+                    return {
+                      behavior: 'deny' as const,
+                      message: 'Classifier turns cannot use tools.',
+                    };
+                  }
                   // Auto-approve if configured (useful for channels without
                   // interactive permission UI, e.g. Feishu WebSocket mode)
                   if (autoApprove) {
@@ -517,6 +545,8 @@ export class SDKLLMProvider implements LLMProvider {
               ? [priorityTurnContext, `Current user request:\n${params.prompt}`].join('\n\n')
               : params.prompt;
             const prompt = buildPrompt(promptText, params.files);
+            const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(params.files, 'claude', ['image']);
+            state.inputEvidenceReceipt = inputEvidenceReceipt;
             const q = query({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],
               options: queryOptions as Parameters<typeof query>[0]['options'],
@@ -710,12 +740,17 @@ export function handleMessage(
 
     case 'system': {
       if (msg.subtype === 'init') {
+        const inputEvidence = state.inputEvidenceReceipt && !state.inputEvidenceReceiptEmitted
+          ? state.inputEvidenceReceipt
+          : undefined;
         controller.enqueue(
           sseEvent('status', {
             session_id: msg.session_id,
             model: msg.model,
+            ...(inputEvidence ? { inputEvidence } : {}),
           }),
         );
+        if (inputEvidence) state.inputEvidenceReceiptEmitted = true;
       }
       break;
     }

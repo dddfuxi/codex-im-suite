@@ -7,6 +7,7 @@ import {
   isNonClaudeModel,
   parseCliMajorVersion,
   handleMessage,
+  buildClassifierClaudeQueryPolicy,
 } from '../llm-provider.js';
 import type { StreamState } from '../llm-provider.js';
 import { sseEvent } from '../sse-utils.js';
@@ -258,6 +259,47 @@ describe('handleMessage state tracking', () => {
     assert.equal(state.lastAssistantText, 'Let me check');
     assert.equal(chunks.length, 1); // only tool_use, no text
     assert.ok(chunks[0].includes('tool_use'));
+  });
+});
+
+describe('Claude structured input evidence receipt', () => {
+  it('emits accepted image evidence with the provider init status', () => {
+    const { controller, chunks } = makeFakeController();
+    const state = freshState() as StreamState & Record<string, unknown>;
+    state.inputEvidenceReceipt = {
+      protocol: 'cti-input-evidence/v1',
+      provider: 'claude',
+      accepted: [{ id: 'image-1', kind: 'image', mediaType: 'image/png' }],
+    };
+
+    handleMessage({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'claude-image-session',
+      model: 'claude-test',
+    } as any, controller, state);
+
+    const events = chunks
+      .flatMap((chunk) => chunk.split('\n'))
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as { type: string; data: string });
+    const status = events.find((event) => event.type === 'status');
+    assert.ok(status);
+    const data = JSON.parse(status.data) as Record<string, any>;
+    assert.equal(data.inputEvidence.protocol, 'cti-input-evidence/v1');
+    assert.deepEqual(data.inputEvidence.accepted, [{ id: 'image-1', kind: 'image', mediaType: 'image/png' }]);
+  });
+});
+
+describe('classifier query policy', () => {
+  it('disables Claude tools, workspace access, and session resume', () => {
+    const policy = buildClassifierClaudeQueryPolicy();
+
+    assert.deepEqual(policy.allowedTools, []);
+    assert.equal(policy.permissionMode, 'plan');
+    assert.equal(policy.cwd, undefined);
+    assert.equal(policy.resume, undefined);
+    assert.equal(policy.maxTurns, 1);
   });
 });
 

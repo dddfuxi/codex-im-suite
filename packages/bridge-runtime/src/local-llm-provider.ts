@@ -116,9 +116,9 @@ function buildAnswerMessages(
   }
 
   const userLines = [
-    priorityTurnContext,
     options.recallContext ? `已命中的相关历史/记忆:\n${options.recallContext}` : '',
     history ? `最近相关上下文:\n${history}` : '',
+    priorityTurnContext,
     `当前请求:\n${prompt}`,
   ].filter(Boolean);
 

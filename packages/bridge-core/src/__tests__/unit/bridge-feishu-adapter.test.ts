@@ -1496,6 +1496,40 @@ describe('FeishuAdapter light conversation context', () => {
     assert.match(context.prompt, /被回复消息/);
     assert.match(context.prompt, /万能区域什么都能改小王分队/);
     assert.doesNotMatch(context.prompt, /@小虾米 你怎么看/);
+    const replyEvidence = context.evidence.find((item: any) => item.relation === 'native_reply');
+    assert.ok(replyEvidence);
+    assert.equal(replyEvidence.id, 'message:om_reply');
+    assert.equal(replyEvidence.source, 'platform_api');
+    assert.equal(replyEvidence.actor.displayName, '苏庆华');
+    assert.match(replyEvidence.content, /万能区域什么都能改小王分队/);
+    assert.ok(context.evidence.some((item: any) => item.id === 'message:om_other' && item.relation === 'nearby'));
+  });
+
+  it('marks native reply resource shells as low-confidence until their content is recovered', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const imageReply = {
+      message_id: 'om_reply_image',
+      chat_id: 'oc_group',
+      create_time: String(Date.now() - 1000),
+      msg_type: 'image',
+      body: { content: JSON.stringify({ image_key: 'img_reply' }) },
+      sender: { id: 'ou_sender', sender_type: 'user' },
+    };
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.fetchMessageById = async () => imageReply;
+    adapter.fetchRecentMessages = async () => [imageReply];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      'om_reply_image',
+      '看这个',
+    );
+
+    const replyEvidence = context?.evidence.find((item: any) => item.id === 'message:om_reply_image');
+    assert.ok(replyEvidence);
+    assert.equal(replyEvidence.metadata.contentRecovered, false);
+    assert.ok(replyEvidence.confidence < 0.8);
   });
 
   it('marks a likely nearby context message for short reply commands without native reply metadata', async () => {
@@ -1533,6 +1567,11 @@ describe('FeishuAdapter light conversation context', () => {
     assert.match(context.prompt, /可能关联上文/);
     assert.match(context.prompt, /你后台连的 Codex 客户端还是 CLI/);
     assert.doesNotMatch(context.prompt, /@小虾米 回复一下/);
+    const likelyEvidence = context.evidence.find((item: any) => item.relation === 'likely_context');
+    assert.ok(likelyEvidence);
+    assert.equal(likelyEvidence.id, 'message:om_question');
+    assert.equal(likelyEvidence.source, 'adapter_inference');
+    assert.ok(likelyEvidence.confidence < 0.8);
   });
 
   it('keeps nearby bot messages and native mention signals for short deictic questions', async () => {
@@ -1576,6 +1615,9 @@ describe('FeishuAdapter light conversation context', () => {
     assert.match(context.prompt, /小虾米/);
     assert.match(context.prompt, /可能关联上文/);
     assert.match(context.prompt, /大世界分支/);
+    const mentionEvidence = context.evidence.filter((item: any) => item.relation === 'native_mention');
+    assert.deepEqual(mentionEvidence.map((item: any) => item.actor.displayName), ['大虾米', '小虾米']);
+    assert.ok(mentionEvidence.every((item: any) => item.source === 'platform_event'));
   });
 
   it('extracts visible interactive card text for short light context', async () => {
@@ -1744,6 +1786,10 @@ describe('FeishuAdapter light conversation context', () => {
     assert.ok(context);
     assert.match(context.prompt, /原始请求：查看当前群里的机器人/);
     assert.match(context.prompt, /上一轮结果：未完成/);
+    const replyEvidence = context.evidence.find((item: any) => item.relation === 'native_reply');
+    assert.ok(replyEvidence);
+    assert.match(replyEvidence.content, /原始请求：查看当前群里的机器人/);
+    assert.match(replyEvidence.content, /上一轮结果：未完成/);
   });
 
   it('enriches bot card shells from local outbound audit for continuation image tasks', async () => {
@@ -4438,6 +4484,82 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.equal((inbound.raw as any)?.feishuReplyTo?.messageId, 'om_bot_card');
     assert.equal(inbound.attachments?.length, 1);
     assert.equal(inbound.attachments?.[0]?.name, 'img_reply_key.png');
+  });
+
+  it('keeps downloaded reply media when the current reply also has an attachment', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_group_policy: 'open',
+    }) as unknown as BridgeStore & {
+      listOutboundRefs: BridgeStore['listOutboundRefs'];
+    };
+    store.listOutboundRefs = (filter = {}) => filter.platformMessageId === 'om_bot_image'
+      ? [{
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        codepilotSessionId: 'session_1',
+        platformMessageId: 'om_bot_image',
+        purpose: 'reply',
+        messageKind: 'assistant',
+        createdAt: '2026-07-10T00:00:00.000Z',
+      }]
+      : [];
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '项目群';
+    adapter.persistChatIndex = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.restClient = {
+      im: {
+        message: {
+          get: async ({ path: requestPath }: any) => ({
+            data: {
+              items: requestPath.message_id === 'om_bot_image' ? [{
+                message_id: 'om_bot_image',
+                chat_id: 'oc_group',
+                create_time: String(Date.now() - 1000),
+                msg_type: 'image',
+                body: { content: JSON.stringify({ image_key: 'img_parent' }) },
+                sender: { id: 'ou_bot', sender_type: 'bot' },
+              }] : [],
+            },
+          }),
+        },
+        messageResource: {
+          get: async ({ path: requestPath }: any) => ({
+            getReadableStream: () => Readable.from([Buffer.from(requestPath.file_key)]),
+          }),
+        },
+      },
+    };
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_user', user_id: 'u_user', union_id: 'on_user' },
+      },
+      message: {
+        message_id: 'om_current_image',
+        parent_id: 'om_bot_image',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'image',
+        content: JSON.stringify({ image_key: 'img_current' }),
+        create_time: String(Date.now()),
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+
+    assert.deepEqual(inbound?.attachments?.map((item: { name: string }) => item.name), ['img_parent.png', 'img_current.png']);
+    assert.equal((inbound?.raw as any)?.feishuReplyTo?.attachmentCount, 1);
   });
 
   it('drops group text replies to this bot without a native mention', async () => {

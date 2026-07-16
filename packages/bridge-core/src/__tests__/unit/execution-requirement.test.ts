@@ -83,6 +83,98 @@ describe('execution requirement classifier', () => {
     });
   });
 
+  it('requires provider-accepted input evidence for read-only image analysis', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '分析一下图片里的关键信息',
+      workingDirectory: 'C:\\unity\\ST3',
+      files: [{
+        id: 'image-1',
+        name: 'build-result.jpg',
+        type: 'image/jpeg',
+        size: 128,
+        data: 'aW1hZ2U=',
+      }],
+    });
+
+    assert.equal(requirement.kind, 'input_evidence_required');
+    assert.deepEqual((requirement as any).requiredInputEvidenceKinds, ['image']);
+    assert.deepEqual((requirement as any).requiredInputEvidenceIds, ['image-1']);
+    assert.equal(
+      isExecutionEvidenceSatisfied(requirement, {
+        successfulToolResultCount: 0,
+        acceptedInputEvidenceIds: [],
+        acceptedInputEvidenceKinds: [],
+      } as any),
+      false,
+    );
+    assert.equal(
+      isExecutionEvidenceSatisfied(requirement, {
+        successfulToolResultCount: 0,
+        acceptedInputEvidenceIds: ['image-1'],
+        acceptedInputEvidenceKinds: ['image'],
+      } as any),
+      true,
+    );
+
+    assert.equal(
+      shouldReplaceWithNoExecutionEvidenceText(
+        requirement,
+        {
+          toolResultCount: 0,
+          successfulToolResultCount: 0,
+          acceptedInputEvidenceIds: [],
+          acceptedInputEvidenceKinds: [],
+        } as any,
+        '```cti-final\n{"kind":"image","text":"图片分析完成","images":["claimed.png"],"files":[],"reply_mode":"markdown"}\n```',
+      ),
+      true,
+      'A declared output artifact must not bypass missing provider input evidence',
+    );
+
+    assert.equal(
+      shouldReplaceWithNoExecutionEvidenceText(
+        requirement,
+        {
+          toolResultCount: 0,
+          successfulToolResultCount: 0,
+          acceptedInputEvidenceIds: ['image-1'],
+          acceptedInputEvidenceKinds: ['image'],
+        } as any,
+        '图片里的构建状态是成功。',
+      ),
+      false,
+    );
+
+    const prompt = buildExecutionRequirementPrompt(requirement);
+    assert.match(prompt, /structured input evidence/i);
+    assert.doesNotMatch(prompt, /call an appropriate real tool/i);
+  });
+
+  it('keeps image editing and output requests behind artifact evidence', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '把这张图里的重点圈出来并保存成一张新图',
+      files: [{
+        id: 'image-1',
+        name: 'source.png',
+        type: 'image/png',
+        size: 64,
+        data: 'aW1hZ2U=',
+      }],
+    });
+
+    assert.equal(requirement.kind, 'artifact_required');
+    assert.ok(requirement.requiredToolFamilies.includes('artifact'));
+  });
+
+  it('does not treat an image noun without actual input as an artifact action', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '分析一下图片里的关键信息',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+
+    assert.equal(requirement.kind, 'none');
+  });
+
   it('requires Unity MCP evidence by default for concrete Unity actions', () => {
     const previous = process.env.CTI_STRICT_TOOL_ROUTING;
     delete process.env.CTI_STRICT_TOOL_ROUTING;

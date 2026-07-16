@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { buildProviderInputEvidenceReceipt } from 'claude-to-im/src/lib/bridge/input-evidence.js';
 import type { Config } from './config.js';
 import {
   buildTurnPrompt,
@@ -50,6 +51,29 @@ const MIME_EXT: Record<string, string> = {
 };
 const MAX_JSON_TOOL_STEPS = 4;
 const DEFAULT_CODEX_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
+const CLASSIFIER_DISABLED_FEATURES = [
+  'shell_tool',
+  'unified_exec',
+  'apps',
+  'plugins',
+  'browser_use',
+  'browser_use_external',
+  'computer_use',
+  'image_generation',
+  'multi_agent',
+  'workspace_dependencies',
+  'skill_mcp_dependency_install',
+  'standalone_web_search',
+  'web_search_request',
+  'request_permissions_tool',
+] as const;
+
+export function buildClassifierCodexExecArgs(baseArgs: string[], outputSchemaPath?: string): string[] {
+  const args = [...baseArgs, '--ephemeral', '--ignore-user-config', '--sandbox', 'read-only'];
+  for (const feature of CLASSIFIER_DISABLED_FEATURES) args.push('--disable', feature);
+  if (outputSchemaPath) args.push('--output-schema', outputSchemaPath);
+  return args;
+}
 
 function resolveCodexExecTimeoutMs(config: Config): number | undefined {
   const configured = Number(config.bridgeProcessingTimeoutMs);
@@ -581,6 +605,7 @@ export class CodexLocalCliProvider implements LLMProvider {
         let stdoutRemainder = '';
         let sawResult = false;
         let sawText = false;
+        let classifierViolation = '';
 
         const cleanup = () => {
           for (const file of tempFiles) {
@@ -598,20 +623,32 @@ export class CodexLocalCliProvider implements LLMProvider {
           const outputLastMessagePath = makeTempPath('cti-codex-last-message', '.txt');
           tempFiles.push(outputLastMessagePath);
           const command = adapter.buildCommand({ model, outputLastMessagePath });
-          const workingDirectory = resolveWorkingDirectory(params.workingDirectory);
-          const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
-          const args = [...command.args];
+          const classifierMode = params.interactionMode === 'classifier';
+          const workingDirectory = classifierMode ? os.tmpdir() : resolveWorkingDirectory(params.workingDirectory);
+          const additionalDirectories = classifierMode ? [] : normalizeAdditionalDirectories(params.additionalDirectories);
+          let classifierSchemaPath: string | undefined;
+          if (classifierMode && params.responseSchema) {
+            classifierSchemaPath = makeTempPath('cti-classifier-schema', '.json');
+            fs.writeFileSync(classifierSchemaPath, JSON.stringify(params.responseSchema), 'utf-8');
+            tempFiles.push(classifierSchemaPath);
+          }
+          const args = classifierMode
+            ? buildClassifierCodexExecArgs(command.args, classifierSchemaPath)
+            : [...command.args];
 
-          for (const dir of additionalDirectories) args.push('--add-dir', dir);
-          if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
-          if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
-          if (shouldBypassLocalApprovals()) {
-            args.push('--dangerously-bypass-approvals-and-sandbox');
-          } else {
-            args.push('--sandbox', getSandboxMode());
+          if (!classifierMode) {
+            for (const dir of additionalDirectories) args.push('--add-dir', dir);
+            if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
+            if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
+            if (shouldBypassLocalApprovals()) {
+              args.push('--dangerously-bypass-approvals-and-sandbox');
+            } else {
+              args.push('--sandbox', getSandboxMode());
+            }
           }
 
-          const imageFiles = params.files?.filter((file) => file.type.startsWith('image/')) ?? [];
+          const imageFiles = classifierMode ? [] : params.files?.filter((file) => file.type.startsWith('image/')) ?? [];
+          const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(imageFiles, adapter.id, ['image']);
           for (const file of imageFiles) {
             const ext = MIME_EXT[file.type] || '.png';
             const tmpPath = makeTempPath('cti-img', ext);
@@ -641,7 +678,7 @@ export class CodexLocalCliProvider implements LLMProvider {
             },
           }));
 
-          if (isJsonToolProtocolEligible(params.executionRequirement, 'local_api')) {
+          if (!classifierMode && isJsonToolProtocolEligible(params.executionRequirement, 'local_api')) {
             await this.runJsonToolProtocol(controller, params, model, baseUrl);
             controller.close();
             return;
@@ -682,11 +719,17 @@ export class CodexLocalCliProvider implements LLMProvider {
               case 'thread.started': {
                 controller.enqueue(sseEvent('status', {
                   session_id: typeof event.thread_id === 'string' ? event.thread_id : undefined,
+                  ...(inputEvidenceReceipt ? { inputEvidence: inputEvidenceReceipt } : {}),
                 }));
                 break;
               }
               case 'item.completed': {
                 const item = event.item && typeof event.item === 'object' ? event.item as Record<string, unknown> : {};
+                if (classifierMode && ['command_execution', 'file_change', 'mcp_tool_call', 'web_search'].includes(String(item.type || ''))) {
+                  classifierViolation = `classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`;
+                  terminateProcessTree(child);
+                  break;
+                }
                 this.handleCompletedItem(controller, item, () => { sawText = true; });
                 break;
               }
@@ -736,6 +779,10 @@ export class CodexLocalCliProvider implements LLMProvider {
             child.on('close', (code) => {
               params.abortController?.signal.removeEventListener('abort', abort);
               if (timeoutTimer) clearTimeout(timeoutTimer);
+              if (classifierViolation) {
+                reject(new Error(classifierViolation));
+                return;
+              }
               const tailEvent = parseCodexExecJsonLine(stdoutRemainder);
               if (tailEvent) handleJsonEvent(tailEvent);
               if (timedOut) {

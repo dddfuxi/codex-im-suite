@@ -168,6 +168,7 @@ describe('Feishu cloud document links', () => {
   });
 
   it('asks for user authorization when tenant access is denied and no user token exists', async () => {
+    let requestedScopes: string[] = [];
     const host = createFeishuCloudDocumentHost({
       config: {
         appId: 'cli_xxx',
@@ -178,13 +179,24 @@ describe('Feishu cloud document links', () => {
         maxSheets: 5,
       },
       tokenProvider: {
-        getAccessToken: async () => null,
-        requestUserAuthorization: async (input) => ({
-          status: 'auth_required',
-          loginUrl: 'https://accounts.feishu.cn/auth?state=nonce',
-          userMessage: `请 ${input.userId} 登录飞书授权`,
-          feishuCardJson: '{"card":"login"}',
-        }),
+        getAccessToken: async (_userId, scopes) => {
+          requestedScopes = scopes || [];
+          return null;
+        },
+        requestUserAuthorization: async (input) => {
+          assert.equal(input.resourceClass, 'cloud_document');
+          assert.deepEqual(input.requestedScopes, [
+            'auth:user.id:read',
+            'docx:document:readonly',
+            'offline_access',
+          ]);
+          return {
+            status: 'auth_required',
+            loginUrl: 'https://accounts.feishu.cn/auth?state=nonce',
+            userMessage: `请 ${input.userId} 登录飞书授权`,
+            feishuCardJson: '{"card":"login"}',
+          };
+        },
       },
       tenantTokenProvider: {
         getTenantAccessToken: async () => 'tenant-token',
@@ -201,6 +213,11 @@ describe('Feishu cloud document links', () => {
     });
 
     assert.equal(result.status, 'auth_required');
+    assert.deepEqual(requestedScopes, [
+      'auth:user.id:read',
+      'docx:document:readonly',
+      'offline_access',
+    ]);
     assert.match(result.userMessage || '', /ou_liudan/);
     assert.equal(result.feishuCardJson, '{"card":"login"}');
   });
@@ -414,7 +431,7 @@ describe('Feishu cloud document links', () => {
           assert.equal(input.text, 'summarize https://example.feishu.cn/sheets/shtcn123');
           return {
             status: 'auth_required',
-            loginUrl: 'https://open.feishu.cn/open-apis/authen/v1/index?state=nonce',
+            loginUrl: 'https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=nonce',
             userMessage: '需要重新授权以刷新 Sheets 用户权限。',
             feishuCardJson: '{"config":{"wide_screen_mode":true}}',
           };

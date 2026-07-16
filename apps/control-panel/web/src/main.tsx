@@ -432,10 +432,15 @@ type WorkflowRun = {
     selectedSource?: 'local_api' | 'external_api' | 'official';
     model?: string;
     baseUrl?: string;
-    requiredEvidenceKind?: 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+    requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
     evidenceSatisfied?: boolean;
     noEvidenceRetryAttempted?: boolean;
     requiredToolFamilies?: string[];
+    requiredInputEvidenceKinds?: string[];
+    requiredInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: string[];
+    acceptedInputEvidenceIds?: string[];
+    inputEvidenceProvider?: string;
     toolUseCount?: number;
     toolResultCount?: number;
     successfulToolResultCount?: number;
@@ -1862,6 +1867,14 @@ function workflowCacheTokenSummary(run: WorkflowRun) {
 function workflowEvidenceSummary(run: WorkflowRun) {
   const kind = run.execution?.requiredEvidenceKind;
   if (!kind || kind === 'none') return '证据：不要求';
+  if (kind === 'input_evidence_required') {
+    const accepted = run.execution?.acceptedInputEvidenceIds?.length || 0;
+    const required = run.execution?.requiredInputEvidenceIds?.length || 0;
+    const provider = run.execution?.inputEvidenceProvider ? `，Provider：${run.execution.inputEvidenceProvider}` : '';
+    if (run.execution?.evidenceSatisfied === true) return `证据：输入已接收（${accepted}/${required}${provider}）`;
+    if (run.execution?.noEvidenceRetryAttempted) return `证据：重试后输入仍未被 Provider 接收（${accepted}/${required}${provider}）`;
+    return `证据：输入尚未被 Provider 接收（${accepted}/${required}${provider}）`;
+  }
   if (run.execution?.evidenceSatisfied === true) return `证据：已满足（${kind}）`;
   if (run.execution?.noEvidenceRetryAttempted) return `证据：重试后仍缺少工具结果（${kind}）`;
   return `证据：缺少工具结果（${kind}）`;
@@ -1869,6 +1882,19 @@ function workflowEvidenceSummary(run: WorkflowRun) {
 
 function workflowEvidenceSummaryV2(run: WorkflowRun) {
   const kind = run.execution?.requiredEvidenceKind;
+  if (kind === 'input_evidence_required') {
+    const accepted = run.execution?.acceptedInputEvidenceIds?.length || 0;
+    const required = run.execution?.requiredInputEvidenceIds?.length || 0;
+    const kinds = run.execution?.acceptedInputEvidenceKinds?.join('、') || '无';
+    const provider = run.execution?.inputEvidenceProvider || '未确认';
+    if (run.execution?.evidenceSatisfied === true) {
+      return `证据：结构化输入已接收（${accepted}/${required}，类型：${kinds}，Provider：${provider}）`;
+    }
+    if (run.execution?.noEvidenceRetryAttempted) {
+      return `证据：重试后输入仍未接收（${accepted}/${required}，Provider：${provider}）`;
+    }
+    return `证据：等待 Provider 接收输入（${accepted}/${required}，Provider：${provider}）`;
+  }
   const tool = run.execution?.executedTool || run.execution?.requestedTool;
   const counts = run.execution
     ? [

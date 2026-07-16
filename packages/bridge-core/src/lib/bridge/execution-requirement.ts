@@ -1,11 +1,17 @@
 import type { FileAttachment, MemoryQueryPlan } from './host.js';
+import {
+  describeInputEvidence,
+  type InputEvidenceKind,
+} from './input-evidence.js';
 
-export type ExecutionRequirementKind = 'none' | 'local_read_required' | 'tool_required' | 'artifact_required';
+export type ExecutionRequirementKind = 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
 
 export interface ExecutionRequirement {
   kind: ExecutionRequirementKind;
   reason: string;
   requiredToolFamilies: string[];
+  requiredInputEvidenceKinds?: InputEvidenceKind[];
+  requiredInputEvidenceIds?: string[];
   strictToolEvidence?: boolean;
 }
 
@@ -33,9 +39,10 @@ const EXPLANATION_RE = /^(解释|说明|介绍|讲一下|说一下|为什么|怎
 const NAME_LOOKUP_RE = /(叫啥|叫什么|名字|名称|是哪一个|叫作|叫做)/iu;
 const LOCAL_READ_RE = /(看一看|看一下|看一眼|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|目录|文件夹|子目录|工作目录|当前目录|本地目录|项目结构|仓库结构|读一下|读取|打开.*文件|搜索|搜一下|查找|grep|rg\b|ls\b|dir\b|get-childitem)/iu;
 const LOCAL_TARGET_RE = /(本地|工作目录|当前目录|目录|文件夹|文件|项目|仓库|路径|Game|Assets|Packages|ProjectSettings|\.md|\.json|\.txt|\.ts|\.tsx|\.cs|\.prefab|\.unity)/iu;
-const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+|截图|截个图|截一张|图片|图像|场景|节点|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
-const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|图片|图像|文件|文档|上传|下载|game\s*view|scene\s*view)/iu;
+const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+|截图|截个图|截一张|场景|节点|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码)/iu;
+const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|文件|文档|上传|下载|game\s*view|scene\s*view|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码)/iu;
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
+const INPUT_ARTIFACT_ACTION_RE = /(生成|创建|导出|保存|截图|截个图|截一张|上传|下载|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码|写入|修改|替换)/iu;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
 const EXPLICIT_INCOMPLETE_REPLY_RE = /(未完成|没有拿到|没拿到|未能|无法|不能|不可用|阻塞|失败|报错|错误|找不到|不存在|未执行|已拒绝)/i;
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
@@ -122,7 +129,7 @@ export function classifyToolResultQuality(content: unknown, isError?: boolean): 
 
 function shouldRequireStrictToolEvidence(kind: ExecutionRequirementKind, families: string[]): boolean {
   if (kind === 'none') return false;
-  if (kind === 'artifact_required' || kind === 'local_read_required') return true;
+  if (kind === 'input_evidence_required' || kind === 'artifact_required' || kind === 'local_read_required') return true;
   return families.some((family) => STRICT_EVIDENCE_FAMILIES.has(family));
 }
 
@@ -130,11 +137,16 @@ function makeExecutionRequirement(
   kind: ExecutionRequirementKind,
   reason: string,
   requiredToolFamilies: string[],
+  inputEvidence?: { kinds: InputEvidenceKind[]; ids: string[] },
 ): ExecutionRequirement {
   return {
     kind,
     reason,
     requiredToolFamilies,
+    ...(inputEvidence ? {
+      requiredInputEvidenceKinds: inputEvidence.kinds,
+      requiredInputEvidenceIds: inputEvidence.ids,
+    } : {}),
     strictToolEvidence: shouldRequireStrictToolEvidence(kind, requiredToolFamilies),
   };
 }
@@ -184,10 +196,34 @@ function classifyExecutionRequirementInternal(
   options: { respectStrictToolRouting: boolean },
 ): ExecutionRequirement {
   const text = (input.userText || '').trim();
-  if (!text) return NONE_REQUIREMENT;
 
   if (isFeishuStickerMessageKind(input.messageKind) || isGeneratedFeishuStickerSemanticEvent(text)) {
     return NONE_REQUIREMENT;
+  }
+
+  const inputEvidence = describeInputEvidence(input.files);
+  const imageEvidence = inputEvidence.filter((item) => item.kind === 'image');
+  if (!text && imageEvidence.length === 0) return NONE_REQUIREMENT;
+
+  if (imageEvidence.length > 0 && INPUT_ARTIFACT_ACTION_RE.test(text)) {
+    return makeExecutionRequirement(
+      'artifact_required',
+      'request asks to create or modify an output artifact from structured input evidence',
+      inferToolFamilies(text, input.files),
+    );
+  }
+
+  const asksForExternalExecution = TOOL_REQUIRED_RE.test(text) || (TOOL_DOMAIN_RE.test(text) && INSPECTION_ACTION_RE.test(text));
+  if (imageEvidence.length > 0 && !asksForExternalExecution) {
+    return makeExecutionRequirement(
+      'input_evidence_required',
+      'request depends on provider-accepted structured input evidence',
+      [],
+      {
+        kinds: ['image'],
+        ids: imageEvidence.map((item) => item.id),
+      },
+    );
   }
 
   if (input.memoryPlan?.intent === 'explicit_recall') {
@@ -272,6 +308,19 @@ function inferToolFamilies(text: string, files?: FileAttachment[]): string[] {
 
 export function buildExecutionRequirementPrompt(requirement: ExecutionRequirement): string {
   if (requirement.kind === 'none') return '';
+  if (requirement.kind === 'input_evidence_required') {
+    const kinds = requirement.requiredInputEvidenceKinds?.join(', ') || 'input';
+    const ids = requirement.requiredInputEvidenceIds?.join(', ') || 'unknown';
+    return [
+      'Structured input evidence requirement for this turn:',
+      `- Requirement: ${requirement.kind}.`,
+      `- Reason: ${requirement.reason}.`,
+      `- Required input evidence kinds: ${kinds}.`,
+      `- Required input evidence IDs: ${ids}.`,
+      '- Base the answer on the attached evidence actually supplied to this provider.',
+      '- If the input evidence is unavailable or unreadable, reply with "未完成：" and the concrete input blocker instead of guessing from filenames or history.',
+    ].join('\n');
+  }
   const families = requirement.requiredToolFamilies.length
     ? requirement.requiredToolFamilies.join(', ')
     : 'appropriate tool';
@@ -298,6 +347,14 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
 }
 
 export function buildNoEvidenceRetryPrompt(requirement: ExecutionRequirement): string {
+  if (requirement.kind === 'input_evidence_required') {
+    return [
+      'The previous attempt did not confirm provider acceptance of the required structured input evidence.',
+      `Required input evidence IDs: ${(requirement.requiredInputEvidenceIds || []).join(', ') || 'unknown'}.`,
+      'Retry with a provider that supports the required input evidence. Do not infer content from filenames, metadata, memory, or nearby messages.',
+      'If the input cannot be accepted, reply only with "未完成：" and the concrete input blocker.',
+    ].join('\n');
+  }
   return [
     'No successful tool result was detected in the previous attempt.',
     `This request still requires execution evidence: ${requirement.kind}.`,
@@ -352,8 +409,22 @@ function hasRequiredToolFamilyEvidence(
 
 export function isExecutionEvidenceSatisfied(
   requirement: ExecutionRequirement,
-  evidence: { successfulToolResultCount: number; toolNames?: string[] },
+  evidence: {
+    successfulToolResultCount: number;
+    toolNames?: string[];
+    acceptedInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: InputEvidenceKind[];
+  },
 ): boolean {
+  if (requirement.kind === 'input_evidence_required') {
+    const acceptedIds = new Set(evidence.acceptedInputEvidenceIds || []);
+    const acceptedKinds = new Set(evidence.acceptedInputEvidenceKinds || []);
+    const requiredIds = requirement.requiredInputEvidenceIds || [];
+    const requiredKinds = requirement.requiredInputEvidenceKinds || [];
+    return requiredIds.length > 0
+      && requiredIds.every((id) => acceptedIds.has(id))
+      && requiredKinds.every((kind) => acceptedKinds.has(kind));
+  }
   if (!requiresSuccessfulToolEvidence(requirement)) return true;
   return hasRequiredToolFamilyEvidence(requirement, evidence);
 }
@@ -378,13 +449,18 @@ function ctiFinalDeclaresArtifacts(responseText: string): boolean {
 
 export function shouldReplaceWithNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
-  evidence: { toolResultCount: number; successfulToolResultCount: number },
+  evidence: {
+    toolResultCount: number;
+    successfulToolResultCount: number;
+    acceptedInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: InputEvidenceKind[];
+  },
   responseText: string,
 ): boolean {
   if (!requiresSuccessfulToolEvidence(requirement)) return false;
   if (isExecutionEvidenceSatisfied(requirement, evidence)) return false;
 
-  if (ctiFinalDeclaresArtifacts(responseText)) {
+  if (requirement.kind !== 'input_evidence_required' && ctiFinalDeclaresArtifacts(responseText)) {
     return false;
   }
 
@@ -401,8 +477,26 @@ export function shouldReplaceWithNoExecutionEvidenceText(
 
 export function buildNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
-  evidence: { toolUseCount: number; toolResultCount: number; successfulToolResultCount: number; toolNames: string[]; failedToolErrors?: string[] },
+  evidence: {
+    toolUseCount: number;
+    toolResultCount: number;
+    successfulToolResultCount: number;
+    toolNames: string[];
+    failedToolErrors?: string[];
+    acceptedInputEvidenceIds?: string[];
+    acceptedInputEvidenceKinds?: InputEvidenceKind[];
+    inputEvidenceProvider?: string;
+  },
 ): string {
+  if (requirement.kind === 'input_evidence_required') {
+    return [
+      '未完成：本轮模型执行没有确认接收到所需输入证据。',
+      `证据要求：${requirement.kind}`,
+      `需要的输入证据：${(requirement.requiredInputEvidenceIds || []).join('、') || '未记录'}`,
+      `已接收输入证据：${(evidence.acceptedInputEvidenceIds || []).join('、') || '0'}`,
+      `Provider：${evidence.inputEvidenceProvider || '未确认'}`,
+    ].join('\n');
+  }
   const lines = [
     '未完成：本轮没有检测到真实工具执行成功记录。',
     `证据要求：${requirement.kind}`,

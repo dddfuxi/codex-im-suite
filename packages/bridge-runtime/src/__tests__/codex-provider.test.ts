@@ -73,6 +73,10 @@ describe('CodexProvider', () => {
       sessionId: 'priority-context-session',
       systemPrompt: 'x'.repeat(5_000),
       priorityTurnContext: priorityEvidence,
+      conversationHistory: [
+        { role: 'user', content: '无关旧问题' },
+        { role: 'assistant', content: '无关旧回答' },
+      ],
     });
 
     assert.match(prompt, /Current turn context evidence/);
@@ -80,6 +84,10 @@ describe('CodexProvider', () => {
     assert.ok(
       prompt.indexOf('Current turn context evidence:') < prompt.indexOf('Current user request:'),
       '本轮上下文必须在当前请求之前提供给模型',
+    );
+    assert.ok(
+      prompt.indexOf('Conversation context:') < prompt.indexOf('Current turn context evidence:'),
+      '普通历史必须位于结构化本轮焦点之前，避免旧对话覆盖 reply 焦点',
     );
   });
 
@@ -678,6 +686,96 @@ describe('CodexProvider', () => {
     }
   });
 
+  it('runs classifier turns in an isolated tool-disabled Codex client', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+    let classifierClientOptions: Record<string, any> | undefined;
+    let threadOptions: Record<string, unknown> | undefined;
+    let turnOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: Record<string, unknown>) => {
+        turnOptions = options;
+        return {
+          events: (async function* () {
+            yield { type: 'item.completed', item: { type: 'agent_message', text: '{"focus":"current_request"}' } };
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        };
+      },
+    };
+    class MockCodex {
+      constructor(options: Record<string, any>) {
+        classifierClientOptions = options;
+      }
+      startThread(options: Record<string, unknown>) {
+        threadOptions = options;
+        return mockThread;
+      }
+    }
+    (provider as any).sdk = { Codex: MockCodex };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    await collectStream(provider.streamChat({
+      prompt: '只裁决 evidence',
+      sessionId: 'classifier-codex-session',
+      interactionMode: 'classifier',
+      responseSchema: { type: 'object', required: ['focus'] },
+      workingDirectory: 'C:\\dangerous-workspace',
+      additionalDirectories: ['D:\\extra'],
+      permissionMode: 'acceptEdits',
+      abortController: new AbortController(),
+    }));
+
+    assert.equal(classifierClientOptions?.config?.features?.shell_tool, false);
+    assert.equal(classifierClientOptions?.config?.features?.plugins, false);
+    assert.equal(threadOptions?.sandboxMode, 'read-only');
+    assert.equal(threadOptions?.approvalPolicy, 'untrusted');
+    assert.equal(threadOptions?.networkAccessEnabled, false);
+    assert.equal(threadOptions?.webSearchMode, 'disabled');
+    assert.equal(Object.hasOwn(threadOptions || {}, 'workingDirectory'), false);
+    assert.equal(Object.hasOwn(threadOptions || {}, 'additionalDirectories'), false);
+    assert.deepEqual(turnOptions?.outputSchema, { type: 'object', required: ['focus'] });
+    assert.ok(turnOptions?.signal instanceof AbortSignal);
+  });
+
+  it('rejects any tool event that leaks into a classifier turn', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: {
+              type: 'command_execution',
+              id: 'cmd-1',
+              command: 'echo should-not-run',
+              aggregated_output: 'unexpected',
+              exit_code: 0,
+            },
+          };
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+    (provider as any).classifierCodex = { startThread: () => mockThread };
+
+    const chunks = await collectStream(provider.streamChat({
+      prompt: '只分类',
+      sessionId: 'classifier-tool-guard',
+      interactionMode: 'classifier',
+      responseSchema: { type: 'object' },
+      abortController: new AbortController(),
+    }));
+    const events = parseSSEChunks(chunks);
+
+    assert.equal(events.some((event) => event.type === 'tool_use'), false);
+    assert.ok(events.some((event) => event.type === 'error' && /forbidden tool/i.test(event.data)));
+  });
+
   it('reuses the in-memory Codex thread even when the stored model is Claude-like', async () => {
     const oldResume = process.env.CTI_CODEX_RESUME_THREADS;
     process.env.CTI_CODEX_RESUME_THREADS = 'true';
@@ -1031,6 +1129,7 @@ describe('CodexProvider image input', () => {
         capturedInput = input;
         return {
           events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'thread-image-input' };
             yield { type: 'turn.completed', usage: { input_tokens: 0, output_tokens: 0 } };
           })(),
         };
@@ -1046,13 +1145,14 @@ describe('CodexProvider image input', () => {
     // Use valid base64 (1x1 red PNG pixel)
     const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
 
+    const imageFile = makeFile('image/png', pngBase64, 'test.png');
     const stream = provider.streamChat({
       prompt: 'Describe this image',
       sessionId: 'img-session',
-      files: [makeFile('image/png', pngBase64, 'test.png')],
+      files: [imageFile],
     });
 
-    await collectStream(stream);
+    const events = parseSSEChunks(await collectStream(stream));
 
     assert.ok(Array.isArray(capturedInput), 'Input should be an array for image input');
     const parts = capturedInput as Array<Record<string, string>>;
@@ -1063,6 +1163,18 @@ describe('CodexProvider image input', () => {
     assert.match(parts[0].text, /Current user request:\nDescribe this image$/);
     assert.equal(parts[1].type, 'local_image');
     assert.ok(parts[1].path.endsWith('.png'), 'Temp file should have .png extension');
+
+    const receiptStatus = events
+      .filter((event) => event.type === 'status')
+      .map((event) => JSON.parse(event.data) as Record<string, any>)
+      .find((data) => data.inputEvidence?.protocol === 'cti-input-evidence/v1');
+    assert.ok(receiptStatus, 'Provider should emit a structured input evidence receipt');
+    assert.equal(receiptStatus.inputEvidence.provider, 'codex');
+    assert.deepEqual(receiptStatus.inputEvidence.accepted, [{
+      id: imageFile.id,
+      kind: 'image',
+      mediaType: 'image/png',
+    }]);
   });
 
   it('passes plain string when no images attached', async () => {
