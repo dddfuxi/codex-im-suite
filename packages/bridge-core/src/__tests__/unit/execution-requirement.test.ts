@@ -180,6 +180,126 @@ describe('execution requirement classifier', () => {
         family: 'unity-mcp',
       },
       {
+        text: '根据这张截图通过 Blender 查看当前模型',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，当前场景里的对象也看一下',
+        family: 'unity-mcp',
+      },
+      {
+        text: '根据这张截图诊断 MCP 当前连接状态',
+        family: 'mcp',
+      },
+      {
+        text: '先分析截图，再查看不同 Unity 当前场景对象',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不要改图但请用 Unity 检查当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，用 Unity 检查当前场景但不要修改图片',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图但不要修改图片而是通过 Blender 重建模型',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，不修改图片却要用 Unity 检查当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不修改图片而要通过 Blender 重建模型',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，不处理 Blender 模型同时检查 MCP 当前连接状态',
+        family: 'mcp',
+      },
+      {
+        text: '先分析截图，不修改图片并且用 Unity 检查当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不要修改图片然后用 Unity 检查当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不用 Unity 改由 Blender 重建模型',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，不处理 Blender 模型接着查询 MCP 当前状态',
+        family: 'mcp',
+      },
+      {
+        text: '先分析截图，不要修改图片随后通过 Blender 重建模型',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，不得不用 Unity 检查当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不能不用 Unity 查看当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把不需要的 Unity 场景对象删除',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把未使用的 Blender 模型删除',
+        family: 'blender',
+      },
+      {
+        text: '先分析截图，对不可见的 Unity 场景对象进行修改',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把不是当前场景的 Unity 对象列出来',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，对 Unity 里未激活的场景对象进行检查',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把没有必要保留的 Unity 场景对象删除',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把没有必要修改的 Unity 场景对象删除',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，把不需要检查的 Unity 场景对象列出来',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不需要修改图片而是用 Unity 检查当前场景的对象',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，不需要改图，但用 Unity 查看当前场景的对象',
+        family: 'unity-mcp',
+      },
+      {
+        text: '先分析截图，没有必要处理 Blender，同时检查 MCP 连接的状态',
+        family: 'mcp',
+      },
+      {
+        text: '分析截图后在 Blender 里修一下模型',
+        family: 'blender',
+      },
+      {
+        text: '分析截图后在 Blender 里处理一下模型',
+        family: 'blender',
+      },
+      {
         text: '分析截图后通过 Blender 重建这个模型',
         family: 'blender',
       },
@@ -200,6 +320,56 @@ describe('execution requirement classifier', () => {
 
       assert.notEqual(requirement.kind, 'input_evidence_required', testCase.text);
       assert.ok(requirement.requiredToolFamilies.includes(testCase.family), testCase.text);
+    }
+  });
+
+  it('keeps Unity or Blender names inside screenshot analysis as read-only input evidence', () => {
+    const prompts = [
+      '检查一下这张 Unity 截图里的报错',
+      '查看这张 Unity 截图里的报错',
+      '读取这张 Unity 截图里的文字',
+      '看看这张 Blender 截图哪里错了',
+      '分析这张 Scene View 截图里的构图',
+      '诊断这张 Game View 截图反映的当前状态',
+      '分析这张 MCP 截图里的连接错误',
+      '看看这张 Unity 截图，不用 Unity，只分析截图内容',
+      '只分析截图，不要修改 Unity 模型',
+      '看看截图，不处理 Blender 模型',
+      '不要用 Unity 查看当前场景，只分析这张截图',
+      '不要再用 Unity，只分析截图',
+      '别再调用 Blender，只分析截图',
+      '分析这张当前场景截图里的布局',
+      '看看这张场景里的对象截图哪里有问题',
+      '分析这张截图里的当前场景布局',
+      '不能用 Unity 查看当前场景，只分析这张截图',
+      '不需要用 Unity 检查当前场景，只分析截图',
+      '无法用 Blender 修改模型，只分析截图',
+      '我不想用 Unity 检查当前场景，只分析截图',
+      '我不打算调用 Blender 修改模型，只分析截图',
+      '没有必要用 MCP 查询当前状态，只分析截图',
+      '不要在 Unity 里查看当前场景，只分析这张截图',
+      '我不想让 Blender 修改模型，只分析截图',
+      '不需要借助 MCP 查询当前连接状态，只分析截图',
+      '无法从 Unity 获取当前场景，只分析截图',
+      '禁止对 Blender 模型进行修改，只分析截图',
+      '无需在 Unity 当前场景中删除对象，只分析截图',
+    ];
+
+    for (const userText of prompts) {
+      const requirement = classifyExecutionRequirement({
+        userText,
+        workingDirectory: 'C:\\workspace',
+        files: [{
+          id: 'screenshot-1',
+          name: 'reference.png',
+          type: 'image/png',
+          size: 128,
+          data: 'aW1hZ2U=',
+        }],
+      });
+
+      assert.equal(requirement.kind, 'input_evidence_required', userText);
+      assert.equal(requirement.requiredToolFamilies.length, 0, userText);
     }
   });
 

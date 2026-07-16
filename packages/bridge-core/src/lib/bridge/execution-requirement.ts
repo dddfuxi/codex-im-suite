@@ -44,7 +44,18 @@ const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|文
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
 const INPUT_ARTIFACT_ACTION_RE = /(生成|创建|导出|保存|截个图|截一张|上传|下载|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码|写入|修改|替换)/iu;
 const READ_ONLY_IMAGE_ANALYSIS_RE = /(分析|总结|识别|查看|看看|看一下|看一眼|解释|读取|提取|判断|检查|诊断).{0,24}(?:图片|图像|照片|截图|画面|附件)|(?:图片|图像|照片|截图|画面|附件).{0,24}(?:分析|总结|识别|查看|看看|解释|读取|提取|判断|检查|诊断)/iu;
-const EXPLICIT_EXTERNAL_TOOL_ACTION_RE = /(?:(?:修复|修改|重建|创建|删除|检查|查看|看看|查询|列出|读取|获取|扫描|运行|执行|启动|停止|重启|导入|导出).{0,32}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景里的(?:对象|节点|组件))|(?:用|使用|通过|调用|连接到?)?.{0,4}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景).{0,32}(?:修复|修改|重建|创建|删除|检查|查看|看看|查询|列出|读取|获取|扫描|运行|执行|启动|停止|重启|导入|导出))/iu;
+const EXTERNAL_MUTATION_ACTION_RE = /(?:(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出).{0,32}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出))/iu;
+const EXTERNAL_READ_STATE_RE = /(?:(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索).{0,32}(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索))/iu;
+const EXPLICIT_EXTERNAL_READ_INVOCATION_RE = /(?:用|使用|通过|调用|连接到?)\s*(?:unity(?:\s*mcp)?|blender|mcp).{0,32}(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索)|(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索).{0,32}(?:用|使用|通过|调用|连接到?)\s*(?:unity(?:\s*mcp)?|blender|mcp)/iu;
+const ACTION_SIGNAL_GLOBAL_RE = /(?:使用|通过|调用|连接到?|修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出|生成|保存|编辑|标注|圈出|裁剪|转换|分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索|用)/giu;
+const LOCAL_NEGATION_MODAL_RE = /(?:不要|不必|不能|不需要|不想|不打算|不准备|不希望|不考虑|不是|无法|没法|没有必要|不可|不允许|别|无需|无须|禁止|勿)/u;
+const DIRECT_NEGATION_PREFIX_RE = /不(?:\s|再|继续|直接|实际|真的|立即|现在|重新|尝试)*$/u;
+const DOUBLE_NEGATION_SCOPE_RE = /(?:不得不|不能不|不是不|不可能不)/u;
+const NEGATED_TARGET_ATTRIBUTE_RE = /(?:不需要|不可见|不是|没有必要|未(?:使用|激活|启用|加载|选择|保存|处理|修改|删除|检查|查看|完成|采用|配置|绑定)).{0,24}?的/giu;
+const EXTERNAL_TARGET_LABEL_RE = /(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)?)/iu;
+const ACTION_SCOPE_RESET_RE = /(?:[，,。；;！？!?\n]+|但(?:是)?|不过|然而|而是|而要|却(?:要)?|同时|并且|以及|转而|只是|然后|随后|接着|继而|改由|改为)/u;
+const SCREENSHOT_SUFFIX_EXTERNAL_LABEL_RE = /(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)?)(?:\s*的)?\s*截图/giu;
+const SCREENSHOT_PREFIX_EXTERNAL_LABEL_RE = /截图(?:里|里的|中|中的|所示的)\s*(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)?)/giu;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
 const EXPLICIT_INCOMPLETE_REPLY_RE = /(未完成|没有拿到|没拿到|未能|无法|不能|不可用|阻塞|失败|报错|错误|找不到|不存在|未执行|已拒绝)/i;
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
@@ -193,6 +204,54 @@ function isGeneratedFeishuStickerSemanticEvent(text: string): boolean {
     && /(尚未标注语义|已记录语义)/u.test(text);
 }
 
+function normalizeAffirmativeActionText(text: string): string {
+  const screenshotNormalized = text
+    .replace(SCREENSHOT_SUFFIX_EXTERNAL_LABEL_RE, '截图')
+    .replace(SCREENSHOT_PREFIX_EXTERNAL_LABEL_RE, '截图');
+  const actionSource = screenshotNormalized
+    .split(ACTION_SCOPE_RESET_RE)
+    .map((segment) => segment.replace(NEGATED_TARGET_ATTRIBUTE_RE, (attribute) => (
+      attribute.match(EXTERNAL_TARGET_LABEL_RE)?.[0] || ''
+    )))
+    .join('\n');
+
+  // 逐动作维护局部极性：否定可覆盖紧随动作，转向后重置，双重否定恢复为肯定。
+  let normalized = '';
+  let cursor = 0;
+  let previousActionEnd = 0;
+  let inheritedNegation: boolean = false;
+
+  for (const match of actionSource.matchAll(ACTION_SIGNAL_GLOBAL_RE)) {
+    const action = match[0];
+    const offset = match.index ?? 0;
+    const betweenActions = actionSource.slice(previousActionEnd, offset);
+    if (ACTION_SCOPE_RESET_RE.test(betweenActions)) inheritedNegation = false;
+
+    const localScope = (betweenActions.split(ACTION_SCOPE_RESET_RE).at(-1) || '')
+      .replace(NEGATED_TARGET_ATTRIBUTE_RE, '');
+    const doubleNegation = DOUBLE_NEGATION_SCOPE_RE.test(localScope);
+    const localNegation = !doubleNegation
+      && (LOCAL_NEGATION_MODAL_RE.test(localScope) || DIRECT_NEGATION_PREFIX_RE.test(localScope));
+    const actionNegated: boolean = doubleNegation ? false : localNegation || inheritedNegation;
+
+    normalized += actionSource.slice(cursor, offset);
+    if (!actionNegated) normalized += action;
+    cursor = offset + action.length;
+    previousActionEnd = cursor;
+    inheritedNegation = actionNegated;
+  }
+
+  normalized += actionSource.slice(cursor);
+  return normalized.replace(new RegExp(ACTION_SCOPE_RESET_RE.source, 'gu'), '\n');
+}
+
+function hasExplicitExternalToolAction(actionText: string): boolean {
+  // 只对肯定动作判断：截图标签和否定子句已在统一归一化入口剥离。
+  return EXTERNAL_MUTATION_ACTION_RE.test(actionText)
+    || EXTERNAL_READ_STATE_RE.test(actionText)
+    || EXPLICIT_EXTERNAL_READ_INVOCATION_RE.test(actionText);
+}
+
 function classifyExecutionRequirementInternal(
   input: ExecutionRequirementInput,
   options: { respectStrictToolRouting: boolean },
@@ -205,9 +264,10 @@ function classifyExecutionRequirementInternal(
 
   const inputEvidence = describeInputEvidence(input.files);
   const imageEvidence = inputEvidence.filter((item) => item.kind === 'image');
+  const affirmativeActionText = normalizeAffirmativeActionText(text);
   if (!text && imageEvidence.length === 0) return NONE_REQUIREMENT;
 
-  if (imageEvidence.length > 0 && INPUT_ARTIFACT_ACTION_RE.test(text)) {
+  if (imageEvidence.length > 0 && INPUT_ARTIFACT_ACTION_RE.test(affirmativeActionText)) {
     return makeExecutionRequirement(
       'artifact_required',
       'request asks to create or modify an output artifact from structured input evidence',
@@ -218,7 +278,7 @@ function classifyExecutionRequirementInternal(
   if (
     imageEvidence.length > 0
     && READ_ONLY_IMAGE_ANALYSIS_RE.test(text)
-    && !EXPLICIT_EXTERNAL_TOOL_ACTION_RE.test(text)
+    && !hasExplicitExternalToolAction(affirmativeActionText)
   ) {
     return makeExecutionRequirement(
       'input_evidence_required',
