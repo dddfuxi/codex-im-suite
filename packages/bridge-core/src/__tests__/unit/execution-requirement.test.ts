@@ -169,6 +169,40 @@ describe('execution requirement classifier', () => {
     assert.equal(requirement.requiredToolFamilies.length, 0);
   });
 
+  it('keeps explicit Unity or Blender follow-up actions above read-only screenshot analysis', () => {
+    const cases = [
+      {
+        text: '先分析这张截图，再用 Unity 修复当前场景',
+        family: 'unity-mcp',
+      },
+      {
+        text: '根据这张截图检查 Unity 当前场景里的对象',
+        family: 'unity-mcp',
+      },
+      {
+        text: '分析截图后通过 Blender 重建这个模型',
+        family: 'blender',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const requirement = classifyExecutionRequirement({
+        userText: testCase.text,
+        workingDirectory: 'C:\\workspace',
+        files: [{
+          id: 'screenshot-1',
+          name: 'reference.png',
+          type: 'image/png',
+          size: 128,
+          data: 'aW1hZ2U=',
+        }],
+      });
+
+      assert.notEqual(requirement.kind, 'input_evidence_required', testCase.text);
+      assert.ok(requirement.requiredToolFamilies.includes(testCase.family), testCase.text);
+    }
+  });
+
   it('keeps image editing and output requests behind artifact evidence', () => {
     const requirement = classifyExecutionRequirement({
       userText: '把这张图里的重点圈出来并保存成一张新图',

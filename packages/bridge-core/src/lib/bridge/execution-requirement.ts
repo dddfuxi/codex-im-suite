@@ -44,6 +44,7 @@ const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|文
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
 const INPUT_ARTIFACT_ACTION_RE = /(生成|创建|导出|保存|截个图|截一张|上传|下载|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码|写入|修改|替换)/iu;
 const READ_ONLY_IMAGE_ANALYSIS_RE = /(分析|总结|识别|查看|看看|看一下|看一眼|解释|读取|提取|判断|检查|诊断).{0,24}(?:图片|图像|照片|截图|画面|附件)|(?:图片|图像|照片|截图|画面|附件).{0,24}(?:分析|总结|识别|查看|看看|解释|读取|提取|判断|检查|诊断)/iu;
+const EXPLICIT_EXTERNAL_TOOL_ACTION_RE = /(?:(?:修复|修改|重建|创建|删除|检查|查看|看看|查询|列出|读取|获取|扫描|运行|执行|启动|停止|重启|导入|导出).{0,32}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景里的(?:对象|节点|组件))|(?:用|使用|通过|调用|连接到?)?.{0,4}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景).{0,32}(?:修复|修改|重建|创建|删除|检查|查看|看看|查询|列出|读取|获取|扫描|运行|执行|启动|停止|重启|导入|导出))/iu;
 const NEGATIVE_EXECUTION_RESULT_RE = /(未完成|失败|无法|不能|没有|未能|不可用|阻塞|报错|错误|找不到|不存在|未执行|已拒绝|exitCode|exited with code)/i;
 const EXPLICIT_INCOMPLETE_REPLY_RE = /(未完成|没有拿到|没拿到|未能|无法|不能|不可用|阻塞|失败|报错|错误|找不到|不存在|未执行|已拒绝)/i;
 const INSPECTION_ACTION_RE = /(看一下|看一眼|看看|查看|查询|列出|列一下|查找|搜索|找|总结|统计|读取|获取|扫描|盘点|有[^，。；\n]*组件|组件|物体|对象|节点|层级|hierarchy)/iu;
@@ -214,7 +215,11 @@ function classifyExecutionRequirementInternal(
     );
   }
 
-  if (imageEvidence.length > 0 && READ_ONLY_IMAGE_ANALYSIS_RE.test(text)) {
+  if (
+    imageEvidence.length > 0
+    && READ_ONLY_IMAGE_ANALYSIS_RE.test(text)
+    && !EXPLICIT_EXTERNAL_TOOL_ACTION_RE.test(text)
+  ) {
     return makeExecutionRequirement(
       'input_evidence_required',
       'request depends on provider-accepted structured input evidence',
