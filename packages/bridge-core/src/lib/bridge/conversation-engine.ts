@@ -40,6 +40,15 @@ import { getAgentPolicyPromptLines } from './agent-architecture.js';
 import { createBridgeMemoryArtifactStore } from './memory-artifact-store.js';
 import { composePromptSections, type ComposedBridgePrompt, type PromptSection } from './prompt-composer.js';
 import { createPromptSnapshot } from './prompt-snapshot.js';
+import {
+  extractFeishuCliUserAuthorizationChallenge,
+  type FeishuCliUserAuthorizationChallenge,
+} from './feishu-cli-user-auth.js';
+import {
+  formatTurnWorkspacePlanPrompt,
+  resolveTurnWorkspacePlan,
+  type TurnWorkspacePlan,
+} from './workspace-plan.js';
 
 export interface PermissionRequestInfo {
   permissionRequestId: string;
@@ -102,6 +111,7 @@ export interface ConversationResult {
     acceptedInputEvidenceKinds?: InputEvidenceKind[];
     acceptedInputEvidenceIds?: string[];
     inputEvidenceProvider?: string;
+    feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
   };
 }
 
@@ -202,6 +212,7 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
     permissionRequestCount: 0,
     acceptedInputEvidenceKinds: [],
     acceptedInputEvidenceIds: [],
+    feishuCliUserAuthorizationChallenges: [],
     ...(requirement ? {
       requiredEvidenceKind: requirement.kind,
       evidenceSatisfied: requirement.kind === 'none',
@@ -270,29 +281,14 @@ function buildBridgeScopedPrompt(
   binding: ChannelBinding,
   baseSystemPrompt?: string,
   leadingSections: readonly PromptSection[] = [],
+  workspacePlan?: TurnWorkspacePlan,
 ): ComposedBridgePrompt {
   const { store } = getBridgeContext();
-  const additionalDirectories = splitWorkspacePathList(store.getSetting('bridge_default_additional_directories'));
-  const allowedWorkspaceRoots = splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
-  const workspaceLines = [
-    `- Primary working directory for this turn: ${binding.workingDirectory || '(unset)'}`,
-  ];
-  if (additionalDirectories.length > 0) {
-    workspaceLines.push(`- Additional accessible directories: ${additionalDirectories.join(' | ')}`);
-  }
-  if (allowedWorkspaceRoots.length > 0) {
-    workspaceLines.push(`- Allowed workspace roots for edits: ${allowedWorkspaceRoots.join(' | ')}`);
-    workspaceLines.push('- If the user specifies a project under an allowed root, operate there via absolute paths or an explicit repo/path switch. Do not edit paths outside those roots.');
-  }
-  if (store.getSetting('bridge_self_optimize_on_failure') === 'true') {
-    workspaceLines.push('- If the user is trying to make the bridge/tooling gain a missing capability, and the relevant code lives inside an allowed workspace, prefer a minimal safe implementation or repair instead of only refusing.');
-  }
 
   const bridgeGuardrails = [
     'Bridge channel context (authoritative):',
     `- Current inbound channel: ${binding.channelType}`,
     `- Current inbound chatId: ${binding.chatId}`,
-    ...workspaceLines,
     '- This turn originated from the inbound chat above. Treat it as the only current chat unless the user explicitly provides another target chat ID or asks for cross-chat forwarding.',
     '- If the user says "发到当前对话"、"发到这里"、"发到这个聊天"、"回这个会话"，it refers to the inbound chat above, not the desktop terminal conversation.',
     '- Normal text replies, generated local image paths, and document-generation replies from this turn are automatically delivered by the bridge back to the same inbound chat.',
@@ -324,24 +320,65 @@ function buildBridgeScopedPrompt(
     '- Direct-message action protocol: when a Feishu user explicitly asks you to privately/directly message an explicit person, the current sender (我/发起人/发送者), or a specific chat/session/group id, do not use Bash, PowerShell, temporary scripts, hand-written platform API calls, or ordinary text to fake the send. Instead output one fenced ```cti-direct-message JSON block with target or targetId, optional targetType ("user" or "chat"), and text. The bridge will resolve the target from Feishu context. Cross-chat/session-id sends are owner-only and the bridge will ask the owner to confirm the resolved name and id before sending.',
     '- If a Feishu user only asks whether you can private-message them, answer that bridge-managed private delivery is supported when there is a clear target and message content; ask for the missing content instead of saying the current configuration is unsupported.',
     '- Do not claim a private/direct/cross-chat message has been sent unless you used the cti-direct-message action protocol and the bridge reports success. If the target is not explicit or may match multiple people, ask for a direct @ mention, exact display name, exact chat name, or platform id.',
+    '- Bridge restart action protocol: only when the current user explicitly asks to restart the live Bridge, output one fenced ```cti-bridge-control JSON block with exactly {"action":"restart_live"}. Do not run shell commands or invent other control actions. The bridge enforces Owner permission and schedules the fixed restart after the current reply is delivered.',
+    '- Do not claim that the live Bridge was restarted or scheduled unless you used cti-bridge-control and the bridge reports success.',
   ].join('\n');
 
   return composePromptSections([
     ...leadingSections,
+    ...(workspacePlan ? [{
+      id: 'workspace.plan',
+      kind: 'execution' as const,
+      source: 'workspace.resolver',
+      priority: 15,
+      content: formatTurnWorkspacePlanPrompt(workspacePlan),
+    }] : []),
     { id: 'session.base', kind: 'base', source: 'session.system_prompt', priority: 40, content: baseSystemPrompt || '' },
     { id: 'bridge.policy', kind: 'policy', source: 'agent-architecture', priority: 50, content: bridgeGuardrails },
     { id: 'reply.style', kind: 'style', source: 'bridge.reply_style', priority: 60, content: buildReplyPresentationPrompt(getReplyStyleHintFromStore()) },
   ]);
 }
 
-function buildBridgeScopedSystemPrompt(binding: ChannelBinding, baseSystemPrompt?: string, extraSystemPrompt?: string): string {
+function buildBridgeScopedSystemPrompt(
+  binding: ChannelBinding,
+  baseSystemPrompt?: string,
+  extraSystemPrompt?: string,
+  workspacePlan?: TurnWorkspacePlan,
+): string {
   return buildBridgeScopedPrompt(binding, baseSystemPrompt, extraSystemPrompt?.trim() ? [{
     id: 'channel.extra',
     kind: 'identity',
     source: 'channel.extra_system_prompt',
     priority: 10,
     content: extraSystemPrompt,
-  }] : []).text;
+  }] : [], workspacePlan).text;
+}
+
+function isWorkspaceWriteTurn(text: string): boolean {
+  return MUTATING_COMMAND_RE.test(text)
+    || /(?:修改|编辑|写入|删除|移动|重命名|创建|生成|修复|更新|替换|保存|导出|发布|安装|重建)/u.test(text);
+}
+
+function resolveConversationWorkspacePlan(input: {
+  text: string;
+  workingDirectory?: string;
+  requiresWrite?: boolean;
+}): TurnWorkspacePlan {
+  const { store } = getBridgeContext();
+  const memoryRoot = store.getSetting('bridge_memory_repo_dir');
+  const uploadRoot = store.getSetting('bridge_upload_cache_dir');
+  return resolveTurnWorkspacePlan({
+    prompt: input.text,
+    currentWorkingDirectory: input.workingDirectory,
+    defaultWorkingDirectory: store.getSetting('bridge_default_work_dir') || input.workingDirectory,
+    registeredRoots: splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots')),
+    deniedRoots: [
+      ...(memoryRoot ? [{ path: memoryRoot, reason: 'memory repository' }] : []),
+      ...(uploadRoot ? [{ path: uploadRoot, reason: 'upload cache' }] : []),
+      { path: defaultCtiHome(), reason: 'bridge runtime data' },
+    ],
+    requiresWrite: input.requiresWrite ?? isWorkspaceWriteTurn(input.text),
+  });
 }
 
 function recordPromptSnapshotSafely(
@@ -709,6 +746,11 @@ export async function processMessage(
       messageKind: options?.messageKind,
       hasPreResolvedEvidence: options?.hasPreResolvedEvidence,
     });
+    const workspacePlan = resolveConversationWorkspacePlan({
+      text,
+      workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+      requiresWrite: isWorkspaceWriteTurn(text),
+    });
     const shouldRetrieveMemory = shouldRetrieveMemoryForTurn(
       options?.memoryMode || 'auto',
       executionRequirement,
@@ -721,7 +763,7 @@ export async function processMessage(
         chatId: binding.chatId,
         userId: options?.memoryUserId,
         userDisplayName: options?.memoryUserDisplayName,
-        workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+        workingDirectory: workspacePlan.primaryWorkspace.path,
         query: text,
         recentHistoryLimit: historyLimit,
       })
@@ -740,7 +782,7 @@ export async function processMessage(
     );
     const memoryPrompt = buildRetrievedMemoryPrompt(retrievedMemory, retrievedFeishuHistory, memoryPromptMaxChars);
     const executionRequirementPrompt = buildExecutionRequirementPrompt(executionRequirement);
-    const additionalDirectories = splitWorkspacePathList(store.getSetting('bridge_default_additional_directories'));
+    const additionalDirectories = workspacePlan.temporaryMounts.map((item) => item.path);
 
     const abortController = new AbortController();
     if (abortSignal) {
@@ -758,7 +800,7 @@ export async function processMessage(
         { id: 'memory.evidence', kind: 'memory', source: 'memory.retrieval', priority: 20, content: memoryPrompt },
         { id: 'execution.requirement', kind: 'execution', source: 'capability_router', priority: 30, content: executionRequirementPrompt },
         { id: 'execution.retry', kind: 'execution', source: 'capability_router.retry', priority: 31, content: retryPrompt },
-      ]);
+      ], workspacePlan);
       const snapshotSections = options?.priorityTurnContext?.trim()
         ? [...composedPrompt.sections, {
           id: 'priority.context',
@@ -783,8 +825,9 @@ export async function processMessage(
       model: effectiveModel,
       systemPrompt: composedPrompt.text,
       priorityTurnContext: options?.priorityTurnContext,
-      workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
+      workingDirectory: workspacePlan.primaryWorkspace.path,
       additionalDirectories,
+      workspacePlan,
       abortController,
       permissionMode,
       provider: resolvedProvider,
@@ -884,6 +927,7 @@ export async function processMessage(
 export const _testOnly = {
   buildBridgeScopedSystemPrompt,
   buildBridgeScopedPrompt,
+  resolveConversationWorkspacePlan,
   recordPromptSnapshotSafely,
   persistFileAttachmentsForHistory,
 };
@@ -918,6 +962,7 @@ async function consumeStream(
   let shouldRefreshSession = false;
   const executionEvidence = emptyExecutionEvidence(executionRequirement, noEvidenceRetryAttempted);
   const seenToolNames = new Set<string>();
+  const toolUsesById = new Map<string, { name: string; input: unknown }>();
   let assistantStorageContent = '';
   let assistantStorageTokenUsage: TokenUsage | null = null;
 
@@ -966,6 +1011,12 @@ async function consumeStream(
                 name: toolData.name,
                 input: toolData.input,
               });
+              if (typeof toolData.id === 'string' && toolData.id.trim()) {
+                toolUsesById.set(toolData.id, {
+                  name: String(toolData.name || ''),
+                  input: toolData.input,
+                });
+              }
               executionEvidence.toolUseCount += 1;
               const toolName = String(toolData.name || '').trim();
               if (toolName && !seenToolNames.has(toolName)) {
@@ -986,6 +1037,26 @@ async function consumeStream(
             try {
               const resultData = JSON.parse(event.data);
               const resultQuality = classifyToolResultQuality(resultData.content, resultData.is_error);
+              const matchingToolUse = toolUsesById.get(String(resultData.tool_use_id || ''));
+              if (matchingToolUse) {
+                const challenge = extractFeishuCliUserAuthorizationChallenge({
+                  toolUseId: String(resultData.tool_use_id || ''),
+                  toolName: matchingToolUse.name,
+                  toolInput: matchingToolUse.input,
+                  toolResultContent: resultData.content,
+                  toolResultIsError: !resultQuality.ok,
+                });
+                if (
+                  challenge
+                  && !(executionEvidence.feishuCliUserAuthorizationChallenges || [])
+                    .some((item) => item.toolUseId === challenge.toolUseId)
+                ) {
+                  executionEvidence.feishuCliUserAuthorizationChallenges = [
+                    ...(executionEvidence.feishuCliUserAuthorizationChallenges || []),
+                    challenge,
+                  ];
+                }
+              }
               const newBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,

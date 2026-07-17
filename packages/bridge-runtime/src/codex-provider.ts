@@ -18,6 +18,7 @@ import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } fr
 import { buildProviderInputEvidenceReceipt } from 'claude-to-im/src/lib/bridge/input-evidence.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { CTI_HOME } from './config.js';
+import { resolveProviderWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
 
 /** MIME → file extension for temp image files. */
@@ -718,8 +719,17 @@ export class CodexProvider implements LLMProvider {
             const modelOverride = getCodexModelOverride(profile);
             const sandboxMode = classifierMode ? 'read-only' : getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
-            const workingDirectory = classifierMode ? undefined : resolveWorkingDirectory(params.workingDirectory);
-            const additionalDirectories = classifierMode ? [] : normalizeAdditionalDirectories(params.additionalDirectories);
+            const providerWorkspace = classifierMode ? null : resolveProviderWorkspace(params);
+            const workingDirectory = classifierMode
+              ? undefined
+              : providerWorkspace?.source === 'workspace_plan'
+                ? providerWorkspace.workingDirectory
+                : resolveWorkingDirectory(params.workingDirectory);
+            const additionalDirectories = classifierMode
+              ? []
+              : providerWorkspace?.source === 'workspace_plan'
+                ? providerWorkspace.additionalDirectories
+                : normalizeAdditionalDirectories(params.additionalDirectories);
             const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
             const modelSource = profile === 'local_primary'
               ? 'local_api'

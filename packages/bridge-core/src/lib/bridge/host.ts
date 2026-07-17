@@ -9,6 +9,8 @@
 import type { ChannelAddress, ChannelBinding, ChannelType, OutboundMention } from './types.js';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
+import type { FeishuCliUserAuthorizationChallenge } from './feishu-cli-user-auth.js';
+import type { TurnWorkspacePlan } from './workspace-plan.js';
 import type {
   AgentTurnFocusDecisionInput,
   TurnEvidenceEnvelope,
@@ -190,6 +192,7 @@ export interface AnswerReviewInput {
     acceptedInputEvidenceKinds?: InputEvidenceKind[];
     acceptedInputEvidenceIds?: string[];
     inputEvidenceProvider?: string;
+    feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
   };
 }
 
@@ -452,6 +455,23 @@ export interface FeishuOAuthManualHost {
   handleManualCallbackText(input: FeishuOAuthManualCallbackInput): Promise<FeishuOAuthManualCallbackResult>;
 }
 
+// ── Host Interface: lark-cli shared user authorization ──────
+
+export interface FeishuCliUserAuthBeginInput extends FeishuOAuthManualResumeRequest {
+  challenge: FeishuCliUserAuthorizationChallenge;
+}
+
+export interface FeishuCliUserAuthBeginResult {
+  status: 'started' | 'reused' | 'error';
+  userMessage: string;
+  feishuCardJson?: string;
+  authorizationRequestId?: string;
+}
+
+export interface FeishuCliUserAuthHost {
+  beginAuthorization(input: FeishuCliUserAuthBeginInput): Promise<FeishuCliUserAuthBeginResult>;
+}
+
 // ── Host Interface: Settings ─────────────────────────────────
 
 export interface SettingsProvider {
@@ -694,6 +714,8 @@ export interface StreamChatParams {
   priorityTurnContext?: string;
   workingDirectory?: string;
   additionalDirectories?: string[];
+  /** 所有 Provider 和工具必须优先使用的本轮工作区计划。 */
+  workspacePlan?: TurnWorkspacePlan;
   abortController?: AbortController;
   permissionMode?: string;
   provider?: BridgeApiProvider;
@@ -775,6 +797,32 @@ export interface ReminderActionHost {
   createDirectReminder(input: DirectReminderCreateInput): Promise<DirectReminderCreateResult>;
   completeReminder?(input: ReminderCompleteInput): Promise<ReminderCompleteResult>;
   tickReminders?(): Promise<void>;
+}
+
+// ── Host Interface: Bridge Control ──────────────────────────
+
+export interface BridgeRestartRequest {
+  requestedBy: {
+    channelType: string;
+    chatId: string;
+    userId?: string;
+    messageId?: string;
+  };
+}
+
+export interface BridgeRestartScheduleResult {
+  ok: boolean;
+  scheduledFor?: string;
+  message?: string;
+  error?: string;
+}
+
+/**
+ * Runtime-owned control boundary. The core can request the single fixed
+ * restart operation, but it cannot pass shell commands or arbitrary args.
+ */
+export interface BridgeControlHost {
+  scheduleRestart(input: BridgeRestartRequest): Promise<BridgeRestartScheduleResult>;
 }
 
 // ── Host Interface: Extension Catalog Actions ────────────────

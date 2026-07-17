@@ -12,13 +12,18 @@ import {
   type KnowledgeKind,
   type KnowledgeSourceFile,
 } from './knowledge-indexer.js';
-import { isIndexableMemoryV2SourceFile, MEMORY_V2_RELATIVE_DIR } from './memory-source-policy.js';
+import {
+  isIndexableMemoryV2SourceFile,
+  MEMORY_V2_RELATIVE_DIR,
+  MEMORY_V3_RELATIVE_DIR,
+} from './memory-source-policy.js';
 import {
   buildMemoryGraphFromKnowledgeIndex,
   getMemoryGraphIndexPath,
   readMemoryGraphIndex,
   writeMemoryGraphIndex,
 } from './memory-graph.js';
+import { writeMemoryMasterIndex } from './agent-home.js';
 
 export interface KnowledgeIndexStatus {
   schema: 'codex-im-suite/knowledge-index-status/v1';
@@ -61,8 +66,6 @@ function shouldSkipDirectory(name: string): boolean {
 }
 
 function collectMarkdownFiles(root: string, limit = MAX_MARKDOWN_FILES): string[] {
-  const memoryV2Root = path.join(root, MEMORY_V2_RELATIVE_DIR);
-  if (!fs.existsSync(memoryV2Root)) return [];
   const files: string[] = [];
   const visit = (dir: string) => {
     if (files.length >= limit) return;
@@ -82,7 +85,15 @@ function collectMarkdownFiles(root: string, limit = MAX_MARKDOWN_FILES): string[
       if (files.length >= limit) return;
     }
   };
-  visit(memoryV2Root);
+  // 新可见布局优先，旧 v2 在迁移期继续只读索引。
+  for (const sourceRoot of [
+    path.join(root, MEMORY_V3_RELATIVE_DIR),
+    path.join(root, MEMORY_V2_RELATIVE_DIR),
+  ]) {
+    if (!fs.existsSync(sourceRoot)) continue;
+    visit(sourceRoot);
+    if (files.length >= limit) break;
+  }
   return files;
 }
 
@@ -178,6 +189,7 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
     files: sources,
   });
   writeKnowledgeIndex(root, index);
+  writeMemoryMasterIndex(root, index);
   const graph = buildMemoryGraphFromKnowledgeIndex(index);
   writeMemoryGraphIndex(root, graph);
   const status = makeStatus(root, {

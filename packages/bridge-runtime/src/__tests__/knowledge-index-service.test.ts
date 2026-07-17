@@ -64,6 +64,66 @@ describe('knowledge index service realtime status', () => {
     assert.equal(index.items.some((item) => item.text.includes('旧显式记忆')), false);
   });
 
+  it('indexes the visible v3 memory layout alongside legacy v2 sources', () => {
+    const userDir = path.join(tmpDir, 'memory', 'users', 'feishu', 'ou_user_1');
+    const legacyDir = path.join(tmpDir, 'data', 'memory', 'v2', 'long-term');
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(userDir, '用户印象.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v3',
+      'memoryScope: user',
+      'channelType: feishu',
+      'userId: ou_user_1',
+      '---',
+      '',
+      '| key | value |',
+      '| --- | --- |',
+      '| 回复偏好 | 使用中文 |',
+    ].join('\n'), 'utf-8');
+    fs.writeFileSync(path.join(legacyDir, 'legacy.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v2',
+      'memoryScope: long_term',
+      '---',
+      '',
+      '事实：旧记忆在迁移期仍可检索。',
+    ].join('\n'), 'utf-8');
+
+    const status = rebuildKnowledgeIndex(tmpDir);
+    const index = JSON.parse(fs.readFileSync(path.join(tmpDir, '.cti-index', 'knowledge.json'), 'utf-8')) as {
+      items: Array<{ key?: string; text: string }>;
+    };
+
+    assert.equal(status.markdownFileCount, 2);
+    assert.equal(index.items.some((item) => item.key === '回复偏好'), true);
+    assert.equal(index.items.some((item) => item.text.includes('迁移期仍可检索')), true);
+  });
+
+  it('refreshes Agent Home and the readable master index during rebuild', () => {
+    const longTermDir = path.join(tmpDir, 'memory', 'long-term');
+    fs.mkdirSync(longTermDir, { recursive: true });
+    fs.writeFileSync(path.join(longTermDir, '公共长期记忆.md'), [
+      '---',
+      'schema: codex-im-suite/memory/v3',
+      'memoryScope: long_term',
+      '---',
+      '',
+      '| key | value |',
+      '| --- | --- |',
+      '| 工作区规则 | 记忆库不挂载 |',
+    ].join('\n'), 'utf8');
+
+    rebuildKnowledgeIndex(tmpDir);
+
+    for (const name of ['机器人身份.md', '行为与安全规则.md', '工具与环境.md', '记忆总索引.md', '记忆库说明.md']) {
+      assert.equal(fs.existsSync(path.join(tmpDir, name)), true, name);
+    }
+    const master = fs.readFileSync(path.join(tmpDir, '记忆总索引.md'), 'utf8');
+    assert.match(master, /公共长期记忆/);
+    assert.match(master, /工作区规则：记忆库不挂载/);
+  });
+
   it('persists status next to the knowledge index after a rebuild', () => {
     const validDir = path.join(tmpDir, 'data', 'memory', 'v2', 'long-term');
     fs.mkdirSync(validDir, { recursive: true });

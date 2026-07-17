@@ -40,9 +40,12 @@ import { CTI_HOME } from './config.js';
 import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReviewInput } from './answer-review.js';
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
+import {
+  materializeDerivedUserImpression,
+  upsertConfirmedMemoryDocument,
+} from './memory-documents.js';
 import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext, type MemoryGraphIndex } from './memory-graph.js';
 import {
-  MEMORY_V2_SCHEMA,
   memoryPartitionSegment,
   isVisibleMemoryV2PathToQuery,
   isVisibleMemoryV2SourceToQuery,
@@ -81,7 +84,6 @@ const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.C
 const ENGLISH_STOP_TOKENS = new Set(['this', 'that', 'with', 'from', 'then', 'just', 'into', 'them', 'they', 'what', 'when', 'where', 'which', 'have', 'will', 'your', 'about', 'please']);
 const CHINESE_STOP_TOKENS = new Set(['这个', '那个', '现在', '刚才', '继续', '直接', '帮我', '处理', '一下', '看看', '这里', '当前', '应该', '进行', '根据', '然后', '就是', '可以', '能够']);
 const MEMORY_RECALL_RE = /(记得|回忆|历史|上次|之前|以前|刚才|说过|提到|对应表|常用|查一下|找一下|回溯|总结|汇总)/i;
-const MEMORY_PARTITION_DIR = path.join('data', 'memory', 'v2');
 
 // Helpers
 
@@ -157,12 +159,12 @@ function resolveDurableMemoryDirectory(
       return { error: 'temporary memory must remain in runtime session context' };
     case 'user':
       if (!input.userId?.trim()) return { error: 'user memory requires a verified user id' };
-      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'users', channel, memoryPartitionSegment(input.userId)) };
+      return { dir: path.join(memoryRoot, 'memory', 'users', channel, memoryPartitionSegment(input.userId)) };
     case 'group':
       if (!input.chatId?.trim()) return { error: 'group memory requires a verified chat id' };
-      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'groups', channel, memoryPartitionSegment(input.chatId)) };
+      return { dir: path.join(memoryRoot, 'memory', 'groups', channel, memoryPartitionSegment(input.chatId)) };
     case 'long_term':
-      return { dir: path.join(memoryRoot, MEMORY_PARTITION_DIR, 'long-term') };
+      return { dir: path.join(memoryRoot, 'memory', 'long-term') };
     default:
       return { error: 'unknown memory partition scope' };
   }
@@ -299,6 +301,7 @@ interface MemoryProfileRecord {
   topics: string[];
   facts: string[];
   pending: string[];
+  observationCounts?: Record<string, number>;
   messageCount: number;
   updatedAt: string;
   lastEventAt: string;
@@ -688,6 +691,12 @@ export class JsonFileStore implements BridgeStore {
   ): void {
     const existing = this.memoryProfiles.get(key);
     const timestamp = event.createdAt || now();
+    const observationCounts = { ...(existing?.observationCounts || {}) };
+    for (const fact of items.facts) {
+      const normalizedFact = this.summarizeMessageContent(fact, 180);
+      if (!normalizedFact) continue;
+      observationCounts[normalizedFact] = (observationCounts[normalizedFact] || 0) + 1;
+    }
     const record: MemoryProfileRecord = {
       scope,
       key,
@@ -703,6 +712,7 @@ export class JsonFileStore implements BridgeStore {
       topics: this.appendMemoryItems(existing?.topics || [], items.topics),
       facts: this.appendMemoryItems(existing?.facts || [], items.facts),
       pending: this.appendMemoryItems(existing?.pending || [], items.pending),
+      observationCounts,
       messageCount: (existing?.messageCount || 0) + 1,
       updatedAt: now(),
       lastEventAt: timestamp,
@@ -1778,50 +1788,22 @@ export class JsonFileStore implements BridgeStore {
     for (const pair of candidatePairs) {
       addMemoryCandidatePair(pairs, pairSeen, pair.key, pair.value);
     }
-    const cleanedText = cleanMemoryWriteText(text) || text;
-    const firstContentLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || cleanedText;
-    const cleanedTitle = cleanMemoryWriteText(firstContentLine) || cleanedText;
-    const bodyText = /\r?\n/.test(text) ? text : cleanedText;
-    const title = candidatePairs[0]?.key || cleanedTitle.slice(0, 40);
-    const dir = partition.dir;
-    const filePath = path.join(dir, `${slugForFileName(title)}.md`);
-    const createdAt = event.createdAt || now();
-    const frontmatter = [
-      '---',
-      `schema: ${MEMORY_V2_SCHEMA}`,
-      `createdAt: ${createdAt}`,
-      `updatedAt: ${now()}`,
-      `memoryScope: ${classification!.scope}`,
-      `intentConfidence: ${classification!.confidence}`,
-      `channelType: ${event.channelType || ''}`,
-      `chatId: ${event.chatId || ''}`,
-      `userId: ${event.userId || ''}`,
-      `displayName: ${event.userDisplayName || ''}`,
-      '---',
-      '',
-    ].join('\n');
-    const body: string[] = [
-      `# ${title}`,
-      '',
-      bodyText,
-      '',
-    ];
-    const prefixedLine = inferExplicitMemoryPrefixedLine(bodyText);
-    if (prefixedLine) {
-      body.push(prefixedLine, '');
-    }
-
-    if (pairs.length > 0) {
-      body.push('| key | value |', '| --- | --- |');
-      for (const pair of pairs) {
-        body.push(`| ${escapeMarkdownTableCell(pair.key)} | ${escapeMarkdownTableCell(pair.value)} |`);
-      }
-      body.push('');
-    }
-
+    let filePath = partition.dir;
     try {
-      ensureDir(dir);
-      atomicWrite(filePath, `${frontmatter}${body.join('\n')}`);
+      const written = upsertConfirmedMemoryDocument({
+        memoryRoot,
+        scope: classification!.scope as 'user' | 'group' | 'long_term',
+        channelType: event.channelType,
+        chatId: event.chatId,
+        userId: event.userId,
+        displayName: classification!.scope === 'group'
+          ? event.chatDisplayName
+          : event.userDisplayName,
+        pairs,
+        evidenceText: cleanMemoryWriteText(text) || text,
+        createdAt: event.createdAt || now(),
+      });
+      filePath = written.filePath;
       rebuildKnowledgeIndex(memoryRoot);
       return {
         ok: true,
@@ -1868,6 +1850,24 @@ export class JsonFileStore implements BridgeStore {
   recordMemoryEvent(event: ConversationMemoryEvent): void {
     if (!this.applyMemoryEvent(event)) return;
     this.persistMemoryProfiles();
+    if (event.role !== 'user' || !event.userId?.trim()) return;
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return;
+    const profile = this.memoryProfiles.get(this.memoryProfileKey('user', event.channelType, event.userId));
+    if (!profile) return;
+    try {
+      const result = materializeDerivedUserImpression({
+        memoryRoot,
+        channelType: event.channelType,
+        userId: event.userId,
+        displayName: event.userDisplayName || profile.displayName,
+        observations: Object.entries(profile.observationCounts || {}).map(([text, count]) => ({ text, count })),
+        updatedAt: event.createdAt || now(),
+      });
+      if (result.updated) rebuildKnowledgeIndex(memoryRoot);
+    } catch (error) {
+      console.warn('[store] Failed to materialize derived user impression:', error instanceof Error ? error.message : error);
+    }
   }
 
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {

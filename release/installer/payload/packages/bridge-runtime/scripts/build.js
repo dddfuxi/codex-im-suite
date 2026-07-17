@@ -45,4 +45,15 @@ await esbuild.build({
   banner: sharedBanner,
 });
 
-console.log('Built dist/daemon.mjs, dist/memory-optimizer-cli.mjs, and dist/skill-lifecycle-cli.mjs');
+await esbuild.build({
+  entryPoints: ['src/memory-layout-migration-cli.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: 'dist/memory-layout-migration-cli.mjs',
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
+console.log('Built daemon, memory optimizer, memory layout migration, and skill lifecycle CLI bundles');

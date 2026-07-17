@@ -67,7 +67,7 @@ export function buildPromptSectionRows(snapshot: PromptSnapshotRecord): PromptSe
     .sort((left, right) => left.section.priority - right.section.priority || left.index - right.index)
     .map(({ section }) => ({
       ...section,
-      kindLabel: kindLabels[section.kind] ?? section.kind,
+      kindLabel: section.id === 'workspace.plan' ? '本轮工作区计划' : kindLabels[section.kind] ?? section.kind,
       shortHash: section.hash.slice(0, 12),
       warning: !section.injected
         ? '未注入'

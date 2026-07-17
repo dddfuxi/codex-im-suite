@@ -190,7 +190,7 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_default_mode'), 'plan');
   });
 
-  it('maps workspace roots, additional directories, and self-optimize flag', () => {
+  it('maps workspace roots but does not expose legacy additional directories to the bridge', () => {
     const m = configToSettings({
       ...base,
       allowedWorkspaceRoots: ['C:\\Users\\admin\\Documents\\New project', 'E:\\cli-md', 'F:\\unity'],
@@ -201,10 +201,7 @@ describe('configToSettings', () => {
       m.get('bridge_allowed_workspace_roots'),
       'C:\\Users\\admin\\Documents\\New project;E:\\cli-md;F:\\unity',
     );
-    assert.equal(
-      m.get('bridge_default_additional_directories'),
-      'E:\\cli-md;F:\\unity',
-    );
+    assert.equal(m.has('bridge_default_additional_directories'), false);
     assert.equal(m.get('bridge_self_optimize_on_failure'), 'true');
   });
 
@@ -528,6 +525,37 @@ describe('loadConfig/saveConfig round-trip', () => {
       fs.rmSync(configDir, { recursive: true, force: true });
       fs.rmSync(workDir, { recursive: true, force: true });
       fs.rmSync(unityProject, { recursive: true, force: true });
+    }
+  });
+
+  it('does not merge legacy Codex additional directories into allowed workspace roots', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-config-'));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-default-'));
+    const allowedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-allowed-'));
+    const legacyExtra = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-legacy-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        `CTI_DEFAULT_WORKDIR=${workDir}`,
+        `CTI_ALLOWED_WORKSPACE_ROOTS=${allowedDir}`,
+        `CTI_CODEX_ADDITIONAL_DIRECTORIES=${legacyExtra}`,
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?workspace-roots-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.deepEqual(config.allowedWorkspaceRoots, [workDir, allowedDir]);
+      assert.deepEqual(config.codexAdditionalDirectories, [legacyExtra]);
+      assert.equal(module.configToSettings(config).has('bridge_default_additional_directories'), false);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+      fs.rmSync(workDir, { recursive: true, force: true });
+      fs.rmSync(allowedDir, { recursive: true, force: true });
+      fs.rmSync(legacyExtra, { recursive: true, force: true });
     }
   });
 

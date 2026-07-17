@@ -305,8 +305,8 @@ describe('JsonFileStore', () => {
     });
 
     assert.equal(result.ok, true);
-    assert.match(result.filePath || '', /data[\\/]memory[\\/]v2[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]/u);
-    assert.match(fs.readFileSync(result.filePath || '', 'utf-8'), /schema: codex-im-suite\/memory\/v2/);
+    assert.match(result.filePath || '', /memory[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]用户印象\.md$/u);
+    assert.match(fs.readFileSync(result.filePath || '', 'utf-8'), /schema: codex-im-suite\/memory\/v3/);
     const indexPath = path.join(memoryRoot, '.cti-index', 'knowledge.json');
     assert.equal(fs.existsSync(indexPath), true);
     const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as {
@@ -316,6 +316,60 @@ describe('JsonFileStore', () => {
     assert.ok(index.items.some((item) => item.kind === 'fact'));
     assert.equal(index.items.some((item) => item.key === 'HSScene' && item.kind === 'resource'), false);
     assert.ok(index.items.some((item) => item.classificationSource === 'table_inference'));
+  });
+
+  it('writes repeated confirmed user memories into one v3 用户印象.md', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-v3-user-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+    const classification = { scope: 'user' as const, actorKind: 'human' as const, confidence: 0.95 };
+
+    const first = store.persistMemoryWrite({
+      sessionId: 'sess-v3-user', channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user_1', userDisplayName: '刘丹',
+      text: '以后请用中文回复',
+      candidates: [{ key: '回复语言', value: '中文', text: '回复语言是中文', confidence: 0.95, source: 'model' }],
+      classification,
+    });
+    const second = store.persistMemoryWrite({
+      sessionId: 'sess-v3-user', channelType: 'feishu', chatId: 'oc_group', userId: 'ou_user_1', userDisplayName: '刘丹',
+      text: '默认项目是 ST4',
+      candidates: [{ key: '默认项目', value: 'ST4', text: '默认项目是 ST4', confidence: 0.95, source: 'model' }],
+      classification,
+    });
+
+    assert.equal(first.ok, true);
+    assert.equal(first.filePath, second.filePath);
+    assert.match(first.filePath || '', /memory[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]用户印象\.md$/u);
+    const text = fs.readFileSync(first.filePath || '', 'utf8');
+    assert.match(text, /schema: codex-im-suite\/memory\/v3/);
+    assert.match(text, /\| 回复语言 \| 中文 \|/);
+    assert.match(text, /\| 默认项目 \| ST4 \|/);
+  });
+
+  it('promotes only a repeated user observation into the tentative impression section', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-derived-user-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+    const event = {
+      sessionId: 'sess-profile',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user' as const,
+      text: '我偏好直接给出可执行结果，不要只给教程',
+    };
+
+    store.recordMemoryEvent(event);
+    store.recordMemoryEvent(event);
+    assert.equal(fs.existsSync(path.join(memoryRoot, 'memory', 'users', 'feishu', 'ou_user_1', '用户印象.md')), false);
+    store.recordMemoryEvent(event);
+
+    const impressionPath = path.join(memoryRoot, 'memory', 'users', 'feishu', 'ou_user_1', '用户印象.md');
+    assert.equal(fs.existsSync(impressionPath), true);
+    assert.match(fs.readFileSync(impressionPath, 'utf8'), /我偏好直接给出可执行结果/);
   });
 
   it('persists model-planned memory candidates into the visible knowledge repository', () => {
@@ -343,7 +397,7 @@ describe('JsonFileStore', () => {
     });
 
     assert.equal(result.ok, true);
-    assert.match(result.filePath || '', /data[\\/]memory[\\/]v2[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]/u);
+    assert.match(result.filePath || '', /memory[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]用户印象\.md$/u);
     const indexPath = path.join(memoryRoot, '.cti-index', 'knowledge.json');
     const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as {
       items: Array<{ key?: string; value?: string; text: string }>;
@@ -380,7 +434,7 @@ describe('JsonFileStore', () => {
     } as any);
 
     assert.equal(result.ok, true);
-    assert.match(result.filePath || '', /data[\\/]memory[\\/]v2[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]/u);
+    assert.match(result.filePath || '', /memory[\\/]users[\\/]feishu[\\/]ou_user_1[\\/]用户印象\.md$/u);
     assert.equal(fs.existsSync(path.join(memoryRoot, 'data', 'explicit-memories')), false);
   });
 
@@ -402,7 +456,7 @@ describe('JsonFileStore', () => {
     });
 
     assert.equal(result.ok, true);
-    assert.match(result.filePath || '', /data[\\/]memory[\\/]v2[\\/]groups[\\/]feishu[\\/]oc_group_1[\\/]/u);
+    assert.match(result.filePath || '', /memory[\\/]groups[\\/]feishu[\\/]oc_group_1[\\/]群聊记忆\.md$/u);
 
     const otherGroupMemory = store.retrieveRelevantMemory({
       sessionId: 'sess-group-memory', channelType: 'feishu', chatId: 'oc_group_2', userId: 'ou_user_1',

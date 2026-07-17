@@ -158,6 +158,50 @@ describe('mavis executor provider', () => {
       assert.equal(provider.binding?.agentName, 'mavis');
     });
 
+    it('uses the workspace plan primary directory instead of the legacy working directory', async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-plan-'));
+      const primary = path.join(root, 'primary');
+      const legacy = path.join(root, 'legacy');
+      fs.mkdirSync(primary);
+      fs.mkdirSync(legacy);
+      const client = new FakeMavisClient();
+      const provider = new MavisExecutorProvider({
+        client,
+        config: { ...baseConfig, defaultWorkDir: legacy, allowedWorkspaceRoots: [primary, legacy] },
+        agentName: 'mavis',
+        pollIntervalMs: 50,
+        hardTimeoutMs: 5_000,
+        quietTimeoutMs: 1_000,
+        maxDiffBytes: 1024,
+      });
+
+      try {
+        await provider.preDispatch(params({
+          sessionId: 'bridge-workspace-plan',
+          workingDirectory: legacy,
+          workspacePlan: {
+            version: 'cti-turn-workspace/v1',
+            primaryWorkspace: {
+              path: primary,
+              accessMode: 'read_only',
+              evidenceIds: ['current_message'],
+              reason: 'test',
+              expiresAfterTurn: true,
+            },
+            temporaryMounts: [],
+            deniedRoots: [],
+            resolvedFrom: 'explicit_path',
+            createdAt: '2026-07-17T12:00:00.000Z',
+            expiresAfterTurn: true,
+          },
+        }));
+
+        assert.equal(client.createSessionCalls[0]?.workspace, primary);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('materializes image attachments and gives Mavis absolute local paths on new sessions', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-new-'));
       const uploadCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-upload-new-'));

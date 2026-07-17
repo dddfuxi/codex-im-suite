@@ -12,6 +12,7 @@ import type {
   PreviewCapabilities,
   SendResult,
   UploadedFileLink,
+  VerifiedMediaAction,
 } from './types.js';
 
 export interface AdapterAssistantIdentity {
@@ -19,6 +20,8 @@ export interface AdapterAssistantIdentity {
   platform?: string;
   appId?: string;
   botOpenId?: string;
+  /** 官方平台返回的当前机器人头像地址，仅用于构造受控视觉证据。 */
+  avatarUrl?: string;
 }
 
 export interface DirectMessageRequest {
@@ -26,6 +29,8 @@ export interface DirectMessageRequest {
   targetText: string;
   text: string;
   parseMode?: OutboundMessage['parseMode'];
+  /** 本轮 bridge 基于真实附件和模型精确选择签发的媒体许可。 */
+  verifiedMediaAction?: VerifiedMediaAction;
 }
 
 export interface DirectMessageSendResult extends SendResult {

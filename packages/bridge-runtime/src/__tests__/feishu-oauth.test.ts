@@ -271,6 +271,11 @@ describe('Feishu OAuth state and refresh', () => {
         }),
       ]);
 
+      assert.equal(docx.status, 'auth_required');
+      assert.equal(sheets.status, 'auth_required');
+      if (docx.status !== 'auth_required' || sheets.status !== 'auth_required') {
+        assert.fail('different-scope requests must both require independent authorization');
+      }
       assert.equal(docx.cardDisposition, 'send');
       assert.equal(sheets.cardDisposition, 'send');
       assert.notEqual(docx.authorizationRequestId, sheets.authorizationRequestId);

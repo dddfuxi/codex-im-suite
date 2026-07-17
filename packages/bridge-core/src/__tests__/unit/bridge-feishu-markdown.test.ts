@@ -464,4 +464,21 @@ describe('Feishu streaming card markdown', () => {
     assert.match(content, /未完成：模型没有返回可展示结果/);
     assert.match(content, /耗时：36\.7s/);
   });
+
+  it('uses a red header when visible content is unfinished even if transport status completed', () => {
+    const card = JSON.parse(buildFinalCardJson(
+      '未完成：当前缺少目标发送权限。',
+      [],
+      { status: '已完成', elapsed: '1.2s' },
+    )) as {
+      header?: { template?: string; title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.equal(card.header?.template, 'red');
+    assert.equal(card.header?.title?.content, '未完成');
+    assert.match(content, /×/);
+    assert.doesNotMatch(content, /✅/);
+  });
 });

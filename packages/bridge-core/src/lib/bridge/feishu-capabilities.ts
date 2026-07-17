@@ -67,6 +67,18 @@ const CAPABILITIES: FeishuCapability[] = [
     note: '用于群聊历史同步、私聊漏事件补捞和被回复附件读取。',
   },
   {
+    id: 'im.avatar_evidence',
+    label: '群成员头像视觉证据',
+    status: 'partial',
+    requiredScopes: [
+      'im:chat.members:read',
+      ['contact:contact.base:readonly', 'contact:contact:access_as_app', 'contact:contact:readonly', 'contact:contact:readonly_as_app'],
+      ['contact:user.base:readonly', 'contact:contact:access_as_app', 'contact:contact:readonly', 'contact:contact:readonly_as_app'],
+      'admin:app.info:readonly',
+    ],
+    note: '用户头像走 Contact v3，当前机器人头像走 Bot v3，其他机器人头像走 Application v6；全部使用应用身份，不使用普通用户 OAuth。另需把目标用户纳入应用通讯录数据权限范围。',
+  },
+  {
     id: 'im.reactions',
     label: 'Typing 表情反应',
     status: 'ready',

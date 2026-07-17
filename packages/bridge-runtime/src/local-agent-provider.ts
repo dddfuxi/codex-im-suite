@@ -21,6 +21,7 @@ import {
 import type { PendingPermissions } from './permission-gateway.js';
 import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
 import { McpBridge, type McpManifestRecord } from './mcp-bridge.js';
+import { resolveProviderWorkspace } from './provider-workspace.js';
 import type {
   ConservativeRouteDecision,
   LocalRouteProtocolResult,
@@ -1772,7 +1773,8 @@ export class LocalAgentProvider {
 
   private resolveWorkingDirectory(params: StreamChatParams): string {
     const roots = this.getAllowedRoots(params);
-    const candidate = params.workingDirectory || this.config.defaultWorkDir || process.cwd();
+    const providerWorkspace = resolveProviderWorkspace(params);
+    const candidate = providerWorkspace.workingDirectory || this.config.defaultWorkDir || process.cwd();
     const resolved = path.resolve(candidate);
     if (!isPathWithinAllowedRoots(resolved, roots)) {
       throw new Error(`工作目录不在允许范围内：${resolved}`);
@@ -1791,6 +1793,10 @@ export class LocalAgentProvider {
   }
 
   private getAllowedRoots(params: StreamChatParams): string[] {
+    const providerWorkspace = resolveProviderWorkspace(params);
+    if (providerWorkspace.source === 'workspace_plan') {
+      return providerWorkspace.allowedRoots;
+    }
     const configured = this.config.allowedWorkspaceRoots || [];
     const extras = params.additionalDirectories || [];
     return [...new Set([

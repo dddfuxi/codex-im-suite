@@ -995,6 +995,74 @@ describe('CodexProvider', () => {
     );
   });
 
+  it('uses the authoritative workspace plan instead of legacy provider paths', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const provider = new CodexProvider(new PendingPermissions());
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-plan-'));
+    const primary = path.join(root, 'primary');
+    const temporary = path.join(root, 'temporary');
+    const legacy = path.join(root, 'legacy');
+    fs.mkdirSync(primary);
+    fs.mkdirSync(temporary);
+    fs.mkdirSync(legacy);
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    try {
+      const stream = provider.streamChat({
+        prompt: 'hello',
+        sessionId: 'workspace-plan-session',
+        workingDirectory: legacy,
+        additionalDirectories: [legacy],
+        workspacePlan: {
+          version: 'cti-turn-workspace/v1',
+          primaryWorkspace: {
+            path: primary,
+            accessMode: 'read_only',
+            evidenceIds: ['current_message'],
+            reason: 'test',
+            expiresAfterTurn: true,
+          },
+          temporaryMounts: [{
+            path: temporary,
+            accessMode: 'read_only',
+            evidenceIds: ['current_message'],
+            reason: 'test',
+            expiresAfterTurn: true,
+          }],
+          deniedRoots: [],
+          resolvedFrom: 'explicit_path',
+          createdAt: '2026-07-17T12:00:00.000Z',
+          expiresAfterTurn: true,
+        },
+      });
+      await collectStream(stream);
+
+      assert.equal(capturedStartOptions?.workingDirectory, primary);
+      assert.deepEqual(capturedStartOptions?.additionalDirectories, [temporary]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to CTI_DEFAULT_WORKDIR when the requested workingDirectory is missing and drops missing additionalDirectories', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');

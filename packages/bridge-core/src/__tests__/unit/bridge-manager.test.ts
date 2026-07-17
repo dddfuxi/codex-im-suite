@@ -845,7 +845,7 @@ describe('bridge-manager lifecycle', () => {
     assert.doesNotMatch(progressText, /会话、权限/);
     assert.doesNotMatch(progressText, /正在选择执行器/);
     assert.equal(finalized.length, 1);
-    assert.equal(finalized[0].status, 'completed');
+    assert.equal(finalized[0].status, 'error');
     assert.ok(finalized[0].text.length > 0);
     });
   });
@@ -896,6 +896,82 @@ describe('bridge-manager lifecycle', () => {
     assert.doesNotMatch(cardUpdates.join('\n'), /Unity MCP|工具|tool_use|tool_result|正在连接/);
     assert.equal(finalized.length, 1);
     assert.equal(finalized[0].status, 'completed');
+  });
+
+  it('finalizes an explicit unfinished result as an error card', async () => {
+    const finalized: Array<{ status: string; text: string }> = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在核对发送权限。' },
+          { type: 'text', data: '未完成：当前缺少目标发送权限。' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async (_chatId, status, responseText) => {
+      finalized.push({ status, text: responseText });
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('执行这个需要权限的动作'));
+
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].status, 'error');
+    assert.match(finalized[0].text, /^未完成/);
+  });
+
+  it('forces a red unfinished card when all structured avatar evidence failed', async () => {
+    const finalized: Array<{ status: string; text: string }> = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' }) as any;
+    store.reviewOutboundAnswer = () => ({
+      verdict: 'replace',
+      reasonCodes: ['generic_rewrite'],
+      replacementText: '请联系管理员开通相关权限。',
+      mode: 'block_or_replace',
+      createdAt: '2026-07-17T00:00:00.000Z',
+    });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在核对头像读取结果。' },
+          { type: 'text', data: '当前应用缺少读取群成员头像所需的权限。' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async (_chatId, status, responseText) => {
+      finalized.push({ status, text: responseText });
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const inbound: any = createInboundMessage('查看群成员头像', 'ou_sender', 'oc_group');
+    inbound.raw = {
+      feishuAvatarEvidence: {
+        prompt: 'Feishu group avatar evidence: all unavailable.',
+        requestedCount: 2,
+        successfulCount: 0,
+        failedCount: 2,
+      },
+    };
+
+    await _testOnly.handleMessage(adapter, inbound);
+
+    assert.equal(finalized.length, 1);
+    assert.equal(finalized[0].status, 'error');
+    assert.match(finalized[0].text, /^未完成：/u);
+    assert.match(finalized[0].text, /请联系管理员开通相关权限/u);
   });
 
   it('keeps Feishu progress cards high-level instead of exposing internal tool steps', async () => {
@@ -1566,6 +1642,152 @@ describe('bridge-manager result block delivery', () => {
     assert.doesNotMatch(sent[0].text, /Reminder ID|rem_real_1|reminder-state\.json|oc_123|cti-reminder|"target":"current_chat"|我会交给 bridge 创建提醒/);
   });
 
+  it('schedules an owner requested live bridge restart through the fixed bridge control host', async () => {
+    const sent: OutboundMessage[] = [];
+    const scheduled: unknown[] = [];
+    const response = [
+      '```cti-bridge-control',
+      JSON.stringify({ action: 'restart_live' }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      bridgeControl: {
+        scheduleRestart: async (input) => {
+          scheduled.push(input);
+          return { ok: true, scheduledFor: '2026-05-07T04:00:02.000Z' };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('重启 live bridge，让新安装的 Skill 生效', 'ou_owner'));
+
+    assert.deepEqual(scheduled, [{
+      requestedBy: {
+        channelType: 'feishu',
+        chatId: 'oc_123',
+        userId: 'ou_owner',
+        messageId: 'm_1',
+      },
+    }]);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已安排 live Bridge 重启/);
+    assert.doesNotMatch(sent[0].text, /cti-bridge-control|restart_live/);
+  });
+
+  it('rejects live bridge restart actions from non-owner users', async () => {
+    const sent: OutboundMessage[] = [];
+    let scheduled = false;
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-bridge-control',
+        JSON.stringify({ action: 'restart_live' }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      bridgeControl: {
+        scheduleRestart: async () => {
+          scheduled = true;
+          return { ok: true };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('重启 live bridge', 'ou_viewer'));
+
+    assert.equal(scheduled, false);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /只允许 owner/);
+  });
+
+  it('rejects model emitted restart actions when the current user did not request a restart', async () => {
+    const sent: OutboundMessage[] = [];
+    let scheduled = false;
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-bridge-control',
+        JSON.stringify({ action: 'restart_live' }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      bridgeControl: {
+        scheduleRestart: async () => {
+          scheduled = true;
+          return { ok: true };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('解释一下 live bridge 的工作方式', 'ou_owner'));
+
+    assert.equal(scheduled, false);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /没有明确要求重启/);
+  });
+
+  it('blocks fake restart completion when the agent omits the controlled action', async () => {
+    const sent: OutboundMessage[] = [];
+    let scheduled = false;
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream('live Bridge 已经重启完成。') },
+      permissions: { resolvePendingPermission: () => false },
+      bridgeControl: {
+        scheduleRestart: async () => {
+          scheduled = true;
+          return { ok: true };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('重启 live bridge', 'ou_owner'));
+
+    assert.equal(scheduled, false);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /没有使用受控重启动作/);
+    assert.doesNotMatch(sent[0].text, /已经重启完成/);
+  });
+
   it('executes cti-direct-message through the channel adapter and only confirms in the source chat', async () => {
     const sent: OutboundMessage[] = [];
     const directMessages: any[] = [];
@@ -1644,6 +1866,92 @@ describe('bridge-manager result block delivery', () => {
     assert.equal(directMessages[0].text, '你好');
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /已私发给 小明/);
+  });
+
+  it('treats a named sticker send request as explicit direct-message authorization', async () => {
+    const sent: OutboundMessage[] = [];
+    const directMessages: any[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => createTextStreamWithInputEvidence(params, [
+          '```cti-direct-message',
+          JSON.stringify({
+            target: '乔治',
+            targetType: 'user',
+            text: '[表情包:sticker_george] 辛苦了～',
+          }),
+          '```',
+          '',
+          '```cti-sticker-candidate-analysis',
+          JSON.stringify({
+            selectedFileKey: 'sticker_george',
+            annotations: [{
+              fileKey: 'sticker_george',
+              label: '鼓励',
+              description: '画面表达鼓励和夸赞',
+              intent: '鼓励对方',
+              tone: '友好',
+              usage: '对方完成事情后使用',
+              confidence: 0.9,
+            }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      sendDirectMessage?: (request: any) => Promise<SendResult & { targetDisplayName?: string }>;
+    };
+    adapter.sendDirectMessage = async (request) => {
+      directMessages.push(request);
+      return { ok: true, messageId: 'om_direct_sticker', targetDisplayName: '乔治' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('给乔治发个表情包', 'ou_owner', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_owner',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      attachments: [{
+        id: 'sticker_george',
+        name: 'sticker-candidate-sticker_george.png',
+        type: 'image/png',
+        size: 8,
+        data: Buffer.from('image').toString('base64'),
+      }],
+      raw: {
+        feishuStickerLibraryContext: {
+          prompt: 'Feishu sticker library candidate evidence:\n- fileKey=sticker_george; image=attached',
+          candidateCount: 1,
+          attachedImageCount: 1,
+          fileKeys: ['sticker_george'],
+          attachedFileKeys: ['sticker_george'],
+        },
+      },
+    });
+
+    assert.equal(directMessages.length, 1);
+    assert.equal(directMessages[0].targetText, '乔治');
+    assert.equal(directMessages[0].text, '[表情包:sticker_george] 辛苦了～');
+    assert.deepEqual(directMessages[0].verifiedMediaAction, {
+      kind: 'sticker',
+      key: 'sticker_george',
+      provenance: 'turn_attached_model_selection',
+    });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已私发给 乔治/);
+    assert.doesNotMatch(sent[0].text, /没有明确授权|等待 Owner 确认|未完成/);
   });
 
   it('reports unresolved cti-direct-message targets without leaking the private text', async () => {
@@ -2821,6 +3129,181 @@ describe('bridge-manager Feishu cloud documents', () => {
   });
 });
 
+describe('bridge-manager Feishu CLI user authorization governance', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  function createAuthChallengeStream(): ReadableStream<string> {
+    return createEventStream([
+      {
+        type: 'tool_use',
+        data: JSON.stringify({
+          id: 'tool-auth-1',
+          name: 'Bash',
+          input: { command: 'lark-cli auth login --scope "task:task:read" --no-wait --json' },
+        }),
+      },
+      {
+        type: 'tool_result',
+        data: JSON.stringify({
+          tool_use_id: 'tool-auth-1',
+          content: JSON.stringify({
+            device_code: 'device-secret-value',
+            verification_url: 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=ABCD-EFGH',
+            expires_in: 600,
+          }),
+          is_error: false,
+        }),
+      },
+      {
+        type: 'text',
+        data: [
+          '```cti-final',
+          JSON.stringify({
+            kind: 'mixed',
+            text: '请扫描二维码完成授权。',
+            images: ['C:\\temp\\must-not-send-auth-qr.png'],
+            files: [],
+            reply_mode: 'plain',
+          }),
+          '```',
+        ].join('\n'),
+      },
+      { type: 'result', data: '{}' },
+    ]);
+  }
+
+  it('replaces an Owner auth QR response with one interactive authorization card', async () => {
+    const sent: OutboundMessage[] = [];
+    const beginCalls: unknown[] = [];
+    const auditSummaries: string[] = [];
+    const store = createStatefulStore({
+      remote_bridge_enabled: 'true',
+      bridge_feishu_owner_users: 'ou_owner',
+    });
+    store.insertAuditLog = (entry: any) => { auditSummaries.push(entry.summary); };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createAuthChallengeStream() },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCliUserAuth: {
+        beginAuthorization: async (input: unknown) => {
+          beginCalls.push(input);
+          return {
+            status: 'started',
+            userMessage: '需要你的飞书用户授权，完成后会自动继续原任务。',
+            feishuCardJson: JSON.stringify({
+              header: { title: { tag: 'plain_text', content: '需要飞书用户授权' } },
+              elements: [{ tag: 'action', actions: [{ tag: 'button', url: 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1' }] }],
+            }),
+            authorizationRequestId: 'auth-1',
+          };
+        },
+      },
+      lifecycle: {},
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const finalizedStatuses: string[] = [];
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async (_chatId, status) => {
+      finalizedStatuses.push(status);
+      return true;
+    };
+    let imageSendCount = 0;
+    adapter.sendLocalImage = async () => {
+      imageSendCount += 1;
+      return { ok: true, messageId: 'om_image' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('查询一下今日待办', 'ou_owner', 'oc_auth'));
+
+    assert.equal(beginCalls.length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /自动继续原任务/);
+    assert.ok(sent[0].feishuCardJson);
+    assert.doesNotMatch(sent[0].text, /二维码|扫描/);
+    assert.equal(imageSendCount, 0);
+    assert.deepEqual(finalizedStatuses, ['error']);
+    const authAudit = auditSummaries.find((summary) => /FEISHU_CLI_USER_AUTH_REQUEST/.test(summary));
+    assert.ok(authAudit);
+    assert.match(authAudit, /task:task:read/);
+    assert.doesNotMatch(authAudit, /device-secret-value|flow-1|ABCD-EFGH/);
+  });
+
+  it('blocks non-Owners without starting or exposing the shared CLI authorization', async () => {
+    const sent: OutboundMessage[] = [];
+    let beginCount = 0;
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createAuthChallengeStream() },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCliUserAuth: {
+        beginAuthorization: async () => {
+          beginCount += 1;
+          throw new Error('non-owner must not start authorization');
+        },
+      },
+      lifecycle: {},
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('查询一下今日待办', 'ou_viewer', 'oc_auth'));
+
+    assert.equal(beginCount, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /未完成/);
+    assert.match(sent[0].text, /Owner|owner/);
+    assert.equal(sent[0].feishuCardJson, undefined);
+  });
+
+  it('falls back to the official authorization URL when the interactive card cannot be sent', async () => {
+    const attempts: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createAuthChallengeStream() },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCliUserAuth: {
+        beginAuthorization: async () => ({
+          status: 'started',
+          userMessage: '需要你的飞书用户授权。',
+          feishuCardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+        }),
+      },
+      lifecycle: {},
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      attempts.push(message);
+      if (message.feishuCardJson) return { ok: false, error: 'interactive card rejected' };
+      return { ok: true, messageId: 'om_fallback' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('查询一下今日待办', 'ou_owner', 'oc_auth'));
+
+    assert.equal(attempts.length, 4);
+    assert.ok(attempts.slice(0, 3).every((attempt) => attempt.feishuCardJson));
+    assert.equal(attempts[3].feishuCardJson, undefined);
+    assert.match(attempts[3].text, /https:\/\/accounts\.feishu\.cn\/oauth\/v1\/device\/verify/);
+    assert.doesNotMatch(attempts[3].text, /二维码|device-secret-value/);
+  });
+});
+
 describe('bridge-manager Feishu capability diagnostics', () => {
   it('renders Feishu developer platform scope gaps for owners', () => {
     const report = buildFeishuCapabilityReport(createStatefulStore({
@@ -2843,6 +3326,11 @@ describe('bridge-manager Feishu capability diagnostics', () => {
     assert.match(report, /CTI_FEISHU_GRANTED_SCOPES/);
     assert.match(report, /Missing declared scopes:/);
     assert.match(report, /base:record:retrieve/);
+    assert.match(report, /群成员头像视觉证据/);
+    assert.match(report, /im:chat\.members:read/);
+    assert.match(report, /contact:user\.base:readonly/);
+    assert.match(report, /admin:app\.info:readonly/);
+    assert.match(report, /不使用普通用户 OAuth/);
     assert.doesNotMatch(report, /app-secret/);
   });
 });
@@ -4575,6 +5063,66 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(streamParams[0].priorityTurnContext || '', /Feishu recent conversation context/);
   });
 
+  it('records a verified Feishu CLI user authorization challenge from matching tool evidence', async () => {
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => createEventStream([
+          {
+            type: 'tool_use',
+            data: JSON.stringify({
+              id: 'tool-auth-1',
+              name: 'Bash',
+              input: {
+                command: 'lark-cli auth login --scope "task:task:read" --no-wait --json',
+              },
+            }),
+          },
+          {
+            type: 'tool_result',
+            data: JSON.stringify({
+              tool_use_id: 'tool-auth-1',
+              content: JSON.stringify({
+                device_code: 'device-secret-value',
+                verification_url: 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=ABCD-EFGH',
+                expires_in: 600,
+              }),
+              is_error: false,
+            }),
+          },
+          { type: 'text', data: '请扫描二维码完成授权。' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const session = store.createSession('feishu-cli-auth-evidence', '', undefined, process.cwd());
+    const binding = store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_cli_auth',
+      displayName: 'owner',
+      codepilotSessionId: session.id,
+      model: '',
+      workingDirectory: process.cwd(),
+    });
+    const { processMessage } = await import('../../lib/bridge/conversation-engine');
+
+    const result = await processMessage(binding, '查询今日待办');
+
+    assert.equal(result.executionEvidence.feishuCliUserAuthorizationChallenges?.length, 1);
+    assert.deepEqual(result.executionEvidence.feishuCliUserAuthorizationChallenges?.[0], {
+      protocol: 'cti-feishu-cli-user-auth/v1',
+      toolUseId: 'tool-auth-1',
+      verificationUrl: 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=ABCD-EFGH',
+      deviceCode: 'device-secret-value',
+      requestedScopes: ['task:task:read'],
+      expiresInSeconds: 600,
+    });
+  });
+
   it('accepts provider input evidence without requiring tool_use or retrying the turn', async () => {
     const store = createStatefulStore({ remote_bridge_enabled: 'true' });
     let streamCalls = 0;
@@ -4749,6 +5297,54 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].systemPrompt || '', /Feishu sticker library candidate evidence/);
     assert.match(streamParams[0].systemPrompt || '', /sticker_praise_candidate/);
     assert.equal(streamParams[0].files?.[0]?.id, 'sticker_praise_candidate');
+  });
+
+  it('keeps Feishu avatar name-to-image evidence in the retained prompt and provider attachments', async () => {
+    const streamParams: StreamChatParams[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStreamWithInputEvidence(params, '刘丹的头像是一只卡通猫。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('描述群成员头像', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      attachments: [{
+        id: 'feishu-avatar:user:ou_sender',
+        name: '飞书头像-用户-刘丹.png',
+        type: 'image/png',
+        size: 8,
+        data: Buffer.from('image').toString('base64'),
+      }],
+      raw: {
+        feishuAvatarEvidence: {
+          prompt: 'Feishu group avatar evidence:\n- 用户“刘丹” => attachment “飞书头像-用户-刘丹.png”。',
+          requestedCount: 1,
+          successfulCount: 1,
+          failedCount: 0,
+        },
+      },
+    });
+
+    assert.equal(streamParams.length, 1);
+    assert.match(streamParams[0].priorityTurnContext || '', /刘丹.*飞书头像-用户-刘丹\.png/u);
+    assert.match(streamParams[0].systemPrompt || '', /Feishu group avatar evidence/);
+    assert.equal(streamParams[0].files?.[0]?.name, '飞书头像-用户-刘丹.png');
   });
 
   it('routes a trusted generic Feishu sticker request through the agent before delivery', async () => {
@@ -5428,7 +6024,7 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@乔治/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -5547,6 +6143,147 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(sent[0].mentions, undefined);
   });
 
+  it('preserves the agent reply context when a replied Feishu card asks for an unverified mention target', async () => {
+    const sent: OutboundMessage[] = [];
+    const streamParams: StreamChatParams[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamParams.push(params);
+          return createTextStream([
+            '```cti-final',
+            JSON.stringify({
+              kind: 'text',
+              text: '@大虾米 新的一局已经接上被回复卡片。\n\n题面：房间里没有窗，但每天早上地板都会湿。',
+              images: [],
+              files: [],
+              reply_mode: 'markdown',
+            }),
+            '```',
+          ].join('\n'));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    });
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你艾特大虾米', 'ou_sender', 'oc_reply_card_mention'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_reply_card_mention',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:om_replied_card',
+            kind: 'message',
+            relation: 'native_reply',
+            source: 'platform_api',
+            confidence: 1,
+            content: '上一张机器人卡片：请按当前游戏上下文继续。',
+            messageId: 'om_replied_card',
+            actor: { id: 'cli_current_bot', displayName: '小虾米', type: 'bot' },
+          }],
+        },
+        feishuReplyTo: { messageId: 'om_replied_card', attachmentCount: 0 },
+      },
+    } as any);
+
+    assert.equal(streamParams.length, 1);
+    assert.match(streamParams[0].priorityTurnContext || '', /上一张机器人卡片/);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /新的一局已经接上被回复卡片/);
+    assert.match(sent[0].text, /房间里没有窗/);
+    assert.doesNotMatch(sent[0].text, /当前不再按文字自动解析飞书/);
+    assert.doesNotMatch(sent[0].text, /@大虾米/);
+    assert.match(sent[0].text, /原生 @ 未投递|未执行原生 @/);
+    assert.match(sent[0].text, /直接 @ TA/);
+    assert.equal(sent[0].mentions, undefined);
+  });
+
+  it('preserves the agent reply in streaming card finalization when a mention target lacks native evidence', async () => {
+    const finalized: unknown[][] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在读取被回复卡片。' },
+          {
+            type: 'text',
+            data: [
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '@大虾米 我已经根据被回复卡片继续回答：答案不是窗户漏水。',
+                images: [],
+                files: [],
+                reply_mode: 'markdown',
+              }),
+              '```',
+            ].join('\n'),
+          },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_reply' }));
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    (adapter as any).onStreamText = () => {};
+    (adapter as any).onStreamEnd = async (...args: unknown[]) => {
+      finalized.push(args);
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你艾特大虾米', 'ou_sender', 'oc_stream_reply_card_mention'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_stream_reply_card_mention',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:om_stream_replied_card',
+            kind: 'message',
+            relation: 'native_reply',
+            source: 'platform_api',
+            confidence: 1,
+            content: '上一张机器人卡片：继续回答当前问题。',
+            messageId: 'om_stream_replied_card',
+            actor: { id: 'cli_current_bot', displayName: '小虾米', type: 'bot' },
+          }],
+        },
+        feishuReplyTo: { messageId: 'om_stream_replied_card', attachmentCount: 0 },
+      },
+    } as any);
+
+    assert.equal(finalized.length, 1);
+    assert.match(String(finalized[0][2]), /根据被回复卡片继续回答/);
+    assert.doesNotMatch(String(finalized[0][2]), /当前不再按文字自动解析飞书/);
+    assert.doesNotMatch(String(finalized[0][2]), /@大虾米/);
+    assert.match(String(finalized[0][2]), /原生 @ 未投递|未执行原生 @/);
+    assert.equal(finalized[0][4], undefined);
+  });
+
   it('lets the agent use a same-message native target mention via structured cti-final mentions', async () => {
     const sent: OutboundMessage[] = [];
     const streamParams: any[] = [];
@@ -5608,6 +6345,67 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /^@乔治/);
     assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('resolves an agent-selected bare mention from a matching explicit current request', async () => {
+    const sent: OutboundMessage[] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '@大虾米 新汤开锅：房间里没有窗，但每天早上地板都会湿。\n\n提问请 @小虾米。',
+            images: [],
+            files: [],
+            reply_mode: 'markdown',
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage, sourceMessage?: any) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_big_shrimp', name: '大虾米' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('再来一汤，艾特大虾米回答', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /@大虾米/);
+    assert.doesNotMatch(resolverInputs[0].text, /@小虾米/);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_big_shrimp', name: '大虾米' }]);
+    assert.match(sent[0].text, /@大虾米/);
+    assert.match(sent[0].text, /房间里没有窗/);
+    assert.doesNotMatch(sent[0].text, /原生 @ 未投递|当前不再按文字自动解析/);
   });
 
   it('normalizes supported mention id field spellings and matches them against current native evidence', async () => {
@@ -6117,7 +6915,7 @@ describe('bridge-manager policy helpers', () => {
     const reply = sent.at(-1);
     assert.ok(reply);
     assert.equal(resolverInputs.length, 0);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6428,7 +7226,7 @@ describe('bridge-manager policy helpers', () => {
     const reply = sent.at(-1);
     assert.ok(reply);
     assert.equal(resolverCalled, false);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6447,7 +7245,7 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@乔治/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6466,7 +7264,7 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@_user_1/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6506,7 +7304,7 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.doesNotMatch(reply!.text, /_user_1/);
     assert.equal(reply!.mentions, undefined);
   });
@@ -6599,7 +7397,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@_user_1/);
     assert.doesNotMatch(reply!.text, /@George/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6644,7 +7442,7 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@苏木/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6684,7 +7482,7 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverCalls, 0);
     assert.doesNotMatch(reply!.text, /@乔治/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
@@ -6731,7 +7529,7 @@ describe('bridge-manager policy helpers', () => {
     assert.deepEqual(inspectedTargets, []);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.doesNotMatch(reply!.text, /我已查：|找到的相关候选/);
-    assert.match(reply!.text, /不再按文字.*自动解析/);
+    assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 

@@ -3,6 +3,8 @@ import path from 'node:path';
 
 export const MEMORY_V2_SCHEMA = 'codex-im-suite/memory/v2';
 export const MEMORY_V2_RELATIVE_DIR = path.join('data', 'memory', 'v2');
+export const MEMORY_V3_SCHEMA = 'codex-im-suite/memory/v3';
+export const MEMORY_V3_RELATIVE_DIR = 'memory';
 
 export type DurableMemoryScope = 'user' | 'group' | 'long_term';
 export type MemoryV2SourceGroup = 'memory_user' | 'memory_group' | 'memory_long_term';
@@ -22,6 +24,8 @@ export interface MemoryV2SourcePolicyResult {
   ok: boolean;
   scope?: DurableMemoryScope;
   sourceGroup?: MemoryV2SourceGroup;
+  layoutVersion?: 'v2' | 'v3';
+  legacy?: boolean;
   reason?: string;
 }
 
@@ -77,43 +81,61 @@ export function classifyMemoryV2Source(
   if (!sourcePath || !sourcePath.toLowerCase().endsWith('.md')) {
     return { ok: false, reason: 'source is not a markdown file' };
   }
-  if (metadata?.schema !== MEMORY_V2_SCHEMA) {
-    return { ok: false, reason: 'memory v2 schema is required' };
-  }
-  const scope = normalizeScope(metadata.memoryScope);
+  const layoutVersion = metadata?.schema === MEMORY_V3_SCHEMA
+    ? 'v3'
+    : metadata?.schema === MEMORY_V2_SCHEMA
+      ? 'v2'
+      : null;
+  if (!layoutVersion) return { ok: false, reason: 'supported memory schema is required' };
+  const sourceMetadata = metadata || {};
+  const scope = normalizeScope(sourceMetadata.memoryScope);
   if (!scope) return { ok: false, reason: 'memoryScope is missing or invalid' };
 
   const segments = relativeSegments(memoryRoot, sourcePath);
-  if (segments[0] !== 'data' || segments[1] !== 'memory' || segments[2] !== 'v2') {
-    return { ok: false, reason: 'source is outside data/memory/v2' };
+  const layoutOffset = layoutVersion === 'v3' ? 1 : 3;
+  if (layoutVersion === 'v3' && segments[0] !== 'memory') {
+    return { ok: false, reason: 'v3 source is outside memory' };
+  }
+  if (layoutVersion === 'v2' && (segments[0] !== 'data' || segments[1] !== 'memory' || segments[2] !== 'v2')) {
+    return { ok: false, reason: 'v2 source is outside data/memory/v2' };
   }
 
   if (scope === 'long_term') {
-    if (segments[3] !== 'long-term' || segments.length < 5) {
-      return { ok: false, reason: 'long-term memory must live under data/memory/v2/long-term' };
+    if (segments[layoutOffset] !== 'long-term' || segments.length < layoutOffset + 2) {
+      return { ok: false, reason: `long-term memory must live under ${layoutVersion === 'v3' ? 'memory/long-term' : 'data/memory/v2/long-term'}` };
     }
-    return { ok: true, scope, sourceGroup: sourceGroupForScope(scope) };
+    return { ok: true, scope, sourceGroup: sourceGroupForScope(scope), layoutVersion, legacy: layoutVersion === 'v2' };
   }
 
-  const channel = metadata.channelType?.trim();
+  const channel = sourceMetadata.channelType?.trim();
   if (!channel) return { ok: false, reason: 'channelType is required for scoped memory' };
   const expectedChannel = memoryPartitionSegment(channel);
 
   if (scope === 'user') {
-    const userId = metadata.userId?.trim();
+    const userId = sourceMetadata.userId?.trim();
     if (!userId) return { ok: false, reason: 'user memory requires userId' };
-    if (segments[3] !== 'users' || segments[4] !== expectedChannel || segments[5] !== memoryPartitionSegment(userId) || segments.length < 7) {
+    if (
+      segments[layoutOffset] !== 'users'
+      || segments[layoutOffset + 1] !== expectedChannel
+      || segments[layoutOffset + 2] !== memoryPartitionSegment(userId)
+      || segments.length < layoutOffset + 4
+    ) {
       return { ok: false, reason: 'user memory path does not match channelType/userId metadata' };
     }
-    return { ok: true, scope, sourceGroup: sourceGroupForScope(scope) };
+    return { ok: true, scope, sourceGroup: sourceGroupForScope(scope), layoutVersion, legacy: layoutVersion === 'v2' };
   }
 
-  const chatId = metadata.chatId?.trim();
+  const chatId = sourceMetadata.chatId?.trim();
   if (!chatId) return { ok: false, reason: 'group memory requires chatId' };
-  if (segments[3] !== 'groups' || segments[4] !== expectedChannel || segments[5] !== memoryPartitionSegment(chatId) || segments.length < 7) {
+  if (
+    segments[layoutOffset] !== 'groups'
+    || segments[layoutOffset + 1] !== expectedChannel
+    || segments[layoutOffset + 2] !== memoryPartitionSegment(chatId)
+    || segments.length < layoutOffset + 4
+  ) {
     return { ok: false, reason: 'group memory path does not match channelType/chatId metadata' };
   }
-  return { ok: true, scope, sourceGroup: sourceGroupForScope(scope) };
+  return { ok: true, scope, sourceGroup: sourceGroupForScope(scope), layoutVersion, legacy: layoutVersion === 'v2' };
 }
 
 export function isIndexableMemoryV2SourceFile(memoryRoot: string, file: MemorySourceFileLike): boolean {
@@ -134,18 +156,21 @@ export function isVisibleMemoryV2PathToQuery(
   query: MemoryVisibilityQuery,
 ): boolean {
   const segments = relativeSegments(memoryRoot, sourcePath);
-  if (segments[0] !== 'data' || segments[1] !== 'memory' || segments[2] !== 'v2') return false;
-  if (segments[3] === 'long-term') return true;
+  const isV3 = segments[0] === 'memory';
+  const isV2 = segments[0] === 'data' && segments[1] === 'memory' && segments[2] === 'v2';
+  if (!isV3 && !isV2) return false;
+  const offset = isV3 ? 1 : 3;
+  if (segments[offset] === 'long-term') return true;
   const expectedChannel = memoryPartitionSegment(query.channelType || 'unknown');
-  if (segments[3] === 'users') {
+  if (segments[offset] === 'users') {
     return !!query.userId
-      && segments[4] === expectedChannel
-      && segments[5] === memoryPartitionSegment(query.userId);
+      && segments[offset + 1] === expectedChannel
+      && segments[offset + 2] === memoryPartitionSegment(query.userId);
   }
-  if (segments[3] === 'groups') {
+  if (segments[offset] === 'groups') {
     return !!query.chatId
-      && segments[4] === expectedChannel
-      && segments[5] === memoryPartitionSegment(query.chatId);
+      && segments[offset + 1] === expectedChannel
+      && segments[offset + 2] === memoryPartitionSegment(query.chatId);
   }
   return false;
 }

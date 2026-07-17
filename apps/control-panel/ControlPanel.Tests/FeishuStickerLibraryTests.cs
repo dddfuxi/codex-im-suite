@@ -96,6 +96,106 @@ public sealed class FeishuStickerLibraryTests
     }
 
     [Fact]
+    public void Archive_PreservesRecordMediaAndDisabledState()
+    {
+        var root = CreateTempRoot();
+        var artifacts = WriteSampleStore(root);
+        FeishuStickerLibrary.Update(artifacts, new FeishuStickerUpdateRequest
+        {
+            FileKey = "sticker_1",
+            Disabled = true,
+            DisabledReason = "人工暂停",
+        });
+        Directory.CreateDirectory(artifacts.FeishuStickerMediaDirPath);
+        var mediaPath = Path.Combine(
+            artifacts.FeishuStickerMediaDirPath,
+            MemoryArtifactStore.StableFileName("sticker_1", ".png"));
+        File.WriteAllBytes(mediaPath, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+        var snapshot = FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
+        {
+            FileKey = "sticker_1",
+        });
+
+        var item = Assert.Single(snapshot.Stickers);
+        Assert.True(item.Archived);
+        Assert.False(string.IsNullOrWhiteSpace(item.ArchivedAt));
+        Assert.True(item.Disabled);
+        Assert.Equal("已归档", item.StatusLabel);
+        Assert.True(File.Exists(mediaPath));
+        var audit = FeishuStickerLibrary.Audit(artifacts);
+        Assert.Equal(0, audit.Enabled);
+        Assert.Equal(1, audit.Archived);
+    }
+
+    [Fact]
+    public void Restore_ClearsArchiveStateWithoutChangingDisabledState()
+    {
+        var root = CreateTempRoot();
+        var artifacts = WriteSampleStore(root);
+        FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
+        {
+            FileKey = "sticker_1",
+        });
+
+        var snapshot = FeishuStickerLibrary.Restore(artifacts, new FeishuStickerLifecycleRequest
+        {
+            FileKey = "sticker_1",
+        });
+
+        var item = Assert.Single(snapshot.Stickers);
+        Assert.False(item.Archived);
+        Assert.True(string.IsNullOrWhiteSpace(item.ArchivedAt));
+        Assert.False(item.Disabled);
+    }
+
+    [Fact]
+    public void DeleteArchived_RemovesRecordAndMediaAndWritesTombstone()
+    {
+        var root = CreateTempRoot();
+        var artifacts = WriteSampleStore(root);
+        Directory.CreateDirectory(artifacts.FeishuStickerMediaDirPath);
+        var mediaPath = Path.Combine(
+            artifacts.FeishuStickerMediaDirPath,
+            MemoryArtifactStore.StableFileName("sticker_1", ".webp"));
+        File.WriteAllBytes(mediaPath, [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
+        FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
+        {
+            FileKey = "sticker_1",
+        });
+
+        var snapshot = FeishuStickerLibrary.DeleteArchived(artifacts, new FeishuStickerLifecycleRequest
+        {
+            FileKey = "sticker_1",
+        });
+
+        Assert.Empty(snapshot.Stickers);
+        Assert.False(File.Exists(mediaPath));
+        using var document = JsonDocument.Parse(File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
+        var tombstone = document.RootElement
+            .GetProperty("deletedStickers")
+            .GetProperty("sticker_1");
+        Assert.False(string.IsNullOrWhiteSpace(tombstone.GetProperty("deletedAt").GetString()));
+        using var backupDocument = JsonDocument.Parse(File.ReadAllText($"{artifacts.FeishuStickerStorePath}.bak", Encoding.UTF8));
+        Assert.True(backupDocument.RootElement.GetProperty("deletedStickers").TryGetProperty("sticker_1", out _));
+    }
+
+    [Fact]
+    public void DeleteArchived_RejectsActiveSticker()
+    {
+        var root = CreateTempRoot();
+        var artifacts = WriteSampleStore(root);
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            FeishuStickerLibrary.DeleteArchived(artifacts, new FeishuStickerLifecycleRequest
+            {
+                FileKey = "sticker_1",
+            }));
+
+        Assert.Contains("先归档", error.Message);
+    }
+
+    [Fact]
     public void Read_SniffsLegacyStickerMediaMimeAndAuditStatus()
     {
         var root = CreateTempRoot();

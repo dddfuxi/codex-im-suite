@@ -60,23 +60,24 @@ public sealed class SkillLifecycleGatewayTests
     }
 
     [Fact]
-    public async Task ReadSnapshotAsync_UsesRuntimeRegistryFileWithoutRepeatedCliExecution()
+    public async Task ReadSnapshotAsync_RefreshesRuntimeRegistryToDiscoverExternallyInstalledSkills()
     {
         using var fixture = new SkillGatewayFixture(includeDevelopmentCli: true, includeLiveCli: false);
-        fixture.WriteRegistry("{\"protocol\":\"cti-skill-registry/v1\",\"generatedAt\":\"2026-07-15T00:00:00.000Z\",\"items\":[{\"id\":\"installed\"}]}");
+        fixture.WriteRegistry("{\"protocol\":\"cti-skill-registry/v1\",\"generatedAt\":\"2026-07-15T00:00:00.000Z\",\"items\":[{\"id\":\"stale\"}]}");
         var called = false;
         var gateway = fixture.CreateGateway(invocation =>
         {
             called = true;
-            return Task.FromResult(new SkillCliExecutionResult(0, "{}", ""));
+            return Task.FromResult(new SkillCliExecutionResult(
+                0,
+                "{\"protocol\":\"cti-skill-registry/v1\",\"generatedAt\":\"2026-07-16T00:00:00.000Z\",\"items\":[{\"id\":\"external-skill\"}]}",
+                ""));
         });
 
-        using var first = await gateway.ReadSnapshotAsync();
-        using var second = await gateway.ReadSnapshotAsync();
+        using var snapshot = await gateway.ReadSnapshotAsync();
 
-        Assert.False(called);
-        Assert.Equal("installed", first.RootElement.GetProperty("items")[0].GetProperty("id").GetString());
-        Assert.Equal("installed", second.RootElement.GetProperty("items")[0].GetProperty("id").GetString());
+        Assert.True(called);
+        Assert.Equal("external-skill", snapshot.RootElement.GetProperty("items")[0].GetProperty("id").GetString());
     }
 
     [Fact]

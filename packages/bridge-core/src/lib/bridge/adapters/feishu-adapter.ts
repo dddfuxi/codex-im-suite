@@ -16,10 +16,13 @@
  */
 
 import crypto from 'crypto';
+import { lookup } from 'node:dns/promises';
 import fs from 'node:fs';
+import { isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { Agent } from 'undici';
 import type {
   ChannelType,
   ChannelAddress,
@@ -181,6 +184,14 @@ const FEISHU_CARD_COMPATIBILITY_PLACEHOLDERS = [
   '请升级到最新版本客户端，以查看内容',
 ];
 const FEISHU_STICKER_LIBRARY_CANDIDATE_LIMIT = 24;
+const FEISHU_AVATAR_EVIDENCE_LIMIT = 12;
+const FEISHU_AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+const FEISHU_AVATAR_CACHE_TTL_MS = 10 * 60 * 1000;
+const FEISHU_USER_AVATAR_API_SCOPES = [
+  'contact:contact.base:readonly',
+  'contact:user.base:readonly',
+] as const;
+const FEISHU_OTHER_APP_AVATAR_SCOPE = 'admin:app.info:readonly';
 
 type FeishuMentionCandidateEvidence = 'native_inbound' | 'current_chat' | 'current_sender' | 'history';
 
@@ -513,6 +524,8 @@ interface FeishuStickerRecord {
   disabled?: boolean;
   disabledReason?: string;
   lastEditedAt?: string;
+  archived?: boolean;
+  archivedAt?: string;
   chatId?: string;
   userId?: string;
   messageId?: string;
@@ -546,7 +559,206 @@ interface FeishuStickerStore {
   version: 1;
   updatedAt: string;
   stickers: FeishuStickerRecord[];
+  deletedStickers?: Record<string, FeishuStickerTombstone>;
   historyBackfills?: Record<string, FeishuStickerHistoryBackfillRecord>;
+}
+
+type FeishuAvatarActorType = 'user' | 'bot';
+
+interface FeishuAvatarActor {
+  actorType: FeishuAvatarActorType;
+  displayName: string;
+  platformId: string;
+  appId?: string;
+}
+
+interface FeishuAvatarEvidenceItem {
+  actorType: FeishuAvatarActorType;
+  displayName: string;
+  platformId: string;
+  appId?: string;
+  status: 'attached' | 'blocked';
+  sourceApi: string;
+  attachmentId?: string;
+  attachmentName?: string;
+  reasonCode?: string;
+  reason?: string;
+  missingScopes?: string[];
+  consoleUrl?: string;
+  userOAuthRequired: false;
+}
+
+interface FeishuAvatarEvidenceContext {
+  prompt: string;
+  requestedCount: number;
+  successfulCount: number;
+  failedCount: number;
+  truncated: boolean;
+  items: FeishuAvatarEvidenceItem[];
+  blockers: Array<{
+    reasonCode: string;
+    reason: string;
+    missingScopes?: string[];
+    consoleUrl?: string;
+    userOAuthRequired: false;
+  }>;
+}
+
+interface FeishuAvatarResolutionSuccess {
+  ok: true;
+  url: string;
+  sourceApi: string;
+}
+
+interface FeishuAvatarResolutionFailure {
+  ok: false;
+  sourceApi: string;
+  reasonCode: string;
+  reason: string;
+  missingScopes?: string[];
+  consoleUrl?: string;
+}
+
+type FeishuAvatarResolution = FeishuAvatarResolutionSuccess | FeishuAvatarResolutionFailure;
+
+function splitFeishuAvatarIntentClauses(text: string): string[] {
+  const clauses: string[] = [];
+  const boundaryPattern = /[，,。；;！!？?]+|但是|不过|然而|而是|只要|改为|改成|然后|接着|随后|并且|並且|同时|同時|但|却|卻/gu;
+  let cursor = 0;
+  let pendingConnector = '';
+  for (const match of text.matchAll(boundaryPattern)) {
+    const content = text.slice(cursor, match.index ?? cursor).trim();
+    if (content) clauses.push(`${pendingConnector}${content}`.trim());
+    const boundary = match[0];
+    pendingConnector = /^[，,。；;！!？?]+$/u.test(boundary) ? '' : boundary;
+    cursor = (match.index ?? cursor) + boundary.length;
+  }
+  const tail = text.slice(cursor).trim();
+  if (tail) clauses.push(`${pendingConnector}${tail}`.trim());
+  return clauses;
+}
+
+function isFeishuAvatarEvidenceRequest(text: string): boolean {
+  const normalized = String(text || '').trim();
+  if (!normalized) return false;
+  const avatarPattern = /(?:头像|頭像|avatar|profile\s*(?:photo|picture|image))/iu;
+  const memberPattern = /(?:群(?:里|内|中|聊)?).{0,16}(?:成员|成員|群友|用户|用戶|机器人|機器人|大家)|(?:群成员|群成員|群友|大家|所有(?:用户|用戶|成员|成員|机器人|機器人|bots?)|每(?:个|位)(?:用户|用戶|成员|成員|机器人|機器人|bot)|多个(?:用户|用戶|成员|成員|机器人|機器人|bots?))/iu;
+  const avatarIntent = avatarPattern.test(normalized);
+  const memberTarget = memberPattern.test(normalized);
+  const quotedOrMetaIntent = /(?:翻译|翻譯|translate|改写|改寫|润色|潤色|解释(?:这|這)?(?:句|段|句话|句話)|文案|示例|正则|正規表示式|关键词|關鍵詞|怎么实现|如何实现|怎麼實現|如何實現).{0,40}(?:头像|頭像|avatar)|(?:把|将|將).{0,40}(?:头像|頭像|avatar).{0,20}(?:翻译|翻譯|translate|改写|改寫|解释|解釋)/iu.test(normalized);
+  if (!avatarIntent || !memberTarget || quotedOrMetaIntent) return false;
+
+  const clauses = splitFeishuAvatarIntentClauses(normalized);
+  const inspectActionPattern = /(?:查看|看看|看下|看一下|描述|识别|識別|辨认|辨認|分析|比较|比較|对比|對比|检查|檢查|展示|列出|说说|說說|inspect|view|describe|analy[sz]e|compare|show|list)/giu;
+  const questionLeadPattern = /(?:^|\s)(?:请问)?(?:你|机器人|機器人|这个机器人|這個機器人|该机器人|該機器人)?\s*(?:能否|是否(?:能|可以)?|能不能|可不可以|会不会|會不會|有没有能力|有沒有能力|怎么|怎麼|怎样|怎樣|如何|为什么|為什麼|为何|為何|为啥)/iu;
+  const imperativeCuePattern = /(?:麻烦|麻煩|帮我|幫我|请你|請你|直接|只要|就|现在|現在|立即|马上|馬上)/u;
+  const strongNegationPattern = /(?:不用|不要|无需|無需|无须|無須|不必|禁止|不是要|不需要).{0,10}$/iu;
+  const inabilityPattern = /(?:不能|无法|無法).{0,10}$/iu;
+  const politeExecutionPattern = /(?:能不能|可不可以).{0,8}(?:麻烦|麻煩|帮我|幫我|请你|請你)/iu;
+  const bareNegationPattern = /(?:^|[^\p{L}\p{N}]|你|请|先|暂时|现在|千万|可|但|不过|麻烦)(?:别|別)(?:再|去|给我|幫我|帮我|把)?\s*.{0,4}$/iu;
+  const inheritedAvatarObjectPattern = /^(?:(?:但是|不过|然而|而是|只要|改为|改成|然后|接着|随后|并且|並且|同时|同時|但|却|卻|直接|就|再)\s*)?(?:查看|看看|看下|看一下|展示|显示|顯示|show|view)(?:一下|出来|出來|即可|就行)?$/iu;
+
+  for (const clause of clauses) {
+    const matches = [...clause.matchAll(inspectActionPattern)];
+    if (matches.length === 0) continue;
+    const looksLikeQuestion = (questionLeadPattern.test(clause) || /(?:吗|嗎|么|麼|呢)\s*$/u.test(clause))
+      && !imperativeCuePattern.test(clause);
+    if (looksLikeQuestion) continue;
+    const actionTargetsAvatar = avatarPattern.test(clause) || inheritedAvatarObjectPattern.test(clause);
+    if (!actionTargetsAvatar) continue;
+    for (const match of matches) {
+      const prefix = clause.slice(0, match.index ?? 0).slice(-16);
+      const negated = strongNegationPattern.test(prefix)
+        || bareNegationPattern.test(prefix)
+        || (inabilityPattern.test(prefix) && !politeExecutionPattern.test(prefix));
+      if (!negated) return true;
+    }
+  }
+  return false;
+}
+
+function isPrivateNetworkAddress(address: string): boolean {
+  const normalized = address.trim().toLowerCase().split('%')[0];
+  const version = isIP(normalized);
+  if (version === 4) {
+    const [a, b, c] = normalized.split('.').map((item) => Number(item));
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 0 && c === 0)
+      || (a === 192 && b === 0 && c === 2)
+      || (a === 192 && b === 88 && c === 99)
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19))
+      || (a === 198 && b === 51 && c === 100)
+      || (a === 203 && b === 0 && c === 113)
+      || a >= 224;
+  }
+  if (version === 6) {
+    if (normalized === '::' || normalized === '::1') return true;
+    const mappedDotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/u.exec(normalized);
+    if (mappedDotted) return isPrivateNetworkAddress(mappedDotted[1]);
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(normalized);
+    if (mappedHex) {
+      const high = Number.parseInt(mappedHex[1], 16);
+      const low = Number.parseInt(mappedHex[2], 16);
+      return isPrivateNetworkAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
+    }
+    const firstSegment = Number.parseInt(normalized.split(':')[0] || '0', 16);
+    const globallyRoutableUnicast = firstSegment >= 0x2000 && firstSegment <= 0x3fff;
+    if (!globallyRoutableUnicast) return true;
+    return /^2001:(?:0002|2|0db8|db8)(?::|$)/u.test(normalized);
+  }
+  return true;
+}
+
+function sanitizeFeishuAvatarFileName(value: string): string {
+  const normalized = value
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '_')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return (normalized || '未知成员').slice(0, 80);
+}
+
+function pickFeishuMemberName(item: FeishuChatMemberListItem): string {
+  const raw = getRawObject(item);
+  const user = getRawObject(item.user);
+  const bot = getRawObject(item.bot);
+  return uniqueCleanStrings([
+    item.name,
+    item.user_name,
+    item.userName,
+    item.display_name,
+    item.displayName,
+    item.app_name,
+    item.appName,
+    item.bot_name,
+    item.botName,
+    raw.name,
+    raw.displayName,
+    raw.appName,
+    raw.botName,
+    user.name,
+    user.display_name,
+    user.displayName,
+    bot.name,
+    bot.app_name,
+    bot.appName,
+  ])[0] || '';
+}
+
+function pickFeishuMemberAppId(item: FeishuChatMemberListItem): string {
+  const raw = getRawObject(item);
+  const bot = getRawObject(item.bot);
+  return firstNonEmptyString(item.app_id, item.appId, raw.app_id, raw.appId, bot.app_id, bot.appId);
+}
+
+interface FeishuStickerTombstone {
+  deletedAt: string;
+  source?: string;
 }
 
 interface FeishuStickerHistoryBackfillRecord {
@@ -798,6 +1010,8 @@ interface FeishuChatMemberListItem {
   appName?: string;
   bot_name?: string;
   botName?: string;
+  app_id?: string;
+  appId?: string;
   id?: { open_id?: string; openId?: string; user_id?: string; userId?: string; union_id?: string; unionId?: string };
   user?: Record<string, unknown>;
   bot?: Record<string, unknown>;
@@ -844,6 +1058,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private seenMessageIds = new Map<string, boolean>();
   private botOpenId: string | null = null;
   private botDisplayName: string | null = null;
+  private botAvatarUrl: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
@@ -859,6 +1074,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botToBotLoopState = new Map<string, { count: number; updatedAt: number }>();
   private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
   private p2pPollInFlight = false;
+  private avatarImageCache = new Map<string, { buffer: Buffer; mimeType: string; extension: string; cachedAt: number }>();
+  private avatarDnsCache = new Map<string, { addresses: string[]; cachedAt: number }>();
 
   private getLightContextMessageLimit(): number {
     const raw = getBridgeContext().store.getSetting('bridge_feishu_light_context_limit')
@@ -893,13 +1110,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return Math.max(0, Math.min(Number.isFinite(parsed) ? parsed : FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT, 8));
   }
 
-  getAssistantIdentity(): { displayName?: string; platform: string; appId?: string; botOpenId?: string } {
+  getAssistantIdentity(): { displayName?: string; platform: string; appId?: string; botOpenId?: string; avatarUrl?: string } {
     const store = getBridgeContext().store;
     return {
       displayName: this.botDisplayName || store.getSetting('bridge_feishu_bot_name') || store.getSetting('bridge_feishu_app_name') || undefined,
       platform: 'Feishu',
       appId: store.getSetting('bridge_feishu_app_id') || undefined,
       botOpenId: this.botOpenId || undefined,
+      avatarUrl: this.botAvatarUrl || undefined,
     };
   }
 
@@ -978,7 +1196,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
     }
-    return { version: 1, updatedAt: '', stickers: [] };
+    return { version: 1, updatedAt: '', stickers: [], deletedStickers: {} };
   }
 
   private listStickerStoreRecoveryPaths(storePath: string): string[] {
@@ -1020,6 +1238,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private normalizeStickerStore(parsed: Partial<FeishuStickerStore>): FeishuStickerStore {
     const stickers = Array.isArray(parsed.stickers) ? parsed.stickers.filter((item) => item?.fileKey) : [];
+    const rawDeletedStickers = parsed.deletedStickers && typeof parsed.deletedStickers === 'object' && !Array.isArray(parsed.deletedStickers)
+      ? parsed.deletedStickers
+      : {};
+    const deletedStickers: Record<string, FeishuStickerTombstone> = {};
+    for (const [fileKey, value] of Object.entries(rawDeletedStickers)) {
+      const normalizedFileKey = fileKey.trim();
+      if (!normalizedFileKey || !value || typeof value !== 'object') continue;
+      const tombstone = value as Partial<FeishuStickerTombstone>;
+      const deletedAt = typeof tombstone.deletedAt === 'string' ? tombstone.deletedAt.trim() : '';
+      if (!deletedAt) continue;
+      deletedStickers[normalizedFileKey] = {
+        deletedAt,
+        source: typeof tombstone.source === 'string' ? tombstone.source.trim() || undefined : undefined,
+      };
+    }
     const rawBackfills = parsed.historyBackfills && typeof parsed.historyBackfills === 'object' && !Array.isArray(parsed.historyBackfills)
       ? parsed.historyBackfills
       : {};
@@ -1040,6 +1273,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       version: 1,
       updatedAt: parsed.updatedAt || '',
       stickers: stickers.map((item) => this.sanitizeStickerRecord(item as FeishuStickerRecord)),
+      deletedStickers,
       historyBackfills,
     };
   }
@@ -1116,6 +1350,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * storage, and repeated events reuse this durable copy.
    */
   private async downloadAndCacheStickerResource(messageId: string, fileKey: string): Promise<FileAttachment | null> {
+    if (this.isStickerDeleted(this.readStickerStore(), fileKey)) return null;
     const existing = this.readCachedStickerResource(fileKey);
     if (existing) return existing;
 
@@ -1187,7 +1422,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private countStickerCandidatesForChat(chatId: string): number {
     return this.readStickerStore().stickers
-      .filter((item) => !item.disabled && item.fileKey?.trim())
+      .filter((item) => this.isStickerActive(item) && item.fileKey?.trim())
       .filter((item) => !item.chatId || item.chatId === chatId)
       .length;
   }
@@ -1304,7 +1539,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!isExplicitFeishuStickerSendRequest(requestText)) return null;
     const store = this.readStickerStore();
     const records = store.stickers
-      .filter((item) => !item.disabled && item.fileKey?.trim())
+      .filter((item) => this.isStickerActive(item) && item.fileKey?.trim())
       .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
         || Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a))
         || (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))
@@ -1483,7 +1718,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   getStickerPresentationPrompt(chatId?: string): string {
     const store = this.readStickerStore();
     const annotated = store.stickers
-      .filter((item) => !item.disabled)
+      .filter((item) => this.isStickerActive(item))
       .filter((item) => this.isStickerReliableForAutoSend(item))
       .filter((item) => !chatId || !item.chatId || item.chatId === chatId)
       .sort((a, b) => Number(b.chatId === chatId) - Number(a.chatId === chatId)
@@ -1588,6 +1823,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       delete cleaned.annotationVerifiedAt;
     }
     cleaned.disabled = cleaned.disabled === true;
+    cleaned.archived = cleaned.archived === true;
+    if (!cleaned.archived) delete cleaned.archivedAt;
     cleaned.annotationConfidence = Number.isFinite(Number(cleaned.annotationConfidence))
       ? Math.max(0, Math.min(1, Number(cleaned.annotationConfidence)))
       : cleaned.annotationConfidence;
@@ -1698,6 +1935,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (this.stickerUserAnnotationText(record.userAnnotation)) score += 650;
     if (record.mediaCachedAt || record.mediaMimeType || record.mediaSize || this.findStickerCachePath(record.fileKey)) score += 600;
     if (record.disabled) score += 500;
+    if (record.archived) score += 550;
     if (record.mediaDownloadFailedAt || record.mediaDownloadError) score += 250;
     if (record.lastUsedAt) score += 120;
     if ((record.aliases || []).some((alias) => !/^(?:最近|默认|表情包)$/u.test(alias))) score += 60;
@@ -1755,7 +1993,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private stickerSemanticScore(record: FeishuStickerRecord, contextText: string, chatId?: string): number {
-    if (record.disabled) return Number.NEGATIVE_INFINITY;
+    if (!this.isStickerActive(record)) return Number.NEGATIVE_INFINITY;
     if (contextText.trim() && this.stickerAvoidsContext(record, contextText)) return Number.NEGATIVE_INFINITY;
     const semanticText = this.stickerSemanticText(record);
     const semanticScore = contextText.trim() ? this.stickerTextOverlapScore(contextText, semanticText) : 0;
@@ -1778,6 +2016,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!fileKey) return;
     const now = new Date().toISOString();
     const store = this.readStickerStore();
+    if (this.isStickerDeleted(store, fileKey)) return;
     const aliases = new Set(['最近', '默认', '表情包', ...(input.aliases || [])].map((item) => item.trim()).filter(Boolean));
     let record = store.stickers.find((item) => item.fileKey === fileKey);
     if (!record) {
@@ -1845,7 +2084,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           ? compareSemanticStickerCandidate
           : compareRotatingStickerCandidate
         : compareSpecificStickerCandidate;
-    const enabledStickers = store.stickers.filter((item) => !item.disabled);
+    const enabledStickers = store.stickers.filter((item) => this.isStickerActive(item));
     if (genericTarget) {
       const minimumSemanticScore = contextText.trim().length <= 8 ? 3 : 6;
       const genericCandidates = enabledStickers
@@ -1903,7 +2142,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private markStickerUsed(fileKey: string): void {
     const store = this.readStickerStore();
     const record = store.stickers.find((item) => item.fileKey === fileKey);
-    if (!record) return;
+    if (!record || !this.isStickerActive(record)) return;
     record.useCount = (record.useCount || 0) + 1;
     record.lastUsedAt = new Date().toISOString();
     store.updatedAt = record.lastUsedAt;
@@ -2009,10 +2248,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (input.replyToMessageId) {
       // 有 reply 目标时必须精确回复到 sticker 原消息，不能退回“最近未标注表情包”。
       // 飞书里用户常回复机器人卡片继续提任务，这类文本不能被 sticker 学习链抢走。
-      return store.stickers.find((item) => item.messageId === input.replyToMessageId) || null;
+      return store.stickers.find((item) => this.isStickerActive(item) && item.messageId === input.replyToMessageId) || null;
     }
     return store.stickers
-      .filter((item) => item.chatId === input.chatId && !this.hasStickerAnnotation(item))
+      .filter((item) => this.isStickerActive(item) && item.chatId === input.chatId && !this.hasStickerAnnotation(item))
       .sort((a, b) => (Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0))[0]
       || null;
   }
@@ -2065,8 +2304,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return false;
     }
     const store = this.readStickerStore();
+    if (this.isStickerDeleted(store, fileKey)) return false;
     const now = new Date().toISOString();
     let record = store.stickers.find((item) => item.fileKey === fileKey);
+    if (record?.archived) return false;
     if (!record) {
       record = {
         fileKey,
@@ -2199,7 +2440,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private hasReliableStickerSemantics(record: FeishuStickerRecord | null): boolean {
-    if (!record || record.disabled || !this.hasStickerAnnotation(record)) return false;
+    if (!record || !this.isStickerActive(record) || !this.hasStickerAnnotation(record)) return false;
     // 旧版无来源语义只作为 evidence 给 agent 参考，不能直接触发表情包发送。
     if (!this.hasTrustedStickerSemanticSource(record)) return false;
     // 只有“表情包 / 发一个 / 用于聊天”这类泛词时，说明还没有真正可用的语义。
@@ -2215,6 +2456,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private isStickerReliableForAutoSend(record: FeishuStickerRecord | null): boolean {
     return this.hasReliableStickerSemantics(record);
+  }
+
+  private isStickerActive(record: FeishuStickerRecord): boolean {
+    return record.disabled !== true && record.archived !== true;
+  }
+
+  private isStickerDeleted(store: FeishuStickerStore, fileKey: string): boolean {
+    const normalized = fileKey.trim();
+    return Boolean(normalized && store.deletedStickers?.[normalized]);
   }
 
   private buildStickerSemanticText(fileKey: string | null, record: FeishuStickerRecord | null): string {
@@ -3792,6 +4042,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     let botToBotTurn: { chainCount: number; maxTurns: number; senderType: string } | null = null;
     let botNameWake: FeishuBotNameWakeClassification | null = null;
     let replyToBotMediaWake: { messageId: string; messageType: string } | null = null;
+    let implicitReplyMentionWake: { messageId: string; threadId?: string } | null = null;
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
@@ -4023,6 +4274,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Strip @mention markers from text
     text = this.stripMentionMarkers(text);
+    if (
+      isGroup
+      && !isOtherBotSender
+      && messageType === 'text'
+      && !text.trim()
+      && replyTargetMessageId
+      && this.isBotMentionedFromMessage(msg)
+    ) {
+      // 话题/原生回复里只 @ 当前 bot，语义是让 bot 处理被回复内容。
+      // 仅在本轮同时具备原生 mention 与平台 reply/root ID 时生成隐式请求；
+      // 普通群里单独发一个 @ 仍保持静默，避免扩大唤醒范围。
+      text = '请处理我在本条飞书话题中回复或引用的消息。';
+      implicitReplyMentionWake = {
+        messageId: replyTargetMessageId,
+        threadId: msg.thread_id?.trim() || undefined,
+      };
+    }
     if (this.isWithdrawnPlaceholderText(text)) {
       this.insertInboundFilterAudit(
         chatId,
@@ -4077,6 +4345,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
           reason: 'reply_to_current_bot_media',
           messageId: replyToBotMediaWake.messageId,
           messageType: replyToBotMediaWake.messageType,
+        },
+      } : {}),
+      ...(implicitReplyMentionWake ? {
+        feishuImplicitReplyMention: {
+          reason: 'native_mention_only_reply',
+          messageId: implicitReplyMentionWake.messageId,
+          threadId: implicitReplyMentionWake.threadId,
         },
       } : {}),
       ...(stickerInfo ? { sticker: stickerInfo } : {}),
@@ -4179,6 +4454,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
 
       if (messageType === 'text' && trimmedUserText) {
+        if (isGroup && isFeishuAvatarEvidenceRequest(trimmedUserText)) {
+          const avatarEvidence = await this.buildAvatarEvidenceForRequest(chatId, trimmedUserText);
+          const existingAttachmentIds = new Set(attachments.map((item) => item.id));
+          for (const attachment of avatarEvidence.attachments) {
+            if (existingAttachmentIds.has(attachment.id)) continue;
+            attachments.push(attachment);
+            existingAttachmentIds.add(attachment.id);
+          }
+          rawMetadata.feishuAvatarEvidence = avatarEvidence.context;
+        }
         await this.ensureStickerHistoryBackfilledForRequest(chatId, msg.chat_type, resolvedDisplayName, trimmedUserText);
         const stickerLibraryEvidence = await this.buildStickerLibraryEvidenceForRequest(chatId, trimmedUserText);
         if (stickerLibraryEvidence) {
@@ -4302,7 +4587,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const item = await this.fetchMessageById(target);
     if (!item || item.deleted) return false;
-    return this.isHistoryItemFromSelf(item.sender);
+    return this.isHistoryItemFromCurrentBot(item.sender);
+  }
+
+  private isHistoryItemFromCurrentBot(
+    sender: { id?: string; id_type?: string; sender_type?: string } | undefined,
+  ): boolean {
+    if (!sender || !this.isBotOrAppSenderType(sender.sender_type)) return false;
+    const senderId = (sender.id || '').trim();
+    if (this.isKnownBotSenderId(senderId)) return true;
+    const currentAppId = (getBridgeContext().store.getSetting('bridge_feishu_app_id') || '').trim();
+    // 云端消息查询对机器人通常返回 app_id。必须与当前应用精确一致，
+    // 不能把任意 sender_type=app/bot 都当作本机器人，否则回复其他机器人的媒体也会误唤醒。
+    return !!currentAppId && senderId === currentAppId;
   }
 
   private isHistoryItemFromSelf(sender: { id?: string; id_type?: string; sender_type?: string } | undefined): boolean {
@@ -4900,10 +5197,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     const receiveIdType = inferDirectMessageReceiveIdType(resolved.userId);
+    const stickerHint = extractFeishuStickerHint(body);
+    const verifiedStickerKey = stickerHint
+      ? this.resolveVerifiedStickerFileKey(stickerHint.target, request.verifiedMediaAction)
+      : '';
+    if (stickerHint && !verifiedStickerKey) {
+      return { ok: false, error: '表情包未通过本轮真实附件与精确选择校验，未发送' };
+    }
     const messageText = request.parseMode === 'Markdown'
       ? preprocessFeishuMarkdown(body)
       : body;
-    const data = request.parseMode === 'Markdown'
+    const data = verifiedStickerKey
+      ? {
+        receive_id: resolved.userId,
+        msg_type: 'sticker',
+        content: JSON.stringify({ file_key: verifiedStickerKey }),
+      }
+      : request.parseMode === 'Markdown'
       ? {
         receive_id: resolved.userId,
         msg_type: 'interactive',
@@ -4923,6 +5233,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         data,
       });
       if (res?.data?.message_id) {
+        if (verifiedStickerKey) this.markStickerUsed(verifiedStickerKey);
         return {
           ok: true,
           messageId: res.data.message_id,
@@ -6134,6 +6445,540 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return names;
+  }
+
+  private buildFeishuScopeApplyUrl(appId: string, scopes: readonly string[], baseUrl: string): string | undefined {
+    const normalizedAppId = appId.trim();
+    const normalizedScopes = Array.from(new Set(scopes.map((item) => item.trim()).filter(Boolean)));
+    if (!normalizedAppId || normalizedScopes.length === 0) return undefined;
+    const origin = baseUrl.includes('larksuite') ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
+    const url = new URL('/page/scope-apply', origin);
+    url.searchParams.set('clientID', normalizedAppId);
+    url.searchParams.set('scopes', normalizedScopes.join(','));
+    return url.toString();
+  }
+
+  private extractScopeNames(payload: unknown, fallback: readonly string[]): string[] {
+    const text = this.safeStringifyCompact(payload);
+    const matches = text.match(/[a-z][a-z0-9_.-]*:[a-z0-9_.:-]+/giu) || [];
+    const scopes = Array.from(new Set(matches.filter((item) => !item.includes('://'))));
+    return scopes.length > 0 ? scopes : [...fallback];
+  }
+
+  private buildAvatarApiFailure(input: {
+    actor: FeishuAvatarActor;
+    sourceApi: string;
+    payload: unknown;
+    status: number;
+    defaultScopes: readonly string[];
+    appId: string;
+    baseUrl: string;
+  }): FeishuAvatarResolutionFailure {
+    const record = this.asRecord(input.payload);
+    const code = this.readErrorCode(record);
+    const message = this.readErrorMessage(record) || `HTTP ${input.status}`;
+    const missingScope = code !== 41050 && (code === 99991672
+      || code === 99991679
+      || code === 210508
+      || /scope|permission|权限/iu.test(message));
+    const reasonCode = code === 41050
+      ? 'contact_data_scope_denied'
+      : missingScope
+        ? 'missing_app_scope'
+        : 'platform_api_error';
+    const missingScopes = missingScope
+      ? Array.from(new Set([
+          ...this.extractScopeNames(input.payload, input.defaultScopes),
+          ...input.defaultScopes,
+        ]))
+      : undefined;
+    return {
+      ok: false,
+      sourceApi: input.sourceApi,
+      reasonCode,
+      reason: code === 41050
+        ? '应用通讯录数据权限范围不包含该成员。'
+        : `飞书官方接口返回 [${code ?? input.status}]：${message}`,
+      missingScopes,
+      consoleUrl: missingScopes
+        ? this.buildFeishuScopeApplyUrl(input.appId, missingScopes, input.baseUrl)
+        : undefined,
+    };
+  }
+
+  private async fetchChatAvatarActors(
+    chatId: string,
+    tenantAccessToken: string,
+    baseUrl: string,
+  ): Promise<{ actors: FeishuAvatarActor[]; truncated: boolean }> {
+    const actors: FeishuAvatarActor[] = [];
+    const seen = new Set<string>();
+    let pageToken = '';
+    let serverHasMore = false;
+
+    const addActor = (item: FeishuChatMemberListItem, actorType: FeishuAvatarActorType): void => {
+      const displayName = pickFeishuMemberName(item);
+      const appId = actorType === 'bot' ? pickFeishuMemberAppId(item) : '';
+      const platformId = pickFeishuMentionableMemberId(item, true)
+        || (actorType === 'bot' ? appId : '')
+        || firstNonEmptyString(item.member_id, item.memberId);
+      if (!displayName || !platformId) return;
+      const key = `${actorType}:${platformId}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      actors.push({ actorType, displayName, platformId, ...(appId ? { appId } : {}) });
+    };
+
+    while (actors.length < FEISHU_AVATAR_EVIDENCE_LIMIT) {
+      const url = new URL(`/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/list`, baseUrl);
+      url.searchParams.set('member_id_type', 'open_id');
+      url.searchParams.set('page_size', '50');
+      if (pageToken) url.searchParams.set('page_token', pageToken);
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tenantAccessToken}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = await response.json() as {
+        code?: number;
+        msg?: string;
+        data?: {
+          users?: FeishuChatMemberListItem[];
+          bots?: FeishuChatMemberListItem[];
+          items?: FeishuChatMemberListItem[];
+          members?: FeishuChatMemberListItem[];
+          has_more?: boolean;
+          page_token?: string;
+        };
+      };
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(`Feishu chats.members.list failed [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
+      }
+      const data = payload.data || {};
+      for (const item of data.users || []) addActor(item, 'user');
+      for (const item of data.bots || []) addActor(item, 'bot');
+      // 兼容只返回混合桶的旧/灰度 schema；带 app_id 的成员按机器人处理。
+      for (const item of [...(data.items || []), ...(data.members || [])]) {
+        addActor(item, pickFeishuMemberAppId(item) ? 'bot' : 'user');
+      }
+      serverHasMore = Boolean(data.has_more && data.page_token);
+      if (!serverHasMore || !data.page_token) break;
+      pageToken = data.page_token;
+    }
+
+    return {
+      actors: actors.slice(0, FEISHU_AVATAR_EVIDENCE_LIMIT),
+      truncated: actors.length > FEISHU_AVATAR_EVIDENCE_LIMIT || serverHasMore,
+    };
+  }
+
+  private async resolveOfficialAvatarUrl(
+    actor: FeishuAvatarActor,
+    auth: { appId: string; baseUrl: string },
+    tenantAccessToken: string,
+  ): Promise<FeishuAvatarResolution> {
+    if (actor.actorType === 'user') {
+      const sourceApi = 'GET /open-apis/contact/v3/users/:user_id';
+      const url = new URL(`/open-apis/contact/v3/users/${encodeURIComponent(actor.platformId)}`, auth.baseUrl);
+      url.searchParams.set('user_id_type', 'open_id');
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${tenantAccessToken}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const payload = await response.json() as {
+        code?: number;
+        msg?: string;
+        data?: { user?: { avatar?: { avatar_72?: string; avatar_240?: string; avatar_640?: string; avatar_origin?: string } } };
+      };
+      if (!response.ok || payload.code !== 0) {
+        return this.buildAvatarApiFailure({
+          actor,
+          sourceApi,
+          payload,
+          status: response.status,
+          defaultScopes: FEISHU_USER_AVATAR_API_SCOPES,
+          appId: auth.appId,
+          baseUrl: auth.baseUrl,
+        });
+      }
+      const avatar = payload.data?.user?.avatar;
+      if (!avatar) {
+        const missingScopes = ['contact:user.base:readonly'];
+        return {
+          ok: false,
+          sourceApi,
+          reasonCode: 'missing_app_scope',
+          reason: '用户详情接口成功，但头像字段未返回；通常是缺少头像字段只读权限。',
+          missingScopes,
+          consoleUrl: this.buildFeishuScopeApplyUrl(auth.appId, missingScopes, auth.baseUrl),
+        };
+      }
+      const avatarUrl = firstNonEmptyString(avatar?.avatar_640, avatar?.avatar_240, avatar?.avatar_origin, avatar?.avatar_72);
+      return avatarUrl
+        ? { ok: true, url: avatarUrl, sourceApi }
+        : { ok: false, sourceApi, reasonCode: 'avatar_not_set', reason: '该用户资料没有可用头像地址。' };
+    }
+
+    if ((actor.appId && actor.appId === auth.appId) || actor.platformId === this.botOpenId) {
+      const sourceApi = 'GET /open-apis/bot/v3/info';
+      return this.botAvatarUrl
+        ? { ok: true, url: this.botAvatarUrl, sourceApi }
+        : { ok: false, sourceApi, reasonCode: 'avatar_field_unavailable', reason: '当前机器人官方信息未返回头像地址。' };
+    }
+
+    const sourceApi = 'GET /open-apis/application/v6/applications/:app_id';
+    if (!actor.appId) {
+      return { ok: false, sourceApi, reasonCode: 'bot_app_id_unavailable', reason: '群成员信息未返回该机器人的 app_id。' };
+    }
+    const url = new URL(`/open-apis/application/v6/applications/${encodeURIComponent(actor.appId)}`, auth.baseUrl);
+    url.searchParams.set('lang', 'zh_cn');
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${tenantAccessToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const payload = await response.json() as {
+      code?: number;
+      msg?: string;
+      data?: { app?: { avatar_url?: string } };
+    };
+    if (!response.ok || payload.code !== 0) {
+      return this.buildAvatarApiFailure({
+        actor,
+        sourceApi,
+        payload,
+        status: response.status,
+        defaultScopes: [FEISHU_OTHER_APP_AVATAR_SCOPE],
+        appId: auth.appId,
+        baseUrl: auth.baseUrl,
+      });
+    }
+    const avatarUrl = firstNonEmptyString(payload.data?.app?.avatar_url);
+    return avatarUrl
+      ? { ok: true, url: avatarUrl, sourceApi }
+      : { ok: false, sourceApi, reasonCode: 'avatar_field_unavailable', reason: '官方应用信息接口未返回头像地址。' };
+  }
+
+  private isSafeOfficialAvatarUrl(value: string): boolean {
+    try {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase();
+      return parsed.protocol === 'https:'
+        && Boolean(host)
+        && !isIP(host)
+        && host !== 'localhost'
+        && !host.endsWith('.localhost')
+        && !host.endsWith('.local');
+    } catch {
+      return false;
+    }
+  }
+
+  private async resolveAvatarHostAddresses(hostname: string, timeoutMs = 3_000): Promise<string[]> {
+    const cached = this.avatarDnsCache.get(hostname);
+    if (cached && Date.now() - cached.cachedAt < FEISHU_AVATAR_CACHE_TTL_MS) return cached.addresses;
+    const records = await Promise.race([
+      lookup(hostname, { all: true, verbatim: true }),
+      new Promise<never>((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('头像域名 DNS 解析超时')), Math.max(1, timeoutMs));
+        timer.unref?.();
+      }),
+    ]);
+    const addresses = Array.from(new Set(records.map((item) => item.address).filter(Boolean)));
+    if (addresses.length === 0) throw new Error('头像域名 DNS 未返回地址');
+    this.avatarDnsCache.set(hostname, { addresses, cachedAt: Date.now() });
+    return addresses;
+  }
+
+  private async assertAvatarUrlNetworkSafe(value: string, deadlineAt: number): Promise<string[]> {
+    if (!this.isSafeOfficialAvatarUrl(value)) throw new Error('头像地址未通过 HTTPS/公网域名校验');
+    const hostname = new URL(value).hostname.toLowerCase();
+    const remainingMs = Math.max(1, deadlineAt - Date.now());
+    const addresses = await this.resolveAvatarHostAddresses(hostname, Math.min(3_000, remainingMs));
+    if (addresses.some(isPrivateNetworkAddress)) {
+      throw new Error('头像域名 DNS 解析到了私网或本地地址');
+    }
+    return addresses;
+  }
+
+  /**
+   * 把安全检查得到的地址直接交给本次 TLS 连接的 lookup，避免校验后由 fetch
+   * 再次解析域名产生 DNS rebinding 窗口；Host 与 SNI 仍保留原始官方域名。
+   */
+  private createAvatarFetchDispatcher(hostname: string, addresses: string[]): Agent {
+    const normalizedHostname = hostname.replace(/\.$/u, '').toLowerCase();
+    return new Agent({
+      connect: {
+        lookup: ((requestedHostname: string, options: { all?: boolean; family?: number }, callback: (...args: any[]) => void) => {
+          const requested = requestedHostname.replace(/\.$/u, '').toLowerCase();
+          if (requested !== normalizedHostname) {
+            callback(new Error('头像连接域名与已校验域名不一致'));
+            return;
+          }
+          const records = addresses
+            .map((address) => ({ address, family: isIP(address) }))
+            .filter((item): item is { address: string; family: 4 | 6 } => item.family === 4 || item.family === 6);
+          const selected = options?.family === 4 || options?.family === 6
+            ? records.filter((item) => item.family === options.family)
+            : records;
+          if (selected.length === 0) {
+            callback(new Error('头像域名没有可连接的已校验公网地址'));
+            return;
+          }
+          if (options?.all) callback(null, selected);
+          else callback(null, selected[0].address, selected[0].family);
+        }) as any,
+      },
+    });
+  }
+
+  private async closeAvatarFetchDispatcher(dispatcher: { close?: () => Promise<void> } | null | undefined): Promise<void> {
+    if (!dispatcher?.close) return;
+    await dispatcher.close().catch(() => {});
+  }
+
+  private async readAvatarResponseBuffer(response: Response): Promise<Buffer> {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > FEISHU_AVATAR_MAX_BYTES) throw new Error('头像文件超过 2 MB 上限');
+      return buffer;
+    }
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      totalBytes += chunk.length;
+      if (totalBytes > FEISHU_AVATAR_MAX_BYTES) {
+        await reader.cancel('avatar size limit exceeded').catch(() => {});
+        throw new Error('头像文件超过 2 MB 上限');
+      }
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+
+  private async fetchSafeAvatarResponse(
+    avatarUrl: string,
+    deadlineAt: number,
+  ): Promise<{ response: Response; dispatcher: { close?: () => Promise<void> } }> {
+    let currentUrl = avatarUrl;
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+      const addresses = await this.assertAvatarUrlNetworkSafe(currentUrl, deadlineAt);
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) throw new Error('头像下载超过 15 秒总时限');
+      const hostname = new URL(currentUrl).hostname.toLowerCase();
+      const dispatcher = this.createAvatarFetchDispatcher(hostname, addresses);
+      let response: Response;
+      try {
+        response = await fetch(currentUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(Math.max(1, remainingMs)),
+          dispatcher,
+        } as RequestInit & { dispatcher: unknown });
+      } catch (error) {
+        await this.closeAvatarFetchDispatcher(dispatcher);
+        throw error;
+      }
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        await response.body?.cancel().catch(() => {});
+        await this.closeAvatarFetchDispatcher(dispatcher);
+        if (!location) throw new Error('头像重定向响应缺少 Location');
+        if (redirectCount >= 3) throw new Error('头像重定向次数超过上限');
+        const nextUrl = new URL(location, currentUrl).toString();
+        await this.assertAvatarUrlNetworkSafe(nextUrl, deadlineAt);
+        currentUrl = nextUrl;
+        continue;
+      }
+      if (response.url && !this.isSafeOfficialAvatarUrl(response.url)) {
+        await response.body?.cancel().catch(() => {});
+        await this.closeAvatarFetchDispatcher(dispatcher);
+        throw new Error('头像最终地址未通过 HTTPS/公网域名校验');
+      }
+      return { response, dispatcher };
+    }
+    throw new Error('头像重定向次数超过上限');
+  }
+
+  private async downloadAvatarAttachment(actor: FeishuAvatarActor, avatarUrl: string): Promise<FileAttachment> {
+    if (!this.isSafeOfficialAvatarUrl(avatarUrl)) {
+      throw new Error('头像地址未通过 HTTPS/公网域名校验');
+    }
+    const cached = this.avatarImageCache.get(avatarUrl);
+    let image = cached && Date.now() - cached.cachedAt < FEISHU_AVATAR_CACHE_TTL_MS ? cached : null;
+    if (!image) {
+      const fetched = await this.fetchSafeAvatarResponse(avatarUrl, Date.now() + 15_000);
+      let bodyCompleted = false;
+      try {
+        const { response } = fetched;
+        if (!response.ok) throw new Error(`头像下载失败：HTTP ${response.status}`);
+        const contentLength = Number(response.headers.get('content-length') || 0);
+        if (contentLength > FEISHU_AVATAR_MAX_BYTES) throw new Error('头像文件超过 2 MB 上限');
+        const buffer = await this.readAvatarResponseBuffer(response);
+        bodyCompleted = true;
+        if (buffer.length === 0) throw new Error('头像文件为空');
+        const sniffed = sniffImageMimeType(buffer);
+        if (!sniffed) throw new Error('头像响应不是受支持的 PNG/JPEG/GIF/WebP 图片');
+        image = { buffer, mimeType: sniffed.mimeType, extension: sniffed.extension, cachedAt: Date.now() };
+        this.avatarImageCache.set(avatarUrl, image);
+        while (this.avatarImageCache.size > 32) {
+          const oldestKey = this.avatarImageCache.keys().next().value as string | undefined;
+          if (!oldestKey) break;
+          this.avatarImageCache.delete(oldestKey);
+        }
+      } finally {
+        if (!bodyCompleted) await fetched.response.body?.cancel().catch(() => {});
+        await this.closeAvatarFetchDispatcher(fetched.dispatcher);
+      }
+    }
+    const typeLabel = actor.actorType === 'user' ? '用户' : '机器人';
+    const stableSuffix = crypto
+      .createHash('sha256')
+      .update(`${actor.actorType}:${actor.platformId}`)
+      .digest('hex')
+      .slice(0, 8);
+    const attachmentName = `飞书头像-${typeLabel}-${sanitizeFeishuAvatarFileName(actor.displayName)}-${stableSuffix}.${image.extension}`;
+    return {
+      id: `feishu-avatar:${actor.actorType}:${actor.platformId}`,
+      name: attachmentName,
+      type: image.mimeType,
+      size: image.buffer.length,
+      data: image.buffer.toString('base64'),
+    };
+  }
+
+  private buildAvatarEvidencePrompt(context: Omit<FeishuAvatarEvidenceContext, 'prompt'>): string {
+    const lines = [
+      'Feishu group avatar evidence (official APIs, current turn):',
+      '- Attached avatar images are the only visual facts you may describe. Keep each image bound to the exact display name listed below; never swap identities.',
+      '- Do not expose platform IDs, avatar URLs, access tokens, or raw API payloads in the user-visible reply.',
+      '- 此能力使用应用 bot 身份；不要向普通用户申请 user OAuth 来读取群成员头像。',
+      '- If every avatar is unavailable, start the final reply with “未完成：” so the Feishu result card is visibly marked red. If only some succeeded, state “部分完成” and list the unavailable members separately.',
+    ];
+    for (const item of context.items) {
+      if (item.status === 'attached') {
+        lines.push(`- ${item.actorType === 'user' ? '用户' : '机器人'}“${item.displayName}” => attachment “${item.attachmentName}” (source: ${item.sourceApi}).`);
+      } else {
+        const scopeText = item.missingScopes?.length ? ` Missing app scopes: ${item.missingScopes.join(', ')}.` : '';
+        const consoleText = item.consoleUrl ? ` Developer console: ${item.consoleUrl}` : '';
+        lines.push(`- ${item.actorType === 'user' ? '用户' : '机器人'}“${item.displayName}” unavailable: ${item.reason || item.reasonCode}.${scopeText}${consoleText}`);
+      }
+    }
+    for (const blocker of context.blockers) {
+      lines.push(`- Group-level blocker: ${blocker.reason}${blocker.consoleUrl ? ` Developer console: ${blocker.consoleUrl}` : ''}`);
+    }
+    if (context.truncated) lines.push(`- The group exceeded the per-turn safety limit of ${FEISHU_AVATAR_EVIDENCE_LIMIT}; report that only the bounded subset was inspected.`);
+    return lines.join('\n');
+  }
+
+  private async buildAvatarEvidenceForRequest(
+    chatId: string,
+    requestText: string,
+  ): Promise<{ attachments: FileAttachment[]; context: FeishuAvatarEvidenceContext }> {
+    const auth = this.getAuthContext();
+    const attachments: FileAttachment[] = [];
+    const items: FeishuAvatarEvidenceItem[] = [];
+    const blockers: FeishuAvatarEvidenceContext['blockers'] = [];
+    let actors: FeishuAvatarActor[] = [];
+    let truncated = false;
+    try {
+      const tenantAccessToken = await this.fetchTenantAccessToken(auth.appId, auth.appSecret, auth.baseUrl);
+      const listed = await this.fetchChatAvatarActors(chatId, tenantAccessToken, auth.baseUrl);
+      actors = listed.actors;
+      truncated = listed.truncated;
+      const resolvedItems = await Promise.all(actors.map(async (actor): Promise<{ item: FeishuAvatarEvidenceItem; attachment?: FileAttachment }> => {
+        const fallbackSourceApi = actor.actorType === 'user'
+          ? 'GET /open-apis/contact/v3/users/:user_id'
+          : ((actor.appId && actor.appId === auth.appId) || actor.platformId === this.botOpenId)
+            ? 'GET /open-apis/bot/v3/info'
+            : 'GET /open-apis/application/v6/applications/:app_id';
+        try {
+          const resolution = await this.resolveOfficialAvatarUrl(actor, auth, tenantAccessToken);
+          if (!resolution.ok) {
+            return {
+              item: {
+                actorType: actor.actorType,
+                displayName: actor.displayName,
+                platformId: actor.platformId,
+                appId: actor.appId,
+                status: 'blocked',
+                sourceApi: resolution.sourceApi,
+                reasonCode: resolution.reasonCode,
+                reason: resolution.reason,
+                missingScopes: resolution.missingScopes,
+                consoleUrl: resolution.consoleUrl,
+                userOAuthRequired: false,
+              },
+            };
+          }
+          const attachment = await this.downloadAvatarAttachment(actor, resolution.url);
+          return {
+            attachment,
+            item: {
+              actorType: actor.actorType,
+              displayName: actor.displayName,
+              platformId: actor.platformId,
+              appId: actor.appId,
+              status: 'attached',
+              sourceApi: resolution.sourceApi,
+              attachmentId: attachment.id,
+              attachmentName: attachment.name,
+              userOAuthRequired: false,
+            },
+          };
+        } catch (error) {
+          return {
+            item: {
+              actorType: actor.actorType,
+              displayName: actor.displayName,
+              platformId: actor.platformId,
+              appId: actor.appId,
+              status: 'blocked',
+              sourceApi: fallbackSourceApi,
+              reasonCode: 'avatar_lookup_failed',
+              reason: error instanceof Error ? error.message : String(error),
+              userOAuthRequired: false,
+            },
+          };
+        }
+      }));
+      for (const resolved of resolvedItems) {
+        items.push(resolved.item);
+        if (resolved.attachment) attachments.push(resolved.attachment);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const missingScope = /(?:99991672|99991679|im:chat\.members:read|missing[^\n]{0,24}scope|scope[^\n]{0,24}required)/iu.test(reason);
+      const missingScopes = missingScope ? ['im:chat.members:read'] : undefined;
+      blockers.push({
+        reasonCode: missingScope ? 'member_list_scope_missing' : 'member_list_unavailable',
+        reason: `无法读取群成员列表：${reason}`,
+        missingScopes,
+        consoleUrl: missingScopes ? this.buildFeishuScopeApplyUrl(auth.appId, missingScopes, auth.baseUrl) : undefined,
+        userOAuthRequired: false,
+      });
+    }
+
+    const contextWithoutPrompt = {
+      requestedCount: actors.length,
+      successfulCount: items.filter((item) => item.status === 'attached').length,
+      failedCount: items.filter((item) => item.status === 'blocked').length + blockers.length,
+      truncated,
+      items,
+      blockers,
+    };
+    return {
+      attachments,
+      context: {
+        ...contextWithoutPrompt,
+        prompt: this.buildAvatarEvidencePrompt(contextWithoutPrompt),
+      },
+    };
   }
 
   private getAuthContext(): { appId: string; appSecret: string; baseUrl: string } {
@@ -7400,6 +8245,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (botId) {
         this.botIds.add(String(botId));
       }
+      const avatarUrl = firstNonEmptyString(
+        botInfo.avatar_url,
+        botInfo.avatarUrl,
+        botData?.data?.avatar_url,
+        botData?.avatar_url,
+      );
+      if (avatarUrl) {
+        this.botAvatarUrl = avatarUrl;
+      }
       if (!this.botOpenId) {
         console.warn('[feishu-adapter] Could not resolve bot open_id');
       }
@@ -7517,8 +8371,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private isNonActionableBotCorrection(text: string, aliases: string[]): boolean {
-    const compact = text.replace(/\s+/g, '');
-    if (/(?:不用|不要|别|别再|先别).{0,8}(?:回复|处理|管|说话)/u.test(compact)) return true;
+    // 只压缩同一行内的空白，保留换行作为规则项/段落边界。长消息里相邻的
+    // “别套卡片刷屏”与“每次回复……”不能被拼成当前轮的“别……回复”命令。
+    const compact = text.replace(/[^\S\r\n]+/gu, '');
+    // “别人回复 / 分别处理 / 区别处理”里的“别”不是禁止机器人行动的祈使词，
+    // 不能据此把已经原生 @ 当前机器人的明确指令丢弃。
+    // 否定词和动作还必须处于同一自然语句或 Markdown 规则项，禁止跨标点、
+    // 标题、表格和列表分隔符拼接，避免规则正文中的词被误判为“不要响应”。
+    if (/(?:不用|不要|别再|先别|别(?!人|的|处|家|名))[^，,。；;！!？?\r\n#|—–-]{0,8}(?:回复|处理|管|说话)/u.test(compact)) return true;
     if (/(?:搞错|搞混|误判|误会|看清(?:楚)?(?:聊天)?记录|不是让你|没让你|不是叫你|没叫你|不是问你|没问你|不是at你|不是@你|不是艾特你)/iu.test(compact)) return true;
     return aliases.some((alias) => {
       const safeAlias = escapeRegExp(alias.replace(/\s+/g, ''));

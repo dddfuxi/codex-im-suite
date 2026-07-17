@@ -241,10 +241,10 @@ function splitPathList(value: string | undefined): string[] | undefined {
   return entries.length > 0 ? entries : undefined;
 }
 
-function mergeWorkspaceRoots(defaultWorkDir: string, explicitRoots?: string[], additionalDirectories?: string[]): string[] | undefined {
+function mergeWorkspaceRoots(defaultWorkDir: string, explicitRoots?: string[]): string[] | undefined {
   const seen = new Set<string>();
   const merged: string[] = [];
-  for (const rawEntry of [defaultWorkDir, ...(explicitRoots || []), ...(additionalDirectories || [])]) {
+  for (const rawEntry of [defaultWorkDir, ...(explicitRoots || [])]) {
     if (!rawEntry) continue;
     const normalized = path.normalize(rawEntry);
     const dedupeKey = path.resolve(normalized).toLowerCase();
@@ -382,7 +382,6 @@ export function loadConfig(): Config {
   const allowedWorkspaceRoots = mergeWorkspaceRoots(
     defaultWorkDir,
     splitPathList(env.get("CTI_ALLOWED_WORKSPACE_ROOTS")),
-    codexAdditionalDirectories,
   );
   const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir);
   const uploadCacheDir = resolveSafeUploadCacheDir(rawUploadCacheDir, defaultWorkDir);
@@ -952,9 +951,6 @@ export function configToSettings(config: Config): Map<string, string> {
   m.set("bridge_default_work_dir", config.defaultWorkDir);
   if (config.allowedWorkspaceRoots && config.allowedWorkspaceRoots.length > 0) {
     m.set("bridge_allowed_workspace_roots", config.allowedWorkspaceRoots.join(";"));
-  }
-  if (config.codexAdditionalDirectories && config.codexAdditionalDirectories.length > 0) {
-    m.set("bridge_default_additional_directories", config.codexAdditionalDirectories.join(";"));
   }
   if (config.memoryRepoDir) {
     m.set("bridge_memory_repo_dir", config.memoryRepoDir);

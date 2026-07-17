@@ -120,25 +120,8 @@ internal sealed class SkillLifecycleGateway
 
     public async Task<JsonDocument> ReadSnapshotAsync(int timeoutMs = 120_000)
     {
-        var registryPath = Path.Combine(_ctiHome, "data", "skill-registry.json");
-        if (File.Exists(registryPath))
-        {
-            try
-            {
-                using var stream = new FileStream(registryPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                var document = await JsonDocument.ParseAsync(stream);
-                if (document.RootElement.TryGetProperty("protocol", out var protocol)
-                    && string.Equals(protocol.GetString(), "cti-skill-registry/v1", StringComparison.Ordinal))
-                {
-                    return document;
-                }
-                document.Dispose();
-            }
-            catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException)
-            {
-                // 损坏的 runtime 状态由 lifecycle CLI 按 Registry 备份/扫描规则恢复。
-            }
-        }
+        // Skill 可能由机器人、官方安装器或其他受控入口写入 CODEX_HOME。
+        // 面板刷新必须重新扫描实际目录，不能继续展示安装前的落盘快照。
         return await RunAsync("snapshot", null, timeoutMs);
     }
 

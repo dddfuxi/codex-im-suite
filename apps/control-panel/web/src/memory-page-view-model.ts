@@ -1,0 +1,116 @@
+/**
+ * React effects use this stable key to distinguish filter changes from a
+ * user-requested global refresh. Including the revision prevents page-local
+ * search results from staying stale when PanelState itself has refreshed.
+ */
+export function buildMemoryQueryRefreshKey(kind: string, sourceGroup: string, refreshRevision: number): string {
+  return JSON.stringify([kind, sourceGroup, refreshRevision]);
+}
+
+export async function runPanelRefresh(input: {
+  refreshState: () => Promise<unknown>;
+  refreshRuntimeUnits: () => Promise<unknown>;
+  invalidatePageData: () => void;
+}): Promise<void> {
+  await input.refreshState();
+  await input.refreshRuntimeUnits();
+  input.invalidatePageData();
+}
+
+export interface WorkspacePathSettings {
+  defaultWorkDir: string;
+  allowedRoots: string;
+  memoryRepo: string;
+  additionalDirs: string;
+}
+
+export interface WorkspacePathField {
+  key: keyof WorkspacePathSettings;
+  label: string;
+  value: string;
+  editable: boolean;
+  note: string;
+}
+
+export function buildWorkspacePathSections(settings: WorkspacePathSettings): {
+  editable: WorkspacePathField[];
+  diagnostics: WorkspacePathField[];
+} {
+  return {
+    editable: [
+      {
+        key: 'defaultWorkDir',
+        label: '当前工作区',
+        value: settings.defaultWorkDir,
+        editable: true,
+        note: '每轮默认只挂载这个工作区；明确引用其他项目时才临时挂载。',
+      },
+      {
+        key: 'allowedRoots',
+        label: '项目注册根',
+        value: settings.allowedRoots,
+        editable: true,
+        note: '只定义可访问上界，不会自动进入 Prompt 或附加目录。',
+      },
+      {
+        key: 'memoryRepo',
+        label: 'Agent Home / 记忆库',
+        value: settings.memoryRepo,
+        editable: true,
+        note: '身份、规则、工具、总索引和分区记忆的集中入口，不作为工作区挂载。',
+      },
+    ],
+    diagnostics: [{
+      key: 'additionalDirs',
+      label: '旧 Codex 附加目录',
+      value: settings.additionalDirs,
+      editable: false,
+      note: '兼容读取旧配置，但不再自动挂载，也不再从控制面板修改。',
+    }],
+  };
+}
+
+function joinWindowsDisplayPath(root: string, fileName: string): string {
+  const normalizedRoot = root.replace(/[\\/]+$/u, '');
+  if (!normalizedRoot) return fileName;
+  const separator = normalizedRoot.includes('\\') || /^[A-Za-z]:/u.test(normalizedRoot) ? '\\' : '/';
+  return `${normalizedRoot}${separator}${fileName}`;
+}
+
+export function buildAgentHomeEntries(memoryRoot: string): Array<{ name: string; path: string }> {
+  return [
+    '机器人身份.md',
+    '行为与安全规则.md',
+    '工具与环境.md',
+    '记忆总索引.md',
+    '记忆库说明.md',
+  ].map((name) => ({ name, path: joinWindowsDisplayPath(memoryRoot, name) }));
+}
+
+export interface MemoryLayoutSummaryInput {
+  layoutVersion?: string;
+  migrationState?: string;
+  v3SourceCount?: number;
+  legacySourceCount?: number;
+  unclassifiedRootDocuments?: Array<{ name: string; path: string }>;
+}
+
+export function buildMemoryLayoutSummary(layout: MemoryLayoutSummaryInput | undefined): {
+  migrationLabel: string;
+  unclassifiedCount: number;
+  unclassifiedRootDocuments: Array<{ name: string; path: string }>;
+} {
+  const migrationLabel = layout?.migrationState === 'mixed'
+    ? 'v3 与旧 v2 并存，等待迁移'
+    : layout?.migrationState === 'legacy_only'
+      ? '仅旧 v2，等待迁移'
+      : layout?.migrationState === 'v3_only'
+        ? '已使用 v3 可见布局'
+        : '尚无分区记忆';
+  const unclassifiedRootDocuments = layout?.unclassifiedRootDocuments || [];
+  return {
+    migrationLabel,
+    unclassifiedCount: unclassifiedRootDocuments.length,
+    unclassifiedRootDocuments,
+  };
+}

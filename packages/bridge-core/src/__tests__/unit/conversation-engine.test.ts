@@ -134,6 +134,80 @@ test('encourages proactive completion instead of unnecessary retreat', () => {
   assert.match(prompt, /do not make the user re-do work/i);
 });
 
+test('does not inject global allowed roots or legacy additional directories into the prompt', () => {
+  initBridgeContext({
+    store: {
+      getSetting: (key: string) => ({
+        bridge_allowed_workspace_roots: 'F:\\unity\\ST4;C:\\unity\\ST3;F:\\unity\\ST3_master',
+        bridge_default_additional_directories: 'E:\\cli-md;C:\\Users\\admin\\.claude-to-im',
+        bridge_default_work_dir: 'F:\\unity\\ST4',
+        bridge_memory_repo_dir: 'E:\\cli-md',
+      })[key] || '',
+    },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const plan = _testOnly.resolveConversationWorkspacePlan({
+    text: '检查当前项目',
+    workingDirectory: 'F:\\unity\\ST4',
+    requiresWrite: false,
+  });
+  const prompt = _testOnly.buildBridgeScopedSystemPrompt(
+    {
+      id: 'binding-1',
+      codepilotSessionId: 'session-1',
+      channelType: 'feishu',
+      chatId: 'chat-1',
+      sdkSessionId: '',
+      workingDirectory: 'F:\\unity\\ST4',
+      model: '',
+      mode: 'code',
+      active: true,
+      createdAt: '2026-07-17T00:00:00.000Z',
+      updatedAt: '2026-07-17T00:00:00.000Z',
+    },
+    'base',
+    '',
+    plan,
+  );
+
+  assert.match(prompt, /Turn workspace plan/);
+  assert.match(prompt, /F:\\unity\\ST4/);
+  assert.doesNotMatch(prompt, /C:\\unity\\ST3/);
+  assert.doesNotMatch(prompt, /F:\\unity\\ST3_master/);
+  assert.doesNotMatch(prompt, /E:\\cli-md/);
+  assert.doesNotMatch(prompt, /\.claude-to-im/);
+});
+
+test('builds turn-scoped mounts from explicit registered project paths', () => {
+  initBridgeContext({
+    store: {
+      getSetting: (key: string) => ({
+        bridge_allowed_workspace_roots: 'F:\\unity\\ST4;C:\\unity\\ST3;F:\\unity\\ST3_master',
+        bridge_default_work_dir: 'F:\\unity\\ST4',
+        bridge_memory_repo_dir: 'E:\\cli-md',
+      })[key] || '',
+    },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const plan = _testOnly.resolveConversationWorkspacePlan({
+    text: '对照 "C:\\unity\\ST3\\Assets" 和 "F:\\unity\\ST3_master\\Assets"',
+    workingDirectory: 'F:\\unity\\ST4',
+    requiresWrite: false,
+  });
+
+  assert.equal(plan.primaryWorkspace.path, 'F:\\unity\\ST4');
+  assert.deepEqual(plan.temporaryMounts.map((item) => item.path), [
+    'C:\\unity\\ST3',
+    'F:\\unity\\ST3_master',
+  ]);
+});
+
 test('keeps memory-backed sticker attachments out of the workspace upload cache', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-conversation-sticker-'));
   const previousMemoryRoot = process.env.CTI_MEMORY_REPO_DIR;

@@ -14,8 +14,10 @@ import type {
   PermissionGateway,
   LifecycleHooks,
   ReminderActionHost,
+  BridgeControlHost,
   ExtensionCatalogHost,
   FeishuCloudDocumentHost,
+  FeishuCliUserAuthHost,
   FeishuOAuthManualHost,
   MemoryIntentHost,
   TurnReferenceResolverHost,
@@ -27,8 +29,10 @@ export interface BridgeContext {
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;
   reminders?: ReminderActionHost;
+  bridgeControl?: BridgeControlHost;
   extensions?: ExtensionCatalogHost;
   feishuCloudDocuments?: FeishuCloudDocumentHost;
+  feishuCliUserAuth?: FeishuCliUserAuthHost;
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
   turnReferences?: TurnReferenceResolverHost;

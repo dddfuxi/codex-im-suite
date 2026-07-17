@@ -10,6 +10,7 @@ import {
 } from '@tanstack/react-table';
 import {
   Activity,
+  Archive,
   ArrowDownUp,
   ArrowLeftRight,
   Bell,
@@ -61,6 +62,18 @@ import { PromptPage } from './pages/PromptPage.js';
 import { SkillsPage } from './pages/SkillsPage.js';
 import type { PromptSnapshotPanelState } from './prompt-view-model.js';
 import type { SkillGovernancePanelState } from './skill-view-model.js';
+import {
+  buildAgentHomeEntries,
+  buildMemoryLayoutSummary,
+  buildMemoryQueryRefreshKey,
+  buildWorkspacePathSections,
+  runPanelRefresh,
+} from './memory-page-view-model.js';
+import {
+  getStickerLifecycleActions,
+  matchesStickerStatusFilter,
+  type StickerStatusFilter,
+} from './sticker-library-view-model.js';
 import './styles.css';
 
 type StatusKind = 'ok' | 'warning' | 'error' | 'idle';
@@ -533,6 +546,14 @@ type KnowledgeIndexStatus = {
   statusUpdatedAt?: string;
   lastError: string;
   optimization?: MemoryOptimizationStatus;
+  layout?: {
+    layoutVersion: string;
+    migrationState: 'mixed' | 'v3_only' | 'legacy_only' | 'empty' | string;
+    v3SourceCount: number;
+    legacySourceCount: number;
+    agentHome: Array<{ name: string; path: string; exists: boolean }>;
+    unclassifiedRootDocuments?: Array<{ name: string; path: string }>;
+  };
 };
 
 type KnowledgeSearchItem = {
@@ -657,6 +678,8 @@ type FeishuStickerLibraryItem = {
   disabled: boolean;
   disabledReason: string;
   lastEditedAt: string;
+  archived: boolean;
+  archivedAt: string;
 };
 
 type FeishuStickerLibrarySnapshot = {
@@ -2303,6 +2326,7 @@ function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const [commandNotice, setCommandNotice] = useState<CommandNotice | null>(null);
+  const [pageRefreshRevision, setPageRefreshRevision] = useState(0);
   const lastLoadedSessionKeyRef = useRef('');
   const sessionsRef = useRef<SessionItem[]>([]);
   const inFlightSessionKeyRef = useRef('');
@@ -2343,6 +2367,15 @@ function App() {
   async function loadReplyPresets() {
     const data = (await sendCommand('settings.listReplyPresets')) as ReplyPresetItem[];
     setReplyPresets(Array.isArray(data) ? data : []);
+  }
+
+  async function refreshPanelState() {
+    await runPanelRefresh({
+      refreshState: () => sendCommand('state.refresh'),
+      refreshRuntimeUnits: loadRuntimeUnits,
+      // 页面内部缓存（例如记忆搜索结果和表情包列表）需要显式收到刷新信号。
+      invalidatePageData: () => setPageRefreshRevision((current) => current + 1),
+    });
   }
 
   async function openSessionDetail(sessionKey: string, force = false) {
@@ -2570,7 +2603,7 @@ function App() {
               {theme === 'dark' ? <SunMedium size={16} /> : <MoonStar size={16} />}
               <span>{theme === 'dark' ? '夜间' : '白天'}</span>
             </button>
-            <button className="icon-button" title="刷新状态" onClick={() => void sendCommand('state.refresh').then(loadRuntimeUnits)} disabled={pending['state.refresh']}>
+            <button className="icon-button" title="刷新状态" onClick={() => void refreshPanelState()} disabled={pending['state.refresh']}>
               <RefreshCw size={16} className={pending['state.refresh'] ? 'spin' : ''} />
             </button>
             <button
@@ -2612,7 +2645,7 @@ function App() {
             runtimeUnits={runtimeUnits}
             activities={activities}
             openLogs={() => setPage('logs')}
-            refresh={() => void sendCommand('state.refresh').then(loadRuntimeUnits)}
+            refresh={() => void refreshPanelState()}
             refreshPending={pending['state.refresh']}
             run={run}
             invokeAction={invokeRuntimeAction}
@@ -2705,7 +2738,7 @@ function App() {
             setSessionPersonRole={setSessionPersonRole}
           />
         )}
-        {page === 'memory' && <MemoryPage state={state} run={run} pending={pending} />}
+        {page === 'memory' && <MemoryPage state={state} run={run} pending={pending} refreshRevision={pageRefreshRevision} />}
         {page === 'settings' && (
           <SettingsPage
             state={state}
@@ -4860,7 +4893,17 @@ function MemoryRelationTree({
   );
 }
 
-function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps['run']; pending: Record<string, boolean> }) {
+function MemoryPage({
+  state,
+  run,
+  pending,
+  refreshRevision,
+}: {
+  state: PanelState;
+  run: PageProps['run'];
+  pending: Record<string, boolean>;
+  refreshRevision: number;
+}) {
   const [status, setStatus] = useState<KnowledgeIndexStatus>(state.memory);
   const reminders = state.memoryReminders;
   const [query, setQuery] = useState('');
@@ -4872,12 +4915,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const [searchMeta, setSearchMeta] = useState({ totalMatched: 0, offset: 0, limit: 200 });
   const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', mediaDir: '', updatedAt: '', stickers: [] });
   const [stickerQuery, setStickerQuery] = useState('');
-  const [stickerStatusFilter, setStickerStatusFilter] = useState<'asset' | 'all' | 'enabled' | 'disabled' | 'failed' | 'history'>('asset');
+  const [stickerStatusFilter, setStickerStatusFilter] = useState<StickerStatusFilter>('asset');
   const [stickerChatFilter, setStickerChatFilter] = useState('all');
   const [editingStickerKey, setEditingStickerKey] = useState('');
   const [editingSticker, setEditingSticker] = useState<Partial<FeishuStickerLibraryItem>>({});
   const [aliasDrafts, setAliasDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
+  const memoryQueryRefreshKey = buildMemoryQueryRefreshKey(kind, sourceGroup, refreshRevision);
 
   useEffect(() => setStatus(state.memory), [state.memory]);
 
@@ -4955,6 +4999,35 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
     setAliasDrafts((current) => ({ ...current, [fileKey]: '' }));
   };
 
+  const archiveSticker = async (item: FeishuStickerLibraryItem) => {
+    setError('');
+    const next = await run('memory.archiveFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+    if (editingStickerKey === item.fileKey) {
+      setEditingStickerKey('');
+      setEditingSticker({});
+    }
+  };
+
+  const restoreSticker = async (item: FeishuStickerLibraryItem) => {
+    setError('');
+    const next = await run('memory.restoreFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+  };
+
+  const deleteSticker = async (item: FeishuStickerLibraryItem) => {
+    const title = item.label || item.aliases[0] || item.fileKey;
+    if (!window.confirm(`永久删除已归档表情包“${title}”？\n\n记录和本地缓存图片会被删除，并保留防止历史同步复活的删除标记。该操作不可恢复。`)) return;
+    setError('');
+    const next = await run('memory.deleteFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
+    setStickerLibrary(next);
+    setAliasDrafts((current) => {
+      const copy = { ...current };
+      delete copy[item.fileKey];
+      return copy;
+    });
+  };
+
   const search = async (nextOffset = searchMeta.offset) => {
     setError('');
     try {
@@ -4981,11 +5054,11 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
 
   useEffect(() => {
     void search(0);
-  }, [kind, sourceGroup]);
+  }, [memoryQueryRefreshKey]);
 
   useEffect(() => {
     void refreshStickerLibrary();
-  }, []);
+  }, [refreshRevision]);
   const statusKind: StatusKind = status.lastError
     ? 'error'
     : status.exists
@@ -5013,14 +5086,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   const visibleStickers = useMemo(() => {
     const queryText = stickerQuery.trim().toLowerCase();
     return stickerLibrary.stickers.filter((item) => {
-      const isLibraryAsset = item.isLibraryAsset !== false;
-      const isHistoryOnly = item.isHistoryOnly === true;
-      const hasMediaFailure = item.hasMediaDownloadFailure === true || Boolean(item.mediaDownloadFailedAt || item.mediaDownloadError);
-      if (stickerStatusFilter === 'asset' && !isLibraryAsset) return false;
-      if (stickerStatusFilter === 'enabled' && (item.disabled || !isLibraryAsset)) return false;
-      if (stickerStatusFilter === 'disabled' && !item.disabled) return false;
-      if (stickerStatusFilter === 'failed' && !hasMediaFailure) return false;
-      if (stickerStatusFilter === 'history' && !isHistoryOnly) return false;
+      if (!matchesStickerStatusFilter(item, stickerStatusFilter)) return false;
       if (stickerChatFilter !== 'all' && item.chatId !== stickerChatFilter) return false;
       if (!queryText) return true;
       const haystack = [
@@ -5039,17 +5105,23 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
   }, [stickerLibrary.stickers, stickerQuery, stickerStatusFilter, stickerChatFilter]);
   const stickerStats = useMemo(() => {
     const total = stickerLibrary.stickers.length;
-    const disabled = stickerLibrary.stickers.filter((item) => item.disabled).length;
+    const disabled = stickerLibrary.stickers.filter((item) => item.disabled && !item.archived).length;
+    const archived = stickerLibrary.stickers.filter((item) => item.archived).length;
     const trusted = stickerLibrary.stickers.filter((item) => item.hasTrustedSemantic).length;
     const cached = stickerLibrary.stickers.filter((item) => item.hasMedia).length;
     const userOnly = stickerLibrary.stickers.filter((item) => item.hasUserAnnotation && !item.hasTrustedSemantic).length;
     const failed = stickerLibrary.stickers.filter((item) => item.hasMediaDownloadFailure || item.mediaDownloadFailedAt || item.mediaDownloadError).length;
     const historyOnly = stickerLibrary.stickers.filter((item) => item.isHistoryOnly === true).length;
-    const assets = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false).length;
-    const enabled = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false && !item.disabled).length;
-    return { total, assets, enabled, disabled, trusted, cached, userOnly, failed, historyOnly };
+    const assets = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false && !item.archived).length;
+    const enabled = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false && !item.disabled && !item.archived).length;
+    return { total, assets, enabled, disabled, archived, trusted, cached, userOnly, failed, historyOnly };
   }, [stickerLibrary.stickers]);
   const memoryRelationGroups = useMemo(() => buildMemoryRelationGroups(selectedMemory, reminders), [selectedMemory, reminders]);
+  const memoryLayout = status.layout;
+  const agentHomeEntries = memoryLayout?.agentHome?.length
+    ? memoryLayout.agentHome
+    : buildAgentHomeEntries(status.memoryRoot || state.paths.memoryRepo).map((item) => ({ ...item, exists: false }));
+  const memoryLayoutSummary = buildMemoryLayoutSummary(memoryLayout);
   const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
     {
       accessorKey: 'kind',
@@ -5135,6 +5207,41 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
 
   return (
     <section className="content-stack">
+      <section className="panel">
+        <SectionHeader title="Agent Home 与记忆布局" />
+        <p className="panel-intro">身份、规则、工具、说明和总索引集中放在记忆库根目录；总索引只引用真实分区文件，不作为第二事实源。</p>
+        <div className="summary-grid wide">
+          <Metric label="布局" value={memoryLayout?.layoutVersion || 'none'} compact />
+          <Metric label="v3 来源" value={String(memoryLayout?.v3SourceCount ?? 0)} compact />
+          <Metric label="待迁移 v2" value={String(memoryLayout?.legacySourceCount ?? 0)} compact />
+          <Metric label="迁移状态" value={memoryLayoutSummary.migrationLabel} compact />
+          <Metric label="未归类根文档" value={String(memoryLayoutSummary.unclassifiedCount)} compact />
+        </div>
+        <div className="runtime-list compact-list">
+          {agentHomeEntries.map((item) => (
+            <article key={item.name} className="runtime-row">
+              <div><strong>{item.name}</strong><code>{item.path}</code></div>
+              <div className="row-actions">
+                <StatusPill status={item.exists ? 'ok' : 'warning'} label={item.exists ? '已创建' : '缺失'} />
+                <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('path.openAny', { path: item.path })} disabled={!item.exists} />
+              </div>
+            </article>
+          ))}
+        </div>
+        {memoryLayoutSummary.unclassifiedRootDocuments.length > 0 && (
+          <div className="runtime-list compact-list">
+            {memoryLayoutSummary.unclassifiedRootDocuments.map((item) => (
+              <article key={item.path} className="runtime-row">
+                <div><strong>{item.name}</strong><code>{item.path}</code></div>
+                <div className="row-actions">
+                  <StatusPill status="warning" label="未归类" />
+                  <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('path.openAny', { path: item.path })} />
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
       <section className="panel memory-tree-primary">
         <SectionHeader
           title="记忆关系树"
@@ -5213,12 +5320,13 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           title="Feishu 表情包库"
           action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerLibrary()} pending={pending['memory.feishuStickers']} />}
         />
-        <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；默认隐藏仅历史 key 和媒体下载失败的空索引记录。禁用项不会进入提示词、语义匹配或裸表情包候选。</p>
+        <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；禁用用于暂停发送，归档用于移出日常资产列表。归档项可恢复，再次操作可永久删除。</p>
         <div className="memory-optimizer-summary">
           <Metric label="可管理" value={String(stickerStats.assets)} compact />
           <Metric label="历史 key" value={String(stickerStats.historyOnly)} compact />
           <Metric label="启用" value={String(stickerStats.enabled)} compact />
           <Metric label="禁用" value={String(stickerStats.disabled)} compact />
+          <Metric label="归档" value={String(stickerStats.archived)} compact />
           <Metric label="可信语义" value={String(stickerStats.trusted)} compact />
           <Metric label="已缓存图" value={String(stickerStats.cached)} compact />
           <Metric label="仅用户解释" value={String(stickerStats.userOnly)} compact />
@@ -5233,11 +5341,12 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
               placeholder="搜索名称、别名、意图、语气、用法或群聊"
             />
           </div>
-          <select value={stickerStatusFilter} onChange={(event) => setStickerStatusFilter(event.target.value as 'asset' | 'all' | 'enabled' | 'disabled' | 'failed' | 'history')}>
+          <select value={stickerStatusFilter} onChange={(event) => setStickerStatusFilter(event.target.value as StickerStatusFilter)}>
             <option value="asset">可管理资产</option>
             <option value="all">全部记录</option>
             <option value="enabled">仅启用</option>
             <option value="disabled">仅禁用</option>
+            <option value="archived">已归档</option>
             <option value="failed">媒体失败</option>
             <option value="history">仅历史 key</option>
           </select>
@@ -5250,8 +5359,9 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
           {visibleStickers.map((item) => {
             const isEditing = editingStickerKey === item.fileKey;
             const title = item.label || item.aliases[0] || '未命名表情包';
+            const lifecycleActions = getStickerLifecycleActions(item);
             return (
-              <article key={item.fileKey} className={item.disabled ? 'feishu-sticker-row disabled' : 'feishu-sticker-row'}>
+              <article key={item.fileKey} className={item.archived || item.disabled ? 'feishu-sticker-row disabled' : 'feishu-sticker-row'}>
                 <div className="sticker-row-main">
                   <div className="sticker-row-title">
                     <span className="sticker-preview">
@@ -5261,7 +5371,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                       <strong>{title}</strong>
                       <span>{item.intent || item.tone || item.usage || item.statusLabel || (item.previewUrl ? '已缓存图片，待视觉标注' : '仅历史 key，无媒体')}</span>
                     </div>
-                    <StatusPill status={item.disabled || !item.hasTrustedSemantic ? 'warning' : 'ok'} label={item.statusLabel || (item.disabled ? '已禁用' : '启用')} />
+                    <StatusPill status={item.archived || item.disabled || !item.hasTrustedSemantic ? 'warning' : 'ok'} label={item.statusLabel || (item.archived ? '已归档' : item.disabled ? '已禁用' : '启用')} />
                   </div>
                   <div className="sticker-alias-row">
                     {item.aliases.length > 0 ? item.aliases.slice(0, 12).map((alias) => <code key={alias}>{alias}</code>) : <span>暂无别名</span>}
@@ -5298,6 +5408,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                     <span>chat: {item.chatId || '-'}</span>
                     <span>使用 {item.useCount} 次，最近收到 {item.lastSeenAt || '-'}，最近发送 {item.lastUsedAt || '-'}</span>
                     <span>置信度 {Math.round((item.annotationConfidence || 0) * 100)}%，最近编辑 {item.lastEditedAt || '-'}</span>
+                    <span>归档时间 {item.archivedAt || '-'}</span>
                   </details>
                 </div>
                 <div className="sticker-row-actions">
@@ -5308,16 +5419,27 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                     </>
                   ) : (
                     <>
-                      <MiniButton label="编辑" icon={<Settings size={14} />} onClick={() => beginEditSticker(item)} />
-                      <MiniButton
-                        label={item.disabled ? '恢复' : '禁用'}
-                        icon={item.disabled ? <CheckCircle2 size={14} /> : <Trash2 size={14} />}
-                        onClick={() => void toggleStickerDisabled(item)}
-                        pending={pending['memory.updateFeishuSticker']}
-                      />
+                      {!item.archived && <MiniButton label="编辑" icon={<Settings size={14} />} onClick={() => beginEditSticker(item)} />}
+                      {!item.archived && (
+                        <MiniButton
+                          label={item.disabled ? '恢复启用' : '禁用'}
+                          icon={item.disabled ? <CheckCircle2 size={14} /> : <Trash2 size={14} />}
+                          onClick={() => void toggleStickerDisabled(item)}
+                          pending={pending['memory.updateFeishuSticker']}
+                        />
+                      )}
+                      {lifecycleActions.includes('archive') && (
+                        <MiniButton label="一键归档" icon={<Archive size={14} />} onClick={() => void archiveSticker(item)} pending={pending['memory.archiveFeishuSticker']} />
+                      )}
+                      {lifecycleActions.includes('restore') && (
+                        <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restoreSticker(item)} pending={pending['memory.restoreFeishuSticker']} />
+                      )}
+                      {lifecycleActions.includes('delete') && (
+                        <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteSticker(item)} pending={pending['memory.deleteFeishuSticker']} />
+                      )}
                     </>
                   )}
-                  <div className="alias-merge-box">
+                  {!item.archived && <div className="alias-merge-box">
                     <input
                       value={aliasDrafts[item.fileKey] || ''}
                       onChange={(event) => setAliasDrafts((current) => ({ ...current, [item.fileKey]: event.target.value }))}
@@ -5330,7 +5452,7 @@ function MemoryPage({ state, run, pending }: { state: PanelState; run: PageProps
                       pending={pending['memory.mergeFeishuStickerAliases']}
                       disabled={!String(aliasDrafts[item.fileKey] || '').trim()}
                     />
-                  </div>
+                  </div>}
                 </div>
               </article>
             );
@@ -5695,6 +5817,7 @@ function SettingsPage({
   const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
   const fallbackChain = parseCodexChain(settings.codexApiFallbackChain);
   const executorOptions = state.executors?.executors ?? [];
+  const pathSections = buildWorkspacePathSections(settings);
   const localModelOptions = useMemo(() => {
     const byModel = new Map<string, ExtensionCatalogItem>();
     for (const item of modelCatalogItems) {
@@ -5870,14 +5993,31 @@ function SettingsPage({
           action={<MiniButton label={settingsDirty ? '保存未应用修改' : '保存'} icon={<CheckCircle2 size={14} />} onClick={() => void saveSettings(false)} pending={pending['settings.save']} />}
         />
         <div className="path-grid">
-          <PathField label="默认工作目录" value={settings.defaultWorkDir} onChange={(value) => update('defaultWorkDir', value)} run={run} />
-          <TokenPathField label="允许根目录" value={settings.allowedRoots} onChange={(value) => update('allowedRoots', value)} run={run} />
-          <PathField label="记忆仓库" value={settings.memoryRepo} onChange={(value) => update('memoryRepo', value)} run={run} />
-          <TokenPathField label="Codex 附加目录" value={settings.additionalDirs} onChange={(value) => update('additionalDirs', value)} run={run} />
+          {pathSections.editable.map((field) => field.key === 'allowedRoots' ? (
+            <div key={field.key} className="detail-stack">
+              <TokenPathField label={field.label} value={field.value} onChange={(value) => update(field.key, value)} run={run} />
+              <span className="micro-copy">{field.note}</span>
+            </div>
+          ) : (
+            <div key={field.key} className="detail-stack">
+              <PathField label={field.label} value={field.value} onChange={(value) => update(field.key, value)} run={run} />
+              <span className="micro-copy">{field.note}</span>
+            </div>
+          ))}
         </div>
+        <details className="advanced-settings">
+          <summary>高级诊断</summary>
+          {pathSections.diagnostics.map((field) => (
+            <div key={field.key} className="detail-stack">
+              <strong>{field.label}</strong>
+              <code>{field.value || '未配置'}</code>
+              <span className="micro-copy">{field.note}</span>
+            </div>
+          ))}
+        </details>
         <div className="project-fact-hint">
           <strong>项目事实</strong>
-          <span>默认工作目录只表示机器人没有更明确目标时的起步项目；允许根目录表示可访问范围。临时图片/附件缓存默认进入 Bridge 运行态 uploads，表情包长期资产进入记忆仓库，不应再落到默认工作目录。Unity 工程、常用场景、素材目录这类长期事实请通过记忆记录到项目事实，机器人会在后续对话中按记忆检索使用。</span>
+          <span>当前工作区是每轮唯一默认挂载；项目注册根只是权限上界。明确引用其他项目时，Bridge 才会为当前回合建立临时挂载，回合结束即失效。临时附件进入运行态 uploads，长期事实进入 Agent Home/记忆库，二者都不会自动注入工作区。</span>
         </div>
       </section>
       <section className="panel panel-span-2">

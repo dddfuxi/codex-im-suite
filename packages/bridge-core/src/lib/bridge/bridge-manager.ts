@@ -96,6 +96,7 @@ const STICKER_CANDIDATE_ANALYSIS_FENCE = 'cti-sticker-candidate-analysis';
 const STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE = 0.45;
 const REMINDER_ACTION_FENCE = 'cti-reminder';
 const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
+const BRIDGE_CONTROL_ACTION_FENCE = 'cti-bridge-control';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -196,6 +197,17 @@ interface CtiDirectMessageAction {
 
 interface ExtractedDirectMessageAction {
   action: CtiDirectMessageAction | null;
+  text: string;
+  hadBlock: boolean;
+  error?: string;
+}
+
+interface CtiBridgeControlAction {
+  action: 'restart_live';
+}
+
+interface ExtractedBridgeControlAction {
+  action: CtiBridgeControlAction | null;
   text: string;
   hadBlock: boolean;
   error?: string;
@@ -397,10 +409,54 @@ function extractCtiDirectMessageAction(text: string): ExtractedDirectMessageActi
   }
 }
 
-function isExplicitDirectMessageRequestText(text: string): boolean {
+function extractCtiBridgeControlAction(text: string): ExtractedBridgeControlAction {
+  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
+  const match = text.match(fencePattern);
+  if (!match) return { action: null, text, hadBlock: false };
+  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
+  try {
+    const parsed = JSON.parse(match[2].trim()) as Partial<CtiBridgeControlAction>;
+    if (parsed.action !== 'restart_live') {
+      return { action: null, text: cleaned, hadBlock: true, error: '不支持的 Bridge 控制动作' };
+    }
+    return { action: { action: 'restart_live' }, text: cleaned, hadBlock: true };
+  } catch {
+    return { action: null, text: cleaned, hadBlock: true, error: 'Bridge 控制动作 JSON 解析失败' };
+  }
+}
+
+function isExplicitBridgeRestartRequestText(text: string): boolean {
+  const normalized = (text || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /(重启|重新启动|restart|reboot)/iu.test(normalized)
+    && /(live\s*bridge|bridge|桥接|机器人(?:服务)?|daemon|守护进程)/iu.test(normalized);
+}
+
+function containsUnverifiedBridgeRestartCompletion(rawReply: string, rawPrompt: string): boolean {
+  if (!isExplicitBridgeRestartRequestText(rawPrompt)) return false;
+  const visible = stripFinalReplyProtocolArtifacts(rawReply).trim();
+  return /(?:已|已经|成功).{0,16}(?:重启|重新启动|restart).{0,16}(?:完成|成功|好了|完毕|生效)/iu.test(visible)
+    || /(?:live\s*bridge|bridge|桥接|机器人(?:服务)?).{0,16}(?:已|已经|成功).{0,12}(?:重启|重新启动|restart)/iu.test(visible);
+}
+
+function isExplicitDirectMessageRequestText(text: string, targetText = ''): boolean {
   const normalized = (text || '').normalize('NFKC').replace(/\s+/g, '');
   if (!normalized) return false;
-  return /(?:私发|私信|单独发|悄悄发|发私聊|DM|directmessage|给.{1,32}发(?:一条)?消息|发(?:一条)?消息给|转告|转发给|发到(?:会话|群|群聊|chat|channel|session)|发送到(?:会话|群|群聊|chat|channel|session)|跨群发|跨会话发)/iu.test(normalized);
+  const broadIntent = /(?:私发|私信|单独发|悄悄发|发私聊|DM|directmessage|给.{1,32}发(?:一条)?消息|发(?:一条)?消息给|转告|转发给|发到(?:会话|群|群聊|chat|channel|session)|发送到(?:会话|群|群聊|chat|channel|session)|跨群发|跨会话发)/iu;
+  const target = (targetText || '').normalize('NFKC').replace(/\s+/g, '').replace(/^[@＠]+/u, '').trim();
+  if (!target) return broadIntent.test(normalized);
+
+  const safeTarget = escapeRegExp(target);
+  const targetAppears = new RegExp(`(?:@|＠)?${safeTarget}`, 'iu').test(normalized);
+  if (targetAppears && broadIntent.test(normalized)) return true;
+
+  // “给张三发个表情包/图片/文件”本身就是明确的本轮发送授权；
+  // 必须与动作目标同名，避免模型把用户提到的其他名字升级成私发对象。
+  const mediaOrContent = '(?:表情包|表情|sticker|图片|照片|图|文件|附件|消息|文字|文本|链接|内容)';
+  const sendToTarget = new RegExp(`(?:给|向)(?:@|＠)?${safeTarget}(?:发|发送|来|回)(?:一|1)?(?:个|张|份|条)?${mediaOrContent}`, 'iu');
+  const targetAfterContent = new RegExp(`(?:发|发送)(?:一|1)?(?:个|张|份|条)?${mediaOrContent}(?:给|到)(?:@|＠)?${safeTarget}`, 'iu');
+  const explicitlyNegated = new RegExp(`(?:不要|别|不想|不用|禁止)(?:给|向)(?:@|＠)?${safeTarget}(?:发|发送|来|回)`, 'iu').test(normalized);
+  return !explicitlyNegated && (sendToTarget.test(normalized) || targetAfterContent.test(normalized));
 }
 
 function containsUnverifiedDirectMessageCompletion(rawReply: string, rawPrompt: string): boolean {
@@ -421,6 +477,13 @@ function formatDirectMessageResultText(result: SendResult & { targetDisplayName?
   return `未完成：${reason || '无法完成私发'}`;
 }
 
+function isExplicitUnfinishedReplyText(text: string): boolean {
+  const visible = stripFinalReplyProtocolArtifacts(text || '')
+    .replace(/^\s*(?:#{1,6}\s*)?(?:\*\*)?/u, '')
+    .trim();
+  return /^(?:未完成|失败|执行失败|阻塞|已拦截|无法完成)(?:\s*[:：]|\s|$)/iu.test(visible);
+}
+
 interface BridgeActionReplyResult {
   handled: boolean;
   text: string;
@@ -428,18 +491,64 @@ interface BridgeActionReplyResult {
   bridgeActionToolName?: string;
 }
 
+async function executeBridgeControlActionFromReply(
+  rawReply: string,
+  msg: InboundMessage,
+  rawPrompt: string,
+): Promise<BridgeActionReplyResult> {
+  const extracted = extractCtiBridgeControlAction(rawReply);
+  if (!extracted.action) {
+    if (extracted.hadBlock) {
+      return { handled: true, text: `未完成：${extracted.error || 'Bridge 控制动作无效'}` };
+    }
+    if (containsUnverifiedBridgeRestartCompletion(rawReply, rawPrompt)) {
+      return { handled: true, text: '未完成：模型声称已重启 live Bridge，但没有使用受控重启动作，已拦截这条伪完成回复。' };
+    }
+    return { handled: false, text: rawReply };
+  }
+  if (!isExplicitBridgeRestartRequestText(rawPrompt)) {
+    return { handled: true, text: '未完成：本轮用户没有明确要求重启 live Bridge，已拦截重启动作。' };
+  }
+  if (!isOwnerMessage(msg)) return { handled: true, text: buildOwnerRequiredMessage(msg) };
+  const bridgeControl = getBridgeContext().bridgeControl;
+  if (!bridgeControl) {
+    return { handled: true, text: '未完成：当前 runtime 没有加载受控 Bridge 重启服务。' };
+  }
+  const result = await bridgeControl.scheduleRestart({
+    requestedBy: {
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      userId: msg.address.userId,
+      messageId: msg.messageId,
+    },
+  });
+  if (!result.ok) {
+    return { handled: true, text: `未完成：${result.error || result.message || 'live Bridge 重启调度失败。'}` };
+  }
+  return {
+    handled: true,
+    text: '已安排 live Bridge 重启。当前回复发送完成后，外部 supervisor 会延迟执行固定重启流程。',
+    bridgeActionToolName: BRIDGE_CONTROL_ACTION_FENCE,
+  };
+}
+
 async function executeDirectMessageActionFromReply(
   adapter: BaseChannelAdapter,
   rawReply: string,
   msg: InboundMessage,
   rawPrompt: string,
+  verifiedMediaAction?: VerifiedMediaAction,
 ): Promise<BridgeActionReplyResult> {
   const extracted = extractCtiDirectMessageAction(rawReply);
   if (extracted.action) {
-    if (!isExplicitDirectMessageRequestText(rawPrompt)) {
+    if (!isExplicitDirectMessageRequestText(rawPrompt, extracted.action.targetText)) {
       return { handled: true, text: '未完成：本轮用户没有明确授权私发消息，已拦截私发动作。' };
     }
-    const requiresConversationConfirmation = Boolean(extracted.action.targetId || extracted.action.targetKind);
+    // name-only 的 targetType=user 只是模型对人员类型的补充说明；目标仍必须由
+    // 当前群成员 evidence 唯一解析，不应误升为跨会话 Owner 二次确认。
+    const requiresConversationConfirmation = Boolean(
+      extracted.action.targetId || extracted.action.targetKind === 'chat',
+    );
     if (requiresConversationConfirmation) {
       if (!isOwnerMessage(msg)) {
         return { handled: true, text: buildOwnerRequiredMessage(msg) };
@@ -490,6 +599,7 @@ async function executeDirectMessageActionFromReply(
       targetText: extracted.action.targetText,
       text: extracted.action.text,
       parseMode: extracted.action.parseMode,
+      verifiedMediaAction,
     });
     return {
       handled: true,
@@ -1645,7 +1755,7 @@ function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
 function sanitizeProgressCardDetail(text: string): string {
   const normalized = (text || '')
     .replace(/\r\n/g, '\n')
-    .replace(/```(?:cti-final|cti-direct-message)[\s\S]*?```/gi, '')
+    .replace(/```(?:cti-final|cti-direct-message|cti-bridge-control)[\s\S]*?```/gi, '')
     .replace(/^\s*#{1,6}\s*处理思路\s*$/gim, '')
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
@@ -1698,7 +1808,7 @@ function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
   // 进度卡允许展示面向用户改写过的处理思路；这里只拦截会暴露工具名、路径、命令或 agent 内部阶段的细节。
-  if (/(JsonTool|tool_use|tool_result|cti-final|cti-direct-message|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
+  if (/(JsonTool|tool_use|tool_result|cti-final|cti-direct-message|cti-bridge-control|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
     return true;
   }
   if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
@@ -2557,6 +2667,7 @@ function stripFinalReplyProtocolArtifacts(text: string): string {
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${FINAL_REPLY_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_ANNOTATION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -2900,7 +3011,7 @@ const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【])@([^\s@,，.。!！?？~～
 const FEISHU_BARE_AT_BOUNDARY_CLASS = '[\\s([{（【]';
 const FEISHU_BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
 const FEISHU_EXPLICIT_MENTION_TARGET_TOKEN = '[@＠]?[\\p{L}\\p{N}_.$·-]{1,64}?';
-const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|处理|吗|呢|吧|啊|呀|哈|哦|噢)';
+const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|回答|处理|吗|呢|吧|啊|呀|哈|哦|噢)';
 const FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE = /(?:让|叫|喊|通知|请|麻烦|要)(?:他|她|它|ta|TA|对方|其|那个人|这个人|该成员)|(?:跟|和)(?:你|我|他|她|它|ta|TA|对方)|(?:去|来|帮|帮忙|帮我)(?:看|看看|处理|回复|聊|聊天|说|问|确认|查|检查|修|改|做|发|转发)/iu;
 const FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE = new RegExp(
   `(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)\\s*(?:一下|下|一声|一下子|给|把|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})${FEISHU_EXPLICIT_MENTION_TARGET_STOP}`,
@@ -3129,7 +3240,7 @@ function cleanExplicitFeishuMentionTarget(target: string): string {
     .replace(/[<>"'`]/g, '')
     .trim()
     .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '')
-    .replace(/(?:一下|下|一声|看看|看一下|回复一下|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
+    .replace(/(?:一下|下|一声|看看|看一下|回复(?:一下)?|回答(?:一下)?|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
     // “机器人/智能体”常是目标类型说明，不是飞书显示名本体；真实目标仍交给 resolver 校验。
     .replace(/(?:这个|那个|该|对应的)?(?:机器人|智能体|agent|bot|应用)(?:人)?(?:的)?$/iu, '')
     .trim();
@@ -3317,6 +3428,134 @@ function needsExplicitFeishuMentionTarget(userText: string, options: FeishuMenti
   return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
 }
 
+/**
+ * 只有“用户本轮明确要求的显示名”与“Agent 最终主动选择的裸 @”相交时，
+ * 才允许调用飞书 adapter 的官方成员/机器人 resolver。这样既能恢复自然语言
+ * @ 投递，又不会让用户文本或模型单方面写出的任意名字触发平台身份查询。
+ */
+async function resolveFeishuAgentSelectedMentions(
+  adapter: BaseChannelAdapter,
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    channelType: string;
+    userText: string;
+    message: InboundMessage;
+    mentionIntentOptions?: FeishuMentionIntentOptions;
+  },
+): Promise<PreparedBridgeReplyPayload> {
+  if (context.channelType !== 'feishu' || hasStructuredMentions(payload.mentions)) return payload;
+  if (!adapter.resolveOutboundMentions) return payload;
+
+  const requestedTargets = extractExplicitFeishuMentionTargetsFromRequest(
+    context.userText,
+    context.mentionIntentOptions,
+  );
+  if (requestedTargets.length === 0) return payload;
+
+  const requestedByKey = new Map(
+    requestedTargets
+      .map((target) => [normalizeFeishuMentionTargetKey(target), target] as const)
+      .filter(([key]) => !!key),
+  );
+  const selectedTargets = new Map<string, string>();
+  for (const target of extractBareFeishuAtTargets(payload.text)) {
+    const key = normalizeFeishuMentionTargetKey(target);
+    if (key && requestedByKey.has(key)) selectedTargets.set(key, requestedByKey.get(key) || target);
+  }
+  if (selectedTargets.size === 0) return payload;
+
+  // resolver 只看到三重交集内的 @；题面、引用或说明中的其他裸 @ 只保留文字，不产生通知。
+  let resolverText = payload.text;
+  for (const target of extractBareFeishuAtTargets(payload.text)) {
+    if (!selectedTargets.has(normalizeFeishuMentionTargetKey(target))) {
+      resolverText = stripBareFeishuAtTarget(resolverText, target);
+    }
+  }
+
+  try {
+    const resolved = await adapter.resolveOutboundMentions({
+      address: context.message.address,
+      text: resolverText,
+      parseMode: payload.parseMode,
+      mentions: payload.mentions,
+      replyToMessageId: payload.replyTo,
+      feishuCardJson: payload.feishuCardJson,
+    }, context.message);
+
+    const acceptedMentions = new Map<string, OutboundMention>();
+    for (const mention of resolved.mentions || []) {
+      const userId = mention.userId?.trim() || '';
+      const name = mention.name?.trim() || '';
+      const nameKey = normalizeFeishuMentionTargetKey(name);
+      if (!userId || mention.atAll || !nameKey || !selectedTargets.has(nameKey)) continue;
+      acceptedMentions.set(userId, { userId, name });
+    }
+
+    const acceptedNameKeys = new Set(
+      [...acceptedMentions.values()]
+        .map((mention) => normalizeFeishuMentionTargetKey(mention.name || ''))
+        .filter(Boolean),
+    );
+    const unresolvedTargets: string[] = [];
+    let text = resolved.text;
+    for (const [key, target] of selectedTargets) {
+      if (acceptedNameKeys.has(key)) continue;
+      text = stripBareFeishuAtTarget(text, target);
+      unresolvedTargets.push(target);
+    }
+
+    if (unresolvedTargets.length > 0) {
+      text = appendFeishuMentionNonDeliveryNotice(text, unresolvedTargets);
+    }
+    const mentions = [...acceptedMentions.values()];
+    return {
+      ...payload,
+      text,
+      mentions: mentions.length > 0 ? mentions : undefined,
+    };
+  } catch {
+    // 平台查询失败继续交给统一安全层，保留 Agent 正常回答并明确标记未投递。
+    return payload;
+  }
+}
+
+function stripUnverifiedFeishuBareMentions(text: string): string {
+  let sanitized = text;
+  for (const target of extractBareFeishuAtTargets(text)) {
+    sanitized = stripBareFeishuAtTarget(sanitized, target);
+  }
+  return sanitized;
+}
+
+function appendFeishuMentionNonDeliveryNotice(text: string, unresolvedTargets: string[] = []): string {
+  const marker = getReplyEndMarker();
+  const trimmed = text.trimEnd();
+  const body = trimmed.endsWith(marker)
+    ? trimmed.slice(0, -marker.length).trimEnd()
+    : trimmed;
+  const alreadyExplainsNonDelivery = /(?:原生\s*@|飞书\s*@|mention).{0,32}(?:未投递|未执行|无法投递|不能投递|没有投递)|(?:未投递|未执行|无法投递|不能投递|没有投递).{0,32}(?:原生\s*@|飞书\s*@|mention)/iu.test(body);
+  const withNotice = alreadyExplainsNonDelivery
+    ? body
+    : [
+        body,
+        unresolvedTargets.length > 0
+          ? `> 原生 @ 未投递：未能从当前群官方成员/机器人中唯一确认 ${unresolvedTargets.join('、')}。请在飞书消息里直接 @ TA 后重试。`
+          : '> 原生 @ 未投递：本轮没有唯一可信的平台身份。请在飞书消息里直接 @ TA 后重试。',
+      ].filter(Boolean).join('\n\n');
+  return appendReplyEndMarker(withNotice);
+}
+
+function preserveReplyWithFeishuMentionNonDelivery(
+  payload: PreparedBridgeReplyPayload,
+): PreparedBridgeReplyPayload {
+  return {
+    ...payload,
+    // mention 校验失败只撤销平台投递动作，不能覆盖 Agent 已基于 reply/历史/附件生成的正常答案。
+    text: appendFeishuMentionNonDeliveryNotice(stripUnverifiedFeishuBareMentions(payload.text)),
+    mentions: undefined,
+  };
+}
+
 function enforceFeishuMentionTargetSafety(
   payload: PreparedBridgeReplyPayload,
   context: {
@@ -3329,29 +3568,41 @@ function enforceFeishuMentionTargetSafety(
   if (context.channelType !== 'feishu') return payload;
   if (hasStructuredMentions(payload.mentions)) return payload;
   if (needsExplicitFeishuMentionTarget(context.userText, context.mentionIntentOptions)) {
-    return {
-      ...payload,
-      text: appendReplyEndMarker('你要我艾特谁？请在飞书消息里直接 @ TA（原生提及）；收到结构化 mention 证据后，我会按上下文处理。'),
-      parseMode: 'plain',
-      images: [],
-      files: [],
-      mentions: undefined,
-    };
+    return preserveReplyWithFeishuMentionNonDelivery(payload);
   }
 
   const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText, context.mentionIntentOptions);
   if (!target) return payload;
 
+  // 到这里说明 Agent 没有选择同名裸 @，或官方 resolver 没有唯一命中；
+  // 交付层只撤销不可信的平台动作，不能覆盖 Agent 的上下文回答。
+  return preserveReplyWithFeishuMentionNonDelivery(payload);
+}
+
+function enforceFeishuAvatarEvidenceCompletion(
+  payload: PreparedBridgeReplyPayload,
+  evidence: { successfulCount?: number; failedCount?: number } | null | undefined,
+): PreparedBridgeReplyPayload {
+  const successfulCount = Number(evidence?.successfulCount || 0);
+  const failedCount = Number(evidence?.failedCount || 0);
+  if (successfulCount > 0 || failedCount <= 0 || isExplicitUnfinishedReplyText(payload.text)) return payload;
   return {
     ...payload,
-    // 禁止按显示名查群成员、机器人或历史记录后补原生 @；这类快捷解析
-    // 会把正常消息、规则和格式文本误升级为平台投递动作。
-    text: appendReplyEndMarker(`当前不再按文字自动解析飞书 @，不会查询群成员或机器人来补全“${target}”。请在飞书消息里直接 @ TA（原生提及）；收到结构化 mention 证据后，我会按上下文处理。`),
+    // 全部头像证据失败属于平台能力阻塞，不能只靠模型自觉决定卡片颜色。
+    text: `未完成：${payload.text.trim() || '未取得可供视觉分析的群成员头像。'}`,
+  };
+}
+
+function enforceFeishuAvatarEvidenceCompletionText(
+  text: string,
+  evidence: { successfulCount?: number; failedCount?: number } | null | undefined,
+): string {
+  return enforceFeishuAvatarEvidenceCompletion({
+    text,
     parseMode: 'plain',
     images: [],
     files: [],
-    mentions: undefined,
-  };
+  }, evidence).text;
 }
 
 async function prepareBridgeReplyPayload(
@@ -5692,6 +5943,13 @@ async function handleMessage(
       attachedFileKeys?: string[];
       preferredFileKey?: string;
     };
+    feishuAvatarEvidence?: {
+      prompt?: string;
+      requestedCount?: number;
+      successfulCount?: number;
+      failedCount?: number;
+      truncated?: boolean;
+    };
     feishuHistoryContext?: {
       responseMode?: string;
       scopeText?: string;
@@ -6360,6 +6618,7 @@ async function handleMessage(
   const feishuStickerLibraryPreferredFileKey = typeof rawData?.feishuStickerLibraryContext?.preferredFileKey === 'string'
     ? rawData.feishuStickerLibraryContext.preferredFileKey.trim()
     : '';
+  const feishuAvatarEvidencePrompt = rawData?.feishuAvatarEvidence?.prompt?.trim() || '';
   const stickerCandidateAnalysisSystemPrompt = feishuStickerLibraryContextPrompt
     ? buildStickerCandidateAnalysisSystemPrompt(feishuStickerLibraryAttachedFileKeys, rawText)
     : '';
@@ -6397,7 +6656,8 @@ async function handleMessage(
     feishuCloudSystemPrompt
     || feishuHistoryEvidencePrompt
     || feishuDocumentMemoryPrompt
-    || feishuStickerLibraryContextPrompt,
+    || feishuStickerLibraryContextPrompt
+    || feishuAvatarEvidencePrompt,
   );
   const uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
@@ -6698,6 +6958,7 @@ async function handleMessage(
     const priorityTurnContext = [
       structuredTurnContextPrompt,
       inboundActorContextPrompt,
+      feishuAvatarEvidencePrompt,
     ].filter(Boolean).join('\n\n');
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
@@ -6731,6 +6992,7 @@ async function handleMessage(
         // imagegen) cannot replace a bridge-owned sticker delivery action.
         feishuStickerLibraryContextPrompt,
         stickerCandidateAnalysisSystemPrompt,
+        feishuAvatarEvidencePrompt,
         adapterIdentityPrompt,
         assistantMaintainerContextPrompt,
         inboundActorContextPrompt,
@@ -6754,6 +7016,111 @@ async function handleMessage(
       hasPreResolvedEvidence,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
+
+    const feishuCliAuthorizationChallenge = adapter.channelType === 'feishu'
+      ? result.executionEvidence.feishuCliUserAuthorizationChallenges?.[0]
+      : undefined;
+    if (feishuCliAuthorizationChallenge) {
+      clearLightStatusTimer();
+      const ownerAuthorized = isOwnerMessage(msg);
+      let authorizationText = ownerAuthorized
+        ? '未完成：当前运行时没有配置飞书 CLI 用户授权接管能力。'
+        : '未完成：本机 lark-cli 用户身份由所有任务共享，只允许 Owner 发起授权。请联系 Owner 完成授权后再重试。';
+      let authorizationCardJson: string | undefined;
+      const authorizationStatus: 'error' = 'error';
+      let authorizationAuditStatus = ownerAuthorized ? 'host_missing' : 'owner_required';
+      let authorizationRequestId = '';
+
+      if (ownerAuthorized) {
+        const authHost = getBridgeContext().feishuCliUserAuth;
+        if (authHost) {
+          try {
+            const authorization = await authHost.beginAuthorization({
+              challenge: feishuCliAuthorizationChallenge,
+              text: rawText,
+              channelType: adapter.channelType,
+              chatId: msg.address.chatId,
+              userId: msg.address.userId,
+              userDisplayName: msg.address.displayName,
+              messageId: msg.messageId,
+            });
+            authorizationText = authorization.userMessage;
+            authorizationCardJson = authorization.feishuCardJson;
+            authorizationAuditStatus = authorization.status;
+            authorizationRequestId = authorization.authorizationRequestId || '';
+          } catch (error) {
+            authorizationAuditStatus = 'error';
+            console.warn('[bridge-manager] Feishu CLI user authorization broker failed to start:', error instanceof Error ? error.name : 'unknown_error');
+            authorizationText = '未完成：飞书用户授权流程启动失败，请稍后重新发送原任务。';
+          }
+        }
+      }
+
+      // 审计只记录裁决结果和 scope，不落 device code、授权 URL 或 token。
+      store.insertAuditLog({
+        channelType: msg.address.channelType,
+        chatId: msg.address.chatId,
+        direction: 'outbound',
+        messageId: msg.messageId,
+        summary: [
+          '[FEISHU_CLI_USER_AUTH_REQUEST]',
+          `status=${authorizationAuditStatus}`,
+          `requestId=${authorizationRequestId || '(none)'}`,
+          `userId=${msg.address.userId || '(unknown)'}`,
+          `scopes=${feishuCliAuthorizationChallenge.requestedScopes.join(',')}`,
+        ].join(' '),
+      });
+
+      // 授权 challenge 一旦被治理层接管，模型正文中的二维码文字和本地图片声明均作废。
+      // streaming card 仅收口到高层状态，实际授权入口始终单独投递为交互卡。
+      let statusCardFinalized = false;
+      if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd) {
+        try {
+          statusCardFinalized = await adapter.onStreamEnd(
+            msg.address.chatId,
+            authorizationStatus,
+            authorizationText,
+            result.runSummary,
+            undefined,
+            undefined,
+            {
+              codepilotSessionId: effectiveBinding.codepilotSessionId,
+              sourceMessageId: msg.messageId,
+              sourceText: storedUserText,
+            },
+          );
+        } catch (error) {
+          console.warn('[bridge-manager] Feishu CLI auth status card finalize failed:', error instanceof Error ? error.message : error);
+        }
+      }
+      if (!statusCardFinalized || authorizationCardJson) {
+        const authorizationSend = await deliver(adapter, {
+          address: msg.address,
+          text: authorizationText,
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+          feishuCardJson: authorizationCardJson,
+        }, { sessionId: effectiveBinding.codepilotSessionId });
+        if (!authorizationSend.ok && authorizationCardJson) {
+          await deliver(adapter, {
+            address: msg.address,
+            text: [
+              authorizationText,
+              '',
+              `授权链接：${feishuCliAuthorizationChallenge.verificationUrl}`,
+              '',
+              '完成授权后我会自动继续原任务。',
+            ].join('\n'),
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+          }, { sessionId: effectiveBinding.codepilotSessionId });
+        }
+      }
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', authorizationText);
+      ack();
+      return;
+    }
+
     if (workflowCardStarted) {
       emitProgressCardStep?.('agent 已返回内容，正在核对证据和可展示结果。');
     }
@@ -6827,12 +7194,23 @@ async function handleMessage(
       }
     }
     const providerVisibleResponseText = stickerCandidateAnalysisResult.text;
-    const directMessageAction = providerVisibleResponseText
-      ? await executeDirectMessageActionFromReply(adapter, providerVisibleResponseText, msg, rawText)
+    const bridgeControlAction = providerVisibleResponseText
+      ? await executeBridgeControlActionFromReply(providerVisibleResponseText, msg, rawText)
       : { handled: false, text: '' };
-    let bridgeActionToolName = directMessageAction.bridgeActionToolName;
-    let responseText = directMessageAction.handled ? directMessageAction.text : '';
-    if (!directMessageAction.handled && providerVisibleResponseText) {
+    const directMessageAction = !bridgeControlAction.handled && providerVisibleResponseText
+      ? await executeDirectMessageActionFromReply(
+        adapter,
+        providerVisibleResponseText,
+        msg,
+        rawText,
+        verifiedStickerAction,
+      )
+      : { handled: false, text: '' };
+    let bridgeActionToolName = bridgeControlAction.bridgeActionToolName || directMessageAction.bridgeActionToolName;
+    let responseText = bridgeControlAction.handled
+      ? bridgeControlAction.text
+      : (directMessageAction.handled ? directMessageAction.text : '');
+    if (!bridgeControlAction.handled && !directMessageAction.handled && providerVisibleResponseText) {
       const reminderAction = await executeReminderActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -6864,17 +7242,24 @@ async function handleMessage(
         channelType: adapter.channelType,
         message: msg,
       });
+      preparedReply = await resolveFeishuAgentSelectedMentions(adapter, preparedReply, {
+        channelType: adapter.channelType,
+        userText: rawText,
+        message: msg,
+        mentionIntentOptions: feishuMentionIntentOptions,
+      });
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,
         userText: rawText,
         senderDisplayName: msg.address.displayName,
         mentionIntentOptions: feishuMentionIntentOptions,
       });
+      preparedReply = enforceFeishuAvatarEvidenceCompletion(preparedReply, rawData?.feishuAvatarEvidence);
     }
     if (workflowCardStarted) {
       emitProgressCardStep?.('正在整理为最终回复。');
     }
-    const userFacingResponseText = preparedReply?.text
+    const reviewedUserFacingResponseText = preparedReply?.text
       ? applyOutboundAnswerReview({
         channelType: adapter.channelType,
         chatId: msg.address.chatId,
@@ -6890,6 +7275,10 @@ async function handleMessage(
         executionEvidence: responseExecutionEvidence,
       })
       : '';
+    const userFacingResponseText = enforceFeishuAvatarEvidenceCompletionText(
+      reviewedUserFacingResponseText,
+      rawData?.feishuAvatarEvidence,
+    );
     const stickerSafeUserFacingResponseText = adapter.channelType === 'feishu' && isStickerMessage
       ? suppressFeishuStickerHintForInboundStickerReply(userFacingResponseText)
       : userFacingResponseText;
@@ -6933,10 +7322,16 @@ async function handleMessage(
       cardFinalized = true;
     } else if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd) {
       try {
-        const status = taskAbort.signal.aborted ? 'interrupted' : result.hasError ? 'error' : 'completed';
         const finalText = taskAbort.signal.aborted
           ? DEFAULT_INTERRUPTED_CARD_TEXT
           : deliveryResponseText || safeProviderErrorText;
+        // provider 流正常结束只代表传输成功；用户可见结果明确写着“未完成/失败”时，
+        // 卡片状态和耐久 continuation 也必须记录为 error，不能展示紫色完成态。
+        const status = taskAbort.signal.aborted
+          ? 'interrupted'
+          : result.hasError || isExplicitUnfinishedReplyText(finalText)
+            ? 'error'
+            : 'completed';
         cardFinalized = await adapter.onStreamEnd(
           msg.address.chatId,
           status,

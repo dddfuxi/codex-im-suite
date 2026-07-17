@@ -48,6 +48,7 @@ import { buildToolSandboxPolicy, inferCapabilities, listMavisReadOnlyForbiddenCa
 import { sanitizeToolResult, summarizeMavisFailureMessage } from './mavis-failure-summarizer.js';
 import { findBindingByMvs, findBindingBySource, readBindings, removeBinding, upsertBinding, type MavisSessionBinding } from './mavis-session-store.js';
 import { buildMavisSessionTitle } from './mavis-session-title.js';
+import { resolveProviderWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
 import type {
   MavisClient,
@@ -644,7 +645,8 @@ export class MavisExecutorProvider implements LLMProvider {
    */
   async preDispatch(params: StreamChatParams): Promise<void> {
     // 1) workspace gate
-    const workingDirectory = params.workingDirectory || this.opts.config.defaultWorkDir;
+    const providerWorkspace = resolveProviderWorkspace(params);
+    const workingDirectory = providerWorkspace.workingDirectory || this.opts.config.defaultWorkDir;
     assertWorkspaceAllowed(workingDirectory, this.allowedRoots);
 
     // 2) readOnly gate — v3.5 + v3.6 P1 fix: capability allow-list + permissionMode.

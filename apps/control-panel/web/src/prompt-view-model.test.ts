@@ -44,6 +44,26 @@ describe('prompt snapshot view model', () => {
     assert.equal(rows[0].warning, '已脱敏');
     assert.equal(rows[1].warning, '未注入');
   });
+
+  it('labels the workspace plan as a first-class turn section', () => {
+    const snapshot: PromptSnapshotRecord = {
+      protocol: 'cti-prompt-snapshot/v1',
+      sessionId: 'session-workspace',
+      createdAt: '2026-07-17T12:00:00.000Z',
+      totalChars: 80,
+      sections: [{
+        ...section('execution', 15),
+        id: 'workspace.plan',
+        source: 'workspace.resolver',
+        content: '主工作区：F:\\unity\\ST4\n临时挂载：无\n权限：read_write\n理由：session_binding',
+      }],
+    };
+
+    const [row] = buildPromptSectionRows(snapshot);
+
+    assert.equal(row.kindLabel, '本轮工作区计划');
+    assert.match(row.content, /临时挂载/u);
+  });
 });
 
 function section(

@@ -33,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
-- 记忆知识库 v1：默认索引 `E:\cli-md` Markdown 到 `.cti-index\knowledge.json`，并把 watcher 心跳写入 `.cti-index\status.json`；面板“记忆索引”页只展示关系、搜索、来源、历史和 Skill 元数据引用，不复制 `SKILL.md` 正文。
+- 工作区与记忆分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home 与 memory v3 分区，`.cti-index` 只保存机器索引。
 - 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
@@ -53,6 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 架构文档检查：`scripts/update-architecture-docs.ps1`
 - 扩展协议校验：`scripts/validate-extension-manifests.ps1`
 - 旧记忆规则 dry-run 归档：`scripts/memory/archive-legacy-rules.ps1`
+- 记忆布局迁移：`scripts/memory/migrate-memory-layout.ps1`
 - 主干发布预检：`scripts/prepare-main-release.ps1`
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
@@ -60,6 +61,29 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
 - 套件清单：[suite.manifest.json](./suite.manifest.json)
+
+## 工作区与记忆入口
+
+- 当前工作区：每轮唯一默认挂载，对应 `CTI_DEFAULT_WORKDIR` 或会话绑定目录。
+- 项目注册根：`CTI_ALLOWED_WORKSPACE_ROOTS` 只定义可访问上界，不自动进入 Prompt、Provider 或附加目录。
+- 临时挂载：只由本轮消息中的明确绝对路径等强证据生成，随当前回合结束失效。
+- Agent Home / 记忆库：默认 `E:\cli-md`，集中放置 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md`。
+- 未归类根文档：记忆库根目录中不属于五个固定入口的 Markdown 会在控制面板显示警告和打开入口，但不会被自动移动、删除或注入知识索引。
+- 分区记忆：用户写入 `memory/users/<channel>/<userId>/用户印象.md`，群聊写入 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实写入 `memory/long-term/公共长期记忆.md`。
+- 旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只保留为诊断值，不再自动挂载，也不再由控制面板修改。
+
+迁移旧 `data/memory/v2` 前先停止 Bridge，并先预览：
+
+```powershell
+npm --workspace packages/bridge-runtime run build
+powershell -ExecutionPolicy Bypass -File .\scripts\memory\migrate-memory-layout.ps1 -MemoryRoot E:\cli-md -ReportPath E:\cli-md\reports\记忆迁移预览.json
+```
+
+确认报告后再显式应用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\memory\migrate-memory-layout.ps1 -MemoryRoot E:\cli-md -Apply -ReportPath E:\cli-md\reports\记忆迁移结果.json
+```
 
 ## 我该改哪里
 
@@ -122,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 默认是 `自动 executor 选择 + Codex CLI agent 模型来源链`：
 
 - 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和实验性的 `codex-oss-ollama`；本地 API 与外部 API 都通过 `codex` 的模型来源接入，不再作为独立本地 agent 或兜底执行器。
-- 外部 Agent Executor（截至 2026-06-27 新增）：`mavis-agent` 是首个 opt-in external agent executor，通过本地 `mavis` CLI 派发任务、轮询结果；Windows `.cmd/.bat` shim 会在可解析时直连真实 executable/script，避免飞书图片/表情的多行 prompt 被 batch `%*` 二次解析后丢失 agent 参数。**默认不启用**——在 `config.env` 设 `CTI_MAVIS_ENABLED=true` 且 `CTI_MAVIS_CLI_PATH=<path>` 才激活；如果 live daemon 没继承 Mavis 父会话环境，续聊发送可补 `CTI_MAVIS_BRIDGE_SESSION_ID=<mvs_...>`，但该 sender 若已被 Mavis 标记为归档/压缩，runtime 会自动放弃续聊通信并创建新的 Mavis session，避免 MiniMax 把 Feishu 请求误当成“回报给归档 source”的任务。续聊结果会同时采集普通 session assistant 文本与 Mavis communication 出站回复，避免 MiniMax 已作答但 Feishu 卡片显示无结果。图片和表情包会先落成当前工作区内的本地文件，再以绝对路径交给 Mavis 使用视觉工具读取，避免 external agent 只收到 file_key 文本。Mavis 工具阶段和可展示处理思路会作为 `progress` SSE 显示在 Feishu streaming card 中，最终正文会拆成多个 `text` chunk 形成打字机效果；binding 也会保存来源通道 / chat / thread，bridge 内部 session id 变化时仍能按同一飞书会话续接 Mavis 上下文。用户可用 `@mavis` / `@minimax` / `@minimax-code` 显式选择该 executor，也可在控制面板设为全局默认 executor；`selectExecutor` 之外的"真分派"由 `ExecutorProviderRegistry` 在 `selectExecutor` 之后立刻接管 external executor，不走本地 Codex 路由链。两阶段错误处理：pre-dispatch 失败可回落 Codex，post-dispatch 失败禁止回落，避免 mavis 已接单后重复执行。详细设计见 `docs/ai-agent-talk-mavis-executor.md`（v3.4）。
+- 外部 Agent Executor：`mavis-agent` 是 opt-in external executor，通过本地 `mavis` CLI 派发和续接任务；默认关闭，使用 `CTI_MAVIS_ENABLED=true` 与 `CTI_MAVIS_CLI_PATH=<path>` 启用。用户可用 `@mavis` / `@minimax` / `@minimax-code` 显式选择，也可在控制面板设置默认 executor。当前模块边界、路由和失败收口统一维护在 `docs/PROJECT-ARCHITECTURE.md`，阶段性变更统一记录在 `docs/DEVELOPMENT-LOG.md`。
 - 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态，并通过按钮设置或清除全局默认 executor；“节点”页可查看本机 node 与 fake remote node 的能力清单。
 - 普通对话、复杂判断、Unity/Blender/MCP 多步任务默认走 Codex。
 - 设置页的“AI 执行与模型来源”可选默认 executor；默认 executor 写入 `CTI_DEFAULT_EXECUTOR_ID`，优先级低于显式 `@hint`、高于历史会话默认值。Codex 模型来源仍可选官方 Codex、本地 API、外部 API或自动切换链；手动模式由 `CTI_CODEX_MODEL_SOURCE` 控制，本地 API 使用 `CTI_LOCAL_AI_*`，外部 API 使用 `CTI_CODEX_BASE_URL`、`CTI_CODEX_API_KEY`、`CTI_CODEX_MODEL`、`CTI_CODEX_PASS_MODEL`。

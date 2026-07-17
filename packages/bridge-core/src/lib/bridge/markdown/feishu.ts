@@ -418,6 +418,7 @@ export function buildFinalCardJson(
   if (!content.trim()) {
     content = '未完成：模型没有返回可展示结果。';
   }
+  const effectiveStatus = inferVisibleFinalCardStatus(footer?.status || '', content);
   const splitContent = splitFinalCardContentForDisplay(content);
   const titledContent = extractFinalCardTitleAndBody(splitContent.result || content);
 
@@ -445,7 +446,7 @@ export function buildFinalCardJson(
   // Footer
   if (footer) {
     const parts: string[] = [];
-    parts.push(formatCompletionMark(footer.status));
+    parts.push(formatCompletionMark(effectiveStatus));
     if (footer.elapsed) parts.push(`耗时：${footer.elapsed}`);
     parts.push(...formatRunSummaryFooterParts(summary));
     if (parts.length > 0) {
@@ -458,7 +459,7 @@ export function buildFinalCardJson(
     }
   }
 
-  const header = buildFinalCardHeader(footer?.status || '', titledContent.title);
+  const header = buildFinalCardHeader(effectiveStatus, titledContent.title);
 
   return JSON.stringify({
     schema: '2.0',
@@ -466,6 +467,16 @@ export function buildFinalCardJson(
     header,
     body: { elements },
   });
+}
+
+function inferVisibleFinalCardStatus(status: string, content: string): string {
+  if (/失败|未完成|中断|error|interrupted/iu.test(status || '')) return status;
+  const visible = stripStandaloneCompletionMarkLines(content)
+    .replace(/^\s*(?:#{1,6}\s*)?(?:\*\*)?/u, '')
+    .trim();
+  return /^(?:未完成|失败|执行失败|阻塞|已拦截|无法完成)(?:\s*[:：]|\s|$)/iu.test(visible)
+    ? '未完成'
+    : status;
 }
 
 interface FinalCardContentSplit {

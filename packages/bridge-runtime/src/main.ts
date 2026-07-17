@@ -112,6 +112,7 @@ import {
   type TodoReminderService,
 } from './todo-reminders.js';
 import { createExtensionCatalogHost } from './extension-catalog-host.js';
+import { createBridgeControlHost } from './bridge-control-host.js';
 import { createOfficialSkillTools } from './official-skill-tools.js';
 import { createSkillLifecycleService } from './skill-lifecycle.js';
 import { createSkillRegistry } from './skill-registry.js';
@@ -122,6 +123,10 @@ import {
   FeishuOAuthTokenStore,
   startFeishuOAuthCallbackServer,
 } from './feishu-oauth.js';
+import {
+  createFeishuCliUserAuthHost,
+  createLarkCliDeviceAuthorizationRunner,
+} from './feishu-cli-user-auth.js';
 import { prepareWorkflowRetryExecution } from './workflow-retry.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
@@ -2815,6 +2820,26 @@ async function main(): Promise<void> {
     tokenProvider: feishuOAuthService,
     tenantTokenProvider: feishuTenantTokenProvider,
   });
+  const feishuCliUserAuth = createFeishuCliUserAuthHost({
+    runner: createLarkCliDeviceAuthorizationRunner(),
+    onResume: async (resume) => {
+      await bridgeManager.resumeFeishuOAuthRequest(resume);
+    },
+    onNotify: async (notification) => {
+      await bridgeManager.deliverProactiveMessage({
+        address: {
+          channelType: notification.channelType,
+          chatId: notification.chatId,
+          userId: notification.userId || notification.chatId,
+          displayName: notification.userDisplayName || notification.userId || notification.chatId,
+        },
+        text: notification.text,
+        parseMode: 'plain',
+        replyToMessageId: notification.messageId,
+        feishuCardJson: notification.feishuCardJson,
+      });
+    },
+  });
   const shouldStartFeishuOAuthCallbackServer = Boolean(config.feishuOAuthPublicBaseUrl)
     || config.feishuOAuthMode === 'manual';
   const feishuOAuthCallbackServer = shouldStartFeishuOAuthCallbackServer
@@ -2841,8 +2866,10 @@ async function main(): Promise<void> {
     store,
     llm,
     permissions: gateway,
+    bridgeControl: createBridgeControlHost(),
     extensions: createExtensionCatalogHost({ lifecycle: skillLifecycle }),
     feishuCloudDocuments,
+    feishuCliUserAuth,
     feishuOAuth: {
       handleManualCallbackText: async (input) => feishuOAuthService.handleManualCallbackText({
         text: input.text,

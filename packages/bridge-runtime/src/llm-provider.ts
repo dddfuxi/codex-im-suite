@@ -361,7 +361,7 @@ function getSupportedClaudeImageFiles(files?: FileAttachment[]): FileAttachment[
 }
 
 export function buildClaudeInputEvidenceReceipt(files?: FileAttachment[]): ProviderInputEvidenceReceipt | undefined {
-  return buildProviderInputEvidenceReceipt(getSupportedClaudeImageFiles(files), 'claude', ['image']);
+  return buildProviderInputEvidenceReceipt(getSupportedClaudeImageFiles(files), 'claude', ['image']) || undefined;
 }
 
 /**

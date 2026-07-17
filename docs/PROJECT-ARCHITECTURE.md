@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-07-15
+更新时间：2026-07-17
 
 ## 0. 架构文档维护规则
 
@@ -63,6 +63,7 @@ flowchart TD
   Runtime --> ProviderLayer[Codex 和本地模型 Provider]
   Runtime --> McpLayer[MCP manifest 和调用层]
   Runtime --> SkillLifecycle[Skill Registry 和 Lifecycle]
+  Runtime --> BridgeControl[受控 live Bridge 重启宿主]
   SkillLifecycle --> OfficialSkillTools[官方 skill-creator 和 skill-installer]
   Panel --> SkillLifecycle
   McpLayer --> IgnisPackage[packages/mcp-ignis]
@@ -150,11 +151,12 @@ flowchart LR
 ```
 
 - `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 声明能力缺口判断、来源分类、风险等级和审批动作，不执行下载或写目录。
-- `packages/bridge-runtime/src/skill-registry.ts` 扫描正式安装、禁用目录、草稿和 manifest，持久化到 `CTI_HOME\data\skill-registry.json`；首次扫描不搬动或改写已有 `SKILL.md`。
+- `packages/bridge-runtime/src/skill-registry.ts` 扫描正式安装、禁用目录、草稿和 manifest，持久化到 `CTI_HOME\data\skill-registry.json`；首次扫描不搬动或改写已有 `SKILL.md`。控制面板打开或刷新状态时通过 runtime CLI 重新扫描真实 `CODEX_HOME\skills`，因此机器人或官方安装器在面板外完成的安装也会进入当前 Registry，不再依赖关闭面板重开。
 - `packages/bridge-runtime/src/skill-lifecycle.ts` 统一创建、验证、审批、安装、启停和回滚；飞书扩展入口与 `skill-lifecycle-cli.mjs` 共用该服务。安装使用 staging、校验、原子替换和 backup，审计写入 `CTI_HOME\data\skill-lifecycle-audit.jsonl`。
 - 已安装 Skill 能满足任务时不会查询外部目录；官方精选未安装需用户确认，白名单低风险来源可自动处理，第三方、未知或高风险变更需要 Owner。
 - `Prompt Composer` 按稳定顺序生成带来源标签的 section；短期只读 Snapshot 写入 `CTI_HOME\runtime\prompt-snapshots.json`，默认最多 100 条、保留 7 天，并记录脱敏、哈希和截断元数据。
 - Memory 只投影 Skill ID、状态、来源类别、风险和真实路径，不读取或复制 `SKILL.md` 正文。
+- live Bridge 重启通过 `cti-bridge-control` 受控动作进入 core：只接受当前用户明确提出的 `restart_live`，强制 Owner 门禁，拒绝模型伪完成。runtime 的 `BridgeControlHost` 只启动仓库自带的延迟 worker；worker 等当前回复收尾后调用既有 `daemon.ps1/daemon.sh restart`，不接受任意命令或参数，并把调度结果写入 `CTI_HOME\data\bridge-control-audit.jsonl`。
 
 路径职责表：
 
@@ -162,13 +164,61 @@ flowchart LR
 | --- | --- | --- |
 | 开发仓库 | `C:\Users\admin\Documents\New project\codex-im-suite` | 唯一源码维护入口，默认只改这里。 |
 | live skill | `C:\Users\admin\.codex\skills\claude-to-im*` | 运行副本，只由同步脚本写入。 |
-| 记忆仓库 | `E:\cli-md` 或配置的 memory repo | 存 durable 知识、提醒、文档记忆和长期语义。 |
+| Agent Home / 记忆仓库 | `E:\cli-md` 或配置的 memory repo | 根目录集中放身份、规则、工具、说明和总索引；真实事实写入 `memory/*` 分区，不能作为普通工作区挂载。 |
 | 运行态数据 | `C:\Users\admin\.claude-to-im\data` / `runtime` | 存 sessions、bindings、workflow、permission links 等服务状态。 |
 | 临时上传缓存 | `CTI_HOME\runtime\uploads` 或 `CTI_UPLOAD_CACHE_DIR`；旧 `.codepilot-uploads` 只作为遗留暂存识别 | 只作为候选/暂存；Feishu 表情包不扫描、不迁入、不写入工作区缓存，其他有效产物需通过明确提升流程进入记忆或交付附件。 |
 | 文档 | `README.md`、`docs/PROJECT-ARCHITECTURE.md`、`docs/DEVELOPMENT-LOG.md` | 只写当前事实、入口、风险和阶段记录。 |
 | 规则 | `AGENTS.md`、`config/*.d`、`agent-architecture.ts` | 存可维护规则、manifest、policy 归属和分类口径。 |
 | 日志 | `.claude-to-im\logs`、runtime audit | 只读核验证据，不提交、不手工改写。 |
 | 发布产物 | `release/*` | 脚本生成，不作为源码手修入口。 |
+
+### 1.4 回合工作区与可见记忆
+
+`packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区解析的唯一协议入口。Conversation Engine 根据当前消息、会话绑定目录、默认目录、项目注册根和禁止根生成 `TurnWorkspacePlan`；所有 Provider 和本地文件工具消费同一计划。
+
+```mermaid
+flowchart LR
+  Evidence[当前消息与结构化路径证据] --> Resolver[TurnWorkspacePlan Resolver]
+  Session[会话绑定或默认工作区] --> Resolver
+  Allowed[项目注册根权限上界] --> Resolver
+  Denied[记忆库、运行态与发布产物禁止根] --> Resolver
+  Resolver --> Primary[唯一主工作区]
+  Resolver --> Temporary[本轮临时挂载]
+  Resolver --> Prompt[workspace.plan Prompt section]
+  Primary --> Providers[Codex、CLI、本地 Agent、Mavis]
+  Temporary --> Providers
+  Prompt --> Snapshot[Prompt Snapshot 可观察证据]
+```
+
+- `allowed roots` 只参与路径授权和最具体项目根匹配，不能自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
+- 当前会话工作区始终优先作为唯一主工作区；本轮明确引用的其他已注册项目只成为临时挂载，不得抢占或替换当前工作区。当前绑定目录若命中禁止根或超出项目注册上界，会跳过并选择安全默认根；所有候选都不安全时失败关闭。
+- `temporaryMounts` 带访问模式、证据 ID、理由和 `expiresAfterTurn=true`；回合结束后不形成长期挂载。
+- 记忆仓库、`CTI_HOME` 运行态、上传缓存、日志和 `release/*` 按各自受控能力访问，不能提升为普通项目工作区。
+- classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
+
+记忆根目录采用 Agent Home + 分区事实源：
+
+```text
+<memory-root>/
+├─ 机器人身份.md
+├─ 行为与安全规则.md
+├─ 工具与环境.md
+├─ 记忆总索引.md
+├─ 记忆库说明.md
+├─ memory/
+│  ├─ users/<channel>/<userId>/用户印象.md
+│  ├─ groups/<channel>/<chatId>/群聊记忆.md
+│  └─ long-term/公共长期记忆.md
+└─ .cti-index/
+   ├─ knowledge.json
+   ├─ memory-graph.json
+   └─ status.json
+```
+
+- `codex-im-suite/memory/v3` 是新写入 schema；同一用户的已确认事实和稳定印象合并在单个 `用户印象.md`，不同用户和群聊保持目录与元数据双重隔离。
+- `记忆总索引.md` 只保存分类摘要和相对路径引用，不复制事实，不成为第二事实源。
+- `data/memory/v2` 在兼容期只读索引并标记为 legacy。`memory-layout-migration-cli` 默认 dry-run；Apply 会先在暂存根合并和校验，再备份、切换、归档旧 v2 并重建索引，已有不同值只记录冲突、不覆盖。
+- 控制面板路径设置分为当前工作区、项目注册根、Agent Home/记忆库和高级诊断；旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只读显示。Memory 页展示五个 Agent Home 入口、v3/v2 来源数、迁移状态和未归类根 Markdown；未归类文件只提示并提供打开入口，不自动移动或删除。Prompt 页将 `workspace.plan` 显示为本轮工作区计划。
 
 ## 2. 运行链路
 
@@ -179,22 +229,24 @@ Feishu 接收现在是双通道：
 
 - WS 长连是主链路。
 - p2p 私聊有历史轮询补捞兜底，避免私聊事件偶发漏掉。
-- Feishu 平台接入按三层分工：FeishuAdapter 通过官方 Node SDK / OpenAPI 承担 bot 长连接实时入站、自动回复、卡片、历史 evidence、权限、索引、表情包和 Agent 主链；bridge-runtime 的 OAuth host 跟随飞书官方授权页、PKCE 与 Token 协议，并由自定义治理层维护身份裁决、最小权限、每用户加密隔离、授权卡去重、任务恢复和审计；官方 `lark-cli` 承担配置、身份、doctor/whoami、scope/schema 与控制面板发起的人工平台操作。控制面板只负责白名单编排和展示，不维护重复的 OAuth 或 OpenAPI 主链。
-- 官方 `lark-cli` 不启动 `event consume`，也不接管 WS、私聊补捞、原生 @ 判断、callback 或自动消息发送，避免与 live Bridge 竞争同一事件。普通消息、原生 @、reply、reaction、sticker 和机器人卡片始终使用 bot 长连接，不触发 user OAuth；P2P 私聊补捞仍由 FeishuAdapter 负责，只有应用身份无法读取且任务确实需要用户私有资源时才进入 bridge-runtime 的每用户 OAuth 链。
+- Feishu 平台接入按三层分工：FeishuAdapter 通过官方 Node SDK / OpenAPI 承担 bot 长连接实时入站、自动回复、卡片、历史 evidence、权限、索引、表情包和 Agent 主链；bridge-runtime 的 OAuth host 跟随飞书官方授权页、PKCE 与 Token 协议，并由自定义治理层维护身份裁决、最小权限、每用户加密隔离、授权卡去重、任务恢复和审计；官方 `lark-cli` 承担配置、身份、doctor/whoami、scope/schema、Agent 的官方飞书 Skill 调用与控制面板发起的人工平台操作。控制面板只负责白名单编排和展示，不维护重复的 OAuth 或 OpenAPI 主链。
+- 官方 `lark-cli` 不启动 `event consume`，也不接管 WS、私聊补捞、原生 @ 判断、callback 或自动消息发送，避免与 live Bridge 竞争同一事件。普通消息、原生 @、reply、reaction、sticker 和机器人卡片始终使用 bot 长连接，不触发 user OAuth；P2P 私聊补捞仍由 FeishuAdapter 负责。Agent 通过官方 `lark-*` Skill 读取待办、日历等用户私有资源时，如果真实执行 `lark-cli auth login --scope ... --no-wait --json` 并返回官方 device challenge，Conversation Engine 才生成结构化 `cti-feishu-cli-user-auth/v1` evidence；模型正文、普通 shell JSON、失败结果、非官方 URL 或缺少非阻塞参数都不能触发授权。
+- `lark-cli` 用户身份属于本机共享登录态，因此只允许 Feishu Owner 发起授权。bridge-core 会拦截模型的二维码文案和 `cti-final.images`，把原进度卡按红色“未完成”收口，再让 bridge-runtime 发送 Card 2.0 `open_url` 授权卡；同一 Owner 与规范化 scope 只启动一个后台 `--device-code` 登录，重复任务合并，成功后自动逐个恢复原请求。授权卡不需要 `card.action.trigger`，也不要求新增网页应用能力；发送失败时只降级为官方 HTTPS 授权链接，不生成二维码。审计只记录 requestId、裁决和 scope，不保存 device code、授权 URL 或 token。
 - Feishu 开放平台权限、事件和回调是外部前置条件，不是 bridge 能自动开通的运行时能力。消息接收依赖已发布生效的 `im.message.receive_v1` 长连接事件；权限按钮、提醒完成按钮和卡片交互依赖已发布生效的 `card.action.trigger` 回调；Markdown/streaming card、消息更新、资源下载、成员/机器人解析和云文档读取分别依赖对应 IM、CardKit、Drive、Docx、Sheets、Base 或成员 API scope。后台新增 scope、事件、回调或机器人能力后，必须创建版本、管理员审核发布，并重启 bridge 读取新配置。
 - `bridge-manager` 会在进入执行链前做持久入站去重：同一 channel/chat/messageId 只允许执行一次；带附件的媒体说明文字还会写入短期文本指纹，避免 Feishu p2p 历史补捞把同一张图的 caption 当成另一个 messageId 再跑一轮 Codex。
-- 群聊 `require_mention=true` 时，adapter 主入口只接受原生 @ 当前 bot 的事件：先按 `message.mentions` 中的 `open_id/user_id/union_id` 与当前 bot 身份精确匹配；飞书长连缺失 `mentions` 时，仅允许正文内 `<at ...>` / post `tag=at` 所携带的同一身份 ID 作为兼容的原生结构化 @ 证据。纯文本别名、机器人 displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases`、`CTI_FEISHU_BOT_ALIASES`、普通文本回复/引用链及其他 bot/app 的 sender 都不能唤醒。唯一受控例外是用户用飞书原生 reply/引用当前 bot 已发送消息补发 `sticker` 或 `image`：adapter 必须先通过 `outbound-refs` 或被回复消息 sender 证明目标确为当前 bot，才把这类媒体消息作为当前回合交互放行，并在 `raw.feishuReplyWake` 记录唤醒证据。原生 @ 仍会继续过滤纠错、抱怨、无需回复等无需处理的内容；被过滤消息写入统一审计，不触发 LLM。
+- 群聊 `require_mention=true` 时，adapter 主入口只接受原生 @ 当前 bot 的事件：先按 `message.mentions` 中的 `open_id/user_id/union_id` 与当前 bot 身份精确匹配；飞书长连缺失 `mentions` 时，仅允许正文内 `<at ...>` / post `tag=at` 所携带的同一身份 ID 作为兼容的原生结构化 @ 证据。纯文本别名、机器人 displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases`、`CTI_FEISHU_BOT_ALIASES`、普通文本回复/引用链及其他 bot/app 的 sender 都不能唤醒。用户在飞书话题或原生回复中只发送原生 @ 当前 bot 时，如果本轮同时带有平台 `parent_id/upper_message_id/root_id`，adapter 会生成受控的隐式处理请求，保留 `feishuReplyTo`，并以 `feishuImplicitReplyMention` 记录 reply/thread evidence，让 Context Broker 把被回复消息或话题根消息作为主要上下文；没有 reply/root 的普通空 @、其他 bot/app 的空 @ 仍保持静默。另一个受控例外是用户用飞书原生 reply/引用当前 bot 已发送消息补发 `sticker` 或 `image`：adapter 必须先通过 `outbound-refs` 证明目标是本地已记录的当前 bot 出站消息；本地无记录时才回查飞书消息，并要求 sender ID 精确命中当前 bot 已知身份或配置的当前 App ID，不能仅凭 `sender_type=app/bot` 放行。验证通过后才把这类媒体消息作为当前回合交互放行，并在 `raw.feishuReplyWake` 记录唤醒证据。原生 @ 仍会继续过滤真正的纠错、转述和“不要回复/先别处理”等无需响应内容，但否定词与回复/处理动作必须位于同一自然语句或 Markdown 规则项，不能跨换行、标题、列表、表格或标点拼接；“当别人回复你时……”中的“别人”也不得被误判成“别回复”。明确要求当前机器人遵守、记录或处理的长规则消息必须进入 Agent。被过滤消息写入统一审计，不触发 LLM。
 - adapter 会在 WS 和历史补捞入口统一忽略 `system`、未原生 @ 当前 bot 的 `interactive` 卡片、当前 bot 自己发出的消息、邀请/加群通知等没有明确可处理文本的事件；p2p 历史补捞还会按已解析的 bot 身份 ID 过滤 `sender_type` 缺失但 sender id 属于机器人的消息。这类事件只进入审计或受控历史索引，不触发 LLM，避免机器人自己的卡片更新、出站消息或入群系统事件再次自触发。其他 `sender_type=app/bot` 的实时群消息不再一刀切忽略：只有原生 @ 当前 bot、通过既有 actionable mention 分类，并且没有超过 `bridge_feishu_bot_to_bot_max_turns` / `CTI_FEISHU_BOT_TO_BOT_MAX_TURNS` 连续跳数预算时才会进入队列；默认 5 分钟窗口内最多 2 跳，人类消息会重置预算。来自他方 app/bot 的 `interactive` 卡片会递归提取 CardKit 中 markdown、plain_text、标题、summary 等用户可见字段，并用 `<at id/user_id/open_id/union_id=...>` 或 `tag=at` 结构识别当前 bot；未 @、p2p bot 卡片或当前 bot 自己的卡片仍会被过滤。
 - Feishu `interactive` 卡片统一先生成受控卡片 evidence，再进入入站、reply/light context 和历史索引链路。解析器会递归读取普通 JSON、`body.content`、转义 JSON、标题、markdown/plain_text/lark_md、按钮、summary、alt、`image_key/imageKey/img_key/imgKey/file_key/fileKey`、文件名和 `card_id/template_id` 引用，并剔除“请升级至最新版本客户端，以查看内容”这类客户端兼容占位。可取到的图片/文件作为本轮 provider attachment，`raw.feishuInteractiveCard` 记录可见文本、资源引用、raw preview、占位清理、下载数量和 `resourceDownloadFailures`。他方应用/机器人卡片里的预览资源可能被飞书开放平台判定为非当前应用资源或已删除资源，当前应用无法凭 key 强行读取图片；这种情况下错误 code/msg 只保留在审计和 raw evidence，不再作为用户可见快答正文，agent 只基于可见卡片文本、上下文和明确边界整理回复。
-- Feishu sticker 入站和历史同步通过 `MemoryArtifactStore` 按 `file_key` 去重写入设置的记忆仓库 `data/im/feishu/stickers/stickers.json`，保留聊天、消息、时间和可信语义等记录。实时收到新 sticker 时，adapter 仅在 `data/im/feishu/stickers/media` 尚无同一 `file_key` 时下载一次真实图片并写入记忆仓库，用于当前视觉识别；重复 key 直接复用，不再复制到会话工作区。历史同步只登记 key，不会批量下载媒体。sticker store 有容量裁剪时按资产价值保留：可信 `vision/manual` 语义、已缓存媒体、用户待核验解释、禁用决策、下载失败状态和非默认别名优先于纯历史 key，避免历史回填把可复用表情包挤出主库。控制面板默认只展示有图、可信语义、用户解释或禁用处理的可管理资产；纯历史 key 与纯媒体下载失败壳分别进入“仅历史 key”和“媒体失败”筛选，避免空索引记录冒充表情包资产。全链路禁止扫描、迁入或写入工作区 `.codepilot-uploads`。群聊中的 sticker 通常必须具备原生 @ 当前 bot 的唤醒证据；若用户把 sticker 作为飞书原生 reply 发给当前 bot 的已知出站消息，则按上方媒体 reply 窄例外进入 sticker 链，普通无 @ sticker 或回复他人消息仍被过滤。
+- 用户在群聊中明确要求查看、描述、识别或比较成员头像时，FeishuAdapter 会在 `prepareForAgent` 阶段生成受控 `feishuAvatarEvidence`；能力询问、教程/原因问题、明确否定、翻译/改写等元任务，以及“更换机器人头像”“群头像是谁设计的”等非读取意图不会触发全群头像查询。执行意图按子句裁决，子句边界同时识别标点和“只要/然后/而是/并且”等逻辑连接词，并把连接词保留给后续动作：否定识别只接受明确命令语境，不会把“分别描述、个别分析、特别查看”等普通词误判成“别描述/别分析/别查看”；“能不能帮我查看”按礼貌执行请求处理；后续肯定动作必须显式绑定头像对象，只有“不要描述只要展示出来”这类无新对象的窄省略可以继承，不能把“列出成员名字/分析聊天内容”误升成头像读取。链路先用官方群成员接口取得用户 `open_id` 与机器人 `app_id`，用户头像走 Contact v3，当前机器人头像复用 Bot v3 身份缓存，其他机器人头像走 Application v6。头像地址只接受 HTTPS 公网域名，DNS 会拒绝私网、IPv4-mapped 私网和非公网保留地址，并把已校验地址直接绑定到本次 `undici` TLS 连接 lookup，防止校验后由 HTTP 客户端二次解析形成 DNS rebinding；Host 与 SNI 仍保留原官方域名。HTTP 重定向按最多 3 跳手动逐跳校验，整次下载共享 15 秒截止时间，并设置 2 MB 流式读取上限、图片文件头校验、每轮 12 个成员上限和 10 分钟内存缓存；非 2xx、声明大小超限或其他 early rejection 会先取消未消费响应体再关闭 dispatcher，避免优雅关闭等待无限 body。成功图片以“成员类型 + 显示名 + 平台 ID 稳定哈希”命名为唯一 provider attachment，结构化 evidence 保存一一对应关系并进入高优先级 prompt，防止重名成员串位或描述未取得的头像。单个成员的网络、JSON、权限或资源失败只形成该成员 blocker，不会丢弃其他成功图片；全部失败时 Delivery Layer 在答案审查后仍会确定性补上“未完成：”并进入红色卡片，不依赖模型自觉。成员列表需要 `im:chat.members:read`，用户头像需要应用 Contact API/字段只读 scope 和通讯录数据权限范围，其他机器人头像需要 `admin:app.info:readonly`；全部使用 bot 身份，不向普通用户申请 user OAuth，`/feishu` 能力矩阵展示这些 scope 与发布审批前置条件。
+- Feishu sticker 入站和历史同步通过 `MemoryArtifactStore` 按 `file_key` 去重写入设置的记忆仓库 `data/im/feishu/stickers/stickers.json`，保留聊天、消息、时间和可信语义等记录。实时收到新 sticker 时，adapter 仅在 `data/im/feishu/stickers/media` 尚无同一 `file_key` 时下载一次真实图片并写入记忆仓库，用于当前视觉识别；重复 key 直接复用，不再复制到会话工作区。历史同步只登记 key，不会批量下载媒体。sticker store 有容量裁剪时按资产价值保留：可信 `vision/manual` 语义、已缓存媒体、用户待核验解释、禁用/归档决策、下载失败状态和非默认别名优先于纯历史 key，避免历史回填把可复用表情包挤出主库。控制面板默认只展示未归档且有图、可信语义、用户解释或禁用处理的可管理资产；纯历史 key、纯媒体下载失败壳和已归档资产分别进入“仅历史 key”“媒体失败”和“已归档”筛选。`disabled` 只表示暂停自动发送，`archived/archivedAt` 表示移出日常资产列表，两者互不覆盖；归档可恢复并保留原禁用状态。全链路禁止扫描、迁入或写入工作区 `.codepilot-uploads`。群聊中的 sticker 通常必须具备原生 @ 当前 bot 的唤醒证据；若用户把 sticker 作为飞书原生 reply 发给当前 bot 的已知出站消息，则按上方媒体 reply 窄例外进入 sticker 链，普通无 @ sticker 或回复他人消息仍被过滤。
 - 有真实 media 的入站 sticker 会先随本轮 provider 附件进入视觉语义标注链：主回复应追加隐藏 `cti-sticker-annotation`，由 `bridge-manager` 剥离后交给 adapter 写入 `source=vision` 可信语义。视觉标注只有在本轮存在与目标 `file_key` 精确相同的图片附件时才能持久化；同轮其他表情包候选图片、历史图片或用户文字说明都不能为目标表情包提供视觉依据。如果主回复漏掉隐藏标注，但本轮确实存在同 `file_key` 的图片附件，`bridge-manager` 只允许发起一次隐藏、只读、不进入聊天历史的视觉标注 fallback；该 fallback 只写记忆仓库语义，不改变用户可见回复，不触发表情包发送，不下载历史 key，也不调用 imagegen 或任何生成图路径。入站 sticker 回合的可见回复即使误以 `[表情包]` / `[表情包:file_key]` 开头，也会在出站前剥离动作 hint，避免“收到表情包”上下文被误解成“机器人再发一个表情包”。
-- 表情包语义库写入采用主文件有效快照、临时文件和 rename 的原子保护；读取主库失败时会优先从同目录 `.bak`、带时间戳 `.bak-*` 和 `backup/*.json` 中选择最新可解析备份恢复，避免一次半写或解析失败把 `label/intent/usage/annotationSource` 压成空壳记录。恢复与裁剪都遵守语义来源门禁：只有 `vision` 或 `manual` 能成为自动发送候选，`userAnnotation` 和 source-less 旧语义只作为 evidence；仅历史 key 是索引证据，不等同于可发送或可编辑的表情包资产。
+- 表情包语义库写入采用主文件有效快照、临时文件和 rename 的原子保护；控制面板写入后同步刷新 `.bak`，读取主库失败时会优先从同目录 `.bak`、带时间戳 `.bak-*` 和 `backup/*.json` 中选择最新可解析备份恢复，避免一次半写或解析失败把 `label/intent/usage/annotationSource` 压成空壳记录。永久删除只允许对已归档记录执行：先从 `stickers` 移除记录并在根级 `deletedStickers[file_key]` 写入 tombstone，再清理 `media` 下同 key 图片。FeishuAdapter 在入站、历史回填、候选生成、语义标注和媒体缓存入口都识别 tombstone，禁止相同 `file_key` 被重新登记或发送；主库与 `.bak` 同步保存 tombstone，避免恢复旧备份时复活。恢复与裁剪都遵守语义来源门禁：只有未禁用、未归档且来源为 `vision` 或 `manual` 的记录能成为自动发送候选，`userAnnotation` 和 source-less 旧语义只作为 evidence；仅历史 key 是索引证据，不等同于可发送或可编辑的表情包资产。
 - 用户明确要求“发/回/来个表情包”时，adapter 优先复用当前 chat 的可信视觉/人工语义记录；如该可信候选媒体尚未在记忆仓库中，最多补取一个候选并缓存，不会扫描工作区或批量回捞历史。对于“发个/来个/随机一个表情包”这类单个通用请求，可信候选只作为 `preferredFileKey` evidence 注入本轮 provider，不再由 bridge-manager 在 provider 前直接投递；只有 AI/provider 明确输出 `[表情包]` 或精确本轮候选动作后，bridge 才能把该候选补成真实 sticker。具体语义请求仍需匹配候选语义。没有可信候选时进入受控视觉分析，候选证据、禁止 imagegen/技能调用和 `cti-sticker-candidate-analysis` 协议必须排在 provider 会保留的系统提示前缀。bridge 只接受本轮真实附加、带充分置信度和具体画面/情绪/用途的 `fileKey` 发送动作。
 - Feishu 短指代追问（例如“这个 / 他这是 / 怎么回事 / 回复一下”）会优先使用原生 `parent_id/root_id/upper_message_id` 拉取被回复消息；原生 reply 元数据缺失时，adapter 会生成受控 light conversation evidence：当前用户短句、当前消息 native mentions、同群近邻消息和 best-effort `[可能关联上文]`。普通上下文仍避免把机器人出站消息当作用户请求；但短指代追问会把 nearby `sender_type=app/bot` 的卡片或机器人消息作为候选证据交给 agent 判断，防止用户追问上一条机器人回复时只看到孤立短句。若飞书云历史只返回本机器人 card/image 的资源壳，adapter 会按同一 channel/chat/messageId 从本地 outbound audit 读取已实际发送给用户的摘要，作为“本地已发送内容摘要”补进上下文，避免连续图片标注、命名、总结等任务只看到卡片壳而丢失上轮规则。当前消息带“也 / 继续 / 同样 / 按刚刚”等续作信号时，prompt 会要求 agent 先继承被回复消息、近邻消息和本地 outbound 摘要中的任务规则；类似“这是/这个是…”的短描述默认视为图片/文件元信息，只有用户明确要求写上该文字时才当作待标注文本。若用户明确说“看我上面消息 / 上面那条卡片 / 上文 / 前面消息 / 上一条 / 上几条”并要求查看、分析、回复、总结、对照或纠错，则不再降级为 light context，而是按有界历史范围走飞书消息页同步和历史索引检索。
 - `turn-context.ts` 定义 Context Broker 的平台无关证据协议和纯裁决函数，`turn-context-broker.ts` 统一归一化各来源并按需调用解析 host。每轮都会生成 `cti-turn-context/v1` envelope：当前正文、原生 reply、native mention、当前/被回复附件、近邻、推测关联、历史和文档分别记录 `id/kind/relation/source/confidence`；再由确定性 resolver 生成 `cti-turn-focus/v1`。唯一且正文可读的原生 reply 直接成为 primary evidence，图片/文件/卡片资源壳会标记 `contentRecovered=false` 并降为低置信，只有真实下载的 `reply_attachment` 或耐久出站摘要才能恢复可靠焦点；当前消息自带附件时仍会同时下载并保留被回复附件。近邻、历史、文档和 memory 只能作为 supporting evidence；多个强引用、仅有 `[可能关联上文]` 或 reply 正文未可靠恢复时，才通过 runtime host 调用独立解析 Agent。解析 Agent 使用 `interactionMode=classifier`：Hub、manifest、外部 executor 和本地工具路由全部绕过，Codex 使用独立禁用工具配置、只读沙箱、禁网和原生 JSON schema，Claude 使用 `allowedTools=[]`，本地 Codex CLI 使用 ephemeral、忽略用户配置和禁用工具特性；解析 host 接口不接收工作目录，并继承主任务 abort signal，stop 时会取消 provider reader。解析结果只能选择 envelope 中真实存在的 evidence ID，focus 必须与 primary evidence relation 一致，并复用确定性层的 reply 可读性函数，禁止重新提升不可恢复资源壳。native mention 和当前/回复附件进入 envelope 后即计为平台 evidence，不再额外注入重复的旧自由文本上下文。最终 Prompt 顺序固定为普通历史、结构化焦点、当前请求；焦点和主证据先于辅助证据进入独立字符预算，避免长历史截断后重新退化为自由文本猜测。
 - `input-evidence.ts` 定义独立于工具调用的 `cti-input-evidence/v1`。当当前请求只需分析、识别或总结真实图片附件时，`ExecutionRequirement` 生成 `input_evidence_required`，记录必需附件 ID 和媒体类型；Codex SDK 在 `thread.started`、Claude SDK 在 `system/init`、本地 Codex CLI 在 `thread.started` 后由运行时发出 receipt。所有必需 ID 与类型均被接收才算证据满足，不要求视觉输入产生 `tool_use/tool_result`，也不允许模型正文、文件名、历史文本、未支持 MIME 或虚假产物声明绕过。Claude receipt 与实际 prompt 共用 PNG/JPEG/GIF/WebP 过滤结果。图片正文里仅出现 Unity/Blender/MCP/Game View/Scene View 名称，例如“查看这张 Unity 截图里的报错”，仍属于只读输入证据；只有副作用动作、明确指向 MCP/Game View/Scene View/当前场景或场景对象等实时外部状态，或显式使用“用/通过/调用 Unity、Blender、MCP”的只读动作，才升级为外部工具任务。状态目标可以位于读取动词前后；“修一下/改一下/调整/处理”等常见副作用表达同样升级。动作极性按片段和动作顺序裁决：否定只约束本片段动作，标点、转折、并列和顺序转向后可恢复肯定动作；“不得不/不能不”按肯定处理；“不需要的对象/未使用的模型”等目标属性不会否定后置删除、修改或列出动作；“不用 Unity，只分析截图”等真实否定调用仍保持输入证据任务。生成、编辑、标注、裁剪、保存、截图、导出等动作仍走 `artifact_required`；复合请求采用最强外部状态/副作用优先级，“先分析截图，再用 Unity/Blender/MCP 检查、修复或重建”继续要求对应工具证据。缺 receipt 会带原附件重试，最终仍缺失时返回明确阻塞。协议结构预留 `image/audio/video/file`，当前只启用 Provider 已正式承载的图片输入。
 - Feishu adapter 对 agent 上下文采用两阶段入站：完成权限、原生 @、消息类型和必要附件解析后，立即把受理消息加入 bridge 队列；群名解析、增量历史索引、light conversation、显式历史请求和 sticker library evidence 通过通用 `InboundMessage.prepareForAgent` 继续准备。`bridge-manager` 在等待该准备钩子前先预备 turn feedback，因此平台网络读取仍会在 provider 启动前提供完整证据，但不会继续挡住用户可见状态卡。群名与历史准备 Promise 在 adapter 入队时已经启动，快速系统入口无需等待也不会重复发起同一轮平台读取。
-- Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息、玩法规则或流程说明里的 `@名字`，只作为受控 evidence prompt 交给 agent。bridge-manager 不会从普通显示名、裸 `@显示名`、模型正文或用户请求文本自动补 `@目标`，也不会调用 Feishu resolver/inspector 作为通用出站快捷路径；当前消息里的原生 mentions（包括同时 @ 本机器人和目标）只注入 actor context/evidence。出站结构化 mention 统一兼容 `userId/user_id/openId/open_id`（以及既有 `unionId/union_id`），但归一化后的 ID 仍必须与本轮原生 mention evidence 中任一平台 ID 精确匹配。该门禁位于 `preparedReply` 统一交付边界，普通消息和 streaming card 收尾共用；模型提供但本轮 evidence 不存在的 ID 会被丢弃，对应裸 `@` 会移除并保留文字语义，明确艾特请求则返回未投递/需原生 @ 的最小缺口。`atAll/at_all` 属于广播动作，不具备可求交集的单一用户 ID；在建立独立 Owner 确认协议前默认拒绝。
+- Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息、玩法规则或流程说明里的 `@名字`，只作为受控 evidence prompt 交给 agent。bridge-manager 不会从普通显示名、裸 `@显示名`、模型正文或用户请求文本自动补 `@目标`，也不会调用 Feishu resolver/inspector 作为通用出站快捷路径；当前消息里的原生 mentions（包括同时 @ 本机器人和目标）只注入 actor context/evidence。出站结构化 mention 统一兼容 `userId/user_id/openId/open_id`（以及既有 `unionId/union_id`），但归一化后的 ID 仍必须与本轮原生 mention evidence 中任一平台 ID 精确匹配。该门禁位于 `preparedReply` 统一交付边界，普通消息和 streaming card 收尾共用；模型提供但本轮 evidence 不存在的 ID 会被丢弃，对应裸 `@` 会移除并保留文字语义。明确艾特请求缺少可信目标时，交付层只撤销原生 mention 动作并在 Agent 正文末尾追加未投递说明，不得覆盖已基于 reply、历史、附件生成的正常答案，也不得清空 Markdown、图片或文件。`atAll/at_all` 属于广播动作，不具备可求交集的单一用户 ID；在建立独立 Owner 确认协议前默认拒绝。
 - Feishu 显示名解析按证据来源分层：本轮原生 mention 最高，其次是当前群成员/群机器人列表、当前发送者，历史 `<at>` 映射仅作回退。同一最高层出现多个不同可原生 @ ID 才拒绝为歧义；历史中的旧同名 ID 不会覆盖当前群唯一候选。该排序是平台证据通用规则，不依赖固定机器人名。
 - Feishu 出站 mention 只接受明确显示名、原生 mention evidence 或结构化 mention。类似“你自己的主人 / 开发者 / 维护者 / 某个成员 / 相关机器人”的关系描述或泛称不再被当成飞书显示名，不会补 `@目标`、不会触发 resolver/inspector 机械 blocker；模型若生成 `@关系描述`，bridge-core 会在发送前移除裸 `@`，保留自然语言语义。
 - Feishu 身份/关系问题会额外注入 assistant maintainer evidence：adapter 已知的 bot/app 身份、当前发送者 bridge role、权限库和 `CTI_*_OWNER_USERS` 合并出的 owner/maintainer 线索。权限 JSON 同时兼容控制面板写出的 PascalCase 字段和 bridge 旧 camelCase 字段，并按最高角色合并，避免旧 viewer 记录覆盖 env/store owner。agent 可以据此回答“当前可确认的 bridge 维护者/Owner”，但不得把它伪称为飞书开放平台开发者/管理员；只有 admin API 明确返回的平台证据才能这么说。
@@ -213,11 +265,12 @@ Feishu 接收现在是双通道：
 9. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。普通“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”，以及“看我上面消息 / 上面那条卡片 / 上文 / 前面消息 / 上一条 / 上几条”这类明确回看上方消息的说法，会先命中 Feishu 历史意图，bridge-core 只使用 adapter/store 的历史索引和 `retrieveRelevantFeishuHistory()` 生成受控历史 evidence，由 agent 总结或回答；不把 `feishu-history/*.json` 路径交给 Codex 自行用 Bash 或 MCP 读取。当前 sender、角色、chat、原生 mention、reply、附件、近邻、历史和已解析文档会进入 `TurnEvidenceEnvelope`，Context Broker 先生成确定性 focus；只有低置信或证据冲突才调用解析 Agent。Prompt Composer 将普通历史放在结构化焦点之前，并把焦点紧贴当前请求；引用和检索文本始终只作 evidence，不能绕过权限、工具证据或当前用户明确改意图。流式最终卡片不走普通 `delivery` 时，FeishuAdapter 会以实际卡片消息 ID 写入耐久出站引用，保存有界的原始请求、终态和最终结果；用户原生回复该卡片而飞书只提供卡片资源壳时，adapter 优先从此引用精确回填续办上下文。
 10. 对带有明确可读对象的请求，`ExecutionRequirement` 会在不依赖关键词硬触发的前提下启用低风险主动探查：例如当前工作区、明确路径、文件名、MCP manifest、`config/mcp.d` 等对象会进入 `local_read_required`，让 provider 先做受控读取/列目录/检查；没有明确对象的时效或泛问仍保持普通回答或追问。
 11. 调用运行时 provider。Codex provider 继续把普通 `systemPrompt` 控制在 4000 字符预算内；当完整提示超过预算时，会先从任意位置提取同时声明为 `protocol` 且包含 fenced `cti-*` 动作标识的规则行，去重后作为关键协议块保留，再用剩余预算裁剪身份和普通上下文。短提示不重排，`priorityTurnContext` 与 provider 自带的 `cti-final` 回复契约仍使用各自独立入口。这样 `cti-reminder`、`cti-direct-message` 及后续同类结构化动作不会因为位于长提示后部而在到达模型前丢失，目标解析、Owner 门禁和真实发送仍由 bridge-core / FeishuAdapter 负责。
-12. 对带图片附件的 Feishu 表情包结果，先解析并剥离 `cti-sticker-annotation` 语义标注块，交由 FeishuAdapter 持久化；如果本轮真实 sticker 图片已附加但主回复漏掉标注块，bridge-manager 会用同一附件发起一次隐藏视觉标注 fallback，仅补写 `source=vision` 语义，不进入聊天历史、不改变可见回复、不触发 sticker 出站动作。非表情包回复不经过该协议，避免影响 `cti-final` 等通用结果块。
-13. 解析最终结果块、`cti-reminder` 和 `cti-direct-message` 动作块。
-14. 如果 Codex 明确请求创建提醒，bridge-core 只把低风险结构化动作交给 bridge-runtime 的 reminder host 执行，并把这次 bridge-owned action 的成功结果计入本轮执行证据，避免后置假完成防线误拦真实 host 摘要。用户看到的是面向人的执行摘要，包括提醒内容、时间、目标会话和到点通知对象；`reminderId`、`chatId`、状态文件路径和内部协议字段只保留在运行态状态或审计里，不外发。`cti-reminder` 的标题、sourcePrompt 或用户原文一旦呈现系统控制、文件发送、命令执行、安装发布等副作用，就不会写入 reminder host：普通用户返回 Owner 门禁，Owner 也会收到“需走受控工具/命令链和真实工具证据”的阻塞。模型只口头声称“已创建/已设置提醒”但没有动作块时一律拦截为未完成，不再从原文反向解析并补建提醒。
-15. 如果 Codex 明确请求向某个 Feishu 成员、当前发送者或另一个群/会话发送消息，bridge-core 只接受 `cti-direct-message` 结构化动作，并要求用户原文存在明确私发/私信/发给某人/发到会话的授权；FeishuAdapter 会复用入站 mention、历史 `<at>` 映射、群成员列表、sender 上下文和本地 channel binding 解析目标。动作解析兼容字符串 `target`，也兼容官方模型可能输出的对象型 `target={display_name, open_id}`：对象同时含显示名和用户 ID 时只提取显示名，仍走本轮原生 mention / 成员证据的唯一解析，不直接信任模型生成的 ID；只有缺少名称或明确给出 chat/session 目标时才进入既有 ID/Owner 确认链。普通一对一私发只有唯一命中真实用户 ID 时才用 `im.message.create` 的 `open_id/user_id/union_id` 收件人发送；对“给我 / 私发给我 / 发起人 / 发送者”这类目标，群聊中即使成员列表不可用，也可以用本轮 sender open_id/user_id 作为收件人兜底，且不能把群名当成发送者姓名。若动作包含 `targetId/chatId/sessionId` 或 `targetType=chat/user`，则视为跨会话/id 发送，必须是 owner 发起，adapter 先返回目标名称、类型和平台 ID，bridge-core 在源会话发确认卡，只有同一 owner 在有效期内确认后才用已确认目标发送。源群只回确认/成功/失败状态，不复述待发送正文；其他目标不唯一、缺少目标、确认过期或模型只口头声称已发送时都返回阻塞，不用 Bash、临时脚本或手写平台 API 代发。
-16. 通过 Feishu 原生 reply/card/image 等方式回复。reply 只表示引用消息，不自动 @ 提问人；出站 mention 默认只透传 `cti-final.mentions` 等已有结构化 `mentions`，bridge-manager 不会从最终正文的裸 `@显示名`、普通显示名、模型文本或规则文本补出 native mention，也不会调用 resolver/inspector 快捷查人。结构化 ID 先统一兼容 camelCase/snake_case 的 user/open ID 字段，再与本轮原生 mention evidence 精确求交集；只有验证后的 `preparedReply.mentions` 才会同时进入普通 delivery 和 streaming card `onStreamEnd`。当前消息的原生 @ 只作为 agent 判断证据；即使同一消息已原生 @ 了唯一目标，也必须先经过 provider 处理完整意图，再由结构化 `cti-final.mentions` 选择该 evidence。诊断、流程、未来动作、广播受众、格式/规则与关系型目标只作为上下文；无效结构化目标会移除裸 `@`，明确投递请求返回未投递/需原生 @ 的最小缺口，不能呈现为成功。Markdown card / post / text 在已有结构化目标时分别渲染飞书原生 at；`replyToMessageId` 仅表示引用，不推断为艾特。Feishu streaming card 只展示高层状态，不直接直播工具名、路径、命令或内部事件；运行中每次更新只保留最新一条安全进度，不回放累计的 provider 叙述，收尾时再由最终结果替换卡片正文。
+12. Conversation Engine 会把 `tool_use_id -> tool input` 与对应 `tool_result` 配对；只有真实、成功且符合官方 URL 白名单的 `lark-cli auth login --scope ... --no-wait --json` 才生成飞书 CLI 用户授权 challenge。bridge-manager 在任何结果块或附件发送前优先接管该 challenge：非 Owner 返回红色阻塞；Owner 调用 runtime broker，禁止继续发送模型声明的二维码、本地 QR 图片或“回复好了”文案。runtime 只在内存中保留当前有效期内的 device challenge，以 `Owner userId + normalized scopes` 合并等待任务，后台执行官方 `lark-cli auth login --device-code ...`，成功后自动重新入队原请求，失败或过期则发送不含秘密的红色未完成卡。
+13. 对带图片附件的 Feishu 表情包结果，先解析并剥离 `cti-sticker-annotation` 语义标注块，交由 FeishuAdapter 持久化；如果本轮真实 sticker 图片已附加但主回复漏掉标注块，bridge-manager 会用同一附件发起一次隐藏视觉标注 fallback，仅补写 `source=vision` 语义，不进入聊天历史、不改变可见回复、不触发 sticker 出站动作。非表情包回复不经过该协议，避免影响 `cti-final` 等通用结果块。
+14. 解析最终结果块、`cti-reminder` 和 `cti-direct-message` 动作块。
+15. 如果 Codex 明确请求创建提醒，bridge-core 只把低风险结构化动作交给 bridge-runtime 的 reminder host 执行，并把这次 bridge-owned action 的成功结果计入本轮执行证据，避免后置假完成防线误拦真实 host 摘要。用户看到的是面向人的执行摘要，包括提醒内容、时间、目标会话和到点通知对象；`reminderId`、`chatId`、状态文件路径和内部协议字段只保留在运行态状态或审计里，不外发。`cti-reminder` 的标题、sourcePrompt 或用户原文一旦呈现系统控制、文件发送、命令执行、安装发布等副作用，就不会写入 reminder host：普通用户返回 Owner 门禁，Owner 也会收到“需走受控工具/命令链和真实工具证据”的阻塞。模型只口头声称“已创建/已设置提醒”但没有动作块时一律拦截为未完成，不再从原文反向解析并补建提醒。
+16. 如果 Codex 明确请求向某个 Feishu 成员、当前发送者或另一个群/会话发送消息，bridge-core 只接受 `cti-direct-message` 结构化动作，并要求用户原文存在与动作目标一致的明确私发/私信/“给某人发送表情包、图片、文件、消息”等授权；FeishuAdapter 会复用入站 mention、历史 `<at>` 映射、群成员列表、sender 上下文和本地 channel binding 解析目标。动作解析兼容字符串 `target`，也兼容官方模型可能输出的对象型 `target={display_name, open_id}`：对象同时含显示名和用户 ID 时只提取显示名，仍走本轮原生 mention / 成员 evidence 的唯一解析，不直接信任模型生成的 ID。普通一对一私发只有唯一命中真实用户 ID 时才用 `im.message.create` 的 `open_id/user_id/union_id` 收件人发送；name-only `targetType=user` 只是人员类型提示，不会单独升级跨会话确认。对“给我 / 私发给我 / 发起人 / 发送者”这类目标，群聊中即使成员列表不可用，也可以用本轮 sender open_id/user_id 作为收件人兜底，且不能把群名当成发送者姓名。若动作包含 `targetId/chatId/sessionId` 或 `targetType=chat`，则视为跨会话/id 发送，必须是 owner 发起，adapter 先返回目标名称、类型和平台 ID，bridge-core 在源会话发确认卡，只有同一 owner 在有效期内确认后才用已确认目标发送。私发表情包必须同时携带本轮真实附件和模型精确选择签发的 `VerifiedMediaAction`，FeishuAdapter 才以官方 `msg_type=sticker` 投递；未验证 file_key 不会作为文字或贴纸发送。源群只回确认/成功/失败状态，不复述待发送正文；其他目标不唯一、缺少目标、确认过期或模型只口头声称已发送时都返回阻塞，不用 Bash、临时脚本或手写平台 API 代发。
+17. 通过 Feishu 原生 reply/card/image 等方式回复。reply 只表示引用消息，不自动 @ 提问人；出站 mention 默认只透传 `cti-final.mentions` 等已有结构化 `mentions`，bridge-manager 不会从最终正文的裸 `@显示名`、普通显示名、模型文本或规则文本补出 native mention，也不会调用 resolver/inspector 快捷查人。结构化 ID 先统一兼容 camelCase/snake_case 的 user/open ID 字段，再与本轮原生 mention evidence 精确求交集；只有验证后的 `preparedReply.mentions` 才会同时进入普通 delivery 和 streaming card `onStreamEnd`。当前消息的原生 @ 只作为 agent 判断证据；即使同一消息已原生 @ 了唯一目标，也必须先经过 provider 处理完整意图，再由结构化 `cti-final.mentions` 选择该 evidence。诊断、流程、未来动作、广播受众、格式/规则与关系型目标只作为上下文；无效结构化目标会移除裸 `@`，明确投递请求缺少可信目标时保留 Agent 正文和附件，仅追加未投递/需原生 @ 的状态，不能呈现为成功，也不能用固定治理文案覆盖 reply 上下文答案。Markdown card / post / text 在已有结构化目标时分别渲染飞书原生 at；`replyToMessageId` 仅表示引用，不推断为艾特。Feishu streaming card 只展示高层状态，不直接直播工具名、路径、命令或内部事件；运行中每次更新只保留最新一条安全进度，不回放累计的 provider 叙述，收尾时再由最终结果替换卡片正文。
 
 ```mermaid
 sequenceDiagram
@@ -228,6 +281,7 @@ sequenceDiagram
   participant Runtime as bridge-runtime
   participant Cloud as Feishu 云文档 API/OAuth
   participant OAuth as 飞书官方 OAuth
+  participant CLI as 官方 lark-cli
   participant Provider as Codex agent / 模型来源
   participant Sender as Feishu 发送器
 
@@ -273,6 +327,20 @@ sequenceDiagram
   end
   Provider-->>Runtime: 返回 cti-final 或可见结果
   Runtime-->>Core: 返回最终候选回复
+  opt 工具证据包含 lark-cli 用户授权 challenge
+    Core->>Core: 校验真实命令、tool_use_id、scope 与官方 verification URL
+    alt 发起人不是 Owner
+      Core->>Sender: 红色未完成卡，不暴露授权入口
+    else Owner 发起共享用户身份授权
+      Core->>Runtime: 合并 Owner + scopes 等待任务
+      Core->>Sender: 红色未完成进度卡 + 蓝色 open_url 授权卡
+      Sender-->>User: 打开飞书官方授权页
+      User->>OAuth: 确认最小 scope
+      Runtime->>CLI: 后台执行 auth login --device-code
+      CLI-->>Runtime: 登录成功、拒绝或过期
+      Runtime->>Core: 成功时逐个恢复原始请求
+    end
+  end
   Core->>Core: 解析结果块、附件声明、cti-reminder 和 cti-direct-message
   opt 命中 cti-reminder
     Core->>Runtime: 创建直接提醒
@@ -670,14 +738,15 @@ flowchart TD
 关键能力：
 
 - Feishu 群聊原生 reply。
-- 群聊 reply 只表示引用消息，不自动 @ 提问人；原生 @ 默认只来自已有的结构化 `mentions`，bridge-manager 不会把最终正文的裸 `@显示名`、普通显示名、模型文本或用户请求中的名字送入 resolver/inspector，也不自动补 `@目标`。当前消息里的原生 @ 目标只作为 agent evidence；复合意图、总结、转述和单纯艾特请求都先进入 provider，由 AI 决定是否输出结构化 `cti-final.mentions`。流程、格式、诊断、历史引用和模型文字均不能触发平台 mention 投递；缺少结构化真实 ID 时不能替换正常答案。
+- 群聊 reply 只表示引用消息，不自动 @ 提问人。已有结构化 `cti-final.mentions` 仍只接受本轮原生 mention evidence 中真实存在的 `user/open/union` ID；模型不能自行创造 ID。对于没有结构化 ID 的显示名请求，bridge-manager 只允许一条 Agent 选择型解析链：本轮用户必须明确发出当前命令式 @ 请求，Agent 最终可见回复也必须主动写出同名裸 `@显示名`，两者规范化交集才会交给 FeishuAdapter 从当前群官方成员/机器人 evidence 中唯一解析。用户文字或模型回复任一方单独出现名字都不能触发 resolver；题面、引用和说明中的其他裸 @ 不会顺带投递。未命中、歧义或平台查询失败时只移除未验证的 `@` 标记、追加未投递状态，保留正常答案、Markdown 模式和附件。
 - “怎么 at / 为什么 at 不了 / at 后不回复”这类解释或诊断型 mention 问题不会触发原生 mention 发送，正文中的 `@名字` 只作为示例或问题对象展示；其他普通出站文本同样不走 resolver 快捷解析。
 - Feishu mention 规则不得写死某个机器人名或现场玩法词。紧凑称呼句只使用 adapter 当前助手身份、本轮 `feishuBotWake.alias` 或原生 @ 作为唤醒证据；流程规则、步骤说明、等待别人点名、未来“我会/主持人会/参与者会 @”和“一个/某个/另一个/你们/成员/机器人”等泛指目标只作为上下文交给 agent，不触发 native mention 补全、resolver/inspection 或假 @ 拦截。
-- Feishu 私发和跨会话发送走 `cti-direct-message` 受控动作：模型只声明目标和正文，bridge-core 校验用户明确授权，FeishuAdapter 复用 mention 候选解析为唯一用户 ID 后调用平台一对一发送；“我 / 本人 / 发起人 / 发送者”会解析为本轮 sender ID，成员列表不可用时也能给当前发送者私发，但不会把群名当人名。若动作声明 `targetId/chatId/sessionId` 或 `targetType=chat/user` 这类跨群、跨会话或按 ID 发送目标，则升级为 owner-only：adapter 先解析出目标名称、类型和平台 ID，bridge-core 在源会话发确认卡，只有同一 owner 在有效期内确认后才用已确认的 `chat_id/open_id/user_id/union_id` 发送。确认卡和源群结果不回显待发送正文，目标不唯一、确认过期、非 owner 点击或 resolver 不支持时只返回未完成。
+- Feishu 私发和跨会话发送走 `cti-direct-message` 受控动作：模型只声明目标和正文，bridge-core 校验用户原文与动作目标一致的明确授权，FeishuAdapter 复用 mention 候选解析为唯一用户 ID 后调用平台一对一发送；“我 / 本人 / 发起人 / 发送者”会解析为本轮 sender ID，成员列表不可用时也能给当前发送者私发，但不会把群名当人名。name-only `targetType=user` 仍属于普通人员私发；只有声明 `targetId/chatId/sessionId` 或 `targetType=chat` 的跨群、跨会话或按 ID 发送才升级为 owner-only，并在源会话展示目标名称、类型、平台 ID 和确认卡。私发表情包只能消费 bridge 本轮基于真实候选附件签发的 `VerifiedMediaAction`，以 `msg_type=sticker` 发送；用户文字、模型 marker 或未验证 file_key 不能单独授权媒体。确认卡和源群结果不回显待发送正文，目标不唯一、确认过期、非 owner 点击或 resolver 不支持时只返回未完成。
 - 群聊 mention 判定优先使用事件 `mentions`，事件缺字段时再解析正文里的飞书 at 标记，避免“已 @ 机器人但消息未入会话”。
 - Feishu Markdown 默认走 card。
 - Feishu streaming card 等待态只展示当前一步用户可见思考动作：卡片正文由彩色阶段标题、灰色小字正文和通用阶段轨迹组成，随着模型/provider progress、记忆证据、工具事件或收口阶段刷新，不累计历史步骤，不写入最终回复或会话历史。允许展示经过改写的“处理思路 / 依据 / 正在识别或核对的对象”，但必须过滤工具名、路径、命令、`JsonTool/tool_*`、MCP 原始事件和 `agent` 内部结果块；当 provider 已给出安全且更具体的进度内容时，不用“正在回复...”这类泛化文案遮住它。
 - Feishu streaming card 会在 adapter 侧做增量刷新：每个新思考动作先显示题头，再逐步补齐灰色正文，形成可见的打字机效果；如果下一步到来，会取消上一轮增量刷新并切到新内容。
+- streaming card 的传输状态与业务结果分开判定：provider 正常结束不等于任务完成。最终可见正文明确以“未完成 / 失败 / 阻塞 / 已拦截 / 无法完成”开头时，bridge-manager 会用 `error` 收尾并把 continuation 状态记为未完成；`buildFinalCardJson()` 还会从可见正文二次校验，统一使用红色 header 和 `×` footer，避免紫色完成卡包裹失败结果。
 - Feishu adapter 启动时会通过 `/bot/v3/info` 读取机器人身份，保存 `open_id/bot_id` 用于 mention 识别，并提取 `name/app_name/i18n_name` 作为本通道的助手显示名。bridge-core 会把该显示名作为高优先级 system context 注入本轮 provider，并放在 system prompt 前部，避免 provider 截断长系统提示时丢失渠道身份。用户问“你是谁 / 自我介绍”时，机器人以飞书应用名作为自己的名字，`Codex` 只作为底层执行引擎说明，不再默认自称 Codex。普通聊天、自我介绍、问候和确认不再走 bridge-core 本地硬编码秒答，而是统一进入配置的 provider/API 模型，由模型结合通道身份和上下文生成回复。
 - Feishu 群聊和其他共享会话仍按 session lock 串行处理普通消息；截至 2026-06-05，如果同一 session 已有未完成请求，新消息入队时会先发送一条可见确认，说明上一条还在处理且会按顺序继续回复。这条确认不替代最终回复，也不改变 provider 执行顺序。
 - Feishu 文本、Markdown card 和 streaming final card 出站都支持通用 reaction hint：普通文本或最终结果开头的 `[表情]` 会先尝试转成被回复消息上的原生 reaction，再发送或渲染剥离 hint 后的正文；对于 `[微笑]`、`[赞]`、`[OK]`、`[BULL]` 等已知 hint，即使 reaction API 不可用、权限失败或没有可回复的源消息，也会剥离 hint 并用对应 Unicode emoji 作为可见兜底，避免把 `[微笑]` 这类内部发送指令展示给用户。未知 reaction 类型失败时保留原文，避免吞掉用户本来想发送的括号文本。provider prompt 会提示模型只在轻量聊天、确认、问候、表情包接话等场景偶尔使用 Feishu 原生 reaction hint，并必须按实际意图选择；不能把 `SMILE` 当默认表情，语气中性、正式、阻塞或不明确时应不加表情。
@@ -726,6 +795,7 @@ flowchart TD
 - Skill Registry / Lifecycle：扫描并合并 manifest、草稿、禁用项和正式安装项；通过官方 `skill-creator` / `skill-installer` 脚本执行创建、校验和安装，统一处理审批、审计、原子替换与回滚。
 - Prompt Snapshot Store：接收 bridge-core 生成的脱敏 Snapshot，以原子 JSON 文件保存短期运行证据；Snapshot 写入失败只影响观察能力，不阻断 provider 或消息交付。
 - Feishu OAuth 和云文档 host：先用应用 `tenant_access_token` 读取 Docx / Sheets / Base，应用无权且任务需要用户私有资源时再使用发起人 OAuth token。官方层使用 `accounts.feishu.cn/open-apis/authen/v1/authorize`、PKCE 和 `accounts.feishu.cn/oauth/v3/token` 完成授权、换取与刷新；治理层按用户隔离 state，并为同一用户保存可并存的最小 scope 加密 Token grant，兼容读取旧版单 Token 文件；按任务计算最小 scope，以 `userId + normalized scopes` 去重授权卡，并将多个等待任务持久化到同一 state 后逐个恢复。callback 模式按需启动公网回调监听，manual 模式让用户把 `code/state` 回调 URL 发回飞书；读取失败时会按具体接口返回需要检查的只读 scope，避免把权限不足伪装成空内容。
+- Feishu CLI 用户授权 host：接收 bridge-core 从真实工具对提取的 `cti-feishu-cli-user-auth/v1` challenge，只允许 Owner 为本机共享 `lark-cli` 用户身份授权。Card 2.0 按最小 scope 展示 `open_url` 按钮，后台 runner 用 argv 调用官方 `auth login --device-code`；同 Owner 与 scope 的并发任务共用一次轮询，成功自动恢复，拒绝/过期发送红色未完成结果。该 host 不持久化 device code、URL 或 token，也不替代 FeishuAdapter 的 bot 长连接。
 
 关键能力：
 
@@ -735,9 +805,9 @@ flowchart TD
 - 记忆索引分五层：Markdown 分区知识库索引、当前会话压缩摘要、按人/按聊天隔离的临时 profile、Feishu 历史片段、`audit.json` 已发结果；不再创建或检索 global profile。运行时按本轮 `memoryMode` 决定是否生成 `MemoryQueryPlan`：普通聊天默认 `off`，不预跑记忆检索；明确回忆请求为 `recall`，工具、Unity/MCP、文件等执行类请求可用 `augment` 少量补充上下文。检索结果会标注来源、置信度、可回答性、质量和结构化 key/value；模型上下文只注入当前用户、当前群和公共长期分区内命中的少量片段，当前请求始终优先。
 - Feishu 历史回看是“远端历史 + 本地归档”的双证据链：远端 `feishu-history` 负责确认聊天消息水位和用户原话，本地 `messages` / `message-archives` 用于补回 bot 自己的 `cti-final` 最终答复。检索器不会把 `tool_use`、`tool_result`、命令、路径或日志当成用户答案；即使缺少最终结果块，主记忆摘要也只保留 assistant 的可见文本块，工具审计仍留在 workflow/audit/压缩摘要等专门通道。
 - 明确回忆类请求会走 `MemoryReplyDecision`：只有 `quality=high` 的高置信结构化命中才允许作为最终回复证据进入 agent；结构化映射既支持 key 正向命中，也支持按 value/描述反查对应 key，例如“某个场景叫啥”可命中“`scene_id` == 场景描述”表项。最终回答必须按用户意图整理：问“所有 / 全部 / 列表 / 对应表”时保留命中的完整结构化项，只问单个名称时才收窄到匹配项；模糊、多命中、关系图扩展或需要综合的问题只把记忆作为受限上下文交给 Codex，并要求不跑工具、不搜仓库、不编造；未命中时由 agent 明确收口“没找到相关记忆”。普通任务只做上下文增强，不允许因为关键词命中绕过主执行链。
-- 记忆意图先于任何长期写入执行：每个无附件、非 sticker 的可处理文本都会调用 `MemoryIntentHost`，独立判断 `ignore / clarify / write` 与 `temporary / user / group / long_term` 范围，不能用“记住 / 记录”等关键词正则作为写入开关。范围、对象或具体事实不能唯一确认时为 `clarify`，bridge 不写入、由主 agent 追问最小缺口；分类器不可用也不回退表格/键值解析写入。`temporary` 只保留在当前 session；持久化范围必须同时满足 human 来源、置信度阈值和结构化候选，并写入带 frontmatter `schema: codex-im-suite/memory/v2` 的白名单分区：`data/memory/v2/users/<channel>/<userId>/`、`data/memory/v2/groups/<channel>/<chatId>/` 或 `data/memory/v2/long-term/`。分类、写入与检索只提供 evidence，最终答复仍由主 agent 生成，不允许固定“已记录”回复。
-- Markdown 知识库默认位于 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`。索引器只扫描并接受 `data/memory/v2` 下 schema、scope、channel/user/chat 身份边界匹配的 Markdown；旧 `data/explicit-memories`、旧 `data/memory`、`docs/*`、根目录笔记和 `data/documents` 不再进入知识索引。知识单元分为 `事实 / 结论 / 待办 / 资源`，保留来源文件和片段；显式前缀优先决定分类，Markdown 表格 key/value 会按路径/链接/文件扩展名/Prefab/UIScene/预制体/路径、决策规则词、待办风险词等保守推断分类。
-- 知识索引重建后会同步生成 `.cti-index/memory-graph.json`。关系图只来自通过 v2 source policy 的结构化 key/value、同文件上下文和冲突标记；边类型包括 `maps_to`、`reverse_lookup`、`related_to`、`conflicts_with` 等。精确 key 命中仍优先，关系扩展只作为次级候选和 Codex 上下文增强，不提升为 direct memory reply。控制面板“记忆”页默认用关系树展示选中记忆的对应内容、相关对象、待办提醒、可能冲突和来源文件；TanStack Table 网格、联系权重、索引路径和需要检查的回复保留在高级诊断里。
+- 记忆意图先于任何长期写入执行：每个无附件、非 sticker 的可处理文本都会调用 `MemoryIntentHost`，独立判断 `ignore / clarify / write` 与 `temporary / user / group / long_term` 范围，不能用“记住 / 记录”等关键词正则作为写入开关。范围、对象或具体事实不能唯一确认时为 `clarify`，bridge 不写入、由主 agent 追问最小缺口；分类器不可用也不回退表格/键值解析写入。`temporary` 只保留在当前 session；持久化范围必须同时满足 human 来源、置信度阈值和结构化候选，并写入带 frontmatter `schema: codex-im-suite/memory/v3` 的白名单分区：`memory/users/<channel>/<userId>/用户印象.md`、`memory/groups/<channel>/<chatId>/群聊记忆.md` 或 `memory/long-term/公共长期记忆.md`。分类、写入与检索只提供 evidence，最终答复仍由主 agent 生成，不允许固定“已记录”回复。
+- Markdown 知识库默认位于 `E:\cli-md`，生成 `E:\cli-md\.cti-index\knowledge.json`。索引器优先扫描并接受 `memory/*` 下 schema、scope、channel/user/chat 身份边界匹配的 v3 Markdown，同时在兼容期只读接受 `data/memory/v2`；旧 `data/explicit-memories`、旧 `data/memory`、`docs/*`、根目录笔记和 `data/documents` 不进入知识索引。知识单元分为 `事实 / 结论 / 待办 / 资源`，保留来源文件和片段；显式前缀优先决定分类，Markdown 表格 key/value 会按路径/链接/文件扩展名/Prefab/UIScene/预制体/路径、决策规则词、待办风险词等保守推断分类。
+- 知识索引重建后会同步生成 `.cti-index/memory-graph.json`。关系图只来自通过统一 memory source policy 的结构化 key/value、同文件上下文和冲突标记；边类型包括 `maps_to`、`reverse_lookup`、`related_to`、`conflicts_with` 等。精确 key 命中仍优先，关系扩展只作为次级候选和 Codex 上下文增强，不提升为 direct memory reply。控制面板“记忆”页默认用关系树展示选中记忆的对应内容、相关对象、待办提醒、可能冲突和来源文件；TanStack Table 网格、联系权重、索引路径和需要检查的回复保留在高级诊断里。
 - 记忆整理草稿保存到 `.cti-index/memory-optimization-drafts`，状态保存到 `.cti-index/memory-optimizer-state.json`。草稿 schema 为 `codex-im-suite/memory-optimization-draft/v1`，包含 `archive` 等动作、原因、置信度、风险、来源分组、默认勾选状态和源文件定位；应用草稿只执行前端传入的 `selectedActionIds`，不会默认批量应用所有动作。v2 用户记忆、群聊记忆和长期记忆可默认勾选低风险重复归档；整理器不再生成 `data/explicit-memories/memory-summary.md`，也不把 docs、根目录笔记或文档索引作为可整理来源。应用前会校验草稿生成时的 `sourceIndexGeneratedAt` 是否仍匹配当前 `knowledge.json.generatedAt`，不匹配时要求重新生成草稿。
 - 出站前新增答案审查收口：`bridge-core` 把用户原文、候选回复、memory plan/hits、channel/chat/user 和执行证据交给 runtime/store 的 `reviewOutboundAnswer`。v1 规则检查 mojibake、`cti-final` 残留、低价值兜底、工具假完成、内部工具协议泄漏、缺少成功工具证据的执行完成声明、本地读取缺工具证据和 `memory_key_mismatch`，默认写 `CTI_HOME\data\answer-review-audit.json`；普通 warning 只有显式配置 `block_or_replace` 时才改变飞书可见文本。内部工具协议泄漏会硬替换：如果本轮是明确记忆召回且有高置信结构化命中，审查层先用同一套 `MemoryReplyDecision` 重组用户可见答案；否则替换为不含内部工具名的短阻塞，避免把 provider 内部状态发给用户。
 - 出站前还有一层硬验证：`cti-final.images/files` 中声明的本地路径必须真实存在；对于“查看本地目录 / 读取文件 / 搜索项目 / 创建 / 生成 / 写入 / 保存 / 执行”等真实执行请求，只要候选回复声称已经执行或创建了结果，但本轮没有成功 `tool_result`，bridge 会直接把可见回复改为“未完成”，并附上本轮工具证据计数。普通聊天、问候、确认和 `feishu_sticker_*` 表情包轻量消息即使文本里出现“图片 / 已收到”等词，也不会进入这层工具证据拦截。Unity/MCP、web-search 和截图/图片产物类请求在默认模式下也会生成严格 `ExecutionRequirement`，并按 `requiredToolFamilies` 校验工具名，避免普通 `Bash/Edit` 或无关工具结果冒充 Unity MCP、MCP 搜索或产物工具成功。`cti-final` 会先交给出站层解析和本地路径校验，再决定是否拦截，避免通用 no-evidence 文案覆盖“路径不存在”等更具体阻塞。

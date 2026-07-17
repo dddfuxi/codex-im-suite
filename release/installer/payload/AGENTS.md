@@ -30,8 +30,23 @@
 - `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 是机器人分层、策略归属和路径职责分类的第一入口；新增通用 policy、prompt 片段、路径类别或角色门禁时，先在这里声明并补 `bridge-agent-architecture.test.ts`。
 - `bridge-manager.ts` 只保留编排职责：消费入站、调用 context/capability/policy/delivery 入口、串联审计和状态；不要继续把通用角色表、路径表、prompt 规则或平台无关策略内联进 manager。
 - prompt 规则按归属迁移：默认行为和个性属于 Agent Kernel，权限和风险属于 Policy Registry，证据和上下文属于 Context Broker，工具选择属于 Capability Router，最终呈现属于 Delivery Layer。
+- `packages/bridge-core/src/lib/bridge/turn-context.ts` 定义当前回合结构化证据协议和纯裁决函数，`turn-context-broker.ts` 负责归一化各来源并按需调用解析 host；current message、原生 reply、mention、附件、近邻、历史、文档和记忆证据必须带 `id/kind/relation/source/confidence`，不得只拼成平台专用自由文本交给模型猜。
+- 每轮先运行确定性 `Reference Resolver`；唯一且可读的原生 reply 直接成为主焦点，普通近邻和 memory 只能作为辅助。图片、文件、卡片资源壳或下载失败占位不算“正文已恢复”，只有真实附件或本地耐久摘要可提升为可靠 reply。只有多个强引用、仅有推测上文或引用内容未可靠恢复时，才调用只输出 JSON、禁用工具的解析 Agent；classifier 必须绕过 executor、manifest、MCP 和本地工具路由，不携带工作目录，并在 stop 时由同一 abort signal 取消。解析结果必须引用本轮真实 evidence ID，focus 必须与 primary evidence 的 relation 一致，并复用确定性层的 reply 可读性判断；解析 Agent 不得把 `contentRecovered=false` 且无可靠附件/耐久摘要的资源壳重新提升为 `reply_target`。
+- 只读分析真实附件与生成/编辑输出产物必须分开裁决：前者使用 `cti-input-evidence/v1` 记录 Provider 实际接收的附件 `id/kind/mediaType`，不得再因“图片/文件/截图”等名词强制要求 `tool_use/tool_result`；后者仍使用 `artifact_required` 和真实产物证据。复合请求按最强外部状态或副作用要求优先，“先分析截图，再用 Unity/Blender/MCP 检查、修复、重建”不能降级成纯 input evidence。receipt 只能由受控 Provider 运行时状态基于实际支持并传入模型的附件生成，模型正文、文件名、历史文本、未支持 MIME 或 `cti-final` 声明都不能伪造输入已接收。
 - 路径判断必须优先使用统一分类口径：开发仓库、live skill、记忆仓库、运行态数据、临时上传缓存、文档、规则、日志、发布产物各自有边界；不要为了现场问题硬写某个群、机器人名、截图路径或缓存路径。
 - 渐进重构顺序固定为：先建立注册表和测试，再迁移纯函数规则，再迁移上下文构造、能力路由、记忆/暂存提升和交付收口；每一步保持兼容并补单测。
+
+## 2.2 工作区与记忆分层边界
+
+- `packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区计划唯一入口；Conversation Engine、官方 Codex、Codex CLI、本地 JSON 工具、本地 Agent 和 Mavis 必须消费同一 `TurnWorkspacePlan`，不得各自重新推断目录。
+- 每轮默认只挂载当前会话工作区；`CTI_ALLOWED_WORKSPACE_ROOTS` 和项目注册根只作为权限上界，禁止自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
+- 当前会话工作区不得被消息中出现的其他项目路径替换；其他已注册项目只能作为本轮临时挂载。当前绑定目录命中禁止根或超出注册上界时必须选择安全回退，所有候选均不安全时失败关闭。
+- 只有本轮当前消息中的明确绝对路径等强证据才能临时挂载其他项目；临时挂载必须记录 evidence、reason、accessMode 和 `expiresAfterTurn=true`，不能沉淀成全局附加目录。
+- 记忆库、`CTI_HOME` 运行态、上传缓存、日志和发布产物不得提升为普通 workspace。它们只能通过各自的受控检索、附件、审计或发布能力访问。
+- 新长期记忆只写入 `codex-im-suite/memory/v3`：用户使用 `memory/users/<channel>/<userId>/用户印象.md`，群聊使用 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实使用 `memory/long-term/公共长期记忆.md`。
+- Agent Home 根目录只保留 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md` 五个固定入口；`记忆总索引.md` 只引用真实源文件，不得复制事实形成第二事实源。
+- 记忆库根目录出现五入口之外的 Markdown 时，控制面板必须显式列为未归类文档；不得静默索引、自动移动或删除用户文件。
+- 旧 `data/memory/v2` 只读兼容；迁移必须默认 dry-run，Apply 前停止 Bridge/watcher，并经过暂存校验、备份、冲突不覆盖、归档和索引重建。未知 `docs|logs|runtime|config.env` 不得随记忆布局迁移自动移动。
 
 ## 3. 文档收口规则
 
@@ -120,6 +135,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - 排查 Feishu 消息、卡片、成员、群机器人、云文档、附件、提醒完成按钮或 OAuth 失效时，必须先检查飞书开放平台外部前置条件：对应 API 权限是否在“权限管理”开通，权限类型是否匹配应用身份 `tenant_access_token` 或用户身份 `user_access_token`，是否已创建版本并通过管理员审核发布，`im.message.receive_v1` 事件和 `card.action.trigger` 回调是否配置为长连接并发布生效，bridge 是否已重启读取最新配置。不能把缺 scope、未发布、未审批、事件/回调未配置或文档资源未授权误判为代码已坏，也不能伪造平台权限或数据。
 - 飞书应用管理员类权限（如 `admin:app.admin_id:readonly`、`admin:app.admin:check`）只能用于应用管理员身份诊断或门禁辅助，不能替代 IM、CardKit、Drive、Docx、Sheets、Base、成员列表、消息资源等业务 API scope。文档能力必须同时满足开放平台 scope、应用/用户身份 token、文档本身分享/授权和 OAuth redirect 配置；缺任一项时应返回明确阻塞和所需权限，而不是降级成空总结或假装已读取。
 - `/feishu` 能力诊断应作为 Feishu 平台权限和事件回调问题的一线入口：展示本地声明的 `CTI_FEISHU_GRANTED_SCOPES`、实际 token/API probe、OAuth 请求 scope、事件/回调配置提示和能力缺口。`CTI_FEISHU_GRANTED_SCOPES` 只是“后台已开通并发布”的本地声明，不会自动给应用开权限；后台改动后必须发布审批并重启 bridge。
+- Feishu 用户 OAuth 采用“官方协议 + 自定义治理层”：授权页、scope 展示、用户确认、PKCE、Token 获取与刷新必须跟随飞书官方当前协议；bridge 自定义层只负责 sender 身份绑定、每用户加密隔离、任务级最小 scope、授权状态持久化、同一用户 + 同一规范化 scope 授权卡去重、多任务恢复和审计。普通消息、原生 @、reply、reaction、sticker 与 bot 卡片继续走应用身份长连接，禁止向普通用户索取 user OAuth；只有应用身份无法访问且当前任务确实需要读取该用户私有资源时才可发起授权。OAuth v3 换得 token 后必须调用官方 `GET /open-apis/authen/v1/user_info`，只有返回 `open_id` 与原 state 发起人精确一致才可保存和恢复任务；失败、缺 ID 或账号不一致一律拒绝绑定。`user_info` 获取 open_id 无需 `auth:user.id:read`，不得把该 scope 作为基础强制项；`offline_access` 仅在需要刷新 token 时保留。复用中的授权请求不得重复发卡，已授权恢复回合必须携带结构化 resume 标记，后续资源权限不足应返回真实阻塞而不是再次发卡，也不得把一个用户的 token、state 或等待任务用于另一个用户。
 - Feishu `interactive` 卡片入站、reply/light context 和历史索引必须先生成受控卡片 evidence：递归解析 `body.content`、转义 JSON、标题、markdown、plain_text、按钮、summary、alt、资源 key 和卡片引用，剔除“请升级客户端”兼容占位；他方应用资源被飞书拒绝读取时，错误码只进入 `raw.feishuInteractiveCard.resourceDownloadFailures` / 审计，不得作为用户可见快答正文或绕过 agent 的最终回复。
 - 飞书最终回复默认同时包含用户可见结果与可展示的思考过程；允许展示面向用户整理后的“处理思路 / 依据 / 执行过程 / 结果”，不再默认压缩为只给结论。但禁止泄漏密钥、token、内部协议名、原始工具日志、未脱敏路径、权限票据或其他不适合外发的原始调试细节。
 - 用户等待期间默认通过 Feishu streaming card 展示 `progress` 事件，支持持续更新的富文本处理进度；该内容应优先呈现用户可读的思考过程、判断依据、工具计划、执行进展和阶段结果。允许把模型或执行链的思路整理后外发到进度卡与最终回复正文，但必须做面向用户的重写，不能直接转发内部协议、原始工具日志、密钥、token 或未脱敏调试输出。任务完成后同一张卡片应更新为最终结果；如果候选回复包含“处理思路 / 执行结果”，收尾卡片应保留思考过程和最终结果两部分，而不是只保留结果段。
@@ -133,7 +149,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - 结果块解析失败时，不允许蠢裁剪成半截废话；应走可读兜底。
 - 记忆回捞命中结构化键值时，必须保留原始键和值，不能只发概括词。
 - 所有可处理的纯文本 turn 都必须先经过独立记忆意图分类，再决定忽略、仅保留当前会话、写入用户/群聊/公共长期分区或向用户追问；不得由“记住/记录”等关键词正则、历史文本、显示名或路径直接推断写入范围。分类不明确、低置信、缺少具体事实、来源不是 human 或运行时写入服务不可用时，禁止落长期库，必须让主 agent 以最小问题追问。`temporary` 只进入当前 session 上下文，不得调用持久化写入；任何分类结果都不得绕过主 agent 生成最终回复。
-- IM/bridge 里的“记住/保存/记录”只能通过受控 v2 记忆写入链进入设置的记忆仓库；禁止 agent 使用 `github-memory-protocol`、`~/.codex/memory` / `C:\Users\admin\.codex\memory`、项目 Markdown 或聊天日志替代记忆仓库。只有本轮存在成功的 v2 写入 evidence，最终回复才可以说“已记住/已保存”；否则必须说明未保存并追问最小缺口或报告具体阻塞。
+- IM/bridge 里的“记住/保存/记录”只能通过受控 memory v3 写入链进入设置的记忆仓库；禁止 agent 使用 `github-memory-protocol`、`~/.codex/memory` / `C:\Users\admin\.codex\memory`、项目 Markdown 或聊天日志替代记忆仓库。只有本轮存在成功的受控写入 evidence，最终回复才可以说“已记住/已保存”；否则必须说明未保存并追问最小缺口或报告具体阻塞。
 - 高危 / owner 权限门禁不得只靠危险关键词命中；必须区分“用户当前要求机器人执行”与“报错、日志、卡片资源状态、故事/游戏文本、引用证据里提到危险词”。adapter 生成的诊断边界、飞书资源错误（例如资源已删除）、历史 evidence 和叙事规则只能作为上下文交给 agent，不应触发 owner 快速拒绝。
 - IM 工具权限批准必须读取 pending permission link 里的工具名和输入 evidence 后再判定角色：只读/检索类工具可由 Operator 批准；shell、写文件、删除/移动/发布/安装/系统控制、跨会话发送等具备副作用或高风险的工具必须 Owner 批准。Feishu 卡片按钮、数字快捷回复和 `/perm` 文本命令必须复用同一套风险与角色门禁，不能因为入口不同绕过 Owner。
 - IM slash 命令必须按影响范围声明最低角色：普通聊天、`/whoami` 和低风险 `/remind` 可开放给普通用户；会话、工作目录、模式、状态、历史列表、文档列表和停止会话等运行态管理命令必须至少 Operator；`/feishu` 等平台权限诊断和高危动作必须 Owner。新增 slash 命令时必须接入统一角色门禁或在命令内部写明更严格的结构化 action 门禁，不能靠隐藏快答或关键词绕过。
@@ -148,11 +164,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - Feishu 历史同步和短上下文中的 `sticker` 消息必须按 `file_key` 进入表情包库，但媒体采用最小留存策略：只有记忆仓库 `data/im/feishu/stickers/media` 尚无该键时才从当前消息资源下载一次真实图片并按文件头保存为真实扩展，后续同键只复用；历史同步只登记 key、消息来源和水位，不批量下载、不按旧历史全量回捞。禁止扫描、迁入或写入工作区 `.codepilot-uploads`。如果旧本地历史索引里只有 `[sticker]` 且没有 `file_key`，不得凭空恢复图片。
 - 入站 sticker 标注回合不得被解释成出站 sticker 请求：收到表情包后只能把图片作为语气/语义证据交给 agent，provider prompt 中的 `cti-sticker-annotation` 必须放在可保留前缀并明确禁止 imagegen、生成图和快捷发送。若 provider 主回复漏写隐藏标注，bridge 只能在本轮真实附加同 `file_key` 图片时做一次隐藏、只读的视觉标注补写；该补写只落 `source=vision` 语义，不改变用户可见回复，不批量补旧数据，不触发表情包发送。可见回复里的 `[表情包]` / `[表情包:file_key]` 在入站 sticker 场景必须剥离，防止上下文突然注入表情包后走死回复。
 - 用户要求发表情包时只能复用已有可信视觉/人工语义；如可信候选缺少媒体，最多下载一个已验证候选，绝不能批量回捞，也绝不能用 imagegen 或其他生成图工具替代。候选图片进入 agent 后，应通过隐藏 `cti-sticker-candidate-analysis` 写回看图语义；bridge 只接受本轮真实附加过的候选 `fileKey`，写入 `source=vision`、带有效置信度且达到阈值、并包含具体画面/情绪/用途/语气语义时，才可用精确 `[表情包:file_key]` 发送。对于“发个/来个/随机一个表情包”这类单个通用请求，adapter 可提供可信 `preferredFileKey` 作为候选 evidence，但不得在 provider 前直接投递；只有 AI/provider 明确输出 `[表情包]` 或精确候选动作后，bridge 才能用本轮可信候选补成真实 sticker 交付，禁止进入 imagegen 或生成新图路径。视觉分析约束必须放在 provider 可保留的系统提示前缀，不能因提示截断而失效。低置信或缺置信度视觉读图、不可读图片、泛泛“这是表情包/用于聊天”语义、未核验用户解释、source-less 旧语义和看起来像平台资源 key 的裸 `file_key` 都只能作为 evidence，不能绕过表情包库的可信语义门禁直接发送。裸 `[表情包]` 不是强制发送：如果回复文本有明确夸赞、安慰、吐槽、疑惑等语义约束但没有可靠匹配，应降级为自然文字或合适 reaction，禁止只因为库里只有一个旧候选就硬发错图。
-- Feishu 私发给成员必须走 `cti-direct-message` 受控动作，不允许模型口头声称已私发或手写平台 API。目标可以是明确显示名、原生 mention evidence、历史/群成员唯一候选，或本轮当前发送者（如“我 / 本人 / 发起人 / 发送者”）；群聊成员列表不可用时仍可用本轮 sender open_id/user_id 给当前发送者私发，但不能把群名误当发送者姓名，其他模糊目标必须要求用户提供准确对象。
+- Feishu 私发给成员必须走 `cti-direct-message` 受控动作，不允许模型口头声称已私发或手写平台 API。用户原文里的明确授权必须与动作目标一致；“给/向某人发送表情包、图片、文件、消息”等当前命令本身就是授权，不得误判后直接退缩。目标可以是明确显示名、原生 mention evidence、历史/群成员唯一候选，或本轮当前发送者（如“我 / 本人 / 发起人 / 发送者”）；群聊成员列表不可用时仍可用本轮 sender open_id/user_id 给当前发送者私发，但不能把群名误当发送者姓名，其他模糊目标必须要求用户提供准确对象。name-only `targetType=user` 只是人员类型提示，仍走当前群 evidence 唯一解析；只有目标 ID 或 `targetType=chat` 才属于跨会话 Owner 确认。私发表情包必须消费本轮真实候选附件和模型精确选择共同签发的 `VerifiedMediaAction`，未验证 file_key 不得作为文字或贴纸发送。
 - Feishu 跨群、跨会话或按 `chat_id/session_id/targetId` 发送消息必须仍走 `cti-direct-message` 受控动作，但属于 owner-only 操作。bridge 必须先通过 adapter resolver 得到唯一目标，向发起 owner 展示目标名称、类型和平台 ID 并要求确认；确认回调必须来自同一源会话、同一 owner，确认后才调用 adapter 发送。确认卡和源会话结果不得回显待发送正文；目标不唯一、权限不足、确认过期或 resolver 不支持时必须返回未完成，不得让模型口头声称已跨会话发送。
 - Feishu @ 投递、事件订阅、回调、入站、通知送达等诊断文本，以及引用他人消息或规则说明里出现的 `@名字`，只能作为 evidence prompt 交给 agent 判断；不得触发出站原生 mention 补全、resolver 检索或假 @ 安全拦截。真实当前命令式请求（例如“请艾特某人让他看一下”）也必须先进入 agent，由 agent 基于本轮原生 mention evidence 和完整上下文判断是否输出结构化 `cti-final.mentions`，bridge 只负责校验和投递结构化真实 ID，不得在 provider 前快捷执行。
 - Feishu 出站 mention 的目标必须是明确飞书显示名、原生 mention evidence 或结构化 mention；“你自己的主人 / 开发者 / 维护者 / 某个成员 / 相关机器人”这类关系描述和泛称不是可执行目标，不得补 `@目标`、不得触发 resolver/inspector 机械 blocker。若模型输出 `@关系描述`，发送前应移除裸 `@` 并保留文字语义。
 - Feishu 出站不得把裸 `@显示名`、普通显示名或用户文本中的名字交给 resolver 作快捷补全；bridge-manager 只透传 AI/provider 产出的结构化 `mentions`（优先 `cti-final.mentions`）或已受控校验的结构化动作。当前消息即使同时原生 @ 了机器人和目标，也只能作为 agent evidence，不得在 provider 前直接投递；AI 未输出结构化真实 ID 时，后置安全层只能自然说明缺少可投递目标或追问最小缺口，不能查询成员/机器人/历史来补全，也不能覆盖其他正常回复。
+- Feishu 结构化 mention 的 ID 字段必须统一兼容 `userId/user_id/openId/open_id`（保留 `unionId/union_id` 兼容），但字段归一化不代表可信：普通回复和 streaming card 收尾必须共用同一投递前门禁，只有该 ID 与本轮原生 mention evidence 中任一平台 ID 精确一致时才允许发送。模型生成、历史猜测或显示名补全出的任意 ID 一律拒绝；被拒绝后要移除对应裸 `@` 并保留文字语义，若用户本轮明确要求艾特，则必须明确说明未投递或要求用户原生 @ 目标，不能展示成看似成功。广播 `atAll/at_all` 没有单一用户 ID，不能复用普通 mention 门禁；在存在独立 Owner 广播动作和确认协议前一律拒绝。
 - 显示名解析汇总本轮原生 @、当前群成员/群机器人、当前发送者和历史候选时，必须保留来源等级：本轮原生与当前群平台证据优先，历史只作当前证据缺失时的回退；同一最高等级命中多个不同 ID 才算歧义。禁止让已过期的历史同名记录压制当前群的唯一可原生 @ 身份，也不能为了绕过歧义写死某个机器人名。
 - 对单个通用表情包请求，若本轮确实已向模型附加候选图片、模型只唯一输出其中一个精确 `[表情包:file_key]`，但完全漏写隐藏 `cti-sticker-candidate-analysis` 块，bridge 可一次性投递该真实 sticker；此兜底只证明本轮选择，不得写入长期可信语义或降低后续视觉置信度门槛。
 - 这种一次性表情包许可必须作为 bridge 结构化的 per-turn media action 同时传入普通投递和 streaming card 收尾；adapter 只在动作类型、来源和精确 `file_key` 都与可见 hint 一致时发送，禁止从模型正文、用户文本或不匹配 key 自行推导许可。
@@ -175,7 +192,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 ## 9. MCP 与工作区安全
 
 - MCP 只能从 `config/mcp.d/*.json` 发现。
-- MCP 的 `cwd` 必须命中默认工作区、允许根目录或明确的 Unity 工程路径。
+- MCP 的 `cwd` 必须命中本轮 `TurnWorkspacePlan` 的主工作区或临时挂载；允许根目录只证明路径可授权，不能单独证明本轮已经挂载。
 - Unity 项目目标必须由当前 `CTI_UNITY_PROJECT_PATH`、MCP manifest `cwd`、允许根目录和项目事实记忆共同确定；不要把历史 `C:\unity\ST3\Game` 当成固定默认项目。执行 Unity MCP 前必须确认当前 Editor `Application.dataPath` 推导出的项目根与配置一致。
 - Ignis 生成能力通过 `config/mcp.d/ignis-mcp.json` 和 `packages/mcp-ignis` 维护，config/token 只允许放在 `C:\Users\admin\.ignis\config.json`，不得写入仓库、release 包或日志。
 - 没有授权时，不要操作其他 Unity 工程或外部项目。

@@ -19,6 +19,7 @@ import {
   type CodexProviderProfile,
 } from './codex-provider.js';
 import { getLocalCodexProviderAdapter, type LocalCodexProviderAdapter } from './local-codex-provider-registry.js';
+import { resolveProviderWorkspace } from './provider-workspace.js';
 import { McpBridge, type McpManifestRecord, type McpToolInfo } from './mcp-bridge.js';
 import { loadMcpToolCallDefinitions, loadShellArtifactDefinitions, loadUnityMcpExecuteCodeDefinitions } from './local-agent-tool-registry.js';
 import {
@@ -624,8 +625,17 @@ export class CodexLocalCliProvider implements LLMProvider {
           tempFiles.push(outputLastMessagePath);
           const command = adapter.buildCommand({ model, outputLastMessagePath });
           const classifierMode = params.interactionMode === 'classifier';
-          const workingDirectory = classifierMode ? os.tmpdir() : resolveWorkingDirectory(params.workingDirectory);
-          const additionalDirectories = classifierMode ? [] : normalizeAdditionalDirectories(params.additionalDirectories);
+          const providerWorkspace = classifierMode ? null : resolveProviderWorkspace(params);
+          const workingDirectory = classifierMode
+            ? os.tmpdir()
+            : providerWorkspace?.source === 'workspace_plan'
+              ? providerWorkspace.workingDirectory
+              : resolveWorkingDirectory(params.workingDirectory);
+          const additionalDirectories = classifierMode
+            ? []
+            : providerWorkspace?.source === 'workspace_plan'
+              ? providerWorkspace.additionalDirectories
+              : normalizeAdditionalDirectories(params.additionalDirectories);
           let classifierSchemaPath: string | undefined;
           if (classifierMode && params.responseSchema) {
             classifierSchemaPath = makeTempPath('cti-classifier-schema', '.json');
@@ -824,16 +834,25 @@ export class CodexLocalCliProvider implements LLMProvider {
     model: string,
     baseUrl: string,
   ): Promise<void> {
-    const workingDirectory = resolveWorkingDirectory(params.workingDirectory) || process.cwd();
-    const additionalDirectories = normalizeAdditionalDirectories(params.additionalDirectories);
+    const providerWorkspace = resolveProviderWorkspace(params);
+    const workingDirectory = providerWorkspace.workingDirectory
+      || resolveWorkingDirectory(params.workingDirectory)
+      || process.cwd();
+    const additionalDirectories = providerWorkspace.source === 'workspace_plan'
+      ? providerWorkspace.additionalDirectories
+      : normalizeAdditionalDirectories(params.additionalDirectories);
+    const ordinaryWorkspaceRoots = providerWorkspace.source === 'workspace_plan'
+      ? providerWorkspace.allowedRoots
+      : [
+        workingDirectory,
+        this.config.defaultWorkDir,
+        this.config.unityProjectPath,
+        ...(this.config.allowedWorkspaceRoots || []),
+        ...additionalDirectories,
+      ];
     const allowedRoots = Array.from(new Set([
-      workingDirectory,
-      this.config.defaultWorkDir,
-      this.config.unityProjectPath,
-      process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
+      ...ordinaryWorkspaceRoots,
       ...this.getShellArtifactAllowedRoots(),
-      ...(this.config.allowedWorkspaceRoots || []),
-      ...additionalDirectories,
     ].filter((item): item is string => !!item?.trim())));
     const toolCatalog = buildJsonToolCatalogForRequirement(params.executionRequirement);
     const contextText = [params.systemPrompt, params.prompt].filter(Boolean).join('\n');
@@ -1295,8 +1314,13 @@ export class CodexLocalCliProvider implements LLMProvider {
       tempFiles.push(outputLastMessagePath);
       const command = this.adapter.buildCommand({ model: input.model, outputLastMessagePath });
       const args = [...command.args];
-      const workingDirectory = resolveWorkingDirectory(input.params.workingDirectory);
-      const additionalDirectories = normalizeAdditionalDirectories(input.params.additionalDirectories);
+      const providerWorkspace = resolveProviderWorkspace(input.params);
+      const workingDirectory = providerWorkspace.source === 'workspace_plan'
+        ? providerWorkspace.workingDirectory
+        : resolveWorkingDirectory(input.params.workingDirectory);
+      const additionalDirectories = providerWorkspace.source === 'workspace_plan'
+        ? providerWorkspace.additionalDirectories
+        : normalizeAdditionalDirectories(input.params.additionalDirectories);
       for (const dir of additionalDirectories) args.push('--add-dir', dir);
       if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
       if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');

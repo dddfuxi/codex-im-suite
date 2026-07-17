@@ -567,9 +567,15 @@ internal sealed partial class MainForm : Form
             || string.Equals(command, "memory.updateFeishuSticker", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.auditFeishuStickers", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.mergeFeishuStickerAliases", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.archiveFeishuSticker", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.restoreFeishuSticker", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
         {
             return "operator";
+        }
+        if (string.Equals(command, "memory.deleteFeishuSticker", StringComparison.OrdinalIgnoreCase))
+        {
+            return "owner";
         }
         return "viewer";
     }
@@ -913,6 +919,12 @@ internal sealed partial class MainForm : Form
                 return FeishuStickerLibrary.Update(GetMemoryArtifactStore(), ReadFeishuStickerUpdatePayload(payload));
             case "memory.mergeFeishuStickerAliases":
                 return FeishuStickerLibrary.MergeAliases(GetMemoryArtifactStore(), ReadFeishuStickerAliasMergePayload(payload));
+            case "memory.archiveFeishuSticker":
+                return FeishuStickerLibrary.Archive(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
+            case "memory.restoreFeishuSticker":
+                return FeishuStickerLibrary.Restore(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
+            case "memory.deleteFeishuSticker":
+                return FeishuStickerLibrary.DeleteArchived(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
             case "memory.archiveItem":
                 return ArchiveKnowledgeItem(payload);
             case "memory.archives":
@@ -1657,6 +1669,14 @@ internal sealed partial class MainForm : Form
         };
     }
 
+    private static FeishuStickerLifecycleRequest ReadFeishuStickerLifecyclePayload(JsonElement payload)
+    {
+        return new FeishuStickerLifecycleRequest
+        {
+            FileKey = ReadPayloadString(payload, "fileKey", "").Trim(),
+        };
+    }
+
     private SettingsSnapshot ReadSettingsPayload(JsonElement payload)
     {
         if (payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("settings", out var settings))
@@ -1668,7 +1688,8 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "defaultWorkDir", current.DefaultWorkDir),
             ReadPayloadString(payload, "allowedRoots", current.AllowedRoots),
             ReadPayloadString(payload, "memoryRepo", current.MemoryRepo),
-            ReadPayloadString(payload, "additionalDirs", current.AdditionalDirs),
+            // 旧附加目录只保留诊断值，任何控制面板入口都不能再改写它。
+            current.AdditionalDirs,
             ReadPayloadString(payload, "replyStyleHint", current.ReplyStyleHint),
             NormalizeExecutorId(ReadPayloadString(payload, "defaultExecutorId", current.DefaultExecutorId)),
             NormalizeLocalAiKind(ReadPayloadString(payload, "localAiKind", current.LocalAiKind)),
@@ -2633,53 +2654,12 @@ internal sealed partial class MainForm : Form
     }
 
     private static string ClassifyMemoryV2SourceGroup(string root, string sourcePath, IReadOnlyDictionary<string, string> metadata)
-    {
-        if (!sourcePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)) return "";
-        if (!metadata.TryGetValue("schema", out var schema) || !string.Equals(schema, MemoryV2Schema, StringComparison.Ordinal)) return "";
-        if (!metadata.TryGetValue("memoryScope", out var scope)) return "";
+        => MemorySourceLayoutClassifier.Classify(root, sourcePath, metadata).SourceGroup;
 
-        var segments = GetRelativePathSegments(root, sourcePath);
-        if (segments.Length < 5 || !segments[0].Equals("data", StringComparison.OrdinalIgnoreCase)
-            || !segments[1].Equals("memory", StringComparison.OrdinalIgnoreCase)
-            || !segments[2].Equals("v2", StringComparison.OrdinalIgnoreCase))
-        {
-            return "";
-        }
-
-        if (scope.Equals("long_term", StringComparison.OrdinalIgnoreCase))
-        {
-            return segments[3].Equals("long-term", StringComparison.OrdinalIgnoreCase) ? "memory_long_term" : "";
-        }
-
-        if (!metadata.TryGetValue("channelType", out var channelType) || string.IsNullOrWhiteSpace(channelType)) return "";
-        var channelSegment = MemoryPartitionSegment(channelType);
-        if (scope.Equals("user", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!metadata.TryGetValue("userId", out var userId) || string.IsNullOrWhiteSpace(userId)) return "";
-            return segments.Length >= 7
-                   && segments[3].Equals("users", StringComparison.OrdinalIgnoreCase)
-                   && segments[4].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
-                   && segments[5].Equals(MemoryPartitionSegment(userId), StringComparison.OrdinalIgnoreCase)
-                ? "memory_user"
-                : "";
-        }
-        if (scope.Equals("group", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!metadata.TryGetValue("chatId", out var chatId) || string.IsNullOrWhiteSpace(chatId)) return "";
-            return segments.Length >= 7
-                   && segments[3].Equals("groups", StringComparison.OrdinalIgnoreCase)
-                   && segments[4].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
-                   && segments[5].Equals(MemoryPartitionSegment(chatId), StringComparison.OrdinalIgnoreCase)
-                ? "memory_group"
-                : "";
-        }
-        return "";
-    }
-
-    private bool IsIndexableMemoryV2File(string filePath)
+    private bool IsIndexableMemorySourceFile(string filePath)
         => !string.IsNullOrWhiteSpace(ClassifyMemoryV2SourceGroup(_memoryRepo.Text.Trim(), filePath, ReadMarkdownMetadataFile(filePath)));
 
-    private bool IsIndexableMemoryV2Item(string sourcePath, JsonElement source)
+    private bool IsIndexableMemorySourceItem(string sourcePath, JsonElement source)
         => !string.IsNullOrWhiteSpace(ClassifyMemoryV2SourceGroup(_memoryRepo.Text.Trim(), sourcePath, ReadSourceMetadata(source)));
 
     private sealed class SourceCoverageAccumulator
@@ -2729,8 +2709,8 @@ internal sealed partial class MainForm : Form
         var root = Path.GetFullPath(_memoryRepo.Text.Trim());
         var fullPath = string.IsNullOrWhiteSpace(sourcePath) ? sourcePath : Path.GetFullPath(sourcePath);
         var metadata = ReadMarkdownMetadataFile(fullPath);
-        var memoryV2Group = ClassifyMemoryV2SourceGroup(root, fullPath, metadata);
-        if (!string.IsNullOrWhiteSpace(memoryV2Group)) return memoryV2Group;
+        var memoryGroup = ClassifyMemoryV2SourceGroup(root, fullPath, metadata);
+        if (!string.IsNullOrWhiteSpace(memoryGroup)) return memoryGroup;
         var relative = IsPathInside(root, fullPath)
             ? Path.GetRelativePath(root, fullPath)
             : fullPath;
@@ -2759,10 +2739,11 @@ internal sealed partial class MainForm : Form
     private IEnumerable<string> EnumerateKnowledgeMarkdownFiles(string root)
     {
         if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
-        var memoryV2Root = Path.Combine(root, "data", "memory", "v2");
-        if (!Directory.Exists(memoryV2Root)) yield break;
         var stack = new Stack<string>();
-        stack.Push(memoryV2Root);
+        foreach (var sourceRoot in new[] { Path.Combine(root, "memory"), Path.Combine(root, "data", "memory", "v2") })
+        {
+            if (Directory.Exists(sourceRoot)) stack.Push(sourceRoot);
+        }
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
@@ -2780,7 +2761,7 @@ internal sealed partial class MainForm : Form
             foreach (var subdir in subdirs) stack.Push(subdir);
             foreach (var file in files)
             {
-                if (IsIndexableMemoryV2File(file)) yield return file;
+                if (IsIndexableMemorySourceFile(file)) yield return file;
             }
         }
     }
@@ -2802,6 +2783,7 @@ internal sealed partial class MainForm : Form
         var kindCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var sourceCoverage = new Dictionary<string, SourceCoverageAccumulator>(StringComparer.OrdinalIgnoreCase);
         var recentReviewWarnings = ReadRecentAnswerReviewWarnings(6);
+        var layout = MemoryLayoutInspector.Inspect(root);
         var generatedAt = "";
         var lastIndexedAt = "";
         var lastEventAt = "";
@@ -2837,7 +2819,7 @@ internal sealed partial class MainForm : Form
                             ? sourceElement
                             : default;
                         var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
-                        if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
+                        if (!IsIndexableMemorySourceItem(sourcePath, source)) continue;
 
                         var kind = ReadJsonString(item, "kind");
                         if (!string.IsNullOrWhiteSpace(kind))
@@ -2939,6 +2921,17 @@ internal sealed partial class MainForm : Form
             skippedDirectories = new[] { ".git", ".cti-index", "archive", "node_modules", ".obsidian" },
             kindCounts,
             recentReviewWarnings,
+            layout = new
+            {
+                layoutVersion = layout.LayoutVersion,
+                migrationState = layout.MigrationState,
+                v3SourceCount = layout.V3SourceCount,
+                legacySourceCount = layout.LegacySourceCount,
+                agentHome = layout.AgentHome.Select(item => new { name = item.Name, path = item.Path, exists = item.Exists }).ToArray(),
+                unclassifiedRootDocuments = layout.UnclassifiedRootDocuments
+                    .Select(item => new { name = item.Name, path = item.Path })
+                    .ToArray(),
+            },
             generatedAt,
             lastIndexedAt,
             lastEventAt,
@@ -3153,7 +3146,7 @@ internal sealed partial class MainForm : Form
                 ? sourceElement
                 : default;
             var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
-            if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
+            if (!IsIndexableMemorySourceItem(sourcePath, source)) continue;
             var sourceUpdatedAt = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "updatedAt") : "";
             var snippet = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "snippet") : "";
             var sourceGroup = ClassifyMemorySourceGroup(sourcePath);
@@ -3538,7 +3531,7 @@ internal sealed partial class MainForm : Form
                 ? sourceElement
                 : default;
             var sourcePath = source.ValueKind == JsonValueKind.Object ? ReadJsonString(source, "path") : "";
-            if (!IsIndexableMemoryV2Item(sourcePath, source)) continue;
+            if (!IsIndexableMemorySourceItem(sourcePath, source)) continue;
             if (string.Equals(ReadJsonString(item, "id"), id, StringComparison.OrdinalIgnoreCase))
             {
                 return item.Clone();
@@ -6682,7 +6675,7 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_DEFAULT_WORKDIR", settings.DefaultWorkDir.Trim());
         SetOrAppendEnv(lines, "CTI_ALLOWED_WORKSPACE_ROOTS", settings.AllowedRoots.Trim());
         SetOrAppendEnv(lines, "CTI_MEMORY_REPO_DIR", memoryRepo);
-        SetOrAppendEnv(lines, "CTI_CODEX_ADDITIONAL_DIRECTORIES", settings.AdditionalDirs.Trim());
+        // 保留配置文件中的旧值供诊断，不再由控制面板写入或删除。
         SetOrAppendEnv(lines, "CTI_REPLY_STYLE_HINT", settings.ReplyStyleHint.Trim());
         SetOrAppendEnv(lines, "CTI_DEFAULT_EXECUTOR_ID", NormalizeExecutorId(settings.DefaultExecutorId));
         SetOrAppendEnv(lines, "CTI_LOCAL_AI_KIND", NormalizeLocalAiKind(settings.LocalAiKind));
@@ -11872,7 +11865,9 @@ internal sealed class SettingsForm : Form
         AddPathRow(layout, 0, "默认工作目录", _workdir, true);
         AddPathRow(layout, 1, "允许仓库根目录", _allowedRoots, false);
         AddPathRow(layout, 2, "聊天记忆仓库", _memoryRepo, true);
-        AddPathRow(layout, 3, "Codex 附加目录", _additionalDirs, false);
+        _additionalDirs.ReadOnly = true;
+        _additionalDirs.BackColor = SystemColors.Control;
+        AddPathRow(layout, 3, "旧附加目录（诊断）", _additionalDirs, false);
         return group;
     }
 
