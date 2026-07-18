@@ -17,6 +17,7 @@ runtime/
 # Temp / IDE
 .DS_Store
 Thumbs.db
+.worktrees/
 .codepilot-uploads/
 .vs/
 .idea/
