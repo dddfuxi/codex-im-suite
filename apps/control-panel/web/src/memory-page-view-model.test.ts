@@ -4,6 +4,7 @@ import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
   buildMemoryQueryRefreshKey,
+  buildSelfMaintenanceMetrics,
   buildWorkspacePathSections,
   runPanelRefresh,
 } from './memory-page-view-model.js';
@@ -77,5 +78,37 @@ describe('memory page refresh view model', () => {
     assert.deepEqual(summary.unclassifiedRootDocuments, [
       { name: 'CodexNotes.md', path: 'E:\\cli-md\\CodexNotes.md' },
     ]);
+  });
+
+  it('exposes self-maintenance archives, backups, and the last update time as observable metrics', () => {
+    const metrics = buildSelfMaintenanceMetrics({
+      dailyReflectionCount: 2,
+      workProfileCount: 3,
+      correctionDocumentCount: 4,
+      versionBackupCount: 5,
+      classifierCalls: 12,
+      classifierSkips: 8,
+      classifierRejected: 2,
+      averageDurationMs: 95,
+      lockConflicts: 1,
+      hashConflicts: 1,
+      trialRuleCount: 2,
+      confirmedRuleCount: 3,
+      regressedRuleCount: 1,
+      lastUpdatedAt: '2026-07-18T08:00:00.000Z',
+      statusPath: 'E:\\cli-md\\.cti-self-history\\status.json',
+    });
+
+    assert.deepEqual(metrics.map((item) => [item.label, item.value]), [
+      ['工作档案', '3'],
+      ['每日反思', '2'],
+      ['纠错档案', '4'],
+      ['可回滚版本', '5'],
+      ['分类器调用', '12 / 跳过 8'],
+      ['平均耗时', '95 ms'],
+      ['规则状态', '试用 2 / 已确认 3 / 回归 1'],
+      ['并发冲突', '锁 1 / 哈希 1'],
+    ]);
+    assert.equal(metrics[0].updatedAt, '2026-07-18T08:00:00.000Z');
   });
 });

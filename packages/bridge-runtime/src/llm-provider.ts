@@ -470,6 +470,7 @@ export class SDKLLMProvider implements LLMProvider {
           try {
             const cleanEnv = buildSubprocessEnv();
             const classifierMode = params.interactionMode === 'classifier';
+            const restrictedMode = classifierMode || params.interactionMode === 'response_only';
 
             // Cross-runtime migration safety: drop non-Claude model names
             // that may linger in session data from a previous Codex runtime.
@@ -489,16 +490,16 @@ export class SDKLLMProvider implements LLMProvider {
             }
 
             const queryOptions: Record<string, unknown> = {
-              cwd: classifierMode ? undefined : params.workingDirectory,
+              cwd: restrictedMode ? undefined : params.workingDirectory,
               model,
-              resume: classifierMode ? undefined : params.sdkSessionId || undefined,
+              resume: restrictedMode ? undefined : params.sdkSessionId || undefined,
               abortController: params.abortController,
-              permissionMode: classifierMode
+              permissionMode: restrictedMode
                 ? 'plan'
                 : (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
-              ...(classifierMode ? buildClassifierClaudeQueryPolicy() : {}),
+              ...(restrictedMode ? buildClassifierClaudeQueryPolicy() : {}),
               stderr: (data: string) => {
                 stderrBuf += data;
                 if (stderrBuf.length > MAX_STDERR) {
@@ -510,10 +511,10 @@ export class SDKLLMProvider implements LLMProvider {
                   input: Record<string, unknown>,
                   opts: { toolUseID: string; suggestions?: string[] },
                 ): Promise<PermissionResult> => {
-                  if (classifierMode) {
+                  if (restrictedMode) {
                     return {
                       behavior: 'deny' as const,
-                      message: 'Classifier turns cannot use tools.',
+                      message: 'Restricted response turns cannot use tools.',
                     };
                   }
                   // Auto-approve if configured (useful for channels without

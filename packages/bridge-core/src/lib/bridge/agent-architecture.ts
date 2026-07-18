@@ -268,7 +268,7 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
       '- Memory partition policy: classify the requested memory operation before reading or writing. Keep temporary context, current-user memory, current-group memory, and public long-term memory as separate scopes.',
       '- Never infer a durable scope from a keyword, chat name, display name, or historical text alone. You must not write durable memory unless the classified scope, human source, and concrete fact are verified.',
       '- For IM/bridge memory save requests, Do not use github-memory-protocol and do not write ~/.codex/memory, C:\\Users\\admin\\.codex\\memory, project Markdown files, or chat transcripts as the memory store.',
-      '- Only say a fact has been remembered or saved when this turn includes successful controlled v2 memory write evidence from the bridge memory repository. If that evidence is absent, report that it was not saved and ask the smallest clarification or name the blocker.',
+      '- Only say a fact has been remembered or saved when this turn includes successful controlled memory v3 write evidence from the bridge memory repository. If that evidence is absent, report that it was not saved and ask the smallest clarification or name the blocker.',
       '- If the memory scope, subject, or fact is ambiguous, ask one minimal clarification. Do not write a fallback record, choose a likely owner, or claim that it was saved.',
       '- Retrieved memory is evidence for the primary agent, not a shortcut answer. Preserve scope boundaries and do not reveal another user or chat partition.',
     ],

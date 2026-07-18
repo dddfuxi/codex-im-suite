@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-07-17
+更新时间：2026-07-18
 
 ## 0. 架构文档维护规则
 
@@ -205,10 +205,27 @@ flowchart LR
 ├─ 工具与环境.md
 ├─ 记忆总索引.md
 ├─ 记忆库说明.md
+├─ daily-reflection/每日反思-YYYY-MM-DD.md
+├─ work/<workspaceId>/工作档案.md
+├─ corrections/纠错记录-YYYY-MM-DD.md
 ├─ memory/
 │  ├─ users/<channel>/<userId>/用户印象.md
 │  ├─ groups/<channel>/<chatId>/群聊记忆.md
 │  └─ long-term/公共长期记忆.md
+├─ .cti-self-history/
+│  ├─ versions/<timestamp>/*.md
+│  ├─ transactions/<transactionId>/manifest.json
+│  ├─ transactions/<transactionId>/before/*
+│  ├─ rules/<target>/<key>.json
+│  ├─ metrics.json
+│  ├─ write.lock
+│  ├─ 自维护审计.jsonl
+│  └─ status.json
+├─ archive/self-maintenance/
+│  ├─ versions/
+│  ├─ audit/
+│  ├─ daily-reflection/
+│  └─ corrections/
 └─ .cti-index/
    ├─ knowledge.json
    ├─ memory-graph.json
@@ -216,9 +233,34 @@ flowchart LR
 ```
 
 - `codex-im-suite/memory/v3` 是新写入 schema；同一用户的已确认事实和稳定印象合并在单个 `用户印象.md`，不同用户和群聊保持目录与元数据双重隔离。
+- 每个可处理纯文本回合先经过独立记忆意图 classifier。成功写入、临时会话记忆、范围澄清或明确记忆请求的分类阻塞都会形成 `memoryIntentHandled`，Capability Router 随后不再把正文中的 Unity 场景名、路径或 Prefab 词解释成新的工具任务。旧 `CTI_MEMORY_INTENT_TIMEOUT_MS=4000` 会提升到 30000ms 下限；分类器使用通用兼容的 `low` 推理档位，不再向只支持 `low/medium/high/xhigh` 的模型发送 `minimal`。记忆候选的 structured-output schema 明确声明 `key/value/text/confidence`、全字段 required 和 `additionalProperties:false`，兼容当前严格 JSON Schema 校验。明确记忆请求若仍超时，进入无工具、只读、无工作区的 `response_only` 主模型回合并确定性收口为未保存，不允许回退旧目录。bridge Codex Home 默认保留健康的 `state_*.sqlite`，避免主客户端与分类器反复删除状态库、同时回填 sessions 并形成 backfill 锁；只有诊断确认状态库不兼容时才通过 `CTI_CODEX_RESET_STATE=true` 显式执行一次重置。
+- bridge 专用 Codex Home 对个人 skill 使用生成态过滤目录：默认排除 `github-memory-protocol`，保留其他正常 skill，额外禁用项由 `CTI_CODEX_BLOCKED_SKILLS` 配置；全局 `C:\Users\admin\.codex\skills` 不被修改。这样 IM 记忆只能由 runtime 的受控 memory v3 host 写入，旧 `.codex\memory` 不再成为可触发入口。
+- `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md` 由 runtime 的 `AgentHomeHost` 每轮重新读取，分别进入 identity、policy、skills Prompt section；当前稳定 workspaceId 对应的 `work/<workspaceId>/工作档案.md` 以独立、限长、不可执行的只读事实 memory section 回读，超预算时保留头部与最新尾部，其他项目档案、每日反思和纠错日志不进入 Prompt。Git 项目优先用规范化 origin remote 形成稳定 ID，项目移动、改名、从子目录进入或同 remote 副本共用档案；旧路径 ID 目录只提升到稳定 ID，不复制第二事实源。Prompt Snapshot 可观察实际注入、真实来源与截断。
+- `SelfMaintenanceHost` 是独立 classifier + 存储边界：纠错阶段先经过候选门禁，普通继续、确认和感谢不调用 classifier；候选纠错在主 Agent 前裁决，使通过门禁的修改可在同一回合后续 Prompt 生效。结果阶段在真实回复交付后依据 runtime evidence 更新工作档案、反思和已有规则效果。classifier 无工具、无工作目录，只输出 JSON。
+- 核心文档修改必须确认是 Agent 自身错误，并提供 `correction` 双片段证据：错误片段逐字存在于真实 `assistant_output`，纠正片段逐字存在于当前 `human_message` 或 `success=false` 的 `runtime_result`；两个 ID 必须同时列入本轮 evidenceIds。引用文本、历史内容、普通自改命令、低置信结果和含密钥内容均拒绝。Owner/Operator、密钥、平台权限、工具证据和高危动作门禁仍由代码强制，Markdown 不可取消。
+- 所有自维护写入由 `.cti-self-history/write.lock` 串行化，锁被占用时失败关闭且不阻塞主回复；超过超时阈值后仍会先检查持锁 PID，存活进程的锁不得删除。核心 mutation 必须携带 classifier 读取时的 `baseHash`，且只允许稳定 key 的受控 patch 更新 `Agent 自维护规则` 块，禁止整篇 replace 用户主体。多文件提交在首次事实源写入前持久化 `cti-self-maintenance-transaction/v1` manifest 和 before-image，后续写失败立即回滚；进程崩溃留下的 `committing` 事务在下次获取锁后恢复。核心改写前保存受控版本，审计只保存纠错类型、evidence ID 与片段哈希；回滚只能从受控 versions 目录恢复，恢复前再保存当前版本。工作档案使用 `cti-work-profile:v2` 与稳定 key upsert 当前有效状态，不把其他项目内容写入当前档案。
+- 每条受控核心规则以 `target/key` 保存 `cti-self-maintenance-rule-state/v1`：首次真实纠错为 `trial`，同内容获得不同 session 的再次支持后为 `confirmed`，真实失败 runtime evidence 可标记 `regressed`；同一 evidence 和同一 session 不重复计数，内容变化会保留旧版本摘要并重新试用。`regressed` 只记录回归状态并保留受控回滚入口，不自动回滚。`.cti-self-history/metrics.json` 聚合 classifier 调用/跳过、结果、耗时和锁/哈希冲突，不保存原始 reason；活跃窗口外的版本、审计、反思和纠错记录移动到 `archive/self-maintenance`，不直接删除用户资料。
+
+```mermaid
+flowchart LR
+  Turn[结构化回合 evidence] --> Gate[纠错候选门禁]
+  Gate -->|普通继续或确认| Metrics[脱敏 metrics]
+  Gate -->|候选纠错| Classifier[禁工具 Self-Maintenance classifier]
+  Result[真实 runtime result] --> Classifier
+  Classifier --> Policy[证据、baseHash、稳定 key 校验]
+  Policy --> Tx[持久化事务与 before-image]
+  Tx --> Core[核心规则受控 patch]
+  Tx --> Profile[工作档案 upsert]
+  Core --> Lifecycle[trial / confirmed / regressed]
+  Profile --> Index[派生索引重建]
+  Lifecycle --> Panel[Memory 治理指标]
+  Metrics --> Panel
+  Tx --> Archive[版本与档案非破坏归档]
+```
+
 - `记忆总索引.md` 只保存分类摘要和相对路径引用，不复制事实，不成为第二事实源。
 - `data/memory/v2` 在兼容期只读索引并标记为 legacy。`memory-layout-migration-cli` 默认 dry-run；Apply 会先在暂存根合并和校验，再备份、切换、归档旧 v2 并重建索引，已有不同值只记录冲突、不覆盖。
-- 控制面板路径设置分为当前工作区、项目注册根、Agent Home/记忆库和高级诊断；旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只读显示。Memory 页展示五个 Agent Home 入口、v3/v2 来源数、迁移状态和未归类根 Markdown；未归类文件只提示并提供打开入口，不自动移动或删除。Prompt 页将 `workspace.plan` 显示为本轮工作区计划。
+- 控制面板路径设置分为当前工作区、项目注册根、Agent Home/记忆库和高级诊断；旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只读显示。Memory 页展示五个 Agent Home 入口、v3/v2 来源数、迁移状态、未归类根 Markdown，以及工作档案/每日反思/纠错档案/可回滚版本计数和最近自维护时间；同时展示自维护 classifier 调用/跳过、平均耗时、规则 `trial/confirmed/regressed` 数量以及锁/哈希冲突。未归类文件只提示并提供打开入口，不自动移动或删除。Prompt 页将 `workspace.plan` 和 Agent Home sections 显示为本轮实际注入证据。
 
 ## 2. 运行链路
 
@@ -794,6 +836,7 @@ flowchart TD
 - 扩展目录 host：Skill 搜索、准备安装和确认安装转交同一 `SkillLifecycleService`；MCP、模型和 Plugin 等非 Skill 类型继续保留原 Control API 兼容入口。旧 `extension.remote.install` 即使命中 Skill 也会后端转交 lifecycle，不允许绕过来源与审批策略。
 - Skill Registry / Lifecycle：扫描并合并 manifest、草稿、禁用项和正式安装项；通过官方 `skill-creator` / `skill-installer` 脚本执行创建、校验和安装，统一处理审批、审计、原子替换与回滚。
 - Prompt Snapshot Store：接收 bridge-core 生成的脱敏 Snapshot，以原子 JSON 文件保存短期运行证据；Snapshot 写入失败只影响观察能力，不阻断 provider 或消息交付。
+- Agent Home / Self-Maintenance Host：从配置的记忆根读取三份核心 Prompt 文档和当前稳定工作区档案，调用独立 JSON classifier 裁决候选纠错、结果归档和已有规则效果，并在 runtime 存储层执行 evidence 校验、受控 patch/upsert、事务恢复、规则生命周期、版本备份、脱敏指标、非破坏归档、审计、回滚与索引重建；bridge-core 只传结构化回合事实和 classifier 跳过事件，不知道 `E:\cli-md` 等具体路径。
 - Feishu OAuth 和云文档 host：先用应用 `tenant_access_token` 读取 Docx / Sheets / Base，应用无权且任务需要用户私有资源时再使用发起人 OAuth token。官方层使用 `accounts.feishu.cn/open-apis/authen/v1/authorize`、PKCE 和 `accounts.feishu.cn/oauth/v3/token` 完成授权、换取与刷新；治理层按用户隔离 state，并为同一用户保存可并存的最小 scope 加密 Token grant，兼容读取旧版单 Token 文件；按任务计算最小 scope，以 `userId + normalized scopes` 去重授权卡，并将多个等待任务持久化到同一 state 后逐个恢复。callback 模式按需启动公网回调监听，manual 模式让用户把 `code/state` 回调 URL 发回飞书；读取失败时会按具体接口返回需要检查的只读 scope，避免把权限不足伪装成空内容。
 - Feishu CLI 用户授权 host：接收 bridge-core 从真实工具对提取的 `cti-feishu-cli-user-auth/v1` challenge，只允许 Owner 为本机共享 `lark-cli` 用户身份授权。Card 2.0 按最小 scope 展示 `open_url` 按钮，后台 runner 用 argv 调用官方 `auth login --device-code`；同 Owner 与 scope 的并发任务共用一次轮询，成功自动恢复，拒绝/过期发送红色未完成结果。该 host 不持久化 device code、URL 或 token，也不替代 FeishuAdapter 的 bot 长连接。
 
@@ -916,7 +959,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 查看节点拓扑、heartbeat、capability inventory 和 fake remote node 状态。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
-- 查看可操作系统蓝图、机器人八层架构、Prompt Snapshot、Memory 关系与资产索引；专业网格、关系缓存和运行诊断默认收进高级区域。
+- 查看可操作系统蓝图、机器人八层架构、Prompt Snapshot、Memory 关系与资产索引；Memory 同时展示 Agent Home 自维护档案、版本备份、classifier 调用/跳过与耗时、规则成熟度、锁/哈希冲突和最近更新时间，专业网格、关系缓存和运行诊断默认收进高级区域。
 - 通过“AI 执行与模型来源”配置默认 executor，并配置和测试官方 Codex、本地 API 或外部 API 主模型；常用模式只展示策略、服务、模型和地址，高级字段折叠保留。API key 只写入本机 `config.env`，Web 状态只返回是否已设置和掩码。
 
 截至 2026-05-16，控制面板采用 `Control API + React/Vite + 可选 WinForms/WebView2 壳`：
@@ -1230,7 +1273,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-suite-skills.ps1
 - `CTI_DEFAULT_EXECUTOR_ID`：全局默认 executor id。为空时按显式 hint、兼容 session 默认和自动选择；非空时优先于历史会话默认值，低于本轮 `@codex` / `@mavis` 等显式 hint。
 - `CTI_CODEX_MODEL_SOURCE`：`official`、`local_api` 或 `external_api`，手动模式下决定 Codex CLI 模型来源。
 - `CTI_CODEX_API_FALLBACK_CHAIN`：自动切换模式下的来源顺序，默认 `local_api,external_api`；只有显式包含 `official` 才允许调用官方 Codex。
-- `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用、独立预算 2000ms、最多保留 2 条短历史、输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。`CTI_PROVIDER_CIRCUIT_COOLDOWN_MS` 控制本地 provider 熔断冷却，默认 60000ms；`CTI_CODEX_FAILOVER_CANDIDATE_TIMEOUT_MS` 控制 Codex 自动来源候选首个有效事件期限，默认 2000ms；`CTI_MEMORY_INTENT_TIMEOUT_MS` 控制记忆意图分类预算，默认 4000ms。`CTI_FEISHU_LIGHT_CONTEXT_LIMIT` / `bridge_feishu_light_context_limit` 控制 Feishu 群聊轻量上下文补捞数量，默认 6 条、最大 12 条，只用于被 @ 或回复触发的短接话上下文。
+- `CTI_LIGHT_CHAT_FAST_PATH_ENABLED`、`CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS`、`CTI_LIGHT_CHAT_HISTORY_LIMIT`、`CTI_LIGHT_CHAT_MAX_INPUT_CHARS`：控制 Feishu 轻聊天 fast path，默认启用、独立预算 2000ms、最多保留 2 条短历史、输入上限 280 字符；禁用后普通 provider 路由仍按原策略执行。`CTI_PROVIDER_CIRCUIT_COOLDOWN_MS` 控制本地 provider 熔断冷却，默认 60000ms；`CTI_CODEX_FAILOVER_CANDIDATE_TIMEOUT_MS` 控制 Codex 自动来源候选首个有效事件期限，默认 2000ms；`CTI_MEMORY_INTENT_TIMEOUT_MS` 控制记忆意图分类预算，默认及最低有效值为 30000ms、最大 60000ms。`CTI_CODEX_RESET_STATE=true` 只用于诊断确认 Codex 状态库不兼容后的单次重置，默认保留健康状态库。`CTI_CODEX_BLOCKED_SKILLS` 以逗号或分号追加 bridge Codex Home 禁用 skill，`github-memory-protocol` 始终默认禁用。`CTI_FEISHU_LIGHT_CONTEXT_LIMIT` / `bridge_feishu_light_context_limit` 控制 Feishu 群聊轻量上下文补捞数量，默认 6 条、最大 12 条，只用于被 @ 或回复触发的短接话上下文。
 - Feishu 轻聊天 fast path 会排除带明确可读对象的短句，例如 URL、文件路径、当前工作目录、仓库/项目目录、MCP manifest 或附件语义；这些请求即使语气很短，也会交给普通 provider/工具证据链判断，避免把“帮我看一下这个对象”误当闲聊。
 - `CTI_CODEX_INHERIT_GLOBAL_MCP`：是否让 bridge Codex 继承桌面全局 `mcp_servers.*`，默认 `false`；普通飞书运行态不依赖桌面 MCP，避免外部 MCP 离线导致主模型失败。
 - `CTI_CODEX_LOCAL_IGNORE_USER_CONFIG`：本地 Codex CLI OSS agent 是否忽略桌面用户配置，默认 `true`；这不会禁用内置 shell/file agent 能力，但会减少插件和全局 provider 配置干扰。
@@ -1275,8 +1318,9 @@ Ignis 会话映射：
 - Feishu 云历史可能只保留或只索引到用户问题、卡片摘要或平台可见占位；bot 自己的最终回复还要从本地 `messages` / `message-archives` 回捞。运行时检索命中历史用户请求时，会把相邻 assistant 最终答复作为同一条 evidence 返回；结构化 assistant 消息优先提取 `cti-final.text` 作为用户真正看见的答案，缺少最终结果块时也只使用可见 text block，不把进度中的 `tool_use`、`tool_result`、命令、路径或日志混入主记忆文本。
 - AI 不直接吃全量历史，而是按 `memoryMode=off|recall|augment` 决定是否检索相关片段；普通聊天默认不检索，显式回忆和执行类任务才按需调用记忆工具。
 - 短期会话历史只保留近期窗口；普通聊天只带少量最近消息，`historyLimit=0` 表示完全不注入短期历史。runtime 会定期把过长消息流归档，默认只保留最近活跃消息，并且记忆检索读取归档时限制为最近少量归档文件，避免历史越积越长后拖慢每轮回复。
-- Markdown 知识库默认位于 `E:\cli-md`，运行时只监听并索引 `data/memory/v2` 下通过 schema 和身份边界校验的 Markdown，生成 `.cti-index\knowledge.json`。
-- IM/bridge 的记忆保存只能通过受控 v2 写入链进入上述仓库；agent 不得使用 `github-memory-protocol`、`~/.codex/memory` / `C:\Users\admin\.codex\memory`、项目 Markdown 或聊天日志来替代记忆仓库。没有 `Memory write evidence` 且写入结果为成功时，最终回复不能声称“已记住/已保存”，只能说明未保存并追问最小缺口或报告阻塞。
+- Markdown 知识库默认位于 `E:\cli-md`，运行时优先监听并索引 `memory/*` 下通过 `codex-im-suite/memory/v3` schema 和身份边界校验的 Markdown；旧 `data/memory/v2` 只读兼容，统一生成 `.cti-index\knowledge.json`。
+- IM/bridge 的长期记忆保存只能通过受控 memory v3 写入链进入上述仓库；agent 不得使用 `github-memory-protocol`、`~/.codex/memory` / `C:\Users\admin\.codex\memory`、项目 Markdown 或聊天日志来替代记忆仓库。没有成功写入 evidence 时，最终回复不能声称“已记住/已保存”，只能说明未保存并追问最小缺口或报告阻塞。Agent Home 的身份/规则/工具自维护走独立 Self-Maintenance evidence 门禁：核心只做受控 patch，工作档案只做稳定 key upsert，规则回归只记录状态并走显式受控回滚，不与用户/群/公共长期记忆写入混用。
+- Provider 运行态与 bridge-core 最终交付共用 `isExecutionEvidenceSatisfied()` 工具家族裁决；workflow 不再因任意 Bash/Edit 成功就宣称 Unity MCP、MCP 或其他指定能力已满足，面板状态与最终卡片保持同一证据口径。
 - 运行时 watcher 同步写入 `.cti-index\status.json`，包含 `watching`、`watcherPid`、`watcherStartedAt`、`lastEventAt`、`lastIndexedAt` 和 `statusUpdatedAt`；控制面板用该心跳判断真实监听状态。
 - 知识单元分为 `事实 / 结论 / 待办 / 资源`，结果保留来源路径、片段和冲突标记。
 - `memory.status` 会返回 `sourceCoverage`，按 v2 来源路径汇总知识单元数、最近更新时间、来源分组、默认风险和是否可自动整理；`memory.search` 支持 `sourceGroup`、`offset`、`limit`，默认轻量显示但可分页查看完整匹配列表。控制面板直接读取旧 `knowledge.json` 时也会复用 v2 过滤口径，旧残留条目不会显示。

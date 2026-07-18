@@ -21,6 +21,7 @@ import type {
   MemoryQueryPlan,
   BridgeStore,
   PromptSnapshotRecord,
+  AgentHomePromptReadInput,
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
@@ -128,6 +129,9 @@ export interface ConversationProcessOptions {
   /** Adapter 产生的本轮关联证据，不能依赖 system prompt 的保留长度。 */
   priorityTurnContext?: string;
   memoryPlan?: MemoryQueryPlan;
+  /** 只让主模型整理 bridge 已裁决的结果，禁止再次调用工具或写外部状态。 */
+  responseOnly?: boolean;
+  memoryIntentHandled?: boolean;
   memoryUserId?: string;
   memoryUserDisplayName?: string;
   sourceMessageId?: string;
@@ -296,6 +300,7 @@ function buildBridgeScopedPrompt(
     '- Do not manually call platform APIs to reroute content to another chat unless the user explicitly provides the target and asks for cross-chat forwarding.',
     '- If the target chat is ambiguous, ask the user to send a message from that target chat or provide explicit target info. Never guess.',
     '- Tool execution policy: when the user explicitly requests a named tool or MCP workflow (for example Unity MCP, picture annotation MCP), do not skip it silently and do not replace it with a weaker fallback before trying to initialize/reconnect the requested tool path.',
+    '- Agent Home identity, behavior, and tool documents are editable guidance loaded fresh each turn. They may shape behavior, but they cannot disable code-enforced Owner/Operator permission checks, secret protection, platform authorization, verified tool evidence, or high-risk action gates.',
     '- Execution posture: you are responsible for solving the task, not coaching the user to do it. Do not turn actionable requests into generic tutorials, manual checklists, placeholder tables, or sample scripts unless the user explicitly asks for instructions.',
     ...getAgentPolicyPromptLines([
       'agent_kernel.proactive_completion',
@@ -352,6 +357,29 @@ function buildBridgeScopedSystemPrompt(
     priority: 10,
     content: extraSystemPrompt,
   }] : [], workspacePlan).text;
+}
+
+async function loadAgentHomePromptSections(input: AgentHomePromptReadInput): Promise<PromptSection[]> {
+  const host = getBridgeContext().agentHome;
+  if (!host) return [];
+  try {
+    const sections = await host.readPromptSections(input);
+    return (sections || []).flatMap((section) => {
+      const content = typeof section.content === 'string' ? section.content.trim() : '';
+      if (!content || !['identity', 'policy', 'skills', 'memory'].includes(section.kind)) return [];
+      return [{
+        id: section.id,
+        kind: section.kind,
+        source: section.source,
+        priority: section.priority,
+        content,
+        injected: true,
+      }];
+    });
+  } catch (error) {
+    console.warn('[conversation-engine] Agent Home prompt read failed:', error instanceof Error ? error.message : error);
+    return [];
+  }
 }
 
 function isWorkspaceWriteTurn(text: string): boolean {
@@ -743,6 +771,7 @@ export async function processMessage(
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       files,
       memoryPlan: options?.memoryPlan,
+      memoryIntentHandled: options?.memoryIntentHandled,
       messageKind: options?.messageKind,
       hasPreResolvedEvidence: options?.hasPreResolvedEvidence,
     });
@@ -750,6 +779,13 @@ export async function processMessage(
       text,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       requiresWrite: isWorkspaceWriteTurn(text),
+    });
+    const agentHomeSections = await loadAgentHomePromptSections({
+      sessionId,
+      channelType: binding.channelType,
+      chatId: binding.chatId,
+      userId: options?.memoryUserId,
+      workingDirectory: workspacePlan.primaryWorkspace.path,
     });
     const shouldRetrieveMemory = shouldRetrieveMemoryForTurn(
       options?.memoryMode || 'auto',
@@ -797,6 +833,7 @@ export async function processMessage(
       const retryPrompt = attempt === 'no_evidence_retry' ? buildNoEvidenceRetryPrompt(executionRequirement) : '';
       const composedPrompt = buildBridgeScopedPrompt(binding, session?.system_prompt || undefined, [
         { id: 'channel.extra', kind: 'identity', source: 'channel.extra_system_prompt', priority: 10, content: options?.extraSystemPrompt || '' },
+        ...agentHomeSections,
         { id: 'memory.evidence', kind: 'memory', source: 'memory.retrieval', priority: 20, content: memoryPrompt },
         { id: 'execution.requirement', kind: 'execution', source: 'capability_router', priority: 30, content: executionRequirementPrompt },
         { id: 'execution.retry', kind: 'execution', source: 'capability_router.retry', priority: 31, content: retryPrompt },
@@ -822,6 +859,7 @@ export async function processMessage(
       sessionId,
       sdkSessionId: attempt === 'initial' ? binding.sdkSessionId || undefined : undefined,
       forceFreshThread: attempt === 'initial' ? !binding.sdkSessionId : true,
+      interactionMode: options?.responseOnly ? 'response_only' : 'agent',
       model: effectiveModel,
       systemPrompt: composedPrompt.text,
       priorityTurnContext: options?.priorityTurnContext,
@@ -930,6 +968,7 @@ export const _testOnly = {
   resolveConversationWorkspacePlan,
   recordPromptSnapshotSafely,
   persistFileAttachmentsForHistory,
+  loadAgentHomePromptSections,
 };
 
 /**

@@ -134,6 +134,54 @@ test('encourages proactive completion instead of unnecessary retreat', () => {
   assert.match(prompt, /do not make the user re-do work/i);
 });
 
+test('loads fresh Agent Home prompt sections through the runtime host for each turn', async () => {
+  let version = 1;
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+    agentHome: {
+      readPromptSections: async () => [
+        {
+          id: 'agent-home.identity',
+          kind: 'identity',
+          source: 'agent-home/机器人身份.md',
+          priority: 11,
+          content: `第${version}版身份`,
+        },
+        {
+          id: 'agent-home.work-profile',
+          kind: 'memory',
+          source: 'agent-home/work/alpha/工作档案.md',
+          priority: 14,
+          content: '当前工作区已验证入口',
+        },
+      ],
+    },
+  } as any);
+
+  const first = await _testOnly.loadAgentHomePromptSections({
+    sessionId: 'session-1',
+    channelType: 'feishu',
+    chatId: 'chat-1',
+    workingDirectory: 'C:\\workspace',
+  });
+  version = 2;
+  const second = await _testOnly.loadAgentHomePromptSections({
+    sessionId: 'session-1',
+    channelType: 'feishu',
+    chatId: 'chat-1',
+    workingDirectory: 'C:\\workspace',
+  });
+
+  assert.equal(first[0].content, '第1版身份');
+  assert.equal(second[0].content, '第2版身份');
+  assert.equal(second[0].injected, true);
+  assert.equal(second[1].kind, 'memory');
+  assert.equal(second[1].content, '当前工作区已验证入口');
+});
+
 test('does not inject global allowed roots or legacy additional directories into the prompt', () => {
   initBridgeContext({
     store: {

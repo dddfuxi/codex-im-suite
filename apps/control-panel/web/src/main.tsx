@@ -66,6 +66,7 @@ import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
   buildMemoryQueryRefreshKey,
+  buildSelfMaintenanceMetrics,
   buildWorkspacePathSections,
   runPanelRefresh,
 } from './memory-page-view-model.js';
@@ -553,6 +554,24 @@ type KnowledgeIndexStatus = {
     legacySourceCount: number;
     agentHome: Array<{ name: string; path: string; exists: boolean }>;
     unclassifiedRootDocuments?: Array<{ name: string; path: string }>;
+    selfMaintenance?: {
+      dailyReflectionCount: number;
+      workProfileCount: number;
+      correctionDocumentCount: number;
+      versionBackupCount: number;
+      classifierCalls?: number;
+      classifierSkips?: number;
+      classifierApplied?: number;
+      classifierRejected?: number;
+      averageDurationMs?: number;
+      lockConflicts?: number;
+      hashConflicts?: number;
+      trialRuleCount?: number;
+      confirmedRuleCount?: number;
+      regressedRuleCount?: number;
+      lastUpdatedAt?: string;
+      statusPath?: string;
+    };
   };
 };
 
@@ -5122,6 +5141,7 @@ function MemoryPage({
     ? memoryLayout.agentHome
     : buildAgentHomeEntries(status.memoryRoot || state.paths.memoryRepo).map((item) => ({ ...item, exists: false }));
   const memoryLayoutSummary = buildMemoryLayoutSummary(memoryLayout);
+  const selfMaintenanceMetrics = buildSelfMaintenanceMetrics(memoryLayout?.selfMaintenance);
   const itemColumns = useMemo<Array<ColumnDef<KnowledgeSearchItem>>>(() => [
     {
       accessorKey: 'kind',
@@ -5216,6 +5236,13 @@ function MemoryPage({
           <Metric label="待迁移 v2" value={String(memoryLayout?.legacySourceCount ?? 0)} compact />
           <Metric label="迁移状态" value={memoryLayoutSummary.migrationLabel} compact />
           <Metric label="未归类根文档" value={String(memoryLayoutSummary.unclassifiedCount)} compact />
+        </div>
+        <p className="panel-intro">身份、规则和工具文档每轮重新读取；只有确认是 Agent 自身错误且引用真实证据时才自动改写。所有核心改写都会保留版本、纠错记录和审计，可从受控历史回滚。</p>
+        <div className="summary-grid wide">
+          {selfMaintenanceMetrics.map((item) => (
+            <Metric key={item.label} label={item.label} value={item.value} compact />
+          ))}
+          <Metric label="最近自维护" value={memoryLayout?.selfMaintenance?.lastUpdatedAt || '尚无'} compact />
         </div>
         <div className="runtime-list compact-list">
           {agentHomeEntries.map((item) => (

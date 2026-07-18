@@ -78,7 +78,7 @@ describe('agent architecture registry', () => {
     assert.match(lines.join('\n'), /Memory partition policy/i);
     assert.match(lines.join('\n'), /must not write durable memory/i);
     assert.match(lines.join('\n'), /Do not use github-memory-protocol/i);
-    assert.match(lines.join('\n'), /controlled v2 memory write evidence/i);
+    assert.match(lines.join('\n'), /controlled memory v3 write evidence/i);
     assert.match(lines.join('\n'), /clarification/i);
     assert.doesNotMatch(lines.join('\n'), /小虾米|小桥|mavis/iu);
   });

@@ -20,6 +20,8 @@ import type {
   FeishuCliUserAuthHost,
   FeishuOAuthManualHost,
   MemoryIntentHost,
+  AgentHomeHost,
+  SelfMaintenanceHost,
   TurnReferenceResolverHost,
 } from './host.js';
 
@@ -35,6 +37,8 @@ export interface BridgeContext {
   feishuCliUserAuth?: FeishuCliUserAuthHost;
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
+  agentHome?: AgentHomeHost;
+  selfMaintenance?: SelfMaintenanceHost;
   turnReferences?: TurnReferenceResolverHost;
 }
 

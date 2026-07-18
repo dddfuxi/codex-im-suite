@@ -501,6 +501,17 @@ describe('execution requirement classifier', () => {
     assert.equal(requirement.kind, 'none');
   });
 
+  it('does not turn a controlled memory write containing prefab paths into a Unity tool task', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '记住HSScene里面的交互物相关：__ArtData\\_Resources\\Prefab\\HospitalSimulation\\Actor\\Prop，命名格式是 H_Inter_ActualName',
+      workingDirectory: 'C:\\unity\\ST3',
+      memoryIntentHandled: true,
+    });
+
+    assert.equal(requirement.kind, 'none');
+    assert.deepEqual(requirement.requiredToolFamilies, []);
+  });
+
   it('does not require tool evidence for Feishu sticker semantic events', () => {
     const unknown = classifyExecutionRequirement({
       userText: [

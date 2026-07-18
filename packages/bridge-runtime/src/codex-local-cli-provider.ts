@@ -625,13 +625,15 @@ export class CodexLocalCliProvider implements LLMProvider {
           tempFiles.push(outputLastMessagePath);
           const command = adapter.buildCommand({ model, outputLastMessagePath });
           const classifierMode = params.interactionMode === 'classifier';
-          const providerWorkspace = classifierMode ? null : resolveProviderWorkspace(params);
-          const workingDirectory = classifierMode
+          const responseOnlyMode = params.interactionMode === 'response_only';
+          const restrictedMode = classifierMode || responseOnlyMode;
+          const providerWorkspace = restrictedMode ? null : resolveProviderWorkspace(params);
+          const workingDirectory = restrictedMode
             ? os.tmpdir()
             : providerWorkspace?.source === 'workspace_plan'
               ? providerWorkspace.workingDirectory
               : resolveWorkingDirectory(params.workingDirectory);
-          const additionalDirectories = classifierMode
+          const additionalDirectories = restrictedMode
             ? []
             : providerWorkspace?.source === 'workspace_plan'
               ? providerWorkspace.additionalDirectories
@@ -646,7 +648,7 @@ export class CodexLocalCliProvider implements LLMProvider {
             ? buildClassifierCodexExecArgs(command.args, classifierSchemaPath)
             : [...command.args];
 
-          if (!classifierMode) {
+          if (!restrictedMode) {
             for (const dir of additionalDirectories) args.push('--add-dir', dir);
             if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
             if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
@@ -655,9 +657,12 @@ export class CodexLocalCliProvider implements LLMProvider {
             } else {
               args.push('--sandbox', getSandboxMode());
             }
+          } else if (responseOnlyMode) {
+            args.push('--sandbox', 'read-only', '--skip-git-repo-check');
+            if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
           }
 
-          const imageFiles = classifierMode ? [] : params.files?.filter((file) => file.type.startsWith('image/')) ?? [];
+          const imageFiles = restrictedMode ? [] : params.files?.filter((file) => file.type.startsWith('image/')) ?? [];
           const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(imageFiles, adapter.id, ['image']);
           for (const file of imageFiles) {
             const ext = MIME_EXT[file.type] || '.png';
@@ -688,7 +693,7 @@ export class CodexLocalCliProvider implements LLMProvider {
             },
           }));
 
-          if (!classifierMode && isJsonToolProtocolEligible(params.executionRequirement, 'local_api')) {
+          if (!restrictedMode && isJsonToolProtocolEligible(params.executionRequirement, 'local_api')) {
             await this.runJsonToolProtocol(controller, params, model, baseUrl);
             controller.close();
             return;
@@ -735,7 +740,7 @@ export class CodexLocalCliProvider implements LLMProvider {
               }
               case 'item.completed': {
                 const item = event.item && typeof event.item === 'object' ? event.item as Record<string, unknown> : {};
-                if (classifierMode && ['command_execution', 'file_change', 'mcp_tool_call', 'web_search'].includes(String(item.type || ''))) {
+                if (restrictedMode && ['command_execution', 'file_change', 'mcp_tool_call', 'web_search'].includes(String(item.type || ''))) {
                   classifierViolation = `classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`;
                   terminateProcessTree(child);
                   break;

@@ -24,6 +24,8 @@ import type {
   MemoryWriteIntentDecision,
   MemoryWriteResult,
   MemoryReplyDecision,
+  SelfMaintenanceInput,
+  SelfMaintenanceResult,
 } from './host.js';
 import type { TurnEvidenceItem } from './turn-context.js';
 import { execFile } from 'node:child_process';
@@ -78,6 +80,7 @@ import {
 } from './feishu-document-memory.js';
 import { buildFeishuCapabilityReport } from './feishu-capabilities.js';
 import { resolveStructuredTurnContext } from './turn-context-broker.js';
+import { shouldRunCorrectionMaintenance } from './self-maintenance-routing.js';
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -1585,6 +1588,14 @@ interface MemoryIntentPreflight {
   preparedWrite?: PreparedMemoryWrite;
   temporaryMemory?: MemoryWriteIntentDecision;
   clarification?: string;
+  blocker?: string;
+}
+
+const EXPLICIT_MEMORY_WRITE_REQUEST_RE = /(?:记住|记一下|记下来|记入|保存到?记忆|写入记忆|更新记忆|记录下来|以后(?:都|统一|默认)?按)/u;
+const NEGATED_MEMORY_WRITE_REQUEST_RE = /(?:不要|不用|不必|别|无需|无须|禁止).{0,12}(?:记住|记录|保存|写入记忆)/u;
+
+function isExplicitMemoryWriteRequestText(text: string): boolean {
+  return EXPLICIT_MEMORY_WRITE_REQUEST_RE.test(text) && !NEGATED_MEMORY_WRITE_REQUEST_RE.test(text);
 }
 
 function resolveInboundMemoryActorKind(msg: InboundMessage): MemoryWriteClassification['actorKind'] {
@@ -1631,6 +1642,11 @@ async function prepareModelPlannedMemoryWrite(
       });
     } catch (error) {
       console.warn('[bridge-manager] Memory write intent classifier failed:', error instanceof Error ? error.message : error);
+      if (isExplicitMemoryWriteRequestText(text || rawText)) {
+        return {
+          blocker: '记忆意图判断超时或中止，本轮没有写入受控 memory v3。请重新发送，并明确说明保存到当前用户、当前群或公共长期记忆。',
+        };
+      }
     }
   }
 
@@ -1726,6 +1742,27 @@ function buildMemoryScopeClarificationAgentPrompt(clarification: string): string
     `Ask the user this minimal clarification: ${clarification}`,
     'Do not write memory, infer a scope, or claim that anything was saved before the user answers.',
   ].join('\n');
+}
+
+function buildMemoryIntentBlockerAgentPrompt(blocker: string): string {
+  return [
+    'Memory intent blocker for this turn:',
+    blocker,
+    'The primary agent must state that the memory was not saved. Do not use tools, skills, project files, chat logs, or legacy memory directories as a fallback store.',
+  ].join('\n');
+}
+
+function enforceMemoryIntentOutcome(text: string, preflight: MemoryIntentPreflight | null): string {
+  if (!preflight) return text;
+  if (preflight.blocker) return `未保存：${preflight.blocker}`;
+  if (preflight.clarification) return `尚未保存。${preflight.clarification}`;
+  if (preflight.preparedWrite && !preflight.preparedWrite.result.ok) {
+    return `未保存：${preflight.preparedWrite.result.error || '受控 memory v3 写入失败。'}`;
+  }
+  if (preflight.temporaryMemory && /(?:已记住|记住了|已保存|保存成功|写入.*记忆|长期记忆)/u.test(text)) {
+    return '已按当前会话上下文保留，本轮没有写入用户、群聊或公共长期记忆。';
+  }
+  return text;
 }
 
 function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
@@ -3426,6 +3463,32 @@ function validateFeishuStructuredMentions(
 function needsExplicitFeishuMentionTarget(userText: string, options: FeishuMentionIntentOptions = {}): boolean {
   if (!isFeishuMentionExecutionRequest(userText, options)) return false;
   return FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
+}
+
+async function runSelfMaintenanceSafely(input: SelfMaintenanceInput): Promise<SelfMaintenanceResult | null> {
+  const host = getBridgeContext().selfMaintenance;
+  if (!host) return null;
+  try {
+    return await host.maintain(input);
+  } catch (error) {
+    // 自维护是旁路治理能力，classifier、磁盘或索引失败不得中断主回复。
+    console.warn('[bridge-manager] Self-maintenance failed:', error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+async function recordSelfMaintenanceSkipSafely(input: {
+  phase: 'correction' | 'outcome';
+  sessionId: string;
+  reason: string;
+}): Promise<void> {
+  const host = getBridgeContext().selfMaintenance;
+  if (!host?.recordRoutingSkip) return;
+  try {
+    await host.recordRoutingSkip(input);
+  } catch {
+    // 指标属于旁路观察数据，不能影响主回复。
+  }
 }
 
 /**
@@ -6440,6 +6503,9 @@ async function handleMessage(
   const memoryScopeClarificationAgentPrompt = memoryIntentPreflight?.clarification
     ? buildMemoryScopeClarificationAgentPrompt(memoryIntentPreflight.clarification)
     : '';
+  const memoryIntentBlockerAgentPrompt = memoryIntentPreflight?.blocker
+    ? buildMemoryIntentBlockerAgentPrompt(memoryIntentPreflight.blocker)
+    : '';
   let memoryReviewContext: Pick<AnswerReviewInput, 'memoryPlan' | 'memoryHits'> = {};
   const preExecutionProgressSteps: string[] = [];
   if (preparedMemoryWrite) {
@@ -6664,6 +6730,7 @@ async function handleMessage(
     workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
     files: executionEvidenceAttachments,
     memoryPlan: memoryReviewContext.memoryPlan,
+    memoryIntentHandled: Boolean(memoryIntentPreflight),
     messageKind: inboundMessageKind,
     hasPreResolvedEvidence,
   });
@@ -6912,8 +6979,39 @@ async function handleMessage(
     }
 
     const storedUserText = rawData?.feishuHistoryContext?.originalPrompt?.trim() || text || rawText;
+    const preMaintenanceWorkingDirectory = effectiveBinding.workingDirectory
+      || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory
+      || undefined;
+    const previousAssistantText = [...store.getMessages(effectiveBinding.codepilotSessionId, { limit: 12 }).messages]
+      .reverse()
+      .find((entry) => entry.role === 'assistant')?.content;
+    const hasPreviousAssistant = Boolean(previousAssistantText?.trim());
+    if (shouldRunCorrectionMaintenance({
+      currentUserText: storedUserText,
+      previousAssistantText,
+    })) {
+      await runSelfMaintenanceSafely({
+        phase: 'correction',
+        sessionId: effectiveBinding.codepilotSessionId,
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        currentUserText: storedUserText,
+        previousAssistantText,
+        workingDirectory: preMaintenanceWorkingDirectory,
+        abortSignal: taskAbort.signal,
+      });
+    } else if (hasPreviousAssistant) {
+      await recordSelfMaintenanceSkipSafely({
+        phase: 'correction',
+        sessionId: effectiveBinding.codepilotSessionId,
+        reason: 'no correction candidate',
+      });
+    }
     recordConversationMemoryEvent(msg, effectiveBinding, 'user', storedUserText);
-    const providerPromptText = feishuCloudSystemPrompt && !directFeishuDocRequest
+    const providerPromptText = memoryIntentPreflight
+      ? '请根据本轮系统提示中的受控记忆裁决，生成准确、简洁的用户回复。'
+      : feishuCloudSystemPrompt && !directFeishuDocRequest
       ? sanitizeFeishuCloudDocumentLinks(rawText) || '请基于已读取的飞书云文档上下文回答当前请求。'
       : basePromptText;
     const resolvedTurnContext = await resolveStructuredTurnContext({
@@ -7003,10 +7101,13 @@ async function handleMessage(
         preparedMemoryWriteAgentPrompt,
         temporaryMemoryAgentPrompt,
         memoryScopeClarificationAgentPrompt,
+        memoryIntentBlockerAgentPrompt,
         feishuCloudSystemPrompt,
         recentConversationMediaPrompt,
       ].filter(Boolean).join('\n\n'),
       memoryPlan: memoryReviewContext.memoryPlan,
+      memoryIntentHandled: Boolean(memoryIntentPreflight),
+      responseOnly: Boolean(memoryIntentPreflight),
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
@@ -7275,8 +7376,12 @@ async function handleMessage(
         executionEvidence: responseExecutionEvidence,
       })
       : '';
-    const userFacingResponseText = enforceFeishuAvatarEvidenceCompletionText(
+    const memorySafeUserFacingResponseText = enforceMemoryIntentOutcome(
       reviewedUserFacingResponseText,
+      memoryIntentPreflight,
+    );
+    const userFacingResponseText = enforceFeishuAvatarEvidenceCompletionText(
+      memorySafeUserFacingResponseText,
       rawData?.feishuAvatarEvidence,
     );
     const stickerSafeUserFacingResponseText = adapter.channelType === 'feishu' && isStickerMessage
@@ -7528,6 +7633,29 @@ async function handleMessage(
           });
         } catch { /* best effort */ }
       }
+    }
+
+    if (!taskAbort.signal.aborted) {
+      const maintainedAssistantText = stickerSafeUserFacingResponseText || safeProviderErrorText || result.responseText;
+      await runSelfMaintenanceSafely({
+        phase: 'outcome',
+        sessionId: effectiveBinding.codepilotSessionId,
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        userId: msg.address.userId,
+        currentUserText: storedUserText,
+        assistantText: maintainedAssistantText,
+        workingDirectory: resolvedWorkingDirectory,
+        executionEvidence: {
+          hasError: result.hasError || isExplicitUnfinishedReplyText(maintainedAssistantText),
+          errorMessage: result.errorMessage || undefined,
+          evidenceSatisfied: responseExecutionEvidence.evidenceSatisfied,
+          toolUseCount: responseExecutionEvidence.toolUseCount,
+          successfulToolResultCount: responseExecutionEvidence.successfulToolResultCount,
+          failedToolResultCount: responseExecutionEvidence.failedToolResultCount,
+        },
+        abortSignal: taskAbort.signal,
+      });
     }
 
     // Persist the actual SDK session ID for future resume.
@@ -7974,4 +8102,6 @@ export const _testOnly = {
   containsUnverifiedReminderCompletion,
   parseNaturalReminderRequest,
   pollAdapterMessageForTest: pollAdapterMessage,
+  runSelfMaintenanceSafely,
+  recordSelfMaintenanceSkipSafely,
 };

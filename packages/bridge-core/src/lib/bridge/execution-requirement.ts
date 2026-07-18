@@ -20,6 +20,8 @@ export interface ExecutionRequirementInput {
   workingDirectory?: string;
   files?: FileAttachment[];
   memoryPlan?: MemoryQueryPlan;
+  /** Bridge 已完成或安全收口本轮记忆意图；不得再按正文里的路径/Prefab 词触发工具任务。 */
+  memoryIntentHandled?: boolean;
   messageKind?: string;
   hasPreResolvedEvidence?: boolean;
 }
@@ -302,6 +304,10 @@ function classifyExecutionRequirementInternal(
         ids: imageEvidence.map((item) => item.id),
       },
     );
+  }
+
+  if (input.memoryIntentHandled) {
+    return NONE_REQUIREMENT;
   }
 
   if (input.memoryPlan?.intent === 'explicit_recall') {

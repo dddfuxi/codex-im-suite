@@ -38,6 +38,7 @@ const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
 const FINAL_REPLY_FENCE = 'cti-final';
 const SHARED_CODEX_HOME_PATHS = ['skills', 'plugins', 'vendor_imports', 'rules'];
+const DEFAULT_BRIDGE_BLOCKED_SKILLS = ['github-memory-protocol'];
 const LOCAL_CODEX_HOME_BLOCKED_PATHS = ['plugins', path.join('.tmp', 'plugins')];
 const STATE_DB_PATTERNS = [
   /^state_\d+\.sqlite(?:-shm|-wal)?$/i,
@@ -264,6 +265,50 @@ function ensureSharedPath(sourcePath: string, targetPath: string): void {
   fs.copyFileSync(sourcePath, targetPath);
 }
 
+function removeGeneratedSharedPath(targetPath: string): void {
+  if (!fs.existsSync(targetPath)) return;
+  const stats = fs.lstatSync(targetPath);
+  if (stats.isSymbolicLink()) {
+    fs.unlinkSync(targetPath);
+    return;
+  }
+  fs.rmSync(targetPath, { recursive: true, force: true });
+}
+
+export function getBridgeBlockedSkillNames(): Set<string> {
+  const configured = (process.env.CTI_CODEX_BLOCKED_SKILLS || '')
+    .split(/[;,\n]/u)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set([...DEFAULT_BRIDGE_BLOCKED_SKILLS, ...configured]);
+}
+
+/**
+ * Bridge Codex Home 不能直接共享整个个人 skills 根目录，否则 IM 记忆请求会被
+ * 旧 github-memory-protocol 的高优先级触发规则抢走。这里保留其他个人 skill，
+ * 只在生成的 bridge home 中过滤明确禁止的旧入口，不修改用户全局技能目录。
+ */
+function ensureFilteredSkillsRoot(globalHome: string, bridgeHome: string): void {
+  const sourceRoot = path.join(globalHome, 'skills');
+  const targetRoot = path.join(bridgeHome, 'skills');
+  if (!fs.existsSync(sourceRoot)) return;
+
+  if (fs.existsSync(targetRoot) && fs.lstatSync(targetRoot).isSymbolicLink()) {
+    fs.unlinkSync(targetRoot);
+  }
+  fs.mkdirSync(targetRoot, { recursive: true });
+
+  const blocked = getBridgeBlockedSkillNames();
+  for (const entry of fs.readdirSync(sourceRoot, { withFileTypes: true })) {
+    const target = path.join(targetRoot, entry.name);
+    if (blocked.has(entry.name.toLowerCase())) {
+      removeGeneratedSharedPath(target);
+      continue;
+    }
+    ensureSharedPath(path.join(sourceRoot, entry.name), target);
+  }
+}
+
 function syncFileIfNewer(sourcePath: string, targetPath: string): void {
   if (!fs.existsSync(sourcePath)) return;
   if (!fs.existsSync(targetPath)) {
@@ -278,10 +323,9 @@ function syncFileIfNewer(sourcePath: string, targetPath: string): void {
 }
 
 function getSharedCodexHomePaths(profile: CodexProviderProfile): string[] {
-  if (profile === 'local_primary') {
-    return SHARED_CODEX_HOME_PATHS.filter((relativePath) => relativePath !== 'plugins');
-  }
-  return SHARED_CODEX_HOME_PATHS;
+  const shared = SHARED_CODEX_HOME_PATHS.filter((relativePath) => relativePath !== 'skills');
+  if (profile === 'local_primary') return shared.filter((relativePath) => relativePath !== 'plugins');
+  return shared;
 }
 
 function removeLocalCodexPluginState(bridgeHome: string, profile: CodexProviderProfile): void {
@@ -341,7 +385,10 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: 
 }
 
 function resetBridgeStateDatabases(bridgeHome: string): void {
-  if (process.env.CTI_CODEX_RESET_STATE === 'false') return;
+  // Codex 会从 sessions 回填 state DB。若每次创建主客户端/分类器都删除它，
+  // 冷启动回填会与短超时互相打断，并留下持续的 backfill 锁。
+  // 因此只在明确诊断到状态库不兼容时，才由运维显式请求一次重置。
+  if (process.env.CTI_CODEX_RESET_STATE !== 'true') return;
   if (!fs.existsSync(bridgeHome)) return;
   for (const entry of fs.readdirSync(bridgeHome)) {
     if (!STATE_DB_PATTERNS.some((pattern) => pattern.test(entry))) continue;
@@ -377,6 +424,7 @@ export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
   for (const relativePath of getSharedCodexHomePaths(profile)) {
     ensureSharedPath(path.join(globalHome, relativePath), path.join(bridgeHome, relativePath));
   }
+  ensureFilteredSkillsRoot(globalHome, bridgeHome);
 
   const globalConfigPath = path.join(globalHome, 'config.toml');
   const bridgeConfigPath = path.join(bridgeHome, 'config.toml');
@@ -678,7 +726,8 @@ export class CodexProvider implements LLMProvider {
         ...(clientOptions.baseUrl ? { baseUrl: clientOptions.baseUrl } : {}),
         config: {
           ...clientOptions.config,
-          model_reasoning_effort: 'minimal',
+          // 部分官方/代理模型不接受 minimal；low 仍保持低延迟，且属于通用支持档位。
+          model_reasoning_effort: 'low',
           features: CLASSIFIER_DISABLED_FEATURES,
         },
         env: clientOptions.env,
@@ -696,7 +745,9 @@ export class CodexProvider implements LLMProvider {
           const tempFiles: string[] = [];
           try {
             const classifierMode = params.interactionMode === 'classifier';
-            const { codex } = classifierMode
+            const responseOnlyMode = params.interactionMode === 'response_only';
+            const restrictedMode = classifierMode || responseOnlyMode;
+            const { codex } = restrictedMode
               ? await self.ensureClassifierSDK()
               : await self.ensureSDK();
 
@@ -709,23 +760,23 @@ export class CodexProvider implements LLMProvider {
             if (!resumeThreads) {
               self.threadIds.delete(params.sessionId);
             }
-            let savedThreadId = (classifierMode || params.forceFreshThread || !resumeThreads)
+            let savedThreadId = (restrictedMode || params.forceFreshThread || !resumeThreads)
               ? undefined
               : (inMemoryThreadId || params.sdkSessionId || undefined);
 
             const profile = self.options.profile || 'primary';
-            const approvalPolicy = classifierMode ? 'untrusted' : toApprovalPolicy(params.permissionMode);
+            const approvalPolicy = restrictedMode ? 'untrusted' : toApprovalPolicy(params.permissionMode);
             const passModel = shouldPassModelToCodex(profile);
             const modelOverride = getCodexModelOverride(profile);
-            const sandboxMode = classifierMode ? 'read-only' : getSandboxMode();
+            const sandboxMode = restrictedMode ? 'read-only' : getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
-            const providerWorkspace = classifierMode ? null : resolveProviderWorkspace(params);
-            const workingDirectory = classifierMode
+            const providerWorkspace = restrictedMode ? null : resolveProviderWorkspace(params);
+            const workingDirectory = restrictedMode
               ? undefined
               : providerWorkspace?.source === 'workspace_plan'
                 ? providerWorkspace.workingDirectory
                 : resolveWorkingDirectory(params.workingDirectory);
-            const additionalDirectories = classifierMode
+            const additionalDirectories = restrictedMode
               ? []
               : providerWorkspace?.source === 'workspace_plan'
                 ? providerWorkspace.additionalDirectories
@@ -759,8 +810,8 @@ export class CodexProvider implements LLMProvider {
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,
               sandboxMode,
-              modelReasoningEffort: classifierMode ? 'minimal' : getReasoningEffort(self.options.profile || 'primary'),
-              ...(classifierMode ? {
+              modelReasoningEffort: restrictedMode ? 'low' : getReasoningEffort(self.options.profile || 'primary'),
+              ...(restrictedMode ? {
                 networkAccessEnabled: false,
                 webSearchMode: 'disabled',
                 skipGitRepoCheck: true,
@@ -770,7 +821,7 @@ export class CodexProvider implements LLMProvider {
             // Build input: Codex SDK UserInput supports { type: "text" } and
             // { type: "local_image", path: string }. We write base64 data to
             // temp files so the SDK can read them as local images.
-            const imageFiles = classifierMode ? [] : params.files?.filter(
+            const imageFiles = restrictedMode ? [] : params.files?.filter(
               f => f.type.startsWith('image/')
             ) ?? [];
             const inputEvidenceReceipt = buildProviderInputEvidenceReceipt(imageFiles, 'codex', ['image']);
@@ -822,7 +873,7 @@ export class CodexProvider implements LLMProvider {
                   switch (event.type) {
                     case 'thread.started': {
                       const threadId = event.thread_id as string;
-                      if (!classifierMode) self.threadIds.set(params.sessionId, threadId);
+                      if (!restrictedMode) self.threadIds.set(params.sessionId, threadId);
 
                       controller.enqueue(sseEvent('status', {
                         session_id: threadId,
@@ -833,7 +884,7 @@ export class CodexProvider implements LLMProvider {
 
                     case 'item.completed': {
                       const item = event.item as Record<string, unknown>;
-                      if (classifierMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                      if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
                         params.abortController?.abort();
                         throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
                       }
@@ -844,7 +895,7 @@ export class CodexProvider implements LLMProvider {
                     case 'item.started':
                     case 'item.updated': {
                       const item = event.item as Record<string, unknown>;
-                      if (classifierMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                      if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
                         params.abortController?.abort();
                         throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
                       }

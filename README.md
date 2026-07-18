@@ -33,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
-- 工作区与记忆分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home 与 memory v3 分区，`.cti-index` 只保存机器索引。
+- 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
 - 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
 - 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
@@ -68,6 +68,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 项目注册根：`CTI_ALLOWED_WORKSPACE_ROOTS` 只定义可访问上界，不自动进入 Prompt、Provider 或附加目录。
 - 临时挂载：只由本轮消息中的明确绝对路径等强证据生成，随当前回合结束失效。
 - Agent Home / 记忆库：默认 `E:\cli-md`，集中放置 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md`。
+- Agent Home 注入：身份、行为安全和工具环境三份文档每轮按独立 Prompt section 重新读取；当前工作区的 `work/<workspaceId>/工作档案.md` 另以“只读事实证据”限长回读，超预算时保留头部与最新尾部，其他项目档案、每日反思和纠错日志不注入。Git 项目优先使用规范化 origin remote 生成稳定 workspaceId，项目移动、改名或从子目录进入仍共用档案；旧路径 ID 档案会提升到稳定 ID，提升失败时临时回读真实旧来源。
+- 受控自主维护：独立、禁工具、无工作目录的 Self-Maintenance classifier 只在候选纠错或任务结果阶段运行。核心三文档只有在确认是 Agent 自身错误，并逐字绑定真实 assistant 错误片段与当前 human/失败 runtime 纠正片段时才能通过稳定 key、`baseHash` 和受控 patch 更新专用规则块；不允许整篇替换用户主体。工作档案使用稳定 key upsert，只保存当前有效状态；默认核心模板已升级到 `cti-agent-home-template:v4`，未改 v1/v3 自动升级，用户手改模板不覆盖。
+- 自维护档案：`work/<workspaceId>/工作档案.md`、`daily-reflection/每日反思-YYYY-MM-DD.md`、`corrections/纠错记录-YYYY-MM-DD.md`；写入使用 `.cti-self-history/write.lock` 排他锁和持久化事务 before-image，崩溃后会恢复未完成事务。受控规则记录 `trial / confirmed / regressed` 成熟度和真实 runtime 效果，`regressed` 只标记回归并保留回滚入口，不自动覆盖用户内容。版本、审计和日期档案超过活跃窗口后移动到 `archive/self-maintenance`，不直接删除；控制面板展示 classifier 调用/跳过、平均耗时、规则状态和锁/哈希冲突。
 - 未归类根文档：记忆库根目录中不属于五个固定入口的 Markdown 会在控制面板显示警告和打开入口，但不会被自动移动、删除或注入知识索引。
 - 分区记忆：用户写入 `memory/users/<channel>/<userId>/用户印象.md`，群聊写入 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实写入 `memory/long-term/公共长期记忆.md`。
 - 旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只保留为诊断值，不再自动挂载，也不再由控制面板修改。
@@ -154,7 +157,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 本地 API 的目录/文件读取、明确工具类任务和产物类任务支持 JSON 工具协议：runtime 会先对可安全推断的只读目标、用户原文明示命令、`config/action-manifests.d` 注册的 MCP / Unity MCP 动作或 `shell_artifact` 产物工具生成确定性工具计划；旧 `config/local-agent-tools.d` 只作为兼容 overlay 读取。模糊请求会把可用 MCP 工具 schema 与工具目录注入给本地模型，让模型自己输出 `tool_request`，并在真实 `tool_result` 后继续规划下一步，最多执行多步工具循环。随后统一按 `requiredToolFamilies` 校验允许工具目录和路径 / cwd / MCP manifest / 产物路径，执行 `list_dir/read_file/search_files/shell/shell_artifact/mcp_call/unity_mcp_execute_code`；MCP、Unity MCP 和 artifact 任务不能绕到普通 shell 假完成。处理期间 bridge-core 会按回复表面选择 Feishu CardKit streaming card：工具链展示当前一步用户可见处理动作，轻量聊天和表情包优先使用轻量 reply surface / prompt profile，必要时只短暂显示“正在回复…”。这些等待态内容只用于卡片，不写入最终回复或会话历史。工具完成后，同一张 streaming card 会关闭流式模式并替换为结果正文优先、底部附状态 / 来源 / 工具轨迹 / 耗时 / 当前模型 / 输入输出 token 的结果卡；最终回复会读取设置页保存的回复风格 `CTI_REPLY_STYLE_HINT`，按该语气生成结果优先的 Markdown/`cti-final`，不再强制固定“处理思路 / 执行结果”模板，也不暴露隐藏推理链、协议 JSON 或原始 MCP 返回。工具结果里出现真实存在的本地图片或文件路径时，会自动封装为 `cti-final.images/files` 交给 Feishu 附件链路发送，而不是只回复路径文本。Workflow 会显示 `JSON 工具协议已满足`、工具计数、具体工具名、shell exitCode 和耗时。
 - 自动切换由 `CTI_CODEX_ROUTING_MODE=auto_failover` 和 `CTI_CODEX_API_FALLBACK_CHAIN` 控制，默认推荐 `local_api,external_api`；官方 Codex 只有显式加入自动链或手动选择官方时才会被调用，避免意外消耗付费流量。
 - 对 `git status`、当前分支、最近提交、暂存区内容、读取文件和搜索文本这类只读固定动作，Codex 模型来源失败后允许走 runtime 自己的受控工具补执行；这不是本地模型直答，也不会用于写入或 Unity/Blender/MCP 多步任务。
-- bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和共享资源，不继承桌面全局 `mcp_servers.*`；这样 Unity / Blender 等桌面 MCP 没启动时，不会把普通飞书问答拖成 Codex 主模型失败。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
+- bridge 的 Codex 会话默认使用独立 `CTI_CODEX_HOME`，只同步认证和受控共享资源，不继承桌面全局 `mcp_servers.*`；个人 skills 会保留正常项，但默认过滤会绕过 memory v3 的旧 `github-memory-protocol`，可用 `CTI_CODEX_BLOCKED_SKILLS` 追加禁用 skill。明确记忆请求由受控 memory v3 预检处理，旧短超时会提升到 30 秒，分类超时会进入无工具 `response_only` 回合并明确说明未保存，不会写入 `C:\Users\admin\.codex\memory`。bridge 会保留健康的 Codex 状态数据库，只有诊断确认不兼容时才使用 `CTI_CODEX_RESET_STATE=true` 显式重置，避免每轮回填历史造成分类器锁死。如确实要继承全局 MCP，可显式设置 `CTI_CODEX_INHERIT_GLOBAL_MCP=true`。
 - live 同步会校验运行副本里的 `@openai/codex-sdk` 版本，避免 package 已更新但 live `node_modules` 仍停在旧 Codex CLI，导致新旧 `CODEX_HOME` 状态库迁移不兼容。
 - 每轮回复都会记录执行证据；如果模型声称已生成图片、创建文件、执行命令或完成 Unity/MCP 当前状态检查，但没有成功工具记录，或 `cti-final` 声明的本地文件路径不存在，bridge 会在发送前改成“未完成”并提示已拦截可能的假完成。若 provider 没有返回任何可展示最终文本，Feishu 最终卡片也会显示“未完成：模型没有返回可展示结果。”，不会只留下空白完成状态。
 - `hybrid` 模式下 MCP 状态、工具和可用性询问默认先走 Codex；只有 `local_only` 或 Codex 不可用后才使用本地 MCP 动态状态兜底，不再返回硬编码入口列表。

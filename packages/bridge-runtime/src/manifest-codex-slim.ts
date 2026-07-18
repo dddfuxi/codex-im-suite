@@ -89,7 +89,7 @@ export function buildManifestCodexSlimParams(
   params: StreamChatParams,
   options: ManifestCodexSlimOptions,
 ): ManifestCodexSlimResult {
-  if (params.interactionMode === 'classifier') {
+  if (params.interactionMode === 'classifier' || params.interactionMode === 'response_only') {
     return {
       params,
       plan: null,

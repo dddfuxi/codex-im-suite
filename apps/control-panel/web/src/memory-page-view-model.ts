@@ -114,3 +114,40 @@ export function buildMemoryLayoutSummary(layout: MemoryLayoutSummaryInput | unde
     unclassifiedRootDocuments,
   };
 }
+
+export interface SelfMaintenanceMetricsInput {
+  dailyReflectionCount?: number;
+  workProfileCount?: number;
+  correctionDocumentCount?: number;
+  versionBackupCount?: number;
+  classifierCalls?: number;
+  classifierSkips?: number;
+  classifierApplied?: number;
+  classifierRejected?: number;
+  averageDurationMs?: number;
+  lockConflicts?: number;
+  hashConflicts?: number;
+  trialRuleCount?: number;
+  confirmedRuleCount?: number;
+  regressedRuleCount?: number;
+  lastUpdatedAt?: string;
+  statusPath?: string;
+}
+
+export function buildSelfMaintenanceMetrics(input: SelfMaintenanceMetricsInput | undefined): Array<{
+  label: string;
+  value: string;
+  updatedAt?: string;
+  statusPath?: string;
+}> {
+  return [
+    { label: '工作档案', value: String(input?.workProfileCount ?? 0) },
+    { label: '每日反思', value: String(input?.dailyReflectionCount ?? 0) },
+    { label: '纠错档案', value: String(input?.correctionDocumentCount ?? 0) },
+    { label: '可回滚版本', value: String(input?.versionBackupCount ?? 0) },
+    { label: '分类器调用', value: `${input?.classifierCalls ?? 0} / 跳过 ${input?.classifierSkips ?? 0}` },
+    { label: '平均耗时', value: `${input?.averageDurationMs ?? 0} ms` },
+    { label: '规则状态', value: `试用 ${input?.trialRuleCount ?? 0} / 已确认 ${input?.confirmedRuleCount ?? 0} / 回归 ${input?.regressedRuleCount ?? 0}` },
+    { label: '并发冲突', value: `锁 ${input?.lockConflicts ?? 0} / 哈希 ${input?.hashConflicts ?? 0}` },
+  ].map((item) => ({ ...item, updatedAt: input?.lastUpdatedAt, statusPath: input?.statusPath }));
+}

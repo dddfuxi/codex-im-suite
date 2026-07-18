@@ -64,4 +64,49 @@ describe('ProviderMemoryIntentHost', () => {
       recentMessages: [],
     }), /classifier aborted/);
   });
+
+  it('uses a strict structured-output schema accepted by current Codex models', async () => {
+    const { ProviderMemoryIntentHost } = await import('../main.js');
+    let capturedSchema: Record<string, any> | undefined;
+    const provider: LLMProvider = {
+      streamChat: (params) => new ReadableStream<string>({
+        start(controller) {
+          capturedSchema = params.responseSchema as Record<string, any>;
+          controller.enqueue(`data: ${JSON.stringify({
+            type: 'text',
+            data: JSON.stringify({
+              action: 'clarify',
+              scope: 'group',
+              confidence: 0.9,
+              reason: 'scope needs confirmation',
+              candidates: [],
+              clarification: '保存到当前群吗？',
+            }),
+          })}\n\n`);
+          controller.close();
+        },
+      }),
+    };
+    const host = new ProviderMemoryIntentHost(provider, 1000);
+
+    await host.classifyMemoryWrite({
+      sessionId: 'strict-memory-schema',
+      channelType: 'feishu',
+      chatId: 'oc_memory',
+      text: '记住这个命名规则',
+      recentMessages: [],
+    });
+
+    const candidateSchema = capturedSchema?.properties?.candidates?.items;
+    assert.equal(candidateSchema?.additionalProperties, false);
+    assert.deepEqual(candidateSchema?.required, ['key', 'value', 'text', 'confidence']);
+    assert.deepEqual(capturedSchema?.required, [
+      'action',
+      'scope',
+      'confidence',
+      'reason',
+      'candidates',
+      'clarification',
+    ]);
+  });
 });

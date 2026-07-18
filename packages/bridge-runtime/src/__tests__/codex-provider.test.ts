@@ -729,6 +729,7 @@ describe('CodexProvider', () => {
 
     assert.equal(classifierClientOptions?.config?.features?.shell_tool, false);
     assert.equal(classifierClientOptions?.config?.features?.plugins, false);
+    assert.equal(classifierClientOptions?.config?.model_reasoning_effort, 'low');
     assert.equal(threadOptions?.sandboxMode, 'read-only');
     assert.equal(threadOptions?.approvalPolicy, 'untrusted');
     assert.equal(threadOptions?.networkAccessEnabled, false);
@@ -993,6 +994,90 @@ describe('CodexProvider', () => {
       capturedStartOptions?.additionalDirectories,
       ['E:\\cli-md', 'F:\\unity'],
     );
+  });
+
+  it('filters bridge-blocked legacy skills while preserving normal personal skills', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      bridgeHome: process.env.CTI_CODEX_HOME,
+      blockedSkills: process.env.CTI_CODEX_BLOCKED_SKILLS,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-filtered-skills-'));
+    const globalHome = path.join(root, 'global');
+    const bridgeHome = path.join(root, 'bridge');
+    fs.mkdirSync(path.join(globalHome, 'skills', 'github-memory-protocol'), { recursive: true });
+    fs.mkdirSync(path.join(globalHome, 'skills', 'memory-repo-retrieval'), { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'skills', 'github-memory-protocol', 'SKILL.md'), 'legacy', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'skills', 'memory-repo-retrieval', 'SKILL.md'), 'allowed', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), '', 'utf8');
+    fs.mkdirSync(bridgeHome, { recursive: true });
+    fs.symlinkSync(path.join(globalHome, 'skills'), path.join(bridgeHome, 'skills'), 'junction');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_HOME = bridgeHome;
+    delete process.env.CTI_CODEX_BLOCKED_SKILLS;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('primary');
+      const skillsRoot = path.join(options.env.CODEX_HOME, 'skills');
+
+      assert.equal(fs.existsSync(path.join(skillsRoot, 'github-memory-protocol')), false);
+      assert.equal(fs.existsSync(path.join(skillsRoot, 'memory-repo-retrieval', 'SKILL.md')), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.bridgeHome === undefined) delete process.env.CTI_CODEX_HOME;
+      else process.env.CTI_CODEX_HOME = saved.bridgeHome;
+      if (saved.blockedSkills === undefined) delete process.env.CTI_CODEX_BLOCKED_SKILLS;
+      else process.env.CTI_CODEX_BLOCKED_SKILLS = saved.blockedSkills;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
+  it('preserves a healthy bridge state database unless an explicit reset is requested', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      bridgeHome: process.env.CTI_CODEX_HOME,
+      resetState: process.env.CTI_CODEX_RESET_STATE,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-state-preserve-'));
+    const globalHome = path.join(root, 'global');
+    const bridgeHome = path.join(root, 'bridge');
+    const statePath = path.join(bridgeHome, 'state_5.sqlite');
+    fs.mkdirSync(globalHome, { recursive: true });
+    fs.mkdirSync(bridgeHome, { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), '', 'utf8');
+    fs.writeFileSync(statePath, 'healthy-state', 'utf8');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_HOME = bridgeHome;
+    delete process.env.CTI_CODEX_RESET_STATE;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      buildCodexClientOptionsForTest('primary');
+
+      assert.equal(fs.readFileSync(statePath, 'utf8'), 'healthy-state');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.bridgeHome === undefined) delete process.env.CTI_CODEX_HOME;
+      else process.env.CTI_CODEX_HOME = saved.bridgeHome;
+      if (saved.resetState === undefined) delete process.env.CTI_CODEX_RESET_STATE;
+      else process.env.CTI_CODEX_RESET_STATE = saved.resetState;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
   });
 
   it('uses the authoritative workspace plan instead of legacy provider paths', async () => {

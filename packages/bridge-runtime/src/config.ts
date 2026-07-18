@@ -515,8 +515,8 @@ export function loadConfig(): Config {
       ? Math.max(1000, Math.min(10 * 60_000, Math.floor(providerCircuitCooldownMs)))
       : 60_000,
     memoryIntentTimeoutMs: typeof memoryIntentTimeoutMs === "number" && Number.isFinite(memoryIntentTimeoutMs)
-      ? Math.max(250, Math.min(15_000, Math.floor(memoryIntentTimeoutMs)))
-      : 4000,
+      ? Math.max(30_000, Math.min(60_000, Math.floor(memoryIntentTimeoutMs)))
+      : 30_000,
     lightChatHistoryLimit: typeof lightChatHistoryLimit === "number" && Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
     lightChatMaxInputChars: typeof lightChatMaxInputChars === "number" && Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,

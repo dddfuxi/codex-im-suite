@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace ClaudeToImControlPanel;
@@ -103,6 +104,23 @@ internal static class MemorySourceLayoutClassifier
 
 internal sealed record AgentHomeEntry(string Name, string Path, bool Exists);
 internal sealed record RootMarkdownDocument(string Name, string Path);
+internal sealed record SelfMaintenanceLayoutSnapshot(
+    int DailyReflectionCount,
+    int WorkProfileCount,
+    int CorrectionDocumentCount,
+    int VersionBackupCount,
+    int ClassifierCalls,
+    int ClassifierSkips,
+    int ClassifierApplied,
+    int ClassifierRejected,
+    int AverageDurationMs,
+    int LockConflicts,
+    int HashConflicts,
+    int TrialRuleCount,
+    int ConfirmedRuleCount,
+    int RegressedRuleCount,
+    string? LastUpdatedAt,
+    string StatusPath);
 
 internal sealed record MemoryLayoutSnapshot(
     string LayoutVersion,
@@ -110,7 +128,8 @@ internal sealed record MemoryLayoutSnapshot(
     int V3SourceCount,
     int LegacySourceCount,
     IReadOnlyList<AgentHomeEntry> AgentHome,
-    IReadOnlyList<RootMarkdownDocument> UnclassifiedRootDocuments);
+    IReadOnlyList<RootMarkdownDocument> UnclassifiedRootDocuments,
+    SelfMaintenanceLayoutSnapshot SelfMaintenance);
 
 internal static class MemoryLayoutInspector
 {
@@ -143,13 +162,122 @@ internal static class MemoryLayoutInspector
             })
             .ToArray();
         var unclassifiedRootDocuments = FindUnclassifiedRootDocuments(root);
+        var selfMaintenance = InspectSelfMaintenance(root);
         return new MemoryLayoutSnapshot(
             v3SourceCount > 0 ? "v3" : legacySourceCount > 0 ? "v2" : "none",
             migrationState,
             v3SourceCount,
             legacySourceCount,
             agentHome,
-            unclassifiedRootDocuments);
+            unclassifiedRootDocuments,
+            selfMaintenance);
+    }
+
+    private static SelfMaintenanceLayoutSnapshot InspectSelfMaintenance(string root)
+    {
+        var statusPath = Path.Combine(root, ".cti-self-history", "status.json");
+        var metricsPath = Path.Combine(root, ".cti-self-history", "metrics.json");
+        string? lastUpdatedAt = null;
+        var classifierCalls = 0;
+        var classifierSkips = 0;
+        var classifierApplied = 0;
+        var classifierRejected = 0;
+        var averageDurationMs = 0;
+        var lockConflicts = 0;
+        var hashConflicts = 0;
+        if (File.Exists(statusPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(statusPath, Encoding.UTF8));
+                if (document.RootElement.TryGetProperty("updatedAt", out var value) && value.ValueKind == JsonValueKind.String)
+                {
+                    lastUpdatedAt = value.GetString();
+                }
+            }
+            catch
+            {
+                // 面板只展示可观察状态；损坏的 status 不应阻断整个内存布局页。
+            }
+        }
+
+        if (File.Exists(metricsPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(metricsPath, Encoding.UTF8));
+                classifierCalls = ReadInt(document.RootElement, "totalCalls");
+                classifierSkips = ReadInt(document.RootElement, "skipped");
+                classifierApplied = ReadInt(document.RootElement, "applied");
+                classifierRejected = ReadInt(document.RootElement, "rejected");
+                averageDurationMs = ReadInt(document.RootElement, "averageDurationMs");
+                lockConflicts = ReadInt(document.RootElement, "lockConflicts");
+                hashConflicts = ReadInt(document.RootElement, "hashConflicts");
+            }
+            catch
+            {
+                // 指标损坏只影响观察数据，不阻断 Memory 页面。
+            }
+        }
+
+        var ruleCounts = CountRuleStatuses(Path.Combine(root, ".cti-self-history", "rules"));
+
+        return new SelfMaintenanceLayoutSnapshot(
+            CountMarkdown(Path.Combine(root, "daily-reflection")),
+            CountNamedMarkdown(Path.Combine(root, "work"), "工作档案.md"),
+            CountMarkdown(Path.Combine(root, "corrections")),
+            CountMarkdown(Path.Combine(root, ".cti-self-history", "versions")),
+            classifierCalls,
+            classifierSkips,
+            classifierApplied,
+            classifierRejected,
+            averageDurationMs,
+            lockConflicts,
+            hashConflicts,
+            ruleCounts.Trial,
+            ruleCounts.Confirmed,
+            ruleCounts.Regressed,
+            lastUpdatedAt,
+            statusPath);
+    }
+
+    private static int ReadInt(JsonElement root, string name)
+    {
+        return root.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : 0;
+    }
+
+    private static (int Trial, int Confirmed, int Regressed) CountRuleStatuses(string root)
+    {
+        if (!Directory.Exists(root)) return (0, 0, 0);
+        var trial = 0;
+        var confirmed = 0;
+        var regressed = 0;
+        try
+        {
+            foreach (var filePath in Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(filePath, Encoding.UTF8));
+                    if (!document.RootElement.TryGetProperty("status", out var value) || value.ValueKind != JsonValueKind.String) continue;
+                    switch (value.GetString())
+                    {
+                        case "trial": trial += 1; break;
+                        case "confirmed": confirmed += 1; break;
+                        case "regressed": regressed += 1; break;
+                    }
+                }
+                catch
+                {
+                    // 单条规则状态损坏时跳过该条。
+                }
+            }
+        }
+        catch
+        {
+            return (0, 0, 0);
+        }
+        return (trial, confirmed, regressed);
     }
 
     private static IReadOnlyList<RootMarkdownDocument> FindUnclassifiedRootDocuments(string root)
@@ -167,6 +295,19 @@ internal static class MemoryLayoutInspector
         catch
         {
             return [];
+        }
+    }
+
+    private static int CountNamedMarkdown(string root, string fileName)
+    {
+        if (!Directory.Exists(root)) return 0;
+        try
+        {
+            return Directory.EnumerateFiles(root, fileName, SearchOption.AllDirectories).Count();
+        }
+        catch
+        {
+            return 0;
         }
     }
 

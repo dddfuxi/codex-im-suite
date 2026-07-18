@@ -274,6 +274,68 @@ export interface MemoryIntentHost {
   classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision>;
 }
 
+export interface AgentHomePromptReadInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  workingDirectory?: string;
+}
+
+export interface AgentHomePromptSectionRecord {
+  id: string;
+  kind: 'identity' | 'policy' | 'skills' | 'memory';
+  source: string;
+  priority: number;
+  content: string;
+}
+
+/** Runtime-owned Agent Home reader. Core never assumes a memory-root path. */
+export interface AgentHomeHost {
+  readPromptSections(input: AgentHomePromptReadInput): Promise<AgentHomePromptSectionRecord[]>;
+}
+
+export interface SelfMaintenanceExecutionEvidence {
+  hasError: boolean;
+  errorMessage?: string;
+  evidenceSatisfied?: boolean;
+  toolUseCount?: number;
+  successfulToolResultCount?: number;
+  failedToolResultCount?: number;
+}
+
+export interface SelfMaintenanceInput {
+  phase: 'correction' | 'outcome';
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  currentUserText: string;
+  previousAssistantText?: string;
+  assistantText?: string;
+  quotedText?: string;
+  workingDirectory?: string;
+  executionEvidence?: SelfMaintenanceExecutionEvidence;
+  abortSignal?: AbortSignal;
+}
+
+export interface SelfMaintenanceResult {
+  applied: boolean;
+  reason: string;
+  changedTargets?: string[];
+  backupCount?: number;
+}
+
+/** 独立于主 Agent 的受控自维护裁决与持久化边界。 */
+export interface SelfMaintenanceHost {
+  maintain(input: SelfMaintenanceInput): Promise<SelfMaintenanceResult>;
+  recordRoutingSkip?(input: {
+    phase: 'correction' | 'outcome';
+    sessionId: string;
+    reason: string;
+  }): Promise<void> | void;
+}
+
 export interface TurnReferenceResolutionInput {
   sessionId: string;
   channelType: string;
@@ -704,8 +766,8 @@ export interface StreamChatParams {
   sessionId: string;
   sdkSessionId?: string;
   forceFreshThread?: boolean;
-  /** classifier 模式必须绕过执行器/工具路由，只允许结构化模型输出。 */
-  interactionMode?: 'agent' | 'classifier';
+  /** classifier/response_only 模式必须绕过执行器与工具路由。 */
+  interactionMode?: 'agent' | 'classifier' | 'response_only';
   /** provider 原生支持时用于约束 classifier 的最终 JSON。 */
   responseSchema?: unknown;
   model?: string;

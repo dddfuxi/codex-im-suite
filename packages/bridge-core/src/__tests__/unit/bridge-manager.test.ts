@@ -3997,11 +3997,13 @@ describe('bridge-manager policy helpers', () => {
   it('routes a confirmed memory write through the primary agent instead of a shortcut reply', async () => {
     let resolveClassifier!: (value: {
       action: 'write';
+      scope: 'long_term';
       confidence: number;
       candidates: Array<{ key: string; value: string; text: string; confidence: number }>;
     }) => void;
     const classifierResult = new Promise<{
       action: 'write';
+      scope: 'long_term';
       confidence: number;
       candidates: Array<{ key: string; value: string; text: string; confidence: number }>;
     }>((resolve) => { resolveClassifier = resolve; });
@@ -4013,11 +4015,13 @@ describe('bridge-manager policy helpers', () => {
       persistMemoryWrite: () => ({ ok: true, skipped: false }),
     } as BridgeStore;
     let providerCalls = 0;
+    let providerParams: StreamChatParams | undefined;
     initBridgeContext({
       store,
       llm: {
-        streamChat: () => {
+        streamChat: (params) => {
           providerCalls += 1;
+          providerParams = params;
           return createTextStream('已判断并完成记忆操作。');
         },
       },
@@ -4051,6 +4055,7 @@ describe('bridge-manager policy helpers', () => {
 
     resolveClassifier({
       action: 'write',
+      scope: 'long_term',
       confidence: 1,
       candidates: [{ key: '项目代号', value: '夜航', text: '项目代号 = 夜航', confidence: 1 }],
     });
@@ -4059,6 +4064,8 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(startCount, 1, 'the memory path must reuse the existing feedback card');
     assert.equal(finalizeCount, 1);
     assert.equal(providerCalls, 1, 'memory writes must not bypass the primary agent with a fixed reply');
+    assert.equal(providerParams?.interactionMode, 'response_only');
+    assert.equal(providerParams?.executionRequirement?.kind, 'none');
   });
 
   it('asks the primary agent to clarify an ambiguous memory scope without writing', async () => {
@@ -4099,6 +4106,56 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(providerCalls, 1);
     assert.equal(writeCalls, 0);
     assert.match(providerSystemPrompt, /这是当前用户、当前群还是公共长期记忆/);
+  });
+
+  it('fails closed through a response-only agent turn when memory classification aborts', async () => {
+    let persistCalls = 0;
+    let providerParams: StreamChatParams | undefined;
+    const sent: OutboundMessage[] = [];
+    const store = {
+      ...createStatefulStore({ remote_bridge_enabled: 'true' }),
+      persistMemoryWrite: () => {
+        persistCalls += 1;
+        return { ok: true, skipped: false };
+      },
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: (params) => {
+          providerParams = params;
+          return createTextStream('记住啦，已经写进旧记忆库。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      memoryIntents: {
+        classifyMemoryWrite: async () => {
+          const error = new Error('classifier aborted');
+          error.name = 'AbortError';
+          throw error;
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_memory_timeout' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '记住HSScene里面的交互物相关：__ArtData\\_Resources\\Prefab\\HospitalSimulation\\Actor\\Prop',
+      'ou_1',
+      'oc_memory_timeout',
+    ));
+
+    assert.equal(persistCalls, 0);
+    assert.equal(providerParams?.interactionMode, 'response_only');
+    assert.equal(providerParams?.executionRequirement?.kind, 'none');
+    assert.match(providerParams?.systemPrompt || '', /记忆意图判断.*中止|记忆意图判断.*超时/);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /未保存|未写入/);
+    assert.doesNotMatch(sent[0].text, /记住啦|已记住|已经写进/);
   });
 
   it('classifies every eligible text turn instead of using a memory-keyword shortcut', async () => {

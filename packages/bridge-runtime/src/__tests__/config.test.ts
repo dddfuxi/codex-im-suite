@@ -528,6 +528,28 @@ describe('loadConfig/saveConfig round-trip', () => {
     }
   });
 
+  it('raises legacy four-second memory intent timeouts above cold classifier startup latency', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-intent-timeout-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_MEMORY_INTENT_TIMEOUT_MS=4000',
+      ].join('\n'), 'utf8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?memory-intent-timeout-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.memoryIntentTimeoutMs, 30000);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not merge legacy Codex additional directories into allowed workspace roots', async () => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-config-'));
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-root-default-'));
