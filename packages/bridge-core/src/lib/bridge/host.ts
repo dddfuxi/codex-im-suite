@@ -895,8 +895,10 @@ export interface ScheduledTaskHistoryInput extends ScheduledTaskMutationInput {
   limit?: number;
 }
 
-export interface ScheduledTaskRetryDeliveryInput extends ScheduledTaskMutationInput {
+export interface ScheduledTaskRetryDeliveryInput {
+  taskId?: string;
   runId: string;
+  actor: ScheduledTaskActorInput;
 }
 
 export interface ScheduledTaskDeleteInput extends ScheduledTaskMutationInput {}
@@ -908,6 +910,7 @@ export interface ScheduledTaskMutationResult {
   nextRunAt?: string;
   message?: string;
   error?: string;
+  feishuCardJson?: string;
 }
 
 export interface ScheduledTaskListResult {

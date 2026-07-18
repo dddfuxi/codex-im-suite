@@ -24,6 +24,7 @@ import type {
   ScheduledTaskRun,
   VersionedScheduledTask,
 } from './scheduled-tasks/types.js';
+import { buildScheduledTaskCard } from './scheduled-tasks/presentation.js';
 
 export type ScheduledTaskActorRole = 'viewer' | 'operator' | 'owner';
 
@@ -359,6 +360,18 @@ function mutationFailure(error: unknown): ScheduledTaskMutationResult {
   return { ok: false, error: error instanceof Error ? error.message : String(error) };
 }
 
+function buildTaskCard(task: VersionedScheduledTask, nextRunAt?: string): string {
+  return buildScheduledTaskCard({
+    taskId: task.id,
+    name: task.name,
+    actionKind: task.action.kind,
+    scheduleKind: task.schedule.kind,
+    timezone: task.schedule.kind === 'every' ? undefined : task.schedule.timezone,
+    nextRunAt,
+    enabled: task.enabled,
+  });
+}
+
 /**
  * 将 bridge-core 的可信动作协议适配为 runtime 持久化协议。
  * 漏跑和重试策略由 runtime 统一给默认值，模型与渠道都不能覆盖。
@@ -401,6 +414,7 @@ export function createBridgeScheduledTaskActionHost(
         taskId: created.task.id,
         name: created.task.name,
         nextRunAt: created.state.nextRunAt,
+        feishuCardJson: buildTaskCard(created.task, created.state.nextRunAt),
       };
     } catch (error) {
       return mutationFailure(error);
@@ -417,7 +431,13 @@ export function createBridgeScheduledTaskActionHost(
         ? result as { name?: string }
         : await options.store.getTask(input.taskId);
       const state = await options.store.getState(input.taskId);
-      return { ok: true, taskId: input.taskId, name: task?.name, nextRunAt: state?.nextRunAt };
+      return {
+        ok: true,
+        taskId: input.taskId,
+        name: task?.name,
+        nextRunAt: state?.nextRunAt,
+        feishuCardJson: task ? buildTaskCard(task as VersionedScheduledTask, state?.nextRunAt) : undefined,
+      };
     } catch (error) {
       return mutationFailure(error);
     }

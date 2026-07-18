@@ -1786,6 +1786,55 @@ describe('bridge-manager result block delivery', () => {
     assert.match(sent[0].text, /已设置提醒：看电脑/);
   });
 
+  it('routes scheduled task callbacks through the shared host without invoking the model', async () => {
+    const sent: OutboundMessage[] = [];
+    const paused: any[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => { throw new Error('scheduled callbacks must not invoke the model'); } },
+      permissions: { resolvePendingPermission: () => false },
+      scheduledTasks: {
+        create: async () => ({ ok: false }),
+        list: async () => ({ ok: true, tasks: [] }),
+        get: async () => ({
+          ok: true,
+          task: {
+            id: 'task_callback_001',
+            name: '喝水',
+            action: { kind: 'notify', text: '喝水' },
+            owner: { channelType: 'feishu', userId: 'ou_1' },
+          },
+        }),
+        pause: async (input) => { paused.push(input); return { ok: true, taskId: input.taskId, name: '喝水' }; },
+        resume: async () => ({ ok: true }),
+        runNow: async () => ({ ok: true }),
+        cancelRun: async () => ({ ok: false }),
+        delete: async () => ({ ok: true }),
+        history: async () => ({ ok: true, runs: [] }),
+        retryDelivery: async () => ({ ok: false }),
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_1', 'oc_123'),
+      messageId: 'card_scheduled_pause',
+      callbackData: 'scheduled-task:pause:task_callback_001',
+      callbackMessageId: 'om_task_card',
+    });
+
+    assert.equal(paused.length, 1);
+    assert.equal(paused[0].taskId, 'task_callback_001');
+    assert.equal(paused[0].actor.userId, 'ou_1');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已暂停计划任务：喝水/);
+  });
+
   it('schedules an owner requested live bridge restart through the fixed bridge control host', async () => {
     const sent: OutboundMessage[] = [];
     const scheduled: unknown[] = [];

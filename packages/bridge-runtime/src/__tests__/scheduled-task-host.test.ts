@@ -10,6 +10,7 @@ import {
   createScheduledTaskRunExecutor,
   createScheduledTaskScheduler,
 } from '../scheduled-task-host.js';
+import { buildScheduledTaskCard, buildScheduledTaskFailureCard } from '../scheduled-tasks/presentation.js';
 import { createScheduledTaskService } from '../scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from '../scheduled-tasks/store.js';
 import type { ScheduledTaskCreate } from '../scheduled-tasks/types.js';
@@ -304,5 +305,35 @@ describe('scheduled task runtime host', () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(cleared, true);
     assert.deepEqual(calls, ['recover', 'tick', 'tick']);
+  });
+
+  it('builds Feishu task and failure cards from redacted summaries only', () => {
+    const card = buildScheduledTaskCard({
+      taskId: 'task_card_001',
+      name: '每日单子',
+      actionKind: 'agent_turn',
+      scheduleKind: 'cron',
+      timezone: 'Asia/Shanghai',
+      nextRunAt: '2026-07-20T02:30:00.000Z',
+      enabled: true,
+    });
+    for (const expected of [
+      '每日单子', '动态 Agent 任务', 'Asia/Shanghai', '2026-07-20',
+      'scheduled-task:pause:task_card_001',
+      'scheduled-task:run:task_card_001',
+      'scheduled-task:history:task_card_001',
+      'scheduled-task:delete:task_card_001',
+    ]) assert.match(card, new RegExp(expected));
+
+    const failure = buildScheduledTaskFailureCard({
+      taskId: 'task_card_001',
+      runId: 'run_failed_001',
+      name: '每日单子',
+      error: '投递超时',
+      executionStatus: 'ok',
+      deliveryStatus: 'failed',
+    });
+    assert.match(failure, /scheduled-task:retry-delivery:run_failed_001/);
+    assert.doesNotMatch(failure, /token|完整工具日志|file contents/iu);
   });
 });

@@ -1290,6 +1290,7 @@ async function executeScheduledTaskActionFromReply(
     return {
       handled: true,
       text: buildScheduledTaskResultText(result, extracted.action.name, extracted.action.taskAction.kind),
+      feishuCardJson: result.feishuCardJson,
       bridgeActionToolName: result.ok ? SCHEDULED_TASK_ACTION_FENCE : undefined,
     };
   }
@@ -1346,6 +1347,7 @@ async function executeReminderActionFromReply(
           notifyTargets,
           error: result.error,
         }),
+        feishuCardJson: result.feishuCardJson,
         bridgeActionToolName: result.ok ? SCHEDULED_TASK_ACTION_FENCE : undefined,
       };
     }
@@ -6219,6 +6221,69 @@ async function handleReminderCompleteCallback(
   });
 }
 
+type ScheduledTaskCallbackAction = 'pause' | 'resume' | 'run' | 'history' | 'delete' | 'retry-delivery';
+
+function resolveScheduledTaskRequiredRole(actionKind: string | undefined): PermissionRole | null {
+  return actionKind === 'controlled_tool' ? 'owner' : null;
+}
+
+function parseScheduledTaskCallback(callbackData: string): { action: ScheduledTaskCallbackAction; id: string } | null {
+  const match = /^scheduled-task:(pause|resume|run|history|delete|retry-delivery):(.+)$/u.exec(callbackData.trim());
+  if (!match) return null;
+  return { action: match[1] as ScheduledTaskCallbackAction, id: match[2].trim() };
+}
+
+async function handleScheduledTaskCallback(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  callback: { action: ScheduledTaskCallbackAction; id: string },
+): Promise<void> {
+  const host = getBridgeContext().scheduledTasks;
+  if (!host) {
+    await deliver(adapter, { address: msg.address, text: '未完成：当前 bridge 没有加载统一计划任务服务。', parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
+    return;
+  }
+  const actor = buildScheduledTaskActor(msg);
+  if (callback.action === 'retry-delivery') {
+    const result = await host.retryDelivery({ runId: callback.id, actor });
+    await deliver(adapter, { address: msg.address, text: result.ok ? '已提交投递重试。' : `未完成：${result.error || '投递重试失败。'}`, parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
+    return;
+  }
+  const current = await host.get({ taskId: callback.id, actor });
+  if (!current.ok || !current.task) {
+    await deliver(adapter, { address: msg.address, text: `未完成：${current.error || '计划任务不存在或无权访问。'}`, parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
+    return;
+  }
+  const task = current.task as { name?: string; action?: { kind?: string } };
+  const requiredRole = resolveScheduledTaskRequiredRole(task.action?.kind);
+  if (requiredRole && !hasRole(msg, requiredRole)) {
+    await deliver(adapter, { address: msg.address, text: buildRoleRequiredMessage(msg, requiredRole), parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
+    return;
+  }
+  if (callback.action === 'history') {
+    const history = await host.history({ taskId: callback.id, actor, limit: 10 });
+    const runs = history.runs as Array<{ queuedAt?: string; executionStatus?: string; deliveryStatus?: string; error?: string }>;
+    const text = history.ok
+      ? [`计划任务历史：${task.name || callback.id}`, ...runs.map((run) => `- ${run.queuedAt || '-'} · 执行 ${run.executionStatus || '-'} · 投递 ${run.deliveryStatus || '-'}${run.error ? ` · ${run.error}` : ''}`)].join('\n')
+      : `未完成：${history.error || '读取运行历史失败。'}`;
+    await deliver(adapter, { address: msg.address, text, parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
+    return;
+  }
+  const operation = callback.action === 'pause' ? host.pause
+    : callback.action === 'resume' ? host.resume
+      : callback.action === 'run' ? host.runNow
+        : host.delete;
+  const result = await operation({ taskId: callback.id, actor });
+  const verb = callback.action === 'pause' ? '暂停' : callback.action === 'resume' ? '恢复' : callback.action === 'run' ? '立即运行' : '删除';
+  await deliver(adapter, {
+    address: msg.address,
+    text: result.ok ? `已${verb}计划任务：${result.name || task.name || callback.id}` : `未完成：${result.error || `${verb}计划任务失败。`}`,
+    parseMode: 'plain',
+    replyToMessageId: msg.callbackMessageId,
+    feishuCardJson: result.feishuCardJson,
+  });
+}
+
 /**
  * Handle a single inbound message.
  */
@@ -6346,6 +6411,12 @@ async function handleMessage(
   if (msg.callbackData) {
     if (msg.callbackData.startsWith('reminder:complete:')) {
       await handleReminderCompleteCallback(adapter, msg);
+      ack();
+      return;
+    }
+    const scheduledTaskCallback = parseScheduledTaskCallback(msg.callbackData);
+    if (scheduledTaskCallback) {
+      await handleScheduledTaskCallback(adapter, msg, scheduledTaskCallback);
       ack();
       return;
     }
@@ -7608,8 +7679,11 @@ async function handleMessage(
     let preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
-    if (preparedReply && directMessageAction.feishuCardJson) {
-      preparedReply.feishuCardJson = directMessageAction.feishuCardJson;
+    const bridgeActionCardJson = bridgeControlAction.feishuCardJson
+      || directMessageAction.feishuCardJson
+      || scheduledTaskAction.feishuCardJson;
+    if (preparedReply && bridgeActionCardJson) {
+      preparedReply.feishuCardJson = bridgeActionCardJson;
     }
     if (preparedReply && !feishuDocRequest) {
       preparedReply = verifyPreparedReplyExecution(preparedReply, {
