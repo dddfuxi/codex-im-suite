@@ -68,6 +68,13 @@ export type ScheduledTaskDelivery = {
   mode: 'result' | 'summary' | 'none';
 };
 
+export type ScheduledTaskDeliveryPayload = {
+  text?: string;
+  parseMode?: 'Markdown' | 'plain';
+  files?: string[];
+  images?: string[];
+};
+
 export type ScheduledTaskMisfirePolicy = {
   mode: 'run_latest' | 'skip';
   maxLatenessMs: number;
@@ -154,6 +161,8 @@ export type ScheduledTaskRun = {
   model?: string;
   messageId?: string;
   cardId?: string;
+  deliveryPayload?: ScheduledTaskDeliveryPayload;
+  executionStarted?: boolean;
 };
 
 export type ScheduledTaskState = {

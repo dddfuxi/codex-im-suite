@@ -24,11 +24,15 @@ export type ScheduledTaskExecutionResult = {
   model?: string;
   messageId?: string;
   cardId?: string;
+  deliveryPayload?: ScheduledTaskRun['deliveryPayload'];
+  executionStarted?: boolean;
 };
 
 export type ScheduledTaskExecuteInput = {
   task: VersionedScheduledTask;
   run: ScheduledTaskRun;
+  mode: 'full' | 'delivery_only';
+  previousRun?: ScheduledTaskRun;
 };
 
 export type ScheduledTaskServiceOptions = {
@@ -40,6 +44,7 @@ export type ScheduledTaskServiceOptions = {
 
 export interface ScheduledTaskService {
   tick(): Promise<number>;
+  recover(): Promise<number>;
   ensureTaskState(taskId: string): Promise<VersionedScheduledTaskState>;
   runNow(taskId: string): Promise<ScheduledTaskRun>;
 }
@@ -158,6 +163,8 @@ export function createScheduledTaskService(
       model: result.model,
       messageId: result.messageId,
       cardId: result.cardId,
+      deliveryPayload: result.deliveryPayload,
+      executionStarted: result.executionStarted,
     };
     await options.store.appendRun(finalized);
 
@@ -204,7 +211,7 @@ export function createScheduledTaskService(
 
     let result: ScheduledTaskExecutionResult;
     try {
-      result = await options.execute({ task, run: runningRun });
+      result = await options.execute({ task, run: runningRun, mode: 'full' });
     } catch (error) {
       result = {
         executionStatus: 'error',
@@ -275,6 +282,7 @@ export function createScheduledTaskService(
   };
 
   const tickOnce = async (): Promise<number> => {
+    await recoverExpiredRuns();
     const tickNow = now();
     let handled = 0;
     for (const task of await options.store.listTasks()) {
@@ -293,8 +301,82 @@ export function createScheduledTaskService(
     return handled;
   };
 
+  const recoverExpiredRuns = async (): Promise<number> => {
+    const recoveryNow = now();
+    const recoveryNowMs = new Date(recoveryNow).getTime();
+    let recovered = 0;
+    for (const task of await options.store.listTasks()) {
+      const state = await options.store.getState(task.id);
+      if (!state) continue;
+
+      if (state.queuedRunId && !state.runningRunId) {
+        await options.store.compareAndSetState(task.id, state.version, {
+          ...state,
+          queuedRunId: undefined,
+        });
+        recovered += 1;
+        continue;
+      }
+
+      if (!state.runningRunId || !state.runningLeaseUntil) continue;
+      const leaseMs = new Date(state.runningLeaseUntil).getTime();
+      if (!Number.isFinite(leaseMs) || leaseMs > recoveryNowMs) continue;
+
+      const previousRun = (await options.store.listRuns(task.id, 200))
+        .find((run) => run.runId === state.runningRunId);
+      if (
+        previousRun
+        && previousRun.executionStatus === 'ok'
+        && previousRun.deliveryStatus === 'failed'
+        && previousRun.deliveryPayload
+      ) {
+        const deliveryResult = await options.execute({
+          task,
+          run: previousRun,
+          mode: 'delivery_only',
+          previousRun,
+        });
+        await finalizeRun(task, previousRun, deliveryResult, false);
+        recovered += 1;
+        continue;
+      }
+
+      const scheduledFor = previousRun?.scheduledFor ?? state.nextRunAt ?? recoveryNow;
+      const interrupted: ScheduledTaskRun = {
+        ...(previousRun ?? createRun(task, scheduledFor, 'scheduled', scheduledFor, recoveryNow)),
+        runId: state.runningRunId,
+        startedAt: previousRun?.startedAt ?? recoveryNow,
+        endedAt: recoveryNow,
+        executionStatus: 'error',
+        deliveryStatus: 'unknown',
+        errorKind: 'interrupted_by_restart',
+        error: '计划任务在 Bridge 重启前未留下终态结果',
+        executionStarted: true,
+      };
+      await options.store.appendRun(interrupted);
+      await options.store.compareAndSetState(task.id, state.version, {
+        ...state,
+        nextRunAt: computeNextScheduledAt(task.schedule, scheduledFor),
+        queuedRunId: undefined,
+        runningRunId: undefined,
+        runningLeaseUntil: undefined,
+        lastRunAt: recoveryNow,
+        lastRunStatus: 'error',
+        lastExecutionStatus: 'error',
+        lastDeliveryStatus: 'unknown',
+        consecutiveErrors: state.consecutiveErrors + 1,
+        consecutiveSkipped: 0,
+        lastError: interrupted.error,
+      });
+      recovered += 1;
+    }
+    return recovered;
+  };
+
   return {
     ensureTaskState,
+
+    recover: recoverExpiredRuns,
 
     async tick() {
       if (runningTick) return runningTick;

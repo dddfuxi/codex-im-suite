@@ -137,4 +137,122 @@ describe('scheduled task service', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('marks an expired unknown run interrupted without replaying it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-recovery-'));
+    try {
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => 'task_recovery_001',
+      });
+      const task = await store.createTask(makeTaskCreate());
+      await store.compareAndSetState(task.id, 0, {
+        taskId: task.id,
+        nextRunAt: '2026-07-20T02:30:00.000Z',
+        runningRunId: 'run_interrupted',
+        runningLeaseUntil: '2026-07-20T02:20:00.000Z',
+        consecutiveErrors: 0,
+        consecutiveSkipped: 0,
+      });
+      await store.appendRun({
+        schema: 'codex-im-suite/scheduled-task-run/v1',
+        taskId: task.id,
+        runId: 'run_interrupted',
+        slotKey: 'slot_interrupted',
+        scheduledFor: '2026-07-20T02:30:00.000Z',
+        trigger: 'scheduled',
+        attempt: 1,
+        queuedAt: '2026-07-20T02:10:00.000Z',
+        startedAt: '2026-07-20T02:11:00.000Z',
+        executionStatus: 'running',
+        deliveryStatus: 'pending',
+      });
+      let executed = false;
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-20T02:30:00.000Z',
+        execute: async () => {
+          executed = true;
+          return { executionStatus: 'ok', deliveryStatus: 'delivered' };
+        },
+      });
+
+      const recovered = await service.recover();
+
+      assert.equal(recovered, 1);
+      assert.equal(executed, false);
+      const run = (await store.listRuns(task.id, 10))[0];
+      assert.equal(run?.executionStatus, 'error');
+      assert.equal(run?.errorKind, 'interrupted_by_restart');
+      const state = await store.getState(task.id);
+      assert.equal(state?.runningRunId, undefined);
+      assert.equal(state?.lastRunStatus, 'error');
+      assert.equal(state?.consecutiveErrors, 1);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a successful execution by retrying delivery only', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-delivery-recovery-'));
+    try {
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => 'task_delivery_001',
+      });
+      const task = await store.createTask(makeTaskCreate());
+      await store.compareAndSetState(task.id, 0, {
+        taskId: task.id,
+        nextRunAt: '2026-07-20T02:30:00.000Z',
+        runningRunId: 'run_delivery_failed',
+        runningLeaseUntil: '2026-07-20T02:20:00.000Z',
+        consecutiveErrors: 0,
+        consecutiveSkipped: 0,
+      });
+      await store.appendRun({
+        schema: 'codex-im-suite/scheduled-task-run/v1',
+        taskId: task.id,
+        runId: 'run_delivery_failed',
+        slotKey: 'slot_delivery_failed',
+        scheduledFor: '2026-07-20T02:30:00.000Z',
+        trigger: 'scheduled',
+        attempt: 1,
+        queuedAt: '2026-07-20T02:10:00.000Z',
+        startedAt: '2026-07-20T02:11:00.000Z',
+        endedAt: '2026-07-20T02:12:00.000Z',
+        executionStatus: 'ok',
+        deliveryStatus: 'failed',
+        deliveryPayload: { text: '已经生成的每日单子' },
+        error: '503 Service Unavailable',
+      });
+      const modes: string[] = [];
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-20T02:30:00.000Z',
+        execute: async ({ mode, previousRun }) => {
+          modes.push(mode);
+          assert.equal(previousRun?.deliveryPayload?.text, '已经生成的每日单子');
+          return {
+            executionStatus: 'ok',
+            deliveryStatus: 'delivered',
+            deliveryPayload: previousRun?.deliveryPayload,
+            messageId: 'om_recovered',
+          };
+        },
+      });
+
+      const recovered = await service.recover();
+
+      assert.equal(recovered, 1);
+      assert.deepEqual(modes, ['delivery_only']);
+      const run = (await store.listRuns(task.id, 10))[0];
+      assert.equal(run?.deliveryStatus, 'delivered');
+      assert.equal(run?.messageId, 'om_recovered');
+      const state = await store.getState(task.id);
+      assert.equal(state?.runningRunId, undefined);
+      assert.equal(state?.nextRunAt, '2026-07-21T02:30:00.000Z');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
