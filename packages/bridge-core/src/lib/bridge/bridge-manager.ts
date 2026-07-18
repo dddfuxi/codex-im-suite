@@ -7020,6 +7020,7 @@ async function handleMessage(
       chatId: msg.address.chatId,
       messageId: msg.messageId,
       currentText: rawText,
+      currentTimestamp: msg.timestamp,
       currentActor: {
         id: msg.address.userId,
         displayName: msg.address.displayName,

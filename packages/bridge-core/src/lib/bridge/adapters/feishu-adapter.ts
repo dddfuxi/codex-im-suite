@@ -4448,6 +4448,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             replyTargetMessageId,
             trimmedUserText,
             msg.mentions,
+            timestamp,
           );
           if (lightContext) rawMetadata.feishuConversationContext = lightContext;
         }
@@ -7412,6 +7413,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     replyTargetMessageId: string | null,
     userText: string,
     nativeMentions: FeishuMessageEventData['message']['mentions'] = [],
+    currentMessageTimestamp?: number,
   ): Promise<FeishuLightContext | null> {
     const limit = this.getLightContextMessageLimit();
     if (limit <= 0 || !userText.trim()) return null;
@@ -7444,6 +7446,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
       for (const item of recentMessages) {
         if (selected.size >= selectionLimit) break;
+        const itemTimestamp = Number.parseInt(item.create_time, 10);
+        if (
+          Number.isFinite(currentMessageTimestamp)
+          && Number.isFinite(itemTimestamp)
+          && itemTimestamp > (currentMessageTimestamp as number)
+        ) continue;
         if (!this.isLightContextHistoryItem(item, currentMessageId, { includeBotMessages })) continue;
         selected.set(item.message_id, item);
       }

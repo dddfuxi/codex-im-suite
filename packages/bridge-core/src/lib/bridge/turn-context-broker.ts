@@ -5,6 +5,7 @@ import type {
 import {
   createTurnEvidenceEnvelope,
   formatStructuredTurnContext,
+  resolveUnrecoveredReplyFallback,
   resolveTurnFocus,
   validateAgentTurnFocusDecision,
   type TurnEvidenceActor,
@@ -35,6 +36,7 @@ export interface ResolveStructuredTurnContextInput {
   chatId: string;
   messageId: string;
   currentText: string;
+  currentTimestamp?: number;
   currentActor?: TurnEvidenceActor;
   abortSignal?: AbortSignal;
   platformEvidence?: TurnEvidenceItem[];
@@ -70,7 +72,13 @@ function appendEvidence(
 export async function resolveStructuredTurnContext(
   input: ResolveStructuredTurnContextInput,
 ): Promise<ResolvedStructuredTurnContext> {
-  const evidence = [...(input.platformEvidence || [])];
+  const currentTimestamp = Number.isFinite(input.currentTimestamp)
+    ? input.currentTimestamp as number
+    : undefined;
+  const evidence = (input.platformEvidence || []).filter((item) =>
+    currentTimestamp === undefined
+    || !Number.isFinite(item.timestamp)
+    || (item.timestamp as number) <= currentTimestamp);
   const evidenceIds = new Set(evidence.map((item) => item.id));
 
   for (const [index, mention] of (input.mentions || []).entries()) {
@@ -132,6 +140,7 @@ export async function resolveStructuredTurnContext(
     chatId: input.chatId,
     messageId: input.messageId,
     currentText: input.currentText,
+    currentTimestamp,
     currentActor: input.currentActor,
     evidence,
   });
@@ -158,6 +167,10 @@ export async function resolveStructuredTurnContext(
       // 解析 Agent 是增强层；失败时保留 ambiguous 决策，让主 Agent只追问最小缺口。
       console.warn('[context-broker] Turn reference resolver failed:', error instanceof Error ? error.message : error);
     }
+  }
+
+  if (decision.requiresAgentResolution) {
+    decision = resolveUnrecoveredReplyFallback(envelope, decision);
   }
 
   return {

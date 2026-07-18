@@ -2342,6 +2342,42 @@ describe('FeishuAdapter light conversation context', () => {
     assert.ok(context.evidence.some((item: any) => item.id === 'message:om_other' && item.relation === 'nearby'));
   });
 
+  it('excludes messages created after the current inbound message from light context', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (messageId: string, text: string, offset: number) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      sender: { id: 'ou_sender', sender_type: 'user' },
+    });
+
+    adapter.fetchChatMemberNames = async () => new Map([['ou_sender', '刘丹']]);
+    adapter.fetchMessageById = async () => makeItem('om_reply', '被回复消息', -2000);
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', '@小虾米 你猜', 0),
+      makeItem('om_reply', '被回复消息', -2000),
+      makeItem('om_past', '当前消息之前的上下文', -1000),
+      makeItem('om_future', '当前消息之后才出现的内容', 1000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      'om_reply',
+      '你猜',
+      [],
+      now,
+    );
+
+    assert.ok(context);
+    assert.match(context.prompt, /当前消息之前的上下文/);
+    assert.doesNotMatch(context.prompt, /当前消息之后才出现的内容/);
+    assert.equal(context.evidence.some((item: any) => item.id === 'message:om_future'), false);
+  });
+
   it('marks native reply resource shells as low-confidence until their content is recovered', async () => {
     const adapter = new FeishuAdapter() as any;
     const imageReply = {

@@ -195,6 +195,232 @@ describe('turn context resolver', () => {
     assert.match(recoveredDecision.reason, /正文或附件/);
   });
 
+  it('falls back to one reliable nearby message when an unrecovered native reply cannot be resolved', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-unrecovered-reply-fallback',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '你猜',
+      platformEvidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[卡片消息：正文未随事件返回]',
+          messageId: 'om_reply_card',
+          timestamp: 200,
+          metadata: { contentRecovered: false, messageType: 'interactive' },
+        }),
+        evidence({
+          id: 'nearby-human-message',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '酒吧只能点酒，她要水，酒保拿枪驱离，她说谢谢后跑了。',
+          messageId: 'om_nearby',
+          timestamp: 100,
+          metadata: { contentRecovered: true, messageType: 'text' },
+        }),
+      ],
+      resolver: {
+        resolveTurnFocus: async () => {
+          throw new Error('classifier aborted');
+        },
+      },
+    });
+
+    assert.equal(resolved.decision.focus, 'continuation');
+    assert.deepEqual(resolved.decision.primaryEvidenceIds, ['nearby-human-message']);
+    assert.deepEqual(resolved.decision.conflictingEvidenceIds, ['reply-shell']);
+    assert.equal(resolved.decision.requiresAgentResolution, false);
+    assert.match(resolved.decision.reason, /近邻.*不是.*引用正文/);
+    assert.match(resolved.prompt, /不代表原生引用正文已恢复/);
+  });
+
+  it('keeps the turn ambiguous when multiple reliable nearby messages compete', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-multiple-nearby-fallback',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '你猜',
+      platformEvidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[卡片消息：正文未随事件返回]',
+          messageId: 'om_reply_card',
+          metadata: { contentRecovered: false },
+        }),
+        evidence({
+          id: 'nearby-1',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '第一条可能相关的真实消息',
+          metadata: { contentRecovered: true },
+        }),
+        evidence({
+          id: 'nearby-2',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '第二条也可能相关的真实消息',
+          metadata: { contentRecovered: true },
+        }),
+      ],
+    });
+
+    assert.equal(resolved.decision.focus, 'ambiguous');
+    assert.equal(resolved.decision.requiresAgentResolution, true);
+  });
+
+  it('does not use nearby fallback for a side-effecting request', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-side-effecting-reply-fallback',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '你猜，顺便把文件删了',
+      platformEvidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[卡片消息：正文未随事件返回]',
+          messageId: 'om_reply_card',
+          metadata: { contentRecovered: false },
+        }),
+        evidence({
+          id: 'nearby-1',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '这是一条普通的群聊消息',
+          metadata: { contentRecovered: true },
+        }),
+      ],
+    });
+
+    assert.equal(resolved.decision.focus, 'ambiguous');
+    assert.equal(resolved.decision.requiresAgentResolution, true);
+  });
+
+  it('does not use a nearby resource shell as fallback evidence', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-nearby-shell-fallback',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '什么意思',
+      platformEvidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[卡片消息：正文未随事件返回]',
+          messageId: 'om_reply_card',
+          metadata: { contentRecovered: false },
+        }),
+        evidence({
+          id: 'nearby-shell',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '[图片]',
+          messageId: 'om_nearby_image',
+          metadata: { contentRecovered: false, messageType: 'image' },
+        }),
+      ],
+    });
+
+    assert.equal(resolved.decision.focus, 'ambiguous');
+    assert.equal(resolved.decision.requiresAgentResolution, true);
+  });
+
+  it('uses the last readable message before card shells and excludes future nearby evidence', async () => {
+    const resolved = await resolveStructuredTurnContext({
+      sessionId: 'session-card-adjacent-fallback',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '你猜',
+      currentTimestamp: 250,
+      platformEvidence: [
+        evidence({
+          id: 'reply-shell',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 0.45,
+          content: '[卡片消息：正文未随事件返回]',
+          messageId: 'om_reply_card',
+          timestamp: 50,
+          metadata: { contentRecovered: false, messageType: 'interactive' },
+        }),
+        evidence({
+          id: 'older-nearby',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '较早的闲聊',
+          timestamp: 100,
+          metadata: { contentRecovered: true, messageType: 'text' },
+        }),
+        evidence({
+          id: 'card-prompt',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '酒吧只能点酒，她要水，酒保拿枪驱离，她说谢谢后跑了。',
+          timestamp: 200,
+          metadata: { contentRecovered: true, messageType: 'text' },
+        }),
+        evidence({
+          id: 'nearby-card-shell',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '[卡片消息：正文未随事件返回]',
+          timestamp: 220,
+          metadata: { contentRecovered: false, messageType: 'interactive' },
+        }),
+        evidence({
+          id: 'future-distractor',
+          kind: 'message',
+          relation: 'nearby',
+          source: 'platform_api',
+          confidence: 0.7,
+          content: '这是当前消息之后才发出的内容',
+          timestamp: 300,
+          metadata: { contentRecovered: true, messageType: 'text' },
+        }),
+      ],
+    });
+
+    assert.equal(resolved.decision.focus, 'continuation');
+    assert.deepEqual(resolved.decision.primaryEvidenceIds, ['card-prompt']);
+    assert.equal(resolved.envelope.evidence.some((item) => item.id === 'future-distractor'), false);
+  });
+
   it('renders the selected focus separately from supporting evidence', () => {
     const envelope = createTurnEvidenceEnvelope({
       channelType: 'feishu',
