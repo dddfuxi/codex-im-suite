@@ -16,6 +16,7 @@ import {
   buildToolResultPrompt,
   buildFallbackJsonToolRequest,
   executeJsonToolRequest,
+  injectMcpArtifactRoot,
   isJsonToolProtocolEligible,
   parseJsonToolRequest,
   planConfiguredJsonToolRequest,
@@ -24,6 +25,15 @@ import {
 } from '../local-agent-tool-protocol.js';
 
 describe('local agent JSON tool protocol', () => {
+  it('forces the runtime turn artifact directory into MCP call arguments', () => {
+    const artifactDirectory = path.join(os.tmpdir(), 'cti-artifacts', 'session-1', 'turn-1');
+    assert.deepEqual(
+      injectMcpArtifactRoot({ output_path: 'preview.png', artifact_root: 'C:\\untrusted' }, artifactDirectory),
+      { output_path: 'preview.png', artifact_root: artifactDirectory },
+    );
+    assert.deepEqual(injectMcpArtifactRoot({ output_path: 'preview.png' }, undefined), { output_path: 'preview.png' });
+  });
+
   it('parses a strict JSON tool request from local model text', () => {
     const request = parseJsonToolRequest('{"action":"tool_request","tool":"list_dir","args":{"path":"Game","kind":"folders"}}');
 

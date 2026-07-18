@@ -1007,6 +1007,18 @@ function validateMcpCallRequest(request: JsonToolRequest): JsonToolValidation {
   };
 }
 
+export function injectMcpArtifactRoot(
+  args: Record<string, unknown>,
+  artifactDirectory: string | undefined,
+): Record<string, unknown> {
+  if (!artifactDirectory?.trim()) return { ...args };
+  return {
+    ...args,
+    // runtime 生成的回合目录具有最高优先级，禁止模型覆盖到 cwd 或任意路径。
+    artifact_root: path.resolve(artifactDirectory),
+  };
+}
+
 function validateUnityMcpExecuteCodeRequest(request: JsonToolRequest): JsonToolValidation {
   const code = typeof request.args.code === 'string' ? request.args.code.trim() : '';
   if (!code) return { ok: false, error: 'unity_mcp_execute_code request is missing args.code' };

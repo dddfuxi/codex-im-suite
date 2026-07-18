@@ -16,6 +16,7 @@ interface ParsedArgs {
   command: Command;
   imagePath: string;
   outputPath?: string;
+  artifactRoot?: string;
   language: Language;
   detail: Detail;
   context?: string;
@@ -28,10 +29,12 @@ function printHelp(): void {
   console.log(`
 MCP-for-Picture CLI
 
+Relative or omitted output paths require --artifact-root or CTI_ARTIFACT_ROOT.
+
 Usage:
   npm run cli -- describe --image <path> [--language zh|en] [--detail brief|standard|rich] [--context "..."]
-  npm run cli -- subject --image <path> [--output <path>] [--language zh|en] [--detail brief|standard|rich] [--context "..."]
-  npm run cli -- objects --image <path> [--output <path>] [--category <name>] [--style arrow|numbered] [--language zh|en]
+  npm run cli -- subject --image <path> [--output <path>] [--artifact-root <dir>] [--language zh|en] [--detail brief|standard|rich] [--context "..."]
+  npm run cli -- objects --image <path> [--output <path>] [--artifact-root <dir>] [--category <name>] [--style arrow|numbered] [--language zh|en]
   npm run cli -- remember --image <path> [--note "..."] [--context "..."]
   npm run cli -- recall --image <path>
 `.trim());
@@ -70,6 +73,7 @@ function parseArgs(argv: string[]): ParsedArgs | { error: string } {
     command: commandRaw as Command,
     imagePath,
     outputPath: args.get("output")?.trim(),
+    artifactRoot: args.get("artifact-root")?.trim() || process.env.CTI_ARTIFACT_ROOT?.trim(),
     language: args.get("language") === "en" ? "en" : "zh",
     detail,
     context: args.get("context")?.trim(),
@@ -162,6 +166,7 @@ async function main(): Promise<void> {
       detail: parsed.detail,
       context: parsed.context,
       output_path: parsed.outputPath,
+      artifact_root: parsed.artifactRoot,
     });
     if ("error" in result) {
       console.error(result.error);
@@ -189,6 +194,7 @@ async function main(): Promise<void> {
     context: parsed.context,
     style: parsed.style,
     output_path: parsed.outputPath,
+    artifact_root: parsed.artifactRoot,
   });
   if ("error" in result) {
     console.error(result.error);

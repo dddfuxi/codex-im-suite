@@ -30,6 +30,7 @@ import {
   collectJsonToolArtifacts,
   buildFallbackJsonToolRequest,
   executeJsonToolRequest,
+  injectMcpArtifactRoot,
   isJsonToolProtocolEligible,
   normalizeGeneratedToolFinalText,
   parseJsonToolRequest,
@@ -1015,7 +1016,11 @@ export class CodexLocalCliProvider implements LLMProvider {
 
       let toolResult: JsonToolResult;
       if (validation.ok) {
-        toolResult = await this.executeValidatedJsonToolRequest(validation.request, params.executionRequirement?.requiredToolFamilies || []);
+        toolResult = await this.executeValidatedJsonToolRequest(
+          validation.request,
+          params.executionRequirement?.requiredToolFamilies || [],
+          params.artifactDirectory,
+        );
       } else {
         toolResult = { tool: request.tool, ok: false, error: validation.error };
       }
@@ -1160,7 +1165,11 @@ export class CodexLocalCliProvider implements LLMProvider {
     controller.enqueue(sseEvent('result', usage ? { usage } : {}));
   }
 
-  private async executeValidatedJsonToolRequest(request: JsonToolRequest, requiredFamilies: string[] = []): Promise<JsonToolResult> {
+  private async executeValidatedJsonToolRequest(
+    request: JsonToolRequest,
+    requiredFamilies: string[] = [],
+    artifactDirectory?: string,
+  ): Promise<JsonToolResult> {
     if (request.tool !== 'mcp_call' && request.tool !== 'unity_mcp_execute_code') return executeJsonToolRequest(request);
 
     const startedAt = Date.now();
@@ -1187,8 +1196,8 @@ export class CodexLocalCliProvider implements LLMProvider {
         : 'execute_code';
       const args = request.tool === 'mcp_call'
         ? request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
-          ? request.args.arguments as Record<string, unknown>
-          : {}
+          ? injectMcpArtifactRoot(request.args.arguments as Record<string, unknown>, artifactDirectory)
+          : injectMcpArtifactRoot({}, artifactDirectory)
         : {
           action: 'execute',
           code: String(request.args.code || ''),

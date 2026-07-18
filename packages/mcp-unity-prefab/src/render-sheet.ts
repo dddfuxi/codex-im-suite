@@ -107,6 +107,7 @@ export async function renderPrefabSheet(input: {
   folderPath: string;
   prefabs: PrefabRecord[];
   outputPath: string;
+  artifactRoot?: string;
   columns: number;
 }): Promise<string> {
   const columns = Math.max(1, input.columns);
@@ -151,7 +152,7 @@ export async function renderPrefabSheet(input: {
     });
   }
 
-  const outputPath = path.resolve(process.cwd(), input.outputPath);
+  const outputPath = resolvePrefabSheetOutputPath(input.outputPath, input.artifactRoot);
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
 
   await sharp({
@@ -167,4 +168,22 @@ export async function renderPrefabSheet(input: {
     .toFile(outputPath);
 
   return outputPath;
+}
+
+export function resolvePrefabSheetOutputPath(outputPath: string, artifactRoot?: string): string {
+  const requested = outputPath.trim();
+  if (!requested) throw new Error("outputPath is required");
+  if (path.isAbsolute(requested)) return path.resolve(requested);
+
+  const configuredRoot = artifactRoot?.trim() || process.env.CTI_ARTIFACT_ROOT?.trim() || "";
+  if (!configuredRoot) {
+    throw new Error("artifact_root is required when output_path is relative");
+  }
+  const root = path.resolve(configuredRoot);
+  const resolved = path.resolve(root, requested);
+  const relative = path.relative(root, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`output_path is outside artifact_root: ${resolved}`);
+  }
+  return resolved;
 }

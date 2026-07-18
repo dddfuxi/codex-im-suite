@@ -905,6 +905,7 @@ flowchart TD
 - 图片标注。
 - 视觉布局辅助。
 - 图片工作流中间能力。
+- 生成图片默认或相对 `output_path` 必须结合 runtime 注入的 `artifact_root` 解析；缺少受控根时失败关闭，禁止回退 `process.cwd()\output`。显式绝对路径保留给已通过上层项目写入门禁的调用。
 
 ### 3.5 packages/mcp-unity-prefab
 
@@ -915,6 +916,7 @@ Unity Prefab MCP，定位为独立 Unity 资源分析/生成能力。
 - Prefab 扫描。
 - Prefab 数据服务。
 - Unity 资源侧辅助。
+- Prefab 预览图的默认/相对输出同样基于 `artifact_root`，`render-sheet.ts` 只接收解析后的受控路径，不再把相对路径拼到 MCP 进程 cwd。
 
 ### 3.6 packages/mcp-ignis
 
@@ -1169,6 +1171,7 @@ MCP 安全规则：
 - MCP manifest 的 `cwd` 必须真实存在且是目录；不存在时健康检查、启动、列工具和调用工具都会失败，不再 fallback 到 suite root 隐藏配置错误。
 - MCP 的 `cwd` 必须命中当前默认工作区、允许根目录、Unity 工程路径或用户扩展包根目录。
 - 不符合时拒绝启动、检查、列工具和调用工具；Unity MCP 在 `tools/list` 和 `tools/call` 前还会校验当前 Editor 项目一致性，避免把 ST3/ST4 之类错绑项目的工具目录或工具结果交给 agent。`scripts/validate-extension-manifests.ps1` 也会在发布前拦截缺 `cwd` 的 MCP manifest。
+- 产物类 `mcp_call` 由 runtime 使用本轮 `TurnStorageHost` 返回的目录强制覆盖注入 `artifact_root`；模型传入的同名字段不可信。Picture MCP 与 Unity Prefab MCP 的默认或相对输出只能位于该根内，`../` 越界会拒绝，缺根会失败关闭；绝对 `output_path` 是兼容的显式输出入口，必须由后续项目注册表和写入门禁裁决，MCP 不得自行猜测项目根。
 - `mcp-bridge` 对 HTTP MCP 和 stdio MCP 都提供统一的 `tools/list` 与 `tools/call` 能力；stdio MCP 通过 manifest launcher 按需启动，完成 JSON-RPC 调用后关闭进程树。
 - Unity 截图、Blender 操作等复杂任务默认走 Codex 主脑，不由本地 MCP 快路径接管。
 - Ignis MCP 允许本地模型快路径直接提交和查询创意生成任务，但不接收仓库内保存的密钥。

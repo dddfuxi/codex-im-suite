@@ -94,6 +94,7 @@ import {
   buildVisibleToolOutcomeFallback,
   collectJsonToolArtifacts,
   executeJsonToolRequest,
+  injectMcpArtifactRoot,
   parseJsonToolRequest,
   validateJsonToolRequest,
   type JsonToolRequest,
@@ -1104,7 +1105,11 @@ class ManifestSlimCodexProvider implements LLMProvider {
             input: executableRequest.args,
           }));
           const toolResult = validation.ok
-            ? await this.executeValidatedJsonToolRequest(executableRequest, slim.params.executionRequirement?.requiredToolFamilies || [])
+            ? await this.executeValidatedJsonToolRequest(
+              executableRequest,
+              slim.params.executionRequirement?.requiredToolFamilies || [],
+              slim.params.artifactDirectory,
+            )
             : { tool: executableRequest.tool, ok: false, error: validation.error } as JsonToolResult;
           controller.enqueue(sseEvent('tool_result', {
             tool_use_id: toolId,
@@ -1205,7 +1210,11 @@ class ManifestSlimCodexProvider implements LLMProvider {
     ].filter((item): item is string => !!item && item.trim().length > 0);
   }
 
-  private async executeValidatedJsonToolRequest(request: JsonToolRequest, requiredFamilies: string[] = []): Promise<JsonToolResult> {
+  private async executeValidatedJsonToolRequest(
+    request: JsonToolRequest,
+    requiredFamilies: string[] = [],
+    artifactDirectory?: string,
+  ): Promise<JsonToolResult> {
     if (request.tool !== 'mcp_call' && request.tool !== 'unity_mcp_execute_code') return executeJsonToolRequest(request);
 
     const startedAt = Date.now();
@@ -1228,8 +1237,8 @@ class ManifestSlimCodexProvider implements LLMProvider {
       const toolName = request.tool === 'mcp_call' ? String(request.args.tool || '') : 'execute_code';
       const args = request.tool === 'mcp_call'
         ? request.args.arguments && typeof request.args.arguments === 'object' && !Array.isArray(request.args.arguments)
-          ? request.args.arguments as Record<string, unknown>
-          : {}
+          ? injectMcpArtifactRoot(request.args.arguments as Record<string, unknown>, artifactDirectory)
+          : injectMcpArtifactRoot({}, artifactDirectory)
         : {
           action: 'execute',
           code: String(request.args.code || ''),
