@@ -805,7 +805,7 @@ sequenceDiagram
 - `notify` 发送固定内容；`agent_turn` 每次运行重新生成结果；`controlled_tool` 只调用 Runtime registry 中 Owner-only 的受控工具。
 - 同一计划槽使用稳定 `slotKey`，运行记录保存执行状态、投递状态和恢复信息。Bridge 重启后只恢复可证明安全的运行；未知副作用不自动重放。
 - 执行成功但飞书投递失败时保存原 delivery payload，只重试投递，不重新运行 Agent。
-- `agent_turn` 的绑定工作区每次重新解析，不可用时失败关闭。`workspaceMode=none` 的目标是无项目工作区，不能回退默认 cwd；该硬约束仍需在最终 live 验收中确认所有 Provider 均遵守。
+- `agent_turn` 的绑定工作区每次重新解析，不可用时失败关闭。`workspaceMode=none` 会为当前回合创建只读临时空白沙箱，构造唯一 `TurnWorkspacePlan` 并传给所有 Provider；沙箱不挂载注册项目、`CTI_HOME`、记忆库或上传缓存，回合结束后立即清理，因此不会回退默认 cwd。
 - `scheduled-task-cli.mjs` 提供 Store 级 list/get/pause/resume/delete/history/status 和旧 direct reminder 迁移。需要活跃 daemon controller 的 run-now/cancel-run/retry-delivery 当前明确返回未开放，控制面板按 capabilities 禁用。
 - 旧 `data\todos\direct-reminders\*.md` 只读兼容；迁移默认 dry-run，Apply 前检查 Bridge/watcher、校验 source hash、备份、冲突不覆盖并写迁移清单。新提醒不再进入记忆 Markdown。
 - `extensions/skills/manage-codex-im-scheduled-tasks` 只指导 Agent 选择动作和协议，不直接操作 Store 或飞书 API。

@@ -69,6 +69,7 @@ import {
   createBridgeScheduledTaskActionHost,
   createScheduledTaskRunExecutor,
   createScheduledTaskScheduler,
+  withScheduledTaskIsolatedWorkspace,
 } from './scheduled-task-host.js';
 import { createScheduledTaskService } from './scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from './scheduled-tasks/store.js';
@@ -3184,6 +3185,11 @@ async function main(): Promise<void> {
 
   const scheduledTaskRuntimeAbort = new AbortController();
   const scheduledTaskStore = createFileScheduledTaskStore(path.join(CTI_HOME, 'data', 'scheduled-tasks'));
+  const scheduledTaskDeniedRoots = [
+    { path: CTI_HOME, reason: 'bridge runtime data' },
+    ...(config.memoryRepoDir ? [{ path: config.memoryRepoDir, reason: 'memory repository' }] : []),
+    ...(config.uploadCacheDir ? [{ path: config.uploadCacheDir, reason: 'upload cache' }] : []),
+  ];
   let scheduledTaskService: ReturnType<typeof createScheduledTaskService>;
   const scheduledTaskExecute = createScheduledTaskRunExecutor({
     runtimeSignal: scheduledTaskRuntimeAbort.signal,
@@ -3202,11 +3208,7 @@ async function main(): Promise<void> {
           prompt: '',
           currentWorkingDirectory: boundDirectory,
           registeredRoots: config.allowedWorkspaceRoots,
-          deniedRoots: [
-            { path: CTI_HOME, reason: 'bridge runtime data' },
-            ...(config.memoryRepoDir ? [{ path: config.memoryRepoDir, reason: 'memory repository' }] : []),
-            ...(config.uploadCacheDir ? [{ path: config.uploadCacheDir, reason: 'upload cache' }] : []),
-          ],
+          deniedRoots: scheduledTaskDeniedRoots,
           requiresWrite: true,
         });
         if (path.resolve(plan.primaryWorkspace.path) !== path.resolve(boundDirectory)) {
@@ -3221,26 +3223,36 @@ async function main(): Promise<void> {
       const runSessionId = task.action.kind === 'agent_turn' && task.action.sessionMode === 'bound'
         ? task.executionContext.sourceSessionId
         : `${task.executionContext.sourceSessionId}:scheduled:${task.id}:${run.runId}`;
+      let executionStarted = false;
       try {
-        const roots = workspacePlan ? getWorkspacePlanRoots(workspacePlan) : [];
-        const responseText = await collectScheduledTaskAgentResponse(llm, {
-          prompt: task.action.kind === 'agent_turn' ? task.action.prompt : '',
-          sessionId: runSessionId,
-          forceFreshThread: task.action.kind === 'agent_turn' && task.action.sessionMode === 'isolated',
-          interactionMode: 'agent',
-          workspacePlan,
-          workingDirectory: workspacePlan?.primaryWorkspace.path,
-          additionalDirectories: roots.slice(1),
-          sourceUserId: task.owner.userId,
-          sourceMessageId: task.owner.sourceMessageId,
-          sourceChannelType: task.delivery.channelType,
-          sourceChatId: task.delivery.chatId,
-          systemPrompt: [
-            '这是统一计划任务触发的后台 Agent 回合。',
-            '必须基于运行时当前状态生成新结果；不得声称已投递，投递由独立 Delivery 层完成。',
-            '如果需要新的交互授权，必须失败关闭，不得等待或伪造授权。',
-          ].join('\n'),
-        }, signal);
+        const executeInWorkspace = async (effectiveWorkspacePlan: NonNullable<typeof workspacePlan>) => {
+          const roots = getWorkspacePlanRoots(effectiveWorkspacePlan);
+          executionStarted = true;
+          return collectScheduledTaskAgentResponse(llm, {
+            prompt: task.action.kind === 'agent_turn' ? task.action.prompt : '',
+            sessionId: runSessionId,
+            forceFreshThread: task.action.kind === 'agent_turn' && task.action.sessionMode === 'isolated',
+            interactionMode: 'agent',
+            workspacePlan: effectiveWorkspacePlan,
+            workingDirectory: effectiveWorkspacePlan.primaryWorkspace.path,
+            additionalDirectories: roots.slice(1),
+            sourceUserId: task.owner.userId,
+            sourceMessageId: task.owner.sourceMessageId,
+            sourceChannelType: task.delivery.channelType,
+            sourceChatId: task.delivery.chatId,
+            systemPrompt: [
+              '这是统一计划任务触发的后台 Agent 回合。',
+              '必须基于运行时当前状态生成新结果；不得声称已投递，投递由独立 Delivery 层完成。',
+              '如果需要新的交互授权，必须失败关闭，不得等待或伪造授权。',
+              '工作区计划是本轮唯一目录边界；无绑定项目时只允许使用临时空白沙箱。',
+            ].join('\n'),
+          }, signal);
+        };
+        const responseText = workspacePlan
+          ? await executeInWorkspace(workspacePlan)
+          : await withScheduledTaskIsolatedWorkspace({
+              deniedRoots: scheduledTaskDeniedRoots,
+            }, executeInWorkspace);
         return {
           ok: true,
           deliveryPayload: { text: responseText, parseMode: 'Markdown' },
@@ -3252,7 +3264,7 @@ async function main(): Promise<void> {
         return {
           ok: false,
           error: error instanceof Error ? error.message : String(error),
-          executionStarted: true,
+          executionStarted,
         };
       }
     },

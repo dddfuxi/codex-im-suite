@@ -90,6 +90,32 @@ describe('provider workspace resolution', () => {
     }
   });
 
+  it('keeps an isolated scheduled-task sandbox as the only provider root', async () => {
+    const module = await loadProviderWorkspaceModule();
+    assert.ok(module, 'provider workspace module should exist');
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-provider-workspace-isolated-'));
+    const sandbox = path.join(root, 'sandbox');
+    const legacyProject = path.join(root, 'legacy-project');
+    fs.mkdirSync(sandbox);
+    fs.mkdirSync(legacyProject);
+
+    try {
+      const resolved = module.resolveProviderWorkspace({
+        workingDirectory: legacyProject,
+        additionalDirectories: [legacyProject],
+        workspacePlan: makePlan(sandbox),
+      });
+
+      assert.equal(resolved.workingDirectory, sandbox);
+      assert.deepEqual(resolved.additionalDirectories, []);
+      assert.deepEqual(resolved.allowedRoots, [sandbox]);
+      assert.equal(resolved.source, 'workspace_plan');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('preserves the legacy provider behavior when no plan is supplied', async () => {
     const module = await loadProviderWorkspaceModule();
     assert.ok(module, 'provider workspace module should exist');

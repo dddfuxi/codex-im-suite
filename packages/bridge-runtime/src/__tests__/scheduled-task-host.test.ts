@@ -5,10 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  createScheduledTaskIsolatedWorkspacePlan,
   createBridgeScheduledTaskActionHost,
   createScheduledTaskHost,
   createScheduledTaskRunExecutor,
   createScheduledTaskScheduler,
+  withScheduledTaskIsolatedWorkspace,
 } from '../scheduled-task-host.js';
 import { buildScheduledTaskCard, buildScheduledTaskFailureCard } from '../scheduled-tasks/presentation.js';
 import { createScheduledTaskService } from '../scheduled-tasks/service.js';
@@ -35,6 +37,43 @@ function makeTaskCreate(overrides: Partial<ScheduledTaskCreate> = {}): Scheduled
 }
 
 describe('scheduled task runtime host', () => {
+  it('builds a read-only isolated workspace plan without mounting project directories', () => {
+    const sandbox = path.join(os.tmpdir(), 'cti-scheduled-task-sandbox');
+    const plan = createScheduledTaskIsolatedWorkspacePlan(sandbox, [
+      { path: 'C:\\runtime\\cti-home', reason: 'bridge runtime data' },
+      { path: 'C:\\memory', reason: 'memory repository' },
+    ], '2026-07-18T08:00:00.000Z');
+
+    assert.equal(plan.primaryWorkspace.path, path.resolve(sandbox));
+    assert.equal(plan.primaryWorkspace.accessMode, 'read_only');
+    assert.deepEqual(plan.primaryWorkspace.evidenceIds, ['scheduled_task_runtime']);
+    assert.equal(plan.primaryWorkspace.expiresAfterTurn, true);
+    assert.deepEqual(plan.temporaryMounts, []);
+    assert.deepEqual(plan.deniedRoots, [
+      { path: path.resolve('C:\\runtime\\cti-home'), reason: 'bridge runtime data' },
+      { path: path.resolve('C:\\memory'), reason: 'memory repository' },
+    ]);
+    assert.equal(plan.resolvedFrom, 'default');
+    assert.equal(plan.createdAt, '2026-07-18T08:00:00.000Z');
+  });
+
+  it('removes an isolated scheduled-task sandbox after the agent turn', async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-task-parent-'));
+    let sandboxPath = '';
+    try {
+      const result = await withScheduledTaskIsolatedWorkspace({ tempRoot, deniedRoots: [] }, async (plan) => {
+        sandboxPath = plan.primaryWorkspace.path;
+        assert.equal(fs.existsSync(sandboxPath), true);
+        return 'done';
+      });
+
+      assert.equal(result, 'done');
+      assert.equal(fs.existsSync(sandboxPath), false);
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('re-resolves a bound workspace and fails closed before an agent run', async () => {
     let agentRuns = 0;
     const execute = createScheduledTaskRunExecutor({

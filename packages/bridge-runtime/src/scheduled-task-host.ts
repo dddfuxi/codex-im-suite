@@ -1,4 +1,11 @@
-import type { TurnWorkspacePlan } from 'claude-to-im/src/lib/bridge/workspace-plan.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import type {
+  DeniedWorkspaceRoot,
+  TurnWorkspacePlan,
+} from 'claude-to-im/src/lib/bridge/workspace-plan.js';
 import type {
   ScheduledTaskActionHost,
   ScheduledTaskActorInput,
@@ -38,6 +45,58 @@ export type ScheduledTaskActor = {
 export type ScheduledTaskWorkspaceResolution =
   | { ok: true; workspacePlan: TurnWorkspacePlan }
   | { ok: false; error: string };
+
+export type ScheduledTaskIsolatedWorkspaceOptions = {
+  deniedRoots: readonly DeniedWorkspaceRoot[];
+  tempRoot?: string;
+  now?: () => string;
+};
+
+/**
+ * 无绑定工作区的计划任务仍必须携带真实工作区计划，避免 Provider 回退到
+ * 默认项目目录。该沙箱只在当前回合存在，也不会自动挂载任何注册项目根。
+ */
+export function createScheduledTaskIsolatedWorkspacePlan(
+  sandboxPath: string,
+  deniedRoots: readonly DeniedWorkspaceRoot[],
+  createdAt = new Date().toISOString(),
+): TurnWorkspacePlan {
+  const resolvedSandbox = path.resolve(sandboxPath);
+  return {
+    version: 'cti-turn-workspace/v1',
+    primaryWorkspace: {
+      path: resolvedSandbox,
+      accessMode: 'read_only',
+      evidenceIds: ['scheduled_task_runtime'],
+      reason: 'ephemeral isolated workspace for a scheduled agent turn',
+      expiresAfterTurn: true,
+    },
+    temporaryMounts: [],
+    deniedRoots: deniedRoots
+      .filter((item) => item.path?.trim())
+      .map((item) => ({ path: path.resolve(item.path.trim()), reason: item.reason })),
+    resolvedFrom: 'default',
+    createdAt,
+    expiresAfterTurn: true,
+  };
+}
+
+export async function withScheduledTaskIsolatedWorkspace<T>(
+  options: ScheduledTaskIsolatedWorkspaceOptions,
+  operation: (workspacePlan: TurnWorkspacePlan) => Promise<T>,
+): Promise<T> {
+  const tempRoot = path.resolve(options.tempRoot ?? os.tmpdir());
+  const sandboxPath = await fs.promises.mkdtemp(path.join(tempRoot, 'cti-scheduled-task-'));
+  try {
+    return await operation(createScheduledTaskIsolatedWorkspacePlan(
+      sandboxPath,
+      options.deniedRoots,
+      options.now?.() ?? new Date().toISOString(),
+    ));
+  } finally {
+    await fs.promises.rm(sandboxPath, { recursive: true, force: true });
+  }
+}
 
 export type ScheduledTaskAgentTurnInput = {
   task: VersionedScheduledTask;
