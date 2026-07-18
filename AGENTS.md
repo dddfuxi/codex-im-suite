@@ -52,6 +52,15 @@
 - 记忆库根目录出现五入口之外的 Markdown 时，控制面板必须显式列为未归类文档；不得静默索引、自动移动或删除用户文件。
 - 旧 `data/memory/v2` 只读兼容；迁移必须默认 dry-run，Apply 前停止 Bridge/watcher，并经过暂存校验、备份、冲突不覆盖、归档和索引重建。未知 `docs|logs|runtime|config.env` 不得随记忆布局迁移自动移动。
 
+## 2.3 统一计划任务边界
+
+- `packages/bridge-runtime/src/scheduled-tasks` 是计划任务时间计算、Store、运行准入、执行/投递、恢复和迁移的唯一运行时实现；`bridge-core` 只解析 `cti-scheduled-task` / `cti-reminder`、重建真实飞书目标和角色证据、调用 Host 并收口用户回复。
+- 新单次提醒和周期任务统一写入 `CTI_HOME/data/scheduled-tasks`；禁止继续把新 direct reminder 写到记忆 Markdown、工作区、聊天日志或面板私有文件。旧 `data/todos/direct-reminders/*.md` 只读兼容，迁移默认 dry-run，Apply 前必须停止 Bridge/watcher、校验 source hash、备份并禁止冲突覆盖。
+- 同一计划槽必须使用稳定 `slotKey` 幂等；执行状态和飞书投递状态必须分开记入运行账本。执行成功但投递失败时只能重试投递，不得重新运行 Agent 或受控工具。
+- `notify`、`agent_turn`、`controlled_tool` 必须走同一 Host、权限和审计边界。`controlled_tool` 必须 Owner，且只能信 Runtime 工具注册表声明的幂等性；模型提供的 owner、role、chatId、openId、workspace、sourceSessionId 等字段一律不可信。
+- 每次 `agent_turn` 运行都重新解析绑定工作区；工作区不可用时失败关闭。`workspaceMode=none` 不得回退默认 cwd 或把 `CTI_HOME`、记忆库、上传缓存、日志、发布产物当工作区。
+- 控制面板和 CLI 只能展示 runtime capabilities 明确开放的动作；尚未接通 daemon 控制面的立即运行、取消和仅重试投递必须禁用或返回真实未完成原因。
+
 ## 3. 文档收口规则
 
 当前文档只保留少数固定入口，禁止为每次小改动新建零散 Markdown。

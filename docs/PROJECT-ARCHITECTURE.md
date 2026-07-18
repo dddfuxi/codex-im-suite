@@ -36,6 +36,9 @@ flowchart TD
   BridgeRuntime --> CodexBrain[Codex 主脑]
   BridgeRuntime --> LocalHelper[Ollama 本地后端和辅助执行器]
   BridgeRuntime --> McpBridge[MCP Bridge]
+  BridgeRuntime --> ScheduledEngine[统一计划任务 Scheduler]
+  ScheduledEngine --> ScheduledStore[(CTI_HOME data scheduled-tasks)]
+  ScheduledEngine --> FeishuPlatform
   McpBridge --> UnityMcp[Unity MCP]
   McpBridge --> BlenderMcp[Blender MCP]
   McpBridge --> PictureMcp[Picture MCP]
@@ -64,6 +67,10 @@ flowchart TD
   Runtime --> McpLayer[MCP manifest 和调用层]
   Runtime --> SkillLifecycle[Skill Registry 和 Lifecycle]
   Runtime --> BridgeControl[受控 live Bridge 重启宿主]
+  Runtime --> ScheduledEngine[Scheduler、Store、Executors 和运行账本]
+  Core --> ScheduledActions[cti-scheduled-task 与 cti-reminder 可信动作]
+  Panel --> ScheduledGateway[计划任务 Control API 和 CLI Gateway]
+  ScheduledGateway --> ScheduledEngine
   SkillLifecycle --> OfficialSkillTools[官方 skill-creator 和 skill-installer]
   Panel --> SkillLifecycle
   McpLayer --> IgnisPackage[packages/mcp-ignis]
@@ -73,6 +80,7 @@ flowchart TD
   Core --> ReplyEnvelope[cti-final 结果块收口]
   Config[config/*.d 扩展和运行单元 manifest] --> Runtime
   Extensions[extensions/skills] --> Scripts[scripts/install-suite-skills.ps1]
+  Extensions --> ScheduledSkill[飞书计划任务 Skill]
   Scripts --> CodexSkills[本机 Codex skills 和 live skill]
 ```
 
@@ -500,6 +508,8 @@ Workflow run 运行状态：
 运行时状态文件：
 
 - `C:\Users\admin\.claude-to-im\runtime\workflow-runs.json`
+- `C:\Users\admin\.claude-to-im\data\scheduled-tasks\tasks|states|runs|quarantine`
+- `C:\Users\admin\.claude-to-im\data\scheduled-tasks\migrations\direct-reminders.json`
 - `C:\Users\admin\.claude-to-im\runtime\executor-status.json`
 - `C:\Users\admin\.claude-to-im\runtime\executor-session-defaults.json`
 
@@ -764,6 +774,42 @@ flowchart TD
   Blocker --> FinalReply
 ```
 
+### 2.4 统一计划任务
+
+计划任务运行态唯一位于 `CTI_HOME\data\scheduled-tasks`，不属于项目工作区、Agent Home 或记忆库。`bridge-core` 只处理结构化动作、权限、真实飞书证据和交付呈现；`bridge-runtime` 负责时间计算、持久化、slot 幂等、执行、恢复与投递。
+
+```mermaid
+sequenceDiagram
+  participant User as 飞书用户
+  participant Core as bridge-core
+  participant Host as Scheduled Task Host
+  participant Store as 原子 Store 与运行账本
+  participant Executor as notify / agent_turn / controlled_tool
+  participant Feishu as Feishu Delivery
+
+  User->>Core: 自然语言或卡片 callback
+  Core->>Core: 重建 actor、chat、session 和权限证据
+  Core->>Host: cti-scheduled-task / cti-reminder
+  Host->>Store: 保存任务并计算 nextRunAt
+  Store-->>Host: taskId、version、state
+  Host-->>User: 任务确认卡
+  Host->>Store: 到点按 slotKey 准入运行
+  Host->>Executor: 执行动作
+  Executor-->>Store: executionStatus 与 deliveryPayload
+  Store->>Feishu: 独立投递
+  Feishu-->>Store: deliveryStatus
+```
+
+关键约束：
+
+- `notify` 发送固定内容；`agent_turn` 每次运行重新生成结果；`controlled_tool` 只调用 Runtime registry 中 Owner-only 的受控工具。
+- 同一计划槽使用稳定 `slotKey`，运行记录保存执行状态、投递状态和恢复信息。Bridge 重启后只恢复可证明安全的运行；未知副作用不自动重放。
+- 执行成功但飞书投递失败时保存原 delivery payload，只重试投递，不重新运行 Agent。
+- `agent_turn` 的绑定工作区每次重新解析，不可用时失败关闭。`workspaceMode=none` 的目标是无项目工作区，不能回退默认 cwd；该硬约束仍需在最终 live 验收中确认所有 Provider 均遵守。
+- `scheduled-task-cli.mjs` 提供 Store 级 list/get/pause/resume/delete/history/status 和旧 direct reminder 迁移。需要活跃 daemon controller 的 run-now/cancel-run/retry-delivery 当前明确返回未开放，控制面板按 capabilities 禁用。
+- 旧 `data\todos\direct-reminders\*.md` 只读兼容；迁移默认 dry-run，Apply 前检查 Bridge/watcher、校验 source hash、备份、冲突不覆盖并写迁移清单。新提醒不再进入记忆 Markdown。
+- `extensions/skills/manage-codex-im-scheduled-tasks` 只指导 Agent 选择动作和协议，不直接操作 Store 或飞书 API。
+
 ## 3. 核心包职责
 
 ### 3.1 packages/bridge-core
@@ -777,7 +823,8 @@ flowchart TD
 - 飞书 Markdown/card/image/file/reply 发送。
 - 图片出站只使用当前回复显式给出的图片路径：`cti-final.images` 或当前可见文本中的本地图片路径。出站层不再扫描最近 assistant 历史消息补发旧图，避免截图/预览任务失败时把历史截图误当成当前结果。
 - 最终结果块解析和出站收口。
-- `cti-reminder` 动作块解析、提醒创建请求转交和伪完成拦截。
+- `cti-scheduled-task` 动作块解析、可信飞书目标/actor/session 重建、权限门禁和伪完成拦截。
+- `cti-reminder` 与 `/remind` 低风险单次提醒兼容，并优先转换为统一 `at + notify` 计划任务。
 - `cti-direct-message` 动作块解析、Feishu 私发/跨会话目标解析、owner 二次确认、发送请求转交和伪完成拦截。
 - 运行审计落盘。
 
@@ -815,8 +862,8 @@ flowchart TD
 - 飞书本地图片和本地文件分别走原生 image/file 消息回传；`.glb` 等非图片资产不能退化成仅发本地路径。
 - 超过飞书 IM 单文件上传限制的生成资产改发文档链接或下载链接，不再假装“已发送文件”。
 - 本地 `cti-final.files` 文件超过飞书 30MB 单文件限制时，出站层不再分卷，而是走 artifact delivery provider；飞书场景优先支持 `feishu_docx`，会自动创建新版云文档、把文件作为 `docx_file` 附件挂入文档，并回文档链接；也保留 `local_http` 作为公网目录备用方案。
-- 直接提醒是受控 reminder action，不是内容快答：Codex 可通过 `cti-reminder` 动作块请求，bridge-core 校验动作后调用运行时 reminder host；自然语言提醒本身必须先交给 agent 判断，不能由 bridge 在 provider 前正则直建。可见回复只展示真实 host 执行摘要，防止 Codex 或本地 profile 自行声称“已创建系统计划任务 / 已实际发送”。
-- 到点提醒的飞书出站优先使用互动卡片，卡片按钮 callback data 为 `reminder:complete:<reminderId>`；`card.action.trigger` 回调在 `bridge-manager` 内直接转给 reminder host，不进入 Codex，也不复用普通权限按钮链路。直接提醒可携带结构化 `notifyTargets`，来源包括本轮 Feishu 原生 mention、AI 动作块里的真实 mention evidence 和群聊自提醒发送者；到点推送会通过 `mentions` 原生 @ 对应成员，避免只在群里发普通文本导致对方看不见。
+- 计划任务是受控 Host action，不是内容快答：Codex 可通过 `cti-scheduled-task` 创建周期或动态任务，`cti-reminder` 只作为单次低风险兼容协议。自然语言请求必须先交给 agent 判断，不能由 bridge 在 provider 前正则直建。可见回复只展示真实 Scheduled Task Host 执行摘要，防止 Codex 或本地 profile 自行声称“已创建系统计划任务 / 已实际发送”。
+- 新计划任务确认卡使用 `scheduled-task:pause|resume|run|history|delete|retry-delivery:*` callback，并复用统一任务角色门禁。旧记忆待办/旧 direct reminder 的完成卡仍保留 `reminder:complete:<reminderId>` 只读兼容；两类 callback 不混用。计划任务 `notifyTargets` 只来自本轮 Feishu 原生 mention 和受控 resolver evidence，到点投递通过结构化 mentions 原生 @ 对应成员。
 - 在线扩展安装只由 `/ext search`、`/ext install`、`/ext remove` 和扩展安装/移除确认卡进入确定性链路；自然语言里的“搜索模型 / 找插件 / 装 skill”必须先进入 agent/provider 判断，不再在 provider 前扫描用户文本触发目录搜索。搜索只展示候选，安装和移除必须发确认卡片。卡片按钮 callback data 使用 `extinstall:confirm:<nonce>` 或 `extinstall:remove:<nonce>`，不复用 `perm:*` 权限按钮。
 - 扩展安装和移除确认只允许同一 chat、同一 Feishu user 且具备 `Owner` 角色的发起人点击；bridge-core 只做命令解析、权限和卡片交互，不直接写扩展目录。
 - 用户回复到上一条图片/文件时，Feishu adapter 会尽量读取被回复消息并把附件并入本次请求。
@@ -840,6 +887,7 @@ flowchart TD
 - 扩展目录 host：Skill 搜索、准备安装和确认安装转交同一 `SkillLifecycleService`；MCP、模型和 Plugin 等非 Skill 类型继续保留原 Control API 兼容入口。旧 `extension.remote.install` 即使命中 Skill 也会后端转交 lifecycle，不允许绕过来源与审批策略。
 - Skill Registry / Lifecycle：扫描并合并 manifest、草稿、禁用项和正式安装项；通过官方 `skill-creator` / `skill-installer` 脚本执行创建、校验和安装，统一处理审批、审计、原子替换与回滚。
 - Prompt Snapshot Store：接收 bridge-core 生成的脱敏 Snapshot，以原子 JSON 文件保存短期运行证据；Snapshot 写入失败只影响观察能力，不阻断 provider 或消息交付。
+- 统一计划任务：`scheduled-tasks/*` 负责 at/every/cron、原子 Store、CAS、quarantine、slot 准入、运行账本、执行/投递分离、重试、重启恢复和旧 direct reminder 迁移；`scheduled-task-host.ts` 适配 bridge-core Host 与飞书卡片，`scheduled-task-cli.ts` 为控制面板和人工诊断提供正式入口。
 - Agent Home / Self-Maintenance Host：从配置的记忆根读取三份核心 Prompt 文档和当前稳定工作区档案，调用独立 JSON classifier 裁决候选纠错、结果归档和已有规则效果，并在 runtime 存储层执行 evidence 校验、受控 patch/upsert、事务恢复、规则生命周期、版本备份、脱敏指标、非破坏归档、审计、回滚与索引重建；bridge-core 只传结构化回合事实和 classifier 跳过事件，不知道 `E:\cli-md` 等具体路径。
 - Feishu OAuth 和云文档 host：先用应用 `tenant_access_token` 读取 Docx / Sheets / Base，应用无权且任务需要用户私有资源时再使用发起人 OAuth token。官方层使用 `accounts.feishu.cn/open-apis/authen/v1/authorize`、PKCE 和 `accounts.feishu.cn/oauth/v3/token` 完成授权、换取与刷新；治理层按用户隔离 state，并为同一用户保存可并存的最小 scope 加密 Token grant，兼容读取旧版单 Token 文件；按任务计算最小 scope，以 `userId + normalized scopes` 去重授权卡，并将多个等待任务持久化到同一 state 后逐个恢复。callback 模式按需启动公网回调监听，manual 模式让用户把 `code/state` 回调 URL 发回飞书；读取失败时会按具体接口返回需要检查的只读 scope，避免把权限不足伪装成空内容。
 - Feishu CLI 用户授权 host：接收 bridge-core 从真实工具对提取的 `cti-feishu-cli-user-auth/v1` challenge，只允许 Owner 为本机共享 `lark-cli` 用户身份授权。Card 2.0 按最小 scope 展示 `open_url` 按钮，后台 runner 用 argv 调用官方 `auth login --device-code`；同 Owner 与 scope 的并发任务共用一次轮询，成功自动恢复，拒绝/过期发送红色未完成结果。该 host 不持久化 device code、URL 或 token，也不替代 FeishuAdapter 的 bot 长连接。
@@ -863,12 +911,12 @@ flowchart TD
 - 历史乱码修复入口为 `scripts/repair-history-mojibake.ps1`。默认 dry-run 扫描 `CTI_HOME\data` 历史、Feishu 历史索引、记忆 Markdown、记忆仓库 `data/im` 与 `data/projects` 下的长期 JSON 资产，以及 `.cti-index`；显式 `-Apply` 时备份原文件、修复典型 mojibake、重建 `knowledge.json` 和 `reminders.json`，`-Restore <manifest>` 可回滚备份。单个历史文件读取、备份或写入失败时不会中断整轮修复，而是在 `files[].unresolved/error` 和 `unresolvedFileCount` 中报告，便于处理 Windows 锁定文件后再次运行。
 - 运行时在 Feishu 历史入库/检索、记忆 profile 入库、Markdown 知识索引和待办提醒派生前会先修复或拒绝疑似坏文本，避免错码继续进入 Codex 记忆上下文或主动提醒标题。
 - 控制面板可归档和恢复单个知识单元：归档时按知识单元的来源文件和片段精确删除源 Markdown 中对应行，再把原始行和元信息写入 `archive\knowledge-units\*.md`；恢复时只允许读取该归档目录内的文件，并校验归档记录的源文件仍在记忆仓库内，然后回写原始 Markdown 行并重建索引。`archive` 目录被索引器跳过，因此归档项不会在下一次重建后回到知识单元列表；归档区支持手动恢复或永久删除归档文件。
-- 待办提醒从两类受控来源派生：v2 记忆索引里的 `kind=todo` 知识单元，以及 `data\todos\direct-reminders\*.md` 里的直接提醒文件。提醒解析 `@YYYY-MM-DD HH:mm`、`提醒时间: YYYY-MM-DD HH:mm`、`状态: 未完成|完成|取消` 和来源元信息，生成 `.cti-index\reminders.json`；直接提醒不会再为了进入提醒索引而混入长期知识索引。
-- 直接提醒由 `cti-reminder` 动作或 `/remind` 命令创建；自然语言提醒先进入 agent/provider 判断，只有 agent 输出结构化 `cti-reminder` 后才调用同一 reminder host。时间短语解析层仍作为 slash 命令和 action 校验的辅助能力，支持相对时间、数字/中文数字绝对时刻、半点/刻、上午/下午/晚上/今晚、今天/明天/后天和年月日时刻，但不再作为 provider 前快捷创建入口。Feishu 群聊里已经通过原生 @ 或 bot 名唤醒的未来时间请求也交给 agent 判断一次性/周期/副作用边界；若语义包含关机、关闭屏幕、运行命令、发送文件等未来副作用动作，则按高危/工具请求继续走权限和 agent 执行链。运行时写入 `E:\cli-md\data\todos\direct-reminders\*.md`，随后重建 `reminders.json`。Codex 只做意图判断，不直接写 Windows 计划任务，也不直接调用飞书 API。
+- 记忆 Markdown 中普通 `kind=todo` 仍由旧提醒索引只读兼容，用于历史待办和完成按钮；它不自动提升为通用计划任务。
+- 新单次提醒、周期任务和动态 Agent job 统一进入 Scheduled Task Store。自然语言请求先由 agent 判断 `notify / agent_turn / controlled_tool`；周期请求输出 `cti-scheduled-task`，单次低风险提醒的 `cti-reminder` 和 `/remind` 由 bridge-core 转成 `at + notify`。Codex 只声明可决定字段，不直接写 Store、Windows 计划任务或飞书 API。
 - 主动推送状态写入 `.cti-index\reminder-state.json`，记录 `pending`、已发送、失败、跳过原因和完成字段，保证“到点单条提醒一次”不会重复发送。
 - 主动推送默认关闭；启用 `CTI_TODO_PUSH_ENABLED=true` 后按 `CTI_TODO_PUSH_CHANNELS` 加载 PushProvider。v1 飞书 provider 复用 bridge-core 的发送收口、去重和审计；微信 provider 只返回 `unsupported`，面板显示“未接入”。
 - `completeReminder()` 是飞书卡片和控制面板共用的完成收口：直接提醒必须把 `data\todos\direct-reminders\*.md` 中的 `状态: 未完成` 改成 `状态: 完成` 并重建索引；普通记忆待办只在精确匹配同一待办行时自动改源文件，否则仅记录完成状态和需手动确认的原因。
-- 直接提醒的创建和推送由 `CTI_DIRECT_REMINDER_ENABLED`、`CTI_DIRECT_REMINDER_PUSH_ENABLED`、`CTI_DIRECT_REMINDER_DECISION_MODE` 和 `CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND` 控制；默认使用 Codex action 判断和 bridge 统一执行。
+- 旧 direct reminder Markdown 不再接收新写入；迁移器只转换未完成、时间和飞书目标有效的旧文件，并使用 source hash 防重复。缺失字段或损坏文件进入 `blocked`，不会猜测目标。
 - 待办来源会话必须来自 Markdown frontmatter 或结构化字段 `channelType`、`chatId`、`chatType`、`messageId`、`displayName`。直接提醒创建时会把 `chatType=group/p2p` 和可选 `notifyTargets` 一并写入源 Markdown、`reminders.json` 和 `reminder-state.json`，用于区分群聊、私聊目标和到点要原生 @ 的成员。来源无法确认时进入“待补来源”状态，不回退 owner 私聊，也不猜测 chatId。
 - 旧规则 Markdown 归档入口为 `scripts/memory/archive-legacy-rules.ps1`，默认 dry-run；显式 `-Apply` 时才移动到 `archive\legacy-rules` 并生成 `AUTHORITATIVE-RULES.md`。
 - v2 记忆硬重置入口为 `scripts/memory/reset-memory-v2.ps1`，默认 dry-run；显式 `-Apply` 时会先检查未来 pending 提醒、bridge 运行状态和记忆索引 watcher 状态，备份旧 `knowledge.json` / `memory-graph.json` / 旧记忆分区 / 旧 `memory-profiles.json`，再清空旧索引并创建空的 `data/memory/v2` 分区。发现未来提醒或 bridge/watcher 仍在运行时默认中止；未来提醒需人工确认后传入 `-AllowFutureReminders`，运行态竞态需先停止 bridge，或显式传入 `-AllowRunningBridge` 接受写回风险。
@@ -962,6 +1010,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 - 通过“查看会话”弹窗查看会话、历史索引检索和同步状态。
 - WebView 会话列表会合并 `bindings.json`、`sessions.json`、Feishu chat index 和 `feishu-history-index.json`：`localMessageCount` 表示本地 bridge session 消息数，`remoteMessageCount` 表示已同步的飞书远端历史条数；来源标签按远端当前可见、本地绑定和远端历史索引统一推导，避免把已有远端历史误显示成“仅本地”。
 - 查看 workflow run、executor 目录、最近路由选择、全局默认 executor 和兼容的会话默认 executor。
+- 查看计划任务总数、启用/暂停/运行/失败/隔离统计、nextRunAt、执行状态、投递状态和运行历史；暂停、恢复和删除只经正式 CLI Gateway，未开放的 daemon 控制动作按 capabilities 禁用。
 - 查看节点拓扑、heartbeat、capability inventory 和 fake remote node 状态。
 - 管理 IM 用户权限、角色和最近会话参与人。
 - 本机备份发布和主干发布预检。
@@ -972,7 +1021,7 @@ Ignis CLI MCP，定位为创意生成能力包。
 
 - Control API 是状态读取、白名单命令分发、会话详情、媒体缓存、workflow/executor/permissions 和本机脚本调用的统一后端。
 - WinForms 负责窗口生命周期、WebView2 Runtime 检测，并启动或连接本机 Control API；桌面壳不再把业务命令硬塞进 WebView 事件。
-- React 前端负责四域信息架构、导航、状态展示、长任务 pending 状态和活动流；一级分区固定为“运行 / 机器人 / 能力 / 治理”。
+- React 前端负责四域信息架构、导航、状态展示、长任务 pending 状态和活动流；一级分区固定为“运行 / 机器人 / 能力 / 治理”，计划任务位于“运行”。
 - 前端通过 `HostBridge` 自动探测传输层：WebView2 内仍可走 `window.chrome.webview`，普通浏览器走 HTTP API 和 SSE。
 - 前端只能通过 HostBridge 请求后端执行白名单命令，不能直接运行 shell、PowerShell、Git 或文件系统操作。
 - Control API 默认只监听 `127.0.0.1:8788`；只有显式配置 `CTI_CONTROL_API_ALLOW_REMOTE=true` 和 `CTI_CONTROL_API_AUTH_TOKEN` 后才允许非本机访问。
@@ -1382,8 +1431,8 @@ Codex 应输出：
 
 桥接行为：
 
-- `cti-reminder` 或 `/remind` 显式入口会创建直接提醒；自然语言提醒必须先进入 agent/provider 判断，不能由 bridge-core 在 provider 前正则直建。bridge-core 支持的时间短语解析层仍用于 `/remind` 和 action 校验，覆盖相对时间、当天/明天/后天时刻和年月日时刻，提醒内容可出现在时间前或时间后；普通任务讨论、脚本请求、待办查询不进入直接创建链路。未来关机、关闭屏幕、运行命令、发送文件等执行型定时请求不是低风险提醒，必须进入权限和 agent/action 链。
-- bridge-core 校验动作块后调用 bridge-runtime reminder host，写入 Markdown 源文件、派生索引和 `reminder-state.json`。动作块解析出的 `notifyTargets` 只保存可发送 mention 所需结构化字段；用户可见执行摘要不展示 `reminderId`、`chatId`、状态文件路径或内部协议名。host 返回成功后，bridge-core 会把该 bridge-owned action 计入本轮执行证据，避免真实执行摘要被无工具证据防线误判为模型伪完成。
+- `cti-scheduled-task` 用于周期、动态 Agent 和受控工具任务；`cti-reminder` 或 `/remind` 只创建单次低风险 `at + notify`。自然语言提醒必须先进入 agent/provider 判断，不能由 bridge-core 在 provider 前正则直建。未来关机、关闭屏幕、运行命令、发送文件等执行型定时请求不是低风险提醒，必须进入 Owner 和受控工具链。
+- bridge-core 校验动作块后调用 bridge-runtime Scheduled Task Host，真实任务写入 `CTI_HOME\data\scheduled-tasks`。动作块中的 `notifyTargets` 只保留可发送 mention 所需结构化字段；模型提供的 actor、chatId、sourceSessionId 或工作区字段被忽略并审计。Host 成功后，该 bridge-owned action 计入本轮执行证据，避免真实执行摘要被无工具证据防线误判为模型伪完成。
 - 如果 Codex 只声称“已创建系统计划任务 / 已实际发送 / 已设置提醒”但没有动作块，bridge-core 直接拦截原回复并返回未进入统一提醒系统；即使原请求文本能被时间解析器识别，也不会补建提醒。
 
 ## 9. 打包与发布
@@ -1520,6 +1569,7 @@ live skill 同步时，`scripts/sync-live-skill.ps1` 会先构建 `packages/brid
 - `workflow.status`
 - `workflow.recovery.kind`
 - `workflow.retry.status`
+- `scheduled task nextRunAt / runningRunId / lastExecutionStatus / lastDeliveryStatus`
 - `feishuWs`
 - `feishuP2pPoll`
 - `lastUnhandledError`

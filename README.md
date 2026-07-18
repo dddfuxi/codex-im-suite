@@ -28,14 +28,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
 - 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务收口成声明式运行单元；服务页和非 Skill 扩展继续复用通用 `update` 协议与白名单执行模板。
 - Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
-- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
+- 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
 - 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
-- 待办主动提醒 v1：从记忆 Markdown 待办和 Codex `cti-reminder` 动作派生 `.cti-index\reminders.json`，状态写入 `.cti-index\reminder-state.json`；记忆待办默认关闭，直接提醒可由 bridge 统一创建并按来源会话到点推送一次，飞书优先发送可点击完成的互动卡片，微信显示未接入。
+- 统一计划任务：`notify / agent_turn / controlled_tool` 共用 Scheduler、原子 Store、slot 幂等和运行账本；`cti-reminder` 与 `/remind` 兼容转换为单次 `notify`，周期任务使用 `cti-scheduled-task`。执行成功但飞书投递失败时只重试投递，不重跑 Agent；运行态固定写入 `CTI_HOME\data\scheduled-tasks`，不进入工作区或记忆库。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
 - 能力和 CLI 运维补齐：能力区拆为 Skills、MCP、模型与插件；MCP 状态按健康检查、Codex 注册和托管进程综合判断，Skill 安装只走 lifecycle，其他扩展保留 manifest 和白名单更新模板。
@@ -55,6 +55,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 旧记忆规则 dry-run 归档：`scripts/memory/archive-legacy-rules.ps1`
 - 记忆布局迁移：`scripts/memory/migrate-memory-layout.ps1`
 - 工作区污染清理（dry-run / 隔离备份 / 恢复）：`scripts/cleanup-workspace-pollution.ps1`
+- 计划任务 CLI：`packages/bridge-runtime/dist/scheduled-task-cli.mjs`
 - 主干发布预检：`scripts/prepare-main-release.ps1`
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
@@ -186,7 +187,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
 - 本地模型只作为 Codex agent 的可选模型来源、轻量 prompt profile、模型能力检测和少数内部测试/整理入口使用；普通飞书消息不再绕过 agent 生成独立最终回复。本地轻量路由的当前 decision 名称为 `use_local_profile`，旧 `answer_local` 只作为历史 payload 兼容输入。
 - 记忆关键词不再触发快捷最终回复；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。`quality=high` 的高置信结构化命中会作为 `high_confidence_evidence` 注入 agent system prompt，由 agent 按当前问题整理最终回复；关系图候选和其他低确定性结果只注入主执行链。
-- 直接提醒不再由“任务 / 待办 / 提醒”关键词硬拦截；只有高置信自然语言提醒、Codex 输出 `cti-reminder` 动作块或用户显式使用 `/remind` 时，bridge 才会创建统一 reminder 记录。高置信自然语言提醒必须同时包含创建意图、未来时间和提醒内容；普通任务讨论、脚本请求和待办查询仍走正常对话。Codex 不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
+- 自然语言计划任务不走 provider 前关键词快路：Agent 必须区分固定通知、动态 Agent turn 和受控工具。周期任务输出 `cti-scheduled-task`；单次低风险提醒可输出 `cti-reminder` 或使用 `/remind`，随后由统一 Scheduled Task Host 创建。没有 Host success 时不能声称已创建，Codex 也不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
 ## 关键命令
@@ -218,7 +219,7 @@ CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS=24
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、计划任务状态/历史/暂停/恢复/删除、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。面板会读取 runtime capabilities；尚未接通 daemon 控制面的“立即运行 / 取消运行 / 仅重试投递”保持禁用并显示原因。
 
 打包 portable 和 installer：
 
@@ -328,21 +329,49 @@ CTI_TODO_PUSH_WINDOW_MS=300000
 
 运行时会从 `.cti-index\knowledge.json` 派生 `.cti-index\reminders.json`，并用 `.cti-index\reminder-state.json` 记录已发送、失败、跳过和完成状态，避免重复推送。来源会话无法确认、状态不是未完成或缺少提醒时间的待办不会发送，只会在面板“记忆”页标注原因。飞书提醒优先发互动卡片，用户点击“完成”后会走 `card.action.trigger` 回调更新本地 Markdown 和状态文件；面板也提供同一套完成入口。知识单元可在面板归档，归档会从源 Markdown 精确移除该行并写入 `archive\knowledge-units`，归档目录不会重新进入索引，归档项可手动恢复或永久删除；整理草稿应用前会检查索引时间戳，防止旧草稿批量改动新索引。
 
-直接提醒入口默认开启。Codex 判断用户确实要创建提醒时，只能输出 `cti-reminder` 动作块；bridge 负责写入 `E:\cli-md\data\todos\direct-reminders`、重建索引、记录 `pending / sent / failed / skipped` 状态并到点推送。显式命令也可使用：
+## 统一计划任务
+
+飞书自然语言示例：
+
+```text
+定个任务，每个工作日早上十点半给我发一下每日的单子。
+每天 18:00 提醒我提交日报。
+```
+
+第一条会创建 `cron 30 10 * * 1-5 + Asia/Shanghai` 的动态 `agent_turn`；第二条属于固定 `notify`。单次低风险提醒继续兼容：
 
 ```text
 /remind 10分钟后 看电脑
 /remind 2026-04-29 19:42 看电脑
 ```
 
-相关配置：
+运行态和配置：
 
 ```powershell
-CTI_DIRECT_REMINDER_ENABLED=true
-CTI_DIRECT_REMINDER_PUSH_ENABLED=true
-CTI_DIRECT_REMINDER_DECISION_MODE=codex_action
-CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND=true
+CTI_SCHEDULED_TASKS_ENABLED=true
+CTI_SCHEDULED_TASKS_POLL_MS=15000
+CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS=4
+CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER=3
+CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS=3600000
 ```
+
+任务定义、状态、运行记录、隔离区和迁移清单统一位于 `CTI_HOME\data\scheduled-tasks`。当前调度 tick 仍按安全串行方式执行；`MAX_CONCURRENT_RUNS` 和连续失败告警配置已经保留，但并发与主动告警尚未开放为完成能力，面板和文档不把它们伪装为已生效。
+
+CLI 示例：
+
+```powershell
+node .\packages\bridge-runtime\dist\scheduled-task-cli.mjs status --json
+node .\packages\bridge-runtime\dist\scheduled-task-cli.mjs list --json
+node .\packages\bridge-runtime\dist\scheduled-task-cli.mjs history <taskId> --json
+```
+
+旧 `data\todos\direct-reminders\*.md` 只读兼容。迁移默认 dry-run，不写 Store：
+
+```powershell
+node .\packages\bridge-runtime\dist\scheduled-task-cli.mjs migrate-direct-reminders --memory-root E:\cli-md --json
+```
+
+审核 `create / skip / blocked` 后先停止 Bridge 和记忆 watcher，再显式加 `--apply`。Apply 会重新校验 source hash、备份旧文件、冲突不覆盖，并记录迁移清单；新提醒不再写入记忆 Markdown。
 
 飞书云文档读取默认支持 Docx、Sheets 和 Base/多维表格。bridge 会先用应用 `tenant_access_token` 读取；只有应用身份无法访问且当前任务确实需要读取发起人的私有资源时，才给该发起人发送飞书 OAuth 登录卡片，使用该用户自己的文档权限读取内容。普通消息、原生 @、reply、reaction、sticker 和机器人卡片继续走 bot 长连接，不向普通用户索权。不使用 owner 代读，也不自动替用户加权限。应用 token 首试不需要公网回调；用户 OAuth fallback 支持公网回调模式，也支持无公网的手动 code/state 回传模式。飞书开放平台需要给应用申请只读权限：
 
