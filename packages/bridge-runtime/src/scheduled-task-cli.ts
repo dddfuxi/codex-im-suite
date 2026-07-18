@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CTI_HOME } from './config.js';
-import { assertCleanupProcessesStopped } from './cleanup-cli.js';
+import { assertCleanupProcessesStopped } from './process-stop-guard.js';
 import {
   applyScheduledTaskMigrationPlan,
   buildScheduledTaskMigrationPlan,

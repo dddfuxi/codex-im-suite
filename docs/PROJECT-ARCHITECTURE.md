@@ -206,7 +206,7 @@ flowchart LR
 - classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
 - `packages/bridge-runtime/src/turn-storage.ts` 是临时输入、回合产物目录和会话 Scratch 的 runtime 所有者。Conversation Engine 每轮生成稳定 `turnId`，先通过 `TurnStorageHost.stageInputFiles()` 把非耐久附件归一化到 session/turn 目录，再把相同 `filePath`、`artifactDirectory` 和 `scratchDirectory` 传给 Codex、Mavis、Ignis 等 Provider；记忆仓库中的耐久媒体只读复用原路径。
 - 尚未接入 Host 的旧宿主只允许使用 core 内的兼容回退，且同样必须按 session/turn 分层；正式 daemon 不走该回退。旧工作区 `.codepilot-uploads` 或任意外部可读文件只能被复制进受控上传目录，不能继续作为 Provider 的默认输入缓存。
-- `packages/bridge-runtime/src/cleanup-plan.ts` 与 `cleanup-cli.ts` 提供工作区污染治理：默认 dry-run，逐文件记录绝对/相对路径、大小、修改时间、SHA-256、Git 状态和分类，并生成 UTF-8 中文 JSON/Markdown 清单。Apply 前检查 Bridge 与记忆 watcher，且只允许 `legacy_upload_cache / runtime_upload_cache / test_fixture`；执行时把完整目录移动到 `CTI_HOME\backups\workspace-cleanup\<timestamp>\payload`，不做永久删除。Restore 必须读取同一 manifest、确认原路径不存在并重新校验 Hash；Unity `Assets`、源码、显式产物和未知目录失败关闭。
+- `packages/bridge-runtime/src/cleanup-plan.ts` 与 `cleanup-cli.ts` 提供工作区污染治理：默认 dry-run，逐文件记录绝对/相对路径、大小、修改时间、SHA-256、Git 状态和分类，并生成 UTF-8 中文 JSON/Markdown 清单。Apply 前通过无 CLI 自启动副作用的 `process-stop-guard.ts` 检查 Bridge 与记忆 watcher，且只允许 `legacy_upload_cache / runtime_upload_cache / test_fixture`；执行时把完整目录移动到 `CTI_HOME\backups\workspace-cleanup\<timestamp>\payload`，不做永久删除。Restore 必须读取同一 manifest、确认原路径不存在并重新校验 Hash；Unity `Assets`、源码、显式产物和未知目录失败关闭。迁移类 CLI 复用同一门禁模块，禁止互相导入可执行 CLI 入口，避免单文件 bundle 同时启动多个命令。
 
 记忆根目录采用 Agent Home + 分区事实源：
 
@@ -806,7 +806,7 @@ sequenceDiagram
 - 同一计划槽使用稳定 `slotKey`，运行记录保存执行状态、投递状态和恢复信息。Bridge 重启后只恢复可证明安全的运行；未知副作用不自动重放。
 - 执行成功但飞书投递失败时保存原 delivery payload，只重试投递，不重新运行 Agent。
 - `agent_turn` 的绑定工作区每次重新解析，不可用时失败关闭。`workspaceMode=none` 会为当前回合创建只读临时空白沙箱，构造唯一 `TurnWorkspacePlan` 并传给所有 Provider；沙箱不挂载注册项目、`CTI_HOME`、记忆库或上传缓存，回合结束后立即清理，因此不会回退默认 cwd。
-- `scheduled-task-cli.mjs` 提供 Store 级 list/get/pause/resume/delete/history/status 和旧 direct reminder 迁移。需要活跃 daemon controller 的 run-now/cancel-run/retry-delivery 当前明确返回未开放，控制面板按 capabilities 禁用。
+- `scheduled-task-cli.mjs` 提供 Store 级 list/get/pause/resume/delete/history/status 和旧 direct reminder 迁移；它只依赖无自启动副作用的进程停止门禁，保证单文件 bundle 向控制面板 Gateway 输出纯 JSON。需要活跃 daemon controller 的 run-now/cancel-run/retry-delivery 当前明确返回未开放，控制面板按 capabilities 禁用。
 - 旧 `data\todos\direct-reminders\*.md` 只读兼容；迁移默认 dry-run，Apply 前检查 Bridge/watcher、校验 source hash、备份、冲突不覆盖并写迁移清单。新提醒不再进入记忆 Markdown。
 - `extensions/skills/manage-codex-im-scheduled-tasks` 只指导 Agent 选择动作和协议，不直接操作 Store 或飞书 API。
 

@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +10,15 @@ import {
   writeWorkspaceCleanupReports,
   type WorkspaceCleanupPlan,
 } from './cleanup-plan.js';
+import {
+  assertCleanupProcessesStopped,
+  type CleanupProcessCheckOptions,
+} from './process-stop-guard.js';
+
+export {
+  assertCleanupProcessesStopped,
+  type CleanupProcessCheckOptions,
+} from './process-stop-guard.js';
 
 interface CleanupCliOptions {
   targets: string[];
@@ -20,12 +28,6 @@ interface CleanupCliOptions {
   applyManifest?: string;
   restoreManifest?: string;
   now?: string;
-}
-
-export interface CleanupProcessCheckOptions {
-  ctiHome: string;
-  memoryRoot?: string;
-  isProcessAlive?: (pid: number) => boolean;
 }
 
 function requireValue(argv: string[], index: number, option: string): string {
@@ -84,44 +86,6 @@ function parseCleanupCliOptions(argv: string[]): CleanupCliOptions {
     applyManifest: options.applyManifest ? path.resolve(options.applyManifest) : undefined,
     targets: options.targets.map((target) => path.resolve(target)),
   };
-}
-
-function defaultIsProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-function readJsonIfExists(filePath: string): Record<string, unknown> | null {
-  if (!fs.existsSync(filePath)) return null;
-  try {
-    const value = JSON.parse(fs.readFileSync(filePath, 'utf8')) as unknown;
-    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  } catch (error) {
-    throw new Error(`无法解析进程状态文件，拒绝清理：${filePath}；${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-export function assertCleanupProcessesStopped(options: CleanupProcessCheckOptions): void {
-  const isProcessAlive = options.isProcessAlive || defaultIsProcessAlive;
-  const bridgeStatusPath = path.join(path.resolve(options.ctiHome), 'runtime', 'status.json');
-  const bridgeStatus = readJsonIfExists(bridgeStatusPath);
-  const bridgePid = Number(bridgeStatus?.pid || 0);
-  if (bridgeStatus?.running === true && isProcessAlive(bridgePid)) {
-    throw new Error(`Bridge 仍在运行（PID ${bridgePid}），拒绝 Apply/Restore。请先安全停止 Bridge。`);
-  }
-
-  if (!options.memoryRoot) return;
-  const watcherStatusPath = path.join(path.resolve(options.memoryRoot), '.cti-index', 'status.json');
-  const watcherStatus = readJsonIfExists(watcherStatusPath);
-  const watcherPid = Number(watcherStatus?.watcherPid || 0);
-  if (watcherStatus?.watching === true && (!watcherPid || isProcessAlive(watcherPid))) {
-    throw new Error(`记忆索引 watcher 仍在运行（PID ${watcherPid || 'unknown'}），拒绝 Apply/Restore。`);
-  }
 }
 
 export function runWorkspaceCleanupCli(argv: string[]): WorkspaceCleanupPlan {

@@ -9,6 +9,12 @@ import { createFileScheduledTaskStore } from '../scheduled-tasks/store.js';
 import { makeScheduledTask } from './scheduled-task-test-fixtures.js';
 
 describe('scheduled task cli', () => {
+  it('does not bundle another self-starting CLI into the scheduled-task entry point', () => {
+    const sourcePath = path.resolve('src', 'scheduled-task-cli.ts');
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    assert.doesNotMatch(source, /from\s+['"]\.\/cleanup-cli\.js['"]/u);
+  });
+
   it('lists, pauses, resumes, and reports status through the runtime store', async () => {
     const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-cli-'));
     try {
