@@ -166,7 +166,8 @@ flowchart LR
 | live skill | `C:\Users\admin\.codex\skills\claude-to-im*` | 运行副本，只由同步脚本写入。 |
 | Agent Home / 记忆仓库 | `E:\cli-md` 或配置的 memory repo | 根目录集中放身份、规则、工具、说明和总索引；真实事实写入 `memory/*` 分区，不能作为普通工作区挂载。 |
 | 运行态数据 | `C:\Users\admin\.claude-to-im\data` / `runtime` | 存 sessions、bindings、workflow、permission links 等服务状态。 |
-| 临时上传缓存 | `CTI_HOME\runtime\uploads` 或 `CTI_UPLOAD_CACHE_DIR`；旧 `.codepilot-uploads` 只作为遗留暂存识别 | 只作为候选/暂存；Feishu 表情包不扫描、不迁入、不写入工作区缓存，其他有效产物需通过明确提升流程进入记忆或交付附件。 |
+| 临时上传缓存 | `CTI_HOME\runtime\uploads\<sessionId>\<turnId>` 或 `CTI_UPLOAD_CACHE_DIR` 下的同级结构；旧 `.codepilot-uploads` 只作为遗留输入识别 | 由 runtime `TurnStorageHost` 统一暂存并生成带 SHA-256 的 `输入附件清单.json`；Provider 不再创建 `uploads/history`、`mavis-input` 或 `runtime/ignis-attachment-*` 平铺文件。 |
+| 回合产物与 Scratch | `CTI_HOME\runtime\artifacts\<sessionId>\<turnId>`、`CTI_HOME\runtime\workspaces\<sessionId>\<turnId>` | runtime 为本轮统一解析路径，core 和 Provider 只消费 Host 返回值；它们不是项目工作区，也不能自动提升到项目。 |
 | 文档 | `README.md`、`docs/PROJECT-ARCHITECTURE.md`、`docs/DEVELOPMENT-LOG.md` | 只写当前事实、入口、风险和阶段记录。 |
 | 规则 | `AGENTS.md`、`config/*.d`、`agent-architecture.ts` | 存可维护规则、manifest、policy 归属和分类口径。 |
 | 日志 | `.claude-to-im\logs`、runtime audit | 只读核验证据，不提交、不手工改写。 |
@@ -195,6 +196,8 @@ flowchart LR
 - `temporaryMounts` 带访问模式、证据 ID、理由和 `expiresAfterTurn=true`；回合结束后不形成长期挂载。
 - 记忆仓库、`CTI_HOME` 运行态、上传缓存、日志和 `release/*` 按各自受控能力访问，不能提升为普通项目工作区。
 - classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
+- `packages/bridge-runtime/src/turn-storage.ts` 是临时输入、回合产物目录和会话 Scratch 的 runtime 所有者。Conversation Engine 每轮生成稳定 `turnId`，先通过 `TurnStorageHost.stageInputFiles()` 把非耐久附件归一化到 session/turn 目录，再把相同 `filePath`、`artifactDirectory` 和 `scratchDirectory` 传给 Codex、Mavis、Ignis 等 Provider；记忆仓库中的耐久媒体只读复用原路径。
+- 尚未接入 Host 的旧宿主只允许使用 core 内的兼容回退，且同样必须按 session/turn 分层；正式 daemon 不走该回退。旧工作区 `.codepilot-uploads` 或任意外部可读文件只能被复制进受控上传目录，不能继续作为 Provider 的默认输入缓存。
 
 记忆根目录采用 Agent Home + 分区事实源：
 
@@ -617,9 +620,9 @@ Executor 目录当前内置四类：
 外部 Agent Executor v3.18 图片/表情附件桥接（2026-07-01）：
 
 - `mavis-executor-provider.ts` 在 pre-dispatch 阶段统一处理 `StreamChatParams.files` 中的 `image/*` 附件；新建 session 与续聊 `communicationSend` 均调用同一套附件物化逻辑，避免一条路径能看图、另一条路径退化成 file_key 文本。
-- 当前 Mavis CLI 的 `session new --prompt` 和 `communication send --content` 只提供文本入口，没有原生附件参数。因此 bridge 会把新图片/表情包落成 `CTI_UPLOAD_CACHE_DIR` 或 `CTI_HOME\runtime\uploads\mavis-input` 文件，再把绝对本地路径附到 prompt 中，并明确要求 Mavis 使用可用的视觉工具（如 `matrix_describe_images`）读取该路径，而不是根据 file_key 猜测图像内容。
-- 安全边界：如果上游已经提供工作区内或 upload cache 内的 `filePath`，provider 直接复用；如果 `filePath` 指向其他位置但可读，先复制进 bridge 运行态 upload cache 再暴露给 Mavis；如果没有 `filePath`，用 base64 `data` 重建文件。Mavis prompt 中只出现受控缓存或工作区内可读路径，不把任意外部路径直接交给 external agent，也不再把临时输入图塞进 Unity/仓库默认工作目录。
-- 判据：飞书图片/表情包由 `mavis-agent` 执行时，MiniMax Code 端应看到 `Bridge-provided local input files` 与 `Local path: ...`，并能基于真实图片路径调用视觉工具；不能只收到“用户发送了一个飞书表情包，file_key=...”这类纯文本提示。测试覆盖 base64 落盘、工作区路径复用、工作区外路径复制和 resume path 附件传递。
+- 当前 Mavis CLI 的 `session new --prompt` 和 `communication send --content` 只提供文本入口，没有原生附件参数。因此 bridge 先通过共享 `TurnStorageHost` 把图片/表情包归一化到 `CTI_UPLOAD_CACHE_DIR\<sessionId>\<turnId>`，再把绝对本地路径附到 prompt 中，并明确要求 Mavis 使用可用的视觉工具（如 `matrix_describe_images`）读取该路径，而不是根据 file_key 猜测图像内容。
+- 安全边界：记忆仓库中的耐久媒体可只读复用；旧工作区 `.codepilot-uploads`、项目内临时文件和其他外部可读路径一律复制进本轮受控 upload 目录再暴露给 Mavis。Mavis 与 Ignis 共用 Conversation Engine 已暂存的 `filePath`，不再各自生成平铺缓存，也不把临时输入图继续留在 Unity/仓库默认工作目录。
+- 判据：飞书图片/表情包由 `mavis-agent` 执行时，MiniMax Code 端应看到 `Bridge-provided local input files` 与本轮 session/turn `Local path`，并能基于真实图片路径调用视觉工具；不能只收到 file_key 文本，也不能出现新的 `mavis-input` 或 `ignis-attachment-*` 平铺文件。测试覆盖 base64 落盘、旧工作区路径迁出、工作区外路径复制和 resume path 附件传递。
 
 外部 Agent Executor v3.19 可见进度与来源会话连续性（2026-07-01）：
 

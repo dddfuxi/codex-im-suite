@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams, TurnStorageHost } from 'claude-to-im/src/lib/bridge/host.js';
 import { isDangerousInput, isPathWithinAllowedRoots, splitWorkspacePathList } from 'claude-to-im/src/lib/bridge/security/validators.js';
 
 import { CTI_HOME, type Config } from './config.js';
@@ -37,6 +37,7 @@ import {
   type LocalRouterMode,
 } from './local-llm-status.js';
 import { sseEvent } from './sse-utils.js';
+import { createRuntimeTurnStorage, stageProviderInputFiles } from './turn-storage.js';
 
 type LocalExecutionAction = 'answer_only' | 'run_shell' | 'edit_file' | 'multi_step';
 type LocalExecutionStepType = 'shell_command' | 'read_file' | 'write_file' | 'search_text';
@@ -513,6 +514,7 @@ export class LocalAgentProvider {
     private readonly config: Config,
     private readonly pendingPerms: PendingPermissions,
     private readonly localProvider: OllamaProvider,
+    private readonly turnStorage: TurnStorageHost = createRuntimeTurnStorage(config),
   ) {
     this.mcpBridge = new McpBridge(config);
   }
@@ -582,20 +584,15 @@ export class LocalAgentProvider {
       }
     }
 
-    const tempFiles: string[] = [];
     try {
       const { toolName, args } = this.buildIgnisToolCall(params, intent);
       if (toolName === 'ignis_ask' && params.files?.length) {
         const attachments = (args.attachments as string[] | undefined) || [];
-        for (const file of params.files) {
-          if (!file.data) continue;
-          const ext = mimeToExtension(file.type || '', file.name || 'attachment');
-          const filePath = path.join(CTI_HOME, 'runtime', `ignis-attachment-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`);
-          fs.mkdirSync(path.dirname(filePath), { recursive: true });
-          fs.writeFileSync(filePath, Buffer.from(file.data, 'base64'));
-          tempFiles.push(filePath);
-          attachments.push(filePath);
-        }
+        attachments.push(...stageProviderInputFiles(this.turnStorage, {
+          sessionId: params.sessionId,
+          turnId: params.turnId || params.sourceMessageId || crypto.randomUUID(),
+          files: params.files,
+        }));
         args.attachments = attachments;
       }
 
@@ -634,10 +631,6 @@ export class LocalAgentProvider {
       this.recordIgnisSummary(mode, false, text);
       this.emitTerminalResponse(controller, params.sessionId, makeCtiFinalReply(text), true);
       return { handled: true, fallbackToCodex: false, fallbackReason: text };
-    } finally {
-      for (const filePath of tempFiles) {
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-      }
     }
   }
 

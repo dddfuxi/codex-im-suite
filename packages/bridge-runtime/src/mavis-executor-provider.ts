@@ -34,22 +34,25 @@
  *      between phases.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import type {
   LLMProvider,
   StreamChatParams,
+  TurnStorageHost,
 } from 'claude-to-im/src/lib/bridge/host.js';
 import { formatPriorityTurnContext } from 'claude-to-im/src/lib/bridge/host.js';
 
-import { CTI_HOME, type Config } from './config.js';
+import type { Config } from './config.js';
 import { buildToolSandboxPolicy, inferCapabilities, listMavisReadOnlyForbiddenCapabilities, MAVIS_READ_ONLY_ALLOWED_CAPABILITIES } from './executor-registry.js';
 import { sanitizeToolResult, summarizeMavisFailureMessage } from './mavis-failure-summarizer.js';
 import { findBindingByMvs, findBindingBySource, readBindings, removeBinding, upsertBinding, type MavisSessionBinding } from './mavis-session-store.js';
 import { buildMavisSessionTitle } from './mavis-session-title.js';
 import { resolveProviderWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
+import { createRuntimeTurnStorage } from './turn-storage.js';
 import type {
   MavisClient,
   MavisCommunicationMessage,
@@ -66,6 +69,7 @@ export interface MavisExecutorOptions {
   hardTimeoutMs: number;         // default 480_000 (8 min)
   quietTimeoutMs: number;        // default 90_000
   maxDiffBytes: number;          // default 32_000
+  turnStorage?: TurnStorageHost;
 }
 
 export type MavisSseErrorCode =
@@ -403,83 +407,23 @@ interface MavisInputFileRef {
   localPath: string;
 }
 
-const MAVIS_ATTACHMENT_EXT_BY_MIME: Record<string, string> = {
-  'image/png': '.png',
-  'image/jpeg': '.jpg',
-  'image/jpg': '.jpg',
-  'image/webp': '.webp',
-  'image/gif': '.gif',
-};
-
-function safeAttachmentName(name: string, fallbackExt: string): string {
-  const base = path.basename(name || `attachment${fallbackExt}`)
-    .replace(/[^a-zA-Z0-9._-]/g, '_')
-    .replace(/_{2,}/g, '_')
-    .slice(0, 120);
-  if (!base || base === '.' || base === '..') return `attachment${fallbackExt}`;
-  return path.extname(base) ? base : `${base}${fallbackExt}`;
-}
-
-function resolveAttachmentExt(name: string, mimeType: string): string {
-  const ext = path.extname(name || '').toLowerCase();
-  if (/^\.[a-z0-9]{1,8}$/u.test(ext)) return ext;
-  return MAVIS_ATTACHMENT_EXT_BY_MIME[mimeType.toLowerCase()] || '.bin';
-}
-
-function isPathInside(parent: string, child: string): boolean {
-  const relative = path.relative(path.resolve(parent), path.resolve(child));
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
-function resolveExistingInputFilePath(filePath: string | undefined, workingDirectory: string): string {
-  if (!filePath) return '';
-  const resolved = path.resolve(workingDirectory, filePath);
-  try {
-    if (!fs.statSync(resolved).isFile()) return '';
-  } catch {
-    return '';
-  }
-  return resolved;
-}
-
-function materializeMavisInputFiles(params: StreamChatParams, workingDirectory: string, uploadCacheDir: string): MavisInputFileRef[] {
+function materializeMavisInputFiles(params: StreamChatParams, turnStorage: TurnStorageHost): MavisInputFileRef[] {
   const files = params.files?.filter((file) => file.type.toLowerCase().startsWith('image/')) ?? [];
   if (files.length === 0) return [];
 
-  const root = path.join(path.resolve(uploadCacheDir), 'mavis-input');
-  fs.mkdirSync(root, { recursive: true });
-
-  return files.map((file, index): MavisInputFileRef => {
-    const existingPath = resolveExistingInputFilePath(file.filePath, workingDirectory);
-    if (existingPath && (isPathInside(workingDirectory, existingPath) || isPathInside(uploadCacheDir, existingPath))) {
-      return {
-        id: file.id,
-        name: file.name,
-        type: file.type,
-        size: fs.statSync(existingPath).size,
-        localPath: existingPath,
-      };
-    }
-
-    const ext = resolveAttachmentExt(file.name, file.type);
-    const name = safeAttachmentName(file.name || `image-${index + 1}${ext}`, ext);
-    const localPath = path.join(root, `${Date.now()}-${index + 1}-${name}`);
-    // 外部执行器当前只能收到文本路径；把临时附件复制到 bridge 运行态上传缓存，
-    // 避免把 .codepilot-uploads 长期塞进 Unity/仓库默认工作目录。
-    const data = existingPath ? fs.readFileSync(existingPath) : Buffer.from(file.data || '', 'base64');
-    fs.writeFileSync(localPath, data);
+  return turnStorage.stageInputFiles({
+    sessionId: params.sessionId,
+    turnId: params.turnId || params.sourceMessageId || crypto.randomUUID(),
+    files,
+  }).map((file): MavisInputFileRef => {
     return {
       id: file.id,
-      name: file.name || name,
+      name: file.name,
       type: file.type,
-      size: data.length,
-      localPath,
+      size: file.size,
+      localPath: file.filePath,
     };
   });
-}
-
-function getMavisUploadCacheDir(config: Config): string {
-  return config.uploadCacheDir || path.join(CTI_HOME, 'runtime', 'uploads');
 }
 
 function buildTurnPromptWithInputFiles(params: StreamChatParams, inputFiles: MavisInputFileRef[]): string {
@@ -587,11 +531,13 @@ type BridgeSenderResolution =
 export class MavisExecutorProvider implements LLMProvider {
   private readonly opts: MavisExecutorOptions;
   private readonly allowedRoots: string[];
+  private readonly turnStorage: TurnStorageHost;
   binding?: MavisSessionBinding;
 
   constructor(opts: MavisExecutorOptions) {
     this.opts = opts;
     this.allowedRoots = buildToolSandboxPolicy(opts.config).allowedWorkspaceRoots || [];
+    this.turnStorage = opts.turnStorage || createRuntimeTurnStorage(opts.config);
   }
 
   async probe(): Promise<{ ok: boolean; reason?: string }> {
@@ -719,7 +665,7 @@ export class MavisExecutorProvider implements LLMProvider {
         command: 'prompt',
         content: buildTurnPromptWithInputFiles(
           params,
-          materializeMavisInputFiles(params, workingDirectory, getMavisUploadCacheDir(this.opts.config)),
+          materializeMavisInputFiles(params, this.turnStorage),
         ),
         // Use a configured Mavis sender when the bridge process does not
         // inherit $__MAVIS_PARENT_SESSION_ID; never pass the bridge sessionId.
@@ -745,7 +691,7 @@ export class MavisExecutorProvider implements LLMProvider {
     const title = buildMavisSessionTitle(params);
     const turnPrompt = buildTurnPromptWithInputFiles(
       params,
-      materializeMavisInputFiles(params, workingDirectory, getMavisUploadCacheDir(this.opts.config)),
+      materializeMavisInputFiles(params, this.turnStorage),
     );
     const created = await this.opts.client.createSession({
       agent: this.opts.agentName,

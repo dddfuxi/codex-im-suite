@@ -23,6 +23,7 @@ import type {
   AgentHomeHost,
   SelfMaintenanceHost,
   TurnReferenceResolverHost,
+  TurnStorageHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -40,6 +41,7 @@ export interface BridgeContext {
   agentHome?: AgentHomeHost;
   selfMaintenance?: SelfMaintenanceHost;
   turnReferences?: TurnReferenceResolverHost;
+  turnStorage?: TurnStorageHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

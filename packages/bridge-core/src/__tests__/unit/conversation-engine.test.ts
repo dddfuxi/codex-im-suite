@@ -274,7 +274,11 @@ test('keeps memory-backed sticker attachments out of the workspace upload cache'
       size: 14,
       data: Buffer.from('memory-sticker').toString('base64'),
       filePath: stickerPath,
-    }], workspace);
+    }], {
+      sessionId: 'session-sticker',
+      turnId: 'turn-sticker',
+      workingDirectory: workspace,
+    });
 
     assert.equal(files[0].filePath, stickerPath);
     assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
@@ -300,10 +304,16 @@ test('stages transient IM attachments in runtime upload cache instead of workspa
       type: 'image/png',
       size: 12,
       data: Buffer.from('transient-image').toString('base64'),
-    }], workspace);
+    }], {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      workingDirectory: workspace,
+    });
 
     assert.equal(files.length, 1);
     assert.equal(path.relative(uploadRoot, files[0].filePath).startsWith('..'), false);
+    assert.match(path.relative(uploadRoot, files[0].filePath), /session-1[\\/]turn-1/);
+    assert.doesNotMatch(files[0].filePath, /[\\/]history[\\/]/);
     assert.equal(fs.readFileSync(files[0].filePath, 'utf8'), 'transient-image');
     assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
   } finally {
@@ -311,4 +321,55 @@ test('stages transient IM attachments in runtime upload cache instead of workspa
     else process.env.CTI_UPLOAD_CACHE_DIR = previousUploadRoot;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('delegates attachment persistence to the runtime turn storage host', () => {
+  const calls: unknown[] = [];
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+    turnStorage: {
+      stageInputFiles: (input: unknown) => {
+        calls.push(input);
+        return [{
+          id: 'image-1',
+          name: 'incoming.png',
+          type: 'image/png',
+          size: 5,
+          filePath: 'C:\\runtime\\uploads\\session-1\\turn-1\\incoming.png',
+          sha256: 'hash',
+        }];
+      },
+      getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+      getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+    },
+  } as any);
+
+  const files = _testOnly.persistFileAttachmentsForHistory([{
+    id: 'image-1',
+    name: 'incoming.png',
+    type: 'image/png',
+    size: 5,
+    data: Buffer.from('image').toString('base64'),
+  }], {
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    workingDirectory: 'C:\\workspace',
+  });
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    files: [{
+      id: 'image-1',
+      name: 'incoming.png',
+      type: 'image/png',
+      size: 5,
+      data: Buffer.from('image').toString('base64'),
+    }],
+  });
+  assert.equal(files[0].filePath, 'C:\\runtime\\uploads\\session-1\\turn-1\\incoming.png');
 });

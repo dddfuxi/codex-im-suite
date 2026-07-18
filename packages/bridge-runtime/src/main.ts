@@ -148,6 +148,7 @@ import {
   createLarkCliDeviceAuthorizationRunner,
 } from './feishu-cli-user-auth.js';
 import { prepareWorkflowRetryExecution } from './workflow-retry.js';
+import { createRuntimeTurnStorage, type RuntimeTurnStorage } from './turn-storage.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
   appendWorkflowEvent,
@@ -2768,7 +2769,7 @@ class ObservedLLMProvider implements LLMProvider {
  * mavis-agent external executor. Returned registry is passed to
  * `HubLlmProvider` and `ObservedLLMProvider` for two-phase dispatch.
  */
-function buildExecutorRegistry(config: Config): ExecutorProviderRegistry {
+function buildExecutorRegistry(config: Config, turnStorage: RuntimeTurnStorage): ExecutorProviderRegistry {
   const registry = new ExecutorProviderRegistry();
   if (config.mavisEnabled === true && config.mavisCliPath) {
     try {
@@ -2787,6 +2788,7 @@ function buildExecutorRegistry(config: Config): ExecutorProviderRegistry {
         hardTimeoutMs: config.mavisHardTimeoutMs ?? 480_000,
         quietTimeoutMs: config.mavisQuietTimeoutMs ?? 90_000,
         maxDiffBytes: config.mavisMaxDiffBytes ?? 32_000,
+        turnStorage,
       });
       registry.register('mavis-agent', provider);
     } catch (err) {
@@ -2799,11 +2801,16 @@ function buildExecutorRegistry(config: Config): ExecutorProviderRegistry {
   return registry;
 }
 
-async function resolveProvider(config: Config, pendingPerms: PendingPermissions, store: BridgeStore): Promise<LLMProvider> {
+async function resolveProvider(
+  config: Config,
+  pendingPerms: PendingPermissions,
+  store: BridgeStore,
+  turnStorage: RuntimeTurnStorage,
+): Promise<LLMProvider> {
   // v3.4: registry is built once per daemon start, then injected into
   // HubLlmProvider / ObservedLLMProvider. External executors (currently
   // mavis-agent) are registered here based on the live `Config` snapshot.
-  const executorRegistry = buildExecutorRegistry(config);
+  const executorRegistry = buildExecutorRegistry(config, turnStorage);
 
   const wrapWithLocalHub = (
     provider: LLMProvider,
@@ -2814,7 +2821,7 @@ async function resolveProvider(config: Config, pendingPerms: PendingPermissions,
       config,
       store,
       localProvider,
-      new LocalAgentProvider(config, pendingPerms, localProvider),
+      new LocalAgentProvider(config, pendingPerms, localProvider, turnStorage),
       provider,
       null,
       primaryExecutorId,
@@ -3060,6 +3067,7 @@ function startWorkflowRetryService(
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const turnStorage = createRuntimeTurnStorage(config);
   setupLogger();
   clearLocalLlmTransientStatus(config);
 
@@ -3113,7 +3121,7 @@ async function main(): Promise<void> {
   } catch (error) {
     console.warn('[claude-to-im] Failed to write executor baseline status:', error instanceof Error ? error.message : error);
   }
-  const llm = await resolveProvider(config, pendingPerms, store);
+  const llm = await resolveProvider(config, pendingPerms, store, turnStorage);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
   const gateway = {
@@ -3223,6 +3231,7 @@ async function main(): Promise<void> {
       timeoutMs: Number.parseInt(store.getSetting('bridge_self_maintenance_timeout_ms') || '5000', 10) || 5000,
     }) : undefined,
     turnReferences: new ProviderTurnReferenceResolverHost(llm),
+    turnStorage,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         try {

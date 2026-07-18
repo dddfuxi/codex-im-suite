@@ -29,6 +29,30 @@ export interface FileAttachment {
   filePath?: string;
 }
 
+export interface StoredTurnFile {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  filePath: string;
+  sha256: string;
+}
+
+export interface TurnStorageScope {
+  sessionId: string;
+  turnId: string;
+}
+
+/**
+ * Runtime-owned storage boundary for transient inputs, generated artifacts,
+ * and conversation scratch directories. Core never derives these roots.
+ */
+export interface TurnStorageHost {
+  stageInputFiles(input: TurnStorageScope & { files: FileAttachment[] }): StoredTurnFile[];
+  getArtifactDirectory(input: TurnStorageScope): string;
+  getScratchDirectory(input: TurnStorageScope): string;
+}
+
 /** Server-Sent Event from the LLM stream. */
 export interface SSEEvent {
   type: SSEEventType;
@@ -783,6 +807,10 @@ export interface StreamChatParams {
   provider?: BridgeApiProvider;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   files?: FileAttachment[];
+  /** Runtime-owned identifier and paths shared by every provider in this turn. */
+  turnId?: string;
+  artifactDirectory?: string;
+  scratchDirectory?: string;
   onRuntimeStatusChange?: (status: string) => void;
   sourceUserId?: string;
   sourceUserDisplayName?: string;

@@ -170,29 +170,53 @@ function resolveUploadCacheRoot(): string {
  * (or CTI_UPLOAD_CACHE_DIR), not under the task working directory, so Unity
  * or repo roots do not become long-lived attachment/cache buckets.
  */
-function persistFileAttachmentsForHistory(files: FileAttachment[], _workingDirectory: string): Array<{
+interface AttachmentPersistenceScope {
+  sessionId: string;
+  turnId: string;
+  workingDirectory: string;
+}
+
+function safeStorageSegment(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(trimmed)) return trimmed;
+  const readable = trimmed.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || fallback;
+  return `${readable}-${crypto.createHash('sha256').update(trimmed || fallback).digest('hex').slice(0, 12)}`;
+}
+
+function persistFileAttachmentsForHistory(files: FileAttachment[], scope: AttachmentPersistenceScope): Array<{
   id: string;
   name: string;
   type: string;
   size: number;
   filePath: string;
 }> {
+  const host = getBridgeContext().turnStorage;
+  if (host) {
+    return host.stageInputFiles({
+      sessionId: scope.sessionId,
+      turnId: scope.turnId,
+      files,
+    });
+  }
+
+  // 兼容尚未接入 TurnStorageHost 的旧宿主；正式 runtime 统一使用上方 Host。
   const memoryRoot = createBridgeMemoryArtifactStore().root;
   const uploadRoot = resolveUploadCacheRoot();
-  let uploadDir = '';
+  const uploadDir = path.join(
+    uploadRoot,
+    safeStorageSegment(scope.sessionId, 'session'),
+    safeStorageSegment(scope.turnId, 'turn'),
+  );
   return files.map((file) => {
     const existingPath = file.filePath?.trim() || '';
     if (existingPath && fs.existsSync(existingPath) && isPathWithinRoot(existingPath, memoryRoot)) {
       return { id: file.id, name: file.name, type: file.type, size: file.size, filePath: existingPath };
     }
-    if (existingPath && fs.existsSync(existingPath) && isPathWithinRoot(existingPath, uploadRoot)) {
+    if (existingPath && fs.existsSync(existingPath) && isPathWithinRoot(existingPath, uploadDir)) {
       return { id: file.id, name: file.name, type: file.type, size: file.size, filePath: existingPath };
     }
 
-    if (!uploadDir) {
-      uploadDir = path.join(uploadRoot, 'history');
-      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    }
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
     const safeName = path.basename(file.name).replace(/[^a-zA-Z0-9._-]/g, '_');
     const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
     const buffer = file.data
@@ -701,15 +725,25 @@ export async function processMessage(
   try {
     // Resolve session early — needed for workingDirectory and provider resolution
     const session = store.getSession(sessionId);
+    const turnId = options?.sourceMessageId?.trim() || crypto.randomUUID();
+    const turnStorage = getBridgeContext().turnStorage;
+    const artifactDirectory = turnStorage?.getArtifactDirectory({ sessionId, turnId });
+    const scratchDirectory = turnStorage?.getScratchDirectory({ sessionId, turnId });
 
     // Save user message — persist file attachments to disk using the same
     // <!--files:JSON--> format as the desktop chat route, so the UI can render them.
     const storedUserText = options?.storedUserText || text;
     let savedContent = storedUserText;
+    let providerFiles = files;
     if (files && files.length > 0) {
       const workDir = binding.workingDirectory || session?.working_directory || '';
       try {
-        const fileMeta = persistFileAttachmentsForHistory(files, workDir);
+        const fileMeta = persistFileAttachmentsForHistory(files, { sessionId, turnId, workingDirectory: workDir });
+        providerFiles = files.map((file, index) => ({
+          ...file,
+          size: fileMeta[index]?.size ?? file.size,
+          filePath: fileMeta[index]?.filePath || file.filePath,
+        }));
         savedContent = `<!--files:${JSON.stringify(fileMeta)}-->${storedUserText}`;
       } catch (err) {
         console.warn('[conversation-engine] Failed to persist file attachments:', err instanceof Error ? err.message : err);
@@ -769,7 +803,7 @@ export async function processMessage(
     const executionRequirement = classifyExecutionRequirement({
       userText: options?.storedUserText || text,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
-      files,
+      files: providerFiles,
       memoryPlan: options?.memoryPlan,
       memoryIntentHandled: options?.memoryIntentHandled,
       messageKind: options?.messageKind,
@@ -870,7 +904,10 @@ export async function processMessage(
       permissionMode,
       provider: resolvedProvider,
       conversationHistory: compactHistory,
-      files,
+      files: providerFiles,
+      turnId,
+      artifactDirectory,
+      scratchDirectory,
       sourceUserId: options?.memoryUserId,
       sourceUserDisplayName: options?.memoryUserDisplayName,
       sourceMessageId: options?.sourceMessageId,

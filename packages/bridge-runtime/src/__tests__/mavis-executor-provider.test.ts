@@ -219,6 +219,7 @@ describe('mavis executor provider', () => {
 
         await provider.preDispatch(params({
           sessionId: 'bridge-image-new',
+          turnId: 'turn-image-new',
           workingDirectory: workspace,
           prompt: '用户发送了一个飞书表情包。',
           files: [{
@@ -239,7 +240,8 @@ describe('mavis executor provider', () => {
         assert.ok(pathMatch, prompt);
         assert.equal(fs.existsSync(pathMatch[1]), true);
         assert.deepEqual(fs.readFileSync(pathMatch[1]), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'mavis-input')), true);
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'bridge-image-new', 'turn-image-new')), true);
+        assert.equal(fs.existsSync(path.join(uploadCacheDir, 'mavis-input')), false);
         assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
       } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
@@ -247,7 +249,7 @@ describe('mavis executor provider', () => {
       }
     });
 
-    it('reuses existing workspace image paths instead of sending only text metadata', async () => {
+    it('copies legacy workspace upload paths into the turn-scoped runtime cache', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-existing-'));
       const uploadCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-upload-existing-'));
       try {
@@ -267,6 +269,7 @@ describe('mavis executor provider', () => {
 
         await provider.preDispatch(params({
           sessionId: 'bridge-image-existing',
+          turnId: 'turn-image-existing',
           workingDirectory: workspace,
           prompt: '请看这张图。',
           files: [{
@@ -280,7 +283,10 @@ describe('mavis executor provider', () => {
         }));
 
         const prompt = client.createSessionCalls[0]?.prompt || '';
-        assert.match(prompt, new RegExp(`Local path: ${escapeRegExp(imagePath)}`));
+        assert.doesNotMatch(prompt, new RegExp(`Local path: ${escapeRegExp(imagePath)}`));
+        const pathMatch = /Local path: (.+incoming\.png)/u.exec(prompt);
+        assert.ok(pathMatch, prompt);
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'bridge-image-existing', 'turn-image-existing')), true);
       } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
         fs.rmSync(uploadCacheDir, { recursive: true, force: true });
@@ -307,6 +313,7 @@ describe('mavis executor provider', () => {
 
         await provider.preDispatch(params({
           sessionId: 'bridge-image-copy',
+          turnId: 'turn-image-copy',
           workingDirectory: workspace,
           prompt: '请看这张外部图。',
           files: [{
@@ -323,7 +330,7 @@ describe('mavis executor provider', () => {
         assert.doesNotMatch(prompt, new RegExp(escapeRegExp(externalPath)));
         const pathMatch = /Local path: (.+outside\.png)/u.exec(prompt);
         assert.ok(pathMatch, prompt);
-        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'mavis-input')), true);
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'bridge-image-copy', 'turn-image-copy')), true);
         assert.equal(fs.existsSync(path.join(workspace, '.codepilot-uploads')), false);
         assert.deepEqual(fs.readFileSync(pathMatch[1]), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
       } finally {
@@ -751,6 +758,7 @@ describe('mavis executor provider', () => {
     it('materializes image attachments and includes local paths when resuming via communicationSend', async () => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-image-resume-'));
       const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mvp-'));
+      const uploadCacheDir = path.join(tmpHome, 'runtime', 'uploads');
       const prevHome = process.env.CTI_HOME;
       process.env.CTI_HOME = tmpHome;
 
@@ -773,6 +781,7 @@ describe('mavis executor provider', () => {
             ...baseConfig,
             allowedWorkspaceRoots: [workspace],
             defaultWorkDir: workspace,
+            uploadCacheDir,
             mavisBridgeSessionId: 'mvs_parent',
           } as Config,
           agentName: 'mavis',
@@ -784,6 +793,7 @@ describe('mavis executor provider', () => {
 
         await provider.preDispatch(params({
           sessionId: 'bridge-image-resume',
+          turnId: 'turn-image-resume',
           workingDirectory: workspace,
           prompt: '用户发送了一张图片。',
           files: [{
@@ -803,6 +813,7 @@ describe('mavis executor provider', () => {
         assert.ok(pathMatch, content);
         assert.equal(fs.existsSync(pathMatch[1]), true);
         assert.deepEqual(fs.readFileSync(pathMatch[1]), Buffer.from([0xff, 0xd8, 0xff]));
+        assert.equal(pathMatch[1].startsWith(path.join(uploadCacheDir, 'bridge-image-resume', 'turn-image-resume')), true);
       } finally {
         if (prevHome === undefined) delete process.env.CTI_HOME;
         else process.env.CTI_HOME = prevHome;
