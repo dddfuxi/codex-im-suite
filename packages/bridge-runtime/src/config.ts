@@ -24,6 +24,11 @@ export interface Config {
   directReminderPushEnabled?: boolean;
   directReminderDecisionMode?: string;
   directReminderAllowSlashCommand?: boolean;
+  scheduledTasksEnabled?: boolean;
+  scheduledTasksPollMs?: number;
+  scheduledTasksMaxConcurrentRuns?: number;
+  scheduledTasksFailureAlertAfter?: number;
+  scheduledTasksFailureAlertCooldownMs?: number;
   unityMcpEndpoints?: string;
   unityMcpStartCommand?: string;
   localAiKind?: 'ollama' | 'lmstudio' | 'vllm' | 'openai-compatible' | 'custom';
@@ -322,6 +327,18 @@ export function loadConfig(): Config {
   const todoPushWindowMs = env.get("CTI_TODO_PUSH_WINDOW_MS")
     ? Number(env.get("CTI_TODO_PUSH_WINDOW_MS"))
     : undefined;
+  const scheduledTasksPollMs = env.get("CTI_SCHEDULED_TASKS_POLL_MS")
+    ? Number(env.get("CTI_SCHEDULED_TASKS_POLL_MS"))
+    : undefined;
+  const scheduledTasksMaxConcurrentRuns = env.get("CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS")
+    ? Number(env.get("CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS"))
+    : undefined;
+  const scheduledTasksFailureAlertAfter = env.get("CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER")
+    ? Number(env.get("CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER"))
+    : undefined;
+  const scheduledTasksFailureAlertCooldownMs = env.get("CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS")
+    ? Number(env.get("CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS"))
+    : undefined;
   const localLlmTimeoutMs = env.get("CTI_LOCAL_LLM_TIMEOUT_MS")
     ? Number(env.get("CTI_LOCAL_LLM_TIMEOUT_MS"))
     : undefined;
@@ -454,6 +471,21 @@ export function loadConfig(): Config {
     directReminderAllowSlashCommand: env.has("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND")
       ? env.get("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND") === "true"
       : true,
+    scheduledTasksEnabled: env.has("CTI_SCHEDULED_TASKS_ENABLED")
+      ? env.get("CTI_SCHEDULED_TASKS_ENABLED") === "true"
+      : true,
+    scheduledTasksPollMs: typeof scheduledTasksPollMs === "number" && Number.isFinite(scheduledTasksPollMs)
+      ? Math.max(5000, Math.floor(scheduledTasksPollMs))
+      : 15000,
+    scheduledTasksMaxConcurrentRuns: typeof scheduledTasksMaxConcurrentRuns === "number" && Number.isFinite(scheduledTasksMaxConcurrentRuns)
+      ? Math.max(1, Math.min(16, Math.floor(scheduledTasksMaxConcurrentRuns)))
+      : 4,
+    scheduledTasksFailureAlertAfter: typeof scheduledTasksFailureAlertAfter === "number" && Number.isFinite(scheduledTasksFailureAlertAfter)
+      ? Math.max(1, Math.floor(scheduledTasksFailureAlertAfter))
+      : 3,
+    scheduledTasksFailureAlertCooldownMs: typeof scheduledTasksFailureAlertCooldownMs === "number" && Number.isFinite(scheduledTasksFailureAlertCooldownMs)
+      ? Math.max(60000, Math.floor(scheduledTasksFailureAlertCooldownMs))
+      : 3600000,
     unityMcpEndpoints: env.get("CTI_UNITY_MCP_ENDPOINTS") || undefined,
     unityMcpStartCommand: env.get("CTI_UNITY_MCP_START_COMMAND") || undefined,
     localAiKind,
@@ -638,6 +670,16 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_DIRECT_REMINDER_DECISION_MODE", config.directReminderDecisionMode);
   if (config.directReminderAllowSlashCommand !== undefined)
     out += formatEnvLine("CTI_DIRECT_REMINDER_ALLOW_SLASH_COMMAND", String(config.directReminderAllowSlashCommand));
+  if (config.scheduledTasksEnabled !== undefined)
+    out += formatEnvLine("CTI_SCHEDULED_TASKS_ENABLED", String(config.scheduledTasksEnabled));
+  if (config.scheduledTasksPollMs !== undefined)
+    out += formatEnvLine("CTI_SCHEDULED_TASKS_POLL_MS", String(config.scheduledTasksPollMs));
+  if (config.scheduledTasksMaxConcurrentRuns !== undefined)
+    out += formatEnvLine("CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS", String(config.scheduledTasksMaxConcurrentRuns));
+  if (config.scheduledTasksFailureAlertAfter !== undefined)
+    out += formatEnvLine("CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER", String(config.scheduledTasksFailureAlertAfter));
+  if (config.scheduledTasksFailureAlertCooldownMs !== undefined)
+    out += formatEnvLine("CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS", String(config.scheduledTasksFailureAlertCooldownMs));
   out += formatEnvLine("CTI_UNITY_MCP_ENDPOINTS", config.unityMcpEndpoints);
   out += formatEnvLine("CTI_UNITY_MCP_START_COMMAND", config.unityMcpStartCommand);
   out += formatEnvLine("CTI_LOCAL_AI_KIND", config.localAiKind);
@@ -975,6 +1017,19 @@ export function configToSettings(config: Config): Map<string, string> {
   m.set("bridge_direct_reminder_push_enabled", String(config.directReminderPushEnabled !== false));
   m.set("bridge_direct_reminder_decision_mode", config.directReminderDecisionMode || "codex_action");
   m.set("bridge_direct_reminder_allow_slash_command", String(config.directReminderAllowSlashCommand !== false));
+  m.set("bridge_scheduled_tasks_enabled", String(config.scheduledTasksEnabled !== false));
+  if (typeof config.scheduledTasksPollMs === "number" && Number.isFinite(config.scheduledTasksPollMs)) {
+    m.set("bridge_scheduled_tasks_poll_ms", String(Math.max(5000, Math.floor(config.scheduledTasksPollMs))));
+  }
+  if (typeof config.scheduledTasksMaxConcurrentRuns === "number" && Number.isFinite(config.scheduledTasksMaxConcurrentRuns)) {
+    m.set("bridge_scheduled_tasks_max_concurrent_runs", String(Math.max(1, Math.min(16, Math.floor(config.scheduledTasksMaxConcurrentRuns)))));
+  }
+  if (typeof config.scheduledTasksFailureAlertAfter === "number" && Number.isFinite(config.scheduledTasksFailureAlertAfter)) {
+    m.set("bridge_scheduled_tasks_failure_alert_after", String(Math.max(1, Math.floor(config.scheduledTasksFailureAlertAfter))));
+  }
+  if (typeof config.scheduledTasksFailureAlertCooldownMs === "number" && Number.isFinite(config.scheduledTasksFailureAlertCooldownMs)) {
+    m.set("bridge_scheduled_tasks_failure_alert_cooldown_ms", String(Math.max(60000, Math.floor(config.scheduledTasksFailureAlertCooldownMs))));
+  }
   if (typeof config.todoPushPollMs === "number" && Number.isFinite(config.todoPushPollMs)) {
     m.set("bridge_todo_push_poll_ms", String(Math.max(5000, Math.floor(config.todoPushPollMs))));
   }

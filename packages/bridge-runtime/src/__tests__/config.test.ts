@@ -338,6 +338,22 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_todo_push_window_ms'), '600000');
     assert.equal(m.get('bridge_todo_push_channels'), 'feishu,weixin');
   });
+
+  it('maps scheduled task runtime limits', () => {
+    const m = configToSettings({
+      ...base,
+      scheduledTasksEnabled: true,
+      scheduledTasksPollMs: 15000,
+      scheduledTasksMaxConcurrentRuns: 4,
+      scheduledTasksFailureAlertAfter: 3,
+      scheduledTasksFailureAlertCooldownMs: 3600000,
+    });
+    assert.equal(m.get('bridge_scheduled_tasks_enabled'), 'true');
+    assert.equal(m.get('bridge_scheduled_tasks_poll_ms'), '15000');
+    assert.equal(m.get('bridge_scheduled_tasks_max_concurrent_runs'), '4');
+    assert.equal(m.get('bridge_scheduled_tasks_failure_alert_after'), '3');
+    assert.equal(m.get('bridge_scheduled_tasks_failure_alert_cooldown_ms'), '3600000');
+  });
 });
 
 // ── Config file parsing (loadConfig/saveConfig round-trip) ──
@@ -493,6 +509,36 @@ describe('loadConfig/saveConfig round-trip', () => {
       assert.equal(config.todoPushPollMs, 30000);
       assert.equal(config.todoPushWindowMs, 600000);
       assert.deepEqual(config.todoPushChannels, ['feishu', 'weixin']);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads and bounds scheduled task env config', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-task-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\unity\\ST3',
+        'CTI_SCHEDULED_TASKS_ENABLED=true',
+        'CTI_SCHEDULED_TASKS_POLL_MS=1000',
+        'CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS=99',
+        'CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER=3',
+        'CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS=3600000',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?scheduled-tasks-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.scheduledTasksEnabled, true);
+      assert.equal(config.scheduledTasksPollMs, 5000);
+      assert.equal(config.scheduledTasksMaxConcurrentRuns, 16);
+      assert.equal(config.scheduledTasksFailureAlertAfter, 3);
+      assert.equal(config.scheduledTasksFailureAlertCooldownMs, 3600000);
     } finally {
       if (previousCtiHome === undefined) delete process.env.CTI_HOME;
       else process.env.CTI_HOME = previousCtiHome;

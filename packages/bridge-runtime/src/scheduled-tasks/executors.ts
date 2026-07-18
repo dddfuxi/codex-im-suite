@@ -40,6 +40,14 @@ export type ExecuteScheduledTaskRunOptions = {
   sleep?: (ms: number) => Promise<void>;
 };
 
+export type RetryScheduledTaskDeliveryOptions = {
+  task: VersionedScheduledTask;
+  run: ScheduledTaskRun;
+  payload: ScheduledTaskDeliveryPayload;
+  deliver: (payload: ScheduledTaskDeliveryPayload) => Promise<ScheduledDeliveryResult>;
+  sleep?: (ms: number) => Promise<void>;
+};
+
 function retryDelay(task: VersionedScheduledTask, retryIndex: number): number {
   const delays = task.retryPolicy.backoffMs;
   if (delays.length === 0) return 0;
@@ -62,6 +70,49 @@ function canReplayAction(
 ): boolean {
   if (result.executionStarted !== true) return true;
   return task.action.kind === 'controlled_tool' && task.action.idempotent === true;
+}
+
+export async function retryScheduledTaskDelivery(
+  options: RetryScheduledTaskDeliveryOptions,
+): Promise<ScheduledTaskExecutionResult> {
+  const sleep = options.sleep ?? (async (ms: number) => {
+    await delay(ms);
+  });
+  let deliveryRetryIndex = 0;
+  while (true) {
+    const delivered = await options.deliver(options.payload);
+    if (delivered.ok) {
+      return {
+        executionStatus: 'ok',
+        deliveryStatus: 'delivered',
+        deliveryPayload: options.payload,
+        summary: options.run.summary,
+        sessionId: options.run.sessionId,
+        provider: options.run.provider,
+        model: options.run.model,
+        messageId: delivered.messageId,
+        cardId: delivered.cardId,
+        executionStarted: options.run.executionStarted ?? true,
+      };
+    }
+    const errorKind = delivered.errorKind ?? classifyScheduledTaskError(delivered.error);
+    if (!canRetry(options.task, errorKind, deliveryRetryIndex)) {
+      return {
+        executionStatus: 'ok',
+        deliveryStatus: 'failed',
+        deliveryPayload: options.payload,
+        errorKind,
+        error: delivered.error,
+        summary: options.run.summary,
+        sessionId: options.run.sessionId,
+        provider: options.run.provider,
+        model: options.run.model,
+        executionStarted: options.run.executionStarted ?? true,
+      };
+    }
+    await sleep(retryDelay(options.task, deliveryRetryIndex));
+    deliveryRetryIndex += 1;
+  }
 }
 
 export async function executeScheduledTaskRun(
@@ -118,41 +169,20 @@ export async function executeScheduledTaskRun(
     };
   }
 
-  let deliveryRetryIndex = 0;
-  while (true) {
-    const delivered = await options.deliver(payload);
-    if (delivered.ok) {
-      return {
-        executionStatus: 'ok',
-        deliveryStatus: 'delivered',
-        deliveryPayload: payload,
-        summary: action.summary,
-        sessionId: action.sessionId,
-        provider: action.provider,
-        model: action.model,
-        messageId: delivered.messageId,
-        cardId: delivered.cardId,
-        executionStarted: true,
-      };
-    }
-    const errorKind = delivered.errorKind ?? classifyScheduledTaskError(delivered.error);
-    if (!canRetry(options.task, errorKind, deliveryRetryIndex)) {
-      return {
-        executionStatus: 'ok',
-        deliveryStatus: 'failed',
-        deliveryPayload: payload,
-        errorKind,
-        error: delivered.error,
-        summary: action.summary,
-        sessionId: action.sessionId,
-        provider: action.provider,
-        model: action.model,
-        executionStarted: true,
-      };
-    }
-    await sleep(retryDelay(options.task, deliveryRetryIndex));
-    deliveryRetryIndex += 1;
-  }
+  return retryScheduledTaskDelivery({
+    task: options.task,
+    run: {
+      ...options.run,
+      summary: action.summary,
+      sessionId: action.sessionId,
+      provider: action.provider,
+      model: action.model,
+      executionStarted: true,
+    },
+    payload,
+    deliver: options.deliver,
+    sleep,
+  });
 }
 
 export { classifyScheduledTaskError } from './errors.js';
