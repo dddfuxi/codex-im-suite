@@ -7,6 +7,7 @@ const suiteRoot = path.resolve(import.meta.dirname, '..', '..', '..', '..');
 const skillRoot = path.join(suiteRoot, 'extensions', 'skills', 'manage-codex-im-scheduled-tasks');
 const skillPath = path.join(skillRoot, 'SKILL.md');
 const openAiPath = path.join(skillRoot, 'agents', 'openai.yaml');
+const manifestPath = path.join(suiteRoot, 'config', 'skills.d', 'manage-codex-im-scheduled-tasks.json');
 
 describe('Feishu scheduled task skill', () => {
   it('contains every required scheduled-task workflow guard', () => {
@@ -43,5 +44,14 @@ describe('Feishu scheduled task skill', () => {
     assert.match(metadata, /display_name: "管理飞书计划任务"/u);
     assert.match(metadata, /short_description: ".{25,64}"/u);
     assert.match(metadata, /default_prompt: "Use \$manage-codex-im-scheduled-tasks/u);
+  });
+
+  it('registers the bundled skill for the control panel and lifecycle installer', () => {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(manifest.id, 'manage-codex-im-scheduled-tasks');
+    assert.equal(manifest.type, 'skill');
+    assert.equal(manifest.enabled, true);
+    assert.equal(manifest.installState, 'bundled');
+    assert.equal(manifest.source, '${SUITE_ROOT}\\extensions\\skills\\manage-codex-im-scheduled-tasks');
   });
 });
