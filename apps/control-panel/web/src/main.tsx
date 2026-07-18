@@ -16,6 +16,7 @@ import {
   Bell,
   Bot,
   BrainCircuit,
+  CalendarClock,
   CheckCircle2,
   Clipboard,
   Database,
@@ -60,8 +61,10 @@ import { McpPage } from './pages/McpPage.js';
 import { ModelsPluginsPage } from './pages/ModelsPluginsPage.js';
 import { PromptPage } from './pages/PromptPage.js';
 import { SkillsPage } from './pages/SkillsPage.js';
+import { ScheduledTasksPage } from './pages/ScheduledTasksPage.js';
 import type { PromptSnapshotPanelState } from './prompt-view-model.js';
 import type { SkillGovernancePanelState } from './skill-view-model.js';
+import type { ScheduledTaskPanelState } from './scheduled-task-view-model.js';
 import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
@@ -969,6 +972,7 @@ type PanelState = {
   };
   skillGovernance: SkillGovernancePanelState;
   promptSnapshots: PromptSnapshotPanelState;
+  scheduledTasks: ScheduledTaskPanelState;
   mcp: {
     total: number;
     running: number;
@@ -1046,6 +1050,7 @@ const pageIcons = {
   overview: Activity,
   services: Power,
   sessions: History,
+  scheduledTasks: CalendarClock,
   architecture: Network,
   prompts: FileText,
   memory: Search,
@@ -1083,6 +1088,7 @@ const fallbackState: PanelState = {
       snapshots: [],
     },
   },
+  scheduledTasks: { available: false, error: '计划任务状态尚未加载', status: {}, items: [] },
   mcp: { total: 0, running: 0, items: [], runtimeStatus: '', details: '' },
   release: { publishSummaryExists: false, releaseNotesExists: false, prepareMainReleaseExists: false, tagScriptExists: false, pendingChanges: [] },
   liveSync: { status: 'unavailable', lastSyncedAt: '', suiteCommit: '', liveCommit: '', summary: 'Live 同步状态不可用', canSync: false, detail: '' },
@@ -1184,6 +1190,12 @@ const commandLabels: Record<string, string> = {
   'release.publishBackup': '一键发布',
   'release.prepareMainRelease': '主干发布预检',
   'history.recallBotMessage': '撤回消息',
+  'scheduledTasks.pause': '暂停计划任务',
+  'scheduledTasks.resume': '恢复计划任务',
+  'scheduledTasks.runNow': '立即运行计划任务',
+  'scheduledTasks.cancelRun': '取消计划任务运行',
+  'scheduledTasks.delete': '删除计划任务',
+  'scheduledTasks.retryDelivery': '重试计划任务投递',
 };
 const trackedCommands = new Set(Object.keys(commandLabels));
 
@@ -2682,6 +2694,14 @@ function App() {
             selectedUnitId={selectedServiceUnit?.unitId ?? ''}
             setSelectedUnitId={setSelectedServiceUnitId}
             invokeAction={invokeRuntimeAction}
+            pending={pending}
+          />
+        )}
+        {page === 'scheduledTasks' && (
+          <ScheduledTasksPage
+            state={state.scheduledTasks}
+            run={run}
+            refresh={async () => { await run('state.refresh'); }}
             pending={pending}
           />
         )}

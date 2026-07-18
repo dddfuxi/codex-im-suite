@@ -532,6 +532,8 @@ internal sealed partial class MainForm : Form
 
     private static string RequiredRoleForControlCommand(string command, JsonElement payload = default)
     {
+        var scheduledTaskRole = ScheduledTaskCommandPolicy.GetRequiredRole(command);
+        if (!string.IsNullOrWhiteSpace(scheduledTaskRole)) return scheduledTaskRole;
         var skillRole = SkillControlCommandPolicy.GetRequiredRole(command);
         if (!string.IsNullOrWhiteSpace(skillRole)) return skillRole;
         if (string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
@@ -1080,6 +1082,26 @@ internal sealed partial class MainForm : Form
                 return GetWorkflowEvents(payload);
             case "workflow.retryRun":
                 return RetryWorkflowRun(payload);
+            case "scheduledTasks.list":
+                return await RunScheduledTaskCliAsync("list", payload);
+            case "scheduledTasks.get":
+                return await RunScheduledTaskCliAsync("get", payload);
+            case "scheduledTasks.pause":
+                return await RunScheduledTaskCliAsync("pause", payload);
+            case "scheduledTasks.resume":
+                return await RunScheduledTaskCliAsync("resume", payload);
+            case "scheduledTasks.runNow":
+                return await RunScheduledTaskCliAsync("run-now", payload);
+            case "scheduledTasks.cancelRun":
+                return await RunScheduledTaskCliAsync("cancel-run", payload);
+            case "scheduledTasks.delete":
+                return await RunScheduledTaskCliAsync("delete", payload);
+            case "scheduledTasks.history":
+                return await RunScheduledTaskCliAsync("history", payload);
+            case "scheduledTasks.retryDelivery":
+                return await RunScheduledTaskCliAsync("retry-delivery", payload);
+            case "scheduledTasks.status":
+                return await RunScheduledTaskCliAsync("status", payload);
             case "executor.list":
                 return ReadExecutorStatusPayload();
             case "executor.check":
@@ -1134,6 +1156,7 @@ internal sealed partial class MainForm : Form
         var sessionItems = await BuildSessionItemsAsync();
         var skillGovernance = await BuildSkillGovernanceStateAsync();
         var promptSnapshots = BuildPromptSnapshotState();
+        var scheduledTasks = await CreateScheduledTaskGateway().ReadPanelStateAsync();
         var memorySkillAssets = MemoryArtifactStore.BuildSkillAssetIndex(skillGovernance.Snapshot ?? default);
         var services = new[]
         {
@@ -1168,6 +1191,7 @@ internal sealed partial class MainForm : Form
             },
             skillGovernance,
             promptSnapshots,
+            scheduledTasks,
             mcp = new
             {
                 total = mcpItems.Length,
@@ -10106,6 +10130,22 @@ exit $LASTEXITCODE
             _ctiHome,
             codexHome,
             nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+    }
+
+    private ScheduledTaskGateway CreateScheduledTaskGateway()
+        => new(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
+    private async Task<JsonElement> RunScheduledTaskCliAsync(string cliCommand, JsonElement payload)
+    {
+        object input = payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            ? new { }
+            : JsonSerializer.Deserialize<object>(payload.GetRawText(), WebJsonOptions) ?? new { };
+        using var document = await CreateScheduledTaskGateway().RunAsync(cliCommand, input);
+        return document.RootElement.Clone();
     }
 
     private async Task<JsonElement> RunSkillLifecycleCommandAsync(string cliCommand, JsonElement payload, bool includePanelActor)

@@ -2981,6 +2981,132 @@ button:disabled {
   padding: 18px 0;
 }
 
+.scheduled-task-summary {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.scheduled-task-list,
+.scheduled-task-history {
+  display: grid;
+  gap: 12px;
+}
+
+.scheduled-task-card,
+.scheduled-task-run {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.scheduled-task-card-head,
+.scheduled-task-title-row,
+.scheduled-task-actions,
+.scheduled-task-unavailable,
+.scheduled-task-warning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.scheduled-task-capability-note {
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-soft);
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
+}
+
+.scheduled-task-card-head {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.scheduled-task-card-head h3,
+.scheduled-task-unavailable h2 {
+  margin: 0;
+}
+
+.scheduled-task-card-head code {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.scheduled-task-meta,
+.scheduled-task-error,
+.scheduled-task-run p,
+.scheduled-task-unavailable p {
+  margin: 4px 0 0;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.scheduled-task-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.scheduled-task-facts > div,
+.scheduled-task-run > div {
+  display: grid;
+  gap: 4px;
+}
+
+.scheduled-task-facts span,
+.scheduled-task-run span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.scheduled-task-actions {
+  flex-wrap: wrap;
+}
+
+.mini-button.danger {
+  color: var(--danger-text);
+  border-color: color-mix(in srgb, var(--danger-text) 24%, var(--border));
+}
+
+.scheduled-task-warning {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning-text) 24%, var(--border));
+  border-radius: 10px;
+  color: var(--warning-text);
+  background: color-mix(in srgb, var(--warning-bg) 52%, var(--panel-bg));
+}
+
+.scheduled-task-unavailable {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.scheduled-task-unavailable > div {
+  flex: 1;
+}
+
+.scheduled-task-run {
+  grid-template-columns: minmax(180px, 1.4fr) minmax(90px, 0.6fr) minmax(100px, 0.7fr) auto;
+  align-items: center;
+}
+
+.scheduled-task-run p {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 1099px) {
+  .scheduled-task-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scheduled-task-facts,
+  .scheduled-task-run {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .spin {
   animation: spin 0.9s linear infinite;
 }

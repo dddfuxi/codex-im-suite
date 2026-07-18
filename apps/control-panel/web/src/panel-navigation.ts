@@ -2,6 +2,7 @@ export const panelPageMeta = {
   overview: { label: '总览' },
   services: { label: '服务' },
   sessions: { label: '会话' },
+  scheduledTasks: { label: '计划任务' },
   architecture: { label: '机器人架构' },
   prompts: { label: '提示词注入' },
   memory: { label: '记忆索引' },
@@ -18,7 +19,7 @@ export type PageId = keyof typeof panelPageMeta;
 export type ServiceTabId = 'services' | 'nodes' | 'executors';
 
 export const panelNavigation = [
-  { id: 'run', label: '运行', pages: ['overview', 'services', 'sessions'] },
+  { id: 'run', label: '运行', pages: ['overview', 'services', 'sessions', 'scheduledTasks'] },
   { id: 'robot', label: '机器人', pages: ['architecture', 'prompts', 'memory'] },
   { id: 'capability', label: '能力', pages: ['skills', 'mcp', 'modelsPlugins'] },
   { id: 'governance', label: '治理', pages: ['permissions', 'release', 'logs', 'settings'] },
