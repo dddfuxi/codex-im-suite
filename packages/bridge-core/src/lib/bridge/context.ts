@@ -14,6 +14,7 @@ import type {
   PermissionGateway,
   LifecycleHooks,
   ReminderActionHost,
+  ScheduledTaskActionHost,
   BridgeControlHost,
   ExtensionCatalogHost,
   FeishuCloudDocumentHost,
@@ -32,6 +33,7 @@ export interface BridgeContext {
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;
   reminders?: ReminderActionHost;
+  scheduledTasks?: ScheduledTaskActionHost;
   bridgeControl?: BridgeControlHost;
   extensions?: ExtensionCatalogHost;
   feishuCloudDocuments?: FeishuCloudDocumentHost;

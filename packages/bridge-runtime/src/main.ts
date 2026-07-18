@@ -11,6 +11,10 @@ import { fileURLToPath } from 'node:url';
 
 import { initBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
 import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
+import {
+  getWorkspacePlanRoots,
+  resolveTurnWorkspacePlan,
+} from 'claude-to-im/src/lib/bridge/workspace-plan.js';
 import 'claude-to-im/src/lib/bridge/adapters/index.js';
 import {
   classifyToolResultQuality,
@@ -61,6 +65,13 @@ import { listManagedRuleStates } from './self-maintenance-rule-lifecycle.js';
 import { recordSelfMaintenanceMetric } from './self-maintenance-metrics.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
+import {
+  createBridgeScheduledTaskActionHost,
+  createScheduledTaskRunExecutor,
+  createScheduledTaskScheduler,
+} from './scheduled-task-host.js';
+import { createScheduledTaskService } from './scheduled-tasks/service.js';
+import { createFileScheduledTaskStore } from './scheduled-tasks/store.js';
 import { setupLogger } from './logger.js';
 import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
 import { ProviderHealthCircuit, type ProviderFailureKind } from './provider-health-circuit.js';
@@ -2980,6 +2991,45 @@ async function collectWorkflowRetryResponse(
   return parts.join('').trim();
 }
 
+async function collectScheduledTaskAgentResponse(
+  llm: LLMProvider,
+  params: Parameters<LLMProvider['streamChat']>[0],
+  signal: AbortSignal,
+): Promise<string> {
+  const abortController = new AbortController();
+  const relayAbort = () => abortController.abort(signal.reason || 'scheduled task aborted');
+  if (signal.aborted) relayAbort();
+  else signal.addEventListener('abort', relayAbort, { once: true });
+  const parts: string[] = [];
+  let reader: ReadableStreamDefaultReader<string> | null = null;
+  try {
+    reader = llm.streamChat({ ...params, abortController }).getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const event of parseBridgeSseEvents(value)) {
+        if (event.type === 'permission_request') {
+          abortController.abort('background permission request is not allowed');
+          throw new Error('计划任务运行需要新的交互授权，后台任务已安全停止');
+        }
+        if (event.type === 'error') {
+          throw new Error(typeof event.data === 'string' ? event.data : '计划任务 Provider 执行失败');
+        }
+        if (event.type === 'text') {
+          if (typeof event.data === 'string') parts.push(event.data);
+          else if (event.data != null) parts.push(JSON.stringify(event.data));
+        }
+      }
+    }
+    const text = parts.join('').trim();
+    if (!text) throw new Error('计划任务 Agent 没有返回可投递结果');
+    return text;
+  } finally {
+    signal.removeEventListener('abort', relayAbort);
+    await reader?.cancel().catch(() => {});
+  }
+}
+
 function startWorkflowRetryService(
   runId: string,
   llm: LLMProvider,
@@ -3133,6 +3183,116 @@ async function main(): Promise<void> {
   const llm = await resolveProvider(config, pendingPerms, store, turnStorage);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
+  const scheduledTaskRuntimeAbort = new AbortController();
+  const scheduledTaskStore = createFileScheduledTaskStore(path.join(CTI_HOME, 'data', 'scheduled-tasks'));
+  let scheduledTaskService: ReturnType<typeof createScheduledTaskService>;
+  const scheduledTaskExecute = createScheduledTaskRunExecutor({
+    runtimeSignal: scheduledTaskRuntimeAbort.signal,
+    tools: new Map(),
+    resolveWorkspacePlan: async ({ sourceSessionId }) => {
+      const session = store.getSession(sourceSessionId);
+      const boundDirectory = session?.working_directory?.trim();
+      if (!session || !boundDirectory) {
+        return { ok: false, error: `绑定会话不存在或没有工作区：${sourceSessionId}` };
+      }
+      if (!fs.existsSync(boundDirectory) || !fs.statSync(boundDirectory).isDirectory()) {
+        return { ok: false, error: `绑定工作区不存在：${boundDirectory}` };
+      }
+      try {
+        const plan = resolveTurnWorkspacePlan({
+          prompt: '',
+          currentWorkingDirectory: boundDirectory,
+          registeredRoots: config.allowedWorkspaceRoots,
+          deniedRoots: [
+            { path: CTI_HOME, reason: 'bridge runtime data' },
+            ...(config.memoryRepoDir ? [{ path: config.memoryRepoDir, reason: 'memory repository' }] : []),
+            ...(config.uploadCacheDir ? [{ path: config.uploadCacheDir, reason: 'upload cache' }] : []),
+          ],
+          requiresWrite: true,
+        });
+        if (path.resolve(plan.primaryWorkspace.path) !== path.resolve(boundDirectory)) {
+          return { ok: false, error: '绑定工作区未被工作区计划选为当前主目录' };
+        }
+        return { ok: true, workspacePlan: plan };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    runAgentTurn: async ({ task, run, workspacePlan, signal }) => {
+      const runSessionId = task.action.kind === 'agent_turn' && task.action.sessionMode === 'bound'
+        ? task.executionContext.sourceSessionId
+        : `${task.executionContext.sourceSessionId}:scheduled:${task.id}:${run.runId}`;
+      try {
+        const roots = workspacePlan ? getWorkspacePlanRoots(workspacePlan) : [];
+        const responseText = await collectScheduledTaskAgentResponse(llm, {
+          prompt: task.action.kind === 'agent_turn' ? task.action.prompt : '',
+          sessionId: runSessionId,
+          forceFreshThread: task.action.kind === 'agent_turn' && task.action.sessionMode === 'isolated',
+          interactionMode: 'agent',
+          workspacePlan,
+          workingDirectory: workspacePlan?.primaryWorkspace.path,
+          additionalDirectories: roots.slice(1),
+          sourceUserId: task.owner.userId,
+          sourceMessageId: task.owner.sourceMessageId,
+          sourceChannelType: task.delivery.channelType,
+          sourceChatId: task.delivery.chatId,
+          systemPrompt: [
+            '这是统一计划任务触发的后台 Agent 回合。',
+            '必须基于运行时当前状态生成新结果；不得声称已投递，投递由独立 Delivery 层完成。',
+            '如果需要新的交互授权，必须失败关闭，不得等待或伪造授权。',
+          ].join('\n'),
+        }, signal);
+        return {
+          ok: true,
+          deliveryPayload: { text: responseText, parseMode: 'Markdown' },
+          summary: responseText.replace(/\s+/g, ' ').trim().slice(0, 500),
+          sessionId: runSessionId,
+          executionStarted: true,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          executionStarted: true,
+        };
+      }
+    },
+    deliver: async ({ task, run, payload }) => {
+      const sourceSession = store.getSession(task.executionContext.sourceSessionId);
+      const delivered = await bridgeManager.deliverProactiveMessage({
+        address: {
+          channelType: task.delivery.channelType,
+          chatId: task.delivery.chatId,
+          chatType: task.delivery.chatType,
+        },
+        text: payload.text || run.summary || task.name,
+        parseMode: payload.parseMode || 'plain',
+        mentions: task.delivery.notifyTargets,
+        sessionId: run.sessionId || task.executionContext.sourceSessionId,
+        dedupKey: `scheduled-task:${task.id}:${run.slotKey}`,
+        prepareFinalReply: true,
+        workingDirectory: sourceSession?.working_directory,
+        sourcePrompt: task.action.kind === 'agent_turn' ? task.action.prompt : task.name,
+      });
+      return delivered.ok
+        ? { ok: true, messageId: delivered.messageId, cardId: delivered.cardId }
+        : { ok: false, error: delivered.error || '计划任务投递失败' };
+    },
+  });
+  scheduledTaskService = createScheduledTaskService({
+    store: scheduledTaskStore,
+    execute: scheduledTaskExecute,
+  });
+  const scheduledTasks = createBridgeScheduledTaskActionHost({
+    store: scheduledTaskStore,
+    service: scheduledTaskService,
+  });
+  const scheduledTaskScheduler = createScheduledTaskScheduler({
+    service: scheduledTaskService,
+    pollMs: config.scheduledTasksPollMs ?? 15_000,
+    onError: (error) => console.error('[claude-to-im] Scheduled task tick failed:', error instanceof Error ? error.message : error),
+  });
+
   const gateway = {
     resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>
       pendingPerms.resolve(id, resolution),
@@ -3241,6 +3401,7 @@ async function main(): Promise<void> {
     }) : undefined,
     turnReferences: new ProviderTurnReferenceResolverHost(llm),
     turnStorage,
+    scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         try {
@@ -3316,6 +3477,10 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
+  if (config.scheduledTasksEnabled !== false) {
+    await scheduledTaskScheduler.start();
+    console.log(`[claude-to-im] Scheduled tasks: enabled, root=${path.join(CTI_HOME, 'data', 'scheduled-tasks')}`);
+  }
   workflowRetryTimer = startWorkflowRetryService(runId, llm, store, feishuCloudDocuments);
   if (config.memoryRepoDir) {
     const todoPushChannels = config.todoPushChannels && config.todoPushChannels.length > 0
@@ -3354,6 +3519,8 @@ async function main(): Promise<void> {
     const reason = signal ? `signal: ${signal}` : 'shutdown requested';
     console.log(`[claude-to-im] Shutting down (${reason})...`);
     pendingPerms.denyAll();
+    scheduledTaskScheduler.stop();
+    scheduledTaskRuntimeAbort.abort(reason);
     await bridgeManager.stop();
     todoReminderService?.close();
     knowledgeWatcher?.close();
@@ -3376,6 +3543,8 @@ async function main(): Promise<void> {
   });
   process.on('uncaughtException', (err) => {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
+    scheduledTaskScheduler.stop();
+    scheduledTaskRuntimeAbort.abort(`uncaughtException: ${err.message}`);
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();
@@ -3390,6 +3559,8 @@ async function main(): Promise<void> {
   });
   process.on('exit', (code) => {
     console.log(`[claude-to-im] exit (code: ${code})`);
+    scheduledTaskScheduler.stop();
+    scheduledTaskRuntimeAbort.abort(`process exit: ${code}`);
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();

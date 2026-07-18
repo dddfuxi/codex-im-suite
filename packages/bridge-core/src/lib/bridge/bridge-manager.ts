@@ -26,6 +26,10 @@ import type {
   MemoryReplyDecision,
   SelfMaintenanceInput,
   SelfMaintenanceResult,
+  ScheduledTaskActionInput,
+  ScheduledTaskCreateInput,
+  ScheduledTaskMutationResult,
+  ScheduledTaskScheduleInput,
 } from './host.js';
 import type { TurnEvidenceItem } from './turn-context.js';
 import { execFile } from 'node:child_process';
@@ -98,6 +102,7 @@ const STICKER_ANNOTATION_FENCE = 'cti-sticker-annotation';
 const STICKER_CANDIDATE_ANALYSIS_FENCE = 'cti-sticker-candidate-analysis';
 const STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE = 0.45;
 const REMINDER_ACTION_FENCE = 'cti-reminder';
+const SCHEDULED_TASK_ACTION_FENCE = 'cti-scheduled-task';
 const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
 const BRIDGE_CONTROL_ACTION_FENCE = 'cti-bridge-control';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
@@ -188,6 +193,22 @@ interface CtiReminderAction {
 interface ExtractedReminderAction {
   action: CtiReminderAction | null;
   text: string;
+}
+
+interface CtiScheduledTaskCreateAction {
+  action: 'create';
+  name: string;
+  schedule: ScheduledTaskScheduleInput;
+  taskAction: ScheduledTaskActionInput;
+  deliveryMode: 'result' | 'summary' | 'none';
+  ignoredTrustedFields: string[];
+}
+
+interface ExtractedScheduledTaskAction {
+  action: CtiScheduledTaskCreateAction | null;
+  text: string;
+  hadBlock: boolean;
+  error?: string;
 }
 
 interface CtiDirectMessageAction {
@@ -332,6 +353,115 @@ function extractCtiReminderAction(text: string): ExtractedReminderAction {
     };
   } catch {
     return { action: null, text: cleaned };
+  }
+}
+
+function parseScheduledTaskSchedule(value: unknown): ScheduledTaskScheduleInput | null {
+  const raw = getRecordField(value);
+  if (!raw) return null;
+  const kind = getStringField(raw, ['kind']).toLowerCase();
+  if (kind === 'at') {
+    const at = getStringField(raw, ['at', 'dueAt', 'due_at']);
+    const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
+    return at && timezone ? { kind: 'at', at, timezone } : null;
+  }
+  if (kind === 'every') {
+    const everyMs = Number(raw.everyMs ?? raw.every_ms);
+    const anchorAt = getStringField(raw, ['anchorAt', 'anchor_at']);
+    return Number.isFinite(everyMs) && everyMs > 0 && anchorAt
+      ? { kind: 'every', everyMs: Math.floor(everyMs), anchorAt }
+      : null;
+  }
+  if (kind === 'cron') {
+    const expression = getStringField(raw, ['expression', 'cron']);
+    const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
+    return expression && timezone ? { kind: 'cron', expression, timezone } : null;
+  }
+  return null;
+}
+
+function parseScheduledTaskAction(value: unknown): ScheduledTaskActionInput | null {
+  const raw = getRecordField(value);
+  if (!raw) return null;
+  const kind = getStringField(raw, ['kind']).toLowerCase();
+  if (kind === 'notify') {
+    const text = getStringField(raw, ['text', 'message', 'content']);
+    return text ? { kind: 'notify', text } : null;
+  }
+  if (kind === 'agent_turn') {
+    const prompt = getStringField(raw, ['prompt', 'text', 'request']);
+    const sessionMode = getStringField(raw, ['sessionMode', 'session_mode']).toLowerCase();
+    if (!prompt || (sessionMode !== 'isolated' && sessionMode !== 'bound')) return null;
+    const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms);
+    return {
+      kind: 'agent_turn',
+      prompt,
+      sessionMode,
+      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs: Math.floor(timeoutMs) } : {}),
+    };
+  }
+  if (kind === 'controlled_tool') {
+    const toolName = getStringField(raw, ['toolName', 'tool_name', 'name']);
+    if (!toolName) return null;
+    const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms);
+    return {
+      kind: 'controlled_tool',
+      toolName,
+      input: raw.input ?? null,
+      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs: Math.floor(timeoutMs) } : {}),
+    };
+  }
+  return null;
+}
+
+function collectIgnoredScheduledTaskFields(value: unknown): string[] {
+  const ignoredNames = new Set([
+    'actor', 'owner', 'role', 'userid', 'user_id', 'openid', 'open_id', 'chatid', 'chat_id',
+    'target', 'delivery', 'sourcesessionid', 'source_session_id', 'workspaceid', 'workspace_id',
+    'workspacemode', 'workspace_mode', 'workingdirectory', 'working_directory',
+    'additionaldirectories', 'additional_directories', 'evidence', 'messageid', 'message_id',
+  ]);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>)
+    .filter((key) => ignoredNames.has(key.replace(/[-\s]/gu, '_').toLowerCase()))
+    .sort();
+}
+
+function extractCtiScheduledTaskAction(text: string): ExtractedScheduledTaskAction {
+  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${SCHEDULED_TASK_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
+  const match = text.match(fencePattern);
+  if (!match) return { action: null, text, hadBlock: false };
+  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
+  try {
+    const parsed = JSON.parse(match[2].trim());
+    const raw = getRecordField(parsed);
+    if (!raw || getStringField(raw, ['action']).toLowerCase() !== 'create') {
+      return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作仅支持 create' };
+    }
+    const name = getStringField(raw, ['name', 'title']);
+    const schedule = parseScheduledTaskSchedule(raw.schedule);
+    const taskAction = parseScheduledTaskAction(raw.taskAction ?? raw.task_action);
+    const requestedDeliveryMode = getStringField(raw, ['deliveryMode', 'delivery_mode']).toLowerCase();
+    const deliveryMode = requestedDeliveryMode === 'summary' || requestedDeliveryMode === 'none'
+      ? requestedDeliveryMode
+      : 'result';
+    if (!name || !schedule || !taskAction) {
+      return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name、schedule 或 taskAction' };
+    }
+    return {
+      action: {
+        action: 'create',
+        name,
+        schedule,
+        taskAction,
+        deliveryMode,
+        ignoredTrustedFields: collectIgnoredScheduledTaskFields(parsed),
+      },
+      text: cleaned,
+      hadBlock: true,
+    };
+  } catch {
+    return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作 JSON 解析失败' };
   }
 }
 
@@ -1063,6 +1193,112 @@ function buildReminderActionResultText(result: DirectReminderCreateResult): stri
   ].filter(Boolean).join('\n');
 }
 
+function buildScheduledTaskActor(msg: InboundMessage): ScheduledTaskCreateInput['actor'] {
+  return {
+    role: getPermissionRoleForMessage(msg) || 'viewer',
+    channelType: msg.address.channelType,
+    userId: msg.address.userId?.trim() || '',
+    messageId: msg.messageId,
+  };
+}
+
+function buildScheduledTaskResultText(
+  result: ScheduledTaskMutationResult,
+  fallbackName: string,
+  kind: ScheduledTaskActionInput['kind'],
+): string {
+  if (!result.ok) {
+    return `未完成：计划任务没有进入统一调度系统。\n原因：${result.error || '未知错误'}`;
+  }
+  const kindLabel = kind === 'agent_turn' ? '动态 Agent 任务' : kind === 'controlled_tool' ? '受控工具任务' : '固定通知';
+  return [
+    `已创建计划任务：${result.name || fallbackName}`,
+    `类型：${kindLabel}`,
+    result.nextRunAt ? `下次运行：${formatLocalReminderTime(result.nextRunAt)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function buildTrustedScheduledTaskCreateInput(input: {
+  msg: InboundMessage;
+  sessionId: string;
+  name: string;
+  schedule: ScheduledTaskScheduleInput;
+  taskAction: ScheduledTaskActionInput;
+  deliveryMode: 'result' | 'summary' | 'none';
+  notifyTargets?: OutboundMention[];
+}): ScheduledTaskCreateInput {
+  return {
+    name: input.name,
+    schedule: input.schedule,
+    taskAction: input.taskAction,
+    executionContext: {
+      sourceSessionId: input.sessionId,
+      workspaceMode: input.taskAction.kind === 'agent_turn' && input.taskAction.sessionMode === 'bound'
+        ? 'bound'
+        : 'none',
+    },
+    delivery: {
+      target: input.msg.address,
+      ...(input.notifyTargets?.length ? { notifyTargets: input.notifyTargets } : {}),
+      mode: input.deliveryMode,
+    },
+    actor: buildScheduledTaskActor(input.msg),
+  };
+}
+
+async function executeScheduledTaskActionFromReply(
+  rawReply: string,
+  msg: InboundMessage,
+  sessionId: string,
+  rawPrompt: string,
+): Promise<BridgeActionReplyResult> {
+  const extracted = extractCtiScheduledTaskAction(rawReply);
+  if (extracted.action) {
+    const scheduledTasks = getBridgeContext().scheduledTasks;
+    if (!scheduledTasks) {
+      return { handled: true, text: '未完成：当前 bridge 没有加载统一计划任务服务。' };
+    }
+    if (extracted.action.taskAction.kind === 'controlled_tool' && !isOwnerMessage(msg)) {
+      return { handled: true, text: buildOwnerRequiredMessage(msg) };
+    }
+    if (
+      extracted.action.taskAction.kind === 'agent_turn'
+      && isSystemAffectingReminderRequest(rawPrompt, extracted.action.taskAction.prompt)
+      && !isOwnerMessage(msg)
+    ) {
+      return { handled: true, text: buildOwnerRequiredMessage(msg) };
+    }
+    if (extracted.action.ignoredTrustedFields.length > 0) {
+      getBridgeContext().store.insertAuditLog({
+        channelType: msg.address.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[IGNORED_SCHEDULED_TASK_FIELDS] fields=${extracted.action.ignoredTrustedFields.join(',')}`,
+      });
+    }
+    const notifyTargets = await resolveReminderNotifyTargets(msg, rawPrompt);
+    const result = await scheduledTasks.create(buildTrustedScheduledTaskCreateInput({
+      msg,
+      sessionId,
+      name: extracted.action.name,
+      schedule: extracted.action.schedule,
+      taskAction: extracted.action.taskAction,
+      deliveryMode: extracted.action.deliveryMode,
+      notifyTargets,
+    }));
+    return {
+      handled: true,
+      text: buildScheduledTaskResultText(result, extracted.action.name, extracted.action.taskAction.kind),
+      bridgeActionToolName: result.ok ? SCHEDULED_TASK_ACTION_FENCE : undefined,
+    };
+  }
+  if (extracted.hadBlock) {
+    return { handled: true, text: `未完成：${extracted.error || '计划任务动作无效'}` };
+  }
+  return { handled: false, text: rawReply };
+}
+
 async function executeReminderActionFromReply(
   adapter: BaseChannelAdapter,
   rawReply: string,
@@ -1083,10 +1319,39 @@ async function executeReminderActionFromReply(
         ].join('\n'),
       };
     }
+    const scheduledTasks = getBridgeContext().scheduledTasks;
+    const notifyTargets = await resolveReminderNotifyTargets(msg, rawPrompt, extracted.action.notifyTargets);
+    if (scheduledTasks) {
+      const result = await scheduledTasks.create(buildTrustedScheduledTaskCreateInput({
+        msg,
+        sessionId,
+        name: extracted.action.title,
+        schedule: {
+          kind: 'at',
+          at: extracted.action.dueAt,
+          timezone: extracted.action.timezone || 'Asia/Shanghai',
+        },
+        taskAction: { kind: 'notify', text: extracted.action.title },
+        deliveryMode: 'result',
+        notifyTargets,
+      }));
+      return {
+        handled: true,
+        text: buildReminderActionResultText({
+          ok: result.ok,
+          reminderId: result.taskId,
+          title: result.name || extracted.action.title,
+          dueAt: result.nextRunAt || extracted.action.dueAt,
+          target: msg.address,
+          notifyTargets,
+          error: result.error,
+        }),
+        bridgeActionToolName: result.ok ? SCHEDULED_TASK_ACTION_FENCE : undefined,
+      };
+    }
     if (!reminders) {
       return { handled: true, text: '未完成：当前 bridge 没有加载统一提醒服务，不能创建提醒。' };
     }
-    const notifyTargets = await resolveReminderNotifyTargets(msg, rawPrompt, extracted.action.notifyTargets);
     const result = await reminders.createDirectReminder({
       title: extracted.action.title,
       dueAt: extracted.action.dueAt,
@@ -1792,7 +2057,7 @@ function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
 function sanitizeProgressCardDetail(text: string): string {
   const normalized = (text || '')
     .replace(/\r\n/g, '\n')
-    .replace(/```(?:cti-final|cti-direct-message|cti-bridge-control)[\s\S]*?```/gi, '')
+    .replace(/```(?:cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control)[\s\S]*?```/gi, '')
     .replace(/^\s*#{1,6}\s*处理思路\s*$/gim, '')
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
@@ -1845,7 +2110,7 @@ function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
   // 进度卡允许展示面向用户改写过的处理思路；这里只拦截会暴露工具名、路径、命令或 agent 内部阶段的细节。
-  if (/(JsonTool|tool_use|tool_result|cti-final|cti-direct-message|cti-bridge-control|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
+  if (/(JsonTool|tool_use|tool_result|cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
     return true;
   }
   if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
@@ -2704,6 +2969,8 @@ function stripFinalReplyProtocolArtifacts(text: string): string {
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${FINAL_REPLY_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_ANNOTATION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${REMINDER_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${SCHEDULED_TASK_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -7308,11 +7575,25 @@ async function handleMessage(
         verifiedStickerAction,
       )
       : { handled: false, text: '' };
-    let bridgeActionToolName = bridgeControlAction.bridgeActionToolName || directMessageAction.bridgeActionToolName;
+    const scheduledTaskAction = !bridgeControlAction.handled && !directMessageAction.handled && providerVisibleResponseText
+      ? await executeScheduledTaskActionFromReply(
+        providerVisibleResponseText,
+        msg,
+        effectiveBinding.codepilotSessionId,
+        rawText,
+      )
+      : { handled: false, text: '' };
+    let bridgeActionToolName = bridgeControlAction.bridgeActionToolName
+      || directMessageAction.bridgeActionToolName
+      || scheduledTaskAction.bridgeActionToolName;
     let responseText = bridgeControlAction.handled
       ? bridgeControlAction.text
-      : (directMessageAction.handled ? directMessageAction.text : '');
-    if (!bridgeControlAction.handled && !directMessageAction.handled && providerVisibleResponseText) {
+      : directMessageAction.handled
+        ? directMessageAction.text
+        : scheduledTaskAction.handled
+          ? scheduledTaskAction.text
+          : '';
+    if (!bridgeControlAction.handled && !directMessageAction.handled && !scheduledTaskAction.handled && providerVisibleResponseText) {
       const reminderAction = await executeReminderActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -7790,12 +8071,13 @@ async function handleCommand(
     case '/remind': {
       const parsed = parseSlashReminderArgs(args);
       const reminders = getBridgeContext().reminders;
+      const scheduledTasks = getBridgeContext().scheduledTasks;
       if (!parsed) {
         response = '用法：/remind 10分钟后 看电脑，或 /remind 2026-04-29 19:42 看电脑';
         break;
       }
-      if (!reminders) {
-        response = '未完成：当前 bridge 没有加载统一提醒服务。';
+      if (!scheduledTasks && !reminders) {
+        response = '未完成：当前 bridge 没有加载统一计划任务或提醒服务。';
         break;
       }
       if (isSystemAffectingReminderRequest(text, parsed.title)) {
@@ -7808,7 +8090,26 @@ async function handleCommand(
         break;
       }
       const binding = router.resolve(msg.address);
-      const result = await reminders.createDirectReminder({
+      if (scheduledTasks) {
+        const result = await scheduledTasks.create(buildTrustedScheduledTaskCreateInput({
+          msg,
+          sessionId: binding.codepilotSessionId,
+          name: parsed.title,
+          schedule: { kind: 'at', at: parsed.dueAt, timezone: 'Asia/Shanghai' },
+          taskAction: { kind: 'notify', text: parsed.title },
+          deliveryMode: 'result',
+        }));
+        response = buildReminderActionResultText({
+          ok: result.ok,
+          reminderId: result.taskId,
+          title: result.name || parsed.title,
+          dueAt: result.nextRunAt || parsed.dueAt,
+          target: msg.address,
+          error: result.error,
+        });
+        break;
+      }
+      const result = await reminders!.createDirectReminder({
         title: parsed.title,
         dueAt: parsed.dueAt,
         timezone: 'Asia/Shanghai',
@@ -7817,7 +8118,7 @@ async function handleCommand(
         createdByMessageId: msg.messageId,
         sessionId: binding.codepilotSessionId,
       });
-      await reminders.tickReminders?.();
+      await reminders!.tickReminders?.();
       response = buildReminderActionResultText(result);
       break;
     }

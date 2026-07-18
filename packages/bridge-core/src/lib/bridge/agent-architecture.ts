@@ -252,6 +252,20 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['policy', 'mentions', 'delivery', 'target-validation'],
   },
   {
+    id: 'policy_registry.scheduled_task_actions',
+    layerId: 'policy_registry',
+    title: 'Scheduled Task Actions',
+    responsibility: 'Route one-shot reminders, recurring schedules, dynamic agent turns, and controlled tools through one trusted runtime Host.',
+    promptLines: [
+      '- Scheduled task action protocol: for periodic, recurring, cron, interval, or dynamic future work, output one fenced ```cti-scheduled-task JSON block. Use action="create", name, schedule, and taskAction; use taskAction.kind="agent_turn" when the future run must inspect current state or produce a fresh result.',
+      '- A low-risk one-shot notification may continue to use ```cti-reminder with title, dueAt, timezone, target="current_chat", and sourcePrompt; the bridge converts it into the same unified scheduled task runtime.',
+      '- Never place chatId, userId, owner role, sourceSessionId, workingDirectory, additionalDirectories, or platform credentials in either action block. The bridge rebuilds target, actor, session, workspace, and evidence from the current inbound turn.',
+      '- Controlled-tool scheduled tasks require Owner authorization and a runtime allowlist. Do not substitute shell, temporary scripts, operating-system schedulers, or handwritten platform APIs.',
+      '- Do not claim a reminder, periodic task, scheduled run, or proactive delivery was created unless the scheduled task Host success result is returned for this turn.',
+    ],
+    tags: ['policy', 'scheduled-task', 'reminder', 'cron', 'delivery'],
+  },
+  {
     id: 'memory_system.durable_recall',
     layerId: 'memory_system',
     title: 'Durable Recall',

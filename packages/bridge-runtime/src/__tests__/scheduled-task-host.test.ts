@@ -5,8 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  createBridgeScheduledTaskActionHost,
   createScheduledTaskHost,
   createScheduledTaskRunExecutor,
+  createScheduledTaskScheduler,
 } from '../scheduled-task-host.js';
 import { createScheduledTaskService } from '../scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from '../scheduled-tasks/store.js';
@@ -157,6 +159,41 @@ describe('scheduled task runtime host', () => {
     assert.equal(result.executionStatus, 'error');
   });
 
+  it('aborts an active agent run when the runtime is stopping', async () => {
+    const runtime = new AbortController();
+    let childAbortSeen = false;
+    const execute = createScheduledTaskRunExecutor({
+      resolveWorkspacePlan: async () => assert.fail('isolated task must not resolve a workspace'),
+      runAgentTurn: async ({ signal }) => new Promise((resolve) => {
+        signal.addEventListener('abort', () => {
+          childAbortSeen = true;
+          resolve({ ok: false, error: 'runtime stopping', errorKind: 'unknown', executionStarted: true });
+        }, { once: true });
+      }),
+      deliver: async () => assert.fail('cancelled task must not deliver'),
+      tools: new Map(),
+      runtimeSignal: runtime.signal,
+      sleep: async () => {},
+    });
+    const pending = execute({
+      task: makeScheduledTask({
+        action: { kind: 'agent_turn', prompt: '后台运行', sessionMode: 'isolated' },
+        executionContext: { sourceSessionId: 'session_1', workspaceMode: 'none' },
+      }),
+      run: makeScheduledRun(),
+      mode: 'full',
+    });
+
+    runtime.abort('bridge shutdown');
+    const result = await Promise.race([
+      pending,
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 100)),
+    ]);
+
+    assert.notEqual(result, 'timeout');
+    assert.equal(childAbortSeen, true);
+  });
+
   it('requires owner role to create a controlled tool task', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-host-'));
     try {
@@ -195,5 +232,77 @@ describe('scheduled task runtime host', () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('adapts trusted bridge create inputs and lets a viewer manage their own low-risk task', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-bridge-host-'));
+    try {
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => 'task_bridge_001',
+      });
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-18T08:00:00.000Z',
+        execute: async () => ({ executionStatus: 'ok', deliveryStatus: 'not_requested' }),
+      });
+      const host = createBridgeScheduledTaskActionHost({ store, service });
+      const created = await host.create({
+        name: '每日单子',
+        schedule: { kind: 'cron', expression: '30 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: { kind: 'agent_turn', prompt: '查询并发送每日单子', sessionMode: 'bound' },
+        executionContext: { sourceSessionId: 'session_1', workspaceMode: 'bound' },
+        delivery: {
+          target: { channelType: 'feishu', chatId: 'oc_123', userId: 'ou_1', chatType: 'group' },
+          mode: 'result',
+        },
+        actor: { role: 'viewer', channelType: 'feishu', userId: 'ou_1', messageId: 'om_1' },
+      });
+
+      assert.equal(created.ok, true);
+      assert.equal(created.taskId, 'task_bridge_001');
+      assert.equal(created.nextRunAt, '2026-07-20T02:30:00.000Z');
+      const stored = await store.getTask('task_bridge_001');
+      assert.equal(stored?.delivery.chatId, 'oc_123');
+      assert.equal(stored?.owner.userId, 'ou_1');
+      assert.equal(stored?.executionContext.sourceSessionId, 'session_1');
+
+      const paused = await host.pause({ taskId: 'task_bridge_001', actor: { role: 'viewer', channelType: 'feishu', userId: 'ou_1' } });
+      assert.equal(paused.ok, true);
+      assert.equal((await store.getTask('task_bridge_001'))?.enabled, false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers before polling and stops accepting scheduler ticks during shutdown', async () => {
+    const calls: string[] = [];
+    let intervalHandler: (() => void) | undefined;
+    let cleared = false;
+    const scheduler = createScheduledTaskScheduler({
+      service: {
+        recover: async () => { calls.push('recover'); return 0; },
+        tick: async () => { calls.push('tick'); return 0; },
+        ensureTaskState: async () => assert.fail('not used'),
+        runNow: async () => assert.fail('not used'),
+      },
+      pollMs: 5000,
+      setInterval: (handler: () => void) => {
+        intervalHandler = handler;
+        return 1 as unknown as NodeJS.Timeout;
+      },
+      clearInterval: () => { cleared = true; },
+    });
+
+    await scheduler.start();
+    assert.deepEqual(calls, ['recover', 'tick']);
+    intervalHandler?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, ['recover', 'tick', 'tick']);
+    scheduler.stop();
+    intervalHandler?.();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(cleared, true);
+    assert.deepEqual(calls, ['recover', 'tick', 'tick']);
   });
 });

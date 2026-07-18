@@ -840,6 +840,109 @@ export interface LLMProvider {
   streamChat(params: StreamChatParams): ReadableStream<string>;
 }
 
+// ── Host Interface: Scheduled Task Actions ─────────────────
+
+export type ScheduledTaskScheduleInput =
+  | { kind: 'at'; at: string; timezone: string }
+  | { kind: 'every'; everyMs: number; anchorAt: string }
+  | { kind: 'cron'; expression: string; timezone: string };
+
+export type ScheduledTaskActionInput =
+  | { kind: 'notify'; text: string }
+  | { kind: 'agent_turn'; prompt: string; sessionMode: 'isolated' | 'bound'; timeoutMs?: number }
+  | { kind: 'controlled_tool'; toolName: string; input: unknown; timeoutMs?: number };
+
+export interface ScheduledTaskActorInput {
+  role: 'viewer' | 'operator' | 'owner';
+  channelType: string;
+  userId: string;
+  messageId?: string;
+}
+
+export interface ScheduledTaskCreateInput {
+  name: string;
+  schedule: ScheduledTaskScheduleInput;
+  taskAction: ScheduledTaskActionInput;
+  executionContext: {
+    sourceSessionId: string;
+    workspaceMode: 'bound' | 'none';
+    workspaceId?: string;
+  };
+  delivery: {
+    target: ChannelAddress;
+    notifyTargets?: OutboundMention[];
+    mode: 'result' | 'summary' | 'none';
+  };
+  actor: ScheduledTaskActorInput;
+}
+
+export interface ScheduledTaskMutationInput {
+  taskId: string;
+  actor: ScheduledTaskActorInput;
+}
+
+export interface ScheduledTaskCancelRunInput extends ScheduledTaskMutationInput {
+  runId: string;
+}
+
+export interface ScheduledTaskListInput {
+  actor: ScheduledTaskActorInput;
+}
+
+export interface ScheduledTaskGetInput extends ScheduledTaskMutationInput {}
+
+export interface ScheduledTaskHistoryInput extends ScheduledTaskMutationInput {
+  limit?: number;
+}
+
+export interface ScheduledTaskRetryDeliveryInput extends ScheduledTaskMutationInput {
+  runId: string;
+}
+
+export interface ScheduledTaskDeleteInput extends ScheduledTaskMutationInput {}
+
+export interface ScheduledTaskMutationResult {
+  ok: boolean;
+  taskId?: string;
+  name?: string;
+  nextRunAt?: string;
+  message?: string;
+  error?: string;
+}
+
+export interface ScheduledTaskListResult {
+  ok: boolean;
+  tasks: unknown[];
+  error?: string;
+}
+
+export interface ScheduledTaskGetResult {
+  ok: boolean;
+  task?: unknown;
+  state?: unknown;
+  error?: string;
+}
+
+export interface ScheduledTaskHistoryResult {
+  ok: boolean;
+  runs: unknown[];
+  error?: string;
+}
+
+/** Runtime-owned scheduled task boundary shared by IM actions, CLI, and panel. */
+export interface ScheduledTaskActionHost {
+  create(input: ScheduledTaskCreateInput): Promise<ScheduledTaskMutationResult>;
+  list(input: ScheduledTaskListInput): Promise<ScheduledTaskListResult>;
+  get(input: ScheduledTaskGetInput): Promise<ScheduledTaskGetResult>;
+  pause(input: ScheduledTaskMutationInput): Promise<ScheduledTaskMutationResult>;
+  resume(input: ScheduledTaskMutationInput): Promise<ScheduledTaskMutationResult>;
+  runNow(input: ScheduledTaskMutationInput): Promise<ScheduledTaskMutationResult>;
+  cancelRun(input: ScheduledTaskCancelRunInput): Promise<ScheduledTaskMutationResult>;
+  delete(input: ScheduledTaskDeleteInput): Promise<ScheduledTaskMutationResult>;
+  history(input: ScheduledTaskHistoryInput): Promise<ScheduledTaskHistoryResult>;
+  retryDelivery(input: ScheduledTaskRetryDeliveryInput): Promise<ScheduledTaskMutationResult>;
+}
+
 // ── Host Interface: Reminder Actions ────────────────────────
 
 export interface DirectReminderCreateInput {
