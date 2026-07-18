@@ -215,48 +215,13 @@ describe('todo reminders', () => {
     assert.match(deliveries[0].text, /提交文件/);
   });
 
-  it('creates direct reminders as markdown-backed pending reminder records', () => {
+  it('rejects new markdown-backed direct reminders after scheduled tasks take ownership', () => {
     const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-direct-reminder-'));
     try {
-      const result = createDirectReminder(memoryRoot, {
-        title: '看电脑',
-        dueAt: '2026-04-29T11:42:00.000Z',
-        timezone: 'Asia/Shanghai',
-        target: {
-          channelType: 'feishu',
-          chatId: 'oc_123',
-          chatType: 'group',
-          displayName: '当前会话',
-          messageId: 'om_1',
-        },
-        notifyTargets: [{ userId: 'ou_liudan', name: '刘丹' }],
-        sourcePrompt: '帮我设置个代办，两分钟后给我发消息提醒我看电脑',
-        createdAt: '2026-04-29T11:40:00.000Z',
-        createdByMessageId: 'om_1',
-      });
-
-      assert.equal(result.reminder.status, 'pending');
-      assert.equal(result.reminder.sourceType, 'direct');
-      assert.equal(result.reminder.createdByMessageId, 'om_1');
-      assert.equal(fs.existsSync(result.filePath), true);
-      const markdown = fs.readFileSync(result.filePath, 'utf-8');
-      assert.match(markdown, /channelType: feishu/);
-      assert.match(markdown, /chatId: oc_123/);
-      assert.match(markdown, /chatType: group/);
-      assert.match(markdown, /notifyTargets:/);
-      assert.match(markdown, /createdBy: agent-action/);
-      assert.match(markdown, /待办: 看电脑 @2026-04-29 19:42 状态: 未完成/);
-
-      const index = readReminderIndex(memoryRoot);
-      assert.equal(index?.reminderCount, 1);
-      assert.equal(index?.reminders[0].sourceType, 'direct');
-      assert.equal(index?.reminders[0].target.chatType, 'group');
-      assert.deepEqual(index?.reminders[0].notifyTargets, [{ userId: 'ou_liudan', name: '刘丹' }]);
-
-      const state = readReminderDeliveryState(memoryRoot);
-      assert.equal(state.deliveries[result.reminder.id]?.status, 'pending');
-      assert.equal(state.deliveries[result.reminder.id]?.chatType, 'group');
-      assert.equal(state.deliveries[result.reminder.id]?.attempts, 0);
+      assert.throws(() => createDirectReminder(memoryRoot, {
+        title: '看电脑', dueAt: '2026-04-29T11:42:00.000Z', target: { channelType: 'feishu', chatId: 'oc_123' },
+      }), /统一计划任务/);
+      assert.equal(fs.existsSync(path.join(memoryRoot, 'data', 'todos', 'direct-reminders')), false);
     } finally {
       fs.rmSync(memoryRoot, { recursive: true, force: true });
     }
@@ -265,23 +230,20 @@ describe('todo reminders', () => {
   it('completes direct reminders by updating markdown, index, and delivery state', () => {
     const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-complete-reminder-'));
     try {
-      const created = createDirectReminder(memoryRoot, {
-        title: '看电脑',
-        dueAt: '2026-04-29T11:42:00.000Z',
-        timezone: 'Asia/Shanghai',
-        target: {
-          channelType: 'feishu',
-          chatId: 'oc_123',
-          displayName: '当前会话',
-          messageId: 'om_1',
-        },
-        sourcePrompt: '两分钟后提醒我看电脑',
-        createdAt: '2026-04-29T11:40:00.000Z',
-        createdByMessageId: 'om_1',
-      });
+      const sourceDir = path.join(memoryRoot, 'data', 'todos', 'direct-reminders');
+      fs.mkdirSync(sourceDir, { recursive: true });
+      const filePath = path.join(sourceDir, 'legacy.md');
+      fs.writeFileSync(filePath, [
+        '---', 'channelType: feishu', 'chatId: oc_123', 'displayName: 当前会话', 'messageId: om_1', 'sourceType: direct', '---',
+        '待办: 看电脑 @2026-04-29 19:42 状态: 未完成',
+      ].join('\n'), 'utf8');
+      const index = buildReminderIndexFromKnowledge({ ...makeIndex([]), memoryRoot }, { includeDirectReminders: true, enabledChannels: ['feishu'] });
+      const reminder = index.reminders[0];
+      fs.mkdirSync(path.join(memoryRoot, '.cti-index'), { recursive: true });
+      fs.writeFileSync(path.join(memoryRoot, '.cti-index', 'reminders.json'), `${JSON.stringify({ ...index, memoryRoot }, null, 2)}\n`, 'utf8');
 
       const completed = completeReminder(memoryRoot, {
-        reminderId: created.reminder.id,
+        reminderId: reminder.id,
         chatId: 'oc_123',
         completedAt: '2026-04-29T11:43:00.000Z',
         completedByUserId: 'ou_1',
@@ -291,15 +253,15 @@ describe('todo reminders', () => {
       assert.equal(completed.ok, true);
       assert.equal(completed.status, 'completed');
       assert.equal(completed.sourceUpdated, true);
-      const markdown = fs.readFileSync(created.filePath, 'utf-8');
+      const markdown = fs.readFileSync(filePath, 'utf-8');
       assert.match(markdown, /状态: 完成/);
 
-      const index = readReminderIndex(memoryRoot);
-      assert.equal(index?.reminders[0].todoStatus, 'done');
+      const updatedIndex = readReminderIndex(memoryRoot);
+      assert.equal(updatedIndex?.reminders[0].todoStatus, 'done');
       const state = readReminderDeliveryState(memoryRoot);
-      assert.equal(state.deliveries[created.reminder.id]?.completedAt, '2026-04-29T11:43:00.000Z');
-      assert.equal(state.deliveries[created.reminder.id]?.completedByUserId, 'ou_1');
-      assert.equal(state.deliveries[created.reminder.id]?.completionSource, 'panel');
+      assert.equal(state.deliveries[reminder.id]?.completedAt, '2026-04-29T11:43:00.000Z');
+      assert.equal(state.deliveries[reminder.id]?.completedByUserId, 'ou_1');
+      assert.equal(state.deliveries[reminder.id]?.completionSource, 'panel');
     } finally {
       fs.rmSync(memoryRoot, { recursive: true, force: true });
     }

@@ -137,7 +137,6 @@ import { startKnowledgeIndexWatcher } from './knowledge-index-service.js';
 import { startMemoryOptimizerService, type MemoryOptimizerService } from './memory-optimizer.js';
 import {
   createFeishuPushProvider,
-  createDirectReminder,
   completeReminder,
   createWeixinPushProvider,
   startTodoReminderService,
@@ -3404,31 +3403,11 @@ async function main(): Promise<void> {
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
-        try {
-          const created = createDirectReminder(config.memoryRepoDir!, {
-            title: input.title,
-            dueAt: input.dueAt,
-            timezone: input.timezone,
-            target: input.target,
-            notifyTargets: input.notifyTargets,
-            sourcePrompt: input.sourcePrompt,
-            createdByMessageId: input.createdByMessageId,
-          });
-          return {
-            ok: true,
-            reminderId: created.reminder.id,
-            title: created.reminder.title,
-            dueAt: created.reminder.dueAt,
-            target: created.reminder.target,
-            notifyTargets: created.reminder.notifyTargets,
-            message: 'direct reminder created',
-          };
-        } catch (error) {
-          return {
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
+        void input;
+        return {
+          ok: false,
+          error: '新直接提醒必须通过统一计划任务 Host 创建；旧 reminder Host 仅保留完成和只读兼容。',
+        };
       },
       completeReminder: async (input) => {
         try {

@@ -4,6 +4,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CTI_HOME } from './config.js';
+import { assertCleanupProcessesStopped } from './cleanup-cli.js';
+import {
+  applyScheduledTaskMigrationPlan,
+  buildScheduledTaskMigrationPlan,
+} from './scheduled-tasks/migration.js';
 import { createFileScheduledTaskStore } from './scheduled-tasks/store.js';
 
 export type ScheduledTaskCliDependencies = { ctiHome?: string };
@@ -40,9 +45,24 @@ export async function executeScheduledTaskCli(
   dependencies: ScheduledTaskCliDependencies = {},
 ): Promise<ScheduledTaskCliResult> {
   const root = path.join(dependencies.ctiHome || CTI_HOME, 'data', 'scheduled-tasks');
-  const store = createFileScheduledTaskStore(root);
+  const getStore = () => createFileScheduledTaskStore(root);
   const command = (argv[0] || 'status').trim().toLowerCase();
   try {
+    if (command === 'migrate-direct-reminders') {
+      const memoryRoot = option(argv, '--memory-root')?.trim();
+      if (!memoryRoot) throw new Error('direct reminder 迁移需要 --memory-root。');
+      const plan = buildScheduledTaskMigrationPlan({ memoryRoot, scheduledTasksRoot: root });
+      if (!argv.includes('--apply')) return jsonResult(plan);
+      const applied = await applyScheduledTaskMigrationPlan(plan, {
+        store: getStore(),
+        assertProcessesStopped: () => assertCleanupProcessesStopped({
+          ctiHome: dependencies.ctiHome || CTI_HOME,
+          memoryRoot,
+        }),
+      });
+      return jsonResult(applied);
+    }
+    const store = getStore();
     if (command === 'list') {
       const tasks = await store.listTasks();
       const items = await Promise.all(tasks.map(async (task) => ({ task, state: await store.getState(task.id) })));

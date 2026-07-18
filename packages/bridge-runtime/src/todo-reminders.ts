@@ -379,67 +379,9 @@ export function createFeishuPushProvider(options: FeishuPushProviderOptions): Re
 }
 
 export function createDirectReminder(memoryRoot: string, input: DirectReminderInput): DirectReminderCreateResult {
-  const root = path.resolve(memoryRoot);
-  const createdAt = input.createdAt || new Date().toISOString();
-  const dueAt = normalizeDueAt(input.dueAt);
-  if (!dueAt) {
-    throw new Error(`无效提醒时间：${input.dueAt}`);
-  }
-  if (!input.title.trim()) {
-    throw new Error('提醒标题不能为空');
-  }
-  if (!input.target.channelType || !input.target.chatId) {
-    throw new Error('缺少提醒目标会话');
-  }
-
-  const idSeed = `${input.target.channelType}:${input.target.chatId}:${dueAt}:${input.title}:${createdAt}`;
-  const reminderSlug = crypto.createHash('sha1').update(idSeed).digest('hex').slice(0, 12);
-  const filePath = path.join(root, 'data', 'todos', 'direct-reminders', `${formatFileTimestamp(dueAt)}-${reminderSlug}.md`);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const localDue = formatLocalDateTime(dueAt);
-  const markdown = [
-    '---',
-    'channelType: ' + input.target.channelType,
-    'chatId: ' + input.target.chatId,
-    input.target.chatType ? 'chatType: ' + input.target.chatType : '',
-    input.target.messageId ? 'messageId: ' + input.target.messageId : '',
-    input.target.displayName ? 'displayName: ' + input.target.displayName : '',
-    input.notifyTargets?.length ? 'notifyTargets: ' + encodeURIComponent(JSON.stringify(input.notifyTargets)) : '',
-    'createdBy: agent-action',
-    input.createdByMessageId ? 'createdByMessageId: ' + input.createdByMessageId : '',
-    'createdAt: ' + createdAt,
-    'sourceType: direct',
-    '---',
-    '',
-    `待办: ${input.title.trim()} @${localDue} 状态: 未完成`,
-    input.sourcePrompt ? `来源请求: ${input.sourcePrompt.trim()}` : '',
-    '',
-  ].filter((line) => line !== '').join('\n');
-  fs.writeFileSync(filePath, markdown, 'utf-8');
-
-  const knowledgeIndex = readJsonFile<KnowledgeIndex>(path.join(root, '.cti-index', 'knowledge.json'))
-    ?? createEmptyKnowledgeIndex(root);
-  const index = rebuildReminderIndexFromKnowledge(root, knowledgeIndex, {
-    enabledChannels: [input.target.channelType],
-  });
-  const reminder = index.reminders.find((item) => path.resolve(item.source.path) === path.resolve(filePath));
-  if (!reminder) {
-    throw new Error('直接提醒未进入提醒索引');
-  }
-
-  const state = readReminderDeliveryState(root);
-  state.updatedAt = new Date().toISOString();
-  state.deliveries[reminder.id] = {
-    reminderId: reminder.id,
-    status: 'pending',
-    channelType: reminder.target.channelType,
-    chatId: reminder.target.chatId,
-    chatType: reminder.target.chatType,
-    dueAt: reminder.dueAt,
-    attempts: 0,
-  };
-  writeReminderDeliveryState(root, state);
-  return { reminder, filePath, index };
+  void memoryRoot;
+  void input;
+  throw new Error('新直接提醒必须通过统一计划任务 Host 创建，不再写入记忆 Markdown。');
 }
 
 export function createWeixinPushProvider(): ReminderPushProvider {
@@ -917,18 +859,6 @@ function makeDeliveryRecord(
     completionSource: previous?.completionSource,
     completionError: previous?.completionError,
   };
-}
-
-function normalizeDueAt(raw: string): string {
-  const date = new Date(raw);
-  return Number.isFinite(date.getTime()) ? date.toISOString() : '';
-}
-
-function formatFileTimestamp(iso: string): string {
-  const date = new Date(iso);
-  if (!Number.isFinite(date.getTime())) return 'unknown-time';
-  const parts = getShanghaiParts(date);
-  return `${parts.year}${parts.month}${parts.day}-${parts.hour}${parts.minute}`;
 }
 
 function formatLocalDateTime(iso: string): string {

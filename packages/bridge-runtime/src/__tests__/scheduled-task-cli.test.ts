@@ -60,4 +60,27 @@ describe('scheduled task cli', () => {
       fs.rmSync(ctiHome, { recursive: true, force: true });
     }
   });
+
+  it('previews direct reminder migration without mutating the task store', async () => {
+    const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-cli-migration-'));
+    const memoryRoot = path.join(ctiHome, 'memory');
+    try {
+      const sourceDir = path.join(memoryRoot, 'data', 'todos', 'direct-reminders');
+      fs.mkdirSync(sourceDir, { recursive: true });
+      fs.writeFileSync(path.join(sourceDir, 'pending.md'), [
+        '---', 'channelType: feishu', 'chatId: oc_cli', 'sourceType: direct', '---',
+        '待办: CLI 迁移 @2026-07-20 10:30 状态: 未完成',
+      ].join('\n'), 'utf8');
+
+      const result = await executeScheduledTaskCli([
+        'migrate-direct-reminders', '--memory-root', memoryRoot, '--json',
+      ], { ctiHome });
+
+      assert.equal(result.exitCode, 0);
+      assert.equal(JSON.parse(result.stdout).operations[0].action, 'create');
+      assert.equal(fs.existsSync(path.join(ctiHome, 'data', 'scheduled-tasks')), false);
+    } finally {
+      fs.rmSync(ctiHome, { recursive: true, force: true });
+    }
+  });
 });
