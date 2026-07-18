@@ -198,6 +198,7 @@ flowchart LR
 - classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
 - `packages/bridge-runtime/src/turn-storage.ts` 是临时输入、回合产物目录和会话 Scratch 的 runtime 所有者。Conversation Engine 每轮生成稳定 `turnId`，先通过 `TurnStorageHost.stageInputFiles()` 把非耐久附件归一化到 session/turn 目录，再把相同 `filePath`、`artifactDirectory` 和 `scratchDirectory` 传给 Codex、Mavis、Ignis 等 Provider；记忆仓库中的耐久媒体只读复用原路径。
 - 尚未接入 Host 的旧宿主只允许使用 core 内的兼容回退，且同样必须按 session/turn 分层；正式 daemon 不走该回退。旧工作区 `.codepilot-uploads` 或任意外部可读文件只能被复制进受控上传目录，不能继续作为 Provider 的默认输入缓存。
+- `packages/bridge-runtime/src/cleanup-plan.ts` 与 `cleanup-cli.ts` 提供工作区污染治理：默认 dry-run，逐文件记录绝对/相对路径、大小、修改时间、SHA-256、Git 状态和分类，并生成 UTF-8 中文 JSON/Markdown 清单。Apply 前检查 Bridge 与记忆 watcher，且只允许 `legacy_upload_cache / runtime_upload_cache / test_fixture`；执行时把完整目录移动到 `CTI_HOME\backups\workspace-cleanup\<timestamp>\payload`，不做永久删除。Restore 必须读取同一 manifest、确认原路径不存在并重新校验 Hash；Unity `Assets`、源码、显式产物和未知目录失败关闭。
 
 记忆根目录采用 Agent Home + 分区事实源：
 

@@ -56,4 +56,15 @@ await esbuild.build({
   banner: sharedBanner,
 });
 
-console.log('Built daemon, memory optimizer, memory layout migration, and skill lifecycle CLI bundles');
+await esbuild.build({
+  entryPoints: ['src/cleanup-cli.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: 'dist/cleanup-cli.mjs',
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
+console.log('Built daemon, memory optimizer, memory layout migration, workspace cleanup, and skill lifecycle CLI bundles');

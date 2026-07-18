@@ -54,6 +54,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 扩展协议校验：`scripts/validate-extension-manifests.ps1`
 - 旧记忆规则 dry-run 归档：`scripts/memory/archive-legacy-rules.ps1`
 - 记忆布局迁移：`scripts/memory/migrate-memory-layout.ps1`
+- 工作区污染清理（dry-run / 隔离备份 / 恢复）：`scripts/cleanup-workspace-pollution.ps1`
 - 主干发布预检：`scripts/prepare-main-release.ps1`
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
@@ -87,6 +88,26 @@ powershell -ExecutionPolicy Bypass -File .\scripts\memory\migrate-memory-layout.
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\memory\migrate-memory-layout.ps1 -MemoryRoot E:\cli-md -Apply -ReportPath E:\cli-md\reports\记忆迁移结果.json
 ```
+
+清理工作区旧上传缓存或测试夹具时，先生成中文清单和 Hash：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cleanup-workspace-pollution.ps1 -Target <候选目录>
+```
+
+核对清单后使用同一 JSON manifest 执行隔离移动；不会永久删除：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cleanup-workspace-pollution.ps1 -ApplyManifest <工作区污染清理清单.json>
+```
+
+需要撤销时先停止 Bridge，再恢复：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\cleanup-workspace-pollution.ps1 -RestoreManifest <工作区污染清理清单.json>
+```
+
+自动 Apply 只接受旧上传缓存、runtime 上传缓存和测试夹具；Unity `Assets`、源码、未知目录和显式用户产物必须保留并单独确认。
 
 ## 我该改哪里
 
