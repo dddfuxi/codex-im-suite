@@ -19,6 +19,7 @@
     "test:runtime": "npm --workspace packages/bridge-runtime test",
     "test:boundaries": "node --test scripts/__tests__/dependency-boundaries.test.mjs",
     "check:boundaries": "node scripts/check-dependency-boundaries.mjs",
+    "check:human-docs": "node scripts/check-human-documentation.mjs",
     "validate:extensions": "powershell -ExecutionPolicy Bypass -File ./scripts/validate-extension-manifests.ps1"
   },
   "engines": {

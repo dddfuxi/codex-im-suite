@@ -161,7 +161,7 @@ internal static class MemoryLayoutInspector
                 return new AgentHomeEntry(name, filePath, File.Exists(filePath));
             })
             .ToArray();
-        var unclassifiedRootDocuments = FindUnclassifiedRootDocuments(root);
+        var unclassifiedRootDocuments = FindUnclassifiedDocuments(root);
         var selfMaintenance = InspectSelfMaintenance(root);
         return new MemoryLayoutSnapshot(
             v3SourceCount > 0 ? "v3" : legacySourceCount > 0 ? "v2" : "none",
@@ -280,15 +280,23 @@ internal static class MemoryLayoutInspector
         return (trial, confirmed, regressed);
     }
 
-    private static IReadOnlyList<RootMarkdownDocument> FindUnclassifiedRootDocuments(string root)
+    private static IReadOnlyList<RootMarkdownDocument> FindUnclassifiedDocuments(string root)
     {
         if (!Directory.Exists(root)) return [];
         var agentHomeNames = AgentHomeNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
         try
         {
-            return Directory.EnumerateFiles(root, "*.md", SearchOption.TopDirectoryOnly)
-                .Where(filePath => !agentHomeNames.Contains(Path.GetFileName(filePath)))
-                .Select(filePath => new RootMarkdownDocument(Path.GetFileName(filePath), filePath))
+            var rootDocuments = Directory.EnumerateFiles(root, "*.md", SearchOption.TopDirectoryOnly)
+                .Where(filePath => !agentHomeNames.Contains(Path.GetFileName(filePath)));
+            var docsRoot = Path.Combine(root, "docs");
+            var docsDocuments = Directory.Exists(docsRoot)
+                ? Directory.EnumerateFiles(docsRoot, "*.md", SearchOption.AllDirectories)
+                : [];
+            return rootDocuments
+                .Concat(docsDocuments)
+                .Select(filePath => new RootMarkdownDocument(
+                    Path.GetRelativePath(root, filePath).Replace('\\', '/'),
+                    filePath))
                 .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }

@@ -10,6 +10,7 @@ import {
   MEMORY_INDEX_BLOCK_START,
   upsertMemoryIndexManagedBlock,
 } from './human-readable-markdown.js';
+import { refreshHumanDocumentGovernanceProjection } from './human-document-governance.js';
 
 export interface AgentHomePromptSection {
   id: string;
@@ -236,6 +237,11 @@ export function ensureAgentHome(memoryRoot: string): { root: string; files: stri
       atomicWrite(filePath, content);
       updated.push(filePath);
     }
+  }
+  // 每轮以真实目录状态刷新人类阅读入口；内容不变时不会重写文件或制造时间戳噪声。
+  const governance = refreshHumanDocumentGovernanceProjection(root);
+  if (governance.changed && !created.includes(governance.guidePath) && !updated.includes(governance.guidePath)) {
+    updated.push(governance.guidePath);
   }
   return { root, files, created, updated };
 }

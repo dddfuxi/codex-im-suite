@@ -84,6 +84,31 @@ public sealed class MemoryLayoutInspectorTests
     }
 
     [Fact]
+    public void Inspector_AlsoReportsMarkdownUnderDocsButExcludesHumanDocumentArchives()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cti-memory-doc-tree-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "docs", "nested"));
+        Directory.CreateDirectory(Path.Combine(root, "archive", "human-documents", "batch-1"));
+        File.WriteAllText(Path.Combine(root, "docs", "AI_BRIDGE_CONTEXT.md"), "# 旧说明", System.Text.Encoding.UTF8);
+        File.WriteAllText(Path.Combine(root, "docs", "nested", "操作手册.md"), "# 操作手册", System.Text.Encoding.UTF8);
+        File.WriteAllText(Path.Combine(root, "archive", "human-documents", "batch-1", "旧说明.md"), "# 已归档", System.Text.Encoding.UTF8);
+
+        try
+        {
+            var snapshot = MemoryLayoutInspector.Inspect(root);
+
+            Assert.Equal(
+                ["docs/AI_BRIDGE_CONTEXT.md", "docs/nested/操作手册.md"],
+                snapshot.UnclassifiedRootDocuments.Select(item => item.Name).ToArray());
+            Assert.DoesNotContain(snapshot.UnclassifiedRootDocuments, item => item.Name.Contains("archive", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Inspector_ReportsVisibleSelfMaintenanceArchivesAndHiddenVersionHistory()
     {
         var root = Path.Combine(Path.GetTempPath(), "cti-self-layout-" + Guid.NewGuid().ToString("N"));
