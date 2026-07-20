@@ -762,7 +762,7 @@
 - 机器状态、人类 `表情包语义档案.md`、`记忆总索引.md` 和 `记忆库说明.md` 使用同一写锁与 before-image 事务。已验证最后一个人类文档写失败时 revision、version、档案和先前已写投影全部恢复，受控区块之外的用户手写字节保持不变。
 - 新增 `sticker-semantic-cli.mjs` 与 C# `StickerSemanticGateway`；控制面板新增“表情包语义进化”视图，展示 trial/confirmed/regressed/rejected、scope、patch、避免规则、支持/矛盾会话、接受/拒绝/回滚和档案同步状态。`FeishuStickerLibrary` 只读兼容，不再直接写 `stickers.json`。
 - 旧语义迁移默认 dry-run：只有 `vision/manual` 生成 confirmed baseline，自由文本 `avoidWhen` 生成 trial 结构化规则，用户解释保持 blocked evidence。Apply 校验每条 source hash、先备份、幂等执行并刷新人类档案。
-- 定向验证已覆盖 runtime store/classifier/policy/host/prompt/CLI/migration、Core delivery/adapter/manager/prompt 和 Web/C# Gateway；最终全量构建、真实迁移、live 同步、8788 页面与 Feishu 行为仍需在本阶段收尾时复核。
+- 2026-07-20 现场收尾：Runtime 769/769、Control Panel 94/94、Web 25/25，Core 全量与所有构建均通过；严格 manifest、架构、UTF-8 和 doctor 检查通过。真实 dry-run 共 80 个操作，Apply 生成 12 个 confirmed baseline、阻断 68 个未核验项，重复 Apply 为 0；备份位于 `E:\cli-md\backups\sticker-semantic-migration\20260720053523200`。live fingerprint 已同步到 `e2dd2d3`，Bridge running、Feishu WS connected、`lastUnhandledError=null`，8788 页面显示资产 80 / 已确认 12 / 人类档案已同步，人工无标题语义使用别名可读展示且语义区块不泄漏 open_id/messageId/evidence hash。当前 lark-cli 只有 bot 身份，未伪造 Owner reply/reaction；真实用户侧反馈回路待 Owner 现场消息验证，自动化测试已覆盖绑定、去重、沉默 neutral、avoid rule 和回滚。
 
 ## 10. 2026-07-15 Registry 驱动机器人能力治理（已实施并完成 live 复核）
 
