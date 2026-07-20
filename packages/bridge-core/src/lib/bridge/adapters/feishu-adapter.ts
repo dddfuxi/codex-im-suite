@@ -75,6 +75,7 @@ import {
   FeishuStreamingCardRegistry,
   type FeishuStreamingCardState,
 } from '../channels/feishu/cards/streaming-card-registry.js';
+import { FeishuStreamingCardLifecycle } from '../channels/feishu/cards/streaming-card-lifecycle.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -83,10 +84,7 @@ import {
   buildCardContent,
   buildPostContent,
   buildStreamingContent,
-  buildStreamingTypewriterContent,
-  getStreamingCurrentStep,
   extractStreamingFinalResponse,
-  buildFinalCardJson,
   buildPermissionButtonCard,
   formatElapsed,
 } from '../markdown/feishu.js';
@@ -454,10 +452,6 @@ function applyReactionFallbackText(originalText: string, hint: FeishuReactionHin
   return `${hint.fallbackEmoji} ${body || '收到~'}`.trim();
 }
 
-/** Streaming card throttle interval (ms). */
-const CARD_THROTTLE_MS = 200;
-const CARD_TYPEWRITER_INTERVAL_MS = 70;
-const CARD_TYPEWRITER_STEP_CHARS = 2;
 const P2P_POLL_INTERVAL_MS = 5000;
 const FEISHU_CHAT_INDEX_PATH = path.join(
   process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im'),
@@ -1012,6 +1006,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private typingReactions = new Map<string, string>();
   /** Active and in-flight streaming card state per chatId. */
   private readonly streamingCards = new FeishuStreamingCardRegistry();
+  /** 流式推进和最终清理由独立控制器管理；adapter 只注入真实 CardKit 调用。 */
+  private readonly streamingCardLifecycle = new FeishuStreamingCardLifecycle({
+    registry: this.streamingCards,
+    pushStreamingContent: async (state, content, sequence) => {
+      if (!this.restClient) throw new Error('Feishu REST client is unavailable');
+      const cardKit = resolveFeishuCardKitCompat(this.restClient);
+      if (!cardKit) throw new Error('Feishu CardKit API is unavailable');
+      await updateFeishuCardKitStreamingContent(cardKit, state.cardId, content, sequence);
+    },
+    onStreamingUpdate: (state, sequence) => {
+      if (sequence === 1 || sequence % 10 === 0) {
+        console.log(`[feishu-adapter] Streaming card updated: cardId=${state.cardId}, sequence=${sequence}`);
+      }
+    },
+    onStreamingError: (error) => {
+      console.warn('[feishu-adapter] streamContent failed:', error instanceof Error ? error.message : error);
+    },
+  });
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
   private mentionHistoryCache: FeishuMentionHistoryCache | null = null;
   private botToBotLoopState = new Map<string, { count: number; updatedAt: number }>();
@@ -2994,103 +3006,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Update streaming card content with throttling.
    */
   private updateCardContent(chatId: string, text: string): void {
-    const state = this.streamingCards.get(chatId);
-    if (!state || !this.restClient) return;
-
-    // Clear thinking state once text arrives
-    if (state.thinking && text.trim()) {
-      state.thinking = false;
-    }
-    state.pendingText = text;
-
-    const elapsed = Date.now() - state.lastUpdateAt;
-    if (elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
-      // Schedule trailing-edge flush
-      if (!state.throttleTimer) {
-        state.throttleTimer = setTimeout(() => {
-          state.throttleTimer = null;
-          this.flushCardUpdate(chatId);
-        }, CARD_THROTTLE_MS - elapsed);
-      }
-      return;
-    }
-
-    // Clear pending timer and flush immediately
-    if (state.throttleTimer) {
-      clearTimeout(state.throttleTimer);
-      state.throttleTimer = null;
-    }
-    this.flushCardUpdate(chatId);
-  }
-
-  /**
-   * Flush pending card update to Feishu API.
-   */
-  private flushCardUpdate(chatId: string): void {
-    const state = this.streamingCards.get(chatId);
-    if (!state || !this.restClient) return;
-
-    const sourceText = state.pendingText || '';
-    const currentStep = getStreamingCurrentStep(sourceText, state.toolCalls);
-    const toolKey = state.toolCalls.map((tool) => `${tool.id}:${tool.name}:${tool.status}`).join('|');
-    const typewriterKey = `${currentStep}\u0000${toolKey}`;
-    if (state.typewriterKey === typewriterKey && state.typewriterTimer) return;
-
-    if (state.typewriterTimer) {
-      clearTimeout(state.typewriterTimer);
-      state.typewriterTimer = null;
-    }
-    state.typewriterKey = typewriterKey;
-
-    const totalChars = [...currentStep].length;
-    const runTypewriter = (visibleChars: number) => {
-      const latest = this.streamingCards.get(chatId);
-      if (!latest || latest.typewriterKey !== typewriterKey) return;
-      const content = buildStreamingTypewriterContent(sourceText, latest.toolCalls, visibleChars);
-      this.flushCardContent(chatId, content);
-      if (visibleChars < totalChars) {
-        latest.typewriterTimer = setTimeout(
-          () => runTypewriter(Math.min(totalChars, visibleChars + CARD_TYPEWRITER_STEP_CHARS)),
-          CARD_TYPEWRITER_INTERVAL_MS,
-        );
-      } else {
-        latest.typewriterTimer = null;
-      }
-    };
-
-    runTypewriter(0);
-  }
-
-  private flushCardContent(chatId: string, content: string): void {
-    const state = this.streamingCards.get(chatId);
-    if (!state || !this.restClient) return;
-
-    state.sequence++;
-    const seq = state.sequence;
-    const cardId = state.cardId;
-    const cardKit = resolveFeishuCardKitCompat(this.restClient);
-    if (!cardKit) return;
-
-    // Fire-and-forget — streaming updates are non-critical
-    updateFeishuCardKitStreamingContent(cardKit, cardId, content, seq).then(() => {
-      state.lastUpdateAt = Date.now();
-      if (seq === 1 || seq % 10 === 0) {
-        console.log(`[feishu-adapter] Streaming card updated: cardId=${cardId}, sequence=${seq}`);
-      }
-    }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
-    });
+    if (!this.restClient) return;
+    this.streamingCardLifecycle.updateText(chatId, text);
   }
 
   /**
    * Update tool progress in the streaming card.
    */
   private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
-    const state = this.streamingCards.get(chatId);
-    if (!state) return;
-    state.toolCalls = tools;
-    // Trigger a content flush with current text + updated tools
-    this.updateCardContent(chatId, state.pendingText || '');
+    this.streamingCardLifecycle.updateTools(chatId, tools);
   }
 
   /**
@@ -3105,85 +3029,75 @@ export class FeishuAdapter extends BaseChannelAdapter {
     verifiedMediaAction?: VerifiedMediaAction,
     turnContext?: StreamingCardTurnContext,
   ): Promise<boolean> {
-    // Wait for in-flight card creation to complete before finalizing
-    const pending = this.streamingCards.getCreation(chatId);
-    if (pending) {
-      try { await pending; } catch { /* creation failed — no card to finalize */ }
-    }
-
-    const state = this.streamingCards.get(chatId);
-    if (!state || !this.restClient) return false;
-
-    this.streamingCards.clearTimers(chatId);
-
-    try {
-      const cardKit = resolveFeishuCardKitCompat(this.restClient);
-      if (!cardKit) return false;
-
-      // Step 1: Close streaming mode
-      state.sequence++;
-      await setFeishuCardKitStreamingMode(cardKit, state.cardId, false, state.sequence);
-
-      // Step 2: Build and apply final card
-      const statusLabels: Record<string, string> = {
-        completed: '已完成',
-        interrupted: '已中断',
-        error: '未完成',
-      };
-      const elapsedMs = Date.now() - state.startTime;
-      const footer = {
-        status: statusLabels[status] || status,
-        elapsed: formatElapsed(elapsedMs),
-      };
-
-      let finalResponseText = responseText;
-      const visibleFinalText = extractStreamingFinalResponse(responseText);
-      const stickerHint = extractFeishuStickerHint(visibleFinalText);
-      if (stickerHint) {
-        const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, verifiedMediaAction)
-          || this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
-        if (fileKey) {
-          const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId, verifiedMediaAction);
-          if (stickerResult.ok) {
-            finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '表情包已发送。');
+    if (!this.restClient) return false;
+    return this.streamingCardLifecycle.finalize({
+      chatId,
+      status,
+      responseText,
+      summary,
+      mentions,
+      hooks: {
+        closeStreaming: async (state, sequence) => {
+          if (!this.restClient) throw new Error('Feishu REST client is unavailable');
+          const cardKit = resolveFeishuCardKitCompat(this.restClient);
+          if (!cardKit) throw new Error('Feishu CardKit API is unavailable');
+          await setFeishuCardKitStreamingMode(cardKit, state.cardId, false, sequence);
+        },
+        resolveFinalResponse: async (state, visibleFinalText, originalText) => {
+          let finalResponseText = originalText;
+          const stickerHint = extractFeishuStickerHint(visibleFinalText);
+          if (stickerHint) {
+            const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, verifiedMediaAction)
+              || this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
+            if (fileKey) {
+              const stickerResult = await this.sendStickerMessage(
+                chatId,
+                fileKey,
+                state.sourceMessageId,
+                verifiedMediaAction,
+              );
+              if (stickerResult.ok) {
+                finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '表情包已发送。');
+              }
+            } else {
+              finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '收到~');
+            }
           }
-        } else {
-          finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '收到~');
-        }
-      }
-      const reactionHint = extractFeishuReactionHint(visibleFinalText);
-      if (!stickerHint && reactionHint) {
-        const textWithoutHint = stripFeishuReactionHintText(visibleFinalText, reactionHint);
-        const reactionAdded = state.sourceMessageId
-          ? await this.addMessageReaction(state.sourceMessageId, reactionHint.emojiType, {
-            chatId,
-            alias: reactionHint.raw,
-          })
-          : false;
-        if (reactionAdded) {
-          finalResponseText = meaningfulHintRemainder(textWithoutHint, '已回应。');
-        } else {
-          finalResponseText = applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
-        }
-      }
-      const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer, summary, mentions);
-
-      state.sequence++;
-      await updateFeishuCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
-
-      // 流式卡片在收尾时不会走普通 delivery，因此必须把“卡片消息 ID ->
-      // 原任务 + 最终结果”单独记入出站引用。后续用户原生回复这张卡片时，
-      // 飞书即使只回传卡片资源壳，也能恢复可续办任务，而不是只看到“继续”。
-      this.persistStreamingCardContinuation(chatId, state, status, finalResponseText, turnContext);
-
-      console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
-      return true;
-    } catch (err) {
-      console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
-      return false;
-    } finally {
-      this.streamingCards.remove(chatId);
-    }
+          const reactionHint = extractFeishuReactionHint(visibleFinalText);
+          if (!stickerHint && reactionHint) {
+            const textWithoutHint = stripFeishuReactionHintText(visibleFinalText, reactionHint);
+            const reactionAdded = state.sourceMessageId
+              ? await this.addMessageReaction(state.sourceMessageId, reactionHint.emojiType, {
+                chatId,
+                alias: reactionHint.raw,
+              })
+              : false;
+            finalResponseText = reactionAdded
+              ? meaningfulHintRemainder(textWithoutHint, '已回应。')
+              : applyReactionFallbackText(visibleFinalText, reactionHint, textWithoutHint);
+          }
+          return finalResponseText;
+        },
+        updateFinalCard: async (state, finalCardJson, sequence) => {
+          if (!this.restClient) throw new Error('Feishu REST client is unavailable');
+          const cardKit = resolveFeishuCardKitCompat(this.restClient);
+          if (!cardKit) throw new Error('Feishu CardKit API is unavailable');
+          await updateFeishuCardKitCard(cardKit, state.cardId, finalCardJson, sequence);
+        },
+        // 流式卡片不会走普通 delivery，必须保留卡片消息到任务结果的耐久引用。
+        persistContinuation: (state, finalStatus, finalText) => {
+          this.persistStreamingCardContinuation(chatId, state, finalStatus, finalText, turnContext);
+        },
+        onFinalized: (state, finalStatus, _finalText, elapsedMs) => {
+          console.log(
+            `[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${finalStatus}, elapsed=${formatElapsed(elapsedMs)}`,
+          );
+        },
+        onError: (error) => {
+          console.warn('[feishu-adapter] Card finalize failed:', error instanceof Error ? error.message : error);
+        },
+      },
+    });
   }
 
   private persistStreamingCardContinuation(

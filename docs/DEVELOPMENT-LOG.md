@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu cards 第三阶段收口：新增 `channels/feishu/cards/streaming-card-lifecycle.ts`，把文本即时/尾缘节流、打字机字符推进、tool 状态重启、stream sequence、创建中等待、关闭 streaming、最终状态/耗时构造和成功失败必清理从 adapter 迁出；adapter 改为只注入真实 CardKit SDK 调用、sticker/reaction 最终动作和出站引用持久化。新增 5 项确定性时钟/调度器直接测试，验证 RED 为模块不存在、GREEN 后 lifecycle 5/5、adapter + cards/markdown 专项 190/190、Core 599/599、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。cards 子系统拆分完成，下一子域进入 mentions。
+
 - 2026-07-20 Feishu cards 第二阶段迁移：新增 `channels/feishu/cards/streaming-card-registry.ts`，统一每个 chat 的 active card、创建中 promise 去重、初始状态、单卡删除和 adapter stop 全量清理；原 adapter 的两个 Map 与状态接口已移除。注册表在 finalize、message end、异常清理和 stop 时同时清除 throttle/typewriter 两类 timer，修复旧 stop 只清 throttle timer、可能遗留打字机回调的生命周期缺口。新增 4 项直接模块测试；Core 594/594、adapter + cards/markdown 专项 185/185、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 同步和现场验收将在提交后执行。
 
 - 2026-07-20 Feishu cards 第一阶段迁移：新增 `channels/feishu/cards/cardkit-compat.ts`，集中 CardKit v2 优先、v1 fallback、完整能力面门禁以及 create、stream content、streaming mode、final update 的 SDK payload 差异；adapter 删除对应类型和五个内联兼容方法，只保留真实 IM 卡片消息发送、active card 状态、节流/打字机、最终 sticker/reaction 收口与出站引用持久化。新增 4 项直接模块测试；Core 590/590、adapter + cards/markdown 专项 181/181、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 同步和现场验收将在提交后执行。
