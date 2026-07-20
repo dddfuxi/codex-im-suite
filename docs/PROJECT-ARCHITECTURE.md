@@ -174,8 +174,8 @@ flowchart LR
 | live skill | `C:\Users\admin\.codex\skills\claude-to-im*` | 运行副本，只由同步脚本写入。 |
 | Agent Home / 记忆仓库 | `E:\cli-md` 或配置的 memory repo | 根目录集中放身份、规则、工具、说明和总索引；真实事实写入 `memory/*` 分区，不能作为普通工作区挂载。 |
 | 运行态数据 | `C:\Users\admin\.claude-to-im\data` / `runtime` | 存 sessions、bindings、workflow、permission links 等服务状态。 |
-| 临时上传缓存 | `CTI_HOME\runtime\uploads\<sessionId>\<turnId>` 或 `CTI_UPLOAD_CACHE_DIR` 下的同级结构；旧 `.codepilot-uploads` 只作为遗留输入识别 | 由 runtime `TurnStorageHost` 统一暂存并生成带 SHA-256 的 `输入附件清单.json`；Provider 不再创建 `uploads/history`、`mavis-input` 或 `runtime/ignis-attachment-*` 平铺文件。 |
-| 回合产物与 Scratch | `CTI_HOME\runtime\artifacts\<sessionId>\<turnId>`、`CTI_HOME\runtime\workspaces\<sessionId>\<turnId>` | runtime 为本轮统一解析路径，core 和 Provider 只消费 Host 返回值；它们不是项目工作区，也不能自动提升到项目。 |
+| 临时上传缓存 | `CTI_HOME\runtime\uploads\<sessionId>\<turnId>` 或 `CTI_UPLOAD_CACHE_DIR` 下的同级结构；旧 `.codepilot-uploads` 只作为遗留输入识别 | 由 runtime `TurnStorageHost` 统一暂存并生成带 SHA-256 的 `输入附件清单.json/.md`；两份文件同事务更新。Provider 不再创建 `uploads/history`、`mavis-input` 或 `runtime/ignis-attachment-*` 平铺文件。 |
+| 回合产物与 Scratch | `CTI_HOME\runtime\artifacts\<sessionId>\<turnId>`、`CTI_HOME\runtime\workspaces\<sessionId>\<turnId>` | runtime 为本轮统一解析路径，生成 `回合元数据.json/.md`、`产物清单.json/.md` 和 `提升记录.jsonl/.md`；机器文件是唯一事实源，Markdown 是同事务确定性投影。它们不是项目工作区，也不能自动提升到项目。 |
 | 文档 | `README.md`、`docs/PROJECT-ARCHITECTURE.md`、`docs/DEVELOPMENT-LOG.md` | 只写当前事实、入口、风险和阶段记录。 |
 | 规则 | `AGENTS.md`、`config/*.d`、`agent-architecture.ts` | 存可维护规则、manifest、policy 归属和分类口径。 |
 | 日志 | `.claude-to-im\logs`、runtime audit | 只读核验证据，不提交、不手工改写。 |
@@ -210,8 +210,25 @@ flowchart LR
 - 记忆仓库、`CTI_HOME` 运行态、上传缓存、日志和 `release/*` 按各自受控能力访问，不能提升为普通项目工作区。
 - classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
 - `packages/bridge-runtime/src/turn-storage.ts` 是临时输入、回合产物目录和会话 Scratch 的 runtime 所有者。Conversation Engine 每轮生成稳定 `turnId`，先通过 `TurnStorageHost.stageInputFiles()` 把非耐久附件归一化到 session/turn 目录，再把相同 `filePath`、`artifactDirectory` 和 `scratchDirectory` 传给 Codex、Mavis、Ignis 等 Provider；记忆仓库中的耐久媒体只读复用原路径。
+- `packages/contracts/src/artifact.ts` 定义稳定产物记录和提升请求；`packages/bridge-runtime/src/artifacts/artifact-store.ts` 负责复制外部生成物、计算 SHA-256、生成稳定 `artifactId`、维护清单和提升审计。工具结果登记成功后，Conversation Engine 把受信 `managedArtifacts` 放在工具历史前部，并覆盖模型伪造的同名字段，便于后续回合使用真实 ID。
+- Mavis 的回合 Prompt 显式携带 `artifactDirectory`，要求普通生成物默认写入 Artifact Store；只有当前请求明确要求修改项目源码/资产时才写项目。Ignis 下载、结果重发和 GLB 后处理均使用当前回合 Artifact 目录，不再写平铺 `runtime/ignis-assets` 或 `runtime/asset-pipeline`，并把真实输出登记为 Provider 产物。
+- `cti-artifact-promote` 是 Artifact Store 写入项目的唯一 Bridge 动作。它只接受 `artifactId / targetProjectId / targetRelativePath / expectedSha256`，Bridge 重新核对当前消息的明确写入意图与 Owner 身份，Runtime 再核对 Registry、`read_write`、禁止根、相对路径、符号链接、目标不存在和 Hash。动作成功后才增加真实 bridge action evidence。
 - 尚未接入 Host 的旧宿主只允许使用 core 内的兼容回退，且同样必须按 session/turn 分层；正式 daemon 不走该回退。旧工作区 `.codepilot-uploads` 或任意外部可读文件只能被复制进受控上传目录，不能继续作为 Provider 的默认输入缓存。
 - `packages/bridge-runtime/src/cleanup-plan.ts` 与 `cleanup-cli.ts` 提供工作区污染治理：默认 dry-run，逐文件记录绝对/相对路径、大小、修改时间、SHA-256、Git 状态和分类，并生成 UTF-8 中文 JSON/Markdown 清单。Apply 前通过无 CLI 自启动副作用的 `process-stop-guard.ts` 检查 Bridge 与记忆 watcher，且只允许 `legacy_upload_cache / runtime_upload_cache / test_fixture`；执行时把完整目录移动到 `CTI_HOME\backups\workspace-cleanup\<timestamp>\payload`，不做永久删除。Restore 必须读取同一 manifest、确认原路径不存在并重新校验 Hash；Unity `Assets`、源码、显式产物和未知目录失败关闭。迁移类 CLI 复用同一门禁模块，禁止互相导入可执行 CLI 入口，避免单文件 bundle 同时启动多个命令。
+
+```mermaid
+flowchart LR
+  Input[入站附件] --> Upload[Turn Upload<br/>输入附件清单 JSON + Markdown]
+  Provider[工具 / Mavis / Ignis] --> Store[Artifact Store]
+  Store --> Manifest[稳定 artifactId + SHA-256<br/>产物清单 JSON + Markdown]
+  Manifest --> Delivery[cti-final 附件交付]
+  Manifest --> Promote{cti-artifact-promote}
+  Registry[结构化项目 Registry] --> Promote
+  Owner[明确请求 + Owner] --> Promote
+  Promote -->|边界与 Hash 通过| Project[注册可写项目]
+  Promote --> Ledger[提升记录 JSONL + Markdown]
+  Promote -->|任一步失败| Rollback[回滚项目复制和全部投影]
+```
 
 记忆根目录采用 Agent Home + 分区事实源：
 

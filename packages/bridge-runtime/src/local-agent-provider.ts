@@ -116,12 +116,14 @@ interface IgnisDownloadedAssets {
   files: string[];
   links: string[];
   localFiles: string[];
+  managedArtifactIds?: string[];
 }
 
 interface IgnisAssetPipelineResult {
   note: string;
   files: string[];
   links: string[];
+  localFiles: string[];
 }
 
 const SHELL_TIMEOUT_MS = 120_000;
@@ -134,6 +136,33 @@ const IGNIS_GENERATION_WAIT_MS = Math.max(30_000, Number.parseInt(process.env.CT
 const IGNIS_REPLY_FILE_MAX_BYTES = Math.max(1, Number.parseInt(process.env.CTI_IGNIS_REPLY_FILE_MAX_BYTES || String(30 * 1024 * 1024), 10) || 30 * 1024 * 1024);
 const IGNIS_ASSET_PIPELINE_TIMEOUT_MS = Math.max(60_000, Number.parseInt(process.env.CTI_ASSET_PIPELINE_TIMEOUT_MS || '900000', 10) || 900_000);
 const RUNTIME_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+export function resolveIgnisArtifactDirectoryForTurn(
+  params: Pick<StreamChatParams, 'sessionId' | 'turnId' | 'sourceMessageId' | 'artifactDirectory'>,
+  turnStorage: Pick<TurnStorageHost, 'getArtifactDirectory'>,
+): string {
+  const turnId = params.turnId || params.sourceMessageId || crypto.randomUUID();
+  const artifactDirectory = params.artifactDirectory?.trim()
+    ? path.resolve(params.artifactDirectory)
+    : path.resolve(turnStorage.getArtifactDirectory({ sessionId: params.sessionId, turnId }));
+  return path.join(artifactDirectory, 'ignis');
+}
+
+export function registerProviderOutputArtifacts(
+  turnStorage: Pick<TurnStorageHost, 'registerArtifacts'>,
+  params: Pick<StreamChatParams, 'sessionId' | 'turnId' | 'sourceMessageId'>,
+  filePaths: string[],
+  toolName: string,
+): string[] {
+  if (!turnStorage.registerArtifacts || filePaths.length === 0) return [];
+  const records = turnStorage.registerArtifacts({
+    sessionId: params.sessionId,
+    turnId: params.turnId || params.sourceMessageId || crypto.randomUUID(),
+    files: uniq(filePaths).map((filePath) => ({ filePath })),
+    source: { kind: 'provider_output', toolName },
+  });
+  return uniq(records.map((record) => record.id));
+}
 
 function truncateText(text: string, maxChars = MAX_OUTPUT_CHARS): string {
   const normalized = text.replace(/\r\n/g, '\n').trim();
@@ -613,13 +642,28 @@ export class LocalAgentProvider {
         timedOut = waitResult.timedOut;
         waitMessage = waitResult.message || '';
       }
-      const assets = await this.downloadIgnisAssets(extractIgnisSummary(finalPayload).fileIds);
+      const assets = await this.downloadIgnisAssets(extractIgnisSummary(finalPayload).fileIds, params);
       const pipeline = toolName === 'ignis_ask' && intent === 'generate' && !timedOut && wantsIgnisAssetPipeline(params.prompt)
-        ? await this.runIgnisAssetPipeline(params.prompt, assets)
+        ? await this.runIgnisAssetPipeline(
+            params.prompt,
+            assets,
+            resolveIgnisArtifactDirectoryForTurn(params, this.turnStorage),
+          )
         : undefined;
       if (pipeline) {
         assets.files.push(...pipeline.files);
         assets.links.push(...pipeline.links);
+        assets.localFiles.push(...pipeline.localFiles);
+      }
+      try {
+        assets.managedArtifactIds = registerProviderOutputArtifacts(
+          this.turnStorage,
+          params,
+          uniq(assets.localFiles).filter((filePath) => fs.existsSync(filePath)),
+          'ignis',
+        );
+      } catch (error) {
+        console.warn('[local-agent-provider] Ignis artifact registration failed:', error instanceof Error ? error.message : error);
       }
       const replyBase = this.formatIgnisReply(toolName, finalPayload, resultText, { intent, timedOut, waitMessage, assets });
       const reply = pipeline?.note ? `${replyBase}\n\n${pipeline.note}` : replyBase;
@@ -696,9 +740,9 @@ export class LocalAgentProvider {
     }
   }
 
-  private async downloadIgnisAssets(fileIds: string[]): Promise<IgnisDownloadedAssets> {
+  private async downloadIgnisAssets(fileIds: string[], params: StreamChatParams): Promise<IgnisDownloadedAssets> {
     const assets: IgnisDownloadedAssets = { images: [], files: [], links: [], localFiles: [] };
-    const assetDir = path.join(CTI_HOME, 'runtime', 'ignis-assets');
+    const assetDir = resolveIgnisArtifactDirectoryForTurn(params, this.turnStorage);
     fs.mkdirSync(assetDir, { recursive: true });
     for (const fileId of uniq(fileIds).slice(0, 8)) {
       const url = /^https?:\/\//i.test(fileId) ? fileId : `${IGNIS_CDN_BASE_URL}/${fileId}`;
@@ -726,20 +770,25 @@ export class LocalAgentProvider {
     return assets;
   }
 
-  private async runIgnisAssetPipeline(prompt: string, assets: IgnisDownloadedAssets): Promise<IgnisAssetPipelineResult> {
+  private async runIgnisAssetPipeline(
+    prompt: string,
+    assets: IgnisDownloadedAssets,
+    artifactDirectory: string,
+  ): Promise<IgnisAssetPipelineResult> {
     const sourceGlb = [...assets.localFiles, ...assets.files].reverse().find(isIgnisModelAsset);
     if (!sourceGlb) {
       return {
         note: '模型拆分未执行：本次 Ignis 结果里没有可处理的 GLB/GLTF 文件。',
         files: [],
         links: [],
+        localFiles: [],
       };
     }
 
     const packageZip = wantsIgnisAssetZip(prompt);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const sourceName = path.basename(sourceGlb, path.extname(sourceGlb)).replace(/[^a-zA-Z0-9._-]+/g, '-');
-    const outputRoot = path.join(CTI_HOME, 'runtime', 'asset-pipeline', `${sourceName}-${stamp}`);
+    const outputRoot = path.join(artifactDirectory, 'asset-pipeline', `${sourceName}-${stamp}`);
     try {
       const scriptPath = this.resolveAssetPipelineScript();
       const args = [
@@ -804,13 +853,19 @@ export class LocalAgentProvider {
         lines.push(...localOnly.slice(0, 6));
       }
 
-      return { note: lines.join('\n'), files: sendFiles, links: [] };
+      return {
+        note: lines.join('\n'),
+        files: sendFiles,
+        links: [],
+        localFiles: uniq([...sendFiles, ...localOnly]),
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
         note: `模型已生成，但 FBX/贴图拆分失败：${truncateText(message, 500)}`,
         files: [],
         links: [],
+        localFiles: [],
       };
     }
   }
@@ -982,7 +1037,17 @@ export class LocalAgentProvider {
     const selectedFileIds = pickIgnisReplayFileIds(replayState.fileIds, params.prompt);
     if (selectedFileIds.length === 0) return null;
 
-    const assets = await this.downloadIgnisAssets(selectedFileIds);
+    const assets = await this.downloadIgnisAssets(selectedFileIds, params);
+    try {
+      assets.managedArtifactIds = registerProviderOutputArtifacts(
+        this.turnStorage,
+        params,
+        uniq(assets.localFiles).filter((filePath) => fs.existsSync(filePath)),
+        'ignis',
+      );
+    } catch (error) {
+      console.warn('[local-agent-provider] Ignis replay artifact registration failed:', error instanceof Error ? error.message : error);
+    }
     const deliveredCount = assets.images.length + assets.files.length;
     const lines = ['Ignis 上次结果已回传。'];
     if (deliveredCount > 0) {
@@ -994,6 +1059,10 @@ export class LocalAgentProvider {
     } else if (selectedFileIds.length > 0 && deliveredCount === 0) {
       lines.push('生成文件链接：');
       lines.push(...selectedFileIds.slice(0, 4).map((id) => `${IGNIS_CDN_BASE_URL}/${id}`));
+    }
+    if (assets.managedArtifactIds?.length) {
+      lines.push('受管产物 ID：');
+      lines.push(...assets.managedArtifactIds.map((id) => `- ${id}`));
     }
 
     return { reply: lines.join('\n').trim(), assets };
@@ -1038,6 +1107,10 @@ export class LocalAgentProvider {
     } else if (summary.fileIds.length > 0 && deliveredCount === 0) {
       lines.push('生成文件链接：');
       lines.push(...summary.fileIds.slice(0, 4).map((id) => `${IGNIS_CDN_BASE_URL}/${id}`));
+    }
+    if (options.assets?.managedArtifactIds?.length) {
+      lines.push('受管产物 ID：');
+      lines.push(...options.assets.managedArtifactIds.map((id) => `- ${id}`));
     }
 
     const readable = options.intent === 'result' && (deliveredCount > 0 || summary.fileIds.length > 0)

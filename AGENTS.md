@@ -48,12 +48,14 @@
 - 当前会话工作区不得被消息中出现的其他项目路径替换；其他已注册项目只能作为本轮临时挂载。当前绑定目录命中禁止根或超出注册上界时必须选择安全回退，所有候选均不安全时失败关闭。
 - 只有本轮当前消息中的明确绝对路径等强证据才能临时挂载其他项目；临时挂载必须记录 evidence、reason、accessMode 和 `expiresAfterTurn=true`，不能沉淀成全局附加目录。
 - 记忆库、`CTI_HOME` 运行态、上传缓存、日志和发布产物不得提升为普通 workspace。它们只能通过各自的受控检索、附件、审计或发布能力访问。
+- `packages/bridge-runtime/src/turn-storage.ts` 与 `artifacts/*` 是 Upload、Artifact、Scratch 的唯一运行时所有者；入站附件、Provider 生成物和工具结果必须按 `sessionId/turnId` 归属并记录来源、稳定 `artifactId`、SHA-256 和 TTL，不得回退 `process.cwd()`、项目 `.codepilot-uploads` 或平铺 `runtime/ignis-assets|asset-pipeline`。
+- 产物写入项目只能使用 `cti-artifact-promote` 结构化动作，且只允许 `artifactId / targetProjectId / targetRelativePath / expectedSha256` 四个字段。Bridge 必须重新验证当前消息的明确写入意图和 Owner 身份，Runtime 必须重新解析 Registry、访问模式、禁止根、相对路径、符号链接、目标存在性和 Hash；模型提供的绝对路径、workspace、角色或替代源路径一律不可信。
 - 新长期记忆只写入 `codex-im-suite/memory/v3`：用户使用 `memory/users/<channel>/<userId>/用户印象.md`，群聊使用 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实使用 `memory/long-term/公共长期记忆.md`。
 - Agent Home 根目录只保留 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md` 五个固定入口；`记忆总索引.md` 只引用真实源文件，不得复制事实形成第二事实源。
 - 记忆库根目录出现五入口之外的 Markdown 时，控制面板必须显式列为未归类文档；不得静默索引、自动移动或删除用户文件。
 - 旧 `data/memory/v2` 只读兼容；迁移必须默认 dry-run，Apply 前停止 Bridge/watcher，并经过暂存校验、备份、冲突不覆盖、归档和索引重建。未知 `docs|logs|runtime|config.env` 不得随记忆布局迁移自动移动。
 - managed memory hidden state 是 confirmed/candidate 生命周期唯一事实源；普通 conversation profile 只属于当前 session，命令、问题、链接、mention、工具文本和历史重扫不得自动进入 durable candidate。主索引、关系图和默认 Prompt 只消费 confirmed/兼容 legacy，candidate/archive 必须保持隔离。
-- 凡机器状态承诺提供人类可读视图，文档投影必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块、`archive/memory-items/记忆归档索引.md`、表情包语义档案等任一写入失败时，必须回滚 managed state、归档记录、索引和全部投影；Markdown 只展示确定性摘要与真实入口，不得形成第二事实源，受控区块外用户手写内容必须原样保留。
+- 凡机器状态承诺提供人类可读视图，文档投影必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块、`archive/memory-items/记忆归档索引.md`、表情包语义档案、`输入附件清单.md`、`回合元数据.md`、`产物清单.md`、`提升记录.md` 等任一写入失败时，必须回滚 managed state、归档记录、索引、项目复制和全部投影；Markdown 只展示确定性摘要与真实入口，不得形成第二事实源，受控区块外用户手写内容必须原样保留。
 - 控制面板只能通过 `MemoryItemGateway -> memory-item-cli.mjs` 执行确认、归档、还原、永久删除和迁移，不得直接编辑 memory JSON/Markdown；浏览器 payload 只允许 opaque `itemId/archiveId`、`expectedBaseHash` 和审核后的 ID 数组，禁止接受任意源路径或归档路径。
 - tentative 迁移只允许应用审核过的 manifest 和 source hash；Apply 前复用统一 Bridge/watcher 停止门禁并保留备份与成功 ledger。只有同一 plan hash 的有效 ledger 才能作为幂等依据，不能因为当前文件“看起来已经是 v2”就跳过未审核变更。
 - tentative 迁移 Apply 后不得重新启动仍只认识 v1 `tentative` 的旧 live runtime；必须保持 Bridge 停止，先同步支持 managed memory v2 的 suite live 副本，再启动 Bridge。若旧 runtime 已覆盖迁移结果，只能基于原 migration ledger、备份和当前 baseHash 做 dry-run 差异恢复，不得整文件回滚或覆盖后续用户操作。

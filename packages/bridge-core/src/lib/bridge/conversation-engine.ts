@@ -9,7 +9,11 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { parseProjectRegistryDocument, type RegisteredProject } from '@codex-im-suite/contracts';
+import {
+  parseProjectRegistryDocument,
+  type RegisteredProject,
+  type TurnArtifactRecord,
+} from '@codex-im-suite/contracts';
 import type { ChannelBinding, RunSummary } from './types.js';
 import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from './input-evidence.js';
 import type {
@@ -33,6 +37,7 @@ import {
   buildNoExecutionEvidenceText,
   classifyExecutionRequirement,
   classifyToolResultQuality,
+  hasDeferredBridgeExecutionAction,
   isExecutionEvidenceSatisfied,
   requiresSuccessfulToolEvidence,
   shouldReplaceWithNoExecutionEvidenceText,
@@ -334,6 +339,7 @@ function buildBridgeScopedPrompt(
       'capability_router.existing_sticker_delivery',
       'policy_registry.outbound_mention_targets',
       'policy_registry.scheduled_task_actions',
+      'policy_registry.artifact_promotion',
       'memory_system.partitioned_memory_intent',
     ]),
     '- Low-risk proactive context policy: when the request names an explicit readable context object such as current chat history, a replied message, an attachment, a URL/link, a local path, the current workspace, config/mcp.d, or an available MCP manifest, make a bounded low-risk read/list/check before asking for clarification.',
@@ -459,6 +465,47 @@ function recordPromptSnapshotSafely(
   } catch (error) {
     console.warn('[conversation-engine] Prompt snapshot write failed:', error instanceof Error ? error.message : error);
   }
+}
+
+function registerToolResultArtifactsSafely(input: {
+  sessionId: string;
+  turnId: string;
+  toolUseId: string;
+  toolName: string;
+  content: unknown;
+  isError: boolean;
+}): TurnArtifactRecord[] {
+  try {
+    const register = getBridgeContext().turnStorage?.registerToolResultArtifacts;
+    return register ? register(input) : [];
+  } catch (error) {
+    // 产物登记属于旁路审计；失败不能篡改真实工具结果或伪造 artifactId。
+    console.warn('[conversation-engine] Tool result artifact registration failed:', error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
+function attachManagedArtifactsToToolResult(content: unknown, artifacts: TurnArtifactRecord[]): string {
+  const managedArtifacts = artifacts.map((artifact) => ({
+    artifactId: artifact.id,
+    fileName: artifact.fileName,
+    relativePath: artifact.relativePath,
+    sizeBytes: artifact.sizeBytes,
+    sha256: artifact.sha256,
+  }));
+  let parsed: unknown = content;
+  if (typeof content === 'string') {
+    try { parsed = JSON.parse(content) as unknown; } catch { /* 保留非 JSON 工具正文 */ }
+  }
+  let payload: Record<string, unknown>;
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const original = { ...(parsed as Record<string, unknown>) };
+    delete original.managedArtifacts;
+    payload = { managedArtifacts, ...original };
+  } else {
+    payload = { managedArtifacts, result: parsed };
+  }
+  return JSON.stringify(payload, null, 2);
 }
 
 function getReplyStyleHintFromStore(): string {
@@ -948,6 +995,7 @@ export async function processMessage(
       return await consumeStream(
         stream,
         sessionId,
+        turnId,
         onPermissionRequest,
         attempt === 'initial' && requiresSuccessfulToolEvidence(executionRequirement) ? undefined : onPartialText,
         onProgressText,
@@ -961,6 +1009,7 @@ export async function processMessage(
     if (
       requiresSuccessfulToolEvidence(executionRequirement)
       && !isExecutionEvidenceSatisfied(executionRequirement, result.executionEvidence)
+      && !hasDeferredBridgeExecutionAction(result.responseText)
       && !abortController.signal.aborted
     ) {
       result = await runAttempt('no_evidence_retry');
@@ -1022,6 +1071,8 @@ export const _testOnly = {
   buildBridgeScopedPrompt,
   resolveConversationWorkspacePlan,
   recordPromptSnapshotSafely,
+  registerToolResultArtifactsSafely,
+  attachManagedArtifactsToToolResult,
   persistFileAttachmentsForHistory,
   loadAgentHomePromptSections,
 };
@@ -1033,6 +1084,7 @@ export const _testOnly = {
 async function consumeStream(
   stream: ReadableStream<string>,
   sessionId: string,
+  turnId: string,
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onProgressText?: OnPartialText,
@@ -1132,6 +1184,17 @@ async function consumeStream(
               const resultData = JSON.parse(event.data);
               const resultQuality = classifyToolResultQuality(resultData.content, resultData.is_error);
               const matchingToolUse = toolUsesById.get(String(resultData.tool_use_id || ''));
+              const managedArtifacts = registerToolResultArtifactsSafely({
+                sessionId,
+                turnId,
+                toolUseId: String(resultData.tool_use_id || ''),
+                toolName: matchingToolUse?.name || '',
+                content: resultData.content,
+                isError: !resultQuality.ok,
+              });
+              const storedToolResultContent = managedArtifacts.length > 0
+                ? attachManagedArtifactsToToolResult(resultData.content, managedArtifacts)
+                : resultData.content;
               if (matchingToolUse) {
                 const challenge = extractFeishuCliUserAuthorizationChallenge({
                   toolUseId: String(resultData.tool_use_id || ''),
@@ -1154,7 +1217,7 @@ async function consumeStream(
               const newBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,
-                content: resultData.content,
+                content: storedToolResultContent,
                 is_error: !resultQuality.ok,
               };
               if (seenToolResultIds.has(resultData.tool_use_id)) {

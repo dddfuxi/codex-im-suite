@@ -7,6 +7,12 @@
  */
 
 import type { ChannelAddress, ChannelBinding, ChannelType, OutboundMention } from './types.js';
+import type {
+  ArtifactPromotionRequest,
+  ArtifactPromotionResult,
+  ArtifactSource,
+  TurnArtifactRecord,
+} from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
 import type { FeishuCliUserAuthorizationChallenge } from './feishu-cli-user-auth.js';
@@ -60,6 +66,17 @@ export interface TurnStorageHost {
   stageInputFiles(input: TurnStorageScope & { files: FileAttachment[] }): StoredTurnFile[];
   getArtifactDirectory(input: TurnStorageScope): string;
   getScratchDirectory(input: TurnStorageScope): string;
+  registerArtifacts?(input: TurnStorageScope & {
+    files: Array<{ filePath: string; mediaType?: string }>;
+    source: ArtifactSource;
+  }): TurnArtifactRecord[];
+  registerToolResultArtifacts?(input: TurnStorageScope & {
+    toolUseId: string;
+    toolName: string;
+    content: unknown;
+    isError: boolean;
+  }): TurnArtifactRecord[];
+  promoteArtifact?(input: ArtifactPromotionRequest): ArtifactPromotionResult;
 }
 
 /** Server-Sent Event from the LLM stream. */

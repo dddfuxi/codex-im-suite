@@ -1,4 +1,5 @@
 import type { FileAttachment, MemoryQueryPlan } from './host.js';
+import { parseArtifactPromotionRequest } from '@codex-im-suite/contracts';
 import {
   describeInputEvidence,
   type InputEvidenceKind,
@@ -531,6 +532,23 @@ function ctiFinalDeclaresArtifacts(responseText: string): boolean {
   return false;
 }
 
+export function hasDeferredBridgeExecutionAction(responseText: string): boolean {
+  const matches = responseText.matchAll(/(?:^|\n)\s*```cti-artifact-promote\s*\n([\s\S]*?)\n\s*```/giu);
+  const allowedFields = new Set(['artifactId', 'targetProjectId', 'targetRelativePath', 'expectedSha256']);
+  for (const match of matches) {
+    try {
+      const parsed = JSON.parse(match[1].trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      if (Object.keys(parsed as Record<string, unknown>).some((key) => !allowedFields.has(key))) continue;
+      parseArtifactPromotionRequest(parsed);
+      return true;
+    } catch {
+      // 无效动作不能推迟工具证据判定。
+    }
+  }
+  return false;
+}
+
 export function shouldReplaceWithNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
   evidence: {
@@ -543,6 +561,7 @@ export function shouldReplaceWithNoExecutionEvidenceText(
 ): boolean {
   if (!requiresSuccessfulToolEvidence(requirement)) return false;
   if (isExecutionEvidenceSatisfied(requirement, evidence)) return false;
+  if (hasDeferredBridgeExecutionAction(responseText)) return false;
 
   if (requirement.kind !== 'input_evidence_required' && ctiFinalDeclaresArtifacts(responseText)) {
     return false;

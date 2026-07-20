@@ -1981,6 +1981,174 @@ describe('bridge-manager result block delivery', () => {
     assert.doesNotMatch(sent[0].text, /已经重启完成/);
   });
 
+  it('parses only the four trusted artifact promotion fields', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const valid = _testOnly.extractCtiArtifactPromotionAction([
+      '```cti-artifact-promote',
+      JSON.stringify({
+        artifactId: 'artifact-111111111111111111111111',
+        targetProjectId: 'st3',
+        targetRelativePath: 'Game/Assets/Generated/preview.png',
+        expectedSha256: 'a'.repeat(64),
+      }),
+      '```',
+    ].join('\n'));
+    assert.equal(valid.action?.targetProjectId, 'st3');
+    assert.equal(valid.action?.targetRelativePath, 'Game/Assets/Generated/preview.png');
+
+    const injected = _testOnly.extractCtiArtifactPromotionAction([
+      '```cti-artifact-promote',
+      JSON.stringify({
+        artifactId: 'artifact-111111111111111111111111',
+        targetProjectId: 'st3',
+        targetRelativePath: 'Game/Assets/Generated/preview.png',
+        workingDirectory: 'C:\\untrusted',
+      }),
+      '```',
+    ].join('\n'));
+    assert.equal(injected.action, null);
+    assert.match(injected.error || '', /不允许字段/);
+  });
+
+  it('promotes a managed artifact only for an explicit owner project-write request', async () => {
+    const sent: OutboundMessage[] = [];
+    const promoted: unknown[] = [];
+    const response = [
+      '```cti-artifact-promote',
+      JSON.stringify({
+        artifactId: 'artifact-111111111111111111111111',
+        targetProjectId: 'st3',
+        targetRelativePath: 'Game/Assets/Generated/preview.png',
+        expectedSha256: 'a'.repeat(64),
+      }),
+      '```',
+    ].join('\n');
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      turnStorage: {
+        stageInputFiles: () => [],
+        getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+        getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+        promoteArtifact: (input) => {
+          promoted.push(input);
+          return {
+            ok: true,
+            artifactId: input.artifactId,
+            targetProjectId: input.targetProjectId,
+            targetPath: 'C:\\unity\\ST3\\Game\\Assets\\Generated\\preview.png',
+            sha256: input.expectedSha256 || 'a'.repeat(64),
+            promotedAt: '2026-07-20T00:00:00.000Z',
+          };
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '把刚才生成的图片保存到 ST3 项目的 Game/Assets/Generated/preview.png',
+      'ou_owner',
+    ));
+
+    assert.equal(promoted.length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已将产物提升到项目 st3/);
+    assert.match(sent[0].text, /Game\/Assets\/Generated\/preview\.png/);
+    assert.doesNotMatch(sent[0].text, /cti-artifact-promote|C:\\unity/);
+  });
+
+  it('rejects artifact promotion actions from non-owner users before calling the store', async () => {
+    const sent: OutboundMessage[] = [];
+    let promoted = false;
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-artifact-promote',
+        JSON.stringify({
+          artifactId: 'artifact-111111111111111111111111',
+          targetProjectId: 'st3',
+          targetRelativePath: 'Game/Assets/Generated/preview.png',
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      turnStorage: {
+        stageInputFiles: () => [],
+        getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+        getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+        promoteArtifact: () => {
+          promoted = true;
+          throw new Error('should_not_run');
+        },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '把这个产物保存到 ST3 项目里',
+      'ou_viewer',
+    ));
+
+    assert.equal(promoted, false);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /只允许 owner/);
+  });
+
+  it('rejects artifact promotion when an owner only asks for an explanation', async () => {
+    let promoted = false;
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true', bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-artifact-promote',
+        JSON.stringify({
+          artifactId: 'artifact-111111111111111111111111',
+          targetProjectId: 'st3',
+          targetRelativePath: 'Game/Assets/Generated/preview.png',
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      turnStorage: {
+        stageInputFiles: () => [],
+        getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+        getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+        promoteArtifact: () => {
+          promoted = true;
+          throw new Error('should_not_run');
+        },
+      },
+      lifecycle: {},
+    });
+    const sent: OutboundMessage[] = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('解释一下“把产物保存到项目”这句话的含义', 'ou_owner'));
+
+    assert.equal(promoted, false);
+    assert.match(sent[0].text, /没有明确要求把产物写入项目/);
+  });
+
   it('executes cti-direct-message through the channel adapter and only confirms in the source chat', async () => {
     const sent: OutboundMessage[] = [];
     const directMessages: any[] = [];

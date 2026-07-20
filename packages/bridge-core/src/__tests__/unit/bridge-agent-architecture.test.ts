@@ -68,6 +68,7 @@ describe('agent architecture registry', () => {
       'agent_kernel.proactive_completion',
       'capability_router.existing_sticker_delivery',
       'policy_registry.scheduled_task_actions',
+      'policy_registry.artifact_promotion',
       'memory_system.partitioned_memory_intent',
     ]);
 
@@ -79,6 +80,9 @@ describe('agent architecture registry', () => {
     assert.match(lines.join('\n'), /cti-scheduled-task/i);
     assert.match(lines.join('\n'), /periodic|recurring|周期/i);
     assert.match(lines.join('\n'), /Host success/i);
+    assert.match(lines.join('\n'), /cti-artifact-promote/i);
+    assert.match(lines.join('\n'), /artifactId.*targetProjectId.*targetRelativePath.*expectedSha256/i);
+    assert.match(lines.join('\n'), /Owner/i);
     assert.match(lines.join('\n'), /Memory partition policy/i);
     assert.match(lines.join('\n'), /must not write durable memory/i);
     assert.match(lines.join('\n'), /Do not use github-memory-protocol/i);

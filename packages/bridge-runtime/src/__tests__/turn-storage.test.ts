@@ -45,6 +45,10 @@ describe('RuntimeTurnStorage', () => {
       assert.equal(manifest.turnId, 'message:1');
       assert.equal(manifest.files[0].sha256, files[0].sha256);
       assert.equal(manifest.files[0].filePath, files[0].filePath);
+      const humanManifest = fs.readFileSync(path.join(turnDirectory, '输入附件清单.md'), 'utf8');
+      assert.match(humanManifest, /根据 `输入附件清单\.json` 自动生成/);
+      assert.match(humanManifest, /截图 01\.png/);
+      assert.match(humanManifest, new RegExp(files[0].sha256));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -80,6 +84,32 @@ describe('RuntimeTurnStorage', () => {
       assert.equal(files[0].filePath, durableFile);
       assert.equal(storage.getArtifactDirectory({ sessionId: 'session-1', turnId: 'turn-1' }), path.join(root, 'artifacts', 'session-1', 'turn-1'));
       assert.equal(storage.getScratchDirectory({ sessionId: 'session-1', turnId: 'turn-1' }), path.join(root, 'workspaces', 'session-1', 'turn-1'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('removes newly staged inputs when the human-readable manifest cannot be committed', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-projection-'));
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'),
+        artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+      });
+      const turnDirectory = path.join(root, 'uploads', 'session-1', 'turn-1');
+      fs.mkdirSync(path.join(turnDirectory, '输入附件清单.md'), { recursive: true });
+
+      assert.throws(() => storage.stageInputFiles({
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        files: [{
+          id: 'image-1', name: 'incoming.png', type: 'image/png', size: 5,
+          data: Buffer.from('image').toString('base64'),
+        }],
+      }));
+      assert.equal(fs.readdirSync(turnDirectory).some((name) => name.endsWith('.png')), false);
+      assert.equal(fs.existsSync(path.join(turnDirectory, '输入附件清单.json')), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -121,6 +151,71 @@ describe('RuntimeTurnStorage', () => {
       assert.deepEqual(providerPaths, [first[0].filePath]);
       assert.equal(fs.readdirSync(path.dirname(first[0].filePath)).filter((name) => name.endsWith('.png')).length, 1);
       assert.equal(fs.readdirSync(path.join(root, 'uploads')).some((name) => name.startsWith('ignis-attachment-')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('registers tool-result artifacts with stable ids and promotes them through the structured host boundary', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-artifact-host-'));
+    const projectRoot = path.join(root, 'project');
+    const generated = path.join(root, 'legacy-output.png');
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.writeFileSync(generated, 'generated');
+
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'),
+        artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+        registeredProjects: [{
+          id: 'project-1', displayName: 'Project 1', type: 'generic', workspaceRoot: projectRoot,
+          accessMode: 'read_write', enabled: true,
+        }],
+      });
+      const artifacts = storage.registerToolResultArtifacts({
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        toolUseId: 'tool-1',
+        toolName: 'JsonTool:mcp_call',
+        content: JSON.stringify({
+          tool: 'mcp_call',
+          ok: true,
+          data: { artifacts: { images: [generated] } },
+        }),
+        isError: false,
+      });
+
+      assert.equal(artifacts.length, 1);
+      assert.match(artifacts[0].id, /^artifact-[a-f0-9]{24}$/u);
+      assert.equal(path.relative(path.join(root, 'artifacts'), artifacts[0].filePath).startsWith('..'), false);
+      const result = storage.promoteArtifact({
+        artifactId: artifacts[0].id,
+        targetProjectId: 'project-1',
+        targetRelativePath: 'Assets/Generated/output.png',
+        expectedSha256: artifacts[0].sha256,
+      });
+      assert.equal(fs.readFileSync(result.targetPath, 'utf8'), 'generated');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not register arbitrary read-tool paths as generated artifacts', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-artifact-filter-'));
+    const source = path.join(root, 'README.md');
+    fs.writeFileSync(source, '# read only');
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'),
+        artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+      });
+      const artifacts = storage.registerToolResultArtifacts({
+        sessionId: 'session-1', turnId: 'turn-1', toolUseId: 'tool-1', toolName: 'Read',
+        content: JSON.stringify({ path: source, content: '# read only' }), isError: false,
+      });
+      assert.deepEqual(artifacts, []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

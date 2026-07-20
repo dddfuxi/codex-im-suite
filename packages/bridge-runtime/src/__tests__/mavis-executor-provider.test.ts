@@ -158,6 +158,32 @@ describe('mavis executor provider', () => {
       assert.equal(provider.binding?.agentName, 'mavis');
     });
 
+    it('tells Mavis to place generated deliverables in the turn artifact directory', async () => {
+      const client = new FakeMavisClient();
+      const provider = new MavisExecutorProvider({
+        client,
+        config: baseConfig,
+        agentName: 'mavis',
+        pollIntervalMs: 50,
+        hardTimeoutMs: 5_000,
+        quietTimeoutMs: 1_000,
+        maxDiffBytes: 1024,
+      });
+      const artifactDirectory = path.join(mvpTmpHome, 'runtime', 'artifacts', 'bridge-artifact', 'turn-1');
+
+      await provider.preDispatch(params({
+        sessionId: 'bridge-artifact',
+        turnId: 'turn-1',
+        prompt: '生成一份诊断报告',
+        artifactDirectory,
+      }));
+
+      const prompt = client.createSessionCalls[0]?.prompt || '';
+      assert.match(prompt, new RegExp(escapeRegExp(artifactDirectory)));
+      assert.match(prompt, /generated deliverables|生成产物/i);
+      assert.match(prompt, /不得.*默认写入.*项目|must not.*default.*project/i);
+    });
+
     it('uses the workspace plan primary directory instead of the legacy working directory', async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mavis-plan-'));
       const primary = path.join(root, 'primary');

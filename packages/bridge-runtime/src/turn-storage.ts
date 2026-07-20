@@ -3,18 +3,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import type {
+  ArtifactPromotionRequest,
+  ArtifactPromotionResult,
+  RegisteredProject,
+  TurnArtifactRecord,
+} from '@codex-im-suite/contracts';
+
+import type {
   FileAttachment,
   StoredTurnFile,
   TurnStorageHost,
   TurnStorageScope,
 } from 'claude-to-im/src/lib/bridge/host.js';
-import { CTI_HOME, type Config } from './config.js';
+import { CODEX_HOME, CTI_HOME, type Config } from './config.js';
+import { ArtifactStore } from './artifacts/artifact-store.js';
+import {
+  normalizeTurnSegment,
+  resolveTurnDirectory,
+  writeAtomic,
+  writeAtomicProjection,
+} from './artifacts/session-scratch.js';
 
 export interface RuntimeTurnStorageOptions {
   uploadRoot: string;
   artifactRoot: string;
   scratchRoot: string;
   durableInputRoots?: string[];
+  registeredProjects?: RegisteredProject[];
+  deniedRoots?: string[];
 }
 
 function isPathInside(root: string, candidate: string): boolean {
@@ -37,30 +53,68 @@ function safeFileName(name: string, index: number): string {
 }
 
 export function normalizeTurnStorageSegment(value: string, fallback: string): string {
-  const trimmed = value.trim();
-  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(trimmed)) return trimmed;
-  const readable = trimmed
-    .normalize('NFKC')
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || fallback;
-  const suffix = crypto.createHash('sha256').update(trimmed || fallback).digest('hex').slice(0, 12);
-  return `${readable}-${suffix}`;
+  return normalizeTurnSegment(value, fallback);
 }
 
 export function resolveRuntimeTurnDirectory(root: string, scope: TurnStorageScope): string {
-  return path.join(
-    path.resolve(root),
-    normalizeTurnStorageSegment(scope.sessionId, 'session'),
-    normalizeTurnStorageSegment(scope.turnId, 'turn'),
-  );
+  return resolveTurnDirectory(root, scope);
 }
 
 function writeFileAtomic(filePath: string, data: Buffer): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporaryPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(temporaryPath, data);
-  fs.renameSync(temporaryPath, filePath);
+  writeAtomic(filePath, data);
+}
+
+function escapeMarkdownCell(value: unknown): string {
+  return String(value ?? '').replace(/\|/gu, '\\|').replace(/\r?\n/gu, ' ');
+}
+
+function renderInputManifestMarkdown(manifest: {
+  sessionId: string;
+  turnId: string;
+  createdAt: string;
+  files: StoredTurnFile[];
+}): string {
+  const lines = [
+    '# 输入附件清单',
+    '',
+    '> 此文件由 Runtime Turn Storage 根据 `输入附件清单.json` 自动生成；请勿手工修改。',
+    '',
+    `- 会话：${manifest.sessionId}`,
+    `- 回合：${manifest.turnId}`,
+    `- 创建时间：${manifest.createdAt}`,
+    '',
+    '| 名称 | 类型 | 大小（字节） | SHA-256 | 受管路径 |',
+    '|---|---|---:|---|---|',
+  ];
+  for (const file of manifest.files) {
+    lines.push(`| ${escapeMarkdownCell(file.name)} | ${escapeMarkdownCell(file.type)} | ${file.size} | ${file.sha256} | ${escapeMarkdownCell(file.filePath)} |`);
+  }
+  if (manifest.files.length === 0) lines.push('| 暂无 |  | 0 |  |  |');
+  return `${lines.join('\n')}\n`;
+}
+
+function parseToolResultContent(content: unknown): unknown {
+  if (typeof content !== 'string') return content;
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+  try { return JSON.parse(trimmed) as unknown; } catch { return null; }
+}
+
+function collectArtifactFilePaths(value: unknown, active = false, out = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) collectArtifactFilePaths(item, active, out);
+    return out;
+  }
+  if (typeof value === 'string') {
+    if (active && path.isAbsolute(value) && fs.existsSync(value)) out.add(path.resolve(value));
+    return out;
+  }
+  if (!value || typeof value !== 'object') return out;
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const artifactField = /^(?:artifacts?|artifactPaths|images|files|filePath|localFiles)$/iu.test(key);
+    collectArtifactFilePaths(nested, active || artifactField, out);
+  }
+  return out;
 }
 
 export class RuntimeTurnStorage implements TurnStorageHost {
@@ -68,37 +122,109 @@ export class RuntimeTurnStorage implements TurnStorageHost {
   private readonly artifactRoot: string;
   private readonly scratchRoot: string;
   private readonly durableInputRoots: string[];
+  private readonly artifactStore: ArtifactStore;
 
   constructor(options: RuntimeTurnStorageOptions) {
     this.uploadRoot = path.resolve(options.uploadRoot);
     this.artifactRoot = path.resolve(options.artifactRoot);
     this.scratchRoot = path.resolve(options.scratchRoot);
     this.durableInputRoots = (options.durableInputRoots || []).map((item) => path.resolve(item));
+    this.artifactStore = new ArtifactStore({
+      artifactRoot: this.artifactRoot,
+      scratchRoot: this.scratchRoot,
+      registeredProjects: options.registeredProjects || [],
+      deniedRoots: options.deniedRoots,
+    });
   }
 
   stageInputFiles(input: TurnStorageScope & { files: FileAttachment[] }): StoredTurnFile[] {
     const turnDirectory = resolveRuntimeTurnDirectory(this.uploadRoot, input);
-    const storedFiles = input.files.map((file, index) => this.stageInputFile(turnDirectory, file, index));
-    const manifest = {
-      version: 1,
-      sessionId: input.sessionId,
-      turnId: input.turnId,
-      createdAt: new Date().toISOString(),
-      files: storedFiles,
-    };
-    writeFileAtomic(
-      path.join(turnDirectory, '输入附件清单.json'),
-      Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'),
+    const existingTurnFiles = new Set(
+      fs.existsSync(turnDirectory)
+        ? fs.readdirSync(turnDirectory, { withFileTypes: true })
+            .filter((entry) => entry.isFile())
+            .map((entry) => path.join(turnDirectory, entry.name))
+        : [],
     );
-    return storedFiles;
+    let storedFiles: StoredTurnFile[] = [];
+    try {
+      storedFiles = input.files.map((file, index) => this.stageInputFile(turnDirectory, file, index));
+      const manifest = {
+        version: 1,
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        createdAt: new Date().toISOString(),
+        files: storedFiles,
+      };
+      writeAtomicProjection({
+        machinePath: path.join(turnDirectory, '输入附件清单.json'),
+        machineContent: `${JSON.stringify(manifest, null, 2)}\n`,
+        humanPath: path.join(turnDirectory, '输入附件清单.md'),
+        humanContent: renderInputManifestMarkdown(manifest),
+      });
+      return storedFiles;
+    } catch (error) {
+      for (const file of storedFiles) {
+        if (!isPathInside(turnDirectory, file.filePath) || existingTurnFiles.has(file.filePath)) continue;
+        try { fs.unlinkSync(file.filePath); } catch { /* 投影失败时尽力回滚新暂存文件 */ }
+      }
+      throw error;
+    }
   }
 
   getArtifactDirectory(input: TurnStorageScope): string {
-    return resolveRuntimeTurnDirectory(this.artifactRoot, input);
+    return this.artifactStore.getArtifactDirectory(input);
   }
 
   getScratchDirectory(input: TurnStorageScope): string {
-    return resolveRuntimeTurnDirectory(this.scratchRoot, input);
+    return this.artifactStore.getScratchDirectory(input);
+  }
+
+  registerArtifacts(input: TurnStorageScope & {
+    files: Array<{ filePath: string; mediaType?: string }>;
+    source: { kind: 'tool_result' | 'provider_output' | 'manual_import'; toolUseId?: string; toolName?: string };
+  }): TurnArtifactRecord[] {
+    return this.artifactStore.registerArtifacts(input);
+  }
+
+  registerToolResultArtifacts(input: TurnStorageScope & {
+    toolUseId: string;
+    toolName: string;
+    content: unknown;
+    isError: boolean;
+  }): TurnArtifactRecord[] {
+    if (input.isError) return [];
+    const parsed = parseToolResultContent(input.content);
+    if (!parsed || typeof parsed !== 'object') return [];
+    const payload = parsed as Record<string, unknown>;
+    if (payload.ok === false) return [];
+    const explicitArtifactPayload = {
+      artifacts: payload.artifacts,
+      artifactPaths: payload.artifactPaths,
+      images: payload.images,
+      files: payload.files,
+      data: payload.data && typeof payload.data === 'object'
+        ? {
+            artifacts: (payload.data as Record<string, unknown>).artifacts,
+            artifactPaths: (payload.data as Record<string, unknown>).artifactPaths,
+            images: (payload.data as Record<string, unknown>).images,
+            files: (payload.data as Record<string, unknown>).files,
+            result: (payload.data as Record<string, unknown>).result,
+          }
+        : undefined,
+    };
+    const paths = [...collectArtifactFilePaths(explicitArtifactPayload)];
+    if (paths.length === 0) return [];
+    return this.registerArtifacts({
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      files: paths.map((filePath) => ({ filePath })),
+      source: { kind: 'tool_result', toolUseId: input.toolUseId, toolName: input.toolName },
+    });
+  }
+
+  promoteArtifact(input: ArtifactPromotionRequest): ArtifactPromotionResult {
+    return this.artifactStore.promoteArtifact(input);
   }
 
   private stageInputFile(turnDirectory: string, file: FileAttachment, index: number): StoredTurnFile {
@@ -154,6 +280,14 @@ export function createRuntimeTurnStorage(config: Config): RuntimeTurnStorage {
     artifactRoot: path.join(CTI_HOME, 'runtime', 'artifacts'),
     scratchRoot: path.join(CTI_HOME, 'runtime', 'workspaces'),
     durableInputRoots: config.memoryRepoDir ? [config.memoryRepoDir] : [],
+    registeredProjects: config.registeredProjects || [],
+    deniedRoots: [
+      CTI_HOME,
+      CODEX_HOME,
+      ...(config.memoryRepoDir ? [config.memoryRepoDir] : []),
+      ...(config.uploadCacheDir ? [config.uploadCacheDir] : []),
+      ...(config.projectDeniedRoots || []),
+    ],
   });
 }
 

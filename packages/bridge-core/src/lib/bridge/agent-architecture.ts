@@ -266,6 +266,19 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['policy', 'scheduled-task', 'reminder', 'cron', 'delivery'],
   },
   {
+    id: 'policy_registry.artifact_promotion',
+    layerId: 'policy_registry',
+    title: 'Managed Artifact Promotion',
+    responsibility: 'Promote only registered turn artifacts into registered writable projects through a strict Owner-gated bridge action.',
+    promptLines: [
+      '- Managed artifact promotion protocol: only when the current user explicitly asks to copy or save an existing managed turn artifact into a registered project, output one fenced ```cti-artifact-promote JSON block.',
+      '- The JSON object must contain only artifactId, targetProjectId, targetRelativePath, and optional expectedSha256. Never include workingDirectory, absolute target paths, user IDs, roles, credentials, or alternate source paths.',
+      '- Project writes through cti-artifact-promote are Owner-only. The Artifact Store re-resolves the real artifact and project, verifies Hash and path boundaries, rejects read-only or denied projects, and must not overwrite an existing target.',
+      '- Do not claim that an artifact was saved into a project unless the bridge reports a successful promotion result for this turn.',
+    ],
+    tags: ['policy', 'artifact', 'promotion', 'workspace', 'owner'],
+  },
+  {
     id: 'memory_system.durable_recall',
     layerId: 'memory_system',
     title: 'Durable Recall',

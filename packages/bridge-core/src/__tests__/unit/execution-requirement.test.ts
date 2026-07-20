@@ -8,6 +8,7 @@ import {
   isExecutionEvidenceSatisfied,
   shouldReplaceWithNoExecutionEvidenceText,
   buildNoExecutionEvidenceText,
+  hasDeferredBridgeExecutionAction,
 } from '../../lib/bridge/execution-requirement.js';
 
 function withStrictToolRouting<T>(fn: () => T): T {
@@ -597,6 +598,22 @@ describe('execution requirement classifier', () => {
         true,
       );
     });
+  });
+
+  it('defers evidence enforcement only for a valid structured artifact promotion action', () => {
+    const valid = [
+      '```cti-artifact-promote',
+      JSON.stringify({
+        artifactId: 'artifact-111111111111111111111111',
+        targetProjectId: 'st3',
+        targetRelativePath: 'Game/Assets/Generated/preview.png',
+        expectedSha256: 'a'.repeat(64),
+      }),
+      '```',
+    ].join('\n');
+    assert.equal(hasDeferredBridgeExecutionAction(valid), true);
+    assert.equal(hasDeferredBridgeExecutionAction(valid.replace('artifact-111111111111111111111111', 'fake-id')), false);
+    assert.equal(hasDeferredBridgeExecutionAction('产物已经保存到项目。'), false);
   });
 
   it('includes failed tool reasons in no-evidence blockers', () => {

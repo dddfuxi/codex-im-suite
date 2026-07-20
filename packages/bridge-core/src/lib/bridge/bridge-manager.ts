@@ -38,6 +38,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import {
+  parseArtifactPromotionRequest,
+  type ArtifactPromotionRequest,
+} from '@codex-im-suite/contracts';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type {
   AdapterAssistantIdentity,
@@ -57,6 +61,7 @@ import { formatVisibleToolName } from './markdown/feishu.js';
 import {
   classifyExecutionRequirement,
   isFeishuStickerMessageKind,
+  isExecutionEvidenceSatisfied,
   type ExecutionRequirement,
 } from './execution-requirement.js';
 import {
@@ -105,6 +110,7 @@ const REMINDER_ACTION_FENCE = 'cti-reminder';
 const SCHEDULED_TASK_ACTION_FENCE = 'cti-scheduled-task';
 const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
 const BRIDGE_CONTROL_ACTION_FENCE = 'cti-bridge-control';
+const ARTIFACT_PROMOTION_ACTION_FENCE = 'cti-artifact-promote';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -232,6 +238,13 @@ interface CtiBridgeControlAction {
 
 interface ExtractedBridgeControlAction {
   action: CtiBridgeControlAction | null;
+  text: string;
+  hadBlock: boolean;
+  error?: string;
+}
+
+interface ExtractedArtifactPromotionAction {
+  action: ArtifactPromotionRequest | null;
   text: string;
   hadBlock: boolean;
   error?: string;
@@ -558,6 +571,60 @@ function extractCtiBridgeControlAction(text: string): ExtractedBridgeControlActi
   }
 }
 
+function extractCtiArtifactPromotionAction(text: string): ExtractedArtifactPromotionAction {
+  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${ARTIFACT_PROMOTION_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
+  const match = text.match(fencePattern);
+  if (!match) return { action: null, text, hadBlock: false };
+  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
+  try {
+    const raw = getRecordField(JSON.parse(match[2].trim()) as unknown);
+    if (!raw) return { action: null, text: cleaned, hadBlock: true, error: '产物提升动作不是有效 JSON 对象' };
+    const allowedFields = new Set(['artifactId', 'targetProjectId', 'targetRelativePath', 'expectedSha256']);
+    const unexpectedFields = Object.keys(raw).filter((key) => !allowedFields.has(key));
+    if (unexpectedFields.length > 0) {
+      return {
+        action: null,
+        text: cleaned,
+        hadBlock: true,
+        error: `产物提升动作包含不允许字段：${unexpectedFields.sort().join(', ')}`,
+      };
+    }
+    return { action: parseArtifactPromotionRequest(raw), text: cleaned, hadBlock: true };
+  } catch (error) {
+    return {
+      action: null,
+      text: cleaned,
+      hadBlock: true,
+      error: `产物提升动作无效：${error instanceof Error ? error.message : 'JSON 解析失败'}`,
+    };
+  }
+}
+
+function isExplicitArtifactPromotionRequestText(text: string): boolean {
+  const normalized = (text || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized || /(?:不要|别|禁止|取消).{0,12}(?:保存|复制|写入|提升|导入|放到|放进)/iu.test(normalized)) return false;
+  if (/(?:解释|说明|教程|示例|格式|规则|含义|是什么意思|怎么|如何|是否|能否|可以吗|可不可以).{0,48}(?:保存|复制|写入|提升|导入|放到|放进|存到)/iu.test(normalized)) return false;
+  const writeIntent = /(?:保存|复制|写入|提升|导入|放到|放进|加入|落到|存到|拷贝)/iu.test(normalized);
+  const projectTarget = /(?:项目|仓库|workspace|Assets|Packages|src|docs|目录|文件夹|工程)/iu.test(normalized);
+  return writeIntent && projectTarget;
+}
+
+function formatArtifactPromotionError(error: unknown): string {
+  const code = error instanceof Error ? error.message : String(error || 'artifact_promotion_failed');
+  const messages: Record<string, string> = {
+    artifact_target_project_not_found: '目标项目不存在或未启用。',
+    project_read_only: '目标项目被注册为只读，禁止写入。',
+    artifact_target_project_denied: '目标项目命中禁止目录。',
+    artifact_not_found: '找不到对应的受管产物 ID。',
+    artifact_hash_mismatch: '产物 Hash 与登记值不一致，已拒绝写入。',
+    artifact_target_outside_project: '目标相对路径越过项目边界。',
+    artifact_target_symlink_denied: '目标路径包含符号链接，已拒绝写入。',
+    artifact_target_exists: '目标文件已存在；默认禁止覆盖。',
+    artifact_manifest_corrupt: '产物清单损坏，无法安全提升。',
+  };
+  return messages[code] || code.replace(/[_-]+/gu, ' ').trim() || '产物提升失败。';
+}
+
 function isExplicitBridgeRestartRequestText(text: string): boolean {
   const normalized = (text || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
@@ -622,6 +689,35 @@ interface BridgeActionReplyResult {
   text: string;
   feishuCardJson?: string;
   bridgeActionToolName?: string;
+}
+
+async function executeArtifactPromotionActionFromReply(
+  rawReply: string,
+  msg: InboundMessage,
+  rawPrompt: string,
+): Promise<BridgeActionReplyResult> {
+  const extracted = extractCtiArtifactPromotionAction(rawReply);
+  if (!extracted.action) {
+    return extracted.hadBlock
+      ? { handled: true, text: `未完成：${extracted.error || '产物提升动作无效'}` }
+      : { handled: false, text: rawReply };
+  }
+  if (!isExplicitArtifactPromotionRequestText(rawPrompt)) {
+    return { handled: true, text: '未完成：本轮用户没有明确要求把产物写入项目，已拦截提升动作。' };
+  }
+  if (!isOwnerMessage(msg)) return { handled: true, text: buildOwnerRequiredMessage(msg) };
+  const promote = getBridgeContext().turnStorage?.promoteArtifact;
+  if (!promote) return { handled: true, text: '未完成：当前 runtime 没有加载受控 Artifact Store。' };
+  try {
+    const result = promote(extracted.action);
+    return {
+      handled: true,
+      text: `已将产物提升到项目 ${result.targetProjectId}：${extracted.action.targetRelativePath}`,
+      bridgeActionToolName: ARTIFACT_PROMOTION_ACTION_FENCE,
+    };
+  } catch (error) {
+    return { handled: true, text: `未完成：${formatArtifactPromotionError(error)}` };
+  }
 }
 
 async function executeBridgeControlActionFromReply(
@@ -2059,7 +2155,7 @@ function sanitizeOutsourcedToolReply(text: string, sourcePrompt = ''): string {
 function sanitizeProgressCardDetail(text: string): string {
   const normalized = (text || '')
     .replace(/\r\n/g, '\n')
-    .replace(/```(?:cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control)[\s\S]*?```/gi, '')
+    .replace(/```(?:cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control|cti-artifact-promote)[\s\S]*?```/gi, '')
     .replace(/^\s*#{1,6}\s*处理思路\s*$/gim, '')
     .replace(/^\s*#{1,6}\s*执行结果\s*$/gim, '')
     .trim();
@@ -2112,7 +2208,7 @@ function isInternalProgressNarration(line: string): boolean {
   const normalized = line.replace(/^[-*]\s*/, '').trim();
   if (!normalized) return true;
   // 进度卡允许展示面向用户改写过的处理思路；这里只拦截会暴露工具名、路径、命令或 agent 内部阶段的细节。
-  if (/(JsonTool|tool_use|tool_result|cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
+  if (/(JsonTool|tool_use|tool_result|cti-final|cti-reminder|cti-scheduled-task|cti-direct-message|cti-bridge-control|cti-artifact-promote|shell|powershell|pwsh|cmd\s*\/c|Get-Content|npm|node|python|git\s|MCP|agent\s*已返回)/iu.test(normalized)) {
     return true;
   }
   if (/(?:[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b)/iu.test(normalized)) {
@@ -2699,6 +2795,7 @@ type ExecutionEvidence = NonNullable<engine.ConversationResult['executionEvidenc
 function addBridgeActionExecutionEvidence(
   executionEvidence: ExecutionEvidence,
   bridgeActionToolName?: string,
+  executionRequirement?: ExecutionRequirement,
 ): ExecutionEvidence {
   const toolName = bridgeActionToolName?.trim();
   if (!toolName) return executionEvidence;
@@ -2707,7 +2804,7 @@ function addBridgeActionExecutionEvidence(
   // bridge host reports success, the answer-review/no-evidence guard should
   // see that real local side effect instead of treating the host result as a
   // model hallucination.
-  return {
+  const updated = {
     ...executionEvidence,
     toolUseCount: executionEvidence.toolUseCount + 1,
     toolResultCount: executionEvidence.toolResultCount + 1,
@@ -2715,6 +2812,12 @@ function addBridgeActionExecutionEvidence(
     toolNames: executionEvidence.toolNames.includes(toolName)
       ? executionEvidence.toolNames
       : [...executionEvidence.toolNames, toolName],
+  };
+  return {
+    ...updated,
+    evidenceSatisfied: executionRequirement
+      ? isExecutionEvidenceSatisfied(executionRequirement, updated)
+      : updated.evidenceSatisfied,
   };
 }
 
@@ -2974,6 +3077,7 @@ function stripFinalReplyProtocolArtifacts(text: string): string {
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${REMINDER_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${SCHEDULED_TASK_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
+    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${ARTIFACT_PROMOTION_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -7675,7 +7779,10 @@ async function handleMessage(
     const bridgeControlAction = providerVisibleResponseText
       ? await executeBridgeControlActionFromReply(providerVisibleResponseText, msg, rawText)
       : { handled: false, text: '' };
-    const directMessageAction = !bridgeControlAction.handled && providerVisibleResponseText
+    const artifactPromotionAction = !bridgeControlAction.handled && providerVisibleResponseText
+      ? await executeArtifactPromotionActionFromReply(providerVisibleResponseText, msg, rawText)
+      : { handled: false, text: '' };
+    const directMessageAction = !bridgeControlAction.handled && !artifactPromotionAction.handled && providerVisibleResponseText
       ? await executeDirectMessageActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -7684,7 +7791,7 @@ async function handleMessage(
         verifiedStickerAction,
       )
       : { handled: false, text: '' };
-    const scheduledTaskAction = !bridgeControlAction.handled && !directMessageAction.handled && providerVisibleResponseText
+    const scheduledTaskAction = !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && providerVisibleResponseText
       ? await executeScheduledTaskActionFromReply(
         providerVisibleResponseText,
         msg,
@@ -7693,16 +7800,19 @@ async function handleMessage(
       )
       : { handled: false, text: '' };
     let bridgeActionToolName = bridgeControlAction.bridgeActionToolName
+      || artifactPromotionAction.bridgeActionToolName
       || directMessageAction.bridgeActionToolName
       || scheduledTaskAction.bridgeActionToolName;
     let responseText = bridgeControlAction.handled
       ? bridgeControlAction.text
-      : directMessageAction.handled
-        ? directMessageAction.text
-        : scheduledTaskAction.handled
-          ? scheduledTaskAction.text
-          : '';
-    if (!bridgeControlAction.handled && !directMessageAction.handled && !scheduledTaskAction.handled && providerVisibleResponseText) {
+      : artifactPromotionAction.handled
+        ? artifactPromotionAction.text
+        : directMessageAction.handled
+          ? directMessageAction.text
+          : scheduledTaskAction.handled
+            ? scheduledTaskAction.text
+            : '';
+    if (!bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && !scheduledTaskAction.handled && providerVisibleResponseText) {
       const reminderAction = await executeReminderActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -7713,7 +7823,11 @@ async function handleMessage(
       responseText = reminderAction.text;
       bridgeActionToolName = reminderAction.bridgeActionToolName;
     }
-    const responseExecutionEvidence = addBridgeActionExecutionEvidence(result.executionEvidence, bridgeActionToolName);
+    const responseExecutionEvidence = addBridgeActionExecutionEvidence(
+      result.executionEvidence,
+      bridgeActionToolName,
+      uiExecutionRequirement,
+    );
     let preparedReply = responseText
       ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
       : null;
@@ -8513,6 +8627,7 @@ export const _testOnly = {
   addFeishuStickerHintForExplicitRequest,
   buildProgressCardTextForTest: buildProgressCardTextForStreaming,
   extractCtiReminderAction,
+  extractCtiArtifactPromotionAction,
   containsUnverifiedReminderCompletion,
   parseNaturalReminderRequest,
   pollAdapterMessageForTest: pollAdapterMessage,

@@ -363,11 +363,19 @@ function buildTurnPrompt(params: StreamChatParams): string {
   // history is already in mavis (binding.sessionId is the same
   // mavis session), so the daemon has full context.
   const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
-  if (!priorityTurnContext) return params.prompt || '';
-  return [
-    priorityTurnContext,
-    `Current user request:\n${params.prompt || ''}`,
-  ].join('\n\n');
+  const artifactBoundary = params.artifactDirectory?.trim()
+    ? [
+        'Runtime artifact boundary:',
+        `- Generated deliverables / 生成产物默认写入：${path.resolve(params.artifactDirectory)}`,
+        '- 生成产物不得默认写入项目工作区。只有当前用户明确要求修改该项目源码或资产时，才允许编辑项目内容。',
+      ].join('\n')
+    : '';
+  const userRequest = priorityTurnContext
+    ? `Current user request:\n${params.prompt || ''}`
+    : params.prompt || '';
+  return [priorityTurnContext, artifactBoundary, userRequest]
+    .filter((part) => part.trim())
+    .join('\n\n');
 }
 
 type SourceAwareStreamChatParams = StreamChatParams & {

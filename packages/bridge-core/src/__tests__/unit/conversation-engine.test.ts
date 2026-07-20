@@ -256,6 +256,34 @@ test('builds turn-scoped mounts from explicit registered project paths', () => {
   ]);
 });
 
+test('instructs project writes to use the managed artifact promotion action', () => {
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const prompt = _testOnly.buildBridgeScopedSystemPrompt({
+    id: 'binding-1',
+    codepilotSessionId: 'session-1',
+    channelType: 'feishu',
+    chatId: 'chat-1',
+    sdkSessionId: '',
+    workingDirectory: '',
+    model: '',
+    mode: 'code',
+    active: true,
+    createdAt: '2026-07-20T00:00:00.000Z',
+    updatedAt: '2026-07-20T00:00:00.000Z',
+  });
+
+  assert.match(prompt, /cti-artifact-promote/i);
+  assert.match(prompt, /artifactId.*targetProjectId.*targetRelativePath.*expectedSha256/i);
+  assert.match(prompt, /Owner/i);
+  assert.match(prompt, /不得.*覆盖|must not overwrite/i);
+});
+
 test('uses structured project records for Unity-root to workspace-root planning', () => {
   initBridgeContext({
     store: {
@@ -435,4 +463,72 @@ test('delegates attachment persistence to the runtime turn storage host', () => 
     }],
   });
   assert.equal(files[0].filePath, 'C:\\runtime\\uploads\\session-1\\turn-1\\incoming.png');
+});
+
+test('delegates successful tool-result artifact registration to the runtime host', () => {
+  const calls: unknown[] = [];
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+    turnStorage: {
+      stageInputFiles: () => [],
+      getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+      getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+      registerToolResultArtifacts: (input: unknown) => {
+        calls.push(input);
+        return [];
+      },
+    },
+  } as any);
+
+  assert.doesNotThrow(() => _testOnly.registerToolResultArtifactsSafely({
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    toolUseId: 'tool-1',
+    toolName: 'JsonTool:mcp_call',
+    content: '{"ok":true}',
+    isError: false,
+  }));
+  assert.deepEqual(calls, [{
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    toolUseId: 'tool-1',
+    toolName: 'JsonTool:mcp_call',
+    content: '{"ok":true}',
+    isError: false,
+  }]);
+});
+
+test('adds stable managed artifact ids to structured tool results without replacing tool data', () => {
+  const content = _testOnly.attachManagedArtifactsToToolResult(JSON.stringify({
+    ok: true,
+    data: { files: ['C:\\outside\\preview.png'] },
+    managedArtifacts: [{ artifactId: 'model-invented-id' }],
+  }), [{
+    id: 'artifact-123',
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    fileName: 'preview.png',
+    relativePath: 'preview.png',
+    filePath: 'C:\\runtime\\artifacts\\session-1\\turn-1\\preview.png',
+    sizeBytes: 7,
+    sha256: 'abc123',
+    createdAt: '2026-07-20T00:00:00.000Z',
+    source: { kind: 'tool_result', toolUseId: 'tool-1', toolName: 'JsonTool:mcp_call' },
+  }]);
+
+  assert.deepEqual(JSON.parse(content), {
+    ok: true,
+    data: { files: ['C:\\outside\\preview.png'] },
+    managedArtifacts: [{
+      artifactId: 'artifact-123',
+      fileName: 'preview.png',
+      relativePath: 'preview.png',
+      sizeBytes: 7,
+      sha256: 'abc123',
+    }],
+  });
+  assert.ok(content.indexOf('"managedArtifacts"') < content.indexOf('"data"'));
 });
