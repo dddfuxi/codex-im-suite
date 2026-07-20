@@ -41,9 +41,12 @@ import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReview
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
 import {
-  materializeDerivedUserImpression,
   upsertConfirmedMemoryDocument,
 } from './memory-documents.js';
+import {
+  classifyCandidateEligibility,
+  mergeCandidateObservation,
+} from './memory-items/candidate-policy.js';
 import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext, type MemoryGraphIndex } from './memory-graph.js';
 import {
   memoryPartitionSegment,
@@ -293,6 +296,7 @@ type MemoryProfileScope = 'user' | 'chat' | 'global';
 interface MemoryProfileRecord {
   scope: MemoryProfileScope;
   key: string;
+  sessionId?: string;
   channelType?: string;
   chatId?: string;
   userId?: string;
@@ -302,6 +306,8 @@ interface MemoryProfileRecord {
   facts: string[];
   pending: string[];
   observationCounts?: Record<string, number>;
+  observationSessions?: Record<string, string[]>;
+  observationMessageHashes?: Record<string, string[]>;
   messageCount: number;
   updatedAt: string;
   lastEventAt: string;
@@ -426,6 +432,15 @@ export class JsonFileStore implements BridgeStore {
           topics: Array.isArray(value.topics) ? value.topics : [],
           facts: Array.isArray(value.facts) ? value.facts : [],
           pending: Array.isArray(value.pending) ? value.pending : [],
+          observationCounts: value.observationCounts && typeof value.observationCounts === 'object'
+            ? value.observationCounts
+            : {},
+          observationSessions: value.observationSessions && typeof value.observationSessions === 'object'
+            ? value.observationSessions
+            : {},
+          observationMessageHashes: value.observationMessageHashes && typeof value.observationMessageHashes === 'object'
+            ? value.observationMessageHashes
+            : {},
           messageCount: Number.isFinite(value.messageCount) ? value.messageCount : 0,
           updatedAt: value.updatedAt || now(),
           lastEventAt: value.lastEventAt || value.updatedAt || now(),
@@ -620,9 +635,12 @@ export class JsonFileStore implements BridgeStore {
     return repaired.unresolved ? '' : repaired.text;
   }
 
-  private memoryProfileKey(scope: MemoryProfileScope, channelType: string, id = ''): string {
+  private memoryProfileKey(scope: MemoryProfileScope, channelType: string, id = '', sessionId = ''): string {
     const normalizedId = id.trim() || 'all';
-    return `${scope}:${channelType || 'all'}:${normalizedId}`;
+    const sessionKey = sessionId.trim()
+      ? crypto.createHash('sha1').update(sessionId.trim(), 'utf8').digest('hex').slice(0, 12)
+      : 'legacy';
+    return `${scope}:${channelType || 'all'}:${normalizedId}:${sessionKey}`;
   }
 
   private appendMemoryItems(existing: string[], incoming: string[]): string[] {
@@ -657,19 +675,13 @@ export class JsonFileStore implements BridgeStore {
     const topics: string[] = [];
     const lower = normalized.toLowerCase();
 
-    if (
-      /记住|以后|以后.*就|固定|对应表|常用|叫|命名|偏好|喜欢|不要|别|必须|默认|约定|规则|==|=>|->/.test(normalized)
-      || /prefab|scene|mcp|unity|codex|feishu|家具|场景|权限|发布/i.test(normalized)
-    ) {
-      facts.push(normalized);
-    }
+    // 这里只维护有界运行态画像，不授予持久化权限。候选资格是失败关闭
+    // 预筛；真正写入 memory v3 仍必须经过独立记忆意图分类器。
+    const candidate = classifyCandidateEligibility({ role, text: normalized });
+    if (candidate.eligible) facts.push(candidate.normalizedText);
 
     if (/未完成|阻塞|失败|报错|不可用|待办|下次|继续|还没|需要后续/.test(normalized)) {
       pending.push(normalized);
-    }
-
-    if (role === 'assistant' && /(已|已经|完成|修复|同步|发布|重启|生成|整理|改好|通过|成功)/.test(normalized)) {
-      facts.push(normalized);
     }
 
     if (
@@ -692,14 +704,35 @@ export class JsonFileStore implements BridgeStore {
     const existing = this.memoryProfiles.get(key);
     const timestamp = event.createdAt || now();
     const observationCounts = { ...(existing?.observationCounts || {}) };
+    const observationSessions = { ...(existing?.observationSessions || {}) };
+    const observationMessageHashes = { ...(existing?.observationMessageHashes || {}) };
     for (const fact of items.facts) {
       const normalizedFact = this.summarizeMessageContent(fact, 180);
       if (!normalizedFact) continue;
-      observationCounts[normalizedFact] = (observationCounts[normalizedFact] || 0) + 1;
+      const previousSessionIds = observationSessions[normalizedFact] || [];
+      const previousMessageHashes = observationMessageHashes[normalizedFact] || [];
+      const merged = mergeCandidateObservation({
+        normalizedText: normalizedFact,
+        fingerprint: crypto.createHash('sha256').update(normalizedFact, 'utf8').digest('hex'),
+        sessionIds: previousSessionIds,
+        sourceMessageHashes: previousMessageHashes,
+        distinctSessionCount: previousSessionIds.length,
+        firstObservedAt: existing?.lastEventAt || timestamp,
+        lastObservedAt: existing?.lastEventAt || timestamp,
+      }, {
+        sessionId: event.sessionId,
+        text: normalizedFact,
+        sourceMessageHash: crypto.createHash('sha256').update(`${event.sessionId}\n${timestamp}\n${normalizedFact}`, 'utf8').digest('hex'),
+        observedAt: timestamp,
+      });
+      observationCounts[normalizedFact] = merged.distinctSessionCount;
+      observationSessions[normalizedFact] = merged.sessionIds;
+      observationMessageHashes[normalizedFact] = merged.sourceMessageHashes;
     }
     const record: MemoryProfileRecord = {
       scope,
       key,
+      sessionId: event.sessionId,
       channelType: event.channelType || existing?.channelType,
       chatId: scope === 'chat' ? event.chatId : existing?.chatId,
       userId: scope === 'user' ? event.userId : existing?.userId,
@@ -713,6 +746,8 @@ export class JsonFileStore implements BridgeStore {
       facts: this.appendMemoryItems(existing?.facts || [], items.facts),
       pending: this.appendMemoryItems(existing?.pending || [], items.pending),
       observationCounts,
+      observationSessions,
+      observationMessageHashes,
       messageCount: (existing?.messageCount || 0) + 1,
       updatedAt: now(),
       lastEventAt: timestamp,
@@ -1247,6 +1282,7 @@ export class JsonFileStore implements BridgeStore {
 
     const hits: RetrievedMemoryHit[] = [];
     for (const profile of this.memoryProfiles.values()) {
+      if (!profile.sessionId || profile.sessionId !== query.sessionId) continue;
       if (profile.scope === 'user' && profile.userId !== query.userId) continue;
       if (profile.scope === 'chat' && profile.chatId !== query.chatId) continue;
       if (profile.scope === 'global') continue;
@@ -1749,12 +1785,12 @@ export class JsonFileStore implements BridgeStore {
     };
 
     if (event.chatId?.trim()) {
-      const chatKey = this.memoryProfileKey('chat', event.channelType, event.chatId);
+      const chatKey = this.memoryProfileKey('chat', event.channelType, event.chatId, event.sessionId);
       this.upsertMemoryProfile('chat', chatKey, timestampedEvent, items);
     }
 
     if (event.userId?.trim() && event.role === 'user') {
-      const userKey = this.memoryProfileKey('user', event.channelType, event.userId);
+      const userKey = this.memoryProfileKey('user', event.channelType, event.userId, event.sessionId);
       this.upsertMemoryProfile('user', userKey, timestampedEvent, items);
     }
 
@@ -1850,24 +1886,6 @@ export class JsonFileStore implements BridgeStore {
   recordMemoryEvent(event: ConversationMemoryEvent): void {
     if (!this.applyMemoryEvent(event)) return;
     this.persistMemoryProfiles();
-    if (event.role !== 'user' || !event.userId?.trim()) return;
-    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
-    if (!memoryRoot) return;
-    const profile = this.memoryProfiles.get(this.memoryProfileKey('user', event.channelType, event.userId));
-    if (!profile) return;
-    try {
-      const result = materializeDerivedUserImpression({
-        memoryRoot,
-        channelType: event.channelType,
-        userId: event.userId,
-        displayName: event.userDisplayName || profile.displayName,
-        observations: Object.entries(profile.observationCounts || {}).map(([text, count]) => ({ text, count })),
-        updatedAt: event.createdAt || now(),
-      });
-      if (result.updated) rebuildKnowledgeIndex(memoryRoot);
-    } catch (error) {
-      console.warn('[store] Failed to materialize derived user impression:', error instanceof Error ? error.message : error);
-    }
   }
 
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {

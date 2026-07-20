@@ -347,7 +347,7 @@ describe('JsonFileStore', () => {
     assert.match(text, /\| 默认项目 \| ST4 \|/);
   });
 
-  it('promotes only a repeated user observation into the tentative impression section', () => {
+  it('keeps repeated stable observations in bounded profiles until a classifier authorizes persistence', () => {
     const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-derived-user-memory-'));
     const store = new JsonFileStore(makeSettings([
       ['bridge_memory_repo_dir', memoryRoot],
@@ -368,8 +368,75 @@ describe('JsonFileStore', () => {
     store.recordMemoryEvent(event);
 
     const impressionPath = path.join(memoryRoot, 'memory', 'users', 'feishu', 'ou_user_1', '用户印象.md');
-    assert.equal(fs.existsSync(impressionPath), true);
-    assert.match(fs.readFileSync(impressionPath, 'utf8'), /我偏好直接给出可执行结果/);
+    assert.equal(fs.existsSync(impressionPath), false);
+    const profiles = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'memory-profiles.json'), 'utf8')) as Record<string, {
+      sessionId?: string;
+      userId?: string;
+      facts?: string[];
+      observationCounts?: Record<string, number>;
+    }>;
+    const userProfile = Object.values(profiles).find((profile) =>
+      profile.sessionId === 'sess-profile' && profile.userId === 'ou_user_1');
+    assert.ok(userProfile);
+    assert.match(JSON.stringify(userProfile.facts), /我偏好直接给出可执行结果/u);
+    assert.equal(Object.values(userProfile.observationCounts || {})[0], 1, 'same session replay counts once');
+  });
+
+  it('never materializes repeated commands questions links or mentions into memory v3', () => {
+    const memoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-rejected-derived-memory-'));
+    const store = new JsonFileStore(makeSettings([
+      ['bridge_memory_repo_dir', memoryRoot],
+    ]));
+    const texts = [
+      'Unity MCP 截一张 game 图',
+      'pve 关卡场景叫啥',
+      'https://example.com 看一下并总结',
+      '@_user_1 按这个格式回复',
+      'powershell -File doctor.ps1 检查工具',
+    ];
+
+    for (let round = 0; round < 4; round += 1) {
+      for (const text of texts) {
+        store.recordMemoryEvent({
+          sessionId: `session-${round}`,
+          channelType: 'feishu',
+          chatId: 'oc_group',
+          userId: 'ou_user_1',
+          role: 'user',
+          text,
+        });
+      }
+    }
+
+    assert.equal(fs.existsSync(path.join(memoryRoot, 'memory')), false);
+    const profiles = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'memory-profiles.json'), 'utf8')) as Record<string, { userId?: string; facts?: string[] }>;
+    const userProfiles = Object.values(profiles).filter((profile) => profile.userId === 'ou_user_1');
+    assert.equal(userProfiles.every((profile) => (profile.facts || []).length === 0), true);
+  });
+
+  it('does not retrieve a bounded conversation profile from another session', () => {
+    const store = new JsonFileStore(makeSettings());
+    store.recordMemoryEvent({
+      sessionId: 'session-a',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      role: 'user',
+      text: '我更喜欢先给结论，再列验证证据。',
+    });
+
+    const memory = store.retrieveRelevantMemory({
+      sessionId: 'session-b',
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userId: 'ou_user_1',
+      userDisplayName: '刘丹',
+      query: '我之前偏好什么回复方式',
+      recentHistoryLimit: 0,
+    });
+
+    assert.doesNotMatch(memory?.summary || '', /先给结论/u);
   });
 
   it('persists model-planned memory candidates into the visible knowledge repository', () => {
