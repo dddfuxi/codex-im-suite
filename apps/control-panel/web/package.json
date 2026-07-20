@@ -10,6 +10,7 @@
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
+    "@codex-im-suite/contracts": "file:../../../packages/contracts",
     "claude-to-im": "file:../../../packages/bridge-core",
     "@tanstack/react-table": "^8.21.3",
     "@vitejs/plugin-react": "^5.1.1",

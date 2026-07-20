@@ -9,6 +9,18 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./control-api": {
+      "types": "./src/control-api.ts",
+      "import": "./dist/control-api.js"
+    },
+    "./project-registry": {
+      "types": "./src/project-registry.ts",
+      "import": "./dist/project-registry.js"
+    },
+    "./workflow": {
+      "types": "./src/workflow.ts",
+      "import": "./dist/workflow.js"
     }
   },
   "files": [

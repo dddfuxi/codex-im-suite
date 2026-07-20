@@ -20,6 +20,15 @@ export interface ProjectRegistryDocumentV1 {
   projects: RegisteredProject[];
 }
 
+export interface ProjectRegistrySnapshotContract {
+  schema: 'codex-im-suite/project-registry-snapshot/v1';
+  generatedAt: string;
+  registryPath: string;
+  exists: boolean;
+  projects: RegisteredProject[];
+  error: string;
+}
+
 export interface ParseProjectRegistryOptions {
   deniedRoots?: readonly string[];
 }

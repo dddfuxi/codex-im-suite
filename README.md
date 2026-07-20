@@ -41,6 +41,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 能力和 CLI 运维补齐：能力区拆为 Skills、MCP、模型与插件；MCP 状态按健康检查、Codex 注册和托管进程综合判断，Skill 安装只走 lifecycle，其他扩展保留 manifest 和白名单更新模板。
 - 控制面板 HTTP 化：桌面面板会启动同一套本机 Control API，React 前端可在 WebView2 或普通浏览器里通过 HTTP/SSE 读取状态、会话、图片、workflow 和权限数据；远程监听默认关闭，必须显式配置 token。
 - Workflow 契约适配：`workflow-runs.json` 继续作为本地事实来源，runtime 额外提供共享 `WorkflowRunContract` 映射，统一 checkpoint、trace event、recovery 和 delivery 字段。
+- 控制面板共享协议：`PanelState`、`RuntimeUnit`、Control Command/Result、面板消费的完整 Workflow Run 和项目注册表快照统一由 `packages/contracts` 提供；React 只从浏览器安全的 `@codex-im-suite/contracts/control-api|workflow|project-registry` 子路径导入。`control-api.schema.json` 与 `project-registry.schema.json` 是 C# 薄 DTO 的跨语言字段约束，.NET 测试会逐字段检查 schema 对齐；控制面板只读展示项目注册表，不维护第二份项目事实。
 - AI 执行来源收口：设置页支持选择默认 executor 来源，执行器页可一键设为默认或恢复自动；Codex 内部仍支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源。Feishu 最终卡片底部会分开展示“来源”（executor/provider）与“模型 / token”，便于确认本轮到底由 Codex、Claude CLI 还是外部 agent 执行。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
@@ -76,6 +77,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 自维护档案：`work/<workspaceId>/工作档案.md`、`daily-reflection/每日反思-YYYY-MM-DD.md`、`corrections/纠错记录-YYYY-MM-DD.md`；写入使用 `.cti-self-history/write.lock` 排他锁和持久化事务 before-image，崩溃后会恢复未完成事务。受控规则记录 `trial / confirmed / regressed` 成熟度和真实 runtime 效果，`regressed` 只标记回归并保留回滚入口，不自动覆盖用户内容。版本、审计和日期档案超过活跃窗口后移动到 `archive/self-maintenance`，不直接删除；控制面板展示 classifier 调用/跳过、平均耗时、规则状态和锁/哈希冲突。
 - 人类可读投影：机器状态发生受控 mutation 时，面向人审核的既有 Markdown 入口必须在同一写锁事务中更新；任一投影失败则回滚机器状态。机器状态始终是唯一事实源，Markdown 只展示索引、状态、范围和可操作入口，受控区块之外的用户手写内容原样保留。`记忆总索引.md` 和 `记忆库说明.md` 由记忆生命周期、表情包语义和 Agent Home 自维护分别维护独立受控区块，禁止某个领域整篇覆盖其他投影；核心文档回滚也同步刷新这两个入口。回合 Upload/Artifact/Scratch 清单同样遵守此规则。
 - 跨包公共出口：`claude-to-im` 根只暴露 Bridge Application Facade；Runtime 按需使用 `/host`、`/evidence`、`/policy`、`/channel`、`/workspace`、`/runtime-audit`，Web 只使用浏览器安全的 `/architecture`。`npm run check:boundaries` 会拒绝 `*/src/*` 深层导入、Web 跨包源码相对路径、Node-only policy 进入浏览器和 `bridge-core -> runtime` 反向依赖。
+- 人类文档同步：共享协议、schema ID、顶层状态字段、项目注册表可见字段或跨包公共出口发生变化时，必须在同一阶段同步 README、`docs/PROJECT-ARCHITECTURE.md`、`docs/DEVELOPMENT-LOG.md`、路线图勾选和必要的 AGENTS 维护规则；文档说明协议职责与入口，不复制运行时动态状态形成第二事实源。
 - 回合输入与产物：入站附件进入 `CTI_HOME\runtime\uploads\<sessionId>\<turnId>`，生成物进入 `CTI_HOME\runtime\artifacts\<sessionId>\<turnId>`，会话临时工作目录进入 `CTI_HOME\runtime\workspaces\<sessionId>\<turnId>`。每个目录同步维护机器 JSON 与中文 Markdown 投影，包括 `输入附件清单`、`回合元数据`、`产物清单` 和 `提升记录`。
 - 产物提升：工具结果里的真实文件会登记为稳定 `artifactId + SHA-256`；只有 Owner 在当前消息中明确要求写入项目时，Agent 才能输出 `cti-artifact-promote`。动作只接受 `artifactId / targetProjectId / targetRelativePath / expectedSha256`，目标项目必须来自结构化 Registry 且为可写，默认禁止覆盖、越界、符号链接和 Hash 不一致。
 - 未归类根文档：记忆库根目录中不属于五个固定入口的 Markdown 会在控制面板显示警告和打开入口，但不会被自动移动、删除或注入知识索引。
@@ -183,7 +185,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 - `packages/bridge-core`：IM 桥接核心库，包含 Feishu 适配器、消息路由、权限、审计、发送收口。
 - `packages/bridge-runtime`：运行时壳层，包含配置、daemon、provider、Codex、本地模型、本地执行器、MCP 桥接。
-- `packages/contracts`：Control API、workflow、node agent 和 extension capability 的共享 TypeScript 契约与 JSON schema。
+- `packages/contracts`：Control API、完整/精简 workflow、项目注册表、node agent 和 extension capability 的共享 TypeScript 契约与稳定 JSON schema；浏览器按 `control-api`、`workflow`、`project-registry` 子路径消费，避免把 Node-only 解析实现打入 Web bundle。
 - `packages/mcp-picture`：图片能力 MCP。
 - `packages/mcp-unity-prefab`：Unity Prefab MCP。
 - `packages/mcp-ignis`：Ignis CLI MCP，负责原画、图片、视频、3D 模型生成和结果查询。

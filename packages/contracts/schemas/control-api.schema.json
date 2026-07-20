@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/control-api.schema.json",
+  "title": "Codex IM Suite Control API",
+  "$defs": {
+    "ControlCommandRequest": {
+      "type": "object",
+      "required": ["schema", "id", "type", "command", "payload"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/control-command/v1" },
+        "id": { "type": "string" },
+        "type": { "const": "command" },
+        "command": { "type": "string", "minLength": 1 },
+        "payload": {},
+        "nodeId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ControlCommandResult": {
+      "type": "object",
+      "required": ["schema", "id", "type", "ok"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/control-result/v1" },
+        "id": { "type": "string" },
+        "type": { "const": "result" },
+        "ok": { "type": "boolean" },
+        "data": {},
+        "error": { "type": "string" },
+        "nodeId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeActionContract": {
+      "type": "object",
+      "required": ["id", "label", "enabled"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeUnitContract": {
+      "type": "object",
+      "required": ["unitId", "id", "displayName", "kind", "category", "status", "detail", "enabled", "installState", "source", "cwd", "version", "description", "canInstall", "actions"],
+      "properties": {
+        "unitId": { "type": "string" },
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "kind": { "type": "string" },
+        "category": { "type": "string" },
+        "status": { "type": "string" },
+        "detail": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "installState": { "type": "string" },
+        "source": { "type": "string" },
+        "cwd": { "type": "string" },
+        "version": { "type": "string" },
+        "description": { "type": "string" },
+        "canInstall": { "type": "boolean" },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/RuntimeActionContract" } }
+      },
+      "additionalProperties": false
+    },
+    "RegisteredProjectContract": {
+      "type": "object",
+      "required": ["id", "displayName", "type", "workspaceRoot", "accessMode", "enabled"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "type": { "enum": ["unity", "node", "dotnet", "generic"] },
+        "workspaceRoot": { "type": "string" },
+        "accessMode": { "enum": ["read_only", "read_write"] },
+        "enabled": { "type": "boolean" },
+        "unityProjectRoot": { "type": "string" },
+        "mcpProfileIds": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "ProjectRegistrySnapshotContract": {
+      "type": "object",
+      "required": ["schema", "generatedAt", "registryPath", "exists", "projects", "error"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/project-registry-snapshot/v1" },
+        "generatedAt": { "type": "string" },
+        "registryPath": { "type": "string" },
+        "exists": { "type": "boolean" },
+        "projects": { "type": "array", "items": { "$ref": "#/$defs/RegisteredProjectContract" } },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ControlPanelStateContract": {
+      "type": "object",
+      "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/control-panel-state/v1" },
+        "generatedAt": { "type": "string" },
+        "suite": {
+          "type": "object",
+          "required": ["version", "protocol", "branch", "commit", "gitDirty", "suiteRoot", "skillDir"],
+          "properties": {
+            "version": { "type": "string" },
+            "protocol": { "type": "string" },
+            "branch": { "type": "string" },
+            "commit": { "type": "string" },
+            "gitDirty": { "type": "integer", "minimum": 0 },
+            "suiteRoot": { "type": "string" },
+            "skillDir": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "services": { "type": "array" },
+        "nodes": {},
+        "extensions": {},
+        "skillGovernance": {},
+        "promptSnapshots": {},
+        "scheduledTasks": {},
+        "mcp": {},
+        "release": {},
+        "liveSync": {},
+        "settings": {},
+        "history": {},
+        "workflow": {},
+        "projectRegistry": { "$ref": "#/$defs/ProjectRegistrySnapshotContract" },
+        "memory": {},
+        "memorySkillAssets": {},
+        "memoryReminders": {},
+        "executors": {},
+        "permissions": {},
+        "paths": {},
+        "activities": { "type": "array" },
+        "diagnostics": {}
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/ControlCommandRequest" },
+    { "$ref": "#/$defs/ControlCommandResult" },
+    { "$ref": "#/$defs/RuntimeUnitContract" },
+    { "$ref": "#/$defs/ControlPanelStateContract" }
+  ]
+}

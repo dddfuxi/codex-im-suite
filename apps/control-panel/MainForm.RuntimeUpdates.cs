@@ -140,13 +140,13 @@ internal sealed partial class MainForm
         return ApplyUpdateAvailabilityProbe(plan, installRoot, ExpandManifestValue(update.SourceRootHint), update.PackageName);
     }
 
-    private WebRuntimeUnit BuildCodexRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    private RuntimeUnitContract BuildCodexRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var updatePlan = ResolveRuntimeUpdatePlan(manifest);
         var version = ResolveRuntimeVersion(
             manifest,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm", "node_modules", "@openai", "codex"));
-        return new WebRuntimeUnit(
+        return new RuntimeUnitContract(
             manifest.Id,
             manifest.Id,
             manifest.DisplayName,
@@ -162,13 +162,13 @@ internal sealed partial class MainForm
             manifest.Description,
             false,
             [
-                new WebRuntimeAction("check", "检查", true),
-                new WebRuntimeAction("update", "更新", updatePlan?.CanUpdate == true, updatePlan?.Reason ?? ""),
-                new WebRuntimeAction("openLocation", "打开位置", true)
+                new RuntimeActionContract("check", "检查", true),
+                new RuntimeActionContract("update", "更新", updatePlan?.CanUpdate == true, updatePlan?.Reason ?? ""),
+                new RuntimeActionContract("openLocation", "打开位置", true)
             ]);
     }
 
-    private WebRuntimeUnit BuildBridgeRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    private RuntimeUnitContract BuildBridgeRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var version = ResolveRuntimeVersion(manifest, _skillDir);
         return new(
@@ -187,16 +187,16 @@ internal sealed partial class MainForm
             manifest.Description,
             false,
             [
-                new WebRuntimeAction("status", "状态", true),
-                new WebRuntimeAction("logs", "日志", true),
-                new WebRuntimeAction("start", "启动", true),
-                new WebRuntimeAction("stop", "停止", true),
-                new WebRuntimeAction("restart", "重启", true),
-                new WebRuntimeAction("openLocation", "打开位置", true)
+                new RuntimeActionContract("status", "状态", true),
+                new RuntimeActionContract("logs", "日志", true),
+                new RuntimeActionContract("start", "启动", true),
+                new RuntimeActionContract("stop", "停止", true),
+                new RuntimeActionContract("restart", "重启", true),
+                new RuntimeActionContract("openLocation", "打开位置", true)
             ]);
     }
 
-    private WebRuntimeUnit BuildLocalLlmRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    private RuntimeUnitContract BuildLocalLlmRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var version = ResolveRuntimeVersion(manifest, _skillDir);
         return new(
@@ -215,14 +215,14 @@ internal sealed partial class MainForm
             manifest.Description,
             false,
             [
-                new WebRuntimeAction("check", "检查", true),
-                new WebRuntimeAction("start", "启动", File.Exists(_localLlmStartScript)),
-                new WebRuntimeAction("stop", "停止", File.Exists(_localLlmStopScript)),
-                new WebRuntimeAction("openLocation", "打开位置", true)
+                new RuntimeActionContract("check", "检查", true),
+                new RuntimeActionContract("start", "启动", File.Exists(_localLlmStartScript)),
+                new RuntimeActionContract("stop", "停止", File.Exists(_localLlmStopScript)),
+                new RuntimeActionContract("openLocation", "打开位置", true)
             ]);
     }
 
-    private WebRuntimeUnit BuildManagedToolRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    private RuntimeUnitContract BuildManagedToolRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var updatePlan = ResolveRuntimeUpdatePlan(manifest);
         var installRoot = ExpandManifestValue(string.IsNullOrWhiteSpace(manifest.Cwd) ? manifest.Source : manifest.Cwd);
@@ -230,7 +230,7 @@ internal sealed partial class MainForm
         var version = ResolveRuntimeVersion(manifest, packageRoot, installRoot);
         var detail = BuildManagedToolDetail(manifest, installRoot, version, updatePlan);
         var status = ClassifyManagedToolStatus(installRoot, updatePlan);
-        return new WebRuntimeUnit(
+        return new RuntimeUnitContract(
             manifest.Id,
             manifest.Id,
             manifest.DisplayName,
@@ -246,9 +246,9 @@ internal sealed partial class MainForm
             manifest.Description,
             false,
             [
-                new WebRuntimeAction("check", "检查", true),
-                new WebRuntimeAction("update", "更新", updatePlan?.CanUpdate == true, updatePlan?.Reason ?? ""),
-                new WebRuntimeAction("openLocation", "打开位置", Directory.Exists(installRoot))
+                new RuntimeActionContract("check", "检查", true),
+                new RuntimeActionContract("update", "更新", updatePlan?.CanUpdate == true, updatePlan?.Reason ?? ""),
+                new RuntimeActionContract("openLocation", "打开位置", Directory.Exists(installRoot))
             ]);
     }
 

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/project-registry.schema.json",
+  "title": "ProjectRegistryDocumentV1",
+  "type": "object",
+  "required": ["schema", "projects"],
+  "properties": {
+    "schema": { "const": "codex-im-suite/project-registry/v1" },
+    "projects": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/RegisteredProject" }
+    }
+  },
+  "$defs": {
+    "RegisteredProject": {
+      "type": "object",
+      "required": ["id", "displayName", "type", "workspaceRoot", "accessMode", "enabled"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "type": { "enum": ["unity", "node", "dotnet", "generic"] },
+        "workspaceRoot": { "type": "string", "minLength": 1 },
+        "accessMode": { "enum": ["read_only", "read_write"] },
+        "unityProjectRoot": { "type": "string", "minLength": 1 },
+        "mcpProfileIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "enabled": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

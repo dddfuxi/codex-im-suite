@@ -43,6 +43,17 @@ describe('dependency boundaries', () => {
     assert.deepEqual(findPackageExportViolations(root), []);
   });
 
+  it('keeps control panel and workflow wire DTOs in the shared contracts package', () => {
+    const root = path.resolve(import.meta.dirname, '..', '..');
+    const webSource = fs.readFileSync(path.join(root, 'apps', 'control-panel', 'web', 'src', 'main.tsx'), 'utf8');
+    const runtimeSource = fs.readFileSync(path.join(root, 'packages', 'bridge-runtime', 'src', 'workflow-status.ts'), 'utf8');
+
+    assert.match(webSource, /from ['"]@codex-im-suite\/contracts\/(?:control-api|project-registry|workflow)['"]/u);
+    assert.doesNotMatch(webSource, /type\s+(?:RuntimeAction|RuntimeUnit|WorkflowRun|PanelState|HostResult)\s*=\s*\{/u);
+    assert.match(runtimeSource, /from ['"]@codex-im-suite\/contracts['"]/u);
+    assert.doesNotMatch(runtimeSource, /export interface (?:WorkflowRun|WorkflowExecutionSummary|WorkflowTokenUsage|WorkflowRecoveryState|WorkflowRetryState|WorkflowEvent)/u);
+  });
+
   it('rejects public exports that expose package source internals', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-package-exports-'));
     try {

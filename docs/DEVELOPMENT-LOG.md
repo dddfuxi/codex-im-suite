@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 控制面板共享协议收口：将 React `PanelState / RuntimeUnit / WorkflowRun / HostResult` 和 Runtime workflow 状态 DTO 迁移到 `packages/contracts`，新增浏览器安全的 `control-api`、`workflow`、`project-registry` 子路径，避免 Web 从包含 Node 路径解析代码的根出口取运行时值。新增稳定 `control-api.schema.json`、`project-registry.schema.json` 和 C# `ControlApiContracts.cs` 薄 DTO；HTTP 与 WebView2 command/result 统一携带协议标识，PanelState 新增 schema 与同源项目注册表只读快照。C# 不复制项目挂载规则，只展示结构化文件；Runtime 继续拥有 legacy 合并与工作区裁决。新增 Contract、依赖边界和 .NET schema 逐字段 RED/GREEN 回归，并同步 README、架构、路线图和 AGENTS，确保机器协议与人类维护入口同阶段更新。
+
 - 2026-07-20 Bridge Core 公共出口第一阶段：新增 Application Facade 与 `host/evidence/policy/channel/workspace/runtime-audit/architecture` 稳定子路径，移除 `claude-to-im/src/lib/*` 发布通配符和源码目录发布；Runtime、测试和控制面板架构页已迁移到 package exports。Web 使用独立 browser-safe `architecture` 出口，避免 Node `path` 校验器进入浏览器 bundle。新增依赖边界测试和 `npm run check:boundaries`，拦截深层导入、跨包源码相对路径、Node-only Web 入口和 core 反向依赖 runtime。
 
 - 2026-07-20 Agent Home 人类入口自更新收口：`记忆总索引.md` 与 `记忆库说明.md` 不再由单一领域整篇覆盖，新增通用稳定受控区块合并原语；记忆生命周期迁移为 `cti-memory-index`，表情包和 Agent Home 分别维护独立区块，旧整篇索引自动保留其他区块和用户手写内容。Self-Maintenance 的核心规则修改、工作档案/反思/纠错写入和核心版本回滚会在同一 before-image 事务中刷新五入口的人类说明；任一投影失败时事实、备份、审计和先前投影整体回滚。

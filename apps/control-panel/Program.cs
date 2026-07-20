@@ -424,30 +424,30 @@ internal sealed partial class MainForm : Form
 
         app.MapPost("/api/commands", async (HttpContext context) =>
         {
-            WebCommandRequest? request;
+            ControlCommandRequest? request;
             try
             {
-                request = await JsonSerializer.DeserializeAsync<WebCommandRequest>(context.Request.Body, WebJsonOptions);
+                request = await JsonSerializer.DeserializeAsync<ControlCommandRequest>(context.Request.Body, WebJsonOptions);
             }
             catch (Exception ex)
             {
-                return Results.BadRequest(new { ok = false, error = $"请求解析失败：{ex.Message}" });
+                return Results.BadRequest(ControlCommandResult.Failure("", $"请求解析失败：{ex.Message}"));
             }
             if (request is null || string.IsNullOrWhiteSpace(request.Command))
             {
-                return Results.BadRequest(new { ok = false, error = "缺少 command。" });
+                return Results.BadRequest(ControlCommandResult.Failure(request?.Id ?? "", "缺少 command。"));
             }
             if (!AuthorizeControlApi(context, request.Command, out var failure, request.Payload)) return failure;
             try
             {
                 var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
                 AddControlApiAudit(context, request.Command, request.Payload, true, "");
-                return Results.Json(new { ok = true, data }, WebJsonOptions);
+                return Results.Json(ControlCommandResult.Success(request.Id, data), WebJsonOptions);
             }
             catch (Exception ex)
             {
                 AddControlApiAudit(context, request.Command, request.Payload, false, ex.Message);
-                return Results.Json(new { ok = false, error = ex.Message }, WebJsonOptions, statusCode: 500);
+                return Results.Json(ControlCommandResult.Failure(request.Id, ex.Message), WebJsonOptions, statusCode: 500);
             }
         });
 
@@ -733,20 +733,20 @@ internal sealed partial class MainForm : Form
 
     private async Task HandleWebMessageAsync(string json)
     {
-        WebCommandRequest? request;
+        ControlCommandRequest? request;
         try
         {
-            request = JsonSerializer.Deserialize<WebCommandRequest>(json, WebJsonOptions);
+            request = JsonSerializer.Deserialize<ControlCommandRequest>(json, WebJsonOptions);
         }
         catch (Exception ex)
         {
-            PostWebMessage(new { type = "result", id = "", ok = false, error = $"请求解析失败：{ex.Message}" });
+            PostWebMessage(ControlCommandResult.Failure("", $"请求解析失败：{ex.Message}"));
             return;
         }
 
         if (request is null || request.Type != "command" || string.IsNullOrWhiteSpace(request.Command))
         {
-            PostWebMessage(new { type = "result", id = request?.Id ?? "", ok = false, error = "无效的 WebView 命令。" });
+            PostWebMessage(ControlCommandResult.Failure(request?.Id ?? "", "无效的 WebView 命令。"));
             return;
         }
 
@@ -759,7 +759,7 @@ internal sealed partial class MainForm : Form
                 AddWebActivity("info", "开始执行", request.Command);
             }
             var data = await ExecuteWebCommandAsync(request.Command, request.Payload);
-            PostWebMessage(new { type = "result", id = request.Id, ok = true, data });
+            PostWebMessage(ControlCommandResult.Success(request.Id, data));
             if (!quietCommand)
             {
                 await PushWebStateAsync();
@@ -771,7 +771,7 @@ internal sealed partial class MainForm : Form
             {
                 AddWebActivity("error", request.Command, ex.Message);
             }
-            PostWebMessage(new { type = "result", id = request.Id, ok = false, error = ex.Message });
+            PostWebMessage(ControlCommandResult.Failure(request.Id, ex.Message));
             if (!IsQuietWebCommand(request.Command))
             {
                 await PushWebStateAsync();
@@ -1176,7 +1176,7 @@ internal sealed partial class MainForm : Form
         PostWebMessage(new { type = "state", data = state });
     }
 
-    private async Task<object> BuildWebStateAsync()
+    private async Task<ControlPanelStateContract> BuildWebStateAsync()
     {
         var branch = !string.IsNullOrWhiteSpace(_suiteRoot) ? await RunGitTextAsync("branch --show-current") : "unknown";
         var commit = !string.IsNullOrWhiteSpace(_suiteRoot) ? await RunGitTextAsync("rev-parse --short HEAD") : "unknown";
@@ -1202,10 +1202,10 @@ internal sealed partial class MainForm : Form
             BuildServiceItem("mcp", "MCP 清单", _mcpStatus.Text),
             BuildServiceItem("version", "版本 / 扩展", _buildStatus.Text),
         };
-        return new
-        {
-            generatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-            suite = new
+        return new ControlPanelStateContract(
+            Schema: ControlApiContracts.PanelStateSchema,
+            GeneratedAt: DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+            Suite: new
             {
                 version = suite.Version,
                 protocol = suite.Protocol,
@@ -1215,9 +1215,9 @@ internal sealed partial class MainForm : Form
                 suiteRoot = _suiteRoot,
                 skillDir = _skillDir,
             },
-            services,
-            nodes = BuildNodeSnapshot(suite.Version, services, mcpItems, extensions),
-            extensions = new
+            Services: services,
+            Nodes: BuildNodeSnapshot(suite.Version, services, mcpItems, extensions),
+            Extensions: new
             {
                 total = extensions.Total,
                 enabled = extensions.Enabled,
@@ -1225,10 +1225,10 @@ internal sealed partial class MainForm : Form
                 missingSources = extensions.MissingSources,
                 items = BuildExtensionItems(),
             },
-            skillGovernance,
-            promptSnapshots,
-            scheduledTasks,
-            mcp = new
+            SkillGovernance: skillGovernance,
+            PromptSnapshots: promptSnapshots,
+            ScheduledTasks: scheduledTasks,
+            Mcp: new
             {
                 total = mcpItems.Length,
                 running = mcpItems.Count(item => item.IsRunning),
@@ -1237,7 +1237,7 @@ internal sealed partial class MainForm : Form
                 runtimeStatus = _mcpRuntimeStatus.Text,
                 details = _mcpDetails.Text,
             },
-            release = new
+            Release: new
             {
                 publishSummaryExists = File.Exists(Path.Combine(_suiteRoot, "publish-summary.md")),
                 releaseNotesExists = File.Exists(Path.Combine(_suiteRoot, "release-notes.md")),
@@ -1245,34 +1245,34 @@ internal sealed partial class MainForm : Form
                 tagScriptExists = File.Exists(Path.Combine(_suiteRoot, "scripts", "create-main-release-tag.ps1")),
                 pendingChanges = statusLines.Take(80).ToArray(),
             },
-            liveSync = BuildLiveSyncStatus(commit),
-            settings = GetSettingsSnapshot(),
-            history = new
+            LiveSync: BuildLiveSyncStatus(commit),
+            Settings: GetSettingsSnapshot(),
+            History: new
             {
                 status = GetFeishuHistorySyncStatusText(full: false),
                 sessions = sessionItems.Take(80).ToArray(),
             },
-            memory = BuildKnowledgeIndexStatus(),
-            memorySkillAssets,
-            memoryReminders = BuildTodoReminderSnapshot(),
-            workflow = ListWorkflowRuns(),
-            executors = ReadExecutorStatusPayload(),
-            permissions = LoadPermissionSnapshot(syncFromConfig: true),
-            diagnostics = new
-            {
-                webNavigationCount = Volatile.Read(ref _webNavigationCount),
-                webStatePushCount = Volatile.Read(ref _webStatePushCount),
-                sessionDetailRequestCount = Volatile.Read(ref _webSessionDetailRequestCount),
-            },
-            paths = new
+            Workflow: ListWorkflowRuns(),
+            ProjectRegistry: BuildProjectRegistrySnapshot(),
+            Memory: BuildKnowledgeIndexStatus(),
+            MemorySkillAssets: memorySkillAssets,
+            MemoryReminders: BuildTodoReminderSnapshot(),
+            Executors: ReadExecutorStatusPayload(),
+            Permissions: LoadPermissionSnapshot(syncFromConfig: true),
+            Paths: new
             {
                 config = _configPath,
                 manifestDir = _manifestDir,
                 memoryRepo = _memoryRepo.Text,
                 logs = Path.Combine(_ctiHome, "logs"),
             },
-            activities = _activities.TakeLast(220).ToArray(),
-        };
+            Activities: _activities.TakeLast(220).ToArray(),
+            Diagnostics: new
+            {
+                webNavigationCount = Volatile.Read(ref _webNavigationCount),
+                webStatePushCount = Volatile.Read(ref _webStatePushCount),
+                sessionDetailRequestCount = Volatile.Read(ref _webSessionDetailRequestCount),
+            });
     }
 
     private WebLiveSyncStatus BuildLiveSyncStatus(string suiteCommit)
@@ -2302,6 +2302,55 @@ internal sealed partial class MainForm : Form
             .ThenBy(item => string.IsNullOrWhiteSpace(item.DisplayName) ? item.UserId : item.DisplayName, StringComparer.OrdinalIgnoreCase)
             .Take(200)
             .ToList();
+    }
+
+    private ProjectRegistrySnapshotContract BuildProjectRegistrySnapshot()
+    {
+        var configuredPath = GetConfig("CTI_PROJECT_REGISTRY_PATH", Path.Combine(_ctiHome, "project-registry.json"));
+        var registryPath = Path.GetFullPath(Environment.ExpandEnvironmentVariables(configuredPath));
+        if (!File.Exists(registryPath))
+        {
+            return new ProjectRegistrySnapshotContract(
+                "codex-im-suite/project-registry-snapshot/v1",
+                DateTimeOffset.UtcNow.ToString("O"),
+                registryPath,
+                false,
+                [],
+                "");
+        }
+
+        try
+        {
+            var root = ReadJsonObjectFile(registryPath);
+            if (!string.Equals(ReadJsonString(root, "schema", ""), "codex-im-suite/project-registry/v1", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("项目注册表 schema 不是 codex-im-suite/project-registry/v1。");
+            }
+            var projects = (root?["projects"] as JsonArray ?? [])
+                .Select(node => node is null
+                    ? null
+                    : JsonSerializer.Deserialize<RegisteredProjectContract>(node.ToJsonString(), WebJsonOptions))
+                .Where(project => project is not null)
+                .Cast<RegisteredProjectContract>()
+                .ToArray();
+            return new ProjectRegistrySnapshotContract(
+                "codex-im-suite/project-registry-snapshot/v1",
+                DateTimeOffset.UtcNow.ToString("O"),
+                registryPath,
+                true,
+                projects,
+                "");
+        }
+        catch (Exception ex)
+        {
+            return new ProjectRegistrySnapshotContract(
+                "codex-im-suite/project-registry-snapshot/v1",
+                DateTimeOffset.UtcNow.ToString("O"),
+                registryPath,
+                true,
+                [],
+                ex.Message);
+        }
     }
 
     private object ListWorkflowRuns()
@@ -4023,10 +4072,10 @@ internal sealed partial class MainForm : Form
         return await CreateLarkCliGateway().SendTextAsync(chatId, text, idempotencyKey, _ctiHome);
     }
 
-    private WebRuntimeUnit[] BuildRuntimeUnits()
+    private RuntimeUnitContract[] BuildRuntimeUnits()
     {
         var runtimeManifests = LoadRuntimeUnitManifestMap();
-        var units = new List<WebRuntimeUnit>
+        var units = new List<RuntimeUnitContract>
         {
             BuildBridgeRuntimeUnit(GetRuntimeManifestOrFallback(
                 runtimeManifests,
@@ -4094,7 +4143,7 @@ internal sealed partial class MainForm : Form
                 manifest.ManifestPath ?? "",
                 ResolveManifestDirectory(manifest.Cwd, manifest),
                 FormatManifestSource(manifest.Source, manifest));
-            var actions = new List<WebRuntimeAction>
+            var actions = new List<RuntimeActionContract>
             {
                 new("check", "检查", true),
                 new("start", "启动", manifest.Enabled != false && hasLauncher),
@@ -4103,11 +4152,11 @@ internal sealed partial class MainForm : Form
             };
             if (updatePlan is not null)
             {
-                actions.Add(new WebRuntimeAction("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
+                actions.Add(new RuntimeActionContract("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
             }
-            actions.Add(new WebRuntimeAction("register", "注册", true));
-            actions.Add(new WebRuntimeAction("openLocation", "打开位置", true));
-            units.Add(new WebRuntimeUnit(
+            actions.Add(new RuntimeActionContract("register", "注册", true));
+            actions.Add(new RuntimeActionContract("openLocation", "打开位置", true));
+            units.Add(new RuntimeUnitContract(
                 $"mcp.{manifest.Id}",
                 manifest.Id ?? "",
                 manifest.DisplayName ?? manifest.Id ?? "",
@@ -4128,7 +4177,7 @@ internal sealed partial class MainForm : Form
         foreach (var item in BuildExtensionItems())
         {
             var updatePlan = ResolveManifestUpdatePlan(item.ManifestPath, ExpandManifestValue(item.Source), item.Source);
-            var actions = new List<WebRuntimeAction>
+            var actions = new List<RuntimeActionContract>
             {
                 new("enable", "启用", !item.Enabled),
                 new("disable", "禁用", item.Enabled),
@@ -4136,12 +4185,12 @@ internal sealed partial class MainForm : Form
             };
             if (updatePlan is not null)
             {
-                actions.Add(new WebRuntimeAction("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
+                actions.Add(new RuntimeActionContract("update", "更新", updatePlan.CanUpdate, updatePlan.Reason ?? ""));
             }
-            actions.Add(new WebRuntimeAction("remove", "移除记录", item.CanRemove));
-            actions.Add(new WebRuntimeAction("openManifest", "Manifest", true));
-            actions.Add(new WebRuntimeAction("openSource", "Source", item.SourceExists));
-            units.Add(new WebRuntimeUnit(
+            actions.Add(new RuntimeActionContract("remove", "移除记录", item.CanRemove));
+            actions.Add(new RuntimeActionContract("openManifest", "Manifest", true));
+            actions.Add(new RuntimeActionContract("openSource", "Source", item.SourceExists));
+            units.Add(new RuntimeUnitContract(
                 $"extension.{item.ManifestPath}",
                 item.Id,
                 string.IsNullOrWhiteSpace(item.DisplayName) ? item.Id : item.DisplayName,
@@ -10726,14 +10775,6 @@ exit $LASTEXITCODE
     private readonly record struct ProcessResult(int ExitCode, string Stdout, string Stderr);
 }
 
-internal sealed class WebCommandRequest
-{
-    public string? Id { get; set; }
-    public string? Type { get; set; }
-    public string? Command { get; set; }
-    public JsonElement Payload { get; set; }
-}
-
 internal sealed record WebActivityRecord(string Level, string Title, string Message, string Timestamp);
 internal sealed record WebSkillGovernanceState(bool Available, string Error, JsonElement? Snapshot);
 internal sealed record WebServiceItem(string Id, string Title, string Status, string Detail);
@@ -11084,23 +11125,6 @@ internal sealed class PermissionCandidate
     public int MessageCount { get; set; }
 }
 
-internal sealed record WebRuntimeAction(string Id, string Label, bool Enabled, string Reason = "");
-internal sealed record WebRuntimeUnit(
-    string UnitId,
-    string Id,
-    string DisplayName,
-    string Kind,
-    string Category,
-    string Status,
-    string Detail,
-    bool Enabled,
-    string InstallState,
-    string Source,
-    string Cwd,
-    string Version,
-    string Description,
-    bool CanInstall,
-    WebRuntimeAction[] Actions);
 internal sealed class McpManifest
 {
     public string? Id { get; set; }

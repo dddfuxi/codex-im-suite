@@ -1,6 +1,20 @@
 import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
+  CONTROL_COMMAND_SCHEMA,
+  CONTROL_PANEL_STATE_SCHEMA,
+  type ControlCommandRequest,
+  type ControlCommandResult as HostResult,
+  type ControlPanelStateContract,
+  type RuntimeActionContract as RuntimeAction,
+  type RuntimeUnitContract,
+} from '@codex-im-suite/contracts/control-api';
+import type { ProjectRegistrySnapshotContract } from '@codex-im-suite/contracts/project-registry';
+import type {
+  WorkflowPanelRunContract as WorkflowRun,
+  WorkflowPanelStateContract as WorkflowStatus,
+} from '@codex-im-suite/contracts/workflow';
+import {
   flexRender,
   getCoreRowModel,
   getSortedRowModel,
@@ -383,30 +397,7 @@ type ReplyPresetItem = {
   value: string;
 };
 
-type RuntimeAction = {
-  id: string;
-  label: string;
-  enabled: boolean;
-  reason?: string;
-};
-
-type RuntimeUnit = {
-  unitId: string;
-  id: string;
-  displayName: string;
-  kind: string;
-  category: string;
-  status: StatusKind;
-  detail: string;
-  enabled: boolean;
-  installState: string;
-  source: string;
-  cwd: string;
-  version: string;
-  description: string;
-  canInstall: boolean;
-  actions: RuntimeAction[];
-};
+type RuntimeUnit = RuntimeUnitContract<StatusKind>;
 
 type ExecutorItem = {
   id: string;
@@ -433,95 +424,6 @@ type ExecutorStatus = {
     fallbackExecutorIds: string[];
     selectedAt: string;
   };
-};
-
-type WorkflowRun = {
-  id: string;
-  sessionId: string;
-  channelType?: string;
-  chatId?: string;
-  promptPreview: string;
-  stage: string;
-  status: string;
-  executorId?: string;
-  startedAt: string;
-  updatedAt: string;
-  endedAt?: string;
-  error?: string;
-  execution?: {
-    executorId?: string;
-    executorName?: string;
-    executorKind?: string;
-    provider?: string;
-    codexProfile?: string;
-    modelSource?: string;
-    attemptedSources?: string[];
-    selectedSource?: 'local_api' | 'external_api' | 'official';
-    model?: string;
-    baseUrl?: string;
-    requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
-    evidenceSatisfied?: boolean;
-    noEvidenceRetryAttempted?: boolean;
-    requiredToolFamilies?: string[];
-    requiredInputEvidenceKinds?: string[];
-    requiredInputEvidenceIds?: string[];
-    acceptedInputEvidenceKinds?: string[];
-    acceptedInputEvidenceIds?: string[];
-    inputEvidenceProvider?: string;
-    toolUseCount?: number;
-    toolResultCount?: number;
-    successfulToolResultCount?: number;
-    failedToolResultCount?: number;
-    toolNames?: string[];
-    evidenceProtocol?: string;
-    requestedTool?: string;
-    executedTool?: string;
-    jsonToolRetryAttempted?: boolean;
-    jsonToolFallbackUsed?: boolean;
-    shellExitCode?: number;
-    shellDurationMs?: number;
-    promptProfile?: string;
-  };
-  tokenUsage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-    total_tokens?: number;
-  };
-  recovery?: {
-    kind: 'recoverable' | 'not_recoverable';
-    reason: string;
-    input?: {
-      prompt?: string;
-      workingDirectory?: string;
-      model?: string;
-      permissionMode?: string;
-      channelType?: string;
-      chatId?: string;
-      messageId?: string;
-    };
-    runtimeRunId?: string;
-    markedAt: string;
-  };
-  retry?: {
-    status: 'none' | 'auto_pending' | 'manual_pending' | 'retrying' | 'succeeded' | 'failed' | 'exhausted' | 'unavailable';
-    attempts: number;
-    maxAttempts: number;
-    requestedBy?: string;
-    requestedAt?: string;
-    claimedBy?: string;
-    claimedAt?: string;
-    lastAttemptAt?: string;
-    lastError?: string;
-  };
-  events?: Array<{ id: string; stage: string; type: string; message: string; at: string }>;
-};
-
-type WorkflowStatus = {
-  protocol: string;
-  updatedAt: string;
-  runs: WorkflowRun[];
 };
 
 type KnowledgeIndexStatus = {
@@ -1000,17 +902,7 @@ type SkillAssetIndexSnapshot = {
   }>;
 };
 
-type PanelState = {
-  generatedAt: string;
-  suite: {
-    version: string;
-    protocol: string;
-    branch: string;
-    commit: string;
-    gitDirty: number;
-    suiteRoot: string;
-    skillDir: string;
-  };
+type PanelState = ControlPanelStateContract<{
   services: ServiceItem[];
   nodes: NodeSnapshot;
   extensions: {
@@ -1045,6 +937,7 @@ type PanelState = {
     sessions: SessionItem[];
   };
   workflow: WorkflowStatus;
+  projectRegistry: ProjectRegistrySnapshotContract;
   memory: KnowledgeIndexStatus;
   memorySkillAssets: SkillAssetIndexSnapshot;
   memoryReminders: TodoReminderSnapshot;
@@ -1062,15 +955,7 @@ type PanelState = {
     webStatePushCount?: number;
     sessionDetailRequestCount?: number;
   };
-};
-
-type HostResult = {
-  id: string;
-  type: 'result';
-  ok: boolean;
-  data?: unknown;
-  error?: string;
-};
+}>;
 
 type HostStateMessage = {
   type: 'state';
@@ -1114,6 +999,7 @@ const pageIcons = {
 } as const;
 
 const fallbackState: PanelState = {
+  schema: CONTROL_PANEL_STATE_SCHEMA,
   generatedAt: '-',
   suite: {
     version: 'loading',
@@ -1175,6 +1061,14 @@ const fallbackState: PanelState = {
   },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
+  projectRegistry: {
+    schema: 'codex-im-suite/project-registry-snapshot/v1',
+    generatedAt: '',
+    registryPath: '',
+    exists: false,
+    projects: [],
+    error: '',
+  },
   memory: {
     schema: 'codex-im-suite/knowledge-index-status/v1',
     memoryRoot: '',
@@ -2323,6 +2217,13 @@ function useHostBridge() {
 
   const sendCommand = async (command: string, payload: Record<string, unknown> = {}) => {
     const id = createRequestId();
+    const request: ControlCommandRequest<Record<string, unknown>> = {
+      schema: CONTROL_COMMAND_SCHEMA,
+      id,
+      type: 'command',
+      command,
+      payload,
+    };
     setPending((current) => ({ ...current, [command]: true }));
     try {
       if (!isWebViewHost) {
@@ -2340,9 +2241,9 @@ function useHostBridge() {
         const response = await fetch(buildApiUrl('/api/commands', controlApiToken), {
           method: 'POST',
           headers: controlApiToken ? { 'Content-Type': 'application/json', Authorization: `Bearer ${controlApiToken}` } : { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id, type: 'command', command, payload }),
+          body: JSON.stringify(request),
         });
-        const message = (await response.json()) as { ok: boolean; data?: unknown; error?: string };
+        const message = (await response.json()) as HostResult;
         if (!response.ok || !message.ok) throw new Error(message.error || `HTTP ${response.status}`);
         if (command === 'history.getSessionDetail') {
           setDebug((current) => ({ ...current, sessionDetailResultCount: current.sessionDetailResultCount + 1 }));
@@ -2372,7 +2273,7 @@ function useHostBridge() {
           reject(new Error('当前不在 WebView2 宿主中运行'));
           return;
         }
-        window.chrome.webview.postMessage({ id, type: 'command', command, payload });
+        window.chrome.webview.postMessage(request);
       });
     } finally {
       setPending((current) => {

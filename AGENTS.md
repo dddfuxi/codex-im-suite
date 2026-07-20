@@ -29,6 +29,7 @@
 
 - `packages/bridge-core/src/lib/bridge/agent-architecture.ts` 是机器人分层、策略归属和路径职责分类的第一入口；新增通用 policy、prompt 片段、路径类别或角色门禁时，先在这里声明并补 `bridge-agent-architecture.test.ts`。
 - 跨包依赖只能使用 `packages/bridge-core/src/index.ts` 及 `host/evidence/policy/channel/workspace/runtime-audit/architecture` 稳定公共出口；runtime、Web、脚本和测试禁止导入 `claude-to-im/src/*` 或其他 package 的 `src`。Web 只能消费浏览器安全出口，`bridge-core` 禁止反向依赖 runtime；新增出口或调整依赖后必须运行 `npm run test:boundaries` 和 `npm run check:boundaries`。
+- 控制面板跨语言 wire DTO 以 `packages/contracts/src/control-api.ts`、`workflow.ts`、`project-registry.ts` 和 `packages/contracts/schemas/*.schema.json` 为共享来源；React 不得在 `main.tsx` 重新声明 `PanelState / WorkflowRun / RuntimeUnit / HostResult`，C# 只允许维护无业务规则的薄 DTO，并由 `ControlApiContractTests` 逐字段核对 schema。新增或修改 schema ID、顶层字段、command/result 或项目注册表快照时，必须同阶段更新 README、架构、开发日志、实施计划勾选和必要的 AGENTS 规则，不能只更新机器协议。
 - `bridge-manager.ts` 只保留编排职责：消费入站、调用 context/capability/policy/delivery 入口、串联审计和状态；不要继续把通用角色表、路径表、prompt 规则或平台无关策略内联进 manager。
 - prompt 规则按归属迁移：默认行为和个性属于 Agent Kernel，权限和风险属于 Policy Registry，证据和上下文属于 Context Broker，工具选择属于 Capability Router，最终呈现属于 Delivery Layer。
 - `packages/bridge-core/src/lib/bridge/turn-context.ts` 定义当前回合结构化证据协议和纯裁决函数，`turn-context-broker.ts` 负责归一化各来源并按需调用解析 host；current message、原生 reply、mention、附件、近邻、历史、文档和记忆证据必须带 `id/kind/relation/source/confidence`，不得只拼成平台专用自由文本交给模型猜。

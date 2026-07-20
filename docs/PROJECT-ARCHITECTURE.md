@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-07-18
+更新时间：2026-07-20
 
 ## 0. 架构文档维护规则
 
@@ -24,6 +24,8 @@
 - `scripts` 负责构建、同步、打包、发布。
 
 跨包依赖通过稳定公共出口收口：`bridge-core/src/index.ts` 是 Application Facade，`host/evidence/policy/channel/workspace/runtime-audit` 面向 Node Runtime，`architecture` 是控制面板 Web 可消费的浏览器安全元数据出口。`package.json exports` 不再发布 `src/lib` 通配符，Runtime 和测试不能穿透 package 内部目录；`scripts/check-dependency-boundaries.mjs` 同时拦截深层导入、跨包源码相对路径、Web 引入 Node-only policy 和 `bridge-core -> runtime` 反向依赖。
+
+控制面板 wire 协议由 `packages/contracts` 单点声明：`control-api.ts` 固定 `ControlPanelStateContract`、Control Command/Result、`RuntimeUnitContract`，`workflow.ts` 同时提供面板读取的完整 runtime run 与跨节点精简 trace contract，`project-registry.ts` 提供项目记录和只读面板快照。React 只从 `@codex-im-suite/contracts/control-api|workflow|project-registry` 浏览器安全子路径导入；Runtime 的 `workflow-status.ts` 只保留存储和归一化行为，DTO 通过 type alias 复用共享来源。C# 宿主的 `ControlApiContracts.cs` 是无业务裁决的薄 DTO 层，字段由 `schemas/control-api.schema.json` 和 `schemas/project-registry.schema.json` 约束，.NET 测试逐字段核对；`Program.cs` 只装配真实状态，并把项目注册表文件作为只读快照放入 PanelState，不写入或推断第二份项目事实。
 
 ### 1.1 系统上下文图
 
@@ -186,6 +188,8 @@ flowchart LR
 ### 1.4 回合工作区与可见记忆
 
 `packages/contracts/src/project-registry.ts` 定义结构化项目协议，`packages/bridge-runtime/src/projects/project-registry.ts` 从 `CTI_HOME\project-registry.json` 或 `CTI_PROJECT_REGISTRY_PATH` 加载并校验记录，再由 Config 注入 Bridge settings。`packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区解析的唯一入口；Conversation Engine 根据当前消息、会话绑定目录、结构化项目、legacy 允许根和禁止根生成 `TurnWorkspacePlan`，所有 Provider 和本地文件工具消费同一计划。
+
+控制面板的 `projectRegistry` 字段只读取同一个结构化 Registry 文件并报告路径、存在性、项目列表或解析错误，供人工核对；它不导入 legacy roots、不改写文件，也不参与回合挂载裁决。真正的 legacy 合并、禁止根和重叠优先级仍只由 Runtime Registry Loader 执行。
 
 ```mermaid
 flowchart LR

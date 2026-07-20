@@ -2,133 +2,29 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import type {
+  WorkflowExecutionSummaryContract,
+  WorkflowPanelRunContract,
+  WorkflowPanelStateContract,
+  WorkflowRecoveryInputContract,
+  WorkflowRecoveryStateContract,
+  WorkflowRetryStateContract,
+  WorkflowRuntimeEventContract,
+  WorkflowStage,
+  WorkflowTokenUsageContract,
+} from '@codex-im-suite/contracts';
+
 import { CTI_HOME } from './config.js';
 
-export type WorkflowStage =
-  | 'received'
-  | 'authorized'
-  | 'contextualized'
-  | 'routed'
-  | 'executing'
-  | 'finalizing'
-  | 'delivered'
-  | 'failed';
-
-export interface WorkflowEvent {
-  id: string;
-  runId: string;
-  stage: WorkflowStage;
-  type: string;
-  message: string;
-  at: string;
-  data?: Record<string, unknown>;
-}
-
-export interface WorkflowExecutionSummary {
-  executorId?: string;
-  executorName?: string;
-  executorKind?: string;
-  provider?: string;
-  codexProfile?: string;
-  modelSource?: string;
-  attemptedSources?: string[];
-  selectedSource?: 'local_api' | 'external_api' | 'official';
-  model?: string;
-  baseUrl?: string;
-  requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
-  evidenceSatisfied?: boolean;
-  noEvidenceRetryAttempted?: boolean;
-  requiredToolFamilies?: string[];
-  requiredInputEvidenceKinds?: string[];
-  requiredInputEvidenceIds?: string[];
-  acceptedInputEvidenceKinds?: string[];
-  acceptedInputEvidenceIds?: string[];
-  inputEvidenceProvider?: string;
-  toolUseCount?: number;
-  toolResultCount?: number;
-  successfulToolResultCount?: number;
-  failedToolResultCount?: number;
-  failedToolErrors?: string[];
-  toolNames?: string[];
-  evidenceProtocol?: string;
-  requestedTool?: string;
-  executedTool?: string;
-  jsonToolRetryAttempted?: boolean;
-  jsonToolFallbackUsed?: boolean;
-  shellExitCode?: number;
-  shellDurationMs?: number;
-  progressCardCreated?: boolean;
-  progressCardFinalized?: boolean;
-  progressCardFallbackReason?: string;
-  promptProfile?: string;
-}
-
-export interface WorkflowTokenUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  total_tokens?: number;
-}
-
-export interface WorkflowRun {
-  id: string;
-  sessionId: string;
-  channelType?: string;
-  chatId?: string;
-  promptPreview: string;
-  stage: WorkflowStage;
-  status: 'running' | 'succeeded' | 'failed' | 'retry_pending' | 'retrying';
-  executorId?: string;
-  startedAt: string;
-  updatedAt: string;
-  endedAt?: string;
-  error?: string;
-  execution?: WorkflowExecutionSummary;
-  tokenUsage?: WorkflowTokenUsage;
-  recovery?: WorkflowRecoveryState;
-  retry?: WorkflowRetryState;
-  events: WorkflowEvent[];
-}
-
-export interface WorkflowRecoveryInput {
-  prompt: string;
-  workingDirectory?: string;
-  model?: string;
-  systemPrompt?: string;
-  permissionMode?: string;
-  channelType?: string;
-  chatId?: string;
-  userId?: string;
-  userDisplayName?: string;
-  messageId?: string;
-}
-
-export interface WorkflowRecoveryState {
-  kind: 'recoverable' | 'not_recoverable';
-  reason: string;
-  input?: WorkflowRecoveryInput;
-  runtimeRunId?: string;
-  markedAt: string;
-}
-
-export interface WorkflowRetryState {
-  status: 'none' | 'auto_pending' | 'manual_pending' | 'retrying' | 'succeeded' | 'failed' | 'exhausted' | 'unavailable';
-  attempts: number;
-  maxAttempts: number;
-  requestedBy?: 'auto' | 'manual';
-  requestedAt?: string;
-  claimedBy?: string;
-  claimedAt?: string;
-  lastAttemptAt?: string;
-  lastError?: string;
-}
-
-export interface WorkflowStatusFile {
-  protocol: 'workflow-runtime/v1';
-  updatedAt: string;
-  runs: WorkflowRun[];
-}
+export type WorkflowEvent = WorkflowRuntimeEventContract;
+export type WorkflowExecutionSummary = WorkflowExecutionSummaryContract;
+export type WorkflowTokenUsage = WorkflowTokenUsageContract;
+export type WorkflowRun = WorkflowPanelRunContract;
+export type WorkflowRecoveryInput = WorkflowRecoveryInputContract;
+export type WorkflowRecoveryState = WorkflowRecoveryStateContract;
+export type WorkflowRetryState = WorkflowRetryStateContract;
+export type WorkflowStatusFile = WorkflowPanelStateContract;
+export type { WorkflowStage } from '@codex-im-suite/contracts';
 
 const MAX_RUNS = 80;
 const MAX_EVENTS_PER_RUN = 80;
