@@ -78,8 +78,6 @@ import {
   type FeishuMentionIntentOptions,
 } from './application/mentions.js';
 import {
-  STICKER_ANNOTATION_FENCE,
-  STICKER_CANDIDATE_ANALYSIS_FENCE,
   addFeishuStickerHintForExplicitRequest,
   buildStickerAnnotationFallbackPrompt,
   buildStickerAnnotationSystemPrompt,
@@ -93,6 +91,13 @@ import {
   suppressFeishuStickerHintForInboundStickerReply,
   type StickerAnnotationPayload,
 } from './application/stickers.js';
+import {
+  compactBridgeReplyForDelivery,
+  prepareDeliveryCandidate,
+  stripDeliveryProtocolArtifacts,
+  type DeliveryCandidatePayload,
+  type FinalReplyKind,
+} from './application/delivery-preparation.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -145,7 +150,6 @@ import {
 
 const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
-const FINAL_REPLY_FENCE = 'cti-final';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -361,7 +365,7 @@ function isExplicitBridgeRestartRequestText(text: string): boolean {
 
 function containsUnverifiedBridgeRestartCompletion(rawReply: string, rawPrompt: string): boolean {
   if (!isExplicitBridgeRestartRequestText(rawPrompt)) return false;
-  const visible = stripFinalReplyProtocolArtifacts(rawReply).trim();
+  const visible = stripDeliveryProtocolArtifacts(rawReply).trim();
   return /(?:已|已经|成功).{0,16}(?:重启|重新启动|restart).{0,16}(?:完成|成功|好了|完毕|生效)/iu.test(visible)
     || /(?:live\s*bridge|bridge|桥接|机器人(?:服务)?).{0,16}(?:已|已经|成功).{0,12}(?:重启|重新启动|restart)/iu.test(visible);
 }
@@ -388,7 +392,7 @@ function isExplicitDirectMessageRequestText(text: string, targetText = ''): bool
 
 function containsUnverifiedDirectMessageCompletion(rawReply: string, rawPrompt: string): boolean {
   if (!isExplicitDirectMessageRequestText(rawPrompt)) return false;
-  const withoutBlocks = stripFinalReplyProtocolArtifacts(rawReply)
+  const withoutBlocks = stripDeliveryProtocolArtifacts(rawReply)
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${DIRECT_MESSAGE_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .trim();
   if (!withoutBlocks) return false;
@@ -405,7 +409,7 @@ function formatDirectMessageResultText(result: SendResult & { targetDisplayName?
 }
 
 function isExplicitUnfinishedReplyText(text: string): boolean {
-  const visible = stripFinalReplyProtocolArtifacts(text || '')
+  const visible = stripDeliveryProtocolArtifacts(text || '')
     .replace(/^\s*(?:#{1,6}\s*)?(?:\*\*)?/u, '')
     .trim();
   return /^(?:未完成|失败|执行失败|阻塞|已拦截|无法完成)(?:\s*[:：]|\s|$)/iu.test(visible);
@@ -1987,19 +1991,6 @@ function formatPlatformFileLinkNotice(link: UploadedFileLink, filePath: string):
   ].join('\n');
 }
 
-type FinalReplyKind = 'text' | 'image' | 'file' | 'mixed';
-type FinalReplyMode = 'plain' | 'markdown' | 'html';
-
-interface FinalReplyEnvelope {
-  kind: FinalReplyKind;
-  text: string;
-  images: string[];
-  files: string[];
-  reply_mode: FinalReplyMode;
-  mentions?: OutboundMention[];
-  reply_to?: string;
-}
-
 interface FinalEnvelopeStatusRecord {
   parsed: boolean;
   kind?: FinalReplyKind | null;
@@ -2008,15 +1999,7 @@ interface FinalEnvelopeStatusRecord {
   updatedAt: string;
 }
 
-interface PreparedBridgeReplyPayload {
-  text: string;
-  parseMode: 'plain' | 'Markdown' | 'HTML';
-  images: string[];
-  files: string[];
-  mentions?: OutboundMention[];
-  replyTo?: string;
-  feishuCardJson?: string;
-}
+type PreparedBridgeReplyPayload = DeliveryCandidatePayload;
 
 type ExecutionEvidence = NonNullable<engine.ConversationResult['executionEvidence']>;
 
@@ -2085,17 +2068,6 @@ interface PermissionSubject {
   Role?: string;
   source?: string;
   Source?: string;
-}
-
-function parseReplyMode(mode: string | undefined | null): 'plain' | 'Markdown' | 'HTML' {
-  switch ((mode || 'plain').trim().toLowerCase()) {
-    case 'markdown':
-      return 'Markdown';
-    case 'html':
-      return 'HTML';
-    default:
-      return 'plain';
-  }
 }
 
 function getPendingSystemActions(): Map<string, PendingSystemAction> {
@@ -2181,107 +2153,6 @@ function writeFinalEnvelopeStatus(status: FinalEnvelopeStatusRecord): void {
   } catch {
     // best effort
   }
-}
-
-function extractVisibleAssistantText(text: string): string {
-  const normalized = text.replace(/\r\n/g, '\n').trim();
-  if (!normalized) return '';
-  const blockPattern = /\[\{"type":"text","text":"([\s\S]*?)"}(?:,[\s\S]*?)?\]/g;
-  const matches = Array.from(normalized.matchAll(blockPattern));
-  if (matches.length > 0) {
-    const last = matches[matches.length - 1]?.[1] || '';
-    return last
-      .replace(/\\"/g, '"')
-      .replace(/\\n/g, '\n')
-      .replace(/\\r/g, '')
-      .trim();
-  }
-  return normalized;
-}
-
-function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
-  if (!candidate || typeof candidate !== 'object') return null;
-  const raw = candidate as Record<string, unknown>;
-  const kind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() as FinalReplyKind : null;
-  const text = typeof raw.text === 'string' ? raw.text : '';
-  const images = Array.isArray(raw.images) ? raw.images.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
-  const files = Array.isArray(raw.files) ? raw.files.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
-  const replyMode = typeof raw.reply_mode === 'string' ? raw.reply_mode.trim().toLowerCase() as FinalReplyMode : null;
-  if (!kind || !['text', 'image', 'file', 'mixed'].includes(kind)) return null;
-  if (!replyMode || !['plain', 'markdown', 'html'].includes(replyMode)) return null;
-  if (!text.trim() && images.length === 0 && files.length === 0) return null;
-  return {
-    kind,
-    text,
-    images,
-    files,
-    reply_mode: replyMode,
-    mentions: parseEnvelopeMentions(raw.mentions),
-    reply_to: typeof raw.reply_to === 'string' && raw.reply_to.trim() ? raw.reply_to.trim() : undefined,
-  };
-}
-
-function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | null {
-  const fencePattern = new RegExp(String.raw`(?:^|\n)\`\`\`${FINAL_REPLY_FENCE}\s*\n([\s\S]*?)\n\`\`\``, 'g');
-  let lastMatch: RegExpExecArray | null = null;
-  for (const match of text.matchAll(fencePattern)) {
-    lastMatch = match;
-  }
-  if (lastMatch) {
-    try {
-      return parseEnvelopeObject(JSON.parse(lastMatch[1].trim()));
-    } catch {
-      // continue to raw JSON fallback
-    }
-  }
-  const rawJsonPattern = /(\{[\s\S]*?"kind"\s*:\s*"(?:text|image|file|mixed)"[\s\S]*?"reply_mode"\s*:\s*"(?:plain|markdown|html)"[\s\S]*?\})/g;
-  let rawJsonMatch: RegExpExecArray | null = null;
-  for (const match of text.matchAll(rawJsonPattern)) {
-    rawJsonMatch = match;
-  }
-  if (!rawJsonMatch) return null;
-  try {
-    return parseEnvelopeObject(JSON.parse(rawJsonMatch[1].trim()));
-  } catch {
-    return null;
-  }
-}
-
-function stripFinalReplyProtocolArtifacts(text: string): string {
-  return text
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${FINAL_REPLY_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_ANNOTATION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${REMINDER_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${SCHEDULED_TASK_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${ARTIFACT_PROMOTION_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function resolveExplicitPaths(
-  items: string[],
-  workingDirectory: string,
-  additionalDirectories: string[] = [],
-): string[] {
-  const resolved = new Set<string>();
-  for (const item of items) {
-    if (!item || typeof item !== 'string') continue;
-    const trimmed = item.trim();
-    if (!trimmed) continue;
-    if (path.isAbsolute(trimmed)) {
-      resolved.add(trimmed);
-      continue;
-    }
-    if (workingDirectory) {
-      resolved.add(path.resolve(workingDirectory, trimmed));
-    }
-    for (const dir of additionalDirectories) {
-      if (dir) resolved.add(path.resolve(dir, trimmed));
-    }
-  }
-  return Array.from(resolved);
 }
 
 const CONCRETE_EXECUTION_REQUEST_RE = /(ignis|unity|blender|mcp|截图|图片|图像|关机|关闭电脑|shutdown|文件|文档|txt|\.txt|\.md|\.json|(?:看一眼|看一下|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|读取|打开|搜索).{0,32}(本地|工作目录|目录|文件夹|文件|项目|仓库|路径|Game|Assets)|(?:生成|创建|新建|写入|保存|删除|移动|复制|上传|下载|导入|导出|安装|启动|停止|重启|运行|执行).{0,32}(文件|文档|图片|图像|截图|txt|项目|服务|bridge|mcp|命令|脚本|本机|电脑|工作区))/i;
@@ -2711,116 +2582,16 @@ async function prepareBridgeReplyPayload(
   additionalDirectories: string[] = [],
   sourcePrompt = '',
 ): Promise<PreparedBridgeReplyPayload> {
-  const envelope = extractFinalReplyEnvelope(text);
-  if (envelope) {
-    writeFinalEnvelopeStatus({
-      parsed: true,
-      kind: envelope.kind,
-      usedRawFallback: false,
-      usedLegacyCompactor: false,
-      updatedAt: new Date().toISOString(),
-    });
-    return {
-      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(envelope.text || '', sourcePrompt)),
-      parseMode: parseReplyMode(envelope.reply_mode),
-      images: resolveExplicitPaths(envelope.images, workingDirectory, additionalDirectories),
-      files: resolveExplicitPaths(envelope.files, workingDirectory, additionalDirectories),
-      mentions: envelope.mentions,
-      replyTo: envelope.reply_to,
-    };
-  }
-
-  const visible = extractVisibleAssistantText(text);
-  const visibleEnvelope = visible ? extractFinalReplyEnvelope(visible) : null;
-  if (visibleEnvelope) {
-    writeFinalEnvelopeStatus({
-      parsed: true,
-      kind: visibleEnvelope.kind,
-      usedRawFallback: false,
-      usedLegacyCompactor: false,
-      updatedAt: new Date().toISOString(),
-    });
-    return {
-      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(visibleEnvelope.text || '', sourcePrompt)),
-      parseMode: parseReplyMode(visibleEnvelope.reply_mode),
-      images: resolveExplicitPaths(visibleEnvelope.images, workingDirectory, additionalDirectories),
-      files: resolveExplicitPaths(visibleEnvelope.files, workingDirectory, additionalDirectories),
-      mentions: visibleEnvelope.mentions,
-      replyTo: visibleEnvelope.reply_to,
-    };
-  }
-  const safeVisible = visible ? stripFinalReplyProtocolArtifacts(visible) : '';
-  if (safeVisible) {
-    writeFinalEnvelopeStatus({
-      parsed: false,
-      kind: null,
-      usedRawFallback: true,
-      usedLegacyCompactor: false,
-      updatedAt: new Date().toISOString(),
-    });
-    return {
-      text: appendReplyEndMarker(sanitizeOutsourcedToolReply(safeVisible, sourcePrompt)),
-      parseMode: 'plain',
-      images: [],
-      files: [],
-    };
-  }
-
-  const compacted = compactBridgeReplyForDelivery(stripFinalReplyProtocolArtifacts(text) || text);
+  const candidate = prepareDeliveryCandidate(text, workingDirectory, additionalDirectories);
   writeFinalEnvelopeStatus({
-    parsed: false,
-    kind: null,
-    usedRawFallback: false,
-    usedLegacyCompactor: true,
+    ...candidate.status,
     updatedAt: new Date().toISOString(),
   });
   return {
-    text: appendReplyEndMarker(sanitizeOutsourcedToolReply(compacted, sourcePrompt)),
-    parseMode: 'plain',
-    images: [],
-    files: [],
+    ...candidate.payload,
+    // 脱敏、用户可见结尾标记和状态落盘仍属于 Manager 交付编排边界。
+    text: appendReplyEndMarker(sanitizeOutsourcedToolReply(candidate.payload.text, sourcePrompt)),
   };
-}
-
-function isProcessNarrationLine(line: string): boolean {
-  const normalized = line.trim();
-  if (!normalized) return false;
-  return /^(我先|我会|我正在|我继续|我再|我开始|我已经找到|我确认到|下一步|接下来|现在我|当前我|先看|先查|我改用|我准备|我补查|我切到|我定位到|启动尝试|直连服务|刚确认|刚才|随后|Then |Next )/i.test(normalized);
-}
-
-function isOutcomeLine(line: string): boolean {
-  const normalized = line.trim();
-  if (!normalized) return false;
-  return /(已完成|已处理|已修复|已生成|已同步|已发送|已重启|已更新|运行中|成功|失败|报错|错误|文件在|图片在|文档在|链接|PID|channel|当前状态|结论|原因|结果|可用|不可用|命中|同步完成|请直接|你现在可以)/i.test(normalized);
-}
-
-function compactBridgeReplyForDelivery(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return trimmed;
-
-  const normalized = trimmed.replace(/\r\n/g, '\n');
-  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
-  const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean);
-
-  const strongBlocks = blocks.filter((block) => isOutcomeLine(block) && !isProcessNarrationLine(block));
-  if (strongBlocks.length > 0) {
-    const compact = strongBlocks.slice(-3).join('\n\n').trim();
-    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
-  }
-
-  const strongLines = lines.filter((line) => isOutcomeLine(line) && !isProcessNarrationLine(line));
-  if (strongLines.length > 0) {
-    const compact = strongLines.slice(-4).join('\n').trim();
-    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
-  }
-
-  if (blocks.length >= 3 || lines.length >= 8) {
-    const filtered = lines.filter((line) => !isProcessNarrationLine(line));
-    const compact = (filtered.length > 0 ? filtered.slice(-4) : lines.slice(-3)).join('\n').trim();
-    return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact;
-  }
-
-  return trimmed.length > 420 ? `${trimmed.slice(0, 417)}...` : trimmed;
 }
 
 /** Default stream config per channel type. */

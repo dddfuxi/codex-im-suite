@@ -84,6 +84,7 @@ flowchart TD
   BridgeFacade --> ReminderParsing[application/reminders 单次提醒解析]
   BridgeFacade --> MentionParsing[application/mentions 提及意图与目标解析]
   BridgeFacade --> StickerPolicy[application/stickers 表情包意图、协议与候选门禁]
+  BridgeFacade --> DeliveryPreparation[application/delivery-preparation 结果块与交付候选准备]
   FeishuAdapter --> HistoryIntent[application/history-intent 历史范围与输出意图解析]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
@@ -145,6 +146,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/application/mentions.ts` 统一处理飞书 mention ID 字段兼容、唤醒 alias、直接执行/流程叙述/诊断语义区分、显示名目标提取以及占位符和非地址化裸 `@` 清理。该模块不查询成员、不接受模型自造 ID，也不执行发送；Manager 只把 adapter 身份和当前原生事件 evidence 注入后续安全层，官方 resolver、ID 求交集、Owner/广播门禁和最终交付仍留在平台编排边界。
 - `packages/bridge-core/src/lib/bridge/application/stickers.ts` 统一处理表情包发送意图、入站/出站 hint 隔离、标注与候选分析协议清理、置信度和具体语义门禁，以及仅允许本轮真实附件 fileKey 的一次性选择。图片附件真实性、视觉模型调用、语义 revision 授权与写入、平台投递和真实 messageId 回执仍由 Manager、Sticker Host 与 Feishu adapter 共同完成，纯策略模块不能自行发送或确认语义。
 - `packages/bridge-core/src/lib/bridge/application/history-intent.ts` 统一解析群历史总结、回看上方消息、时间范围、数量上限、说话人范围、引用式校对动作和文档输出意图，并允许测试注入当前时间。Feishu adapter 只保留兼容薄包装，云端消息分页、历史增量同步、受控索引检索、附件恢复和 prompt 构造仍留在 adapter/History Host；普通飞书文档权限问题不会被误路由为群历史请求。
+- `packages/bridge-core/src/lib/bridge/application/delivery-preparation.ts` 统一解析最后一个 `cti-final`、结构化 assistant 文本包装、reply mode、附件相对路径、结构化 mention/reply target、机器协议块剥离和无结果块时的可见文本压缩，并返回纯 delivery candidate 与解析状态。Manager 继续负责工具输出脱敏、结尾标记、状态文件落盘、真实文件存在性/执行证据校验、平台 mention 安全层和最终发送，纯模块不能把声明路径或模型身份直接提升为可信事实。
 
 渐进迁移顺序：
 
