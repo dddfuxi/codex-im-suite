@@ -37,6 +37,7 @@ export interface MemoryItemLifecycleService {
   listConfirmed(): MemoryItemListRecord[];
   listCandidates(): MemoryItemListRecord[];
   listArchives(): MemoryItemArchive[];
+  refreshHumanReadableDocuments(): void;
   confirmCandidate(itemId: string, actor: MemoryItemActor, options?: { key?: string; expectedBaseHash?: string }): MemoryItemListRecord;
   archive(itemId: string, actor: MemoryItemActor, options?: { expectedBaseHash?: string }): MemoryItemArchive;
   restore(archiveId: string, actor: MemoryItemActor): MemoryItemListRecord;
@@ -335,6 +336,13 @@ export function createMemoryItemLifecycleService(options: MemoryItemLifecycleSer
     listConfirmed: () => listItems(memoryRoot, 'confirmed'),
     listCandidates: () => listItems(memoryRoot, 'candidate'),
     listArchives: () => listArchives(memoryRoot),
+    refreshHumanReadableDocuments: () => mutate(() => {
+      const documents = listManagedDocuments(memoryRoot);
+      const archives = listArchives(memoryRoot);
+      const generatedAt = now();
+      const projections = buildProjectionMutations(documents, archives, generatedAt);
+      commitMutation([], projections, archives.length);
+    }),
 
     confirmCandidate: (itemId, _actor, confirmOptions = {}) => mutate(() => {
       const item = requireItem(itemId, 'candidate');

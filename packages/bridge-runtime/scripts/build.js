@@ -68,6 +68,17 @@ await esbuild.build({
 });
 
 await esbuild.build({
+  entryPoints: ['src/memory-item-cli.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: 'dist/memory-item-cli.mjs',
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
+await esbuild.build({
   entryPoints: ['src/cleanup-cli.ts'],
   bundle: true,
   platform: 'node',
@@ -78,4 +89,4 @@ await esbuild.build({
   banner: sharedBanner,
 });
 
-console.log('Built daemon, memory optimizer, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');
+console.log('Built daemon, memory optimizer, memory item, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');
