@@ -1,6 +1,6 @@
 # codex-im-suite 开发记录
 
-- 2026-07-20 人类阅读文档治理补强：新增 `human-document-governance.ts`，每轮从真实 Agent Home 扫描五个固定入口、根目录额外 Markdown、`docs/**/*.md` 与人类文档归档区，并只在目录事实变化时刷新 `记忆库说明.md` 的稳定受控区块；未归类文档不进入 Prompt、索引或自动迁移。控制面板审计范围扩展到 `docs/` 子树，归档目录保持隔离。新增通用事务性归档/还原能力，固定入口禁止归档，归档清单记录原路径与 SHA-256。现场已将过期 `docs/AI_BRIDGE_CONTEXT.md` 和空壳 `CodexNotes.md` 可恢复归档到 `E:\cli-md\archive\human-documents\20260720T103341139Z`。仓库新增 `check:human-docs`，实现、协议、Manifest 或运行行为变化未同步开发日志，或架构变化未同步架构文档时失败关闭。
+- 2026-07-20 人类阅读文档治理补强：新增 `human-document-governance.ts`，每轮从真实 Agent Home 扫描五个固定入口、根目录额外 Markdown、`docs/**/*.md` 与人类文档归档区，并只在目录事实变化时刷新 `记忆库说明.md` 的稳定受控区块；未归类文档不进入 Prompt、索引或自动迁移。控制面板审计范围扩展到 `docs/` 子树，归档目录保持隔离。新增通用事务性归档/还原能力，固定入口禁止归档，归档清单记录原路径与 SHA-256。现场已将过期 `docs/AI_BRIDGE_CONTEXT.md` 和空壳 `CodexNotes.md` 可恢复归档到 `E:\cli-md\archive\human-documents\20260720T103341139Z`。仓库新增 `check:human-docs`，实现、协议、Manifest 或运行行为变化未同步开发日志，或架构变化未同步架构文档时失败关闭。验收结果：Core 565/565、Runtime 792/792、Control Panel 96/96、Web 25/25、依赖边界 4/4，Runtime 与面板构建、架构、UTF-8、乱码和 Git diff 检查通过；live 已同步 `fe93277`，Bridge PID `169224`、Feishu WS connected、`lastUnhandledError=null`，8788 Memory 页显示五入口齐全且未归类文档为 0。
 
 - 2026-07-20 Bridge Core delivery preparation 迁移：新增 `application/delivery-preparation.ts`，集中解析最后一个 `cti-final`、结构化 assistant 文本包装、reply mode、附件路径、mention/replyTo、机器协议清理和无结果块时的安全压缩，返回纯候选 payload 与解析状态。`bridge-manager` 删除约 180 行结果块/兜底纯逻辑，只保留工具结果脱敏、结尾标记、状态落盘、执行证据/真实文件校验、mention 安全层和平台发送。新增 5 项直接模块测试，Manager + delivery 专项 184/184 通过；Task 8 Step 2 六个纯函数域已全部迁移，并同步更新架构和路线图。
 
