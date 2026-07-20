@@ -38,17 +38,24 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import {
-  parseArtifactPromotionRequest,
-  type ArtifactPromotionRequest,
-} from '@codex-im-suite/contracts';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type {
   AdapterAssistantIdentity,
   BaseChannelAdapter,
-  ConversationTargetKind,
   ResolvedConversationTarget,
 } from './channel-adapter.js';
+import {
+  ARTIFACT_PROMOTION_ACTION_FENCE,
+  BRIDGE_CONTROL_ACTION_FENCE,
+  DIRECT_MESSAGE_ACTION_FENCE,
+  REMINDER_ACTION_FENCE,
+  SCHEDULED_TASK_ACTION_FENCE,
+  extractCtiArtifactPromotionAction as parseCtiArtifactPromotionActionBlock,
+  extractCtiBridgeControlAction as parseCtiBridgeControlActionBlock,
+  extractCtiDirectMessageAction as parseCtiDirectMessageActionBlock,
+  extractCtiReminderAction as parseCtiReminderActionBlock,
+  extractCtiScheduledTaskAction as parseCtiScheduledTaskActionBlock,
+} from './application/action-blocks.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -106,11 +113,6 @@ const FINAL_REPLY_FENCE = 'cti-final';
 const STICKER_ANNOTATION_FENCE = 'cti-sticker-annotation';
 const STICKER_CANDIDATE_ANALYSIS_FENCE = 'cti-sticker-candidate-analysis';
 const STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE = 0.45;
-const REMINDER_ACTION_FENCE = 'cti-reminder';
-const SCHEDULED_TASK_ACTION_FENCE = 'cti-scheduled-task';
-const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
-const BRIDGE_CONTROL_ACTION_FENCE = 'cti-bridge-control';
-const ARTIFACT_PROMOTION_ACTION_FENCE = 'cti-artifact-promote';
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -186,69 +188,6 @@ const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|
 const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
 const MCP_ENTRY_CLARIFICATION_REPLY_PATTERN = /(?:请(?:先)?(?:明确|指定).{0,12}(?:MCP|Unity MCP).{0,12}(?:入口|目标)|可用\s*MCP\s*入口|例如[:：].{0,80}(?:Unity MCP|Unity Prefab MCP|Blender MCP|Fetch MCP))/i;
 const TASK_INTENT_PATTERN = /(帮我|麻烦|请|需要|能不能|可以帮|处理|执行|运行|启动|停止|重启|发布|同步|安装|升级|修|修复|改|修改|替换|检查|排查|诊断|看一下|看一眼|查一下|找一下|分析|整理|总结|汇总|生成|创建|写|删除|添加|上传|下载|截图|回溯|记忆|记得|历史|权限|报错|异常|失败|为什么|怎么回事|哪里|怎么|如何|unity|mcp|codex|claude|bridge|飞书|面板|文件|代码|仓库|commit|push|git)/i;
-
-interface CtiReminderAction {
-  title: string;
-  dueAt: string;
-  timezone?: string;
-  target: 'current_chat';
-  notifyTargets?: OutboundMention[];
-  sourcePrompt?: string;
-}
-
-interface ExtractedReminderAction {
-  action: CtiReminderAction | null;
-  text: string;
-}
-
-interface CtiScheduledTaskCreateAction {
-  action: 'create';
-  name: string;
-  schedule: ScheduledTaskScheduleInput;
-  taskAction: ScheduledTaskActionInput;
-  deliveryMode: 'result' | 'summary' | 'none';
-  ignoredTrustedFields: string[];
-}
-
-interface ExtractedScheduledTaskAction {
-  action: CtiScheduledTaskCreateAction | null;
-  text: string;
-  hadBlock: boolean;
-  error?: string;
-}
-
-interface CtiDirectMessageAction {
-  targetText: string;
-  targetId?: string;
-  targetKind?: ConversationTargetKind | 'any';
-  text: string;
-  parseMode?: OutboundMessage['parseMode'];
-}
-
-interface ExtractedDirectMessageAction {
-  action: CtiDirectMessageAction | null;
-  text: string;
-  hadBlock: boolean;
-  error?: string;
-}
-
-interface CtiBridgeControlAction {
-  action: 'restart_live';
-}
-
-interface ExtractedBridgeControlAction {
-  action: CtiBridgeControlAction | null;
-  text: string;
-  hadBlock: boolean;
-  error?: string;
-}
-
-interface ExtractedArtifactPromotionAction {
-  action: ArtifactPromotionRequest | null;
-  text: string;
-  hadBlock: boolean;
-  error?: string;
-}
 
 interface ParsedReminderRequest {
   title: string;
@@ -334,270 +273,26 @@ function claimInboundForExecution(
   return { duplicate: false };
 }
 
-function extractCtiReminderAction(text: string): ExtractedReminderAction {
-  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${REMINDER_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
-  const match = text.match(fencePattern);
-  if (!match) {
-    return { action: null, text };
-  }
-
-  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
-  try {
-    const parsed = JSON.parse(match[2].trim()) as Partial<CtiReminderAction> & { notify_targets?: unknown };
-    if (
-      typeof parsed.title !== 'string'
-      || !parsed.title.trim()
-      || typeof parsed.dueAt !== 'string'
-      || !parsed.dueAt.trim()
-      || parsed.target !== 'current_chat'
-    ) {
-      return { action: null, text: cleaned };
-    }
-    return {
-      action: {
-        title: parsed.title.trim(),
-        dueAt: parsed.dueAt.trim(),
-        timezone: typeof parsed.timezone === 'string' ? parsed.timezone.trim() : undefined,
-        target: 'current_chat',
-        notifyTargets: parseEnvelopeMentions(parsed.notifyTargets ?? parsed.notify_targets),
-        sourcePrompt: typeof parsed.sourcePrompt === 'string' ? parsed.sourcePrompt.trim() : undefined,
-      },
-      text: cleaned,
-    };
-  } catch {
-    return { action: null, text: cleaned };
-  }
+function extractCtiReminderAction(text: string) {
+  return parseCtiReminderActionBlock(text, {
+    parseMentions: parseEnvelopeMentions,
+  });
 }
 
-function parseScheduledTaskSchedule(value: unknown): ScheduledTaskScheduleInput | null {
-  const raw = getRecordField(value);
-  if (!raw) return null;
-  const kind = getStringField(raw, ['kind']).toLowerCase();
-  if (kind === 'at') {
-    const at = getStringField(raw, ['at', 'dueAt', 'due_at']);
-    const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
-    return at && timezone ? { kind: 'at', at, timezone } : null;
-  }
-  if (kind === 'every') {
-    const everyMs = Number(raw.everyMs ?? raw.every_ms);
-    const anchorAt = getStringField(raw, ['anchorAt', 'anchor_at']);
-    return Number.isFinite(everyMs) && everyMs > 0 && anchorAt
-      ? { kind: 'every', everyMs: Math.floor(everyMs), anchorAt }
-      : null;
-  }
-  if (kind === 'cron') {
-    const expression = getStringField(raw, ['expression', 'cron']);
-    const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
-    return expression && timezone ? { kind: 'cron', expression, timezone } : null;
-  }
-  return null;
+function extractCtiScheduledTaskAction(text: string) {
+  return parseCtiScheduledTaskActionBlock(text);
 }
 
-function parseScheduledTaskAction(value: unknown): ScheduledTaskActionInput | null {
-  const raw = getRecordField(value);
-  if (!raw) return null;
-  const kind = getStringField(raw, ['kind']).toLowerCase();
-  if (kind === 'notify') {
-    const text = getStringField(raw, ['text', 'message', 'content']);
-    return text ? { kind: 'notify', text } : null;
-  }
-  if (kind === 'agent_turn') {
-    const prompt = getStringField(raw, ['prompt', 'text', 'request']);
-    const sessionMode = getStringField(raw, ['sessionMode', 'session_mode']).toLowerCase();
-    if (!prompt || (sessionMode !== 'isolated' && sessionMode !== 'bound')) return null;
-    const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms);
-    return {
-      kind: 'agent_turn',
-      prompt,
-      sessionMode,
-      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs: Math.floor(timeoutMs) } : {}),
-    };
-  }
-  if (kind === 'controlled_tool') {
-    const toolName = getStringField(raw, ['toolName', 'tool_name', 'name']);
-    if (!toolName) return null;
-    const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms);
-    return {
-      kind: 'controlled_tool',
-      toolName,
-      input: raw.input ?? null,
-      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs: Math.floor(timeoutMs) } : {}),
-    };
-  }
-  return null;
+function extractCtiDirectMessageAction(text: string) {
+  return parseCtiDirectMessageActionBlock(text);
 }
 
-function collectIgnoredScheduledTaskFields(value: unknown): string[] {
-  const ignoredNames = new Set([
-    'actor', 'owner', 'role', 'userid', 'user_id', 'openid', 'open_id', 'chatid', 'chat_id',
-    'target', 'delivery', 'sourcesessionid', 'source_session_id', 'workspaceid', 'workspace_id',
-    'workspacemode', 'workspace_mode', 'workingdirectory', 'working_directory',
-    'additionaldirectories', 'additional_directories', 'evidence', 'messageid', 'message_id',
-  ]);
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
-  return Object.keys(value as Record<string, unknown>)
-    .filter((key) => ignoredNames.has(key.replace(/[-\s]/gu, '_').toLowerCase()))
-    .sort();
+function extractCtiBridgeControlAction(text: string) {
+  return parseCtiBridgeControlActionBlock(text);
 }
 
-function extractCtiScheduledTaskAction(text: string): ExtractedScheduledTaskAction {
-  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${SCHEDULED_TASK_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
-  const match = text.match(fencePattern);
-  if (!match) return { action: null, text, hadBlock: false };
-  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
-  try {
-    const parsed = JSON.parse(match[2].trim());
-    const raw = getRecordField(parsed);
-    if (!raw || getStringField(raw, ['action']).toLowerCase() !== 'create') {
-      return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作仅支持 create' };
-    }
-    const name = getStringField(raw, ['name', 'title']);
-    const schedule = parseScheduledTaskSchedule(raw.schedule);
-    const taskAction = parseScheduledTaskAction(raw.taskAction ?? raw.task_action);
-    const requestedDeliveryMode = getStringField(raw, ['deliveryMode', 'delivery_mode']).toLowerCase();
-    const deliveryMode = requestedDeliveryMode === 'summary' || requestedDeliveryMode === 'none'
-      ? requestedDeliveryMode
-      : 'result';
-    if (!name || !schedule || !taskAction) {
-      return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name、schedule 或 taskAction' };
-    }
-    return {
-      action: {
-        action: 'create',
-        name,
-        schedule,
-        taskAction,
-        deliveryMode,
-        ignoredTrustedFields: collectIgnoredScheduledTaskFields(parsed),
-      },
-      text: cleaned,
-      hadBlock: true,
-    };
-  } catch {
-    return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作 JSON 解析失败' };
-  }
-}
-
-function getStringField(raw: Record<string, unknown>, keys: string[]): string {
-  for (const key of keys) {
-    const value = raw[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
-}
-
-function getRecordField(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function parseDirectMessageParseMode(value: unknown): OutboundMessage['parseMode'] | undefined {
-  if (typeof value !== 'string') return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (normalized === 'markdown') return 'Markdown';
-  if (normalized === 'html') return 'HTML';
-  if (normalized === 'plain' || normalized === 'text') return 'plain';
-  return undefined;
-}
-
-function parseConversationTargetKind(value: unknown): ConversationTargetKind | 'any' | undefined {
-  if (typeof value !== 'string') return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return undefined;
-  if (/^(?:chat|group|channel|conversation|session|room|群|群聊|会话)$/u.test(normalized)) return 'chat';
-  if (/^(?:user|person|member|private|p2p|dm|open_id|user_id|用户|成员|私聊|人)$/u.test(normalized)) return 'user';
-  if (/^(?:any|auto|自动)$/u.test(normalized)) return 'any';
-  return undefined;
-}
-
-function extractCtiDirectMessageAction(text: string): ExtractedDirectMessageAction {
-  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${DIRECT_MESSAGE_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
-  const match = text.match(fencePattern);
-  if (!match) {
-    return { action: null, text, hadBlock: false };
-  }
-
-  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
-  try {
-    const parsed = JSON.parse(match[2].trim()) as unknown;
-    if (!parsed || typeof parsed !== 'object') {
-      return { action: null, text: cleaned, hadBlock: true, error: '私发动作不是有效 JSON 对象' };
-    }
-    const raw = parsed as Record<string, unknown>;
-    const nestedTarget = getRecordField(raw.target);
-    const targetText = getStringField(raw, ['targetText', 'target', 'to', 'name', 'user', 'displayName'])
-      || (nestedTarget ? getStringField(nestedTarget, ['displayName', 'display_name', 'name', 'label', 'targetText', 'text']) : '');
-    const explicitTargetId = getStringField(raw, ['targetId', 'targetID', 'toId', 'toID', 'id', 'chatId', 'chat_id', 'sessionId', 'session_id', 'conversationId', 'conversation_id', 'receiveId', 'receive_id']);
-    const nestedChatId = nestedTarget ? getStringField(nestedTarget, ['chatId', 'chat_id', 'sessionId', 'session_id', 'conversationId', 'conversation_id']) : '';
-    const nestedUserId = nestedTarget ? getStringField(nestedTarget, ['openId', 'open_id', 'userId', 'user_id', 'unionId', 'union_id', 'id']) : '';
-    // 模型对象同时给出显示名和用户 ID 时，仍按显示名走本轮原生 mention 唯一解析，不能直接信任模型生成的 ID。
-    const targetId = explicitTargetId || nestedChatId || (!targetText ? nestedUserId : '');
-    const targetKind = parseConversationTargetKind(raw.targetKind ?? raw.target_type ?? raw.targetType ?? raw.kind ?? raw.type)
-      || (nestedChatId ? 'chat' : (!targetText && nestedUserId ? 'user' : undefined));
-    const body = getStringField(raw, ['text', 'message', 'content', 'body']);
-    if ((!targetText && !targetId) || !body) {
-      return { action: null, text: cleaned, hadBlock: true, error: '私发动作缺少 target 或 text' };
-    }
-    return {
-      action: {
-        targetText,
-        targetId,
-        targetKind,
-        text: body,
-        parseMode: parseDirectMessageParseMode(raw.parseMode ?? raw.parse_mode),
-      },
-      text: cleaned,
-      hadBlock: true,
-    };
-  } catch {
-    return { action: null, text: cleaned, hadBlock: true, error: '私发动作 JSON 解析失败' };
-  }
-}
-
-function extractCtiBridgeControlAction(text: string): ExtractedBridgeControlAction {
-  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${BRIDGE_CONTROL_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
-  const match = text.match(fencePattern);
-  if (!match) return { action: null, text, hadBlock: false };
-  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
-  try {
-    const parsed = JSON.parse(match[2].trim()) as Partial<CtiBridgeControlAction>;
-    if (parsed.action !== 'restart_live') {
-      return { action: null, text: cleaned, hadBlock: true, error: '不支持的 Bridge 控制动作' };
-    }
-    return { action: { action: 'restart_live' }, text: cleaned, hadBlock: true };
-  } catch {
-    return { action: null, text: cleaned, hadBlock: true, error: 'Bridge 控制动作 JSON 解析失败' };
-  }
-}
-
-function extractCtiArtifactPromotionAction(text: string): ExtractedArtifactPromotionAction {
-  const fencePattern = new RegExp(`(^|\\n)\\s*\`\`\`${ARTIFACT_PROMOTION_ACTION_FENCE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
-  const match = text.match(fencePattern);
-  if (!match) return { action: null, text, hadBlock: false };
-  const cleaned = text.replace(fencePattern, '$1').replace(/\n{3,}/g, '\n\n').trim();
-  try {
-    const raw = getRecordField(JSON.parse(match[2].trim()) as unknown);
-    if (!raw) return { action: null, text: cleaned, hadBlock: true, error: '产物提升动作不是有效 JSON 对象' };
-    const allowedFields = new Set(['artifactId', 'targetProjectId', 'targetRelativePath', 'expectedSha256']);
-    const unexpectedFields = Object.keys(raw).filter((key) => !allowedFields.has(key));
-    if (unexpectedFields.length > 0) {
-      return {
-        action: null,
-        text: cleaned,
-        hadBlock: true,
-        error: `产物提升动作包含不允许字段：${unexpectedFields.sort().join(', ')}`,
-      };
-    }
-    return { action: parseArtifactPromotionRequest(raw), text: cleaned, hadBlock: true };
-  } catch (error) {
-    return {
-      action: null,
-      text: cleaned,
-      hadBlock: true,
-      error: `产物提升动作无效：${error instanceof Error ? error.message : 'JSON 解析失败'}`,
-    };
-  }
+function extractCtiArtifactPromotionAction(text: string) {
+  return parseCtiArtifactPromotionActionBlock(text);
 }
 
 function isExplicitArtifactPromotionRequestText(text: string): boolean {

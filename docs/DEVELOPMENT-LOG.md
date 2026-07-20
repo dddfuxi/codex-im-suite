@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Bridge Core 动作块解析迁移：新增 `application/action-blocks.ts`，把 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote` 的 fence、JSON 与字段归一化从 `bridge-manager.ts` 迁为可独立测试的纯解析模块。Manager 只保留 mention parser 注入和薄包装，身份、权限、工作区、目标解析、Artifact 校验与 Host 执行继续基于当前回合真实 evidence，不信任模型动作块中的 ID、角色或路径。新增 5 项领域测试，并同步架构、维护规则和路线图子阶段；Task 8 Step 2 仍待提醒解析、mention、sticker policy、history intent 与 delivery preparation 完成。
+
 - 2026-07-20 Bridge Core / Feishu 拆分前行为目录：在搬迁巨型 `bridge-manager.ts` 和 `feishu-adapter.ts` 之前，新增机器可检查的 Characterization Catalog，把入站、权限、提醒、私发、历史、表情包、附件、卡片、产物和最终交付十个 Task 8 领域分别绑定到现有真实回归测试标题。目录测试会验证来源文件和测试标题仍存在，防止后续拆分时误删整类安全网；它不复制实现、不成为运行时协议，也不替代被引用测试本身。路线图 Task 8 Step 1 同步标记完成。
 
 - 2026-07-20 控制面板共享协议收口：将 React `PanelState / RuntimeUnit / WorkflowRun / HostResult` 和 Runtime workflow 状态 DTO 迁移到 `packages/contracts`，新增浏览器安全的 `control-api`、`workflow`、`project-registry` 子路径，避免 Web 从包含 Node 路径解析代码的根出口取运行时值。新增稳定 `control-api.schema.json`、`project-registry.schema.json` 和 C# `ControlApiContracts.cs` 薄 DTO；HTTP 与 WebView2 command/result 统一携带协议标识，PanelState 新增 schema 与同源项目注册表只读快照。C# 不复制项目挂载规则，只展示结构化文件；Runtime 继续拥有 legacy 合并与工作区裁决。新增 Contract、依赖边界和 .NET schema 逐字段 RED/GREEN 回归，并同步 README、架构、路线图和 AGENTS，确保机器协议与人类维护入口同阶段更新。

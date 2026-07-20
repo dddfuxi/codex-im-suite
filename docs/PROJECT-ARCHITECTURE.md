@@ -79,6 +79,8 @@ flowchart TD
   Panel --> SkillLifecycle
   McpLayer --> IgnisPackage[packages/mcp-ignis]
   Core --> FeishuAdapter[Feishu Adapter]
+  Core --> BridgeFacade[bridge-manager 编排 Facade]
+  BridgeFacade --> ActionBlocks[application/action-blocks 纯动作块解析]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
   Core --> ReplyEnvelope[cti-final 结果块收口]
@@ -93,7 +95,7 @@ flowchart TD
 当前主要混乱点：
 
 - `AGENTS.md`、架构文档、prompt、adapter、manager 和 runtime 都沉淀了行为规则，导致同一类策略可能在多个入口重复或互相覆盖。
-- `bridge-manager.ts` 仍同时承担入站编排、权限策略、提醒解析、上下文拼装、结果协议和部分出站收口，文件职责过宽。
+- `bridge-manager.ts` 仍同时承担入站编排、权限策略、提醒自然语言解析、上下文拼装、结果协议和部分出站收口，文件职责过宽；五类结构化动作块的纯解析已迁出。
 - prompt 规则分散在 `conversation-engine`、`codex-provider` 和 `local-agent-tool-protocol`，同一“主动完成 / 不外泄内部协议 / 工具证据”口径需要多处同步。
 - 路径职责过去主要靠文档约定，缺少可测试的分类入口，容易把开发版、live skill、运行态数据、临时缓存和发布产物混在一起处理。
 
@@ -134,6 +136,7 @@ flowchart TD
 - `conversation-engine` 的主动完成 prompt 已改为从 `agent_kernel.proactive_completion` policy 读取。
 - `bridge-manager` 的 slash 命令最低角色表已迁入 Policy Registry 的 `getSlashCommandRequiredRole()`。
 - 权限批准风险、危险执行请求和系统副作用提醒边界已迁入 Policy Registry 的 `getPermissionApprovalRequiredRole()`、`isDangerousUserRequest()` 和 `isSystemAffectingReminderRequest()`，manager 只负责读取 evidence、执行角色门禁和调用提醒/权限链路。
+- `packages/bridge-core/src/lib/bridge/application/action-blocks.ts` 统一解析 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote`。该模块只做 fence 清理、JSON/字段归一化和安全字段过滤；`bridge-manager` 保留薄包装，并继续基于当前回合原生 mention、Owner/Operator、项目 Registry、Artifact Host 和审计证据执行真实裁决，模型动作块中的用户 ID、角色、工作区和目标字段不成为可信事实。
 
 渐进迁移顺序：
 
