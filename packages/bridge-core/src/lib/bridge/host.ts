@@ -12,6 +12,15 @@ import type { InputEvidenceKind } from './input-evidence.js';
 import type { FeishuCliUserAuthorizationChallenge } from './feishu-cli-user-auth.js';
 import type { TurnWorkspacePlan } from './workspace-plan.js';
 import type {
+  StickerDeliveryEvidence,
+  StickerExpressionPromptRequest,
+  StickerExpressionPromptSection,
+  StickerFeedbackCandidate,
+  StickerFeedbackResult,
+  StickerSelectionAuthorization,
+  StickerSelectionRequest,
+} from './sticker-semantic-evolution.js';
+import type {
   AgentTurnFocusDecisionInput,
   TurnEvidenceEnvelope,
   TurnFocusDecision,
@@ -296,6 +305,15 @@ export interface MemoryWriteIntentDecision {
 
 export interface MemoryIntentHost {
   classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision>;
+}
+
+/** Runtime-owned sticker semantic persistence and policy boundary. */
+export interface StickerSemanticEvolutionHost {
+  authorizeSelection(input: StickerSelectionRequest): Promise<StickerSelectionAuthorization | null>;
+  recordDelivery(evidence: StickerDeliveryEvidence): Promise<void>;
+  findDeliveriesByOutboundMessageIds(messageIds: string[]): Promise<StickerDeliveryEvidence[]>;
+  processFeedback(candidate: StickerFeedbackCandidate): Promise<StickerFeedbackResult>;
+  buildExpressionPromptSection(input: StickerExpressionPromptRequest): Promise<StickerExpressionPromptSection | null>;
 }
 
 export interface AgentHomePromptReadInput {

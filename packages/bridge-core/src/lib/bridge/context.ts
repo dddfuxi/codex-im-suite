@@ -21,6 +21,7 @@ import type {
   FeishuCliUserAuthHost,
   FeishuOAuthManualHost,
   MemoryIntentHost,
+  StickerSemanticEvolutionHost,
   AgentHomeHost,
   SelfMaintenanceHost,
   TurnReferenceResolverHost,
@@ -40,6 +41,7 @@ export interface BridgeContext {
   feishuCliUserAuth?: FeishuCliUserAuthHost;
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
+  stickerSemantics?: StickerSemanticEvolutionHost;
   agentHome?: AgentHomeHost;
   selfMaintenance?: SelfMaintenanceHost;
   turnReferences?: TurnReferenceResolverHost;

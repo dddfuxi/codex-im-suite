@@ -106,6 +106,13 @@ export interface VerifiedMediaAction {
   provenance: 'turn_attached_model_selection';
 }
 
+export interface VerifiedStickerDeliveryReceipt {
+  kind: 'sticker';
+  fileKey: string;
+  semanticRevisionId: string;
+  contextHash: string;
+}
+
 /** Outbound message to send to an IM channel */
 export interface OutboundMessage {
   /** Target address */
@@ -139,6 +146,8 @@ export interface SendResult {
   messageId?: string;
   /** Platform-specific card ID when the channel returns one. */
   cardId?: string;
+  /** Bridge-owned receipt emitted only after a verified sticker action succeeds. */
+  verifiedMediaDelivery?: VerifiedStickerDeliveryReceipt;
   error?: string;
 }
 
