@@ -3,6 +3,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createStickerSemanticStore, type StickerManualSemanticPatch } from './sticker-semantics/store.js';
+import {
+  applyStickerSemanticMigrationPlan,
+  buildStickerSemanticMigrationPlan,
+  type StickerSemanticMigrationPlan,
+} from './sticker-semantics/migration.js';
 
 export interface StickerSemanticCliResult {
   ok: true;
@@ -88,6 +93,18 @@ function counts(revisions: Array<{ status: string }>): Record<string, number> {
   }, { trial: 0, confirmed: 0, regressed: 0, rejected: 0 } as Record<string, number>);
 }
 
+function writeJsonAtomic(filePath: string, value: unknown): void {
+  const resolved = path.resolve(filePath);
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  const temporary = `${resolved}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.renameSync(temporary, resolved);
+  } finally {
+    if (fs.existsSync(temporary)) fs.rmSync(temporary, { force: true });
+  }
+}
+
 export function runStickerSemanticCli(argv: string[]): StickerSemanticCliResult {
   const parsed = parseArguments(argv);
   const [command = 'status', target, extra] = parsed.positionals;
@@ -166,8 +183,25 @@ export function runStickerSemanticCli(argv: string[]): StickerSemanticCliResult 
       const snapshot = store.deleteArchived({ fileKey: requireFileKey(target), expectedBaseHash: requireBaseHash(parsed.options), actor: 'control-panel' });
       return { ok: true, data: { snapshot } };
     }
-    case 'migrate':
-      throw new Error('migration_not_implemented');
+    case 'migrate': {
+      if (target === 'preview') {
+        const output = parsed.options.get('--output');
+        if (!output) throw new Error('migration_output_required');
+        const plan = buildStickerSemanticMigrationPlan({ memoryRoot });
+        writeJsonAtomic(output, plan);
+        return { ok: true, data: { plan, output: path.resolve(output) } };
+      }
+      if (target === 'apply') {
+        const manifestPath = parsed.options.get('--manifest');
+        if (!manifestPath) throw new Error('migration_manifest_required');
+        let plan: StickerSemanticMigrationPlan;
+        try { plan = JSON.parse(fs.readFileSync(path.resolve(manifestPath), 'utf8')) as StickerSemanticMigrationPlan; }
+        catch { throw new Error('invalid_migration_manifest'); }
+        if (path.resolve(plan.memoryRoot) !== memoryRoot) throw new Error('migration_memory_root_mismatch');
+        return { ok: true, data: applyStickerSemanticMigrationPlan(plan) };
+      }
+      throw new Error('unknown_migration_command');
+    }
     default:
       throw new Error(`unknown_command: ${command}`);
   }

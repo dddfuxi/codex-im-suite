@@ -59,6 +59,43 @@ describe('sticker semantic human-readable projection', () => {
     assert.doesNotMatch(markdown, /open_id|outboundMessageId|evidenceHash|om_secret|oc_secret_chat|session-secret/u);
   });
 
+  it('uses aliases as a readable fallback for manual semantics without a label', () => {
+    const snapshot: StickerSemanticSnapshot = {
+      schema: 'codex-im-suite/sticker-semantic-snapshot/v1',
+      generatedAt: '2026-07-20T00:00:00.000Z',
+      baseHash: 'a'.repeat(64),
+      assets: [{
+        fileKey: 'manual-file',
+        aliases: ['最近', '默认'],
+        archived: false,
+        disabled: false,
+        visual: { source: 'manual' },
+      }],
+      revisions: [{
+        schema: 'codex-im-suite/sticker-semantic-revision/v1',
+        revisionId: 'manual-revision',
+        fileKey: 'manual-file',
+        scope: 'global',
+        status: 'confirmed',
+        versionId: 'manual-version',
+        baseHash: 'a'.repeat(64),
+        patch: { aliases: ['最近', '默认'] },
+        supportEvidenceHashes: [],
+        contradictionEvidenceHashes: [],
+        supportSessionIds: [],
+        contradictionSessionIds: [],
+        createdAt: '2026-07-20T00:00:00.000Z',
+        updatedAt: '2026-07-20T00:00:00.000Z',
+      }],
+      deliveries: [],
+    };
+
+    const markdown = renderStickerSemanticArchive(snapshot);
+    assert.match(markdown, /- 最近：已确认/u);
+    assert.match(markdown, /可用称呼：最近、默认/u);
+    assert.doesNotMatch(markdown, /未命名表情包|无可展示 patch/u);
+  });
+
   it('updates managed blocks without rewriting human-authored bytes', () => {
     const snapshot: StickerSemanticSnapshot = {
       schema: 'codex-im-suite/sticker-semantic-snapshot/v1',

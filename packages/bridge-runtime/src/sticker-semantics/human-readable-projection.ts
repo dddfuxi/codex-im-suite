@@ -28,13 +28,17 @@ export function renderStickerSemanticArchive(snapshot: StickerSemanticSnapshot):
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .map((revision) => {
       const asset = assetByKey.get(revision.fileKey);
+      const aliases = revision.patch.aliases?.length ? revision.patch.aliases : asset?.aliases || [];
+      const displayName = asset?.label || aliases[0] || '未命名表情包';
       const patch = [
         revision.patch.intent ? `意图：${revision.patch.intent}` : '',
         revision.patch.tone ? `语气：${revision.patch.tone}` : '',
         revision.patch.usage ? `用法：${revision.patch.usage}` : '',
+        aliases.length ? `可用称呼：${aliases.join('、')}` : '',
+        revision.patch.examples?.length ? `示例：${revision.patch.examples.join('、')}` : '',
         revision.patch.avoidRules?.length ? `避免规则：${revision.patch.avoidRules.map((rule) => `${rule.category}：${rule.condition}（${statusLabel(rule.status)}）`).join('、')}` : '',
       ].filter(Boolean).join('；') || '无可展示 patch。';
-      return `- ${asset?.label || '未命名表情包'}：${statusLabel(revision.status)}；${scopeLabel(revision.scope)}；${patch}；支持会话 ${revision.supportSessionIds.length}；矛盾会话 ${revision.contradictionSessionIds.length}；更新 ${revision.updatedAt}`;
+      return `- ${displayName}：${statusLabel(revision.status)}；${scopeLabel(revision.scope)}；${patch}；支持会话 ${revision.supportSessionIds.length}；矛盾会话 ${revision.contradictionSessionIds.length}；更新 ${revision.updatedAt}`;
     });
   const counts = snapshot.revisions.reduce((result, item) => {
     result[item.status] = (result[item.status] || 0) + 1;

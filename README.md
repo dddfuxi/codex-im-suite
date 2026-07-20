@@ -306,6 +306,21 @@ node .\packages\bridge-runtime\dist\memory-item-cli.mjs migrate apply --memory-r
 
 Memory 页直接提供“已确认 / 候选收件箱 / 已归档”三个入口。候选不进入主索引和默认 Prompt；确认、归档、还原、永久删除统一通过 runtime CLI，控制面板不直接改 JSON/Markdown。机器 state、源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块和 `记忆归档索引.md` 同事务更新，任一人类文档写入失败会整体回滚。
 
+表情包语义进化与回滚：
+
+```powershell
+# 查看 revision 状态和人类档案同步状态
+node .\packages\bridge-runtime\dist\sticker-semantic-cli.mjs status --memory-root E:\cli-md
+
+# 默认只生成迁移清单，不修改旧 stickers.json
+node .\packages\bridge-runtime\dist\sticker-semantic-cli.mjs migrate preview --memory-root E:\cli-md --output "$env:TEMP\codex-im-suite-sticker-semantic-migration.json"
+
+# 审核清单后，先停止 Bridge 和记忆 watcher，再应用同一 manifest
+node .\packages\bridge-runtime\dist\sticker-semantic-cli.mjs migrate apply --memory-root E:\cli-md --manifest "$env:TEMP\codex-im-suite-sticker-semantic-migration.json"
+```
+
+迁移只把 `vision/manual` 可信语义生成 confirmed baseline；旧自由文本 `avoidWhen` 转为 trial 结构化规则，`userAnnotation` 仍不进入可发送主语义。真实发送成功后才记录 delivery evidence，原生 reply/reaction 只绑定同 chat 的已记录 outbound message。机器 revision、版本、feedback ledger、`表情包语义档案.md`、`记忆总索引.md` 和 `记忆库说明.md` 同事务更新；控制面板通过 runtime CLI 接受、拒绝、回滚、人工编辑、归档、还原和永久删除，不再直接写 `stickers.json`。
+
 历史乱码扫描和修复入口：
 
 ```powershell

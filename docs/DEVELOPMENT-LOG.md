@@ -755,6 +755,15 @@
 - 2026-07-07 Feishu 名字唤醒与回复状态：群聊 `require_mention=true` 下，没有原生 @ 时会使用 bot displayName、`bridge_feishu_bot_name`、`bridge_feishu_app_name`、`bridge_feishu_bot_aliases` 或 `CTI_FEISHU_BOT_ALIASES` 形成别名，先分类 `chat / investigate / need_info / done` 再决定是否入队；“小桥 帮我看看”这类明确请求会写入 `raw.feishuBotWake` 并进入执行链，“刚才小桥说的那个方案挺好”这类第三人称提及只写过滤审计。`conversation-engine` 的回复契约同步要求 Feishu turn 先判 intent/state，查完只回结果，缺信息才问最小澄清，艾特人必须基于明确姓名、被回复消息或唯一群成员匹配，不再把工具流水、路径、命令或内部协议倒给用户。
 - 2026-07-15 表情包视觉语义防串图：模型返回的 `cti-sticker-annotation` 只有在本轮实际附加了同一 `file_key` 的图片时才可写入 `source=vision`；同轮其他候选图不能为被回复表情包背书，避免错误画面描述进入可信语义库后持续误导后续解释与发送。
 
+## 11. 2026-07-20 表情包语义进化、回滚与人类档案自更新
+
+- Bridge Core 新增平台无关的 sticker delivery/feedback/scope/revision/Prompt Host 协议；Delivery Layer 只在 Feishu 返回真实 `messageId` 和受控 receipt 后记录 evidence，reply/reaction 只绑定同 chat 的已记录 outbound delivery。
+- Bridge Runtime 新增版本化语义主库、strict JSON feedback classifier、独立会话去重状态机、结构化 `avoidRules`、scope 合成和 `expression.sticker-semantics` Prompt section。沉默为 neutral；三个独立 session 支持才确认 trial，强绑定纠错可立即回归；人工视觉事实不可被自动 patch 覆盖。
+- 机器状态、人类 `表情包语义档案.md`、`记忆总索引.md` 和 `记忆库说明.md` 使用同一写锁与 before-image 事务。已验证最后一个人类文档写失败时 revision、version、档案和先前已写投影全部恢复，受控区块之外的用户手写字节保持不变。
+- 新增 `sticker-semantic-cli.mjs` 与 C# `StickerSemanticGateway`；控制面板新增“表情包语义进化”视图，展示 trial/confirmed/regressed/rejected、scope、patch、避免规则、支持/矛盾会话、接受/拒绝/回滚和档案同步状态。`FeishuStickerLibrary` 只读兼容，不再直接写 `stickers.json`。
+- 旧语义迁移默认 dry-run：只有 `vision/manual` 生成 confirmed baseline，自由文本 `avoidWhen` 生成 trial 结构化规则，用户解释保持 blocked evidence。Apply 校验每条 source hash、先备份、幂等执行并刷新人类档案。
+- 定向验证已覆盖 runtime store/classifier/policy/host/prompt/CLI/migration、Core delivery/adapter/manager/prompt 和 Web/C# Gateway；最终全量构建、真实迁移、live 同步、8788 页面与 Feishu 行为仍需在本阶段收尾时复核。
+
 ## 10. 2026-07-15 Registry 驱动机器人能力治理（已实施并完成 live 复核）
 
 状态：实施分支为 `codex/agent-capability-registry`。Registry、官方生命周期适配、飞书/CLI 共用入口、Prompt Snapshot、Memory Skill 元数据索引和控制面板四域分区均已落地；完整测试、构建、live 同步、Bridge 重启、Feishu 长连接与面板 HTTP 状态均已复核。当前架构事实以 `docs/PROJECT-ARCHITECTURE.md` 为准。
