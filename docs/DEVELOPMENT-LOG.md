@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu documents 第一阶段迁移：新增 `channels/feishu/documents/document-request-policy.ts`，把文档生成/列表意图、确定性标题、通用标题、正文改写 prompt、云链接/OAuth callback 识别、链接脱敏、阻塞文案和授权卡 reuse 去重从 `bridge-manager.ts` 迁出。云链接由宽松文本正则升级为 URL 主机后缀与资源路径白名单，伪造相似域名不再触发 OAuth/读取链。新增 6 项直接模块测试，RED 为模块不存在；GREEN 后模块 6/6、manager 联合 185/185、Core 全量 634/634、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过。live 和飞书现场验收在阶段提交后执行；documents 后续仍需拆云文档 Host 调用编排、授权审计输入与文档创建交付。
+
 - 2026-07-20 Feishu stickers 第三阶段迁移：新增 `sticker-semantic-evolution-policy.ts` 与 `sticker-candidate-evidence.ts`，把用户解释解析、reply/同群近期目标绑定、user/vision/manual 不可变语义演进、候选排序、受控 evidence DTO 和视觉检查 prompt 从 adapter 迁出。新策略保证用户说法只进入未核验 `userAnnotation`、vision 必须绑定真实同 key 媒体、manual 不被后续 vision 降级，候选 DTO 不携带用户说法。新增 6 项直接模块测试，RED 为两个模块不存在；GREEN 后直接测试 6/6、adapter 联合专项 160/160、Core 全量 628/628、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过。live 与飞书现场验收在阶段提交后执行；stickers 子域已收口，下一子域为 documents。
 
 - 2026-07-20 Feishu stickers 第二阶段迁移：新增 `channels/feishu/stickers/sticker-selection-policy.ts`，把可信 annotation/视觉置信度/active/deleted 门禁、具体语义过滤、中文口语 n-gram、元描述停用词、`avoidWhen`、语义得分、同群/使用次数/最近使用排序、精确 file key/别名/通用请求解析和 80 条 retention 去重从 adapter 迁出；时间与媒体缓存命中通过参数注入。直接测试发现并修复“表达愤怒”仅因共享元描述词“表达”误选“难过”表情的问题，现通用元描述不再贡献匹配分。新增 5 项直接模块测试，RED 为模块不存在，GREEN 后模块 5/5、adapter 联合专项 159/159、Core 622/622、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。下一阶段迁移用户解释/视觉标注演进与候选 evidence/prompt 构造。
