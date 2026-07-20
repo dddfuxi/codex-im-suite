@@ -104,6 +104,9 @@ export interface VerifiedMediaAction {
   kind: 'sticker';
   key: string;
   provenance: 'turn_attached_model_selection';
+  /** Runtime authorization fields; absent legacy actions remain non-recordable. */
+  semanticRevisionId?: string;
+  contextHash?: string;
 }
 
 export interface VerifiedStickerDeliveryReceipt {

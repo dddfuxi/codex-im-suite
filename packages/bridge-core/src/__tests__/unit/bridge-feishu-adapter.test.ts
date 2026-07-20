@@ -2090,12 +2090,20 @@ describe('FeishuAdapter outbound mentions', () => {
         kind: 'sticker',
         key: 'v3_0011f_f57bd3a8-cb9d-41f3-8e9f-6bd21ab4be8g',
         provenance: 'turn_attached_model_selection',
+        semanticRevisionId: 'revision-direct-1',
+        contextHash: 'b'.repeat(64),
       },
     });
 
     assert.equal(result.ok, true);
     assert.equal(result.messageId, 'om_direct_sticker');
     assert.equal(result.targetDisplayName, '乔治');
+    assert.deepEqual(result.verifiedMediaDelivery, {
+      kind: 'sticker',
+      fileKey: 'v3_0011f_f57bd3a8-cb9d-41f3-8e9f-6bd21ab4be8g',
+      semanticRevisionId: 'revision-direct-1',
+      contextHash: 'b'.repeat(64),
+    });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].params.receive_id_type, 'open_id');
     assert.equal(sent[0].data.receive_id, 'ou_george');

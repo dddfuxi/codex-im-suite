@@ -3,6 +3,8 @@
  * dedup, retry, error classification, and reference tracking.
  */
 
+import crypto from 'node:crypto';
+
 import type {
   ChannelType,
   ChannelAddress,
@@ -174,7 +176,7 @@ export async function deliver(
     dedupKey?: string;
   },
 ): Promise<SendResult> {
-  const { store } = getBridgeContext();
+  const { store, stickerSemantics } = getBridgeContext();
 
   // Dedup check
   if (opts?.dedupKey) {
@@ -203,6 +205,7 @@ export async function deliver(
   }
 
   let lastMessageId: string | undefined;
+  let lastVerifiedMediaDelivery: SendResult['verifiedMediaDelivery'];
 
   for (let i = 0; i < chunks.length; i++) {
     // Rate limit: wait if this chat is sending too fast
@@ -227,6 +230,36 @@ export async function deliver(
       return result;
     }
     lastMessageId = result.messageId;
+    lastVerifiedMediaDelivery = result.verifiedMediaDelivery;
+
+    if (
+      adapter.channelType === 'feishu'
+      && result.messageId
+      && result.verifiedMediaDelivery?.kind === 'sticker'
+      && opts?.sessionId
+      && stickerSemantics
+    ) {
+      try {
+        await stickerSemantics.recordDelivery({
+          schema: 'codex-im-suite/sticker-delivery-evidence/v1',
+          deliveryId: crypto.createHash('sha256')
+            .update(`${adapter.channelType}\n${message.address.chatId}\n${result.messageId}`, 'utf8')
+            .digest('hex'),
+          channelType: 'feishu',
+          chatId: message.address.chatId,
+          targetUserId: message.address.userId,
+          fileKey: result.verifiedMediaDelivery.fileKey,
+          outboundMessageId: result.messageId,
+          semanticRevisionId: result.verifiedMediaDelivery.semanticRevisionId,
+          contextHash: result.verifiedMediaDelivery.contextHash,
+          sessionId: opts.sessionId,
+          sentAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        // 平台发送已经成功；语义审计失败只能失败关闭学习，不能向用户谎报发送失败。
+        console.warn('[delivery-layer] Sticker delivery evidence write failed:', error instanceof Error ? error.message : error);
+      }
+    }
 
     // Track outbound reference
     if (result.messageId && opts?.sessionId) {
@@ -259,7 +292,7 @@ export async function deliver(
     });
   } catch { /* best effort */ }
 
-  return { ok: true, messageId: lastMessageId };
+  return { ok: true, messageId: lastMessageId, verifiedMediaDelivery: lastVerifiedMediaDelivery };
 }
 
 /**

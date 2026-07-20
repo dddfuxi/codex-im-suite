@@ -2139,6 +2139,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return verifiedMediaAction.key;
   }
 
+  private verifiedStickerReceipt(fileKey: string, action?: VerifiedMediaAction): SendResult['verifiedMediaDelivery'] {
+    if (
+      action?.kind !== 'sticker'
+      || action.key !== fileKey
+      || !action.semanticRevisionId?.trim()
+      || !action.contextHash?.trim()
+    ) return undefined;
+    return {
+      kind: 'sticker',
+      fileKey,
+      semanticRevisionId: action.semanticRevisionId,
+      contextHash: action.contextHash,
+    };
+  }
+
   private markStickerUsed(fileKey: string): void {
     const store = this.readStickerStore();
     const record = store.stickers.find((item) => item.fileKey === fileKey);
@@ -3201,7 +3216,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, verifiedMediaAction)
           || this.resolveStickerFileKey(stickerHint.target, chatId, stickerHint.remainingText);
         if (fileKey) {
-          const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId);
+          const stickerResult = await this.sendStickerMessage(chatId, fileKey, state.sourceMessageId, verifiedMediaAction);
           if (stickerResult.ok) {
             finalResponseText = meaningfulHintRemainder(stickerHint.remainingText, '表情包已发送。');
           }
@@ -3447,7 +3462,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const fileKey = this.resolveVerifiedStickerFileKey(stickerHint.target, message.verifiedMediaAction)
         || this.resolveStickerFileKey(stickerHint.target, message.address.chatId, stickerHint.remainingText);
       if (fileKey) {
-        const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId);
+        const stickerResult = await this.sendStickerMessage(message.address.chatId, fileKey, message.replyToMessageId, message.verifiedMediaAction);
         if (stickerResult.ok) {
           text = stickerHint.remainingText;
           if (!stripStandaloneStatusMarks(text)) return stickerResult;
@@ -3569,8 +3584,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private async sendStickerMessage(chatId: string, fileKey: string, replyToMessageId?: string): Promise<SendResult> {
+  private async sendStickerMessage(
+    chatId: string,
+    fileKey: string,
+    replyToMessageId?: string,
+    verifiedMediaAction?: VerifiedMediaAction,
+  ): Promise<SendResult> {
     const content = JSON.stringify({ file_key: fileKey });
+    const verifiedMediaDelivery = this.verifiedStickerReceipt(fileKey, verifiedMediaAction);
     const sendDirect = async (): Promise<SendResult> => {
       try {
         const res = await this.restClient!.im.message.create({
@@ -3584,7 +3605,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         if (res?.data?.message_id) {
           this.markStickerUsed(fileKey);
           console.log(`[feishu-adapter] Sticker send ok: {"chatId":"${chatId}","messageId":"${res.data.message_id}"}`);
-          return { ok: true, messageId: res.data.message_id };
+          return { ok: true, messageId: res.data.message_id, verifiedMediaDelivery };
         }
         const error = res?.msg || 'Feishu sticker send failed';
         console.warn(`[feishu-adapter] Sticker direct send failed: ${error}`);
@@ -3605,7 +3626,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         if (res?.data?.message_id) {
           this.markStickerUsed(fileKey);
           console.log(`[feishu-adapter] Sticker reply send ok: {"chatId":"${chatId}","messageId":"${res.data.message_id}"}`);
-          return { ok: true, messageId: res.data.message_id };
+          return { ok: true, messageId: res.data.message_id, verifiedMediaDelivery };
         }
         console.warn(`[feishu-adapter] Sticker reply send failed, retrying as direct chat send: ${res?.msg || 'Feishu sticker reply failed'}`);
         return sendDirect();
@@ -3621,7 +3642,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (res?.data?.message_id) {
         this.markStickerUsed(fileKey);
         console.log(`[feishu-adapter] Sticker send ok: {"chatId":"${chatId}","messageId":"${res.data.message_id}"}`);
-        return { ok: true, messageId: res.data.message_id };
+        return { ok: true, messageId: res.data.message_id, verifiedMediaDelivery };
       }
       const error = res?.msg || 'Feishu sticker send failed';
       console.warn(`[feishu-adapter] Sticker send failed: ${error}`);
@@ -5240,6 +5261,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
           messageId: res.data.message_id,
           targetUserId: resolved.userId,
           targetDisplayName: resolved.name || targetText,
+          verifiedMediaDelivery: verifiedStickerKey
+            ? this.verifiedStickerReceipt(verifiedStickerKey, request.verifiedMediaAction)
+            : undefined,
         };
       }
       return { ok: false, error: res?.msg || 'Feishu direct message send failed' };
