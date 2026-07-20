@@ -61,6 +61,7 @@ import {
 } from '../channels/feishu/media/sticker-media-cache.js';
 import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/indexed-history-prompt.js';
+import { selectFeishuLightContextItems } from '../channels/feishu/history/light-context-selection.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -7161,34 +7162,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
         || mentions.length > 0
         || this.isDeicticLightContextAsk(userText)
         || hasContinuationTask;
-      const selected = new Map<string, FeishuMessageListItem>();
-      const selectionLimit = !replyTargetMessageId && isShortReplyCommand
-        ? Math.max(limit + 8, 12)
-        : limit + (repliedMessage ? 1 : 0);
-      if (repliedMessage && !repliedMessage.deleted && repliedMessage.msg_type !== 'system') {
-        selected.set(repliedMessage.message_id, repliedMessage);
-      }
-      for (const item of recentMessages) {
-        if (selected.size >= selectionLimit) break;
-        const itemTimestamp = Number.parseInt(item.create_time, 10);
-        if (
-          Number.isFinite(currentMessageTimestamp)
-          && Number.isFinite(itemTimestamp)
-          && itemTimestamp > (currentMessageTimestamp as number)
-        ) continue;
-        if (!this.isLightContextHistoryItem(item, currentMessageId, { includeBotMessages })) continue;
-        selected.set(item.message_id, item);
-      }
-
-      const items = [...selected.values()]
-        .filter((item) => this.extractHistoryText(item))
-        .sort((a, b) => (Number.parseInt(a.create_time, 10) || 0) - (Number.parseInt(b.create_time, 10) || 0))
-        .slice(-Math.max(limit, repliedMessage ? limit + 1 : isShortReplyCommand ? Math.min(selectionLimit, limit + 4) : limit));
+      const { items, likelyContextMessageId } = selectFeishuLightContextItems({
+        recentMessages,
+        repliedMessage,
+        currentMessageId,
+        currentMessageTimestamp,
+        limit,
+        isShortReplyCommand,
+        includeBotMessages,
+        extractText: (item) => this.extractHistoryText(item),
+        isFromSelf: (sender) => this.isHistoryItemFromSelf(sender),
+      });
       if (items.length === 0) return null;
-
-      const likelyContextMessageId = !replyTargetMessageId && isShortReplyCommand
-        ? this.findLikelyLightContextAnchor(items)?.message_id || ''
-        : '';
       const formatted = items
         .map((item) => {
           const prefix = replyTargetMessageId && item.message_id === replyTargetMessageId
@@ -7393,40 +7378,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || /^(?:这|这个|那|那个|他|她|它|ta|TA)(?:呢|咋样|怎么看)?$/u.test(normalized);
   }
 
-  private isLightContextHistoryItem(
-    item: FeishuMessageListItem,
-    currentMessageId: string,
-    options: { includeBotMessages?: boolean } = {},
-  ): boolean {
-    if (!item || item.deleted) return false;
-    if (item.message_id === currentMessageId) return false;
-    if (item.msg_type === 'system') return false;
-    if (!options.includeBotMessages && this.isHistoryItemFromSelf(item.sender)) return false;
-    return Boolean(this.extractHistoryText(item));
-  }
-
   private isShortReplyContextCommand(userText: string): boolean {
     const normalized = userText.replace(/\s+/g, '').trim();
     if (!normalized || normalized.length > 24) return false;
     return /^(?:回复(?:一下|下)?|回(?:一下|下)?|答(?:一下|下)?|说(?:一下|下)?|看(?:一下|下)?|[？?]+|(?:(?:他|她|它|ta|TA)?(?:这|这个|那|那个)?(?:是)?(?:咋回事|怎么回事|什么情况|啥情况|啥意思|什么意思|咋样|怎么看)|(?:这|这个|那|那个|他|她|它|ta|TA)(?:呢|咋样|怎么看)?)|怎么看|咋看|咋回|怎么回|你觉得)$/u.test(normalized);
-  }
-
-  private findLikelyLightContextAnchor(items: FeishuMessageListItem[]): FeishuMessageListItem | null {
-    let best: { item: FeishuMessageListItem; score: number; time: number } | null = null;
-    for (const item of items) {
-      const text = this.extractHistoryText(item);
-      if (!text || /^\[[^\]]+\]$/u.test(text)) continue;
-      let score = 0;
-      if (/[?？]/u.test(text)) score += 4;
-      if (/(?:吗|么|嘛|是不是|是否|怎么|咋|如何|哪个|哪种|还是|能不能|可不可以|有没有|什么|啥|why|how|which|\bor\b)/iu.test(text)) score += 3;
-      if (text.length >= 8) score += 1;
-      if (/^(?:好|嗯|哦|行|可以|收到|哈哈|哈|ok|yes|no|[？?。.!！]+)$/iu.test(text.trim())) score -= 3;
-      const time = Number.parseInt(item.create_time, 10) || 0;
-      if (!best || score > best.score || (score === best.score && time > best.time)) {
-        best = { item, score, time };
-      }
-    }
-    return best && best.score > 0 ? best.item : null;
   }
 
   private getReplyTargetMessageId(msg: FeishuMessageEventData['message']): string | null {

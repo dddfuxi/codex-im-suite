@@ -89,6 +89,7 @@ flowchart TD
   FeishuAdapter --> StickerMediaCache[channels/feishu/media 表情包媒体缓存]
   FeishuAdapter --> IndexedHistorySync[channels/feishu/history 云历史索引同步]
   FeishuAdapter --> IndexedHistoryPrompt[channels/feishu/history 索引结果 Prompt 构造]
+  FeishuAdapter --> LightContextSelection[channels/feishu/history 短接话上下文选择]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
   Core --> ReplyEnvelope[cti-final 结果块收口]
@@ -153,6 +154,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/channels/feishu/media/sticker-media-cache.ts` 独占表情包媒体文件的稳定哈希命名、兼容扩展查找、文件头 MIME 嗅探、大小门禁、第一份缓存复用和 `FileAttachment` 恢复。Feishu adapter 仍负责调用平台资源 API、15 分钟失败冷却和 sticker record 状态写入；缓存模块不读取聊天语义、不选择表情包，也不把 media 目录提升为工作区。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/history/indexed-history-sync.ts` 统一编排云历史的增量/全量分页、本地水位停止、成员显示名映射、删除/system/空消息过滤、历史 sticker 采集时序和单次索引 upsert；全量同步即使没有可读消息也写入空完成快照。Feishu adapter 只注入 OpenAPI 分页、成员查询、平台正文解析与 sticker 采集函数，模块本身不持有凭据、不检索索引、不恢复附件，也不构造 Provider prompt。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/history/indexed-history-prompt.ts` 把受控索引检索结果转换为空结果说明、飞书文档正文约束、指定说话人引用约束或普通总结 prompt，并保留历史中的英文标识、资源名、配置名、ID 与 token 原文。adapter 只负责传入 `FeishuHistoryIntent` 和真实检索结果；该纯模块不读取平台、文件、附件、工作区或 Provider 状态。
+- `packages/bridge-core/src/lib/bridge/channels/feishu/history/light-context-selection.ts` 统一选择短接话的 reply/nearby 消息：以当前入站时间剔除未来消息，优先保留原生 reply，按配置决定是否纳入机器人消息，过滤 current/deleted/system/空正文，并为无 reply 的短命令选择带问句和选择语义的 best-effort 上文锚点。adapter 继续注入正文解析和当前 bot 身份判断，并负责成员名、结构化 evidence、资源壳可读性与最终 prompt 呈现。
 
 渐进迁移顺序：
 
@@ -1465,7 +1467,8 @@ Ignis 会话映射：
 - 远端 Feishu 历史是主来源。
 - 本地索引用于检索、加速、压缩和容灾。
 - 云历史索引同步由 `channels/feishu/history/indexed-history-sync.ts` 统一执行：增量模式读取本地最新时间水位，并在整页均无更新消息时停止后续分页；全量模式读取全部页面，即使过滤后为空也写入完成快照。平台鉴权、消息类型正文解析、附件恢复、索引检索和 prompt 组装仍留在 adapter/Host 边界。
-- 索引命中后的用户任务 prompt 由 `indexed-history-prompt.ts` 确定性构造；adapter 仍拥有同步触发与 `retrieveRelevantFeishuHistory` 查询，但不再内联维护文档/定向引用/普通总结的长文本规则。附件恢复、light context 和旧云端回退链仍待后续 history 子阶段迁移。
+- 索引命中后的用户任务 prompt 由 `indexed-history-prompt.ts` 确定性构造；adapter 仍拥有同步触发与 `retrieveRelevantFeishuHistory` 查询，但不再内联维护文档/定向引用/普通总结的长文本规则。附件恢复和旧云端回退链仍待后续 history 子阶段迁移。
+- light context 的候选选择与时间边界已迁入 `light-context-selection.ts`，确保 receive_v1 异步准备不会把当前消息之后出现的平台消息注入本轮。adapter 仍维护 native mention、outbound audit/card 壳恢复、evidence 置信度、附件下载和 prompt 说明；这些平台/资源职责不会下沉到纯选择器。
 - Feishu 云历史可能只保留或只索引到用户问题、卡片摘要或平台可见占位；bot 自己的最终回复还要从本地 `messages` / `message-archives` 回捞。运行时检索命中历史用户请求时，会把相邻 assistant 最终答复作为同一条 evidence 返回；结构化 assistant 消息优先提取 `cti-final.text` 作为用户真正看见的答案，缺少最终结果块时也只使用可见 text block，不把进度中的 `tool_use`、`tool_result`、命令、路径或日志混入主记忆文本。
 - AI 不直接吃全量历史，而是按 `memoryMode=off|recall|augment` 决定是否检索相关片段；普通聊天默认不检索，显式回忆和执行类任务才按需调用记忆工具。
 - 短期会话历史只保留近期窗口；普通聊天只带少量最近消息，`historyLimit=0` 表示完全不注入短期历史。runtime 会定期把过长消息流归档，默认只保留最近活跃消息，并且记忆检索读取归档时限制为最近少量归档文件，避免历史越积越长后拖慢每轮回复。
