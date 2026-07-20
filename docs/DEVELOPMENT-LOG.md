@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu history prompt 第二阶段迁移：新增 `channels/feishu/history/indexed-history-prompt.ts`，把索引空结果、飞书文档正文、指定说话人引用和普通总结四类 Provider prompt 从 adapter 迁为纯函数，并保留英文标识、资源名、配置名、ID、token 等历史原文约束。adapter 的 V2 入口现在只负责同步当前群索引、按 intent 查询 `retrieveRelevantFeishuHistory` 并传入构造器；平台凭据、附件恢复、light context、旧云端回退链和真实 Provider 调用未迁移。新增 4 项直接模块测试。Core 574/574、专项 161/161、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 与乱码检查已通过；live 同步和现场验收将在提交后执行。
+
 - 2026-07-20 Feishu history 索引同步第一阶段迁移：新增 `channels/feishu/history/indexed-history-sync.ts`，把增量/全量分页、本地时间水位停止、成员显示名映射、删除/system/空消息过滤、历史 sticker 采集时序和单次索引 upsert 从 Feishu adapter 迁出；全量同步即使没有可读消息也保留空完成快照。adapter 改为薄包装，仅注入 OpenAPI 分页、成员查询、正文解析和 sticker 采集能力，平台凭据、附件恢复、索引检索与 prompt 组装暂不迁移。新增 3 项直接模块测试，并把增量分页回归设为 Characterization Catalog 的 history 代表项。Core 570/570、专项 157/157、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 与乱码检查已通过；live 同步和现场验收将在提交后执行。
 
 - 2026-07-20 Feishu 子系统媒体缓存迁移：新增 `channels/feishu/media/sticker-media-cache.ts`，把稳定 Hash 文件名、旧 `.jpeg` 等兼容查找、PNG/JPEG/GIF/WebP 文件头识别、大小门禁、首份缓存复用和 `FileAttachment` 恢复从 8000 行 Feishu adapter 迁出。adapter 继续拥有平台资源下载、失败冷却、sticker store 状态和入站编排，不把缓存模块扩成语义或发送策略。Characterization Catalog 新增 `media` 域并绑定既有“同 file_key 不重复下载”回归；新增直接模块测试覆盖错误 MIME、真实扩展、旧缓存、空/超限/非图片拒绝和不覆盖首份缓存。Core 567/567、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过。
