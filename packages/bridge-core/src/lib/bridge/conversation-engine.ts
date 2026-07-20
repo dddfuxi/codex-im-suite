@@ -126,6 +126,8 @@ export interface ConversationProcessOptions {
   historyLimit?: number;
   memoryMode?: 'auto' | 'off' | 'recall' | 'augment';
   extraSystemPrompt?: string;
+  /** Runtime 生成的独立策略 section；不得拼进 Agent Home 或记忆正文。 */
+  additionalPromptSections?: PromptSection[];
   /** Adapter 产生的本轮关联证据，不能依赖 system prompt 的保留长度。 */
   priorityTurnContext?: string;
   memoryPlan?: MemoryQueryPlan;
@@ -867,6 +869,7 @@ export async function processMessage(
       const composedPrompt = buildBridgeScopedPrompt(binding, session?.system_prompt || undefined, [
         { id: 'channel.extra', kind: 'identity', source: 'channel.extra_system_prompt', priority: 10, content: options?.extraSystemPrompt || '' },
         ...agentHomeSections,
+        ...(options?.additionalPromptSections || []),
         { id: 'memory.evidence', kind: 'memory', source: 'memory.retrieval', priority: 20, content: memoryPrompt },
         { id: 'execution.requirement', kind: 'execution', source: 'capability_router', priority: 30, content: executionRequirementPrompt },
         { id: 'execution.retry', kind: 'execution', source: 'capability_router.retry', priority: 31, content: retryPrompt },

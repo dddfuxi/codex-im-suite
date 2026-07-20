@@ -10,6 +10,7 @@ import type {
 
 import type { StickerFeedbackClassification, StickerFeedbackClassifier } from './feedback-classifier.js';
 import { applyAutomaticPatch, applyStickerFeedback } from './revision-policy.js';
+import { matchesConfirmedStickerAvoidRule } from './prompt-section.js';
 import type { StickerSemanticStore } from './store.js';
 import type {
   StickerAvoidRuleV1,
@@ -161,6 +162,7 @@ export function createStickerSemanticEvolutionHost(options: StickerSemanticHostO
       if (!asset || asset.archived || asset.disabled) return null;
       const revision = effectiveRevision(snapshot.revisions, input);
       if (!revision) return null;
+      if (revision.patch.avoidRules?.some((rule) => matchesConfirmedStickerAvoidRule(rule, input.contextText))) return null;
       const contextHash = crypto.createHash('sha256').update(JSON.stringify({
         fileKey: input.fileKey,
         revisionId: revision.revisionId,

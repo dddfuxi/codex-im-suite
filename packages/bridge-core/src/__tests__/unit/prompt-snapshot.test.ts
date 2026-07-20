@@ -26,4 +26,19 @@ describe('prompt snapshot', () => {
     assert.equal(snapshot.sections[0].kind, 'priority_context');
     assert.equal(snapshot.sections[0].charCount, 'reply evidence'.length);
   });
+
+  it('records the scoped sticker expression policy as its own section', () => {
+    const snapshot = createPromptSnapshot({
+      sessionId: 's3',
+      sections: [{
+        id: 'expression.sticker-semantics',
+        kind: 'expression',
+        source: 'sticker-semantics',
+        priority: 18,
+        content: '## 表达与表情包策略\n- 当前群聊可试用庆祝猫',
+      }],
+    });
+    assert.equal(snapshot.sections[0].id, 'expression.sticker-semantics');
+    assert.equal(snapshot.sections[0].kind, 'expression');
+  });
 });

@@ -7392,6 +7392,20 @@ async function handleMessage(
     // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
     // 此处仅放当前回合理解和结构化投递所必需的受控 evidence，不混入表情包或记忆写入策略。
     // 原生 mention / sender ID 必须独立保留，否则长 system prompt 会让模型知道动作协议却看不到真实目标。
+    let stickerExpressionPromptSection: Awaited<ReturnType<NonNullable<ReturnType<typeof getBridgeContext>['stickerSemantics']>['buildExpressionPromptSection']>> = null;
+    const stickerSemanticsHost = getBridgeContext().stickerSemantics;
+    if (adapter.channelType === 'feishu' && stickerSemanticsHost) {
+      try {
+        stickerExpressionPromptSection = await stickerSemanticsHost.buildExpressionPromptSection({
+          channelType: 'feishu',
+          chatId: msg.address.chatId,
+          userId: msg.address.userId,
+          maxChars: Math.max(240, Number.parseInt(store.getSetting('bridge_sticker_prompt_max_chars') || '2400', 10) || 2400),
+        });
+      } catch (error) {
+        console.warn('[bridge-manager] Sticker expression prompt unavailable:', error instanceof Error ? error.message : error);
+      }
+    }
     const priorityTurnContext = [
       structuredTurnContextPrompt,
       inboundActorContextPrompt,
@@ -7444,6 +7458,13 @@ async function handleMessage(
         feishuCloudSystemPrompt,
         recentConversationMediaPrompt,
       ].filter(Boolean).join('\n\n'),
+      additionalPromptSections: stickerExpressionPromptSection ? [{
+        id: stickerExpressionPromptSection.id,
+        kind: 'expression',
+        source: 'sticker-semantics',
+        priority: 18,
+        content: stickerExpressionPromptSection.content,
+      }] : [],
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryIntentHandled: Boolean(memoryIntentPreflight),
       responseOnly: Boolean(memoryIntentPreflight),
@@ -7604,13 +7625,30 @@ async function handleMessage(
     // This action is constructed solely from bridge-owned attachment evidence
     // and an exact model choice. It is never inferred by adapters from reply
     // text, and it authorizes this one turn only rather than durable semantics.
-    const verifiedStickerAction: VerifiedMediaAction | undefined = (
+    let verifiedStickerAction: VerifiedMediaAction | undefined = (
       stickerCandidateAnalysisResult.selectedFileKey || turnScopedAttachedStickerFileKey
     ) ? {
       kind: 'sticker',
       key: stickerCandidateAnalysisResult.selectedFileKey || turnScopedAttachedStickerFileKey,
       provenance: 'turn_attached_model_selection',
     } : undefined;
+    if (verifiedStickerAction && stickerSemanticsHost) {
+      try {
+        const authorization = await stickerSemanticsHost.authorizeSelection({
+          channelType: 'feishu',
+          chatId: msg.address.chatId,
+          userId: msg.address.userId,
+          fileKey: verifiedStickerAction.key,
+          contextText: [rawText, structuredTurnContextPrompt].filter(Boolean).join('\n\n'),
+        });
+        verifiedStickerAction = authorization?.fileKey === verifiedStickerAction.key
+          ? { ...verifiedStickerAction, semanticRevisionId: authorization.semanticRevisionId, contextHash: authorization.contextHash }
+          : undefined;
+      } catch (error) {
+        console.warn('[bridge-manager] Sticker selection authorization failed:', error instanceof Error ? error.message : error);
+        verifiedStickerAction = undefined;
+      }
+    }
     if (currentStickerAnnotation && typeof adapter.recordStickerAnnotation === 'function') {
       adapter.recordStickerAnnotation({
         ...currentStickerAnnotation,

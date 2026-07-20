@@ -26,4 +26,13 @@ describe('prompt composer', () => {
     ]);
     assert.equal(result.text, 'channel\n\nmemory\n\nbase');
   });
+
+  it('keeps sticker expression policy as an independent prompt section', () => {
+    const result = composePromptSections([
+      { id: 'expression.sticker-semantics', kind: 'expression', source: 'sticker-semantics', priority: 18, content: '表达与表情包策略' },
+      { id: 'memory', kind: 'memory', source: 'memory', priority: 20, content: 'memory' },
+    ]);
+    assert.equal(result.sections[0].id, 'expression.sticker-semantics');
+    assert.equal(result.sections[0].kind, 'expression');
+  });
 });

@@ -65,6 +65,7 @@ import { listManagedRuleStates } from './self-maintenance-rule-lifecycle.js';
 import { recordSelfMaintenanceMetric } from './self-maintenance-metrics.js';
 import { createStickerFeedbackClassifier } from './sticker-semantics/feedback-classifier.js';
 import { createStickerSemanticEvolutionHost } from './sticker-semantics/host.js';
+import { createStickerSemanticPromptBuilder } from './sticker-semantics/prompt-section.js';
 import { createStickerSemanticStore } from './sticker-semantics/store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
@@ -3185,13 +3186,17 @@ async function main(): Promise<void> {
   }
   const llm = await resolveProvider(config, pendingPerms, store, turnStorage);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
-  const stickerSemantics = config.memoryRepoDir
+  const stickerSemanticStore = config.memoryRepoDir
+    ? createStickerSemanticStore({ memoryRoot: config.memoryRepoDir })
+    : undefined;
+  const stickerSemantics = stickerSemanticStore
     ? createStickerSemanticEvolutionHost({
-        store: createStickerSemanticStore({ memoryRoot: config.memoryRepoDir }),
+        store: stickerSemanticStore,
         classifier: createStickerFeedbackClassifier({
           provider: llm,
           timeoutMs: Number.parseInt(store.getSetting('bridge_sticker_feedback_timeout_ms') || '8000', 10) || 8000,
         }),
+        promptBuilder: createStickerSemanticPromptBuilder(stickerSemanticStore),
         confirmationThreshold: Number.parseInt(store.getSetting('bridge_sticker_semantic_confirmation_threshold') || '3', 10) || 3,
       })
     : undefined;
