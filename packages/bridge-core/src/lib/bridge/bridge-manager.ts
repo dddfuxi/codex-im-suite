@@ -99,11 +99,18 @@ import {
   isFeishuDocumentGenerationRequest as isFeishuDocGenerationRequest,
   isFeishuDocumentGenerationRequestStrict as isFeishuDocGenerationRequestStrict,
   isFeishuDocumentListRequest,
-  isGenericFeishuDocumentTitle,
   sanitizeFeishuCloudDocumentLinks,
   shouldHandleFeishuOAuthCallback,
   shouldResolveFeishuCloudLinks,
 } from './channels/feishu/documents/document-request-policy.js';
+import {
+  buildFeishuDocumentCreationPlan,
+  buildFeishuDocumentFailureMessage,
+  buildFeishuDocumentGuideMeta,
+  buildFeishuDocumentGuideSyncPlan,
+  buildFeishuDocumentRecordInput,
+  buildFeishuDocumentSuccessMessage,
+} from './channels/feishu/documents/document-delivery-policy.js';
 import {
   compactBridgeReplyForDelivery,
   prepareDeliveryCandidate,
@@ -3916,7 +3923,11 @@ async function syncFeishuDocumentGuideBestEffort(
   }
 
   const configuredGuideId = store.getSetting('bridge_feishu_document_guide_doc_id') || '';
-  const guideDocumentId = configuredGuideId || meta.documentId || '';
+  const guidePlan = buildFeishuDocumentGuideSyncPlan({
+    configuredDocumentId: configuredGuideId,
+    storedDocumentId: meta.documentId,
+    ownerUserId,
+  });
   const replaceDoc = (adapter as BaseChannelAdapter & {
     replaceDocumentFromMarkdown?: (documentId: string, markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
   }).replaceDocumentFromMarkdown;
@@ -3926,26 +3937,19 @@ async function syncFeishuDocumentGuideBestEffort(
 
   try {
     let guideInfo: { documentId?: string; title: string; url: string } | null = null;
-    if (guideDocumentId && typeof replaceDoc === 'function') {
-      guideInfo = await replaceDoc.call(adapter, guideDocumentId, markdown, {
-        title: '飞书文档导览',
-        ownerUserId,
-      });
-    } else if (!guideDocumentId && typeof createDoc === 'function') {
-      guideInfo = await createDoc.call(adapter, markdown, {
-        title: '飞书文档导览',
-        ownerUserId,
-      });
+    if (guidePlan.mode === 'replace' && typeof replaceDoc === 'function') {
+      guideInfo = await replaceDoc.call(adapter, guidePlan.documentId, markdown, guidePlan.options);
+    } else if (guidePlan.mode === 'create' && typeof createDoc === 'function') {
+      guideInfo = await createDoc.call(adapter, markdown, guidePlan.options);
     }
 
     if (!guideInfo) return null;
     fs.mkdirSync(path.dirname(metaPath), { recursive: true });
-    fs.writeFileSync(`${metaPath}.tmp`, JSON.stringify({
-      documentId: guideInfo.documentId || guideDocumentId,
-      title: guideInfo.title,
-      url: guideInfo.url,
-      updatedAt: new Date().toISOString(),
-    }, null, 2), 'utf-8');
+    fs.writeFileSync(`${metaPath}.tmp`, JSON.stringify(
+      buildFeishuDocumentGuideMeta(guidePlan, guideInfo, new Date().toISOString()),
+      null,
+      2,
+    ), 'utf-8');
     fs.renameSync(`${metaPath}.tmp`, metaPath);
     return { title: guideInfo.title, url: guideInfo.url };
   } catch (err) {
@@ -6280,55 +6284,47 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     let handledAsDoc = false;
     if (feishuDocRequest && adapter.channelType === 'feishu' && responseText) {
+      handledAsDoc = true;
       const createDoc = (adapter as BaseChannelAdapter & {
         createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
       }).createDocumentFromMarkdown;
 
-        if (typeof createDoc === 'function') {
-          try {
-            const docInfo = await createDoc.call(adapter, userFacingResponseText || responseText, {
-              title: feishuDocRequest.title && !isGenericFeishuDocumentTitle(feishuDocRequest.title)
-              ? feishuDocRequest.title
-              : undefined,
-            ownerUserId: getConfiguredOwnerIds(adapter.channelType)[0],
-          });
-          recordFeishuDocumentMemory(store, {
-            title: docInfo.title,
-            url: docInfo.url,
-            documentId: docInfo.documentId,
+      if (typeof createDoc !== 'function') {
+        await deliver(adapter, {
+          address: msg.address,
+          text: buildFeishuDocumentFailureMessage('当前飞书适配器未提供文档创建能力。'),
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        }, { sessionId: effectiveBinding.codepilotSessionId });
+      } else {
+        try {
+          const ownerUserId = getConfiguredOwnerIds(adapter.channelType)[0];
+          const creationPlan = buildFeishuDocumentCreationPlan({
+            markdown: userFacingResponseText || responseText,
+            requestedTitle: feishuDocRequest.title,
+            ownerUserId,
             chatId: msg.address.chatId,
             requesterId: msg.address.userId,
             workspace: resolvedWorkingDirectory,
             sourceText: rawText,
-            markdown: userFacingResponseText || responseText,
           });
+          const docInfo = await createDoc.call(adapter, creationPlan.markdown, creationPlan.createOptions);
+          recordFeishuDocumentMemory(store, buildFeishuDocumentRecordInput(creationPlan, docInfo));
           const guideInfo = await syncFeishuDocumentGuideBestEffort(
             adapter,
             store,
-            getConfiguredOwnerIds(adapter.channelType)[0],
+            ownerUserId,
           );
-          handledAsDoc = true;
-          if (false) {
           await deliver(adapter, {
             address: msg.address,
-            text: `已生成飞书文档《${docInfo.title}》\n${docInfo.url}`,
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          }, { sessionId: effectiveBinding.codepilotSessionId });
-          }
-          await deliver(adapter, {
-            address: msg.address,
-            text: guideInfo
-              ? `已生成飞书文档《${docInfo.title}》\n${docInfo.url}\n\n文档导览已更新：${guideInfo.url}`
-              : `已生成飞书文档《${docInfo.title}》\n${docInfo.url}`,
+            text: buildFeishuDocumentSuccessMessage(docInfo, guideInfo),
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
           }, { sessionId: effectiveBinding.codepilotSessionId });
         } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : String(err);
           await deliver(adapter, {
             address: msg.address,
-            text: `飞书文档创建失败：${errorMessage}`,
+            text: buildFeishuDocumentFailureMessage(err),
             parseMode: 'plain',
             replyToMessageId: msg.messageId,
           }, { sessionId: effectiveBinding.codepilotSessionId });

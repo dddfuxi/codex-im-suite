@@ -3524,6 +3524,55 @@ describe('bridge-manager Feishu cloud documents', () => {
     assert.match(sent[0].text, /当前登录飞书用户也没有这个云文档权限/);
     assert.match(sent[0].text, /文档所有者分享/);
   });
+
+  it('does not fall back to the provider reply after Feishu document creation fails', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('# 已整理正文') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    }) as BaseChannelAdapter & {
+      createDocumentFromMarkdown?: () => Promise<{ title: string; url: string }>;
+    };
+    adapter.createDocumentFromMarkdown = async () => { throw new Error('文档 API 不可用'); };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('把内容整理成飞书文档', 'ou_1', 'oc_doc_create'),
+      raw: { feishuDocRequest: { title: '项目复盘', scopeText: '当前内容' } },
+    } as any);
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text, '飞书文档创建失败：文档 API 不可用');
+  });
+
+  it('fails clearly when a Feishu document request reaches an adapter without creation capability', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('# 已整理正文') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('把内容整理成飞书文档', 'ou_1', 'oc_doc_missing'),
+      raw: { feishuDocRequest: { title: '项目复盘', scopeText: '当前内容' } },
+    } as any);
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text, '飞书文档创建失败：当前飞书适配器未提供文档创建能力。');
+  });
 });
 
 describe('bridge-manager Feishu CLI user authorization governance', () => {
