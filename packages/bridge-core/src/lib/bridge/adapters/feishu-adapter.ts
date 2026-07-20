@@ -76,6 +76,27 @@ import {
   type FeishuStreamingCardState,
 } from '../channels/feishu/cards/streaming-card-registry.js';
 import { FeishuStreamingCardLifecycle } from '../channels/feishu/cards/streaming-card-lifecycle.js';
+import {
+  FEISHU_AT_ALL_ALIASES,
+  FEISHU_SENDER_ALIASES,
+  addFeishuMentionCandidate,
+  buildFeishuMentionCandidateFromMember,
+  buildFeishuOutboundMentionTags,
+  cleanFeishuMentionName as cleanMentionName,
+  extractVerifiedFeishuMentionCandidatesFromText as extractVerifiedMentionCandidatesFromText,
+  findFeishuMentionCandidateMatches as findOutboundMentionCandidateMatches,
+  inferFeishuDirectMessageReceiveIdType as inferDirectMessageReceiveIdType,
+  isDefinitelyNonUserFeishuMentionId as isDefinitelyNonUserMentionId,
+  normalizeFeishuMentionAlias as normalizeMentionAlias,
+  pickFeishuMentionableMemberId,
+  preferHighestEvidenceFeishuMentionCandidates as preferHighestEvidenceMentionCandidates,
+  resolveFeishuOutboundMentionTarget as resolveOutboundMentionTarget,
+  toFeishuMentionResolutionCandidates as toMentionResolutionCandidates,
+  uniqueFeishuMentionAliases as uniqueCleanStrings,
+  type FeishuChatMemberListItem,
+  type FeishuMentionCandidate,
+  type FeishuMentionCandidateEvidence,
+} from '../channels/feishu/mentions/outbound-mention-resolution.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -195,9 +216,6 @@ function escapeRegExp(text: string): string {
 const BARE_AT_TARGET_RE = /(^|[\s([{（【])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
 const BARE_AT_BOUNDARY_CLASS = '[\\s([{（【]';
 const BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
-const FEISHU_AT_ALL_ALIASES = new Set(['all', '所有人', '全体成员', '大家']);
-const FEISHU_SENDER_ALIASES = new Set(['我', '俺', '本人', '你', '用户', '发起人', '提问人', '发送者']);
-
 const BOT_NAME_WAKE_INVESTIGATE_RE = /(?:帮|看看|看一下|查|搜索|搜|找|总结|梳理|分析|解释|处理|排查|检查|修|改|写|生成|创建|读取|打开|截图|提醒|记录|记住|发给|转发|同步|部署|运行|测试|构建|发布|瞅|弄|搞|做)/iu;
 const BOT_NAME_WAKE_CHAT_RE = /(?:你觉得|你看|怎么想|在吗|你好|哈喽|hi|hello|说说|聊聊|回复|回答|为什么|怎么|能不能|可不可以|可以|是否|是不是|吗|呢|\?|？)/iu;
 const BOT_NAME_WAKE_MENTION_ACTION_RE = /(?:艾特|@|＠|mention|提到|点名|叫|喊|通知)/iu;
@@ -219,16 +237,6 @@ const FEISHU_USER_AVATAR_API_SCOPES = [
 ] as const;
 const FEISHU_OTHER_APP_AVATAR_SCOPE = 'admin:app.info:readonly';
 
-type FeishuMentionCandidateEvidence = 'native_inbound' | 'current_chat' | 'current_sender' | 'history';
-
-interface FeishuMentionCandidate {
-  userId: string;
-  name: string;
-  aliases: string[];
-  /** Sources are attached only while resolving one outbound action. */
-  evidenceSources?: FeishuMentionCandidateEvidence[];
-}
-
 const FEISHU_MENTION_SEARCH_SOURCES = [
   '本轮入站 @',
   '本地历史 @ 记录',
@@ -249,49 +257,6 @@ interface FeishuBotNameWakeClassification {
   alias: string;
   reason: 'actionable_request' | 'direct_chat' | 'mention_target_missing' | 'done_ack' | 'non_actionable';
   shouldHandle: boolean;
-}
-
-function cleanMentionName(name: string | undefined, fallback = '用户'): string {
-  const cleaned = (name || '').replace(/^@+/, '').replace(/[<>"]/g, '').trim();
-  if (!cleaned || /^o[cu]_[A-Za-z0-9_-]+$/u.test(cleaned)) return fallback;
-  return cleaned;
-}
-
-function normalizeMentionAlias(name: string | undefined): string {
-  return (name || '').replace(/^@+/, '').replace(/\s+/g, '').trim().toLowerCase();
-}
-
-function isDefinitelyNonUserMentionId(id: string | undefined): boolean {
-  const normalized = (id || '').trim().toLowerCase();
-  return /^cli_/u.test(normalized)
-    || /^app_/u.test(normalized)
-    || /^bot_/u.test(normalized);
-}
-
-function inferDirectMessageReceiveIdType(id: string): 'open_id' | 'union_id' | 'user_id' {
-  const normalized = id.trim();
-  if (/^ou_/iu.test(normalized)) return 'open_id';
-  if (/^on_/iu.test(normalized)) return 'union_id';
-  return 'user_id';
-}
-
-function extractVerifiedMentionCandidatesFromText(text: string): FeishuMentionCandidate[] {
-  const candidates: FeishuMentionCandidate[] = [];
-  const seen = new Set<string>();
-  const pattern = /<at\s+[^>]*\b(?:user_id|id)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>([\s\S]*?)<\/at>/giu;
-
-  for (const match of text.matchAll(pattern)) {
-    const userId = (match[1] || match[2] || match[3] || '').trim();
-    if (!userId || userId.toLowerCase() === 'all' || isDefinitelyNonUserMentionId(userId)) continue;
-    const name = cleanMentionName(match[4], '');
-    if (!name) continue;
-    const key = `${userId}\u0000${normalizeMentionAlias(name)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    candidates.push({ userId, name, aliases: [name] });
-  }
-
-  return candidates;
 }
 
 function extractBareAtTargets(text: string): string[] {
@@ -324,109 +289,6 @@ function firstNonEmptyString(...values: unknown[]): string {
     if (trimmed) return trimmed;
   }
   return '';
-}
-
-function uniqueCleanStrings(values: unknown[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const value of values) {
-    if (typeof value !== 'string') continue;
-    const cleaned = cleanMentionName(value, '');
-    const key = normalizeMentionAlias(cleaned);
-    if (!cleaned || !key || seen.has(key)) continue;
-    seen.add(key);
-    result.push(cleaned);
-  }
-  return result;
-}
-
-function pickFeishuMentionableMemberId(item: FeishuChatMemberListItem, allowLegacyMemberId = false): string {
-  const raw = getRawObject(item);
-  const id = getRawObject(item.id);
-  const user = getRawObject(item.user);
-  const bot = getRawObject(item.bot);
-  const directId = firstNonEmptyString(
-    item.open_id,
-    item.openId,
-    id.open_id,
-    id.openId,
-    user.open_id,
-    user.openId,
-    bot.open_id,
-    bot.openId,
-    item.user_id,
-    item.userId,
-    id.user_id,
-    id.userId,
-    user.user_id,
-    user.userId,
-    bot.user_id,
-    bot.userId,
-    item.union_id,
-    item.unionId,
-    id.union_id,
-    id.unionId,
-    user.union_id,
-    user.unionId,
-    bot.union_id,
-    bot.unionId,
-  );
-  if (directId) return directId;
-
-  const memberId = firstNonEmptyString(item.member_id, item.memberId, raw.memberId);
-  const memberIdType = firstNonEmptyString(item.member_id_type, item.memberIdType, raw.memberIdType).toLowerCase();
-  if (!memberId) return '';
-  if (['open_id', 'user_id', 'union_id'].includes(memberIdType)) return memberId;
-  // 旧 members 接口在请求 member_id_type=open_id 后只给 member_id，可继续作为普通成员候选；
-  // 新 members/list 的 bots[] 若没有类型，只接受明显的 open_id/union_id，避免把 bot_id/app_id 误当原生 @ ID。
-  if (allowLegacyMemberId || /^o[un]_/iu.test(memberId)) return memberId;
-  return '';
-}
-
-function buildFeishuMentionCandidateFromMember(item: FeishuChatMemberListItem, allowLegacyMemberId = false): FeishuMentionCandidate | null {
-  const raw = getRawObject(item);
-  const user = getRawObject(item.user);
-  const bot = getRawObject(item.bot);
-  const i18nName = getRawObject(item.i18n_name);
-  const localizedName = getRawObject(item.localized_name);
-  const userId = pickFeishuMentionableMemberId(item, allowLegacyMemberId);
-  if (!userId || isDefinitelyNonUserMentionId(userId)) return null;
-
-  const aliases = uniqueCleanStrings([
-    item.name,
-    item.user_name,
-    item.userName,
-    item.display_name,
-    item.displayName,
-    item.nickname,
-    item.en_name,
-    item.enName,
-    item.app_name,
-    item.appName,
-    item.bot_name,
-    item.botName,
-    raw.name,
-    raw.displayName,
-    raw.appName,
-    raw.botName,
-    user.name,
-    user.display_name,
-    user.displayName,
-    user.user_name,
-    user.userName,
-    bot.name,
-    bot.app_name,
-    bot.appName,
-    bot.bot_name,
-    bot.botName,
-    i18nName.zh_cn,
-    i18nName.en_us,
-    localizedName.zh_cn,
-    localizedName.en_us,
-  ]);
-  const name = aliases[0] || '';
-  if (!name) return null;
-  return { userId, name, aliases };
 }
 
 function stripFeishuReactionHintText(text: string, hint: FeishuReactionHint): string {
@@ -923,38 +785,6 @@ interface FeishuChatMemberItem {
   member_id?: string;
   member_id_type?: string;
   name?: string;
-}
-
-interface FeishuChatMemberListItem {
-  member_id?: string;
-  memberId?: string;
-  member_id_type?: string;
-  memberIdType?: string;
-  open_id?: string;
-  openId?: string;
-  user_id?: string;
-  userId?: string;
-  union_id?: string;
-  unionId?: string;
-  name?: string;
-  user_name?: string;
-  userName?: string;
-  display_name?: string;
-  displayName?: string;
-  nickname?: string;
-  en_name?: string;
-  enName?: string;
-  app_name?: string;
-  appName?: string;
-  bot_name?: string;
-  botName?: string;
-  app_id?: string;
-  appId?: string;
-  id?: { open_id?: string; openId?: string; user_id?: string; userId?: string; union_id?: string; unionId?: string };
-  user?: Record<string, unknown>;
-  bot?: Record<string, unknown>;
-  i18n_name?: Record<string, unknown>;
-  localized_name?: Record<string, unknown>;
 }
 
 interface FeishuChatIndexRecord {
@@ -4876,7 +4706,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     let text = message.text;
     let changed = false;
     for (const target of targets) {
-      const resolved = this.resolveOutboundMentionTarget(target, candidates);
+      const resolved = resolveOutboundMentionTarget(target, candidates);
       if (!resolved) continue;
 
       const key = resolved.atAll ? '__all__' : (resolved.userId || '').trim();
@@ -4916,8 +4746,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
-      const exactMatches = this.preferHighestEvidenceMentionCandidates(
-        this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'exact'),
+      const exactMatches = preferHighestEvidenceMentionCandidates(
+        findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'exact'),
       );
       const uniqueExactIds = new Set(exactMatches.map((candidate) => candidate.userId));
       if (uniqueExactIds.size === 1) {
@@ -4925,7 +4755,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           target: cleanedTarget,
           status: 'resolved',
           searchedSources: FEISHU_MENTION_SEARCH_SOURCES,
-          candidates: this.toMentionResolutionCandidates(exactMatches),
+          candidates: toMentionResolutionCandidates(exactMatches),
         };
       }
       if (uniqueExactIds.size > 1) {
@@ -4933,18 +4763,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
           target: cleanedTarget,
           status: 'ambiguous',
           searchedSources: FEISHU_MENTION_SEARCH_SOURCES,
-          candidates: this.toMentionResolutionCandidates(exactMatches),
+          candidates: toMentionResolutionCandidates(exactMatches),
         };
       }
 
-      const relatedMatches = this.preferHighestEvidenceMentionCandidates(
-        this.findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'related'),
+      const relatedMatches = preferHighestEvidenceMentionCandidates(
+        findOutboundMentionCandidateMatches(cleanedTarget, candidates, 'related'),
       );
       return {
         target: cleanedTarget,
         status: relatedMatches.length > 0 ? 'ambiguous' : 'not_found',
         searchedSources: FEISHU_MENTION_SEARCH_SOURCES,
-        candidates: this.toMentionResolutionCandidates(relatedMatches),
+        candidates: toMentionResolutionCandidates(relatedMatches),
       };
     } catch (err) {
       return {
@@ -4979,7 +4809,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text: `@${targetText}`,
       parseMode: 'plain',
     }, request.sourceMessage);
-    const resolved = this.resolveOutboundMentionTarget(targetText, candidates);
+    const resolved = resolveOutboundMentionTarget(targetText, candidates);
     if (!resolved?.userId || resolved.atAll) {
       return { ok: false, error: '无法确认目标，请直接 @ TA 或提供准确显示名' };
     }
@@ -5110,7 +4940,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           text: `@${targetText}`,
           parseMode: 'plain',
         }, request.sourceMessage);
-        const resolved = this.resolveOutboundMentionTarget(targetText, candidates);
+        const resolved = resolveOutboundMentionTarget(targetText, candidates);
         if (resolved?.userId && !resolved.atAll) {
           return {
             ok: true,
@@ -5188,27 +5018,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       aliases: string[] = [],
       evidenceSource?: FeishuMentionCandidateEvidence,
     ) => {
-      const id = (userId || '').trim();
-      const displayName = cleanMentionName(name, '');
-      // 飞书消息 @ 语法面向用户 ID；明显的 app/bot 标识不能进入原生 mention 候选。
-      if (isDefinitelyNonUserMentionId(id)) return;
-      if (!id || !displayName) return;
-      const existing = byId.get(id);
-      const mergedAliases = new Set([
-        ...(existing?.aliases || []),
-        displayName,
-        ...aliases.map((item) => cleanMentionName(item, '')).filter(Boolean),
-      ]);
-      const evidenceSources = new Set([
-        ...(existing?.evidenceSources || []),
-        ...(evidenceSource ? [evidenceSource] : []),
-      ]);
-      byId.set(id, {
-        userId: id,
-        name: existing?.name || displayName,
-        aliases: [...mergedAliases],
-        evidenceSources: [...evidenceSources],
-      });
+      addFeishuMentionCandidate(byId, { userId, name, aliases, evidenceSource });
     };
 
     this.addInboundMentionCandidates(sourceMessage, (userId, name, aliases) =>
@@ -5247,67 +5057,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return [...byId.values()];
-  }
-
-  private findOutboundMentionCandidateMatches(
-    target: string,
-    candidates: FeishuMentionCandidate[],
-    mode: 'exact' | 'related',
-  ): FeishuMentionCandidate[] {
-    const normalizedTarget = normalizeMentionAlias(target);
-    if (!normalizedTarget) return [];
-    const byId = new Map<string, FeishuMentionCandidate>();
-    for (const candidate of candidates) {
-      const aliases = [candidate.name, ...candidate.aliases]
-        .map((alias) => normalizeMentionAlias(alias))
-        .filter(Boolean);
-      const matched = mode === 'exact'
-        ? aliases.some((alias) => alias === normalizedTarget)
-        : aliases.some((alias) => (
-            alias === normalizedTarget
-            || (normalizedTarget.length >= 2 && alias.includes(normalizedTarget))
-            || (alias.length >= 2 && normalizedTarget.includes(alias))
-          ));
-      if (matched && !byId.has(candidate.userId)) {
-        byId.set(candidate.userId, candidate);
-      }
-    }
-    return [...byId.values()];
-  }
-
-  /**
-   * A display name can survive in history after a bot/app was recreated with a
-   * new mentionable ID. Resolve same-chat actions from current platform
-   * evidence first; history remains a fallback only when live evidence is
-   * unavailable. Equal-priority IDs deliberately stay ambiguous.
-   */
-  private preferHighestEvidenceMentionCandidates(candidates: FeishuMentionCandidate[]): FeishuMentionCandidate[] {
-    const evidenceRank = (candidate: FeishuMentionCandidate): number => {
-      const sources = candidate.evidenceSources || [];
-      if (sources.includes('native_inbound')) return 40;
-      if (sources.includes('current_chat')) return 30;
-      if (sources.includes('current_sender')) return 20;
-      if (sources.includes('history')) return 10;
-      return 0;
-    };
-    const highestRank = Math.max(...candidates.map(evidenceRank), Number.NEGATIVE_INFINITY);
-    return candidates.filter((candidate) => evidenceRank(candidate) === highestRank);
-  }
-
-  private toMentionResolutionCandidates(candidates: FeishuMentionCandidate[]): Array<{ name: string; aliases?: string[] }> {
-    const byName = new Map<string, { name: string; aliases?: string[] }>();
-    for (const candidate of candidates) {
-      const name = cleanMentionName(candidate.name, '');
-      if (!name || byName.has(name)) continue;
-      const aliases = uniqueCleanStrings(candidate.aliases)
-        .filter((alias) => normalizeMentionAlias(alias) !== normalizeMentionAlias(name))
-        .slice(0, 3);
-      byName.set(name, {
-        name,
-        aliases: aliases.length > 0 ? aliases : undefined,
-      });
-    }
-    return [...byName.values()].slice(0, 8);
   }
 
   private addInboundMentionCandidates(
@@ -5409,58 +5158,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return [...new Set(ids)];
   }
 
-  private resolveOutboundMentionTarget(target: string, candidates: FeishuMentionCandidate[]): OutboundMention | null {
-    const normalizedTarget = normalizeMentionAlias(target);
-    if (!normalizedTarget) return null;
-    if (FEISHU_AT_ALL_ALIASES.has(normalizedTarget)) {
-      return { atAll: true, name: '所有人' };
-    }
-
-    const matches = this.preferHighestEvidenceMentionCandidates(candidates.filter((candidate) => {
-      const aliases = [candidate.name, ...candidate.aliases];
-      return aliases.some((alias) => normalizeMentionAlias(alias) === normalizedTarget);
-    }));
-    const uniqueById = new Map(matches.map((candidate) => [candidate.userId, candidate]));
-    if (uniqueById.size !== 1) return null;
-    const candidate = [...uniqueById.values()][0];
-    return {
-      userId: candidate.userId,
-      name: candidate.name,
-    };
-  }
-
-  private buildOutboundMentionTags(message?: OutboundMessage): string[] {
-    if (!message) return [];
-    if (/<at\s+user_id=/i.test(message.text)) return [];
-
-    const resolvedMentions: OutboundMention[] = [];
-    const seen = new Set<string>();
-    const pushMention = (mention?: OutboundMention | null) => {
-      if (!mention) return;
-      const key = mention.atAll ? '__all__' : (mention.userId || '').trim();
-      if (!key || seen.has(key)) return;
-      seen.add(key);
-      resolvedMentions.push(mention);
-    };
-
-    for (const mention of message.mentions || []) {
-      pushMention(mention);
-    }
-
-    // Reply metadata is only a quote target; native Feishu mentions must be explicit.
-    return resolvedMentions.map((mention) => {
-      if (mention.atAll) {
-        return '<at user_id="all">所有人</at>';
-      }
-      const userId = (mention.userId || '').trim();
-      if (!userId) return '';
-      const name = (mention.name || '你').replace(/[<>"]/g, '').trim() || '你';
-      return `<at user_id="${userId}">${name}</at>`;
-    }).filter(Boolean);
-  }
-
   private buildFeishuTextPayload(text: string, message?: OutboundMessage): string {
-    const mentionTags = this.buildOutboundMentionTags(message);
+    const mentionTags = buildFeishuOutboundMentionTags(message);
     const body = mentionTags.length > 0
       ? `${mentionTags.join(' ')}${text.trim() ? `\n${text}` : ''}`
       : text;
@@ -5661,20 +5360,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const errors: unknown[] = [];
     const addCandidate = (candidate: FeishuMentionCandidate | null) => {
       if (!candidate) return;
-      const id = (candidate.userId || '').trim();
-      const name = cleanMentionName(candidate.name, '');
-      if (!id || !name || isDefinitelyNonUserMentionId(id)) return;
-      const existing = byId.get(id);
-      const aliases = new Set([
-        ...(existing?.aliases || []),
-        name,
-        ...candidate.aliases.map((item) => cleanMentionName(item, '')).filter(Boolean),
-      ]);
-      byId.set(id, {
-        userId: id,
-        name: existing?.name || name,
-        aliases: [...aliases],
-      });
+      addFeishuMentionCandidate(byId, candidate);
     };
 
     try {

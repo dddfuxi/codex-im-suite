@@ -163,6 +163,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/channels/feishu/cards/cardkit-compat.ts` 统一探测完整 CardKit v2/v1 SDK 能力面，优先 v2，并封装 card create、stream content、streaming mode 与 final update 的请求结构差异。模块只调用 adapter 注入的 SDK 方法，不持有凭据、chat/message 身份或 active card 状态；真实 IM 卡片消息创建和最终 sticker/reaction 平台动作仍由 adapter 编排。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/cards/streaming-card-registry.ts` 统一保存 active card 与创建中 promise，负责重复创建合并、初始状态、单卡删除和 adapter stop 全量清理，并确保 throttle/typewriter 两类 timer 总是成对释放。模块不推进 sequence、不构造可见内容，也不调用 Feishu API 或持久化出站引用。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/cards/streaming-card-lifecycle.ts` 统一管理文本更新的即时/尾缘节流、工具状态触发的打字机重启、字符步进、stream sequence、创建中等待、关闭 streaming、最终状态/耗时卡片构造，以及成功或失败后的状态清理。真实 CardKit 调用、表情包/reaction 解析和耐久出站引用通过 adapter 回调注入，因此生命周期模块可用确定性时钟和调度器单测，不持有 SDK Client、凭据或平台存储。
+- `packages/bridge-core/src/lib/bridge/channels/feishu/mentions/outbound-mention-resolution.ts` 统一处理新版/旧版成员 payload 的 open/user/union ID 选择、app/bot ID 排除、别名清洗、候选合并、`native_inbound > current_chat > current_sender > history` 证据排序、同级多 ID 歧义保留、related inspection 候选和 text/post 原生 `<at>` 标签构造。adapter 继续负责本轮原生 evidence、当前 sender、历史文件与群成员网络查询，并只把这些真实来源交给纯解析模块；模块不调用 Feishu API、不读取历史目录，也不信任模型输出的用户 ID。
 
 渐进迁移顺序：
 

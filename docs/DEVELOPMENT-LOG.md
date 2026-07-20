@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu mentions 第一阶段迁移：新增 `channels/feishu/mentions/outbound-mention-resolution.ts`，把成员 payload 多版本兼容、open/user/union ID 选择、app/bot ID 排除、别名清洗、候选按 ID 合并、`native_inbound > current_chat > current_sender > history` 证据优先级、同级歧义保持、related inspection、历史 `<at>` 提取、DM receive ID 类型和原生标签构造从 adapter 迁出。adapter 仍负责当前 sender、本轮原生 mention、历史文件、群成员 API 和实际消息发送。新增 6 项直接模块测试，RED 为模块不存在，GREEN 后 mention/adapter 专项 165/165、Core 605/605、typecheck 通过；边界、人类文档、架构、UTF-8、live 和飞书现场验收按阶段提交链继续执行。下一阶段迁移入站原生 @/结构化卡片检测与 bot wake 分类。
+
 - 2026-07-20 Feishu cards 第三阶段收口：新增 `channels/feishu/cards/streaming-card-lifecycle.ts`，把文本即时/尾缘节流、打字机字符推进、tool 状态重启、stream sequence、创建中等待、关闭 streaming、最终状态/耗时构造和成功失败必清理从 adapter 迁出；adapter 改为只注入真实 CardKit SDK 调用、sticker/reaction 最终动作和出站引用持久化。新增 5 项确定性时钟/调度器直接测试，验证 RED 为模块不存在、GREEN 后 lifecycle 5/5、adapter + cards/markdown 专项 190/190、Core 599/599、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。cards 子系统拆分完成，下一子域进入 mentions。
 
 - 2026-07-20 Feishu cards 第二阶段迁移：新增 `channels/feishu/cards/streaming-card-registry.ts`，统一每个 chat 的 active card、创建中 promise 去重、初始状态、单卡删除和 adapter stop 全量清理；原 adapter 的两个 Map 与状态接口已移除。注册表在 finalize、message end、异常清理和 stop 时同时清除 throttle/typewriter 两类 timer，修复旧 stop 只清 throttle timer、可能遗留打字机回调的生命周期缺口。新增 4 项直接模块测试；Core 594/594、adapter + cards/markdown 专项 185/185、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 同步和现场验收将在提交后执行。
