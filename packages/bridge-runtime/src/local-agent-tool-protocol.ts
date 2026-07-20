@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import type { ExecutionRequirementKind } from 'claude-to-im/src/lib/bridge/host.js';
+import type { ExecutionRequirementKind } from 'claude-to-im/host';
 import { maskSecrets } from './logger.js';
 
 export interface JsonToolRequest {

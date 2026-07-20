@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { StickerDeliveryEvidence } from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+import type { StickerDeliveryEvidence } from 'claude-to-im/policy';
 
 import { buildStickerSemanticHumanReadableProjections } from './human-readable-projection.js';
 import type {

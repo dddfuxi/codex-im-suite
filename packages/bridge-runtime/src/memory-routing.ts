@@ -3,7 +3,7 @@ import type {
   MemoryReplyDecision,
   RetrievedMemoryContext,
   RetrievedMemoryHit,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 
 const EXPLICIT_RECALL_PATTERNS = [
   /你还记得/u,

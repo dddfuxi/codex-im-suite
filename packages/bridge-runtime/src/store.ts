@@ -34,8 +34,8 @@ import type {
   MemoryWriteCandidate,
   MemoryWriteClassification,
   PromptSnapshotRecord,
-} from 'claude-to-im/src/lib/bridge/host.js';
-import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
+} from 'claude-to-im/host';
+import type { ChannelBinding, ChannelType } from 'claude-to-im/channel';
 import { CTI_HOME } from './config.js';
 import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReviewInput } from './answer-review.js';
 import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';

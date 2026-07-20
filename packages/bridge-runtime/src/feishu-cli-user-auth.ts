@@ -8,7 +8,7 @@ import type {
   FeishuCliUserAuthBeginResult,
   FeishuCliUserAuthHost,
   FeishuOAuthManualResumeRequest,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 
 const execFileAsync = promisify(execFile);
 

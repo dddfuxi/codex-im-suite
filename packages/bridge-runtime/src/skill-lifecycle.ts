@@ -7,8 +7,8 @@ import type {
   SkillLifecycleApprovalRecord,
   SkillRegistryItem,
   SkillRegistrySnapshot,
-} from 'claude-to-im/src/lib/bridge/host.js';
-import { shouldSearchSkillCatalog, type SkillChangeKind, type SkillRiskLevel, type SkillSourceClass } from 'claude-to-im/src/lib/bridge/agent-architecture.js';
+} from 'claude-to-im/host';
+import { shouldSearchSkillCatalog, type SkillChangeKind, type SkillRiskLevel, type SkillSourceClass } from 'claude-to-im/policy';
 import { CODEX_HOME, CTI_HOME } from './config.js';
 import type { OfficialSkillListItem, OfficialSkillTools, SkillValidationResult } from './official-skill-tools.js';
 import type { SkillRegistry } from './skill-registry.js';

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 import { normalizeExecutorId, type Config } from './config.js';
 import { readLocalModelCapabilityProfile } from './local-model-capability.js';

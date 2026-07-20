@@ -1,12 +1,12 @@
 import crypto from 'node:crypto';
 
-import type { StickerSemanticEvolutionHost } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StickerSemanticEvolutionHost } from 'claude-to-im/host';
 import type {
   StickerExpressionPromptSection,
   StickerFeedbackCandidate,
   StickerFeedbackResult,
   StickerSelectionRequest,
-} from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+} from 'claude-to-im/policy';
 
 import type { StickerFeedbackClassification, StickerFeedbackClassifier } from './feedback-classifier.js';
 import { applyAutomaticPatch, applyStickerFeedback } from './revision-policy.js';

@@ -5,13 +5,13 @@ import path from 'node:path';
 import type {
   DeniedWorkspaceRoot,
   TurnWorkspacePlan,
-} from 'claude-to-im/src/lib/bridge/workspace-plan.js';
+} from 'claude-to-im/workspace';
 import type {
   ScheduledTaskActionHost,
   ScheduledTaskActorInput,
   ScheduledTaskCreateInput,
   ScheduledTaskMutationResult,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 
 import {
   executeScheduledTaskRun,

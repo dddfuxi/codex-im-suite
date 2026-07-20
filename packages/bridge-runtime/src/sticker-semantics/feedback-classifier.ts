@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider } from 'claude-to-im/host';
 import type {
   StickerDeliveryEvidence,
   StickerFeedbackCandidate,
-} from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+} from 'claude-to-im/policy';
 
 import type { StickerAvoidRuleV1, StickerSemanticScopeName } from './types.js';
 

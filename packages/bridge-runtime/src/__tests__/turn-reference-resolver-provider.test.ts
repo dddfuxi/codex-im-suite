@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider, StreamChatParams } from 'claude-to-im/host';
 import {
   createTurnEvidenceEnvelope,
   resolveTurnFocus,
-} from 'claude-to-im/src/lib/bridge/turn-context.js';
+} from 'claude-to-im/evidence';
 
 describe('ProviderTurnReferenceResolverHost', () => {
   it('returns a strict JSON focus decision without tools or conversation history', async () => {

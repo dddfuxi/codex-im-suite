@@ -42,8 +42,8 @@ import type {
   LLMProvider,
   StreamChatParams,
   TurnStorageHost,
-} from 'claude-to-im/src/lib/bridge/host.js';
-import { formatPriorityTurnContext } from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
+import { formatPriorityTurnContext } from 'claude-to-im/host';
 
 import type { Config } from './config.js';
 import { buildToolSandboxPolicy, inferCapabilities, listMavisReadOnlyForbiddenCapabilities, MAVIS_READ_ONLY_ALLOWED_CAPABILITIES } from './executor-registry.js';

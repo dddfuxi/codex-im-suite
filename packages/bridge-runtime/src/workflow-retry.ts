@@ -2,7 +2,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuCloudLinkResolveResult,
   StreamChatParams,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import type { WorkflowRun } from './workflow-status.js';
 
 export type WorkflowRetryExecutionPreparation =

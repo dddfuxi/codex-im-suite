@@ -1,4 +1,4 @@
-import { AGENT_ARCHITECTURE_LAYERS } from '../../../../../packages/bridge-core/src/lib/bridge/agent-architecture.js';
+import { AGENT_ARCHITECTURE_LAYERS } from 'claude-to-im/architecture';
 
 export type ArchitectureBlueprintItem = {
   id: string;

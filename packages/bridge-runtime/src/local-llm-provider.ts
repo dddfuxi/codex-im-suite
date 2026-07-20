@@ -1,4 +1,4 @@
-import { formatPriorityTurnContext, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type StreamChatParams } from 'claude-to-im/host';
 
 import type { Config } from './config.js';
 import {

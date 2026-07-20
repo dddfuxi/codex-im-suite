@@ -14,7 +14,7 @@ import type {
   StoredTurnFile,
   TurnStorageHost,
   TurnStorageScope,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import { CODEX_HOME, CTI_HOME, type Config } from './config.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import {

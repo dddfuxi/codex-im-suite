@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import type {
   StickerDeliveryEvidence,
   StickerFeedbackCandidate,
-} from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+} from 'claude-to-im/policy';
 
 import { createStickerSemanticEvolutionHost } from '../sticker-semantics/host.js';
 import { createStickerSemanticStore } from '../sticker-semantics/store.js';

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { LLMProvider, StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider, StreamChatParams } from 'claude-to-im/host';
 import type {
   StickerDeliveryEvidence,
   StickerFeedbackCandidate,
-} from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+} from 'claude-to-im/policy';
 
 import { createStickerFeedbackClassifier } from '../sticker-semantics/feedback-classifier.js';
 

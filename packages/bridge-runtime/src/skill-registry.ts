@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { SkillRegistryItem, SkillRegistrySnapshot } from 'claude-to-im/src/lib/bridge/host.js';
+import type { SkillRegistryItem, SkillRegistrySnapshot } from 'claude-to-im/host';
 import { CODEX_HOME, CTI_HOME, resolveSuiteRoot } from './config.js';
 
 interface SkillManifest {

@@ -1,8 +1,8 @@
 import {
   isExecutionEvidenceSatisfied,
   type ExecutionRequirement,
-} from 'claude-to-im/src/lib/bridge/execution-requirement.js';
-import type { InputEvidenceKind } from 'claude-to-im/src/lib/bridge/input-evidence.js';
+} from 'claude-to-im/evidence';
+import type { InputEvidenceKind } from 'claude-to-im/evidence';
 
 export interface RuntimeExecutionEvidenceInput {
   requirement?: ExecutionRequirement;

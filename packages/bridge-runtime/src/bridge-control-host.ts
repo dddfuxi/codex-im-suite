@@ -7,7 +7,7 @@ import type {
   BridgeControlHost,
   BridgeRestartRequest,
   BridgeRestartScheduleResult,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import { CTI_HOME } from './config.js';
 
 interface DetachedChild {

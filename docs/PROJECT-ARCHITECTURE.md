@@ -23,6 +23,8 @@
 - `config/*.d` 负责 manifest 驱动的扩展与内建运行单元发现。
 - `scripts` 负责构建、同步、打包、发布。
 
+跨包依赖通过稳定公共出口收口：`bridge-core/src/index.ts` 是 Application Facade，`host/evidence/policy/channel/workspace/runtime-audit` 面向 Node Runtime，`architecture` 是控制面板 Web 可消费的浏览器安全元数据出口。`package.json exports` 不再发布 `src/lib` 通配符，Runtime 和测试不能穿透 package 内部目录；`scripts/check-dependency-boundaries.mjs` 同时拦截深层导入、跨包源码相对路径、Web 引入 Node-only policy 和 `bridge-core -> runtime` 反向依赖。
+
 ### 1.1 系统上下文图
 
 ```mermaid

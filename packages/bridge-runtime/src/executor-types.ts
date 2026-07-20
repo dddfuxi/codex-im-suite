@@ -1,4 +1,4 @@
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 export type ExecutorKind = 'cli' | 'agent' | 'local_model' | 'mcp';
 export type ExecutorRiskLevel = 'read_only' | 'workspace_write' | 'system';

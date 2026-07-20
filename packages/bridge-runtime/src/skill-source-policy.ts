@@ -4,7 +4,7 @@ import {
   type SkillLifecycleAction,
   type SkillRiskLevel,
   type SkillSourceClass,
-} from 'claude-to-im/src/lib/bridge/agent-architecture.js';
+} from 'claude-to-im/policy';
 import path from 'node:path';
 
 export interface SkillSourcePolicyInput {

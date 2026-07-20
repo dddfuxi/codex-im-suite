@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { ExtensionActionActor } from 'claude-to-im/src/lib/bridge/host.js';
+import type { ExtensionActionActor } from 'claude-to-im/host';
 import { createOfficialSkillTools } from './official-skill-tools.js';
 import { createSkillLifecycleService, type SkillLifecycleService } from './skill-lifecycle.js';
 import { createSkillRegistry } from './skill-registry.js';

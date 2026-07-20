@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { FeishuCloudDocumentHost } from 'claude-to-im/src/lib/bridge/host.js';
+import type { FeishuCloudDocumentHost } from 'claude-to-im/host';
 import type { WorkflowRun } from '../workflow-status.js';
 import { prepareWorkflowRetryExecution } from '../workflow-retry.js';
 

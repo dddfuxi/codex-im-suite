@@ -1,4 +1,4 @@
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider } from 'claude-to-im/host';
 import {
   planConfiguredJsonToolRequest,
   type McpToolCallDefinition,

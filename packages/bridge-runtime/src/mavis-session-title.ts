@@ -11,7 +11,7 @@
  * mavis-created sessions when listing them.
  */
 
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 const MAX_TITLE_LEN = 64;
 const MAX_PROMPT_SUMMARY_LEN = 30;

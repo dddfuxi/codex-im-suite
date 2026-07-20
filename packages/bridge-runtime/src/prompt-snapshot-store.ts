@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { PromptSnapshotRecord } from 'claude-to-im/src/lib/bridge/host.js';
+import type { PromptSnapshotRecord } from 'claude-to-im/host';
 import { CTI_HOME } from './config.js';
 
 export interface PromptSnapshotStoreState {

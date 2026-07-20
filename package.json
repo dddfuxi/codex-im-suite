@@ -17,6 +17,8 @@
     "typecheck:contracts": "npm --workspace @codex-im-suite/contracts run typecheck",
     "test:core": "npm --workspace packages/bridge-core test",
     "test:runtime": "npm --workspace packages/bridge-runtime test",
+    "test:boundaries": "node --test scripts/__tests__/dependency-boundaries.test.mjs",
+    "check:boundaries": "node scripts/check-dependency-boundaries.mjs",
     "validate:extensions": "powershell -ExecutionPolicy Bypass -File ./scripts/validate-extension-manifests.ps1"
   },
   "engines": {

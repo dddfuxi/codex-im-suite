@@ -1,4 +1,4 @@
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 import type { Config } from './config.js';
 import type { LocalRouterMode } from './local-llm-status.js';

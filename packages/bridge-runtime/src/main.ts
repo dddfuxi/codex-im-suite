@@ -9,23 +9,22 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { initBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
-import * as bridgeManager from 'claude-to-im/src/lib/bridge/bridge-manager.js';
+import { initBridgeContext } from 'claude-to-im';
+import * as bridgeManager from 'claude-to-im';
 import {
   getWorkspacePlanRoots,
   resolveTurnWorkspacePlan,
-} from 'claude-to-im/src/lib/bridge/workspace-plan.js';
-import 'claude-to-im/src/lib/bridge/adapters/index.js';
+} from 'claude-to-im/workspace';
 import {
   classifyToolResultQuality,
   type ExecutionRequirement,
-} from 'claude-to-im/src/lib/bridge/execution-requirement.js';
-import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from 'claude-to-im/src/lib/bridge/input-evidence.js';
+} from 'claude-to-im/evidence';
+import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from 'claude-to-im/evidence';
 import {
   initializeBridgeRuntimeAudit,
   recordBridgeRuntimeExit,
   touchBridgeRuntimeHeartbeat,
-} from 'claude-to-im/src/lib/bridge/runtime-audit.js';
+} from 'claude-to-im/runtime-audit';
 import './adapters/weixin-adapter.js';
 
 import type {
@@ -41,11 +40,11 @@ import type {
   SelfMaintenanceResult,
   TurnReferenceResolutionInput,
   TurnReferenceResolverHost,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import {
   createTurnReferenceResolverSnapshot,
   type AgentTurnFocusDecisionInput,
-} from 'claude-to-im/src/lib/bridge/turn-context.js';
+} from 'claude-to-im/evidence';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { JsonFileStore } from './store.js';

@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { StreamChatParams, TurnStorageHost } from 'claude-to-im/src/lib/bridge/host.js';
-import { isDangerousInput, isPathWithinAllowedRoots, splitWorkspacePathList } from 'claude-to-im/src/lib/bridge/security/validators.js';
+import type { StreamChatParams, TurnStorageHost } from 'claude-to-im/host';
+import { isDangerousInput, isPathWithinAllowedRoots, splitWorkspacePathList } from 'claude-to-im/policy';
 
 import { CTI_HOME, type Config } from './config.js';
 import {

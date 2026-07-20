@@ -1,4 +1,4 @@
-import type { StickerExpressionPromptSection } from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+import type { StickerExpressionPromptSection } from 'claude-to-im/policy';
 
 import type { StickerSemanticStore } from './store.js';
 import type {

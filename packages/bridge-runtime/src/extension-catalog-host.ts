@@ -10,7 +10,7 @@ import type {
   ExtensionCatalogItemSummary,
   ExtensionInstallPrepareInput,
   ExtensionRemovePrepareInput,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import { CTI_HOME } from './config.js';
 import type { SkillLifecycleService } from './skill-lifecycle.js';
 

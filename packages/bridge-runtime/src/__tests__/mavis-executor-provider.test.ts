@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 import type { Config } from '../config.js';
 import { MavisExecutorProvider, MavisSafetyError, __internals, isMavisTerminalAutoRetryable, MAVIS_TERMINAL_AUTO_RETRYABLE } from '../mavis-executor-provider.js';

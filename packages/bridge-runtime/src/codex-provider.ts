@@ -14,8 +14,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
-import { buildProviderInputEvidenceReceipt } from 'claude-to-im/src/lib/bridge/input-evidence.js';
+import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } from 'claude-to-im/host';
+import { buildProviderInputEvidenceReceipt } from 'claude-to-im/evidence';
 import type { PendingPermissions } from './permission-gateway.js';
 import { CTI_HOME } from './config.js';
 import { resolveProviderWorkspace } from './provider-workspace.js';

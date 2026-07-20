@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import type { StreamChatParams } from 'claude-to-im/host';
 
 import type { Config } from '../config.js';
 import { MavisExecutorProvider } from '../mavis-executor-provider.js';
@@ -12,7 +12,7 @@ import { ExecutorProviderRegistry } from '../executor-provider-registry.js';
 import type {
   ExecutorRequest,
 } from '../executor-types.js';
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider } from 'claude-to-im/host';
 import type {
   MavisClient,
   MavisSessionInfo,

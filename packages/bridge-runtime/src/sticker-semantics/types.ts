@@ -1,7 +1,7 @@
 import type {
   StickerDeliveryEvidence,
   StickerRevisionStatus,
-} from 'claude-to-im/src/lib/bridge/sticker-semantic-evolution.js';
+} from 'claude-to-im/policy';
 
 export type StickerSemanticActor = 'control-panel' | 'feedback' | 'manual' | 'migration';
 export type StickerSemanticScopeName = 'global' | 'chat' | 'user';

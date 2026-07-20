@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider } from 'claude-to-im/host';
 
 describe('ProviderMemoryIntentHost', () => {
   it('treats project-scoped mapping records as durable memory candidates even without a remember verb', async () => {

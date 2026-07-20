@@ -2,7 +2,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuCloudLinkResolveInput,
   FeishuCloudLinkResolveResult,
-} from 'claude-to-im/src/lib/bridge/host.js';
+} from 'claude-to-im/host';
 import type { FeishuAuthorizationInput, FeishuAuthorizationResult } from './feishu-oauth.js';
 import {
   FEISHU_OAUTH_BASE_SCOPES,

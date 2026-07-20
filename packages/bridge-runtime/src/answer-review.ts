@@ -1,4 +1,4 @@
-import type { MemoryQueryPlan, RetrievedMemoryHit } from 'claude-to-im/src/lib/bridge/host.js';
+import type { MemoryQueryPlan, RetrievedMemoryHit } from 'claude-to-im/host';
 
 import { repairLikelyMojibakeText } from './mojibake.js';
 import { decideMemoryReply, inferStructuredMemories, isLowValueMemoryText } from './memory-routing.js';

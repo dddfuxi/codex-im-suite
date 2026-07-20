@@ -18,7 +18,7 @@
  *   (v3.3 P1 — `@hint` strictly wins over `sessionDefault`).
  */
 
-import type { LLMProvider } from 'claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider } from 'claude-to-im/host';
 
 import type { Config } from './config.js';
 import { selectExecutor } from './executor-registry.js';

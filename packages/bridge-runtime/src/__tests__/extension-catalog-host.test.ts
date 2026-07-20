@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createExtensionCatalogHost } from '../extension-catalog-host.js';
-import type { ExtensionCatalogItemSummary } from 'claude-to-im/src/lib/bridge/host.js';
+import type { ExtensionCatalogItemSummary } from 'claude-to-im/host';
 import type { SkillLifecycleService } from '../skill-lifecycle.js';
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-ext-host-'));
