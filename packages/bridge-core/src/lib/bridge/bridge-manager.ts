@@ -77,6 +77,22 @@ import {
   stripFeishuPlaceholderMentionText,
   type FeishuMentionIntentOptions,
 } from './application/mentions.js';
+import {
+  STICKER_ANNOTATION_FENCE,
+  STICKER_CANDIDATE_ANALYSIS_FENCE,
+  addFeishuStickerHintForExplicitRequest,
+  buildStickerAnnotationFallbackPrompt,
+  buildStickerAnnotationSystemPrompt,
+  buildStickerCandidateAnalysisSystemPrompt,
+  buildStickerChatPrompt,
+  extractStickerAnnotationFromReply,
+  extractStickerCandidateAnalysisFromReply,
+  hasLeadingFeishuStickerHint,
+  isExplicitStickerSendRequest,
+  resolveTurnScopedAttachedStickerSelection,
+  suppressFeishuStickerHintForInboundStickerReply,
+  type StickerAnnotationPayload,
+} from './application/stickers.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -130,9 +146,6 @@ import {
 const GLOBAL_KEY = '__bridge_manager__';
 const execFileAsync = promisify(execFile);
 const FINAL_REPLY_FENCE = 'cti-final';
-const STICKER_ANNOTATION_FENCE = 'cti-sticker-annotation';
-const STICKER_CANDIDATE_ANALYSIS_FENCE = 'cti-sticker-candidate-analysis';
-const STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE = 0.45;
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
 const PENDING_SYSTEM_ACTIONS_KEY = '__bridge_pending_system_actions__';
@@ -1765,134 +1778,6 @@ function loadRecentConversationImageAttachments(
   return files;
 }
 
-function buildStickerChatPrompt(rawText: string, hasVisualReference: boolean): string {
-  const text = rawText.trim();
-  return [
-    text || '用户发送了一个飞书表情包。',
-    '',
-    '这是一条轻量聊天消息。请把表情包当作聊天语气信号来理解，再像普通聊天一样简短自然地回应。',
-    hasVisualReference
-      ? '可以根据表情包画面判断情绪、态度或玩笑语气，但最终回复要直接接话，不要写成“图片里是……”的说明报告。'
-      : '如果没有可用图片或已学习语义，只能根据上下文轻量回应，不要凭 file_key 猜具体图案。',
-    '只有用户明确要求解释表情包时，才展开说明图案、文字或含义。',
-  ].join('\n');
-}
-
-function isExplicitStickerSendRequest(text: string): boolean {
-  const normalized = text.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
-  if (!normalized || normalized.length > 80) return false;
-  if (/(?:不要|别|不用|禁止|别发|不要发)(?:.*?)(?:表情包|表情|sticker|贴纸)/iu.test(normalized)) return false;
-  if (/(?:为什么|为何|原因|问题|失败|不能|不会|识别|解释|含义|意思)/iu.test(normalized)) return false;
-  const hasStickerNoun = /(?:表情包|表情|sticker|贴纸)/iu.test(normalized);
-  const hasSendIntent = /(?:发|发送|回|回复|来|整|丢|贴|用|给|send|reply|post)/iu.test(normalized);
-  return hasStickerNoun && hasSendIntent;
-}
-
-/**
- * Generic one-sticker requests may carry a trusted adapter-preferred key, but
- * that key is only evidence for the agent/renderer. The bridge must not send
- * it before the provider has judged the full turn; otherwise compound requests
- * get truncated into a platform media action.
- */
-function isGenericSingleStickerSendRequest(text: string): boolean {
-  if (!isExplicitStickerSendRequest(text)) return false;
-  const normalized = text.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
-  if (/(?:两|二|2|几|多)(?:个|张)?(?:表情包|表情|sticker|贴纸)/iu.test(normalized)) return false;
-  if (/(?:随便|随机)/iu.test(normalized)) return true;
-  return /^(?:(?:请|帮我|给我|来|发|回|回复|整|丢|贴|用|给))*(?:一|1)?(?:个|张)?(?:表情包|表情|sticker|贴纸)(?:吧|呀|啊|呗|喽|嘛|呢|了)?$/iu.test(normalized);
-}
-
-function hasLeadingExpressionHint(text: string): boolean {
-  return /^\s*\[[^\]\r\n]{1,40}\]/u.test(text);
-}
-
-function isLightweightStickerFallbackAnswer(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.length > 120) return false;
-  if (hasLeadingExpressionHint(trimmed)) return false;
-  if (/```|<[^>]+>|cti-|tool_|```json|^\s*[#>|-]\s/mu.test(trimmed)) return false;
-  return true;
-}
-
-function stripLeadingFeishuStickerHint(text: string): string {
-  return text.replace(/^\s*\[表情包(?::[^\]\r\n]{1,180})?\]\s*/u, '').trimStart();
-}
-
-function suppressFeishuStickerHintForInboundStickerReply(text: string): string {
-  if (!hasLeadingFeishuStickerHint(text)) return text;
-  // 入站表情包消息的 provider 回复只允许把表情包当语气证据理解；
-  // 即使模型误输出动作 hint，也不能把“用户发来了表情包”的事实误转成“机器人再发一个表情包”。
-  return stripLeadingFeishuStickerHint(text) || '收到这个表情包了。';
-}
-
-function hasLeadingFeishuStickerHint(text: string): boolean {
-  return /^\s*\[表情包(?::[^\]\r\n]{1,180})?\]/u.test(text || '');
-}
-
-function isStickerSendPlaceholderText(text: string): boolean {
-  const normalized = text
-    .normalize('NFKC')
-    .replace(/[✅✔️☑️~～!！。.\s]+/gu, '')
-    .trim();
-  if (!normalized || normalized.length > 40) return false;
-  if (/(?:不乱发|不确定|看不清|没看清|不可读|没有可靠|不合适|不适合|不能|无法|不要|别发|不发)/u.test(normalized)) {
-    return false;
-  }
-  return /(?:给你(?:来)?一个|发(?:你)?一个|丢一个|上一个|贴一个|安排|来啦|来了|好呀|可以)/u.test(normalized);
-}
-
-function addFeishuStickerHintForExplicitRequest(
-  userText: string,
-  answerText: string,
-  selectedFileKey?: string,
-  options?: { allowBareFallback?: boolean },
-): string {
-  if (!isExplicitStickerSendRequest(userText)) return answerText;
-  const selected = selectedFileKey?.trim() || '';
-  if (selected && /^[A-Za-z0-9_-]{3,160}$/.test(selected)) {
-    const visibleText = stripLeadingFeishuStickerHint(answerText) || '给你一个。';
-    return `[表情包:${selected}] ${visibleText}`;
-  }
-  const allowBareFallback = options?.allowBareFallback !== false;
-  if (!allowBareFallback) {
-    const visibleText = stripLeadingFeishuStickerHint(answerText);
-    if (!visibleText || (hasLeadingFeishuStickerHint(answerText) && isStickerSendPlaceholderText(visibleText))) {
-      return '这个表情包候选还没有可靠语义，我先不乱发。';
-    }
-    return visibleText;
-  }
-  if (hasLeadingExpressionHint(answerText)) return answerText;
-  if (!isLightweightStickerFallbackAnswer(answerText)) return answerText;
-  return `[表情包] ${answerText.trim()}`;
-}
-
-function buildStickerAnnotationSystemPrompt(fileKey?: string): string {
-  const expectedFileKey = fileKey?.trim() || '';
-  return [
-    'Feishu sticker semantic annotation:',
-    '- If this turn includes a Feishu sticker image attachment, answer the user naturally first.',
-    '- This annotation turn is not a request to send a sticker. Do not start the visible reply with `[表情包]`, `[表情包:file_key]`, or any sticker action unless the current user explicitly asks you to send a sticker.',
-    '- Do not invoke image generation, imagegen, asset creation, or shortcut sticker sending for this annotation turn; only inspect the attached existing sticker image.',
-    `- Then append exactly one fenced \`${STICKER_ANNOTATION_FENCE}\` JSON block so the bridge can cache the sticker meaning for future semantic selection.`,
-    expectedFileKey ? `- The JSON fileKey must be exactly "${expectedFileKey}".` : '- Use the current sticker fileKey from the user message.',
-    '- JSON fields: fileKey, label, description, intent, tone, usage, aliases, confidence.',
-    '- Keep label and aliases short. Use confidence from 0 to 1. If the image is unclear, use a low confidence and only include what is visible.',
-    '- If the message includes a user-provided sticker meaning, treat it as an unverified claim. Inspect the image first; when the claim conflicts with visible text, character, tone, or context, annotate from the image facts instead of repeating the claim.',
-    '- The fenced annotation block is machine-readable metadata and will be removed before sending the visible reply.',
-  ].join('\n');
-}
-
-function buildStickerAnnotationFallbackPrompt(fileKey: string): string {
-  return [
-    'Generate only machine-readable Feishu sticker semantic metadata for the attached existing sticker image.',
-    `Current sticker fileKey: ${fileKey}`,
-    `Output exactly one fenced \`${STICKER_ANNOTATION_FENCE}\` JSON block and no other text.`,
-    'The JSON must describe visible image facts: fileKey, label, description, intent, tone, usage, aliases, confidence.',
-    'Do not send, choose, create, search, or generate any sticker/image. Do not use `[表情包]` action hints.',
-    'If the image is unreadable, still use the same JSON shape with low confidence and only concrete visible facts.',
-  ].join('\n');
-}
-
 async function collectTextFromLlmSseStream(stream: ReadableStream<string>, maxChars = 6000): Promise<string> {
   const reader = stream.getReader();
   let pending = '';
@@ -1978,25 +1863,6 @@ async function runInvisibleStickerAnnotationFallback(input: {
     console.warn('[bridge-manager] Invisible sticker annotation fallback failed:', err instanceof Error ? err.message : err);
     return null;
   }
-}
-
-function buildStickerCandidateAnalysisSystemPrompt(attachedFileKeys: string[], requestText: string): string {
-  const allowed = attachedFileKeys.map((item) => item.trim()).filter(Boolean);
-  if (allowed.length === 0) return '';
-  return [
-    'Feishu sticker candidate vision analysis:',
-    '- This turn includes sticker library candidate images attached by the bridge. Inspect the actual images before deciding.',
-    '- This is an existing-sticker analysis turn, not an asset-creation task: do not read or invoke skills, do not call imagegen or any image-generation tool, and do not create, search for, or attach new image files.',
-    `- After the visible reply, append exactly one fenced \`${STICKER_CANDIDATE_ANALYSIS_FENCE}\` JSON block. The bridge removes this block before sending.`,
-    `- Allowed fileKey values for this turn: ${allowed.join(', ')}`,
-    requestText.trim() ? `- User sticker request: ${requestText.trim()}` : '',
-    '- JSON schema: { "selectedFileKey": string|null, "annotations": [{ "fileKey": string, "label": string, "description": string, "intent": string, "tone": string, "usage": string, "avoidWhen": string, "aliases": string[], "confidence": number }] }.',
-    '- Include an annotation for every candidate you can understand from the image. Keep labels short and use confidence from 0 to 1.',
-    `- A selected sticker is auto-sendable only when its annotation includes confidence >= ${STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE} and a specific visible meaning/tone/usage, not just generic words like “sticker” or “表情包”; missing confidence or generic semantics means evidence-only and selectedFileKey should be null.`,
-    '- For generic requests such as “随便发一个表情包”, choose selectedFileKey only after you can describe the selected image meaning. Do not leave it blank merely because old metadata is missing.',
-    '- For specific tone requests, choose selectedFileKey only when the image meaning matches the requested tone or scene. If no candidate is suitable or readable, use null and reply with text or a reaction instead.',
-    '- Treat old aliases and user-provided explanations as retrieval hints, not visual facts.',
-  ].filter(Boolean).join('\n');
 }
 
 function buildImageOnlyIntentPrompt(): string {
@@ -2150,27 +2016,6 @@ interface PreparedBridgeReplyPayload {
   mentions?: OutboundMention[];
   replyTo?: string;
   feishuCardJson?: string;
-}
-
-interface StickerAnnotationPayload {
-  fileKey: string;
-  label?: string;
-  description?: string;
-  intent?: string;
-  tone?: string;
-  usage?: string;
-  avoidWhen?: string;
-  aliases?: string[];
-  examples?: string[];
-  annotationConfidence?: number;
-}
-
-interface StickerCandidateAnalysisResult {
-  annotations: StickerAnnotationPayload[];
-  selectedFileKey?: string;
-  /** True when the model attempted the hidden analysis protocol, even if invalid. */
-  hasAnalysisBlock: boolean;
-  text: string;
 }
 
 type ExecutionEvidence = NonNullable<engine.ConversationResult['executionEvidence']>;
@@ -2413,220 +2258,6 @@ function stripFinalReplyProtocolArtifacts(text: string): string {
     .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${ARTIFACT_PROMOTION_ACTION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-}
-
-function stripStickerAnnotationProtocolArtifacts(text: string): string {
-  return text
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_ANNOTATION_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function stripStickerCandidateAnalysisProtocolArtifacts(text: string): string {
-  return text
-    .replace(new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'), '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function parseStickerAnnotationObject(candidate: unknown, expectedFileKey: string): StickerAnnotationPayload | null {
-  if (!candidate || typeof candidate !== 'object') return null;
-  const raw = candidate as Record<string, unknown>;
-  const fileKey = typeof raw.fileKey === 'string' ? raw.fileKey.trim() : '';
-  if (!fileKey || fileKey !== expectedFileKey) return null;
-  const cleanText = (value: unknown, maxLength: number): string | undefined => {
-    if (typeof value !== 'string') return undefined;
-    const text = value.normalize('NFKC').replace(/\s+/g, ' ').trim();
-    return text && text.length <= maxLength ? text : undefined;
-  };
-  const cleanList = (value: unknown, maxItems: number, maxLength: number): string[] => (
-    Array.isArray(value) ? value : []
-  )
-    .map((item) => cleanText(item, maxLength))
-    .filter((item): item is string => Boolean(item))
-    .slice(0, maxItems);
-  const annotation: StickerAnnotationPayload = { fileKey };
-  const label = cleanText(raw.label, 32);
-  const description = cleanText(raw.description, 180);
-  const intent = cleanText(raw.intent, 160);
-  const tone = cleanText(raw.tone, 80);
-  const usage = cleanText(raw.usage, 180);
-  const avoidWhen = cleanText(raw.avoidWhen, 180);
-  const aliases = cleanList(raw.aliases, 20, 32);
-  const examples = cleanList(raw.examples, 8, 120);
-  const confidence = Number.isFinite(Number(raw.confidence))
-    ? Math.max(0, Math.min(1, Number(raw.confidence)))
-    : Number.isFinite(Number(raw.annotationConfidence))
-      ? Math.max(0, Math.min(1, Number(raw.annotationConfidence)))
-      : undefined;
-  if (label) annotation.label = label;
-  if (description) annotation.description = description;
-  if (intent) annotation.intent = intent;
-  if (tone) annotation.tone = tone;
-  if (usage) annotation.usage = usage;
-  if (avoidWhen) annotation.avoidWhen = avoidWhen;
-  if (aliases.length > 0) annotation.aliases = aliases;
-  if (examples.length > 0) annotation.examples = examples;
-  if (typeof confidence === 'number') annotation.annotationConfidence = confidence;
-  if (!annotation.label && !annotation.description && !annotation.intent && !annotation.tone && !annotation.usage) {
-    return null;
-  }
-  return annotation;
-}
-
-function extractStickerAnnotationFromReply(
-  text: string,
-  expectedFileKey?: string,
-): { annotation: StickerAnnotationPayload | null; text: string } {
-  const fileKey = expectedFileKey?.trim();
-  if (!fileKey) return { annotation: null, text };
-  const fencePattern = new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_ANNOTATION_FENCE}\s*\n([\s\S]*?)\n\s*\`\`\``, 'gi');
-  let annotation: StickerAnnotationPayload | null = null;
-  for (const match of text.matchAll(fencePattern)) {
-    try {
-      annotation = parseStickerAnnotationObject(JSON.parse(match[1].trim()), fileKey) || annotation;
-    } catch {
-      // Ignore malformed annotation blocks; the visible reply is still usable.
-    }
-  }
-  return {
-    annotation,
-    text: stripStickerAnnotationProtocolArtifacts(text),
-  };
-}
-
-function getCandidateAnalysisFileKey(value: unknown): string {
-  if (!value || typeof value !== 'object') return '';
-  const raw = value as Record<string, unknown>;
-  return typeof raw.fileKey === 'string' ? raw.fileKey.trim() : '';
-}
-
-function hasSpecificStickerSemanticText(value: string): boolean {
-  const compact = value
-    .normalize('NFKC')
-    .toLowerCase()
-    .replace(/[\s，,。.;；:：、"'“”‘’()[\]{}<>《》【】!！?？~～_-]+/gu, '')
-    .replace(/(?:飞书|表情包|表情|sticker|贴纸|图片|图像|动图|一张|一个|这个|那个|用于|用来|使用|发送|回复|回话|聊天|消息|默认|随便|普通|轻量|发个|发|给你|来一个|来)/gu, '')
-    .trim();
-  return compact.length >= 2;
-}
-
-function hasSpecificStickerAnnotation(annotation: StickerAnnotationPayload): boolean {
-  return hasSpecificStickerSemanticText([
-    annotation.label,
-    annotation.description,
-    annotation.intent,
-    annotation.tone,
-    annotation.usage,
-    annotation.avoidWhen,
-    ...(annotation.aliases || []),
-    ...(annotation.examples || []),
-  ].filter((item): item is string => Boolean(item?.trim())).join(' '));
-}
-
-function parseStickerCandidateAnalysisObject(
-  candidate: unknown,
-  allowedFileKeys: Set<string>,
-): { annotations: StickerAnnotationPayload[]; selectedFileKey?: string } {
-  if (!candidate || typeof candidate !== 'object' || allowedFileKeys.size === 0) return { annotations: [] };
-  const raw = candidate as Record<string, unknown>;
-  const annotations: StickerAnnotationPayload[] = [];
-  const seen = new Set<string>();
-  const addAnnotation = (item: unknown) => {
-    const fileKey = getCandidateAnalysisFileKey(item);
-    if (!fileKey || !allowedFileKeys.has(fileKey) || seen.has(fileKey)) return;
-    const parsed = parseStickerAnnotationObject(item, fileKey);
-    if (!parsed) return;
-    annotations.push(parsed);
-    seen.add(fileKey);
-  };
-
-  addAnnotation(raw);
-  const selectedObject = raw.selected && typeof raw.selected === 'object'
-    ? raw.selected
-    : raw.selectedSticker && typeof raw.selectedSticker === 'object'
-      ? raw.selectedSticker
-      : null;
-  addAnnotation(selectedObject);
-  for (const item of Array.isArray(raw.annotations) ? raw.annotations : []) addAnnotation(item);
-  for (const item of Array.isArray(raw.candidates) ? raw.candidates : []) addAnnotation(item);
-
-  const selectedFileKey = typeof raw.selectedFileKey === 'string'
-    ? raw.selectedFileKey.trim()
-    : typeof raw.selected_file_key === 'string'
-      ? raw.selected_file_key.trim()
-      : getCandidateAnalysisFileKey(selectedObject);
-  const sendableFileKeys = new Set(annotations
-    .filter((item) => (
-      typeof item.annotationConfidence === 'number'
-      && item.annotationConfidence >= STICKER_CANDIDATE_AUTO_SEND_MIN_CONFIDENCE
-      && hasSpecificStickerAnnotation(item)
-    ))
-    .map((item) => item.fileKey));
-  return {
-    annotations,
-    selectedFileKey: selectedFileKey && allowedFileKeys.has(selectedFileKey) && sendableFileKeys.has(selectedFileKey)
-      ? selectedFileKey
-      : undefined,
-  };
-}
-
-function extractStickerCandidateAnalysisFromReply(
-  text: string,
-  allowedFileKeys: string[] = [],
-): StickerCandidateAnalysisResult {
-  const allowed = new Set(allowedFileKeys.map((item) => item.trim()).filter(Boolean));
-  if (allowed.size === 0) {
-    return { annotations: [], hasAnalysisBlock: false, text: stripStickerCandidateAnalysisProtocolArtifacts(text) };
-  }
-  const fencePattern = new RegExp(String.raw`(?:^|\n)\s*\`\`\`${STICKER_CANDIDATE_ANALYSIS_FENCE}\s*\n([\s\S]*?)\n\s*\`\`\``, 'gi');
-  const annotationsByFileKey = new Map<string, StickerAnnotationPayload>();
-  let selectedFileKey: string | undefined;
-  let hasAnalysisBlock = false;
-  for (const match of text.matchAll(fencePattern)) {
-    hasAnalysisBlock = true;
-    try {
-      const parsed = parseStickerCandidateAnalysisObject(JSON.parse(match[1].trim()), allowed);
-      for (const annotation of parsed.annotations) {
-        annotationsByFileKey.set(annotation.fileKey, annotation);
-      }
-      if (parsed.selectedFileKey) selectedFileKey = parsed.selectedFileKey;
-    } catch {
-      // Malformed candidate analysis should never block the visible reply.
-    }
-  }
-  return {
-    annotations: [...annotationsByFileKey.values()],
-    selectedFileKey,
-    hasAnalysisBlock,
-    text: stripStickerCandidateAnalysisProtocolArtifacts(text),
-  };
-}
-
-/**
- * The model may see an attached candidate and choose it correctly while omitting
- * the machine-only analysis fence. For a generic one-sticker request, that
- * turn-local visual choice is enough to deliver once, but never enough to
- * persist reusable sticker semantics. Any supplied analysis block still wins
- * and must pass the normal confidence checks.
- */
-function resolveTurnScopedAttachedStickerSelection(
-  userText: string,
-  answerText: string,
-  analysis: StickerCandidateAnalysisResult,
-  attachedFileKeys: string[],
-): string {
-  if (!isGenericSingleStickerSendRequest(userText) || analysis.hasAnalysisBlock) return '';
-  const allowed = new Set(attachedFileKeys.map((item) => item.trim()).filter(Boolean));
-  if (allowed.size === 0) return '';
-  const selected = new Set<string>();
-  const hintPattern = /\[表情包:([A-Za-z0-9_-]{3,160})\]/gu;
-  for (const match of answerText.matchAll(hintPattern)) {
-    const fileKey = (match[1] || '').trim();
-    if (allowed.has(fileKey)) selected.add(fileKey);
-  }
-  return selected.size === 1 ? [...selected][0] : '';
 }
 
 function resolveExplicitPaths(
