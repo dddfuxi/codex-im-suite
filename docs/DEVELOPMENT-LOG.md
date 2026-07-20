@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Bridge Core mention 解析迁移：新增 `application/mentions.ts`，集中处理 `userId/user_id/openId/open_id/unionId/union_id` 兼容、唤醒 alias、直接命令与流程叙述/技术诊断区分、显示名目标提取、泛称/关系称呼过滤和 `_user_N` 占位符清理。`bridge-manager` 删除约 350 行正则与纯解析，只保留 adapter 身份、当前原生 mention evidence、官方成员 resolver、结构化 ID 求交集、未投递提示和最终发送编排；模型 ID 仍不能成为可信事实。新增 5 项直接模块测试，完整 Manager mention 安全回归继续通过，并同步更新架构和路线图。
+
 - 2026-07-20 Bridge Core 提醒解析迁移：新增 `application/reminders.ts`，集中处理中文数字、相对/绝对时间、一次性任务标题、`/remind` 固定参数、调度意图提示和伪完成声明；周期表达、教程/查询文本和无明确唤醒的隐式时间请求继续失败关闭。`bridge-manager` 删除约 300 行解析实现，保留当前消息 alias/evidence、通知对象、Owner 门禁、Scheduler/Reminder Host 和交付编排。新增 5 项直接模块测试，原 Manager 行为回归继续通过；同步更新架构与路线图，人类文档与机器边界同阶段前进。
 
 - 2026-07-20 Bridge Core 动作块解析迁移：新增 `application/action-blocks.ts`，把 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote` 的 fence、JSON 与字段归一化从 `bridge-manager.ts` 迁为可独立测试的纯解析模块。Manager 只保留 mention parser 注入和薄包装，身份、权限、工作区、目标解析、Artifact 校验与 Host 执行继续基于当前回合真实 evidence，不信任模型动作块中的 ID、角色或路径。新增 5 项领域测试，并同步架构、维护规则和路线图子阶段；Task 8 Step 2 仍待提醒解析、mention、sticker policy、history intent 与 delivery preparation 完成。
