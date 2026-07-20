@@ -84,6 +84,7 @@ flowchart TD
   BridgeFacade --> ReminderParsing[application/reminders 单次提醒解析]
   BridgeFacade --> MentionParsing[application/mentions 提及意图与目标解析]
   BridgeFacade --> StickerPolicy[application/stickers 表情包意图、协议与候选门禁]
+  FeishuAdapter --> HistoryIntent[application/history-intent 历史范围与输出意图解析]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
   Core --> ReplyEnvelope[cti-final 结果块收口]
@@ -143,6 +144,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/application/reminders.ts` 统一解析高置信单次提醒、`/remind` 固定参数、时间/任务意图提示和伪完成声明。周期表达继续交给 `cti-scheduled-task`，讨论/教程文本不会被提升为提醒；平台唤醒 alias、原生通知目标、系统副作用门禁、角色和真实 Scheduler/Reminder Host 仍由 Manager 基于当前消息 evidence 装配。
 - `packages/bridge-core/src/lib/bridge/application/mentions.ts` 统一处理飞书 mention ID 字段兼容、唤醒 alias、直接执行/流程叙述/诊断语义区分、显示名目标提取以及占位符和非地址化裸 `@` 清理。该模块不查询成员、不接受模型自造 ID，也不执行发送；Manager 只把 adapter 身份和当前原生事件 evidence 注入后续安全层，官方 resolver、ID 求交集、Owner/广播门禁和最终交付仍留在平台编排边界。
 - `packages/bridge-core/src/lib/bridge/application/stickers.ts` 统一处理表情包发送意图、入站/出站 hint 隔离、标注与候选分析协议清理、置信度和具体语义门禁，以及仅允许本轮真实附件 fileKey 的一次性选择。图片附件真实性、视觉模型调用、语义 revision 授权与写入、平台投递和真实 messageId 回执仍由 Manager、Sticker Host 与 Feishu adapter 共同完成，纯策略模块不能自行发送或确认语义。
+- `packages/bridge-core/src/lib/bridge/application/history-intent.ts` 统一解析群历史总结、回看上方消息、时间范围、数量上限、说话人范围、引用式校对动作和文档输出意图，并允许测试注入当前时间。Feishu adapter 只保留兼容薄包装，云端消息分页、历史增量同步、受控索引检索、附件恢复和 prompt 构造仍留在 adapter/History Host；普通飞书文档权限问题不会被误路由为群历史请求。
 
 渐进迁移顺序：
 

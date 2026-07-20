@@ -83,6 +83,10 @@ import {
   type FeishuInteractiveCardResourceRef,
 } from '../feishu-interactive-card-evidence.js';
 import type { TurnEvidenceActor, TurnEvidenceItem } from '../turn-context.js';
+import {
+  parseFeishuHistoryIntent,
+  type FeishuHistoryIntent,
+} from '../application/history-intent.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -907,19 +911,6 @@ function sniffImageMimeType(buffer: Buffer): { mimeType: string; extension: stri
     return { mimeType: 'image/webp', extension: 'webp' };
   }
   return null;
-}
-
-interface FeishuHistoryIntent {
-  originalPrompt: string;
-  taskPrompt: string;
-  limit: number;
-  startTimeMs?: number;
-  endTimeMs?: number;
-  scopeText: string;
-  responseMode: 'chat' | 'doc';
-  docTitle?: string;
-  purpose?: 'summary' | 'reference';
-  targetSpeakerNames?: string[];
 }
 
 interface FeishuMessageListItem {
@@ -5809,122 +5800,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private parseHistoryIntentV2(text: string): FeishuHistoryIntent | null {
-    const normalized = text.replace(/\s+/g, '');
-    // “上面那条消息/卡片/上文”不是普通轻量指代；这类说法需要按
-    // 飞书云端消息页/本地历史索引回看，避免只拿 reply target 或近邻窗口猜错。
-    const mentionsUpwardHistory = /((上面|上方|前面|上文|前文|上一条|前一条|上条|前条|上几条|前几条).{0,16}(消息|卡片|回复|内容|记录|题目|thread|线程|那条|这条|这一条)|((消息|卡片|回复|内容|记录|题目|thread|线程).{0,16}(上面|上方|前面|上文|前文|上一条|前一条|上条|前条|上几条|前几条)))/u.test(normalized);
-    const wantsUpwardHistory = mentionsUpwardHistory
-      && /(看|查|读|翻|找|回看|漏查|对照|分析|总结|汇总|整理|解释|回答|回复|问|题目)/u.test(normalized);
-    const wantsSummary = /(\u603b\u7ed3|\u6c47\u603b|\u6574\u7406|\u68b3\u7406|\u6982\u62ec|\u5f52\u7eb3|\u56de\u987e|\u63d0\u70bc|\u63d0\u53d6|\u770b\u4e00\u4e0b|\u770b\u770b|\u770b\u4e0b|\u5728\u8bf4\u4ec0\u4e48|\u8bf4\u4ec0\u4e48|\u5728\u804a\u4ec0\u4e48|\u804a\u4ec0\u4e48|\u4ec0\u4e48\u5185\u5bb9)/.test(normalized) || wantsUpwardHistory;
-    // "群里/本群/这个群" 也是明确的群历史范围，不要求用户必须说成“群聊记录”。
-    const mentionsHistory = /(\u7fa4\u804a|\u7fa4\u91cc|\u7fa4\u5185|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u804a\u5929|\u5bf9\u8bdd|\u6d88\u606f|\u8bb0\u5f55|\u8ba8\u8bba|\u5185\u5bb9)/.test(normalized) || mentionsUpwardHistory;
-    const mentionsTime = /(\u6700\u8fd1\d{1,3}\u6761|\u6700\u8fd1|\u4eca\u5929|\u4eca\u65e5|\u6628\u5929|\u6628\u65e5|\u524d\u5929|\u4e0a\u5348|\u4e0b\u5348|\u665a\u4e0a|\u5b8c\u6574|\u5168\u90e8)/.test(normalized) || mentionsUpwardHistory;
-    const wantsDoc = /(\u98de\u4e66\u6587\u6863|\u6587\u6863\u94fe\u63a5|\u751f\u6210.*\u6587\u6863|\u6574\u7406\u6210.*\u6587\u6863|\u8f93\u51fa\u5230.*\u6587\u6863|\u53d1\u94fe\u63a5|\u56de\u94fe\u63a5)/.test(normalized);
-    const actionVerbMatched = /(\u6807\u6ce8|\u91cd\u6807|\u6539\u6807|\u5224\u65ad|\u4fee\u6539|\u7ea0\u6b63|\u6838\u5bf9|\u6821\u5bf9|\u547d\u540d|\u5bf9\u7167)/.test(normalized);
-    const targetSpeakerNames = this.extractTargetSpeakerNamesV2(text);
-    const wantsReferenceAction = (
-      /(\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408).*(\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd)/.test(normalized)
-      || (/(\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408).*(\u8bf4\u7684|\u63d0\u5230\u7684|\u804a\u8fc7\u7684)/.test(normalized) && targetSpeakerNames.length > 0)
-    ) && actionVerbMatched;
-
-    if ((!wantsSummary && !wantsDoc && !wantsReferenceAction) || (!mentionsHistory && !mentionsTime && !wantsDoc && !wantsReferenceAction)) {
-      return null;
-    }
-
-    const countMatch = text.match(/(\d{1,3})\s*(\u6761|\u5219|\u6bb5|\u4e2a)?/);
-    const requestedCount = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
-    const now = new Date();
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
-    const startOfTomorrow = new Date(startOfToday);
-    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
-    const startOfYesterday = new Date(startOfToday);
-    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-    const startOfDayBeforeYesterday = new Date(startOfToday);
-    startOfDayBeforeYesterday.setDate(startOfDayBeforeYesterday.getDate() - 2);
-
-    let startTimeMs: number | undefined;
-    let endTimeMs: number | undefined;
-    let scopeText = '\u672c\u7fa4\u6700\u8fd1\u6d88\u606f';
-
-    if (/(\u6628\u5929|\u6628\u65e5)/.test(normalized)) {
-      startTimeMs = startOfYesterday.getTime();
-      endTimeMs = startOfToday.getTime();
-      scopeText = '\u672c\u7fa4\u6628\u5929\u7684\u804a\u5929\u8bb0\u5f55';
-    } else if (/\u524d\u5929/.test(normalized)) {
-      startTimeMs = startOfDayBeforeYesterday.getTime();
-      endTimeMs = startOfYesterday.getTime();
-      scopeText = '\u672c\u7fa4\u524d\u5929\u7684\u804a\u5929\u8bb0\u5f55';
-    } else if (/(\u4eca\u5929|\u4eca\u65e5)/.test(normalized)) {
-      startTimeMs = startOfToday.getTime();
-      endTimeMs = startOfTomorrow.getTime();
-      scopeText = '\u672c\u7fa4\u4eca\u5929\u7684\u804a\u5929\u8bb0\u5f55';
-    } else if (mentionsUpwardHistory) {
-      scopeText = '本群上方消息';
-    }
-
-    if (startTimeMs !== undefined && /(\u4e0a\u5348|\u65e9\u4e0a|\u6e05\u6668)/.test(normalized)) {
-      const end = new Date(startTimeMs);
-      end.setHours(12, 0, 0, 0);
-      endTimeMs = end.getTime();
-      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u4e0a\u5348\u804a\u5929\u8bb0\u5f55');
-    } else if (startTimeMs !== undefined && /\u4e0b\u5348/.test(normalized)) {
-      const start = new Date(startTimeMs);
-      start.setHours(12, 0, 0, 0);
-      startTimeMs = start.getTime();
-      const end = new Date(start);
-      end.setHours(18, 0, 0, 0);
-      endTimeMs = end.getTime();
-      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u4e0b\u5348\u804a\u5929\u8bb0\u5f55');
-    } else if (startTimeMs !== undefined && /(\u665a\u4e0a|\u665a\u95f4)/.test(normalized)) {
-      const start = new Date(startTimeMs);
-      start.setHours(18, 0, 0, 0);
-      startTimeMs = start.getTime();
-      scopeText = scopeText.replace('\u804a\u5929\u8bb0\u5f55', '\u665a\u95f4\u804a\u5929\u8bb0\u5f55');
-    }
-
-    const wantsFull = /(\u5b8c\u6574|\u5168\u90e8|\u6240\u6709)/.test(normalized);
-    const defaultLimit = wantsReferenceAction ? 50 : (startTimeMs !== undefined ? 100 : 30);
-    const limit = Math.max(5, Math.min(requestedCount ?? (wantsFull ? 100 : defaultLimit), 100));
-    const responseMode: 'chat' | 'doc' = wantsDoc ? 'doc' : 'chat';
-    const docTitle = undefined;
-
-    return {
-      originalPrompt: text,
-      taskPrompt: text,
-      limit,
-      startTimeMs,
-      endTimeMs,
-      scopeText,
-      responseMode,
-      docTitle,
-      purpose: wantsReferenceAction ? 'reference' : 'summary',
-      targetSpeakerNames,
-    };
-  }
-
-  private extractTargetSpeakerNamesV2(text: string): string[] {
-    const names = new Set<string>();
-    const patterns = [
-      /(?:\u6839\u636e|\u6309|\u53c2\u8003|\u7ed3\u5408)([^\uFF0C\u3002\uFF1B\uFF1A\s]{1,12}?)(?:\u7684)?(?:\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd)/g,
-      /(?:\u53c2\u8003|\u6309)([^\uFF0C\u3002\uFF1B\uFF1A\s]{1,12}?)(?:\u8bf4\u7684|\u63d0\u5230\u7684|\u804a\u8fc7\u7684)/g,
-      /@([^\s\uFF0C\u3002\uFF1B\uFF1A]{1,24})/g,
-    ];
-
-    for (const pattern of patterns) {
-      for (const match of text.matchAll(pattern)) {
-        const raw = (match[1] || '').trim();
-        const cleaned = raw
-          .replace(/^(\u7fa4\u91cc|\u672c\u7fa4|\u8fd9\u4e2a\u7fa4|\u7fa4\u804a|\u804a\u5929)/, '')
-          .replace(/(\u804a\u5929\u8bb0\u5f55|\u7fa4\u804a\u8bb0\u5f55|\u6d88\u606f|\u5bf9\u8bdd|\u8bf4\u7684|\u63d0\u5230\u7684)$/g, '')
-          .trim();
-        if (cleaned.length >= 2 && cleaned.length <= 12) {
-          names.add(cleaned);
-        }
-      }
-    }
-
-    return [...names];
+    return parseFeishuHistoryIntent(text);
   }
 
   private getExtendedStore(): {
@@ -6146,85 +6022,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       merged.set(item.message_id, item);
     }
     return [...merged.values()].sort((a, b) => Number.parseInt(a.create_time, 10) - Number.parseInt(b.create_time, 10));
-  }
-
-  private parseHistoryIntent(text: string): FeishuHistoryIntent | null {
-    const normalized = text.replace(/\s+/g, '');
-    const wantsSummary = /(总结|汇总|整理|梳理|概括|归纳|回顾|提炼|提取)/.test(normalized);
-    const mentionsHistory = /(群聊|聊天|对话|消息|记录|讨论|内容)/.test(normalized);
-    const timeScoped = /(最近|近\d+条|近\d+则|今天|今日|昨天|昨日|前天|上午|下午|晚上|完整|全部)/.test(normalized);
-    const wantsDoc = /(飞书文档|文档链接|生成.*文档|整理成.*文档|输出到.*文档|发链接|回链接)/.test(normalized);
-
-    if ((!wantsSummary && !wantsDoc) || (!mentionsHistory && !timeScoped && !wantsDoc)) {
-      return null;
-    }
-
-    const countMatch = text.match(/(\d{1,3})\s*(条|则|段|个)/);
-    const requestedCount = countMatch ? Number.parseInt(countMatch[1], 10) : undefined;
-    const now = new Date();
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
-    const startOfTomorrow = new Date(startOfToday);
-    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
-    const startOfYesterday = new Date(startOfToday);
-    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-    const startOfDayBeforeYesterday = new Date(startOfToday);
-    startOfDayBeforeYesterday.setDate(startOfDayBeforeYesterday.getDate() - 2);
-
-    let startTimeMs: number | undefined;
-    let endTimeMs: number | undefined;
-    let scopeText = '本群最近消息';
-
-    if (/(昨天|昨日)/.test(normalized)) {
-      startTimeMs = startOfYesterday.getTime();
-      endTimeMs = startOfToday.getTime();
-      scopeText = '本群昨天的聊天记录';
-    } else if (/前天/.test(normalized)) {
-      startTimeMs = startOfDayBeforeYesterday.getTime();
-      endTimeMs = startOfYesterday.getTime();
-      scopeText = '本群前天的聊天记录';
-    } else if (/(今天|今日)/.test(normalized)) {
-      startTimeMs = startOfToday.getTime();
-      endTimeMs = startOfTomorrow.getTime();
-      scopeText = '本群今天的聊天记录';
-    }
-
-    if (startTimeMs !== undefined && /(上午|早上|清晨)/.test(normalized)) {
-      const end = new Date(startTimeMs);
-      end.setHours(12, 0, 0, 0);
-      endTimeMs = end.getTime();
-      scopeText = scopeText.replace('聊天记录', '上午聊天记录');
-    } else if (startTimeMs !== undefined && /(下午)/.test(normalized)) {
-      const start = new Date(startTimeMs);
-      start.setHours(12, 0, 0, 0);
-      startTimeMs = start.getTime();
-      const end = new Date(start);
-      end.setHours(18, 0, 0, 0);
-      endTimeMs = end.getTime();
-      scopeText = scopeText.replace('聊天记录', '下午聊天记录');
-    } else if (startTimeMs !== undefined && /(晚上|晚间)/.test(normalized)) {
-      const start = new Date(startTimeMs);
-      start.setHours(18, 0, 0, 0);
-      startTimeMs = start.getTime();
-      scopeText = scopeText.replace('聊天记录', '晚上聊天记录');
-    }
-
-    const wantsFull = /(完整|全部|所有)/.test(normalized);
-    const defaultLimit = startTimeMs !== undefined ? 100 : 30;
-    const limit = Math.max(5, Math.min(requestedCount ?? (wantsFull ? 100 : defaultLimit), 100));
-    const responseMode: 'chat' | 'doc' = wantsDoc ? 'doc' : 'chat';
-    const docTitle = undefined;
-
-    return {
-      originalPrompt: text,
-      taskPrompt: text,
-      limit,
-      startTimeMs,
-      endTimeMs,
-      scopeText,
-      responseMode,
-      docTitle,
-    };
   }
 
   private async buildHistoryAugmentedPrompt(

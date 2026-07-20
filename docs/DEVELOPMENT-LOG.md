@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Bridge Core history intent 迁移：新增 `application/history-intent.ts`，集中解析群聊总结、上方消息回看、今天/昨天/前天与上午/下午/晚间范围、数量上下限、目标说话人、引用式校对动作和文档输出模式；当前时间可注入，时间窗口测试不再依赖现场时钟。Feishu adapter 删除约 200 行内联 V2 解析和无调用旧版解析，仅保留兼容薄包装；云端分页同步、本地索引检索、附件恢复和 prompt 组装保持原边界。额外收紧“只提到飞书文档”误触历史流程的问题。新增 5 项直接模块测试，adapter + history 专项 159/159 通过，并同步更新架构和路线图。
+
 - 2026-07-20 Bridge Core sticker policy 迁移：新增 `application/stickers.ts`，集中处理表情包发送意图、单个通用请求、入站 hint 抑制、可见回复 hint 收口、视觉标注/候选分析协议解析、具体语义与置信度门禁，以及本轮真实附件 fileKey 的一次性选择。`bridge-manager` 只保留真实附件校验、视觉 Provider、Sticker Host revision 授权/写入和最终平台投递；低置信、泛化语义、未附加候选和入站表情包误触发出站继续失败关闭。新增 6 项直接模块测试，Manager + sticker 专项 185/185 通过，并同步更新架构和路线图。
 
 - 2026-07-20 Bridge Core mention 解析迁移：新增 `application/mentions.ts`，集中处理 `userId/user_id/openId/open_id/unionId/union_id` 兼容、唤醒 alias、直接命令与流程叙述/技术诊断区分、显示名目标提取、泛称/关系称呼过滤和 `_user_N` 占位符清理。`bridge-manager` 删除约 350 行正则与纯解析，只保留 adapter 身份、当前原生 mention evidence、官方成员 resolver、结构化 ID 求交集、未投递提示和最终发送编排；模型 ID 仍不能成为可信事实。新增 5 项直接模块测试，完整 Manager mention 安全回归继续通过，并同步更新架构和路线图。
