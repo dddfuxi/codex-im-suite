@@ -1,6 +1,13 @@
-import path from 'node:path';
+import {
+  findRegisteredProjectForPath,
+  importLegacyWorkspaceRoots,
+  isSameOrChildProjectPath,
+  normalizeProjectPath,
+  type RegisteredProject,
+  type RegisteredProjectAccessMode,
+} from '@codex-im-suite/contracts';
 
-export type WorkspaceAccessMode = 'read_only' | 'read_write';
+export type WorkspaceAccessMode = RegisteredProjectAccessMode;
 
 export interface WorkspaceMount {
   projectId?: string;
@@ -31,24 +38,23 @@ export interface ResolveTurnWorkspacePlanInput {
   currentWorkingDirectory?: string;
   defaultWorkingDirectory?: string;
   registeredRoots?: readonly string[];
+  registeredProjects?: readonly RegisteredProject[];
   deniedRoots?: readonly DeniedWorkspaceRoot[];
   requiresWrite?: boolean;
   now?: string;
 }
 
 function normalizeWorkspacePath(value: string): string {
-  return path.normalize(path.resolve(value.trim())).replace(/[\\/]+$/u, '');
+  return normalizeProjectPath(value);
 }
 
 function compareKey(value: string): string {
   const normalized = normalizeWorkspacePath(value);
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return /^[A-Za-z]:\\/u.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 function isSameOrChildPath(candidate: string, root: string): boolean {
-  const candidateKey = compareKey(candidate);
-  const rootKey = compareKey(root);
-  return candidateKey === rootKey || candidateKey.startsWith(`${rootKey}${path.sep}`);
+  return isSameOrChildProjectPath(candidate, root);
 }
 
 function uniquePaths(values: readonly string[]): string[] {
@@ -79,20 +85,35 @@ export function extractAbsolutePathCandidates(text: string): string[] {
   return uniquePaths(candidates.map((item) => item.replace(/[.,，。；;、]+$/u, '')));
 }
 
-function findMostSpecificRegisteredRoot(candidate: string, registeredRoots: readonly string[]): string | undefined {
-  return registeredRoots
-    .filter((root) => isSameOrChildPath(candidate, root))
-    .sort((left, right) => normalizeWorkspacePath(right).length - normalizeWorkspacePath(left).length)[0];
-}
-
-function makeMount(pathValue: string, accessMode: WorkspaceAccessMode, explicit: boolean): WorkspaceMount {
+function makeMount(input: {
+  path: string;
+  project?: RegisteredProject;
+  requiresWrite: boolean;
+  explicit: boolean;
+}): WorkspaceMount {
+  const allowedAccessMode = input.project?.accessMode || 'read_write';
+  if (input.requiresWrite && allowedAccessMode === 'read_only') throw new Error('project_read_only');
+  const accessMode: WorkspaceAccessMode = input.requiresWrite ? 'read_write' : 'read_only';
   return {
-    path: normalizeWorkspacePath(pathValue),
+    ...(input.project ? { projectId: input.project.id } : {}),
+    path: normalizeWorkspacePath(input.path),
     accessMode,
-    evidenceIds: [explicit ? 'current_message' : 'session_binding'],
-    reason: explicit ? 'explicit absolute path matched a registered workspace root' : 'current session working directory',
+    evidenceIds: [input.explicit ? 'current_message' : 'session_binding'],
+    reason: input.explicit ? 'explicit absolute path matched a registered project' : 'current session working directory',
     expiresAfterTurn: true,
   };
+}
+
+function mergeRegisteredProjects(input: ResolveTurnWorkspacePlanInput, deniedPaths: readonly string[]): RegisteredProject[] {
+  const structured = (input.registeredProjects || []).filter((project) => (
+    project.enabled && !deniedPaths.some((denied) => isSameOrChildPath(project.workspaceRoot, denied))
+  ));
+  const legacy = importLegacyWorkspaceRoots(input.registeredRoots || [], { deniedRoots: deniedPaths });
+  const compatibleLegacy = legacy.filter((legacyProject) => !structured.some((project) => (
+    isSameOrChildPath(legacyProject.workspaceRoot, project.workspaceRoot)
+    || isSameOrChildPath(project.workspaceRoot, legacyProject.workspaceRoot)
+  )));
+  return [...structured, ...compatibleLegacy];
 }
 
 export function resolveTurnWorkspacePlan(input: ResolveTurnWorkspacePlanInput): TurnWorkspacePlan {
@@ -100,46 +121,68 @@ export function resolveTurnWorkspacePlan(input: ResolveTurnWorkspacePlanInput): 
     .filter((item) => item.path?.trim())
     .map((item) => ({ path: normalizeWorkspacePath(item.path), reason: item.reason }));
   const isDenied = (candidate: string) => deniedRoots.some((item) => isSameOrChildPath(candidate, item.path));
-  const registeredRoots = uniquePaths(input.registeredRoots || []).filter((root) => !isDenied(root));
-  const explicitRoots: string[] = [];
+  const projects = mergeRegisteredProjects(input, deniedRoots.map((item) => item.path));
+  const explicitProjects: RegisteredProject[] = [];
 
   for (const candidate of extractAbsolutePathCandidates(input.prompt)) {
     if (isDenied(candidate)) continue;
-    const matchedRoot = findMostSpecificRegisteredRoot(candidate, registeredRoots);
-    if (matchedRoot) explicitRoots.push(matchedRoot);
+    const matchedProject = findRegisteredProjectForPath(projects, candidate);
+    if (matchedProject) explicitProjects.push(matchedProject);
   }
 
-  const distinctExplicitRoots = uniquePaths(explicitRoots);
-  const accessMode: WorkspaceAccessMode = input.requiresWrite ? 'read_write' : 'read_only';
-  const isWithinRegisteredRoots = (candidate: string) => registeredRoots.length === 0
-    || registeredRoots.some((root) => isSameOrChildPath(candidate, root));
-  const primaryCandidates: Array<{ path?: string; source: TurnWorkspacePlan['resolvedFrom'] }> = [
-    { path: input.currentWorkingDirectory, source: 'session_binding' },
-    { path: input.defaultWorkingDirectory, source: 'default' },
-    ...distinctExplicitRoots.map((root) => ({ path: root, source: 'explicit_path' as const })),
-    ...registeredRoots.map((root) => ({ path: root, source: 'default' as const })),
-    { path: process.cwd(), source: 'default' },
+  const distinctExplicitProjects = Array.from(new Map(explicitProjects.map((project) => [project.id, project])).values());
+  const resolveCandidateProject = (candidate?: string) => candidate?.trim()
+    ? findRegisteredProjectForPath(projects, candidate)
+    : undefined;
+  const primaryCandidates: Array<{
+    path?: string;
+    project?: RegisteredProject;
+    source: TurnWorkspacePlan['resolvedFrom'];
+  }> = [
+    {
+      path: resolveCandidateProject(input.currentWorkingDirectory)?.workspaceRoot || input.currentWorkingDirectory,
+      project: resolveCandidateProject(input.currentWorkingDirectory),
+      source: 'session_binding',
+    },
+    {
+      path: resolveCandidateProject(input.defaultWorkingDirectory)?.workspaceRoot || input.defaultWorkingDirectory,
+      project: resolveCandidateProject(input.defaultWorkingDirectory),
+      source: 'default',
+    },
+    ...distinctExplicitProjects.map((project) => ({ path: project.workspaceRoot, project, source: 'explicit_path' as const })),
+    ...projects.map((project) => ({ path: project.workspaceRoot, project, source: 'default' as const })),
+    { path: projects.length === 0 ? process.cwd() : undefined, source: 'default' },
   ];
   const primary = primaryCandidates.find((candidate) => {
     if (!candidate.path?.trim()) return false;
-    return !isDenied(candidate.path) && isWithinRegisteredRoots(candidate.path);
+    if (isDenied(candidate.path)) return false;
+    return projects.length === 0 || Boolean(candidate.project);
   });
   if (!primary?.path) {
     throw new Error('no safe primary workspace is available for this turn');
   }
   const primaryPath = normalizeWorkspacePath(primary.path);
   const resolvedFrom = primary.source;
-  const temporaryRoots = distinctExplicitRoots.filter((root) => {
-    if (compareKey(root) === compareKey(primaryPath)) return false;
+  const temporaryProjects = distinctExplicitProjects.filter((project) => {
+    if (compareKey(project.workspaceRoot) === compareKey(primaryPath)) return false;
     // 主工作区已经覆盖其子目录时，无需重复扩大 Provider 的挂载列表。
-    return !isSameOrChildPath(root, primaryPath);
+    return !isSameOrChildPath(project.workspaceRoot, primaryPath);
   });
 
   return {
     version: 'cti-turn-workspace/v1',
-    primaryWorkspace: makeMount(primaryPath, accessMode, resolvedFrom === 'explicit_path'),
-    temporaryMounts: temporaryRoots
-      .map((root) => makeMount(root, accessMode, true)),
+    primaryWorkspace: makeMount({
+      path: primaryPath,
+      project: primary.project,
+      requiresWrite: input.requiresWrite === true,
+      explicit: resolvedFrom === 'explicit_path',
+    }),
+    temporaryMounts: temporaryProjects.map((project) => makeMount({
+      path: project.workspaceRoot,
+      project,
+      requiresWrite: input.requiresWrite === true,
+      explicit: true,
+    })),
     deniedRoots,
     resolvedFrom,
     createdAt: input.now || new Date().toISOString(),

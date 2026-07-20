@@ -67,15 +67,47 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 ## 工作区与记忆入口
 
 - 当前工作区：每轮唯一默认挂载，对应 `CTI_DEFAULT_WORKDIR` 或会话绑定目录。
-- 项目注册根：`CTI_ALLOWED_WORKSPACE_ROOTS` 只定义可访问上界，不自动进入 Prompt、Provider 或附加目录。
+- 项目注册表：默认读取 `CTI_HOME\project-registry.json`，也可用 `CTI_PROJECT_REGISTRY_PATH` 指定其他 JSON 文件。结构化记录是项目 ID、类型、工作区根、Unity 工程根、访问模式和 MCP Profile 的唯一协议来源；`CTI_ALLOWED_WORKSPACE_ROOTS` 只兼容导入为 `generic` 项目并继续充当权限上界，不自动进入 Prompt、Provider 或附加目录。
+- 项目禁止根：`CTI_PROJECT_DENIED_ROOTS` 可追加明确禁止注册和挂载的目录；Agent Home、`CTI_HOME`、上传缓存和记忆库仍由运行时自动加入禁止集合。禁止根会同时约束普通会话和计划任务。
 - 临时挂载：只由本轮消息中的明确绝对路径等强证据生成，随当前回合结束失效。
 - Agent Home / 记忆库：默认 `E:\cli-md`，集中放置 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md`。
 - Agent Home 注入：身份、行为安全和工具环境三份文档每轮按独立 Prompt section 重新读取；当前工作区的 `work/<workspaceId>/工作档案.md` 另以“只读事实证据”限长回读，超预算时保留头部与最新尾部，其他项目档案、每日反思和纠错日志不注入。Git 项目优先使用规范化 origin remote 生成稳定 workspaceId，项目移动、改名或从子目录进入仍共用档案；旧路径 ID 档案会提升到稳定 ID，提升失败时临时回读真实旧来源。
 - 受控自主维护：独立、禁工具、无工作目录的 Self-Maintenance classifier 只在候选纠错或任务结果阶段运行。核心三文档只有在确认是 Agent 自身错误，并逐字绑定真实 assistant 错误片段与当前 human/失败 runtime 纠正片段时才能通过稳定 key、`baseHash` 和受控 patch 更新专用规则块；不允许整篇替换用户主体。工作档案使用稳定 key upsert，只保存当前有效状态；默认核心模板已升级到 `cti-agent-home-template:v4`，未改 v1/v3 自动升级，用户手改模板不覆盖。
 - 自维护档案：`work/<workspaceId>/工作档案.md`、`daily-reflection/每日反思-YYYY-MM-DD.md`、`corrections/纠错记录-YYYY-MM-DD.md`；写入使用 `.cti-self-history/write.lock` 排他锁和持久化事务 before-image，崩溃后会恢复未完成事务。受控规则记录 `trial / confirmed / regressed` 成熟度和真实 runtime 效果，`regressed` 只标记回归并保留回滚入口，不自动覆盖用户内容。版本、审计和日期档案超过活跃窗口后移动到 `archive/self-maintenance`，不直接删除；控制面板展示 classifier 调用/跳过、平均耗时、规则状态和锁/哈希冲突。
+- 人类可读投影：机器状态发生受控 mutation 时，面向人审核的既有 Markdown 入口必须在同一写锁事务中更新；任一投影失败则回滚机器状态。机器状态始终是唯一事实源，Markdown 只展示索引、状态、范围和可操作入口，受控区块之外的用户手写内容原样保留。目前记忆生命周期和表情包语义进化均遵守此规则。
 - 未归类根文档：记忆库根目录中不属于五个固定入口的 Markdown 会在控制面板显示警告和打开入口，但不会被自动移动、删除或注入知识索引。
 - 分区记忆：用户写入 `memory/users/<channel>/<userId>/用户印象.md`，群聊写入 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实写入 `memory/long-term/公共长期记忆.md`。
 - 旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只保留为诊断值，不再自动挂载，也不再由控制面板修改。
+
+结构化项目注册表示例：
+
+```json
+{
+  "schema": "codex-im-suite/project-registry/v1",
+  "projects": [
+    {
+      "id": "st4",
+      "displayName": "ST4",
+      "type": "unity",
+      "workspaceRoot": "F:\\unity\\ST4",
+      "unityProjectRoot": "F:\\unity\\ST4\\Game",
+      "accessMode": "read_write",
+      "mcpProfileIds": ["unity-main"],
+      "enabled": true
+    },
+    {
+      "id": "codex-im-suite",
+      "displayName": "codex-im-suite",
+      "type": "node",
+      "workspaceRoot": "C:\\Users\\admin\\Documents\\New project\\codex-im-suite",
+      "accessMode": "read_write",
+      "enabled": true
+    }
+  ]
+}
+```
+
+Unity 项目无论命中 `unityProjectRoot` 还是其内部 `Assets`，实际工作区都回到 `workspaceRoot`；读取回合统一按只读挂载，只有写入回合且项目声明 `read_write` 时才允许写。
 
 迁移旧 `data/memory/v2` 前先停止 Bridge，并先预览：
 

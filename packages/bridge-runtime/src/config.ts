@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { RegisteredProject } from "@codex-im-suite/contracts";
 import { getLocalCodexProviderCapabilities } from "./local-codex-provider-registry.js";
+import { loadRegisteredProjectRegistry } from "./projects/project-registry.js";
 
 export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
@@ -9,6 +11,10 @@ export interface Config {
   defaultWorkDir: string;
   bridgeProcessingTimeoutMs?: number;
   allowedWorkspaceRoots?: string[];
+  projectRegistryPath?: string;
+  projectDeniedRoots?: string[];
+  registeredProjects?: RegisteredProject[];
+  projectRegistryWarnings?: string[];
   codexAdditionalDirectories?: string[];
   memoryRepoDir?: string;
   uploadCacheDir?: string;
@@ -276,6 +282,10 @@ function getDefaultUploadCacheDir(): string {
   return path.join(CTI_HOME, "runtime", "uploads");
 }
 
+function getDefaultProjectRegistryPath(): string {
+  return path.join(CTI_HOME, "project-registry.json");
+}
+
 function resolveSafeMemoryRepoDir(rawMemoryRepoDir: string | undefined, defaultWorkDir: string): string {
   const fallback = getDefaultMemoryRepoDir();
   const configured = rawMemoryRepoDir && rawMemoryRepoDir.trim() ? rawMemoryRepoDir.trim() : fallback;
@@ -402,6 +412,25 @@ export function loadConfig(): Config {
   );
   const memoryRepoDir = resolveSafeMemoryRepoDir(rawMemoryRepoDir, defaultWorkDir);
   const uploadCacheDir = resolveSafeUploadCacheDir(rawUploadCacheDir, defaultWorkDir);
+  const projectRegistryPath = path.resolve(env.get("CTI_PROJECT_REGISTRY_PATH") || getDefaultProjectRegistryPath());
+  const projectDeniedRoots = splitPathList(env.get("CTI_PROJECT_DENIED_ROOTS")) || [];
+  const projectDeniedRootMap = new Map<string, string>();
+  for (const item of [
+    CTI_HOME,
+    CODEX_HOME,
+    memoryRepoDir,
+    uploadCacheDir,
+    ...projectDeniedRoots,
+  ]) {
+    const resolved = path.resolve(item);
+    projectDeniedRootMap.set(process.platform === "win32" ? resolved.toLowerCase() : resolved, resolved);
+  }
+  const effectiveProjectDeniedRoots = Array.from(projectDeniedRootMap.values());
+  const projectRegistry = loadRegisteredProjectRegistry({
+    registryPath: projectRegistryPath,
+    legacyRoots: allowedWorkspaceRoots,
+    deniedRoots: effectiveProjectDeniedRoots,
+  });
   const ollamaEnabled = env.has("CTI_OLLAMA_ENABLED")
     ? env.get("CTI_OLLAMA_ENABLED") === "true"
     : (env.has("CTI_LOCAL_LLM_ENABLED") ? env.get("CTI_LOCAL_LLM_ENABLED") === "true" : true);
@@ -448,6 +477,10 @@ export function loadConfig(): Config {
     defaultWorkDir,
     bridgeProcessingTimeoutMs,
     allowedWorkspaceRoots,
+    projectRegistryPath,
+    projectDeniedRoots,
+    registeredProjects: projectRegistry.projects,
+    projectRegistryWarnings: projectRegistry.warnings,
     codexAdditionalDirectories,
     memoryRepoDir,
     uploadCacheDir,
@@ -646,6 +679,8 @@ export function saveConfig(config: Config): void {
   if (config.bridgeProcessingTimeoutMs !== undefined)
     out += formatEnvLine("CTI_BRIDGE_PROCESSING_TIMEOUT_MS", String(config.bridgeProcessingTimeoutMs));
   out += formatEnvLine("CTI_ALLOWED_WORKSPACE_ROOTS", config.allowedWorkspaceRoots?.join(";"));
+  out += formatEnvLine("CTI_PROJECT_REGISTRY_PATH", config.projectRegistryPath);
+  out += formatEnvLine("CTI_PROJECT_DENIED_ROOTS", config.projectDeniedRoots?.join(";"));
   out += formatEnvLine("CTI_CODEX_ADDITIONAL_DIRECTORIES", config.codexAdditionalDirectories?.join(";"));
   out += formatEnvLine("CTI_MEMORY_REPO_DIR", config.memoryRepoDir);
   out += formatEnvLine("CTI_UPLOAD_CACHE_DIR", config.uploadCacheDir);
@@ -994,6 +1029,16 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.allowedWorkspaceRoots && config.allowedWorkspaceRoots.length > 0) {
     m.set("bridge_allowed_workspace_roots", config.allowedWorkspaceRoots.join(";"));
   }
+  if (config.projectRegistryPath) m.set("bridge_project_registry_path", config.projectRegistryPath);
+  if (config.projectDeniedRoots && config.projectDeniedRoots.length > 0) {
+    m.set("bridge_project_denied_roots", config.projectDeniedRoots.join(";"));
+  }
+  const registeredProjects = config.registeredProjects || [];
+  m.set("bridge_project_registry_json", JSON.stringify({
+    schema: "codex-im-suite/project-registry/v1",
+    projects: registeredProjects,
+  }));
+  m.set("bridge_registered_project_count", String(registeredProjects.length));
   if (config.memoryRepoDir) {
     m.set("bridge_memory_repo_dir", config.memoryRepoDir);
   }

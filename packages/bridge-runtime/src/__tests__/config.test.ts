@@ -627,6 +627,83 @@ describe('loadConfig/saveConfig round-trip', () => {
     }
   });
 
+  it('loads structured projects while preserving legacy allowed roots as compatibility records', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-registry-config-'));
+    const structuredRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-registry-structured-'));
+    const unityRoot = path.join(structuredRoot, 'Game');
+    const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-registry-legacy-'));
+    const registryPath = path.join(configDir, 'projects.json');
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.mkdirSync(unityRoot, { recursive: true });
+      fs.writeFileSync(registryPath, `${JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [{
+          id: 'unity-project',
+          displayName: 'Unity Project',
+          type: 'unity',
+          workspaceRoot: structuredRoot,
+          unityProjectRoot: unityRoot,
+          accessMode: 'read_write',
+          enabled: true,
+        }],
+      }, null, 2)}\n`, 'utf8');
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        `CTI_DEFAULT_WORKDIR=${structuredRoot}`,
+        `CTI_ALLOWED_WORKSPACE_ROOTS=${legacyRoot}`,
+        `CTI_PROJECT_REGISTRY_PATH=${registryPath}`,
+      ].join('\n'), 'utf8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?project-registry-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.equal(config.projectRegistryPath, registryPath);
+      assert.deepEqual(config.registeredProjects.map((item: { id: string }) => item.id)[0], 'unity-project');
+      assert.equal(config.registeredProjects.length, 2);
+      assert.equal(config.registeredProjects[1].workspaceRoot, legacyRoot);
+      assert.equal(module.configToSettings(config).get('bridge_project_registry_path'), registryPath);
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+      fs.rmSync(structuredRoot, { recursive: true, force: true });
+      fs.rmSync(legacyRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves explicit project denied roots through settings and config save', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-denied-roots-'));
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-denied-work-'));
+    const deniedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-project-denied-explicit-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        `CTI_DEFAULT_WORKDIR=${workDir}`,
+        `CTI_PROJECT_DENIED_ROOTS=${deniedRoot}`,
+      ].join('\n'), 'utf8');
+      process.env.CTI_HOME = configDir;
+
+      const module = await import(`../config.js?project-denied-roots-${Date.now()}`);
+      const config = module.loadConfig();
+
+      assert.deepEqual(config.projectDeniedRoots, [deniedRoot]);
+      assert.equal(module.configToSettings(config).get('bridge_project_denied_roots'), deniedRoot);
+
+      module.saveConfig(config);
+      const saved = fs.readFileSync(path.join(configDir, 'config.env'), 'utf8');
+      assert.match(saved, new RegExp(`^CTI_PROJECT_DENIED_ROOTS=${deniedRoot.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}$`, 'mu'));
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+      fs.rmSync(workDir, { recursive: true, force: true });
+      fs.rmSync(deniedRoot, { recursive: true, force: true });
+    }
+  });
+
   it('keeps upload cache outside the default work directory', async () => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-upload-cache-config-'));
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-upload-cache-work-'));

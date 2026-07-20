@@ -256,6 +256,69 @@ test('builds turn-scoped mounts from explicit registered project paths', () => {
   ]);
 });
 
+test('uses structured project records for Unity-root to workspace-root planning', () => {
+  initBridgeContext({
+    store: {
+      getSetting: (key: string) => ({
+        bridge_project_registry_json: JSON.stringify({
+          schema: 'codex-im-suite/project-registry/v1',
+          projects: [{
+            id: 'st4', displayName: 'ST4', type: 'unity', workspaceRoot: 'F:\\unity\\ST4',
+            unityProjectRoot: 'F:\\unity\\ST4\\Game', accessMode: 'read_write', enabled: true,
+          }, {
+            id: 'st3', displayName: 'ST3', type: 'unity', workspaceRoot: 'C:\\unity\\ST3',
+            unityProjectRoot: 'C:\\unity\\ST3\\Game', accessMode: 'read_only', enabled: true,
+          }],
+        }),
+        bridge_allowed_workspace_roots: 'F:\\unity\\ST4;C:\\unity\\ST3',
+        bridge_default_work_dir: 'F:\\unity\\ST4',
+        bridge_memory_repo_dir: 'E:\\cli-md',
+      })[key] || '',
+    },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const plan = _testOnly.resolveConversationWorkspacePlan({
+    text: '读取 C:\\unity\\ST3\\Game\\Assets\\Config.asset',
+    workingDirectory: 'F:\\unity\\ST4\\Game',
+    requiresWrite: false,
+  });
+
+  assert.equal(plan.primaryWorkspace.projectId, 'st4');
+  assert.equal(plan.primaryWorkspace.path, 'F:\\unity\\ST4');
+  assert.deepEqual(plan.temporaryMounts.map((item) => ({
+    projectId: item.projectId,
+    path: item.path,
+    accessMode: item.accessMode,
+  })), [{ projectId: 'st3', path: 'C:\\unity\\ST3', accessMode: 'read_only' }]);
+});
+
+test('applies configured project denied roots before selecting the current workspace', () => {
+  initBridgeContext({
+    store: {
+      getSetting: (key: string) => ({
+        bridge_allowed_workspace_roots: 'F:\\unity\\ST4;C:\\unity\\ST3',
+        bridge_project_denied_roots: 'C:\\unity\\ST3',
+        bridge_default_work_dir: 'F:\\unity\\ST4',
+      })[key] || '',
+    },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const plan = _testOnly.resolveConversationWorkspacePlan({
+    text: '读取当前项目配置',
+    workingDirectory: 'C:\\unity\\ST3',
+    requiresWrite: false,
+  });
+
+  assert.equal(plan.primaryWorkspace.path, 'F:\\unity\\ST4');
+  assert.equal(plan.deniedRoots.some((item) => item.path === 'C:\\unity\\ST3'), true);
+});
+
 test('keeps memory-backed sticker attachments out of the workspace upload cache', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-conversation-sticker-'));
   const previousMemoryRoot = process.env.CTI_MEMORY_REPO_DIR;

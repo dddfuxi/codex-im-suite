@@ -179,4 +179,99 @@ describe('TurnWorkspacePlan', () => {
     assert.equal(plan.primaryWorkspace.accessMode, 'read_write');
     assert.equal(plan.expiresAfterTurn, true);
   });
+
+  it('maps a Unity project directory back to its registered workspace root', async () => {
+    const module = await loadWorkspacePlanModule();
+    assert.ok(module, 'workspace plan module should exist');
+
+    const plan = module.resolveTurnWorkspacePlan({
+      prompt: '检查当前 Unity 项目',
+      currentWorkingDirectory: 'F:\\unity\\ST4\\Game',
+      defaultWorkingDirectory: 'F:\\unity\\ST4',
+      registeredProjects: [{
+        id: 'st4',
+        displayName: 'ST4',
+        type: 'unity',
+        workspaceRoot: 'F:\\unity\\ST4',
+        unityProjectRoot: 'F:\\unity\\ST4\\Game',
+        accessMode: 'read_write',
+        enabled: true,
+      }],
+      deniedRoots: [],
+      requiresWrite: false,
+    });
+
+    assert.equal(plan.primaryWorkspace.projectId, 'st4');
+    assert.equal(plan.primaryWorkspace.path, 'F:\\unity\\ST4');
+  });
+
+  it('temporarily mounts the workspace root when an explicit path points inside a Unity project root', async () => {
+    const module = await loadWorkspacePlanModule();
+    assert.ok(module, 'workspace plan module should exist');
+
+    const plan = module.resolveTurnWorkspacePlan({
+      prompt: '对照 C:\\unity\\ST3\\Game\\Assets\\Config.asset',
+      currentWorkingDirectory: 'F:\\unity\\ST4',
+      defaultWorkingDirectory: 'F:\\unity\\ST4',
+      registeredProjects: [{
+        id: 'st4', displayName: 'ST4', type: 'unity', workspaceRoot: 'F:\\unity\\ST4',
+        unityProjectRoot: 'F:\\unity\\ST4\\Game', accessMode: 'read_write', enabled: true,
+      }, {
+        id: 'st3', displayName: 'ST3', type: 'unity', workspaceRoot: 'C:\\unity\\ST3',
+        unityProjectRoot: 'C:\\unity\\ST3\\Game', accessMode: 'read_only', enabled: true,
+      }],
+      deniedRoots: [],
+      requiresWrite: false,
+    });
+
+    assert.equal(plan.primaryWorkspace.projectId, 'st4');
+    assert.deepEqual(plan.temporaryMounts.map((item: { projectId?: string; path: string; accessMode: string }) => ({
+      projectId: item.projectId,
+      path: item.path,
+      accessMode: item.accessMode,
+    })), [{ projectId: 'st3', path: 'C:\\unity\\ST3', accessMode: 'read_only' }]);
+  });
+
+  it('never matches disabled structured projects', async () => {
+    const module = await loadWorkspacePlanModule();
+    assert.ok(module, 'workspace plan module should exist');
+
+    const plan = module.resolveTurnWorkspacePlan({
+      prompt: '读取 C:\\unity\\ST3\\Game\\Assets\\Config.asset',
+      currentWorkingDirectory: 'F:\\unity\\ST4',
+      defaultWorkingDirectory: 'F:\\unity\\ST4',
+      registeredProjects: [{
+        id: 'st4', displayName: 'ST4', type: 'unity', workspaceRoot: 'F:\\unity\\ST4',
+        unityProjectRoot: 'F:\\unity\\ST4\\Game', accessMode: 'read_write', enabled: true,
+      }, {
+        id: 'st3-disabled', displayName: 'ST3 Disabled', type: 'unity', workspaceRoot: 'C:\\unity\\ST3',
+        unityProjectRoot: 'C:\\unity\\ST3\\Game', accessMode: 'read_write', enabled: false,
+      }],
+      deniedRoots: [],
+      requiresWrite: false,
+    });
+
+    assert.equal(plan.primaryWorkspace.projectId, 'st4');
+    assert.deepEqual(plan.temporaryMounts, []);
+  });
+
+  it('fails closed when a write turn targets a read-only registered project', async () => {
+    const module = await loadWorkspacePlanModule();
+    assert.ok(module, 'workspace plan module should exist');
+
+    assert.throws(() => module.resolveTurnWorkspacePlan({
+      prompt: '修改 C:\\unity\\ST3\\Game\\Assets\\Config.asset',
+      currentWorkingDirectory: 'F:\\unity\\ST4',
+      defaultWorkingDirectory: 'F:\\unity\\ST4',
+      registeredProjects: [{
+        id: 'st4', displayName: 'ST4', type: 'unity', workspaceRoot: 'F:\\unity\\ST4',
+        unityProjectRoot: 'F:\\unity\\ST4\\Game', accessMode: 'read_write', enabled: true,
+      }, {
+        id: 'st3', displayName: 'ST3', type: 'unity', workspaceRoot: 'C:\\unity\\ST3',
+        unityProjectRoot: 'C:\\unity\\ST3\\Game', accessMode: 'read_only', enabled: true,
+      }],
+      deniedRoots: [],
+      requiresWrite: true,
+    }), /project_read_only/u);
+  });
 });

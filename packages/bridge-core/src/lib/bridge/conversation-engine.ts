@@ -9,6 +9,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { parseProjectRegistryDocument, type RegisteredProject } from '@codex-im-suite/contracts';
 import type { ChannelBinding, RunSummary } from './types.js';
 import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from './input-evidence.js';
 import type {
@@ -420,16 +421,31 @@ function resolveConversationWorkspacePlan(input: {
   const { store } = getBridgeContext();
   const memoryRoot = store.getSetting('bridge_memory_repo_dir');
   const uploadRoot = store.getSetting('bridge_upload_cache_dir');
+  const deniedRoots = [
+    ...(memoryRoot ? [{ path: memoryRoot, reason: 'memory repository' }] : []),
+    ...(uploadRoot ? [{ path: uploadRoot, reason: 'upload cache' }] : []),
+    { path: defaultCtiHome(), reason: 'bridge runtime data' },
+    ...splitWorkspacePathList(store.getSetting('bridge_project_denied_roots'))
+      .map((deniedPath) => ({ path: deniedPath, reason: 'configured denied project root' })),
+  ];
+  let registeredProjects: RegisteredProject[] | undefined;
+  const registryJson = store.getSetting('bridge_project_registry_json');
+  if (registryJson) {
+    try {
+      registeredProjects = parseProjectRegistryDocument(JSON.parse(registryJson), {
+        deniedRoots: deniedRoots.map((item) => item.path),
+      });
+    } catch (error) {
+      throw new Error(`invalid_project_registry_setting: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   return resolveTurnWorkspacePlan({
     prompt: input.text,
     currentWorkingDirectory: input.workingDirectory,
     defaultWorkingDirectory: store.getSetting('bridge_default_work_dir') || input.workingDirectory,
     registeredRoots: splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots')),
-    deniedRoots: [
-      ...(memoryRoot ? [{ path: memoryRoot, reason: 'memory repository' }] : []),
-      ...(uploadRoot ? [{ path: uploadRoot, reason: 'upload cache' }] : []),
-      { path: defaultCtiHome(), reason: 'bridge runtime data' },
-    ],
+    registeredProjects,
+    deniedRoots,
     requiresWrite: input.requiresWrite ?? isWorkspaceWriteTurn(input.text),
   });
 }

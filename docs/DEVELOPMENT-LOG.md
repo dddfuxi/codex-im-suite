@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 结构化项目注册表：共享 Contracts 新增 `project-registry/v1`，runtime 默认读取 `CTI_HOME\project-registry.json`，支持 `CTI_PROJECT_REGISTRY_PATH` 覆盖，并把旧 `CTI_ALLOWED_WORKSPACE_ROOTS` 仅作为 `generic` 兼容记录导入；重叠时结构化项目优先。Unity 记录分离 `workspaceRoot` 与 `unityProjectRoot`，命中 Unity 工程内部路径仍挂载 Git/工作区根；读取回合统一只读，写入只读项目失败关闭，disabled 项目不参与匹配。`CTI_PROJECT_DENIED_ROOTS` 已补齐 load/save、Bridge settings、Conversation Engine 和计划任务消费，避免控制面板保存后丢失或只在启动校验生效。人类可读文档继续遵循“机器事实源 + 同事务确定性投影”：README、架构和维护规则更新协议与入口，动态项目记录不复制成第二份 Markdown 状态。
+
 - 2026-07-20 记忆候选与归档中心落地：managed memory hidden state 正式区分 confirmed/candidate，主知识索引、关系图和默认 Prompt 只读取 confirmed；普通命令、问题、链接、mention、工具文本和历史重扫不再物化长期候选，conversation profile 改为 session 隔离。新增确认、归档、还原、仅归档后永久删除、tombstone、baseHash 冲突、存活 PID 锁和投影失败整体回滚。源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块与 `archive/memory-items/记忆归档索引.md` 由机器 state 确定性生成，不形成第二事实源。
 
 - 2026-07-20 记忆迁移 CLI 与控制面板三层入口：runtime 新增 `memory-item-cli.mjs` 和 reviewed manifest/ledger 迁移，控制面板新增 `MemoryItemGateway`，只传 opaque ID、baseHash 和审核后的候选 ID 数组，不再按任意 `path/archivePath` 直接改 Markdown。Memory 页新增“已确认 / 候选收件箱 / 已归档”、候选批量归档、确认、还原和永久删除二次确认；设置页只保留模型辅助整理草稿。`SuiteTargetResolver` 同时改为优先当前 worktree/程序集祖先，避免隔离开发面板误调用主仓库 bundle。

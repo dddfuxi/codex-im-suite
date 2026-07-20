@@ -43,6 +43,7 @@
 ## 2.2 工作区与记忆分层边界
 
 - `packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区计划唯一入口；Conversation Engine、官方 Codex、Codex CLI、本地 JSON 工具、本地 Agent 和 Mavis 必须消费同一 `TurnWorkspacePlan`，不得各自重新推断目录。
+- `CTI_HOME/project-registry.json`（或 `CTI_PROJECT_REGISTRY_PATH` 指向的文件）是结构化项目记录唯一事实源；共享 `packages/contracts/src/project-registry.ts` 是协议入口，runtime loader 负责校验并注入 Config。`CTI_ALLOWED_WORKSPACE_ROOTS` 只能作为 legacy `generic` 项目兼容输入，控制面板、C#、文档和 Provider 不得维护第二份项目记录。
 - 每轮默认只挂载当前会话工作区；`CTI_ALLOWED_WORKSPACE_ROOTS` 和项目注册根只作为权限上界，禁止自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
 - 当前会话工作区不得被消息中出现的其他项目路径替换；其他已注册项目只能作为本轮临时挂载。当前绑定目录命中禁止根或超出注册上界时必须选择安全回退，所有候选均不安全时失败关闭。
 - 只有本轮当前消息中的明确绝对路径等强证据才能临时挂载其他项目；临时挂载必须记录 evidence、reason、accessMode 和 `expiresAfterTurn=true`，不能沉淀成全局附加目录。
@@ -52,7 +53,7 @@
 - 记忆库根目录出现五入口之外的 Markdown 时，控制面板必须显式列为未归类文档；不得静默索引、自动移动或删除用户文件。
 - 旧 `data/memory/v2` 只读兼容；迁移必须默认 dry-run，Apply 前停止 Bridge/watcher，并经过暂存校验、备份、冲突不覆盖、归档和索引重建。未知 `docs|logs|runtime|config.env` 不得随记忆布局迁移自动移动。
 - managed memory hidden state 是 confirmed/candidate 生命周期唯一事实源；普通 conversation profile 只属于当前 session，命令、问题、链接、mention、工具文本和历史重扫不得自动进入 durable candidate。主索引、关系图和默认 Prompt 只消费 confirmed/兼容 legacy，candidate/archive 必须保持隔离。
-- 人类阅读文档必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块和 `archive/memory-items/记忆归档索引.md` 任一写入失败时，必须回滚 managed state、归档记录、索引和全部投影；Markdown 不得形成第二事实源。
+- 凡机器状态承诺提供人类可读视图，文档投影必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块、`archive/memory-items/记忆归档索引.md`、表情包语义档案等任一写入失败时，必须回滚 managed state、归档记录、索引和全部投影；Markdown 只展示确定性摘要与真实入口，不得形成第二事实源，受控区块外用户手写内容必须原样保留。
 - 控制面板只能通过 `MemoryItemGateway -> memory-item-cli.mjs` 执行确认、归档、还原、永久删除和迁移，不得直接编辑 memory JSON/Markdown；浏览器 payload 只允许 opaque `itemId/archiveId`、`expectedBaseHash` 和审核后的 ID 数组，禁止接受任意源路径或归档路径。
 - tentative 迁移只允许应用审核过的 manifest 和 source hash；Apply 前复用统一 Bridge/watcher 停止门禁并保留备份与成功 ledger。只有同一 plan hash 的有效 ledger 才能作为幂等依据，不能因为当前文件“看起来已经是 v2”就跳过未审核变更。
 - tentative 迁移 Apply 后不得重新启动仍只认识 v1 `tentative` 的旧 live runtime；必须保持 Bridge 停止，先同步支持 managed memory v2 的 suite live 副本，再启动 Bridge。若旧 runtime 已覆盖迁移结果，只能基于原 migration ledger、备份和当前 baseHash 做 dry-run 差异恢复，不得整文件回滚或覆盖后续用户操作。

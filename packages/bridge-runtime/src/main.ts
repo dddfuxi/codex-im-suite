@@ -3207,6 +3207,10 @@ async function main(): Promise<void> {
     { path: CTI_HOME, reason: 'bridge runtime data' },
     ...(config.memoryRepoDir ? [{ path: config.memoryRepoDir, reason: 'memory repository' }] : []),
     ...(config.uploadCacheDir ? [{ path: config.uploadCacheDir, reason: 'upload cache' }] : []),
+    ...(config.projectDeniedRoots || []).map((deniedPath) => ({
+      path: deniedPath,
+      reason: 'configured denied project root',
+    })),
   ];
   let scheduledTaskService: ReturnType<typeof createScheduledTaskService>;
   const scheduledTaskExecute = createScheduledTaskRunExecutor({
@@ -3226,6 +3230,7 @@ async function main(): Promise<void> {
           prompt: '',
           currentWorkingDirectory: boundDirectory,
           registeredRoots: config.allowedWorkspaceRoots,
+          registeredProjects: config.registeredProjects,
           deniedRoots: scheduledTaskDeniedRoots,
           requiresWrite: true,
         });
