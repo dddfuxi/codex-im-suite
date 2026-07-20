@@ -83,3 +83,20 @@ export interface StickerSemanticDeliveryFileV1 {
   updatedAt: string;
   deliveries: StickerDeliveryEvidence[];
 }
+
+export interface StickerSemanticFeedbackRecordV1 {
+  schema: 'codex-im-suite/sticker-semantic-feedback/v1';
+  feedbackId: string;
+  deliveryId: string;
+  evidenceId: string;
+  evidenceHash: string;
+  fileKey: string;
+  sessionId: string;
+  kind: 'positive' | 'negative' | 'neutral' | 'ambiguous';
+  scope: StickerSemanticScopeName;
+  scopeId?: string;
+  confidence: number;
+  strength: 'normal' | 'strong';
+  reason: string;
+  createdAt: string;
+}

@@ -9,6 +9,7 @@ import type {
   StickerSemanticActor,
   StickerSemanticAsset,
   StickerSemanticDeliveryFileV1,
+  StickerSemanticFeedbackRecordV1,
   StickerSemanticRevisionFileV1,
   StickerSemanticRevisionV1,
   StickerSemanticSnapshot,
@@ -28,7 +29,14 @@ export interface StickerSemanticStoreOptions {
 export interface StickerSemanticStore {
   readSnapshot(): StickerSemanticSnapshot;
   applyRevision(revision: StickerSemanticRevisionV1, actor: StickerSemanticActor): StickerSemanticRevisionV1;
+  saveRevision(input: {
+    revision: StickerSemanticRevisionV1;
+    expectedBaseHash: string;
+    actor: StickerSemanticActor;
+    feedback?: StickerSemanticFeedbackRecordV1;
+  }): StickerSemanticRevisionV1;
   recordDelivery(evidence: StickerDeliveryEvidence): void;
+  recordFeedback(feedback: StickerSemanticFeedbackRecordV1): void;
   findDeliveries(messageIds: string[]): StickerDeliveryEvidence[];
   refreshHumanReadableDocuments(): void;
 }
@@ -153,6 +161,17 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
   const stickerPath = path.join(stickerRoot, 'stickers.json');
   const revisionPath = path.join(stickerRoot, 'semantic-revisions.json');
   const deliveryPath = path.join(stickerRoot, 'semantic-deliveries.json');
+  const feedbackPath = path.join(stickerRoot, 'semantic-feedback.jsonl');
+
+  const readFeedback = (): StickerSemanticFeedbackRecordV1[] => {
+    if (!fs.existsSync(feedbackPath)) return [];
+    return fs.readFileSync(feedbackPath, 'utf8')
+      .split(/\r?\n/u)
+      .filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line) as StickerSemanticFeedbackRecordV1]; } catch { return []; }
+      });
+  };
 
   const readMachine = () => {
     const stickerFile = readJson<LegacyStickerFile>(stickerPath, { version: 1, stickers: [] });
@@ -162,7 +181,7 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
     const deliveryFile = readJson<StickerSemanticDeliveryFileV1>(deliveryPath, {
       schema: 'codex-im-suite/sticker-semantic-deliveries/v1', updatedAt: '', deliveries: [],
     });
-    return { stickerFile, revisionFile, deliveryFile };
+    return { stickerFile, revisionFile, deliveryFile, feedbackRecords: readFeedback() };
   };
 
   const snapshotFrom = (machine: ReturnType<typeof readMachine>, generatedAt = now()): StickerSemanticSnapshot => ({
@@ -205,27 +224,61 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
     try { return operation(); } finally { release(); }
   };
 
+  const persistRevision = (input: {
+    revision: StickerSemanticRevisionV1;
+    expectedBaseHash: string;
+    actor: StickerSemanticActor;
+    feedback?: StickerSemanticFeedbackRecordV1;
+    versionFileName: string;
+    allowExisting: boolean;
+  }): StickerSemanticRevisionV1 => mutate(() => {
+    const machine = readMachine();
+    const current = snapshotFrom(machine);
+    if (input.expectedBaseHash !== current.baseHash) throw new Error('source_changed');
+    if (!current.assets.some((item) => item.fileKey === input.revision.fileKey)) throw new Error('sticker_not_found');
+    const existingIndex = machine.revisionFile.revisions.findIndex((item) => item.revisionId === input.revision.revisionId);
+    if (existingIndex >= 0 && !input.allowExisting) throw new Error('revision_conflict');
+    const revisions = [...machine.revisionFile.revisions];
+    if (existingIndex >= 0) revisions[existingIndex] = input.revision;
+    else revisions.push(input.revision);
+    machine.revisionFile = {
+      schema: 'codex-im-suite/sticker-semantic-revisions/v1',
+      updatedAt: now(),
+      revisions,
+    };
+    if (input.feedback && !machine.feedbackRecords.some((item) => item.evidenceHash === input.feedback?.evidenceHash)) {
+      machine.feedbackRecords = [...machine.feedbackRecords, input.feedback].slice(-5000);
+    }
+    const next = snapshotFrom(machine, machine.revisionFile.updatedAt);
+    const versionPath = path.join(stickerRoot, 'semantic-versions', input.revision.fileKey, `${input.versionFileName}.json`);
+    const mutations: Mutation[] = [
+      { filePath: revisionPath, content: `${JSON.stringify(machine.revisionFile, null, 2)}\n`, kind: 'machine' },
+      { filePath: versionPath, content: `${JSON.stringify({ actor: input.actor, revision: input.revision }, null, 2)}\n`, kind: 'machine' },
+    ];
+    if (input.feedback) {
+      mutations.push({
+        filePath: feedbackPath,
+        content: machine.feedbackRecords.map((item) => JSON.stringify(item)).join('\n') + '\n',
+        kind: 'machine',
+      });
+    }
+    commit(mutations, projectionMutations(next));
+    return input.revision;
+  });
+
   return {
     readSnapshot: () => snapshotFrom(readMachine()),
-    applyRevision: (revision, _actor) => mutate(() => {
-      const machine = readMachine();
-      const current = snapshotFrom(machine);
-      if (revision.baseHash !== current.baseHash) throw new Error('source_changed');
-      if (!current.assets.some((item) => item.fileKey === revision.fileKey)) throw new Error('sticker_not_found');
-      if (machine.revisionFile.revisions.some((item) => item.revisionId === revision.revisionId)) throw new Error('revision_conflict');
-      machine.revisionFile = {
-        schema: 'codex-im-suite/sticker-semantic-revisions/v1',
-        updatedAt: now(),
-        revisions: [...machine.revisionFile.revisions, revision],
-      };
-      const next = snapshotFrom(machine, machine.revisionFile.updatedAt);
-      const versionPath = path.join(stickerRoot, 'semantic-versions', revision.fileKey, `${revision.revisionId}.json`);
-      const mutations: Mutation[] = [
-        { filePath: revisionPath, content: `${JSON.stringify(machine.revisionFile, null, 2)}\n`, kind: 'machine' },
-        { filePath: versionPath, content: `${JSON.stringify({ actor: _actor, revision }, null, 2)}\n`, kind: 'machine' },
-      ];
-      commit(mutations, projectionMutations(next));
-      return revision;
+    applyRevision: (revision, actor) => persistRevision({
+      revision,
+      expectedBaseHash: revision.baseHash,
+      actor,
+      versionFileName: revision.revisionId,
+      allowExisting: false,
+    }),
+    saveRevision: (input) => persistRevision({
+      ...input,
+      versionFileName: input.revision.versionId,
+      allowExisting: true,
     }),
     recordDelivery: (evidence) => mutate(() => {
       const machine = readMachine();
@@ -239,6 +292,17 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
       commit([
         { filePath: deliveryPath, content: `${JSON.stringify(machine.deliveryFile, null, 2)}\n`, kind: 'machine' },
       ], projectionMutations(next));
+    }),
+    recordFeedback: (feedback) => mutate(() => {
+      const machine = readMachine();
+      if (machine.feedbackRecords.some((item) => item.evidenceHash === feedback.evidenceHash)) return;
+      machine.feedbackRecords = [...machine.feedbackRecords, feedback].slice(-5000);
+      const next = snapshotFrom(machine, feedback.createdAt || now());
+      commit([{
+        filePath: feedbackPath,
+        content: machine.feedbackRecords.map((item) => JSON.stringify(item)).join('\n') + '\n',
+        kind: 'machine',
+      }], projectionMutations(next));
     }),
     findDeliveries: (messageIds) => {
       const ids = new Set(messageIds.map((value) => value.trim()).filter(Boolean));

@@ -63,6 +63,9 @@ import {
 import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
 import { listManagedRuleStates } from './self-maintenance-rule-lifecycle.js';
 import { recordSelfMaintenanceMetric } from './self-maintenance-metrics.js';
+import { createStickerFeedbackClassifier } from './sticker-semantics/feedback-classifier.js';
+import { createStickerSemanticEvolutionHost } from './sticker-semantics/host.js';
+import { createStickerSemanticStore } from './sticker-semantics/store.js';
 import { SDKLLMProvider, resolveClaudeCliPath, preflightCheck } from './llm-provider.js';
 import { PendingPermissions } from './permission-gateway.js';
 import {
@@ -3182,6 +3185,16 @@ async function main(): Promise<void> {
   }
   const llm = await resolveProvider(config, pendingPerms, store, turnStorage);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
+  const stickerSemantics = config.memoryRepoDir
+    ? createStickerSemanticEvolutionHost({
+        store: createStickerSemanticStore({ memoryRoot: config.memoryRepoDir }),
+        classifier: createStickerFeedbackClassifier({
+          provider: llm,
+          timeoutMs: Number.parseInt(store.getSetting('bridge_sticker_feedback_timeout_ms') || '8000', 10) || 8000,
+        }),
+        confirmationThreshold: Number.parseInt(store.getSetting('bridge_sticker_semantic_confirmation_threshold') || '3', 10) || 3,
+      })
+    : undefined;
 
   const scheduledTaskRuntimeAbort = new AbortController();
   const scheduledTaskStore = createFileScheduledTaskStore(path.join(CTI_HOME, 'data', 'scheduled-tasks'));
@@ -3398,6 +3411,7 @@ async function main(): Promise<void> {
       }),
     },
     memoryIntents: new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
+    stickerSemantics,
     agentHome: config.memoryRepoDir ? {
       readPromptSections: async (input) => readAgentHomePromptSections(config.memoryRepoDir!, {
         maxDocumentChars: Number.parseInt(store.getSetting('bridge_agent_home_document_max_chars') || '4000', 10) || 4000,

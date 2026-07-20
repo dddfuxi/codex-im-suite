@@ -32,7 +32,7 @@ export function renderStickerSemanticArchive(snapshot: StickerSemanticSnapshot):
         revision.patch.intent ? `意图：${revision.patch.intent}` : '',
         revision.patch.tone ? `语气：${revision.patch.tone}` : '',
         revision.patch.usage ? `用法：${revision.patch.usage}` : '',
-        revision.patch.avoidRules?.length ? `避免规则：${revision.patch.avoidRules.map((rule) => `${rule.category}（${statusLabel(rule.status)}）`).join('、')}` : '',
+        revision.patch.avoidRules?.length ? `避免规则：${revision.patch.avoidRules.map((rule) => `${rule.category}：${rule.condition}（${statusLabel(rule.status)}）`).join('、')}` : '',
       ].filter(Boolean).join('；') || '无可展示 patch。';
       return `- ${asset?.label || '未命名表情包'}：${statusLabel(revision.status)}；${scopeLabel(revision.scope)}；${patch}；支持会话 ${revision.supportSessionIds.length}；矛盾会话 ${revision.contradictionSessionIds.length}；更新 ${revision.updatedAt}`;
     });
