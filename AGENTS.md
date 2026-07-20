@@ -55,6 +55,7 @@
 - 人类阅读文档必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块和 `archive/memory-items/记忆归档索引.md` 任一写入失败时，必须回滚 managed state、归档记录、索引和全部投影；Markdown 不得形成第二事实源。
 - 控制面板只能通过 `MemoryItemGateway -> memory-item-cli.mjs` 执行确认、归档、还原、永久删除和迁移，不得直接编辑 memory JSON/Markdown；浏览器 payload 只允许 opaque `itemId/archiveId`、`expectedBaseHash` 和审核后的 ID 数组，禁止接受任意源路径或归档路径。
 - tentative 迁移只允许应用审核过的 manifest 和 source hash；Apply 前复用统一 Bridge/watcher 停止门禁并保留备份与成功 ledger。只有同一 plan hash 的有效 ledger 才能作为幂等依据，不能因为当前文件“看起来已经是 v2”就跳过未审核变更。
+- tentative 迁移 Apply 后不得重新启动仍只认识 v1 `tentative` 的旧 live runtime；必须保持 Bridge 停止，先同步支持 managed memory v2 的 suite live 副本，再启动 Bridge。若旧 runtime 已覆盖迁移结果，只能基于原 migration ledger、备份和当前 baseHash 做 dry-run 差异恢复，不得整文件回滚或覆盖后续用户操作。
 - 控制面板解析开发根时，显式 `CODEX_IM_SUITE_ROOT` 优先；否则必须优先当前目录和运行程序集所在的 linked worktree，再回退默认主仓库或 live 路径，禁止默认主仓库抢占当前隔离开发入口。
 
 ## 2.3 统一计划任务边界
