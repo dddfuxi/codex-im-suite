@@ -68,6 +68,18 @@ import {
   type FeishuStickerStore,
   type FeishuStickerUserAnnotation,
 } from '../channels/feishu/stickers/sticker-store-schema.js';
+import {
+  FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE,
+  compactFeishuStickerStoreRecords,
+  feishuStickerSemanticText,
+  feishuStickerUserAnnotationText,
+  hasFeishuStickerAnnotation,
+  hasReliableFeishuStickerSemantics,
+  isFeishuStickerActive,
+  isFeishuStickerDeleted,
+  looksLikeFeishuStickerFileKey,
+  resolveFeishuStickerFileKey,
+} from '../channels/feishu/stickers/sticker-selection-policy.js';
 import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/indexed-history-prompt.js';
 import { retrieveFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-retrieval.js';
@@ -156,7 +168,6 @@ type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'st
 const TYPING_EMOJI = 'Typing';
 const FEISHU_BOT_TO_BOT_LOOP_TTL_MS = 5 * 60 * 1000;
 const FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT = 2;
-const FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE = 0.45;
 const FEISHU_STICKER_MEDIA_DOWNLOAD_RETRY_INTERVAL_MS = 15 * 60 * 1000;
 
 interface FeishuReactionHint {
@@ -203,11 +214,6 @@ function extractFeishuStickerHint(text: string): FeishuStickerHint | null {
   };
 }
 
-function looksLikeFeishuStickerFileKey(value: string): boolean {
-  const trimmed = value.trim();
-  return /^(?:file_v\d+_[A-Za-z0-9_-]+|v\d+_[A-Za-z0-9]+_[A-Za-z0-9-]+g|[0-9a-f]{8}-[0-9a-f-]{20,})$/i.test(trimmed);
-}
-
 function isExplicitFeishuStickerSendRequest(text: string): boolean {
   const normalized = text.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
   if (!normalized || normalized.length > 80) return false;
@@ -216,13 +222,6 @@ function isExplicitFeishuStickerSendRequest(text: string): boolean {
   const hasStickerNoun = /(?:表情包|表情|sticker|贴纸)/iu.test(normalized);
   const hasSendIntent = /(?:发|发送|回|回复|来|整|丢|贴|用|给|send|reply|post)/iu.test(normalized);
   return hasStickerNoun && hasSendIntent;
-}
-
-function hasSpecificStickerSemanticConstraint(text: string): boolean {
-  const compact = text.normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
-  if (!compact) return false;
-  // 这些是“用途/情绪/语气”约束，不是具体表情写死；命中后必须语义匹配才可发 sticker。
-  return /(夸|夸奖|称赞|表扬|赞美|真棒|棒呀|厉害|优秀|鼓励|加油|安慰|抱抱|难过|委屈|生气|愤怒|吐槽|嘲讽|反讽|疑惑|迷惑|懵|尴尬|无语|震惊|惊讶|开心|快乐|高兴|笑|哈哈|感谢|谢谢|抱歉|对不起|庆祝|恭喜|告别|晚安|早安|可爱|撒娇|害羞|期待|拒绝|警告|严肃|催促|困|累|破防|离谱)/iu.test(compact);
 }
 
 function escapeRegExp(text: string): string {
@@ -1389,140 +1388,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
     ].join('\n');
   }
 
-  private tokenizeStickerSemanticText(value: string): Set<string> {
-    const normalized = value.normalize('NFKC').toLowerCase();
-    const tokens = new Set<string>();
-    for (const token of normalized.split(/[^\p{L}\p{N}_+-]+/u)) {
-      const trimmed = token.trim();
-      if (trimmed.length >= 2) tokens.add(trimmed);
-    }
-    const compact = normalized.replace(/[^\p{L}\p{N}]/gu, '');
-    const compactVariants = new Set([compact]);
-    // 中文轻聊天里“了 / 啦 / 喽 / 咯”常只是语气差异；归一化后再做 n-gram，
-    // 让“我来了”和“来啦来啦”这类同义表达先走语义匹配，而不是退到泛用候选。
-    const colloquialParticleVariant = compact.replace(/[啦喽咯]/gu, '了');
-    if (colloquialParticleVariant !== compact) compactVariants.add(colloquialParticleVariant);
-    for (const variant of compactVariants) {
-      for (let size = 2; size <= 4; size += 1) {
-        for (let index = 0; index + size <= variant.length; index += 1) {
-          tokens.add(variant.slice(index, index + size));
-        }
-      }
-    }
-    return tokens;
-  }
-
   private stickerSemanticText(record: FeishuStickerRecord): string {
-    return [
-      record.label,
-      record.description,
-      record.intent,
-      record.tone,
-      record.usage,
-      record.avoidWhen,
-      ...(record.aliases || []),
-      ...(record.examples || []),
-    ].filter((item): item is string => Boolean(item?.trim())).join(' ');
+    return feishuStickerSemanticText(record);
   }
 
   private compactStickerStoreRecords(records: FeishuStickerRecord[]): FeishuStickerRecord[] {
-    const normalized = new Map<string, FeishuStickerRecord>();
-    for (const record of records) {
-      const fileKey = record.fileKey?.trim();
-      if (!fileKey) continue;
-      const existing = normalized.get(fileKey);
-      if (!existing || this.compareStickerRetention(record, existing) < 0) normalized.set(fileKey, record);
-    }
-    return Array.from(normalized.values())
-      .sort((left, right) => this.compareStickerRetention(left, right))
-      .slice(0, 80);
-  }
-
-  private compareStickerRetention(left: FeishuStickerRecord, right: FeishuStickerRecord): number {
-    return this.stickerRetentionScore(right) - this.stickerRetentionScore(left)
-      || (Date.parse(right.lastSeenAt || '') || 0) - (Date.parse(left.lastSeenAt || '') || 0)
-      || (Date.parse(right.annotationUpdatedAt || right.annotationVerifiedAt || '') || 0)
-        - (Date.parse(left.annotationUpdatedAt || left.annotationVerifiedAt || '') || 0)
-      || left.fileKey.localeCompare(right.fileKey);
-  }
-
-  private stickerRetentionScore(record: FeishuStickerRecord): number {
-    let score = 0;
-    // 历史同步会登记大量只有 file_key 的空壳记录；它们可用于水位和审计，
-    // 但绝不能在容量裁剪时挤掉已经有媒体、语义或人工处理痕迹的表情包资产。
-    if (this.hasTrustedStickerSemanticSource(record) && this.hasStickerAnnotation(record)) score += 1000;
-    else if (this.hasStickerAnnotation(record)) score += 700;
-    if (this.stickerUserAnnotationText(record.userAnnotation)) score += 650;
-    if (record.mediaCachedAt || record.mediaMimeType || record.mediaSize || this.findStickerCachePath(record.fileKey)) score += 600;
-    if (record.disabled) score += 500;
-    if (record.archived) score += 550;
-    if (record.mediaDownloadFailedAt || record.mediaDownloadError) score += 250;
-    if (record.lastUsedAt) score += 120;
-    if ((record.aliases || []).some((alias) => !/^(?:最近|默认|表情包)$/u.test(alias))) score += 60;
-    return score;
+    return compactFeishuStickerStoreRecords(records, {
+      hasCachedMedia: (fileKey) => Boolean(this.findStickerCachePath(fileKey)),
+      maxRecords: 80,
+    });
   }
 
   private stickerUserAnnotationText(annotation?: FeishuStickerUserAnnotation): string {
-    if (!annotation) return '';
-    return [
-      annotation.label,
-      annotation.description,
-      annotation.intent,
-      annotation.tone,
-      annotation.usage,
-      annotation.avoidWhen,
-      ...(annotation.aliases || []),
-      ...(annotation.examples || []),
-    ].filter((item): item is string => Boolean(item?.trim())).join(' ');
-  }
-
-  private hasSpecificStickerSemanticText(value: string): boolean {
-    const compact = value
-      .normalize('NFKC')
-      .toLowerCase()
-      .replace(/[\s，,。.;；:：、"'“”‘’()[\]{}<>《》【】!！?？~～_-]+/gu, '')
-      .replace(/(?:飞书|表情包|表情|sticker|贴纸|图片|图像|动图|一张|一个|这个|那个|用于|用来|使用|发送|回复|回话|聊天|消息|默认|随便|普通|轻量|发个|发|给你|来一个|来)/gu, '')
-      .trim();
-    return compact.length >= 2;
-  }
-
-  private stickerTextOverlapScore(left: string, right: string): number {
-    const normalizedLeft = left.normalize('NFKC').toLowerCase().trim();
-    const normalizedRight = right.normalize('NFKC').toLowerCase().trim();
-    if (!normalizedLeft || !normalizedRight) return 0;
-    if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 80;
-    const leftTokens = this.tokenizeStickerSemanticText(normalizedLeft);
-    const rightTokens = this.tokenizeStickerSemanticText(normalizedRight);
-    if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
-    let score = 0;
-    for (const token of leftTokens) {
-      if (!rightTokens.has(token)) continue;
-      score += token.length >= 4 ? 8 : token.length === 3 ? 5 : 3;
-    }
-    return score;
-  }
-
-  private stickerAvoidsContext(record: FeishuStickerRecord, contextText: string): boolean {
-    return Boolean(record.avoidWhen?.trim() && this.stickerTextOverlapScore(contextText, record.avoidWhen) >= 12);
-  }
-
-  private stickerSemanticMatchScore(record: FeishuStickerRecord, contextText: string): number {
-    if (!this.hasStickerAnnotation(record)) return 0;
-    if (!contextText.trim() || this.stickerAvoidsContext(record, contextText)) return 0;
-    return this.stickerTextOverlapScore(contextText, this.stickerSemanticText(record));
-  }
-
-  private stickerSemanticScore(record: FeishuStickerRecord, contextText: string, chatId?: string): number {
-    if (!this.isStickerActive(record)) return Number.NEGATIVE_INFINITY;
-    if (contextText.trim() && this.stickerAvoidsContext(record, contextText)) return Number.NEGATIVE_INFINITY;
-    const semanticText = this.stickerSemanticText(record);
-    const semanticScore = contextText.trim() ? this.stickerTextOverlapScore(contextText, semanticText) : 0;
-    return semanticScore
-      + (record.chatId === chatId ? 20 : 0)
-      + (this.hasStickerAnnotation(record) ? 16 : 0)
-      + Math.round((Number(record.annotationConfidence) || 0) * 8)
-      - Math.min(Number(record.useCount || 0), 20) * 0.25
-      - Math.max(0, Date.now() - (Date.parse(record.lastUsedAt || '') || 0) < 60 * 60 * 1000 ? 3 : 0);
+    return feishuStickerUserAnnotationText(annotation);
   }
 
   private rememberSticker(input: {
@@ -1567,74 +1445,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private resolveStickerFileKey(target: string, chatId?: string, contextText = ''): string | null {
-    const normalized = target.trim();
-    const store = this.readStickerStore();
-    if (looksLikeFeishuStickerFileKey(normalized)) {
-      const record = store.stickers.find((item) => item.fileKey === normalized) || null;
-      return this.isStickerReliableForAutoSend(record) ? normalized : null;
-    }
-    const alias = normalized || '最近';
-    const genericTarget = /^(?:最近|默认|表情包|sticker|飞书表情包)$/iu.test(alias);
-    const wantsRecent = /^最近$/u.test(alias);
-    const compareCommon = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
-      Number(b.chatId === chatId) - Number(a.chatId === chatId)
-      || Number(this.hasStickerAnnotation(b)) - Number(this.hasStickerAnnotation(a));
-    const compareSemanticStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
-      this.stickerSemanticScore(b, contextText, chatId) - this.stickerSemanticScore(a, contextText, chatId)
-      || compareCommon(a, b)
-      || (Number(a.useCount || 0) - Number(b.useCount || 0))
-      || ((Date.parse(a.lastUsedAt || '') || 0) - (Date.parse(b.lastUsedAt || '') || 0))
-      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
-    const compareRecentStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
-      compareCommon(a, b)
-      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
-    const compareRotatingStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
-      compareCommon(a, b)
-      || (Number(a.useCount || 0) - Number(b.useCount || 0))
-      || ((Date.parse(a.lastUsedAt || '') || 0) - (Date.parse(b.lastUsedAt || '') || 0))
-      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
-    const compareSpecificStickerCandidate = (a: FeishuStickerRecord, b: FeishuStickerRecord): number =>
-      compareCommon(a, b)
-      || (Number(b.useCount || 0) - Number(a.useCount || 0))
-      || ((Date.parse(b.lastSeenAt || '') || 0) - (Date.parse(a.lastSeenAt || '') || 0));
-    const compareStickerCandidate = wantsRecent
-      ? compareRecentStickerCandidate
-      : genericTarget
-        ? contextText.trim()
-          ? compareSemanticStickerCandidate
-          : compareRotatingStickerCandidate
-        : compareSpecificStickerCandidate;
-    const enabledStickers = store.stickers.filter((item) => this.isStickerActive(item));
-    if (genericTarget) {
-      const minimumSemanticScore = contextText.trim().length <= 8 ? 3 : 6;
-      const genericCandidates = enabledStickers
-        .filter((item) => this.isStickerReliableForAutoSend(item))
-        .filter((item) => this.stickerSemanticMatchScore(item, contextText) >= minimumSemanticScore)
-        .sort(compareSemanticStickerCandidate);
-      if (genericCandidates[0]?.fileKey) return genericCandidates[0].fileKey;
-      if (hasSpecificStickerSemanticConstraint(contextText)) return null;
-      // 显式发表情包的轻量回复可能只剩“来啦~”这类低信息文本。
-      // 没有文本重合时，仅允许从可信语义档案兜底选择，仍禁止无语义/低置信 file_key 轮换。
-      const annotatedFallback = enabledStickers
-        .filter((item) => this.isStickerReliableForAutoSend(item))
-        .filter((item) => !contextText.trim() || !this.stickerAvoidsContext(item, contextText))
-        .sort(compareSemanticStickerCandidate);
-      return annotatedFallback[0]?.fileKey || null;
-    }
-    const byAlias = (genericTarget
-      ? enabledStickers
-      : enabledStickers
-        .filter((item) => this.isStickerReliableForAutoSend(item))
-        // 用户口头解释或旧快答残留可能写入 alias；只有已核验语义才能通过别名触发表情包发送。
-        .filter((item) => (item.aliases || []).some((name) => name.toLowerCase() === alias.toLowerCase())))
-      .filter((item) => !contextText.trim() || !this.stickerAvoidsContext(item, contextText))
-      .sort(compareStickerCandidate);
-    if (!genericTarget) return byAlias[0]?.fileKey || null;
-    const fallback = enabledStickers
-      .slice()
-      .filter((item) => !contextText.trim() || !this.stickerAvoidsContext(item, contextText))
-      .sort(compareStickerCandidate);
-    return (byAlias[0] || fallback[0])?.fileKey || null;
+    return resolveFeishuStickerFileKey(this.readStickerStore(), target, {
+      chatId,
+      contextText,
+      nowMs: Date.now(),
+      minimumVisionConfidence: FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE,
+    });
   }
 
   /**
@@ -1947,46 +1763,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private hasStickerAnnotation(record: FeishuStickerRecord | null): boolean {
-    const legacyTrusted = !!record
-      && !record.annotationSource
-      && !record.annotationVerifiedAt
-      && !(
-        record.learnedFromMessageId
-        && record.messageId
-        && record.learnedFromMessageId !== record.messageId
-      );
-    const trustedSource = record?.annotationSource === 'vision'
-      || record?.annotationSource === 'manual'
-      || Boolean(record?.annotationVerifiedAt)
-      || legacyTrusted;
-    return !!record && trustedSource && Boolean(
-      record.label?.trim()
-      || record.description?.trim()
-      || record.intent?.trim()
-      || record.tone?.trim()
-      || record.usage?.trim(),
-    );
-  }
-
-  private hasTrustedStickerSemanticSource(record: FeishuStickerRecord | null): boolean {
-    return (record?.annotationSource === 'vision' && record.visionMediaFileKey === record.fileKey)
-      || record?.annotationSource === 'manual'
-      || Boolean(record?.annotationVerifiedAt);
+    return hasFeishuStickerAnnotation(record);
   }
 
   private hasReliableStickerSemantics(record: FeishuStickerRecord | null): boolean {
-    if (!record || !this.isStickerActive(record) || !this.hasStickerAnnotation(record)) return false;
-    // 旧版无来源语义只作为 evidence 给 agent 参考，不能直接触发表情包发送。
-    if (!this.hasTrustedStickerSemanticSource(record)) return false;
-    // 只有“表情包 / 发一个 / 用于聊天”这类泛词时，说明还没有真正可用的语义。
-    if (!this.hasSpecificStickerSemanticText(this.stickerSemanticText(record))) return false;
-    const confidence = Number(record.annotationConfidence);
-    // 低置信视觉读图仍可作为后续复核线索，但不能驱动自动发送，避免“看不懂也发”。
-    if (record.annotationSource === 'vision') {
-      if (!Number.isFinite(confidence)) return false;
-      if (confidence < FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE) return false;
-    }
-    return true;
+    return hasReliableFeishuStickerSemantics(record, FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE);
   }
 
   private isStickerReliableForAutoSend(record: FeishuStickerRecord | null): boolean {
@@ -1994,12 +1775,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private isStickerActive(record: FeishuStickerRecord): boolean {
-    return record.disabled !== true && record.archived !== true;
+    return isFeishuStickerActive(record);
   }
 
   private isStickerDeleted(store: FeishuStickerStore, fileKey: string): boolean {
-    const normalized = fileKey.trim();
-    return Boolean(normalized && store.deletedStickers?.[normalized]);
+    return isFeishuStickerDeleted(store, fileKey);
   }
 
   private buildStickerSemanticText(fileKey: string | null, record: FeishuStickerRecord | null): string {

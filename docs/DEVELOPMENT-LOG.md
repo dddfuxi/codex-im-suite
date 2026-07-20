@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu stickers 第二阶段迁移：新增 `channels/feishu/stickers/sticker-selection-policy.ts`，把可信 annotation/视觉置信度/active/deleted 门禁、具体语义过滤、中文口语 n-gram、元描述停用词、`avoidWhen`、语义得分、同群/使用次数/最近使用排序、精确 file key/别名/通用请求解析和 80 条 retention 去重从 adapter 迁出；时间与媒体缓存命中通过参数注入。直接测试发现并修复“表达愤怒”仅因共享元描述词“表达”误选“难过”表情的问题，现通用元描述不再贡献匹配分。新增 5 项直接模块测试，RED 为模块不存在，GREEN 后模块 5/5、adapter 联合专项 159/159、Core 622/622、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。下一阶段迁移用户解释/视觉标注演进与候选 evidence/prompt 构造。
+
 - 2026-07-20 Feishu stickers 第一阶段迁移：新增 `channels/feishu/stickers/sticker-store-schema.ts`，把 record/store/tombstone/history-backfill 类型、空库构造、状态库归一化、NFKC/长度/数量清洗、乱码剔除、置信度截断、视觉媒体 key 不一致降级、旧文本教学迁入未核验 `userAnnotation`、archive 时间约束和清洗后空 file key 过滤从 adapter 迁出。adapter 继续负责受控记忆路径读取、备份恢复、写前快照、原子替换、媒体缓存、候选选择和平台收发。新增 5 项直接模块测试，RED 为模块不存在，GREEN 后模块 5/5、adapter 联合专项 159/159、Core 617/617、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。下一阶段迁移 retention/语义匹配与候选排序。
 
 - 2026-07-20 Feishu mentions 第二阶段收口：新增 `channels/feishu/mentions/inbound-mention-wake.ts`，把事件 mentions 的 open/user/union ID 精确匹配、text/post/card 结构化 `<at>` 递归检测、mention marker 清理、bot alias 归一化、原生 mention 纠错过滤和通用 bot name wake 分类从 adapter 迁出。adapter 仅保留设置读取、各消息类型可见正文解析和入站编排；群聊 `require_mention` 仍只信任当前 bot 的原生/同 ID 结构化 mention，reply 本 bot 的 sticker/image 窄入口不变。新增 7 项直接模块测试，RED 为模块不存在，GREEN 后模块 7/7、adapter 联合专项 161/161、Core 612/612、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过；live 与飞书现场验收在阶段提交后执行。mentions 子域拆分完成，下一子域进入 stickers。
