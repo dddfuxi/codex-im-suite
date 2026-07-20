@@ -59,6 +59,15 @@ import {
   FeishuStickerMediaCache,
   sniffImageMimeType,
 } from '../channels/feishu/media/sticker-media-cache.js';
+import {
+  createEmptyFeishuStickerStore,
+  isUnsafeFeishuStickerSemanticText,
+  normalizeFeishuStickerStore,
+  type FeishuStickerHistoryBackfillRecord,
+  type FeishuStickerRecord,
+  type FeishuStickerStore,
+  type FeishuStickerUserAnnotation,
+} from '../channels/feishu/stickers/sticker-store-schema.js';
 import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/indexed-history-prompt.js';
 import { retrieveFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-retrieval.js';
@@ -335,66 +344,6 @@ function getFeishuEmojiProfilePath(): string {
   );
 }
 
-interface FeishuStickerRecord {
-  fileKey: string;
-  aliases: string[];
-  label?: string;
-  description?: string;
-  intent?: string;
-  tone?: string;
-  usage?: string;
-  avoidWhen?: string;
-  examples?: string[];
-  annotationConfidence?: number;
-  annotationSource?: 'vision' | 'manual' | 'user';
-  /** 视觉语义实际分析过的媒体 key；必须与 fileKey 一致才可被信任。 */
-  visionMediaFileKey?: string;
-  annotationVerifiedAt?: string;
-  annotationUpdatedAt?: string;
-  userAnnotation?: FeishuStickerUserAnnotation;
-  learnedFromMessageId?: string;
-  disabled?: boolean;
-  disabledReason?: string;
-  lastEditedAt?: string;
-  archived?: boolean;
-  archivedAt?: string;
-  chatId?: string;
-  userId?: string;
-  messageId?: string;
-  mediaCachedAt?: string;
-  mediaMimeType?: string;
-  mediaSize?: number;
-  mediaDownloadFailedAt?: string;
-  mediaDownloadError?: string;
-  firstSeenAt: string;
-  lastSeenAt: string;
-  lastUsedAt?: string;
-  useCount: number;
-}
-
-interface FeishuStickerUserAnnotation {
-  label?: string;
-  description?: string;
-  intent?: string;
-  tone?: string;
-  usage?: string;
-  avoidWhen?: string;
-  aliases?: string[];
-  examples?: string[];
-  annotationConfidence?: number;
-  learnedFromMessageId?: string;
-  userId?: string;
-  updatedAt?: string;
-}
-
-interface FeishuStickerStore {
-  version: 1;
-  updatedAt: string;
-  stickers: FeishuStickerRecord[];
-  deletedStickers?: Record<string, FeishuStickerTombstone>;
-  historyBackfills?: Record<string, FeishuStickerHistoryBackfillRecord>;
-}
-
 type FeishuAvatarActorType = 'user' | 'bot';
 
 interface FeishuAvatarActor {
@@ -586,18 +535,6 @@ function pickFeishuMemberAppId(item: FeishuChatMemberListItem): string {
   const raw = getRawObject(item);
   const bot = getRawObject(item.bot);
   return firstNonEmptyString(item.app_id, item.appId, raw.app_id, raw.appId, bot.app_id, bot.appId);
-}
-
-interface FeishuStickerTombstone {
-  deletedAt: string;
-  source?: string;
-}
-
-interface FeishuStickerHistoryBackfillRecord {
-  chatId: string;
-  latestMessageTime?: string;
-  completedAt: string;
-  candidateCount: number;
 }
 
 interface ParsedFeishuStickerContent {
@@ -964,14 +901,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     for (const candidatePath of [storePath, ...this.listStickerStoreRecoveryPaths(storePath)]) {
       try {
         const parsed = JSON.parse(fs.readFileSync(candidatePath, 'utf8')) as Partial<FeishuStickerStore>;
-        return this.normalizeStickerStore(parsed);
+        return normalizeFeishuStickerStore(parsed);
       } catch (err) {
         if (candidatePath === storePath && fs.existsSync(storePath)) {
           console.warn('[feishu-adapter] sticker store read failed, trying backups:', err instanceof Error ? err.message : err);
         }
       }
     }
-    return { version: 1, updatedAt: '', stickers: [], deletedStickers: {} };
+    return createEmptyFeishuStickerStore();
   }
 
   private listStickerStoreRecoveryPaths(storePath: string): string[] {
@@ -1011,48 +948,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private normalizeStickerStore(parsed: Partial<FeishuStickerStore>): FeishuStickerStore {
-    const stickers = Array.isArray(parsed.stickers) ? parsed.stickers.filter((item) => item?.fileKey) : [];
-    const rawDeletedStickers = parsed.deletedStickers && typeof parsed.deletedStickers === 'object' && !Array.isArray(parsed.deletedStickers)
-      ? parsed.deletedStickers
-      : {};
-    const deletedStickers: Record<string, FeishuStickerTombstone> = {};
-    for (const [fileKey, value] of Object.entries(rawDeletedStickers)) {
-      const normalizedFileKey = fileKey.trim();
-      if (!normalizedFileKey || !value || typeof value !== 'object') continue;
-      const tombstone = value as Partial<FeishuStickerTombstone>;
-      const deletedAt = typeof tombstone.deletedAt === 'string' ? tombstone.deletedAt.trim() : '';
-      if (!deletedAt) continue;
-      deletedStickers[normalizedFileKey] = {
-        deletedAt,
-        source: typeof tombstone.source === 'string' ? tombstone.source.trim() || undefined : undefined,
-      };
-    }
-    const rawBackfills = parsed.historyBackfills && typeof parsed.historyBackfills === 'object' && !Array.isArray(parsed.historyBackfills)
-      ? parsed.historyBackfills
-      : {};
-    const historyBackfills: Record<string, FeishuStickerHistoryBackfillRecord> = {};
-    for (const [chatId, value] of Object.entries(rawBackfills)) {
-      if (!value || typeof value !== 'object') continue;
-      const record = value as Partial<FeishuStickerHistoryBackfillRecord>;
-      const normalizedChatId = String(record.chatId || chatId).trim();
-      if (!normalizedChatId) continue;
-      historyBackfills[normalizedChatId] = {
-        chatId: normalizedChatId,
-        latestMessageTime: typeof record.latestMessageTime === 'string' ? record.latestMessageTime : undefined,
-        completedAt: typeof record.completedAt === 'string' ? record.completedAt : '',
-        candidateCount: Number.isFinite(Number(record.candidateCount)) ? Number(record.candidateCount) : 0,
-      };
-    }
-    return {
-      version: 1,
-      updatedAt: parsed.updatedAt || '',
-      stickers: stickers.map((item) => this.sanitizeStickerRecord(item as FeishuStickerRecord)),
-      deletedStickers,
-      historyBackfills,
-    };
-  }
-
   private writeStickerStore(store: FeishuStickerStore): void {
     const storePath = getFeishuStickerStorePath();
     fs.mkdirSync(path.dirname(storePath), { recursive: true });
@@ -1073,7 +968,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       if (!fs.existsSync(storePath)) return;
       const raw = fs.readFileSync(storePath, 'utf8');
-      this.normalizeStickerStore(JSON.parse(raw) as Partial<FeishuStickerStore>);
+      normalizeFeishuStickerStore(JSON.parse(raw) as Partial<FeishuStickerStore>);
       fs.writeFileSync(`${storePath}.bak`, raw, 'utf8');
     } catch {
       // 不把损坏或半写的主库覆盖到备份，避免下一次恢复也只剩空壳记录。
@@ -1363,7 +1258,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       emojiType,
       aliases: (Array.isArray(record.aliases) ? record.aliases : [])
         .map((item) => String(item || '').trim())
-        .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
+        .filter((item) => item && !isUnsafeFeishuStickerSemanticText(item))
         .slice(0, 20),
       chatId: typeof record.chatId === 'string' ? record.chatId : undefined,
       userId: typeof record.userId === 'string' ? record.userId : undefined,
@@ -1492,123 +1387,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       '- If no listed alias matches but the reply has a clear casual emotion, joke, acknowledgement, or banter tone, use bare `[表情包]` so the adapter can choose the best semantic match.',
       '- Sticker and reaction hints are invisible action hints. Do not explain that you are sending a sticker, and do not mention sticker file keys to the user.',
     ].join('\n');
-  }
-
-  private isUnsafeStickerSemanticText(value: unknown): boolean {
-    if (typeof value !== 'string') return false;
-    const text = value.trim();
-    if (!text) return false;
-    // cti-encoding-allow-start
-    return /\uFFFD|�|\?{3,}|锟|Ã|Â|鈥|鐚|鐤|琛ㄦ儏|鎰忔|鍚嶇О|璇皵/u.test(text);
-    // cti-encoding-allow-end
-  }
-
-  private sanitizeStickerRecord(record: FeishuStickerRecord): FeishuStickerRecord {
-    const cleaned: FeishuStickerRecord = { ...record };
-    const cleanText = (value: unknown, maxLength: number): string | undefined => {
-      if (typeof value !== 'string') return undefined;
-      const text = value.normalize('NFKC').replace(/\s+/g, ' ').trim();
-      if (!text || text.length > maxLength || this.isUnsafeStickerSemanticText(text)) return undefined;
-      return text;
-    };
-    const cleanList = (values: unknown, maxItems: number, maxLength: number): string[] => (
-      Array.isArray(values) ? values : []
-    )
-      .map((item) => cleanText(item, maxLength))
-      .filter((item): item is string => Boolean(item))
-      .slice(0, maxItems);
-    const cleanUserAnnotation = (value: unknown): FeishuStickerUserAnnotation | undefined => {
-      if (!value || typeof value !== 'object') return undefined;
-      const source = value as Partial<FeishuStickerUserAnnotation>;
-      const annotation: FeishuStickerUserAnnotation = {};
-      const label = cleanText(source.label, 32);
-      const description = cleanText(source.description, 180);
-      const intent = cleanText(source.intent, 160);
-      const tone = cleanText(source.tone, 80);
-      const usage = cleanText(source.usage, 180);
-      const avoidWhen = cleanText(source.avoidWhen, 180);
-      const aliases = cleanList(source.aliases, 20, 32);
-      const examples = cleanList(source.examples, 8, 120);
-      if (label) annotation.label = label;
-      if (description) annotation.description = description;
-      if (intent) annotation.intent = intent;
-      if (tone) annotation.tone = tone;
-      if (usage) annotation.usage = usage;
-      if (avoidWhen) annotation.avoidWhen = avoidWhen;
-      if (aliases.length > 0) annotation.aliases = aliases;
-      if (examples.length > 0) annotation.examples = examples;
-      if (Number.isFinite(Number(source.annotationConfidence))) {
-        annotation.annotationConfidence = Math.max(0, Math.min(1, Number(source.annotationConfidence)));
-      }
-      if (source.learnedFromMessageId) annotation.learnedFromMessageId = String(source.learnedFromMessageId);
-      if (source.userId) annotation.userId = String(source.userId);
-      if (source.updatedAt) annotation.updatedAt = String(source.updatedAt);
-      return Object.keys(annotation).length > 0 ? annotation : undefined;
-    };
-    for (const key of ['label', 'description', 'intent', 'tone', 'usage', 'avoidWhen', 'disabledReason'] as const) {
-      if (this.isUnsafeStickerSemanticText(cleaned[key])) delete cleaned[key];
-    }
-    cleaned.annotationSource = cleaned.annotationSource === 'vision' || cleaned.annotationSource === 'manual' || cleaned.annotationSource === 'user'
-      ? cleaned.annotationSource
-      : undefined;
-    // 旧视觉记录没有“目标 key = 实际分析媒体”的证明时一律降级，避免把历史
-    // 串图结果继续显示为可信语义或参与自动发送。
-    if (cleaned.annotationSource === 'vision' && cleaned.visionMediaFileKey !== cleaned.fileKey) {
-      cleaned.annotationSource = undefined;
-      delete cleaned.label;
-      delete cleaned.description;
-      delete cleaned.intent;
-      delete cleaned.tone;
-      delete cleaned.usage;
-      delete cleaned.avoidWhen;
-      delete cleaned.annotationConfidence;
-      delete cleaned.annotationVerifiedAt;
-    }
-    cleaned.disabled = cleaned.disabled === true;
-    cleaned.archived = cleaned.archived === true;
-    if (!cleaned.archived) delete cleaned.archivedAt;
-    cleaned.annotationConfidence = Number.isFinite(Number(cleaned.annotationConfidence))
-      ? Math.max(0, Math.min(1, Number(cleaned.annotationConfidence)))
-      : cleaned.annotationConfidence;
-    cleaned.examples = (Array.isArray(cleaned.examples) ? cleaned.examples : [])
-      .map((item) => String(item || '').trim())
-      .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
-      .slice(0, 8);
-    cleaned.aliases = (Array.isArray(cleaned.aliases) ? cleaned.aliases : [])
-      .map((item) => String(item || '').trim())
-      .filter((item) => item && !this.isUnsafeStickerSemanticText(item))
-      .slice(0, 20);
-    const legacyUserTextAnnotation = !cleaned.annotationSource
-      && Boolean(cleaned.learnedFromMessageId && cleaned.messageId && cleaned.learnedFromMessageId !== cleaned.messageId);
-    if (legacyUserTextAnnotation) {
-      const migratedUserAnnotation = cleanUserAnnotation({
-        label: cleaned.label,
-        description: cleaned.description,
-        intent: cleaned.intent,
-        tone: cleaned.tone,
-        usage: cleaned.usage,
-        avoidWhen: cleaned.avoidWhen,
-        aliases: cleaned.aliases,
-        examples: cleaned.examples,
-        annotationConfidence: cleaned.annotationConfidence,
-        learnedFromMessageId: cleaned.learnedFromMessageId,
-        userId: cleaned.userId,
-        updatedAt: cleaned.annotationUpdatedAt,
-      });
-      if (migratedUserAnnotation) cleaned.userAnnotation = migratedUserAnnotation;
-      cleaned.annotationSource = 'user';
-      delete cleaned.label;
-      delete cleaned.description;
-      delete cleaned.intent;
-      delete cleaned.tone;
-      delete cleaned.usage;
-      delete cleaned.avoidWhen;
-      delete cleaned.annotationConfidence;
-      delete cleaned.annotationVerifiedAt;
-    } else {
-      cleaned.userAnnotation = cleanUserAnnotation(cleaned.userAnnotation);
-    }
-    return cleaned;
   }
 
   private tokenizeStickerSemanticText(value: string): Set<string> {
@@ -2035,7 +1813,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cleanText = (value: unknown, maxLength: number): string | undefined => {
       if (typeof value !== 'string') return undefined;
       const text = value.normalize('NFKC').replace(/\s+/g, ' ').trim();
-      if (!text || text.length > maxLength || this.isUnsafeStickerSemanticText(text)) return undefined;
+      if (!text || text.length > maxLength || isUnsafeFeishuStickerSemanticText(text)) return undefined;
       return text;
     };
     const cleanList = (values: unknown, maxItems: number, maxLength: number): string[] => (
