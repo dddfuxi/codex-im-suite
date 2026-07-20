@@ -64,6 +64,13 @@ import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/inde
 import { retrieveFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-retrieval.js';
 import { selectFeishuLightContextItems } from '../channels/feishu/history/light-context-selection.js';
 import { buildFeishuHistoryAttachmentRecoveryPlan } from '../channels/feishu/history/attachment-recovery.js';
+import {
+  createFeishuCardKitCard,
+  resolveFeishuCardKitCompat,
+  setFeishuCardKitStreamingMode,
+  updateFeishuCardKitCard,
+  updateFeishuCardKitStreamingContent,
+} from '../channels/feishu/cards/cardkit-compat.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -458,32 +465,6 @@ interface FeishuCardState {
   typewriterTimer: ReturnType<typeof setTimeout> | null;
   typewriterKey: string;
 }
-
-type FeishuCardKitCompat =
-  | {
-    version: 'v2';
-    card: {
-      create: (payload: unknown) => Promise<{ data?: { card_id?: string } }>;
-      streamContent: (payload: unknown) => Promise<unknown>;
-      update: (payload: unknown) => Promise<unknown>;
-      settings?: {
-        streamingMode?: {
-          set?: (payload: unknown) => Promise<unknown>;
-        };
-      };
-    };
-  }
-  | {
-    version: 'v1';
-    card: {
-      create: (payload: unknown) => Promise<{ data?: { card_id?: string } }>;
-      update: (payload: unknown) => Promise<unknown>;
-      settings: (payload: unknown) => Promise<unknown>;
-    };
-    cardElement: {
-      content: (payload: unknown) => Promise<unknown>;
-    };
-  };
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
@@ -2955,7 +2936,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!this.restClient) return false;
 
     try {
-      const cardKit = this.getCardKitCompat();
+      const cardKit = resolveFeishuCardKitCompat(this.restClient);
       if (!cardKit) {
         console.warn('[feishu-adapter] CardKit API is unavailable in this SDK version');
         return false;
@@ -2984,7 +2965,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
       };
 
-      const createResp = await this.createCardKitCard(cardKit, cardBody);
+      const createResp = await createFeishuCardKitCard(cardKit, cardBody);
       const cardId = createResp?.data?.card_id;
       if (!cardId) {
         console.warn('[feishu-adapter] Card create returned no card_id');
@@ -3118,11 +3099,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     state.sequence++;
     const seq = state.sequence;
     const cardId = state.cardId;
-    const cardKit = this.getCardKitCompat();
+    const cardKit = resolveFeishuCardKitCompat(this.restClient);
     if (!cardKit) return;
 
     // Fire-and-forget — streaming updates are non-critical
-    this.updateCardKitStreamingContent(cardKit, cardId, content, seq).then(() => {
+    updateFeishuCardKitStreamingContent(cardKit, cardId, content, seq).then(() => {
       state.lastUpdateAt = Date.now();
       if (seq === 1 || seq % 10 === 0) {
         console.log(`[feishu-adapter] Streaming card updated: cardId=${cardId}, sequence=${seq}`);
@@ -3175,12 +3156,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
-      const cardKit = this.getCardKitCompat();
+      const cardKit = resolveFeishuCardKitCompat(this.restClient);
       if (!cardKit) return false;
 
       // Step 1: Close streaming mode
       state.sequence++;
-      await this.setCardKitStreamingMode(cardKit, state.cardId, false, state.sequence);
+      await setFeishuCardKitStreamingMode(cardKit, state.cardId, false, state.sequence);
 
       // Step 2: Build and apply final card
       const statusLabels: Record<string, string> = {
@@ -3227,7 +3208,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const finalCardJson = buildFinalCardJson(finalResponseText, state.toolCalls, footer, summary, mentions);
 
       state.sequence++;
-      await this.updateCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
+      await updateFeishuCardKitCard(cardKit, state.cardId, finalCardJson, state.sequence);
 
       // 流式卡片在收尾时不会走普通 delivery，因此必须把“卡片消息 ID ->
       // 原任务 + 最终结果”单独记入出站引用。后续用户原生回复这张卡片时，
@@ -3307,90 +3288,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
    */
   hasActiveCard(chatId: string): boolean {
     return this.activeCards.has(chatId);
-  }
-
-  private getCardKitCompat(): FeishuCardKitCompat | null {
-    const cardkit = (this.restClient as any)?.cardkit;
-    if (cardkit?.v2?.card?.create && cardkit.v2.card.streamContent && cardkit.v2.card.update) {
-      return { version: 'v2', card: cardkit.v2.card };
-    }
-    if (cardkit?.v1?.card?.create && cardkit.v1.card.update && cardkit.v1.card.settings && cardkit.v1.cardElement?.content) {
-      return {
-        version: 'v1',
-        card: cardkit.v1.card,
-        cardElement: cardkit.v1.cardElement,
-      };
-    }
-    return null;
-  }
-
-  private createCardKitCard(cardKit: FeishuCardKitCompat, cardBody: Record<string, unknown>): Promise<{ data?: { card_id?: string } }> {
-    return cardKit.card.create({
-      data: { type: 'card_json', data: JSON.stringify(cardBody) },
-    });
-  }
-
-  private updateCardKitStreamingContent(
-    cardKit: FeishuCardKitCompat,
-    cardId: string,
-    content: string,
-    sequence: number,
-  ): Promise<unknown> {
-    if (cardKit.version === 'v2') {
-      return cardKit.card.streamContent({
-        path: { card_id: cardId },
-        data: { content, sequence },
-      });
-    }
-    return cardKit.cardElement.content({
-      path: { card_id: cardId, element_id: 'streaming_content' },
-      data: { content, sequence },
-    });
-  }
-
-  private setCardKitStreamingMode(
-    cardKit: FeishuCardKitCompat,
-    cardId: string,
-    streamingMode: boolean,
-    sequence: number,
-  ): Promise<unknown> {
-    if (cardKit.version === 'v2' && cardKit.card.settings?.streamingMode?.set) {
-      return cardKit.card.settings.streamingMode.set({
-        path: { card_id: cardId },
-        data: { streaming_mode: streamingMode, sequence },
-      });
-    }
-    if (cardKit.version === 'v1') {
-      return cardKit.card.settings({
-        path: { card_id: cardId },
-        data: {
-          settings: JSON.stringify({ streaming_mode: streamingMode }),
-          sequence,
-        },
-      });
-    }
-    return Promise.resolve();
-  }
-
-  private updateCardKitCard(
-    cardKit: FeishuCardKitCompat,
-    cardId: string,
-    finalCardJson: string,
-    sequence: number,
-  ): Promise<unknown> {
-    if (cardKit.version === 'v2') {
-      return cardKit.card.update({
-        path: { card_id: cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence },
-      });
-    }
-    return cardKit.card.update({
-      path: { card_id: cardId },
-      data: {
-        card: { type: 'card_json', data: finalCardJson },
-        sequence,
-      },
-    });
   }
 
   // ── Streaming adapter interface ────────────────────────────────

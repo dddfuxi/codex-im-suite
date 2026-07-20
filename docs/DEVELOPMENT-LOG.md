@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu cards 第一阶段迁移：新增 `channels/feishu/cards/cardkit-compat.ts`，集中 CardKit v2 优先、v1 fallback、完整能力面门禁以及 create、stream content、streaming mode、final update 的 SDK payload 差异；adapter 删除对应类型和五个内联兼容方法，只保留真实 IM 卡片消息发送、active card 状态、节流/打字机、最终 sticker/reaction 收口与出站引用持久化。新增 4 项直接模块测试；Core 590/590、adapter + cards/markdown 专项 181/181、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过；live 同步和现场验收将在提交后执行。
+
 - 2026-07-20 Feishu history 第五阶段收口：新增 `channels/feishu/history/indexed-history-retrieval.ts`，把当前 chat ID 和历史意图中的查询、数量、时间、说话人范围统一交给受控索引 Host；缺少稳定 chat 身份或检索 Host 时返回空结果失败关闭。删除 adapter 内从未被正式链调用的 direct recent-message 旧云端 Prompt、说话人/命名辅助和合并方法共约 120 行，避免重启绕过本地索引、当前群隔离与统一 Prompt。新增 4 项直接模块/Facade 边界测试；Core 586/586、adapter + history 专项 173/173、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码与 Git diff 检查通过。Feishu history 的同步、检索、Prompt、light context 和回复附件恢复现已完成领域拆分，下一子系统进入 cards；live 同步和现场验收将在提交后执行。
 
 - 2026-07-20 Feishu history 附件恢复第四阶段迁移：新增 `channels/feishu/history/attachment-recovery.ts`，把被回复历史消息的 image/sticker/file/audio/video/media/post/interactive 资源类型、精确 `messageId/fileKey` 绑定、原顺序和重复 key 去重从 adapter 迁为纯下载计划；缺少消息身份、资源 key 或不可恢复类型时失败关闭。adapter 继续负责平台正文/卡片解析、SDK 与 HTTP fallback、20 MB 门禁、失败审计和真实附件注入，并保持回复附件排在当前消息附件之前。新增 5 项直接模块测试；Core 582/582、adapter + history 专项 169/169、依赖与人类文档门禁、架构、UTF-8 和乱码检查已通过，旧云端回退链仍留作 history 下一独立阶段；live 同步和现场验收将在提交后执行。
