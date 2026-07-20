@@ -557,6 +557,11 @@ internal sealed partial class MainForm : Form
         {
             return "owner";
         }
+        if (string.Equals(command, "memory.deleteFeishuSticker", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "memory.stickerSemantics.deleteArchived", StringComparison.OrdinalIgnoreCase))
+        {
+            return "owner";
+        }
         if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "history.recallBotMessage", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("panel.", StringComparison.OrdinalIgnoreCase)
@@ -571,13 +576,10 @@ internal sealed partial class MainForm : Form
             || string.Equals(command, "memory.mergeFeishuStickerAliases", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.archiveFeishuSticker", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "memory.restoreFeishuSticker", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("memory.stickerSemantics.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("extension.", StringComparison.OrdinalIgnoreCase))
         {
             return "operator";
-        }
-        if (string.Equals(command, "memory.deleteFeishuSticker", StringComparison.OrdinalIgnoreCase))
-        {
-            return "owner";
         }
         return "viewer";
     }
@@ -918,15 +920,35 @@ internal sealed partial class MainForm : Form
             case "memory.auditFeishuStickers":
                 return FeishuStickerLibrary.Audit(GetMemoryArtifactStore());
             case "memory.updateFeishuSticker":
-                return FeishuStickerLibrary.Update(GetMemoryArtifactStore(), ReadFeishuStickerUpdatePayload(payload));
+                return await RunStickerSemanticCliAsync("update-manual", payload);
             case "memory.mergeFeishuStickerAliases":
-                return FeishuStickerLibrary.MergeAliases(GetMemoryArtifactStore(), ReadFeishuStickerAliasMergePayload(payload));
+                return await RunStickerSemanticCliAsync("update-manual", payload);
             case "memory.archiveFeishuSticker":
-                return FeishuStickerLibrary.Archive(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
+                return await RunStickerSemanticCliAsync("archive", payload);
             case "memory.restoreFeishuSticker":
-                return FeishuStickerLibrary.Restore(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
+                return await RunStickerSemanticCliAsync("restore", payload);
             case "memory.deleteFeishuSticker":
-                return FeishuStickerLibrary.DeleteArchived(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
+                return await RunStickerSemanticCliAsync("delete-archived", payload);
+            case "memory.stickerSemantics.status":
+                return await RunStickerSemanticCliAsync("status", payload);
+            case "memory.stickerSemantics.list":
+                return await RunStickerSemanticCliAsync("list", payload);
+            case "memory.stickerSemantics.history":
+                return await RunStickerSemanticCliAsync("history", payload);
+            case "memory.stickerSemantics.acceptRevision":
+                return await RunStickerSemanticCliAsync("accept-revision", payload);
+            case "memory.stickerSemantics.rejectRevision":
+                return await RunStickerSemanticCliAsync("reject-revision", payload);
+            case "memory.stickerSemantics.rollback":
+                return await RunStickerSemanticCliAsync("rollback", payload);
+            case "memory.stickerSemantics.updateManual":
+                return await RunStickerSemanticCliAsync("update-manual", payload);
+            case "memory.stickerSemantics.archive":
+                return await RunStickerSemanticCliAsync("archive", payload);
+            case "memory.stickerSemantics.restore":
+                return await RunStickerSemanticCliAsync("restore", payload);
+            case "memory.stickerSemantics.deleteArchived":
+                return await RunStickerSemanticCliAsync("delete-archived", payload);
             case "memory.items.status":
                 return await RunMemoryItemCliAsync("status", payload);
             case "memory.items.listConfirmed":
@@ -10161,12 +10183,29 @@ exit $LASTEXITCODE
             _memoryRepo.Text.Trim(),
             nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
 
+    private StickerSemanticGateway CreateStickerSemanticGateway()
+        => new(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            _memoryRepo.Text.Trim(),
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
     private async Task<JsonElement> RunMemoryItemCliAsync(string cliCommand, JsonElement payload)
     {
         object input = payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
             ? new { }
             : JsonSerializer.Deserialize<object>(payload.GetRawText(), WebJsonOptions) ?? new { };
         using var document = await CreateMemoryItemGateway().RunAsync(cliCommand, input);
+        return document.RootElement.Clone();
+    }
+
+    private async Task<JsonElement> RunStickerSemanticCliAsync(string cliCommand, JsonElement payload)
+    {
+        object input = payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            ? new { }
+            : JsonSerializer.Deserialize<object>(payload.GetRawText(), WebJsonOptions) ?? new { };
+        using var document = await CreateStickerSemanticGateway().RunAsync(cliCommand, input);
         return document.RootElement.Clone();
     }
 

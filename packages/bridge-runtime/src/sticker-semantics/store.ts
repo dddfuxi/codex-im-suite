@@ -39,6 +39,39 @@ export interface StickerSemanticStore {
   recordFeedback(feedback: StickerSemanticFeedbackRecordV1): void;
   findDeliveries(messageIds: string[]): StickerDeliveryEvidence[];
   refreshHumanReadableDocuments(): void;
+  setRevisionStatus(input: {
+    revisionId: string;
+    status: 'confirmed' | 'rejected' | 'regressed';
+    expectedBaseHash: string;
+    actor: StickerSemanticActor;
+  }): StickerSemanticRevisionV1;
+  updateManual(input: {
+    fileKey: string;
+    patch: StickerManualSemanticPatch;
+    expectedBaseHash: string;
+    actor: StickerSemanticActor;
+  }): { revision: StickerSemanticRevisionV1; snapshot: StickerSemanticSnapshot };
+  setArchived(input: { fileKey: string; archived: boolean; expectedBaseHash: string; actor: StickerSemanticActor }): StickerSemanticSnapshot;
+  deleteArchived(input: { fileKey: string; expectedBaseHash: string; actor: StickerSemanticActor }): StickerSemanticSnapshot;
+}
+
+export interface StickerManualSemanticPatch {
+  label?: string;
+  description?: string;
+  intent?: string;
+  tone?: string;
+  usage?: string;
+  aliases?: string[];
+  examples?: string[];
+  avoidWhen?: string;
+  avoidRules?: Array<{
+    category: import('./types.js').StickerAvoidRuleV1['category'];
+    condition: string;
+    scope?: import('./types.js').StickerSemanticScopeName;
+    scopeId?: string;
+  }>;
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 interface LegacyStickerRecord {
@@ -50,12 +83,22 @@ interface LegacyStickerRecord {
   annotationConfidence?: number;
   archived?: boolean;
   disabled?: boolean;
+  disabledReason?: string;
+  intent?: string;
+  tone?: string;
+  usage?: string;
+  avoidWhen?: string;
+  examples?: string[];
+  annotationVerifiedAt?: string;
+  lastEditedAt?: string;
+  archivedAt?: string;
 }
 
 interface LegacyStickerFile {
   version?: number;
   updatedAt?: string;
   stickers?: LegacyStickerRecord[];
+  deletedStickers?: Record<string, { deletedAt: string; source: string }>;
 }
 
 interface BeforeImage { filePath: string; existed: boolean; content: string }
@@ -86,6 +129,20 @@ function readJson<T>(filePath: string, fallback: T): T {
 
 function sha256Json(value: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+function normalizeOptionalText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxChars) : undefined;
+}
+
+function normalizeTextList(value: unknown, maxItems: number, maxChars: number): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return [...new Set(value.flatMap((item) => {
+    const normalized = normalizeOptionalText(item, maxChars);
+    return normalized ? [normalized] : [];
+  }))].slice(0, maxItems);
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -182,6 +239,14 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
       schema: 'codex-im-suite/sticker-semantic-deliveries/v1', updatedAt: '', deliveries: [],
     });
     return { stickerFile, revisionFile, deliveryFile, feedbackRecords: readFeedback() };
+  };
+
+  const findSticker = (machine: ReturnType<typeof readMachine>, fileKey: string): LegacyStickerRecord => {
+    const normalized = fileKey.trim();
+    if (!normalized) throw new Error('file_key_required');
+    const sticker = (machine.stickerFile.stickers || []).find((item) => item.fileKey === normalized);
+    if (!sticker) throw new Error('sticker_not_found');
+    return sticker;
   };
 
   const snapshotFrom = (machine: ReturnType<typeof readMachine>, generatedAt = now()): StickerSemanticSnapshot => ({
@@ -311,6 +376,181 @@ export function createStickerSemanticStore(options: StickerSemanticStoreOptions)
     refreshHumanReadableDocuments: () => mutate(() => {
       const snapshot = snapshotFrom(readMachine());
       commit([], projectionMutations(snapshot));
+    }),
+    setRevisionStatus: (input) => {
+      const machine = readMachine();
+      const snapshot = snapshotFrom(machine);
+      if (input.expectedBaseHash !== snapshot.baseHash) throw new Error('source_changed');
+      const current = machine.revisionFile.revisions.find((item) => item.revisionId === input.revisionId);
+      if (!current) throw new Error('revision_not_found');
+      if (input.status === 'confirmed' && current.status !== 'trial') throw new Error('revision_transition_not_allowed');
+      if (input.status === 'rejected' && current.status !== 'trial') throw new Error('revision_transition_not_allowed');
+      if (input.status === 'regressed' && current.status !== 'confirmed') throw new Error('revision_transition_not_allowed');
+      const updatedAt = now();
+      const revision: StickerSemanticRevisionV1 = {
+        ...current,
+        status: input.status,
+        versionId: crypto.randomUUID(),
+        restoredVersionId: input.status === 'regressed' ? current.previousConfirmedVersionId : current.restoredVersionId,
+        patch: {
+          ...current.patch,
+          avoidRules: current.patch.avoidRules?.map((rule) => ({
+            ...rule,
+            status: input.status === 'confirmed' ? 'confirmed' : input.status === 'regressed' ? 'regressed' : rule.status,
+            updatedAt,
+          })),
+        },
+        updatedAt,
+      };
+      return persistRevision({
+        revision,
+        expectedBaseHash: input.expectedBaseHash,
+        actor: input.actor,
+        versionFileName: revision.versionId,
+        allowExisting: true,
+      });
+    },
+    updateManual: (input) => mutate(() => {
+      const machine = readMachine();
+      const snapshot = snapshotFrom(machine);
+      if (input.expectedBaseHash !== snapshot.baseHash) throw new Error('source_changed');
+      const sticker = findSticker(machine, input.fileKey);
+      const updatedAt = now();
+      const patch = input.patch;
+      const assignText = (key: keyof LegacyStickerRecord, value: unknown, maxChars: number) => {
+        if (value === undefined) return;
+        const normalized = normalizeOptionalText(value, maxChars);
+        if (normalized === undefined) delete sticker[key];
+        else (sticker as unknown as Record<string, unknown>)[key] = normalized;
+      };
+      assignText('label', patch.label, 160);
+      assignText('description', patch.description, 1_000);
+      assignText('intent', patch.intent, 160);
+      assignText('tone', patch.tone, 160);
+      assignText('usage', patch.usage, 400);
+      assignText('avoidWhen', patch.avoidWhen, 400);
+      assignText('disabledReason', patch.disabledReason, 240);
+      const aliases = normalizeTextList(patch.aliases, 20, 80);
+      if (aliases) sticker.aliases = aliases;
+      const examples = normalizeTextList(patch.examples, 8, 240);
+      if (examples) sticker.examples = examples;
+      if (patch.disabled !== undefined) sticker.disabled = patch.disabled;
+      sticker.annotationSource = 'manual';
+      sticker.annotationVerifiedAt = updatedAt;
+      sticker.lastEditedAt = updatedAt;
+      machine.stickerFile.updatedAt = updatedAt;
+
+      const previousConfirmed = machine.revisionFile.revisions
+        .filter((item) => item.fileKey === input.fileKey && item.status === 'confirmed')
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+      const revisionId = crypto.randomUUID();
+      const revision: StickerSemanticRevisionV1 = {
+        schema: 'codex-im-suite/sticker-semantic-revision/v1',
+        revisionId,
+        fileKey: input.fileKey,
+        scope: 'global',
+        status: 'confirmed',
+        versionId: crypto.randomUUID(),
+        previousConfirmedVersionId: previousConfirmed?.versionId,
+        baseHash: snapshot.baseHash,
+        patch: {
+          intent: normalizeOptionalText(patch.intent, 160),
+          tone: normalizeOptionalText(patch.tone, 160),
+          usage: normalizeOptionalText(patch.usage, 400),
+          aliases,
+          examples,
+          avoidRules: patch.avoidRules?.slice(0, 8).flatMap((rule) => {
+            const condition = normalizeOptionalText(rule.condition, 240);
+            if (!condition) return [];
+            const scope = rule.scope || 'global';
+            if (scope !== 'global' && !normalizeOptionalText(rule.scopeId, 256)) throw new Error('scope_id_required');
+            return [{
+              id: crypto.randomUUID(),
+              condition,
+              category: rule.category,
+              scope,
+              scopeId: scope === 'global' ? undefined : normalizeOptionalText(rule.scopeId, 256),
+              status: 'confirmed' as const,
+              confidence: 1,
+              supportCount: 1,
+              contradictionCount: 0,
+              evidenceHashes: [],
+              createdAt: updatedAt,
+              updatedAt,
+            }];
+          }),
+        },
+        supportEvidenceHashes: [],
+        contradictionEvidenceHashes: [],
+        supportSessionIds: [],
+        contradictionSessionIds: [],
+        createdAt: updatedAt,
+        updatedAt,
+      };
+      machine.revisionFile = {
+        schema: 'codex-im-suite/sticker-semantic-revisions/v1',
+        updatedAt,
+        revisions: [...machine.revisionFile.revisions, revision],
+      };
+      const next = snapshotFrom(machine, updatedAt);
+      const versionPath = path.join(stickerRoot, 'semantic-versions', revision.fileKey, `${revision.versionId}.json`);
+      commit([
+        { filePath: stickerPath, content: `${JSON.stringify(machine.stickerFile, null, 2)}\n`, kind: 'machine' },
+        { filePath: revisionPath, content: `${JSON.stringify(machine.revisionFile, null, 2)}\n`, kind: 'machine' },
+        { filePath: versionPath, content: `${JSON.stringify({ actor: input.actor, revision }, null, 2)}\n`, kind: 'machine' },
+      ], projectionMutations(next));
+      return { revision, snapshot: next };
+    }),
+    setArchived: (input) => mutate(() => {
+      const machine = readMachine();
+      const snapshot = snapshotFrom(machine);
+      if (input.expectedBaseHash !== snapshot.baseHash) throw new Error('source_changed');
+      const sticker = findSticker(machine, input.fileKey);
+      const updatedAt = now();
+      sticker.archived = input.archived;
+      sticker.archivedAt = input.archived ? updatedAt : undefined;
+      sticker.lastEditedAt = updatedAt;
+      machine.stickerFile.updatedAt = updatedAt;
+      const next = snapshotFrom(machine, updatedAt);
+      commit([{ filePath: stickerPath, content: `${JSON.stringify(machine.stickerFile, null, 2)}\n`, kind: 'machine' }], projectionMutations(next));
+      return next;
+    }),
+    deleteArchived: (input) => mutate(() => {
+      const machine = readMachine();
+      const snapshot = snapshotFrom(machine);
+      if (input.expectedBaseHash !== snapshot.baseHash) throw new Error('source_changed');
+      const sticker = findSticker(machine, input.fileKey);
+      if (!sticker.archived) throw new Error('sticker_must_be_archived');
+      const updatedAt = now();
+      machine.stickerFile.stickers = (machine.stickerFile.stickers || []).filter((item) => item.fileKey !== input.fileKey);
+      machine.stickerFile.deletedStickers = {
+        ...(machine.stickerFile.deletedStickers || {}),
+        [input.fileKey]: { deletedAt: updatedAt, source: input.actor },
+      };
+      machine.stickerFile.updatedAt = updatedAt;
+      machine.revisionFile = {
+        ...machine.revisionFile,
+        updatedAt,
+        revisions: machine.revisionFile.revisions.filter((item) => item.fileKey !== input.fileKey),
+      };
+      machine.deliveryFile = {
+        ...machine.deliveryFile,
+        updatedAt,
+        deliveries: machine.deliveryFile.deliveries.filter((item) => item.fileKey !== input.fileKey),
+      };
+      machine.feedbackRecords = machine.feedbackRecords.filter((item) => item.fileKey !== input.fileKey);
+      const next = snapshotFrom(machine, updatedAt);
+      commit([
+        { filePath: stickerPath, content: `${JSON.stringify(machine.stickerFile, null, 2)}\n`, kind: 'machine' },
+        { filePath: revisionPath, content: `${JSON.stringify(machine.revisionFile, null, 2)}\n`, kind: 'machine' },
+        { filePath: deliveryPath, content: `${JSON.stringify(machine.deliveryFile, null, 2)}\n`, kind: 'machine' },
+        { filePath: feedbackPath, content: machine.feedbackRecords.map((item) => JSON.stringify(item)).join('\n') + (machine.feedbackRecords.length ? '\n' : ''), kind: 'machine' },
+      ], projectionMutations(next));
+      for (const extension of ['.png', '.jpg', '.jpeg', '.gif', '.webp']) {
+        fs.rmSync(path.join(stickerRoot, 'media', `${crypto.createHash('sha256').update(input.fileKey, 'utf8').digest('hex')}${extension}`), { force: true });
+      }
+      fs.rmSync(path.join(stickerRoot, 'semantic-versions', input.fileKey), { recursive: true, force: true });
+      return next;
     }),
   };
 }

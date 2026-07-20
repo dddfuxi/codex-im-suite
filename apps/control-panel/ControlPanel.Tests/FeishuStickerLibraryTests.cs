@@ -47,152 +47,23 @@ public sealed class FeishuStickerLibraryTests
     }
 
     [Fact]
-    public void Update_EditsSemanticFieldsAndPreservesUtf8()
+    public void WriteOperationsRequireRuntimeGateway()
     {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-
-        var snapshot = FeishuStickerLibrary.Update(artifacts, new FeishuStickerUpdateRequest
+        var artifacts = WriteSampleStore(CreateTempRoot());
+        var operations = new Action[]
         {
-            FileKey = "sticker_1",
-            Label = "干嘛猫",
-            Description = "疑惑地看着对方",
-            Intent = "疑惑、吐槽",
-            Tone = "轻松吐槽",
-            Usage = "别人突然丢奇怪需求时",
-            Disabled = true,
-            DisabledReason = "先禁用确认",
-        });
+            () => FeishuStickerLibrary.Update(artifacts, new FeishuStickerUpdateRequest { FileKey = "sticker_1", Intent = "疑惑" }),
+            () => FeishuStickerLibrary.MergeAliases(artifacts, new FeishuStickerAliasMergeRequest { FileKey = "sticker_1", Aliases = ["疑惑"] }),
+            () => FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest { FileKey = "sticker_1" }),
+            () => FeishuStickerLibrary.Restore(artifacts, new FeishuStickerLifecycleRequest { FileKey = "sticker_1" }),
+            () => FeishuStickerLibrary.DeleteArchived(artifacts, new FeishuStickerLifecycleRequest { FileKey = "sticker_1" }),
+        };
 
-        var item = Assert.Single(snapshot.Stickers);
-        Assert.Equal("干嘛猫", item.Label);
-        Assert.Equal("疑惑、吐槽", item.Intent);
-        Assert.True(item.Disabled);
-        Assert.Equal("先禁用确认", item.DisabledReason);
-        Assert.False(string.IsNullOrWhiteSpace(item.LastEditedAt));
-        Assert.DoesNotContain('\uFEFF', File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
-        Assert.Contains("干嘛猫", File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
-        using var document = JsonDocument.Parse(File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
-        var sticker = document.RootElement.GetProperty("stickers")[0];
-        Assert.Equal("manual", sticker.GetProperty("annotationSource").GetString());
-        Assert.False(string.IsNullOrWhiteSpace(sticker.GetProperty("annotationVerifiedAt").GetString()));
-    }
-
-    [Fact]
-    public void MergeAliases_DeduplicatesAndTrimsAliases()
-    {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-
-        var snapshot = FeishuStickerLibrary.MergeAliases(artifacts, new FeishuStickerAliasMergeRequest
+        foreach (var operation in operations)
         {
-            FileKey = "sticker_1",
-            Aliases = ["疑惑", "干嘛猫", "  吐槽  ", ""],
-        });
-
-        var item = Assert.Single(snapshot.Stickers);
-        Assert.Equal(["表情包", "疑惑", "干嘛猫", "吐槽"], item.Aliases);
-        Assert.False(string.IsNullOrWhiteSpace(item.LastEditedAt));
-    }
-
-    [Fact]
-    public void Archive_PreservesRecordMediaAndDisabledState()
-    {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-        FeishuStickerLibrary.Update(artifacts, new FeishuStickerUpdateRequest
-        {
-            FileKey = "sticker_1",
-            Disabled = true,
-            DisabledReason = "人工暂停",
-        });
-        Directory.CreateDirectory(artifacts.FeishuStickerMediaDirPath);
-        var mediaPath = Path.Combine(
-            artifacts.FeishuStickerMediaDirPath,
-            MemoryArtifactStore.StableFileName("sticker_1", ".png"));
-        File.WriteAllBytes(mediaPath, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-        var snapshot = FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
-        {
-            FileKey = "sticker_1",
-        });
-
-        var item = Assert.Single(snapshot.Stickers);
-        Assert.True(item.Archived);
-        Assert.False(string.IsNullOrWhiteSpace(item.ArchivedAt));
-        Assert.True(item.Disabled);
-        Assert.Equal("已归档", item.StatusLabel);
-        Assert.True(File.Exists(mediaPath));
-        var audit = FeishuStickerLibrary.Audit(artifacts);
-        Assert.Equal(0, audit.Enabled);
-        Assert.Equal(1, audit.Archived);
-    }
-
-    [Fact]
-    public void Restore_ClearsArchiveStateWithoutChangingDisabledState()
-    {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-        FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
-        {
-            FileKey = "sticker_1",
-        });
-
-        var snapshot = FeishuStickerLibrary.Restore(artifacts, new FeishuStickerLifecycleRequest
-        {
-            FileKey = "sticker_1",
-        });
-
-        var item = Assert.Single(snapshot.Stickers);
-        Assert.False(item.Archived);
-        Assert.True(string.IsNullOrWhiteSpace(item.ArchivedAt));
-        Assert.False(item.Disabled);
-    }
-
-    [Fact]
-    public void DeleteArchived_RemovesRecordAndMediaAndWritesTombstone()
-    {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-        Directory.CreateDirectory(artifacts.FeishuStickerMediaDirPath);
-        var mediaPath = Path.Combine(
-            artifacts.FeishuStickerMediaDirPath,
-            MemoryArtifactStore.StableFileName("sticker_1", ".webp"));
-        File.WriteAllBytes(mediaPath, [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
-        FeishuStickerLibrary.Archive(artifacts, new FeishuStickerLifecycleRequest
-        {
-            FileKey = "sticker_1",
-        });
-
-        var snapshot = FeishuStickerLibrary.DeleteArchived(artifacts, new FeishuStickerLifecycleRequest
-        {
-            FileKey = "sticker_1",
-        });
-
-        Assert.Empty(snapshot.Stickers);
-        Assert.False(File.Exists(mediaPath));
-        using var document = JsonDocument.Parse(File.ReadAllText(artifacts.FeishuStickerStorePath, Encoding.UTF8));
-        var tombstone = document.RootElement
-            .GetProperty("deletedStickers")
-            .GetProperty("sticker_1");
-        Assert.False(string.IsNullOrWhiteSpace(tombstone.GetProperty("deletedAt").GetString()));
-        using var backupDocument = JsonDocument.Parse(File.ReadAllText($"{artifacts.FeishuStickerStorePath}.bak", Encoding.UTF8));
-        Assert.True(backupDocument.RootElement.GetProperty("deletedStickers").TryGetProperty("sticker_1", out _));
-    }
-
-    [Fact]
-    public void DeleteArchived_RejectsActiveSticker()
-    {
-        var root = CreateTempRoot();
-        var artifacts = WriteSampleStore(root);
-
-        var error = Assert.Throws<InvalidOperationException>(() =>
-            FeishuStickerLibrary.DeleteArchived(artifacts, new FeishuStickerLifecycleRequest
-            {
-                FileKey = "sticker_1",
-            }));
-
-        Assert.Contains("先归档", error.Message);
+            var error = Assert.Throws<InvalidOperationException>(operation);
+            Assert.Contains("StickerSemanticGateway", error.Message);
+        }
     }
 
     [Fact]

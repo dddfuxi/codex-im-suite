@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -94,15 +93,6 @@ internal static class FeishuStickerLibrary
 {
     private const string Schema = "codex-im-suite/feishu-sticker-library/v1";
     private static readonly string[] StickerMediaExtensions = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-        WriteIndented = true,
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-    };
-
     public static FeishuStickerLibrarySnapshot Read(MemoryArtifactStore artifacts)
         => Read(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath);
 
@@ -110,19 +100,22 @@ internal static class FeishuStickerLibrary
         => Audit(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath);
 
     public static FeishuStickerLibrarySnapshot Update(MemoryArtifactStore artifacts, FeishuStickerUpdateRequest request)
-        => Update(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request);
+        => throw RuntimeWriteRequired();
 
     public static FeishuStickerLibrarySnapshot MergeAliases(MemoryArtifactStore artifacts, FeishuStickerAliasMergeRequest request)
-        => MergeAliases(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request);
+        => throw RuntimeWriteRequired();
 
     public static FeishuStickerLibrarySnapshot Archive(MemoryArtifactStore artifacts, FeishuStickerLifecycleRequest request)
-        => SetArchived(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request, archived: true);
+        => throw RuntimeWriteRequired();
 
     public static FeishuStickerLibrarySnapshot Restore(MemoryArtifactStore artifacts, FeishuStickerLifecycleRequest request)
-        => SetArchived(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request, archived: false);
+        => throw RuntimeWriteRequired();
 
     public static FeishuStickerLibrarySnapshot DeleteArchived(MemoryArtifactStore artifacts, FeishuStickerLifecycleRequest request)
-        => DeleteArchived(artifacts.FeishuStickerStorePath, artifacts.FeishuStickerMediaDirPath, request);
+        => throw RuntimeWriteRequired();
+
+    private static InvalidOperationException RuntimeWriteRequired()
+        => new("表情包语义写入必须通过 runtime StickerSemanticGateway 执行。");
 
     private static FeishuStickerLibrarySnapshot Read(string storePath, string mediaDir)
     {
@@ -172,97 +165,6 @@ internal static class FeishuStickerLibrary
             FormatMismatch: formatMismatch);
     }
 
-    private static FeishuStickerLibrarySnapshot Update(string storePath, string mediaDir, FeishuStickerUpdateRequest request)
-    {
-        var root = ReadStore(storePath);
-        var sticker = FindSticker(root, request.FileKey);
-        var now = DateTime.UtcNow.ToString("o");
-        SetString(sticker, "label", request.Label);
-        SetString(sticker, "description", request.Description);
-        SetString(sticker, "intent", request.Intent);
-        SetString(sticker, "tone", request.Tone);
-        SetString(sticker, "usage", request.Usage);
-        SetString(sticker, "avoidWhen", request.AvoidWhen);
-        if (HasSemanticUpdate(request))
-        {
-            sticker["annotationSource"] = "manual";
-            sticker["annotationVerifiedAt"] = now;
-        }
-        if (request.Disabled.HasValue) sticker["disabled"] = request.Disabled.Value;
-        SetString(sticker, "disabledReason", request.DisabledReason);
-        sticker["lastEditedAt"] = now;
-        root["updatedAt"] = now;
-        WriteStore(storePath, root);
-        return Read(storePath, mediaDir);
-    }
-
-    private static FeishuStickerLibrarySnapshot MergeAliases(string storePath, string mediaDir, FeishuStickerAliasMergeRequest request)
-    {
-        var root = ReadStore(storePath);
-        var sticker = FindSticker(root, request.FileKey);
-        var aliases = ReadStringArray(sticker, "aliases")
-            .Concat(request.Aliases)
-            .Select(item => item.Trim())
-            .Where(item => !string.IsNullOrWhiteSpace(item))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(20)
-            .ToArray();
-        sticker["aliases"] = new JsonArray(aliases.Select(alias => JsonValue.Create(alias)).ToArray<JsonNode?>());
-        var now = DateTime.UtcNow.ToString("o");
-        sticker["lastEditedAt"] = now;
-        root["updatedAt"] = now;
-        WriteStore(storePath, root);
-        return Read(storePath, mediaDir);
-    }
-
-    private static FeishuStickerLibrarySnapshot SetArchived(
-        string storePath,
-        string mediaDir,
-        FeishuStickerLifecycleRequest request,
-        bool archived)
-    {
-        var root = ReadStore(storePath);
-        var sticker = FindSticker(root, request.FileKey);
-        var now = DateTime.UtcNow.ToString("o");
-        sticker["archived"] = archived;
-        if (archived) sticker["archivedAt"] = now;
-        else sticker.Remove("archivedAt");
-        sticker["lastEditedAt"] = now;
-        root["updatedAt"] = now;
-        WriteStore(storePath, root);
-        return Read(storePath, mediaDir);
-    }
-
-    private static FeishuStickerLibrarySnapshot DeleteArchived(
-        string storePath,
-        string mediaDir,
-        FeishuStickerLifecycleRequest request)
-    {
-        var root = ReadStore(storePath);
-        var sticker = FindSticker(root, request.FileKey);
-        if (!ReadBool(sticker, "archived"))
-        {
-            throw new InvalidOperationException("永久删除前必须先归档该表情包。");
-        }
-
-        var fileKey = ReadString(sticker, "fileKey");
-        var now = DateTime.UtcNow.ToString("o");
-        ReadStickerArray(root).Remove(sticker);
-        var deletedStickers = root["deletedStickers"] as JsonObject ?? new JsonObject();
-        root["deletedStickers"] = deletedStickers;
-        deletedStickers[fileKey] = new JsonObject
-        {
-            ["deletedAt"] = now,
-            ["source"] = "control-panel",
-        };
-        root["updatedAt"] = now;
-
-        // 先写 tombstone，再删除媒体。即使媒体暂时被占用，Bridge 也不会重新登记或发送该 file_key。
-        WriteStore(storePath, root);
-        DeleteStickerMedia(mediaDir, fileKey);
-        return Read(storePath, mediaDir);
-    }
-
     private static JsonObject ReadStore(string storePath)
     {
         if (!File.Exists(storePath))
@@ -283,29 +185,8 @@ internal static class FeishuStickerLibrary
         return root;
     }
 
-    private static void WriteStore(string storePath, JsonObject root)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(storePath)!);
-        var tmp = $"{storePath}.{Guid.NewGuid():N}.tmp";
-        File.WriteAllText(tmp, root.ToJsonString(JsonOptions), new UTF8Encoding(false));
-        if (File.Exists(storePath)) File.Replace(tmp, storePath, null);
-        else File.Move(tmp, storePath);
-        // Bridge 读取主库失败时会回退到 .bak；同步刷新备份，避免永久删除被旧备份复活。
-        File.Copy(storePath, $"{storePath}.bak", overwrite: true);
-    }
-
     private static JsonArray ReadStickerArray(JsonObject root)
         => root["stickers"] as JsonArray ?? [];
-
-    private static JsonObject FindSticker(JsonObject root, string fileKey)
-    {
-        var normalized = fileKey.Trim();
-        if (string.IsNullOrWhiteSpace(normalized)) throw new InvalidOperationException("缺少表情包 fileKey。");
-        var sticker = ReadStickerArray(root)
-            .OfType<JsonObject>()
-            .FirstOrDefault(item => string.Equals(ReadString(item, "fileKey"), normalized, StringComparison.Ordinal));
-        return sticker ?? throw new InvalidOperationException("未找到指定表情包。");
-    }
 
     private static FeishuStickerLibraryItem ToItem(JsonObject item, string mediaDir)
     {
@@ -527,16 +408,6 @@ internal static class FeishuStickerLibrary
         return "仅历史 key，无媒体";
     }
 
-    private static void DeleteStickerMedia(string mediaDir, string fileKey)
-    {
-        if (string.IsNullOrWhiteSpace(mediaDir) || string.IsNullOrWhiteSpace(fileKey)) return;
-        foreach (var extension in StickerMediaExtensions)
-        {
-            var mediaPath = Path.Combine(mediaDir, MemoryArtifactStore.StableFileName(fileKey, extension));
-            if (File.Exists(mediaPath)) File.Delete(mediaPath);
-        }
-    }
-
     private static string BuildPreviewUrl(string mediaPath, string mediaMimeType)
     {
         if (string.IsNullOrWhiteSpace(mediaPath) || !File.Exists(mediaPath)) return "";
@@ -567,19 +438,4 @@ internal static class FeishuStickerLibrary
     private static bool ReadBool(JsonObject item, string key)
         => item[key] is JsonValue value && value.TryGetValue<bool>(out var result) && result;
 
-    private static bool HasSemanticUpdate(FeishuStickerUpdateRequest request)
-        => request.Label is not null
-           || request.Description is not null
-           || request.Intent is not null
-           || request.Tone is not null
-           || request.Usage is not null
-           || request.AvoidWhen is not null;
-
-    private static void SetString(JsonObject item, string key, string? value)
-    {
-        if (value is null) return;
-        var normalized = value.Trim();
-        if (string.IsNullOrWhiteSpace(normalized)) item.Remove(key);
-        else item[key] = normalized;
-    }
 }
