@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -98,6 +99,7 @@ export function runStickerSemanticCli(argv: string[]): StickerSemanticCliResult 
     case 'status': {
       if (target) throw new Error('unexpected_positional_argument');
       const snapshot = store.readSnapshot();
+      const humanArchivePath = path.join(memoryRoot, 'data', 'im', 'feishu', 'stickers', '表情包语义档案.md');
       return {
         ok: true,
         data: {
@@ -106,7 +108,8 @@ export function runStickerSemanticCli(argv: string[]): StickerSemanticCliResult 
           generatedAt: snapshot.generatedAt,
           assetCount: snapshot.assets.length,
           counts: counts(snapshot.revisions),
-          humanArchivePath: path.join(memoryRoot, 'data', 'im', 'feishu', 'stickers', '表情包语义档案.md'),
+          humanArchivePath,
+          humanArchiveExists: fs.existsSync(humanArchivePath),
         },
       };
     }

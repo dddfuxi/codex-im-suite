@@ -3114,6 +3114,107 @@ button:disabled {
   margin-top: 0;
 }
 
+.sticker-evolution-summary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.sticker-archive-status {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 1.8fr);
+  gap: 12px;
+  align-items: center;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.sticker-archive-status.ok {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+.sticker-archive-status.warning {
+  border-color: color-mix(in srgb, var(--warning-text) 35%, var(--border));
+}
+
+.sticker-archive-status > div,
+.sticker-evolution-card header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.sticker-archive-status span,
+.sticker-evolution-card span,
+.sticker-evolution-card small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.sticker-archive-status code {
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+}
+
+.sticker-evolution-list {
+  display: grid;
+  gap: 10px;
+}
+
+.sticker-evolution-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.sticker-evolution-card.trial {
+  border-left: 3px solid var(--warning-text);
+}
+
+.sticker-evolution-card.confirmed {
+  border-left: 3px solid var(--accent);
+}
+
+.sticker-evolution-card.regressed,
+.sticker-evolution-card.rejected {
+  opacity: 0.78;
+}
+
+.sticker-evolution-card header,
+.sticker-evidence-counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+
+.sticker-evolution-card p {
+  margin: 0;
+  color: var(--text-soft);
+}
+
+.sticker-evidence-counts {
+  justify-content: flex-start;
+}
+
+.sticker-avoid-rules {
+  display: grid;
+  gap: 8px;
+}
+
+.sticker-avoid-rules > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.5fr) minmax(180px, 1.5fr) minmax(180px, 1fr);
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: var(--panel);
+}
+
 .scheduled-task-facts > div,
 .scheduled-task-run > div {
   display: grid;
@@ -3164,6 +3265,15 @@ button:disabled {
 @media (max-width: 1099px) {
   .scheduled-task-summary {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .sticker-evolution-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .sticker-archive-status,
+  .sticker-avoid-rules > div {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .scheduled-task-facts,
@@ -3388,6 +3498,7 @@ button:disabled {
   .feishu-sticker-row,
   .sticker-semantic-grid,
   .sticker-editor-grid,
+  .sticker-evolution-summary,
   .optimizer-draft-head,
   .blueprint-action-panel,
   .memory-tree-layout,

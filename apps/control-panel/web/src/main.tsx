@@ -81,8 +81,11 @@ import {
   type MemoryLifecycleStatus,
 } from './memory-page-view-model.js';
 import {
+  buildStickerEvolutionSummary,
   getStickerLifecycleActions,
+  getStickerRevisionActions,
   matchesStickerStatusFilter,
+  type StickerRevisionAction,
   type StickerStatusFilter,
 } from './sticker-library-view-model.js';
 import './styles.css';
@@ -718,6 +721,61 @@ type FeishuStickerLibrarySnapshot = {
   updatedAt: string;
   stickers: FeishuStickerLibraryItem[];
 };
+
+type StickerSemanticAvoidRule = {
+  id: string;
+  condition: string;
+  category: string;
+  status: 'trial' | 'confirmed' | 'regressed';
+  confidence: number;
+  supportCount: number;
+  contradictionCount: number;
+};
+
+type StickerSemanticRevision = {
+  revisionId: string;
+  fileKey: string;
+  scope: 'global' | 'chat' | 'user';
+  scopeId?: string;
+  status: 'trial' | 'confirmed' | 'regressed' | 'rejected';
+  patch: {
+    intent?: string;
+    tone?: string;
+    usage?: string;
+    aliases?: string[];
+    examples?: string[];
+    avoidRules?: StickerSemanticAvoidRule[];
+  };
+  supportSessionIds: string[];
+  contradictionSessionIds: string[];
+  updatedAt: string;
+};
+
+type StickerSemanticAsset = {
+  fileKey: string;
+  label?: string;
+  aliases: string[];
+  archived: boolean;
+  disabled: boolean;
+  visual: { source: 'vision' | 'manual' | 'unverified'; description?: string; confidence?: number };
+};
+
+type StickerSemanticPanelState = {
+  baseHash: string;
+  generatedAt: string;
+  humanArchivePath: string;
+  humanArchiveExists: boolean;
+  assets: StickerSemanticAsset[];
+  revisions: StickerSemanticRevision[];
+};
+
+type StickerSemanticCliEnvelope<T> = { ok: boolean; data: T };
+
+function readStickerSemanticCliData<T>(value: unknown): T {
+  const envelope = value as StickerSemanticCliEnvelope<T>;
+  if (!envelope?.ok || !envelope.data) throw new Error('表情包语义 CLI 返回无效。');
+  return envelope.data;
+}
 
 type UserFacingStatus = 'normal' | 'attention' | 'disabled';
 
@@ -4945,6 +5003,9 @@ function MemoryPage({
   const [items, setItems] = useState<KnowledgeSearchItem[]>([]);
   const [searchMeta, setSearchMeta] = useState({ totalMatched: 0, offset: 0, limit: 200 });
   const [stickerLibrary, setStickerLibrary] = useState<FeishuStickerLibrarySnapshot>({ schema: '', storePath: '', mediaDir: '', updatedAt: '', stickers: [] });
+  const [stickerSemantics, setStickerSemantics] = useState<StickerSemanticPanelState>({
+    baseHash: '', generatedAt: '', humanArchivePath: '', humanArchiveExists: false, assets: [], revisions: [],
+  });
   const [stickerQuery, setStickerQuery] = useState('');
   const [stickerStatusFilter, setStickerStatusFilter] = useState<StickerStatusFilter>('asset');
   const [stickerChatFilter, setStickerChatFilter] = useState('all');
@@ -4970,6 +5031,35 @@ function MemoryPage({
     });
   };
 
+  const refreshStickerSemantics = async () => {
+    const [statusEnvelope, listEnvelope] = await Promise.all([
+      run('memory.stickerSemantics.status'),
+      run('memory.stickerSemantics.list'),
+    ]);
+    const semanticStatus = readStickerSemanticCliData<{
+      baseHash: string;
+      generatedAt: string;
+      humanArchivePath: string;
+      humanArchiveExists?: boolean;
+    }>(statusEnvelope);
+    const semanticList = readStickerSemanticCliData<{
+      assets?: StickerSemanticAsset[];
+      revisions?: StickerSemanticRevision[];
+    }>(listEnvelope);
+    setStickerSemantics({
+      baseHash: semanticStatus.baseHash || '',
+      generatedAt: semanticStatus.generatedAt || '',
+      humanArchivePath: semanticStatus.humanArchivePath || '',
+      humanArchiveExists: semanticStatus.humanArchiveExists === true,
+      assets: Array.isArray(semanticList.assets) ? semanticList.assets : [],
+      revisions: Array.isArray(semanticList.revisions) ? semanticList.revisions : [],
+    });
+  };
+
+  const refreshStickerWorkspace = async () => {
+    await Promise.all([refreshStickerLibrary(), refreshStickerSemantics()]);
+  };
+
   const beginEditSticker = (item: FeishuStickerLibraryItem) => {
     setEditingStickerKey(item.fileKey);
     setEditingSticker({
@@ -4990,9 +5080,11 @@ function MemoryPage({
 
   const saveSticker = async (fileKey: string) => {
     setError('');
-    const next = await run('memory.updateFeishuSticker', {
-      sticker: {
-        fileKey,
+    if (!stickerSemantics.baseHash) throw new Error('表情包语义状态尚未加载，请先刷新。');
+    await run('memory.stickerSemantics.updateManual', {
+      fileKey,
+      expectedBaseHash: stickerSemantics.baseHash,
+      patch: {
         label: editingSticker.label ?? '',
         description: editingSticker.description ?? '',
         intent: editingSticker.intent ?? '',
@@ -5002,8 +5094,8 @@ function MemoryPage({
         disabled: editingSticker.disabled === true,
         disabledReason: editingSticker.disabledReason ?? '',
       },
-    }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    });
+    await refreshStickerWorkspace();
     setEditingStickerKey('');
     setEditingSticker({});
   };
@@ -5011,29 +5103,36 @@ function MemoryPage({
   const toggleStickerDisabled = async (item: FeishuStickerLibraryItem) => {
     setError('');
     const disabled = !item.disabled;
-    const next = await run('memory.updateFeishuSticker', {
-      sticker: {
-        fileKey: item.fileKey,
+    await run('memory.stickerSemantics.updateManual', {
+      fileKey: item.fileKey,
+      expectedBaseHash: stickerSemantics.baseHash,
+      patch: {
         disabled,
         disabledReason: disabled ? (item.disabledReason || '控制面板禁用') : '',
       },
-    }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    });
+    await refreshStickerWorkspace();
   };
 
   const mergeStickerAliases = async (fileKey: string) => {
     const aliases = (aliasDrafts[fileKey] || '').trim();
     if (!aliases) return;
     setError('');
-    const next = await run('memory.mergeFeishuStickerAliases', { fileKey, aliases }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    const nextAliases = aliases.split(/[,，\n]+/u).map((item) => item.trim()).filter(Boolean);
+    const currentAliases = stickerLibrary.stickers.find((item) => item.fileKey === fileKey)?.aliases || [];
+    await run('memory.stickerSemantics.updateManual', {
+      fileKey,
+      expectedBaseHash: stickerSemantics.baseHash,
+      patch: { aliases: Array.from(new Set([...currentAliases, ...nextAliases])) },
+    });
+    await refreshStickerWorkspace();
     setAliasDrafts((current) => ({ ...current, [fileKey]: '' }));
   };
 
   const archiveSticker = async (item: FeishuStickerLibraryItem) => {
     setError('');
-    const next = await run('memory.archiveFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    await run('memory.stickerSemantics.archive', { fileKey: item.fileKey, expectedBaseHash: stickerSemantics.baseHash });
+    await refreshStickerWorkspace();
     if (editingStickerKey === item.fileKey) {
       setEditingStickerKey('');
       setEditingSticker({});
@@ -5042,21 +5141,31 @@ function MemoryPage({
 
   const restoreSticker = async (item: FeishuStickerLibraryItem) => {
     setError('');
-    const next = await run('memory.restoreFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    await run('memory.stickerSemantics.restore', { fileKey: item.fileKey, expectedBaseHash: stickerSemantics.baseHash });
+    await refreshStickerWorkspace();
   };
 
   const deleteSticker = async (item: FeishuStickerLibraryItem) => {
     const title = item.label || item.aliases[0] || item.fileKey;
     if (!window.confirm(`永久删除已归档表情包“${title}”？\n\n记录和本地缓存图片会被删除，并保留防止历史同步复活的删除标记。该操作不可恢复。`)) return;
     setError('');
-    const next = await run('memory.deleteFeishuSticker', { fileKey: item.fileKey }) as FeishuStickerLibrarySnapshot;
-    setStickerLibrary(next);
+    await run('memory.stickerSemantics.deleteArchived', { fileKey: item.fileKey, expectedBaseHash: stickerSemantics.baseHash });
+    await refreshStickerWorkspace();
     setAliasDrafts((current) => {
       const copy = { ...current };
       delete copy[item.fileKey];
       return copy;
     });
+  };
+
+  const applyStickerRevisionAction = async (revision: StickerSemanticRevision, action: StickerRevisionAction) => {
+    const command = action === 'accept'
+      ? 'memory.stickerSemantics.acceptRevision'
+      : action === 'reject'
+        ? 'memory.stickerSemantics.rejectRevision'
+        : 'memory.stickerSemantics.rollback';
+    await run(command, { revisionId: revision.revisionId, expectedBaseHash: stickerSemantics.baseHash });
+    await refreshStickerSemantics();
   };
 
   const search = async (nextOffset = searchMeta.offset) => {
@@ -5088,7 +5197,7 @@ function MemoryPage({
   }, [memoryQueryRefreshKey]);
 
   useEffect(() => {
-    void refreshStickerLibrary();
+    void refreshStickerWorkspace();
   }, [refreshRevision]);
   const statusKind: StatusKind = status.lastError
     ? 'error'
@@ -5147,6 +5256,14 @@ function MemoryPage({
     const enabled = stickerLibrary.stickers.filter((item) => item.isLibraryAsset !== false && !item.disabled && !item.archived).length;
     return { total, assets, enabled, disabled, archived, trusted, cached, userOnly, failed, historyOnly };
   }, [stickerLibrary.stickers]);
+  const stickerEvolutionSummary = useMemo(
+    () => buildStickerEvolutionSummary(stickerSemantics.revisions),
+    [stickerSemantics.revisions],
+  );
+  const stickerSemanticAssets = useMemo(
+    () => new Map(stickerSemantics.assets.map((asset) => [asset.fileKey, asset])),
+    [stickerSemantics.assets],
+  );
   const memoryRelationGroups = useMemo(() => buildMemoryRelationGroups(selectedMemory, reminders), [selectedMemory, reminders]);
   const memoryLayout = status.layout;
   const agentHomeEntries = memoryLayout?.agentHome?.length
@@ -5355,10 +5472,84 @@ function MemoryPage({
         </div>
       </section>
 
+      <section className="panel sticker-evolution-panel">
+        <SectionHeader
+          title="表情包语义进化"
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerSemantics()} pending={pending['memory.stickerSemantics.status'] || pending['memory.stickerSemantics.list']} />}
+        />
+        <p className="panel-intro">机器 revision 是唯一事实源；每次变更都会同步更新人类可读《表情包语义档案》、记忆总索引和记忆库说明。沉默不自动确认，只有绑定反馈与人工审核推动状态变化。</p>
+        <div className="memory-optimizer-summary sticker-evolution-summary">
+          <Metric label="试用" value={String(stickerEvolutionSummary.counts.trial)} compact />
+          <Metric label="已确认" value={String(stickerEvolutionSummary.counts.confirmed)} compact />
+          <Metric label="已回归" value={String(stickerEvolutionSummary.counts.regressed)} compact />
+          <Metric label="已拒绝" value={String(stickerEvolutionSummary.counts.rejected)} compact />
+          <Metric label="资产" value={String(stickerSemantics.assets.length)} compact />
+        </div>
+        <div className={stickerSemantics.humanArchiveExists ? 'sticker-archive-status ok' : 'sticker-archive-status warning'}>
+          <div>
+            <strong>{stickerSemantics.humanArchiveExists ? '人类档案已同步' : '档案未同步'}</strong>
+            <span>最近状态时间 {stickerSemantics.generatedAt || '-'}</span>
+          </div>
+          <code>{stickerSemantics.humanArchivePath || '尚未返回档案路径'}</code>
+        </div>
+        <div className="sticker-evolution-list">
+          {stickerSemantics.revisions
+            .slice()
+            .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+            .map((revision) => {
+              const asset = stickerSemanticAssets.get(revision.fileKey);
+              const manualLocked = asset?.visual.source === 'manual';
+              const actions = getStickerRevisionActions({ status: revision.status, manualLocked });
+              const scopeLabel = revision.scope === 'global' ? '全局' : revision.scope === 'chat' ? '当前群聊范围' : '当前用户范围';
+              const statusLabel = revision.status === 'trial' ? '试用' : revision.status === 'confirmed' ? '已确认' : revision.status === 'regressed' ? '已回归' : '已拒绝';
+              const patchParts = [
+                revision.patch.intent ? `意图：${revision.patch.intent}` : '',
+                revision.patch.tone ? `语气：${revision.patch.tone}` : '',
+                revision.patch.usage ? `用途：${revision.patch.usage}` : '',
+                revision.patch.aliases?.length ? `别名：${revision.patch.aliases.join('、')}` : '',
+              ].filter(Boolean);
+              return (
+                <article key={revision.revisionId} className={`sticker-evolution-card ${revision.status}`}>
+                  <header>
+                    <div>
+                      <strong>{asset?.label || asset?.aliases?.[0] || '未命名表情包'}</strong>
+                      <span>{scopeLabel} · 更新 {revision.updatedAt || '-'}</span>
+                    </div>
+                    <StatusPill status={revision.status === 'confirmed' ? 'ok' : revision.status === 'trial' ? 'warning' : 'idle'} label={statusLabel} />
+                  </header>
+                  <p>{patchParts.length ? patchParts.join('；') : '当前 revision 没有普通语义字段变更。'}</p>
+                  <div className="sticker-evidence-counts">
+                    <span>支持会话 {revision.supportSessionIds.length}</span>
+                    <span>矛盾会话 {revision.contradictionSessionIds.length}</span>
+                    {manualLocked && <span>人工事实锁定</span>}
+                  </div>
+                  {(revision.patch.avoidRules || []).length > 0 && (
+                    <div className="sticker-avoid-rules">
+                      {revision.patch.avoidRules?.map((rule) => (
+                        <div key={rule.id}>
+                          <strong>{rule.category}</strong>
+                          <span>{rule.condition}</span>
+                          <small>{rule.status} · 置信度 {Math.round((rule.confidence || 0) * 100)}% · 支持 {rule.supportCount} / 矛盾 {rule.contradictionCount}</small>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="row-actions">
+                    {actions.includes('accept') && <MiniButton label="接受" icon={<CheckCircle2 size={14} />} onClick={() => void applyStickerRevisionAction(revision, 'accept')} pending={pending['memory.stickerSemantics.acceptRevision']} />}
+                    {actions.includes('reject') && <MiniButton label="拒绝" icon={<X size={14} />} onClick={() => void applyStickerRevisionAction(revision, 'reject')} pending={pending['memory.stickerSemantics.rejectRevision']} />}
+                    {actions.includes('rollback') && <MiniButton label="回滚" icon={<RotateCw size={14} />} onClick={() => void applyStickerRevisionAction(revision, 'rollback')} pending={pending['memory.stickerSemantics.rollback']} />}
+                  </div>
+                </article>
+              );
+            })}
+          {stickerSemantics.revisions.length === 0 && <div className="empty-inline">暂无语义 revision。旧可信语义迁移后会在这里形成 confirmed baseline。</div>}
+        </div>
+      </section>
+
       <section className="panel feishu-sticker-panel">
         <SectionHeader
           title="Feishu 表情包库"
-          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerLibrary()} pending={pending['memory.feishuStickers']} />}
+          action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refreshStickerWorkspace()} pending={pending['memory.feishuStickers'] || pending['memory.stickerSemantics.status']} />}
         />
         <p className="panel-intro">管理已学习表情包的名称、别名和语义档案；禁用用于暂停发送，归档用于移出日常资产列表。归档项可恢复，再次操作可永久删除。</p>
         <div className="memory-optimizer-summary">
@@ -5454,7 +5645,7 @@ function MemoryPage({
                 <div className="sticker-row-actions">
                   {isEditing ? (
                     <>
-                      <MiniButton label="保存" icon={<CheckCircle2 size={14} />} onClick={() => void saveSticker(item.fileKey)} pending={pending['memory.updateFeishuSticker']} />
+                      <MiniButton label="保存" icon={<CheckCircle2 size={14} />} onClick={() => void saveSticker(item.fileKey)} pending={pending['memory.stickerSemantics.updateManual']} />
                       <MiniButton label="取消" icon={<X size={14} />} onClick={() => { setEditingStickerKey(''); setEditingSticker({}); }} />
                     </>
                   ) : (
@@ -5465,17 +5656,17 @@ function MemoryPage({
                           label={item.disabled ? '恢复启用' : '禁用'}
                           icon={item.disabled ? <CheckCircle2 size={14} /> : <Trash2 size={14} />}
                           onClick={() => void toggleStickerDisabled(item)}
-                          pending={pending['memory.updateFeishuSticker']}
+                          pending={pending['memory.stickerSemantics.updateManual']}
                         />
                       )}
                       {lifecycleActions.includes('archive') && (
-                        <MiniButton label="一键归档" icon={<Archive size={14} />} onClick={() => void archiveSticker(item)} pending={pending['memory.archiveFeishuSticker']} />
+                        <MiniButton label="一键归档" icon={<Archive size={14} />} onClick={() => void archiveSticker(item)} pending={pending['memory.stickerSemantics.archive']} />
                       )}
                       {lifecycleActions.includes('restore') && (
-                        <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restoreSticker(item)} pending={pending['memory.restoreFeishuSticker']} />
+                        <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restoreSticker(item)} pending={pending['memory.stickerSemantics.restore']} />
                       )}
                       {lifecycleActions.includes('delete') && (
-                        <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteSticker(item)} pending={pending['memory.deleteFeishuSticker']} />
+                        <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteSticker(item)} pending={pending['memory.stickerSemantics.deleteArchived']} />
                       )}
                     </>
                   )}
@@ -5489,7 +5680,7 @@ function MemoryPage({
                       label="合并"
                       icon={<ArrowDownUp size={14} />}
                       onClick={() => void mergeStickerAliases(item.fileKey)}
-                      pending={pending['memory.mergeFeishuStickerAliases']}
+                      pending={pending['memory.stickerSemantics.updateManual']}
                       disabled={!String(aliasDrafts[item.fileKey] || '').trim()}
                     />
                   </div>}
