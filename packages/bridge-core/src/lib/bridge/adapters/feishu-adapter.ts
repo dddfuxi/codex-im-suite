@@ -59,6 +59,7 @@ import {
   FeishuStickerMediaCache,
   sniffImageMimeType,
 } from '../channels/feishu/media/sticker-media-cache.js';
+import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -5776,58 +5777,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private async syncIndexedChatHistory(chatId: string, chatType: string, displayName: string, full = false): Promise<void> {
-    const store = this.getExtendedStore();
-    if (!store.upsertFeishuHistoryMessages) return;
-
-    const latestKnownTime = full
-      ? 0
-      : Number.parseInt(store.getFeishuHistorySyncStatus?.(chatId)?.[0]?.latestMessageTime || '0', 10) || 0;
-    const memberNames = await this.fetchChatMemberNames(chatId);
-    const collected: FeishuMessageListItem[] = [];
-    let pageToken = '';
-
-    while (true) {
-      const { items, nextPageToken, hasMore } = await this.fetchMessagePage(chatId, pageToken, 50);
-      if (items.length === 0) break;
-      collected.push(...items);
-
-      if (!full) {
-        const pageHasNewer = items.some((item) => (Number.parseInt(item.create_time, 10) || 0) > latestKnownTime);
-        if (!pageHasNewer) break;
-      }
-
-      if (!hasMore || !nextPageToken) break;
-      pageToken = nextPageToken;
-    }
-
-    await this.harvestStickersFromHistory(collected, chatId);
-
-    const prepared = collected
-      .filter((item) => !item.deleted)
-      .filter((item) => item.msg_type !== 'system')
-      .map((item) => {
-        const senderId = item.sender?.id?.trim() || '';
-        const senderName = senderId ? memberNames.get(senderId)?.trim() || '' : '';
-        return {
-          messageId: item.message_id,
-          chatId,
-          createTime: item.create_time,
-          msgType: item.msg_type,
-          senderId,
-          senderType: item.sender?.sender_type,
-          senderName,
-          text: this.extractHistoryText(item),
-        };
-      })
-      .filter((item) => item.text);
-
-    if (prepared.length === 0 && !full) return;
-    store.upsertFeishuHistoryMessages({
+    await syncFeishuIndexedHistory({
       chatId,
-      displayName,
       chatType,
-      messages: prepared,
-      syncedAt: new Date().toISOString(),
+      displayName,
+      full,
+      store: this.getExtendedStore(),
+      fetchMemberNames: (targetChatId) => this.fetchChatMemberNames(targetChatId),
+      fetchPage: (targetChatId, pageToken, pageSize) => this.fetchMessagePage(targetChatId, pageToken, pageSize),
+      harvestStickers: (items, targetChatId) => this.harvestStickersFromHistory(items, targetChatId),
+      extractText: (item) => this.extractHistoryText(item),
     });
   }
 

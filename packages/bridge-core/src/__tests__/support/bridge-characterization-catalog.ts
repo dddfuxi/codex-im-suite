@@ -44,8 +44,8 @@ export const BRIDGE_CHARACTERIZATION_CATALOG: readonly BridgeCharacterizationEnt
   },
   {
     domain: 'history',
-    testFile: 'bridge-feishu-adapter.test.ts',
-    testTitle: 'recognizes upward message references as cloud history intent instead of light context',
+    testFile: 'bridge-feishu-history-index-sync.test.ts',
+    testTitle: 'incrementally paginates until a page has no newer messages and writes normalized records once',
   },
   {
     domain: 'media',
