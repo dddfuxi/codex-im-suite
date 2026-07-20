@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu documents 第二阶段迁移：在 `document-request-policy.ts` 新增云文档 Host 五态统一裁决和 OAuth 审计输入构造，`resolved` 只有携带非空 evidence Prompt 才能进入 Provider，缺正文时明确失败关闭；`auth_required / permission_denied / error` 统一生成阻塞交付，`no_links` 保留无链接裁决。`bridge-manager.ts` 删除 Provider 前的重复云文档 Host 调用，同一回合只解析一次，并只负责真实 Host 调用、Store 审计写入和最终 deliver。OAuth 审计继续只记录 requestId、disposition、可信用户 ID 与 scopes，不保存授权 URL、卡片正文、device code 或 token。TDD 的 RED 证明新裁决函数不存在且旧 manager 会调用 Host 两次；GREEN 后文档策略 9/9、云文档 manager 行为组 10/10（联合 19/19）、Core 全量 638/638、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码和 Git diff 检查通过。documents 后续只剩文档创建、记录、导览和最终交付收口。
+
 - 2026-07-20 Feishu documents 第一阶段迁移：新增 `channels/feishu/documents/document-request-policy.ts`，把文档生成/列表意图、确定性标题、通用标题、正文改写 prompt、云链接/OAuth callback 识别、链接脱敏、阻塞文案和授权卡 reuse 去重从 `bridge-manager.ts` 迁出。云链接由宽松文本正则升级为 URL 主机后缀与资源路径白名单，伪造相似域名不再触发 OAuth/读取链。新增 6 项直接模块测试，RED 为模块不存在；GREEN 后模块 6/6、manager 联合 185/185、Core 全量 634/634、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过。live 和飞书现场验收在阶段提交后执行；documents 后续仍需拆云文档 Host 调用编排、授权审计输入与文档创建交付。
 
 - 2026-07-20 Feishu stickers 第三阶段迁移：新增 `sticker-semantic-evolution-policy.ts` 与 `sticker-candidate-evidence.ts`，把用户解释解析、reply/同群近期目标绑定、user/vision/manual 不可变语义演进、候选排序、受控 evidence DTO 和视觉检查 prompt 从 adapter 迁出。新策略保证用户说法只进入未核验 `userAnnotation`、vision 必须绑定真实同 key 媒体、manual 不被后续 vision 降级，候选 DTO 不携带用户说法。新增 6 项直接模块测试，RED 为两个模块不存在；GREEN 后直接测试 6/6、adapter 联合专项 160/160、Core 全量 628/628、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 和 Git diff 检查通过。live 与飞书现场验收在阶段提交后执行；stickers 子域已收口，下一子域为 documents。

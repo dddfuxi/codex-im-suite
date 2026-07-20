@@ -92,14 +92,14 @@ import {
   type StickerAnnotationPayload,
 } from './application/stickers.js';
 import {
-  buildFeishuCloudBlockerMessage,
+  buildFeishuOAuthRequestAuditInput,
   buildFeishuDocumentMemoryAgentPrompt,
   buildFeishuDocumentRewritePrompt,
+  decideFeishuCloudResolution,
   isFeishuDocumentGenerationRequest as isFeishuDocGenerationRequest,
   isFeishuDocumentGenerationRequestStrict as isFeishuDocGenerationRequestStrict,
   isFeishuDocumentListRequest,
   isGenericFeishuDocumentTitle,
-  resolveFeishuOAuthCardJson,
   sanitizeFeishuCloudDocumentLinks,
   shouldHandleFeishuOAuthCallback,
   shouldResolveFeishuCloudLinks,
@@ -3664,16 +3664,13 @@ function recordFeishuOAuthRequestAudit(
   msg: InboundMessage,
   result: FeishuCloudLinkResolveResult,
 ): void {
-  if (result.status !== 'auth_required' || !result.authorizationRequestId) return;
-  const disposition = result.authorizationCardDisposition || 'send';
-  const scopes = (result.requestedScopes || []).join(',') || '(unspecified)';
-  getBridgeContext().store.insertAuditLog({
+  const auditInput = buildFeishuOAuthRequestAuditInput({
     channelType: msg.address.channelType,
     chatId: msg.address.chatId,
-    direction: 'outbound',
     messageId: msg.messageId,
-    summary: `[FEISHU_OAUTH_REQUEST] requestId=${result.authorizationRequestId} disposition=${disposition} userId=${msg.address.userId || '(unknown)'} scopes=${scopes}`,
-  });
+    userId: msg.address.userId,
+  }, result);
+  if (auditInput) getBridgeContext().store.insertAuditLog(auditInput);
 }
 
 function permissionRank(role: PermissionRole): number {
@@ -5403,17 +5400,18 @@ async function handleMessage(
         messageId: msg.messageId,
         authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
       });
-      if (resolved.status === 'resolved' && resolved.systemPrompt) {
-        feishuCloudSystemPrompt = resolved.systemPrompt;
-      } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
+      const resolutionDecision = decideFeishuCloudResolution(resolved);
+      if (resolutionDecision.kind === 'resolved') {
+        feishuCloudSystemPrompt = resolutionDecision.systemPrompt;
+      } else if (resolutionDecision.kind === 'blocked') {
         endProcessingCard();
         recordFeishuOAuthRequestAudit(msg, resolved);
         await deliver(adapter, {
           address: msg.address,
-          text: buildFeishuCloudBlockerMessage(resolved),
+          text: resolutionDecision.text,
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
-          feishuCardJson: resolveFeishuOAuthCardJson(resolved),
+          feishuCardJson: resolutionDecision.feishuCardJson,
         }, { sessionId: effectiveBinding.codepilotSessionId });
         ack();
         return;
@@ -5715,36 +5713,6 @@ async function handleMessage(
         historyLimit: 0,
         extraSystemPrompt: [fastPathOptions.extraSystemPrompt, memoryRecallExtraSystemPrompt].filter(Boolean).join('\n\n'),
       };
-    }
-    if (!feishuCloudSystemPrompt && !directFeishuDocRequest && shouldResolveFeishuCloudLinks(adapter.channelType, rawText)) {
-      const feishuCloudDocuments = getBridgeContext().feishuCloudDocuments;
-      if (feishuCloudDocuments) {
-        const feishuSender = rawData?.feishuSender;
-        const resolved = await feishuCloudDocuments.resolveFeishuCloudLinks({
-          text: rawText,
-          channelType: adapter.channelType,
-          chatId: msg.address.chatId,
-          userId: feishuSender?.openId || msg.address.userId,
-          userDisplayName: msg.address.displayName,
-          messageId: msg.messageId,
-          authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
-        });
-        if (resolved.status === 'resolved' && resolved.systemPrompt) {
-          feishuCloudSystemPrompt = resolved.systemPrompt;
-        } else if (resolved.status === 'auth_required' || resolved.status === 'permission_denied' || resolved.status === 'error') {
-          progressPulse?.stop();
-          recordFeishuOAuthRequestAudit(msg, resolved);
-          await deliver(adapter, {
-            address: msg.address,
-            text: buildFeishuCloudBlockerMessage(resolved),
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-            feishuCardJson: resolveFeishuOAuthCardJson(resolved),
-          }, { sessionId: effectiveBinding.codepilotSessionId });
-          ack();
-          return;
-        }
-      }
     }
     if (shouldUseUnityQuickActionFastPath(rawText)) {
       const unityMcpCheck = await ensureUnityMcpReady(

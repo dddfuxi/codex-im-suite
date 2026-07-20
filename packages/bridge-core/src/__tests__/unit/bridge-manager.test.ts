@@ -3272,6 +3272,42 @@ describe('bridge-manager Feishu cloud documents', () => {
     assert.doesNotMatch((streamParams as StreamChatParams | null)?.prompt || '', /Feishu cloud document evidence prompt|飞书文档真实内容|bridge/);
     assert.doesNotMatch((streamParams as StreamChatParams | null)?.prompt || '', /https:\/\/example\.feishu\.cn\/docx\/doc_abc/);
   });
+
+  it('fails closed without calling the provider when cloud resolution reports success without evidence', async () => {
+    const sent: OutboundMessage[] = [];
+    let resolverCalls = 0;
+    let providerCalls = 0;
+    const feishuCloudDocuments: FeishuCloudDocumentHost = {
+      resolveFeishuCloudLinks: async () => {
+        resolverCalls += 1;
+        return { status: 'resolved', linkCount: 1 };
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          providerCalls += 1;
+          return createTextStream('不应生成无证据答复');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      feishuCloudDocuments,
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('总结 https://example.feishu.cn/docx/doc_empty'));
+
+    assert.equal(resolverCalls, 1);
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /读取结果缺少可靠正文/u);
+  });
   it('routes resolved Feishu cloud Sheets summaries through the agent with document context', async () => {
     const sent: OutboundMessage[] = [];
     let streamParams: StreamChatParams | null = null;

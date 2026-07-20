@@ -1,5 +1,25 @@
 import type { FeishuCloudLinkResolveResult } from '../../../host.js';
 
+export type FeishuCloudResolutionDecision =
+  | { kind: 'resolved'; systemPrompt: string }
+  | { kind: 'blocked'; text: string; feishuCardJson: string | undefined }
+  | { kind: 'no_links' };
+
+export interface FeishuOAuthAuditMessage {
+  channelType: string;
+  chatId: string;
+  messageId: string;
+  userId?: string;
+}
+
+export interface FeishuOAuthRequestAuditInput {
+  channelType: string;
+  chatId: string;
+  direction: 'outbound';
+  messageId: string;
+  summary: string;
+}
+
 const FEISHU_CLOUD_RESOURCE_SEGMENTS = new Set(['docx', 'docs', 'sheets', 'base', 'bitable']);
 const URL_CANDIDATE_RE = /https?:\/\/[^\s<>"')\]]+/giu;
 
@@ -125,6 +145,43 @@ export function buildFeishuCloudBlockerMessage(result: FeishuCloudLinkResolveRes
 export function resolveFeishuOAuthCardJson(result: FeishuCloudLinkResolveResult): string | undefined {
   // reuse 表示同一用户和规范化 scope 已有授权请求，治理层不得重复发卡。
   return result.authorizationCardDisposition === 'reuse' ? undefined : result.feishuCardJson;
+}
+
+export function decideFeishuCloudResolution(
+  result: FeishuCloudLinkResolveResult,
+): FeishuCloudResolutionDecision {
+  if (result.status === 'no_links') return { kind: 'no_links' };
+  if (result.status === 'resolved') {
+    const systemPrompt = result.systemPrompt?.trim() || '';
+    return systemPrompt
+      ? { kind: 'resolved', systemPrompt }
+      : {
+        kind: 'blocked',
+        text: '未完成：飞书云文档读取结果缺少可靠正文，无法继续处理。',
+        feishuCardJson: undefined,
+      };
+  }
+  return {
+    kind: 'blocked',
+    text: buildFeishuCloudBlockerMessage(result),
+    feishuCardJson: resolveFeishuOAuthCardJson(result),
+  };
+}
+
+export function buildFeishuOAuthRequestAuditInput(
+  message: FeishuOAuthAuditMessage,
+  result: FeishuCloudLinkResolveResult,
+): FeishuOAuthRequestAuditInput | undefined {
+  if (result.status !== 'auth_required' || !result.authorizationRequestId) return undefined;
+  const disposition = result.authorizationCardDisposition || 'send';
+  const scopes = (result.requestedScopes || []).join(',') || '(unspecified)';
+  return {
+    channelType: message.channelType,
+    chatId: message.chatId,
+    direction: 'outbound',
+    messageId: message.messageId,
+    summary: `[FEISHU_OAUTH_REQUEST] requestId=${result.authorizationRequestId} disposition=${disposition} userId=${message.userId || '(unknown)'} scopes=${scopes}`,
+  };
 }
 
 export function sanitizeFeishuCloudDocumentLinks(text: string): string {

@@ -74,4 +74,76 @@ describe('Feishu document request policy', () => {
     assert.equal(resolveFeishuOAuthCardJson({ status: 'auth_required', feishuCardJson: '{"card":1}', authorizationCardDisposition: 'reuse' }), undefined);
     assert.equal(resolveFeishuOAuthCardJson({ status: 'auth_required', feishuCardJson: '{"card":1}', authorizationCardDisposition: 'send' }), '{"card":1}');
   });
+
+  it('turns every cloud host result into one explicit provider or delivery decision', async () => {
+    const { decideFeishuCloudResolution } = await loadPolicy();
+
+    assert.deepEqual(decideFeishuCloudResolution({
+      status: 'resolved',
+      systemPrompt: '  verified document evidence  ',
+    }), {
+      kind: 'resolved',
+      systemPrompt: 'verified document evidence',
+    });
+    assert.deepEqual(decideFeishuCloudResolution({
+      status: 'auth_required',
+      userMessage: '请完成授权',
+      feishuCardJson: '{"card":1}',
+      authorizationCardDisposition: 'send',
+    }), {
+      kind: 'blocked',
+      text: '请完成授权',
+      feishuCardJson: '{"card":1}',
+    });
+    assert.deepEqual(decideFeishuCloudResolution({
+      status: 'permission_denied',
+    }), {
+      kind: 'blocked',
+      text: '未完成：当前登录飞书用户也没有这个云文档权限，请让文档所有者分享给你或导出内容。',
+      feishuCardJson: undefined,
+    });
+    assert.deepEqual(decideFeishuCloudResolution({ status: 'no_links' }), { kind: 'no_links' });
+  });
+
+  it('fails closed when a resolved cloud document result has no evidence prompt', async () => {
+    const { decideFeishuCloudResolution } = await loadPolicy();
+
+    assert.deepEqual(decideFeishuCloudResolution({ status: 'resolved', systemPrompt: '   ' }), {
+      kind: 'blocked',
+      text: '未完成：飞书云文档读取结果缺少可靠正文，无法继续处理。',
+      feishuCardJson: undefined,
+    });
+  });
+
+  it('builds a secret-free OAuth audit entry only for tracked authorization requests', async () => {
+    const { buildFeishuOAuthRequestAuditInput } = await loadPolicy();
+    const message = {
+      channelType: 'feishu',
+      chatId: 'oc_1',
+      messageId: 'om_1',
+      userId: 'ou_1',
+    };
+
+    assert.deepEqual(buildFeishuOAuthRequestAuditInput(message, {
+      status: 'auth_required',
+      authorizationRequestId: 'oauth-request-1',
+      requestedScopes: ['offline_access', 'sheets:spreadsheet:readonly'],
+      authorizationCardDisposition: 'reuse',
+      loginUrl: 'https://accounts.feishu.cn/secret',
+      feishuCardJson: '{"secret":"must-not-appear"}',
+    }), {
+      channelType: 'feishu',
+      chatId: 'oc_1',
+      direction: 'outbound',
+      messageId: 'om_1',
+      summary: '[FEISHU_OAUTH_REQUEST] requestId=oauth-request-1 disposition=reuse userId=ou_1 scopes=offline_access,sheets:spreadsheet:readonly',
+    });
+    assert.equal(buildFeishuOAuthRequestAuditInput(message, {
+      status: 'permission_denied',
+      authorizationRequestId: 'oauth-request-1',
+    }), undefined);
+    assert.equal(buildFeishuOAuthRequestAuditInput(message, {
+      status: 'auth_required',
+    }), undefined);
+  });
 });
