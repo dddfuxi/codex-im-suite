@@ -61,6 +61,7 @@ import {
 } from '../channels/feishu/media/sticker-media-cache.js';
 import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/indexed-history-prompt.js';
+import { retrieveFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-retrieval.js';
 import { selectFeishuLightContextItems } from '../channels/feishu/history/light-context-selection.js';
 import { buildFeishuHistoryAttachmentRecoveryPlan } from '../channels/feishu/history/attachment-recovery.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
@@ -5800,140 +5801,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
   ): Promise<string> {
     const displayName = await this.resolveChatDisplayName(chatId);
     await this.syncIndexedChatHistory(chatId, 'group', displayName, false);
-    const retrieved = this.getExtendedStore().retrieveRelevantFeishuHistory?.({
+    const store = this.getExtendedStore();
+    const retrieved = retrieveFeishuIndexedHistory({
       chatId,
-      query: intent.taskPrompt,
-      limit: intent.limit,
-      startTimeMs: intent.startTimeMs,
-      endTimeMs: intent.endTimeMs,
-      targetSpeakerNames: intent.targetSpeakerNames,
+      intent,
+      retrieve: store.retrieveRelevantFeishuHistory
+        ? (query) => store.retrieveRelevantFeishuHistory!(query)
+        : undefined,
     });
 
     return buildFeishuIndexedHistoryPrompt({ intent, retrieved });
-  }
-
-  private matchesHistorySpeakerV2(
-    item: FeishuMessageListItem,
-    memberNames: Map<string, string>,
-    targetSpeakerNames: string[],
-  ): boolean {
-    const senderId = item.sender?.id?.trim() || '';
-    const senderName = (senderId && memberNames.get(senderId)?.trim()) || '';
-    const speakerCandidates = [senderName, senderId].filter(Boolean);
-    return targetSpeakerNames.some((target) =>
-      speakerCandidates.some((candidate) => candidate === target || candidate.includes(target) || target.includes(candidate)),
-    );
-  }
-
-  private isNamingContextItemV2(item: FeishuMessageListItem): boolean {
-    const content = item.body?.content || '';
-    const namingHints = /(\u82f1\u6587\u540d|\u547d\u540d|\u8d77\u540d|\u683c\u5f0f|\u6807\u8bc6|\u914d\u7f6e\u540d|\u8d44\u6e90\u540d|token|id)/i.test(content);
-    const codeLikeTokens = this.extractCodeLikeTokensV2(content);
-    return namingHints || codeLikeTokens.length > 0;
-  }
-
-  private extractCodeLikeTokensV2(text: string): string[] {
-    const tokens = new Set<string>();
-    const patterns = [
-      /\b[A-Za-z]+(?:_[A-Za-z0-9]+){1,}\b/g,
-      /\b[A-Z][A-Za-z0-9]+(?:[A-Z][A-Za-z0-9]+){1,}\b/g,
-      /\b[a-z]+(?:[A-Z][A-Za-z0-9]+){1,}\b/g,
-      /`([^`\r\n]{2,80})`/g,
-    ];
-
-    for (const pattern of patterns) {
-      for (const match of text.matchAll(pattern)) {
-        const token = (match[1] || match[0] || '').trim();
-        if (token.length >= 3 && token.length <= 80) {
-          tokens.add(token);
-        }
-      }
-    }
-
-    return [...tokens];
-  }
-
-  private mergeHistoryItemsV2(
-    primary: FeishuMessageListItem[],
-    secondary: FeishuMessageListItem[],
-  ): FeishuMessageListItem[] {
-    const merged = new Map<string, FeishuMessageListItem>();
-    for (const item of [...primary, ...secondary]) {
-      merged.set(item.message_id, item);
-    }
-    return [...merged.values()].sort((a, b) => Number.parseInt(a.create_time, 10) - Number.parseInt(b.create_time, 10));
-  }
-
-  private async buildHistoryAugmentedPrompt(
-    chatId: string,
-    currentMessageId: string,
-    intent: FeishuHistoryIntent,
-  ): Promise<string> {
-    const [recentMessages, memberNames] = await Promise.all([
-      this.fetchRecentMessages(chatId, 100),
-      this.fetchChatMemberNames(chatId),
-    ]);
-
-    const historyItems = recentMessages
-      .filter((item) => !item.deleted)
-      .filter((item) => item.msg_type !== 'system')
-      .filter((item) => !this.isHistoryItemFromSelf(item.sender))
-      .filter((item) => item.message_id !== currentMessageId)
-      .filter((item) => {
-        const ts = Number.parseInt(item.create_time, 10);
-        if (intent.startTimeMs !== undefined && ts < intent.startTimeMs) return false;
-        if (intent.endTimeMs !== undefined && ts >= intent.endTimeMs) return false;
-        return true;
-      })
-      .slice(0, intent.limit)
-      .reverse();
-
-    const formattedHistory = historyItems
-      .map((item) => this.formatHistoryItem(item, memberNames))
-      .filter(Boolean)
-      .join('\n');
-
-    if (!formattedHistory) {
-      return [
-        `用户当前请求：${intent.taskPrompt}`,
-        '',
-        '说明：我已尝试读取群聊历史，但当前没有拿到可用于总结的有效消息。请直接告诉用户这次没读到内容，并给出最短下一步建议。',
-      ].join('\n');
-    }
-
-    const scopeText = `${intent.scopeText}中最近筛出的 ${historyItems.length} 条可读消息`;
-
-    if (intent.responseMode === 'doc') {
-      return [
-        `请基于下面提供的 ${scopeText}，生成一份适合直接写入飞书文档的 Markdown 正文。`,
-        '要求：',
-        '1. 第一行必须是一级标题。',
-        '2. 正文默认包含“结论摘要”“关键事实”“执行结果”“问题与风险”“后续待办”五个部分；如果某部分确实为空，也要如实写明。',
-        '3. 这是飞书文档正文，不是聊天记录导出。不要按时间线逐条复述，不要保留“用户A：...”这种原始聊天流水，除非它是必要证据。',
-        '4. 如果历史里出现失败、空白截图、错误替代方案或未完成事项，必须写入“问题与风险”，不能包装成成功。',
-        '5. 只输出文档正文本身，不要写“下面是”“已为你生成”“请查收”等客套句。',
-        '6. 不要输出代码块，不要编造群里没有出现的信息。',
-        '',
-        '=== 群聊历史开始 ===',
-        formattedHistory,
-        '=== 群聊历史结束 ===',
-        '',
-        `用户当前请求：${intent.taskPrompt}`,
-      ].join('\n');
-    }
-
-    return [
-      `请基于下面提供的 ${scopeText} 回答用户请求。`,
-      '要求：直接给出结论和摘要，少讲过程，不要让用户重复贴记录。',
-      '如果信息不完整，可以在结尾用一句话简短说明边界，但不要把整段回答写成拒答或免责声明。',
-      '不要编造未出现的内容，也不要说“我现在看不到本群记录”之类的泛化废话；你现在看到的就是下面这段历史。',
-      '',
-      '=== 群聊历史开始 ===',
-      formattedHistory,
-      '=== 群聊历史结束 ===',
-      '',
-      `用户当前请求：${intent.taskPrompt}`,
-    ].join('\n');
   }
 
   private buildHistoryDocumentTitle(scopeText: string, now: Date): string {
