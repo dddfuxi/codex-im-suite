@@ -58,6 +58,7 @@ function writeFixtureIndex(root: string): { index: KnowledgeIndex; duplicateId: 
     generatedAt: '2026-05-16T00:00:00.000Z',
     itemCount: 5,
     conflictCount: 0,
+    stats: { confirmedCount: 0, candidateCount: 0, archivedCount: 0, legacyCount: 5, conflictCount: 0 },
     items: [
       {
         id: 'fact-a',

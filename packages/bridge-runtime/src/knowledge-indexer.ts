@@ -7,10 +7,11 @@ import {
   isIndexableMemoryV2SourceItem,
   parseMemorySourceFrontmatter,
 } from './memory-source-policy.js';
+import { tryReadManagedStateFromContent } from './memory-items/managed-document.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
 
 export type KnowledgeKind = 'fact' | 'conclusion' | 'todo' | 'resource';
-export type KnowledgeClassificationSource = 'prefix' | 'table_inference' | 'resource_pattern';
+export type KnowledgeClassificationSource = 'prefix' | 'table_inference' | 'resource_pattern' | 'managed_state';
 
 export interface KnowledgeSourceFile {
   path: string;
@@ -42,7 +43,16 @@ export interface KnowledgeIndex {
   generatedAt: string;
   itemCount: number;
   conflictCount: number;
+  stats: KnowledgeIndexStats;
   items: KnowledgeItem[];
+}
+
+export interface KnowledgeIndexStats {
+  confirmedCount: number;
+  candidateCount: number;
+  archivedCount: number;
+  legacyCount: number;
+  conflictCount: number;
 }
 
 export interface KnowledgeSearchQuery {
@@ -92,7 +102,7 @@ function makeItem(
   text: string,
   key?: string,
   value?: string,
-  classification?: { reason: string; source: KnowledgeClassificationSource },
+  classification?: { reason: string; source: KnowledgeClassificationSource; confidence?: number },
 ): KnowledgeItem | null {
   const normalizedText = normalizeIndexedText(stripMarkdown(text));
   if (!normalizedText) return null;
@@ -117,7 +127,7 @@ function makeItem(
     key: normalizedKey,
     value: normalizedValue,
     text: normalizedText,
-    confidence: kind === 'resource' ? 0.9 : 0.75,
+    confidence: classification?.confidence ?? (kind === 'resource' ? 0.9 : 0.75),
     conflict: false,
     classificationReason: classification?.reason,
     classificationSource: classification?.source,
@@ -221,7 +231,44 @@ function inferTableRowKind(key: string, value: string): KnowledgeKindInference {
   };
 }
 
-function collectItemsFromFile(file: KnowledgeSourceFile): KnowledgeItem[] {
+interface CollectedKnowledgeItems {
+  items: KnowledgeItem[];
+  confirmedCount: number;
+  candidateCount: number;
+  legacyCount: number;
+}
+
+function collectManagedItems(file: KnowledgeSourceFile): CollectedKnowledgeItems | null {
+  const managed = tryReadManagedStateFromContent(file.content);
+  if (!managed) return null;
+  const items = Object.entries(managed.confirmed)
+    .map(([key, entry]) => {
+      const inference = inferTableRowKind(key, entry.value);
+      return makeItem(
+        inference.kind,
+        file,
+        `${key}: ${entry.value}`,
+        key,
+        entry.value,
+        {
+          reason: 'managed confirmed memory',
+          source: 'managed_state',
+          confidence: entry.confidence,
+        },
+      );
+    })
+    .filter((item): item is KnowledgeItem => Boolean(item));
+  return {
+    items,
+    confirmedCount: items.length,
+    candidateCount: Object.keys(managed.candidates).length,
+    legacyCount: 0,
+  };
+}
+
+function collectItemsFromFile(file: KnowledgeSourceFile): CollectedKnowledgeItems {
+  const managed = collectManagedItems(file);
+  if (managed) return managed;
   const items: KnowledgeItem[] = [];
   const content = stripFrontmatter(file.content);
   for (const row of parseMarkdownTableRows(content)) {
@@ -249,7 +296,12 @@ function collectItemsFromFile(file: KnowledgeSourceFile): KnowledgeItem[] {
     if (item) items.push(item);
   }
 
-  return items;
+  return {
+    items,
+    confirmedCount: 0,
+    candidateCount: 0,
+    legacyCount: items.length,
+  };
 }
 
 function sanitizeItemForSearch(item: KnowledgeItem): KnowledgeItem | null {
@@ -301,13 +353,22 @@ function markConflicts(items: KnowledgeItem[]): KnowledgeItem[] {
 
 export function buildKnowledgeIndexFromMarkdown(input: BuildInput): KnowledgeIndex {
   const files = input.files.filter((file) => isIndexableMemoryV2SourceFile(input.memoryRoot, file));
-  const items = markConflicts(files.flatMap(collectItemsFromFile));
+  const collected = files.map(collectItemsFromFile);
+  const items = markConflicts(collected.flatMap((result) => result.items));
+  const conflictCount = items.filter((item) => item.conflict).length;
   return {
     schema: 'codex-im-suite/knowledge-index/v1',
     memoryRoot: input.memoryRoot,
     generatedAt: input.generatedAt || new Date().toISOString(),
     itemCount: items.length,
-    conflictCount: items.filter((item) => item.conflict).length,
+    conflictCount,
+    stats: {
+      confirmedCount: collected.reduce((total, result) => total + result.confirmedCount, 0),
+      candidateCount: collected.reduce((total, result) => total + result.candidateCount, 0),
+      archivedCount: 0,
+      legacyCount: collected.reduce((total, result) => total + result.legacyCount, 0),
+      conflictCount,
+    },
     items,
   };
 }
@@ -356,6 +417,13 @@ export function readKnowledgeIndex(memoryRoot: string): KnowledgeIndex | null {
       memoryRoot: root,
       itemCount: items.length,
       conflictCount: items.filter((item) => item.conflict).length,
+      stats: parsed.stats || {
+        confirmedCount: 0,
+        candidateCount: 0,
+        archivedCount: 0,
+        legacyCount: items.length,
+        conflictCount: items.filter((item) => item.conflict).length,
+      },
       items,
     };
   } catch {

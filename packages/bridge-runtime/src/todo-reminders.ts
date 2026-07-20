@@ -618,6 +618,13 @@ function createEmptyKnowledgeIndex(memoryRoot: string): KnowledgeIndex {
     generatedAt: new Date().toISOString(),
     itemCount: 0,
     conflictCount: 0,
+    stats: {
+      confirmedCount: 0,
+      candidateCount: 0,
+      archivedCount: 0,
+      legacyCount: 0,
+      conflictCount: 0,
+    },
     items: [],
   };
 }

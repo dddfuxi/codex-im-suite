@@ -34,6 +34,10 @@ export interface KnowledgeIndexStatus {
   markdownFileCount: number;
   itemCount: number;
   conflictCount: number;
+  confirmedCount: number;
+  candidateCount: number;
+  archivedCount: number;
+  legacyCount: number;
   memoryGraphPath?: string;
   memoryGraphNodeCount?: number;
   memoryGraphEdgeCount?: number;
@@ -132,6 +136,10 @@ function makeStatus(
     markdownFileCount: 0,
     itemCount: index?.itemCount ?? 0,
     conflictCount: index?.conflictCount ?? 0,
+    confirmedCount: index?.stats.confirmedCount ?? 0,
+    candidateCount: index?.stats.candidateCount ?? 0,
+    archivedCount: index?.stats.archivedCount ?? 0,
+    legacyCount: index?.stats.legacyCount ?? 0,
     memoryGraphPath: getMemoryGraphIndexPath(memoryRoot),
     memoryGraphNodeCount: graph?.nodeCount ?? 0,
     memoryGraphEdgeCount: graph?.edgeCount ?? 0,
@@ -197,6 +205,10 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
     markdownFileCount: sources.length,
     itemCount: index.itemCount,
     conflictCount: index.conflictCount,
+    confirmedCount: index.stats.confirmedCount,
+    candidateCount: index.stats.candidateCount,
+    archivedCount: index.stats.archivedCount,
+    legacyCount: index.stats.legacyCount,
     memoryGraphNodeCount: graph.nodeCount,
     memoryGraphEdgeCount: graph.edgeCount,
     generatedAt: index.generatedAt,

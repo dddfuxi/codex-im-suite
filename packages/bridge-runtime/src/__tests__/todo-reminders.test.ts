@@ -25,6 +25,7 @@ function makeIndex(items: KnowledgeIndex['items']): KnowledgeIndex {
     generatedAt: '2026-04-29T00:00:00.000Z',
     itemCount: items.length,
     conflictCount: 0,
+    stats: { confirmedCount: 0, candidateCount: 0, archivedCount: 0, legacyCount: items.length, conflictCount: 0 },
     items,
   };
 }

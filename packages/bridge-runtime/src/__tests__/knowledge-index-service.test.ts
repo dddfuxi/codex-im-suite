@@ -9,6 +9,10 @@ import {
   rebuildKnowledgeIndex,
   startKnowledgeIndexWatcher,
 } from '../knowledge-index-service.js';
+import {
+  materializeDerivedUserImpression,
+  upsertConfirmedMemoryDocument,
+} from '../memory-documents.js';
 
 describe('knowledge index service realtime status', () => {
   let tmpDir: string;
@@ -98,6 +102,41 @@ describe('knowledge index service realtime status', () => {
     assert.equal(status.markdownFileCount, 2);
     assert.equal(index.items.some((item) => item.key === '回复偏好'), true);
     assert.equal(index.items.some((item) => item.text.includes('迁移期仍可检索')), true);
+  });
+
+  it('reports managed confirmed and candidate counts without indexing candidate text', () => {
+    upsertConfirmedMemoryDocument({
+      memoryRoot: tmpDir,
+      scope: 'user',
+      channelType: 'feishu',
+      userId: 'ou_user_1',
+      displayName: '刘丹',
+      pairs: [{ key: '回复偏好', value: '使用中文' }],
+      evidenceText: '以后使用中文回复',
+      createdAt: '2026-07-20T10:00:00.000Z',
+    });
+    materializeDerivedUserImpression({
+      memoryRoot: tmpDir,
+      channelType: 'feishu',
+      userId: 'ou_user_1',
+      displayName: '刘丹',
+      observations: [{ text: 'Unity MCP 截图', count: 3 }],
+      updatedAt: '2026-07-20T10:01:00.000Z',
+    });
+
+    const status = rebuildKnowledgeIndex(tmpDir);
+    const index = JSON.parse(fs.readFileSync(path.join(tmpDir, '.cti-index', 'knowledge.json'), 'utf8')) as {
+      stats: { confirmedCount: number; candidateCount: number; legacyCount: number };
+      items: Array<{ key?: string; text: string }>;
+    };
+
+    assert.equal(status.confirmedCount, 1);
+    assert.equal(status.candidateCount, 1);
+    assert.equal(status.legacyCount, 0);
+    assert.equal(index.stats.confirmedCount, 1);
+    assert.equal(index.stats.candidateCount, 1);
+    assert.deepEqual(index.items.map((item) => item.key), ['回复偏好']);
+    assert.doesNotMatch(JSON.stringify(index.items), /Unity MCP 截图|暂定-/u);
   });
 
   it('refreshes Agent Home and the readable master index during rebuild', () => {

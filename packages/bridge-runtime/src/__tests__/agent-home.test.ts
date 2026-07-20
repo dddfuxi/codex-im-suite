@@ -403,6 +403,7 @@ describe('Agent Home', () => {
         generatedAt: '2026-07-17T12:00:00.000Z',
         itemCount: 3,
         conflictCount: 0,
+        stats: { confirmedCount: 3, candidateCount: 0, archivedCount: 0, legacyCount: 0, conflictCount: 0 },
         items: [
           {
             id: 'user-1', kind: 'fact', key: '回复语言', value: '中文', text: '回复语言 = 中文', confidence: 0.95, conflict: false,

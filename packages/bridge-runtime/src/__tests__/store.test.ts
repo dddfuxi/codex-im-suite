@@ -315,7 +315,7 @@ describe('JsonFileStore', () => {
     assert.ok(index.items.some((item) => item.key === 'HSScene' && item.value === '医院内部场景'));
     assert.ok(index.items.some((item) => item.kind === 'fact'));
     assert.equal(index.items.some((item) => item.key === 'HSScene' && item.kind === 'resource'), false);
-    assert.ok(index.items.some((item) => item.classificationSource === 'table_inference'));
+    assert.ok(index.items.some((item) => item.classificationSource === 'managed_state'));
   });
 
   it('writes repeated confirmed user memories into one v3 用户印象.md', () => {
@@ -508,6 +508,7 @@ describe('JsonFileStore', () => {
       generatedAt: '2026-07-13T00:00:00.000Z',
       itemCount: 2,
       conflictCount: 0,
+      stats: { confirmedCount: 0, candidateCount: 0, archivedCount: 0, legacyCount: 2, conflictCount: 0 },
       items: [
         {
           id: 'old-memory',

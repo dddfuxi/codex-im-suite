@@ -20,7 +20,101 @@ function memoryV2Frontmatter(scope: 'user' | 'group' | 'long_term', extra: strin
   ].join('\n');
 }
 
+function managedMemoryV2Content(): string {
+  const state = {
+    version: 2,
+    confirmed: {
+      场景映射: {
+        value: '医院内部场景',
+        updatedAt: '2026-07-20T10:00:00.000Z',
+        confidence: 1,
+        status: 'confirmed',
+        sourceKind: 'explicit',
+      },
+    },
+    candidates: {
+      '暂定-abc': {
+        value: 'Unity MCP 截图',
+        updatedAt: '2026-07-20T10:01:00.000Z',
+        confidence: 0.71,
+        status: 'candidate',
+        sourceKind: 'candidate_observation',
+      },
+    },
+    evidence: [],
+    deletedCandidateFingerprints: {},
+  };
+  const encoded = Buffer.from(JSON.stringify(state), 'utf8').toString('base64');
+  return [
+    '---',
+    'schema: codex-im-suite/memory/v3',
+    'memoryScope: user',
+    'channelType: feishu',
+    'userId: ou_user_1',
+    '---',
+    '',
+    `<!-- cti-memory-state:${encoded} -->`,
+    '',
+    '## 已确认事实',
+    '',
+    '| key | value | 置信度 | 更新时间 |',
+    '| --- | --- | --- | --- |',
+    '| 场景映射 | 医院内部场景 | 100% | 2026-07-20T10:00:00.000Z |',
+    '',
+    '## 候选记忆（不参与索引）',
+    '',
+    '| key | value | 置信度 | 更新时间 |',
+    '| --- | --- | --- | --- |',
+    '| 暂定-abc | Unity MCP 截图 | 71% | 2026-07-20T10:01:00.000Z |',
+    '',
+  ].join('\n');
+}
+
 describe('knowledge indexer', () => {
+  it('indexes only confirmed entries from managed memory v2 documents', () => {
+    const memoryRoot = 'E:\\cli-md';
+    const managedFile = {
+      path: path.join(memoryRoot, 'memory', 'users', 'feishu', 'ou_user_1', '用户印象.md'),
+      updatedAt: '2026-07-20T10:02:00.000Z',
+      content: managedMemoryV2Content(),
+    };
+
+    const index = buildKnowledgeIndexFromMarkdown({ memoryRoot, files: [managedFile] });
+
+    assert.deepEqual(index.items.map((item) => item.key), ['场景映射']);
+    assert.equal(index.items[0].confidence, 1);
+    assert.equal(index.items[0].classificationSource, 'managed_state');
+    assert.equal(index.stats.confirmedCount, 1);
+    assert.equal(index.stats.candidateCount, 1);
+    assert.equal(index.stats.legacyCount, 0);
+    assert.doesNotMatch(JSON.stringify(index.items), /暂定-|Unity MCP 截图/u);
+  });
+
+  it('keeps compatible markdown parsing for unmanaged v3 documents', () => {
+    const memoryRoot = 'E:\\cli-md';
+    const index = buildKnowledgeIndexFromMarkdown({
+      memoryRoot,
+      files: [{
+        path: path.join(memoryRoot, 'memory', 'long-term', '人工维护.md'),
+        content: [
+          '---',
+          'schema: codex-im-suite/memory/v3',
+          'memoryScope: long_term',
+          '---',
+          '',
+          '| key | value |',
+          '| --- | --- |',
+          '| 人工规则 | 保留兼容解析 |',
+        ].join('\n'),
+      }],
+    });
+
+    assert.equal(index.items.length, 1);
+    assert.equal(index.items[0].key, '人工规则');
+    assert.equal(index.stats.confirmedCount, 0);
+    assert.equal(index.stats.legacyCount, 1);
+  });
+
   it('repairs mojibake before indexing searchable knowledge', () => {
     const memoryRoot = 'E:\\cli-md';
     const index = buildKnowledgeIndexFromMarkdown({
