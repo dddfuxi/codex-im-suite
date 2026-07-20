@@ -12,7 +12,7 @@ describe('Bridge Core characterization coverage', () => {
   it('pins every Task 8 public behavior domain to a real regression test', () => {
     assert.deepEqual(
       BRIDGE_CHARACTERIZATION_CATALOG.map((entry) => entry.domain).sort(),
-      ['artifact', 'attachment', 'card', 'delivery', 'direct_message', 'history', 'inbound', 'permission', 'reminder', 'sticker'],
+      ['artifact', 'attachment', 'card', 'delivery', 'direct_message', 'history', 'inbound', 'media', 'permission', 'reminder', 'sticker'],
     );
 
     for (const entry of BRIDGE_CHARACTERIZATION_CATALOG) {

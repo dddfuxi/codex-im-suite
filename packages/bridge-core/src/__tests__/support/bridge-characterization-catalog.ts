@@ -4,6 +4,7 @@ export type BridgeCharacterizationDomain =
   | 'reminder'
   | 'direct_message'
   | 'history'
+  | 'media'
   | 'sticker'
   | 'attachment'
   | 'card'
@@ -45,6 +46,11 @@ export const BRIDGE_CHARACTERIZATION_CATALOG: readonly BridgeCharacterizationEnt
     domain: 'history',
     testFile: 'bridge-feishu-adapter.test.ts',
     testTitle: 'recognizes upward message references as cloud history intent instead of light context',
+  },
+  {
+    domain: 'media',
+    testFile: 'bridge-feishu-adapter.test.ts',
+    testTitle: 'reuses stored sticker media for repeated sticker file keys without Feishu downloads',
   },
   {
     domain: 'sticker',

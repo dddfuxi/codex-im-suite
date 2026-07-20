@@ -54,7 +54,11 @@ import {
   bindStickerFeedbackCandidate,
   type StickerFeedbackInbound,
 } from '../sticker-feedback-binding.js';
-import { MemoryArtifactStore, createBridgeMemoryArtifactStore } from '../memory-artifact-store.js';
+import { createBridgeMemoryArtifactStore } from '../memory-artifact-store.js';
+import {
+  FeishuStickerMediaCache,
+  sniffImageMimeType,
+} from '../channels/feishu/media/sticker-media-cache.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -884,35 +888,6 @@ type FeishuMessageRecalledEventData = {
   event?: unknown;
   message?: unknown;
 };
-const STICKER_MEDIA_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp'] as const;
-
-function sniffImageMimeType(buffer: Buffer): { mimeType: string; extension: string } | null {
-  if (buffer.length >= 8
-    && buffer[0] === 0x89
-    && buffer[1] === 0x50
-    && buffer[2] === 0x4e
-    && buffer[3] === 0x47
-    && buffer[4] === 0x0d
-    && buffer[5] === 0x0a
-    && buffer[6] === 0x1a
-    && buffer[7] === 0x0a) {
-    return { mimeType: 'image/png', extension: 'png' };
-  }
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return { mimeType: 'image/jpeg', extension: 'jpg' };
-  }
-  if (buffer.length >= 6) {
-    const header = buffer.subarray(0, 6).toString('ascii');
-    if (header === 'GIF87a' || header === 'GIF89a') return { mimeType: 'image/gif', extension: 'gif' };
-  }
-  if (buffer.length >= 12
-    && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
-    && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
-    return { mimeType: 'image/webp', extension: 'webp' };
-  }
-  return null;
-}
-
 interface FeishuMessageListItem {
   message_id: string;
   root_id?: string;
@@ -1301,43 +1276,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private getStickerCachePath(fileKey: string, extension = '.png'): string {
-    const normalizedExtension = extension.startsWith('.') ? extension : `.${extension}`;
-    return path.join(getFeishuStickerCacheDirPath(), MemoryArtifactStore.stableFileName(fileKey, normalizedExtension));
-  }
-
   private findStickerCachePath(fileKey: string): string | null {
-    for (const extension of STICKER_MEDIA_EXTENSIONS) {
-      const cachePath = this.getStickerCachePath(fileKey, extension);
-      if (fs.existsSync(cachePath)) return cachePath;
-    }
-    return null;
+    return this.getStickerMediaCache().findPath(fileKey);
   }
 
   private readCachedStickerResource(fileKey: string): FileAttachment | null {
-    if (!fileKey.trim()) return null;
-    try {
-      const cachePath = this.findStickerCachePath(fileKey);
-      if (!cachePath) return null;
-      const stat = fs.statSync(cachePath);
-      if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_FILE_SIZE) return null;
-      const buffer = fs.readFileSync(cachePath);
-      const imageType = sniffImageMimeType(buffer);
-      const fallbackExtension = path.extname(cachePath).replace(/^\./, '').toLowerCase() || 'png';
-      const type = imageType?.mimeType || this.mimeTypeForImageExtension(fallbackExtension) || 'image/png';
-      const extension = imageType?.extension || this.extensionForFeishuResource('image', type);
-      return {
-        id: fileKey,
-        name: `sticker-${fileKey}.${extension}`,
-        type,
-        size: buffer.length,
-        data: buffer.toString('base64'),
-        filePath: cachePath,
-      };
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to read sticker cache:', err instanceof Error ? err.message : err);
-      return null;
-    }
+    return this.getStickerMediaCache().read(fileKey);
+  }
+
+  private getStickerMediaCache(): FeishuStickerMediaCache {
+    return new FeishuStickerMediaCache(getFeishuStickerCacheDirPath(), { maxFileSize: MAX_FILE_SIZE });
   }
 
   /**
@@ -1366,20 +1314,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
-      const buffer = Buffer.from(attachment.data, 'base64');
-      if (!buffer.length || buffer.length > MAX_FILE_SIZE) return null;
-      const imageType = sniffImageMimeType(buffer);
-      const mimeType = imageType?.mimeType || attachment.type || 'image/png';
-      const extension = imageType?.extension || this.extensionForFeishuResource('image', mimeType);
-      const cachePath = this.getStickerCachePath(fileKey, extension);
-      fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-      fs.writeFileSync(cachePath, buffer);
+      const persisted = this.getStickerMediaCache().persist(fileKey, attachment);
+      if (!persisted) return null;
       this.updateStickerMediaState(fileKey, {
         mediaCachedAt: new Date().toISOString(),
-        mediaMimeType: mimeType,
-        mediaSize: buffer.length,
+        mediaMimeType: persisted.mimeType,
+        mediaSize: persisted.size,
       });
-      return this.readCachedStickerResource(fileKey);
+      return persisted.attachment;
     } catch (err) {
       console.warn('[feishu-adapter] Failed to cache sticker media in memory repository:', err instanceof Error ? err.message : err);
       return null;
@@ -8725,17 +8667,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       size: buffer.length,
       data: buffer.toString('base64'),
     };
-  }
-
-  private mimeTypeForImageExtension(extension: string): string | null {
-    switch (extension.toLowerCase().replace(/^\./, '')) {
-      case 'png': return 'image/png';
-      case 'jpg':
-      case 'jpeg': return 'image/jpeg';
-      case 'gif': return 'image/gif';
-      case 'webp': return 'image/webp';
-      default: return null;
-    }
   }
 
   private extensionForFeishuResource(resourceType: string, mimeType: string): string {
