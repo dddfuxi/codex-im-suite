@@ -62,6 +62,7 @@ import {
 import { syncFeishuIndexedHistory } from '../channels/feishu/history/indexed-history-sync.js';
 import { buildFeishuIndexedHistoryPrompt } from '../channels/feishu/history/indexed-history-prompt.js';
 import { selectFeishuLightContextItems } from '../channels/feishu/history/light-context-selection.js';
+import { buildFeishuHistoryAttachmentRecoveryPlan } from '../channels/feishu/history/attachment-recovery.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
   htmlToFeishuMarkdown,
@@ -7433,47 +7434,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private async downloadAttachmentsFromMessageItem(item: FeishuMessageListItem): Promise<FileAttachment[]> {
-    const attachments: FileAttachment[] = [];
     const content = item.body?.content || '';
+    const parsedPost = item.msg_type === 'post' ? this.parsePostContent(content) : null;
+    const parsedInteractive = item.msg_type === 'interactive'
+      ? this.parseInteractiveMessageContent(content)
+      : null;
+    const plan = buildFeishuHistoryAttachmentRecoveryPlan({
+      messageId: item.message_id,
+      messageType: item.msg_type,
+      fileKey: this.extractFileKey(content) || undefined,
+      imageKeys: parsedPost?.imageKeys || parsedInteractive?.imageKeys,
+      fileKeys: parsedInteractive?.fileKeys,
+    });
 
-    // 飞书原生 sticker 与 image 都由消息资源 API 按 image 下载；回复 sticker
-    // 时必须使用被回复消息自身的 message_id/file_key，不能退回近邻候选图。
-    if (item.msg_type === 'image' || item.msg_type === 'sticker') {
-      const fileKey = this.extractFileKey(content);
-      if (fileKey) {
-        const attachment = await this.downloadResource(item.message_id, fileKey, 'image');
-        if (attachment) attachments.push(attachment);
-      }
-      return attachments;
+    // 回复资源必须严格绑定被回复消息自身的 message_id/file_key；计划层不允许
+    // 退回近邻图片或历史候选，adapter 只负责逐项执行真实平台下载。
+    const attachments: FileAttachment[] = [];
+    for (const request of plan) {
+      const attachment = await this.downloadResource(
+        request.messageId,
+        request.fileKey,
+        request.resourceType,
+      );
+      if (attachment) attachments.push(attachment);
     }
-
-    if (item.msg_type === 'file' || item.msg_type === 'audio' || item.msg_type === 'video' || item.msg_type === 'media') {
-      const fileKey = this.extractFileKey(content);
-      if (fileKey) {
-        const resourceType = item.msg_type === 'audio' || item.msg_type === 'video' || item.msg_type === 'media'
-          ? item.msg_type
-          : 'file';
-        const attachment = await this.downloadResource(item.message_id, fileKey, resourceType);
-        if (attachment) attachments.push(attachment);
-      }
-      return attachments;
-    }
-
-    if (item.msg_type === 'post') {
-      const { imageKeys } = this.parsePostContent(content);
-      for (const key of imageKeys) {
-        const attachment = await this.downloadResource(item.message_id, key, 'image');
-        if (attachment) attachments.push(attachment);
-      }
-      return attachments;
-    }
-
-    if (item.msg_type === 'interactive') {
-      const interactiveInfo = this.parseInteractiveMessageContent(content);
-      const interactiveDownload = await this.downloadInteractiveCardResources(item.message_id, interactiveInfo);
-      attachments.push(...interactiveDownload.attachments);
-    }
-
     return attachments;
   }
 

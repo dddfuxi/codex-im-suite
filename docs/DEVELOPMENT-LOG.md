@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Feishu history 附件恢复第四阶段迁移：新增 `channels/feishu/history/attachment-recovery.ts`，把被回复历史消息的 image/sticker/file/audio/video/media/post/interactive 资源类型、精确 `messageId/fileKey` 绑定、原顺序和重复 key 去重从 adapter 迁为纯下载计划；缺少消息身份、资源 key 或不可恢复类型时失败关闭。adapter 继续负责平台正文/卡片解析、SDK 与 HTTP fallback、20 MB 门禁、失败审计和真实附件注入，并保持回复附件排在当前消息附件之前。新增 5 项直接模块测试；Core 582/582、adapter + history 专项 169/169、依赖与人类文档门禁、架构、UTF-8 和乱码检查已通过，旧云端回退链仍留作 history 下一独立阶段；live 同步和现场验收将在提交后执行。
+
 - 2026-07-20 Feishu light context 第三阶段迁移：新增 `channels/feishu/history/light-context-selection.ts`，把当前入站时间截断、reply 优先、current/deleted/system/self 过滤、短回复扩窗、时间排序和“可能关联上文”问句锚点选择从 adapter 迁为纯函数。adapter 继续注入平台正文解析和当前 bot 身份判断，并保留成员名映射、outbound audit/card 资源壳恢复、结构化 evidence、置信度和 prompt 呈现。新增 3 项直接模块测试。Core 577/577、adapter + history 专项 164/164、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 与乱码检查已通过；live 同步和现场验收将在提交后执行。
 
 - 2026-07-20 Feishu history prompt 第二阶段迁移：新增 `channels/feishu/history/indexed-history-prompt.ts`，把索引空结果、飞书文档正文、指定说话人引用和普通总结四类 Provider prompt 从 adapter 迁为纯函数，并保留英文标识、资源名、配置名、ID、token 等历史原文约束。adapter 的 V2 入口现在只负责同步当前群索引、按 intent 查询 `retrieveRelevantFeishuHistory` 并传入构造器；平台凭据、附件恢复、light context、旧云端回退链和真实 Provider 调用未迁移。新增 4 项直接模块测试。Core 574/574、专项 161/161、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8 与乱码检查已通过；live 同步和现场验收将在提交后执行。

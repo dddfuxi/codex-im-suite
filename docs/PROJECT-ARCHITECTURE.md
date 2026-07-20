@@ -90,6 +90,7 @@ flowchart TD
   FeishuAdapter --> IndexedHistorySync[channels/feishu/history 云历史索引同步]
   FeishuAdapter --> IndexedHistoryPrompt[channels/feishu/history 索引结果 Prompt 构造]
   FeishuAdapter --> LightContextSelection[channels/feishu/history 短接话上下文选择]
+  FeishuAdapter --> HistoryAttachmentRecovery[channels/feishu/history 回复附件恢复计划]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
   Core --> ReplyEnvelope[cti-final 结果块收口]
@@ -155,6 +156,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/channels/feishu/history/indexed-history-sync.ts` 统一编排云历史的增量/全量分页、本地水位停止、成员显示名映射、删除/system/空消息过滤、历史 sticker 采集时序和单次索引 upsert；全量同步即使没有可读消息也写入空完成快照。Feishu adapter 只注入 OpenAPI 分页、成员查询、平台正文解析与 sticker 采集函数，模块本身不持有凭据、不检索索引、不恢复附件，也不构造 Provider prompt。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/history/indexed-history-prompt.ts` 把受控索引检索结果转换为空结果说明、飞书文档正文约束、指定说话人引用约束或普通总结 prompt，并保留历史中的英文标识、资源名、配置名、ID 与 token 原文。adapter 只负责传入 `FeishuHistoryIntent` 和真实检索结果；该纯模块不读取平台、文件、附件、工作区或 Provider 状态。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/history/light-context-selection.ts` 统一选择短接话的 reply/nearby 消息：以当前入站时间剔除未来消息，优先保留原生 reply，按配置决定是否纳入机器人消息，过滤 current/deleted/system/空正文，并为无 reply 的短命令选择带问句和选择语义的 best-effort 上文锚点。adapter 继续注入正文解析和当前 bot 身份判断，并负责成员名、结构化 evidence、资源壳可读性与最终 prompt 呈现。
+- `packages/bridge-core/src/lib/bridge/channels/feishu/history/attachment-recovery.ts` 把已解析的被回复历史消息转换为确定性资源下载计划：image/sticker 严格绑定原消息并按 image 下载，file/audio/video/media 保留平台资源类型，post 与 interactive 按原顺序收集图片/文件并按 fileKey 去重；缺少 messageId、缺少资源 key 或不可恢复消息类型时失败关闭。Feishu adapter 继续负责解析平台正文、调用 SDK/HTTP fallback、执行大小门禁、记录失败并把真实附件置于当前消息附件之前，纯模块不接触凭据、网络、文件系统或 Provider。
 
 渐进迁移顺序：
 
