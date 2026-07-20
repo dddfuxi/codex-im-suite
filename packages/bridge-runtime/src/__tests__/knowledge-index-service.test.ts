@@ -139,6 +139,26 @@ describe('knowledge index service realtime status', () => {
     assert.doesNotMatch(JSON.stringify(index.items), /Unity MCP 截图|暂定-/u);
   });
 
+  it('keeps archived counts in status and the human-readable master index after rebuild', () => {
+    const archiveDir = path.join(tmpDir, 'archive', 'memory-items', 'user');
+    fs.mkdirSync(archiveDir, { recursive: true });
+    fs.writeFileSync(path.join(archiveDir, `${'a'.repeat(64)}.json`), JSON.stringify({
+      schema: 'codex-im-suite/memory-item-archive/v1',
+      archiveId: 'a'.repeat(64),
+      sourceRelativePath: 'memory/users/feishu/ou_user_1/用户印象.md',
+    }), 'utf8');
+
+    const status = rebuildKnowledgeIndex(tmpDir);
+    const index = JSON.parse(fs.readFileSync(path.join(tmpDir, '.cti-index', 'knowledge.json'), 'utf8')) as {
+      stats: { archivedCount: number };
+    };
+    const master = fs.readFileSync(path.join(tmpDir, '记忆总索引.md'), 'utf8');
+
+    assert.equal(status.archivedCount, 1);
+    assert.equal(index.stats.archivedCount, 1);
+    assert.match(master, /已归档 1/u);
+  });
+
   it('refreshes Agent Home and the readable master index during rebuild', () => {
     const longTermDir = path.join(tmpDir, 'memory', 'long-term');
     fs.mkdirSync(longTermDir, { recursive: true });
@@ -160,7 +180,8 @@ describe('knowledge index service realtime status', () => {
     }
     const master = fs.readFileSync(path.join(tmpDir, '记忆总索引.md'), 'utf8');
     assert.match(master, /公共长期记忆/);
-    assert.match(master, /工作区规则：记忆库不挂载/);
+    assert.match(master, /兼容项 1/u);
+    assert.doesNotMatch(master, /工作区规则：记忆库不挂载/u);
   });
 
   it('persists status next to the knowledge index after a rebuild', () => {

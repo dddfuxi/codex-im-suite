@@ -10,6 +10,7 @@ export interface MemoryDocumentEntry {
   confidence: number;
   status: MemoryItemStatus;
   sourceKind: MemoryDocumentSourceKind;
+  candidateFingerprint?: string;
   distinctSessionCount?: number;
   lastEvidenceAt?: string;
   sessionIds?: string[];
@@ -47,4 +48,31 @@ export interface ManagedMemoryDocument {
   baseHash: string;
   metadata: ManagedMemoryDocumentMetadata;
   state: ManagedMemoryDocumentStateV2;
+}
+
+export type MemoryItemActor = 'control-panel' | 'migration';
+
+export interface MemoryItemListRecord {
+  itemId: string;
+  key: string;
+  entry: MemoryDocumentEntry;
+  status: MemoryItemStatus;
+  scope: VisibleMemoryScope;
+  sourcePath: string;
+  sourceRelativePath: string;
+  sourceBaseHash: string;
+}
+
+export interface MemoryItemArchive {
+  schema: 'codex-im-suite/memory-item-archive/v1';
+  archiveId: string;
+  itemId: string;
+  previousStatus: MemoryItemStatus;
+  scope: VisibleMemoryScope;
+  sourceRelativePath: string;
+  sourceBaseHash: string;
+  key: string;
+  entry: MemoryDocumentEntry;
+  archivedAt: string;
+  archivedBy: MemoryItemActor;
 }

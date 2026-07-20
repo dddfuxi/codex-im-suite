@@ -429,6 +429,8 @@ describe('Agent Home', () => {
       assert.match(text, /## 公共长期记忆/);
       assert.doesNotMatch(text, /## 项目记忆|## 主题记忆/);
       assert.match(text, /memory\/users\/feishu\/ou_user_1\/用户印象\.md/);
+      assert.match(text, /兼容项 1/u);
+      assert.doesNotMatch(text, /回复语言：中文|发布前检查：完整测试|工作区规则：记忆库不挂载/u);
       assert.doesNotMatch(text, /完整用户文件正文/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

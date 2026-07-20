@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import type { KnowledgeIndex, KnowledgeItem } from './knowledge-indexer.js';
+import { readManagedMemoryDocument } from './memory-items/managed-document.js';
 import { classifyMemoryV2Source } from './memory-source-policy.js';
 import { resolveWorkspaceIdentity } from './workspace-identity.js';
 
@@ -294,9 +295,12 @@ interface SourceSummary {
   path: string;
   relativePath: string;
   label: string;
-  summary: string;
   group: 'user' | 'group' | 'long_term' | 'legacy';
   updatedAt: string;
+  confirmedCount: number;
+  candidateCount: number;
+  archivedCount: number;
+  legacyCount: number;
 }
 
 function sourceGroup(memoryRoot: string, item: KnowledgeItem): SourceSummary['group'] {
@@ -309,33 +313,85 @@ function sourceGroup(memoryRoot: string, item: KnowledgeItem): SourceSummary['gr
 }
 
 function summarizeSources(memoryRoot: string, index: KnowledgeIndex): SourceSummary[] {
+  const root = path.resolve(memoryRoot);
+  const archivedBySource = new Map<string, number>();
+  const archiveDirectory = path.join(root, 'archive', 'memory-items');
+  const visitArchives = (directory: string): void => {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) visitArchives(fullPath);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')) {
+        try {
+          const archive = JSON.parse(fs.readFileSync(fullPath, 'utf8')) as { sourceRelativePath?: string };
+          if (archive.sourceRelativePath) {
+            archivedBySource.set(archive.sourceRelativePath, (archivedBySource.get(archive.sourceRelativePath) || 0) + 1);
+          }
+        } catch {
+          // 损坏归档由生命周期服务隔离；总索引不从损坏 JSON 猜事实。
+        }
+      }
+    }
+  };
+  visitArchives(archiveDirectory);
+
+  const summaries = new Map<string, SourceSummary>();
+  const memoryDirectory = path.join(root, 'memory');
+  const visitManagedDocuments = (directory: string): void => {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) visitManagedDocuments(fullPath);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        const content = fs.readFileSync(fullPath, 'utf8');
+        if (!content.includes('cti-memory-state:')) continue;
+        const document = readManagedMemoryDocument(fullPath);
+        const relativePath = path.relative(root, fullPath).replace(/\\/gu, '/');
+        summaries.set(path.resolve(fullPath), {
+          path: fullPath,
+          relativePath,
+          label: document.metadata.displayName
+            || document.metadata.userId
+            || document.metadata.chatId
+            || path.basename(fullPath, path.extname(fullPath)),
+          group: document.metadata.scope,
+          updatedAt: document.metadata.updatedAt || index.generatedAt,
+          confirmedCount: Object.keys(document.state.confirmed).length,
+          candidateCount: Object.keys(document.state.candidates).length,
+          archivedCount: archivedBySource.get(relativePath) || 0,
+          legacyCount: 0,
+        });
+      }
+    }
+  };
+  visitManagedDocuments(memoryDirectory);
+
   const grouped = new Map<string, KnowledgeItem[]>();
   for (const item of index.items) {
     const key = path.resolve(item.source.path);
     grouped.set(key, [...(grouped.get(key) || []), item]);
   }
-  return [...grouped.entries()].map(([sourcePath, items]) => {
+  for (const [sourcePath, items] of grouped.entries()) {
+    if (summaries.has(sourcePath)) continue;
     const metadata = items[0].source.metadata || {};
     const relativePath = path.relative(memoryRoot, sourcePath).replace(/\\/gu, '/');
     const label = metadata.displayName
       || metadata.userId
       || metadata.chatId
       || path.basename(sourcePath, path.extname(sourcePath));
-    const summary = items
-      .slice(0, 2)
-      .map((item) => item.key && item.value ? `${item.key}：${item.value}` : item.text)
-      .join('；')
-      .replace(/\s+/gu, ' ')
-      .slice(0, 180);
-    return {
+    summaries.set(sourcePath, {
       path: sourcePath,
       relativePath,
       label,
-      summary,
       group: sourceGroup(memoryRoot, items[0]),
       updatedAt: items.map((item) => item.source.updatedAt || '').sort().at(-1) || index.generatedAt,
-    };
-  }).sort((left, right) => left.relativePath.localeCompare(right.relativePath, 'zh-CN'));
+      confirmedCount: 0,
+      candidateCount: 0,
+      archivedCount: archivedBySource.get(relativePath) || 0,
+      legacyCount: items.length,
+    });
+  }
+  return [...summaries.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath, 'zh-CN'));
 }
 
 function renderSection(title: string, sources: SourceSummary[]): string[] {
@@ -343,7 +399,7 @@ function renderSection(title: string, sources: SourceSummary[]): string[] {
     `## ${title}`,
     '',
     ...(sources.length > 0
-      ? sources.map((item) => `- ${item.label}：${item.summary || '暂无摘要'} → \`${item.relativePath}\`（更新：${item.updatedAt || '未知'}）`)
+      ? sources.map((item) => `- ${item.label} → \`${item.relativePath}\`（已确认 ${item.confirmedCount} / 候选 ${item.candidateCount} / 已归档 ${item.archivedCount} / 兼容项 ${item.legacyCount}；更新：${item.updatedAt || '未知'}）`)
       : ['暂无。']),
     '',
   ];
@@ -359,7 +415,9 @@ export function writeMemoryMasterIndex(memoryRoot: string, index: KnowledgeIndex
     '',
     `生成时间：${index.generatedAt}`,
     '',
-    '本文件只保存分类摘要和真实源文件引用，不是第二事实源。',
+    '本文件只保存真实源文件引用、状态计数和更新时间，不复制具体事实，不是第二事实源。',
+    '',
+    `总计：已确认 ${index.stats.confirmedCount} / 候选 ${index.stats.candidateCount} / 已归档 ${index.stats.archivedCount} / 兼容项 ${index.stats.legacyCount}`,
     '',
     ...renderSection('用户印象', byGroup('user')),
     ...renderSection('群聊记忆', byGroup('group')),

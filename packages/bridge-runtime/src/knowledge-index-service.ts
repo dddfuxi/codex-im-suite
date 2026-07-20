@@ -121,6 +121,28 @@ function collectIndexableMemorySources(root: string): KnowledgeSourceFile[] {
     .filter((file) => isIndexableMemoryV2SourceFile(root, file));
 }
 
+function countMemoryItemArchives(root: string): number {
+  const archiveDir = path.join(root, 'archive', 'memory-items');
+  if (!fs.existsSync(archiveDir)) return 0;
+  let count = 0;
+  const visit = (directory: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(fullPath);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith('.json')) {
+        try {
+          const archive = JSON.parse(fs.readFileSync(fullPath, 'utf8')) as { schema?: string; archiveId?: string };
+          if (archive.schema === 'codex-im-suite/memory-item-archive/v1' && /^[a-f0-9]{64}$/u.test(archive.archiveId || '')) count += 1;
+        } catch {
+          // 损坏归档不进入计数，后续由归档中心隔离并展示诊断。
+        }
+      }
+    }
+  };
+  visit(archiveDir);
+  return count;
+}
+
 function makeStatus(
   memoryRoot: string,
   patch: Partial<KnowledgeIndexStatus> = {},
@@ -196,6 +218,7 @@ export function rebuildKnowledgeIndex(memoryRoot: string): KnowledgeIndexStatus 
     memoryRoot: root,
     files: sources,
   });
+  index.stats.archivedCount = countMemoryItemArchives(root);
   writeKnowledgeIndex(root, index);
   writeMemoryMasterIndex(root, index);
   const graph = buildMemoryGraphFromKnowledgeIndex(index);

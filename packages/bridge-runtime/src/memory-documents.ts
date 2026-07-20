@@ -6,6 +6,7 @@ import { MEMORY_V3_SCHEMA, memoryPartitionSegment } from './memory-source-policy
 import {
   createManagedMemoryDocument,
   isSensitiveMemoryObservation,
+  memoryCandidateFingerprint,
   normalizeMemoryLine,
   readManagedMemoryDocument,
   sha256,
@@ -149,6 +150,7 @@ export function materializeDerivedUserImpression(input: DerivedUserImpressionInp
     const value = normalizeMemoryLine(observation.text, 500);
     if (observation.count < 3 || !value || isSensitiveMemoryObservation(value)) continue;
     const key = `暂定-${crypto.createHash('sha1').update(value, 'utf8').digest('hex').slice(0, 10)}`;
+    if (document.state.deletedCandidateFingerprints[memoryCandidateFingerprint(key, value)]) continue;
     const confidence = Math.min(0.9, 0.55 + (observation.count - 3) * 0.08);
     const existing = document.state.candidates[key];
     if (!existing || existing.value !== value || existing.confidence !== confidence) updated = true;
@@ -158,6 +160,7 @@ export function materializeDerivedUserImpression(input: DerivedUserImpressionInp
       confidence,
       status: 'candidate',
       sourceKind: 'candidate_observation',
+      candidateFingerprint: memoryCandidateFingerprint(key, value),
       distinctSessionCount: observation.count,
       lastEvidenceAt: timestamp,
     };

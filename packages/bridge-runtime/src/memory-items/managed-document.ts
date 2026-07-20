@@ -31,6 +31,10 @@ export function sha256(value: string): string {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+export function memoryCandidateFingerprint(key: string, value: string): string {
+  return sha256(`${normalizeMemoryLine(key, 120)}\n${normalizeMemoryLine(value, 500)}`);
+}
+
 export function normalizeMemoryLine(value: string, maxChars = 300): string {
   return String(value || '')
     .normalize('NFKC')
@@ -89,6 +93,9 @@ function normalizeEntry(
     confidence: Math.max(0, Math.min(1, rawConfidence)),
     status,
     sourceKind,
+    ...(typeof value.candidateFingerprint === 'string' && value.candidateFingerprint.trim()
+      ? { candidateFingerprint: normalizeMemoryLine(value.candidateFingerprint, 128) }
+      : {}),
     ...(distinctSessionCount === undefined ? {} : { distinctSessionCount }),
     ...(typeof value.lastEvidenceAt === 'string' && value.lastEvidenceAt.trim()
       ? { lastEvidenceAt: normalizeMemoryLine(value.lastEvidenceAt, 80) }
@@ -108,7 +115,12 @@ function normalizeEntries(
   for (const [rawKey, rawEntry] of Object.entries(value)) {
     const key = normalizeMemoryLine(rawKey, 120);
     const entry = normalizeEntry(rawEntry, status, fallbackSourceKind);
-    if (key && entry) entries[key] = entry;
+    if (key && entry) {
+      if (status === 'candidate' && !entry.candidateFingerprint) {
+        entry.candidateFingerprint = memoryCandidateFingerprint(key, entry.value);
+      }
+      entries[key] = entry;
+    }
   }
   return entries;
 }
