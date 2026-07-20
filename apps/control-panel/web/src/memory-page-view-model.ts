@@ -151,3 +151,128 @@ export function buildSelfMaintenanceMetrics(input: SelfMaintenanceMetricsInput |
     { label: '并发冲突', value: `锁 ${input?.lockConflicts ?? 0} / 哈希 ${input?.hashConflicts ?? 0}` },
   ].map((item) => ({ ...item, updatedAt: input?.lastUpdatedAt, statusPath: input?.statusPath }));
 }
+
+export type MemoryLifecycleStatus = 'confirmed' | 'candidate' | 'archived';
+export type MemoryLifecycleAction = 'confirm' | 'archive' | 'restore' | 'delete';
+
+export interface MemoryLifecycleEntry {
+  value: string;
+  updatedAt: string;
+  confidence: number;
+  status: 'confirmed' | 'candidate';
+  sourceKind: string;
+  distinctSessionCount?: number;
+  lastEvidenceAt?: string;
+}
+
+export interface MemoryLifecycleItemRecord {
+  itemId: string;
+  key: string;
+  entry: MemoryLifecycleEntry;
+  status: 'confirmed' | 'candidate';
+  scope: string;
+  sourceRelativePath: string;
+  sourceBaseHash: string;
+}
+
+export interface MemoryLifecycleArchiveRecord {
+  archiveId: string;
+  itemId: string;
+  previousStatus: 'confirmed' | 'candidate';
+  key: string;
+  entry: MemoryLifecycleEntry;
+  scope: string;
+  sourceRelativePath: string;
+  sourceBaseHash: string;
+  archivedAt: string;
+  archivedBy: string;
+}
+
+export interface MemoryLifecycleSnapshot {
+  confirmed: MemoryLifecycleItemRecord[];
+  candidates: MemoryLifecycleItemRecord[];
+  archives: MemoryLifecycleArchiveRecord[];
+}
+
+export interface MemoryLifecycleRow {
+  id: string;
+  itemId: string;
+  archiveId?: string;
+  key: string;
+  value: string;
+  status: MemoryLifecycleStatus;
+  previousStatus?: 'confirmed' | 'candidate';
+  scope: string;
+  sourceRelativePath: string;
+  sourceBaseHash: string;
+  confidence: number;
+  updatedAt: string;
+  sourceKind: string;
+  distinctSessionCount?: number;
+  lastEvidenceAt?: string;
+  archivedAt?: string;
+}
+
+function toLifecycleRow(item: MemoryLifecycleItemRecord): MemoryLifecycleRow {
+  return {
+    id: item.itemId,
+    itemId: item.itemId,
+    key: item.key,
+    value: item.entry.value,
+    status: item.status,
+    scope: item.scope,
+    sourceRelativePath: item.sourceRelativePath,
+    sourceBaseHash: item.sourceBaseHash,
+    confidence: item.entry.confidence,
+    updatedAt: item.entry.updatedAt,
+    sourceKind: item.entry.sourceKind,
+    distinctSessionCount: item.entry.distinctSessionCount,
+    lastEvidenceAt: item.entry.lastEvidenceAt,
+  };
+}
+
+function toArchiveRow(item: MemoryLifecycleArchiveRecord): MemoryLifecycleRow {
+  return {
+    id: item.archiveId,
+    archiveId: item.archiveId,
+    itemId: item.itemId,
+    key: item.key,
+    value: item.entry.value,
+    status: 'archived',
+    previousStatus: item.previousStatus,
+    scope: item.scope,
+    sourceRelativePath: item.sourceRelativePath,
+    sourceBaseHash: item.sourceBaseHash,
+    confidence: item.entry.confidence,
+    updatedAt: item.entry.updatedAt,
+    sourceKind: item.entry.sourceKind,
+    distinctSessionCount: item.entry.distinctSessionCount,
+    lastEvidenceAt: item.entry.lastEvidenceAt,
+    archivedAt: item.archivedAt,
+  };
+}
+
+export function buildMemoryLifecycleView(snapshot: MemoryLifecycleSnapshot, status: MemoryLifecycleStatus): {
+  rows: MemoryLifecycleRow[];
+  counts: Record<MemoryLifecycleStatus, number>;
+} {
+  const rows = status === 'confirmed'
+    ? snapshot.confirmed.map(toLifecycleRow)
+    : status === 'candidate'
+      ? snapshot.candidates.map(toLifecycleRow)
+      : snapshot.archives.map(toArchiveRow);
+  return {
+    rows: rows.sort((left, right) => (right.archivedAt || right.updatedAt).localeCompare(left.archivedAt || left.updatedAt)),
+    counts: {
+      confirmed: snapshot.confirmed.length,
+      candidate: snapshot.candidates.length,
+      archived: snapshot.archives.length,
+    },
+  };
+}
+
+export function memoryItemActions(row: MemoryLifecycleRow): MemoryLifecycleAction[] {
+  if (row.status === 'candidate') return ['confirm', 'archive'];
+  if (row.status === 'confirmed') return ['archive'];
+  return ['restore', 'delete'];
+}

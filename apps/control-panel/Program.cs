@@ -10669,14 +10669,12 @@ exit $LASTEXITCODE
     }
 
     private static string FindSuiteRoot(string skillDir)
-    {
-        var candidates = new[] { Environment.GetEnvironmentVariable("CODEX_IM_SUITE_ROOT") ?? "", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Documents", "New project", "codex-im-suite"), Path.Combine(Environment.CurrentDirectory, "codex-im-suite"), Path.Combine(skillDir, "codex-im-suite") };
-        foreach (var candidate in candidates.Where(c => !string.IsNullOrWhiteSpace(c)))
-        {
-            if (File.Exists(Path.Combine(candidate, "scripts", "publish-backup.ps1"))) return Path.GetFullPath(candidate);
-        }
-        return "";
-    }
+        => SuiteTargetResolver.Resolve(
+            Environment.GetEnvironmentVariable("CODEX_IM_SUITE_ROOT") ?? "",
+            Environment.CurrentDirectory,
+            AppContext.BaseDirectory,
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            skillDir);
 
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true };
     private static readonly JsonSerializerOptions WebJsonOptions = new()

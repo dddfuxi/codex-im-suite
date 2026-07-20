@@ -68,10 +68,17 @@ import type { ScheduledTaskPanelState } from './scheduled-task-view-model.js';
 import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
+  buildMemoryLifecycleView,
   buildMemoryQueryRefreshKey,
   buildSelfMaintenanceMetrics,
   buildWorkspacePathSections,
+  memoryItemActions,
   runPanelRefresh,
+  type MemoryLifecycleArchiveRecord,
+  type MemoryLifecycleItemRecord,
+  type MemoryLifecycleRow,
+  type MemoryLifecycleSnapshot,
+  type MemoryLifecycleStatus,
 } from './memory-page-view-model.js';
 import {
   getStickerLifecycleActions,
@@ -775,21 +782,6 @@ type MemoryRelationGroup = {
     relation: string;
     status: UserFacingStatus;
   }>;
-};
-
-type KnowledgeArchiveSnapshot = {
-  archiveRoot: string;
-  items: KnowledgeArchiveItem[];
-};
-
-type KnowledgeArchiveItem = {
-  id: string;
-  itemId: string;
-  kind: string;
-  text: string;
-  sourcePath: string;
-  archivedAt: string;
-  archivePath: string;
 };
 
 type TodoReminderSnapshot = {
@@ -5289,6 +5281,7 @@ function MemoryPage({
           </div>
         )}
       </section>
+      <MemoryLifecyclePanel run={run} pending={pending} refreshRevision={refreshRevision} />
       <section className="panel memory-tree-primary">
         <SectionHeader
           title="记忆关系树"
@@ -5712,19 +5705,193 @@ function MemoryPage({
   );
 }
 
+type MemoryItemCliEnvelope<T> = { ok: true; data: T };
+type MemoryItemListPayload<T> = { items: T[]; count: number };
+
+function memoryLifecycleStatusLabel(status: MemoryLifecycleStatus) {
+  if (status === 'confirmed') return '已确认';
+  if (status === 'candidate') return '候选收件箱';
+  return '已归档';
+}
+
+function memoryScopeLabel(scope: string) {
+  if (scope === 'user') return '用户记忆';
+  if (scope === 'group') return '群聊记忆';
+  if (scope === 'long_term') return '公共长期记忆';
+  return scope || '未知分区';
+}
+
+function MemoryLifecyclePanel({ run, pending, refreshRevision }: {
+  run: PageProps['run'];
+  pending: Record<string, boolean>;
+  refreshRevision: number;
+}) {
+  const [snapshot, setSnapshot] = useState<MemoryLifecycleSnapshot>({ confirmed: [], candidates: [], archives: [] });
+  const [status, setStatus] = useState<MemoryLifecycleStatus>('confirmed');
+  const [selectedCandidateIds, setSelectedCandidateIds] = useState<string[]>([]);
+  const [error, setError] = useState('');
+  const view = useMemo(() => buildMemoryLifecycleView(snapshot, status), [snapshot, status]);
+
+  const readList = <T,>(value: unknown): T[] => {
+    const envelope = value as MemoryItemCliEnvelope<MemoryItemListPayload<T>>;
+    if (envelope?.ok !== true || !Array.isArray(envelope.data?.items)) throw new Error('记忆生命周期接口返回格式无效。');
+    return envelope.data.items;
+  };
+
+  const refresh = async () => {
+    setError('');
+    try {
+      const [confirmed, candidates, archives] = await Promise.all([
+        run('memory.items.listConfirmed'),
+        run('memory.items.listCandidates'),
+        run('memory.items.listArchives'),
+      ]);
+      setSnapshot({
+        confirmed: readList<MemoryLifecycleItemRecord>(confirmed),
+        candidates: readList<MemoryLifecycleItemRecord>(candidates),
+        archives: readList<MemoryLifecycleArchiveRecord>(archives),
+      });
+      setSelectedCandidateIds((current) => current.filter((id) => readList<MemoryLifecycleItemRecord>(candidates).some((item) => item.itemId === id)));
+    } catch (refreshError) {
+      setError(refreshError instanceof Error ? refreshError.message : '记忆生命周期读取失败');
+    }
+  };
+
+  useEffect(() => { void refresh(); }, [refreshRevision]);
+  useEffect(() => {
+    if (status !== 'candidate') setSelectedCandidateIds([]);
+  }, [status]);
+
+  const mutate = async (command: string, payload: Record<string, unknown>) => {
+    setError('');
+    try {
+      await run(command, payload);
+      await refresh();
+    } catch (mutationError) {
+      setError(mutationError instanceof Error ? mutationError.message : '记忆生命周期操作失败');
+    }
+  };
+
+  const confirm = (row: MemoryLifecycleRow) => mutate('memory.items.confirmCandidate', {
+    itemId: row.itemId,
+    expectedBaseHash: row.sourceBaseHash,
+  });
+  const archive = (row: MemoryLifecycleRow) => mutate('memory.items.archive', {
+    itemId: row.itemId,
+    expectedBaseHash: row.sourceBaseHash,
+  });
+  const restore = (row: MemoryLifecycleRow) => mutate('memory.items.restore', { archiveId: row.archiveId });
+  const deleteArchive = (row: MemoryLifecycleRow) => {
+    const previousStatus = row.previousStatus === 'candidate' ? '候选' : '已确认';
+    if (!window.confirm(`永久删除归档记忆“${row.key}”？\n\n原状态：${previousStatus}\n该操作不可恢复，并会保留防止候选自动复活的删除标记。`)) return Promise.resolve();
+    return mutate('memory.items.deleteArchive', { archiveId: row.archiveId });
+  };
+  const archiveSelectedCandidates = async () => {
+    if (selectedCandidateIds.length === 0) return;
+    if (!window.confirm(`归档已选择的 ${selectedCandidateIds.length} 条候选记忆？归档后仍可还原。`)) return;
+    await mutate('memory.items.archiveCandidatesBatch', { itemIds: selectedCandidateIds });
+    setSelectedCandidateIds([]);
+  };
+
+  return (
+    <section className="panel memory-lifecycle-panel">
+      <SectionHeader
+        title="记忆生命周期"
+        action={<MiniButton
+          label="刷新"
+          icon={<RefreshCw size={14} />}
+          onClick={() => void refresh()}
+          pending={pending['memory.items.listConfirmed'] || pending['memory.items.listCandidates'] || pending['memory.items.listArchives']}
+        />}
+      />
+      <p className="panel-intro">机器状态是唯一事实源；这里展示同步生成的人类可读投影。候选和归档不会进入主知识索引或默认 Prompt。</p>
+      <div className="preset-wall memory-lifecycle-tabs" role="tablist" aria-label="记忆生命周期状态">
+        {(['confirmed', 'candidate', 'archived'] as MemoryLifecycleStatus[]).map((item) => (
+          <button
+            key={item}
+            type="button"
+            role="tab"
+            aria-selected={status === item}
+            className={status === item ? 'preset-chip active' : 'preset-chip'}
+            onClick={() => setStatus(item)}
+          >
+            {memoryLifecycleStatusLabel(item)} {view.counts[item]}
+          </button>
+        ))}
+      </div>
+      {status === 'candidate' && (
+        <div className="command-band dense memory-lifecycle-batch">
+          <span>已选择 {selectedCandidateIds.length} 条</span>
+          <MiniButton
+            label="批量归档"
+            icon={<Archive size={14} />}
+            onClick={() => void archiveSelectedCandidates()}
+            disabled={selectedCandidateIds.length === 0}
+            pending={pending['memory.items.archiveCandidatesBatch']}
+          />
+        </div>
+      )}
+      {error && <div className="empty-inline">{error}</div>}
+      <div className="runtime-list compact-list memory-lifecycle-list">
+        {view.rows.map((row) => {
+          const actions = memoryItemActions(row);
+          const isSelected = selectedCandidateIds.includes(row.itemId);
+          return (
+            <article className="runtime-row memory-lifecycle-row" key={row.id}>
+              {row.status === 'candidate' && (
+                <label className="memory-lifecycle-select" title="选择候选记忆">
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={(event) => setSelectedCandidateIds((current) => event.target.checked
+                      ? [...new Set([...current, row.itemId])]
+                      : current.filter((id) => id !== row.itemId))}
+                  />
+                </label>
+              )}
+              <div className="memory-lifecycle-row-main">
+                <div className="detail-summary">
+                  <strong>{row.key}</strong>
+                  <StatusPill
+                    status={row.status === 'confirmed' ? 'ok' : row.status === 'candidate' ? 'warning' : 'idle'}
+                    label={memoryLifecycleStatusLabel(row.status)}
+                  />
+                </div>
+                <p>{row.value}</p>
+                <div className="memory-lifecycle-meta">
+                  <span>{memoryScopeLabel(row.scope)}</span>
+                  <span>置信度 {Math.round((row.confidence || 0) * 100)}%</span>
+                  {row.status === 'candidate' && <span>独立 session {row.distinctSessionCount ?? 0}</span>}
+                  {row.status === 'candidate' && <span>最后证据 {row.lastEvidenceAt || row.updatedAt || '-'}</span>}
+                  {row.status === 'archived' && <span>原状态 {row.previousStatus === 'candidate' ? '候选' : '已确认'}</span>}
+                  {row.status === 'archived' && <span>归档时间 {row.archivedAt || '-'}</span>}
+                  <span>来源 {row.sourceKind || '-'}</span>
+                </div>
+                <code>{row.sourceRelativePath || '-'}</code>
+              </div>
+              <div className="row-actions">
+                {actions.includes('confirm') && <MiniButton label="确认为记忆" icon={<CheckCircle2 size={14} />} onClick={() => void confirm(row)} pending={pending['memory.items.confirmCandidate']} />}
+                {actions.includes('archive') && <MiniButton label="归档" icon={<Archive size={14} />} onClick={() => void archive(row)} pending={pending['memory.items.archive']} />}
+                {actions.includes('restore') && <MiniButton label="还原" icon={<RotateCw size={14} />} onClick={() => void restore(row)} pending={pending['memory.items.restore']} />}
+                {actions.includes('delete') && <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void deleteArchive(row)} pending={pending['memory.items.deleteArchive']} />}
+              </div>
+            </article>
+          );
+        })}
+        {view.rows.length === 0 && <div className="empty-inline">当前分区没有记忆条目。</div>}
+      </div>
+    </section>
+  );
+}
+
 function MemoryGovernancePanel({ initial, run, pending }: { initial?: MemoryOptimizationStatus; run: PageProps['run']; pending: Record<string, boolean> }) {
   const [optimization, setOptimization] = useState<MemoryOptimizationStatus | undefined>(initial);
-  const [archives, setArchives] = useState<KnowledgeArchiveSnapshot>({ archiveRoot: '', items: [] });
   const [selectedActions, setSelectedActions] = useState<string[]>([]);
   const activeDraft = (optimization?.drafts ?? []).find((draft) => draft.status === 'draft') ?? (optimization?.drafts ?? [])[0];
 
   const refresh = async () => {
-    const [nextOptimization, nextArchives] = await Promise.all([
-      run('memory.optimizeStatus') as Promise<MemoryOptimizationStatus>,
-      run('memory.archives') as Promise<KnowledgeArchiveSnapshot>,
-    ]);
+    const nextOptimization = await run('memory.optimizeStatus') as MemoryOptimizationStatus;
     setOptimization(nextOptimization);
-    setArchives(nextArchives);
     const draft = (nextOptimization.drafts ?? []).find((item) => item.status === 'draft');
     setSelectedActions((draft?.actions ?? []).filter((action) => action.defaultSelected !== false).map((action) => action.id));
   };
@@ -5760,25 +5927,14 @@ function MemoryGovernancePanel({ initial, run, pending }: { initial?: MemoryOpti
     }) as { status?: MemoryOptimizationStatus };
     if (result.status) setOptimization(result.status);
   };
-  const restore = async (archivePath: string) => {
-    await run('memory.restoreArchive', { archivePath });
-    await refresh();
-  };
-  const remove = async (archivePath: string) => {
-    if (!window.confirm('永久删除这个归档知识单元？该操作不可恢复。')) return;
-    await run('memory.deleteArchive', { path: archivePath });
-    await refresh();
-  };
-
   return (
     <section className="panel panel-span-2 memory-governance-panel">
-      <SectionHeader title="数据治理" action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refresh()} pending={pending['memory.optimizeStatus'] || pending['memory.archives']} />} />
-      <p className="panel-intro">记忆整理、归档恢复和定期计划属于治理动作，不在 Memory 索引页直接执行。</p>
+      <SectionHeader title="数据治理" action={<MiniButton label="刷新" icon={<RefreshCw size={14} />} onClick={() => void refresh()} pending={pending['memory.optimizeStatus']} />} />
+      <p className="panel-intro">这里保留模型辅助整理草稿和定期计划；逐条确认、归档、还原与永久删除统一在 Memory 页的“记忆生命周期”中执行。</p>
       <div className="summary-grid wide">
         <Metric label="定期整理" value={optimization?.enabled ? '已启用' : '未启用'} compact />
         <Metric label="间隔" value={`${optimization?.intervalDays ?? 7} 天`} compact />
         <Metric label="草稿" value={`${optimization?.draftCount ?? optimization?.drafts?.length ?? 0}`} compact />
-        <Metric label="归档" value={`${archives.items.length}`} compact />
       </div>
       <div className="command-band dense">
         <MiniButton label="生成整理草稿" icon={<BrainCircuit size={14} />} onClick={() => void generate()} pending={pending['memory.optimizePreview']} />
@@ -5807,22 +5963,6 @@ function MemoryGovernancePanel({ initial, run, pending }: { initial?: MemoryOpti
           </div>
         </div>
       )}
-      <details className="advanced-settings">
-        <summary>知识归档</summary>
-        <div className="runtime-list compact-list">
-          {archives.items.map((item) => (
-            <article className="runtime-row" key={item.archivePath}>
-              <div><strong>{item.text || item.itemId}</strong><span>{item.archivedAt}</span><code>{item.archivePath}</code></div>
-              <div className="row-actions">
-                <MiniButton label="打开" icon={<ExternalLink size={14} />} onClick={() => void run('memory.openSource', { path: item.archivePath })} />
-                <MiniButton label="恢复" icon={<RotateCw size={14} />} onClick={() => void restore(item.archivePath)} pending={pending['memory.restoreArchive']} />
-                <MiniButton label="永久删除" icon={<Trash2 size={14} />} onClick={() => void remove(item.archivePath)} pending={pending['memory.deleteArchive']} />
-              </div>
-            </article>
-          ))}
-          {archives.items.length === 0 && <div className="empty-inline">暂无归档知识单元。</div>}
-        </div>
-      </details>
     </section>
   );
 }

@@ -3,9 +3,11 @@ import { describe, it } from 'node:test';
 import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
+  buildMemoryLifecycleView,
   buildMemoryQueryRefreshKey,
   buildSelfMaintenanceMetrics,
   buildWorkspacePathSections,
+  memoryItemActions,
   runPanelRefresh,
 } from './memory-page-view-model.js';
 
@@ -110,5 +112,65 @@ describe('memory page refresh view model', () => {
       ['并发冲突', '锁 1 / 哈希 1'],
     ]);
     assert.equal(metrics[0].updatedAt, '2026-07-18T08:00:00.000Z');
+  });
+
+  it('keeps candidates out of confirmed rows and exposes candidate actions', () => {
+    const model = buildMemoryLifecycleView({
+      confirmed: [{
+        itemId: 'confirmed-1',
+        key: '工作区规则',
+        entry: { value: '记忆库不挂载', updatedAt: '2026-07-20T08:00:00.000Z', confidence: 1, status: 'confirmed', sourceKind: 'explicit' },
+        status: 'confirmed',
+        scope: 'long_term',
+        sourceRelativePath: 'memory/long-term/公共长期记忆.md',
+        sourceBaseHash: 'hash-confirmed',
+      }],
+      candidates: [{
+        itemId: 'candidate-1',
+        key: '暂定-preference',
+        entry: {
+          value: '我更喜欢先给结论，再列验证证据。',
+          updatedAt: '2026-07-20T09:00:00.000Z',
+          confidence: 0.71,
+          status: 'candidate',
+          sourceKind: 'candidate_observation',
+          distinctSessionCount: 3,
+          lastEvidenceAt: '2026-07-20T09:00:00.000Z',
+        },
+        status: 'candidate',
+        scope: 'user',
+        sourceRelativePath: 'memory/users/feishu/ou_user/用户印象.md',
+        sourceBaseHash: 'hash-candidate',
+      }],
+      archives: [],
+    }, 'candidate');
+
+    assert.deepEqual(model.rows.map((row) => row.status), ['candidate']);
+    assert.deepEqual(model.counts, { confirmed: 1, candidate: 1, archived: 0 });
+    assert.deepEqual(memoryItemActions(model.rows[0]), ['confirm', 'archive']);
+    assert.equal(model.rows[0].distinctSessionCount, 3);
+  });
+
+  it('offers restore and permanent delete only for archived items', () => {
+    const model = buildMemoryLifecycleView({
+      confirmed: [],
+      candidates: [],
+      archives: [{
+        archiveId: 'archive-1',
+        itemId: 'confirmed-1',
+        previousStatus: 'confirmed',
+        key: '工作区规则',
+        entry: { value: '记忆库不挂载', updatedAt: '2026-07-20T08:00:00.000Z', confidence: 1, status: 'confirmed', sourceKind: 'explicit' },
+        scope: 'long_term',
+        sourceRelativePath: 'memory/long-term/公共长期记忆.md',
+        sourceBaseHash: 'hash-confirmed',
+        archivedAt: '2026-07-20T10:00:00.000Z',
+        archivedBy: 'control-panel',
+      }],
+    }, 'archived');
+
+    assert.deepEqual(model.rows.map((row) => row.status), ['archived']);
+    assert.deepEqual(memoryItemActions(model.rows[0]), ['restore', 'delete']);
+    assert.equal(model.rows[0].previousStatus, 'confirmed');
   });
 });

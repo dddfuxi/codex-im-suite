@@ -3049,6 +3049,71 @@ button:disabled {
   gap: 8px;
 }
 
+.memory-lifecycle-tabs {
+  margin-bottom: 12px;
+}
+
+.memory-lifecycle-batch {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.memory-lifecycle-batch > span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.memory-lifecycle-row {
+  align-items: stretch;
+}
+
+.memory-lifecycle-select {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: flex-start;
+  padding-top: 4px;
+}
+
+.memory-lifecycle-select input {
+  width: auto;
+}
+
+.memory-lifecycle-row-main {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 6px;
+}
+
+.memory-lifecycle-row-main .detail-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.memory-lifecycle-row-main p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.memory-lifecycle-row-main code {
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.memory-lifecycle-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.memory-lifecycle-meta span {
+  margin-top: 0;
+}
+
 .scheduled-task-facts > div,
 .scheduled-task-run > div {
   display: grid;
