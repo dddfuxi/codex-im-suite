@@ -291,6 +291,21 @@ ollama pull qwen2.5-coder:7b
 powershell -ExecutionPolicy Bypass -File .\scripts\memory\archive-legacy-rules.ps1
 ```
 
+记忆候选与归档中心：
+
+```powershell
+# 查看三层数量；list-confirmed / list-candidates / list-archives 可分别列出
+node .\packages\bridge-runtime\dist\memory-item-cli.mjs status --memory-root E:\cli-md
+
+# 旧 tentative 只生成审核清单，不写文件
+node .\packages\bridge-runtime\dist\memory-item-cli.mjs migrate preview --memory-root E:\cli-md --output "$env:TEMP\codex-im-suite-memory-candidate-migration.json"
+
+# 审核清单后，必须先停止 Bridge 和记忆 watcher，再应用同一 manifest
+node .\packages\bridge-runtime\dist\memory-item-cli.mjs migrate apply --memory-root E:\cli-md --manifest "$env:TEMP\codex-im-suite-memory-candidate-migration.json"
+```
+
+Memory 页直接提供“已确认 / 候选收件箱 / 已归档”三个入口。候选不进入主索引和默认 Prompt；确认、归档、还原、永久删除统一通过 runtime CLI，控制面板不直接改 JSON/Markdown。机器 state、源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块和 `记忆归档索引.md` 同事务更新，任一人类文档写入失败会整体回滚。
+
 历史乱码扫描和修复入口：
 
 ```powershell
@@ -327,7 +342,7 @@ CTI_TODO_PUSH_POLL_MS=60000
 CTI_TODO_PUSH_WINDOW_MS=300000
 ```
 
-运行时会从 `.cti-index\knowledge.json` 派生 `.cti-index\reminders.json`，并用 `.cti-index\reminder-state.json` 记录已发送、失败、跳过和完成状态，避免重复推送。来源会话无法确认、状态不是未完成或缺少提醒时间的待办不会发送，只会在面板“记忆”页标注原因。飞书提醒优先发互动卡片，用户点击“完成”后会走 `card.action.trigger` 回调更新本地 Markdown 和状态文件；面板也提供同一套完成入口。知识单元可在面板归档，归档会从源 Markdown 精确移除该行并写入 `archive\knowledge-units`，归档目录不会重新进入索引，归档项可手动恢复或永久删除；整理草稿应用前会检查索引时间戳，防止旧草稿批量改动新索引。
+运行时会从 `.cti-index\knowledge.json` 派生 `.cti-index\reminders.json`，并用 `.cti-index\reminder-state.json` 记录已发送、失败、跳过和完成状态，避免重复推送。来源会话无法确认、状态不是未完成或缺少提醒时间的待办不会发送，只会在面板“记忆”页标注原因。飞书提醒优先发互动卡片，用户点击“完成”后会走 `card.action.trigger` 回调更新本地 Markdown 和状态文件；面板也提供同一套完成入口。managed memory 条目统一进入三层生命周期：confirmed 可归档，candidate 可确认或归档，archive 可还原或永久删除；归档内容不会进入知识索引，整理草稿应用前仍会检查索引时间戳，防止旧草稿批量改动新索引。
 
 ## 统一计划任务
 

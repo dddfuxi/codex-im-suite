@@ -170,7 +170,7 @@ flowchart LR
 
 | 类型 | 当前入口 | 规则 |
 | --- | --- | --- |
-| 开发仓库 | `C:\Users\admin\Documents\New project\codex-im-suite` | 唯一源码维护入口，默认只改这里。 |
+| 开发仓库 / 隔离 worktree | `C:\Users\admin\Documents\New project\codex-im-suite` 与其 `.worktrees/*` | 主仓库是源码主线；隔离任务可在 linked worktree 修改。控制面板通过 `SuiteTargetResolver` 优先识别显式根、当前目录和运行程序集祖先，禁止默认主仓库抢占当前 worktree。 |
 | live skill | `C:\Users\admin\.codex\skills\claude-to-im*` | 运行副本，只由同步脚本写入。 |
 | Agent Home / 记忆仓库 | `E:\cli-md` 或配置的 memory repo | 根目录集中放身份、规则、工具、说明和总索引；真实事实写入 `memory/*` 分区，不能作为普通工作区挂载。 |
 | 运行态数据 | `C:\Users\admin\.claude-to-im\data` / `runtime` | 存 sessions、bindings、workflow、permission links 等服务状态。 |
@@ -224,6 +224,13 @@ flowchart LR
 │  ├─ users/<channel>/<userId>/用户印象.md
 │  ├─ groups/<channel>/<chatId>/群聊记忆.md
 │  └─ long-term/公共长期记忆.md
+├─ archive/memory-items/
+│  ├─ <scope>/<archiveId>.json
+│  └─ 记忆归档索引.md
+├─ backups/memory-candidate-migration/<timestamp>/
+├─ .cti-memory-items/
+│  ├─ migrations/<planHash>.json
+│  └─ write.lock
 ├─ .cti-self-history/
 │  ├─ versions/<timestamp>/*.md
 │  ├─ transactions/<transactionId>/manifest.json
@@ -244,7 +251,28 @@ flowchart LR
    └─ status.json
 ```
 
+记忆生命周期以 hidden managed state 为唯一事实源，人类 Markdown 和知识索引都是确定性投影：
+
+```mermaid
+flowchart LR
+  Intent[受控记忆分类与显式写入] --> Managed[managed memory v2 state]
+  Managed --> Confirmed[confirmed]
+  Managed --> Candidate[candidate]
+  Confirmed --> Index[knowledge.json 与默认检索]
+  Candidate -.不进入索引与 Prompt.-> Inbox[候选收件箱]
+  Managed --> Projection[源 Markdown、总索引、说明受控区块]
+  Lifecycle[确认 / 归档 / 还原 / 永久删除] --> Managed
+  Lifecycle --> Archive[archive/memory-items 与 tombstone]
+  Archive --> ArchiveProjection[记忆归档索引.md]
+  Cli[memory-item-cli.mjs] --> Lifecycle
+  Panel[MemoryItemGateway + 三层 Memory UI] --> Cli
+```
+
 - `codex-im-suite/memory/v3` 是新写入 schema；同一用户的已确认事实和稳定印象合并在单个 `用户印象.md`，不同用户和群聊保持目录与元数据双重隔离。
+- managed document 的 hidden state 区分 `confirmed` 与 `candidate`。普通 conversation profile 只属于当前 session 运行态；命令、问题、链接、mention、工具文本和历史重扫不能自动提升为长期候选。候选只在受控 classifier 授权并通过失败关闭预筛后写入，主知识索引、关系图和默认 Prompt 只消费 confirmed/兼容 legacy。
+- `human-readable-projections.ts` 从同一 managed state 生成源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块和 `archive/memory-items/记忆归档索引.md`。生命周期 mutation 会先保存 before-image；任一人类文档写入失败时回滚机器 state、归档记录、索引和全部 Markdown，避免人类文档滞后或形成第二事实源。
+- `memory-item-cli.mjs` 是生命周期和旧 tentative 迁移的正式命令边界；控制面板 `MemoryItemGateway` 只传 opaque `itemId/archiveId`、`expectedBaseHash` 与审核后的候选 ID 数组，不接受源路径或归档路径。Memory 页直接展示“已确认 / 候选收件箱 / 已归档”，永久删除仅对已归档项开放并写 tombstone。
+- tentative 迁移默认 preview，manifest 固定 source hash；Apply 复用 Bridge/watcher 停止门禁、逐源备份、成功 ledger 和 source hash 冲突保护。只有同一 plan hash 的有效 ledger 才可视为幂等重复执行，任意未审核的 v2 改写仍拒绝。
 - 每个可处理纯文本回合先经过独立记忆意图 classifier。成功写入、临时会话记忆、范围澄清或明确记忆请求的分类阻塞都会形成 `memoryIntentHandled`，Capability Router 随后不再把正文中的 Unity 场景名、路径或 Prefab 词解释成新的工具任务。旧 `CTI_MEMORY_INTENT_TIMEOUT_MS=4000` 会提升到 30000ms 下限；分类器使用通用兼容的 `low` 推理档位，不再向只支持 `low/medium/high/xhigh` 的模型发送 `minimal`。记忆候选的 structured-output schema 明确声明 `key/value/text/confidence`、全字段 required 和 `additionalProperties:false`，兼容当前严格 JSON Schema 校验。明确记忆请求若仍超时，进入无工具、只读、无工作区的 `response_only` 主模型回合并确定性收口为未保存，不允许回退旧目录。bridge Codex Home 默认保留健康的 `state_*.sqlite`，避免主客户端与分类器反复删除状态库、同时回填 sessions 并形成 backfill 锁；只有诊断确认状态库不兼容时才通过 `CTI_CODEX_RESET_STATE=true` 显式执行一次重置。
 - bridge 专用 Codex Home 对个人 skill 使用生成态过滤目录：默认排除 `github-memory-protocol`，保留其他正常 skill，额外禁用项由 `CTI_CODEX_BLOCKED_SKILLS` 配置；全局 `C:\Users\admin\.codex\skills` 不被修改。这样 IM 记忆只能由 runtime 的受控 memory v3 host 写入，旧 `.codex\memory` 不再成为可触发入口。
 - `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md` 由 runtime 的 `AgentHomeHost` 每轮重新读取，分别进入 identity、policy、skills Prompt section；当前稳定 workspaceId 对应的 `work/<workspaceId>/工作档案.md` 以独立、限长、不可执行的只读事实 memory section 回读，超预算时保留头部与最新尾部，其他项目档案、每日反思和纠错日志不进入 Prompt。Git 项目优先用规范化 origin remote 形成稳定 ID，项目移动、改名、从子目录进入或同 remote 副本共用档案；旧路径 ID 目录只提升到稳定 ID，不复制第二事实源。Prompt Snapshot 可观察实际注入、真实来源与截断。
@@ -270,9 +298,9 @@ flowchart LR
   Tx --> Archive[版本与档案非破坏归档]
 ```
 
-- `记忆总索引.md` 只保存分类摘要和相对路径引用，不复制事实，不成为第二事实源。
+- `记忆总索引.md` 只保存真实文件链接、confirmed/candidate/archive/兼容项计数和更新时间，不复制事实，不成为第二事实源。
 - `data/memory/v2` 在兼容期只读索引并标记为 legacy。`memory-layout-migration-cli` 默认 dry-run；Apply 会先在暂存根合并和校验，再备份、切换、归档旧 v2 并重建索引，已有不同值只记录冲突、不覆盖。
-- 控制面板路径设置分为当前工作区、项目注册根、Agent Home/记忆库和高级诊断；旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只读显示。Memory 页展示五个 Agent Home 入口、v3/v2 来源数、迁移状态、未归类根 Markdown，以及工作档案/每日反思/纠错档案/可回滚版本计数和最近自维护时间；同时展示自维护 classifier 调用/跳过、平均耗时、规则 `trial/confirmed/regressed` 数量以及锁/哈希冲突。未归类文件只提示并提供打开入口，不自动移动或删除。Prompt 页将 `workspace.plan` 和 Agent Home sections 显示为本轮实际注入证据。
+- 控制面板路径设置分为当前工作区、项目注册根、Agent Home/记忆库和高级诊断；旧 `CTI_CODEX_ADDITIONAL_DIRECTORIES` 只读显示。Memory 页展示五个 Agent Home 入口、v3/v2 来源数、迁移状态、未归类根 Markdown，以及工作档案/每日反思/纠错档案/可回滚版本计数和最近自维护时间；同时展示自维护 classifier 调用/跳过、平均耗时、规则 `trial/confirmed/regressed` 数量、锁/哈希冲突和三层记忆生命周期。未归类文件只提示并提供打开入口，不自动移动或删除。Prompt 页将 `workspace.plan` 和 Agent Home sections 显示为本轮实际注入证据。
 
 ## 2. 运行链路
 
