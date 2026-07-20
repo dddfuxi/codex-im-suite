@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Bridge Core 提醒解析迁移：新增 `application/reminders.ts`，集中处理中文数字、相对/绝对时间、一次性任务标题、`/remind` 固定参数、调度意图提示和伪完成声明；周期表达、教程/查询文本和无明确唤醒的隐式时间请求继续失败关闭。`bridge-manager` 删除约 300 行解析实现，保留当前消息 alias/evidence、通知对象、Owner 门禁、Scheduler/Reminder Host 和交付编排。新增 5 项直接模块测试，原 Manager 行为回归继续通过；同步更新架构与路线图，人类文档与机器边界同阶段前进。
+
 - 2026-07-20 Bridge Core 动作块解析迁移：新增 `application/action-blocks.ts`，把 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote` 的 fence、JSON 与字段归一化从 `bridge-manager.ts` 迁为可独立测试的纯解析模块。Manager 只保留 mention parser 注入和薄包装，身份、权限、工作区、目标解析、Artifact 校验与 Host 执行继续基于当前回合真实 evidence，不信任模型动作块中的 ID、角色或路径。新增 5 项领域测试，并同步架构、维护规则和路线图子阶段；Task 8 Step 2 仍待提醒解析、mention、sticker policy、history intent 与 delivery preparation 完成。
 
 - 2026-07-20 Bridge Core / Feishu 拆分前行为目录：在搬迁巨型 `bridge-manager.ts` 和 `feishu-adapter.ts` 之前，新增机器可检查的 Characterization Catalog，把入站、权限、提醒、私发、历史、表情包、附件、卡片、产物和最终交付十个 Task 8 领域分别绑定到现有真实回归测试标题。目录测试会验证来源文件和测试标题仍存在，防止后续拆分时误删整类安全网；它不复制实现、不成为运行时协议，也不替代被引用测试本身。路线图 Task 8 Step 1 同步标记完成。
