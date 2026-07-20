@@ -48,7 +48,7 @@ describe('visible memory documents', () => {
       assert.match(text, /## 已确认事实/);
       assert.match(text, /\| 回复语言 \| 中文 \|/);
       assert.match(text, /\| 默认项目 \| ST4 \|/);
-      assert.match(text, /## 暂定印象/);
+      assert.match(text, /## 候选记忆（不参与索引）/);
       assert.match(text, /## 证据与更新时间/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -121,7 +121,7 @@ describe('visible memory documents', () => {
     }
   });
 
-  it('writes only repeated non-sensitive observations as tentative impressions', async () => {
+  it('writes only repeated non-sensitive observations as candidate memories', async () => {
     const module = await loadMemoryDocumentsModule();
     assert.ok(module, 'memory documents module should exist');
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-derived-impression-'));
