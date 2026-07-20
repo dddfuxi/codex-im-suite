@@ -270,12 +270,14 @@ export function createMemoryItemLifecycleService(options: MemoryItemLifecycleSer
     archives: MemoryItemArchive[],
     generatedAt: string,
   ): FileMutation[] => {
+    const masterIndexPath = path.join(memoryRoot, '记忆总索引.md');
     const guidePath = path.join(memoryRoot, '记忆库说明.md');
     const projections = buildMemoryHumanReadableProjections({
       memoryRoot,
       documents,
       archives,
       generatedAt,
+      existingMasterIndexContent: fs.existsSync(masterIndexPath) ? fs.readFileSync(masterIndexPath, 'utf8') : undefined,
       existingGuideContent: fs.existsSync(guidePath) ? fs.readFileSync(guidePath, 'utf8') : undefined,
     });
     return projections.map((projection: ProjectionFile) => ({

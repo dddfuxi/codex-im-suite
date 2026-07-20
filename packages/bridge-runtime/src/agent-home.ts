@@ -5,6 +5,11 @@ import type { KnowledgeIndex, KnowledgeItem } from './knowledge-indexer.js';
 import { readManagedMemoryDocument } from './memory-items/managed-document.js';
 import { classifyMemoryV2Source } from './memory-source-policy.js';
 import { resolveWorkspaceIdentity } from './workspace-identity.js';
+import {
+  MEMORY_INDEX_BLOCK_END,
+  MEMORY_INDEX_BLOCK_START,
+  upsertMemoryIndexManagedBlock,
+} from './human-readable-markdown.js';
 
 export interface AgentHomePromptSection {
   id: string;
@@ -410,9 +415,8 @@ export function writeMemoryMasterIndex(memoryRoot: string, index: KnowledgeIndex
   ensureAgentHome(root);
   const sources = summarizeSources(root, index);
   const byGroup = (group: SourceSummary['group']) => sources.filter((item) => item.group === group);
-  const content = [
-    '# 记忆总索引',
-    '',
+  const managedBlock = [
+    MEMORY_INDEX_BLOCK_START,
     `生成时间：${index.generatedAt}`,
     '',
     '本文件只保存真实源文件引用、状态计数和更新时间，不复制具体事实，不是第二事实源。',
@@ -423,8 +427,11 @@ export function writeMemoryMasterIndex(memoryRoot: string, index: KnowledgeIndex
     ...renderSection('群聊记忆', byGroup('group')),
     ...renderSection('公共长期记忆', byGroup('long_term')),
     ...renderSection('待迁移旧记忆', byGroup('legacy')),
+    MEMORY_INDEX_BLOCK_END,
   ].join('\n');
   const filePath = path.join(root, '记忆总索引.md');
+  const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  const content = upsertMemoryIndexManagedBlock(existing, managedBlock);
   atomicWrite(filePath, content);
   return { filePath, sourceCount: sources.length };
 }

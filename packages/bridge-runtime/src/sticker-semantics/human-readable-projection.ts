@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 import type { StickerSemanticSnapshot } from './types.js';
+import { upsertManagedMarkdownBlock } from '../human-readable-markdown.js';
 
 const INDEX_START = '<!-- cti-sticker-semantics-index:start -->';
 const INDEX_END = '<!-- cti-sticker-semantics-index:end -->';
@@ -60,23 +61,6 @@ export function renderStickerSemanticArchive(snapshot: StickerSemanticSnapshot):
   ].join('\n');
 }
 
-function replaceManagedBlock(existing: string, start: string, end: string, block: string): string {
-  const startIndex = existing.indexOf(start);
-  const endIndex = startIndex >= 0 ? existing.indexOf(end, startIndex + start.length) : -1;
-  if (startIndex >= 0 && endIndex >= startIndex) {
-    // 只替换机器受控区块，区块前后的用户手写字节必须原样保留。
-    return `${existing.slice(0, startIndex)}${block}${existing.slice(endIndex + end.length)}`;
-  }
-  const separator = existing.length === 0
-    ? ''
-    : existing.endsWith('\n\n')
-      ? ''
-      : existing.endsWith('\n')
-        ? '\n'
-        : '\n\n';
-  return `${existing}${separator}${block}\n`;
-}
-
 export function buildStickerSemanticHumanReadableProjections(input: {
   memoryRoot: string;
   snapshot: StickerSemanticSnapshot;
@@ -113,12 +97,12 @@ export function buildStickerSemanticHumanReadableProjections(input: {
     },
     {
       path: path.join(input.memoryRoot, '记忆总索引.md'),
-      content: replaceManagedBlock(input.masterIndexContent, INDEX_START, INDEX_END, indexBlock),
+      content: upsertManagedMarkdownBlock(input.masterIndexContent, INDEX_START, INDEX_END, indexBlock),
       kind: 'master_index',
     },
     {
       path: path.join(input.memoryRoot, '记忆库说明.md'),
-      content: replaceManagedBlock(input.memoryGuideContent, GUIDE_START, GUIDE_END, guideBlock),
+      content: upsertManagedMarkdownBlock(input.memoryGuideContent, GUIDE_START, GUIDE_END, guideBlock),
       kind: 'memory_guide',
     },
   ];

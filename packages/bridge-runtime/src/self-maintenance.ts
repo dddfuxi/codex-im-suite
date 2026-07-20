@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { ensureAgentHome } from './agent-home.js';
+import { buildAgentHomeHumanReadableProjections } from './agent-home-human-readable-projection.js';
 import { upsertManagedAgentHomeRule } from './agent-home-rules.js';
 import { resolveWorkspaceIdentity } from './workspace-identity.js';
 import { upsertWorkProfileEntry } from './work-profile.js';
@@ -378,6 +379,30 @@ function mutationTargetPath(
   return path.join(root, 'corrections', `纠错记录-${dateKey}.md`);
 }
 
+function writeAgentHomeHumanReadableProjections(input: {
+  root: string;
+  generatedAt: string;
+  lastAction: string;
+  workspaceId?: string;
+  captureOriginalPath: (filePath: string) => void;
+}): string[] {
+  const masterIndexPath = path.join(input.root, '记忆总索引.md');
+  const memoryGuidePath = path.join(input.root, '记忆库说明.md');
+  const projections = buildAgentHomeHumanReadableProjections({
+    memoryRoot: input.root,
+    generatedAt: input.generatedAt,
+    lastAction: input.lastAction,
+    workspaceId: input.workspaceId,
+    masterIndexContent: fs.existsSync(masterIndexPath) ? fs.readFileSync(masterIndexPath, 'utf8') : '',
+    memoryGuideContent: fs.existsSync(memoryGuidePath) ? fs.readFileSync(memoryGuidePath, 'utf8') : '',
+  });
+  for (const projection of projections) {
+    input.captureOriginalPath(projection.path);
+    atomicWrite(projection.path, projection.content);
+  }
+  return projections.map((projection) => projection.path);
+}
+
 function validateDecision(input: ApplySelfMaintenanceInput): string | null {
   const { decision, evidence, phase } = input;
   if (decision.action !== 'apply') return '裁决未要求应用修改';
@@ -621,6 +646,14 @@ export function applySelfMaintenanceDecision(input: ApplySelfMaintenanceInput): 
       changedPaths.push(correctionPath);
     }
 
+    changedPaths.push(...writeAgentHomeHumanReadableProjections({
+      root: layout.root,
+      generatedAt: timestamp,
+      lastAction: input.decision.action,
+      workspaceId: workspace.id,
+      captureOriginalPath,
+    }));
+
     const auditPath = path.join(layout.root, '.cti-self-history', '自维护审计.jsonl');
     captureOriginalPath(auditPath);
     const auditRecord = {
@@ -729,7 +762,12 @@ export function rollbackSelfMaintenanceVersion(input: RollbackSelfMaintenanceInp
   const writeLock = acquireSelfMaintenanceWriteLock(layout.root);
   if (!writeLock.acquired) throw new Error(writeLock.reason);
 
+  let transaction: SelfMaintenanceTransaction | null = null;
   try {
+    const recovery = recoverSelfMaintenanceTransactions(layout.root);
+    if (recovery.failed > 0) throw new Error('检测到无法恢复的自维护事务，本轮回滚失败关闭');
+    transaction = beginSelfMaintenanceTransaction(layout.root);
+    const captureOriginalPath = (filePath: string): void => transaction!.capture(filePath);
     const now = (input.now || (() => new Date()))();
     const timestamp = now.toISOString();
     const safeTimestamp = timestamp.replace(/[:.]/gu, '-');
@@ -741,10 +779,20 @@ export function rollbackSelfMaintenanceVersion(input: RollbackSelfMaintenanceInp
       path.basename(targetPath),
     );
     const currentContent = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : '';
+    captureOriginalPath(currentVersionBackupPath);
+    captureOriginalPath(targetPath);
     atomicWrite(currentVersionBackupPath, currentContent);
     atomicWrite(targetPath, fs.readFileSync(backupPath, 'utf8'));
 
+    writeAgentHomeHumanReadableProjections({
+      root: layout.root,
+      generatedAt: timestamp,
+      lastAction: 'rollback',
+      captureOriginalPath,
+    });
+
     const auditPath = path.join(layout.root, '.cti-self-history', '自维护审计.jsonl');
+    captureOriginalPath(auditPath);
     appendJsonLine(auditPath, {
       protocol: 'cti-self-maintenance-audit/v1',
       timestamp,
@@ -753,6 +801,8 @@ export function rollbackSelfMaintenanceVersion(input: RollbackSelfMaintenanceInp
       restoredFrom: path.relative(layout.root, backupPath).replace(/\\/gu, '/'),
       currentVersionBackup: path.relative(layout.root, currentVersionBackupPath).replace(/\\/gu, '/'),
     });
+    transaction.commit();
+    transaction = null;
     try {
       rotateSelfMaintenanceHistory(layout.root, { now });
     } catch {
@@ -760,6 +810,10 @@ export function rollbackSelfMaintenanceVersion(input: RollbackSelfMaintenanceInp
     }
     input.onChanged?.();
     return { restored: true, targetPath, currentVersionBackupPath };
+  } catch (error) {
+    const restored = transaction?.rollback() ?? true;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(restored ? `自维护回滚写入失败，已恢复原状态：${detail}` : `自维护回滚写入失败且恢复不完整：${detail}`);
   } finally {
     writeLock.release();
   }

@@ -126,6 +126,45 @@ describe('memory item lifecycle', () => {
     }
   });
 
+  it('rebuilds its managed index block without overwriting other human-readable projections', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-projection-compose-'));
+
+    try {
+      const written = upsertConfirmedMemoryDocument({
+        memoryRoot: root,
+        scope: 'long_term',
+        pairs: [{ key: '工作区规则', value: '记忆库不挂载' }],
+        evidenceText: '记忆库不作为工作区挂载',
+        createdAt: '2026-07-20T10:00:00.000Z',
+      });
+      const masterPath = path.join(root, '记忆总索引.md');
+      fs.writeFileSync(masterPath, [
+        '# 记忆总索引',
+        '',
+        '用户手写导读，必须保留。',
+        '',
+        '<!-- cti-agent-home-index:start -->',
+        '## Agent Home 自维护入口',
+        '',
+        '- 旧投影占位。',
+        '<!-- cti-agent-home-index:end -->',
+        '',
+      ].join('\n'), 'utf8');
+
+      const service = createMemoryItemLifecycleService({ memoryRoot: root });
+      service.archive(service.listConfirmed()[0].itemId, 'control-panel');
+
+      const master = fs.readFileSync(masterPath, 'utf8');
+      assert.match(master, /用户手写导读，必须保留/u);
+      assert.match(master, /cti-agent-home-index:start/u);
+      assert.match(master, /## 公共长期记忆/u);
+      assert.equal((master.match(/cti-memory-index:start/gu) || []).length, 1);
+      assert.equal(readManagedMemoryDocument(written.filePath).state.confirmed['工作区规则'], undefined);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects stale source hashes, path traversal and restore conflicts', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-lifecycle-guards-'));
 

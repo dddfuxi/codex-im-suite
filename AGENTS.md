@@ -55,7 +55,7 @@
 - 记忆库根目录出现五入口之外的 Markdown 时，控制面板必须显式列为未归类文档；不得静默索引、自动移动或删除用户文件。
 - 旧 `data/memory/v2` 只读兼容；迁移必须默认 dry-run，Apply 前停止 Bridge/watcher，并经过暂存校验、备份、冲突不覆盖、归档和索引重建。未知 `docs|logs|runtime|config.env` 不得随记忆布局迁移自动移动。
 - managed memory hidden state 是 confirmed/candidate 生命周期唯一事实源；普通 conversation profile 只属于当前 session，命令、问题、链接、mention、工具文本和历史重扫不得自动进入 durable candidate。主索引、关系图和默认 Prompt 只消费 confirmed/兼容 legacy，candidate/archive 必须保持隔离。
-- 凡机器状态承诺提供人类可读视图，文档投影必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块、`archive/memory-items/记忆归档索引.md`、表情包语义档案、`输入附件清单.md`、`回合元数据.md`、`产物清单.md`、`提升记录.md` 等任一写入失败时，必须回滚 managed state、归档记录、索引、项目复制和全部投影；Markdown 只展示确定性摘要与真实入口，不得形成第二事实源，受控区块外用户手写内容必须原样保留。
+- 凡机器状态承诺提供人类可读视图，文档投影必须和机器 mutation 同事务自更新：源 Markdown、`记忆总索引.md`、`记忆库说明.md` 受控区块、`archive/memory-items/记忆归档索引.md`、表情包语义档案、`输入附件清单.md`、`回合元数据.md`、`产物清单.md`、`提升记录.md` 等任一写入失败时，必须回滚 managed state、归档记录、索引、项目复制和全部投影；Markdown 只展示确定性摘要与真实入口，不得形成第二事实源，受控区块外用户手写内容必须原样保留。多个领域共享同一人类文档时必须使用互不重叠的稳定受控区块，禁止整篇重建覆盖其他领域投影；Agent Home 核心文档修改与版本回滚也必须同步更新总索引和说明。
 - 控制面板只能通过 `MemoryItemGateway -> memory-item-cli.mjs` 执行确认、归档、还原、永久删除和迁移，不得直接编辑 memory JSON/Markdown；浏览器 payload 只允许 opaque `itemId/archiveId`、`expectedBaseHash` 和审核后的 ID 数组，禁止接受任意源路径或归档路径。
 - tentative 迁移只允许应用审核过的 manifest 和 source hash；Apply 前复用统一 Bridge/watcher 停止门禁并保留备份与成功 ledger。只有同一 plan hash 的有效 ledger 才能作为幂等依据，不能因为当前文件“看起来已经是 v2”就跳过未审核变更。
 - tentative 迁移 Apply 后不得重新启动仍只认识 v1 `tentative` 的旧 live runtime；必须保持 Bridge 停止，先同步支持 managed memory v2 的 suite live 副本，再启动 Bridge。若旧 runtime 已覆盖迁移结果，只能基于原 migration ledger、备份和当前 baseHash 做 dry-run 差异恢复，不得整文件回滚或覆盖后续用户操作。

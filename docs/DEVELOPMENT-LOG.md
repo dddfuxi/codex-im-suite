@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-20 Agent Home 人类入口自更新收口：`记忆总索引.md` 与 `记忆库说明.md` 不再由单一领域整篇覆盖，新增通用稳定受控区块合并原语；记忆生命周期迁移为 `cti-memory-index`，表情包和 Agent Home 分别维护独立区块，旧整篇索引自动保留其他区块和用户手写内容。Self-Maintenance 的核心规则修改、工作档案/反思/纠错写入和核心版本回滚会在同一 before-image 事务中刷新五入口的人类说明；任一投影失败时事实、备份、审计和先前投影整体回滚。
+
 - 2026-07-20 会话 Artifact Store 与显式项目提升：共享 Contracts 新增 `artifact` 协议，runtime 为工具/Provider 生成物分配稳定 `artifactId`、SHA-256、来源和 session/turn 清单；Conversation Engine 将真实登记结果以 `managedArtifacts` 放回工具历史，模型伪造的同名字段会被覆盖。Mavis 获得本轮生成产物边界提示，Ignis 下载和 GLB 后处理从平铺 `runtime/ignis-assets|asset-pipeline` 迁入当前回合 Artifact 目录并登记。新增 `cti-artifact-promote`：只接受 artifactId、项目 ID、目标相对路径和可选 Hash，要求当前用户明确写入意图与 Owner 身份，Runtime 继续拒绝只读/禁止项目、越界、符号链接、Hash 冲突和默认覆盖。`输入附件清单.json`、`回合元数据.json`、`产物清单.json`、`提升记录.jsonl` 均同步生成中文 Markdown 确定性投影；任一投影失败会回滚机器清单和项目复制，避免人类文档与事实源分叉。
 
 - 2026-07-20 结构化项目注册表：共享 Contracts 新增 `project-registry/v1`，runtime 默认读取 `CTI_HOME\project-registry.json`，支持 `CTI_PROJECT_REGISTRY_PATH` 覆盖，并把旧 `CTI_ALLOWED_WORKSPACE_ROOTS` 仅作为 `generic` 兼容记录导入；重叠时结构化项目优先。Unity 记录分离 `workspaceRoot` 与 `unityProjectRoot`，命中 Unity 工程内部路径仍挂载 Git/工作区根；读取回合统一只读，写入只读项目失败关闭，disabled 项目不参与匹配。`CTI_PROJECT_DENIED_ROOTS` 已补齐 load/save、Bridge settings、Conversation Engine 和计划任务消费，避免控制面板保存后丢失或只在启动校验生效。人类可读文档继续遵循“机器事实源 + 同事务确定性投影”：README、架构和维护规则更新协议与入口，动态项目记录不复制成第二份 Markdown 状态。

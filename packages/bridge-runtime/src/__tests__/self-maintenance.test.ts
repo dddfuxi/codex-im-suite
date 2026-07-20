@@ -615,6 +615,78 @@ describe('受控自主维护存储', () => {
       assert.match(fs.readFileSync(workPath, 'utf8'), /npm test/);
       assert.match(fs.readFileSync(path.join(root, 'daily-reflection', '每日反思-2026-07-18.md'), 'utf8'), /Alpha/);
       assert.equal(fs.existsSync(path.join(root, 'work', 'other-project', '工作档案.md')), false);
+
+      const master = fs.readFileSync(path.join(root, '记忆总索引.md'), 'utf8');
+      const guide = fs.readFileSync(path.join(root, '记忆库说明.md'), 'utf8');
+      assert.match(master, /cti-agent-home-index:start/u);
+      assert.match(master, /work\//u);
+      assert.match(guide, /cti-agent-home-status:start/u);
+      assert.match(guide, /最近同步：2026-07-18T08:00:00.000Z/u);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('人类入口投影失败时回滚同一轮自维护事实写入', async () => {
+    const module = await loadModule();
+    assert.ok(module, 'self-maintenance module should exist');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-self-maintenance-human-projection-rollback-'));
+
+    try {
+      module.ensureSelfMaintenanceLayout(root);
+      const identityPath = path.join(root, '机器人身份.md');
+      const guidePath = path.join(root, '记忆库说明.md');
+      const originalIdentity = fs.readFileSync(identityPath, 'utf8');
+      const originalGuide = fs.readFileSync(guidePath, 'utf8');
+      const originalRenameSync = fs.renameSync;
+      let result: ReturnType<typeof module.applySelfMaintenanceDecision>;
+      try {
+        fs.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+          if (path.resolve(String(newPath)) === path.resolve(guidePath)) {
+            throw new Error('simulated human projection failure');
+          }
+          return originalRenameSync(oldPath, newPath);
+        }) as typeof fs.renameSync;
+        result = module.applySelfMaintenanceDecision({
+          memoryRoot: root,
+          phase: 'correction',
+          sessionId: 'session-human-projection-rollback',
+          evidence: [
+            { id: 'assistant:last', kind: 'assistant_output', source: 'assistant', content: '可以把记忆库当工作区。' },
+            { id: 'user:current', kind: 'human_message', source: 'human', content: '记忆库不能作为工作区。' },
+          ],
+          decision: {
+            action: 'apply',
+            confidence: 0.98,
+            errorConfirmed: true,
+            reason: '工作区边界陈述错误。',
+            evidenceIds: ['assistant:last', 'user:current'],
+            correction: {
+              errorType: 'behavior',
+              claimEvidenceId: 'assistant:last',
+              claimText: '可以把记忆库当工作区。',
+              correctionEvidenceId: 'user:current',
+              correctionText: '记忆库不能作为工作区。',
+            },
+            mutations: [{
+              target: 'safety_rules',
+              mode: 'patch',
+              key: 'memory-workspace-boundary',
+              baseHash: contentHash(fs.readFileSync(path.join(root, '行为与安全规则.md'), 'utf8')),
+              content: '记忆库不得作为普通工作区挂载。',
+            }],
+          },
+          now: () => new Date('2026-07-20T12:00:00.000Z'),
+        });
+      } finally {
+        fs.renameSync = originalRenameSync;
+      }
+
+      assert.equal(result.applied, false);
+      assert.match(result.reason, /投影|回滚|写入失败/u);
+      assert.equal(fs.readFileSync(identityPath, 'utf8'), originalIdentity);
+      assert.equal(fs.readFileSync(guidePath, 'utf8'), originalGuide);
+      assert.doesNotMatch(fs.readFileSync(path.join(root, '行为与安全规则.md'), 'utf8'), /memory-workspace-boundary/u);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -802,6 +874,8 @@ describe('受控自主维护存储', () => {
       assert.equal(result.restored, true);
       assert.match(fs.readFileSync(identityPath, 'utf8'), /历史版本/);
       assert.match(fs.readFileSync(result.currentVersionBackupPath, 'utf8'), /当前版本/);
+      assert.match(fs.readFileSync(path.join(root, '记忆总索引.md'), 'utf8'), /cti-agent-home-index:start/u);
+      assert.match(fs.readFileSync(path.join(root, '记忆库说明.md'), 'utf8'), /cti-agent-home-status:start/u);
       assert.throws(() => module.rollbackSelfMaintenanceVersion({
         memoryRoot: root,
         backupPath: path.join(root, '机器人身份.md'),

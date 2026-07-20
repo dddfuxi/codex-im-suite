@@ -4,6 +4,12 @@ import type {
   ManagedMemoryDocument,
   MemoryItemArchive,
 } from './types.js';
+import {
+  MEMORY_INDEX_BLOCK_END,
+  MEMORY_INDEX_BLOCK_START,
+  upsertManagedMarkdownBlock,
+  upsertMemoryIndexManagedBlock,
+} from '../human-readable-markdown.js';
 
 export interface ProjectionFile {
   path: string;
@@ -16,6 +22,7 @@ export interface MemoryHumanReadableSnapshot {
   documents: ManagedMemoryDocument[];
   archives: MemoryItemArchive[];
   generatedAt: string;
+  existingMasterIndexContent?: string;
   existingGuideContent?: string;
 }
 
@@ -52,8 +59,7 @@ function renderMasterIndex(snapshot: MemoryHumanReadableSnapshot): string {
   const confirmedCount = snapshot.documents.reduce((total, document) => total + Object.keys(document.state.confirmed).length, 0);
   const candidateCount = snapshot.documents.reduce((total, document) => total + Object.keys(document.state.candidates).length, 0);
   return [
-    '# 记忆总索引',
-    '',
+    MEMORY_INDEX_BLOCK_START,
     `生成时间：${snapshot.generatedAt}`,
     '',
     '本文件只保存真实源文件链接、状态计数和更新时间，不复制具体事实，不是第二事实源。',
@@ -70,8 +76,12 @@ function renderMasterIndex(snapshot: MemoryHumanReadableSnapshot): string {
     '## 归档入口',
     '',
     '- `archive/memory-items/记忆归档索引.md`：查看可还原项目。',
-    '',
+    MEMORY_INDEX_BLOCK_END,
   ].join('\n');
+}
+
+function updateMasterIndex(snapshot: MemoryHumanReadableSnapshot): string {
+  return upsertMemoryIndexManagedBlock(snapshot.existingMasterIndexContent || '', renderMasterIndex(snapshot));
 }
 
 function renderGuideManagedBlock(snapshot: MemoryHumanReadableSnapshot): string {
@@ -129,7 +139,7 @@ export function buildMemoryHumanReadableProjections(snapshot: MemoryHumanReadabl
   return [
     {
       path: path.join(root, '记忆总索引.md'),
-      content: renderMasterIndex(snapshot),
+      content: updateMasterIndex(snapshot),
       kind: 'master_index',
     },
     {
