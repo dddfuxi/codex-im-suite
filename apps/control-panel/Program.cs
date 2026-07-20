@@ -927,14 +927,28 @@ internal sealed partial class MainForm : Form
                 return FeishuStickerLibrary.Restore(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
             case "memory.deleteFeishuSticker":
                 return FeishuStickerLibrary.DeleteArchived(GetMemoryArtifactStore(), ReadFeishuStickerLifecyclePayload(payload));
-            case "memory.archiveItem":
-                return ArchiveKnowledgeItem(payload);
+            case "memory.items.status":
+                return await RunMemoryItemCliAsync("status", payload);
+            case "memory.items.listConfirmed":
+                return await RunMemoryItemCliAsync("list-confirmed", payload);
+            case "memory.items.listCandidates":
+                return await RunMemoryItemCliAsync("list-candidates", payload);
+            case "memory.items.listArchives":
             case "memory.archives":
-                return BuildKnowledgeArchiveSnapshot();
-            case "memory.deleteArchive":
-                return DeleteKnowledgeArchive(payload);
+                return await RunMemoryItemCliAsync("list-archives", payload);
+            case "memory.items.confirmCandidate":
+                return await RunMemoryItemCliAsync("confirm", payload);
+            case "memory.items.archive":
+            case "memory.archiveItem":
+                return await RunMemoryItemCliAsync("archive", payload);
+            case "memory.items.restore":
             case "memory.restoreArchive":
-                return await RunMemoryOptimizerCliAsync("restore-archive", payload);
+                return await RunMemoryItemCliAsync("restore", payload);
+            case "memory.items.deleteArchive":
+            case "memory.deleteArchive":
+                return await RunMemoryItemCliAsync("delete-archive", payload);
+            case "memory.items.archiveCandidatesBatch":
+                return await RunMemoryItemCliAsync("archive-candidates", payload);
             case "memory.optimizeStatus":
                 return BuildMemoryOptimizationStatusSnapshot();
             case "memory.optimizePreview":
@@ -10138,6 +10152,23 @@ exit $LASTEXITCODE
             _skillDir,
             _ctiHome,
             nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
+    private MemoryItemGateway CreateMemoryItemGateway()
+        => new(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            _memoryRepo.Text.Trim(),
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
+    private async Task<JsonElement> RunMemoryItemCliAsync(string cliCommand, JsonElement payload)
+    {
+        object input = payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
+            ? new { }
+            : JsonSerializer.Deserialize<object>(payload.GetRawText(), WebJsonOptions) ?? new { };
+        using var document = await CreateMemoryItemGateway().RunAsync(cliCommand, input);
+        return document.RootElement.Clone();
+    }
 
     private async Task<JsonElement> RunScheduledTaskCliAsync(string cliCommand, JsonElement payload)
     {

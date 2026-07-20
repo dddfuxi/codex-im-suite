@@ -41,6 +41,26 @@ describe('memory item cli', () => {
     }
   });
 
+  it('rejects a confirmation key that could corrupt the human-readable Markdown projection', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-item-cli-key-'));
+    try {
+      materializeDerivedUserImpression({
+        memoryRoot: root,
+        channelType: 'feishu',
+        userId: 'ou_user_a',
+        observations: [{ text: '我更喜欢所有技术报告先给结论。', count: 3 }],
+      });
+      const candidate = runMemoryItemCli(['list-candidates', '--memory-root', root]).data.items[0];
+
+      assert.throws(
+        () => runMemoryItemCli(['confirm', candidate.itemId, '--key', '非法\n标题', '--memory-root', root]),
+        /invalid_memory_key/u,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('executes confirm, archive, restore and permanent delete by opaque ids', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-memory-item-cli-lifecycle-'));
 

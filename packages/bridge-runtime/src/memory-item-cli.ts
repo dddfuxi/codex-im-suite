@@ -66,6 +66,13 @@ function optionalBaseHash(options: Map<string, string>): string | undefined {
   return value;
 }
 
+function optionalMemoryKey(options: Map<string, string>): string | undefined {
+  const value = options.get('--key')?.trim();
+  if (!value) return undefined;
+  if (value.length > 120 || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error('invalid_memory_key');
+  return value;
+}
+
 function decodeReviewedIds(encoded: string | undefined): string[] {
   if (!encoded) throw new Error('ids_base64_required');
   try {
@@ -138,7 +145,7 @@ export function runMemoryItemCli(argv: string[]): MemoryItemCliResult {
         ok: true,
         data: service.confirmCandidate(requireOpaqueId(target, 'item'), 'control-panel', {
           expectedBaseHash: optionalBaseHash(parsed.options),
-          key: parsed.options.get('--key'),
+          key: optionalMemoryKey(parsed.options),
         }),
       };
     case 'archive':
