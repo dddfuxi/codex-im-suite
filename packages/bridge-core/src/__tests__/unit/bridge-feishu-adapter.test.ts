@@ -7,7 +7,7 @@ import { Readable } from 'node:stream';
 
 import { initBridgeContext } from '../../lib/bridge/context.js';
 import { FeishuAdapter } from '../../lib/bridge/adapters/feishu-adapter.js';
-import type { BridgeStore } from '../../lib/bridge/host.js';
+import type { BridgeStore, StickerSemanticEvolutionHost } from '../../lib/bridge/host.js';
 import { MemoryArtifactStore } from '../../lib/bridge/memory-artifact-store.js';
 
 function createMockStore(settings: Record<string, string> = {}) {
@@ -45,13 +45,14 @@ function createMockStore(settings: Record<string, string> = {}) {
   };
 }
 
-function setupContext(settings: Record<string, string> = {}) {
+function setupContext(settings: Record<string, string> = {}, stickerSemantics?: StickerSemanticEvolutionHost) {
   delete (globalThis as Record<string, unknown>).__bridge_context__;
   initBridgeContext({
     store: createMockStore(settings) as unknown as BridgeStore,
     llm: { streamChat: () => new ReadableStream() },
     permissions: { resolvePendingPermission: () => false },
     lifecycle: {},
+    stickerSemantics,
   });
 }
 
@@ -180,6 +181,56 @@ describe('FeishuAdapter deferred agent preparation', () => {
 
     const leftover = await adapter.consumeOne();
     assert.equal(leftover, null);
+  });
+
+  it('submits a native reply as sticker feedback only when runtime finds the referenced delivery', async () => {
+    const processed: any[] = [];
+    setupContext({ bridge_feishu_require_mention: 'false' }, {
+      authorizeSelection: async () => null,
+      recordDelivery: async () => {},
+      findDeliveriesByOutboundMessageIds: async (ids) => ids.includes('om_sticker_delivery') ? [{
+        schema: 'codex-im-suite/sticker-delivery-evidence/v1',
+        deliveryId: 'delivery-1',
+        channelType: 'feishu',
+        chatId: 'oc_p2p',
+        fileKey: 'sticker-key',
+        outboundMessageId: 'om_sticker_delivery',
+        semanticRevisionId: 'revision-1',
+        contextHash: 'a'.repeat(64),
+        sessionId: 'session-1',
+        sentAt: '2026-07-20T00:00:00.000Z',
+      }] : [],
+      processFeedback: async (candidate) => {
+        processed.push(candidate);
+        return { status: 'revision_created', revisionId: 'revision-2' };
+      },
+      buildExpressionPromptSection: async () => null,
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '私聊';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+
+    await adapter.processIncomingEvent({
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_user' } },
+      message: {
+        message_id: 'om_feedback',
+        parent_id: 'om_sticker_delivery',
+        chat_id: 'oc_p2p',
+        chat_type: 'p2p',
+        message_type: 'text',
+        content: JSON.stringify({ text: '这个不适合严肃通知' }),
+        create_time: '1784515260000',
+      },
+    });
+
+    const inbound = await adapter.consumeOne();
+    assert.ok(inbound);
+    await inbound.prepareForAgent?.();
+    assert.equal(processed.length, 1);
+    assert.equal(processed[0].referencedOutboundMessageId, 'om_sticker_delivery');
+    assert.equal((inbound.raw as any).feishuStickerFeedback.status, 'revision_created');
   });
 
   it('enqueues accepted text before slow chat and history evidence is prepared', async () => {
@@ -6788,6 +6839,50 @@ describe('FeishuAdapter message reactions', () => {
     assert.equal(profile.emojis[0].userId, 'ou_user');
     assert.equal(profile.emojis[0].inboundCount, 1);
     assert.equal(await adapter.consumeOne(), null);
+  });
+
+  it('binds a reaction to the exact recorded sticker delivery once', async () => {
+    let resolveProcessed!: () => void;
+    const processed = new Promise<void>((resolve) => { resolveProcessed = resolve; });
+    const candidates: any[] = [];
+    setupContext({}, {
+      authorizeSelection: async () => null,
+      recordDelivery: async () => {},
+      findDeliveriesByOutboundMessageIds: async (ids) => ids.includes('om_sticker_delivery') ? [{
+        schema: 'codex-im-suite/sticker-delivery-evidence/v1',
+        deliveryId: 'delivery-1',
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        fileKey: 'sticker-key',
+        outboundMessageId: 'om_sticker_delivery',
+        semanticRevisionId: 'revision-1',
+        contextHash: 'a'.repeat(64),
+        sessionId: 'session-1',
+        sentAt: '2026-07-20T00:00:00.000Z',
+      }] : [],
+      processFeedback: async (candidate) => {
+        candidates.push(candidate);
+        resolveProcessed();
+        return { status: 'recorded' };
+      },
+      buildExpressionPromptSection: async () => null,
+    });
+    const adapter = new FeishuAdapter() as any;
+
+    adapter.handleReactionCreatedEvent({
+      event: {
+        event_id: 'evt_reaction_1',
+        message: { message_id: 'om_sticker_delivery', chat_id: 'oc_group' },
+        operator: { operator_id: { open_id: 'ou_user' } },
+        reaction: { reaction_type: { emoji_type: 'THUMBSUP' } },
+        create_time: '1784515260000',
+      },
+    });
+    await processed;
+
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].relation, 'reaction');
+    assert.equal(candidates[0].referencedOutboundMessageId, 'om_sticker_delivery');
   });
 
   it('builds reaction presentation prompt without defaulting to smile', () => {

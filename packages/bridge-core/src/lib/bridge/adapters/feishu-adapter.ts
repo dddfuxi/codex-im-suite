@@ -50,6 +50,10 @@ import type {
   ResolvedConversationTarget,
 } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
+import {
+  bindStickerFeedbackCandidate,
+  type StickerFeedbackInbound,
+} from '../sticker-feedback-binding.js';
 import { MemoryArtifactStore, createBridgeMemoryArtifactStore } from '../memory-artifact-store.js';
 import { updateFeishuP2pPollAudit, updateFeishuWsAudit } from '../runtime-audit.js';
 import {
@@ -1056,6 +1060,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
   private seenMessageIds = new Map<string, boolean>();
+  private readonly seenStickerFeedbackEvidenceIds = new Set<string>();
   private botOpenId: string | null = null;
   private botDisplayName: string | null = null;
   private botAvatarUrl: string | null = null;
@@ -2836,6 +2841,48 @@ export class FeishuAdapter extends BaseChannelAdapter {
       userId,
       direction: 'inbound',
     });
+    const targetMessageId = this.readNestedString(event, [
+      ['message', 'message_id'],
+      ['message_id'],
+    ]);
+    const eventId = this.readNestedString(event, [
+      ['event_id'],
+      ['reaction', 'reaction_id'],
+      ['reaction_id'],
+    ]);
+    if (chatId && userId && targetMessageId && eventId) {
+      const createdTime = Number(this.readNestedString(event, [['create_time']])) || Date.now();
+      void this.processStickerFeedbackInbound({
+        eventId,
+        channelType: 'feishu',
+        chatId,
+        senderId: userId,
+        sourceMessageId: eventId,
+        reactionTargetMessageId: targetMessageId,
+        reactionType: emojiType,
+        createdAt: new Date(createdTime).toISOString(),
+      }).catch((error) => {
+        console.warn('[feishu-adapter] Sticker reaction feedback failed:', error instanceof Error ? error.message : error);
+      });
+    }
+  }
+
+  private async processStickerFeedbackInbound(inbound: StickerFeedbackInbound) {
+    const host = getBridgeContext().stickerSemantics;
+    if (!host) return null;
+    const referencedIds = [inbound.nativeReplyMessageId, inbound.reactionTargetMessageId]
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value));
+    if (referencedIds.length !== 1) return null;
+    const deliveries = await host.findDeliveriesByOutboundMessageIds(referencedIds);
+    const candidate = bindStickerFeedbackCandidate({
+      inbound,
+      deliveries,
+      seenEvidenceIds: this.seenStickerFeedbackEvidenceIds,
+    });
+    if (!candidate) return null;
+    this.seenStickerFeedbackEvidenceIds.add(candidate.evidenceId);
+    return host.processFeedback(candidate);
   }
 
   private readNestedString(value: unknown, paths: string[][]): string | undefined {
@@ -4437,6 +4484,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const prepareForAgent = async (): Promise<void> => {
       const resolvedDisplayName = await chatEvidencePreparation;
+      if (replyTargetMessageId && trimmedUserText) {
+        try {
+          const feedback = await this.processStickerFeedbackInbound({
+            eventId: msg.message_id,
+            channelType: 'feishu',
+            chatId,
+            senderId: userId,
+            sourceMessageId: msg.message_id,
+            nativeReplyMessageId: replyTargetMessageId,
+            text: trimmedUserText,
+            createdAt: new Date(timestamp).toISOString(),
+          });
+          if (feedback) rawMetadata.feishuStickerFeedback = feedback;
+        } catch (error) {
+          // 反馈学习失败不阻断原消息继续进入 Agent；Host 失败时保持不学习。
+          console.warn('[feishu-adapter] Sticker reply feedback failed:', error instanceof Error ? error.message : error);
+        }
+      }
       if (isGroup && trimmedUserText) {
         const historyIntent = this.parseHistoryIntentV2(trimmedUserText);
         if (historyIntent) {
