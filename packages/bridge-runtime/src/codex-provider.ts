@@ -18,8 +18,18 @@ import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams } fr
 import { buildProviderInputEvidenceReceipt } from 'claude-to-im/evidence';
 import type { PendingPermissions } from './permission-gateway.js';
 import { CTI_HOME } from './config.js';
+import {
+  createCodexExecutionProfile,
+  normalizeCodexReasoningEffort,
+  resolveCodexModelSource,
+  type CodexExecutionProfile,
+  type CodexProviderProfile,
+  type CodexReasoningEffort,
+} from './codex-execution-profile.js';
 import { resolveProviderWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
+
+export type { CodexProviderProfile } from './codex-execution-profile.js';
 
 /** MIME → file extension for temp image files. */
 const MIME_EXT: Record<string, string> = {
@@ -52,8 +62,6 @@ type CodexModule = any;
 type CodexInstance = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ThreadInstance = any;
-export type CodexProviderProfile = 'primary' | 'official' | 'external' | 'local_primary';
-
 interface CodexProviderOptions {
   profile?: CodexProviderProfile;
 }
@@ -82,23 +90,6 @@ export function getSandboxMode(): string {
   return process.env.CTI_CODEX_SANDBOX_MODE || 'danger-full-access';
 }
 
-/** Whether to forward bridge model to Codex CLI. Default: false (use Codex current/default model). */
-function shouldPassModelToCodex(profile: CodexProviderProfile): boolean {
-  if (profile === 'local_primary') return true;
-  if (profile === 'official') return false;
-  return process.env.CTI_CODEX_PASS_MODEL === 'true';
-}
-
-function getCodexModelOverride(profile: CodexProviderProfile): string | undefined {
-  if (profile === 'local_primary') {
-    const model = (process.env.CTI_LOCAL_AI_MODEL || process.env.CTI_OLLAMA_MODEL || 'qwen2.5-coder:7b').trim();
-    return model || 'qwen2.5-coder:7b';
-  }
-  if (profile === 'official') return undefined;
-  const model = (process.env.CTI_CODEX_MODEL || '').trim();
-  return model || undefined;
-}
-
 /** Allow Codex to run outside a trusted Git repository when explicitly enabled. */
 export function shouldSkipGitRepoCheck(): boolean {
   return process.env.CTI_CODEX_SKIP_GIT_REPO_CHECK === 'true';
@@ -113,28 +104,14 @@ function shouldRetryFreshThread(message: string): boolean {
   );
 }
 
-function normalizeReasoningEffort(value: string | undefined, fallback: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
-  const raw = (value || fallback).trim().toLowerCase();
-  switch (raw) {
-    case 'minimal':
-    case 'low':
-    case 'medium':
-    case 'high':
-    case 'xhigh':
-      return raw;
-    default:
-      return fallback;
-  }
-}
-
-export function getReasoningEffort(profile: CodexProviderProfile): 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
-  return normalizeReasoningEffort(process.env.CTI_CODEX_REASONING_EFFORT, DEFAULT_REASONING_EFFORT);
+export function getReasoningEffort(_profile: CodexProviderProfile): CodexReasoningEffort {
+  return normalizeCodexReasoningEffort(process.env.CTI_CODEX_REASONING_EFFORT || DEFAULT_REASONING_EFFORT);
 }
 
 type CodexClientOptions = {
   apiKey?: string;
   baseUrl?: string;
-  config: Record<string, unknown> & { model_reasoning_effort: ReturnType<typeof normalizeReasoningEffort> };
+  config: Record<string, unknown> & { model_reasoning_effort: CodexReasoningEffort };
   env: Record<string, string>;
 };
 
@@ -436,22 +413,60 @@ export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
   return bridgeHome;
 }
 
-function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): CodexClientOptions & { modelOverride?: string; passModel: boolean; profile: CodexProviderProfile } {
+function resolveExecutionProfile(
+  profile: CodexProviderProfile,
+  restrictedInteraction = false,
+): CodexExecutionProfile {
   const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
-  const useLocalApi = profile === 'local_primary';
+  const configuredModelSource = process.env.CTI_CODEX_MODEL_SOURCE
+    || (process.env.CTI_CODEX_BASE_URL || process.env.CTI_CODEX_MODEL || process.env.CTI_CODEX_API_KEY
+      ? 'external_api'
+      : 'official');
+  const modelSource = resolveCodexModelSource({
+    providerProfile: profile,
+    configuredModelSource,
+  });
+  const baseUrl = modelSource === 'local_api'
+    ? normalizeLocalFallbackBaseUrl(
+      process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+      localAiKind,
+    )
+    : modelSource === 'external_api'
+      ? process.env.CTI_CODEX_BASE_URL || undefined
+      : undefined;
+  return createCodexExecutionProfile({
+    providerProfile: profile,
+    configuredModelSource,
+    configuredModel: process.env.CTI_CODEX_MODEL,
+    localModel: process.env.CTI_LOCAL_AI_MODEL || process.env.CTI_OLLAMA_MODEL || 'qwen2.5-coder:7b',
+    configuredReasoningEffort: process.env.CTI_CODEX_REASONING_EFFORT || DEFAULT_REASONING_EFFORT,
+    baseUrl,
+    restrictedInteraction,
+  });
+}
+
+export function getOrdinaryCodexExecutionProfile(
+  profile: CodexProviderProfile = 'primary',
+): CodexExecutionProfile {
+  return resolveExecutionProfile(profile, false);
+}
+
+function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): CodexClientOptions & {
+  executionProfile: CodexExecutionProfile;
+  modelOverride?: string;
+  passModel: boolean;
+  profile: CodexProviderProfile;
+} {
+  const executionProfile = resolveExecutionProfile(profile);
+  const useLocalApi = executionProfile.modelSource === 'local_api';
   const apiKey = useLocalApi
-    ? undefined
-    : profile === 'official'
-      ? undefined
-      : (process.env.CTI_CODEX_API_KEY
+    ? process.env.CTI_LOCAL_AI_API_KEY || undefined
+    : executionProfile.modelSource === 'external_api'
+      ? (process.env.CTI_CODEX_API_KEY
       || process.env.CODEX_API_KEY
       || process.env.OPENAI_API_KEY
-      || undefined);
-  const baseUrl = useLocalApi
-    ? undefined
-    : profile === 'official'
-      ? undefined
-      : (process.env.CTI_CODEX_BASE_URL || undefined);
+      || undefined)
+      : undefined;
   const bridgeCodexHome = ensureBridgeCodexHome(profile);
   process.env.CODEX_HOME = bridgeCodexHome;
   const env = {
@@ -465,18 +480,24 @@ function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): Cod
   };
   return {
     ...(apiKey ? { apiKey } : {}),
-    ...(baseUrl ? { baseUrl } : {}),
+    ...(executionProfile.baseUrl ? { baseUrl: executionProfile.baseUrl } : {}),
     config: {
-      model_reasoning_effort: getReasoningEffort(profile),
+      model_reasoning_effort: executionProfile.requestedReasoningEffort,
     },
     env: useLocalApi ? sanitizeLocalApiEnv(env) : env,
-    modelOverride: getCodexModelOverride(profile),
-    passModel: shouldPassModelToCodex(profile),
+    executionProfile,
+    modelOverride: executionProfile.submittedModel,
+    passModel: executionProfile.modelMode === 'explicit',
     profile,
   };
 }
 
-export function buildCodexClientOptionsForTest(profile: CodexProviderProfile = 'primary'): CodexClientOptions & { modelOverride?: string; passModel: boolean; profile: CodexProviderProfile } {
+export function buildCodexClientOptionsForTest(profile: CodexProviderProfile = 'primary'): CodexClientOptions & {
+  executionProfile: CodexExecutionProfile;
+  modelOverride?: string;
+  passModel: boolean;
+  profile: CodexProviderProfile;
+} {
   return buildCodexClientOptions(profile);
 }
 
@@ -679,8 +700,10 @@ export class CodexProvider implements LLMProvider {
   private codex: CodexInstance | null = null;
   private classifierCodex: CodexInstance | null = null;
 
-  /** Maps session IDs to Codex thread IDs for resume. */
-  private threadIds = new Map<string, string>();
+  /**
+   * 只复用执行档案一致的 Codex thread，避免模型或推理强度变化后沿用旧会话参数。
+   */
+  private threadBindings = new Map<string, { threadId: string; profileFingerprint: string }>();
 
   constructor(
     private pendingPerms: PendingPermissions,
@@ -751,23 +774,35 @@ export class CodexProvider implements LLMProvider {
               ? await self.ensureClassifierSDK()
               : await self.ensureSDK();
 
-            // Resolve or create thread
-            const inMemoryThreadId = self.threadIds.get(params.sessionId);
+            const profile = self.options.profile || 'primary';
+            const executionProfile = resolveExecutionProfile(profile, restrictedMode);
+            const inMemoryBinding = self.threadBindings.get(params.sessionId);
             if (params.forceFreshThread) {
-              self.threadIds.delete(params.sessionId);
+              self.threadBindings.delete(params.sessionId);
             }
             const resumeThreads = shouldResumeThreads();
             if (!resumeThreads) {
-              self.threadIds.delete(params.sessionId);
+              self.threadBindings.delete(params.sessionId);
             }
-            let savedThreadId = (restrictedMode || params.forceFreshThread || !resumeThreads)
-              ? undefined
-              : (inMemoryThreadId || params.sdkSessionId || undefined);
+            let threadMode: 'fresh' | 'resumed' | 'fresh_profile_changed' | 'fresh_resume_failed' = 'fresh';
+            let savedThreadId: string | undefined;
+            if (!restrictedMode && !params.forceFreshThread && resumeThreads) {
+              if (inMemoryBinding) {
+                if (inMemoryBinding.profileFingerprint === executionProfile.fingerprint) {
+                  savedThreadId = inMemoryBinding.threadId;
+                  threadMode = 'resumed';
+                } else {
+                  self.threadBindings.delete(params.sessionId);
+                  threadMode = 'fresh_profile_changed';
+                }
+              } else if (params.sdkSessionId) {
+                // 跨 daemon 的旧 thread 已由 bridge fingerprint 清理不兼容配置；剩余 ID 可安全尝试恢复。
+                savedThreadId = params.sdkSessionId;
+                threadMode = 'resumed';
+              }
+            }
 
-            const profile = self.options.profile || 'primary';
             const approvalPolicy = restrictedMode ? 'untrusted' : toApprovalPolicy(params.permissionMode);
-            const passModel = shouldPassModelToCodex(profile);
-            const modelOverride = getCodexModelOverride(profile);
             const sandboxMode = restrictedMode ? 'read-only' : getSandboxMode();
             const turnPrompt = buildTurnPrompt(params);
             const providerWorkspace = restrictedMode ? null : resolveProviderWorkspace(params);
@@ -781,36 +816,22 @@ export class CodexProvider implements LLMProvider {
               : providerWorkspace?.source === 'workspace_plan'
                 ? providerWorkspace.additionalDirectories
                 : normalizeAdditionalDirectories(params.additionalDirectories);
-            const localAiKind = (process.env.CTI_LOCAL_AI_KIND || 'ollama').trim().toLowerCase();
-            const modelSource = profile === 'local_primary'
-              ? 'local_api'
-              : profile === 'official'
-                ? 'official'
-                : profile === 'external'
-                  ? 'external_api'
-                  : (process.env.CTI_CODEX_MODEL_SOURCE || (process.env.CTI_CODEX_BASE_URL ? 'external_api' : 'official'));
-            const baseUrl = profile === 'local_primary'
-              ? normalizeLocalFallbackBaseUrl(process.env.CTI_LOCAL_AI_BASE_URL || process.env.CTI_OLLAMA_BASE_URL || 'http://127.0.0.1:11434', localAiKind)
-              : profile === 'official'
-                ? undefined
-                : (process.env.CTI_CODEX_BASE_URL || undefined);
-
             controller.enqueue(sseEvent('status', {
               provider: 'codex',
               codexProfile: profile,
-              modelSource,
-              model: modelOverride || (passModel ? params.model : undefined),
-              baseUrl,
+              modelSource: executionProfile.modelSource,
+              model: executionProfile.submittedModel,
+              baseUrl: executionProfile.baseUrl,
             }));
 
             const threadOptions: Record<string, unknown> = {
-              ...(modelOverride ? { model: modelOverride } : passModel && params.model ? { model: params.model } : {}),
+              ...(executionProfile.submittedModel ? { model: executionProfile.submittedModel } : {}),
               ...(workingDirectory ? { workingDirectory } : {}),
               ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
               ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,
               sandboxMode,
-              modelReasoningEffort: restrictedMode ? 'low' : getReasoningEffort(self.options.profile || 'primary'),
+              modelReasoningEffort: executionProfile.submittedReasoningEffort,
               ...(restrictedMode ? {
                 networkAccessEnabled: false,
                 webSearchMode: 'disabled',
@@ -852,10 +873,27 @@ export class CodexProvider implements LLMProvider {
                   thread = codex.resumeThread(savedThreadId, threadOptions);
                 } catch {
                   thread = codex.startThread(threadOptions);
+                  savedThreadId = undefined;
+                  threadMode = 'fresh_resume_failed';
                 }
               } else {
                 thread = codex.startThread(threadOptions);
               }
+
+              controller.enqueue(sseEvent('status', {
+                provider: 'codex',
+                codexProfile: profile,
+                modelSource: executionProfile.modelSource,
+                model: executionProfile.submittedModel,
+                requestedModel: executionProfile.requestedModel,
+                submittedModel: executionProfile.submittedModel,
+                modelMode: executionProfile.modelMode,
+                requestedReasoningEffort: executionProfile.requestedReasoningEffort,
+                submittedReasoningEffort: executionProfile.submittedReasoningEffort,
+                executionOverrideReason: executionProfile.overrideReason,
+                threadMode,
+                parameterEvidence: 'sdk_thread_options',
+              }));
 
               let sawAnyEvent = false;
               try {
@@ -873,7 +911,12 @@ export class CodexProvider implements LLMProvider {
                   switch (event.type) {
                     case 'thread.started': {
                       const threadId = event.thread_id as string;
-                      if (!restrictedMode) self.threadIds.set(params.sessionId, threadId);
+                      if (!restrictedMode) {
+                        self.threadBindings.set(params.sessionId, {
+                          threadId,
+                          profileFingerprint: executionProfile.fingerprint,
+                        });
+                      }
 
                       controller.enqueue(sseEvent('status', {
                         session_id: threadId,
@@ -904,7 +947,7 @@ export class CodexProvider implements LLMProvider {
 
                     case 'turn.completed': {
                       const usage = event.usage as Record<string, unknown> | undefined;
-                      const threadId = self.threadIds.get(params.sessionId);
+                      const threadId = self.threadBindings.get(params.sessionId)?.threadId;
 
                       controller.enqueue(sseEvent('result', {
                         usage: usage ? {
@@ -939,6 +982,7 @@ export class CodexProvider implements LLMProvider {
                   console.warn('[codex-provider] Resume failed, retrying with a fresh thread:', message);
                   savedThreadId = undefined;
                   retryFresh = true;
+                  threadMode = 'fresh_resume_failed';
                   continue;
                 }
                 throw err;

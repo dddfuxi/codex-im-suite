@@ -47,6 +47,7 @@ import {
 } from 'claude-to-im/evidence';
 import { loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
+import { getOrdinaryCodexExecutionProfile } from './codex-provider.js';
 import { JsonFileStore } from './store.js';
 import { readAgentHomePromptSections } from './agent-home.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
@@ -2435,8 +2436,16 @@ function computeRuntimeFingerprints(): { bridgeFingerprint: string; toolingFinge
     path.join(SKILL_ROOT, 'src', 'knowledge-indexer.ts'),
     path.join(SKILL_ROOT, 'src', 'knowledge-index-service.ts'),
   ];
+  const bridgeSourceFingerprint = computeFingerprint(bridgeFiles);
+  const codexExecutionFingerprint = getOrdinaryCodexExecutionProfile('primary').fingerprint;
+  const bridgeFingerprint = crypto.createHash('sha256')
+    .update(bridgeSourceFingerprint)
+    .update('\n')
+    .update(codexExecutionFingerprint)
+    .digest('hex')
+    .slice(0, 16);
   return {
-    bridgeFingerprint: computeFingerprint(bridgeFiles),
+    bridgeFingerprint,
     toolingFingerprint: computeFingerprint(toolingFiles),
   };
 }

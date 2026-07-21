@@ -46,6 +46,11 @@ function parseSSEChunks(chunks: string[]): Array<{ type: string; data: string }>
     .map(line => JSON.parse(line.slice(6)));
 }
 
+function parseSSEData(event: { data: string } | undefined): Record<string, unknown> | undefined {
+  if (!event) return undefined;
+  return JSON.parse(event.data) as Record<string, unknown>;
+}
+
 describe('CodexProvider', () => {
   it('adds explicit reply style context to normal Codex turns', async () => {
     const { buildTurnPrompt } = await import('../codex-provider.js');
@@ -288,8 +293,8 @@ describe('CodexProvider', () => {
       const options = buildCodexClientOptionsForTest('local_primary');
 
       assert.equal(options.profile, 'local_primary');
-      assert.equal(options.apiKey, undefined);
-      assert.equal(options.baseUrl, undefined);
+      assert.equal(options.apiKey, 'local-secret');
+      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
       assert.equal(options.modelOverride, 'qwen3:8b');
       assert.equal(options.passModel, true);
       assert.equal(options.config.model_reasoning_effort, 'minimal');
@@ -384,7 +389,7 @@ describe('CodexProvider', () => {
 
       assert.equal(options.profile, 'local_primary');
       assert.equal(options.apiKey, undefined);
-      assert.equal(options.baseUrl, undefined);
+      assert.equal(options.baseUrl, 'http://127.0.0.1:11434/v1');
       assert.equal(options.modelOverride, 'qwen3:14b');
       assert.equal(options.passModel, true);
       assert.equal(options.env.CODEX_HOME, tempHome);
@@ -628,6 +633,128 @@ describe('CodexProvider', () => {
     assert.equal(chunks.length, 0);
   });
 
+  it('passes configured model and reasoning to official Codex', async () => {
+    const saved = {
+      source: process.env.CTI_CODEX_MODEL_SOURCE,
+      model: process.env.CTI_CODEX_MODEL,
+      passModel: process.env.CTI_CODEX_PASS_MODEL,
+      effort: process.env.CTI_CODEX_REASONING_EFFORT,
+    };
+    process.env.CTI_CODEX_MODEL_SOURCE = 'official';
+    process.env.CTI_CODEX_MODEL = 'gpt-5.4';
+    process.env.CTI_CODEX_PASS_MODEL = 'false';
+    process.env.CTI_CODEX_REASONING_EFFORT = 'xhigh';
+    try {
+      const { CodexProvider } = await import('../codex-provider.js');
+      const { PendingPermissions } = await import('../permission-gateway.js');
+      const provider = new CodexProvider(new PendingPermissions(), { profile: 'official' });
+      let options: Record<string, unknown> | undefined;
+      const mockThread = {
+        runStreamed: () => ({
+          events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'official-thread' };
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        }),
+      };
+      (provider as any).sdk = { Codex: class { constructor() {} } };
+      (provider as any).codex = {
+        startThread(value: Record<string, unknown>) {
+          options = value;
+          return mockThread;
+        },
+      };
+
+      const events = parseSSEChunks(await collectStream(provider.streamChat({
+        prompt: 'hello',
+        sessionId: 'official-model',
+      })));
+      const parameterStatus = parseSSEData(events.find((event) => {
+        if (event.type !== 'status') return false;
+        return parseSSEData(event)?.parameterEvidence === 'sdk_thread_options';
+      }));
+
+      assert.equal(options?.model, 'gpt-5.4');
+      assert.equal(options?.modelReasoningEffort, 'xhigh');
+      assert.equal(parameterStatus?.submittedModel, 'gpt-5.4');
+      assert.equal(parameterStatus?.submittedReasoningEffort, 'xhigh');
+    } finally {
+      if (saved.source === undefined) delete process.env.CTI_CODEX_MODEL_SOURCE;
+      else process.env.CTI_CODEX_MODEL_SOURCE = saved.source;
+      if (saved.model === undefined) delete process.env.CTI_CODEX_MODEL;
+      else process.env.CTI_CODEX_MODEL = saved.model;
+      if (saved.passModel === undefined) delete process.env.CTI_CODEX_PASS_MODEL;
+      else process.env.CTI_CODEX_PASS_MODEL = saved.passModel;
+      if (saved.effort === undefined) delete process.env.CTI_CODEX_REASONING_EFFORT;
+      else process.env.CTI_CODEX_REASONING_EFFORT = saved.effort;
+    }
+  });
+
+  it('starts fresh when the execution profile changes', async () => {
+    const saved = {
+      source: process.env.CTI_CODEX_MODEL_SOURCE,
+      model: process.env.CTI_CODEX_MODEL,
+      effort: process.env.CTI_CODEX_REASONING_EFFORT,
+      resume: process.env.CTI_CODEX_RESUME_THREADS,
+    };
+    process.env.CTI_CODEX_MODEL_SOURCE = 'official';
+    process.env.CTI_CODEX_MODEL = 'gpt-5.4';
+    process.env.CTI_CODEX_REASONING_EFFORT = 'high';
+    process.env.CTI_CODEX_RESUME_THREADS = 'true';
+    try {
+      const { CodexProvider } = await import('../codex-provider.js');
+      const { PendingPermissions } = await import('../permission-gateway.js');
+      const provider = new CodexProvider(new PendingPermissions(), { profile: 'official' });
+      let resumes = 0;
+      let starts = 0;
+      const mockThread = {
+        runStreamed: () => ({
+          events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'new-thread' };
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        }),
+      };
+      (provider as any).threadBindings.set('profile-session', {
+        threadId: 'old-thread',
+        profileFingerprint: 'stale-fingerprint',
+      });
+      (provider as any).sdk = { Codex: class { constructor() {} } };
+      (provider as any).codex = {
+        resumeThread() {
+          resumes += 1;
+          return mockThread;
+        },
+        startThread() {
+          starts += 1;
+          return mockThread;
+        },
+      };
+
+      const events = parseSSEChunks(await collectStream(provider.streamChat({
+        prompt: 'use new profile',
+        sessionId: 'profile-session',
+      })));
+      const parameterStatus = parseSSEData(events.find((event) => {
+        if (event.type !== 'status') return false;
+        return parseSSEData(event)?.parameterEvidence === 'sdk_thread_options';
+      }));
+
+      assert.equal(resumes, 0);
+      assert.equal(starts, 1);
+      assert.equal(parameterStatus?.threadMode, 'fresh_profile_changed');
+    } finally {
+      if (saved.source === undefined) delete process.env.CTI_CODEX_MODEL_SOURCE;
+      else process.env.CTI_CODEX_MODEL_SOURCE = saved.source;
+      if (saved.model === undefined) delete process.env.CTI_CODEX_MODEL;
+      else process.env.CTI_CODEX_MODEL = saved.model;
+      if (saved.effort === undefined) delete process.env.CTI_CODEX_REASONING_EFFORT;
+      else process.env.CTI_CODEX_REASONING_EFFORT = saved.effort;
+      if (saved.resume === undefined) delete process.env.CTI_CODEX_RESUME_THREADS;
+      else process.env.CTI_CODEX_RESUME_THREADS = saved.resume;
+    }
+  });
+
   it('does not pass model by default and still attempts resume for persisted thread ids', async () => {
     const oldResume = process.env.CTI_CODEX_RESUME_THREADS;
     process.env.CTI_CODEX_RESUME_THREADS = 'true';
@@ -716,7 +843,7 @@ describe('CodexProvider', () => {
     (provider as any).sdk = { Codex: MockCodex };
     (provider as any).codex = { startThread: () => mockThread };
 
-    await collectStream(provider.streamChat({
+    const classifierChunks = await collectStream(provider.streamChat({
       prompt: '只裁决 evidence',
       sessionId: 'classifier-codex-session',
       interactionMode: 'classifier',
@@ -725,6 +852,11 @@ describe('CodexProvider', () => {
       additionalDirectories: ['D:\\extra'],
       permissionMode: 'acceptEdits',
       abortController: new AbortController(),
+    }));
+    const classifierEvents = parseSSEChunks(classifierChunks);
+    const parameterStatus = parseSSEData(classifierEvents.find((event) => {
+      if (event.type !== 'status') return false;
+      return parseSSEData(event)?.parameterEvidence === 'sdk_thread_options';
     }));
 
     assert.equal(classifierClientOptions?.config?.features?.shell_tool, false);
@@ -738,6 +870,8 @@ describe('CodexProvider', () => {
     assert.equal(Object.hasOwn(threadOptions || {}, 'additionalDirectories'), false);
     assert.deepEqual(turnOptions?.outputSchema, { type: 'object', required: ['focus'] });
     assert.ok(turnOptions?.signal instanceof AbortSignal);
+    assert.equal(parameterStatus?.submittedReasoningEffort, 'low');
+    assert.equal(parameterStatus?.executionOverrideReason, 'restricted_interaction');
   });
 
   it('rejects any tool event that leaks into a classifier turn', async () => {
@@ -781,7 +915,7 @@ describe('CodexProvider', () => {
     const oldResume = process.env.CTI_CODEX_RESUME_THREADS;
     process.env.CTI_CODEX_RESUME_THREADS = 'true';
     try {
-      const { CodexProvider } = await import('../codex-provider.js');
+      const { CodexProvider, getOrdinaryCodexExecutionProfile } = await import('../codex-provider.js');
       const { PendingPermissions } = await import('../permission-gateway.js');
       const provider = new CodexProvider(new PendingPermissions());
 
@@ -797,7 +931,10 @@ describe('CodexProvider', () => {
         }),
       };
 
-      (provider as any).threadIds.set('sticky-codex-session', 'codex-thread-123');
+      (provider as any).threadBindings.set('sticky-codex-session', {
+        threadId: 'codex-thread-123',
+        profileFingerprint: getOrdinaryCodexExecutionProfile().fingerprint,
+      });
       (provider as any).sdk = { Codex: class { constructor() {} } };
       (provider as any).codex = {
         resumeThread: (threadId: string) => {
@@ -832,7 +969,7 @@ describe('CodexProvider', () => {
     }
   });
 
-  it('passes model only when CTI_CODEX_PASS_MODEL=true', async () => {
+  it('does not forward a session model when only legacy CTI_CODEX_PASS_MODEL is enabled', async () => {
     const old = process.env.CTI_CODEX_PASS_MODEL;
     process.env.CTI_CODEX_PASS_MODEL = 'true';
     try {
@@ -863,7 +1000,7 @@ describe('CodexProvider', () => {
       });
       await collectStream(stream);
 
-      assert.equal(capturedStartOptions?.model, 'gpt-5-codex');
+      assert.equal(capturedStartOptions?.model, undefined);
     } finally {
       if (old === undefined) {
         delete process.env.CTI_CODEX_PASS_MODEL;

@@ -19,20 +19,29 @@ import type { ChannelBinding } from '../../lib/bridge/types';
 
 // ── Mock Store ──────────────────────────────────────────────
 
-function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, { id: string; working_directory: string; model: string }> } {
+function createMockStore(): BridgeStore & {
+  bindings: Map<string, ChannelBinding>;
+  sessions: Map<string, { id: string; working_directory: string; model: string }>;
+  settings: Map<string, string>;
+} {
   const bindings = new Map<string, ChannelBinding>();
   const sessions = new Map<string, { id: string; working_directory: string; model: string }>();
+  const settings = new Map<string, string>([
+    ['bridge_default_work_dir', '/tmp/test'],
+    ['bridge_allowed_workspace_roots', '/tmp/test'],
+    ['bridge_default_model', 'claude-3'],
+    ['bridge_default_provider_id', ''],
+    ['bridge_runtime_fingerprint', 'profile-old'],
+    ['bridge_tooling_fingerprint', 'tooling-stable'],
+  ]);
   let nextId = 1;
 
   return {
     bindings,
     sessions,
+    settings,
     getSetting(key: string) {
-      if (key === 'bridge_default_work_dir') return '/tmp/test';
-      if (key === 'bridge_allowed_workspace_roots') return '/tmp/test';
-      if (key === 'bridge_default_model') return 'claude-3';
-      if (key === 'bridge_default_provider_id') return '';
-      return null;
+      return settings.get(key) ?? null;
     },
     getChannelBinding(channelType: string, chatId: string) {
       return bindings.get(`${channelType}:${chatId}`) ?? null;
@@ -48,6 +57,8 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
         model: data.model,
         mode: 'code',
         active: true,
+        bridgeFingerprint: data.bridgeFingerprint,
+        toolingFingerprint: data.toolingFingerprint,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -149,6 +160,24 @@ describe('channel-router', () => {
 
     assert.equal(first.id, second.id);
     assert.equal(store.bindings.size, 1);
+  });
+
+  it('clears only sdkSessionId when bridge fingerprint changes', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'profile-chat' });
+    store.bindings.set('telegram:profile-chat', {
+      ...first,
+      sdkSessionId: 'old-codex-thread',
+      bridgeFingerprint: 'profile-old',
+      toolingFingerprint: 'tooling-stable',
+    });
+    store.settings.set('bridge_runtime_fingerprint', 'profile-new');
+
+    const refreshed = router.resolve({ channelType: 'telegram', chatId: 'profile-chat' });
+
+    assert.equal(refreshed.sdkSessionId, '');
+    assert.equal(refreshed.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(refreshed.workingDirectory, first.workingDirectory);
+    assert.equal(refreshed.bridgeFingerprint, 'profile-new');
   });
 
   it('resolve() recreates binding when session was deleted', () => {
