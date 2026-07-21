@@ -4604,6 +4604,97 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(sent[0].text, /记住啦|已记住|已经写进/);
   });
 
+  it('keeps successful non-memory work when a compound request memory classifier aborts', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const text = _testOnly.enforceMemoryIntentOutcome([
+      '@乔治',
+      '',
+      '> “既然人承担后果，就应署本人姓名”',
+      '',
+      '反方反驳：责任归属不等于必须公开真实姓名。',
+      '记住啦：后续每轮都引用观点并艾特对方。',
+    ].join('\n'), {
+      blocker: '记忆意图判断超时或中止，本轮没有写入受控 memory v3。',
+    });
+
+    assert.match(text, /@乔治/);
+    assert.match(text, /反方反驳/);
+    assert.match(text, /记忆状态：未保存/);
+    assert.doesNotMatch(text, /记住啦/);
+  });
+
+  it('preserves a verified native mention when only the memory part of a compound request fails', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '@乔治\n\n> “既然人承担后果，就应署本人姓名”\n\n反方反驳：责任归属不等于必须公开真实姓名。\n\n记住啦：后续每轮都引用观点并艾特对方。',
+            images: [],
+            files: [],
+            reply_mode: 'markdown',
+            mentions: [{ userId: 'ou_george', name: '乔治' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      memoryIntents: {
+        classifyMemoryWrite: async () => {
+          throw new Error('classifier aborted');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_compound_memory' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    adapter.resolveOutboundMentions = async () => {
+      throw new Error('same-message native mention evidence should verify the structured target directly');
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('重发并艾特乔治，后面也记住', 'ou_sender', 'oc_compound_memory'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_compound_memory',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [
+          { name: '小虾米', openId: 'ou_current_bot' },
+          { name: '乔治', openId: 'ou_george' },
+        ],
+      },
+    });
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /反方反驳/);
+    assert.match(sent[0].text, /记忆状态：未保存/);
+    assert.doesNotMatch(sent[0].text, /记住啦/);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('still returns only the memory failure when no other compound result exists', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const text = _testOnly.enforceMemoryIntentOutcome('记住啦，已经写入记忆。', {
+      blocker: '记忆意图判断超时或中止，本轮没有写入受控 memory v3。',
+    });
+
+    assert.match(text, /^未保存：/);
+    assert.doesNotMatch(text, /记住啦|已经写入/);
+  });
+
   it('classifies every eligible text turn instead of using a memory-keyword shortcut', async () => {
     let classifierCalls = 0;
     let providerCalls = 0;
@@ -6848,6 +6939,422 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /^@乔治/);
     assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('revalidates a pronoun-selected nearby person against the current chat before native mention delivery', async () => {
+    const sent: OutboundMessage[] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    const auditSummaries: string[] = [];
+    initBridgeContext({
+      store: {
+        ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+        insertAuditLog: (entry) => { auditSummaries.push(entry.summary); },
+      },
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '知道呀，是 @小明 ～明姐姐，小虾米准备接活啦！',
+            images: [],
+            files: [],
+            reply_mode: 'plain',
+            mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_mention' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_xiaoming', name: '小明' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('知道是谁么，艾特她', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+        feishuConversationContext: {
+          evidence: [
+            {
+              id: 'message:card',
+              kind: 'message',
+              relation: 'native_reply',
+              source: 'platform_api',
+              confidence: 1,
+              content: '原始请求：准备好干活，你明姐姐又要来活了。',
+              actor: { id: 'cli_previous_bot', type: 'app' },
+              metadata: { contentRecovered: true },
+            },
+            {
+              id: 'message:xiaoming',
+              kind: 'message',
+              relation: 'nearby',
+              source: 'platform_api',
+              confidence: 0.7,
+              content: '那个管不了，因为左边很远。',
+              actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            },
+            {
+              id: 'message:lin',
+              kind: 'message',
+              relation: 'nearby',
+              source: 'platform_api',
+              confidence: 0.7,
+              content: '[赞]',
+              actor: { id: 'ou_lin', displayName: '林惠中', type: 'human' },
+            },
+          ],
+        },
+      },
+    } as any);
+
+    assert.equal(resolverInputs.length, 1, 'context evidence must still be revalidated by the official current-chat resolver');
+    assert.match(resolverInputs[0].text, /@小明/);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /@小明/);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_xiaoming', name: '小明' }]);
+    assert.ok(auditSummaries.some((summary) => (
+      /\[MENTION_RESOLUTION\]/u.test(summary)
+      && /status=resolved/u.test(summary)
+      && /officialRevalidated=true/u.test(summary)
+      && /candidates=小明/u.test(summary)
+    )));
+  });
+
+  it('passes a revalidated contextual mention into streaming card finalization', async () => {
+    const finalized: unknown[][] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在确认上下文人物。' },
+          {
+            type: 'text',
+            data: [
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text', text: '@小明 收到，准备接活啦！', images: [], files: [], reply_mode: 'markdown',
+                mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+              }),
+              '```',
+            ].join('\n'),
+          },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_stream_contextual' })) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => ({
+      ...message,
+      mentions: [{ userId: 'ou_xiaoming', name: '小明' }],
+    });
+    (adapter as any).onStreamText = () => {};
+    (adapter as any).onStreamEnd = async (...args: unknown[]) => {
+      finalized.push(args);
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_stream_contextual'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.equal(finalized.length, 1);
+    assert.match(String(finalized[0][2]), /@小明/);
+    assert.deepEqual(finalized[0][4], [{ userId: 'ou_xiaoming', name: '小明' }]);
+  });
+
+  it('uses strong current-turn platform evidence when balanced mode cannot reach member verification', async () => {
+    const sent: OutboundMessage[] = [];
+    const audits: string[] = [];
+    initBridgeContext({
+      store: {
+        ...createMinimalStore({ remote_bridge_enabled: 'true', bridge_safety_policy_profile: 'balanced' }),
+        insertAuditLog: (entry) => { audits.push(entry.summary); },
+      },
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text', text: '@小明 收到。', images: [], files: [], reply_mode: 'plain',
+            mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_degraded' };
+    }) as BaseChannelAdapter & {
+      verifyOutboundMentionIdentity?: () => Promise<{ status: 'lookup_failed' }>;
+    };
+    adapter.verifyOutboundMentionIdentity = async () => ({ status: 'lookup_failed' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_xiaoming', name: '小明' }]);
+    assert.ok(audits.some((summary) => /decision=allow_with_audit/u.test(summary)
+      && /verification=failed/u.test(summary)
+      && /profile=balanced/u.test(summary)));
+  });
+
+  it('executes a uniquely resolved contextual mention even when the model omits mention metadata', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true', bridge_safety_policy_profile: 'balanced' }),
+      llm: { streamChat: () => createTextStream('知道了，我来通知她。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_bridge_owned' };
+    }) as BaseChannelAdapter & {
+      verifyOutboundMentionIdentity?: () => Promise<{ status: 'verified'; name: string }>;
+    };
+    adapter.verifyOutboundMentionIdentity = async () => ({ status: 'verified', name: '小明' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_xiaoming', name: '小明' }]);
+    assert.match(sent[0].text, /知道了/);
+  });
+
+  it('keeps strict mode fail-closed when platform member verification is unavailable', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true', bridge_safety_policy_profile: 'strict' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text', text: '@小明 收到。', images: [], files: [], reply_mode: 'plain',
+            mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_strict' };
+    }) as BaseChannelAdapter & {
+      verifyOutboundMentionIdentity?: () => Promise<{ status: 'lookup_failed' }>;
+    };
+    adapter.verifyOutboundMentionIdentity = async () => ({ status: 'lookup_failed' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.equal(sent[0].mentions, undefined);
+    assert.match(sent[0].text, /原生 @ 未投递/);
+  });
+
+  it('asks for the smallest clarification when a pronoun mention has multiple evidence candidates', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('我知道有两个人，但还不能确定你指谁。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_ambiguous' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [
+            {
+              id: 'message:a', kind: 'message', relation: 'nearby', source: 'platform_api', confidence: 0.7,
+              content: '第一条', actor: { id: 'ou_a', displayName: '小明', type: 'human' },
+            },
+            {
+              id: 'message:b', kind: 'message', relation: 'nearby', source: 'platform_api', confidence: 0.7,
+              content: '第二条', actor: { id: 'ou_b', displayName: '林惠中', type: 'human' },
+            },
+          ],
+        },
+      },
+    } as any);
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /小明、林惠中/);
+    assert.match(sent[0].text, /哪一位/);
+    assert.equal(sent[0].mentions, undefined);
+  });
+
+  it('rejects a contextual mention when the official current-chat resolver returns a different identity', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text', text: '@小明 收到。', images: [], files: [], reply_mode: 'plain',
+            mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_mismatch' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => ({
+      ...message,
+      mentions: [{ userId: 'ou_other', name: '小明' }],
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].mentions, undefined);
+    assert.doesNotMatch(sent[0].text, /@小明/);
+    assert.match(sent[0].text, /原生 @ 未投递/);
+  });
+
+  it('uses the official current-chat canonical name when the evidence identity is unchanged', async () => {
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text', text: '@小明 收到。', images: [], files: [], reply_mode: 'plain',
+            mentions: [{ open_id: 'ou_xiaoming', name: '小明' }],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_contextual_canonical' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => ({
+      ...message,
+      mentions: [{ userId: 'ou_xiaoming', name: '小明（产品）' }],
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特她', 'ou_sender', 'oc_group'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:xiaoming', kind: 'message', relation: 'native_reply', source: 'platform_api', confidence: 1,
+            content: '小明刚才的消息', actor: { id: 'ou_xiaoming', displayName: '小明', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+      },
+    } as any);
+
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_xiaoming', name: '小明（产品）' }]);
+    assert.match(sent[0].text, /@小明（产品）/);
   });
 
   it('resolves an agent-selected bare mention from a matching explicit current request', async () => {

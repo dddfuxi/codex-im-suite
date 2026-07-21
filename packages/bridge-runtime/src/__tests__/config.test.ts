@@ -37,6 +37,12 @@ describe('configToSettings', () => {
   it('always sets remote_bridge_enabled to true', () => {
     const m = configToSettings(base);
     assert.equal(m.get('remote_bridge_enabled'), 'true');
+    assert.equal(m.get('bridge_safety_policy_profile'), 'balanced');
+  });
+
+  it('projects the selected adaptive safety profile into bridge settings', () => {
+    const m = configToSettings({ ...base, safetyPolicyProfile: 'fluent' });
+    assert.equal(m.get('bridge_safety_policy_profile'), 'fluent');
   });
 
   it('sets channel enabled flags based on enabledChannels', () => {
@@ -411,6 +417,31 @@ describe('loadConfig/saveConfig round-trip', () => {
       else process.env.CTI_HOME = previousCtiHome;
       if (previousReasoningEffort === undefined) delete process.env.CTI_CODEX_REASONING_EFFORT;
       else process.env.CTI_CODEX_REASONING_EFFORT = previousReasoningEffort;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads adaptive safety profiles and falls back invalid values to balanced', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-safety-profile-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_SAFETY_POLICY_PROFILE=fluent',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+      const fluentModule = await import(`../config.js?safety-profile-${Date.now()}`);
+      assert.equal(fluentModule.loadConfig().safetyPolicyProfile, 'fluent');
+
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_SAFETY_POLICY_PROFILE=disable_everything',
+      ].join('\n'), 'utf-8');
+      const fallbackModule = await import(`../config.js?safety-profile-invalid-${Date.now()}`);
+      assert.equal(fallbackModule.loadConfig().safetyPolicyProfile, 'balanced');
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
       fs.rmSync(configDir, { recursive: true, force: true });
     }
   });

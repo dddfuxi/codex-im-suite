@@ -31,7 +31,7 @@ import type {
   ScheduledTaskMutationResult,
   ScheduledTaskScheduleInput,
 } from './host.js';
-import type { TurnEvidenceItem } from './turn-context.js';
+import type { TurnEvidenceEnvelope, TurnEvidenceItem, TurnFocusDecision } from './turn-context.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -111,6 +111,19 @@ import {
   buildFeishuDocumentRecordInput,
   buildFeishuDocumentSuccessMessage,
 } from './channels/feishu/documents/document-delivery-policy.js';
+import {
+  resolveFeishuContextualMention,
+  type FeishuContextualMentionCandidate,
+  type FeishuContextualMentionResolution,
+} from './channels/feishu/mentions/contextual-mention-resolution.js';
+import {
+  decideAdaptiveActionPolicy,
+  normalizeAdaptiveSafetyProfile,
+  type AdaptiveEvidenceStrength,
+  type AdaptivePolicyDecisionKind,
+  type AdaptiveSafetyProfile,
+  type AdaptiveVerificationStatus,
+} from './adaptive-action-policy.js';
 import {
   compactBridgeReplyForDelivery,
   prepareDeliveryCandidate,
@@ -1531,19 +1544,43 @@ function buildMemoryIntentBlockerAgentPrompt(blocker: string): string {
   return [
     'Memory intent blocker for this turn:',
     blocker,
-    'The primary agent must state that the memory was not saved. Do not use tools, skills, project files, chat logs, or legacy memory directories as a fallback store.',
+    'The primary agent must still complete every non-memory part of a compound request, then state that the memory part was not saved.',
+    'Do not use tools, skills, project files, chat logs, or legacy memory directories as a fallback store, and do not claim that memory was saved.',
   ].join('\n');
+}
+
+const MEMORY_SUCCESS_CLAIM_RE = /(?:已按当前会话上下文保留|(?:已|已经|成功|会|帮你|我会|我已经|我已)?.{0,8}(?:记住(?:了|啦)?|保存(?:成功|好了|到记忆)?|写入(?:了|到)?(?:受控\s*)?(?:memory\s*v3|记忆)|记录到(?:了)?记忆|后续(?:会|都将|默认).{0,8}(?:记住|遵循)))/iu;
+
+/**
+ * 模型可能同时完成了重发、引用、mention 等动作，却又错误声称记忆成功。
+ * 这里只移除包含“记忆已成功”的行，保留复合请求中已经完成的其他结果。
+ */
+function stripUnverifiedMemorySuccessClaims(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter((line) => !MEMORY_SUCCESS_CLAIM_RE.test(line.trim()))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function appendMemoryStatus(text: string, status: string): string {
+  const safeText = stripUnverifiedMemorySuccessClaims(text);
+  return safeText
+    ? `${safeText}\n\n> 记忆状态：${status}`
+    : status;
 }
 
 function enforceMemoryIntentOutcome(text: string, preflight: MemoryIntentPreflight | null): string {
   if (!preflight) return text;
-  if (preflight.blocker) return `未保存：${preflight.blocker}`;
-  if (preflight.clarification) return `尚未保存。${preflight.clarification}`;
+  if (preflight.blocker) return appendMemoryStatus(text, `未保存：${preflight.blocker}`);
+  if (preflight.clarification) return appendMemoryStatus(text, `尚未保存。${preflight.clarification}`);
   if (preflight.preparedWrite && !preflight.preparedWrite.result.ok) {
-    return `未保存：${preflight.preparedWrite.result.error || '受控 memory v3 写入失败。'}`;
+    return appendMemoryStatus(text, `未保存：${preflight.preparedWrite.result.error || '受控 memory v3 写入失败。'}`);
   }
   if (preflight.temporaryMemory && /(?:已记住|记住了|已保存|保存成功|写入.*记忆|长期记忆)/u.test(text)) {
-    return '已按当前会话上下文保留，本轮没有写入用户、群聊或公共长期记忆。';
+    return appendMemoryStatus(text, '已按当前会话上下文保留，本轮没有写入用户、群聊或公共长期记忆。');
   }
   return text;
 }
@@ -2332,12 +2369,23 @@ function sanitizeFeishuPlaceholderMentions(
  */
 function validateFeishuStructuredMentions(
   payload: PreparedBridgeReplyPayload,
-  context: { channelType: string; message: InboundMessage },
+  context: {
+    channelType: string;
+    message: InboundMessage;
+    additionalTrustedMentions?: OutboundMention[];
+  },
 ): PreparedBridgeReplyPayload {
-  if (context.channelType !== 'feishu' || !payload.mentions?.length) return payload;
+  const mentionsToValidate = [
+    ...(payload.mentions || []),
+    ...(context.additionalTrustedMentions || []),
+  ];
+  if (context.channelType !== 'feishu' || mentionsToValidate.length === 0) return payload;
 
   const nativeEvidenceById = new Map(
-    getNativeFeishuMentionEvidence(context.message)
+    [
+      ...getNativeFeishuMentionEvidence(context.message),
+      ...(context.additionalTrustedMentions || []),
+    ]
       .filter((mention): mention is OutboundMention & { userId: string } => !!mention.userId?.trim())
       .map((mention) => [mention.userId.trim(), mention]),
   );
@@ -2345,7 +2393,7 @@ function validateFeishuStructuredMentions(
   const rejectedTargets = new Set<string>();
   let text = payload.text;
 
-  for (const mention of payload.mentions) {
+  for (const mention of mentionsToValidate) {
     if (mention.atAll) {
       // 广播没有可与本轮原生 mention ID 求交集的单一身份，不能复用普通结构化 mention 门禁。
       // 在引入独立 Owner 广播动作协议前，模型输出的 atAll 一律按未验证目标拒绝。
@@ -2393,6 +2441,179 @@ function validateFeishuStructuredMentions(
   };
 }
 
+interface FeishuContextualMentionVerification {
+  resolution: FeishuContextualMentionResolution;
+  trustedMentions: OutboundMention[];
+  profile: AdaptiveSafetyProfile;
+  decision: AdaptivePolicyDecisionKind;
+  reasonCode: string;
+  evidenceStrength: AdaptiveEvidenceStrength;
+  verificationStatus: AdaptiveVerificationStatus;
+}
+
+function getFeishuContextualMentionEvidenceStrength(
+  candidate: FeishuContextualMentionCandidate | undefined,
+): AdaptiveEvidenceStrength {
+  if (!candidate?.userId?.trim()) return 'untrusted';
+  if (['platform_event', 'platform_api', 'local_outbound_ref'].includes(candidate.source)
+    && candidate.confidence >= 0.7) {
+    return 'strong';
+  }
+  if (candidate.confidence >= 0.5) return 'reliable';
+  return 'weak';
+}
+
+function recordFeishuContextualMentionAudit(
+  message: InboundMessage,
+  verification: FeishuContextualMentionVerification,
+): void {
+  if (verification.resolution.status === 'not_applicable') return;
+  const candidateNames = [...new Set(
+    verification.resolution.candidates.map((candidate) => candidate.name).filter(Boolean),
+  )].slice(0, 4);
+  try {
+    getBridgeContext().store.insertAuditLog({
+      channelType: message.address.channelType,
+      chatId: message.address.chatId,
+      direction: 'outbound',
+      messageId: message.messageId,
+      summary: [
+        '[MENTION_RESOLUTION]',
+        `status=${verification.resolution.status}`,
+        `profile=${verification.profile}`,
+        `decision=${verification.decision}`,
+        `reasonCode=${verification.reasonCode}`,
+        `evidence=${verification.evidenceStrength}`,
+        `verification=${verification.verificationStatus}`,
+        `officialRevalidated=${verification.verificationStatus === 'verified'}`,
+        candidateNames.length > 0 ? `candidates=${candidateNames.join('|')}` : '',
+        `reason=${verification.resolution.reason}`,
+      ].filter(Boolean).join(' '),
+    });
+  } catch {
+    // 审计是旁路可观察性；写入故障不能重新把已验证的低风险 mention 变成用户阻塞。
+  }
+}
+
+/**
+ * 上下文 resolver 只能选择本轮真实人物 evidence；这里优先通过当前群成员
+ * ID 验证，再按安全档位裁决临时能力故障。模型输出的 ID 本身从不直接成为可信事实。
+ */
+async function verifyFeishuContextualMentions(
+  adapter: BaseChannelAdapter,
+  payload: PreparedBridgeReplyPayload,
+  context: {
+    channelType: string;
+    userText: string;
+    message: InboundMessage;
+    envelope: TurnEvidenceEnvelope;
+    focus: TurnFocusDecision;
+    mentionIntentOptions?: FeishuMentionIntentOptions;
+  },
+): Promise<FeishuContextualMentionVerification> {
+  const profile = normalizeAdaptiveSafetyProfile(
+    getBridgeContext().store.getSetting('bridge_safety_policy_profile'),
+  );
+  const resolution = resolveFeishuContextualMention({
+    userText: context.userText,
+    envelope: context.envelope,
+    focus: context.focus,
+    modelMentions: payload.mentions,
+    modelText: payload.text,
+    mentionIntentOptions: context.mentionIntentOptions,
+  });
+  const evidenceStrength = getFeishuContextualMentionEvidenceStrength(resolution.candidate);
+  if (context.channelType !== 'feishu'
+    || resolution.status !== 'resolved'
+    || !resolution.candidate) {
+    return {
+      resolution,
+      trustedMentions: [],
+      profile,
+      decision: resolution.status === 'ambiguous' ? 'clarify' : 'deny',
+      reasonCode: resolution.status === 'ambiguous' ? 'ambiguous_target' : 'not_applicable',
+      evidenceStrength,
+      verificationStatus: 'not_required',
+    };
+  }
+
+  const candidate = resolution.candidate;
+  let verificationStatus: AdaptiveVerificationStatus = 'unavailable';
+  let verifiedName = candidate.name;
+  try {
+    if (adapter.verifyOutboundMentionIdentity) {
+      const verified = await adapter.verifyOutboundMentionIdentity({
+        address: context.message.address,
+        text: payload.text,
+        parseMode: payload.parseMode,
+        replyToMessageId: payload.replyTo,
+      }, context.message, { userId: candidate.userId, name: candidate.name });
+      verificationStatus = verified.status === 'lookup_failed' ? 'failed' : verified.status;
+      if (verified.status === 'verified' && verified.name?.trim()) verifiedName = verified.name.trim();
+    } else if (adapter.resolveOutboundMentions) {
+      // 兼容旧 adapter：优先使用新的 ID 级验证；旧入口仅作为迁移期兜底。
+      const verificationText = `@${candidate.name}\n${payload.text}`;
+      const verified = await adapter.resolveOutboundMentions({
+        address: context.message.address,
+        text: verificationText,
+        parseMode: payload.parseMode,
+        replyToMessageId: payload.replyTo,
+      }, context.message);
+      const mentions = (verified.mentions || []).filter((mention) => !mention.atAll && mention.userId?.trim());
+      const trusted = mentions.find((mention) => mention.userId?.trim() === candidate.userId);
+      if (trusted) {
+        verificationStatus = 'verified';
+        verifiedName = trusted.name?.trim() || verifiedName;
+      } else {
+        verificationStatus = mentions.length > 0 ? 'conflict' : 'not_found';
+      }
+    }
+  } catch {
+    verificationStatus = 'failed';
+  }
+
+  const policy = decideAdaptiveActionPolicy({
+    profile,
+    risk: 'low',
+    evidence: evidenceStrength,
+    verification: verificationStatus,
+  });
+  if (policy.decision === 'allow' || policy.decision === 'allow_with_audit') {
+    return {
+      resolution: {
+        ...resolution,
+        reason: policy.decision === 'allow'
+          ? '当前群平台身份已按 ID 验证。'
+          : '低风险同群 mention 使用本轮强平台 evidence 降级执行。',
+      },
+      trustedMentions: [{ userId: candidate.userId, name: verifiedName || candidate.name }],
+      profile,
+      decision: policy.decision,
+      reasonCode: policy.reasonCode,
+      evidenceStrength,
+      verificationStatus,
+    };
+  }
+
+  return {
+    resolution: {
+      ...resolution,
+      status: policy.decision === 'clarify' ? 'ambiguous' : 'unresolved',
+      reason: policy.reasonCode === 'identity_conflict'
+        ? '当前群平台身份与本轮人物 evidence 冲突。'
+        : policy.reasonCode === 'identity_not_found'
+          ? '本轮人物已不在当前群官方成员中。'
+          : '当前安全档位要求更强的平台身份验证。',
+    },
+    trustedMentions: [],
+    profile,
+    decision: policy.decision,
+    reasonCode: policy.reasonCode,
+    evidenceStrength,
+    verificationStatus,
+  };
+}
+
 async function runSelfMaintenanceSafely(input: SelfMaintenanceInput): Promise<SelfMaintenanceResult | null> {
   const host = getBridgeContext().selfMaintenance;
   if (!host) return null;
@@ -2423,7 +2644,8 @@ async function recordSelfMaintenanceSkipSafely(input: {
  * 用户本轮明确要求执行 @ 时，由 delivery 在当前群官方成员/机器人中确定性解析。
  * bot-to-bot 回合另有一个窄口：仅允许回复原生唤醒当前机器人的发送方机器人，
  * 且必须把 sender app_id 与当前群可 mention member_id 唯一关联。普通叙述、未来流程、
- * 关系代词和模型单方面写出的其他名字仍不会触发通知。
+ * 关系代词只能经本轮真实人物 evidence 与当前群官方成员二次复核后触发；
+ * 模型单方面写出的名字或 ID 仍不会触发通知。
  */
 async function resolveFeishuAgentSelectedMentions(
   adapter: BaseChannelAdapter,
@@ -2593,10 +2815,29 @@ function enforceFeishuMentionTargetSafety(
     userText: string;
     senderDisplayName?: string;
     mentionIntentOptions?: FeishuMentionIntentOptions;
+    contextualResolution?: FeishuContextualMentionResolution;
   },
 ): PreparedBridgeReplyPayload {
   if (context.channelType !== 'feishu') return payload;
   if (hasStructuredMentions(payload.mentions)) return payload;
+  if (context.contextualResolution?.status === 'ambiguous') {
+    const names = [...new Set(context.contextualResolution.candidates.map((candidate) => candidate.name).filter(Boolean))];
+    const unresolvedNames = names.length > 0 ? names : ['上下文中的目标'];
+    const clarification = names.length > 1
+      ? `请明确是 ${names.join('、')} 中的哪一位。`
+      : '请明确具体姓名。';
+    return {
+      ...payload,
+      text: appendFeishuMentionNonDeliveryNotice(
+        stripUnverifiedFeishuBareMentions(payload.text),
+        unresolvedNames,
+      ).replace(/请在飞书消息里直接 @ TA 后重试。/u, clarification),
+      mentions: undefined,
+    };
+  }
+  if (context.contextualResolution?.status === 'unresolved') {
+    return preserveReplyWithFeishuMentionNonDelivery(payload);
+  }
   if (needsExplicitFeishuMentionTarget(context.userText, context.mentionIntentOptions)) {
     return preserveReplyWithFeishuMentionNonDelivery(payload);
   }
@@ -6263,9 +6504,19 @@ async function handleMessage(
       preparedReply = sanitizeFeishuPlaceholderMentions(preparedReply, {
         channelType: adapter.channelType,
       });
+      const contextualMentionVerification = await verifyFeishuContextualMentions(adapter, preparedReply, {
+        channelType: adapter.channelType,
+        userText: rawText,
+        message: msg,
+        envelope: resolvedTurnContext.envelope,
+        focus: resolvedTurnContext.decision,
+        mentionIntentOptions: feishuMentionIntentOptions,
+      });
+      recordFeishuContextualMentionAudit(msg, contextualMentionVerification);
       preparedReply = validateFeishuStructuredMentions(preparedReply, {
         channelType: adapter.channelType,
         message: msg,
+        additionalTrustedMentions: contextualMentionVerification.trustedMentions,
       });
       preparedReply = await resolveFeishuAgentSelectedMentions(adapter, preparedReply, {
         channelType: adapter.channelType,
@@ -6278,6 +6529,7 @@ async function handleMessage(
         userText: rawText,
         senderDisplayName: msg.address.displayName,
         mentionIntentOptions: feishuMentionIntentOptions,
+        contextualResolution: contextualMentionVerification.resolution,
       });
       preparedReply = enforceFeishuAvatarEvidenceCompletion(preparedReply, rawData?.feishuAvatarEvidence);
     }
@@ -7041,4 +7293,5 @@ export const _testOnly = {
   pollAdapterMessageForTest: pollAdapterMessage,
   runSelfMaintenanceSafely,
   recordSelfMaintenanceSkipSafely,
+  enforceMemoryIntentOutcome,
 };

@@ -862,6 +862,7 @@ describe('CodexProvider', () => {
     assert.equal(classifierClientOptions?.config?.features?.shell_tool, false);
     assert.equal(classifierClientOptions?.config?.features?.plugins, false);
     assert.equal(classifierClientOptions?.config?.model_reasoning_effort, 'low');
+    assert.equal(classifierClientOptions?.config?.project_doc_max_bytes, 0);
     assert.equal(threadOptions?.sandboxMode, 'read-only');
     assert.equal(threadOptions?.approvalPolicy, 'untrusted');
     assert.equal(threadOptions?.networkAccessEnabled, false);
@@ -872,6 +873,39 @@ describe('CodexProvider', () => {
     assert.ok(turnOptions?.signal instanceof AbortSignal);
     assert.equal(parameterStatus?.submittedReasoningEffort, 'low');
     assert.equal(parameterStatus?.executionOverrideReason, 'restricted_interaction');
+  });
+
+  it('uses a compact classifier prompt without normal bridge reply contracts', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+    let capturedInput = '';
+    const mockThread = {
+      runStreamed: (input: unknown) => {
+        capturedInput = String(input);
+        return {
+          events: (async function* () {
+            yield { type: 'item.completed', item: { type: 'agent_message', text: '{"action":"ignore"}' } };
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+    (provider as any).classifierCodex = { startThread: () => mockThread };
+
+    await collectStream(provider.streamChat({
+      prompt: '判断是否记忆',
+      sessionId: 'compact-classifier',
+      interactionMode: 'classifier',
+      systemPrompt: '只返回 JSON。',
+      replyPresentation: { replyStyleHint: '不应进入 classifier' },
+    }));
+
+    assert.match(capturedInput, /Classifier instructions:/);
+    assert.match(capturedInput, /Classifier input:/);
+    assert.doesNotMatch(capturedInput, /Bridge reply style|replyStyleHint|cti-final/i);
   });
 
   it('rejects any tool event that leaks into a classifier turn', async () => {

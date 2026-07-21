@@ -81,6 +81,8 @@ export interface Config {
   lightChatHistoryLimit?: number;
   lightChatMaxInputChars?: number;
   replyStyleHint?: string;
+  /** 通用自适应安全档位；只影响可降级的低风险动作，不取消高风险硬门禁。 */
+  safetyPolicyProfile?: 'strict' | 'balanced' | 'fluent';
   defaultModel?: string;
   defaultMode: string;
   defaultExecutorId?: string;
@@ -606,6 +608,9 @@ export function loadConfig(): Config {
     lightChatHistoryLimit: typeof lightChatHistoryLimit === "number" && Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
     lightChatMaxInputChars: typeof lightChatMaxInputChars === "number" && Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
+    safetyPolicyProfile: (['strict', 'balanced', 'fluent'].includes(
+      (env.get("CTI_SAFETY_POLICY_PROFILE") || "balanced").trim().toLowerCase(),
+    ) ? (env.get("CTI_SAFETY_POLICY_PROFILE") || "balanced").trim().toLowerCase() : "balanced") as Config["safetyPolicyProfile"],
     defaultModel: env.get("CTI_DEFAULT_MODEL") || undefined,
     defaultMode: env.get("CTI_DEFAULT_MODE") || "code",
     defaultExecutorId,
@@ -925,6 +930,7 @@ export function maskSecret(value: string): string {
 export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
   m.set("remote_bridge_enabled", "true");
+  m.set("bridge_safety_policy_profile", config.safetyPolicyProfile || "balanced");
   if (config.bridgeProcessingTimeoutMs !== undefined) {
     m.set("bridge_processing_timeout_ms", String(config.bridgeProcessingTimeoutMs));
   }

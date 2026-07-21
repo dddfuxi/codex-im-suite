@@ -1782,7 +1782,8 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "codexApiKeyAction", current.CodexApiKeyAction),
             ReadPayloadString(payload, "codexApiKeyValue", ""),
             ReadPayloadString(payload, "codexApiKeyMasked", current.CodexApiKeyMasked),
-            ReadPayloadBool(payload, "codexApiKeySet", current.CodexApiKeySet));
+            ReadPayloadBool(payload, "codexApiKeySet", current.CodexApiKeySet),
+            NormalizeSafetyPolicyProfile(ReadPayloadString(payload, "safetyPolicyProfile", current.SafetyPolicyProfile)));
     }
 
     private async Task<WebSessionDetail> GetSessionDetailAsync(JsonElement payload)
@@ -6770,7 +6771,8 @@ exit $LASTEXITCODE
         "keep",
         "",
         MaskSecretForSettings(GetConfig("CTI_CODEX_API_KEY", "")),
-        !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_API_KEY", ""))
+        !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_API_KEY", "")),
+        NormalizeSafetyPolicyProfile(GetConfig("CTI_SAFETY_POLICY_PROFILE", "balanced"))
     );
 
     private void ShowSettingsDialog()
@@ -6819,6 +6821,7 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", settings.MemoryOptimizerEnabled ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(settings.MemoryOptimizerModelSource));
+        SetOrAppendEnv(lines, "CTI_SAFETY_POLICY_PROFILE", NormalizeSafetyPolicyProfile(settings.SafetyPolicyProfile));
         ApplySecretEnv(lines, "CTI_CODEX_API_KEY", settings.CodexApiKeyAction, settings.CodexApiKeyValue);
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
         AppendLog("配置已保存。Codex CLI 模型来源、路径和回复风格将在重启飞书桥接后生效。");
@@ -7148,6 +7151,12 @@ exit $LASTEXITCODE
     {
         value = (value ?? "").Trim().ToLowerInvariant();
         return value is "codex_primary" or "local_ai" or "external_api" ? value : "codex_primary";
+    }
+
+    private static string NormalizeSafetyPolicyProfile(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "strict" or "balanced" or "fluent" ? value : "balanced";
     }
 
     private static string NormalizeExecutorId(string value)
@@ -11917,7 +11926,8 @@ internal sealed record SettingsSnapshot(
     string CodexApiKeyAction = "keep",
     string CodexApiKeyValue = "",
     string CodexApiKeyMasked = "",
-    bool CodexApiKeySet = false);
+    bool CodexApiKeySet = false,
+    string SafetyPolicyProfile = "balanced");
 
 internal sealed record HistorySearchQuery(
     string Chat,
@@ -11934,6 +11944,7 @@ internal sealed class SettingsForm : Form
     private readonly TextBox _additionalDirs = new();
     private readonly ComboBox _replyStylePreset = new();
     private readonly TextBox _replyStyleRequest = new();
+    private string _safetyPolicyProfile = "balanced";
     private readonly TextBox _replyStyleHint = new();
     private readonly IReadOnlyDictionary<string, string> _presets;
     private readonly Func<string, Task<string>> _summarizeReplyStyleAsync;
@@ -12111,6 +12122,7 @@ internal sealed class SettingsForm : Form
         _additionalDirs.Text = settings.AdditionalDirs;
         _replyStyleHint.Text = settings.ReplyStyleHint;
         _defaultExecutorId = settings.DefaultExecutorId;
+        _safetyPolicyProfile = settings.SafetyPolicyProfile;
         _replyStylePreset.SelectedItem = ResolveReplyStylePreset(settings.ReplyStyleHint);
     }
 
@@ -12120,7 +12132,10 @@ internal sealed class SettingsForm : Form
         _memoryRepo.Text,
         _additionalDirs.Text,
         _replyStyleHint.Text,
-        _defaultExecutorId);
+        _defaultExecutorId)
+    {
+        SafetyPolicyProfile = _safetyPolicyProfile,
+    };
 
     private string ResolveReplyStylePreset(string value)
     {

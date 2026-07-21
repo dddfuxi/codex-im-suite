@@ -171,6 +171,7 @@ function isFeishuDirectMentionExecutionClause(clause: string, options: FeishuMen
   if (!compact) return false;
   const directCompact = stripLeadingFeishuMentionInvocation(compact, options);
   if (FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact) && !isFeishuNarrativeMentionClause(clause, options)) return true;
+  if (/^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot)?(?:把|给)(?:他|她|它|ta|TA|对方|那个人|这个人)(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)) return true;
   if (!FEISHU_MENTION_ACTION_RE.test(compact)) return false;
   FEISHU_MENTION_ACTION_RE.lastIndex = 0;
   if (isFeishuNarrativeMentionClause(clause, options)) return false;
@@ -208,6 +209,7 @@ function cleanExplicitFeishuMentionTarget(target: string): string {
     .replace(/(?:一下|下|一声|看看|看一下|回复(?:一下)?|回答(?:一下)?|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
     .replace(/(?:这个|那个|该|对应的)?(?:机器人|智能体|agent|bot|应用)(?:人)?(?:的)?$/iu, '')
     .trim();
+  if (/^(?:一|一下|下|一声|一下子)$/u.test(cleaned)) return '';
   const followup = FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE.exec(cleaned);
   if (followup) cleaned = cleaned.slice(0, followup.index).trim();
   if (!cleaned || FEISHU_OTHER_PERSON_TARGET_RE.test(cleaned) || isFeishuGenericMentionTarget(cleaned)) return '';

@@ -135,15 +135,19 @@ describe('agent architecture registry', () => {
     assert.equal(isNonAddressableMentionTarget('乔治'), false);
   });
 
-  it('allows only explicit current-turn display names to reach official mention resolution', () => {
+  it('allows explicit names and evidence-bound contextual targets to reach adaptive mention resolution', () => {
     const lines = getAgentPolicyPromptLines(['policy_registry.outbound_mention_targets']).join('\n');
 
     assert.match(lines, /current-turn explicit request/i);
-    assert.match(lines, /official member\/bot roster/i);
-    assert.match(lines, /revalidate.*unique platform identity/i);
+    assert.match(lines, /real current-turn evidence/i);
+    assert.match(lines, /他、她、对方/);
+    assert.match(lines, /verifies by platform ID/i);
+    assert.match(lines, /balanced\/fluent profile/i);
+    assert.match(lines, /strong attributable platform evidence/i);
     assert.match(lines, /bot-to-bot return mention/i);
     assert.match(lines, /sender app_id.*mentionable member_id/i);
-    assert.match(lines, /Model-provided IDs/i);
+    assert.match(lines, /may select a real evidence ID/i);
+    assert.match(lines, /Invented IDs/i);
     assert.match(lines, /broadcast audiences/i);
   });
 

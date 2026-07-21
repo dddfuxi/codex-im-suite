@@ -46,6 +46,7 @@ import type {
   ConversationTargetResolveResult,
   DirectMessageRequest,
   DirectMessageSendResult,
+  OutboundMentionIdentityVerification,
   OutboundMentionResolutionInspection,
   ResolvedConversationTarget,
 } from '../channel-adapter.js';
@@ -4028,6 +4029,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text,
       mentions: nextMentions.length > 0 ? nextMentions : undefined,
     };
+  }
+
+  async verifyOutboundMentionIdentity(
+    message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    candidate: { userId: string; name: string },
+  ): Promise<OutboundMentionIdentityVerification> {
+    const chatId = message.address.chatId?.trim() || '';
+    const userId = candidate.userId.trim();
+    if (!chatId || !userId) return { status: 'unavailable' };
+
+    try {
+      // 直接按平台 ID 验证当前群成员，避免“可信 ID -> 姓名 -> 再反查 ID”的脆弱链路。
+      const members = await this.fetchChatMentionCandidates(chatId);
+      const matches = members.filter((member) => member.userId === userId);
+      if (matches.length !== 1) return { status: 'not_found' };
+      return {
+        status: 'verified',
+        name: cleanMentionName(matches[0].name, candidate.name),
+      };
+    } catch (error) {
+      return {
+        status: 'lookup_failed',
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   async resolveOutboundReplyToSenderMention(

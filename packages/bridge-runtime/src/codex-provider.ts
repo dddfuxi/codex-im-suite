@@ -751,6 +751,9 @@ export class CodexProvider implements LLMProvider {
           ...clientOptions.config,
           // 部分官方/代理模型不接受 minimal；low 仍保持低延迟，且属于通用支持档位。
           model_reasoning_effort: 'low',
+          // classifier 不属于项目执行回合，禁止从进程 cwd 自动加载 AGENTS.md。
+          // 否则 bridge 运行在大型仓库时，简单 JSON 裁决也会携带整份项目规则。
+          project_doc_max_bytes: 0,
           features: CLASSIFIER_DISABLED_FEATURES,
         },
         env: clientOptions.env,
@@ -804,7 +807,12 @@ export class CodexProvider implements LLMProvider {
 
             const approvalPolicy = restrictedMode ? 'untrusted' : toApprovalPolicy(params.permissionMode);
             const sandboxMode = restrictedMode ? 'read-only' : getSandboxMode();
-            const turnPrompt = buildTurnPrompt(params);
+            const turnPrompt = classifierMode
+              ? [
+                params.systemPrompt?.trim() ? `Classifier instructions:\n${params.systemPrompt.trim()}` : '',
+                `Classifier input:\n${params.prompt.trim()}`,
+              ].filter(Boolean).join('\n\n')
+              : buildTurnPrompt(params);
             const providerWorkspace = restrictedMode ? null : resolveProviderWorkspace(params);
             const workingDirectory = restrictedMode
               ? undefined

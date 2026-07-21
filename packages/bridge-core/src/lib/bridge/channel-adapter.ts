@@ -88,6 +88,13 @@ export interface OutboundMentionResolutionInspection {
   error?: string;
 }
 
+export interface OutboundMentionIdentityVerification {
+  status: 'verified' | 'not_found' | 'lookup_failed' | 'unavailable';
+  /** 平台确认后的最新显示名；身份仍以 caller 提供的真实 evidence ID 为准。 */
+  name?: string;
+  error?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -216,6 +223,16 @@ export abstract class BaseChannelAdapter {
    * metadata using platform APIs or cached inbound context.
    */
   resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
+
+  /**
+   * 按本轮真实 evidence 中的平台 ID 验证同群 mention 身份。
+   * 该入口避免把强 ID 证据降级成姓名后再反查，也不接受模型自行生成的 ID。
+   */
+  verifyOutboundMentionIdentity?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _candidate: { userId: string; name: string },
+  ): Promise<OutboundMentionIdentityVerification>;
 
   /**
    * Resolve a return mention to the verified bot/app that sent the current

@@ -228,6 +228,7 @@ type SettingsState = {
   codexApiKeyValue: string;
   codexApiKeyMasked: string;
   codexApiKeySet: boolean;
+  safetyPolicyProfile: 'strict' | 'balanced' | 'fluent' | string;
 };
 
 type AiStrategy = 'official' | 'local_api' | 'external_api' | 'auto_failover';
@@ -1055,6 +1056,7 @@ const fallbackState: PanelState = {
     codexApiKeyValue: '',
     codexApiKeyMasked: '',
     codexApiKeySet: false,
+    safetyPolicyProfile: 'balanced',
   },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
@@ -6288,6 +6290,38 @@ function SettingsPage({
         <div className="project-fact-hint">
           <strong>项目事实</strong>
           <span>当前工作区是每轮唯一默认挂载；项目注册根只是权限上界。明确引用其他项目时，Bridge 才会为当前回合建立临时挂载，回合结束即失效。临时附件进入运行态 uploads，长期事实进入 Agent Home/记忆库，二者都不会自动注入工作区。</span>
+        </div>
+      </section>
+      <section className="panel panel-span-2">
+        <SectionHeader
+          title="自适应安全策略"
+          action={<MiniButton label="保存并重启 Bridge" icon={<RotateCw size={14} />} onClick={() => void saveAndRestartBridge()} pending={pending['settings.saveAndRestartBridge']} />}
+        />
+        <div className="ai-strategy-shell">
+          <label className="stack-field">
+            <span>安全档位</span>
+            <select
+              value={settings.safetyPolicyProfile || 'balanced'}
+              onChange={(event) => update('safetyPolicyProfile', event.target.value)}
+            >
+              <option value="balanced">智能平衡（推荐）</option>
+              <option value="fluent">流畅优先</option>
+              <option value="strict">严格模式</option>
+            </select>
+          </label>
+          <div className="project-fact-hint">
+            <strong>当前含义</strong>
+            <span>
+              {settings.safetyPolicyProfile === 'strict'
+                ? '当前已接入的同群低风险动作要求平台在线复核；接口失败时不降级。'
+                : settings.safetyPolicyProfile === 'fluent'
+                  ? '当前已接入的同群低风险动作可使用可靠平台 evidence 降级执行；真实歧义、身份冲突和高风险动作仍会拦截。'
+                  : '当前已接入的同群低风险动作在强平台 evidence 下可降级执行；跨群、广播、删除、发布和系统控制仍保留确认。'}
+            </span>
+          </div>
+          <p className="field-hint">
+            档位不会信任模型生成的用户 ID，也不会关闭 Owner、平台授权、密钥保护或高风险确认。当前首个接入场景是 Feishu 同群单人 @。
+          </p>
         </div>
       </section>
       <section className="panel panel-span-2">

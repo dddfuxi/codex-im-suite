@@ -1831,6 +1831,37 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(resolved.text, '@刘丹 哈喽呀');
   });
 
+  it('verifies a same-chat mention directly by platform id and returns the latest display name', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return [
+        { userId: 'ou_xiaoming', name: '小明（产品）', aliases: ['小明（产品）', '小明'] },
+      ];
+    };
+
+    const result = await adapter.verifyOutboundMentionIdentity({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@小明 收到。',
+    }, undefined, { userId: 'ou_xiaoming', name: '小明' });
+
+    assert.deepEqual(result, { status: 'verified', name: '小明（产品）' });
+  });
+
+  it('distinguishes a missing member from a temporary member lookup failure', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async () => [];
+    assert.deepEqual(await adapter.verifyOutboundMentionIdentity({
+      address: { channelType: 'feishu', chatId: 'oc_group' }, text: '@小明',
+    }, undefined, { userId: 'ou_xiaoming', name: '小明' }), { status: 'not_found' });
+
+    adapter.fetchChatMentionCandidates = async () => { throw new Error('timeout'); };
+    const failed = await adapter.verifyOutboundMentionIdentity({
+      address: { channelType: 'feishu', chatId: 'oc_group' }, text: '@小明',
+    }, undefined, { userId: 'ou_xiaoming', name: '小明' });
+    assert.equal(failed.status, 'lookup_failed');
+  });
+
   it('resolves bare at-name text from Feishu chat bot members when the bot has a mentionable open_id', async () => {
     setupContext({
       bridge_feishu_app_id: 'cli_app_test',

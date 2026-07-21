@@ -62,6 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
 - Control API 启动脚本：`scripts/start-control-api.ps1`
+- 安全档位：控制面板“设置 → 自适应安全策略”，默认“智能平衡”；只放宽强平台 evidence 支撑的同群低风险动作，不关闭 Owner、平台授权、身份冲突或高风险确认。
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
 - 套件清单：[suite.manifest.json](./suite.manifest.json)

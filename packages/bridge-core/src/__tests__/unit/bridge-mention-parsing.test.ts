@@ -33,6 +33,8 @@ describe('bridge mention parsing', () => {
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('请艾特乔治，让他看一下'), ['乔治']);
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('麻烦艾特大虾米一下'), ['大虾米']);
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('让 George 说话'), ['George']);
+    assert.equal(isFeishuMentionExecutionRequest('把她艾特一下'), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('把她艾特一下'), []);
   });
 
   it('keeps workflow narration and delivery diagnostics out of execution intent', () => {
