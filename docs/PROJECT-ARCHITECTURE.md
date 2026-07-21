@@ -604,7 +604,7 @@ Workflow run 运行状态：
 断点续跑第一版：
 
 - provider 创建 run 后会向 `workflow-runs.json` 写入最小恢复输入，包括 prompt、工作目录、模型、system prompt、权限模式、channelType、chatId、发起人 userId、显示名和 messageId。
-- 当流式执行进入 `status` / `result` 阶段后，runtime 会把模型来源、模型名、provider、codex profile、prompt profile 和 token 用量汇总为 run 顶层的 `execution` / `tokenUsage` 摘要；bridge-core 同步把同一份摘要作为 `RunSummary` 传给 Feishu streaming final card，在卡片底部显示当前模型、输入 / 输出 token，以及 provider 上报的 cache 读写 token；旧 run 或旧 provider 没有这些字段时保持缺省，由控制面板或卡片显示为未知/不展示。
+- 当流式执行进入 `status` / `result` 阶段后，runtime 会把模型来源、模型名、provider、codex profile、prompt profile 和 token 用量汇总为 run 顶层的 `execution` / `tokenUsage` 摘要；Codex SDK 回合额外记录 `requestedModel / submittedModel / modelMode`、请求与提交推理强度、受限回合覆盖原因、thread 模式和 `parameterEvidence=sdk_thread_options`。这些字段证明参数已经进入 SDK `ThreadOptions` 并由当前 SDK 转换为 Codex CLI 参数，但 SDK 0.132.0 不回报服务端最终模型，因此面板只能显示“已提交给 Codex”，不能写成“服务端已确认”。bridge-core 同步把兼容摘要作为 `RunSummary` 传给 Feishu streaming final card；旧 run 或旧 provider 没有这些字段时保持缺省。
 - `workflow-runs.json` 的写入仍优先走临时文件再替换；但在 Windows 上如果替换阶段遇到 `EPERM/EACCES` 文件占用，runtime 会回退为直接写目标文件，减少 retry worker 与控制面板并发读取时的写失败。
 - `workflow-runs.json` 的物理路径不再在模块加载时写死；runtime 每次读写都会按当前 `CTI_HOME` 解析目标路径，便于单测切换到临时目录，避免测试 run 污染 live 运行记录。
 - bridge-runtime 启动时会检查上一次遗留的 `running` run；有恢复输入且未耗尽次数的标为 `recoverable + retry_pending`，缺少 prompt 等关键信息的标为 `not_recoverable + failed`。
@@ -617,6 +617,18 @@ Workflow run 运行状态：
 - 当前 retry 是“重新执行最小输入”，不是恢复原 Codex 进程；如果重跑过程中出现新的权限请求，后台 retry 会失败并把错误写回 run。
 - `packages/bridge-runtime/src/workflow-contract.ts` 会把现有 `workflow-runs.json` 映射为 `packages/contracts` 中的 `WorkflowRunContract`，统一输出 input、provider、retry、delivery、finalizer checkpoint 和 trace event。当前仍不改变执行行为，只为后续 durable execution、run replay 和多节点日志聚合提供稳定契约。
 - channel binding 默认允许延续既有 Codex thread，但如果同一 chat 的 `updatedAt` 超过 `CTI_SESSION_IDLE_FRESH_MS`（默认 12 小时），`channel-router` 会先重绑到 fresh session 并清空 `sdkSessionId`，避免旧会话上下文在长时间断线后继续注入。
+- `packages/bridge-runtime/src/codex-execution-profile.ts` 是 Codex 模型来源、显式/默认模型、普通/受限推理强度和 thread fingerprint 的纯解析入口。官方、外部和本地来源共用同一语义：模型为空时不传 `--model`，模型非空时真实传入；classifier / response-only 固定提交 `low` 并记录 `restricted_interaction`，不伪装成全局推理设置失效。
+- Provider 只复用 fingerprint 一致的内存 thread。模型来源、显式模型、推理强度或脱敏端点身份变化时直接创建 fresh thread；resume 自身在首个事件前失败时仍只允许一次 fresh retry。普通执行档案 fingerprint 同时并入现有 `bridge_runtime_fingerprint`，所以“保存并重启 Bridge”后会通过 channel-router 清空旧 `sdkSessionId`，但保留 CodePilot session、工作区和聊天历史。
+
+```mermaid
+flowchart LR
+  Panel["控制面板全局配置"] --> Profile["CodexExecutionProfile"]
+  Profile --> Fingerprint["Thread fingerprint"]
+  Fingerprint --> SDK["Codex SDK ThreadOptions"]
+  SDK --> CLI["Codex CLI model / reasoning 参数"]
+  SDK --> Evidence["Workflow SDK 参数证据"]
+  Evidence --> PanelRun["控制面板运行记录"]
+```
 
 运行时状态文件：
 
