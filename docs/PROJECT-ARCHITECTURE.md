@@ -618,11 +618,14 @@ Workflow run 运行状态：
 - `packages/bridge-runtime/src/workflow-contract.ts` 会把现有 `workflow-runs.json` 映射为 `packages/contracts` 中的 `WorkflowRunContract`，统一输出 input、provider、retry、delivery、finalizer checkpoint 和 trace event。当前仍不改变执行行为，只为后续 durable execution、run replay 和多节点日志聚合提供稳定契约。
 - channel binding 默认允许延续既有 Codex thread，但如果同一 chat 的 `updatedAt` 超过 `CTI_SESSION_IDLE_FRESH_MS`（默认 12 小时），`channel-router` 会先重绑到 fresh session 并清空 `sdkSessionId`，避免旧会话上下文在长时间断线后继续注入。
 - `packages/bridge-runtime/src/codex-execution-profile.ts` 是 Codex 模型来源、显式/默认模型、普通/受限推理强度和 thread fingerprint 的纯解析入口。官方、外部和本地来源共用同一语义：模型为空时不传 `--model`，模型非空时真实传入；classifier / response-only 固定提交 `low` 并记录 `restricted_interaction`，不伪装成全局推理设置失效。
+- `config.env` 是 daemon 运行配置的跨平台事实源。Unix 启动脚本会 source 该文件；Windows runtime 在创建 Config、执行档案和 Provider 前通过 `hydrateProcessEnvironmentFromConfigFile()` 用文件值覆盖父进程继承的旧环境，避免控制面板保存新模型或推理强度后，旧进程环境继续传给 Codex SDK。只接受合法环境变量名，不执行文件内容。
 - Provider 只复用 fingerprint 一致的内存 thread。模型来源、显式模型、推理强度或脱敏端点身份变化时直接创建 fresh thread；resume 自身在首个事件前失败时仍只允许一次 fresh retry。普通执行档案 fingerprint 同时并入现有 `bridge_runtime_fingerprint`，所以“保存并重启 Bridge”后会通过 channel-router 清空旧 `sdkSessionId`，但保留 CodePilot session、工作区和聊天历史。
 
 ```mermaid
 flowchart LR
-  Panel["控制面板全局配置"] --> Profile["CodexExecutionProfile"]
+  Panel["控制面板全局配置"] --> ConfigEnv["config.env"]
+  ConfigEnv --> RuntimeEnv["Runtime 启动环境覆盖"]
+  RuntimeEnv --> Profile["CodexExecutionProfile"]
   Profile --> Fingerprint["Thread fingerprint"]
   Fingerprint --> SDK["Codex SDK ThreadOptions"]
   SDK --> CLI["Codex CLI model / reasoning 参数"]

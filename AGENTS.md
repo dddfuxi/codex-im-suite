@@ -218,6 +218,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 
 - 默认策略是同一个 Codex agent 执行任务；官方 Codex、本地模型 API、外部 API 都只是可切换的模型来源。
 - 涉及模型和推理强度时，必须区分“配置请求值”“Runtime/SDK 实际提交值”“Provider/服务端回报值”；没有服务端回报时只能声称已提交，不得把配置文件或面板文本描述为模型已确认生效。模型来源、显式模型、普通任务推理强度或端点身份改变时，不得复用执行档案 fingerprint 不匹配的 Codex thread；受限 classifier/response-only 固定 low 时必须记录覆盖原因。
+- `config.env` 是 Bridge 启动配置唯一事实源；Windows live 重启必须在创建 Provider 前用文件值覆盖父进程继承的旧环境，禁止让控制面板或 supervisor 的旧 `CTI_*` 值覆盖刚保存的模型、推理强度、来源或端点。现场验收至少核对生成的 Codex Home 配置或真实 Codex 子进程参数。
 - 本地模型不是独立本地 agent 兜底，也不能绕过 Codex agent 自行宣称完成任务。
 - 本地模型后端统一是 Ollama；默认地址 `http://127.0.0.1:11434`，默认模型 `qwen2.5-coder:7b`。
 - 不要恢复 `llama-server.exe`、GGUF 模型路径或 `127.0.0.1:8080` 作为默认本地模型链路。
