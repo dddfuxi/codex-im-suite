@@ -15,6 +15,10 @@ import type {
   WorkflowPanelStateContract as WorkflowStatus,
 } from '@codex-im-suite/contracts/workflow';
 import {
+  applyCodexSourceStrategy,
+  describeCodexWorkflowExecution,
+} from './codex-model-settings.js';
+import {
   flexRender,
   getCoreRowModel,
   getSortedRowModel,
@@ -1793,7 +1797,7 @@ function workflowStatusLabel(run: WorkflowRun) {
 }
 
 function workflowModelLabel(run: WorkflowRun) {
-  return run.execution?.model || '未知';
+  return describeCodexWorkflowExecution(run.execution).model;
 }
 
 function workflowModelSourceLabel(run: WorkflowRun) {
@@ -4270,6 +4274,7 @@ function WorkflowRunCard({
   refreshDetail: () => void | Promise<void> | undefined;
   linkReason?: WorkflowRunLink['linkReason'];
 }) {
+  const codexExecution = describeCodexWorkflowExecution(runItem.execution);
   return (
     <article className="run-card">
       <header>
@@ -4306,6 +4311,24 @@ function WorkflowRunCard({
           <dt>来源</dt>
           <dd>{workflowModelSourceLabel(runItem)}</dd>
         </div>
+        {(runItem.execution?.submittedReasoningEffort || runItem.execution?.requestedReasoningEffort) && (
+          <div>
+            <dt>推理</dt>
+            <dd>{codexExecution.reasoning}</dd>
+          </div>
+        )}
+        {runItem.execution?.threadMode && (
+          <div>
+            <dt>Thread</dt>
+            <dd>{codexExecution.thread}</dd>
+          </div>
+        )}
+        {runItem.execution?.parameterEvidence && (
+          <div>
+            <dt>参数证据</dt>
+            <dd>{codexExecution.parameterEvidence}</dd>
+          </div>
+        )}
         {runItem.execution?.promptProfile && (
           <div>
             <dt>Profile</dt>
@@ -6095,6 +6118,11 @@ function SettingsPage({
   const aiStrategy = inferAiStrategy(settings);
   const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
   const fallbackChain = parseCodexChain(settings.codexApiFallbackChain);
+  const usesExternalCodexApi = aiStrategy === 'external_api'
+    || (aiStrategy === 'auto_failover' && fallbackChain.includes('external_api'));
+  const usesConfigurableCodexModel = aiStrategy === 'official'
+    || aiStrategy === 'external_api'
+    || (aiStrategy === 'auto_failover' && (fallbackChain.includes('official') || fallbackChain.includes('external_api')));
   const executorOptions = state.executors?.executors ?? [];
   const pathSections = buildWorkspacePathSections(settings);
   const localModelOptions = useMemo(() => {
@@ -6164,48 +6192,13 @@ function SettingsPage({
   const applyAiStrategy = (strategy: AiStrategy) => {
     setSettingsDirty(true);
     setSettings((current) => {
-      const clearCodexKey = current.codexApiKeySet ? 'clear' : current.codexApiKeyAction;
-      if (strategy === 'official') {
-        return {
-          ...current,
-          codexModelSource: 'official',
-          codexRoutingMode: 'manual',
-          codexBaseUrl: '',
-          codexModel: '',
-          codexPassModel: false,
-          codexReasoningEffort: 'low',
-          codexApiKeyAction: clearCodexKey,
-          codexApiKeyValue: '',
-        };
-      }
-      if (strategy === 'local_api') {
-        return {
-          ...current,
-          codexModelSource: 'local_api',
-          codexRoutingMode: 'manual',
-          codexBaseUrl: '',
-          codexModel: '',
-          codexPassModel: true,
-          codexReasoningEffort: 'low',
-          codexApiKeyAction: clearCodexKey,
-          codexApiKeyValue: '',
-        };
-      }
-      if (strategy === 'auto_failover') {
-        return {
-          ...current,
-          codexRoutingMode: 'auto_failover',
+      const next = applyCodexSourceStrategy(current, strategy);
+      return strategy === 'auto_failover'
+        ? {
+          ...next,
           codexApiFallbackChain: formatCodexChain(current.codexApiFallbackChain || 'local_api,external_api'),
-          codexPassModel: true,
-        };
-      }
-      return {
-        ...current,
-        codexModelSource: 'external_api',
-        codexRoutingMode: 'manual',
-        codexPassModel: true,
-        codexReasoningEffort: current.codexReasoningEffort || 'low',
-      };
+        }
+        : next;
     });
   };
 
@@ -6256,8 +6249,13 @@ function SettingsPage({
 
   const saveSettings = async (restartBridge: boolean) => {
     const result = await run(restartBridge ? 'settings.saveAndRestartBridge' : 'settings.save', { settings });
-    setSettings(result as SettingsState);
+    const payload = result as SettingsState | { settings: SettingsState; applySummary?: string };
+    const savedSettings = 'settings' in payload ? payload.settings : payload;
+    setSettings(savedSettings);
     setSettingsDirty(false);
+    if ('settings' in payload && payload.applySummary) {
+      window.alert(payload.applySummary);
+    }
   };
 
   const saveAndRestartBridge = async () => {
@@ -6332,7 +6330,7 @@ function SettingsPage({
             </div>
             <div>
               <span>主脑</span>
-              <strong>{aiStrategy === 'local_api' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : aiStrategy === 'external_api' ? (settings.codexModel || '外部 API') : aiStrategy === 'auto_failover' ? fallbackChain.map((source) => CODEX_SOURCE_LABELS[source]).join(' -> ') : 'Codex 默认'}</strong>
+              <strong>{aiStrategy === 'local_api' ? `${localAiLabel(settings.localAiKind)} ${settings.localAiModel || ''}`.trim() : aiStrategy === 'external_api' ? (settings.codexModel || '外部 API 默认模型') : aiStrategy === 'auto_failover' ? fallbackChain.map((source) => CODEX_SOURCE_LABELS[source]).join(' -> ') : (settings.codexModel || 'Codex 默认模型')}</strong>
             </div>
             <div>
               <span>失败后切换</span>
@@ -6340,7 +6338,7 @@ function SettingsPage({
             </div>
           </div>
           {aiStrategy === 'official' && (
-            <p className="field-hint">使用官方 Codex 登录态和默认模型。除非选择自动切换，否则不会自动改用其他模型来源。</p>
+            <p className="field-hint">使用官方 Codex 登录态；模型留空时跟随 Codex 默认，填写后会显式提交。除非选择自动切换，否则不会改用其他模型来源。</p>
           )}
           {aiStrategy === 'local_api' && (
             <>
@@ -6431,29 +6429,35 @@ function SettingsPage({
               )}
             </div>
           )}
-          {aiStrategy === 'external_api' && (
+          {usesConfigurableCodexModel && (
             <div className="path-grid">
-              <label className="stack-field">
-                <span>主 API Base URL</span>
-                <input value={settings.codexBaseUrl} onChange={(event) => update('codexBaseUrl', event.target.value)} placeholder="例如 http://127.0.0.1:11434/v1 或 https://api.example.com/v1" />
-              </label>
-              <label className="stack-field">
-                <span>主 API Model</span>
-                <input value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)} placeholder="例如 qwen3:8b / gpt-4.1" />
-              </label>
-              <label className="stack-field">
-                <span>主 API Key · {settings.codexApiKeySet ? `已设置 ${settings.codexApiKeyMasked}` : '未设置'}</span>
-                <select value={settings.codexApiKeyAction} onChange={(event) => update('codexApiKeyAction', event.target.value as SettingsState['codexApiKeyAction'])}>
-                  <option value="keep">保持不变</option>
-                  <option value="set">设置新值</option>
-                  <option value="clear">清除</option>
-                </select>
-              </label>
-              {settings.codexApiKeyAction === 'set' && (
+              {usesExternalCodexApi && (
                 <label className="stack-field">
-                  <span>主 API Key 新值</span>
-                  <input type="password" value={settings.codexApiKeyValue} onChange={(event) => update('codexApiKeyValue', event.target.value)} />
+                  <span>主 API Base URL</span>
+                  <input value={settings.codexBaseUrl} onChange={(event) => update('codexBaseUrl', event.target.value)} placeholder="例如 http://127.0.0.1:11434/v1 或 https://api.example.com/v1" />
                 </label>
+              )}
+              <label className="stack-field">
+                <span>{aiStrategy === 'official' ? '官方 Codex Model（可选）' : 'Codex Model（可选）'}</span>
+                <input value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)} placeholder={aiStrategy === 'official' ? '留空跟随 Codex 默认模型' : '留空由当前来源决定默认模型'} />
+              </label>
+              {usesExternalCodexApi && (
+                <>
+                  <label className="stack-field">
+                    <span>主 API Key · {settings.codexApiKeySet ? `已设置 ${settings.codexApiKeyMasked}` : '未设置'}</span>
+                    <select value={settings.codexApiKeyAction} onChange={(event) => update('codexApiKeyAction', event.target.value as SettingsState['codexApiKeyAction'])}>
+                      <option value="keep">保持不变</option>
+                      <option value="set">设置新值</option>
+                      <option value="clear">清除</option>
+                    </select>
+                  </label>
+                  {settings.codexApiKeyAction === 'set' && (
+                    <label className="stack-field">
+                      <span>主 API Key 新值</span>
+                      <input type="password" value={settings.codexApiKeyValue} onChange={(event) => update('codexApiKeyValue', event.target.value)} />
+                    </label>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -6481,7 +6485,7 @@ function SettingsPage({
               )}
               <div className="settings-subhead">Codex 主 API</div>
               <label className="stack-field">
-                <span>Codex 主 API Reasoning</span>
+                <span>普通 Codex 任务推理强度</span>
                 <select value={settings.codexReasoningEffort} onChange={(event) => update('codexReasoningEffort', event.target.value)}>
                   <option value="minimal">minimal</option>
                   <option value="low">low</option>
@@ -6490,10 +6494,7 @@ function SettingsPage({
                   <option value="xhigh">xhigh</option>
                 </select>
               </label>
-              <label className="stack-field inline-field">
-                <input type="checkbox" checked={settings.codexPassModel} onChange={(event) => update('codexPassModel', event.target.checked)} />
-                <span>向 Codex 显式传递 model</span>
-              </label>
+              <p className="field-hint">模型留空时不传 model，由当前来源决定默认模型；classifier / response-only 等受限回合固定使用 low，并在 Workflow 标注覆盖原因。</p>
             </div>
           </details>
         </div>

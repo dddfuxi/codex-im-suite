@@ -897,7 +897,15 @@ internal sealed partial class MainForm : Form
                 SaveSettingsFromDialog(settingsForRestart);
                 await EnsureLocalApiReadyForSettingsAsync(settingsForRestart);
                 await RestartBridgeAsync();
-                return GetSettingsSnapshot();
+                var appliedSettings = GetSettingsSnapshot();
+                return new
+                {
+                    settings = appliedSettings,
+                    applySummary = CodexModelSettingsSupport.BuildLoadedSummary(
+                        appliedSettings.CodexModelSource,
+                        appliedSettings.CodexModel,
+                        appliedSettings.CodexReasoningEffort)
+                };
             case "history.syncAll":
                 await SyncAllFeishuHistoryAsync();
                 return GetFeishuHistorySyncStatusText(full: true);
@@ -6754,7 +6762,7 @@ exit $LASTEXITCODE
         NormalizeCodexApiFallbackChain(GetConfig("CTI_CODEX_API_FALLBACK_CHAIN", "local_api,external_api")),
         GetConfig("CTI_CODEX_BASE_URL", ""),
         GetConfig("CTI_CODEX_MODEL", ""),
-        string.Equals(GetConfig("CTI_CODEX_PASS_MODEL", "false"), "true", StringComparison.OrdinalIgnoreCase),
+        CodexModelSettingsSupport.ShouldPassModel(GetConfig("CTI_CODEX_MODEL", "")),
         NormalizeCodexReasoningEffort(GetConfig("CTI_CODEX_REASONING_EFFORT", "low")),
         string.Equals(GetConfig("CTI_MEMORY_OPTIMIZER_ENABLED", "false"), "true", StringComparison.OrdinalIgnoreCase),
         NormalizePositiveNumber(GetConfig("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", "7"), "7"),
@@ -6806,7 +6814,7 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_CODEX_API_FALLBACK_CHAIN", NormalizeCodexApiFallbackChain(settings.CodexApiFallbackChain));
         SetOrAppendEnv(lines, "CTI_CODEX_BASE_URL", settings.CodexBaseUrl.Trim());
         SetOrAppendEnv(lines, "CTI_CODEX_MODEL", settings.CodexModel.Trim());
-        SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", settings.CodexPassModel ? "true" : "false");
+        SetOrAppendEnv(lines, "CTI_CODEX_PASS_MODEL", CodexModelSettingsSupport.ShouldPassModel(settings.CodexModel) ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_CODEX_REASONING_EFFORT", NormalizeCodexReasoningEffort(settings.CodexReasoningEffort));
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_ENABLED", settings.MemoryOptimizerEnabled ? "true" : "false");
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
@@ -7338,6 +7346,11 @@ exit $LASTEXITCODE
     {
         var result = await RunPowerShellFileAsync(_daemonScript, action, _skillDir, 90000);
         AppendCommand($"daemon {action}", result);
+        if (result.ExitCode != 0)
+        {
+            var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+            throw new InvalidOperationException($"Bridge {action} 失败：{detail}".Trim());
+        }
         await CheckBridgeAsync();
     }
 
