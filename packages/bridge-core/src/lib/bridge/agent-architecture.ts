@@ -244,9 +244,10 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     id: 'policy_registry.outbound_mention_targets',
     layerId: 'policy_registry',
     title: 'Outbound Mention Target Validation',
-    responsibility: 'Resolve only explicit current-turn display-name mention commands through official current-chat evidence while keeping broadcasts, roles, relationships, and model-provided IDs non-addressable.',
+    responsibility: 'Resolve explicit current-turn display-name mention commands and verified bot-to-bot return mentions through official current-chat evidence while keeping broadcasts, roles, relationships, unrelated model names, and model-provided IDs non-addressable.',
     promptLines: [
       '- Outbound mention target policy: only a current-turn explicit request to execute @ for a concrete display name may query the current chat official member/bot roster; delivery must revalidate the unique platform identity before sending.',
+      '- Bot-to-bot return mention policy: when another bot/app natively mentions this bot, delivery may mention that sender back only after its sender app_id uniquely maps to a mentionable member_id in the current official chat roster.',
       '- Model-provided IDs, ordinary bare @ text, history-only names, broadcast audiences such as 各位、大家、全体、群成员、所有机器人, and relationship descriptions are not trusted mention targets.',
     ],
     tags: ['policy', 'mentions', 'delivery', 'target-validation'],

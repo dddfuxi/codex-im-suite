@@ -26,7 +26,7 @@ import type {
   UpsertChannelBindingInput,
 } from '../../lib/bridge/host';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
-import type { ChannelBinding, OutboundMessage, SendResult } from '../../lib/bridge/types';
+import type { ChannelBinding, InboundMessage, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -7246,6 +7246,54 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(finalized.length, 1);
     assert.match(String(finalized[0][2]), /^@乔治机器人/);
     assert.deepEqual(finalized[0][4], [{ userId: 'ou_george_bot', name: '乔治机器人' }]);
+  });
+
+  it('resolves a bot-to-bot reply mention back to the verified inbound bot sender', async () => {
+    const sent: OutboundMessage[] = [];
+    const replyResolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('反方一辩：责任归本人不等于署名本人。@乔治 请继续。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundReplyToSenderMention?: (
+        message: OutboundMessage,
+        sourceMessage?: InboundMessage,
+      ) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundReplyToSenderMention = async (message) => {
+      replyResolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('正方一辩：应署名本人。请反驳。', 'cli_george', 'oc_bot_debate'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_bot_debate',
+        userId: 'cli_george',
+        displayName: '辩论群',
+        chatType: 'group',
+      },
+      raw: {
+        feishuSender: { appId: 'cli_george', senderType: 'app', chatType: 'group' },
+        feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'app' },
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(replyResolverInputs.length, 1);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 
   it('rejects model-provided atAll in streaming card finalization', async () => {

@@ -244,8 +244,8 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-const BARE_AT_TARGET_RE = /(^|[\s([{（【])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
-const BARE_AT_BOUNDARY_CLASS = '[\\s([{（【]';
+const BARE_AT_TARGET_RE = /(^|[\s([{（【,，.。!！?？~～:：;；])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
+const BARE_AT_BOUNDARY_CLASS = '[\\s([{（【,，.。!！?？~～:：;；]';
 const BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
 const FEISHU_CARD_COMPATIBILITY_PLACEHOLDERS = [
   '请升级至最新版本客户端，以查看内容',
@@ -4030,6 +4030,48 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
   }
 
+  async resolveOutboundReplyToSenderMention(
+    message: OutboundMessage,
+    sourceMessage?: InboundMessage,
+  ): Promise<OutboundMessage> {
+    if (message.address.channelType !== 'feishu' || !sourceMessage) return message;
+    if (/<at\s+(?:id|user_id)=/iu.test(message.text)) return message;
+
+    const raw = getRawObject(sourceMessage.raw);
+    const botToBot = getRawObject(raw.feishuBotToBot);
+    const sender = getRawObject(raw.feishuSender);
+    const senderType = firstNonEmptyString(sender.senderType, sender.sender_type, botToBot.senderType).toLowerCase();
+    const senderAppId = firstNonEmptyString(sender.appId, sender.app_id);
+    if (!this.isBotOrAppSenderType(senderType) || !senderAppId) return message;
+
+    const targets = extractBareAtTargets(message.text);
+    if (targets.length === 0) return message;
+
+    const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
+    const senderCandidates = candidates.filter((candidate) => candidate.appIds?.includes(senderAppId));
+    const uniqueSenderIds = new Set(senderCandidates.map((candidate) => candidate.userId));
+    if (uniqueSenderIds.size !== 1) return message;
+
+    const senderUserId = [...uniqueSenderIds][0];
+    const senderCandidate = senderCandidates.find((candidate) => candidate.userId === senderUserId);
+    if (!senderCandidate) return message;
+    const matchingTarget = targets.find((target) => {
+      const resolved = resolveOutboundMentionTarget(target, [senderCandidate]);
+      return resolved?.userId === senderCandidate.userId;
+    });
+    if (!matchingTarget) return message;
+
+    const canonicalName = cleanMentionName(senderCandidate.name, matchingTarget);
+    const text = normalizeMentionAlias(matchingTarget) === normalizeMentionAlias(canonicalName)
+      ? message.text
+      : replaceBareAtTarget(message.text, matchingTarget, canonicalName);
+    return {
+      ...message,
+      text,
+      mentions: [{ userId: senderCandidate.userId, name: canonicalName }],
+    };
+  }
+
   async inspectOutboundMentionTarget(
     message: OutboundMessage,
     sourceMessage: InboundMessage | undefined,
@@ -4318,8 +4360,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       name: string | undefined,
       aliases: string[] = [],
       evidenceSource?: FeishuMentionCandidateEvidence,
+      appIds: string[] = [],
     ) => {
-      addFeishuMentionCandidate(byId, { userId, name, aliases, evidenceSource });
+      addFeishuMentionCandidate(byId, { userId, name, aliases, appIds, evidenceSource });
     };
 
     this.addInboundMentionCandidates(sourceMessage, (userId, name, aliases) =>
@@ -4331,7 +4374,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       try {
         const mentionCandidates = await this.fetchChatMentionCandidates(message.address.chatId);
         for (const candidate of mentionCandidates) {
-          addCandidate(candidate.userId, candidate.name, candidate.aliases, 'current_chat');
+          addCandidate(candidate.userId, candidate.name, candidate.aliases, 'current_chat', candidate.appIds);
         }
       } catch (err) {
         console.warn('[feishu-adapter] chat member mention lookup skipped:', err instanceof Error ? err.message : err);

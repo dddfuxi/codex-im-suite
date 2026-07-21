@@ -6549,6 +6549,91 @@ describe('FeishuAdapter p2p reply media recovery', () => {
     assert.equal(adapter.inboundQueue.size, 0);
   });
 
+  it('maps a bot sender app_id to its mentionable current-chat member_id for a return mention', async () => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_app_test',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const adapter = new FeishuAdapter() as any;
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [{ member_id: 'ou_liudan', name: '刘丹' }],
+            bots: [{ app_id: 'cli_george', member_id: 'ou_george', name: '乔治' }],
+            has_more: false,
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members')) {
+        return new Response(JSON.stringify({ code: 0, data: { items: [], has_more: false } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const resolved = await adapter.resolveOutboundReplyToSenderMention({
+        address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+        text: '反方一辩。@乔治 请继续。',
+        parseMode: 'Markdown',
+      }, {
+        address: { channelType: 'feishu', chatId: 'oc_group', userId: 'cli_george', chatType: 'group' },
+        messageId: 'om_source',
+        timestamp: Date.now(),
+        text: '正方一辩。请反驳。',
+        raw: {
+          feishuSender: { appId: 'cli_george', senderType: 'app' },
+          feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'app' },
+        },
+      });
+
+      assert.deepEqual(resolved.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('does not turn an unrelated model-selected name into a bot-to-bot return mention', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async () => [
+      { userId: 'ou_george', name: '乔治', aliases: ['乔治'], appIds: ['cli_george'] },
+      { userId: 'ou_liudan', name: '刘丹', aliases: ['刘丹'] },
+    ];
+
+    const resolved = await adapter.resolveOutboundReplyToSenderMention({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '@刘丹 请继续。',
+      parseMode: 'Markdown',
+    }, {
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'cli_george', chatType: 'group' },
+      messageId: 'om_source',
+      timestamp: Date.now(),
+      text: '请反驳。',
+      raw: {
+        feishuSender: { appId: 'cli_george', senderType: 'app' },
+        feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'app' },
+      },
+    });
+
+    assert.equal(resolved.mentions, undefined);
+  });
+
   it('does not enqueue a history-polled p2p message after the adapter stops mid-fetch', async () => {
     const adapter = new FeishuAdapter() as any;
     let resolvePage!: (value: unknown) => void;

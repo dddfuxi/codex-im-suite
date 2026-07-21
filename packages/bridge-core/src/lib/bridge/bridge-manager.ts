@@ -2421,8 +2421,9 @@ async function recordSelfMaintenanceSkipSafely(input: {
 
 /**
  * 用户本轮明确要求执行 @ 时，由 delivery 在当前群官方成员/机器人中确定性解析。
- * 模型只负责回复内容，不能因为它遗漏裸 @ 就跳过平台查询；普通叙述、未来流程和
- * 关系代词仍会在 mention intent 层被排除，模型单方面写出的其他名字也不会触发通知。
+ * bot-to-bot 回合另有一个窄口：仅允许回复原生唤醒当前机器人的发送方机器人，
+ * 且必须把 sender app_id 与当前群可 mention member_id 唯一关联。普通叙述、未来流程、
+ * 关系代词和模型单方面写出的其他名字仍不会触发通知。
  */
 async function resolveFeishuAgentSelectedMentions(
   adapter: BaseChannelAdapter,
@@ -2435,13 +2436,43 @@ async function resolveFeishuAgentSelectedMentions(
   },
 ): Promise<PreparedBridgeReplyPayload> {
   if (context.channelType !== 'feishu' || hasStructuredMentions(payload.mentions)) return payload;
-  if (!adapter.resolveOutboundMentions) return payload;
 
   const requestedTargets = extractExplicitFeishuMentionTargetsFromRequest(
     context.userText,
     context.mentionIntentOptions,
   );
-  if (requestedTargets.length === 0) return payload;
+  if (requestedTargets.length === 0) {
+    const raw = context.message.raw && typeof context.message.raw === 'object'
+      ? context.message.raw as Record<string, unknown>
+      : {};
+    const botToBot = raw.feishuBotToBot && typeof raw.feishuBotToBot === 'object'
+      ? raw.feishuBotToBot as Record<string, unknown>
+      : {};
+    const isBotToBotTurn = typeof botToBot.senderType === 'string' && !!botToBot.senderType.trim();
+    if (!isBotToBotTurn || !adapter.resolveOutboundReplyToSenderMention) return payload;
+    if (extractBareFeishuAtTargets(payload.text).length === 0) return payload;
+    try {
+      const resolved = await adapter.resolveOutboundReplyToSenderMention({
+        address: context.message.address,
+        text: payload.text,
+        parseMode: payload.parseMode,
+        mentions: payload.mentions,
+        replyToMessageId: payload.replyTo,
+        feishuCardJson: payload.feishuCardJson,
+      }, context.message);
+      if (!hasStructuredMentions(resolved.mentions)) {
+        return preserveReplyWithFeishuMentionNonDelivery(payload);
+      }
+      return {
+        ...payload,
+        text: resolved.text,
+        mentions: resolved.mentions,
+      };
+    } catch {
+      return preserveReplyWithFeishuMentionNonDelivery(payload);
+    }
+  }
+  if (!adapter.resolveOutboundMentions) return payload;
 
   const requestedByKey = new Map(
     requestedTargets

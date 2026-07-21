@@ -218,6 +218,15 @@ export abstract class BaseChannelAdapter {
   resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
 
   /**
+   * Resolve a return mention to the verified bot/app that sent the current
+   * inbound message. This narrow path must not resolve unrelated model names.
+   */
+  resolveOutboundReplyToSenderMention?(
+    _message: OutboundMessage,
+    _sourceMessage?: InboundMessage,
+  ): Promise<OutboundMessage>;
+
+  /**
    * Explain how a channel-native mention target was resolved or why it was not.
    * Used after normal resolution fails so blockers can say what was searched
    * without exposing platform IDs or raw API payloads.

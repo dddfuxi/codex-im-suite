@@ -9,6 +9,8 @@ export interface FeishuMentionCandidate {
   userId: string;
   name: string;
   aliases: string[];
+  /** 群机器人 sender 事件使用 app_id，原生 mention 使用 member open_id。 */
+  appIds?: string[];
   /** 证据来源只在一次出站解析期间使用，不进入长期事实。 */
   evidenceSources?: FeishuMentionCandidateEvidence[];
 }
@@ -49,6 +51,7 @@ export interface AddFeishuMentionCandidateInput {
   userId?: string;
   name?: string;
   aliases?: string[];
+  appIds?: string[];
   evidenceSource?: FeishuMentionCandidateEvidence;
 }
 
@@ -144,8 +147,13 @@ export function buildFeishuMentionCandidateFromMember(
     bot.name, bot.app_name, bot.appName, bot.bot_name, bot.botName,
     i18nName.zh_cn, i18nName.en_us, localizedName.zh_cn, localizedName.en_us,
   ]);
+  const appIds = Array.from(new Set([
+    item.app_id, item.appId, raw.app_id, raw.appId,
+    bot.app_id, bot.appId,
+  ].filter((value): value is string => typeof value === 'string' && !!value.trim())
+    .map((value) => value.trim())));
   const name = aliases[0] || '';
-  return name ? { userId, name, aliases } : null;
+  return name ? { userId, name, aliases, ...(appIds.length > 0 ? { appIds } : {}) } : null;
 }
 
 export function addFeishuMentionCandidate(
@@ -166,10 +174,15 @@ export function addFeishuMentionCandidate(
     ...(existing?.evidenceSources || []),
     ...(input.evidenceSource ? [input.evidenceSource] : []),
   ]));
+  const appIds = Array.from(new Set([
+    ...(existing?.appIds || []),
+    ...(input.appIds || []),
+  ].map((value) => value.trim()).filter(Boolean)));
   candidates.set(userId, {
     userId,
     name: existing?.name || name,
     aliases,
+    ...(appIds.length > 0 ? { appIds } : {}),
     ...(evidenceSources.length > 0 ? { evidenceSources } : {}),
   });
 }

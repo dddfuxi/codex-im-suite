@@ -141,6 +141,8 @@ describe('agent architecture registry', () => {
     assert.match(lines, /current-turn explicit request/i);
     assert.match(lines, /official member\/bot roster/i);
     assert.match(lines, /revalidate.*unique platform identity/i);
+    assert.match(lines, /bot-to-bot return mention/i);
+    assert.match(lines, /sender app_id.*mentionable member_id/i);
     assert.match(lines, /Model-provided IDs/i);
     assert.match(lines, /broadcast audiences/i);
   });
