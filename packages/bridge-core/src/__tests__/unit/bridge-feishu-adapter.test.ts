@@ -6548,6 +6548,45 @@ describe('FeishuAdapter p2p reply media recovery', () => {
 
     assert.equal(adapter.inboundQueue.size, 0);
   });
+
+  it('does not enqueue a history-polled p2p message after the adapter stops mid-fetch', async () => {
+    const adapter = new FeishuAdapter() as any;
+    let resolvePage!: (value: unknown) => void;
+    let handled = 0;
+
+    adapter.running = true;
+    adapter.resolveChatDisplayName = async () => 'private chat';
+    adapter.persistChatIndex = () => {};
+    adapter.reconcileP2pAliasBinding = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.fetchMessagePage = () => new Promise((resolve) => { resolvePage = resolve; });
+    adapter.handleIncomingEvent = async () => { handled += 1; };
+
+    const polling = adapter.pollSingleP2pChat({
+      chatId: 'oc_p2p',
+      chatType: 'p2p',
+      displayName: 'private chat',
+      lastMessageAt: '1000',
+      updatedAt: '1000',
+    });
+    await adapter.stop();
+    resolvePage({
+      items: [{
+        message_id: 'om_arrived_after_stop',
+        chat_id: 'oc_p2p',
+        create_time: '2000',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'late p2p message' }) },
+        sender: { id: 'ou_user', id_type: 'open_id', sender_type: 'user' },
+      }],
+      hasMore: false,
+      nextPageToken: '',
+    });
+    await polling;
+
+    assert.equal(handled, 0);
+    assert.equal(adapter.inboundQueue.size, 0);
+  });
 });
 
 describe('FeishuAdapter message reactions', () => {

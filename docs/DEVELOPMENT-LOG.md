@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-21 Feishu lifecycle 第二阶段迁移：新增 `channels/feishu/lifecycle/p2p-polling.ts`，把 P2P 私聊补捞的立即首轮、5 秒 interval、single-flight、重复 start timer 替换、stop 清理、失败收口和旧状态抑制从 adapter 迁出；deleted/system/self/seen/旧水位过滤与升序恢复也迁为纯函数。adapter 继续注入已注册 P2P chat、平台分页、bot/seen 判断、消息转换和运行审计，并在 fetch 返回及逐条恢复前复核 `running`，修复停机期间旧轮询仍会继续调用消息处理链的问题。TDD RED 先证明新模块不存在，并证明 stop 发生在 fetch 中时旧实现仍会处理迟到消息；GREEN 后 lifecycle 直接测试 5/5、adapter + lifecycle 专项 161/161、Core 657/657、依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码和 Git diff 检查均通过。
+
 - 2026-07-21 Feishu 表情包候选匹配修复：现场回放“发个失去意识的表情包”发现 Provider 已从 11 张真实候选中选择黑白“开始失去意识”file key，但候选 evidence 的 `preferredFileKey` 只按当前群和最近出现排序，随后被 manager 当作兜底重新写入最终动作，实际发送成黄色“晕乎震惊”。修复后 `buildStickerLibraryEvidenceForRequest()` 复用 `sticker-selection-policy`，把当前请求文本、chat、时间和可信置信度门禁一起用于 preferred 候选；具体语义无可靠匹配时不再随便选择最近表情包。TDD RED 证明较新且置信度更高的“困惑”候选会覆盖“夸人”候选，GREEN 后回归通过；adapter + selection policy 专项 160/160、Core 651/651、依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码与 Git diff 检查均通过。
 
 - 2026-07-21 Feishu lifecycle 第一阶段迁移：新增 `channels/feishu/lifecycle/inbound-queue.ts`，把入站 FIFO、等待消费者、撤回消息删除和 open/close 清理从 `feishu-adapter.ts` 迁出。新控制器把“是否开放接收”和“消费端是否等待未来消息”分离；adapter 停止或启动失败时会丢弃未处理旧任务、唤醒等待者并拒绝迟到事件，修复旧实现停止后仍可能消费停机前排队消息的问题。TDD RED 先证明新模块不存在和旧 stop 回归，GREEN 后队列直接测试 5/5、adapter 停止专项 3/3、Core 全量 651/651；依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码扫描和 Git diff 检查均通过。真实 WS/SDK/P2P 调度仍留在 adapter，lifecycle 后续还需拆分 P2P 轮询和 WS 启停/审计/清理编排。

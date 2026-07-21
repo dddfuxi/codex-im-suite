@@ -110,6 +110,10 @@ import {
 import { FeishuStreamingCardLifecycle } from '../channels/feishu/cards/streaming-card-lifecycle.js';
 import { FeishuInboundQueue } from '../channels/feishu/lifecycle/inbound-queue.js';
 import {
+  FeishuP2pPollingLifecycle,
+  selectFeishuP2pRecoveryCandidates,
+} from '../channels/feishu/lifecycle/p2p-polling.js';
+import {
   FEISHU_AT_ALL_ALIASES,
   FEISHU_SENDER_ALIASES,
   addFeishuMentionCandidate,
@@ -780,13 +784,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private chatMetaCache = new Map<string, { displayName: string; chatType?: string; cachedAt: number }>();
   private mentionHistoryCache: FeishuMentionHistoryCache | null = null;
   private botToBotLoopState = new Map<string, { count: number; updatedAt: number }>();
-  private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
-  private p2pPollInFlight = false;
+  private readonly p2pPolling: FeishuP2pPollingLifecycle;
 
   constructor() {
     super();
     // 单测和 SDK 事件包装会在显式 start 前注入消息；stop 后则由 close() 失败关闭。
     this.inboundQueue.open();
+    this.p2pPolling = new FeishuP2pPollingLifecycle({
+      intervalMs: P2P_POLL_INTERVAL_MS,
+      poll: () => this.runP2pPollCycle(),
+      onState: (state) => {
+        if (state.state === 'polling') {
+          updateFeishuP2pPollAudit({ state: 'polling', lastPollAt: state.at, lastError: '' });
+          return;
+        }
+        if (state.state === 'failed') {
+          console.warn('[feishu-adapter] p2p poll fallback failed:', state.error || 'Unknown error');
+          updateFeishuP2pPollAudit({ state: 'failed', lastError: state.error || 'Unknown error' });
+          return;
+        }
+        updateFeishuP2pPollAudit({ state: 'idle' });
+      },
+    });
   }
   private avatarImageCache = new Map<string, { buffer: Buffer; mimeType: string; extension: string; cachedAt: number }>();
   private avatarDnsCache = new Map<string, { addresses: string[]; cachedAt: number }>();
@@ -1725,6 +1744,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   async stop(): Promise<void> {
+    this.p2pPolling.stop();
     if (!this.running) return;
     this.running = false;
     updateFeishuWsAudit({ state: 'closed', lastDisconnectReason: 'adapter stop() called' });
@@ -1740,12 +1760,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       this.wsClient = null;
     }
     this.restClient = null;
-    if (this.p2pPollTimer) {
-      clearInterval(this.p2pPollTimer);
-      this.p2pPollTimer = null;
-    }
-    this.p2pPollInFlight = false;
-
     // 停止后不能继续消费旧消息；同时唤醒所有正在等待的消费者。
     this.inboundQueue.close();
 
@@ -3912,11 +3926,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private startP2pPollFallback(): void {
-    if (this.p2pPollTimer) clearInterval(this.p2pPollTimer);
-    void this.pollP2pChatsForMissedMessages();
-    this.p2pPollTimer = setInterval(() => {
-      void this.pollP2pChatsForMissedMessages();
-    }, P2P_POLL_INTERVAL_MS);
+    this.p2pPolling.start();
   }
 
   private readIndexedP2pChats(): FeishuChatIndexRecord[] {
@@ -3929,43 +3939,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private async pollP2pChatsForMissedMessages(): Promise<void> {
-    if (!this.running || this.p2pPollInFlight) return;
-    this.p2pPollInFlight = true;
-    updateFeishuP2pPollAudit({
-      state: 'polling',
-      lastPollAt: new Date().toISOString(),
-      lastError: '',
-    });
-    try {
-      const chats = this.readIndexedP2pChats();
-      for (const chat of chats) {
-        await this.pollSingleP2pChat(chat);
-      }
-      updateFeishuP2pPollAudit({ state: 'idle' });
-    } catch (err) {
-      console.warn('[feishu-adapter] p2p poll fallback failed:', err instanceof Error ? err.message : err);
-      updateFeishuP2pPollAudit({
-        state: 'failed',
-        lastError: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      this.p2pPollInFlight = false;
+  private async runP2pPollCycle(): Promise<void> {
+    if (!this.running) return;
+    const chats = this.readIndexedP2pChats();
+    for (const chat of chats) {
+      if (!this.running) break;
+      await this.pollSingleP2pChat(chat);
     }
   }
 
   private async pollSingleP2pChat(chat: FeishuChatIndexRecord): Promise<void> {
     const latestKnownTime = Number.parseInt(chat.lastMessageAt || '0', 10) || 0;
     const { items } = await this.fetchMessagePage(chat.chatId, '', 10);
-    const candidates = items
-      .filter((item) => !item.deleted)
-      .filter((item) => item.msg_type !== 'system')
-      .filter((item) => !this.isHistoryItemFromSelf(item.sender))
-      .filter((item) => !this.seenMessageIds.has(item.message_id))
-      .filter((item) => (Number.parseInt(item.create_time, 10) || 0) > latestKnownTime)
-      .sort((a, b) => (Number.parseInt(a.create_time, 10) || 0) - (Number.parseInt(b.create_time, 10) || 0));
+    if (!this.running) return;
+    const candidates = selectFeishuP2pRecoveryCandidates(items, {
+      latestKnownTime,
+      isFromSelf: (item) => this.isHistoryItemFromSelf(item.sender),
+      isSeen: (messageId) => this.seenMessageIds.has(messageId),
+    });
 
     for (const item of candidates) {
+      if (!this.running) break;
       console.log('[feishu-adapter] recovered p2p event via history poll:', item.message_id, chat.chatId);
       updateFeishuP2pPollAudit({
         state: 'recovered',
