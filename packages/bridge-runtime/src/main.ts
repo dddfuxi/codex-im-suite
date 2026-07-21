@@ -45,7 +45,7 @@ import {
   createTurnReferenceResolverSnapshot,
   type AgentTurnFocusDecisionInput,
 } from 'claude-to-im/evidence';
-import { loadConfig, configToSettings, CTI_HOME } from './config.js';
+import { hydrateProcessEnvironmentFromConfigFile, loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
 import { getOrdinaryCodexExecutionProfile } from './codex-provider.js';
 import { JsonFileStore } from './store.js';
@@ -3169,6 +3169,8 @@ function startWorkflowRetryService(
 }
 
 async function main(): Promise<void> {
+  // config.env 是跨平台运行配置事实源；先覆盖父进程继承的旧值，再创建 Provider。
+  hydrateProcessEnvironmentFromConfigFile();
   const config = loadConfig();
   const turnStorage = createRuntimeTurnStorage(config);
   setupLogger();

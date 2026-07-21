@@ -388,6 +388,33 @@ describe('loadConfig/saveConfig round-trip', () => {
     assert.equal(m.get('bridge_weixin_enabled'), 'false');
   });
 
+  it('uses config.env as the runtime process environment source after restart', async () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-runtime-env-config-'));
+    const previousCtiHome = process.env.CTI_HOME;
+    const previousReasoningEffort = process.env.CTI_CODEX_REASONING_EFFORT;
+    try {
+      fs.writeFileSync(path.join(configDir, 'config.env'), [
+        'CTI_RUNTIME=codex',
+        'CTI_CODEX_REASONING_EFFORT=xhigh',
+      ].join('\n'), 'utf-8');
+      process.env.CTI_HOME = configDir;
+      process.env.CTI_CODEX_REASONING_EFFORT = 'low';
+
+      const module = await import(`../config.js?runtime-env-${Date.now()}`);
+      module.hydrateProcessEnvironmentFromConfigFile();
+      const config = module.loadConfig();
+
+      assert.equal(config.codexReasoningEffort, 'xhigh');
+      assert.equal(process.env.CTI_CODEX_REASONING_EFFORT, 'xhigh');
+    } finally {
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      if (previousReasoningEffort === undefined) delete process.env.CTI_CODEX_REASONING_EFFORT;
+      else process.env.CTI_CODEX_REASONING_EFFORT = previousReasoningEffort;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not use deprecated llama.cpp endpoint and GGUF model as Ollama runtime source', async () => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-legacy-ollama-'));
     const previousCtiHome = process.env.CTI_HOME;

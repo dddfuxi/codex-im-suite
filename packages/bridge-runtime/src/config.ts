@@ -228,6 +228,27 @@ function parseEnvFile(content: string): Map<string, string> {
   return entries;
 }
 
+/**
+ * 将受控 config.env 投影到当前 Bridge 进程环境。
+ *
+ * Windows supervisor 不会像 Unix daemon 那样 source config.env；如果不在
+ * Runtime 启动时显式覆盖，控制面板进程继承的旧 CTI_* 值会继续传给 Codex
+ * SDK。这里只接受合法环境变量名，并按文件值覆盖继承值，使 config.env 在
+ * 各平台都保持同一事实来源。
+ */
+export function hydrateProcessEnvironmentFromConfigFile(configPath = CONFIG_PATH): void {
+  let entries: Map<string, string>;
+  try {
+    entries = parseEnvFile(fs.readFileSync(configPath, "utf-8"));
+  } catch {
+    return;
+  }
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    process.env[key] = value;
+  }
+}
+
 function splitCsv(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
   return value
