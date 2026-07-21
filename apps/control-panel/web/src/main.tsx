@@ -17,6 +17,7 @@ import type {
 import {
   applyCodexSourceStrategy,
   describeCodexWorkflowExecution,
+  inferCodexSourceStrategy,
 } from './codex-model-settings.js';
 import {
   flexRender,
@@ -245,14 +246,6 @@ const LOCAL_AI_PRESETS: Record<string, { label: string; baseUrl: string; timeout
   'openai-compatible': { label: 'OpenAI-compatible', baseUrl: 'http://127.0.0.1:8000/v1', timeoutMs: '45000' },
   custom: { label: '自定义', baseUrl: '', timeoutMs: '45000' },
 };
-
-function inferAiStrategy(settings: SettingsState): AiStrategy {
-  if ((settings.codexRoutingMode || '').trim() === 'auto_failover') return 'auto_failover';
-  const source = (settings.codexModelSource || '').trim();
-  if (source === 'local_api' || source === 'external_api') return source;
-  if (settings.codexBaseUrl.trim() || settings.codexModel.trim() || settings.codexApiKeySet || settings.codexApiKeyAction === 'set') return 'external_api';
-  return 'official';
-}
 
 function strategyLabel(strategy: AiStrategy): string {
   if (strategy === 'local_api') return '本地模型 API';
@@ -1240,7 +1233,7 @@ function formatSessionMessageCount(item: { localMessageCount?: number; remoteMes
 }
 
 function isLocalModelSourceActive(settings: SettingsState): boolean {
-  const strategy = inferAiStrategy(settings);
+  const strategy = inferCodexSourceStrategy(settings);
   return strategy === 'local_api' || (strategy === 'auto_failover' && parseCodexChain(settings.codexApiFallbackChain).includes('local_api'));
 }
 
@@ -6115,7 +6108,7 @@ function SettingsPage({
     setSettingsDirty(true);
     setSettings((current) => ({ ...current, [key]: value }));
   };
-  const aiStrategy = inferAiStrategy(settings);
+  const aiStrategy = inferCodexSourceStrategy(settings);
   const localPreset = LOCAL_AI_PRESETS[settings.localAiKind] || LOCAL_AI_PRESETS.custom;
   const fallbackChain = parseCodexChain(settings.codexApiFallbackChain);
   const usesExternalCodexApi = aiStrategy === 'external_api'

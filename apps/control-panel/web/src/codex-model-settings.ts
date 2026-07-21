@@ -31,6 +31,26 @@ export function applyCodexSourceStrategy<T extends CodexStrategySettings>(curren
   };
 }
 
+/**
+ * 优先尊重用户已经明确选择的来源；只有旧配置缺少来源字段时，才根据端点、
+ * 模型或密钥推断为 external_api。
+ */
+export function inferCodexSourceStrategy(settings: CodexStrategySettings & {
+  codexApiKeySet?: boolean;
+  codexApiKeyAction?: string;
+}): AiStrategy {
+  if ((settings.codexRoutingMode || '').trim() === 'auto_failover') return 'auto_failover';
+  const source = (settings.codexModelSource || '').trim();
+  if (source === 'official' || source === 'local_api' || source === 'external_api') return source;
+  if (
+    settings.codexBaseUrl.trim()
+    || settings.codexModel.trim()
+    || settings.codexApiKeySet
+    || settings.codexApiKeyAction === 'set'
+  ) return 'external_api';
+  return 'official';
+}
+
 function describeThreadMode(mode: WorkflowExecutionSummaryContract['threadMode']): string {
   switch (mode) {
     case 'fresh': return '新建 Thread';

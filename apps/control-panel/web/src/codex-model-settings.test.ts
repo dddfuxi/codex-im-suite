@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   applyCodexSourceStrategy,
   describeCodexWorkflowExecution,
+  inferCodexSourceStrategy,
 } from './codex-model-settings.js';
 
 describe('Codex model settings', () => {
@@ -23,6 +24,18 @@ describe('Codex model settings', () => {
     assert.equal(next.codexModel, 'gpt-5.4');
     assert.equal(next.codexReasoningEffort, 'xhigh');
     assert.equal(next.codexBaseUrl, 'https://example.test/v1');
+  });
+
+  it('keeps an explicitly selected official source when an official model is entered', () => {
+    const strategy = inferCodexSourceStrategy({
+      codexModelSource: 'official',
+      codexRoutingMode: 'manual',
+      codexBaseUrl: '',
+      codexModel: 'gpt-5.6-sol',
+      codexReasoningEffort: 'xhigh',
+    });
+
+    assert.equal(strategy, 'official');
   });
 
   it('describes source default without guessing a model', () => {
