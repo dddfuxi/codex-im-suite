@@ -2467,6 +2467,14 @@ interface StreamEvidence {
   attemptedSources?: string[];
   selectedSource?: CodexModelSource;
   model?: string;
+  requestedModel?: string;
+  submittedModel?: string;
+  modelMode?: 'source_default' | 'explicit';
+  requestedReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  submittedReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  executionOverrideReason?: 'restricted_interaction';
+  threadMode?: 'fresh' | 'resumed' | 'fresh_profile_changed' | 'fresh_resume_failed';
+  parameterEvidence?: 'sdk_thread_options';
   baseUrl?: string;
   requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
   evidenceSatisfied?: boolean;
@@ -2541,6 +2549,14 @@ function readUsageNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function isCodexReasoningEffort(value: unknown): value is NonNullable<StreamEvidence['submittedReasoningEffort']> {
+  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh';
+}
+
+function isCodexThreadMode(value: unknown): value is NonNullable<StreamEvidence['threadMode']> {
+  return value === 'fresh' || value === 'resumed' || value === 'fresh_profile_changed' || value === 'fresh_resume_failed';
+}
+
 function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
   for (const event of parseBridgeSseEvents(value)) {
     const data = event.data && typeof event.data === 'object'
@@ -2578,6 +2594,14 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       if (Array.isArray(data.attemptedSources)) evidence.attemptedSources = data.attemptedSources.filter((item): item is string => typeof item === 'string');
       if (data.selectedSource === 'local_api' || data.selectedSource === 'external_api' || data.selectedSource === 'official') evidence.selectedSource = data.selectedSource;
       if (typeof data.model === 'string') evidence.model = data.model;
+      if (typeof data.requestedModel === 'string') evidence.requestedModel = data.requestedModel;
+      if (typeof data.submittedModel === 'string') evidence.submittedModel = data.submittedModel;
+      if (data.modelMode === 'source_default' || data.modelMode === 'explicit') evidence.modelMode = data.modelMode;
+      if (isCodexReasoningEffort(data.requestedReasoningEffort)) evidence.requestedReasoningEffort = data.requestedReasoningEffort;
+      if (isCodexReasoningEffort(data.submittedReasoningEffort)) evidence.submittedReasoningEffort = data.submittedReasoningEffort;
+      if (data.executionOverrideReason === 'restricted_interaction') evidence.executionOverrideReason = data.executionOverrideReason;
+      if (isCodexThreadMode(data.threadMode)) evidence.threadMode = data.threadMode;
+      if (data.parameterEvidence === 'sdk_thread_options') evidence.parameterEvidence = data.parameterEvidence;
       if (typeof data.baseUrl === 'string') evidence.baseUrl = data.baseUrl;
       if (typeof data.evidenceProtocol === 'string') evidence.evidenceProtocol = data.evidenceProtocol;
       if (typeof data.requestedTool === 'string') evidence.requestedTool = data.requestedTool;
@@ -2654,6 +2678,14 @@ function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
   if (evidence.attemptedSources?.length) payload.attemptedSources = evidence.attemptedSources;
   if (evidence.selectedSource) payload.selectedSource = evidence.selectedSource;
   if (evidence.model) payload.model = evidence.model;
+  if (evidence.requestedModel) payload.requestedModel = evidence.requestedModel;
+  if (evidence.submittedModel) payload.submittedModel = evidence.submittedModel;
+  if (evidence.modelMode) payload.modelMode = evidence.modelMode;
+  if (evidence.requestedReasoningEffort) payload.requestedReasoningEffort = evidence.requestedReasoningEffort;
+  if (evidence.submittedReasoningEffort) payload.submittedReasoningEffort = evidence.submittedReasoningEffort;
+  if (evidence.executionOverrideReason) payload.executionOverrideReason = evidence.executionOverrideReason;
+  if (evidence.threadMode) payload.threadMode = evidence.threadMode;
+  if (evidence.parameterEvidence) payload.parameterEvidence = evidence.parameterEvidence;
   if (evidence.baseUrl) payload.baseUrl = evidence.baseUrl;
   if (evidence.requiredEvidenceKind) payload.requiredEvidenceKind = evidence.requiredEvidenceKind;
   if (typeof evidence.evidenceSatisfied === 'boolean') payload.evidenceSatisfied = evidence.evidenceSatisfied;

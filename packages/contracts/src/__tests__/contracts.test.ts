@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import type {
   ExtensionTrustPolicy,
   NodeAgentHeartbeat,
+  WorkflowPanelRunContract,
   WorkflowRunContract,
 } from '../index.js';
 
@@ -70,6 +71,33 @@ test('workflow run contract includes checkpoints and events', () => {
 
   assert.equal((schema.properties as Record<string, { const?: string }>).schema.const, run.schema);
   assert.equal(run.checkpoints[0].kind, 'provider');
+});
+
+test('workflow panel run records Codex SDK parameter evidence', () => {
+  const run: WorkflowPanelRunContract = {
+    id: 'run-codex-profile',
+    sessionId: 'session-codex-profile',
+    promptPreview: 'hello',
+    stage: 'executing',
+    status: 'running',
+    startedAt: '2026-07-21T00:00:00.000Z',
+    updatedAt: '2026-07-21T00:00:01.000Z',
+    execution: {
+      provider: 'codex',
+      modelSource: 'official',
+      requestedModel: 'gpt-5.4',
+      submittedModel: 'gpt-5.4',
+      modelMode: 'explicit',
+      requestedReasoningEffort: 'xhigh',
+      submittedReasoningEffort: 'xhigh',
+      threadMode: 'fresh_profile_changed',
+      parameterEvidence: 'sdk_thread_options',
+    },
+    events: [],
+  };
+
+  assert.equal(run.execution?.submittedModel, 'gpt-5.4');
+  assert.equal(run.execution?.parameterEvidence, 'sdk_thread_options');
 });
 
 test('extension trust policy exposes capability risk and credential scope', () => {

@@ -123,6 +123,30 @@ describe('workflow status store', () => {
     assert.equal(completed?.tokenUsage?.total_tokens, 124);
   });
 
+  it('persists Codex SDK parameter evidence from workflow events', () => {
+    const run = startWorkflowRun({
+      sessionId: 'codex-profile',
+      prompt: 'hello',
+    });
+    appendWorkflowEvent(run.id, 'finalizing', 'execution.evidence', '执行证据已记录', {
+      requestedModel: 'gpt-5.4',
+      submittedModel: 'gpt-5.4',
+      modelMode: 'explicit',
+      requestedReasoningEffort: 'xhigh',
+      submittedReasoningEffort: 'xhigh',
+      threadMode: 'fresh_profile_changed',
+      parameterEvidence: 'sdk_thread_options',
+    });
+
+    const stored = readWorkflowStatus().runs.find((item) => item.id === run.id);
+
+    assert.equal(stored?.execution?.requestedModel, 'gpt-5.4');
+    assert.equal(stored?.execution?.submittedModel, 'gpt-5.4');
+    assert.equal(stored?.execution?.submittedReasoningEffort, 'xhigh');
+    assert.equal(stored?.execution?.threadMode, 'fresh_profile_changed');
+    assert.equal(stored?.execution?.parameterEvidence, 'sdk_thread_options');
+  });
+
   it('preserves structured input evidence receipts in workflow summaries', () => {
     const run = startWorkflowRun({
       sessionId: 'session-input-evidence',

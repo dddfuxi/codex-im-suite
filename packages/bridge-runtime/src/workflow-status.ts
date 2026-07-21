@@ -110,6 +110,30 @@ function readSelectedSource(value: unknown): 'local_api' | 'external_api' | 'off
   return value === 'local_api' || value === 'external_api' || value === 'official' ? value : undefined;
 }
 
+function readModelMode(value: unknown): WorkflowExecutionSummary['modelMode'] | undefined {
+  return value === 'source_default' || value === 'explicit' ? value : undefined;
+}
+
+function readReasoningEffort(value: unknown): WorkflowExecutionSummary['requestedReasoningEffort'] | undefined {
+  return value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh'
+    ? value
+    : undefined;
+}
+
+function readExecutionOverrideReason(value: unknown): WorkflowExecutionSummary['executionOverrideReason'] | undefined {
+  return value === 'restricted_interaction' ? value : undefined;
+}
+
+function readThreadMode(value: unknown): WorkflowExecutionSummary['threadMode'] | undefined {
+  return value === 'fresh' || value === 'resumed' || value === 'fresh_profile_changed' || value === 'fresh_resume_failed'
+    ? value
+    : undefined;
+}
+
+function readParameterEvidence(value: unknown): WorkflowExecutionSummary['parameterEvidence'] | undefined {
+  return value === 'sdk_thread_options' ? value : undefined;
+}
+
 function readEvidenceKind(value: unknown): WorkflowExecutionSummary['requiredEvidenceKind'] | undefined {
   return value === 'none' || value === 'input_evidence_required' || value === 'local_read_required' || value === 'tool_required' || value === 'artifact_required'
     ? value
@@ -174,6 +198,14 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     attemptedSources: readSourceList(source.attemptedSources),
     selectedSource: readSelectedSource(source.selectedSource),
     model: readStringField(source.model),
+    requestedModel: readStringField(source.requestedModel),
+    submittedModel: readStringField(source.submittedModel),
+    modelMode: readModelMode(source.modelMode),
+    requestedReasoningEffort: readReasoningEffort(source.requestedReasoningEffort),
+    submittedReasoningEffort: readReasoningEffort(source.submittedReasoningEffort),
+    executionOverrideReason: readExecutionOverrideReason(source.executionOverrideReason),
+    threadMode: readThreadMode(source.threadMode),
+    parameterEvidence: readParameterEvidence(source.parameterEvidence),
     baseUrl: readStringField(source.baseUrl),
     requiredEvidenceKind: readEvidenceKind(source.requiredEvidenceKind),
     evidenceSatisfied: readBooleanField(source.evidenceSatisfied),

@@ -32,6 +32,14 @@ export interface WorkflowExecutionSummaryContract {
   attemptedSources?: string[];
   selectedSource?: 'local_api' | 'external_api' | 'official';
   model?: string;
+  requestedModel?: string;
+  submittedModel?: string;
+  modelMode?: 'source_default' | 'explicit';
+  requestedReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  submittedReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  executionOverrideReason?: 'restricted_interaction';
+  threadMode?: 'fresh' | 'resumed' | 'fresh_profile_changed' | 'fresh_resume_failed';
+  parameterEvidence?: 'sdk_thread_options';
   baseUrl?: string;
   requiredEvidenceKind?: 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
   evidenceSatisfied?: boolean;
