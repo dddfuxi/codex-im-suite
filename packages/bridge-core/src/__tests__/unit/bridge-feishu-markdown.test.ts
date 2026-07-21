@@ -129,6 +129,22 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(content, /@张三/);
   });
 
+  it('does not leak native at tags into the finalized card title', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '<at userid="all">所有人</at> <at userid="ou_bot">机器人</at>',
+      '@所有人 @机器人 都通知到了。',
+    ].join('\n'), [], null)) as {
+      header?: { title?: { content?: string } };
+      body?: { elements?: Array<{ content?: string }> };
+    };
+
+    const title = String(card.header?.title?.content || '');
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+    assert.doesNotMatch(title, /<\/?at\b|userid=/iu);
+    assert.match(title, /所有人|机器人/u);
+    assert.match(content, /都通知到了/u);
+  });
+
   it('renders post mentions in text order even when mention metadata order differs', () => {
     const post = JSON.parse(buildPostContent('@Bob and @Alice', [
       { userId: 'ou_alice', name: 'Alice' },

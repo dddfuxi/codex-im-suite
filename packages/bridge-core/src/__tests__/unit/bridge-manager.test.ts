@@ -6488,7 +6488,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not resolve an explicit Feishu display name into a native mention automatically', async () => {
+  it('resolves an explicit Feishu display name from the current official chat roster', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -6525,10 +6525,10 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
-    assert.doesNotMatch(reply!.text, /@乔治/);
-    assert.match(reply!.text, /原生 @ 未投递/);
-    assert.equal(reply!.mentions, undefined);
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.match(reply!.text, /^@乔治/u);
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 
   it('routes Feishu native mention tasks through the agent instead of a shortcut mention reply', async () => {
@@ -6909,6 +6909,68 @@ describe('bridge-manager policy helpers', () => {
     assert.match(sent[0].text, /@大虾米/);
     assert.match(sent[0].text, /房间里没有窗/);
     assert.doesNotMatch(sent[0].text, /原生 @ 未投递|当前不再按文字自动解析/);
+  });
+
+  it('resolves an explicit current-turn mention even when the agent reply omits the bare at target', async () => {
+    const sent: OutboundMessage[] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    const systemPrompts: string[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params: any) => {
+          systemPrompts.push(params.systemPrompt || '');
+          return createTextStream('收到，我来通知。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage, sourceMessage?: any) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    adapter.inspectOutboundMentionTarget = async (_message, _sourceMessage, target) => ({
+      target,
+      status: 'resolved',
+      searchedSources: ['当前群成员', '当前群机器人'],
+      candidates: [{ name: '乔治' }],
+    });
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return message.text.includes('@乔治')
+        ? {
+            ...message,
+            mentions: [{ userId: 'ou_george', name: '乔治' }],
+          }
+        : message;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('艾特乔治', 'ou_sender', 'oc_group'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        userId: 'ou_sender',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(resolverInputs.length, 1);
+    assert.match(systemPrompts[0], /当前群官方成员.*唯一确认.*乔治/u);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    assert.match(sent[0].text, /^@乔治/u);
+    assert.doesNotMatch(sent[0].text, /原生 @ 未投递/);
   });
 
   it('normalizes supported mention id field spellings and matches them against current native evidence', async () => {
@@ -7388,7 +7450,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not resolve a compact Feishu mention command from a wake alias', async () => {
+  it('queries the official roster for a compact Feishu mention command from a wake alias', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -7417,7 +7479,8 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
@@ -7711,7 +7774,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(inspectorCalled, false);
   });
 
-  it('does not resolve an explicit Feishu at command even when it includes a delivery reason', async () => {
+  it('queries the official roster for an explicit Feishu at command with a delivery reason', async () => {
     const sent: OutboundMessage[] = [];
     let resolverCalled = false;
     initBridgeContext({
@@ -7728,12 +7791,12 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverCalled, false);
+    assert.equal(resolverCalled, true);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not resolve a robot type-suffixed Feishu display name automatically', async () => {
+  it('normalizes a robot type suffix before querying the official roster', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({ store: createMinimalStore({ remote_bridge_enabled: 'true' }), llm: { streamChat: () => createTextStream('好，我去叫乔治。') }, permissions: { resolvePendingPermission: () => false }, lifecycle: {} });
@@ -7746,13 +7809,14 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not resolve a placeholder mention string into a display-name target automatically', async () => {
+  it('queries by the user-provided display name without trusting the model placeholder', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({ store: createMinimalStore({ remote_bridge_enabled: 'true' }), llm: { streamChat: () => createTextStream(['```cti-final', '{"kind":"text","text":"乔治乔治，出来接客啦～ @_user_1","images":[],"files":[],"reply_mode":"plain","mentions":["_user_1"]}', '```'].join('\n')) }, permissions: { resolvePendingPermission: () => false }, lifecycle: {} });
@@ -7765,7 +7829,8 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
     assert.doesNotMatch(reply!.text, /@_user_1/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
@@ -7852,7 +7917,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not auto-resolve a named Feishu target that the user asks to speak', async () => {
+  it('resolves a named Feishu target that the user explicitly asks to speak', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -7897,14 +7962,13 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
+    assert.equal(resolverInputs.length, 1);
     assert.doesNotMatch(reply!.text, /@_user_1/);
-    assert.doesNotMatch(reply!.text, /@George/);
-    assert.match(reply!.text, /原生 @ 未投递/);
-    assert.equal(reply!.mentions, undefined);
+    assert.match(reply!.text, /^@George/u);
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: 'George' }]);
   });
 
-  it('does not auto-resolve a named Feishu target followed by a pronoun action', async () => {
+  it('resolves a named Feishu target followed by an explicit pronoun action', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -7943,13 +8007,12 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 0);
-    assert.doesNotMatch(reply!.text, /@苏木/);
-    assert.match(reply!.text, /原生 @ 未投递/);
-    assert.equal(reply!.mentions, undefined);
+    assert.equal(resolverInputs.length, 1);
+    assert.match(reply!.text, /^@苏木/u);
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_sumu', name: '苏木' }]);
   });
 
-  it('does not query the resolver for an explicit Feishu display name', async () => {
+  it('queries the resolver for an explicit Feishu display name', async () => {
     const sent: OutboundMessage[] = [];
     let resolverCalls = 0;
     initBridgeContext({
@@ -7983,13 +8046,13 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverCalls, 0);
+    assert.equal(resolverCalls, 1);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('does not inspect Feishu members or bots for a display-name mention request', async () => {
+  it('inspects official Feishu members and bots before a display-name mention request reaches the agent', async () => {
     const sent: OutboundMessage[] = [];
     const inspectedTargets: string[] = [];
     initBridgeContext({
@@ -8029,7 +8092,7 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.deepEqual(inspectedTargets, []);
+    assert.deepEqual(inspectedTargets, ['乔治']);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.doesNotMatch(reply!.text, /我已查：|找到的相关候选/);
     assert.match(reply!.text, /原生 @ 未投递/);

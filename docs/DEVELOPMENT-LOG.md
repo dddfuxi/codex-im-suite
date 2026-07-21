@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-21 Feishu 显示名 mention 查询与卡片标题修复：真实回放“艾特乔治”确认群成员新接口能返回乔治及可 mention `open_id`，但旧 manager 只有在 Agent 最终回复先主动写出同名裸 `@` 时才调用 resolver；模型同时受旧 Policy Registry“不得按显示名查成员”约束，因而先回答“找不到”，官方成员查询从未发生。现改为仅对当前回合明确执行、且可提取具体显示名的 mention 命令做两阶段官方核验：Provider 前通过 adapter inspector 查询当前群成员/机器人并注入不含平台 ID 的受控 evidence，Delivery 再用同一真实候选唯一解析；即使 Agent 漏写裸 `@`，也会只为用户明确目标补 resolver 输入，模型单方面名字、广播、关系称呼、流程叙述和历史名字仍不能触发通知，模型 ID 继续不可信。同名多 ID、查无目标或平台失败仍失败关闭并保留未投递说明。流式最终卡片标题同时清洗原生 `<at ...>可见名</at>` 标记，只保留可见名称，避免标签泄漏到 plain-text header。TDD RED/GREEN 覆盖 Agent 漏写目标、当前群唯一解析、旧禁查规则更新与标题标签清洗。
+
 - 2026-07-21 Feishu lifecycle 第二阶段迁移：新增 `channels/feishu/lifecycle/p2p-polling.ts`，把 P2P 私聊补捞的立即首轮、5 秒 interval、single-flight、重复 start timer 替换、stop 清理、失败收口和旧状态抑制从 adapter 迁出；deleted/system/self/seen/旧水位过滤与升序恢复也迁为纯函数。adapter 继续注入已注册 P2P chat、平台分页、bot/seen 判断、消息转换和运行审计，并在 fetch 返回及逐条恢复前复核 `running`，修复停机期间旧轮询仍会继续调用消息处理链的问题。TDD RED 先证明新模块不存在，并证明 stop 发生在 fetch 中时旧实现仍会处理迟到消息；GREEN 后 lifecycle 直接测试 5/5、adapter + lifecycle 专项 161/161、Core 657/657、依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码和 Git diff 检查均通过。
 
 - 2026-07-21 Feishu 表情包候选匹配修复：现场回放“发个失去意识的表情包”发现 Provider 已从 11 张真实候选中选择黑白“开始失去意识”file key，但候选 evidence 的 `preferredFileKey` 只按当前群和最近出现排序，随后被 manager 当作兜底重新写入最终动作，实际发送成黄色“晕乎震惊”。修复后 `buildStickerLibraryEvidenceForRequest()` 复用 `sticker-selection-policy`，把当前请求文本、chat、时间和可信置信度门禁一起用于 preferred 候选；具体语义无可靠匹配时不再随便选择最近表情包。TDD RED 证明较新且置信度更高的“困惑”候选会覆盖“夸人”候选，GREEN 后回归通过；adapter + selection policy 专项 160/160、Core 651/651、依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码与 Git diff 检查均通过。

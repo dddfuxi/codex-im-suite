@@ -2420,9 +2420,9 @@ async function recordSelfMaintenanceSkipSafely(input: {
 }
 
 /**
- * 只有“用户本轮明确要求的显示名”与“Agent 最终主动选择的裸 @”相交时，
- * 才允许调用飞书 adapter 的官方成员/机器人 resolver。这样既能恢复自然语言
- * @ 投递，又不会让用户文本或模型单方面写出的任意名字触发平台身份查询。
+ * 用户本轮明确要求执行 @ 时，由 delivery 在当前群官方成员/机器人中确定性解析。
+ * 模型只负责回复内容，不能因为它遗漏裸 @ 就跳过平台查询；普通叙述、未来流程和
+ * 关系代词仍会在 mention intent 层被排除，模型单方面写出的其他名字也不会触发通知。
  */
 async function resolveFeishuAgentSelectedMentions(
   adapter: BaseChannelAdapter,
@@ -2448,19 +2448,27 @@ async function resolveFeishuAgentSelectedMentions(
       .map((target) => [normalizeFeishuMentionTargetKey(target), target] as const)
       .filter(([key]) => !!key),
   );
-  const selectedTargets = new Map<string, string>();
+  const selectedTargets = new Map(requestedByKey);
   for (const target of extractBareFeishuAtTargets(payload.text)) {
     const key = normalizeFeishuMentionTargetKey(target);
     if (key && requestedByKey.has(key)) selectedTargets.set(key, requestedByKey.get(key) || target);
   }
-  if (selectedTargets.size === 0) return payload;
 
-  // resolver 只看到三重交集内的 @；题面、引用或说明中的其他裸 @ 只保留文字，不产生通知。
+  // resolver 只看到用户本轮明确要求的目标；题面、引用或说明中的其他裸 @ 不产生通知。
   let resolverText = payload.text;
   for (const target of extractBareFeishuAtTargets(payload.text)) {
     if (!selectedTargets.has(normalizeFeishuMentionTargetKey(target))) {
       resolverText = stripBareFeishuAtTarget(resolverText, target);
     }
+  }
+  const presentTargetKeys = new Set(
+    extractBareFeishuAtTargets(resolverText).map(normalizeFeishuMentionTargetKey).filter(Boolean),
+  );
+  const missingTargetPrefixes = [...selectedTargets]
+    .filter(([key]) => !presentTargetKeys.has(key))
+    .map(([, target]) => `@${target}`);
+  if (missingTargetPrefixes.length > 0) {
+    resolverText = [missingTargetPrefixes.join(' '), resolverText].filter(Boolean).join('\n');
   }
 
   try {
@@ -3678,6 +3686,58 @@ function recordFeishuOAuthRequestAudit(
     userId: msg.address.userId,
   }, result);
   if (auditInput) getBridgeContext().store.insertAuditLog(auditInput);
+}
+
+async function buildFeishuMentionResolutionPrompt(
+  adapter: BaseChannelAdapter,
+  context: {
+    channelType: string;
+    userText: string;
+    message: InboundMessage;
+    mentionIntentOptions?: FeishuMentionIntentOptions;
+  },
+): Promise<string> {
+  if (context.channelType !== 'feishu' || !adapter.inspectOutboundMentionTarget) return '';
+  const targets = extractExplicitFeishuMentionTargetsFromRequest(
+    context.userText,
+    context.mentionIntentOptions,
+  );
+  if (targets.length === 0) return '';
+
+  const results = await Promise.all(targets.map(async (target) => {
+    try {
+      return await adapter.inspectOutboundMentionTarget!({
+        address: context.message.address,
+        text: `@${target}`,
+        parseMode: 'plain',
+        replyToMessageId: context.message.messageId,
+      }, context.message, target);
+    } catch {
+      return null;
+    }
+  }));
+
+  const lines = results.flatMap((result) => {
+    if (!result) return [];
+    if (result.status === 'resolved') {
+      return [`- 当前群官方成员/机器人已唯一确认显示名“${result.target}”。`];
+    }
+    if (result.status === 'ambiguous') {
+      return [`- 显示名“${result.target}”在当前群不是唯一身份；不要声称已完成原生 @。`];
+    }
+    if (result.status === 'not_found') {
+      return [`- 当前群官方成员/机器人没有找到显示名“${result.target}”；不要伪造平台身份。`];
+    }
+    return [`- 显示名“${result.target}”的平台查询失败；不要声称已完成原生 @。`];
+  });
+  if (lines.length === 0) return '';
+
+  return [
+    'Feishu mention resolution evidence (authoritative, current turn only):',
+    ...lines,
+    '- 对已唯一确认且用户本轮明确要求执行的目标，在最终可见回复中写出同名裸 @（例如 @显示名）；delivery 会再次核验并转换成原生提及。',
+    '- 不要输出、猜测或复述平台用户 ID；普通叙述、广播对象、角色和关系称呼仍不得触发身份查询。',
+  ].join('\n');
 }
 
 function permissionRank(role: PermissionRole): number {
@@ -5812,6 +5872,13 @@ async function handleMessage(
     // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
     // 此处仅放当前回合理解和结构化投递所必需的受控 evidence，不混入表情包或记忆写入策略。
     // 原生 mention / sender ID 必须独立保留，否则长 system prompt 会让模型知道动作协议却看不到真实目标。
+    const feishuMentionResolutionPrompt = await buildFeishuMentionResolutionPrompt(adapter, {
+      channelType: adapter.channelType,
+      userText: rawText,
+      message: msg,
+      mentionIntentOptions: feishuMentionIntentOptions,
+    });
+    if (taskAbort.signal.aborted) return;
     let stickerExpressionPromptSection: Awaited<ReturnType<NonNullable<ReturnType<typeof getBridgeContext>['stickerSemantics']>['buildExpressionPromptSection']>> = null;
     const stickerSemanticsHost = getBridgeContext().stickerSemantics;
     if (adapter.channelType === 'feishu' && stickerSemanticsHost) {
@@ -5829,6 +5896,7 @@ async function handleMessage(
     const priorityTurnContext = [
       structuredTurnContextPrompt,
       inboundActorContextPrompt,
+      feishuMentionResolutionPrompt,
       feishuAvatarEvidencePrompt,
     ].filter(Boolean).join('\n\n');
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
@@ -5867,6 +5935,7 @@ async function handleMessage(
         adapterIdentityPrompt,
         assistantMaintainerContextPrompt,
         inboundActorContextPrompt,
+        feishuMentionResolutionPrompt,
         fastPathOptions.extraSystemPrompt,
         hasStructuredConversationEvidence ? '' : feishuConversationContextPrompt,
         feishuHistoryEvidencePrompt,

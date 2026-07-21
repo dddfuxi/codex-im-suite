@@ -660,6 +660,9 @@ function stripFeishuInlineHintText(text: string): string {
 
 function sanitizeFinalCardTitle(title: string): string {
   const cleaned = title
+    // Card headers are plain text. Keep the visible label but never expose native mention markup.
+    .replace(/<at\b[^>]*>([\s\S]*?)<\/at>/giu, '$1')
+    .replace(/<at\b[^>]*\/?\s*>/giu, '')
     .replace(/^[-*>\s#]+/u, '')
     .replace(/[*_`~]/g, '')
     .replace(/\s+/g, ' ')

@@ -135,6 +135,16 @@ describe('agent architecture registry', () => {
     assert.equal(isNonAddressableMentionTarget('乔治'), false);
   });
 
+  it('allows only explicit current-turn display names to reach official mention resolution', () => {
+    const lines = getAgentPolicyPromptLines(['policy_registry.outbound_mention_targets']).join('\n');
+
+    assert.match(lines, /current-turn explicit request/i);
+    assert.match(lines, /official member\/bot roster/i);
+    assert.match(lines, /revalidate.*unique platform identity/i);
+    assert.match(lines, /Model-provided IDs/i);
+    assert.match(lines, /broadcast audiences/i);
+  });
+
   it('decides skill autonomy from source and risk instead of names', () => {
     assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'installed', risk: 'low', changeKind: 'none' }), 'use');
     assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'official_curated', risk: 'low', changeKind: 'install' }), 'confirm_user');
