@@ -6,6 +6,7 @@
 
 - 始终使用中文回复。
 - 在 Windows/PowerShell 中把中文内容交给 Node/Python/CLI 时，禁止用未设置 UTF-8 的管道或 here-string 直接喂 stdin；优先用 UTF-8 文件、Unicode 环境变量或 base64，并在外发前用码点/回读验证没有变成 `?`。
+- Windows PowerShell 5.1 的用户 Profile 由 `scripts/windows-powershell-utf8-profile.ps1` 以受控区块维护；任何 `powershell.exe -NoProfile` 调用都必须在命令内显式设置 `$OutputEncoding`、`[Console]::InputEncoding` 和 `[Console]::OutputEncoding`，不得假设用户 Profile 会生效。
 - 先确认当前修改对象是 `codex-im-suite` 开发版，还是本机 live skill。
 - 默认只修改开发版仓库：`C:\Users\admin\Documents\New project\codex-im-suite`。
 - 遇到同名文件、旧副本或不确定该改哪里时，先看 `suite.manifest.json`，再运行 `scripts/doctor-suite-targets.ps1`；不要把 live skill 或 `release/*` 当成开发主线。
@@ -65,6 +66,7 @@
 - 只有本轮当前消息中的明确绝对路径等强证据才能临时挂载其他项目；临时挂载必须记录 evidence、reason、accessMode 和 `expiresAfterTurn=true`，不能沉淀成全局附加目录。
 - 记忆库、`CTI_HOME` 运行态、上传缓存、日志和发布产物不得提升为普通 workspace。它们只能通过各自的受控检索、附件、审计或发布能力访问。
 - `packages/bridge-runtime/src/turn-storage.ts` 与 `artifacts/*` 是 Upload、Artifact、Scratch 的唯一运行时所有者；入站附件、Provider 生成物和工具结果必须按 `sessionId/turnId` 归属并记录来源、稳定 `artifactId`、SHA-256 和 TTL，不得回退 `process.cwd()`、项目 `.codepilot-uploads` 或平铺 `runtime/ignis-assets|asset-pipeline`。
+- `packages/bridge-runtime/src/artifact-encoding-inspector.ts` 是文本和 ZIP 产物外发前编码检查的唯一 Runtime Host 实现；Bridge 只能通过 `ArtifactEncodingInspectorHost` 调用。严格 UTF-8、替换字符、连续问号、ZIP 路径和解压限制任一失败时必须清空本轮附件并明确回复“文件编码检查失败，未发送”，不得绕过检查或泄露本地绝对路径。
 - 产物写入项目只能使用 `cti-artifact-promote` 结构化动作，且只允许 `artifactId / targetProjectId / targetRelativePath / expectedSha256` 四个字段。Bridge 必须重新验证当前消息的明确写入意图和 Owner 身份，Runtime 必须重新解析 Registry、访问模式、禁止根、相对路径、符号链接、目标存在性和 Hash；模型提供的绝对路径、workspace、角色或替代源路径一律不可信。
 - 新长期记忆只写入 `codex-im-suite/memory/v3`：用户使用 `memory/users/<channel>/<userId>/用户印象.md`，群聊使用 `memory/groups/<channel>/<chatId>/群聊记忆.md`，公共长期事实使用 `memory/long-term/公共长期记忆.md`。
 - Agent Home 根目录只保留 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md` 五个固定入口；`记忆总索引.md` 只引用真实源文件，不得复制事实形成第二事实源。

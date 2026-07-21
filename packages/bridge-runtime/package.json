@@ -16,13 +16,15 @@
     "claude-to-im": "file:../bridge-core",
     "croner": "^10.0.1",
     "iconv-lite": "^0.7.2",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "yauzl": "^3.4.0"
   },
   "optionalDependencies": {
     "@openai/codex-sdk": "^0.132.0"
   },
   "devDependencies": {
     "@types/node": "^22",
+    "@types/yauzl": "^3.4.0",
     "esbuild": "^0.25.0",
     "tsx": "^4.21.0",
     "typescript": "^5"

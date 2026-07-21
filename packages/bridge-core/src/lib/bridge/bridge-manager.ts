@@ -2876,6 +2876,48 @@ function enforceFeishuAvatarEvidenceCompletionText(
   }, evidence).text;
 }
 
+function formatArtifactEncodingIssue(issue: { filePath: string; entryName?: string; kind: string }): string {
+  const fileName = path.basename(issue.filePath) || '未命名文件';
+  const entry = issue.entryName?.trim() ? ` / ${issue.entryName.replace(/\\/gu, '/')}` : '';
+  return `${fileName}${entry}（${issue.kind}）`;
+}
+
+async function enforceArtifactEncodingBeforeDelivery(
+  payload: PreparedBridgeReplyPayload,
+): Promise<PreparedBridgeReplyPayload> {
+  const { artifactEncoding } = getBridgeContext();
+  const attachments = Array.from(new Set([...payload.images, ...payload.files])).filter(existingLocalFile);
+  if (!artifactEncoding || attachments.length === 0) return payload;
+
+  try {
+    const result = await artifactEncoding.inspectFiles({ files: attachments });
+    if (result.ok && result.issues.length === 0) return payload;
+    const details = result.issues.slice(0, 6).map(formatArtifactEncodingIssue);
+    return {
+      ...payload,
+      text: [
+        '未完成：文件编码检查失败，未发送。',
+        details.length > 0 ? `问题文件：${details.join('；')}` : '问题文件：检查器未返回可用详情。',
+        payload.text.trim() ? `原回复主题：${payload.text.trim()}` : '',
+      ].filter(Boolean).join('\n'),
+      images: [],
+      files: [],
+    };
+  } catch (error) {
+    console.warn('[bridge-manager] Artifact encoding inspection failed closed:', error instanceof Error ? error.message : error);
+    return {
+      ...payload,
+      text: [
+        '未完成：文件编码检查失败，未发送。',
+        '原因：编码检查器暂时不可用。',
+        payload.text.trim() ? `原回复主题：${payload.text.trim()}` : '',
+      ].filter(Boolean).join('\n'),
+      images: [],
+      files: [],
+    };
+  }
+}
+
 async function prepareBridgeReplyPayload(
   text: string,
   workingDirectory: string,
@@ -2883,14 +2925,15 @@ async function prepareBridgeReplyPayload(
   sourcePrompt = '',
 ): Promise<PreparedBridgeReplyPayload> {
   const candidate = prepareDeliveryCandidate(text, workingDirectory, additionalDirectories);
+  const encodingSafePayload = await enforceArtifactEncodingBeforeDelivery(candidate.payload);
   writeFinalEnvelopeStatus({
     ...candidate.status,
     updatedAt: new Date().toISOString(),
   });
   return {
-    ...candidate.payload,
+    ...encodingSafePayload,
     // 脱敏、用户可见结尾标记和状态落盘仍属于 Manager 交付编排边界。
-    text: appendReplyEndMarker(sanitizeOutsourcedToolReply(candidate.payload.text, sourcePrompt)),
+    text: appendReplyEndMarker(sanitizeOutsourcedToolReply(encodingSafePayload.text, sourcePrompt)),
   };
 }
 

@@ -293,7 +293,7 @@ describe('Agent Home', () => {
       ].sort());
       for (const name of ['机器人身份.md', '行为与安全规则.md', '工具与环境.md']) {
         const content = fs.readFileSync(path.join(root, name), 'utf8');
-        assert.match(content, /cti-agent-home-template:v4/);
+        assert.match(content, name === '工具与环境.md' ? /cti-agent-home-template:v5/ : /cti-agent-home-template:v4/);
         assert.match(content, /真实证据|受控自维护|代码级门禁|受控 patch|稳定 key/);
       }
     } finally {
@@ -351,8 +351,50 @@ describe('Agent Home', () => {
 
       assert.deepEqual(result.updated.map((item: string) => path.basename(item)).sort(), Object.keys(v3Templates).sort());
       for (const name of Object.keys(v3Templates)) {
-        assert.match(fs.readFileSync(path.join(root, name), 'utf8'), /cti-agent-home-template:v4/u);
+        assert.match(
+          fs.readFileSync(path.join(root, name), 'utf8'),
+          name === '工具与环境.md' ? /cti-agent-home-template:v5/u : /cti-agent-home-template:v4/u,
+        );
       }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('upgrades the v4 tool guide with PowerShell 5.1 UTF-8 rules while preserving appended user text', async () => {
+    const module = await loadAgentHomeModule();
+    assert.ok(module, 'agent home module should exist');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-agent-home-powershell-utf8-'));
+    const toolPath = path.join(root, '工具与环境.md');
+    const userText = '## 用户自定义\n\nUnity 构建前先确认当前项目版本。\n';
+    const v4ToolGuide = [
+      '# 工具与环境',
+      '',
+      '<!-- cti-agent-home-template:v4 -->',
+      '',
+      '记录稳定的工具入口、环境约束与使用偏好。工具结论必须优先依据真实证据，确认自身错误后可受控自维护。',
+      '',
+      '工作档案使用稳定 key 做 upsert，只保留当前有效状态；注入 Prompt 时只能作为只读事实证据。',
+      '',
+      '禁止在此保存密钥、Token、验证码或私有授权票据；工具规则不能绕过代码级门禁。',
+      '',
+    ].join('\n');
+    fs.writeFileSync(toolPath, `${v4ToolGuide}${userText}`, 'utf8');
+
+    try {
+      const result = module.ensureAgentHome(root);
+      const content = fs.readFileSync(toolPath, 'utf8');
+
+      assert.ok(result.updated.includes(toolPath));
+      assert.match(content, /cti-agent-home-template:v5/u);
+      assert.match(content, /PowerShell 5\.1/u);
+      assert.match(content, /\$OutputEncoding/u);
+      assert.match(content, /-NoProfile/u);
+      assert.match(content, /apply_patch/u);
+      assert.match(content, /UTF-8 文件/u);
+      assert.match(content, /base64/u);
+      assert.match(content, /回读/u);
+      assert.match(content, /Unity 构建前先确认当前项目版本/u);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

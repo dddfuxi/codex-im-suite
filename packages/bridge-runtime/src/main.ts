@@ -50,6 +50,7 @@ import type { Config } from './config.js';
 import { getOrdinaryCodexExecutionProfile } from './codex-provider.js';
 import { JsonFileStore } from './store.js';
 import { readAgentHomePromptSections } from './agent-home.js';
+import { ArtifactEncodingInspector } from './artifact-encoding-inspector.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
 import {
   applySelfMaintenanceDecision,
@@ -3478,6 +3479,7 @@ async function main(): Promise<void> {
     }) : undefined,
     turnReferences: new ProviderTurnReferenceResolverHost(llm),
     turnStorage,
+    artifactEncoding: new ArtifactEncodingInspector(),
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {

@@ -360,6 +360,141 @@ describe('bridge-manager lifecycle', () => {
     }
   });
 
+  it('fails closed and removes proactive files when artifact encoding inspection reports damage', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-proactive-encoding-block-'));
+    const filePath = path.join(tempDir, '损坏说明.md');
+    fs.writeFileSync(filePath, '中文已经变成???', 'utf8');
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      artifactEncoding: {
+        inspectFiles: async () => ({
+          ok: false,
+          issues: [{ filePath, kind: 'question_mark_loss', sample: '中文已经变成???' }],
+        }),
+      },
+    });
+    const sent: OutboundMessage[] = [];
+    const sentFiles: string[] = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_text' };
+    });
+    adapter.sendLocalFile = async (_chatId, localPath) => {
+      sentFiles.push(localPath);
+      return { ok: true, messageId: 'om_file' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    try {
+      const result = await deliverProactiveMessage({
+        address: { channelType: 'feishu', chatId: 'oc_123' },
+        text: ['```cti-final', JSON.stringify({
+          kind: 'file',
+          text: '技能文件已经整理完成。',
+          images: [],
+          files: [filePath],
+          reply_mode: 'plain',
+        }), '```'].join('\n'),
+        prepareFinalReply: true,
+        workingDirectory: tempDir,
+      });
+
+      assert.equal(result.ok, true);
+      assert.equal(sentFiles.length, 0);
+      assert.equal(sent.length, 1);
+      assert.match(sent[0].text, /技能文件已经整理完成/u);
+      assert.match(sent[0].text, /文件编码检查失败，未发送/u);
+      assert.match(sent[0].text, /损坏说明\.md/u);
+      assert.doesNotMatch(sent[0].text, new RegExp(tempDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'u'));
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps proactive files when artifact encoding inspection succeeds', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-proactive-encoding-pass-'));
+    const filePath = path.join(tempDir, '正常说明.md');
+    fs.writeFileSync(filePath, '中文内容正常', 'utf8');
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      artifactEncoding: { inspectFiles: async () => ({ ok: true, issues: [] }) },
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_text' }));
+    const sentFiles: string[] = [];
+    adapter.sendLocalFile = async (_chatId, localPath) => {
+      sentFiles.push(localPath);
+      return { ok: true, messageId: 'om_file' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    try {
+      await deliverProactiveMessage({
+        address: { channelType: 'feishu', chatId: 'oc_123' },
+        text: ['```cti-final', JSON.stringify({
+          kind: 'file', text: '文件如下。', images: [], files: [filePath], reply_mode: 'plain',
+        }), '```'].join('\n'),
+        prepareFinalReply: true,
+        workingDirectory: tempDir,
+      });
+      assert.deepEqual(sentFiles, [filePath]);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without sending files when artifact encoding inspection throws', async () => {
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-proactive-encoding-error-'));
+    const filePath = path.join(tempDir, '说明.md');
+    fs.writeFileSync(filePath, '中文内容正常', 'utf8');
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      artifactEncoding: { inspectFiles: async () => { throw new Error('inspector unavailable'); } },
+    });
+    const sent: OutboundMessage[] = [];
+    const sentFiles: string[] = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_text' };
+    });
+    adapter.sendLocalFile = async (_chatId, localPath) => {
+      sentFiles.push(localPath);
+      return { ok: true, messageId: 'om_file' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    try {
+      const result = await deliverProactiveMessage({
+        address: { channelType: 'feishu', chatId: 'oc_123' },
+        text: ['```cti-final', JSON.stringify({
+          kind: 'file', text: '文件如下。', images: [], files: [filePath], reply_mode: 'plain',
+        }), '```'].join('\n'),
+        prepareFinalReply: true,
+        workingDirectory: tempDir,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(sentFiles.length, 0);
+      assert.match(sent[0].text, /编码检查器暂时不可用/u);
+      assert.doesNotMatch(sent[0].text, /inspector unavailable/u);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects proactive delivery when the channel adapter is unavailable', async () => {
     const store = createMinimalStore({ remote_bridge_enabled: 'true' });
     initBridgeContext({

@@ -52,6 +52,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 架构说明：[docs/PROJECT-ARCHITECTURE.md](./docs/PROJECT-ARCHITECTURE.md)
 - 开发记录：[docs/DEVELOPMENT-LOG.md](./docs/DEVELOPMENT-LOG.md)
 - 目标目录检查：`scripts/doctor-suite-targets.ps1`
+- PowerShell 5.1 UTF-8 Profile 管理：`scripts/windows-powershell-utf8-profile.ps1 -Mode Apply|Check|Remove`
 - 架构文档检查：`scripts/update-architecture-docs.ps1`
 - 扩展协议校验：`scripts/validate-extension-manifests.ps1`
 - 旧记忆规则 dry-run 归档：`scripts/memory/archive-legacy-rules.ps1`
@@ -166,6 +167,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\cleanup-workspace-pollution.p
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\doctor-suite-targets.ps1
 ```
+
+Windows PowerShell 5.1 向 Node/Python 等原生程序管道传递中文前，建议先安装并检查当前用户 UTF-8 Profile：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\windows-powershell-utf8-profile.ps1 -Mode Apply
+powershell -ExecutionPolicy Bypass -File .\scripts\windows-powershell-utf8-profile.ps1 -Mode Check
+```
+
+`-NoProfile` 不会加载该配置；这类命令仍需在命令体内显式设置 UTF-8 编码，或改用 `apply_patch`、UTF-8 文件、Unicode 环境变量或 base64。
 
 开发版面板入口是 `release\artifacts\control-panel\CodexImSuiteControlPanel.exe`，live 面板入口是 `C:\Users\admin\.codex\skills\claude-to-im\dist\control-panel\CodexImSuiteControlPanel.exe`。旧 `ClaudeToImControlPanel.exe` 已退出发布入口。主窗口按四域组织：运行（总览、服务、会话）、机器人（架构、提示词注入、记忆索引）、能力（Skills、MCP、模型与插件）、治理（权限、发布、日志、设置）。旧 `#extensions` 会进入 Skills，旧节点/执行器地址会进入服务页对应 tab。会话页保留提醒操作，设置页保留记忆整理和归档治理，Memory 只做索引；Skills 页只调用 runtime lifecycle，Prompt 页只展示脱敏只读 Snapshot。
 

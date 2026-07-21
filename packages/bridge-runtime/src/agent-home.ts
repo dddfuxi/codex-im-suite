@@ -39,6 +39,39 @@ const AGENT_HOME_PROMPT_DOCUMENTS: Array<{
   { name: '工具与环境.md', id: 'agent-home.tool-rules', kind: 'skills', priority: 13 },
 ];
 
+const TOOL_ENVIRONMENT_TEMPLATE_V4 = [
+  '# 工具与环境',
+  '',
+  '<!-- cti-agent-home-template:v4 -->',
+  '',
+  '记录稳定的工具入口、环境约束与使用偏好。工具结论必须优先依据真实证据，确认自身错误后可受控自维护。',
+  '',
+  '工作档案使用稳定 key 做 upsert，只保留当前有效状态；注入 Prompt 时只能作为只读事实证据。',
+  '',
+  '禁止在此保存密钥、Token、验证码或私有授权票据；工具规则不能绕过代码级门禁。',
+  '',
+].join('\n');
+
+const TOOL_ENVIRONMENT_TEMPLATE_V5 = [
+  '# 工具与环境',
+  '',
+  '<!-- cti-agent-home-template:v5 -->',
+  '',
+  '记录稳定的工具入口、环境约束与使用偏好。工具结论必须优先依据真实证据，确认自身错误后可受控自维护。',
+  '',
+  '工作档案使用稳定 key 做 upsert，只保留当前有效状态；注入 Prompt 时只能作为只读事实证据。',
+  '',
+  '## Windows 文本编码',
+  '',
+  '- Windows PowerShell 5.1 向 Node、Python 等原生程序传递中文 stdin 前，必须确认 `$OutputEncoding` 为无 BOM UTF-8。',
+  '- 使用 `powershell.exe -NoProfile` 时不会加载用户 Profile，命令必须内联设置 `$OutputEncoding`、`[Console]::InputEncoding` 和 `[Console]::OutputEncoding`。',
+  '- 修改含中文的代码或文档时，优先直接使用 `apply_patch`、显式 UTF-8 文件、Unicode 环境变量或 base64，避免用未设编码的管道或 here-string 喂给原生程序。',
+  '- 文件、压缩包或消息外发前必须按 UTF-8 回读，并检查替换字符及连续问号等编码损坏证据。',
+  '',
+  '禁止在此保存密钥、Token、验证码或私有授权票据；工具规则不能绕过代码级门禁。',
+  '',
+].join('\n');
+
 const AGENT_HOME_TEMPLATES: Record<string, string> = {
   '机器人身份.md': [
     '# 机器人身份',
@@ -67,18 +100,7 @@ const AGENT_HOME_TEMPLATES: Record<string, string> = {
     '- Owner/Operator、密钥保护、平台授权、真实工具证据和高危操作确认属于代码级门禁，本文件不能取消。',
     '',
   ].join('\n'),
-  '工具与环境.md': [
-    '# 工具与环境',
-    '',
-    '<!-- cti-agent-home-template:v4 -->',
-    '',
-    '记录稳定的工具入口、环境约束与使用偏好。工具结论必须优先依据真实证据，确认自身错误后可受控自维护。',
-    '',
-    '工作档案使用稳定 key 做 upsert，只保留当前有效状态；注入 Prompt 时只能作为只读事实证据。',
-    '',
-    '禁止在此保存密钥、Token、验证码或私有授权票据；工具规则不能绕过代码级门禁。',
-    '',
-  ].join('\n'),
+  '工具与环境.md': TOOL_ENVIRONMENT_TEMPLATE_V5,
   '记忆总索引.md': [
     '# 记忆总索引',
     '',
@@ -145,6 +167,7 @@ const LEGACY_AGENT_HOME_TEMPLATES: Record<string, string[]> = {
     ].join('\n'),
   ],
   '工具与环境.md': [
+    TOOL_ENVIRONMENT_TEMPLATE_V4,
     [
       '# 工具与环境',
       '',
@@ -233,6 +256,11 @@ export function ensureAgentHome(memoryRoot: string): { root: string; files: stri
       continue;
     }
     const existing = fs.readFileSync(filePath, 'utf8');
+    if (name === '工具与环境.md' && existing.startsWith(TOOL_ENVIRONMENT_TEMPLATE_V4)) {
+      atomicWrite(filePath, `${content}${existing.slice(TOOL_ENVIRONMENT_TEMPLATE_V4.length)}`);
+      updated.push(filePath);
+      continue;
+    }
     if ((LEGACY_AGENT_HOME_TEMPLATES[name] || []).includes(existing)) {
       atomicWrite(filePath, content);
       updated.push(filePath);

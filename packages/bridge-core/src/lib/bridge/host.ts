@@ -79,6 +79,18 @@ export interface TurnStorageHost {
   promoteArtifact?(input: ArtifactPromotionRequest): ArtifactPromotionResult;
 }
 
+export interface ArtifactEncodingIssue {
+  filePath: string;
+  entryName?: string;
+  kind: 'invalid_utf8' | 'replacement_character' | 'question_mark_loss' | 'unsafe_zip_entry' | 'zip_limit';
+  sample: string;
+}
+
+/** Runtime-owned read-only inspection boundary used immediately before artifact delivery. */
+export interface ArtifactEncodingInspectorHost {
+  inspectFiles(input: { files: string[] }): Promise<{ ok: boolean; issues: ArtifactEncodingIssue[] }>;
+}
+
 /** Server-Sent Event from the LLM stream. */
 export interface SSEEvent {
   type: SSEEventType;
