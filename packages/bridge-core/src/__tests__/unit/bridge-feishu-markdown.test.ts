@@ -7,10 +7,40 @@ import {
   buildPostContent,
   buildStreamingContent,
   extractStreamingFinalResponse,
+  preprocessFeishuMarkdown,
 } from '../../lib/bridge/markdown/feishu.js';
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities.js';
 
 describe('Feishu streaming card markdown', () => {
+  it('normalizes unsupported underline tags without touching fenced code', () => {
+    const markdown = preprocessFeishuMarkdown([
+      '<u>关键结论</u>，<ins>必须处理</ins>。',
+      '',
+      '```html',
+      '<u>代码示例保持原样</u>',
+      '```',
+    ].join('\n'));
+
+    assert.match(markdown, /<font color='blue'>\*\*关键结论\*\*<\/font>/u);
+    assert.match(markdown, /<font color='blue'>\*\*必须处理\*\*<\/font>/u);
+    assert.match(markdown, /```html\n<u>代码示例保持原样<\/u>\n```/u);
+  });
+
+  it('keeps Feishu section, quote, emphasis, and list syntax intact', () => {
+    const markdown = preprocessFeishuMarkdown([
+      '**结论**',
+      '> 原文依据',
+      '',
+      '- **重点**：已经完成',
+      '- *补充*：等待验收',
+    ].join('\n'));
+
+    assert.match(markdown, /^\*\*结论\*\*/u);
+    assert.match(markdown, /^> 原文依据$/mu);
+    assert.match(markdown, /- \*\*重点\*\*：已经完成/u);
+    assert.match(markdown, /- \*补充\*：等待验收/u);
+  });
+
   it('renders Bash tool traces as safe user-visible action summaries', () => {
     const markdown = buildToolProgressMarkdown([
       {

@@ -327,6 +327,21 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['prompt', 'composition'],
   },
   {
+    id: 'delivery_layer.feishu_text_presentation',
+    layerId: 'delivery_layer',
+    title: 'Feishu Text Presentation',
+    responsibility: 'Use Feishu-supported rich text deliberately so structured answers are easier to scan without turning lightweight chat into report templates.',
+    promptLines: [
+      '- Feishu text presentation policy: when a reply contains two or more independent information groups, divide it into concise sections with bold labels or small headings; keep one short lead sentence before the sections when it helps orientation.',
+      '- Use blockquotes (`>`) for exact source text, prior-message excerpts, constraints, or the specific statement being answered. Do not use blockquotes as decorative indentation.',
+      '- Use bold for conclusions, statuses, field labels, and actions; use italic for brief caveats or secondary interpretation. Use strikethrough only when showing a real correction or superseded value.',
+      '- Underline is not reliably supported by Feishu card Markdown. When underline-like emphasis is genuinely useful, use the supported blue accent plus bold form `<font color=\'blue\'>**text**</font>`; never emit raw `<u>` or `<ins>` tags.',
+      '- Prefer lists for parallel items and numbered lists for ordered procedures. Use tables only for genuine field-by-field comparison, not for ordinary prose.',
+      '- Keep formatting semantic and sparse: do not stack multiple emphasis styles on the same phrase, do not add empty sections, and do not force headings or lists into short conversational replies.',
+    ],
+    tags: ['delivery', 'feishu', 'presentation', 'markdown', 'rich-text'],
+  },
+  {
     id: 'delivery_layer.result_envelope',
     layerId: 'delivery_layer',
     title: 'Result Envelope',

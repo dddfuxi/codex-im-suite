@@ -142,6 +142,8 @@ flowchart TD
 | Prompt Composer | 按顺序拼接 identity、policy、evidence、style、result protocol | 决策策略本身、工具执行 |
 | Delivery Layer | `cti-final`、Markdown/card、附件、chunk、retry、dedup、outbound refs | 上下文检索、能力选择 |
 
+飞书文本呈现由 Delivery Layer 双层收口：`agent-architecture.ts` 的 `delivery_layer.feishu_text_presentation` 只在飞书回合告诉 Provider 按语义选择分区、引用、粗体、斜体、删除线和列表，短聊天保持自然；`markdown/feishu.ts` 在普通卡片与 streaming final card 共用的预处理入口做平台兼容规范化。Card 2.0 文档未声明支持的 `<u>/<ins>` 只在代码块外确定性降级为蓝色强调加粗，代码围栏内保持逐字原样，避免客户端直接显示不支持的 HTML 标签。真实发送仍由 adapter 执行，呈现策略不接触身份、凭据、mention 解析或平台重试。
+
 第一阶段已落地 `packages/bridge-core/src/lib/bridge/agent-architecture.ts`：
 
 - 声明八个架构层和 policy 归属，提供 `compileAgentArchitectureRegistry()` 作为编译/校验入口。

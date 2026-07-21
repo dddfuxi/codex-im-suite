@@ -151,6 +151,21 @@ describe('agent architecture registry', () => {
     assert.match(lines, /broadcast audiences/i);
   });
 
+  it('keeps Feishu text presentation rules in the Delivery Layer', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'delivery_layer.feishu_text_presentation');
+    const lines = getAgentPolicyPromptLines(['delivery_layer.feishu_text_presentation']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'delivery_layer');
+    assert.match(lines, /independent information groups/i);
+    assert.match(lines, /blockquotes/i);
+    assert.match(lines, /bold/i);
+    assert.match(lines, /italic/i);
+    assert.match(lines, /underline/i);
+    assert.match(lines, /short conversational replies/i);
+  });
+
   it('decides skill autonomy from source and risk instead of names', () => {
     assert.equal(decideSkillLifecycleAction({ installed: true, sourceClass: 'installed', risk: 'low', changeKind: 'none' }), 'use');
     assert.equal(decideSkillLifecycleAction({ installed: false, sourceClass: 'official_curated', risk: 'low', changeKind: 'install' }), 'confirm_user');

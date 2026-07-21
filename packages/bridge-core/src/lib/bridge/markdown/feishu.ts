@@ -29,8 +29,20 @@ export function hasComplexMarkdown(text: string): boolean {
  * Does NOT touch the text after ``` to preserve language tags like ```python.
  */
 export function preprocessFeishuMarkdown(text: string): string {
-  // Ensure ``` has newline before it (unless at start of text)
-  return text.replace(/([^\n])```/g, '$1\n```');
+  // Ensure ``` has newline before it (unless at start of text), then only
+  // normalize presentation syntax outside fenced code so examples stay exact.
+  const withFenceSpacing = text.replace(/\r\n/g, '\n').replace(/([^\n])```/g, '$1\n```');
+  return withFenceSpacing
+    .split(/(```[\s\S]*?(?:```|$))/g)
+    .map((segment, index) => {
+      if (index % 2 === 1) return segment;
+      // Card 2.0 Markdown does not document underline support. Preserve the
+      // intended emphasis with a supported accent instead of leaking raw HTML.
+      return segment.replace(/<(u|ins)\b[^>]*>([\s\S]*?)<\/\1>/giu, (_match, _tag, content: string) => (
+        `<font color='blue'>**${content.trim()}**</font>`
+      ));
+    })
+    .join('');
 }
 
 /**

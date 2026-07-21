@@ -372,7 +372,7 @@ function buildBridgeScopedPrompt(
     }] : []),
     { id: 'session.base', kind: 'base', source: 'session.system_prompt', priority: 40, content: baseSystemPrompt || '' },
     { id: 'bridge.policy', kind: 'policy', source: 'agent-architecture', priority: 50, content: bridgeGuardrails },
-    { id: 'reply.style', kind: 'style', source: 'bridge.reply_style', priority: 60, content: buildReplyPresentationPrompt(getReplyStyleHintFromStore()) },
+    { id: 'reply.style', kind: 'style', source: 'bridge.reply_style', priority: 60, content: buildReplyPresentationPrompt(getReplyStyleHintFromStore(), binding.channelType) },
   ]);
 }
 
@@ -518,7 +518,7 @@ function getReplyStyleHintFromStore(): string {
   ).trim();
 }
 
-function buildReplyPresentationPrompt(replyStyleHint: string): string {
+function buildReplyPresentationPrompt(replyStyleHint: string, channelType: string): string {
   const lines = [
     'Reply presentation contract:',
     '- Final user-facing replies must follow the configured reply style when one is provided.',
@@ -537,6 +537,9 @@ function buildReplyPresentationPrompt(replyStyleHint: string): string {
     '- Feishu sticker messages may include an image attachment only when the memory repository already has media for that sticker file_key. If the inbound text says a sticker image is attached, inspect that image first to identify the visual content and intent.',
     '- If the inbound text says the Feishu sticker is not semantically annotated and no sticker image attachment is available, do not claim you can see its image, caption, or intent. Ask the user to explain the sticker meaning or use any learned sticker semantics provided in the message context.',
   ];
+  if (channelType === 'feishu') {
+    lines.push(...getAgentPolicyPromptLines(['delivery_layer.feishu_text_presentation']));
+  }
   if (replyStyleHint) {
     lines.push(`- Required reply style: ${replyStyleHint}`);
     lines.push('- Apply this style to the first sentence of the final user-facing reply while preserving truthfulness and safety.');
