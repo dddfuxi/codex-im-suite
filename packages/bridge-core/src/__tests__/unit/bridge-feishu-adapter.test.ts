@@ -3102,7 +3102,7 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     assert.match(upserts[0].messages[0].text, /飞书表情包/);
   });
 
-  it('downloads only one trusted candidate for an explicit sticker send request', async () => {
+  it('downloads only the semantically best trusted candidate for an explicit sticker send request', async () => {
     useTempCtiHome();
     const store = createMockStore({ bridge_feishu_bot_aliases: '小虾米' }) as any;
     store.getFeishuHistorySyncStatus = () => [];
@@ -3151,22 +3151,40 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     fs.writeFileSync(getTestFeishuStickerStorePath(), JSON.stringify({
       version: 1,
       updatedAt: '2026-07-11T00:00:00.000Z',
-      stickers: [{
-        fileKey: 'sticker_praise_candidate',
-        aliases: ['表情包', '夸人'],
-        chatId: 'oc_group',
-        messageId: 'om_history_sticker_1',
-        label: '点赞夸奖',
-        intent: '表达认可和夸奖',
-        tone: '开心肯定',
-        usage: '夸奖别人时使用',
-        annotationSource: 'vision',
-        visionMediaFileKey: 'sticker_praise_candidate',
-        annotationConfidence: 0.9,
-        firstSeenAt: '2026-07-11T00:00:00.000Z',
-        lastSeenAt: '2026-07-11T00:00:00.000Z',
-        useCount: 0,
-      }],
+      stickers: [
+        {
+          fileKey: 'sticker_praise_candidate',
+          aliases: ['表情包', '夸人'],
+          chatId: 'oc_group',
+          messageId: 'om_history_sticker_1',
+          label: '点赞夸奖',
+          intent: '表达认可和夸奖',
+          tone: '开心肯定',
+          usage: '夸奖别人时使用',
+          annotationSource: 'vision',
+          visionMediaFileKey: 'sticker_praise_candidate',
+          annotationConfidence: 0.9,
+          firstSeenAt: '2026-07-11T00:00:00.000Z',
+          lastSeenAt: '2026-07-11T00:00:00.000Z',
+          useCount: 0,
+        },
+        {
+          fileKey: 'sticker_confused_candidate',
+          aliases: ['表情包', '懵了'],
+          chatId: 'oc_group',
+          messageId: 'om_history_sticker_2',
+          label: '晕乎震惊',
+          intent: '表达困惑、震惊或反应不过来',
+          tone: '夸张困惑',
+          usage: '遇到离谱信息或突然被震住时使用',
+          annotationSource: 'vision',
+          visionMediaFileKey: 'sticker_confused_candidate',
+          annotationConfidence: 0.95,
+          firstSeenAt: '2026-07-11T00:00:01.000Z',
+          lastSeenAt: '2026-07-11T00:00:01.000Z',
+          useCount: 0,
+        },
+      ],
     }), 'utf8');
 
     await adapter.processIncomingEvent({

@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-07-21 Feishu 表情包候选匹配修复：现场回放“发个失去意识的表情包”发现 Provider 已从 11 张真实候选中选择黑白“开始失去意识”file key，但候选 evidence 的 `preferredFileKey` 只按当前群和最近出现排序，随后被 manager 当作兜底重新写入最终动作，实际发送成黄色“晕乎震惊”。修复后 `buildStickerLibraryEvidenceForRequest()` 复用 `sticker-selection-policy`，把当前请求文本、chat、时间和可信置信度门禁一起用于 preferred 候选；具体语义无可靠匹配时不再随便选择最近表情包。TDD RED 证明较新且置信度更高的“困惑”候选会覆盖“夸人”候选，GREEN 后回归通过；adapter + selection policy 专项 160/160、Core 651/651、依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码与 Git diff 检查均通过。
+
 - 2026-07-21 Feishu lifecycle 第一阶段迁移：新增 `channels/feishu/lifecycle/inbound-queue.ts`，把入站 FIFO、等待消费者、撤回消息删除和 open/close 清理从 `feishu-adapter.ts` 迁出。新控制器把“是否开放接收”和“消费端是否等待未来消息”分离；adapter 停止或启动失败时会丢弃未处理旧任务、唤醒等待者并拒绝迟到事件，修复旧实现停止后仍可能消费停机前排队消息的问题。TDD RED 先证明新模块不存在和旧 stop 回归，GREEN 后队列直接测试 5/5、adapter 停止专项 3/3、Core 全量 651/651；依赖边界 4/4、typecheck/build、人类文档门禁、架构检查、UTF-8/乱码扫描和 Git diff 检查均通过。真实 WS/SDK/P2P 调度仍留在 adapter，lifecycle 后续还需拆分 P2P 轮询和 WS 启停/审计/清理编排。
 
 - 2026-07-20 Feishu documents 第三阶段收口：新增 `channels/feishu/documents/document-delivery-policy.ts`，把创建参数、通用标题降级、文档记忆记录输入、导览 create/replace 计划、导览 meta、成功/失败交付文案从 `bridge-manager.ts` 迁出。manager 继续执行真实 adapter create/replace、Store/文件写入与 deliver，并删除遗留 `if (false)` 双发送死代码。同步修复两个现场风险：创建异常后不再继续发送原 Provider 正文，adapter 缺少文档创建能力时不再假装完成；两类情况都只交付一条明确失败回复。错误文案会脱敏 access/refresh token、app secret、authorization、device code 和 Windows 绝对路径。TDD RED 证明新模块不存在、异常路径会双回复且能力缺失会回落普通回复；GREEN 后 delivery policy 5/5、云文档 manager 行为组 12/12、Core 全量 645/645、依赖边界 4/4、typecheck、build、人类文档门禁、架构、UTF-8、乱码和 Git diff 检查通过。documents 子域已完成，下一子域进入 lifecycle。

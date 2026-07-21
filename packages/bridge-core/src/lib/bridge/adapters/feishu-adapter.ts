@@ -1120,8 +1120,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!isExplicitFeishuStickerSendRequest(requestText)) return null;
     const store = this.readStickerStore();
     const records = rankFeishuStickerEvidenceRecords(store.stickers, { chatId, limit: 80 });
-    const preferredRecord = records.find((record) => this.isStickerReliableForAutoSend(record)) || null;
-    const preferredFileKey = preferredRecord?.fileKey;
+    // preferredFileKey 会在模型未产出候选分析块时成为最终发送兜底，必须按本次
+    // 请求语义选择，不能用“当前群最近出现”替代语义匹配，否则会覆盖模型已选对的候选。
+    const preferredFileKey = resolveFeishuStickerFileKey(store, '表情包', {
+      chatId,
+      contextText: requestText,
+      nowMs: Date.now(),
+      minimumVisionConfidence: FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE,
+    }) || undefined;
     const attachments: FileAttachment[] = [];
     const attachedFileKeys = new Set<string>();
     const candidates: FeishuStickerCandidateEvidence[] = [];
