@@ -108,6 +108,7 @@ import {
   type FeishuStreamingCardState,
 } from '../channels/feishu/cards/streaming-card-registry.js';
 import { FeishuStreamingCardLifecycle } from '../channels/feishu/cards/streaming-card-lifecycle.js';
+import { FeishuInboundQueue } from '../channels/feishu/lifecycle/inbound-queue.js';
 import {
   FEISHU_AT_ALL_ALIASES,
   FEISHU_SENDER_ALIASES,
@@ -742,8 +743,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
 
   private running = false;
-  private queue: InboundMessage[] = [];
-  private waiters: Array<(msg: InboundMessage | null) => void> = [];
+  private readonly inboundQueue = new FeishuInboundQueue();
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
   private seenMessageIds = new Map<string, boolean>();
@@ -782,6 +782,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botToBotLoopState = new Map<string, { count: number; updatedAt: number }>();
   private p2pPollTimer: ReturnType<typeof setInterval> | null = null;
   private p2pPollInFlight = false;
+
+  constructor() {
+    super();
+    // 单测和 SDK 事件包装会在显式 start 前注入消息；stop 后则由 close() 失败关闭。
+    this.inboundQueue.open();
+  }
   private avatarImageCache = new Map<string, { buffer: Buffer; mimeType: string; extension: string; cachedAt: number }>();
   private avatarDnsCache = new Map<string, { addresses: string[]; cachedAt: number }>();
 
@@ -1628,6 +1634,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Cannot start:', configError);
       return;
     }
+    this.inboundQueue.open();
     updateFeishuWsAudit({ state: 'starting', lastError: '', lastDisconnectReason: '' });
 
     const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
@@ -1706,6 +1713,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         lastError: err instanceof Error ? err.stack || err.message : String(err),
       });
       this.running = false;
+      this.inboundQueue.close();
       throw err;
     }
   }
@@ -1732,11 +1740,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
     this.p2pPollInFlight = false;
 
-    // Reject all waiting consumers
-    for (const waiter of this.waiters) {
-      waiter(null);
-    }
-    this.waiters = [];
+    // 停止后不能继续消费旧消息；同时唤醒所有正在等待的消费者。
+    this.inboundQueue.close();
 
     // Clean up active cards and both throttle/typewriter timers.
     this.streamingCards.clear();
@@ -1756,32 +1761,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Queue ───────────────────────────────────────────────────
 
   consumeOne(): Promise<InboundMessage | null> {
-    const queued = this.queue.shift();
-    if (queued) return Promise.resolve(queued);
-
-    if (!this.running) return Promise.resolve(null);
-
-    return new Promise<InboundMessage | null>((resolve) => {
-      this.waiters.push(resolve);
-    });
+    return this.inboundQueue.consumeOne(this.running);
   }
 
   private enqueue(msg: InboundMessage): void {
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(msg);
-    } else {
-      this.queue.push(msg);
-    }
+    this.inboundQueue.enqueue(msg);
   }
 
   private removeQueuedInboundByMessageId(messageId: string): InboundMessage | null {
     const target = messageId.trim();
     if (!target) return null;
-    const index = this.queue.findIndex((item) => item.messageId === target);
-    if (index < 0) return null;
-    const [removed] = this.queue.splice(index, 1);
-    return removed || null;
+    return this.inboundQueue.removeByMessageId(target);
   }
 
   private isWithdrawnPlaceholderText(text: string): boolean {

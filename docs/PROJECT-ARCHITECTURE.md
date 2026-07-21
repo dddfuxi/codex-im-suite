@@ -93,6 +93,7 @@ flowchart TD
   FeishuAdapter --> LightContextSelection[channels/feishu/history 短接话上下文选择]
   FeishuAdapter --> HistoryAttachmentRecovery[channels/feishu/history 回复附件恢复计划]
   FeishuAdapter --> CardSubsystem[channels/feishu/cards SDK 兼容与流式状态生命周期]
+  FeishuAdapter --> InboundQueueLifecycle[channels/feishu/lifecycle 入站队列生命周期]
   Core --> FeishuCardEvidence[Feishu 卡片 evidence 解析]
   Core --> PermissionBroker[权限和高危操作门禁]
   Core --> ReplyEnvelope[cti-final 结果块收口]
@@ -171,6 +172,7 @@ flowchart TD
 - `packages/bridge-core/src/lib/bridge/channels/feishu/cards/streaming-card-lifecycle.ts` 统一管理文本更新的即时/尾缘节流、工具状态触发的打字机重启、字符步进、stream sequence、创建中等待、关闭 streaming、最终状态/耗时卡片构造，以及成功或失败后的状态清理。真实 CardKit 调用、表情包/reaction 解析和耐久出站引用通过 adapter 回调注入，因此生命周期模块可用确定性时钟和调度器单测，不持有 SDK Client、凭据或平台存储。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/mentions/outbound-mention-resolution.ts` 统一处理新版/旧版成员 payload 的 open/user/union ID 选择、app/bot ID 排除、别名清洗、候选合并、`native_inbound > current_chat > current_sender > history` 证据排序、同级多 ID 歧义保留、related inspection 候选和 text/post 原生 `<at>` 标签构造。adapter 继续负责本轮原生 evidence、当前 sender、历史文件与群成员网络查询，并只把这些真实来源交给纯解析模块；模块不调用 Feishu API、不读取历史目录，也不信任模型输出的用户 ID。
 - `packages/bridge-core/src/lib/bridge/channels/feishu/mentions/inbound-mention-wake.ts` 统一处理事件 `mentions` 中 open/user/union ID 与当前 bot 身份的精确匹配、text/post/card JSON 内结构化 `<at>` 的递归兼容检测、`@_user_N`/`<at>` marker 清理、bot alias 去重排序，以及原生 mention 后的纠错/无须回复裁决和通用 bot name wake 分类。adapter 只提供运行时设置、已验证 bot ID 和按消息类型解析出的可见正文；模块不读取 Store、不调用 Feishu API，也不允许普通显示名替代群聊原生 @ 门禁。
+- `packages/bridge-core/src/lib/bridge/channels/feishu/lifecycle/inbound-queue.ts` 统一管理入站 FIFO、等待消费者、按稳定平台 messageId 删除撤回任务和 open/close 状态。`close()` 失败关闭：清空尚未处理的旧消息、把所有等待消费者解析为 `null`，并拒绝随后到达的迟到事件；adapter 显式注入当前是否运行来决定空队列是否等待未来消息。真实 WebSocket、SDK 事件注册、P2P 补捞、启动审计和平台清理由 Feishu adapter 继续编排。
 
 渐进迁移顺序：
 

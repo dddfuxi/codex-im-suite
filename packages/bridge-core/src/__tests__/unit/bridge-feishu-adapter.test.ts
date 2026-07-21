@@ -183,6 +183,21 @@ describe('FeishuAdapter deferred agent preparation', () => {
     assert.equal(leftover, null);
   });
 
+  it('discards queued inbound work when the adapter stops', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.running = true;
+    adapter.inboundQueue.enqueue({
+      messageId: 'om_queued_before_stop',
+      address: { channelType: 'feishu', chatId: 'oc_group' },
+      text: 'queued before stop',
+      timestamp: new Date('2026-07-21T00:00:00.000Z'),
+    });
+
+    await adapter.stop();
+
+    assert.equal(await adapter.consumeOne(), null);
+  });
+
   it('submits a native reply as sticker feedback only when runtime finds the referenced delivery', async () => {
     const processed: any[] = [];
     setupContext({ bridge_feishu_require_mention: 'false' }, {
@@ -6513,7 +6528,7 @@ describe('FeishuAdapter p2p reply media recovery', () => {
       updatedAt: '1000',
     });
 
-    assert.equal(adapter.queue.length, 0);
+    assert.equal(adapter.inboundQueue.size, 0);
   });
 });
 
