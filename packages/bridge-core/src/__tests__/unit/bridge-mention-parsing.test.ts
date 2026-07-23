@@ -5,6 +5,7 @@ import {
   extractExplicitFeishuMentionTargetsFromRequest,
   isFeishuMentionExecutionRequest,
   normalizeFeishuMentionTargetKey,
+  parseEnvelopeMentionTargets,
   parseEnvelopeMentions,
   readFeishuMentionIds,
   stripFeishuGenericBareMentionText,
@@ -17,7 +18,8 @@ describe('bridge mention parsing', () => {
       user_id: 'ou_user',
       openId: 'ou_open',
       union_id: 'on_union',
-    }), ['ou_user', 'ou_open', 'on_union']);
+      id: 'ou_generic',
+    }), ['ou_user', 'ou_open', 'on_union', 'ou_generic']);
 
     assert.deepEqual(parseEnvelopeMentions([
       { open_id: 'ou_target', user_name: '乔治' },
@@ -27,6 +29,13 @@ describe('bridge mention parsing', () => {
       { userId: 'ou_target', name: '乔治' },
       { name: '所有人', atAll: true },
     ]);
+
+    assert.deepEqual(parseEnvelopeMentionTargets([
+      '乔治',
+      { name: '乔治' },
+      { user_name: '大虾米' },
+      { name: '_user_1' },
+    ]), ['乔治', '大虾米']);
   });
 
   it('extracts explicit named targets from direct commands', () => {
@@ -41,6 +50,25 @@ describe('bridge mention parsing', () => {
     assert.equal(isFeishuMentionExecutionRequest('之后主持人艾特另一个参与者继续'), false);
     assert.equal(isFeishuMentionExecutionRequest('为什么群里的 @ 通知没有送进来'), false);
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('等待主持人艾特参与者后再回答'), []);
+  });
+
+  it('treats an explicitly started multi-bot handoff as a current mention action', () => {
+    const request = '你们俩开始辩论，乔治先开始，在辩论结束前，每次发表完观点必须 at 对方';
+    assert.equal(isFeishuMentionExecutionRequest(request), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest(request), ['乔治']);
+
+    const compactRequest = '你们来开始吵架，必须 at 对方，乔治先开始';
+    assert.equal(isFeishuMentionExecutionRequest(compactRequest), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest(compactRequest), ['乔治']);
+  });
+
+  it('treats the assigned responder of an immediately started interaction as the current mention target', () => {
+    const request = '来一局海龟汤，你出题，乔治回答。每次艾特乔治，并且告诉乔治是或者不是以及回答要艾特你，知道它回答正确后暂停游戏。';
+    assert.equal(isFeishuMentionExecutionRequest(request), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest(request), ['乔治']);
+
+    assert.equal(isFeishuMentionExecutionRequest('以后每次活动都艾特乔治，今天先不要开始'), false);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('以后每次活动都艾特乔治，今天先不要开始'), []);
   });
 
   it('uses a supplied wake alias only as an invocation prefix', () => {

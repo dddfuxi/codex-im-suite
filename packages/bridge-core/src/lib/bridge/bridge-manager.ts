@@ -38,6 +38,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { parseProjectRegistryDocument, type RegisteredProject } from '@codex-im-suite/contracts';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type {
   AdapterAssistantIdentity,
@@ -131,6 +132,12 @@ import {
   type DeliveryCandidatePayload,
   type FinalReplyKind,
 } from './application/delivery-preparation.js';
+import {
+  CHOICE_CALLBACK_PREFIX,
+  ChoicePromptRegistry,
+  buildChoiceSelectionText,
+} from './application/choice-prompts.js';
+import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -171,6 +178,14 @@ import {
 import { buildFeishuCapabilityReport } from './feishu-capabilities.js';
 import { resolveStructuredTurnContext } from './turn-context-broker.js';
 import { shouldRunCorrectionMaintenance } from './self-maintenance-routing.js';
+import {
+  buildWorkspaceChatCatalog,
+  parseWorkspaceChatCommand,
+  resolveWorkspaceChatTarget,
+  type WorkspaceChatCatalogEntry,
+} from './workspace-chat-policy.js';
+
+const choicePromptRegistry = new ChoicePromptRegistry();
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -2643,7 +2658,8 @@ async function recordSelfMaintenanceSkipSafely(input: {
 /**
  * 用户本轮明确要求执行 @ 时，由 delivery 在当前群官方成员/机器人中确定性解析。
  * bot-to-bot 回合另有一个窄口：仅允许回复原生唤醒当前机器人的发送方机器人，
- * 且必须把 sender app_id 与当前群可 mention member_id 唯一关联。普通叙述、未来流程、
+ * 且必须把事件真实 sender app/open/user/union ID 与当前群可 mention member_id 唯一求交。
+ * 普通叙述、未来流程、
  * 关系代词只能经本轮真实人物 evidence 与当前群官方成员二次复核后触发；
  * 模型单方面写出的名字或 ID 仍不会触发通知。
  */
@@ -2657,13 +2673,14 @@ async function resolveFeishuAgentSelectedMentions(
     mentionIntentOptions?: FeishuMentionIntentOptions;
   },
 ): Promise<PreparedBridgeReplyPayload> {
-  if (context.channelType !== 'feishu' || hasStructuredMentions(payload.mentions)) return payload;
+  if (context.channelType !== 'feishu') return payload;
 
   const requestedTargets = extractExplicitFeishuMentionTargetsFromRequest(
     context.userText,
     context.mentionIntentOptions,
   );
   if (requestedTargets.length === 0) {
+    if (hasStructuredMentions(payload.mentions)) return payload;
     const raw = context.message.raw && typeof context.message.raw === 'object'
       ? context.message.raw as Record<string, unknown>
       : {};
@@ -2672,11 +2689,26 @@ async function resolveFeishuAgentSelectedMentions(
       : {};
     const isBotToBotTurn = typeof botToBot.senderType === 'string' && !!botToBot.senderType.trim();
     if (!isBotToBotTurn || !adapter.resolveOutboundReplyToSenderMention) return payload;
-    if (extractBareFeishuAtTargets(payload.text).length === 0) return payload;
+    const botReplyTargets = new Map<string, string>();
+    for (const target of [...extractBareFeishuAtTargets(payload.text), ...(payload.mentionTargets || [])]) {
+      const key = normalizeFeishuMentionTargetKey(target);
+      if (key) botReplyTargets.set(key, target);
+    }
+    if (botReplyTargets.size === 0) return payload;
+    let resolverText = payload.text;
+    const presentTargetKeys = new Set(
+      extractBareFeishuAtTargets(resolverText).map(normalizeFeishuMentionTargetKey).filter(Boolean),
+    );
+    const missingTargets = [...botReplyTargets]
+      .filter(([key]) => !presentTargetKeys.has(key))
+      .map(([, target]) => `@${target}`);
+    if (missingTargets.length > 0) {
+      resolverText = [missingTargets.join(' '), resolverText].filter(Boolean).join('\n');
+    }
     try {
       const resolved = await adapter.resolveOutboundReplyToSenderMention({
         address: context.message.address,
-        text: payload.text,
+        text: resolverText,
         parseMode: payload.parseMode,
         mentions: payload.mentions,
         replyToMessageId: payload.replyTo,
@@ -2701,7 +2733,17 @@ async function resolveFeishuAgentSelectedMentions(
       .map((target) => [normalizeFeishuMentionTargetKey(target), target] as const)
       .filter(([key]) => !!key),
   );
-  const selectedTargets = new Map(requestedByKey);
+  const trustedTargetKeys = new Set(
+    (payload.mentions || [])
+      .map((mention) => normalizeFeishuMentionTargetKey(mention.name || ''))
+      .filter(Boolean),
+  );
+  // 已通过本轮原生 evidence 验证的 mention 原样保留；只把仍缺失的明确目标
+  // 交给当前群官方成员/机器人 resolver，避免一个成功目标遮住另一个失败目标。
+  const selectedTargets = new Map(
+    [...requestedByKey].filter(([key]) => !trustedTargetKeys.has(key)),
+  );
+  if (selectedTargets.size === 0) return payload;
   for (const target of extractBareFeishuAtTargets(payload.text)) {
     const key = normalizeFeishuMentionTargetKey(target);
     if (key && requestedByKey.has(key)) selectedTargets.set(key, requestedByKey.get(key) || target);
@@ -2734,24 +2776,30 @@ async function resolveFeishuAgentSelectedMentions(
       feishuCardJson: payload.feishuCardJson,
     }, context.message);
 
-    const acceptedMentions = new Map<string, OutboundMention>();
+    const acceptedMentions = new Map<string, OutboundMention>(
+      (payload.mentions || [])
+        .filter((mention): mention is OutboundMention & { userId: string } => !!mention.userId?.trim())
+        .map((mention) => [mention.userId.trim(), mention]),
+    );
+    const resolvedSelectedMentions = new Map<string, OutboundMention>();
     for (const mention of resolved.mentions || []) {
       const userId = mention.userId?.trim() || '';
       const name = mention.name?.trim() || '';
       const nameKey = normalizeFeishuMentionTargetKey(name);
       if (!userId || mention.atAll || !nameKey || !selectedTargets.has(nameKey)) continue;
-      acceptedMentions.set(userId, { userId, name });
+      const accepted = { userId, name };
+      acceptedMentions.set(userId, accepted);
+      resolvedSelectedMentions.set(nameKey, accepted);
     }
 
-    const acceptedNameKeys = new Set(
-      [...acceptedMentions.values()]
-        .map((mention) => normalizeFeishuMentionTargetKey(mention.name || ''))
-        .filter(Boolean),
-    );
     const unresolvedTargets: string[] = [];
-    let text = resolved.text;
+    let text = payload.text;
     for (const [key, target] of selectedTargets) {
-      if (acceptedNameKeys.has(key)) continue;
+      const accepted = resolvedSelectedMentions.get(key);
+      if (accepted) {
+        text = ensureBareFeishuAtTarget(text, target, accepted.name || target);
+        continue;
+      }
       text = stripBareFeishuAtTarget(text, target);
       unresolvedTargets.push(target);
     }
@@ -2769,6 +2817,21 @@ async function resolveFeishuAgentSelectedMentions(
     // 平台查询失败继续交给统一安全层，保留 Agent 正常回答并明确标记未投递。
     return payload;
   }
+}
+
+function ensureBareFeishuAtTarget(text: string, target: string, canonicalName: string): string {
+  const existingTarget = extractBareFeishuAtTargets(text)
+    .find((item) => normalizeFeishuMentionTargetKey(item) === normalizeFeishuMentionTargetKey(target));
+  if (existingTarget) return replaceBareFeishuAtTarget(text, existingTarget, canonicalName);
+
+  // 结构化模型 ID 被安全层撤销后，正文里通常还保留显示名。只有官方 resolver
+  // 已唯一确认身份时，才把首个独立显示名恢复为原生 mention 占位；否则放到句首。
+  const safeTarget = escapeRegExp(target);
+  const plainTargetPattern = new RegExp(`(^|[^\\p{L}\\p{N}_])${safeTarget}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
+  if (plainTargetPattern.test(text)) {
+    return text.replace(plainTargetPattern, (_match, prefix: string) => `${prefix}@${canonicalName}`);
+  }
+  return text.trim() ? `@${canonicalName}\n${text}` : `@${canonicalName}`;
 }
 
 function stripUnverifiedFeishuBareMentions(text: string): string {
@@ -3395,6 +3458,236 @@ interface WorkspaceCatalogEntry {
   kind: 'root' | 'project';
 }
 
+function getRegisteredWorkspaceProjects(): RegisteredProject[] {
+  const { store } = getBridgeContext();
+  const rawRegistry = store.getSetting('bridge_project_registry_json');
+  if (!rawRegistry) return [];
+  try {
+    return parseProjectRegistryDocument(JSON.parse(rawRegistry));
+  } catch (error) {
+    console.warn('[bridge-manager] Invalid registered project catalog:', error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
+function getWorkspaceChatCatalog(currentWorkingDirectory?: string): WorkspaceChatCatalogEntry[] {
+  return buildWorkspaceChatCatalog(getRegisteredWorkspaceProjects(), currentWorkingDirectory);
+}
+
+function renderRegisteredWorkspaceSummaryLines(currentWorkingDirectory?: string): string[] {
+  const catalog = getWorkspaceChatCatalog(currentWorkingDirectory);
+  const lines = ['当前可用工作区：', ''];
+  if (catalog.length === 0) {
+    lines.push('没有可用的已注册工作区。请先在控制面板“项目注册根”中添加并保存。');
+    return lines;
+  }
+
+  for (const entry of catalog) {
+    const { project } = entry;
+    const current = entry.current ? ' ← 当前' : '';
+    const access = project.accessMode === 'read_write' ? '读写' : '只读';
+    lines.push(`${entry.index}. ${project.displayName} [${project.id}]（${access}）${current}`);
+    lines.push(`   ${project.workspaceRoot}`);
+  }
+  lines.push('');
+  lines.push('切换方式：发送“切换工作区到 <编号 / 项目 ID / 名称>”。切换会创建新的项目会话，避免旧项目上下文串入。');
+  return lines;
+}
+
+function buildWorkspaceSelectionCard(catalog: readonly WorkspaceChatCatalogEntry[]): string {
+  const current = catalog.find((entry) => entry.current);
+  const maxButtons = 20;
+  const visible = catalog.slice(0, maxButtons);
+  return buildFeishuChoiceCard({
+    title: '选择工作目录',
+    prompt: current
+      ? `当前工作目录：**${current.project.displayName}** \`${current.project.id}\`\n请选择要切换的目录。切换后会创建新的项目会话。`
+      : '当前绑定未命中启用的注册项目。请选择要切换的工作目录；切换后会创建新的项目会话。',
+    options: visible.map((entry) => {
+      const access = entry.project.accessMode === 'read_write' ? '读写' : '只读';
+      return {
+        label: `${entry.current ? '当前 · ' : ''}${entry.index}. ${entry.project.displayName}（${access}）`,
+        description: entry.project.workspaceRoot,
+        callbackData: `workspace:switch:${entry.project.id}`,
+        type: entry.current ? 'default' as const : 'primary' as const,
+      };
+    }),
+    footer: catalog.length > maxButtons
+      ? `还有 ${catalog.length - maxButtons} 个工作区未显示按钮，可发送“切换工作区到 <项目 ID / 名称>”。`
+      : undefined,
+  });
+}
+
+function stripConfiguredReplyEndMarker(text: string): string {
+  const marker = getReplyEndMarker();
+  const trimmed = text.trim();
+  return trimmed.endsWith(marker)
+    ? trimmed.slice(0, -marker.length).trimEnd()
+    : trimmed;
+}
+
+function appendChoiceTextFallback(text: string, payload: PreparedBridgeReplyPayload): string {
+  if (!payload.choicePrompt) return text;
+  const base = stripConfiguredReplyEndMarker(text);
+  const lines = payload.choicePrompt.options.map((option, index) => (
+    `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`
+  ));
+  return appendReplyEndMarker([
+    base,
+    '',
+    ...lines,
+    '',
+    '请选择一个选项。',
+  ].join('\n'));
+}
+
+function attachAgentChoicePresentation(input: {
+  adapter: BaseChannelAdapter;
+  msg: InboundMessage;
+  sessionId: string;
+  payload: PreparedBridgeReplyPayload;
+  visibleText: string;
+}): { payload: PreparedBridgeReplyPayload; deliveryText: string } {
+  const choicePrompt = input.payload.choicePrompt;
+  if (!choicePrompt || input.payload.feishuCardJson) {
+    return { payload: input.payload, deliveryText: input.visibleText };
+  }
+  const deliveryText = appendChoiceTextFallback(input.visibleText, input.payload);
+  if (input.adapter.channelType !== 'feishu') {
+    return { payload: input.payload, deliveryText };
+  }
+
+  const prompt = stripConfiguredReplyEndMarker(input.visibleText) || '请选择一个选项。';
+  const registered = choicePromptRegistry.register({
+    channelType: input.adapter.channelType,
+    chatId: input.msg.address.chatId,
+    userId: input.msg.address.userId,
+    sessionId: input.sessionId,
+    prompt,
+    choicePrompt,
+  });
+  return {
+    payload: {
+      ...input.payload,
+      feishuCardJson: buildFeishuChoiceCard({
+        title: registered.title || '请选择',
+        prompt,
+        options: registered.options.map((option) => ({
+          label: option.label,
+          description: option.description,
+          callbackData: option.callbackData,
+          type: 'primary',
+        })),
+        footer: '点击按钮后，机器人会按你的选择继续当前对话。',
+      }),
+    },
+    deliveryText,
+  };
+}
+
+function parseWorkspaceCallback(callbackData: string): { action: 'switch'; projectId: string } | null {
+  const match = /^workspace:switch:([a-z0-9][a-z0-9._-]{0,63})$/u.exec(callbackData.trim());
+  return match ? { action: 'switch', projectId: match[1] } : null;
+}
+
+async function handleWorkspaceChatCommand(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  command: NonNullable<ReturnType<typeof parseWorkspaceChatCommand>>,
+): Promise<void> {
+  const replyToMessageId = msg.callbackMessageId || msg.messageId;
+  if (!isOwnerMessage(msg)) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: buildOwnerRequiredMessage(msg),
+      parseMode: 'plain',
+      replyToMessageId,
+    });
+    return;
+  }
+
+  const currentBinding = router.resolve(msg.address);
+  if (command.kind === 'list') {
+    const catalog = getWorkspaceChatCatalog(currentBinding.workingDirectory);
+    const text = renderRegisteredWorkspaceSummaryLines(currentBinding.workingDirectory).join('\n');
+    await deliver(adapter, {
+      address: msg.address,
+      text,
+      parseMode: 'plain',
+      replyToMessageId,
+      ...(adapter.channelType === 'feishu' && catalog.length > 0
+        ? { feishuCardJson: buildWorkspaceSelectionCard(catalog) }
+        : {}),
+    });
+    return;
+  }
+
+  const catalog = getWorkspaceChatCatalog(currentBinding.workingDirectory);
+  const resolution = resolveWorkspaceChatTarget(catalog, command.target);
+  if (resolution.kind !== 'resolved') {
+    const detail = resolution.kind === 'ambiguous'
+      ? `目标“${command.target}”匹配多个工作区：${resolution.entries.map((entry) => `${entry.project.displayName} [${entry.project.id}]`).join('、')}。请改用项目 ID。`
+      : `未找到工作区“${command.target}”。`;
+    await deliver(adapter, {
+      address: msg.address,
+      text: [detail, '', ...renderRegisteredWorkspaceSummaryLines(currentBinding.workingDirectory)].join('\n'),
+      parseMode: 'plain',
+      replyToMessageId,
+      ...(adapter.channelType === 'feishu' && catalog.length > 0
+        ? { feishuCardJson: buildWorkspaceSelectionCard(catalog) }
+        : {}),
+    });
+    return;
+  }
+
+  const target = resolution.entry.project;
+  if (!fs.existsSync(target.workspaceRoot) || !fs.statSync(target.workspaceRoot).isDirectory()) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `未完成：工作区“${target.displayName}”的注册路径当前不可访问：${target.workspaceRoot}`,
+      parseMode: 'plain',
+      replyToMessageId,
+    });
+    return;
+  }
+  if (resolution.entry.current) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `当前已经绑定工作区“${target.displayName}” [${target.id}]：${target.workspaceRoot}`,
+      parseMode: 'plain',
+      replyToMessageId,
+    });
+    return;
+  }
+
+  const activeTask = getState().activeTasks.get(currentBinding.codepilotSessionId);
+  if (activeTask) {
+    await interruptActiveBridgeTask(currentBinding.codepilotSessionId, '已中断：Owner 正在切换当前聊天的工作区。');
+    getState().activeTasks.delete(currentBinding.codepilotSessionId);
+  }
+
+  // 工作区切换使用新会话，避免旧项目历史、SDK session 和工具状态污染新项目。
+  const newBinding = router.createBinding(msg.address, target.workspaceRoot);
+  getBridgeContext().store.insertAuditLog({
+    channelType: msg.address.channelType,
+    chatId: msg.address.chatId,
+    direction: 'inbound',
+    messageId: msg.messageId,
+    summary: `Owner 切换工作区：${currentBinding.workingDirectory || '(未绑定)'} -> ${target.workspaceRoot}`,
+  });
+  await deliver(adapter, {
+    address: msg.address,
+    text: [
+      `已切换到工作区“${target.displayName}” [${target.id}]。`,
+      `路径：${target.workspaceRoot}`,
+      `新会话：${newBinding.codepilotSessionId.slice(0, 8)}...`,
+      target.accessMode === 'read_only' ? '访问模式：只读；涉及写入时会被工作区策略拒绝。' : '访问模式：读写。',
+    ].join('\n'),
+    parseMode: 'plain',
+    replyToMessageId,
+  });
+}
+
 function getConfiguredWorkspaceRoots(): string[] {
   const { store } = getBridgeContext();
   const configured = splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
@@ -3467,6 +3760,15 @@ function resolveWorkspaceArgument(rawTarget: string): { path?: string; matches?:
   const allowedRoots = getConfiguredWorkspaceRoots();
   const trimmed = rawTarget.trim().replace(/^["']|["']$/g, '').trim();
   if (!trimmed) return { error: 'empty' };
+
+  // `/new`、`/cwd` 与自然语言入口共享结构化项目目标，避免列表可见但命令无法选择。
+  const registeredResolution = resolveWorkspaceChatTarget(getWorkspaceChatCatalog(), trimmed);
+  if (registeredResolution.kind === 'resolved') {
+    return { path: registeredResolution.entry.project.workspaceRoot };
+  }
+  if (registeredResolution.kind === 'ambiguous') {
+    return { error: 'ambiguous', matches: registeredResolution.entries.map((entry) => entry.project.workspaceRoot) };
+  }
 
   const absolute = validateWorkingDirectory(trimmed, allowedRoots);
   if (absolute) {
@@ -3560,7 +3862,11 @@ function detectWorkspaceOverrideFromText(text: string, allowOwnerOverride = fals
   return matched.size === 1 ? Array.from(matched)[0] : null;
 }
 
-function renderWorkspaceSummaryLines(): string[] {
+function renderWorkspaceSummaryLines(currentWorkingDirectory?: string): string[] {
+  const registered = getRegisteredWorkspaceProjects();
+  if (registered.length > 0) {
+    return renderRegisteredWorkspaceSummaryLines(currentWorkingDirectory).map((line) => escapeHtml(line));
+  }
   const roots = getConfiguredWorkspaceRoots();
   const lines = ['<b>Available Workspaces</b>', ''];
   if (roots.length === 0) {
@@ -5231,6 +5537,57 @@ async function handleMessage(
     return;
   }
 
+  // 通用选择按钮会被还原成当前用户的一条结构化自然语言消息，再进入正常 Agent 链路。
+  // 回调必须命中 Bridge 短期注册表，并与原聊天、原用户和原会话一致。
+  if (msg.callbackData?.startsWith(CHOICE_CALLBACK_PREFIX)) {
+    const selected = choicePromptRegistry.consume(msg.callbackData, {
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      userId: msg.address.userId,
+    });
+    if (selected.kind !== 'resolved') {
+      const text = selected.kind === 'forbidden'
+        ? '这个选择按钮属于原发起人，不能代替对方选择。'
+        : selected.kind === 'expired'
+          ? '这个选择已经过期或已处理，请重新发起选择。'
+          : '这个选择按钮无效，请重新发起选择。';
+      await deliver(adapter, {
+        address: msg.address,
+        text,
+        parseMode: 'plain',
+        replyToMessageId: msg.callbackMessageId || msg.messageId,
+      });
+      ack();
+      return;
+    }
+    const currentBinding = store.getChannelBinding(msg.address.channelType, msg.address.chatId);
+    if (!currentBinding || currentBinding.codepilotSessionId !== selected.sessionId) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: '当前会话已经变化，这个旧选择不再有效，请重新发起选择。',
+        parseMode: 'plain',
+        replyToMessageId: msg.callbackMessageId || msg.messageId,
+      });
+      ack();
+      return;
+    }
+    msg.text = [
+      buildChoiceSelectionText(selected.option),
+      selected.prompt ? `对应上一条选择：${selected.prompt}` : '',
+    ].filter(Boolean).join('\n');
+    msg.messageKind = 'choice_selection';
+    msg.callbackData = undefined;
+    activeRequest = makeRequestSummary({
+      messageId: msg.messageId,
+      chatId: msg.address.chatId,
+      channelType: adapter.channelType,
+      displayName: msg.address.displayName || msg.address.userId || msg.address.chatId,
+      text: msg.text,
+      stage: 'message_received',
+    });
+    markBridgeRuntimeStage('message_received', { activeRequest });
+  }
+
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
     if (msg.callbackData.startsWith('reminder:complete:')) {
@@ -5253,6 +5610,12 @@ async function handleMessage(
     const conversationSendCallback = parseConversationSendCallback(msg.callbackData);
     if (conversationSendCallback) {
       await handleConversationSendCallback(adapter, msg, conversationSendCallback);
+      ack();
+      return;
+    }
+    const workspaceCallback = parseWorkspaceCallback(msg.callbackData);
+    if (workspaceCallback) {
+      await handleWorkspaceChatCommand(adapter, msg, { kind: 'switch', target: workspaceCallback.projectId });
       ack();
       return;
     }
@@ -5516,6 +5879,13 @@ async function handleMessage(
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
+  const workspaceChatCommand = parseWorkspaceChatCommand(rawText);
+  if (workspaceChatCommand) {
+    await handleWorkspaceChatCommand(adapter, msg, workspaceChatCommand);
+    ack();
+    return;
+  }
+
   if (rawText.startsWith('/')) {
     await handleCommand(adapter, msg, rawText);
     ack();
@@ -6625,6 +6995,21 @@ async function handleMessage(
           },
         )
       : stickerSafeUserFacingResponseText;
+    let outboundDeliveryResponseText = deliveryResponseText;
+    let agentChoiceCardAttached = false;
+    if (preparedReply) {
+      const hadCardBeforeChoice = Boolean(preparedReply.feishuCardJson);
+      const choicePresentation = attachAgentChoicePresentation({
+        adapter,
+        msg,
+        sessionId: effectiveBinding.codepilotSessionId,
+        payload: preparedReply,
+        visibleText: deliveryResponseText,
+      });
+      preparedReply = choicePresentation.payload;
+      outboundDeliveryResponseText = choicePresentation.deliveryText;
+      agentChoiceCardAttached = !hadCardBeforeChoice && Boolean(preparedReply.feishuCardJson);
+    }
     const safeProviderErrorText = result.hasError
       ? buildSafeProviderErrorMessage(result.errorMessage || 'Unknown provider error', {
         cardFinalized: false,
@@ -6728,12 +7113,12 @@ async function handleMessage(
     }
 
     if (responseText) {
-      if (!cardFinalized && !handledAsDoc) {
+      if ((!cardFinalized || agentChoiceCardAttached) && !handledAsDoc) {
         updateBridgeRuntimeActiveRequest(activeRequest, 'reply_sending');
         await deliverResponse(
           adapter,
           msg.address,
-          deliveryResponseText,
+          outboundDeliveryResponseText,
           effectiveBinding.codepilotSessionId,
           preparedReply?.replyTo || msg.messageId,
           true,
@@ -7186,7 +7571,8 @@ async function handleCommand(
     }
 
     case '/projects': {
-      response = renderWorkspaceSummaryLines().join('\n');
+      const binding = router.resolve(msg.address);
+      response = renderWorkspaceSummaryLines(binding.workingDirectory).join('\n');
       break;
     }
 

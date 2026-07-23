@@ -38,9 +38,12 @@ export function preprocessFeishuMarkdown(text: string): string {
       if (index % 2 === 1) return segment;
       // Card 2.0 Markdown does not document underline support. Preserve the
       // intended emphasis with a supported accent instead of leaking raw HTML.
-      return segment.replace(/<(u|ins)\b[^>]*>([\s\S]*?)<\/\1>/giu, (_match, _tag, content: string) => (
+      const supportedEmphasis = segment.replace(/<(u|ins)\b[^>]*>([\s\S]*?)<\/\1>/giu, (_match, _tag, content: string) => (
         `<font color='blue'>**${content.trim()}**</font>`
       ));
+      // Card Markdown 对“加粗标签闭合后立刻接正文”的解析不稳定；只规范化
+      // 以中英文冒号结尾的标签，不改普通句内加粗，也不触碰代码示例。
+      return supportedEmphasis.replace(/(\*\*[^*\r\n]{1,64}[：:]\*\*)(?=[\p{L}\p{N}“‘"'（(\[])/gu, '$1 ');
     })
     .join('');
 }
@@ -614,7 +617,7 @@ function extractFinalCardTitleAndBody(content: string): { title: string; body: s
     const body = stripStandaloneCompletionMarkLines(heading[2]).trim();
     if (hasSubstantiveFinalBody(body)) {
       return {
-        title: summarizeFinalCardTitle(heading[1]),
+        title: summarizeFinalCardTitle(heading[1], false),
         body,
       };
     }
@@ -642,14 +645,20 @@ function hasSubstantiveFinalBody(content: string): boolean {
     .some((line) => line.trim().length > 0);
 }
 
-function summarizeFinalCardTitle(content: string): string {
+function summarizeFinalCardTitle(content: string, allowLightweightChat = true): string {
   const cleaned = sanitizeFinalCardTitle(stripFeishuInlineHintText(content));
   if (!cleaned) return '回复';
 
   if (/自我介绍|^我是|能帮你|可以帮你|主要帮你|帮你处理|陪你聊天/u.test(cleaned)) {
     return '自我介绍';
   }
-  if (/表情|满月脸|收到|在这儿|在这里|嘿|哈哈|啦|呢|呀|~|～/u.test(cleaned)) {
+  if (/表情|贴纸|sticker|满月脸/iu.test(cleaned)) {
+    return '表情回复';
+  }
+  const isLightweightChat = cleaned.length <= 48
+    && cleaned.split('\n').filter((line) => line.trim()).length <= 2
+    && !/(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|\|.+\|)/u.test(cleaned);
+  if (allowLightweightChat && isLightweightChat && /收到|在这儿|在这里|嘿|哈哈|啦|呢|呀|~|～/u.test(cleaned)) {
     return '表情回复';
   }
   if (/^(?:已|已经)?(?:完成|处理|修复|更新|生成|同步|检查|整理|创建|删除|恢复)/u.test(cleaned)) {

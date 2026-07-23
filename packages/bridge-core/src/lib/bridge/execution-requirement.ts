@@ -40,7 +40,9 @@ function strictToolRoutingEnabled(): boolean {
 const MEMORY_RECALL_RE = /(记得|记不记得|之前.*说过|回忆|历史里|聊天记录里|记录|偏好)/iu;
 const EXPLANATION_RE = /^(解释|说明|介绍|讲一下|说一下|为什么|怎么理解|原理|区别|方案|计划|总结|分析一下)/iu;
 const NAME_LOOKUP_RE = /(叫啥|叫什么|名字|名称|是哪一个|叫作|叫做)/iu;
-const LOCAL_READ_RE = /(看一看|看一下|看一眼|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|目录|文件夹|子目录|工作目录|当前目录|本地目录|项目结构|仓库结构|读一下|读取|打开.*文件|搜索|搜一下|查找|grep|rg\b|ls\b|dir\b|get-childitem)/iu;
+const LOCAL_READ_ACTION_RE = /(看一看|看一下|看一眼|看看|查看|查一下|查询|列出|列一下|读一下|读取|打开.*文件|搜索|搜一下|查找|获取|扫描|盘点|告诉我|给我看|发我|报一下|grep|rg\b|ls\b|dir\b|get-childitem)/iu;
+const LOCAL_CONTEXT_QUESTION_RE = /(?:(?:工作|当前|本地)?(?:目录|路径)|文件夹|子目录|项目结构|仓库结构|文件|仓库).{0,16}(?:是什么|在哪(?:里|儿)?|位置|有哪些|有什么)|(?:是什么|在哪(?:里|儿)?|有哪些|有什么).{0,16}(?:(?:工作|当前|本地)?(?:目录|路径)|文件夹|子目录|项目结构|仓库结构|文件|仓库)/iu;
+const TERSE_LOCAL_CONTEXT_QUERY_RE = /^(?:(?:请问|请告诉我|告诉我|查看|看看|查一下)\s*)?(?:(?:当前|本地)?(?:工作)?(?:目录|路径)|项目结构|仓库结构)(?:呢|吗)?[。！？!?]?$/iu;
 const LOCAL_TARGET_RE = /(本地|工作目录|当前目录|目录|文件夹|文件|项目|仓库|路径|Game|Assets|Packages|ProjectSettings|\.md|\.json|\.txt|\.ts|\.tsx|\.cs|\.prefab|\.unity)/iu;
 const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*view|scene\s*view|powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+|截图|截个图|截一张|场景|节点|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码)/iu;
 const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|文件|文档|上传|下载|game\s*view|scene\s*view|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码)/iu;
@@ -173,9 +175,16 @@ function hasConcreteReadableContextTarget(text: string, input: ExecutionRequirem
   return false;
 }
 
+function hasLocalReadIntent(text: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  return LOCAL_READ_ACTION_RE.test(normalized)
+    || LOCAL_CONTEXT_QUESTION_RE.test(normalized)
+    || TERSE_LOCAL_CONTEXT_QUERY_RE.test(normalized);
+}
+
 function shouldUseLowRiskLocalProbe(text: string, input: ExecutionRequirementInput): boolean {
   if (input.hasPreResolvedEvidence) return false;
-  if (!LOCAL_READ_RE.test(text)) return false;
+  if (!hasLocalReadIntent(text)) return false;
   if (!hasConcreteReadableContextTarget(text, input)) return false;
   if (COMMAND_INVOCATION_RE.test(text)) return false;
   // Mutating verbs still go through the stricter tool/action branches below.
@@ -331,13 +340,13 @@ function classifyExecutionRequirementInternal(
     );
   }
 
-  if (EXPLANATION_RE.test(text) && !LOCAL_READ_RE.test(text) && !TOOL_REQUIRED_RE.test(text)) {
+  if (EXPLANATION_RE.test(text) && !hasLocalReadIntent(text) && !TOOL_REQUIRED_RE.test(text)) {
     return NONE_REQUIREMENT;
   }
 
   const asksForCurrentToolState = TOOL_DOMAIN_RE.test(text) && INSPECTION_ACTION_RE.test(text);
 
-  if (NAME_LOOKUP_RE.test(text) && !LOCAL_READ_RE.test(text) && !ACTION_VERB_RE.test(text) && !asksForCurrentToolState) {
+  if (NAME_LOOKUP_RE.test(text) && !hasLocalReadIntent(text) && !ACTION_VERB_RE.test(text) && !asksForCurrentToolState) {
     return NONE_REQUIREMENT;
   }
 
@@ -359,7 +368,7 @@ function classifyExecutionRequirementInternal(
     return requirement;
   }
 
-  if (LOCAL_READ_RE.test(text) && (LOCAL_TARGET_RE.test(text) || !!input.workingDirectory)) {
+  if (hasLocalReadIntent(text) && (LOCAL_TARGET_RE.test(text) || !!input.workingDirectory)) {
     if (input.hasPreResolvedEvidence) return NONE_REQUIREMENT;
     if (options.respectStrictToolRouting && !strictToolRoutingEnabled()) {
       return NONE_REQUIREMENT;
@@ -409,12 +418,19 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
   const families = requirement.requiredToolFamilies.length
     ? requirement.requiredToolFamilies.join(', ')
     : 'appropriate tool';
+  const localReadGuidance = requirement.kind === 'local_read_required'
+    ? [
+      '- Working-directory and path values already present in routing metadata are context only, not successful tool evidence.',
+      '- For a current-directory question, call an available shell/current-directory tool (for example Get-Location on PowerShell or pwd on POSIX) in the supplied workspace, then answer from that result.',
+    ]
+    : [];
   if (requirement.strictToolEvidence === false) {
     return [
       'Execution evidence preference for this turn:',
       `- Requirement: ${requirement.kind}.`,
       `- Reason: ${requirement.reason}.`,
       `- Preferred tool families: ${families}.`,
+      ...localReadGuidance,
       '- Prefer a real tool when it is available.',
       '- If the preferred tool path is unavailable, you may still answer using the best available model knowledge, but do not claim that a tool succeeded.',
       '- When possible, include source names, dates, and uncertainty instead of fabricating tool evidence.',
@@ -425,6 +441,7 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
     `- Requirement: ${requirement.kind}.`,
     `- Reason: ${requirement.reason}.`,
     `- Required tool families: ${families}.`,
+    ...localReadGuidance,
     '- You must call an appropriate real tool before answering with local facts or completion claims.',
     '- Do not answer from memory, guesses, examples, or prior screenshots when the request asks for current local state.',
     '- If the required tool path is unavailable, answer with "未完成：" followed by the concrete blocker and the attempted tool path.',
@@ -440,9 +457,16 @@ export function buildNoEvidenceRetryPrompt(requirement: ExecutionRequirement): s
       'If the input cannot be accepted, reply only with "未完成：" and the concrete input blocker.',
     ].join('\n');
   }
+  const localReadGuidance = requirement.kind === 'local_read_required'
+    ? [
+      'Working-directory and path values already present in routing metadata are context only, not successful tool evidence.',
+      'For a current-directory question, call an available shell/current-directory tool now (for example Get-Location on PowerShell or pwd on POSIX) in the supplied workspace.',
+    ]
+    : [];
   return [
     'No successful tool result was detected in the previous attempt.',
     `This request still requires execution evidence: ${requirement.kind}.`,
+    ...localReadGuidance,
     'Retry now by calling the required real tool first. Do not provide a factual local answer without a successful tool result.',
     'If you cannot call the tool, reply only with "未完成：" and the concrete blocker.',
   ].join('\n');

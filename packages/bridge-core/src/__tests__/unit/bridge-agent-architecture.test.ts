@@ -145,10 +145,22 @@ describe('agent architecture registry', () => {
     assert.match(lines, /balanced\/fluent profile/i);
     assert.match(lines, /strong attributable platform evidence/i);
     assert.match(lines, /bot-to-bot return mention/i);
-    assert.match(lines, /sender app_id.*mentionable member_id/i);
+    assert.match(lines, /sender app_id or open_id\/user_id\/union_id.*mentionable member_id/i);
+    assert.match(lines, /conflicting identities fail closed/i);
     assert.match(lines, /may select a real evidence ID/i);
     assert.match(lines, /Invented IDs/i);
     assert.match(lines, /broadcast audiences/i);
+  });
+
+  it('assigns persistent chat workspace switching to the Policy Registry', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'policy_registry.workspace_binding');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'policy_registry');
+    assert.match(policy.responsibility, /Owner/i);
+    assert.match(policy.responsibility, /registered project/i);
+    assert.ok(policy.tags.includes('session-binding'));
   });
 
   it('keeps Feishu text presentation rules in the Delivery Layer', () => {
@@ -164,6 +176,22 @@ describe('agent architecture registry', () => {
     assert.match(lines, /italic/i);
     assert.match(lines, /underline/i);
     assert.match(lines, /short conversational replies/i);
+  });
+
+  it('keeps finite user choices in the Delivery Layer without weakening safety gates', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'delivery_layer.structured_choice_prompt');
+    const lines = getAgentPolicyPromptLines(['delivery_layer.structured_choice_prompt']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'delivery_layer');
+    assert.match(lines, /2-8 concrete/i);
+    assert.match(lines, /choices.*cti-final/i);
+    assert.match(lines, /full path or identifier/i);
+    assert.match(lines, /permission approval/i);
+    assert.match(lines, /Owner confirmation/i);
+    assert.match(lines, /callback_data/i);
+    assert.match(lines, /Bridge signs button callbacks/i);
   });
 
   it('decides skill autonomy from source and risk instead of names', () => {

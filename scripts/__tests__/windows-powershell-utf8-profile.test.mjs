@@ -57,6 +57,7 @@ test('PowerShell 5.1 UTF-8 profile supports check apply idempotency probe and re
   const firstContent = await readFile(profilePath, 'utf8');
   assert.match(firstContent, /BEGIN codex-im-suite PowerShell UTF-8/);
   assert.match(firstContent, /\$OutputEncoding/);
+  assert.match(firstContent, /PSDefaultParameterValues\['Get-Content:Encoding'\]\s*=\s*'UTF8'/);
   assert.match(firstContent, /Set-Alias -Name cti_keep/);
 
   const appliedAgain = runProfileScript('Apply', profilePath);
@@ -67,6 +68,7 @@ test('PowerShell 5.1 UTF-8 profile supports check apply idempotency probe and re
   const checked = runProfileScript('Check', profilePath);
   assert.equal(checked.status, 0, `Check after Apply failed:\n${checked.stdout}\n${checked.stderr}`);
   assert.match(checked.stdout, /e4b8ade69687e6b58be8af950d0a/i);
+  assert.match(checked.stdout, /file-probe=e4b8ade69687e6b58be8af95/i);
 
   const removed = runProfileScript('Remove', profilePath);
   assert.equal(removed.status, 0, `Remove failed:\n${removed.stdout}\n${removed.stderr}`);

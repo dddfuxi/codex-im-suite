@@ -7623,6 +7623,7 @@ describe('bridge-manager policy helpers', () => {
       { modelField: 'user_id', evidenceField: 'openId' },
       { modelField: 'openId', evidenceField: 'user_id' },
       { modelField: 'open_id', evidenceField: 'userId' },
+      { modelField: 'id', evidenceField: 'open_id' },
     ] as const;
     let callIndex = 0;
     initBridgeContext({
@@ -7890,6 +7891,158 @@ describe('bridge-manager policy helpers', () => {
     assert.deepEqual(finalized[0][4], [{ userId: 'ou_george_bot', name: '乔治机器人' }]);
   });
 
+  it('resolves a string-selected debate starter before streaming card finalization', async () => {
+    const finalized: unknown[][] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在发起机器人辩论。' },
+          {
+            type: 'text',
+            data: [
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '开辩啦～乔治先手，请亮出观点；发言结束记得艾特我。@乔治',
+                images: [],
+                files: [],
+                reply_mode: 'plain',
+                mentions: ['乔治'],
+              }),
+              '```',
+            ].join('\n'),
+          },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_debate_starter' })) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    (adapter as any).onStreamText = () => {};
+    (adapter as any).onStreamEnd = async (...args: unknown[]) => {
+      finalized.push(args);
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage(
+        '你们来开始吵架，必须 at 对方，乔治先开始',
+        'ou_owner',
+        'oc_stream_debate_starter',
+      ),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_stream_debate_starter',
+        userId: 'ou_owner',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(resolverInputs.length, 1);
+    assert.equal(finalized.length, 1);
+    assert.deepEqual(finalized[0][4], [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('preserves an already verified mention while resolving the assigned responder for an immediate game turn', async () => {
+    const finalized: unknown[][] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          { type: 'progress', data: '正在开局。' },
+          {
+            type: 'text',
+            data: [
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '开汤啦～@乔治\n\n**汤面：**女人回到酒店时，发现自己的房门虚掩。\n\n每次提问都要艾特 @小虾米。',
+                images: [],
+                files: [],
+                reply_mode: 'markdown',
+                mentions: [
+                  { id: 'ou_model_george', name: '乔治' },
+                  { id: 'ou_current_bot', name: '小虾米' },
+                ],
+              }),
+              '```',
+            ].join('\n'),
+          },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_turtle_soup' })) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [
+          ...(message.mentions || []),
+          { userId: 'ou_george', name: '乔治' },
+        ],
+      };
+    };
+    (adapter as any).onStreamText = () => {};
+    (adapter as any).onStreamEnd = async (...args: unknown[]) => {
+      finalized.push(args);
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage(
+        '来一局海龟汤，你出题，乔治回答。每次艾特乔治，并且告诉乔治是或者不是以及回答要艾特你，知道它回答正确后暂停游戏。',
+        'ou_owner',
+        'oc_stream_turtle_soup',
+      ),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_stream_turtle_soup',
+        userId: 'ou_owner',
+        displayName: '刘丹',
+        chatType: 'group',
+      },
+      raw: {
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(resolverInputs.length, 1);
+    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.deepEqual(resolverInputs[0].mentions, [{ userId: 'ou_current_bot', name: '小虾米' }]);
+    assert.equal(finalized.length, 1);
+    assert.match(String(finalized[0][2]), /@乔治/u);
+    assert.match(String(finalized[0][2]), /@小虾米/u);
+    assert.deepEqual(finalized[0][4], [
+      { userId: 'ou_current_bot', name: '小虾米' },
+      { userId: 'ou_george', name: '乔治' },
+    ]);
+  });
+
   it('resolves a bot-to-bot reply mention back to the verified inbound bot sender', async () => {
     const sent: OutboundMessage[] = [];
     const replyResolverInputs: OutboundMessage[] = [];
@@ -7935,6 +8088,67 @@ describe('bridge-manager policy helpers', () => {
 
     assert.equal(replyResolverInputs.length, 1);
     assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('uses a string mention selection to resolve the verified inbound bot sender even without bare at text', async () => {
+    const sent: OutboundMessage[] = [];
+    const replyResolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '反方一辩：责任归本人不等于署名本人。请继续。',
+            images: [],
+            files: [],
+            reply_mode: 'plain',
+            mentions: ['乔治'],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply_string_mention' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundReplyToSenderMention?: (
+        message: OutboundMessage,
+        sourceMessage?: InboundMessage,
+      ) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundReplyToSenderMention = async (message) => {
+      replyResolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('正方一辩：请反驳。', 'cli_george', 'oc_bot_debate_string'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_bot_debate_string',
+        userId: 'cli_george',
+        displayName: '辩论群',
+        chatType: 'group',
+      },
+      raw: {
+        feishuSender: { appId: 'cli_george', senderType: 'app', chatType: 'group' },
+        feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'app' },
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(replyResolverInputs.length, 1);
+    assert.match(replyResolverInputs[0].text, /^@乔治/u);
     assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 
@@ -8876,6 +9090,365 @@ describe('bridge-manager policy helpers', () => {
       dueAt: '2026-07-10T00:00:00.000Z',
     });
     assert.equal(_testOnly.parseNaturalReminderRequest('新建任务，每天8点叫刘丹起床', now), null);
+  });
+});
+
+describe('bridge-manager workspace chat commands', () => {
+  it('routes natural working-directory questions through the agent and retries with real tool evidence', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-agent-read-'));
+    const sent: OutboundMessage[] = [];
+    const prompts: string[] = [];
+    const attempts: Array<{ requirement?: string; retry?: boolean }> = [];
+    let streamCalls = 0;
+    const store = createStatefulStore({
+      bridge_default_work_dir: root,
+      remote_bridge_enabled: 'true',
+    });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: (input: any) => {
+          streamCalls += 1;
+          prompts.push(input.systemPrompt || '');
+          attempts.push({
+            requirement: input.executionRequirement?.kind,
+            retry: input.noEvidenceRetryAttempted,
+          });
+          if (streamCalls === 1) {
+            return createTextStream('```cti-final\n{"kind":"text","text":"当前工作目录是提示里的路径。","images":[],"files":[],"reply_mode":"plain"}\n```');
+          }
+          return createEventStream([
+            {
+              type: 'tool_use',
+              data: JSON.stringify({
+                id: 'tool-cwd-1',
+                name: 'Bash',
+                input: { command: '(Get-Location).Path' },
+              }),
+            },
+            {
+              type: 'tool_result',
+              data: JSON.stringify({
+                tool_use_id: 'tool-cwd-1',
+                content: root,
+                is_error: false,
+              }),
+            },
+            {
+              type: 'text',
+              data: `\`\`\`cti-final\n${JSON.stringify({
+                kind: 'text',
+                text: `当前工作目录：${root}`,
+                images: [],
+                files: [],
+                reply_mode: 'plain',
+              })}\n\`\`\``,
+            },
+            { type: 'result', data: '{}' },
+          ]);
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-agent-read-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('工作目录', 'ou_owner'));
+
+    assert.equal(streamCalls, 2);
+    assert.deepEqual(attempts, [
+      { requirement: 'local_read_required', retry: false },
+      { requirement: 'local_read_required', retry: true },
+    ]);
+    assert.match(prompts[1], /routing metadata.*not.*tool evidence/i);
+    assert.match(prompts[1], /Get-Location|pwd/i);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text.startsWith(`当前工作目录：${root}`), true);
+    assert.equal(sent[0].feishuCardJson, undefined);
+  });
+
+  it('allows an Owner to list registered workspaces without invoking the provider', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-list-'));
+    const projectA = path.join(root, 'ProjectA');
+    const projectB = path.join(root, 'ProjectB');
+    fs.mkdirSync(projectA);
+    fs.mkdirSync(projectB);
+    const sent: OutboundMessage[] = [];
+    let providerCalls = 0;
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: projectA,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project-a', displayName: '项目 A', type: 'generic', workspaceRoot: projectA, accessMode: 'read_write', enabled: true },
+          { id: 'project-b', displayName: '项目 B', type: 'generic', workspaceRoot: projectB, accessMode: 'read_only', enabled: true },
+        ],
+      }),
+    });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          providerCalls += 1;
+          return createTextStream('不应调用');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-list-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('切换工作目录', 'ou_owner'));
+
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /项目 A \[project-a\]/u);
+    assert.match(sent[0].text, /项目 B \[project-b\]/u);
+    assert.match(sent[0].text, /← 当前/u);
+    assert.match(sent[0].text, /切换工作区到/u);
+    assert.ok(sent[0].feishuCardJson);
+    assert.match(sent[0].feishuCardJson || '', /选择工作目录/u);
+    assert.match(sent[0].feishuCardJson || '', /workspace:switch:project-a/u);
+    assert.match(sent[0].feishuCardJson || '', /workspace:switch:project-b/u);
+  });
+
+  it('renders finite Agent choices as Bridge-owned buttons and resumes from a valid click', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-agent-choice-'));
+    const sent: OutboundMessage[] = [];
+    let providerCalls = 0;
+    const store = createStatefulStore({
+      bridge_default_work_dir: root,
+      remote_bridge_enabled: 'true',
+    });
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          providerCalls += 1;
+          if (providerCalls === 1) {
+            return createTextStream([
+              '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '请选择接下来采用的模式。',
+                images: [],
+                files: [],
+                reply_mode: 'markdown',
+                choice_title: '选择模式',
+                choices: [
+                  { label: '只读检查', description: '不修改文件' },
+                  { label: '直接修复', description: '允许修改当前工作区' },
+                ],
+              }),
+              '```',
+            ].join('\n'));
+          }
+          return createTextStream('```cti-final\n{"kind":"text","text":"已按你选择的只读检查继续。","images":[],"files":[],"reply_mode":"plain"}\n```');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `agent-choice-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('我接下来该用哪种模式？', 'ou_owner'));
+
+    assert.equal(providerCalls, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /1\. 只读检查/u);
+    assert.match(sent[0].text, /2\. 直接修复/u);
+    assert.ok(sent[0].feishuCardJson);
+    assert.match(sent[0].feishuCardJson || '', /选择模式/u);
+    const callback = /choice:select:[a-z0-9_-]+:0/iu.exec(sent[0].feishuCardJson || '')?.[0];
+    assert.ok(callback);
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_owner'),
+      messageId: 'agent-choice-click-1',
+      callbackData: callback,
+      callbackMessageId: 'agent-choice-1',
+    });
+
+    assert.equal(providerCalls, 2);
+    assert.equal(sent.length, 2);
+    assert.match(sent[1].text, /已按你选择的只读检查继续/u);
+    assert.equal(sent[1].feishuCardJson, undefined);
+  });
+
+  it('switches an Owner to a fresh session using only a registered project target', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-switch-'));
+    const projectA = path.join(root, 'ProjectA');
+    const projectB = path.join(root, 'ProjectB');
+    fs.mkdirSync(projectA);
+    fs.mkdirSync(projectB);
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: projectA,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project-a', displayName: '项目 A', type: 'generic', workspaceRoot: projectA, accessMode: 'read_write', enabled: true },
+          { id: 'project-b', displayName: '项目 B', type: 'generic', workspaceRoot: projectB, accessMode: 'read_only', enabled: true },
+        ],
+      }),
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('不应调用') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-switch-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const address = createInboundMessage('', 'ou_owner').address;
+    const initial = store.getChannelBinding(address.channelType, address.chatId);
+    assert.equal(initial, null);
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('切换工作区到 project-b', 'ou_owner'));
+
+    const binding = store.getChannelBinding(address.channelType, address.chatId);
+    assert.ok(binding);
+    assert.equal(binding.workingDirectory, projectB);
+    assert.equal(binding.codepilotSessionId, 'session_2');
+    assert.match(sent[0].text, /已切换到工作区“项目 B”/u);
+    assert.match(sent[0].text, /访问模式：只读/u);
+  });
+
+  it('rejects persistent workspace switching from a non-Owner', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-owner-'));
+    const project = path.join(root, 'Project');
+    fs.mkdirSync(project);
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: project,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project', displayName: '项目', type: 'generic', workspaceRoot: project, accessMode: 'read_write', enabled: true },
+        ],
+      }),
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('不应调用') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-owner-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('切换工作区到 project', 'ou_viewer'));
+
+    assert.equal(store.getChannelBinding('feishu', 'oc_123'), null);
+    assert.match(sent[0].text, /只允许 owner/u);
+  });
+
+  it('revalidates Owner and registered project state when a workspace card button is clicked', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-card-'));
+    const projectA = path.join(root, 'ProjectA');
+    const projectB = path.join(root, 'ProjectB');
+    fs.mkdirSync(projectA);
+    fs.mkdirSync(projectB);
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: projectA,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project-a', displayName: '项目 A', type: 'generic', workspaceRoot: projectA, accessMode: 'read_write', enabled: true },
+          { id: 'project-b', displayName: '项目 B', type: 'generic', workspaceRoot: projectB, accessMode: 'read_write', enabled: true },
+        ],
+      }),
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('不应调用') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-card-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_owner'),
+      callbackData: 'workspace:switch:project-b',
+      callbackMessageId: 'om_workspace_card',
+    });
+
+    assert.equal(store.getChannelBinding('feishu', 'oc_123')?.workingDirectory, projectB);
+    assert.match(sent[0].text, /已切换到工作区“项目 B”/u);
+    assert.equal(sent[0].replyToMessageId, 'om_workspace_card');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_viewer'),
+      messageId: 'm_workspace_forged',
+      callbackData: 'workspace:switch:project-a',
+      callbackMessageId: 'om_workspace_card',
+    });
+
+    assert.equal(store.getChannelBinding('feishu', 'oc_123')?.workingDirectory, projectB);
+    assert.match(sent[1].text, /只允许 owner/u);
+  });
+
+  it('keeps /cwd compatible with structured project IDs shown by /projects', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-cwd-'));
+    const projectA = path.join(root, 'ProjectA');
+    const projectB = path.join(root, 'ProjectB');
+    fs.mkdirSync(projectA);
+    fs.mkdirSync(projectB);
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: projectA,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project-a', displayName: '项目 A', type: 'generic', workspaceRoot: projectA, accessMode: 'read_write', enabled: true },
+          { id: 'project-b', displayName: '项目 B', type: 'generic', workspaceRoot: projectB, accessMode: 'read_write', enabled: true },
+        ],
+      }),
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('不应调用') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-cwd-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/cwd project-b', 'ou_owner'));
+
+    assert.equal(store.getChannelBinding('feishu', 'oc_123')?.workingDirectory, projectB);
+    assert.match(sent[0].text, /Working directory set/u);
   });
 });
 

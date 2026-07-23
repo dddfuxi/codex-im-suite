@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildExecutionRequirementPrompt,
+  buildNoEvidenceRetryPrompt,
   classifyToolResultQuality,
   classifyExecutionRequirement,
   isExecutionEvidenceSatisfied,
@@ -54,6 +55,40 @@ describe('execution requirement classifier', () => {
       assert.equal(commandRequirement.kind, 'tool_required');
       assert.ok(commandRequirement.requiredToolFamilies.includes('shell'));
     });
+  });
+
+  it('treats terse directory questions as agent tool tasks without gating descriptive mentions', () => {
+    const terseRequirement = classifyExecutionRequirement({
+      userText: '工作目录',
+      workingDirectory: 'F:\\unity\\ST4',
+    });
+    assert.equal(terseRequirement.kind, 'local_read_required');
+
+    const explicitRequirement = classifyExecutionRequirement({
+      userText: '当前工作路径是什么？',
+      workingDirectory: 'F:\\unity\\ST4',
+    });
+    assert.equal(explicitRequirement.kind, 'local_read_required');
+
+    for (const userText of [
+      '导致构建失败，当前工作目录配置错误',
+      '不要走快捷，导致 xxxx，当前工作路径 xxxx，这样的对话会被误触',
+      '日志里写着当前工作路径 F:\\old，但这只是报错原文',
+      '这个配置的工作目录字段怎么设计',
+    ]) {
+      assert.equal(classifyExecutionRequirement({
+        userText,
+        workingDirectory: 'F:\\unity\\ST4',
+      }).kind, 'none', userText);
+    }
+
+    const initialPrompt = buildExecutionRequirementPrompt(terseRequirement);
+    assert.match(initialPrompt, /routing metadata.*not.*tool evidence/i);
+    assert.match(initialPrompt, /Get-Location|pwd/i);
+
+    const retryPrompt = buildNoEvidenceRetryPrompt(terseRequirement);
+    assert.match(retryPrompt, /routing metadata.*not.*tool evidence/i);
+    assert.match(retryPrompt, /Get-Location|pwd/i);
   });
 
   it('requires tool evidence for local directory listing requests', () => {

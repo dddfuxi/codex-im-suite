@@ -11,6 +11,7 @@ $beginMarker = '# BEGIN codex-im-suite PowerShell UTF-8'
 $endMarker = '# END codex-im-suite PowerShell UTF-8'
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $expectedProbeHex = 'e4b8ade69687e6b58be8af950d0a'
+$expectedFileProbeHex = 'e4b8ade69687e6b58be8af95'
 
 if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
     $ProfilePath = $PROFILE.CurrentUserAllHosts
@@ -26,6 +27,7 @@ $beginMarker original-ended-with-newline=$newlineFlag
 `$OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList `$false
 try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList `$false } catch {}
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding -ArgumentList `$false } catch {}
+`$PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8'
 $endMarker
 "@ -replace "`n", "`r`n"
 }
@@ -129,6 +131,47 @@ function Invoke-Utf8StdinProbe {
     finally {}
 }
 
+function Invoke-Utf8DefaultFileReadProbe {
+    if (-not (Test-Path -LiteralPath $PowerShellPath -PathType Leaf)) {
+        throw "Windows PowerShell executable not found: $PowerShellPath"
+    }
+    $probePath = [System.IO.Path]::GetTempFileName()
+    try {
+        $probeText = -join @([char]0x4e2d, [char]0x6587, [char]0x6d4b, [char]0x8bd5)
+        [System.IO.File]::WriteAllText($probePath, $probeText, $utf8NoBom)
+        $escapedProfile = $ProfilePath.Replace("'", "''")
+        $escapedProbe = $probePath.Replace("'", "''")
+        $command = "`$ProgressPreference = 'SilentlyContinue'; . '$escapedProfile'; `$text = Get-Content -Raw -LiteralPath '$escapedProbe'; [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes(`$text)).Replace('-', '').ToLowerInvariant()"
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $PowerShellPath
+        $startInfo.Arguments = "-NoLogo -NoProfile -EncodedCommand $encodedCommand"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "UTF-8 default file read probe process failed: $stderr"
+        }
+        if ([string]::IsNullOrWhiteSpace($stdout)) {
+            throw "UTF-8 default file read probe returned no stdout. stderr=$stderr"
+        }
+        return $stdout.Trim().ToLowerInvariant()
+    }
+    finally {
+        if (Test-Path -LiteralPath $probePath) {
+            Remove-Item -LiteralPath $probePath -Force
+        }
+    }
+}
+
 $beforeExists = Test-Path -LiteralPath $ProfilePath -PathType Leaf
 $beforeContent = Read-ProfileText
 
@@ -144,7 +187,12 @@ switch ($Mode) {
             Write-Host "powershell-utf8=failed probe=$probe"
             exit 1
         }
-        Write-Host "powershell-utf8=healthy probe=$probe profile=$ProfilePath"
+        $fileProbe = Invoke-Utf8DefaultFileReadProbe
+        if ($fileProbe -ne $expectedFileProbeHex) {
+            Write-Host "powershell-utf8=failed file-probe=$fileProbe"
+            exit 1
+        }
+        Write-Host "powershell-utf8=healthy probe=$probe file-probe=$fileProbe profile=$ProfilePath"
         exit 0
     }
     'Apply' {
@@ -167,6 +215,10 @@ switch ($Mode) {
             if ($probe -ne $expectedProbeHex) {
                 throw "unexpected probe bytes: $probe"
             }
+            $fileProbe = Invoke-Utf8DefaultFileReadProbe
+            if ($fileProbe -ne $expectedFileProbeHex) {
+                throw "unexpected default file read probe bytes: $fileProbe"
+            }
         }
         catch {
             if ($beforeExists) {
@@ -177,7 +229,7 @@ switch ($Mode) {
             throw "PowerShell UTF-8 profile probe failed; before-image restored. $($_.Exception.Message)"
         }
 
-        Write-Host "powershell-utf8=applied probe=$probe profile=$ProfilePath"
+        Write-Host "powershell-utf8=applied probe=$probe file-probe=$fileProbe profile=$ProfilePath"
         exit 0
     }
     'Remove' {

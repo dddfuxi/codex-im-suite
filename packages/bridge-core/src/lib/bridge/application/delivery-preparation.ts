@@ -1,13 +1,14 @@
 import path from 'node:path';
 
 import type { OutboundMention } from '../types.js';
+import { parseChoicePrompt, type ChoicePrompt } from './choice-prompts.js';
 import {
   ARTIFACT_PROMOTION_ACTION_FENCE,
   BRIDGE_CONTROL_ACTION_FENCE,
   REMINDER_ACTION_FENCE,
   SCHEDULED_TASK_ACTION_FENCE,
 } from './action-blocks.js';
-import { parseEnvelopeMentions } from './mentions.js';
+import { parseEnvelopeMentionTargets, parseEnvelopeMentions } from './mentions.js';
 import {
   STICKER_ANNOTATION_FENCE,
   STICKER_CANDIDATE_ANALYSIS_FENCE,
@@ -25,7 +26,9 @@ export interface FinalReplyEnvelope {
   files: string[];
   reply_mode: FinalReplyMode;
   mentions?: OutboundMention[];
+  mention_targets?: string[];
   reply_to?: string;
+  choice_prompt?: ChoicePrompt;
 }
 
 export interface DeliveryCandidatePayload {
@@ -34,8 +37,11 @@ export interface DeliveryCandidatePayload {
   images: string[];
   files: string[];
   mentions?: OutboundMention[];
+  /** 模型选择的显示名提示；不含可信平台身份，只能交给 delivery 再解析。 */
+  mentionTargets?: string[];
   replyTo?: string;
   feishuCardJson?: string;
+  choicePrompt?: ChoicePrompt;
 }
 
 export interface DeliveryCandidateStatus {
@@ -89,12 +95,16 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     files,
     reply_mode: replyMode,
     mentions: parseEnvelopeMentions(raw.mentions),
+    mention_targets: parseEnvelopeMentionTargets(raw.mentions),
     reply_to: typeof raw.reply_to === 'string' && raw.reply_to.trim() ? raw.reply_to.trim() : undefined,
+    choice_prompt: parseChoicePrompt(raw.choices, raw.choice_title),
   };
 }
 
 export function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | null {
-  const fencePattern = new RegExp(String.raw`(?:^|\n)\`\`\`${FINAL_REPLY_FENCE}\s*\n([\s\S]*?)\n\`\`\``, 'g');
+  // 官方 Provider 会把多个 completed agent_message 连续拼接；最终协议块前面
+  // 不一定天然带换行。这里按 fence 自身定位，兼容相邻进度文本和单行 JSON。
+  const fencePattern = new RegExp(String.raw`\`\`\`${FINAL_REPLY_FENCE}\b([\s\S]*?)\`\`\``, 'gi');
   let lastMatch: RegExpExecArray | null = null;
   for (const match of text.matchAll(fencePattern)) lastMatch = match;
   if (lastMatch) {
@@ -104,15 +114,50 @@ export function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | nu
       // 继续尝试无 fence 的兼容 JSON。
     }
   }
-  const rawJsonPattern = /(\{[\s\S]*?"kind"\s*:\s*"(?:text|image|file|mixed)"[\s\S]*?"reply_mode"\s*:\s*"(?:plain|markdown|html)"[\s\S]*?\})/g;
-  let rawJsonMatch: RegExpExecArray | null = null;
-  for (const match of text.matchAll(rawJsonPattern)) rawJsonMatch = match;
-  if (!rawJsonMatch) return null;
-  try {
-    return parseEnvelopeObject(JSON.parse(rawJsonMatch[1].trim()));
-  } catch {
-    return null;
+  // 兼容官方模型偶发输出的裸结构化对象。不能用非贪婪正则截取，因为
+  // mentions 等字段包含嵌套对象；必须按字符串转义和花括号深度找完整 JSON。
+  let lastEnvelope: FinalReplyEnvelope | null = null;
+  for (let start = text.indexOf('{'); start >= 0; start = text.indexOf('{', start + 1)) {
+    const candidate = extractBalancedJsonObject(text, start);
+    if (!candidate) continue;
+    try {
+      const envelope = parseEnvelopeObject(JSON.parse(candidate));
+      if (envelope) lastEnvelope = envelope;
+    } catch {
+      // 继续扫描后续对象；普通正文里的花括号不应阻断结构化结果恢复。
+    }
   }
+  return lastEnvelope;
+}
+
+function extractBalancedJsonObject(text: string, start: number): string | null {
+  if (text[start] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, index + 1);
+      if (depth < 0) return null;
+    }
+  }
+  return null;
 }
 
 export function stripDeliveryProtocolArtifacts(text: string): string {
@@ -128,7 +173,7 @@ export function stripDeliveryProtocolArtifacts(text: string): string {
   let cleaned = text;
   for (const fence of fences) {
     cleaned = cleaned.replace(
-      new RegExp(String.raw`(?:^|\n)\s*\`\`\`${fence}\s*\n[\s\S]*?\n\s*\`\`\``, 'gi'),
+      new RegExp(String.raw`\`\`\`${fence}\b[\s\S]*?\`\`\``, 'gi'),
       '\n',
     );
   }
@@ -203,7 +248,9 @@ function payloadFromEnvelope(
     images: resolveDeliveryPaths(envelope.images, workingDirectory, additionalDirectories),
     files: resolveDeliveryPaths(envelope.files, workingDirectory, additionalDirectories),
     mentions: envelope.mentions,
+    mentionTargets: envelope.mention_targets,
     replyTo: envelope.reply_to,
+    choicePrompt: envelope.choice_prompt,
   };
 }
 

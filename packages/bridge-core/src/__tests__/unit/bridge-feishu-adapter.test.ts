@@ -110,6 +110,48 @@ function writeTestStickerMedia(fileKey: string, data: Buffer): string {
   return mediaPath;
 }
 
+function installStickerFileTransportMock(messageId: string, fileKey: string, media: Buffer) {
+  const originalFetch = globalThis.fetch;
+  const calledUrls: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const text = String(input);
+    const url = new URL(text);
+    calledUrls.push(text);
+    if (url.pathname.includes('/auth/v3/tenant_access_token/internal')) {
+      return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.pathname.includes(`/messages/${messageId}/resources/${fileKey}`)) {
+      if (url.searchParams.get('type') === 'file') {
+        return new Response(media, {
+          status: 200,
+          headers: { 'content-type': 'application/octet-stream' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 40009, msg: 'internal server error' }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.pathname.includes(`/open-apis/im/v1/images/${fileKey}`)) {
+      return new Response(JSON.stringify({ code: 234008, msg: 'image transport unavailable' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+      status: 404,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof fetch;
+  return {
+    calledUrls,
+    restore: () => { globalThis.fetch = originalFetch; },
+  };
+}
+
 describe('FeishuAdapter authorization', () => {
   beforeEach(() => {
     setupContext();
@@ -2942,6 +2984,49 @@ describe('FeishuAdapter replied sticker attachments', () => {
     });
     assert.equal(attachments[0]?.id, 'sticker_original_key');
   });
+
+  it('recovers the exact replied sticker when Feishu exposes its image through file transport', async () => {
+    useTempCtiHome();
+    setupContext({
+      bridge_feishu_app_id: 'cli_current_bot',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const messageId = 'om_replied_sticker_file_transport';
+    const fileKey = 'replied_sticker_file_transport_key';
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const transport = installStickerFileTransportMock(messageId, fileKey, png);
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.restClient = {
+        im: {
+          messageResource: {
+            get: async () => {
+              throw Object.assign(new Error('image transport unavailable'), {
+                response: { status: 500, data: { code: 40009, msg: 'internal server error' } },
+              });
+            },
+          },
+        },
+      };
+
+      const attachments = await adapter.downloadAttachmentsFromMessageItem({
+        message_id: messageId,
+        chat_id: 'oc_group',
+        create_time: String(Date.now()),
+        msg_type: 'sticker',
+        body: { content: JSON.stringify({ file_key: fileKey }) },
+        sender: { id: 'ou_other', sender_type: 'user' },
+      });
+
+      assert.equal(attachments.length, 1);
+      assert.equal(attachments[0]?.type, 'image/png');
+      assert.match(attachments[0]?.name || '', /\.png$/);
+      assert.ok(transport.calledUrls.some((item) => item.includes(`messages/${messageId}/resources/${fileKey}?type=file`)));
+    } finally {
+      transport.restore();
+    }
+  });
 });
 
 describe('FeishuAdapter history intent and bot event guards', () => {
@@ -4780,6 +4865,61 @@ describe('FeishuAdapter sticker inbound', () => {
     assert.equal(store.stickers[0].fileKey, 'sticker_file_key');
   });
 
+  it('falls back to Feishu file transport and caches an inbound sticker as a real image', async () => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_current_bot',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const messageId = 'om_sticker_file_transport';
+    const fileKey = 'sticker_file_transport_key';
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const transport = installStickerFileTransportMock(messageId, fileKey, png);
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.resolveChatDisplayName = async () => '私聊';
+      adapter.persistChatIndex = () => {};
+      adapter.reconcileP2pAliasBinding = () => {};
+      adapter.syncIndexedChatHistory = async () => {};
+      adapter.restClient = {
+        im: {
+          messageResource: {
+            get: async () => {
+              throw Object.assign(new Error('image transport unavailable'), {
+                response: { status: 500, data: { code: 40009, msg: 'internal server error' } },
+              });
+            },
+          },
+        },
+      };
+
+      await adapter.processIncomingEvent({
+        sender: { sender_type: 'user', sender_id: { open_id: 'ou_user' } },
+        message: {
+          message_id: messageId,
+          chat_id: 'oc_chat',
+          chat_type: 'p2p',
+          message_type: 'sticker',
+          content: JSON.stringify({ file_key: fileKey }),
+          create_time: '1710000000000',
+        },
+      });
+
+      const inbound = await adapter.consumeOne();
+      assert.equal(inbound?.messageKind, 'feishu_sticker_image');
+      assert.equal(inbound?.attachments?.length, 1);
+      assert.equal(inbound?.attachments?.[0]?.type, 'image/png');
+      assert.match(inbound?.attachments?.[0]?.name || '', /\.png$/);
+      assert.ok(transport.calledUrls.some((item) => item.includes(`messages/${messageId}/resources/${fileKey}?type=file`)));
+      const store = JSON.parse(fs.readFileSync(getTestFeishuStickerStorePath(), 'utf8'));
+      assert.equal(store.stickers[0].mediaMimeType, 'image/png');
+      assert.equal(store.stickers[0].mediaSize, png.length);
+      assert.equal(store.stickers[0].mediaDownloadFailedAt, undefined);
+    } finally {
+      transport.restore();
+    }
+  });
+
   it('preserves enriched sticker records when history-only keys exceed the store cap', () => {
     const storePath = getTestFeishuStickerStorePath();
     fs.writeFileSync(storePath, JSON.stringify({
@@ -5103,7 +5243,9 @@ describe('FeishuAdapter sticker inbound', () => {
 
     const first = await adapter.consumeOne();
     const second = await adapter.consumeOne();
-    assert.equal(downloadCount, 1);
+    // 首次只执行一轮兼容探测（image + file）；第二条同 key 消息命中冷却，
+    // 不会再次访问任一平台 transport。
+    assert.equal(downloadCount, 2);
     assert.equal(first?.messageKind, 'feishu_sticker_unknown');
     assert.equal(second?.messageKind, 'feishu_sticker_unknown');
     assert.equal(first?.attachments?.length || 0, 0);
@@ -6631,6 +6773,71 @@ describe('FeishuAdapter p2p reply media recovery', () => {
         raw: {
           feishuSender: { appId: 'cli_george', senderType: 'app' },
           feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'app' },
+        },
+      });
+
+      assert.deepEqual(resolved.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('maps a bot sender open_id when the real inbound event omits app_id', async () => {
+    setupContext({
+      bridge_feishu_app_id: 'cli_app_test',
+      bridge_feishu_app_secret: 'secret',
+    });
+    const adapter = new FeishuAdapter() as any;
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            bots: [{
+              app_id: 'cli_george',
+              member_id: 'ou_george',
+              member_id_type: 'open_id',
+              union_id: 'on_george',
+              name: '乔治',
+            }],
+            has_more: false,
+          },
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members')) {
+        return new Response(JSON.stringify({ code: 0, data: { items: [], has_more: false } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const resolved = await adapter.resolveOutboundReplyToSenderMention({
+        address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+        text: '反方一辩。@乔治 请继续。',
+        parseMode: 'Markdown',
+      }, {
+        address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_george', chatType: 'group' },
+        messageId: 'om_source_without_app_id',
+        timestamp: Date.now(),
+        text: '正方一辩。请反驳。',
+        raw: {
+          feishuSender: { openId: 'ou_george', unionId: 'on_george', senderType: 'bot' },
+          feishuBotToBot: { chainCount: 1, maxTurns: 8, senderType: 'bot' },
         },
       });
 

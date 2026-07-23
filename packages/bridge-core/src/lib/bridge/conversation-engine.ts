@@ -538,7 +538,10 @@ function buildReplyPresentationPrompt(replyStyleHint: string, channelType: strin
     '- If the inbound text says the Feishu sticker is not semantically annotated and no sticker image attachment is available, do not claim you can see its image, caption, or intent. Ask the user to explain the sticker meaning or use any learned sticker semantics provided in the message context.',
   ];
   if (channelType === 'feishu') {
-    lines.push(...getAgentPolicyPromptLines(['delivery_layer.feishu_text_presentation']));
+    lines.push(...getAgentPolicyPromptLines([
+      'delivery_layer.feishu_text_presentation',
+      'delivery_layer.structured_choice_prompt',
+    ]));
   }
   if (replyStyleHint) {
     lines.push(`- Required reply style: ${replyStyleHint}`);

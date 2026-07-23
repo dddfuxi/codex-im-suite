@@ -22,7 +22,7 @@ describe('bridge delivery preparation', () => {
         images: ['./result.png'],
         files: ['C:/artifacts/report.md'],
         reply_mode: 'markdown',
-        mentions: [{ open_id: 'ou_target', user_name: '小明' }],
+        mentions: ['乔治', { id: 'ou_target', user_name: '小明' }],
         reply_to: 'om_source',
       }),
       '```',
@@ -39,6 +39,7 @@ describe('bridge delivery preparation', () => {
     assert.deepEqual(result.payload.images, [path.resolve(cwd, './result.png')]);
     assert.deepEqual(result.payload.files, ['C:/artifacts/report.md']);
     assert.deepEqual(result.payload.mentions, [{ userId: 'ou_target', name: '小明' }]);
+    assert.deepEqual(result.payload.mentionTargets, ['乔治', '小明']);
     assert.equal(result.payload.replyTo, 'om_source');
   });
 
@@ -53,6 +54,44 @@ describe('bridge delivery preparation', () => {
     assert.equal(result.payload.text, '包装内结果');
     assert.equal(result.payload.parseMode, 'HTML');
     assert.equal(result.status.parsed, true);
+  });
+
+  it('parses a cti-final fence that is adjacent to a previous agent message', () => {
+    const result = prepareDeliveryCandidate([
+      '我来处理啦～',
+      '```cti-final',
+      JSON.stringify({
+        kind: 'text',
+        text: '@乔治 请回答当前汤面。',
+        images: [],
+        files: [],
+        reply_mode: 'plain',
+        mentions: [{ open_id: 'ou_george', name: '乔治' }],
+      }),
+      '```',
+    ].join(''), 'C:/workspace');
+
+    assert.equal(result.status.parsed, true);
+    assert.equal(result.payload.text, '@乔治 请回答当前汤面。');
+    assert.deepEqual(result.payload.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    assert.doesNotMatch(result.payload.text, /cti-final|reply_mode|我来处理啦/u);
+  });
+
+  it('parses single-line and naked nested final reply objects', () => {
+    const singleLine = prepareDeliveryCandidate(
+      '进度```cti-final {"kind":"text","text":"单行结果","images":[],"files":[],"reply_mode":"plain"}```',
+      'C:/workspace',
+    );
+    const naked = prepareDeliveryCandidate(
+      '结果：{"kind":"text","text":"裸对象结果","images":[],"files":[],"reply_mode":"plain","mentions":[{"open_id":"ou_nested","name":"嵌套成员"}]}',
+      'C:/workspace',
+    );
+
+    assert.equal(singleLine.status.parsed, true);
+    assert.equal(singleLine.payload.text, '单行结果');
+    assert.equal(naked.status.parsed, true);
+    assert.equal(naked.payload.text, '裸对象结果');
+    assert.deepEqual(naked.payload.mentions, [{ userId: 'ou_nested', name: '嵌套成员' }]);
   });
 
   it('removes machine-only action and sticker protocol blocks from visible fallback text', () => {
@@ -97,5 +136,16 @@ describe('bridge delivery preparation', () => {
     assert.equal(result.status.parsed, false);
     assert.equal(result.payload.text, '最终仍然可读。');
     assert.doesNotMatch(result.payload.text, /cti-final|reply_mode/u);
+  });
+
+  it('strips malformed protocol fences even when they follow text on the same line', () => {
+    const result = prepareDeliveryCandidate(
+      '仍可见的结果。```cti-final {"kind":"text","reply_mode":"plain"```',
+      'C:/workspace',
+    );
+
+    assert.equal(result.status.parsed, false);
+    assert.equal(result.payload.text, '仍可见的结果。');
+    assert.doesNotMatch(result.payload.text, /cti-final|reply_mode|kind/u);
   });
 });

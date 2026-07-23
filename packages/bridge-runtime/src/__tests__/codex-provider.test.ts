@@ -483,6 +483,37 @@ describe('CodexProvider', () => {
     assert.equal(events[0].data, 'Hello from Codex!');
   });
 
+  it('preserves boundaries between progress text and a later final envelope', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    const chunks: string[] = [];
+    const mockController = {
+      enqueue: (chunk: string) => chunks.push(chunk),
+    } as unknown as ReadableStreamDefaultController<string>;
+
+    const firstEmitted = (provider as any).handleCompletedItem(mockController, {
+      type: 'agent_message',
+      id: 'msg-progress',
+      text: '我来判断一下～',
+    });
+    const secondEmitted = (provider as any).handleCompletedItem(mockController, {
+      type: 'agent_message',
+      id: 'msg-final',
+      text: '```cti-final\n{"kind":"final","text":"不是"}\n```',
+    }, firstEmitted);
+
+    const events = parseSSEChunks(chunks);
+    assert.equal(firstEmitted, true);
+    assert.equal(secondEmitted, true);
+    assert.equal(events.length, 2);
+    assert.equal(events.map((event) => event.data).join(''), [
+      '我来判断一下～',
+      '\n```cti-final\n{"kind":"final","text":"不是"}\n```',
+    ].join(''));
+  });
+
   it('maps command_execution item to tool_use + tool_result', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');
@@ -1538,6 +1569,8 @@ describe('CodexProvider image input', () => {
     assert.match(capturedInput as string, /use the available context and safe tools first/);
     assert.match(capturedInput as string, /ask only for the smallest missing detail/);
     assert.match(capturedInput as string, /keep the useful partial result/);
+    assert.match(capturedInput as string, /2-8 concrete known alternatives.*choices/is);
+    assert.match(capturedInput as string, /Never include callback_data/i);
     assert.match(capturedInput as string, /Current user request:\nHello$/);
   });
 

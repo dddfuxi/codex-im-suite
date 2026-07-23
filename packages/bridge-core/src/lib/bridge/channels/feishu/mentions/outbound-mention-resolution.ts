@@ -11,6 +11,8 @@ export interface FeishuMentionCandidate {
   aliases: string[];
   /** 群机器人 sender 事件使用 app_id，原生 mention 使用 member open_id。 */
   appIds?: string[];
+  /** 除可 mention userId 外，平台成员 payload 中可用于同一身份求交的 open/user/union ID。 */
+  platformIds?: string[];
   /** 证据来源只在一次出站解析期间使用，不进入长期事实。 */
   evidenceSources?: FeishuMentionCandidateEvidence[];
 }
@@ -52,7 +54,13 @@ export interface AddFeishuMentionCandidateInput {
   name?: string;
   aliases?: string[];
   appIds?: string[];
+  platformIds?: string[];
   evidenceSource?: FeishuMentionCandidateEvidence;
+}
+
+export interface ResolveFeishuBotSenderMentionCandidateInput {
+  appIds?: string[];
+  platformIds?: string[];
 }
 
 function getObject(value: unknown): Record<string, unknown> {
@@ -104,6 +112,13 @@ export function uniqueFeishuMentionAliases(values: unknown[]): string[] {
   return result;
 }
 
+function uniqueFeishuIdentityIds(values: unknown[]): string[] {
+  return Array.from(new Set(values
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean)));
+}
+
 export function pickFeishuMentionableMemberId(
   item: FeishuChatMemberListItem,
   allowLegacyMemberId = false,
@@ -112,6 +127,12 @@ export function pickFeishuMentionableMemberId(
   const id = getObject(item.id);
   const user = getObject(item.user);
   const bot = getObject(item.bot);
+  const memberId = firstNonEmptyString(item.member_id, item.memberId, raw.memberId);
+  const memberIdType = firstNonEmptyString(item.member_id_type, item.memberIdType, raw.memberIdType).toLowerCase();
+  // members/list 会按请求的 member_id_type 返回真正可用于原生 @ 的 member_id；
+  // payload 同时出现 union_id 等辅助身份时，不能让辅助字段抢占 mentionable ID。
+  if (memberId && ['open_id', 'user_id', 'union_id'].includes(memberIdType)) return memberId;
+
   const directId = firstNonEmptyString(
     item.open_id, item.openId, id.open_id, id.openId, user.open_id, user.openId, bot.open_id, bot.openId,
     item.user_id, item.userId, id.user_id, id.userId, user.user_id, user.userId, bot.user_id, bot.userId,
@@ -119,10 +140,7 @@ export function pickFeishuMentionableMemberId(
   );
   if (directId) return directId;
 
-  const memberId = firstNonEmptyString(item.member_id, item.memberId, raw.memberId);
-  const memberIdType = firstNonEmptyString(item.member_id_type, item.memberIdType, raw.memberIdType).toLowerCase();
   if (!memberId) return '';
-  if (['open_id', 'user_id', 'union_id'].includes(memberIdType)) return memberId;
   if (allowLegacyMemberId || /^o[un]_/iu.test(memberId)) return memberId;
   return '';
 }
@@ -132,6 +150,7 @@ export function buildFeishuMentionCandidateFromMember(
   allowLegacyMemberId = false,
 ): FeishuMentionCandidate | null {
   const raw = getObject(item);
+  const id = getObject(item.id);
   const user = getObject(item.user);
   const bot = getObject(item.bot);
   const i18nName = getObject(item.i18n_name);
@@ -152,8 +171,19 @@ export function buildFeishuMentionCandidateFromMember(
     bot.app_id, bot.appId,
   ].filter((value): value is string => typeof value === 'string' && !!value.trim())
     .map((value) => value.trim())));
+  const platformIds = uniqueFeishuIdentityIds([
+    item.open_id, item.openId, id.open_id, id.openId, user.open_id, user.openId, bot.open_id, bot.openId,
+    item.user_id, item.userId, id.user_id, id.userId, user.user_id, user.userId, bot.user_id, bot.userId,
+    item.union_id, item.unionId, id.union_id, id.unionId, user.union_id, user.unionId, bot.union_id, bot.unionId,
+  ]).filter((value) => value !== userId && !isDefinitelyNonUserFeishuMentionId(value));
   const name = aliases[0] || '';
-  return name ? { userId, name, aliases, ...(appIds.length > 0 ? { appIds } : {}) } : null;
+  return name ? {
+    userId,
+    name,
+    aliases,
+    ...(appIds.length > 0 ? { appIds } : {}),
+    ...(platformIds.length > 0 ? { platformIds } : {}),
+  } : null;
 }
 
 export function addFeishuMentionCandidate(
@@ -178,13 +208,42 @@ export function addFeishuMentionCandidate(
     ...(existing?.appIds || []),
     ...(input.appIds || []),
   ].map((value) => value.trim()).filter(Boolean)));
+  const platformIds = uniqueFeishuIdentityIds([
+    ...(existing?.platformIds || []),
+    ...(input.platformIds || []),
+  ]).filter((value) => value !== userId && !isDefinitelyNonUserFeishuMentionId(value));
   candidates.set(userId, {
     userId,
     name: existing?.name || name,
     aliases,
     ...(appIds.length > 0 ? { appIds } : {}),
+    ...(platformIds.length > 0 ? { platformIds } : {}),
     ...(evidenceSources.length > 0 ? { evidenceSources } : {}),
   });
+}
+
+/**
+ * 将真实 bot/app 入站 sender 身份与当前群官方成员候选求交。
+ * 飞书不同事件会给 app_id，或只给 open_id/user_id/union_id；两类证据都可用，
+ * 但只要它们指向不同的可 mention 成员就失败关闭，避免按显示名猜机器人。
+ */
+export function resolveFeishuBotSenderMentionCandidate(
+  candidates: FeishuMentionCandidate[],
+  input: ResolveFeishuBotSenderMentionCandidateInput,
+): FeishuMentionCandidate | null {
+  const senderAppIds = new Set(uniqueFeishuIdentityIds(input.appIds || []));
+  const senderPlatformIds = new Set(uniqueFeishuIdentityIds(input.platformIds || [])
+    .filter((value) => !isDefinitelyNonUserFeishuMentionId(value)));
+  if (senderAppIds.size === 0 && senderPlatformIds.size === 0) return null;
+
+  const matches = candidates.filter((candidate) => {
+    const appMatched = (candidate.appIds || []).some((value) => senderAppIds.has(value));
+    const platformMatched = [candidate.userId, ...(candidate.platformIds || [])]
+      .some((value) => senderPlatformIds.has(value));
+    return appMatched || platformMatched;
+  });
+  const uniqueByMentionableId = new Map(matches.map((candidate) => [candidate.userId, candidate]));
+  return uniqueByMentionableId.size === 1 ? [...uniqueByMentionableId.values()][0] : null;
 }
 
 export function findFeishuMentionCandidateMatches(

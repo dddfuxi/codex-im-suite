@@ -106,7 +106,9 @@ function hasUnsupportedExecutionClaim(input: AnswerReviewInput): boolean {
   }
   if (!CONCRETE_EXECUTION_REQUEST_RE.test(input.userText || '')) return false;
   if (NEGATIVE_EXECUTION_RESULT_RE.test(input.answerText || '')) return false;
-  return POSITIVE_EXECUTION_CLAIM_RE.test(`${input.userText}\n${input.answerText}`);
+  // 用户原文可能是在描述“已提供图片/文件”等输入事实，不能把这类过去式
+  // 误认成 assistant 的完成声明；审查只验证本轮实际要外发的回答。
+  return POSITIVE_EXECUTION_CLAIM_RE.test(input.answerText || '');
 }
 
 function recomposeMemoryReplacement(input: AnswerReviewInput): string | undefined {

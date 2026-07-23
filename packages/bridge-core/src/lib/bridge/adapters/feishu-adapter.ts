@@ -128,6 +128,7 @@ import {
   normalizeFeishuMentionAlias as normalizeMentionAlias,
   pickFeishuMentionableMemberId,
   preferHighestEvidenceFeishuMentionCandidates as preferHighestEvidenceMentionCandidates,
+  resolveFeishuBotSenderMentionCandidate,
   resolveFeishuOutboundMentionTarget as resolveOutboundMentionTarget,
   toFeishuMentionResolutionCandidates as toMentionResolutionCandidates,
   uniqueFeishuMentionAliases as uniqueCleanStrings,
@@ -1025,7 +1026,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return null;
     }
 
-    const attachment = await this.downloadResource(messageId, fileKey, 'image');
+    const attachment = await this.downloadStickerResource(messageId, fileKey);
     if (!attachment?.data || !attachment.type?.toLowerCase().startsWith('image/')) {
       this.updateStickerMediaState(fileKey, {
         mediaDownloadFailedAt: new Date().toISOString(),
@@ -4068,19 +4069,31 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const botToBot = getRawObject(raw.feishuBotToBot);
     const sender = getRawObject(raw.feishuSender);
     const senderType = firstNonEmptyString(sender.senderType, sender.sender_type, botToBot.senderType).toLowerCase();
-    const senderAppId = firstNonEmptyString(sender.appId, sender.app_id);
-    if (!this.isBotOrAppSenderType(senderType) || !senderAppId) return message;
+    if (!this.isBotOrAppSenderType(senderType)) return message;
+
+    const senderAppIds = [sender.appId, sender.app_id]
+      .map((value) => typeof value === 'string' ? value.trim() : '')
+      .filter(Boolean);
+    const senderPlatformIds = [
+      sender.openId,
+      sender.open_id,
+      sender.userId,
+      sender.user_id,
+      sender.unionId,
+      sender.union_id,
+      sourceMessage.address.userId,
+    ].map((value) => typeof value === 'string' ? value.trim() : '')
+      .filter(Boolean);
+    if (senderAppIds.length === 0 && senderPlatformIds.length === 0) return message;
 
     const targets = extractBareAtTargets(message.text);
     if (targets.length === 0) return message;
 
     const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
-    const senderCandidates = candidates.filter((candidate) => candidate.appIds?.includes(senderAppId));
-    const uniqueSenderIds = new Set(senderCandidates.map((candidate) => candidate.userId));
-    if (uniqueSenderIds.size !== 1) return message;
-
-    const senderUserId = [...uniqueSenderIds][0];
-    const senderCandidate = senderCandidates.find((candidate) => candidate.userId === senderUserId);
+    const senderCandidate = resolveFeishuBotSenderMentionCandidate(candidates, {
+      appIds: senderAppIds,
+      platformIds: senderPlatformIds,
+    });
     if (!senderCandidate) return message;
     const matchingTarget = targets.find((target) => {
       const resolved = resolveOutboundMentionTarget(target, [senderCandidate]);
@@ -4388,8 +4401,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       aliases: string[] = [],
       evidenceSource?: FeishuMentionCandidateEvidence,
       appIds: string[] = [],
+      platformIds: string[] = [],
     ) => {
-      addFeishuMentionCandidate(byId, { userId, name, aliases, appIds, evidenceSource });
+      addFeishuMentionCandidate(byId, { userId, name, aliases, appIds, platformIds, evidenceSource });
     };
 
     this.addInboundMentionCandidates(sourceMessage, (userId, name, aliases) =>
@@ -4401,7 +4415,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
       try {
         const mentionCandidates = await this.fetchChatMentionCandidates(message.address.chatId);
         for (const candidate of mentionCandidates) {
-          addCandidate(candidate.userId, candidate.name, candidate.aliases, 'current_chat', candidate.appIds);
+          addCandidate(
+            candidate.userId,
+            candidate.name,
+            candidate.aliases,
+            'current_chat',
+            candidate.appIds,
+            candidate.platformIds,
+          );
         }
       } catch (err) {
         console.warn('[feishu-adapter] chat member mention lookup skipped:', err instanceof Error ? err.message : err);
@@ -6148,11 +6169,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // 退回近邻图片或历史候选，adapter 只负责逐项执行真实平台下载。
     const attachments: FileAttachment[] = [];
     for (const request of plan) {
-      const attachment = await this.downloadResource(
-        request.messageId,
-        request.fileKey,
-        request.resourceType,
-      );
+      const attachment = item.msg_type === 'sticker'
+        ? await this.downloadStickerResource(request.messageId, request.fileKey)
+        : await this.downloadResource(
+          request.messageId,
+          request.fileKey,
+          request.resourceType,
+        );
       if (attachment) attachments.push(attachment);
     }
     return attachments;
@@ -6682,6 +6705,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Resource download ───────────────────────────────────────
 
   /**
+   * 飞书 sticker 在不同客户端、表情来源和 OpenAPI 版本下可能把同一张图片
+   * 暴露为 image 或 file transport。这里保持 sticker 的业务语义仍是图片，
+   * 但只对同一 message_id/file_key 做受控 transport 回退，避免猜测其他资源。
+   */
+  private async downloadStickerResource(
+    messageId: string,
+    fileKey: string,
+    failureCollector?: FeishuResourceDownloadFailure[],
+  ): Promise<FileAttachment | null> {
+    const imageFailures: FeishuResourceDownloadFailure[] = [];
+    const imageAttachment = await this.downloadResource(messageId, fileKey, 'image', imageFailures);
+    if (imageAttachment?.type.toLowerCase().startsWith('image/')) return imageAttachment;
+
+    const fileFailures: FeishuResourceDownloadFailure[] = [];
+    const fileAttachment = await this.downloadResource(messageId, fileKey, 'file', fileFailures);
+    if (fileAttachment?.type.toLowerCase().startsWith('image/')) return fileAttachment;
+
+    this.appendResourceDownloadFailures(failureCollector, [...imageFailures, ...fileFailures]);
+    return null;
+  }
+
+  /**
    * Download a message resource (image/file/audio/video). The SDK path is kept
    * first, but raw HTTP fallbacks preserve Feishu code/msg when SDK logging
    * wraps the real API error in a circular object.
@@ -6935,7 +6980,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     buffer: Buffer,
     mimeTypeOverride?: string,
   ): FileAttachment {
-    const sniffed = resourceType === 'image' ? sniffImageMimeType(buffer) : null;
+    // 飞书有时通过 type=file 返回真实图片，Content-Type 仅为
+    // application/octet-stream；文件头是跨 transport 的最终媒体事实。
+    const sniffed = sniffImageMimeType(buffer);
     const mimeType = sniffed?.mimeType || mimeTypeOverride || MIME_BY_TYPE[resourceType] || 'application/octet-stream';
     const ext = this.extensionForFeishuResource(resourceType, mimeType);
     return {

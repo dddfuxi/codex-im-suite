@@ -585,6 +585,8 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- images and files must be arrays of local paths when applicable, otherwise use empty arrays.',
     '- reply_mode must be one of: plain, markdown, html.',
     '- Optional keys mentions and reply_to may be included when needed.',
+    '- When the user must choose one of 2-8 concrete known alternatives, optional choices may be an array of objects with only label and optional description; optional choice_title names the decision.',
+    '- Do not use choices for free-form input, permissions, Owner/high-risk confirmation, secrets, identity resolution, or arbitrary commands. Never include callback_data or platform/action parameters; the Bridge creates safe buttons.',
     '- Never output a naked JSON object outside the fenced result block.',
     `- Example:\n\`\`\`${FINAL_REPLY_FENCE}\n{"kind":"text","text":"对应关系再发你一次：\\n| Key | Label |\\n|---|---|\\n| \`ITEM_A\` | 标签A |","images":[],"files":[],"reply_mode":"markdown"}\n\`\`\``,
   ];
@@ -910,6 +912,7 @@ export class CodexProvider implements LLMProvider {
                   ...(params.abortController?.signal ? { signal: params.abortController.signal } : {}),
                 });
 
+                let emittedAgentMessage = false;
                 for await (const event of events) {
                   sawAnyEvent = true;
                   if (params.abortController?.signal.aborted) {
@@ -939,7 +942,10 @@ export class CodexProvider implements LLMProvider {
                         params.abortController?.abort();
                         throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
                       }
-                      self.handleCompletedItem(controller, item);
+                      const emitted = self.handleCompletedItem(controller, item, emittedAgentMessage);
+                      if (emitted) {
+                        emittedAgentMessage = true;
+                      }
                       break;
                     }
 
@@ -1024,14 +1030,18 @@ export class CodexProvider implements LLMProvider {
   private handleCompletedItem(
     controller: ReadableStreamDefaultController<string>,
     item: Record<string, unknown>,
-  ): void {
+    prependAgentMessageSeparator = false,
+  ): boolean {
     const itemType = item.type as string;
 
     switch (itemType) {
       case 'agent_message': {
         const text = (item.text as string) || '';
         if (text) {
-          controller.enqueue(sseEvent('text', text));
+          // Official Codex may emit progress and the final envelope as separate completed items.
+          // Preserve that message boundary so Markdown fences and JSON do not stick to prior text.
+          controller.enqueue(sseEvent('text', `${prependAgentMessageSeparator ? '\n' : ''}${text}`));
+          return true;
         }
         break;
       }
@@ -1111,5 +1121,7 @@ export class CodexProvider implements LLMProvider {
         break;
       }
     }
+
+    return false;
   }
 }

@@ -171,4 +171,26 @@ describe('answer review', () => {
     assert.equal(decision.verdict, 'pass');
     assert.ok(!decision.reasonCodes.includes('unsupported_execution_claim'));
   });
+
+  it('does not treat completed-input wording in the user prompt as an assistant completion claim', () => {
+    const decision = reviewOutboundAnswerRules({
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      userText: '图片已经作为本轮附件提供给模型，请根据图片轻量回应。',
+      answerText: '嘿嘿，真棒～继续稳稳推进。',
+      executionEvidence: {
+        toolUseCount: 0,
+        toolResultCount: 0,
+        successfulToolResultCount: 0,
+        failedToolResultCount: 0,
+        toolNames: [],
+        permissionRequestCount: 0,
+        requiredEvidenceKind: 'none',
+        evidenceSatisfied: true,
+      },
+    });
+
+    assert.equal(decision.verdict, 'pass');
+    assert.ok(!decision.reasonCodes.includes('unsupported_execution_claim'));
+  });
 });

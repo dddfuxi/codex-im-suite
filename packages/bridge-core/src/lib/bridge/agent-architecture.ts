@@ -196,6 +196,14 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['permission', 'safety'],
   },
   {
+    id: 'policy_registry.workspace_binding',
+    layerId: 'policy_registry',
+    title: 'Workspace Binding',
+    responsibility: 'Allow only an authenticated Owner to inspect enabled registered projects, receive a Feishu selection card, and persistently switch the current chat to a fresh project-scoped session after callback revalidation.',
+    promptLines: [],
+    tags: ['permission', 'workspace', 'owner', 'session-binding'],
+  },
+  {
     id: 'context_broker.bounded_evidence',
     layerId: 'context_broker',
     title: 'Bounded Evidence',
@@ -255,7 +263,7 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     responsibility: 'Resolve explicit names, evidence-bound contextual pronouns, and verified bot-to-bot return mentions through current-chat evidence; low-risk same-chat mentions may use auditable strong-evidence degradation while broadcasts, conflicts, unrelated model identities, and invented IDs remain non-addressable.',
     promptLines: [
       '- Outbound mention target policy: a current-turn explicit request to execute @ may use either a concrete display name or one person selected from real current-turn evidence for contextual words such as 他、她、对方、刚才那个人. Delivery verifies by platform ID when available; the balanced/fluent profile may degrade only a low-risk same-chat mention with strong attributable platform evidence when roster lookup is temporarily unavailable.',
-      '- Bot-to-bot return mention policy: when another bot/app natively mentions this bot, delivery may mention that sender back only after its sender app_id uniquely maps to a mentionable member_id in the current official chat roster.',
+      '- Bot-to-bot return mention policy: when another bot/app natively mentions this bot, delivery may mention that sender back only after its real sender app_id or open_id/user_id/union_id uniquely intersects one mentionable member_id in the current official chat roster; conflicting identities fail closed.',
       '- A model may select a real evidence ID but may not create a trusted platform identity. Invented IDs, ordinary bare @ text without evidence binding, unbounded history-only names, broadcast audiences such as 各位、大家、全体、群成员、所有机器人, and unsupported relationship descriptions are not trusted mention targets.',
     ],
     tags: ['policy', 'mentions', 'delivery', 'target-validation'],
@@ -340,6 +348,19 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
       '- Keep formatting semantic and sparse: do not stack multiple emphasis styles on the same phrase, do not add empty sections, and do not force headings or lists into short conversational replies.',
     ],
     tags: ['delivery', 'feishu', 'presentation', 'markdown', 'rich-text'],
+  },
+  {
+    id: 'delivery_layer.structured_choice_prompt',
+    layerId: 'delivery_layer',
+    title: 'Structured Choice Prompt',
+    responsibility: 'Render a real finite user decision as Bridge-owned buttons while keeping free-form clarification and privileged confirmation on their existing safety paths.',
+    promptLines: [
+      '- Structured choice policy: when the user truly must choose one item from 2-8 concrete, mutually understandable options, include optional `choices` in the cti-final JSON. Each item contains only `label` and optional `description`; optional `choice_title` names the decision.',
+      '- Use structured choices for finite selection such as project, mode, variant, scope, or next-step alternatives. Do not make the user manually type a full path or identifier when the available options are already known.',
+      '- Do not use choices for free-form missing information, open-ended questions, ordinary rhetorical alternatives, permission approval, Owner confirmation, destructive-action confirmation, secrets, credentials, or platform identity resolution. Those keep their dedicated gates and cards.',
+      '- Never provide callback_data, URLs, commands, tool arguments, user IDs, chat IDs, paths to execute, or trusted action fields inside choices. The Bridge signs button callbacks and turns a valid click into the user\'s next message.',
+    ],
+    tags: ['delivery', 'choice', 'buttons', 'feishu', 'cti-final'],
   },
   {
     id: 'delivery_layer.result_envelope',

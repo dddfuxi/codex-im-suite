@@ -165,6 +165,7 @@ import {
   createLarkCliDeviceAuthorizationRunner,
 } from './feishu-cli-user-auth.js';
 import { prepareWorkflowRetryExecution } from './workflow-retry.js';
+import { decideWorkflowFailureRetry } from './workflow-failure-policy.js';
 import { createRuntimeTurnStorage, type RuntimeTurnStorage } from './turn-storage.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
@@ -810,15 +811,22 @@ function summarizeCodexFailureMessage(message: string): string {
   return truncatePreview(message, 180) || 'Codex 当前不可用。';
 }
 
-function shouldAutoRetryWorkflowError(error: unknown): boolean {
-  const message = (error instanceof Error ? error.message : String(error || '')).toLowerCase();
-  if (!message.trim()) return true;
-  if (message.includes('usage limit')) return false;
-  if (message.includes('401 unauthorized') || message.includes('refresh token') || message.includes('authentication token')) return false;
-  if (message.includes('method not allowed') || message.includes('unexpected status 405')) return false;
-  if (message.includes('/v1/responses')) return false;
-  if (message.includes('invalid request parameter')) return false;
-  return true;
+function applyWorkflowFailureRetryPolicy(runId: string, error: unknown): void {
+  const decision = decideWorkflowFailureRetry(error);
+  appendWorkflowEvent(
+    runId,
+    'failed',
+    decision.autoRetry ? 'workflow.retry.policy' : 'workflow.retry.skipped',
+    decision.autoRetry
+      ? `自动重试策略允许一次重试：${decision.reasonCode}`
+      : `自动重试已跳过：${decision.reasonCode}`,
+    {
+      category: decision.category,
+      reasonCode: decision.reasonCode,
+      autoRetry: decision.autoRetry,
+    },
+  );
+  if (decision.autoRetry) requestWorkflowRetry(runId, 'auto');
 }
 
 type CodexModelSource = 'local_api' | 'external_api' | 'official';
@@ -1481,9 +1489,7 @@ class HubLlmProvider implements LLMProvider {
           workflowFailed = true;
           flushWorkflowEvidence(workflowRun.id, evidence);
           failWorkflowRun(workflowRun.id, error);
-          if (shouldAutoRetryWorkflowError(error)) {
-            requestWorkflowRetry(workflowRun.id, 'auto');
-          }
+          applyWorkflowFailureRetryPolicy(workflowRun.id, error);
           throw error;
         } finally {
           if (!workflowFailed) {
@@ -2814,9 +2820,7 @@ class ObservedLLMProvider implements LLMProvider {
         } catch (error) {
           flushWorkflowEvidence(workflowRun.id, evidence);
           failWorkflowRun(workflowRun.id, error);
-          if (shouldAutoRetryWorkflowError(error)) {
-            requestWorkflowRetry(workflowRun.id, 'auto');
-          }
+          applyWorkflowFailureRetryPolicy(workflowRun.id, error);
           try {
             observedController.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
             observedController.close();

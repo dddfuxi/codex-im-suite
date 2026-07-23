@@ -85,6 +85,43 @@ describe('Feishu outbound mention resolution', () => {
     ]), null);
   });
 
+  it('uniquely resolves a bot sender from app or platform ids and rejects identity conflicts', async () => {
+    const {
+      resolveFeishuBotSenderMentionCandidate,
+    } = await loadMentionResolution();
+    const candidates: FeishuMentionCandidate[] = [
+      {
+        userId: 'ou_george',
+        name: '乔治',
+        aliases: ['乔治'],
+        appIds: ['cli_george'],
+        platformIds: ['ou_george', 'on_george'],
+        evidenceSources: ['current_chat'],
+      },
+      {
+        userId: 'ou_other',
+        name: '另一个机器人',
+        aliases: ['另一个机器人'],
+        appIds: ['cli_other'],
+        evidenceSources: ['current_chat'],
+      },
+    ];
+
+    assert.equal(resolveFeishuBotSenderMentionCandidate(candidates, {
+      appIds: ['cli_george'],
+    })?.userId, 'ou_george');
+    assert.equal(resolveFeishuBotSenderMentionCandidate(candidates, {
+      platformIds: ['ou_george'],
+    })?.userId, 'ou_george');
+    assert.equal(resolveFeishuBotSenderMentionCandidate(candidates, {
+      platformIds: ['on_george'],
+    })?.userId, 'ou_george');
+    assert.equal(resolveFeishuBotSenderMentionCandidate(candidates, {
+      appIds: ['cli_other'],
+      platformIds: ['ou_george'],
+    }), null);
+  });
+
   it('finds related candidates and emits compact inspection names without ids', async () => {
     const {
       findFeishuMentionCandidateMatches,

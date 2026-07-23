@@ -41,6 +41,19 @@ describe('Feishu streaming card markdown', () => {
     assert.match(markdown, /- \*补充\*：等待验收/u);
   });
 
+  it('separates a bold label from adjacent body text for Card Markdown', () => {
+    const markdown = preprocessFeishuMarkdown('**状态：**已完成\n\n```md\n**状态：**已完成\n```');
+
+    assert.match(markdown, /^\*\*状态：\*\* 已完成/u);
+    assert.match(markdown, /```md\n\*\*状态：\*\*已完成\n```/u);
+
+    const card = JSON.parse(buildFinalCardJson('**结论：**可以发布', [], null)) as {
+      body?: { elements?: Array<{ content?: string }> };
+    };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+    assert.match(content, /\*\*结论：\*\* 可以发布/u);
+  });
+
   it('renders Bash tool traces as safe user-visible action summaries', () => {
     const markdown = buildToolProgressMarkdown([
       {
@@ -436,6 +449,22 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(String(card.header?.title?.content || ''), /表情\]/);
     assert.match(main, /\[表情\] 收到满月脸啦/);
     assert.doesNotMatch(main, /✅/);
+  });
+
+  it('does not classify a substantive game result as an emoji reply because it contains tone particles', () => {
+    const card = JSON.parse(buildFinalCardJson([
+      '这轮判断结果如下啦～',
+      '',
+      '- 你的问题：那个人认识酒保吗？',
+      '- 主持人回答：不是',
+      '- 当前公开线索：酒保的行为与危险无关',
+      '',
+      '请继续根据公开线索提问。',
+    ].join('\n'), [], { status: '已完成', elapsed: '3.2s' })) as {
+      header?: { title?: { content?: string } };
+    };
+
+    assert.notEqual(card.header?.title?.content, '表情回复');
   });
 
   it('keeps checklist marks inside the final body', () => {
