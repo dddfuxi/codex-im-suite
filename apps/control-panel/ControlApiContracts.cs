@@ -77,6 +77,69 @@ internal sealed record ProjectRegistrySnapshotContract(
     RegisteredProjectContract[] Projects,
     string Error);
 
+internal sealed record CollaborationAgentManifestContract(
+    string Protocol,
+    string Id,
+    string DisplayName,
+    bool Enabled,
+    string[] Responsibilities,
+    string[] Owns,
+    string[] Excludes,
+    string[] Capabilities,
+    string[] InputEvidenceKinds,
+    string OutputSchemaId,
+    string SideEffectLevel,
+    int TimeoutMs,
+    int Concurrency,
+    string ModelProfile);
+
+internal sealed record AgentWorkerViewContract(
+    string WorkerId,
+    int? Pid,
+    string Health,
+    string? ActiveTaskId,
+    string? StartedAt,
+    string? LastHeartbeatAt,
+    int RestartCount,
+    int TimeoutCount,
+    int CircuitOpenCount,
+    string? CircuitOpenUntil,
+    string? LastErrorCode);
+
+internal sealed record AgentResponsibilityViewContract(
+    CollaborationAgentManifestContract Manifest,
+    string? WorkerId,
+    string Health,
+    string? LastInvokedAt,
+    double? LastDurationMs,
+    int SuccessCount,
+    int FailureCount,
+    int TimeoutCount,
+    double? AverageDurationMs,
+    double? P95DurationMs);
+
+internal sealed record AgentCollaborationMetricsViewContract(
+    int WindowRunCount,
+    double CoordinatorTriggerRate,
+    double FallbackRate,
+    int WorkerRestartCount,
+    int WorkerTimeoutCount,
+    int CircuitOpenCount,
+    object SpecialistCallDistribution);
+
+internal sealed record AgentCollaborationPanelStateContract(
+    string Protocol,
+    string UpdatedAt,
+    string Mode,
+    string PoolHealth,
+    int ActiveTaskCount,
+    AgentWorkerViewContract[] Workers,
+    AgentResponsibilityViewContract[] Agents,
+    object? CurrentRun,
+    object[] RecentRuns,
+    AgentCollaborationMetricsViewContract Metrics,
+    object? LatestPerformanceSuggestion);
+
 internal sealed record ControlPanelStateContract(
     string Schema,
     string GeneratedAt,
@@ -93,6 +156,7 @@ internal sealed record ControlPanelStateContract(
     object Settings,
     object History,
     object Workflow,
+    object? AgentCollaboration,
     object ProjectRegistry,
     object Memory,
     object MemorySkillAssets,

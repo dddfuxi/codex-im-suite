@@ -120,7 +120,7 @@ describe('Feishu streaming card markdown', () => {
     assert.doesNotMatch(main, /处理思路/);
     assert.doesNotMatch(main, /先确认 MCP/);
     assert.equal(detailPanel?.expanded, false);
-    assert.equal(detailPanel?.header?.title?.content, '执行过程');
+    assert.equal(detailPanel?.header?.title?.content, '执行轨迹');
     assert.match(detail, /处理思路/);
     assert.match(detail, /先确认 MCP/);
   });
@@ -274,13 +274,15 @@ describe('Feishu streaming card markdown', () => {
 
     assert.match(content, /<font color="purple">\*\*确认证据\*\*<\/font>/);
     assert.match(content, /<font color="grey">正在确认需要截图证据。<\/font>/);
-    assert.match(content, /依据确认/);
-    assert.match(content, /工具完成/);
-    assert.match(content, /结果生成/);
+    assert.match(content, /✓ 理解/);
+    assert.match(content, /✓ 证据/);
+    assert.match(content, /● 执行/);
+    assert.match(content, /○ 结果/);
     assert.match(content, /正在确认需要截图证据/);
     assert.doesNotMatch(content, /正在理解问题/);
-    assert.doesNotMatch(content, /桌面截图/);
-    assert.doesNotMatch(content, /MCP 工具执行/);
+    assert.match(content, /执行轨迹 1\/2/);
+    assert.match(content, /桌面截图/);
+    assert.match(content, /MCP 工具执行/);
     assert.doesNotMatch(content, /思考路径/);
     assert.doesNotMatch(content, /处理进度/);
     assert.doesNotMatch(content, /已收到请求/);
@@ -319,6 +321,61 @@ describe('Feishu streaming card markdown', () => {
     assert.match(content, /耗时：1\.2s/);
     assert.equal(footer?.text_size, 'notation');
     assert.doesNotMatch(detail, /JsonTool|shell_artifact/);
+  });
+
+  it('renders truthful evidence badges and a relative tool timeline', () => {
+    const card = JSON.parse(buildFinalCardJson('处理结果\n测试和构建均已完成。', [
+      {
+        id: 'tool-1',
+        name: 'Bash',
+        status: 'complete',
+        input: { command: 'npm run test' },
+        startedAt: 1_000,
+        completedAt: 1_500,
+      },
+      {
+        id: 'tool-2',
+        name: 'Bash',
+        status: 'complete',
+        input: { command: 'npm run build' },
+        startedAt: 2_200,
+        completedAt: 3_400,
+      },
+    ], { status: '已完成', elapsed: '2.4s' })) as {
+      body?: { elements?: Array<{
+        tag?: string;
+        content?: string;
+        header?: { title?: { content?: string } };
+        elements?: Array<{ content?: string }>;
+      }> };
+    };
+    const elements = card.body?.elements || [];
+    const visible = elements.map((element) => element.content || '').join('\n');
+    const detailPanel = elements.find((element) => element.tag === 'collapsible_panel');
+    const detail = (detailPanel?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(visible, /● 结果已生成/);
+    assert.match(visible, /● 工具证据 2\/2/);
+    assert.equal(detailPanel?.header?.title?.content, '执行轨迹');
+    assert.match(detail, /\+0ms/);
+    assert.match(detail, /\+1\.2s/);
+    assert.match(detail, /运行测试/);
+    assert.match(detail, /构建项目/);
+    assert.match(detail, /\(500ms\)/);
+    assert.match(detail, /\(1\.2s\)/);
+  });
+
+  it('labels a no-tool answer as text-only instead of claiming verification', () => {
+    const card = JSON.parse(buildFinalCardJson(
+      '普通解释回复。',
+      [],
+      { status: '已完成', elapsed: '0.8s' },
+    )) as { body?: { elements?: Array<{ content?: string }> } };
+    const content = (card.body?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.match(content, /● 结果已生成/);
+    assert.match(content, /● 仅文本回复/);
+    assert.doesNotMatch(content, /现场已验证|工具证据/);
   });
 
   it('does not mark successful summaries as incomplete when the body quotes errors', () => {

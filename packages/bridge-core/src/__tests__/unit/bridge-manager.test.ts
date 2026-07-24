@@ -4327,7 +4327,7 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(streamParams[0].systemPrompt || '', /\[微笑\]/);
     assert.match(streamParams[0].systemPrompt || '', /\[表情包:alias\]/);
     assert.equal(memoryDecisionCalls, 0);
-    assert.equal(memoryWriteClassifierCalls, 1, 'all eligible text turns must be classified before the primary agent replies');
+    assert.equal(memoryWriteClassifierCalls, 0, 'ordinary identity chat must stay on the zero-worker path');
   });
 
   it('keeps safe provider rationale in workflow cards while redacting internals', async () => {

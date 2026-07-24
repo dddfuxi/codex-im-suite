@@ -231,11 +231,37 @@ export function htmlToFeishuMarkdown(html: string): string {
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
-  const lines = tools.map((tc) => {
+  const observedStarts = tools
+    .map((tool) => tool.startedAt)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const baseline = observedStarts.length > 0 ? Math.min(...observedStarts) : undefined;
+  const lines = tools.map((tc, index) => {
     const status = formatToolStatus(tc.status);
-    return `${status} · ${formatVisibleToolCall(tc)}`;
+    const timeline = formatToolTimelineMark(tc, index, baseline);
+    const duration = formatToolDuration(tc);
+    return `${timeline} · ${status} · ${formatVisibleToolCall(tc)}${duration}`;
   });
   return lines.join('\n');
+}
+
+function formatToolTimelineMark(tool: ToolCallInfo, index: number, baseline?: number): string {
+  if (typeof baseline === 'number' && typeof tool.startedAt === 'number') {
+    return `<font color="grey">+${formatCompactDuration(Math.max(0, tool.startedAt - baseline))}</font>`;
+  }
+  return `<font color="grey">${String(index + 1).padStart(2, '0')}</font>`;
+}
+
+function formatToolDuration(tool: ToolCallInfo): string {
+  if (typeof tool.startedAt !== 'number' || typeof tool.completedAt !== 'number') return '';
+  return ` <font color="grey">(${formatCompactDuration(Math.max(0, tool.completedAt - tool.startedAt))})</font>`;
+}
+
+function formatCompactDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  const min = Math.floor(ms / 60_000);
+  const sec = Math.floor((ms % 60_000) / 1000);
+  return `${min}m${String(sec).padStart(2, '0')}s`;
 }
 
 function formatToolStatus(status: ToolCallInfo['status']): string {
@@ -351,28 +377,67 @@ function inferStreamingStepTitle(step: string, tools: ToolCallInfo[]): string {
   return '理解请求';
 }
 
-function formatStreamingStageRail(title: string): string {
-  const stages = [
-    { label: '依据确认', color: title === '确认证据' ? 'purple' : 'grey' },
-    { label: '工具完成', color: title === '调用工具' ? 'purple' : 'grey' },
-    { label: '结果生成', color: title === '整理回复' ? 'purple' : 'grey' },
+type StreamingTaskStage = 'understanding' | 'evidence' | 'tools' | 'result';
+
+function inferStreamingTaskStage(title: string, tools: ToolCallInfo[]): StreamingTaskStage {
+  if (title === '整理回复') return 'result';
+  if (tools.some((tool) => tool.status === 'running')) return 'tools';
+  if (tools.length > 0 && tools.every((tool) => tool.status !== 'running')) return 'result';
+  if (title === '调用工具') return 'tools';
+  if (title === '确认证据' || title === '整理上下文') return 'evidence';
+  return 'understanding';
+}
+
+function formatStreamingStageRail(title: string, tools: ToolCallInfo[]): string {
+  const stageOrder: Array<{ id: StreamingTaskStage; label: string }> = [
+    { id: 'understanding', label: '理解' },
+    { id: 'evidence', label: '证据' },
+    { id: 'tools', label: '执行' },
+    { id: 'result', label: '结果' },
   ];
-  return stages.map((stage) => `<font color="${stage.color}">${stage.label}</font>`).join(' · ');
+  const activeIndex = stageOrder.findIndex((stage) => stage.id === inferStreamingTaskStage(title, tools));
+  return stageOrder.map((stage, index) => {
+    if (index < activeIndex) return `<font color="green">✓ ${stage.label}</font>`;
+    if (index === activeIndex) return `<font color="purple">● ${stage.label}</font>`;
+    return `<font color="grey">○ ${stage.label}</font>`;
+  }).join('　');
+}
+
+function buildLiveToolTrace(tools: ToolCallInfo[]): string {
+  if (tools.length === 0) return '';
+  const completed = tools.filter((tool) => tool.status === 'complete').length;
+  const failed = tools.filter((tool) => tool.status === 'error').length;
+  const recent = tools.slice(-3).map((tool) => {
+    const marker = tool.status === 'complete'
+      ? '<font color="green">✓</font>'
+      : tool.status === 'error'
+        ? '<font color="red">×</font>'
+        : '<font color="blue">◐</font>';
+    return `${marker} ${formatVisibleToolCall(tool)}`;
+  });
+  const suffix = failed > 0 ? ` · 失败 ${failed}` : '';
+  return [
+    `<font color="grey">**执行轨迹 ${completed}/${tools.length}${suffix}**</font>`,
+    ...recent,
+  ].join('\n');
 }
 
 export function buildStreamingStepContent(step: string, tools: ToolCallInfo[] = []): string {
   const currentStep = step.trim() || '正在根据这条消息判断下一步。';
   const title = inferStreamingStepTitle(currentStep, tools);
-  return buildStreamingStepContentWithTitle(title, currentStep);
+  return buildStreamingStepContentWithTitle(title, currentStep, tools);
 }
 
-function buildStreamingStepContentWithTitle(title: string, step: string): string {
-  return [
+function buildStreamingStepContentWithTitle(title: string, step: string, tools: ToolCallInfo[]): string {
+  const blocks = [
     `<font color="purple">**${title}**</font>`,
     `<font color="grey">${escapeFeishuInlineMarkdown(step)}</font>`,
     '',
-    formatStreamingStageRail(title),
-  ].join('\n');
+    formatStreamingStageRail(title, tools),
+  ];
+  const liveToolTrace = buildLiveToolTrace(tools);
+  if (liveToolTrace) blocks.push('', liveToolTrace);
+  return blocks.join('\n');
 }
 
 export function getStreamingCurrentStep(text: string, tools: ToolCallInfo[]): string {
@@ -385,7 +450,7 @@ export function getStreamingCurrentStep(text: string, tools: ToolCallInfo[]): st
 export function buildStreamingTypewriterContent(text: string, tools: ToolCallInfo[], visibleChars: number): string {
   const currentStep = getStreamingCurrentStep(text, tools);
   const visibleStep = [...currentStep].slice(0, Math.max(0, visibleChars)).join('');
-  return buildStreamingStepContentWithTitle(inferStreamingStepTitle(currentStep, tools), visibleStep);
+  return buildStreamingStepContentWithTitle(inferStreamingStepTitle(currentStep, tools), visibleStep, tools);
 }
 
 /**
@@ -442,6 +507,13 @@ export function buildFinalCardJson(
     content: renderFeishuMarkdownMentions(titledContent.body, mentions),
     text_align: 'left',
     text_size: 'normal',
+  });
+
+  elements.push({
+    tag: 'markdown',
+    content: buildFinalEvidenceSummary(effectiveStatus, tools),
+    text_align: 'left',
+    text_size: 'notation',
   });
 
   const executionDetailBlocks: string[] = [];
@@ -537,7 +609,7 @@ function buildExecutionDetailPanel(blocks: string[]): Record<string, unknown> | 
     tag: 'collapsible_panel',
     expanded: false,
     header: {
-      title: { tag: 'plain_text', content: '执行过程' },
+      title: { tag: 'plain_text', content: '执行轨迹' },
       template: 'default',
       padding: '8px 12px 8px 12px',
     },
@@ -548,6 +620,27 @@ function buildExecutionDetailPanel(blocks: string[]): Record<string, unknown> | 
       text_size: 'notation',
     }],
   };
+}
+
+function buildFinalEvidenceSummary(status: string, tools: ToolCallInfo[]): string {
+  const failedResult = /失败|未完成|中断|error|interrupted/iu.test(status || '');
+  const resultBadge = failedResult
+    ? '<font color="red">● 结果未完成</font>'
+    : '<font color="green">● 结果已生成</font>';
+  if (tools.length === 0) {
+    return `${resultBadge}　<font color="grey">● 仅文本回复</font>`;
+  }
+
+  const completed = tools.filter((tool) => tool.status === 'complete').length;
+  const failed = tools.filter((tool) => tool.status === 'error').length;
+  const running = tools.filter((tool) => tool.status === 'running').length;
+  if (failed > 0) {
+    return `${resultBadge}　<font color="red">● 工具失败 ${failed}/${tools.length}</font>`;
+  }
+  if (running > 0) {
+    return `${resultBadge}　<font color="blue">● 工具进行中 ${running}/${tools.length}</font>`;
+  }
+  return `${resultBadge}　<font color="green">● 工具证据 ${completed}/${tools.length}</font>`;
 }
 
 function formatRunSummaryFooterParts(summary?: RunSummary): string[] {

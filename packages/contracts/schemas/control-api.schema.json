@@ -91,6 +91,9 @@
       },
       "additionalProperties": false
     },
+    "AgentCollaborationPanelState": {
+      "$ref": "agent-collaboration.schema.json#/$defs/AgentCollaborationPanelState"
+    },
     "ControlPanelStateContract": {
       "type": "object",
       "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
@@ -123,6 +126,7 @@
         "settings": {},
         "history": {},
         "workflow": {},
+        "agentCollaboration": { "$ref": "#/$defs/AgentCollaborationPanelState" },
         "projectRegistry": { "$ref": "#/$defs/ProjectRegistrySnapshotContract" },
         "memory": {},
         "memorySkillAssets": {},

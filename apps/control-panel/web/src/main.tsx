@@ -9,6 +9,7 @@ import {
   type RuntimeActionContract as RuntimeAction,
   type RuntimeUnitContract,
 } from '@codex-im-suite/contracts/control-api';
+import type { AgentCollaborationPanelState } from '@codex-im-suite/contracts/agent-collaboration';
 import type { ProjectRegistrySnapshotContract } from '@codex-im-suite/contracts/project-registry';
 import type {
   WorkflowPanelRunContract as WorkflowRun,
@@ -76,6 +77,12 @@ import {
   type ServiceTabId,
 } from './panel-navigation.js';
 import { ArchitecturePage } from './pages/ArchitecturePage.js';
+import {
+  agentModeLabel,
+  createEmptyAgentCollaborationState,
+  findAgentRunByWorkflowRunId,
+  normalizeAgentCollaborationState,
+} from './agent-collaboration-view-model.js';
 import { McpPage } from './pages/McpPage.js';
 import { ModelsPluginsPage } from './pages/ModelsPluginsPage.js';
 import { PromptPage } from './pages/PromptPage.js';
@@ -935,6 +942,7 @@ type PanelState = ControlPanelStateContract<{
     sessions: SessionItem[];
   };
   workflow: WorkflowStatus;
+  agentCollaboration: AgentCollaborationPanelState;
   projectRegistry: ProjectRegistrySnapshotContract;
   memory: KnowledgeIndexStatus;
   memorySkillAssets: SkillAssetIndexSnapshot;
@@ -1060,6 +1068,7 @@ const fallbackState: PanelState = {
   },
   history: { status: '', sessions: [] },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
+  agentCollaboration: createEmptyAgentCollaborationState(),
   projectRegistry: {
     schema: 'codex-im-suite/project-registry-snapshot/v1',
     generatedAt: '',
@@ -1420,7 +1429,13 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
     : state.memoryReminders.enabled || state.memoryReminders.directReminderPushEnabled
       ? 'normal'
       : 'disabled';
-  const assistStatus = combineUserStatuses([mcpStatus, memoryStatus, reminderStatus]);
+  const collaboration = normalizeAgentCollaborationState(state.agentCollaboration);
+  const collaborationStatus: UserFacingStatus = collaboration.mode === 'off'
+    ? 'disabled'
+    : collaboration.poolHealth === 'healthy'
+      ? 'normal'
+      : 'attention';
+  const assistStatus = combineUserStatuses([mcpStatus, memoryStatus, reminderStatus, collaborationStatus]);
   const replyStatus = bridgeStatus === 'normal' && aiStatus !== 'disabled' ? 'normal' : 'attention';
   const activeExecutors = runtimeUnits.filter((unit) => unit.kind === 'tool' && unit.status === 'ok').length;
   const mcpAttentionUnits = mcpUnits
@@ -1547,6 +1562,19 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
           secondaryActions: [
             navigateAction('reminder-open-memory', '查看提醒', 'memory', 'reminders', '打开记忆页提醒区。'),
             navigateAction('reminder-open-settings', '打开设置', 'settings', 'memoryRepo', '检查记忆和提醒相关路径。'),
+          ],
+        },
+        {
+          id: 'agent-collaboration',
+          title: '多 Agent 协作',
+          detail: `${agentModeLabel(collaboration.mode)} · Worker ${collaboration.workers.length} · 活动任务 ${collaboration.activeTaskCount}`,
+          status: collaborationStatus,
+          helpText: '协作链只让只读专业 Agent 提供结构化建议；Primary Agent 和 Bridge 仍是唯一执行与投递者。',
+          targetPage: 'architecture',
+          targetUnitId: 'agent-collaboration',
+          primaryAction: navigateAction('agent-collaboration-open', '查看 Agent 链路', 'architecture', 'agent-collaboration', '打开职责拓扑、实时工作流和性能观察。'),
+          secondaryActions: [
+            commandAction('agent-collaboration-refresh', '刷新状态', 'state.refresh', '刷新 Worker、协作回合和性能统计。'),
           ],
         },
       ],
@@ -2306,6 +2334,8 @@ function App() {
   const [sessionError, setSessionError] = useState('');
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
+  const [selectedAgentRunId, setSelectedAgentRunId] = useState('');
+  const [selectedAgentWorkflowRunId, setSelectedAgentWorkflowRunId] = useState('');
   const [commandNotice, setCommandNotice] = useState<CommandNotice | null>(null);
   const [pageRefreshRevision, setPageRefreshRevision] = useState(0);
   const lastLoadedSessionKeyRef = useRef('');
@@ -2539,6 +2569,14 @@ function App() {
     setPage(targetPage);
   };
 
+  const openAgentCollaborationRun = (workflowRunId: string) => {
+    const agentRun = findAgentRunByWorkflowRunId(state.agentCollaboration, workflowRunId);
+    if (!agentRun) return;
+    setSelectedAgentRunId(agentRun.runId);
+    setSelectedAgentWorkflowRunId(workflowRunId);
+    setPage('architecture');
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -2655,7 +2693,18 @@ function App() {
             pending={pending}
           />
         )}
-        {page === 'architecture' && <ArchitecturePage blueprint={architectureBlueprint} />}
+        {page === 'architecture' && (
+          <ArchitecturePage
+            blueprint={architectureBlueprint}
+            collaboration={state.agentCollaboration}
+            selectedRunId={selectedAgentRunId}
+            selectedWorkflowRunId={selectedAgentWorkflowRunId}
+            onSelectRun={(runId, workflowRunId) => {
+              setSelectedAgentRunId(runId);
+              setSelectedAgentWorkflowRunId(workflowRunId ?? '');
+            }}
+          />
+        )}
         {page === 'prompts' && (
           <PromptPage
             state={state.promptSnapshots}
@@ -2725,6 +2774,7 @@ function App() {
             setDrawerOpen={setSessionDrawerOpen}
             deleteSession={deleteSelectedSession}
             setSessionPersonRole={setSessionPersonRole}
+            openAgentCollaborationRun={openAgentCollaborationRun}
           />
         )}
         {page === 'memory' && <MemoryPage state={state} run={run} pending={pending} refreshRevision={pageRefreshRevision} />}
@@ -4115,6 +4165,7 @@ function SessionsPage({
   setDrawerOpen,
   deleteSession,
   setSessionPersonRole,
+  openAgentCollaborationRun,
 }: {
   state: PanelState;
   run: PageProps['run'];
@@ -4138,6 +4189,7 @@ function SessionsPage({
   setDrawerOpen: (value: boolean) => void;
   deleteSession: () => void | Promise<void>;
   setSessionPersonRole: (user: FeishuPerson, role: PermissionRole) => void | Promise<void>;
+  openAgentCollaborationRun: (workflowRunId: string) => void;
 }) {
   return (
     <section className="content-stack">
@@ -4201,6 +4253,8 @@ function SessionsPage({
           deleteSession={deleteSession}
           setSessionPersonRole={setSessionPersonRole}
           refreshDetail={() => detail ? openSessionDetail(`${detail.chatId}::${detail.sessionId}`, true) : undefined}
+          agentCollaboration={state.agentCollaboration}
+          openAgentCollaborationRun={openAgentCollaborationRun}
         />
       </section>
       <ReminderPanel initial={state.memoryReminders} run={run} pending={pending} />
@@ -4262,14 +4316,19 @@ function WorkflowRunCard({
   pending,
   refreshDetail,
   linkReason,
+  agentCollaboration,
+  openAgentCollaborationRun,
 }: {
   runItem: WorkflowRun;
   run: PageProps['run'];
   pending: Record<string, boolean>;
   refreshDetail: () => void | Promise<void> | undefined;
   linkReason?: WorkflowRunLink['linkReason'];
+  agentCollaboration?: AgentCollaborationPanelState;
+  openAgentCollaborationRun: (workflowRunId: string) => void;
 }) {
   const codexExecution = describeCodexWorkflowExecution(runItem.execution);
+  const linkedAgentRun = findAgentRunByWorkflowRunId(agentCollaboration, runItem.id);
   return (
     <article className="run-card">
       <header>
@@ -4357,6 +4416,13 @@ function WorkflowRunCard({
           pending={pending['workflow.retryRun']}
           disabled={!canRetryWorkflow(runItem)}
         />
+        {linkedAgentRun && (
+          <MiniButton
+            label="查看 Agent 链路"
+            icon={<BrainCircuit size={14} />}
+            onClick={() => openAgentCollaborationRun(runItem.id)}
+          />
+        )}
       </div>
       <div className="event-list">
         {(runItem.events ?? []).map((event) => (
@@ -4382,6 +4448,8 @@ const SessionDetailPane = memo(function SessionDetailPane({
   deleteSession,
   setSessionPersonRole,
   refreshDetail,
+  agentCollaboration,
+  openAgentCollaborationRun,
 }: {
   detail: SessionDetail | null;
   run: PageProps['run'];
@@ -4393,6 +4461,8 @@ const SessionDetailPane = memo(function SessionDetailPane({
   deleteSession: () => void | Promise<void>;
   setSessionPersonRole: (user: FeishuPerson, role: PermissionRole) => void | Promise<void>;
   refreshDetail: () => void | Promise<void> | undefined;
+  agentCollaboration?: AgentCollaborationPanelState;
+  openAgentCollaborationRun: (workflowRunId: string) => void;
 }) {
   const [messageSortOrder, setMessageSortOrder] = useState<'desc' | 'asc'>('desc');
   const orderedMessages = useMemo(() => {
@@ -4585,6 +4655,8 @@ const SessionDetailPane = memo(function SessionDetailPane({
                           pending={pending}
                           refreshDetail={refreshDetail}
                           linkReason={link.linkReason}
+                          agentCollaboration={agentCollaboration}
+                          openAgentCollaborationRun={openAgentCollaborationRun}
                         />
                       ))}
                     </div>
@@ -4608,6 +4680,8 @@ const SessionDetailPane = memo(function SessionDetailPane({
                   pending={pending}
                   refreshDetail={refreshDetail}
                   linkReason={undefined}
+                  agentCollaboration={agentCollaboration}
+                  openAgentCollaborationRun={openAgentCollaborationRun}
                 />
               ))}
               {unlinkedRuns.length === 0 && <div className="empty-inline">所有 workflow run 都已归并到对应消息。</div>}

@@ -9,7 +9,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { initBridgeContext } from 'claude-to-im';
+import { getBridgeContext, initBridgeContext } from 'claude-to-im';
 import * as bridgeManager from 'claude-to-im';
 import {
   getWorkspacePlanRoots,
@@ -51,6 +51,7 @@ import { getOrdinaryCodexExecutionProfile } from './codex-provider.js';
 import { JsonFileStore } from './store.js';
 import { readAgentHomePromptSections } from './agent-home.js';
 import { ArtifactEncodingInspector } from './artifact-encoding-inspector.js';
+import { DeterministicEvidenceRecoveryProvider } from './deterministic-evidence-recovery-provider.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
 import {
   applySelfMaintenanceDecision,
@@ -182,6 +183,11 @@ import {
   setWorkflowExecutor,
   startWorkflowRun,
 } from './workflow-status.js';
+import { loadAgentManifestRegistry } from './agent-workers/manifest-registry.js';
+import { AgentCollaborationStateStore } from './agent-workers/state-store.js';
+import { AgentWorkerSupervisor } from './agent-workers/supervisor.js';
+import { RuntimeAgentCollaborationHost } from './agent-workers/collaboration-host.js';
+import { WorkerMemoryIntentHost, WorkerTurnReferenceResolverHost } from './agent-workers/worker-adapters.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
@@ -2758,6 +2764,13 @@ class ObservedLLMProvider implements LLMProvider {
           channelType: binding?.channelType,
           chatId: binding?.chatId,
         });
+        if (params.collaborationRunId) {
+          try {
+            getBridgeContext().agentCollaboration?.linkWorkflowRun?.(params.collaborationRunId, workflowRun.id);
+          } catch {
+            // 协作状态是观察数据；关联失败不能阻断主 Provider。
+          }
+        }
         recordWorkflowRecoveryInfo(workflowRun.id, {
           prompt: params.prompt,
           workingDirectory: params.workingDirectory,
@@ -3231,8 +3244,44 @@ async function main(): Promise<void> {
   } catch (error) {
     console.warn('[claude-to-im] Failed to write executor baseline status:', error instanceof Error ? error.message : error);
   }
-  const llm = await resolveProvider(config, pendingPerms, store, turnStorage);
+  const llm = new DeterministicEvidenceRecoveryProvider(
+    await resolveProvider(config, pendingPerms, store, turnStorage),
+  );
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
+  const agentManifestDirCandidates = [
+    process.env.CTI_AGENT_MANIFEST_DIR?.trim(),
+    path.resolve(SKILL_ROOT, '..', '..', 'config', 'agents.d'),
+    path.join(SKILL_ROOT, 'config', 'agents.d'),
+  ].filter((item): item is string => Boolean(item));
+  const agentManifestDir = agentManifestDirCandidates.find((candidate) => fs.existsSync(candidate))
+    || agentManifestDirCandidates[0];
+  const agentRegistry = loadAgentManifestRegistry(agentManifestDir);
+  const agentCollaborationStateStore = new AgentCollaborationStateStore(
+    path.join(CTI_HOME, 'runtime', 'agent-collaboration.json'),
+    config.agentCollaborationMode || 'off',
+    agentRegistry.manifests,
+  );
+  const agentSupervisor = new AgentWorkerSupervisor({
+    config,
+    registry: agentRegistry,
+    stateStore: agentCollaborationStateStore,
+  });
+  const agentCollaborationEnabled = config.agentCollaborationMode !== 'off';
+  const agentCollaborationHost = agentCollaborationEnabled
+    ? new RuntimeAgentCollaborationHost(config, agentRegistry, agentSupervisor, agentCollaborationStateStore)
+    : undefined;
+  const workerMemoryIntentHost = agentCollaborationEnabled
+    ? new WorkerMemoryIntentHost(config, agentSupervisor, agentCollaborationStateStore)
+    : undefined;
+  const workerTurnReferenceHost = agentCollaborationEnabled
+    ? new WorkerTurnReferenceResolverHost(config, agentSupervisor, agentCollaborationStateStore)
+    : undefined;
+  if (agentCollaborationEnabled) {
+    agentSupervisor.start();
+    console.log(`[claude-to-im] Agent collaboration: mode=${config.agentCollaborationMode}, workers=${config.agentWorkerPoolSize}, manifests=${agentRegistry.manifests.length}`);
+  } else {
+    console.log('[claude-to-im] Agent collaboration: off');
+  }
   const stickerSemanticStore = config.memoryRepoDir
     ? createStickerSemanticStore({ memoryRoot: config.memoryRepoDir })
     : undefined;
@@ -3467,7 +3516,7 @@ async function main(): Promise<void> {
         userId: input.userId,
       }),
     },
-    memoryIntents: new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
+    memoryIntents: workerMemoryIntentHost || new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
     stickerSemantics,
     agentHome: config.memoryRepoDir ? {
       readPromptSections: async (input) => readAgentHomePromptSections(config.memoryRepoDir!, {
@@ -3481,7 +3530,8 @@ async function main(): Promise<void> {
       memoryRoot: config.memoryRepoDir,
       timeoutMs: Number.parseInt(store.getSetting('bridge_self_maintenance_timeout_ms') || '5000', 10) || 5000,
     }) : undefined,
-    turnReferences: new ProviderTurnReferenceResolverHost(llm),
+    turnReferences: workerTurnReferenceHost || new ProviderTurnReferenceResolverHost(llm),
+    agentCollaboration: agentCollaborationHost,
     turnStorage,
     artifactEncoding: new ArtifactEncodingInspector(),
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
@@ -3585,6 +3635,7 @@ async function main(): Promise<void> {
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(reason);
     await bridgeManager.stop();
+    await agentSupervisor.stop(reason);
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();

@@ -616,21 +616,17 @@ export function buildNoExecutionEvidenceText(
   },
 ): string {
   if (requirement.kind === 'input_evidence_required') {
-    return [
-      '未完成：本轮模型执行没有确认接收到所需输入证据。',
-      `证据要求：${requirement.kind}`,
-      `需要的输入证据：${(requirement.requiredInputEvidenceIds || []).join('、') || '未记录'}`,
-      `已接收输入证据：${(evidence.acceptedInputEvidenceIds || []).join('、') || '0'}`,
-      `Provider：${evidence.inputEvidenceProvider || '未确认'}`,
-    ].join('\n');
+    return '未完成：这次没有成功读取到你提供的附件或引用内容，请重新发送后再试。';
   }
-  const lines = [
-    '未完成：本轮没有检测到真实工具执行成功记录。',
-    `证据要求：${requirement.kind}`,
-    `原因：${requirement.reason}`,
-    `本轮工具证据：tool_use=${evidence.toolUseCount}，tool_result=${evidence.toolResultCount}，成功结果=${evidence.successfulToolResultCount}。`,
-  ];
-  if (evidence.toolNames.length > 0) lines.push(`工具：${evidence.toolNames.slice(0, 6).join('、')}`);
-  if (evidence.failedToolErrors?.length) lines.push(`失败原因：${evidence.failedToolErrors.slice(0, 3).join('；')}`);
+
+  const summary = requirement.kind === 'local_read_required'
+    ? '未完成：这次没有成功读取到本地信息。系统已尝试受控只读检查，但仍未获得可用结果。'
+    : requirement.kind === 'artifact_required'
+      ? '未完成：这次没有生成可验证的文件、图片或其他交付结果。'
+      : '未完成：这次没有获得可验证的执行结果。';
+  const lines = [summary];
+  // 详细证据计数、内部 requirement 名称与 Provider 原因继续保留在 workflow/audit，
+  // 用户正文只展示一条有行动价值的失败原因，避免把内部协议直接暴露到聊天卡片。
+  if (evidence.failedToolErrors?.length) lines.push(`具体原因：${evidence.failedToolErrors[0]}`);
   return lines.join('\n');
 }

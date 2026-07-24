@@ -95,6 +95,7 @@ internal sealed partial class MainForm : Form
     private readonly string _executorStatusPath;
     private readonly string _executorSessionDefaultsPath;
     private readonly string _workflowStatusPath;
+    private readonly string _agentCollaborationStatusPath;
     private readonly string _finalEnvelopeStatusPath;
     private readonly string _bridgeRuntimeAuditPath;
     private readonly string _mediaCacheDir;
@@ -200,6 +201,7 @@ internal sealed partial class MainForm : Form
         _executorStatusPath = Path.Combine(_ctiHome, "runtime", "executor-status.json");
         _executorSessionDefaultsPath = Path.Combine(_ctiHome, "runtime", "executor-session-defaults.json");
         _workflowStatusPath = Path.Combine(_ctiHome, "runtime", "workflow-runs.json");
+        _agentCollaborationStatusPath = Path.Combine(_ctiHome, "runtime", "agent-collaboration.json");
         _finalEnvelopeStatusPath = Path.Combine(_ctiHome, "runtime", "final-envelope-status.json");
         _bridgeRuntimeAuditPath = Path.Combine(_ctiHome, "runtime", "bridge-runtime-audit.json");
         _mediaCacheDir = Path.Combine(_ctiHome, "runtime", "control-panel-media");
@@ -1261,6 +1263,7 @@ internal sealed partial class MainForm : Form
                 sessions = sessionItems.Take(80).ToArray(),
             },
             Workflow: ListWorkflowRuns(),
+            AgentCollaboration: ReadAgentCollaborationState(),
             ProjectRegistry: BuildProjectRegistrySnapshot(),
             Memory: BuildKnowledgeIndexStatus(),
             MemorySkillAssets: memorySkillAssets,
@@ -2371,6 +2374,54 @@ internal sealed partial class MainForm : Form
             protocol = ReadJsonString(root, "protocol", "workflow-runtime/v1"),
             updatedAt = ReadJsonString(root, "updatedAt", ""),
             runs = runs.Select(node => node?.DeepClone()).Where(node => node is not null).TakeLast(80).ToArray(),
+        };
+    }
+
+    private object ReadAgentCollaborationState()
+    {
+        var runtimeState = ReadJsonObjectFile(_agentCollaborationStatusPath);
+        if (runtimeState is not null) return runtimeState.DeepClone();
+
+        var configuredMode = GetConfig("CTI_AGENT_COLLABORATION_MODE", "off").Trim().ToLowerInvariant();
+        var mode = configuredMode is "shadow" or "assist" ? configuredMode : "off";
+        var manifestDir = Path.Combine(_suiteRoot, "config", "agents.d");
+        var agentViews = new JsonArray();
+        if (Directory.Exists(manifestDir))
+        {
+            foreach (var manifestPath in Directory.EnumerateFiles(manifestDir, "*.json").OrderBy(item => item, StringComparer.OrdinalIgnoreCase))
+            {
+                var manifest = ReadJsonObjectFile(manifestPath);
+                if (manifest is null) continue;
+                agentViews.Add(new JsonObject
+                {
+                    ["manifest"] = manifest.DeepClone(),
+                    ["health"] = mode == "off" ? "disabled" : "unavailable",
+                    ["successCount"] = 0,
+                    ["failureCount"] = 0,
+                    ["timeoutCount"] = 0,
+                });
+            }
+        }
+        return new JsonObject
+        {
+            ["protocol"] = "codex-im-suite/agent-collaboration/v1",
+            ["updatedAt"] = DateTimeOffset.UtcNow.ToString("O"),
+            ["mode"] = mode,
+            ["poolHealth"] = mode == "off" ? "disabled" : "unavailable",
+            ["activeTaskCount"] = 0,
+            ["workers"] = new JsonArray(),
+            ["agents"] = agentViews,
+            ["recentRuns"] = new JsonArray(),
+            ["metrics"] = new JsonObject
+            {
+                ["windowRunCount"] = 0,
+                ["coordinatorTriggerRate"] = 0,
+                ["fallbackRate"] = 0,
+                ["workerRestartCount"] = 0,
+                ["workerTimeoutCount"] = 0,
+                ["circuitOpenCount"] = 0,
+                ["specialistCallDistribution"] = new JsonObject(),
+            },
         };
     }
 

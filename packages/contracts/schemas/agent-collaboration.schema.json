@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/agent-collaboration.schema.json",
+  "title": "Codex IM Suite Agent Collaboration",
+  "$defs": {
+    "CollaborationAgentManifest": {
+      "type": "object",
+      "required": ["protocol", "id", "displayName", "enabled", "responsibilities", "owns", "excludes", "capabilities", "inputEvidenceKinds", "outputSchemaId", "sideEffectLevel", "timeoutMs", "concurrency", "modelProfile"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/agent-collaboration/v1" },
+        "id": { "type": "string", "minLength": 1 },
+        "displayName": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "responsibilities": { "type": "array", "items": { "type": "string" } },
+        "owns": { "type": "array", "items": { "type": "string" } },
+        "excludes": { "type": "array", "items": { "type": "string" } },
+        "capabilities": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "inputEvidenceKinds": { "type": "array", "items": { "type": "string" } },
+        "outputSchemaId": { "type": "string", "minLength": 1 },
+        "sideEffectLevel": { "const": "none" },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "modelProfile": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "AgentPromptSection": {
+      "type": "object",
+      "required": ["id", "title", "content", "priority"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "priority": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "AgentTaskMetrics": {
+      "type": "object",
+      "required": ["startedAt", "endedAt", "durationMs"],
+      "properties": {
+        "startedAt": { "type": "string" },
+        "endedAt": { "type": "string" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "modelSource": { "type": "string" },
+        "model": { "type": "string" },
+        "inputTokens": { "type": "number", "minimum": 0 },
+        "outputTokens": { "type": "number", "minimum": 0 },
+        "totalTokens": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "AgentTaskRequest": {
+      "type": "object",
+      "required": ["protocol", "runId", "turnId", "taskId", "agentId", "capability", "deadlineAt", "evidenceRefs", "input"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/agent-worker/v1" },
+        "runId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": "string", "minLength": 1 },
+        "taskId": { "type": "string", "minLength": 1 },
+        "agentId": { "type": "string", "minLength": 1 },
+        "capability": { "type": "string", "minLength": 1 },
+        "deadlineAt": { "type": "string" },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "input": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "AgentTaskResult": {
+      "type": "object",
+      "required": ["protocol", "runId", "turnId", "taskId", "agentId", "capability", "status", "findings", "evidenceRefs", "promptSections", "metrics"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/agent-worker/v1" },
+        "runId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "taskId": { "type": "string" },
+        "agentId": { "type": "string" },
+        "capability": { "type": "string" },
+        "status": { "enum": ["succeeded", "failed", "timed_out", "cancelled", "skipped"] },
+        "findings": { "type": "array", "items": { "type": "string" } },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "promptSections": { "type": "array", "items": { "$ref": "#/$defs/AgentPromptSection" } },
+        "output": { "type": "object" },
+        "metrics": { "$ref": "#/$defs/AgentTaskMetrics" },
+        "errorCode": { "type": "string" },
+        "errorSummary": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "AgentTurnPlanTask": {
+      "type": "object",
+      "required": ["taskId", "agentId", "capability", "objective", "evidenceRefs"],
+      "properties": {
+        "taskId": { "type": "string" },
+        "agentId": { "type": "string" },
+        "capability": { "type": "string" },
+        "objective": { "type": "string" },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "AgentTurnPlan": {
+      "type": "object",
+      "required": ["protocol", "shouldCollaborate", "reason", "tasks"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/agent-collaboration/v1" },
+        "shouldCollaborate": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "tasks": { "type": "array", "maxItems": 2, "items": { "$ref": "#/$defs/AgentTurnPlanTask" } }
+      },
+      "additionalProperties": false
+    },
+    "AgentCollaborationWorkflowNode": {
+      "type": "object",
+      "required": ["id", "kind", "label", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "enum": ["bridge", "context_broker", "coordinator", "specialist", "primary_agent", "policy_verifier", "delivery"] },
+        "agentId": { "type": "string" },
+        "label": { "type": "string" },
+        "status": { "enum": ["pending", "running", "succeeded", "failed", "cancelled", "skipped", "fallback"] },
+        "startedAt": { "type": "string" },
+        "endedAt": { "type": "string" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "evidenceCount": { "type": "integer", "minimum": 0 },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "tokenUsage": {
+          "type": "object",
+          "properties": {
+            "inputTokens": { "type": "number", "minimum": 0 },
+            "outputTokens": { "type": "number", "minimum": 0 },
+            "totalTokens": { "type": "number", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "modelSource": { "type": "string" },
+        "model": { "type": "string" },
+        "summary": { "type": "string" },
+        "triggerReason": { "type": "string" },
+        "fallbackReason": { "type": "string" },
+        "errorCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "AgentCollaborationWorkflowEdge": {
+      "type": "object",
+      "required": ["from", "to", "kind", "status"],
+      "properties": {
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "kind": { "enum": ["control", "evidence", "result", "fallback"] },
+        "status": { "enum": ["pending", "active", "completed", "failed", "fallback"] }
+      },
+      "additionalProperties": false
+    },
+    "AgentCollaborationRun": {
+      "type": "object",
+      "required": ["runId", "sessionId", "turnId", "mode", "status", "triggerReason", "injectedIntoPrimary", "startedAt", "nodes", "edges"],
+      "properties": {
+        "runId": { "type": "string" },
+        "workflowRunId": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "turnId": { "type": "string" },
+        "mode": { "enum": ["off", "shadow", "assist"] },
+        "status": { "enum": ["running", "succeeded", "failed", "cancelled", "skipped", "fallback"] },
+        "triggerReason": { "type": "string" },
+        "fallbackReason": { "type": "string" },
+        "injectedIntoPrimary": { "type": "boolean" },
+        "startedAt": { "type": "string" },
+        "endedAt": { "type": "string" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "nodes": { "type": "array", "items": { "$ref": "#/$defs/AgentCollaborationWorkflowNode" } },
+        "edges": { "type": "array", "items": { "$ref": "#/$defs/AgentCollaborationWorkflowEdge" } }
+      },
+      "additionalProperties": false
+    },
+    "AgentWorkerView": {
+      "type": "object",
+      "required": ["workerId", "health", "restartCount", "timeoutCount", "circuitOpenCount"],
+      "properties": {
+        "workerId": { "type": "string" },
+        "pid": { "type": "integer" },
+        "health": { "enum": ["starting", "online", "busy", "unresponsive", "restarting", "circuit_open", "stopped"] },
+        "activeTaskId": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "lastHeartbeatAt": { "type": "string" },
+        "restartCount": { "type": "integer", "minimum": 0 },
+        "timeoutCount": { "type": "integer", "minimum": 0 },
+        "circuitOpenCount": { "type": "integer", "minimum": 0 },
+        "circuitOpenUntil": { "type": "string" },
+        "lastErrorCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "AgentResponsibilityView": {
+      "type": "object",
+      "required": ["manifest", "health", "successCount", "failureCount", "timeoutCount"],
+      "properties": {
+        "manifest": { "$ref": "#/$defs/CollaborationAgentManifest" },
+        "workerId": { "type": "string" },
+        "health": { "enum": ["disabled", "idle", "running", "degraded", "unavailable"] },
+        "lastInvokedAt": { "type": "string" },
+        "lastDurationMs": { "type": "number", "minimum": 0 },
+        "successCount": { "type": "integer", "minimum": 0 },
+        "failureCount": { "type": "integer", "minimum": 0 },
+        "timeoutCount": { "type": "integer", "minimum": 0 },
+        "averageDurationMs": { "type": "number", "minimum": 0 },
+        "p95DurationMs": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "AgentPerformanceSuggestion": {
+      "type": "object",
+      "required": ["id", "generatedAt", "summary", "evidenceWindow", "metricBasis"],
+      "properties": {
+        "id": { "type": "string" },
+        "generatedAt": { "type": "string" },
+        "summary": { "type": "string" },
+        "evidenceWindow": {
+          "type": "object",
+          "required": ["runCount"],
+          "properties": {
+            "runCount": { "type": "integer", "minimum": 0 },
+            "startedAt": { "type": "string" },
+            "endedAt": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "metricBasis": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "AgentCollaborationMetricsView": {
+      "type": "object",
+      "required": ["windowRunCount", "coordinatorTriggerRate", "fallbackRate", "workerRestartCount", "workerTimeoutCount", "circuitOpenCount", "specialistCallDistribution"],
+      "properties": {
+        "windowRunCount": { "type": "integer", "minimum": 0 },
+        "coordinatorTriggerRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "fallbackRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "workerRestartCount": { "type": "integer", "minimum": 0 },
+        "workerTimeoutCount": { "type": "integer", "minimum": 0 },
+        "circuitOpenCount": { "type": "integer", "minimum": 0 },
+        "specialistCallDistribution": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      },
+      "additionalProperties": false
+    },
+    "AgentCollaborationPanelState": {
+      "type": "object",
+      "required": ["protocol", "updatedAt", "mode", "poolHealth", "activeTaskCount", "workers", "agents", "recentRuns", "metrics"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/agent-collaboration/v1" },
+        "updatedAt": { "type": "string" },
+        "mode": { "enum": ["off", "shadow", "assist"] },
+        "poolHealth": { "enum": ["disabled", "healthy", "degraded", "unavailable"] },
+        "activeTaskCount": { "type": "integer", "minimum": 0 },
+        "workers": { "type": "array", "items": { "$ref": "#/$defs/AgentWorkerView" } },
+        "agents": { "type": "array", "items": { "$ref": "#/$defs/AgentResponsibilityView" } },
+        "currentRun": { "$ref": "#/$defs/AgentCollaborationRun" },
+        "recentRuns": { "type": "array", "items": { "$ref": "#/$defs/AgentCollaborationRun" } },
+        "metrics": { "$ref": "#/$defs/AgentCollaborationMetricsView" },
+        "latestPerformanceSuggestion": { "$ref": "#/$defs/AgentPerformanceSuggestion" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/CollaborationAgentManifest" },
+    { "$ref": "#/$defs/AgentTaskRequest" },
+    { "$ref": "#/$defs/AgentTaskResult" },
+    { "$ref": "#/$defs/AgentTurnPlan" },
+    { "$ref": "#/$defs/AgentCollaborationPanelState" }
+  ]
+}

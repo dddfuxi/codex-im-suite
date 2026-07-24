@@ -157,7 +157,24 @@ export class FeishuStreamingCardLifecycle {
   updateTools(chatId: string, tools: ToolCallInfo[]): void {
     const state = this.registry.get(chatId);
     if (!state) return;
-    state.toolCalls = tools;
+    const observedAt = this.now();
+    const previousById = new Map(state.toolCalls.map((tool) => [tool.id, tool]));
+    // 时间字段由 Bridge 生命周期生成，不能信任模型文本，也不要求上游 Provider
+    // 提供平台时间；这样流式卡片和最终卡片始终复用同一份真实工具轨迹。
+    state.toolCalls = tools.map((tool) => {
+      const previous = previousById.get(tool.id);
+      const startedAt = previous?.startedAt ?? tool.startedAt ?? observedAt;
+      const completedAt = tool.status === 'running'
+        ? undefined
+        : previous?.status === 'running'
+          ? observedAt
+          : previous?.completedAt ?? tool.completedAt ?? observedAt;
+      return {
+        ...tool,
+        startedAt,
+        completedAt,
+      };
+    });
     this.updateText(chatId, state.pendingText ?? '');
   }
 

@@ -161,6 +161,28 @@ describe('Feishu streaming card lifecycle', () => {
     assert.equal(harness.streamed.at(-1)?.content, '|tools=1');
   });
 
+  it('records bridge-owned tool start and completion times for the final timeline', async () => {
+    const { FeishuStreamingCardLifecycle } = await loadLifecycle();
+    const harness = createHarness();
+    const lifecycle = new FeishuStreamingCardLifecycle(harness.options);
+    const state = harness.registry.activate('oc_chat', {
+      cardId: 'card_1',
+      messageId: 'om_card',
+    });
+
+    lifecycle.updateTools('oc_chat', [{ id: 'tool_1', name: 'Bash', status: 'running' }]);
+    await Promise.resolve();
+    assert.equal(state.toolCalls[0]?.startedAt, 1_000);
+    assert.equal(state.toolCalls[0]?.completedAt, undefined);
+
+    harness.scheduler.advance(350);
+    lifecycle.updateTools('oc_chat', [{ id: 'tool_1', name: 'Bash', status: 'complete' }]);
+    await Promise.resolve();
+
+    assert.equal(state.toolCalls[0]?.startedAt, 1_000);
+    assert.equal(state.toolCalls[0]?.completedAt, 1_350);
+  });
+
   it('waits for creation, closes streaming, writes the final card, persists, and removes state', async () => {
     const { FeishuStreamingCardLifecycle } = await loadLifecycle();
     const harness = createHarness();

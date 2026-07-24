@@ -78,6 +78,13 @@ export interface Config {
   lightChatFastPathTimeoutMs?: number;
   providerCircuitCooldownMs?: number;
   memoryIntentTimeoutMs?: number;
+  agentCollaborationMode?: 'off' | 'shadow' | 'assist';
+  agentWorkerPoolSize?: number;
+  agentMaxSpecialists?: number;
+  agentTaskTimeoutMs?: number;
+  agentTurnBudgetMs?: number;
+  agentPerformanceBatchSize?: number;
+  agentPerformanceIntervalMs?: number;
   lightChatHistoryLimit?: number;
   lightChatMaxInputChars?: number;
   replyStyleHint?: string;
@@ -402,6 +409,28 @@ export function loadConfig(): Config {
   const memoryIntentTimeoutMs = env.get("CTI_MEMORY_INTENT_TIMEOUT_MS")
     ? Number(env.get("CTI_MEMORY_INTENT_TIMEOUT_MS"))
     : undefined;
+  const rawAgentCollaborationMode = (env.get("CTI_AGENT_COLLABORATION_MODE") || "off").trim().toLowerCase();
+  const agentCollaborationMode = (["off", "shadow", "assist"].includes(rawAgentCollaborationMode)
+    ? rawAgentCollaborationMode
+    : "off") as NonNullable<Config["agentCollaborationMode"]>;
+  const agentWorkerPoolSize = env.get("CTI_AGENT_WORKER_POOL_SIZE")
+    ? Number(env.get("CTI_AGENT_WORKER_POOL_SIZE"))
+    : undefined;
+  const agentMaxSpecialists = env.get("CTI_AGENT_MAX_SPECIALISTS")
+    ? Number(env.get("CTI_AGENT_MAX_SPECIALISTS"))
+    : undefined;
+  const agentTaskTimeoutMs = env.get("CTI_AGENT_TASK_TIMEOUT_MS")
+    ? Number(env.get("CTI_AGENT_TASK_TIMEOUT_MS"))
+    : undefined;
+  const agentTurnBudgetMs = env.get("CTI_AGENT_TURN_BUDGET_MS")
+    ? Number(env.get("CTI_AGENT_TURN_BUDGET_MS"))
+    : undefined;
+  const agentPerformanceBatchSize = env.get("CTI_AGENT_PERFORMANCE_BATCH_SIZE")
+    ? Number(env.get("CTI_AGENT_PERFORMANCE_BATCH_SIZE"))
+    : undefined;
+  const agentPerformanceIntervalMs = env.get("CTI_AGENT_PERFORMANCE_INTERVAL_MS")
+    ? Number(env.get("CTI_AGENT_PERFORMANCE_INTERVAL_MS"))
+    : undefined;
   const lightChatHistoryLimit = env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT")
     ? Number(env.get("CTI_LIGHT_CHAT_HISTORY_LIMIT"))
     : undefined;
@@ -605,6 +634,25 @@ export function loadConfig(): Config {
     memoryIntentTimeoutMs: typeof memoryIntentTimeoutMs === "number" && Number.isFinite(memoryIntentTimeoutMs)
       ? Math.max(30_000, Math.min(60_000, Math.floor(memoryIntentTimeoutMs)))
       : 30_000,
+    agentCollaborationMode,
+    agentWorkerPoolSize: typeof agentWorkerPoolSize === "number" && Number.isFinite(agentWorkerPoolSize)
+      ? Math.max(1, Math.min(4, Math.floor(agentWorkerPoolSize)))
+      : 2,
+    agentMaxSpecialists: typeof agentMaxSpecialists === "number" && Number.isFinite(agentMaxSpecialists)
+      ? Math.max(1, Math.min(2, Math.floor(agentMaxSpecialists)))
+      : 2,
+    agentTaskTimeoutMs: typeof agentTaskTimeoutMs === "number" && Number.isFinite(agentTaskTimeoutMs)
+      ? Math.max(1_000, Math.min(120_000, Math.floor(agentTaskTimeoutMs)))
+      : 30_000,
+    agentTurnBudgetMs: typeof agentTurnBudgetMs === "number" && Number.isFinite(agentTurnBudgetMs)
+      ? Math.max(1_000, Math.min(180_000, Math.floor(agentTurnBudgetMs)))
+      : 35_000,
+    agentPerformanceBatchSize: typeof agentPerformanceBatchSize === "number" && Number.isFinite(agentPerformanceBatchSize)
+      ? Math.max(5, Math.min(500, Math.floor(agentPerformanceBatchSize)))
+      : 20,
+    agentPerformanceIntervalMs: typeof agentPerformanceIntervalMs === "number" && Number.isFinite(agentPerformanceIntervalMs)
+      ? Math.max(60_000, Math.min(24 * 60 * 60_000, Math.floor(agentPerformanceIntervalMs)))
+      : 1_800_000,
     lightChatHistoryLimit: typeof lightChatHistoryLimit === "number" && Number.isFinite(lightChatHistoryLimit) ? Math.max(0, Math.floor(lightChatHistoryLimit)) : 2,
     lightChatMaxInputChars: typeof lightChatMaxInputChars === "number" && Number.isFinite(lightChatMaxInputChars) ? Math.max(80, Math.floor(lightChatMaxInputChars)) : 280,
     replyStyleHint: env.get("CTI_REPLY_STYLE_HINT") || undefined,
@@ -798,6 +846,19 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS", String(config.providerCircuitCooldownMs));
   if (config.memoryIntentTimeoutMs !== undefined)
     out += formatEnvLine("CTI_MEMORY_INTENT_TIMEOUT_MS", String(config.memoryIntentTimeoutMs));
+  out += formatEnvLine("CTI_AGENT_COLLABORATION_MODE", config.agentCollaborationMode || "off");
+  if (config.agentWorkerPoolSize !== undefined)
+    out += formatEnvLine("CTI_AGENT_WORKER_POOL_SIZE", String(config.agentWorkerPoolSize));
+  if (config.agentMaxSpecialists !== undefined)
+    out += formatEnvLine("CTI_AGENT_MAX_SPECIALISTS", String(config.agentMaxSpecialists));
+  if (config.agentTaskTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_AGENT_TASK_TIMEOUT_MS", String(config.agentTaskTimeoutMs));
+  if (config.agentTurnBudgetMs !== undefined)
+    out += formatEnvLine("CTI_AGENT_TURN_BUDGET_MS", String(config.agentTurnBudgetMs));
+  if (config.agentPerformanceBatchSize !== undefined)
+    out += formatEnvLine("CTI_AGENT_PERFORMANCE_BATCH_SIZE", String(config.agentPerformanceBatchSize));
+  if (config.agentPerformanceIntervalMs !== undefined)
+    out += formatEnvLine("CTI_AGENT_PERFORMANCE_INTERVAL_MS", String(config.agentPerformanceIntervalMs));
   if (config.lightChatHistoryLimit !== undefined)
     out += formatEnvLine("CTI_LIGHT_CHAT_HISTORY_LIMIT", String(config.lightChatHistoryLimit));
   if (config.lightChatMaxInputChars !== undefined)
@@ -1234,6 +1295,11 @@ export function configToSettings(config: Config): Map<string, string> {
   if (typeof config.memoryIntentTimeoutMs === "number" && Number.isFinite(config.memoryIntentTimeoutMs)) {
     m.set("bridge_memory_intent_timeout_ms", String(Math.max(250, Math.floor(config.memoryIntentTimeoutMs))));
   }
+  m.set("bridge_agent_collaboration_mode", config.agentCollaborationMode || "off");
+  m.set("bridge_agent_worker_pool_size", String(config.agentWorkerPoolSize || 2));
+  m.set("bridge_agent_max_specialists", String(config.agentMaxSpecialists || 2));
+  m.set("bridge_agent_task_timeout_ms", String(config.agentTaskTimeoutMs || 30_000));
+  m.set("bridge_agent_turn_budget_ms", String(config.agentTurnBudgetMs || 35_000));
   if (typeof config.lightChatHistoryLimit === "number" && Number.isFinite(config.lightChatHistoryLimit)) {
     m.set("bridge_light_chat_history_limit", String(Math.max(0, Math.floor(config.lightChatHistoryLimit))));
   }

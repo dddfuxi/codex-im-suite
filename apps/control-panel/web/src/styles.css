@@ -331,6 +331,622 @@ textarea::placeholder {
   color: var(--text-soft);
 }
 
+.agent-section-heading {
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.agent-mode-badge,
+.agent-run-status,
+.agent-health-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--idle-text);
+  background: var(--idle-bg);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-mode-badge.mode-assist,
+.agent-run-status.status-succeeded,
+.agent-health-badge.idle {
+  color: var(--success-text);
+  background: var(--success-bg);
+}
+
+.agent-mode-badge.mode-shadow,
+.agent-run-status.status-running,
+.agent-health-badge.running {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+
+.agent-run-status.status-failed,
+.agent-health-badge.unavailable {
+  color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+.agent-run-status.status-fallback,
+.agent-health-badge.degraded {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+
+.agent-mode-description {
+  margin: -4px 0 16px;
+  color: var(--text-soft);
+}
+
+.agent-summary-grid,
+.agent-performance-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.agent-summary-grid > div,
+.agent-performance-metrics > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.agent-summary-grid span,
+.agent-performance-metrics span,
+.agent-detail-title span,
+.agent-runtime-facts > span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-summary-grid strong,
+.agent-performance-metrics strong {
+  overflow-wrap: anywhere;
+}
+
+.agent-subsection-title {
+  justify-content: space-between;
+  margin: 22px 0 10px;
+}
+
+.agent-subsection-title span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-responsibility-layout,
+.agent-workflow-detail-layout,
+.agent-performance-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  gap: 14px;
+  align-items: start;
+}
+
+.agent-topology {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 24px minmax(150px, 1fr) 24px minmax(150px, 1fr) 24px minmax(180px, 1.2fr) 24px minmax(150px, 1fr) 24px minmax(150px, 1fr) 24px minmax(150px, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 1120px;
+  padding: 4px;
+}
+
+.agent-topology-viewport {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.agent-topology-node {
+  display: grid;
+  align-content: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 118px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px 18px;
+  color: var(--text);
+  background: var(--panel-muted);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+button.agent-topology-node {
+  cursor: pointer;
+}
+
+button.agent-topology-node:hover,
+button.agent-topology-node.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-topology-node.agent {
+  border-radius: 18px;
+}
+
+.agent-topology-node.executor {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 5px 20px;
+  background: var(--accent-soft);
+}
+
+.agent-topology-node.unavailable {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.agent-topology-node span,
+.agent-topology-node small {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.agent-topology-node small {
+  color: var(--text-muted);
+}
+
+.agent-topology-arrow {
+  color: var(--accent-strong);
+  font-size: 20px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.agent-topology-specialists {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-topology-async {
+  display: grid;
+  gap: 4px;
+}
+
+.agent-topology-async > small {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.agent-manifest-detail,
+.agent-node-detail,
+.agent-performance-side > section {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.agent-detail-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.agent-detail-title h3,
+.agent-performance-side h3,
+.agent-workflow-timeline h3 {
+  margin: 4px 0 0;
+}
+
+.agent-manifest-detail dl,
+.agent-node-detail dl,
+.agent-worker-card dl {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 8px 10px;
+  margin: 14px 0 0;
+  font-size: 12px;
+}
+
+.agent-manifest-detail dt,
+.agent-node-detail dt,
+.agent-worker-card dt {
+  color: var(--text-muted);
+}
+
+.agent-manifest-detail dd,
+.agent-node-detail dd,
+.agent-worker-card dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.agent-runtime-facts {
+  display: grid;
+  gap: 5px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-runtime-facts small {
+  color: var(--text-soft);
+}
+
+.agent-worker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+}
+
+.agent-worker-card {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.agent-worker-card > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-worker-card > div span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-worker-card.unresponsive,
+.agent-worker-card.circuit_open {
+  border-color: color-mix(in srgb, var(--danger-text) 42%, var(--border));
+}
+
+.agent-run-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 420px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.agent-run-toolbar label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-run-toolbar select {
+  min-width: 0;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-strong);
+}
+
+.agent-run-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.agent-workflow-shell {
+  min-width: 0;
+}
+
+.agent-workflow-canvas-viewport {
+  min-width: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-workflow-canvas {
+  position: relative;
+  min-width: 1120px;
+  height: 360px;
+}
+
+.agent-workflow-canvas > svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  color: var(--border-strong);
+  pointer-events: none;
+}
+
+.agent-workflow-canvas marker path {
+  fill: currentColor;
+}
+
+.agent-workflow-edge {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.agent-workflow-edge.active {
+  color: var(--accent);
+  stroke-dasharray: 6 4;
+}
+
+.agent-workflow-edge.failed {
+  color: var(--danger-text);
+}
+
+.agent-workflow-edge.fallback {
+  color: var(--warning-text);
+  stroke-dasharray: 5 4;
+}
+
+.agent-workflow-edge.result {
+  color: var(--accent-strong);
+}
+
+.agent-workflow-node {
+  position: absolute;
+  display: grid;
+  gap: 7px;
+  width: 146px;
+  min-height: 104px;
+  padding: 11px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px 18px;
+  color: var(--text);
+  background: var(--panel-strong);
+  box-shadow: var(--panel-shadow);
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-workflow-node.kind-coordinator,
+.agent-workflow-node.kind-specialist {
+  border-radius: 18px;
+}
+
+.agent-workflow-node.kind-primary_agent {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 50%, var(--panel-strong));
+}
+
+.agent-workflow-node.kind-policy_verifier {
+  border-radius: 4px;
+}
+
+.agent-workflow-node.status-running {
+  border-style: dashed;
+  border-color: var(--warning-text);
+}
+
+.agent-workflow-node.status-failed {
+  border-color: var(--danger-text);
+}
+
+.agent-workflow-node.status-fallback {
+  border-color: var(--warning-text);
+}
+
+.agent-workflow-node.selected,
+.agent-workflow-node:hover {
+  box-shadow: inset 0 0 0 2px var(--accent), var(--panel-shadow);
+}
+
+.agent-workflow-node-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent-workflow-node > small {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.agent-workflow-node-state {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 5px;
+  align-items: center;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.agent-workflow-node-status-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  color: var(--idle-text);
+  background: var(--idle-bg);
+  font-weight: 700;
+}
+
+.status-succeeded .agent-workflow-node-status-mark {
+  color: var(--success-text);
+  background: var(--success-bg);
+}
+
+.status-running .agent-workflow-node-status-mark {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+
+.status-failed .agent-workflow-node-status-mark,
+.status-cancelled .agent-workflow-node-status-mark {
+  border-radius: 3px;
+  color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+.status-fallback .agent-workflow-node-status-mark {
+  border-radius: 3px 12px;
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+
+.agent-workflow-timeline {
+  margin-top: 14px;
+}
+
+.agent-workflow-timeline ol {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-workflow-timeline li button {
+  display: grid;
+  grid-template-columns: 24px minmax(130px, 1fr) minmax(70px, auto) 100px 70px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-soft);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-workflow-timeline li button:hover,
+.agent-workflow-timeline li button[aria-pressed='true'] {
+  border-color: var(--border);
+  background: var(--panel-muted);
+}
+
+.agent-workflow-timeline time {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-performance-layout {
+  margin-top: 14px;
+}
+
+.agent-performance-table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.agent-performance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.agent-performance-table th,
+.agent-performance-table td {
+  padding: 9px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-soft);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.agent-performance-table th {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.agent-performance-side {
+  display: grid;
+  gap: 10px;
+}
+
+.agent-performance-side ul {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-performance-side li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.agent-performance-suggestion p {
+  color: var(--text-soft);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.agent-performance-suggestion small {
+  color: var(--text-muted);
+}
+
+@media (max-width: 1240px) {
+  .agent-responsibility-layout,
+  .agent-workflow-detail-layout,
+  .agent-performance-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+}
+
+@media (max-width: 760px) {
+  .agent-section-heading,
+  .agent-detail-title,
+  .agent-worker-card > div,
+  .agent-subsection-title {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .agent-summary-grid,
+  .agent-performance-metrics,
+  .agent-worker-grid,
+  .agent-run-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-workflow-canvas-viewport {
+    display: none;
+  }
+
+  .agent-workflow-timeline li button {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+  }
+
+  .agent-workflow-timeline li button time,
+  .agent-workflow-timeline li button > span:last-child {
+    grid-column: 2 / -1;
+  }
+
+  .agent-manifest-detail dl,
+  .agent-node-detail dl,
+  .agent-worker-card dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .prompt-workspace {
   display: grid;
   grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);

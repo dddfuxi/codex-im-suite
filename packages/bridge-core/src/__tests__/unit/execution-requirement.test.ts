@@ -651,7 +651,7 @@ describe('execution requirement classifier', () => {
     assert.equal(hasDeferredBridgeExecutionAction('产物已经保存到项目。'), false);
   });
 
-  it('includes failed tool reasons in no-evidence blockers', () => {
+  it('keeps no-evidence blockers user-facing while preserving one actionable failure reason', () => {
     const requirement = {
       kind: 'tool_required' as const,
       reason: 'compatibility test requirement',
@@ -666,7 +666,24 @@ describe('execution requirement classifier', () => {
       toolNames: ['JsonTool:mcp_call'],
     });
 
-    assert.match(text, /失败原因：Network Error: fetch failed/);
-    assert.match(text, /JsonTool:mcp_call/);
+    assert.match(text, /未完成：这次没有获得可验证的执行结果/);
+    assert.match(text, /具体原因：Network Error: fetch failed/);
+    assert.doesNotMatch(text, /tool_use|tool_result|tool_required|JsonTool:mcp_call/);
+  });
+
+  it('does not expose local-read evidence protocol details in user-visible blockers', () => {
+    const text = buildNoExecutionEvidenceText({
+      kind: 'local_read_required',
+      reason: 'must inspect the current workspace directory',
+      requiredToolFamilies: ['read'],
+    }, {
+      toolUseCount: 0,
+      toolResultCount: 0,
+      successfulToolResultCount: 0,
+      toolNames: [],
+    });
+
+    assert.match(text, /系统已尝试受控只读检查/);
+    assert.doesNotMatch(text, /local_read_required|tool_use|tool_result|must inspect/);
   });
 });

@@ -24,6 +24,17 @@ await esbuild.build({
 });
 
 await esbuild.build({
+  entryPoints: ['src/agent-workers/worker-entry.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: 'dist/agent-worker.mjs',
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
+await esbuild.build({
   entryPoints: ['src/memory-optimizer-cli.ts'],
   bundle: true,
   platform: 'node',
@@ -100,4 +111,4 @@ await esbuild.build({
   banner: sharedBanner,
 });
 
-console.log('Built daemon, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');
+console.log('Built daemon, agent worker, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');

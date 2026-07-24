@@ -77,6 +77,7 @@ export interface ControlPanelStateSections {
   settings: unknown;
   history: unknown;
   workflow: unknown;
+  agentCollaboration?: unknown;
   projectRegistry: unknown;
   memory: unknown;
   memorySkillAssets: unknown;
@@ -106,6 +107,7 @@ export interface ControlPanelStateContract<
   settings: TSections['settings'];
   history: TSections['history'];
   workflow: TSections['workflow'];
+  agentCollaboration?: TSections['agentCollaboration'];
   projectRegistry: TSections['projectRegistry'];
   memory: TSections['memory'];
   memorySkillAssets: TSections['memorySkillAssets'];

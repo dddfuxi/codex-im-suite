@@ -260,6 +260,10 @@ export interface ToolCallInfo {
   status: 'running' | 'complete' | 'error';
   /** Raw tool input used only for safe, user-visible progress summaries. */
   input?: unknown;
+  /** Bridge-owned first-seen time, used to render a relative execution timeline. */
+  startedAt?: number;
+  /** Bridge-owned terminal time; absent while the tool is still running. */
+  completedAt?: number;
 }
 
 export interface RunTokenUsage {

@@ -15,14 +15,18 @@ describe('control panel shared contracts', () => {
     assert.equal(contracts.CONTROL_COMMAND_SCHEMA, 'codex-im-suite/control-command/v1');
     assert.equal(contracts.CONTROL_RESULT_SCHEMA, 'codex-im-suite/control-result/v1');
     assert.equal(contracts.WORKFLOW_PANEL_STATE_PROTOCOL, 'workflow-runtime/v1');
+    assert.equal(contracts.AGENT_COLLABORATION_PROTOCOL, 'codex-im-suite/agent-collaboration/v1');
+    assert.equal(contracts.AGENT_WORKER_PROTOCOL, 'codex-im-suite/agent-worker/v1');
   });
 
   it('publishes stable JSON schemas for the control API and project registry', () => {
     const controlApiPath = path.join(schemaDir, 'control-api.schema.json');
     const projectRegistryPath = path.join(schemaDir, 'project-registry.schema.json');
+    const agentCollaborationPath = path.join(schemaDir, 'agent-collaboration.schema.json');
 
     assert.equal(fs.existsSync(controlApiPath), true, 'control-api.schema.json should exist');
     assert.equal(fs.existsSync(projectRegistryPath), true, 'project-registry.schema.json should exist');
+    assert.equal(fs.existsSync(agentCollaborationPath), true, 'agent-collaboration.schema.json should exist');
 
     const controlApi = JSON.parse(fs.readFileSync(controlApiPath, 'utf8')) as {
       $id?: string;
@@ -31,6 +35,10 @@ describe('control panel shared contracts', () => {
     const projectRegistry = JSON.parse(fs.readFileSync(projectRegistryPath, 'utf8')) as {
       $id?: string;
       properties?: { schema?: { const?: string } };
+    };
+    const agentCollaboration = JSON.parse(fs.readFileSync(agentCollaborationPath, 'utf8')) as {
+      $id?: string;
+      $defs?: Record<string, { required?: string[] }>;
     };
 
     assert.equal(controlApi.$id, 'https://codex-im-suite.local/schemas/control-api.schema.json');
@@ -48,5 +56,12 @@ describe('control panel shared contracts', () => {
       'schema', 'generatedAt', 'registryPath', 'exists', 'projects', 'error',
     ]);
     assert.equal(projectRegistry.properties?.schema?.const, 'codex-im-suite/project-registry/v1');
+    assert.equal(agentCollaboration.$id, 'https://codex-im-suite.local/schemas/agent-collaboration.schema.json');
+    assert.deepEqual(agentCollaboration.$defs?.AgentTaskRequest?.required, [
+      'protocol', 'runId', 'turnId', 'taskId', 'agentId', 'capability', 'deadlineAt', 'evidenceRefs', 'input',
+    ]);
+    assert.deepEqual(agentCollaboration.$defs?.AgentCollaborationPanelState?.required, [
+      'protocol', 'updatedAt', 'mode', 'poolHealth', 'activeTaskCount', 'workers', 'agents', 'recentRuns', 'metrics',
+    ]);
   });
 });

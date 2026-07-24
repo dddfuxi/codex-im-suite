@@ -11,6 +11,8 @@ import type {
   ArtifactPromotionRequest,
   ArtifactPromotionResult,
   ArtifactSource,
+  AgentCollaborationMode,
+  AgentPromptSection,
   TurnArtifactRecord,
 } from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
@@ -424,6 +426,45 @@ export interface TurnReferenceResolutionInput {
  */
 export interface TurnReferenceResolverHost {
   resolveTurnFocus(input: TurnReferenceResolutionInput): Promise<AgentTurnFocusDecisionInput>;
+}
+
+export interface AgentCollaborationTurnInput {
+  sessionId: string;
+  turnId: string;
+  currentText: string;
+  envelope: TurnEvidenceEnvelope;
+  focus: TurnFocusDecision;
+  hasAttachments: boolean;
+  memoryIntentCandidate: boolean;
+  abortSignal?: AbortSignal;
+}
+
+export interface AgentCollaborationTurnResult {
+  mode: AgentCollaborationMode;
+  runId?: string;
+  status: 'skipped' | 'shadowed' | 'assisted' | 'fallback';
+  triggerReason: string;
+  promptSections: AgentPromptSection[];
+}
+
+export interface AgentCollaborationCompletionInput {
+  runId: string;
+  status: 'succeeded' | 'failed' | 'cancelled';
+  answerSummary?: string;
+  errorCode?: string;
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+/** Runtime-owned read-only collaboration host. Bridge remains the only executor and sender. */
+export interface AgentCollaborationHost {
+  prepareTurn(input: AgentCollaborationTurnInput): Promise<AgentCollaborationTurnResult>;
+  markPrimaryStarted(runId: string): void;
+  completeTurn(input: AgentCollaborationCompletionInput): void;
+  linkWorkflowRun?(runId: string, workflowRunId: string): void;
 }
 
 export interface MemoryGraphNode {
@@ -865,6 +906,8 @@ export interface StreamChatParams {
   sourceChannelType?: string;
   sourceChatId?: string;
   sourceThreadId?: string;
+  /** Runtime-only link to the read-only collaboration graph for this turn. */
+  collaborationRunId?: string;
   replyPresentation?: {
     replyStyleHint?: string;
   };

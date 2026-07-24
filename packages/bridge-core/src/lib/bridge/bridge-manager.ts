@@ -1404,9 +1404,20 @@ interface MemoryIntentPreflight {
 
 const EXPLICIT_MEMORY_WRITE_REQUEST_RE = /(?:记住|记一下|记下来|记入|保存到?记忆|写入记忆|更新记忆|记录下来|以后(?:都|统一|默认)?按)/u;
 const NEGATED_MEMORY_WRITE_REQUEST_RE = /(?:不要|不用|不必|别|无需|无须|禁止).{0,12}(?:记住|记录|保存|写入记忆)/u;
+const MEMORY_INTENT_CANDIDATE_RE = /(?:记住|记一下|记下来|记入|保存到?记忆|写入记忆|更新记忆|覆盖记忆|长期记忆|跨会话|以后(?:都|统一|默认)?按|固定(?:名|键|值|映射)|仅在.+生效|只在.+生效|memory)/iu;
+const DURABLE_PREFERENCE_MUTATION_RE = /(?:规则|约束|偏好|称呼|别名|映射|默认(?:行为|设置|值)?).{0,24}(?:改成|修改为|设为|设置为|定义为|更新为|覆盖为)/iu;
+const TEMPORARY_CONTEXT_INTENT_RE = /(?:(?:仅|只).{0,12}(?:当前|本次)(?:对话|会话|回合)(?:上下文)?|(?:临时|暂时).{0,12}(?:保留|记住|记录|上下文))/iu;
 
 function isExplicitMemoryWriteRequestText(text: string): boolean {
   return EXPLICIT_MEMORY_WRITE_REQUEST_RE.test(text) && !NEGATED_MEMORY_WRITE_REQUEST_RE.test(text);
+}
+
+function isMemoryIntentCandidateText(text: string): boolean {
+  const normalized = text.replace(/\s+/gu, ' ').trim();
+  if (!normalized || NEGATED_MEMORY_WRITE_REQUEST_RE.test(normalized)) return false;
+  return MEMORY_INTENT_CANDIDATE_RE.test(normalized)
+    || DURABLE_PREFERENCE_MUTATION_RE.test(normalized)
+    || TEMPORARY_CONTEXT_INTENT_RE.test(normalized);
 }
 
 function resolveInboundMemoryActorKind(msg: InboundMessage): MemoryWriteClassification['actorKind'] {
@@ -6015,7 +6026,8 @@ async function handleMessage(
     }
   }
 
-  const memoryIntentPreflight = !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
+  const memoryIntentCandidate = isMemoryIntentCandidateText(text || rawText);
+  const memoryIntentPreflight = memoryIntentCandidate && !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
     ? await prepareModelPlannedMemoryWrite(
       msg,
       binding,
@@ -6430,6 +6442,7 @@ async function handleMessage(
   } : undefined;
 
   for (const step of preExecutionProgressSteps) emitProgressCardStep?.(step);
+  let collaborationRunId = '';
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
@@ -6553,6 +6566,32 @@ async function handleMessage(
     if (taskAbort.signal.aborted) return;
     const structuredTurnContextPrompt = resolvedTurnContext.prompt;
     const hasStructuredConversationEvidence = resolvedTurnContext.hasPlatformEvidence;
+    let collaborationPromptSections: Array<{ id: string; kind: 'collaboration'; source: string; priority: number; content: string }> = [];
+    const collaborationHost = getBridgeContext().agentCollaboration;
+    if (collaborationHost) {
+      try {
+        const collaboration = await collaborationHost.prepareTurn({
+          sessionId: effectiveBinding.codepilotSessionId,
+          turnId: msg.messageId,
+          currentText: rawText,
+          envelope: resolvedTurnContext.envelope,
+          focus: resolvedTurnContext.decision,
+          hasAttachments: Boolean(providerAttachments?.length),
+          memoryIntentCandidate,
+          abortSignal: taskAbort.signal,
+        });
+        collaborationRunId = collaboration.runId || '';
+        collaborationPromptSections = collaboration.promptSections.map((section) => ({
+          id: section.id,
+          kind: 'collaboration' as const,
+          source: 'runtime.agent_collaboration',
+          priority: section.priority,
+          content: section.content,
+        }));
+      } catch (error) {
+        console.warn('[bridge-manager] Agent collaboration unavailable, continuing primary path:', error instanceof Error ? error.message : error);
+      }
+    }
     // 关联上下文必须走独立通道：Codex 等 provider 会裁剪长 system prompt，
     // 不能再依赖它的后半段保存被回复消息、近邻消息和已解析历史证据。
     // 此处仅放当前回合理解和结构化投递所必需的受控 evidence，不混入表情包或记忆写入策略。
@@ -6584,6 +6623,7 @@ async function handleMessage(
       feishuMentionResolutionPrompt,
       feishuAvatarEvidencePrompt,
     ].filter(Boolean).join('\n\n');
+    if (collaborationRunId) collaborationHost?.markPrimaryStarted(collaborationRunId);
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
       updateBridgeRuntimeActiveRequest({
@@ -6632,13 +6672,16 @@ async function handleMessage(
         feishuCloudSystemPrompt,
         recentConversationMediaPrompt,
       ].filter(Boolean).join('\n\n'),
-      additionalPromptSections: stickerExpressionPromptSection ? [{
-        id: stickerExpressionPromptSection.id,
-        kind: 'expression',
-        source: 'sticker-semantics',
-        priority: 18,
-        content: stickerExpressionPromptSection.content,
-      }] : [],
+      additionalPromptSections: [
+        ...(stickerExpressionPromptSection ? [{
+          id: stickerExpressionPromptSection.id,
+          kind: 'expression' as const,
+          source: 'sticker-semantics',
+          priority: 18,
+          content: stickerExpressionPromptSection.content,
+        }] : []),
+        ...collaborationPromptSections,
+      ],
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryIntentHandled: Boolean(memoryIntentPreflight),
       responseOnly: Boolean(memoryIntentPreflight),
@@ -6649,6 +6692,7 @@ async function handleMessage(
       sourceChatId: msg.address.chatId,
       messageKind: inboundMessageKind,
       hasPreResolvedEvidence,
+      collaborationRunId: collaborationRunId || undefined,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
 
@@ -7269,9 +7313,29 @@ async function handleMessage(
         }
       } catch { /* best effort */ }
     }
+    if (collaborationRunId) {
+      collaborationHost?.completeTurn({
+        runId: collaborationRunId,
+        status: result.hasError ? 'failed' : 'succeeded',
+        answerSummary: deliveryResponseText || safeProviderErrorText,
+        errorCode: result.hasError ? 'primary_agent_error' : undefined,
+        tokenUsage: result.tokenUsage ? {
+          inputTokens: result.tokenUsage.input_tokens,
+          outputTokens: result.tokenUsage.output_tokens,
+          totalTokens: result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
+        } : undefined,
+      });
+    }
     auditTerminalState = 'completed';
   } catch (err) {
     auditTerminalState = 'failed';
+    if (collaborationRunId) {
+      getBridgeContext().agentCollaboration?.completeTurn({
+        runId: collaborationRunId,
+        status: taskAbort.signal.aborted ? 'cancelled' : 'failed',
+        errorCode: taskAbort.signal.aborted ? 'turn_cancelled' : 'bridge_turn_failed',
+      });
+    }
     failBridgeRuntimeRequest(err, activeRequest);
     throw err;
   } finally {

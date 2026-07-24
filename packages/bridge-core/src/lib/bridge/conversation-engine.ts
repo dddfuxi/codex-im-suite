@@ -148,6 +148,7 @@ export interface ConversationProcessOptions {
   sourceThreadId?: string;
   messageKind?: string;
   hasPreResolvedEvidence?: boolean;
+  collaborationRunId?: string;
 }
 
 function isPathWithinRoot(filePath: string, root: string): boolean {
@@ -985,6 +986,7 @@ export async function processMessage(
       sourceChannelType: options?.sourceChannelType,
       sourceChatId: options?.sourceChatId,
       sourceThreadId: options?.sourceThreadId,
+      collaborationRunId: options?.collaborationRunId,
       replyPresentation: {
         replyStyleHint: getReplyStyleHintFromStore(),
       },

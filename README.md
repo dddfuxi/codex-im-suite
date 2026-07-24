@@ -31,6 +31,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
+- 运行时多 Agent 协作：新增共享常驻 Worker 池和 `Coordinator / Context / Memory / Performance` 四类只读 Agent；默认 `off`，按 `off → shadow → assist` 灰度。Primary Agent 保持唯一执行者，Bridge 保持唯一发送者；“机器人架构”页可查看职责拓扑、Worker 状态、实时/历史协作工作流与只读性能建议。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
@@ -63,6 +64,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
 - Control API 启动脚本：`scripts/start-control-api.ps1`
+- Agent 协作 Manifest：`config/agents.d`；运行模式使用 `CTI_AGENT_COLLABORATION_MODE=off|shadow|assist`，默认 `off`。
 - 安全档位：控制面板“设置 → 自适应安全策略”，默认“智能平衡”；只放宽强平台 evidence 支撑的同群低风险动作，不关闭 Owner、平台授权、身份冲突或高风险确认。
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
@@ -209,6 +211,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `config/plugins.d`：随项目备份的 plugin manifest。
 - `config/runtime.d`：内建服务的 runtime manifest，声明服务显示信息、来源路径和 update 策略。
 - `config/action-manifests.d`：通用工具动作 manifest，声明 MCP / Unity MCP / shell artifact 等可验证动作；旧 `config/local-agent-tools.d` 只作为兼容 overlay。
+- `config/agents.d`：只读专业 Agent Manifest，声明职责、能力、evidence 类型、严格输出 Schema、超时、并发和模型档位。
 - `config/extension-catalog.json`：在线扩展目录的静态种子；控制面板还会叠加动态排行榜源和 `CTI_EXTENSION_CATALOG_URLS` 自定义 URL。
 - `extensions/skills`：自定义 skill 的项目内副本。
 - `scripts`：启动、注册、构建、打包、发布、同步脚本。
@@ -220,6 +223,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 默认是 `自动 executor 选择 + Codex CLI agent 模型来源链`：
 
+- 多 Agent 协作默认关闭：`CTI_AGENT_COLLABORATION_MODE=off`。`shadow` 只运行和展示协作图，不影响回答；`assist` 才把通过父进程 Schema/evidence/副作用校验的只读结果注入 Primary Agent。Worker 池默认 2，可用 `CTI_AGENT_WORKER_POOL_SIZE` 配置为 1–4；单任务默认 30 秒、总回合预算 35 秒，最多并行两个 Specialist。
 - 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和实验性的 `codex-oss-ollama`；本地 API 与外部 API 都通过 `codex` 的模型来源接入，不再作为独立本地 agent 或兜底执行器。
 - 外部 Agent Executor：`mavis-agent` 是 opt-in external executor，通过本地 `mavis` CLI 派发和续接任务；默认关闭，使用 `CTI_MAVIS_ENABLED=true` 与 `CTI_MAVIS_CLI_PATH=<path>` 启用。用户可用 `@mavis` / `@minimax` / `@minimax-code` 显式选择，也可在控制面板设置默认 executor。当前模块边界、路由和失败收口统一维护在 `docs/PROJECT-ARCHITECTURE.md`，阶段性变更统一记录在 `docs/DEVELOPMENT-LOG.md`。
 - 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态，并通过按钮设置或清除全局默认 executor；“节点”页可查看本机 node 与 fake remote node 的能力清单。

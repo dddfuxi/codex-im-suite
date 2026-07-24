@@ -14,6 +14,10 @@
       "types": "./src/control-api.ts",
       "import": "./dist/control-api.js"
     },
+    "./agent-collaboration": {
+      "types": "./src/agent-collaboration.ts",
+      "import": "./dist/agent-collaboration.js"
+    },
     "./project-registry": {
       "types": "./src/project-registry.ts",
       "import": "./dist/project-registry.js"

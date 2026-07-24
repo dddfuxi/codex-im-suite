@@ -4,6 +4,7 @@ export type PromptSectionKind =
   | 'policy'
   | 'skills'
   | 'memory'
+  | 'collaboration'
   | 'expression'
   | 'style'
   | 'protocol'
