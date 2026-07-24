@@ -47,6 +47,17 @@ export interface ConservativeRouteDecision {
   canFastPath: boolean;
 }
 
+export type LightConversationAction = 'reply' | 'delegate' | 'clarify';
+export type LightConversationIntent = 'light_chat' | 'task' | 'ambiguous';
+
+export interface LightConversationDecision {
+  action: LightConversationAction;
+  intent: LightConversationIntent;
+  reply: string;
+  reason: string;
+  confidence: number;
+}
+
 interface PatternRule {
   pattern: RegExp;
   reason: string;
@@ -177,7 +188,7 @@ function getLightChatHistoryLimit(config: Config): number {
 }
 
 function looksLikeExecutionIntent(text: string): boolean {
-  return /(执行|运行|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
+  return /(执行|运行|重启|同步|修复|修改|更新|部署|构建|测试|检查|查询|查一下|读取|搜索|创建|删除|发送|上传|下载|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
 }
 
 function hasReadableContextObject(text: string): boolean {
@@ -257,6 +268,84 @@ function hasLightChatTone(text: string): boolean {
   return /(收到|好的|好呀|可以|在呢|谢谢|哈哈|嘿嘿|早|晚安|辛苦|赞|OK|ok|嗯|哦|嗨|hello|hi|表情包|sticker)/iu.test(normalized);
 }
 
+/**
+ * Priority context 同时包含固定安全规则和真实消息 evidence。轻聊门禁只应读取
+ * evidence 正文，不能因为固定规则里出现“执行 / 附件 / 文件”等词就把所有消息
+ * 都升级成任务。解析失败时返回空字符串，由当前消息本身继续承担保守判断。
+ */
+export function extractPriorityEvidenceContents(priorityTurnContext?: string): string {
+  const context = (priorityTurnContext || '').trim();
+  if (!context) return '';
+  const contents: string[] = [];
+
+  for (const line of context.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (/^\[(?:被回复消息|可能关联上文)\]/u.test(trimmed)) contents.push(trimmed);
+  }
+
+  const parseLeadingJson = (text: string): unknown => {
+    const start = text.search(/[\[{]/u);
+    if (start < 0) throw new Error('json_start_missing');
+    const opening = text[start];
+    const closing = opening === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === opening) depth += 1;
+      else if (char === closing) {
+        depth -= 1;
+        if (depth === 0) return JSON.parse(text.slice(start, index + 1)) as unknown;
+      }
+    }
+    throw new Error('json_end_missing');
+  };
+
+  const collectJsonSection = (heading: string, nextHeading?: string) => {
+    const start = context.indexOf(heading);
+    if (start < 0) return;
+    const bodyStart = start + heading.length;
+    const end = nextHeading ? context.indexOf(nextHeading, bodyStart) : -1;
+    const body = context.slice(bodyStart, end >= 0 ? end : undefined).trim();
+    if (!body) return;
+    try {
+      const parsed = parseLeadingJson(body);
+      const visit = (value: unknown): void => {
+        if (Array.isArray(value)) {
+          for (const item of value) visit(item);
+          return;
+        }
+        if (!value || typeof value !== 'object') return;
+        const record = value as Record<string, unknown>;
+        if (typeof record.currentText === 'string') contents.push(record.currentText);
+        if (typeof record.content === 'string') contents.push(record.content);
+        for (const [key, nested] of Object.entries(record)) {
+          if (key === 'currentText' || key === 'content') continue;
+          visit(nested);
+        }
+      };
+      visit(parsed);
+    } catch {
+      // 不把无法验证的固定说明或残缺 JSON 当成用户任务证据。
+    }
+  };
+
+  collectJsonSection('Structured turn evidence summary (JSON, quoted facts only):', 'supportingEvidence (JSON, lower priority):');
+  collectJsonSection('supportingEvidence (JSON, lower priority):');
+  return [...new Set(contents.map((item) => normalizeText(item)).filter(Boolean))].join('\n');
+}
+
 export function isLightChatCandidate(params: StreamChatParams, config: Config): boolean {
   if (config.lightChatFastPathEnabled === false) return false;
   const prompt = (params.prompt || '').trim();
@@ -266,7 +355,11 @@ export function isLightChatCandidate(params: StreamChatParams, config: Config): 
   const requirement = params.executionRequirement;
   if (requirement && requirement.kind !== 'none') return false;
 
-  const combinedInput = [prompt, params.priorityTurnContext || ''].filter(Boolean).join('\n');
+  const evidenceText = extractPriorityEvidenceContents(params.priorityTurnContext);
+  // “继续 / 接着”属于明确续办，不需要先花一轮协调模型判断，直接保留完整
+  // 回合进入 Primary；Primary 再依据真实上下文决定是否调用工具或最小澄清。
+  if (getLocalConversationExpectedAction(prompt, params.priorityTurnContext) === 'delegate') return false;
+  const combinedInput = [prompt, evidenceText].filter(Boolean).join('\n');
   for (const rule of HARD_EXCLUDE_PATTERNS) {
     if (rule.pattern.test(combinedInput)) return false;
   }
@@ -314,9 +407,169 @@ export function buildLightChatParams(params: StreamChatParams, config: Config): 
     : [];
   return {
     ...params,
+    interactionMode: 'response_only',
+    forceFreshThread: true,
     systemPrompt,
     conversationHistory: history,
+    priorityTurnContext: extractPriorityEvidenceContents(params.priorityTurnContext),
+    workingDirectory: undefined,
+    additionalDirectories: [],
+    workspacePlan: undefined,
+    permissionMode: 'default',
+    files: [],
     executionRequirement: { kind: 'none', reason: 'light chat does not require tool evidence', requiredToolFamilies: [] },
+  };
+}
+
+export const LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action', 'intent', 'reply', 'reason', 'confidence'],
+  properties: {
+    action: { type: 'string', enum: ['reply', 'delegate', 'clarify'] },
+    intent: { type: 'string', enum: ['light_chat', 'task', 'ambiguous'] },
+    reply: { type: 'string', maxLength: 600 },
+    reason: { type: 'string', maxLength: 240 },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+  },
+} as const;
+
+export const LOCAL_LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['action', 'reply'],
+  properties: {
+    action: { type: 'string', enum: ['reply', 'delegate', 'clarify'] },
+    reply: { type: 'string', maxLength: 320 },
+  },
+} as const;
+
+function buildLocalLightConversationResponseSchema(
+  expectedAction?: LightConversationAction,
+): typeof LOCAL_LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA | Record<string, unknown> {
+  if (!expectedAction) return LOCAL_LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA;
+  return {
+    ...LOCAL_LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA,
+    properties: {
+      ...LOCAL_LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA.properties,
+      action: { type: 'string', enum: [expectedAction] },
+    },
+  };
+}
+
+export function getLocalConversationExpectedAction(
+  prompt: string,
+  priorityTurnContext?: string,
+): LightConversationAction | undefined {
+  const text = normalizeText(prompt);
+  const hasRelatedEvidence = Boolean(extractPriorityEvidenceContents(priorityTurnContext));
+  if (/(?:^|[，。！？!?\s])(继续|接着|然后|往下|照旧)(?:[吧呢呀啊]?[，。！？!?\s]*$)/u.test(text)) return 'delegate';
+  if (!hasRelatedEvidence && (
+    /^(?:这个|那个|刚才(?:那个|这个|说的|提到的)?|上面|前面|之前|为什么)(?:呢|呀|啊|吧)?[？?]?$/u.test(text)
+    || /^(?:帮帮我|帮我一下|怎么办|怎么弄)(?:吧|呢|呀|啊)?[？?]?$/u.test(text)
+  )) return 'clarify';
+  return undefined;
+}
+
+export function buildLightConversationCoordinatorParams(
+  params: StreamChatParams,
+  config: Config,
+): StreamChatParams {
+  const light = buildLightChatParams(params, config);
+  return {
+    ...light,
+    interactionMode: 'classifier',
+    responseSchema: LIGHT_CONVERSATION_COORDINATOR_RESPONSE_SCHEMA,
+    systemPrompt: [
+      light.systemPrompt,
+      'Light conversation coordinator contract:',
+      '- Return exactly one JSON object matching the provided schema.',
+      '- reply: only for genuine social chat, greeting, thanks, acknowledgement, emotion, opinion, or harmless banter that needs no tool or external state.',
+      '- delegate: for any task, investigation, factual lookup, file/path/link/attachment work, continuation of prior work, external action, or request that may need a tool.',
+      '- clarify: only when the user is clearly asking for help but the intended object is still impossible to identify; ask one minimal Chinese question.',
+      '- Never claim that a tool, file, platform, project, or external state was checked.',
+      '- For reply/clarify, place the complete user-visible Chinese reply in reply. For delegate, reply must be empty.',
+    ].filter(Boolean).join('\n\n'),
+  };
+}
+
+export function buildLocalLightConversationCoordinatorParams(
+  params: StreamChatParams,
+  config: Config,
+): StreamChatParams {
+  const light = buildLightChatParams(params, config);
+  const relatedEvidence = extractPriorityEvidenceContents(params.priorityTurnContext);
+  const expectedAction = getLocalConversationExpectedAction(params.prompt, params.priorityTurnContext);
+  const identity = extractSystemSection(params.systemPrompt, 'Channel assistant identity:');
+  const constrainedSystemPrompt = expectedAction === 'clarify'
+    ? [
+        identity,
+        '本轮是缺少指代对象的最小澄清。',
+        '- 只输出符合 Schema 的 JSON。',
+        '- action 必须是 clarify。',
+        '- reply 用一句简短自然的中文，只追问用户具体指什么，不猜测对象，不声称查过外部状态。',
+      ].filter(Boolean).join('\n')
+    : expectedAction === 'delegate'
+      ? [
+          '本轮是明确续办请求。',
+          '- 只输出符合 Schema 的 JSON。',
+          '- action 必须是 delegate，reply 必须为空字符串。',
+        ].join('\n')
+      : '';
+  return {
+    ...light,
+    interactionMode: 'classifier',
+    // 对已经由真实上下文确定的续办/缺对象场景收紧 Schema；可见回复仍由
+    // 协调 Agent 生成，避免小模型忽略文字提示后误把任务或歧义当作轻聊。
+    responseSchema: buildLocalLightConversationResponseSchema(expectedAction),
+    systemPrompt: constrainedSystemPrompt || [
+      light.systemPrompt,
+      '本地轻量会话协调器：',
+      '- 只输出符合 Schema 的 JSON，不要输出解释。',
+      '- reply 仅用于明确的问候、感谢、确认、情绪、闲聊或无需查证的主观看法。',
+      '- delegate 用于任何任务、查询、执行、续办、外部动作，或任何可能需要工具/历史/文件的情况；reply 必须为空。',
+      '- clarify 仅用于用户明显在求助但缺少对象时；reply 只问一个最小中文问题。',
+      `- 当前是否存在可靠关联证据：${relatedEvidence ? '有' : '无'}。`,
+      '- 示例：哈喽 → {"action":"reply","reply":"哈喽，我在～"}',
+      '- 示例：这个呢（无关联证据）→ {"action":"clarify","reply":"你指的是哪一个？"}',
+      '- 示例：帮帮我 → {"action":"clarify","reply":"你希望我帮你处理什么？"}',
+    ].filter(Boolean).join('\n\n'),
+  };
+}
+
+export function parseLightConversationDecision(payload: unknown): LightConversationDecision | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  const action = record.action;
+  const intent = record.intent;
+  if (action !== 'reply' && action !== 'delegate' && action !== 'clarify') return null;
+  if (intent !== 'light_chat' && intent !== 'task' && intent !== 'ambiguous') return null;
+  const reply = typeof record.reply === 'string' ? record.reply.trim().slice(0, 600) : '';
+  const reason = typeof record.reason === 'string' ? record.reason.trim().slice(0, 240) : '';
+  const confidenceValue = typeof record.confidence === 'number'
+    ? record.confidence
+    : Number.parseFloat(String(record.confidence ?? '0'));
+  const confidence = Number.isFinite(confidenceValue) ? Math.max(0, Math.min(1, confidenceValue)) : 0;
+
+  if (action === 'reply' && (intent !== 'light_chat' || !reply || confidence < 0.65)) return null;
+  if (action === 'clarify' && (intent !== 'ambiguous' || !reply || confidence < 0.65)) return null;
+  if (action === 'delegate' && intent === 'light_chat') return null;
+  return { action, intent, reply: action === 'delegate' ? '' : reply, reason, confidence };
+}
+
+export function parseLocalLightConversationDecision(payload: unknown): LightConversationDecision | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  const action = record.action;
+  if (action !== 'reply' && action !== 'delegate' && action !== 'clarify') return null;
+  const reply = typeof record.reply === 'string' ? record.reply.trim().slice(0, 320) : '';
+  if (action !== 'delegate' && !reply) return null;
+  return {
+    action,
+    intent: action === 'reply' ? 'light_chat' : action === 'clarify' ? 'ambiguous' : 'task',
+    reply: action === 'delegate' ? '' : reply,
+    reason: 'local_compact_decision',
+    confidence: 1,
   };
 }
 

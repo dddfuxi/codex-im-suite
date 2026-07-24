@@ -1,3 +1,4 @@
+import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type { ToolCallInfo } from '../../../types.js';
 
 export interface FeishuStreamingCardState {
@@ -7,6 +8,7 @@ export interface FeishuStreamingCardState {
   sequence: number;
   startTime: number;
   toolCalls: ToolCallInfo[];
+  agentProgress?: AgentCardProgressSnapshot;
   thinking: boolean;
   pendingText: string | null;
   lastUpdateAt: number;
@@ -31,6 +33,7 @@ type ClearTimer = (timer: ReturnType<typeof setTimeout>) => void;
 export class FeishuStreamingCardRegistry {
   private readonly active = new Map<string, FeishuStreamingCardState>();
   private readonly creating = new Map<string, Promise<boolean>>();
+  private readonly pendingAgentProgress = new Map<string, AgentCardProgressSnapshot>();
 
   constructor(private readonly clearTimer: ClearTimer = clearTimeout) {}
 
@@ -69,6 +72,7 @@ export class FeishuStreamingCardRegistry {
       sequence: 0,
       startTime: input.startTime ?? Date.now(),
       toolCalls: [],
+      agentProgress: this.pendingAgentProgress.get(chatId),
       thinking: true,
       pendingText: null,
       lastUpdateAt: 0,
@@ -76,8 +80,24 @@ export class FeishuStreamingCardRegistry {
       typewriterTimer: null,
       typewriterKey: '',
     };
+    this.pendingAgentProgress.delete(chatId);
     this.active.set(chatId, state);
     return state;
+  }
+
+  setAgentProgress(chatId: string, progress: AgentCardProgressSnapshot): FeishuStreamingCardState | undefined {
+    const snapshot = structuredClone(progress);
+    const state = this.active.get(chatId);
+    if (state) {
+      state.agentProgress = snapshot;
+      return state;
+    }
+    this.pendingAgentProgress.set(chatId, snapshot);
+    return undefined;
+  }
+
+  getPendingAgentProgress(chatId: string): AgentCardProgressSnapshot | undefined {
+    return this.pendingAgentProgress.get(chatId);
   }
 
   clearTimers(chatId: string): FeishuStreamingCardState | undefined {
@@ -96,6 +116,7 @@ export class FeishuStreamingCardRegistry {
 
   remove(chatId: string): FeishuStreamingCardState | undefined {
     this.creating.delete(chatId);
+    this.pendingAgentProgress.delete(chatId);
     const state = this.clearTimers(chatId);
     this.active.delete(chatId);
     return state;
@@ -105,5 +126,6 @@ export class FeishuStreamingCardRegistry {
     for (const chatId of this.active.keys()) this.clearTimers(chatId);
     this.active.clear();
     this.creating.clear();
+    this.pendingAgentProgress.clear();
   }
 }

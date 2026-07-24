@@ -76,9 +76,15 @@ try {
       "./config/local-agent-tools.d"
     ]
   },
+  "agentCollaborationProtocol": {
+    "manifestDirs": [
+      "./config/agents.d"
+    ]
+  },
   "config": {
     "runtimeManifestDir": "./config/runtime.d",
     "actionManifestDir": "./config/action-manifests.d",
+    "agentManifestDir": "./config/agents.d",
     "legacyLocalAgentToolManifestDir": "./config/local-agent-tools.d"
   }
 }
@@ -90,7 +96,8 @@ try {
         'plugins.d/example-plugin.json',
         'runtime.d/example-runtime.json',
         'action-manifests.d/example-action.json',
-        'local-agent-tools.d/example-legacy-action.json'
+        'local-agent-tools.d/example-legacy-action.json',
+        'agents.d/example-agent.json'
     )
 
     foreach ($relative in $logicalFiles) {
@@ -111,8 +118,8 @@ try {
     $suiteSummary = Get-ReleaseManifestSummary -Root $suiteRoot
     $liveSummary = Get-ReleaseManifestSummary -Root $liveRoot
 
-    Assert-Equal -Expected 6 -Actual $suiteSummary.Count -Message 'suite manifest count'
-    Assert-Equal -Expected 6 -Actual $liveSummary.Count -Message 'live manifest count'
+    Assert-Equal -Expected 7 -Actual $suiteSummary.Count -Message 'suite manifest count'
+    Assert-Equal -Expected 7 -Actual $liveSummary.Count -Message 'live manifest count'
     Assert-Equal -Expected $suiteSummary.Hash -Actual $liveSummary.Hash -Message 'canonical manifest hash'
 
     foreach ($dir in @(
@@ -121,7 +128,8 @@ try {
         'config/plugins.d',
         'config/runtime.d',
         'config/action-manifests.d',
-        'config/local-agent-tools.d'
+        'config/local-agent-tools.d',
+        'config/agents.d'
     )) {
         Assert-Contains -Values $suiteSummary.Directories -Expected $dir -Message 'suite manifest directories'
         Assert-Contains -Values $liveSummary.Directories -Expected $dir -Message 'live manifest directories'

@@ -110,6 +110,37 @@
       },
       "additionalProperties": false
     },
+    "AgentCardProgressItem": {
+      "type": "object",
+      "required": ["taskId", "agentId", "displayName", "kind", "status"],
+      "properties": {
+        "taskId": { "type": "string", "minLength": 1 },
+        "agentId": { "type": "string", "minLength": 1 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "kind": { "enum": ["coordinator", "specialist", "primary_agent"] },
+        "status": { "enum": ["pending", "running", "succeeded", "failed", "cancelled", "skipped", "fallback"] },
+        "startedAt": { "type": "string" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "errorCode": { "type": "string", "maxLength": 80 }
+      },
+      "additionalProperties": false
+    },
+    "AgentCardProgressSnapshot": {
+      "type": "object",
+      "required": ["runId", "mode", "status", "injectedIntoPrimary", "agents"],
+      "properties": {
+        "runId": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["shadow", "assist"] },
+        "status": { "enum": ["running", "succeeded", "failed", "cancelled", "skipped", "fallback"] },
+        "injectedIntoPrimary": { "type": "boolean" },
+        "agents": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/AgentCardProgressItem" }
+        }
+      },
+      "additionalProperties": false
+    },
     "AgentCollaborationWorkflowNode": {
       "type": "object",
       "required": ["id", "kind", "label", "status"],
@@ -268,6 +299,7 @@
     { "$ref": "#/$defs/AgentTaskRequest" },
     { "$ref": "#/$defs/AgentTaskResult" },
     { "$ref": "#/$defs/AgentTurnPlan" },
+    { "$ref": "#/$defs/AgentCardProgressSnapshot" },
     { "$ref": "#/$defs/AgentCollaborationPanelState" }
   ]
 }

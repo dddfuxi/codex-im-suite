@@ -183,6 +183,48 @@ describe('Feishu streaming card lifecycle', () => {
     assert.equal(state.toolCalls[0]?.completedAt, 1_350);
   });
 
+  it('updates Agent progress independently from tools and includes it in final rendering', async () => {
+    const { FeishuStreamingCardLifecycle } = await loadLifecycle();
+    const harness = createHarness();
+    const lifecycle = new FeishuStreamingCardLifecycle(harness.options);
+    const state = harness.registry.activate('oc_chat', {
+      cardId: 'card_1',
+      messageId: 'om_card',
+      startTime: 900,
+    });
+    const progress = {
+      runId: 'run-1',
+      mode: 'assist' as const,
+      status: 'running' as const,
+      injectedIntoPrimary: true,
+      agents: [{
+        taskId: 'memory-1',
+        agentId: 'memory',
+        displayName: 'Memory Agent',
+        kind: 'specialist' as const,
+        status: 'succeeded' as const,
+        durationMs: 120,
+      }],
+    };
+
+    lifecycle.updateAgents('oc_chat', progress);
+    await Promise.resolve();
+    assert.deepEqual(state.agentProgress, progress);
+    assert.match(state.typewriterKey, /run-1/u);
+
+    assert.equal(await lifecycle.finalize({
+      chatId: 'oc_chat',
+      status: 'completed',
+      responseText: 'FINAL:完成',
+      hooks: {
+        closeStreaming: async () => {},
+        resolveFinalResponse: async (_state, visibleText) => visibleText,
+        updateFinalCard: async () => {},
+      },
+    }), true);
+    assert.deepEqual(harness.renderFinalCalls[0]?.[5], progress);
+  });
+
   it('waits for creation, closes streaming, writes the final card, persists, and removes state', async () => {
     const { FeishuStreamingCardLifecycle } = await loadLifecycle();
     const harness = createHarness();

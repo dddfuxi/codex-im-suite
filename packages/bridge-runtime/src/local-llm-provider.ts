@@ -23,6 +23,14 @@ interface ChatCompletionResponse {
   usage?: Record<string, unknown>;
 }
 
+interface OllamaChatResponse {
+  message?: {
+    content?: unknown;
+  };
+  prompt_eval_count?: unknown;
+  eval_count?: unknown;
+}
+
 export interface LocalModelMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -65,6 +73,25 @@ function extractContent(response: ChatCompletionResponse): string {
     );
   }
   return '';
+}
+
+function extractOllamaContent(response: OllamaChatResponse): string {
+  return typeof response.message?.content === 'string'
+    ? trimText(response.message.content)
+    : '';
+}
+
+function extractOllamaUsage(response: OllamaChatResponse): Record<string, unknown> | undefined {
+  const promptTokens = Number(response.prompt_eval_count);
+  const completionTokens = Number(response.eval_count);
+  if (!Number.isFinite(promptTokens) && !Number.isFinite(completionTokens)) return undefined;
+  const normalizedPromptTokens = Number.isFinite(promptTokens) ? Math.max(0, promptTokens) : 0;
+  const normalizedCompletionTokens = Number.isFinite(completionTokens) ? Math.max(0, completionTokens) : 0;
+  return {
+    prompt_tokens: normalizedPromptTokens,
+    completion_tokens: normalizedCompletionTokens,
+    total_tokens: normalizedPromptTokens + normalizedCompletionTokens,
+  };
 }
 
 function looksUnsafe(text: string): string | null {
@@ -131,15 +158,48 @@ function buildAnswerMessages(
 export class OllamaProvider {
   constructor(private readonly config: Config) {}
 
+  /**
+   * 用轻量只读请求预热本地 Provider 健康状态，避免离线端点把重启后的首条
+   * 聊天拖到完整推理超时。该探针不加载模型、不生成文本，也不改变外部状态。
+   */
+  async probe(timeoutMs = 600): Promise<void> {
+    const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    const kind = (this.config.localAiKind || 'ollama').trim().toLowerCase();
+    const endpoint = kind === 'ollama' ? `${baseUrl}/api/tags` : `${baseUrl}/v1/models`;
+    const controller = new AbortController();
+    const boundedTimeoutMs = Math.max(250, Math.min(1_500, Math.floor(timeoutMs)));
+    const timer = setTimeout(() => controller.abort(), boundedTimeoutMs);
+    const headers: Record<string, string> = {};
+    if (this.config.localAiApiKey) headers.Authorization = `Bearer ${this.config.localAiApiKey}`;
+    try {
+      const response = await fetch(endpoint, { method: 'GET', headers, signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`本地模型健康探针超时(${boundedTimeoutMs}ms)`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async complete(
     messages: LocalModelMessage[],
-    options?: { temperature?: number; maxTokens?: number; timeoutMs?: number },
+    options?: { temperature?: number; maxTokens?: number; timeoutMs?: number; responseSchema?: unknown; model?: string; keepAlive?: string | number },
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
     const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
-    const endpoint = `${baseUrl}/v1/chat/completions`;
+    const kind = (this.config.localAiKind || 'ollama').trim().toLowerCase();
+    // Ollama 的 OpenAI 兼容端点会忽略 keep_alive，导致看似已经预热的模型仍按
+    // 默认 TTL 卸载。只有调用者明确要求驻留时才切到原生 chat 端点；普通请求和
+    // 其他 OpenAI-compatible Provider 继续使用现有协议，避免扩大行为变化范围。
+    const useNativeOllama = kind === 'ollama' && options?.keepAlive !== undefined;
+    const endpoint = useNativeOllama ? `${baseUrl}/api/chat` : `${baseUrl}/v1/chat/completions`;
     const timeoutMs = options?.timeoutMs !== undefined
       ? Math.max(250, Math.floor(options.timeoutMs))
       : Math.max(5000, this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const model = options?.model || this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b';
+    const maxTokens = Math.max(options?.responseSchema ? 24 : 128, options?.maxTokens || this.config.localLlmMaxOutputTokens || 768);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -150,21 +210,50 @@ export class OllamaProvider {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          model: this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b',
-          messages,
-          stream: false,
-          temperature: options?.temperature ?? 0.1,
-          max_tokens: Math.max(128, options?.maxTokens || this.config.localLlmMaxOutputTokens || 768),
-        }),
+        body: JSON.stringify(useNativeOllama
+          ? {
+              model,
+              messages,
+              stream: false,
+              keep_alive: options?.keepAlive,
+              options: {
+                temperature: options?.temperature ?? 0.1,
+                num_predict: maxTokens,
+              },
+              ...(options?.responseSchema ? { format: options.responseSchema } : {}),
+            }
+          : {
+              model,
+              messages,
+              stream: false,
+              temperature: options?.temperature ?? 0.1,
+              max_tokens: maxTokens,
+              ...(options?.responseSchema ? {
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: {
+                    name: 'cti_local_structured_output',
+                    strict: true,
+                    schema: options.responseSchema,
+                  },
+                },
+              } : {}),
+            }),
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      const json = await response.json() as ChatCompletionResponse;
-      const text = extractContent(json);
+      const json = await response.json() as ChatCompletionResponse | OllamaChatResponse;
+      const text = useNativeOllama
+        ? extractOllamaContent(json as OllamaChatResponse)
+        : extractContent(json as ChatCompletionResponse);
       const unsafeReason = looksUnsafe(text);
       if (unsafeReason) throw new Error(unsafeReason);
-      return { text, usage: json.usage };
+      return {
+        text,
+        usage: useNativeOllama
+          ? extractOllamaUsage(json as OllamaChatResponse)
+          : (json as ChatCompletionResponse).usage,
+      };
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`本地模型超时(${timeoutMs}ms)`);

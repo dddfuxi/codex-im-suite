@@ -80,18 +80,19 @@ import {
 import { createScheduledTaskService } from './scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from './scheduled-tasks/store.js';
 import { setupLogger } from './logger.js';
-import { OllamaProvider, type LocalModelMessage } from './local-llm-provider.js';
-import { ProviderHealthCircuit, type ProviderFailureKind } from './provider-health-circuit.js';
+import { OllamaProvider } from './local-llm-provider.js';
 import { LocalAgentProvider } from './local-agent-provider.js';
 import {
   compressConversationHistory,
   compressPromptText,
   createCompressedParams,
-  buildLightChatParams,
+  buildLightConversationCoordinatorParams,
   decideConservativeRoute,
   getLocalRouterMode,
   LOCAL_PROFILE_DECISION,
+  parseLightConversationDecision,
   shouldRunPreCodexLocalFastPath,
+  type LightConversationDecision,
   type LocalRouteProtocolResult,
   type LocalTaskKind,
 } from './local-llm-router.js';
@@ -195,6 +196,14 @@ const PID_FILE = path.join(RUNTIME_DIR, 'bridge.pid');
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(MODULE_DIR, '..');
 const CORE_ROOT = path.resolve(SKILL_ROOT, '..', 'claude-to-im-core');
+const SELECTED_PROVIDER_LIGHT_CHAT_DECISION = 'use_selected_provider_profile';
+const runtimeProviderDisposers = new Set<() => Promise<void>>();
+
+async function disposeRuntimeProviders(): Promise<void> {
+  const disposers = [...runtimeProviderDisposers];
+  runtimeProviderDisposers.clear();
+  await Promise.allSettled(disposers.map((dispose) => dispose()));
+}
 
 interface ParsedBridgeSseEvent {
   type: string;
@@ -1381,8 +1390,6 @@ function buildExecutorSourceStatusById(config: Config, executorId: string): Reco
 }
 
 class HubLlmProvider implements LLMProvider {
-  private readonly providerHealthCircuit: ProviderHealthCircuit;
-
   constructor(
     private readonly config: Config,
     private readonly store: BridgeStore,
@@ -1399,12 +1406,12 @@ class HubLlmProvider implements LLMProvider {
     // primary chain. Optional for backward compat with legacy test
     // harnesses that don't need external dispatch.
     private readonly executorRegistry?: ExecutorProviderRegistry,
-  ) {
-    this.providerHealthCircuit = new ProviderHealthCircuit({
-      failureThreshold: 1,
-      cooldownMs: this.config.providerCircuitCooldownMs ?? 60_000,
-    });
-  }
+    /**
+     * 与当前选中模型来源一致的受限轻聊 Provider。它只能做 reply/delegate/clarify
+     * 裁决；为空时保守复用普通 Provider，Primary 的执行边界保持不变。
+     */
+    private readonly lightConversationProvider?: LLMProvider,
+  ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
     // 分类器只允许模型做结构化判断；不能进入本地工具规划、MCP fast path
@@ -1840,99 +1847,57 @@ class HubLlmProvider implements LLMProvider {
     conservative: ReturnType<typeof decideConservativeRoute>,
     mode: ReturnType<typeof getLocalRouterMode>,
   ): Promise<void> {
-    const lightParams = buildLightChatParams(params, this.config);
-    const providerKey = this.getLocalProviderHealthKey();
-    const summary: Omit<LocalLlmRouteSummary, 'timestamp'> = {
+    const coordinatorParams = buildLightConversationCoordinatorParams(params, this.config);
+    await this.runSelectedLightConversationCoordinator(
+      controller,
+      params,
+      coordinatorParams,
+      conservative,
       mode,
-      taskKind: 'light_chat',
-      decision: LOCAL_PROFILE_DECISION,
-      provider: 'local_best_effort',
-      reason: 'light_chat_fast_path',
-      compressedPromptChars: lightParams.prompt.length,
-      compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
-      promptProfile: 'light_chat',
-    };
-    if (!this.providerHealthCircuit.tryAcquire(providerKey)) {
-      await this.pipeFallbackStream(controller, lightParams, {
-        mode,
-        taskKind: 'light_chat',
-        decision: 'escalate_codex',
-        provider: 'codex',
-        reason: 'light_chat_fast_path_skipped; local provider circuit open',
-        compressedPromptChars: lightParams.prompt.length,
-        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
-        promptProfile: 'light_chat',
-        fallbackReason: '本地模型近期不可用，已快速跳过',
-      }, this.fallbackProvider, { excludeCodexSources: new Set<CodexModelSource>(['local_api']) });
+    );
+  }
+
+  private async runSelectedLightConversationCoordinator(
+    controller: ReadableStreamDefaultController<string>,
+    originalParams: Parameters<LLMProvider['streamChat']>[0],
+    coordinatorParams: Parameters<LLMProvider['streamChat']>[0],
+    conservative: ReturnType<typeof decideConservativeRoute>,
+    mode: ReturnType<typeof getLocalRouterMode>,
+  ): Promise<void> {
+    // 轻聊只缩减 Prompt、工作区、附件和工具权限，不再切换模型来源。这里始终
+    // 使用控制面板当前选中的 Provider（或用户明确配置的 failover 链）。
+    const provider = this.lightConversationProvider || this.fallbackProvider;
+    const timeoutMs = Math.max(3_000, Math.min(8_000, (this.config.lightChatFastPathTimeoutMs ?? 2_000) * 3));
+    let decision: LightConversationDecision | null = null;
+    try {
+      const text = await collectProviderText(provider, coordinatorParams, timeoutMs, originalParams.abortController?.signal);
+      decision = parseLightConversationDecision(extractJsonObject(text));
+    } catch {
+      // 协调器失败时保持失败关闭，直接让 Primary 按完整工具边界继续。
+    }
+
+    if (!decision || decision.action === 'delegate') {
+      await this.pipeCodexPrimaryWithFallback(
+        controller,
+        originalParams,
+        { ...conservative, useLocal: false, requestKind: 'chat', preferredDecision: 'escalate_codex' },
+        decision
+          ? '轻量会话协调器判定为任务，已进入 Primary'
+          : '轻量会话协调器未能可靠裁决，已保守进入 Primary',
+      );
       return;
     }
-    try {
-      const result = await this.localProvider.complete(
-        this.buildLightChatLocalMessages(lightParams),
-        {
-          temperature: 0.35,
-          maxTokens: Math.min(256, Math.max(96, this.config.localLlmMaxOutputTokens || 160)),
-          timeoutMs: this.config.lightChatFastPathTimeoutMs ?? 2000,
-        },
-      );
-      this.providerHealthCircuit.recordSuccess(providerKey);
-      this.emitLocalSuccess(controller, lightParams.sessionId, result.text, result.usage, summary);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.providerHealthCircuit.recordFailure(providerKey, this.classifyLocalProviderFailure(error));
-      const current = readLocalLlmStatus(this.config);
-      updateLocalLlmStatus(this.config, {
-        routeFailures: current.routeFailures + 1,
-        serverReachable: false,
-        lastCheckAt: new Date().toISOString(),
-        lastError: message,
-        lastFallbackReason: message,
-      });
-      await this.pipeFallbackStream(controller, lightParams, {
-        mode,
-        taskKind: 'light_chat',
-        decision: 'escalate_codex',
-        provider: 'codex',
-        reason: `light_chat_fast_path_failed; fallback with light prompt: ${truncatePreview(message, 160)}`,
-        compressedPromptChars: lightParams.prompt.length,
-        compressedHistoryChars: JSON.stringify(lightParams.conversationHistory || []).length,
-        promptProfile: 'light_chat',
-        fallbackReason: message,
-      }, this.fallbackProvider, { excludeCodexSources: new Set<CodexModelSource>(['local_api']) });
-    }
-  }
 
-  private getLocalProviderHealthKey(): string {
-    const kind = this.config.localAiKind || 'ollama';
-    const endpoint = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434')
-      .trim()
-      .replace(/\/+$/, '')
-      .toLowerCase();
-    const model = (this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || '').trim().toLowerCase();
-    return `${kind}:${endpoint}:${model}`;
-  }
-
-  private classifyLocalProviderFailure(error: unknown): ProviderFailureKind {
-    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-    if (/timeout|超时|abort/.test(message)) return 'timeout';
-    if (/fetch failed|econn|connection|socket|enotfound|network/.test(message)) return 'transport';
-    if (/http\s+(?:4\d\d|5\d\d)|model.*(?:not found|missing|不存在)/.test(message)) return 'server';
-    return 'content';
-  }
-
-  private buildLightChatLocalMessages(params: Parameters<LLMProvider['streamChat']>[0]): LocalModelMessage[] {
-    const messages: LocalModelMessage[] = [];
-    const systemPrompt = params.systemPrompt?.trim();
-    if (systemPrompt) {
-      messages.push({ role: 'system', content: systemPrompt });
-    }
-    for (const item of params.conversationHistory || []) {
-      const content = item.content?.trim();
-      if (!content) continue;
-      messages.push({ role: item.role, content });
-    }
-    messages.push({ role: 'user', content: params.prompt });
-    return messages;
+    this.emitCoordinatorSuccess(controller, coordinatorParams.sessionId, decision, {
+      mode,
+      taskKind: 'light_chat',
+      decision: SELECTED_PROVIDER_LIGHT_CHAT_DECISION,
+      provider: 'codex',
+      reason: `light_conversation_coordinator:${decision.action}; intent=${decision.intent}`,
+      compressedPromptChars: coordinatorParams.prompt.length,
+      compressedHistoryChars: JSON.stringify(coordinatorParams.conversationHistory || []).length,
+      promptProfile: 'light_chat',
+    });
   }
 
   private async dispatchAfterRouteFailure(
@@ -2399,6 +2364,42 @@ class HubLlmProvider implements LLMProvider {
       is_error: false,
       session_id: sessionId,
       usage: usage || {},
+    }));
+    controller.close();
+  }
+
+  private emitCoordinatorSuccess(
+    controller: ReadableStreamDefaultController<string>,
+    sessionId: string,
+    decision: LightConversationDecision,
+    summary: Omit<LocalLlmRouteSummary, 'timestamp'>,
+  ): void {
+    const current = readLocalLlmStatus(this.config);
+    appendLocalLlmRouteSummary(this.config, {
+      timestamp: new Date().toISOString(),
+      ...summary,
+    }, {
+      routeHits: current.routeHits + 1,
+      lastError: '',
+    });
+    controller.enqueue(sseEvent('status', {
+      provider: 'codex',
+      routeMode: summary.mode,
+      routeDecision: summary.decision,
+      routeReason: summary.reason,
+      promptProfile: 'light_chat',
+      interactionMode: 'classifier',
+      coordinatorAction: decision.action,
+      ...(this.config.runtime === 'codex'
+        ? { submittedReasoningEffort: 'low', executionOverrideReason: 'restricted_interaction' }
+        : {}),
+    }));
+    controller.enqueue(sseEvent('text', decision.reply));
+    controller.enqueue(sseEvent('result', {
+      subtype: 'success',
+      is_error: false,
+      session_id: sessionId,
+      usage: {},
     }));
     controller.close();
   }
@@ -2897,6 +2898,7 @@ async function resolveProvider(
   const wrapWithLocalHub = (
     provider: LLMProvider,
     primaryExecutorId: string,
+    lightConversationProvider?: LLMProvider,
   ): LLMProvider => {
     const localProvider = new OllamaProvider(config);
     return new HubLlmProvider(
@@ -2909,11 +2911,37 @@ async function resolveProvider(
       primaryExecutorId,
       provider,
       executorRegistry,
+      lightConversationProvider,
     );
   };
-  const wrapCodexMainProvider = (provider: LLMProvider): LLMProvider => (
-    new ManifestSlimCodexProvider(config, wrapWithLocalHub(provider, 'codex'))
+  const wrapCodexMainProvider = (
+    provider: LLMProvider,
+    lightConversationProvider?: LLMProvider,
+  ): LLMProvider => (
+    new ManifestSlimCodexProvider(config, wrapWithLocalHub(provider, 'codex', lightConversationProvider))
   );
+  const createCodexLightConversationProvider = async (
+    source: CodexModelSource,
+  ): Promise<LLMProvider | undefined> => {
+    if (config.lightChatFastPathEnabled === false) return undefined;
+    // 自动故障转移必须继续服从完整候选链，不能由常驻进程暗中固定某个来源。
+    if (config.codexRoutingMode === 'auto_failover' || source === 'local_api') return undefined;
+    try {
+      const { CodexAppServerLightProvider } = await import('./codex-app-server-light-provider.js');
+      const provider = new CodexAppServerLightProvider({
+        profile: source === 'official' ? 'official' : 'external',
+      });
+      runtimeProviderDisposers.add(() => provider.dispose());
+      // 预热只初始化受限进程和空的 ephemeral thread，不阻塞飞书 WS 启动。
+      void provider.warmup().catch((error) => {
+        console.warn('[codex-app-server] 轻聊协调器后台预热失败，将安全回退普通 Primary：', error instanceof Error ? error.message : error);
+      });
+      return provider;
+    } catch (error) {
+      console.warn('[codex-app-server] 轻聊协调器不可用，将安全回退普通 Primary：', error instanceof Error ? error.message : error);
+      return undefined;
+    }
+  };
 
   const runtime = config.runtime;
 
@@ -2927,13 +2955,15 @@ async function resolveProvider(
       });
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
       .filter((source) => isCodexSourceConfigured(config, source));
+    const selectedSource = config.codexModelSource || 'official';
     const primaryProvider = config.codexRoutingMode === 'auto_failover'
       ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
         source,
         provider: createCodexProvider(source),
       })), { candidateTimeoutMs: config.codexFailoverCandidateTimeoutMs })
-      : createCodexProvider(config.codexModelSource || 'official');
-    return wrapCodexMainProvider(primaryProvider);
+      : createCodexProvider(selectedSource);
+    const lightConversationProvider = await createCodexLightConversationProvider(selectedSource);
+    return wrapCodexMainProvider(primaryProvider, lightConversationProvider);
   }
 
   if (runtime === 'auto') {
@@ -2960,13 +2990,15 @@ async function resolveProvider(
       });
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
       .filter((source) => isCodexSourceConfigured(config, source));
+    const selectedSource = config.codexModelSource || 'official';
     const primaryProvider = config.codexRoutingMode === 'auto_failover'
       ? new CodexApiFailoverProvider((failoverChain.length > 0 ? failoverChain : ['local_api'] as CodexModelSource[]).map((source) => ({
         source,
         provider: createCodexProvider(source),
       })), { candidateTimeoutMs: config.codexFailoverCandidateTimeoutMs })
-      : createCodexProvider(config.codexModelSource || 'official');
-    return wrapCodexMainProvider(primaryProvider);
+      : createCodexProvider(selectedSource);
+    const lightConversationProvider = await createCodexLightConversationProvider(selectedSource);
+    return wrapCodexMainProvider(primaryProvider, lightConversationProvider);
   }
 
   const cliPath = resolveClaudeCliPath();
@@ -3636,6 +3668,7 @@ async function main(): Promise<void> {
     scheduledTaskRuntimeAbort.abort(reason);
     await bridgeManager.stop();
     await agentSupervisor.stop(reason);
+    await disposeRuntimeProviders();
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();
@@ -3659,6 +3692,7 @@ async function main(): Promise<void> {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(`uncaughtException: ${err.message}`);
+    void disposeRuntimeProviders();
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();

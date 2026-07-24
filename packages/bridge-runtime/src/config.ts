@@ -76,7 +76,6 @@ export interface Config {
   localLlmComplexityMode?: string;
   lightChatFastPathEnabled?: boolean;
   lightChatFastPathTimeoutMs?: number;
-  providerCircuitCooldownMs?: number;
   memoryIntentTimeoutMs?: number;
   agentCollaborationMode?: 'off' | 'shadow' | 'assist';
   agentWorkerPoolSize?: number;
@@ -403,9 +402,6 @@ export function loadConfig(): Config {
   const lightChatFastPathTimeoutMs = env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS")
     ? Number(env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS"))
     : undefined;
-  const providerCircuitCooldownMs = env.get("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS")
-    ? Number(env.get("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS"))
-    : undefined;
   const memoryIntentTimeoutMs = env.get("CTI_MEMORY_INTENT_TIMEOUT_MS")
     ? Number(env.get("CTI_MEMORY_INTENT_TIMEOUT_MS"))
     : undefined;
@@ -628,9 +624,6 @@ export function loadConfig(): Config {
     lightChatFastPathTimeoutMs: typeof lightChatFastPathTimeoutMs === "number" && Number.isFinite(lightChatFastPathTimeoutMs)
       ? Math.max(250, Math.min(10_000, Math.floor(lightChatFastPathTimeoutMs)))
       : 2000,
-    providerCircuitCooldownMs: typeof providerCircuitCooldownMs === "number" && Number.isFinite(providerCircuitCooldownMs)
-      ? Math.max(1000, Math.min(10 * 60_000, Math.floor(providerCircuitCooldownMs)))
-      : 60_000,
     memoryIntentTimeoutMs: typeof memoryIntentTimeoutMs === "number" && Number.isFinite(memoryIntentTimeoutMs)
       ? Math.max(30_000, Math.min(60_000, Math.floor(memoryIntentTimeoutMs)))
       : 30_000,
@@ -842,8 +835,6 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_ENABLED", String(config.lightChatFastPathEnabled));
   if (config.lightChatFastPathTimeoutMs !== undefined)
     out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS", String(config.lightChatFastPathTimeoutMs));
-  if (config.providerCircuitCooldownMs !== undefined)
-    out += formatEnvLine("CTI_PROVIDER_CIRCUIT_COOLDOWN_MS", String(config.providerCircuitCooldownMs));
   if (config.memoryIntentTimeoutMs !== undefined)
     out += formatEnvLine("CTI_MEMORY_INTENT_TIMEOUT_MS", String(config.memoryIntentTimeoutMs));
   out += formatEnvLine("CTI_AGENT_COLLABORATION_MODE", config.agentCollaborationMode || "off");
@@ -1288,9 +1279,6 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (typeof config.lightChatFastPathTimeoutMs === "number" && Number.isFinite(config.lightChatFastPathTimeoutMs)) {
     m.set("bridge_light_chat_fast_path_timeout_ms", String(Math.max(250, Math.floor(config.lightChatFastPathTimeoutMs))));
-  }
-  if (typeof config.providerCircuitCooldownMs === "number" && Number.isFinite(config.providerCircuitCooldownMs)) {
-    m.set("bridge_provider_circuit_cooldown_ms", String(Math.max(1000, Math.floor(config.providerCircuitCooldownMs))));
   }
   if (typeof config.memoryIntentTimeoutMs === "number" && Number.isFinite(config.memoryIntentTimeoutMs)) {
     m.set("bridge_memory_intent_timeout_ms", String(Math.max(250, Math.floor(config.memoryIntentTimeoutMs))));

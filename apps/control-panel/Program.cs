@@ -565,6 +565,7 @@ internal sealed partial class MainForm : Form
             return "owner";
         }
         if (command.StartsWith("bridge.", StringComparison.OrdinalIgnoreCase)
+            || command.StartsWith("agentCollaboration.", StringComparison.OrdinalIgnoreCase)
             || string.Equals(command, "history.recallBotMessage", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("panel.", StringComparison.OrdinalIgnoreCase)
             || command.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase)
@@ -824,6 +825,8 @@ internal sealed partial class MainForm : Form
             case "bridge.status":
                 await CheckBridgeAsync();
                 return _bridgeStatus.Text;
+            case "agentCollaboration.setMode":
+                return await SetAgentCollaborationModeAsync(payload);
             case "codex.check":
                 await CheckCodexAsync();
                 return _codexStatus.Text;
@@ -6783,6 +6786,24 @@ exit $LASTEXITCODE
     }
     private string GetConfig(string key, string fallback)
         => _config.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
+
+    private async Task<object> SetAgentCollaborationModeAsync(JsonElement payload)
+    {
+        var mode = AgentCollaborationModePolicy.Normalize(ReadPayloadString(payload, "mode", ""));
+        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+        var lines = ReadEnvFileLines(_configPath);
+        SetOrAppendEnv(lines, "CTI_AGENT_COLLABORATION_MODE", mode);
+        File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
+        AppendLog($"多 Agent 协作模式已写入：{mode}。正在重启 Bridge 应用配置。");
+        LoadConfig();
+        await RestartBridgeAsync();
+        return new
+        {
+            mode,
+            restarted = true,
+            state = ReadAgentCollaborationState(),
+        };
+    }
 
     private string InferCodexModelSource()
         => !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_BASE_URL", ""))

@@ -190,12 +190,12 @@ describe('hub-llm-provider dispatch contract', () => {
     assert.equal(fallbackCalls, 1);
   });
 
-  it('skips an unhealthy local light-chat provider after the first transport failure', async () => {
+  it('uses the selected provider for light chat without invoking the raw local model', async () => {
     const { HubLlmProvider } = await import('../main.js');
     const { JsonFileStore } = await import('../store.js');
-    const { readLocalLlmStatus } = await import('../local-llm-status.js');
     const config: Config = {
       ...baseConfig,
+      codexModelSource: 'official',
       ollamaEnabled: true,
       localLlmEnabled: true,
       localLlmRouterEnabled: true,
@@ -207,6 +207,7 @@ describe('hub-llm-provider dispatch contract', () => {
     };
     let localCalls = 0;
     let fallbackCalls = 0;
+    let lightCoordinatorCalls = 0;
     const localProvider = {
       complete: async () => {
         localCalls += 1;
@@ -218,7 +219,20 @@ describe('hub-llm-provider dispatch contract', () => {
         fallbackCalls += 1;
         return new ReadableStream<string>({
           start(controller) {
-            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'Codex 回复' })}\n\n`);
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'Codex Primary 回复' })}\n\n`);
+            controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: '{}' })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const lightCoordinatorProvider = {
+      streamChat: () => {
+        lightCoordinatorCalls += 1;
+        return new ReadableStream<string>({
+          start(controller) {
+            const data = JSON.stringify({ action: 'reply', intent: 'light_chat', reply: 'Codex 回复', reason: '普通轻聊', confidence: 0.98 });
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data })}\n\n`);
             controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: '{}' })}\n\n`);
             controller.close();
           },
@@ -234,6 +248,8 @@ describe('hub-llm-provider dispatch contract', () => {
       null,
       'codex',
       fallbackProvider as never,
+      undefined,
+      lightCoordinatorProvider as never,
     );
     const lightParams = {
       ...params({ prompt: '在呢', permissionMode: 'acceptEdits' }),
@@ -247,12 +263,76 @@ describe('hub-llm-provider dispatch contract', () => {
     await collectSse(hub.streamChat(lightParams));
     await collectSse(hub.streamChat({ ...lightParams, sessionId: `${lightParams.sessionId}-2` }));
 
-    assert.equal(localCalls, 1, 'open circuit must skip repeated local attempts');
-    assert.equal(fallbackCalls, 2);
-    assert.equal(readLocalLlmStatus(config).serverReachable, false, 'Codex fallback must not overwrite local health');
+    assert.equal(localCalls, 0, 'official selection must not invoke the raw local model');
+    assert.equal(lightCoordinatorCalls, 2);
+    assert.equal(fallbackCalls, 0, '轻聊裁决成功时不应再启动完整 Primary');
   });
 
-  it('does not retry the same local target inside the Codex failover chain', async () => {
+  it('does not probe or infer with Ollama when the selected source is official', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    let probeCalls = 0;
+    let completeCalls = 0;
+    let fallbackCalls = 0;
+    const config: Config = {
+      ...baseConfig,
+      codexModelSource: 'official',
+      ollamaEnabled: true,
+      localLlmEnabled: true,
+      localLlmRouterEnabled: true,
+      localLlmForceHub: true,
+      localLlmRouterMode: 'hybrid',
+      lightChatFastPathEnabled: true,
+      localAiBaseUrl: 'http://127.0.0.1:11999',
+      localAiModel: 'startup-probe-model',
+    };
+    const localProvider = {
+      probe: async () => {
+        probeCalls += 1;
+        throw new Error('fetch failed');
+      },
+      complete: async () => {
+        completeCalls += 1;
+        throw new Error('full inference should be skipped');
+      },
+    };
+    const fallbackProvider: LLMProvider = {
+      streamChat: (input) => {
+        fallbackCalls += 1;
+        const data = input.interactionMode === 'classifier'
+          ? JSON.stringify({ action: 'reply', intent: 'light_chat', reply: '快速回复', reason: '普通轻聊', confidence: 0.98 })
+          : 'Primary';
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const hub = new HubLlmProvider(
+      config,
+      new JsonFileStore(new Map()),
+      localProvider as never,
+      {} as never,
+      fallbackProvider,
+      null,
+      'codex',
+      fallbackProvider,
+    );
+
+    const chunks = await collectSse(hub.streamChat({
+      ...params({ prompt: '哈喽', permissionMode: 'acceptEdits' }),
+      systemPrompt: 'Channel assistant identity:\nFeishu emoji presentation:\nFeishu sticker library:',
+    }));
+
+    assert.equal(probeCalls, 0);
+    assert.equal(completeCalls, 0);
+    assert.equal(fallbackCalls, 1);
+    assert.match(chunks.join(''), /快速回复/);
+  });
+
+  it('honors the configured provider failover chain without a hidden raw Ollama pre-pass', async () => {
     const { HubLlmProvider, CodexApiFailoverProvider } = await import('../main.js');
     const { JsonFileStore } = await import('../store.js');
     const config: Config = {
@@ -268,7 +348,8 @@ describe('hub-llm-provider dispatch contract', () => {
     };
     let failoverLocalCalls = 0;
     let officialCalls = 0;
-    const localFastPath = { complete: async () => { throw new Error('fetch failed'); } };
+    let rawLocalCalls = 0;
+    const localFastPath = { complete: async () => { rawLocalCalls += 1; throw new Error('fetch failed'); } };
     const localFailoverProvider: LLMProvider = {
       streamChat: () => {
         failoverLocalCalls += 1;
@@ -281,11 +362,14 @@ describe('hub-llm-provider dispatch contract', () => {
       },
     };
     const officialProvider: LLMProvider = {
-      streamChat: () => {
+      streamChat: (input) => {
         officialCalls += 1;
         return new ReadableStream<string>({
           start(controller) {
-            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'official-ok' })}\n\n`);
+            const data = input.interactionMode === 'classifier'
+              ? JSON.stringify({ action: 'reply', intent: 'light_chat', reply: 'official-ok', reason: '普通轻聊', confidence: 0.98 })
+              : 'official-primary-ok';
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data })}\n\n`);
             controller.close();
           },
         });
@@ -311,8 +395,149 @@ describe('hub-llm-provider dispatch contract', () => {
       systemPrompt: 'Channel assistant identity:\nFeishu emoji presentation:\nFeishu sticker library:',
     }));
 
-    assert.equal(failoverLocalCalls, 0, 'a failed local target must not be retried in the same turn');
+    assert.equal(rawLocalCalls, 0, 'the coordinator must not add an auxiliary raw Ollama request');
+    assert.equal(failoverLocalCalls, 1, 'the configured failover chain remains authoritative');
     assert.equal(officialCalls, 1);
+  });
+
+  it('lets the selected provider coordinator reply directly for genuine light chat', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    let localCalls = 0;
+    let selectedCalls = 0;
+    let selectedInteractionMode: StreamChatParams['interactionMode'];
+    const localProvider = {
+      complete: async () => {
+        localCalls += 1;
+        throw new Error('raw local provider must not be called');
+      },
+    };
+    const primaryProvider: LLMProvider = {
+      streamChat: (input) => {
+        selectedCalls += 1;
+        selectedInteractionMode = input.interactionMode;
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({
+              type: 'text',
+              data: JSON.stringify({
+                action: 'reply',
+                intent: 'light_chat',
+                reply: '哈喽，我在～',
+                reason: '普通轻聊',
+                confidence: 0.98,
+              }),
+            })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const hub = new HubLlmProvider(
+      { ...baseConfig, codexModelSource: 'official', ollamaEnabled: true, localLlmEnabled: true, localLlmRouterEnabled: true, localLlmForceHub: true, localLlmRouterMode: 'hybrid', lightChatFastPathEnabled: true },
+      new JsonFileStore(new Map()),
+      localProvider as never,
+      {} as never,
+      primaryProvider,
+      null,
+      'codex',
+      primaryProvider,
+    );
+
+    const chunks = await collectSse(hub.streamChat({
+      ...params({ prompt: '哈喽哈喽', permissionMode: 'acceptEdits' }),
+      systemPrompt: 'Channel assistant identity:\nFeishu emoji presentation:\nFeishu sticker library:',
+    }));
+
+    assert.equal(localCalls, 0);
+    assert.equal(selectedCalls, 1);
+    assert.equal(selectedInteractionMode, 'classifier');
+    assert.match(chunks.join(''), /哈喽，我在/);
+    assert.doesNotMatch(chunks.join(''), /\"action\":\"reply\"/);
+  });
+
+  it('delegates an ambiguous short task to Primary without exposing coordinator JSON', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    let coordinatorCalls = 0;
+    let primaryCalls = 0;
+    let primaryInteractionMode: StreamChatParams['interactionMode'];
+    let primaryInput: StreamChatParams | undefined;
+    let localCalls = 0;
+    const localProvider = {
+      complete: async () => {
+        localCalls += 1;
+        throw new Error('raw local provider must not be called');
+      },
+    };
+    const primaryProvider: LLMProvider = {
+      streamChat: (input) => {
+        if (input.interactionMode === 'classifier') {
+          coordinatorCalls += 1;
+          return new ReadableStream<string>({
+            start(controller) {
+              controller.enqueue(`data: ${JSON.stringify({
+                type: 'text',
+                data: JSON.stringify({
+                  action: 'delegate',
+                  intent: 'task',
+                  reply: '',
+                  reason: '需要继续检查实际状态',
+                  confidence: 0.92,
+                }),
+              })}\n\n`);
+              controller.close();
+            },
+          });
+        }
+        primaryCalls += 1;
+        primaryInteractionMode = input.interactionMode;
+        primaryInput = input;
+        return new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'Primary 已接手' })}\n\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    const hub = new HubLlmProvider(
+      { ...baseConfig, codexModelSource: 'official', ollamaEnabled: true, localLlmEnabled: true, localLlmRouterEnabled: true, localLlmForceHub: true, localLlmRouterMode: 'hybrid', lightChatFastPathEnabled: true },
+      new JsonFileStore(new Map()),
+      localProvider as never,
+      {} as never,
+      primaryProvider,
+      null,
+      'codex',
+      primaryProvider,
+    );
+
+    const originalWorkingDirectory = process.cwd();
+    const originalExecutionRequirement = {
+      kind: 'none' as const,
+      reason: '候选短消息尚未要求工具证据',
+      requiredToolFamilies: [],
+    };
+    const chunks = await collectSse(hub.streamChat({
+      ...params({ prompt: '这个继续弄一下', permissionMode: 'acceptEdits' }),
+      systemPrompt: 'Channel assistant identity:\nFeishu emoji presentation:\nFeishu sticker library:',
+      workingDirectory: originalWorkingDirectory,
+      additionalDirectories: [originalWorkingDirectory],
+      priorityTurnContext: '[可能关联上文] 用户: 一个需要继续处理的真实任务。',
+      executionRequirement: originalExecutionRequirement,
+    }));
+
+    assert.equal(localCalls, 0);
+    assert.equal(coordinatorCalls, 1);
+    assert.equal(primaryCalls, 1);
+    assert.equal(primaryInteractionMode, undefined);
+    assert.equal(primaryInput?.prompt, '这个继续弄一下');
+    assert.equal(primaryInput?.workingDirectory, originalWorkingDirectory);
+    assert.deepEqual(primaryInput?.additionalDirectories, [originalWorkingDirectory]);
+    assert.equal(primaryInput?.priorityTurnContext, '[可能关联上文] 用户: 一个需要继续处理的真实任务。');
+    assert.deepEqual(primaryInput?.executionRequirement, originalExecutionRequirement);
+    assert.match(chunks.join(''), /Primary 已接手/);
+    assert.doesNotMatch(chunks.join(''), /需要继续检查实际状态/);
   });
 
   it('registry routes @mavis hint to MavisExecutorProvider (not the default Codex chain)', async () => {

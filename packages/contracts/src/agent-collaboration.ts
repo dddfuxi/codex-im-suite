@@ -113,6 +113,29 @@ export type AgentWorkflowNodeStatus =
   | 'skipped'
   | 'fallback';
 
+/**
+ * 面向聊天卡片的最小脱敏协作状态。这里刻意不包含 findings、Prompt、
+ * evidence 内容、模型参数或本地路径，避免把控制面板的完整运行快照外发。
+ */
+export interface AgentCardProgressItem {
+  taskId: string;
+  agentId: string;
+  displayName: string;
+  kind: 'coordinator' | 'specialist' | 'primary_agent';
+  status: AgentWorkflowNodeStatus;
+  startedAt?: string;
+  durationMs?: number;
+  errorCode?: string;
+}
+
+export interface AgentCardProgressSnapshot {
+  runId: string;
+  mode: Exclude<AgentCollaborationMode, 'off'>;
+  status: AgentCollaborationRun['status'];
+  injectedIntoPrimary: boolean;
+  agents: AgentCardProgressItem[];
+}
+
 export interface AgentCollaborationWorkflowNode {
   id: string;
   kind: AgentWorkflowNodeKind;

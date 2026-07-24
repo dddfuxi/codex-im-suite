@@ -319,6 +319,15 @@ export abstract class BaseChannelAdapter {
   onToolEvent?(_chatId: string, _tools: import('./types.js').ToolCallInfo[]): void;
 
   /**
+   * Runtime 只通过该入口投递脱敏后的协作状态。Adapter 不得从完整 Workflow
+   * 重新推断 Agent 路由，也不得把 findings、Prompt 或 evidence 原文放进卡片。
+   */
+  onAgentProgress?(
+    _chatId: string,
+    _progress: import('@codex-im-suite/contracts').AgentCardProgressSnapshot,
+  ): void;
+
+  /**
    * Called when streaming ends. Adapter should finalize the streaming card
    * (close streaming mode, add footer, etc.).
    * Returns true if a card was finalized (caller should skip normal delivery).

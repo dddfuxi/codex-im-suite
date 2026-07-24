@@ -52,6 +52,7 @@ describe('Feishu streaming card registry', () => {
       sequence: 0,
       startTime: 1234,
       toolCalls: [],
+      agentProgress: undefined,
       thinking: true,
       pendingText: null,
       lastUpdateAt: 0,
@@ -66,6 +67,31 @@ describe('Feishu streaming card registry', () => {
       return Promise.resolve(true);
     }), false);
     assert.equal(createCalled, false);
+  });
+
+  it('buffers the latest Agent snapshot until a late card creation activates', async () => {
+    const { FeishuStreamingCardRegistry } = await loadRegistry();
+    const registry = new FeishuStreamingCardRegistry();
+    const progress = {
+      runId: 'run-1',
+      mode: 'shadow' as const,
+      status: 'running' as const,
+      injectedIntoPrimary: false,
+      agents: [{
+        taskId: 'coordinator',
+        agentId: 'coordinator',
+        displayName: 'Coordinator Agent',
+        kind: 'coordinator' as const,
+        status: 'running' as const,
+      }],
+    };
+
+    assert.equal(registry.setAgentProgress('oc_chat', progress), undefined);
+    assert.deepEqual(registry.getPendingAgentProgress('oc_chat'), progress);
+
+    const state = registry.activate('oc_chat', { cardId: 'card_1', messageId: 'om_1' });
+    assert.deepEqual(state.agentProgress, progress);
+    assert.equal(registry.getPendingAgentProgress('oc_chat'), undefined);
   });
 
   it('clears both throttle and typewriter timers when one card is removed', async () => {

@@ -34,6 +34,7 @@ describe('codex execution profile', () => {
   it('records restricted reasoning override without losing requested value', () => {
     const profile = createCodexExecutionProfile({ ...base, restrictedInteraction: true });
 
+    assert.equal(profile.submittedModel, 'gpt-5.4');
     assert.equal(profile.requestedReasoningEffort, 'xhigh');
     assert.equal(profile.submittedReasoningEffort, 'low');
     assert.equal(profile.overrideReason, 'restricted_interaction');

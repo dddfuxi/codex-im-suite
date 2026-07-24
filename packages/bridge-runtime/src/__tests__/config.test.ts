@@ -231,7 +231,6 @@ describe('configToSettings', () => {
       localLlmComplexityMode: 'conservative',
       lightChatFastPathEnabled: true,
       lightChatFastPathTimeoutMs: 2000,
-      providerCircuitCooldownMs: 60000,
       memoryIntentTimeoutMs: 4000,
       lightChatHistoryLimit: 2,
       lightChatMaxInputChars: 280,
@@ -256,7 +255,6 @@ describe('configToSettings', () => {
     assert.equal(m.get('bridge_local_llm_complexity_mode'), 'conservative');
     assert.equal(m.get('bridge_light_chat_fast_path_enabled'), 'true');
     assert.equal(m.get('bridge_light_chat_fast_path_timeout_ms'), '2000');
-    assert.equal(m.get('bridge_provider_circuit_cooldown_ms'), '60000');
     assert.equal(m.get('bridge_memory_intent_timeout_ms'), '4000');
     assert.equal(m.get('bridge_light_chat_history_limit'), '2');
     assert.equal(m.get('bridge_light_chat_max_input_chars'), '280');

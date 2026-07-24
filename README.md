@@ -31,7 +31,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
-- 运行时多 Agent 协作：新增共享常驻 Worker 池和 `Coordinator / Context / Memory / Performance` 四类只读 Agent；默认 `off`，按 `off → shadow → assist` 灰度。Primary Agent 保持唯一执行者，Bridge 保持唯一发送者；“机器人架构”页可查看职责拓扑、Worker 状态、实时/历史协作工作流与只读性能建议。
+- 运行时多 Agent 协作：新增共享常驻 Worker 池和 `Coordinator / Context / Memory / Performance` 四类只读 Agent；默认 `off`，按 `off → shadow → assist` 灰度。Primary Agent 保持唯一执行者，Bridge 保持唯一发送者；总览卡片可一键以安全的 Shadow 开启或关闭，机器人架构页可显式切换三档模式并查看职责、Worker、工作流和性能。Shadow 只在控制面板保留旁路观测，不占飞书卡片；只有真正注入 Primary 的 Assist 协作才会在最终卡片默认折叠的“执行轨迹”中显示。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
@@ -64,7 +64,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 主干发行标签：`scripts/create-main-release-tag.ps1`
 - 控制面板前端源码：`apps/control-panel/web`
 - Control API 启动脚本：`scripts/start-control-api.ps1`
-- Agent 协作 Manifest：`config/agents.d`；运行模式使用 `CTI_AGENT_COLLABORATION_MODE=off|shadow|assist`，默认 `off`。
+- Agent 协作 Manifest：`config/agents.d`；运行模式使用 `CTI_AGENT_COLLABORATION_MODE=off|shadow|assist`，默认 `off`。也可在控制面板总览的“多 Agent 协作”卡片点击“开启/关闭”，或在“机器人 → 架构”选择 `关闭 / Shadow / Assist`；面板会写入 `config.env` 并重启 Bridge。
 - 安全档位：控制面板“设置 → 自适应安全策略”，默认“智能平衡”；只放宽强平台 evidence 支撑的同群低风险动作，不关闭 Owner、平台授权、身份冲突或高风险确认。
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
@@ -223,7 +223,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 默认是 `自动 executor 选择 + Codex CLI agent 模型来源链`：
 
-- 多 Agent 协作默认关闭：`CTI_AGENT_COLLABORATION_MODE=off`。`shadow` 只运行和展示协作图，不影响回答；`assist` 才把通过父进程 Schema/evidence/副作用校验的只读结果注入 Primary Agent。Worker 池默认 2，可用 `CTI_AGENT_WORKER_POOL_SIZE` 配置为 1–4；单任务默认 30 秒、总回合预算 35 秒，最多并行两个 Specialist。
+- 多 Agent 协作默认关闭：`CTI_AGENT_COLLABORATION_MODE=off`。`shadow` 只运行并在控制面板展示协作图，不影响回答，也不在飞书卡片显示；`assist` 才把通过父进程 Schema/evidence/副作用校验的只读结果注入 Primary Agent，注入成功后的脱敏轨迹默认折叠。Worker 池默认 2，可用 `CTI_AGENT_WORKER_POOL_SIZE` 配置为 1–4；单任务默认 30 秒、总回合预算 35 秒，最多并行两个 Specialist。
 - 运行时已加入第一阶段 workflow / executor 平台：请求会记录 `received -> authorized -> contextualized -> routed -> executing -> delivered/failed`，执行器目录当前包含 `codex`、`claude-cli` 和实验性的 `codex-oss-ollama`；本地 API 与外部 API 都通过 `codex` 的模型来源接入，不再作为独立本地 agent 或兜底执行器。
 - 外部 Agent Executor：`mavis-agent` 是 opt-in external executor，通过本地 `mavis` CLI 派发和续接任务；默认关闭，使用 `CTI_MAVIS_ENABLED=true` 与 `CTI_MAVIS_CLI_PATH=<path>` 启用。用户可用 `@mavis` / `@minimax` / `@minimax-code` 显式选择，也可在控制面板设置默认 executor。当前模块边界、路由和失败收口统一维护在 `docs/PROJECT-ARCHITECTURE.md`，阶段性变更统一记录在 `docs/DEVELOPMENT-LOG.md`。
 - 用户可用 `@codex`、`@claude`、`@local`、`@本地`、`@ollama` 显式选择执行器；`@local` / `@本地` 表示本轮 Codex 使用 `local_api` 模型来源。控制面板“执行器”页可查看最近 workflow run、executor 状态，并通过按钮设置或清除全局默认 executor；“节点”页可查看本机 node 与 fake remote node 的能力清单。
@@ -239,7 +239,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `hybrid` 模式下 MCP 状态、工具和可用性询问默认先走 Codex；只有 `local_only` 或 Codex 不可用后才使用本地 MCP 动态状态兜底，不再返回硬编码入口列表。
 - 原画、生成图、视频、模型等 Ignis 生成请求可走 Ignis MCP 快路径；`local_only` 模式下也允许提交和查询 Ignis 任务。
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
-- 本地模型只作为 Codex agent 的可选模型来源、轻量 prompt profile、模型能力检测和少数内部测试/整理入口使用；普通飞书消息不再绕过 agent 生成独立最终回复。本地轻量路由的当前 decision 名称为 `use_local_profile`，旧 `answer_local` 只作为历史 payload 兼容输入。
+- 本地模型只在控制面板当前模型来源明确选择 `local_api`，或用户显式选择本地执行模式时参与回答；不会再作为 official Codex / external API 的隐藏轻聊辅助。飞书短消息仍可启用受限轻量会话协调器，但它只缩减 Prompt、历史、工作区、附件和工具权限，并始终复用设置中选中的 Provider/模型来源。manual official/external 会在 Bridge 启动后后台预热同源 Codex `app-server`，按会话复用隔离的 ephemeral thread，避免每条轻聊重新启动 `codex exec`；自动 failover 和 `local_api` 不会被这条常驻链暗中固定来源。明确任务、查询、路径、附件、同步、重启、读写或 MCP 请求直接进入 Primary；只有通过确定性硬门禁的短消息才由协调器输出 `reply / delegate / clarify`，其中 `reply / clarify` 可在第一轮形成可见回复，`delegate` 会把完整原始回合交回 Primary 和真实工具链。
 - 记忆关键词不再触发快捷最终回复；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。`quality=high` 的高置信结构化命中会作为 `high_confidence_evidence` 注入 agent system prompt，由 agent 按当前问题整理最终回复；关系图候选和其他低确定性结果只注入主执行链。
 - 自然语言计划任务不走 provider 前关键词快路：Agent 必须区分固定通知、动态 Agent turn 和受控工具。周期任务输出 `cti-scheduled-task`；单次低风险提醒可输出 `cti-reminder` 或使用 `/remind`，随后由统一 Scheduled Task Host 创建。没有 Host success 时不能声称已创建，Codex 也不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。

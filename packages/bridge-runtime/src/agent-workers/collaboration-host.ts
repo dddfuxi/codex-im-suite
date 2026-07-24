@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 
 import type {
+  AgentCardProgressItem,
+  AgentCardProgressSnapshot,
   AgentCollaborationRun,
   AgentCollaborationWorkflowEdge,
   AgentCollaborationWorkflowNode,
@@ -108,9 +110,44 @@ function promptSectionsFromResult(result: AgentTaskResult): AgentPromptSection[]
   }];
 }
 
+function stableCardErrorCode(value: string | undefined): string | undefined {
+  const normalized = value?.trim() || '';
+  return /^[a-z0-9_.-]{1,80}$/u.test(normalized) ? normalized : undefined;
+}
+
+function toCardProgressSnapshot(run: AgentCollaborationRun): AgentCardProgressSnapshot | null {
+  if (run.mode === 'off') return null;
+  const agents = run.nodes
+    .filter((node) => (
+      node.kind === 'coordinator'
+      || node.kind === 'specialist'
+      || node.kind === 'primary_agent'
+    ) && node.status !== 'pending')
+    .slice(0, 4)
+    .map((node) => ({
+      taskId: node.id.replace(/^agent:/u, ''),
+      agentId: node.agentId || 'primary',
+      displayName: node.label.replace(/（唯一执行者）/gu, '').trim().slice(0, 80),
+      kind: node.kind as AgentCardProgressItem['kind'],
+      status: node.status,
+      startedAt: node.startedAt,
+      durationMs: node.durationMs,
+      errorCode: stableCardErrorCode(node.errorCode),
+    }));
+  if (agents.length === 0) return null;
+  return {
+    runId: run.runId,
+    mode: run.mode,
+    status: run.status,
+    injectedIntoPrimary: run.injectedIntoPrimary,
+    agents,
+  };
+}
+
 export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
   private performanceRunning = false;
   private lastPerformanceAt = 0;
+  private readonly progressListeners = new Map<string, NonNullable<AgentCollaborationTurnInput['onProgress']>>();
 
   constructor(
     private readonly config: Config,
@@ -155,6 +192,8 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
     }
 
     this.stateStore.startRun(run);
+    if (input.onProgress) this.progressListeners.set(runId, input.onProgress);
+    this.emitProgress(runId);
     const deadlineAt = new Date(Date.now() + (this.config.agentTurnBudgetMs || 35_000)).toISOString();
     const evidenceIds = new Set(input.envelope.evidence.map((item) => item.id));
     const coordinatorRequest: AgentTaskRequest = {
@@ -189,6 +228,7 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
       : null;
     if (!plan) {
       this.markCoordinatorFallback(runId, coordinatorResult.errorCode || 'invalid_coordinator_plan');
+      this.emitProgress(runId);
       return { mode, runId, status: 'fallback', triggerReason: eligibility.reason, promptSections: [] };
     }
     this.stateStore.updateNode(runId, 'agent:coordinator', {
@@ -197,6 +237,7 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
       endedAt: coordinatorResult.metrics.endedAt,
       durationMs: coordinatorResult.metrics.durationMs,
     });
+    this.emitProgress(runId);
     if (!plan.shouldCollaborate || plan.tasks.length === 0) {
       this.stateStore.updateRun(runId, (current) => ({
         ...current,
@@ -204,13 +245,16 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
           ? { ...edge, status: 'completed' }
           : edge),
       }));
+      this.emitProgress(runId);
       return { mode, runId, status: 'skipped', triggerReason: plan.reason || eligibility.reason, promptSections: [] };
     }
 
     this.addSpecialistNodes(runId, plan.tasks);
+    this.emitProgress(runId);
     const results = await Promise.all(plan.tasks.map(async (task) => {
       const result = await this.supervisor.executeTask(taskRequest(input, runId, task, deadlineAt), evidenceIds, input.abortSignal);
       this.stateStore.recordAgentResult(runId, result);
+      this.emitProgress(runId);
       return result;
     }));
     const succeeded = results.filter((result) => result.status === 'succeeded');
@@ -221,6 +265,7 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
         fallbackReason: '专业 Agent 全部失败，已继续现有单 Agent 链路。',
         edges: current.edges.map((edge) => edge.to === 'primary' ? { ...edge, kind: 'fallback', status: 'fallback' } : edge),
       }));
+      this.emitProgress(runId);
       return { mode, runId, status: 'fallback', triggerReason: plan.reason, promptSections: [] };
     }
     this.stateStore.updateRun(runId, (current) => ({
@@ -239,13 +284,16 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
 
   markPrimaryStarted(runId: string): void {
     this.stateStore.updateNode(runId, 'primary', { status: 'running', startedAt: nowIso() });
+    this.stateStore.updateRun(runId, (run) => ({
+      ...run,
+      injectedIntoPrimary: run.mode === 'assist'
+        && run.nodes.some((node) => node.kind === 'specialist' && node.status === 'succeeded'),
+    }));
+    this.emitProgress(runId);
   }
 
-  completeTurn(input: AgentCollaborationCompletionInput): void {
-    const snapshot = this.stateStore.snapshot();
-    const run = snapshot.currentRun?.runId === input.runId
-      ? snapshot.currentRun
-      : snapshot.recentRuns.find((item) => item.runId === input.runId);
+  markPrimaryCompleted(input: AgentCollaborationCompletionInput): void {
+    const run = this.findRun(input.runId);
     if (!run) return;
     const endedAt = nowIso();
     const primary = run.nodes.find((node) => node.id === 'primary');
@@ -258,6 +306,15 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
       summary: input.answerSummary?.replace(/\s+/gu, ' ').trim().slice(0, 600),
       errorCode: input.errorCode,
     });
+    this.emitProgress(input.runId);
+  }
+
+  completeTurn(input: AgentCollaborationCompletionInput): void {
+    this.markPrimaryCompleted(input);
+    const run = this.findRun(input.runId);
+    if (!run) return;
+    const endedAt = nowIso();
+    const succeeded = input.status === 'succeeded';
     this.stateStore.updateNode(input.runId, 'policy', {
       status: succeeded ? 'succeeded' : 'fallback',
       startedAt: endedAt,
@@ -277,6 +334,8 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
       fallbackReason: fallback ? run.fallbackReason || input.errorCode || '主链以 fallback 收口' : undefined,
       injectedIntoPrimary: run.mode === 'assist' && run.nodes.some((node) => node.kind === 'specialist' && node.status === 'succeeded'),
     });
+    this.emitProgress(input.runId);
+    this.progressListeners.delete(input.runId);
     void this.maybeAnalyzePerformance();
   }
 
@@ -322,6 +381,27 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
         ? { ...edge, kind: 'fallback', status: 'fallback' }
         : edge),
     }));
+  }
+
+  private findRun(runId: string): AgentCollaborationRun | undefined {
+    const snapshot = this.stateStore.snapshot();
+    return snapshot.currentRun?.runId === runId
+      ? snapshot.currentRun
+      : snapshot.recentRuns.find((item) => item.runId === runId);
+  }
+
+  private emitProgress(runId: string): void {
+    const listener = this.progressListeners.get(runId);
+    if (!listener) return;
+    const run = this.findRun(runId);
+    if (!run) return;
+    const snapshot = toCardProgressSnapshot(run);
+    if (!snapshot) return;
+    try {
+      listener(snapshot);
+    } catch {
+      // 卡片观察链失败不能影响只读协作或主 Agent 执行。
+    }
   }
 
   private async maybeAnalyzePerformance(): Promise<void> {

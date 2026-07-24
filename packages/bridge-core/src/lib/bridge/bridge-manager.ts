@@ -6435,6 +6435,17 @@ async function handleMessage(
     emitProgressCardStep?.(describeToolProgressStatus(status));
   } : undefined;
 
+  const onAgentProgress = supportsStreamingCards && typeof adapter.onAgentProgress === 'function'
+    ? (progress: import('@codex-im-suite/contracts').AgentCardProgressSnapshot) => {
+      if (progress.agents.length === 0 || !ensureWorkflowCard()) return;
+      try {
+        adapter.onAgentProgress!(msg.address.chatId, progress);
+      } catch {
+        // Agent 卡片状态是观察能力；失败时继续主 Agent 和现有交付链。
+      }
+    }
+    : undefined;
+
   // Combined partial text callback: streaming preview + streaming cards
   const onPartialText = (previewOnPartialText || onStreamCardText) ? (fullText: string) => {
     if (previewOnPartialText) previewOnPartialText(fullText);
@@ -6579,6 +6590,7 @@ async function handleMessage(
           hasAttachments: Boolean(providerAttachments?.length),
           memoryIntentCandidate,
           abortSignal: taskAbort.signal,
+          onProgress: onAgentProgress,
         });
         collaborationRunId = collaboration.runId || '';
         collaborationPromptSections = collaboration.promptSections.map((section) => ({
@@ -7064,6 +7076,20 @@ async function handleMessage(
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', stickerSafeUserFacingResponseText);
     } else if (safeProviderErrorText) {
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', safeProviderErrorText);
+    }
+
+    if (collaborationRunId) {
+      collaborationHost?.markPrimaryCompleted({
+        runId: collaborationRunId,
+        status: result.hasError ? 'failed' : 'succeeded',
+        answerSummary: deliveryResponseText || safeProviderErrorText,
+        errorCode: result.hasError ? 'primary_agent_error' : undefined,
+        tokenUsage: result.tokenUsage ? {
+          inputTokens: result.tokenUsage.input_tokens,
+          outputTokens: result.tokenUsage.output_tokens,
+          totalTokens: result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
+        } : undefined,
+      });
     }
 
     // Finalize streaming card if adapter supports it.

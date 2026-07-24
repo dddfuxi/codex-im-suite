@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type {
+  AgentCardProgressSnapshot,
   AgentTaskRequest,
   AgentTaskResult,
   CollaborationAgentManifest,
@@ -67,5 +68,28 @@ describe('agent collaboration contract', () => {
     assert.equal('toolActions' in result, false);
     assert.equal('delivery' in result, false);
     assert.equal('write' in result, false);
+  });
+
+  it('keeps the card progress snapshot free of prompt, evidence content, and actions', () => {
+    const snapshot: AgentCardProgressSnapshot = {
+      runId: 'run-1',
+      mode: 'shadow',
+      status: 'running',
+      injectedIntoPrimary: false,
+      agents: [{
+        taskId: 'coordinator',
+        agentId: 'coordinator',
+        displayName: 'Coordinator Agent',
+        kind: 'coordinator',
+        status: 'running',
+        startedAt: '2026-07-24T00:00:00.000Z',
+      }],
+    };
+
+    const encoded = JSON.stringify(snapshot);
+    assert.equal('promptSections' in snapshot, false);
+    assert.equal('evidenceRefs' in snapshot, false);
+    assert.equal('findings' in snapshot, false);
+    assert.doesNotMatch(encoded, /credential|absolutePath|toolActions/u);
   });
 });

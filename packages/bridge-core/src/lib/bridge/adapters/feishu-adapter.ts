@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { Agent } from 'undici';
+import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type {
   ChannelType,
   ChannelAddress,
@@ -2170,6 +2171,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.streamingCardLifecycle.updateTools(chatId, tools);
   }
 
+  private updateAgentProgress(chatId: string, progress: AgentCardProgressSnapshot): void {
+    this.streamingCardLifecycle.updateAgents(chatId, progress);
+  }
+
   /**
    * Finalize the streaming card: close streaming mode, update with final content + footer.
    */
@@ -2331,6 +2336,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
     if (!this.isStreamingCardEnabled()) return;
     this.updateToolProgress(chatId, tools);
+  }
+
+  onAgentProgress(chatId: string, progress: AgentCardProgressSnapshot): void {
+    if (!this.isStreamingCardEnabled()) return;
+    this.updateAgentProgress(chatId, progress);
   }
 
   async onStreamEnd(
@@ -3318,26 +3328,42 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const trimmedUserText = text.trim();
 
-    // Start platform evidence hydration immediately, but do not await it in
-    // the event callback. BridgeManager awaits the same promise only after it
-    // has armed the user-visible turn feedback timer.
-    const chatEvidencePreparation = (async () => {
+    const historyIntent = isGroup && trimmedUserText
+      ? this.parseHistoryIntentV2(trimmedUserText)
+      : null;
+    const explicitStickerSendRequest = messageType === 'text'
+      && trimmedUserText
+      && isExplicitFeishuStickerSendRequest(trimmedUserText);
+
+    // 群名称和增量历史属于增强证据，不应让每条普通轻聊在进入 Provider 前
+    // 串行等待平台网络。名称解析立即后台启动；只有显式历史/表情包请求才在
+    // prepareForAgent 中等待。普通回合的增量同步延后执行，避免与轻聊首包竞争。
+    const chatMetadataPreparation = (async () => {
       const resolvedDisplayName = await this.resolveChatDisplayName(chatId, msg.chat_type);
       address.displayName = resolvedDisplayName;
       this.persistChatIndex(chatId, msg.chat_type, resolvedDisplayName, sender, msg.create_time);
       if (msg.chat_type === 'p2p') {
         this.reconcileP2pAliasBinding(chatId, this.getPreferredPrivateUserId(sender), resolvedDisplayName);
       }
-      try {
-        await this.syncIndexedChatHistory(chatId, msg.chat_type, resolvedDisplayName, false);
-      } catch (err) {
-        console.warn('[feishu-adapter] incremental history sync failed:', err instanceof Error ? err.message : err);
-      }
       return resolvedDisplayName;
     })();
 
+    if (!historyIntent && !explicitStickerSendRequest) {
+      const backgroundSyncTimer = setTimeout(() => {
+        if (!this.running) return;
+        void chatMetadataPreparation.then(async (resolvedDisplayName) => {
+          if (!this.running) return;
+          try {
+            await this.syncIndexedChatHistory(chatId, msg.chat_type, resolvedDisplayName, false);
+          } catch (err) {
+            console.warn('[feishu-adapter] background incremental history sync failed:', err instanceof Error ? err.message : err);
+          }
+        });
+      }, 2_500);
+      backgroundSyncTimer.unref?.();
+    }
+
     const prepareForAgent = async (): Promise<void> => {
-      const resolvedDisplayName = await chatEvidencePreparation;
       if (replyTargetMessageId && trimmedUserText) {
         try {
           const feedback = await this.processStickerFeedbackInbound({
@@ -3357,9 +3383,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
       if (isGroup && trimmedUserText) {
-        const historyIntent = this.parseHistoryIntentV2(trimmedUserText);
         if (historyIntent) {
           try {
+            await chatMetadataPreparation;
             const historyPrompt = await this.buildHistoryAugmentedPromptV2(chatId, msg.message_id, historyIntent);
             if (historyIntent.responseMode === 'chat') {
               rawMetadata.feishuHistoryContext = {
@@ -3405,16 +3431,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
           }
           rawMetadata.feishuAvatarEvidence = avatarEvidence.context;
         }
-        await this.ensureStickerHistoryBackfilledForRequest(chatId, msg.chat_type, resolvedDisplayName, trimmedUserText);
-        const stickerLibraryEvidence = await this.buildStickerLibraryEvidenceForRequest(chatId, trimmedUserText);
-        if (stickerLibraryEvidence) {
-          const existingAttachmentIds = new Set(attachments.map((item) => item.id));
-          for (const attachment of stickerLibraryEvidence.attachments) {
-            if (existingAttachmentIds.has(attachment.id)) continue;
-            attachments.push(attachment);
-            existingAttachmentIds.add(attachment.id);
+        if (explicitStickerSendRequest) {
+          const resolvedDisplayName = await chatMetadataPreparation;
+          try {
+            await this.syncIndexedChatHistory(chatId, msg.chat_type, resolvedDisplayName, false);
+          } catch (err) {
+            console.warn('[feishu-adapter] sticker request incremental history sync failed:', err instanceof Error ? err.message : err);
           }
-          rawMetadata.feishuStickerLibraryContext = stickerLibraryEvidence.context;
+          await this.ensureStickerHistoryBackfilledForRequest(chatId, msg.chat_type, resolvedDisplayName, trimmedUserText);
+          const stickerLibraryEvidence = await this.buildStickerLibraryEvidenceForRequest(chatId, trimmedUserText);
+          if (stickerLibraryEvidence) {
+            const existingAttachmentIds = new Set(attachments.map((item) => item.id));
+            for (const attachment of stickerLibraryEvidence.attachments) {
+              if (existingAttachmentIds.has(attachment.id)) continue;
+              attachments.push(attachment);
+              existingAttachmentIds.add(attachment.id);
+            }
+            rawMetadata.feishuStickerLibraryContext = stickerLibraryEvidence.context;
+          }
         }
       }
     };
@@ -6086,8 +6120,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private isShortContextualAskText(userText: string): boolean {
     const normalized = userText.replace(/\s+/g, '').trim();
-    return normalized.length <= 80
-      || /(?:怎么看|咋看|怎么起|起名|这个|这个呢|那个|上面|刚刚|前面|上一条|前一条|回复|你觉得|帮.*想|咋回事|怎么回事|什么情况|啥情况|啥意思|什么意思)/u.test(userText);
+    if (!normalized || normalized.length > 80) return false;
+    return /(?:怎么看|咋看|怎么起|起名|这个|那个|上面|刚刚|刚才|前面|上一条|前一条|回复|你觉得|帮.*想|咋回事|怎么回事|什么情况|啥情况|啥意思|什么意思|为什么|为啥|继续|接着|然后呢|你说|刚说)/u.test(userText);
   }
 
   private isDeicticLightContextAsk(userText: string): boolean {

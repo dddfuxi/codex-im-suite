@@ -11,6 +11,7 @@ import {
   buildAgentWorkflowLayout,
   createEmptyAgentCollaborationState,
   findAgentRunByWorkflowRunId,
+  getAgentCollaborationQuickControl,
   orderAgentResponsibilities,
   orderWorkflowTimeline,
   redactAgentDisplayText,
@@ -60,6 +61,12 @@ function state(runs: AgentCollaborationRun[]): AgentCollaborationPanelState {
 }
 
 describe('agent collaboration view model', () => {
+  it('uses Shadow as the safe quick-enable mode and Off as the quick-disable target', () => {
+    assert.deepEqual(getAgentCollaborationQuickControl('off'), { label: '开启', targetMode: 'shadow' });
+    assert.deepEqual(getAgentCollaborationQuickControl('shadow'), { label: '关闭', targetMode: 'off' });
+    assert.deepEqual(getAgentCollaborationQuickControl('assist'), { label: '关闭', targetMode: 'off' });
+  });
+
   it('selects a workflow-linked run before the latest fallback', () => {
     const latest = run({ runId: 'latest', workflowRunId: 'workflow-latest', startedAt: '2026-07-24T01:00:00.000Z' });
     const linked = run({ runId: 'linked', workflowRunId: 'workflow-target' });

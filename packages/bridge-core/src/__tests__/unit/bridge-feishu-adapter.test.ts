@@ -290,7 +290,7 @@ describe('FeishuAdapter deferred agent preparation', () => {
     assert.equal((inbound.raw as any).feishuStickerFeedback.status, 'revision_created');
   });
 
-  it('enqueues accepted text before slow chat and history evidence is prepared', async () => {
+  it('enqueues an explicit history request before its required platform evidence is prepared', async () => {
     const adapter = new FeishuAdapter() as any;
     let resolveDisplayName!: (value: string) => void;
     const displayName = new Promise<string>((resolve) => {
@@ -299,17 +299,14 @@ describe('FeishuAdapter deferred agent preparation', () => {
     adapter.resolveChatDisplayName = async () => displayName;
     adapter.persistChatIndex = () => {};
     adapter.syncIndexedChatHistory = async () => {};
-    adapter.buildLightConversationContext = async () => ({
-      prompt: 'recent context',
-      messageCount: 1,
-    });
+    adapter.buildHistoryAugmentedPromptV2 = async () => 'indexed history context';
     adapter.ensureStickerHistoryBackfilledForRequest = async () => {};
     adapter.buildStickerLibraryEvidenceForRequest = async () => null;
     const queued: any[] = [];
     adapter.enqueue = (message: unknown) => queued.push(message);
 
     const processing = adapter.processIncomingEvent(
-      createFeishuTextEvent('om_deferred_prepare', '请结合最近群聊回答这个问题'),
+      createFeishuTextEvent('om_deferred_prepare', '总结最近群聊记录'),
     );
 
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -327,12 +324,46 @@ describe('FeishuAdapter deferred agent preparation', () => {
       resolveDisplayName('性能验收群');
       await preparation;
       assert.equal(queued[0].address.displayName, '性能验收群');
-      assert.equal(queued[0].raw.feishuConversationContext.prompt, 'recent context');
+      assert.equal(queued[0].raw.feishuHistoryContext.prompt, 'indexed history context');
       await processing;
     } finally {
       resolveDisplayName('性能验收群');
       await processing;
     }
+  });
+
+  it('does not block a context-free greeting on chat metadata or history hydration', async () => {
+    const adapter = new FeishuAdapter() as any;
+    let resolveDisplayName!: (value: string) => void;
+    const displayName = new Promise<string>((resolve) => {
+      resolveDisplayName = resolve;
+    });
+    let historySyncCalls = 0;
+    let recentMessageCalls = 0;
+    let memberNameCalls = 0;
+    adapter.resolveChatDisplayName = async () => displayName;
+    adapter.persistChatIndex = () => {};
+    adapter.syncIndexedChatHistory = async () => { historySyncCalls += 1; };
+    adapter.fetchRecentMessages = async () => { recentMessageCalls += 1; return []; };
+    adapter.fetchChatMemberNames = async () => { memberNameCalls += 1; return new Map(); };
+    const queued: any[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent('om_fast_greeting', '哈喽哈喽'));
+
+    assert.equal(queued.length, 1);
+    const completedBeforeMetadata = await Promise.race([
+      queued[0].prepareForAgent().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    assert.equal(completedBeforeMetadata, true);
+    assert.equal(recentMessageCalls, 0);
+    assert.equal(memberNameCalls, 0);
+    assert.equal(historySyncCalls, 0, 'incremental history should be delayed instead of blocking the greeting');
+
+    resolveDisplayName('性能验收群');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(queued[0].address.displayName, '性能验收群');
   });
 });
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  buildAgentCollaborationProgressMarkdown,
   buildToolProgressMarkdown,
   buildFinalCardJson,
   buildPostContent,
@@ -12,6 +13,138 @@ import {
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities.js';
 
 describe('Feishu streaming card markdown', () => {
+  it('hides Shadow and folds only Assist collaboration that actually joined the answer', () => {
+    const shadow = buildAgentCollaborationProgressMarkdown({
+      runId: 'run-shadow',
+      mode: 'shadow',
+      status: 'running',
+      injectedIntoPrimary: false,
+      agents: [{
+        taskId: 'context-1',
+        agentId: 'context',
+        displayName: 'Context <Agent>',
+        kind: 'specialist',
+        status: 'running',
+      }],
+    });
+    assert.equal(shadow, '');
+
+    const pendingAssist = buildAgentCollaborationProgressMarkdown({
+      runId: 'run-assist-pending',
+      mode: 'assist',
+      status: 'running',
+      injectedIntoPrimary: false,
+      agents: [{
+        taskId: 'context-2',
+        agentId: 'context',
+        displayName: 'Context Agent',
+        kind: 'specialist',
+        status: 'running',
+      }],
+    });
+    assert.equal(pendingAssist, '');
+
+    const assist = buildAgentCollaborationProgressMarkdown({
+      runId: 'run-assist',
+      mode: 'assist',
+      status: 'running',
+      injectedIntoPrimary: true,
+      agents: [{
+        taskId: 'memory-1',
+        agentId: 'memory',
+        displayName: 'Memory Agent',
+        kind: 'specialist',
+        status: 'succeeded',
+        durationMs: 1250,
+      }, {
+        taskId: 'primary-1',
+        agentId: 'primary',
+        displayName: 'Primary Agent',
+        kind: 'primary_agent',
+        status: 'succeeded',
+      }],
+    });
+    assert.match(assist, /已参与回答/u);
+    assert.match(assist, /Memory Agent/u);
+    assert.match(assist, /1\.3s/u);
+    assert.doesNotMatch(assist, /Primary Agent/u);
+    assert.doesNotMatch(assist, /prompt|evidence|C:\\/iu);
+  });
+
+  it('keeps Agent collaboration out of streaming text and folds meaningful Assist into final execution details', () => {
+    const shadowProgress = {
+      runId: 'run-shadow-card',
+      mode: 'shadow' as const,
+      status: 'running' as const,
+      injectedIntoPrimary: false,
+      agents: [{
+        taskId: 'coordinator-shadow',
+        agentId: 'coordinator',
+        displayName: 'Coordinator Agent',
+        kind: 'coordinator' as const,
+        status: 'running' as const,
+      }],
+    };
+    const shadowStreaming = buildStreamingContent('正在核对可用信息。', [], shadowProgress);
+    assert.doesNotMatch(shadowStreaming, /Agent 协作|Shadow|旁路观察/u);
+
+    const assistProgress = {
+      runId: 'run-assist-card',
+      mode: 'assist' as const,
+      status: 'succeeded' as const,
+      injectedIntoPrimary: true,
+      agents: [{
+        taskId: 'memory-assist',
+        agentId: 'memory',
+        displayName: 'Memory Agent',
+        kind: 'specialist' as const,
+        status: 'succeeded' as const,
+        durationMs: 900,
+      }],
+    };
+    const assistStreaming = buildStreamingContent('正在生成回答。', [], assistProgress);
+    assert.doesNotMatch(assistStreaming, /Agent 协作|Memory Agent/u);
+
+    const card = JSON.parse(buildFinalCardJson(
+      '回答结果。',
+      [],
+      { status: '已完成', elapsed: '1.2s' },
+      undefined,
+      [],
+      assistProgress,
+    )) as {
+      body?: { elements?: Array<{
+        tag?: string;
+        content?: string;
+        expanded?: boolean;
+        header?: { title?: { content?: string } };
+        elements?: Array<{ content?: string }>;
+      }> };
+    };
+    const elements = card.body?.elements || [];
+    const visible = elements.map((element) => element.content || '').join('\n');
+    const detailPanel = elements.find((element) => element.tag === 'collapsible_panel');
+    const detail = (detailPanel?.elements || []).map((element) => element.content || '').join('\n');
+
+    assert.doesNotMatch(visible, /Agent 协作|Memory Agent/u);
+    assert.equal(detailPanel?.expanded, false);
+    assert.equal(detailPanel?.header?.title?.content, '执行轨迹');
+    assert.match(detail, /Agent 协作 · 已参与回答/u);
+    assert.match(detail, /Memory Agent/u);
+
+    const shadowCard = JSON.parse(buildFinalCardJson(
+      '回答结果。',
+      [],
+      { status: '已完成', elapsed: '1.2s' },
+      undefined,
+      [],
+      shadowProgress,
+    )) as { body?: { elements?: Array<{ tag?: string; content?: string }> } };
+    const shadowElements = shadowCard.body?.elements || [];
+    assert.doesNotMatch(shadowElements.map((element) => element.content || '').join('\n'), /Agent 协作|Shadow/u);
+    assert.equal(shadowElements.some((element) => element.tag === 'collapsible_panel'), false);
+  });
+
   it('normalizes unsupported underline tags without touching fenced code', () => {
     const markdown = preprocessFeishuMarkdown([
       '<u>关键结论</u>，<ins>必须处理</ins>。',

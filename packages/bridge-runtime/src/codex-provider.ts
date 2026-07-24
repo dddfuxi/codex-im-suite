@@ -115,7 +115,7 @@ type CodexClientOptions = {
   env: Record<string, string>;
 };
 
-const CLASSIFIER_DISABLED_FEATURES = {
+export const CLASSIFIER_DISABLED_FEATURES = {
   shell_tool: false,
   unified_exec: false,
   apps: false,
@@ -499,6 +499,31 @@ export function buildCodexClientOptionsForTest(profile: CodexProviderProfile = '
   profile: CodexProviderProfile;
 } {
   return buildCodexClientOptions(profile);
+}
+
+/**
+ * 常驻 app-server 与一次性 Codex SDK 必须复用同一模型、认证和隔离 Home。
+ * 该出口只暴露启动受限会话所需的运行参数，避免第二套 Provider 配置漂移。
+ */
+export function buildRestrictedCodexRuntimeProfile(profile: CodexProviderProfile = 'official'): {
+  executionProfile: CodexExecutionProfile;
+  env: Record<string, string>;
+  apiKey?: string;
+  config: Record<string, unknown>;
+} {
+  const clientOptions = buildCodexClientOptions(profile);
+  return {
+    executionProfile: resolveExecutionProfile(profile, true),
+    env: clientOptions.env,
+    ...(clientOptions.apiKey ? { apiKey: clientOptions.apiKey } : {}),
+    config: {
+      ...clientOptions.config,
+      model_reasoning_effort: 'low',
+      project_doc_max_bytes: 0,
+      web_search: 'disabled',
+      features: CLASSIFIER_DISABLED_FEATURES,
+    },
+  };
 }
 
 function normalizeText(text: string): string {

@@ -1,11 +1,21 @@
 import {
   AGENT_COLLABORATION_PROTOCOL,
+  type AgentCollaborationMode,
   type AgentCollaborationPanelState,
   type AgentCollaborationRun,
   type AgentCollaborationWorkflowEdge,
   type AgentCollaborationWorkflowNode,
   type AgentResponsibilityView,
 } from '@codex-im-suite/contracts/agent-collaboration';
+
+export function getAgentCollaborationQuickControl(mode: AgentCollaborationMode): {
+  label: '开启' | '关闭';
+  targetMode: 'off' | 'shadow';
+} {
+  return mode === 'off'
+    ? { label: '开启', targetMode: 'shadow' }
+    : { label: '关闭', targetMode: 'off' };
+}
 
 const agentOrder = ['coordinator', 'context', 'memory', 'performance'] as const;
 const workflowColumnByKind: Record<AgentCollaborationWorkflowNode['kind'], number> = {

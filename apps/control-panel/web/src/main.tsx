@@ -81,6 +81,7 @@ import {
   agentModeLabel,
   createEmptyAgentCollaborationState,
   findAgentRunByWorkflowRunId,
+  getAgentCollaborationQuickControl,
   normalizeAgentCollaborationState,
 } from './agent-collaboration-view-model.js';
 import { McpPage } from './pages/McpPage.js';
@@ -698,6 +699,7 @@ type BlueprintAction = {
   targetPage?: PageId;
   targetUnitId?: string;
   description?: string;
+  payload?: Record<string, unknown>;
 };
 
 type SystemBlueprintNode = {
@@ -709,6 +711,7 @@ type SystemBlueprintNode = {
   targetPage?: PageId;
   targetUnitId?: string;
   primaryAction?: BlueprintAction;
+  quickAction?: BlueprintAction;
   secondaryActions?: BlueprintAction[];
   children?: Array<{
     id: string;
@@ -719,6 +722,7 @@ type SystemBlueprintNode = {
     targetPage?: PageId;
     targetUnitId?: string;
     primaryAction?: BlueprintAction;
+    quickAction?: BlueprintAction;
     secondaryActions?: BlueprintAction[];
   }>;
 };
@@ -732,6 +736,7 @@ type BlueprintNodeView = {
   targetPage?: PageId;
   targetUnitId?: string;
   primaryAction?: BlueprintAction;
+  quickAction?: BlueprintAction;
   secondaryActions?: BlueprintAction[];
   parentTitle?: string;
 };
@@ -1385,8 +1390,14 @@ function runtimeAction(id: string, label: string, unitId: string, actionId: stri
   return { id, label, kind: 'runtime', unitId, actionId, description };
 }
 
-function commandAction(id: string, label: string, command: string, description?: string): BlueprintAction {
-  return { id, label, kind: 'command', command, description };
+function commandAction(
+  id: string,
+  label: string,
+  command: string,
+  description?: string,
+  payload?: Record<string, unknown>,
+): BlueprintAction {
+  return { id, label, kind: 'command', command, description, payload };
 }
 
 function navigateAction(id: string, label: string, targetPage: PageId, targetUnitId?: string, description?: string): BlueprintAction {
@@ -1394,7 +1405,17 @@ function navigateAction(id: string, label: string, targetPage: PageId, targetUni
 }
 
 function blueprintActionKey(action: BlueprintAction) {
-  return `${action.kind}:${action.unitId ?? ''}:${action.actionId ?? ''}:${action.command ?? ''}:${action.targetPage ?? ''}:${action.targetUnitId ?? ''}`;
+  return `${action.kind}:${action.unitId ?? ''}:${action.actionId ?? ''}:${action.command ?? ''}:${action.targetPage ?? ''}:${action.targetUnitId ?? ''}:${JSON.stringify(action.payload ?? {})}`;
+}
+
+function confirmAgentCollaborationModeChange(currentMode: string, targetMode: string): boolean {
+  if (currentMode === targetMode) return false;
+  const detail = targetMode === 'off'
+    ? '将关闭 Worker 池和协作链，普通 Primary Agent 链路继续工作。'
+    : targetMode === 'shadow'
+      ? '将以 Shadow 模式启动 Worker：记录和展示协作，但不参与回答。'
+      : '将切换到 Assist：已验证的专业 Agent 结果会注入 Primary Agent。';
+  return window.confirm(`${detail}\n\n该操作会写入 config.env 并重启 Bridge，是否继续？`);
 }
 
 function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): SystemBlueprintNode[] {
@@ -1430,6 +1451,7 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
       ? 'normal'
       : 'disabled';
   const collaboration = normalizeAgentCollaborationState(state.agentCollaboration);
+  const collaborationQuickControl = getAgentCollaborationQuickControl(collaboration.mode);
   const collaborationStatus: UserFacingStatus = collaboration.mode === 'off'
     ? 'disabled'
     : collaboration.poolHealth === 'healthy'
@@ -1573,7 +1595,21 @@ function buildSystemBlueprint(state: PanelState, runtimeUnits: RuntimeUnit[]): S
           targetPage: 'architecture',
           targetUnitId: 'agent-collaboration',
           primaryAction: navigateAction('agent-collaboration-open', '查看 Agent 链路', 'architecture', 'agent-collaboration', '打开职责拓扑、实时工作流和性能观察。'),
+          quickAction: commandAction(
+            `agent-collaboration-${collaborationQuickControl.targetMode}`,
+            collaborationQuickControl.label,
+            'agentCollaboration.setMode',
+            collaborationQuickControl.targetMode === 'shadow'
+              ? '以安全的 Shadow 模式开启协作并重启 Bridge。'
+              : '关闭协作 Worker 并重启 Bridge。',
+            { mode: collaborationQuickControl.targetMode },
+          ),
           secondaryActions: [
+            ...(collaboration.mode === 'assist'
+              ? [commandAction('agent-collaboration-shadow', '切换 Shadow', 'agentCollaboration.setMode', '保留旁路观察，但不再把结果注入回答。', { mode: 'shadow' })]
+              : collaboration.mode === 'shadow'
+                ? [commandAction('agent-collaboration-assist', '切换 Assist', 'agentCollaboration.setMode', '把已验证的专业 Agent 结果注入 Primary Agent。', { mode: 'assist' })]
+                : []),
             commandAction('agent-collaboration-refresh', '刷新状态', 'state.refresh', '刷新 Worker、协作回合和性能统计。'),
           ],
         },
@@ -2577,6 +2613,14 @@ function App() {
     setPage('architecture');
   };
 
+  const setAgentCollaborationMode = async (mode: 'off' | 'shadow' | 'assist') => {
+    const currentMode = normalizeAgentCollaborationState(state.agentCollaboration).mode;
+    if (!confirmAgentCollaborationModeChange(currentMode, mode)) return;
+    await run('agentCollaboration.setMode', { mode });
+    await refreshPanelState();
+    await loadRuntimeUnits();
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -2699,6 +2743,8 @@ function App() {
             collaboration={state.agentCollaboration}
             selectedRunId={selectedAgentRunId}
             selectedWorkflowRunId={selectedAgentWorkflowRunId}
+            modeChangePending={pending['agentCollaboration.setMode']}
+            onSetMode={(mode) => void setAgentCollaborationMode(mode)}
             onSelectRun={(runId, workflowRunId) => {
               setSelectedAgentRunId(runId);
               setSelectedAgentWorkflowRunId(workflowRunId ?? '');
@@ -2841,7 +2887,12 @@ function OverviewPage({
       return;
     }
     if (action.kind === 'command' && action.command) {
-      await run(action.command);
+      if (action.command === 'agentCollaboration.setMode') {
+        const currentMode = normalizeAgentCollaborationState(state.agentCollaboration).mode;
+        const targetMode = String(action.payload?.mode || '');
+        if (!confirmAgentCollaborationModeChange(currentMode, targetMode)) return;
+      }
+      await run(action.command, action.payload);
       refresh();
       return;
     }
@@ -2882,6 +2933,8 @@ function OverviewPage({
               nodes={systemBlueprint}
               selectedNodeId={selectedBlueprintNode?.id ?? ''}
               onSelect={setSelectedBlueprintNodeId}
+              onRunAction={(action) => void runBlueprintAction(action)}
+              pending={pending}
             />
           </div>
           {selectedBlueprintNode && (
@@ -2972,10 +3025,14 @@ function InteractiveSystemBlueprint({
   nodes,
   selectedNodeId,
   onSelect,
+  onRunAction,
+  pending,
 }: {
   nodes: SystemBlueprintNode[];
   selectedNodeId: string;
   onSelect: (nodeId: string) => void;
+  onRunAction: (action: BlueprintAction) => void;
+  pending: Record<string, boolean>;
 }) {
   return (
     <div className="system-blueprint" aria-label="系统蓝图">
@@ -2994,19 +3051,36 @@ function InteractiveSystemBlueprint({
             {node.children && node.children.length > 0 && (
               <div className="blueprint-children">
                 {node.children.map((child) => (
-                  <button
+                  <div
                     key={child.id}
                     className={`blueprint-child ${child.status} ${selectedNodeId === child.id ? 'active' : ''}`}
-                    onClick={() => onSelect(child.id)}
-                    aria-pressed={selectedNodeId === child.id}
                   >
-                    <span><BlueprintIcon id={child.id} /></span>
-                    <div>
-                      <strong>{child.title}</strong>
-                      <p>{child.detail}</p>
-                    </div>
-                    <StatusPill status={userStatusKind(child.status)} label={userStatusLabel(child.status)} />
-                  </button>
+                    <button
+                      type="button"
+                      className="blueprint-child-select"
+                      onClick={() => onSelect(child.id)}
+                      aria-pressed={selectedNodeId === child.id}
+                      aria-label={`${child.title}，${userStatusLabel(child.status)}`}
+                    >
+                      <span><BlueprintIcon id={child.id} /></span>
+                      <div>
+                        <strong>{child.title}</strong>
+                        <p>{child.detail}</p>
+                      </div>
+                      {!child.quickAction && <StatusPill status={userStatusKind(child.status)} label={userStatusLabel(child.status)} />}
+                    </button>
+                    {child.quickAction && (
+                      <button
+                        type="button"
+                        className={`blueprint-child-quick ${child.quickAction.label === '关闭' ? 'enabled' : ''}`}
+                        onClick={() => onRunAction(child.quickAction!)}
+                        disabled={Boolean(pending[child.quickAction.command || child.quickAction.id])}
+                        title={child.quickAction.description || child.quickAction.label}
+                      >
+                        {pending[child.quickAction.command || child.quickAction.id] ? '处理中' : child.quickAction.label}
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             )}

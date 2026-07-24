@@ -1,3 +1,4 @@
+import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type {
   OutboundMention,
   RunSummary,
@@ -33,7 +34,12 @@ export interface FeishuStreamingCardLifecycleOptions {
   typewriterIntervalMs?: number;
   typewriterStepChars?: number;
   getCurrentStep?: (text: string, tools: ToolCallInfo[]) => string;
-  renderStreamingContent?: (text: string, tools: ToolCallInfo[], visibleChars: number) => string;
+  renderStreamingContent?: (
+    text: string,
+    tools: ToolCallInfo[],
+    visibleChars: number,
+    agentProgress?: AgentCardProgressSnapshot,
+  ) => string;
   extractFinalResponse?: (text: string) => string;
   renderFinalCard?: (
     responseText: string,
@@ -41,6 +47,7 @@ export interface FeishuStreamingCardLifecycleOptions {
     footer: { status: string; elapsed: string },
     summary?: RunSummary,
     mentions?: OutboundMention[],
+    agentProgress?: AgentCardProgressSnapshot,
   ) => string;
   formatElapsed?: (elapsedMs: number) => string;
   onStreamingUpdate?: (state: FeishuStreamingCardState, sequence: number) => void;
@@ -178,6 +185,12 @@ export class FeishuStreamingCardLifecycle {
     this.updateText(chatId, state.pendingText ?? '');
   }
 
+  updateAgents(chatId: string, progress: AgentCardProgressSnapshot): void {
+    const state = this.registry.setAgentProgress(chatId, progress);
+    if (!state) return;
+    this.updateText(chatId, state.pendingText ?? '');
+  }
+
   async finalize(input: FinalizeFeishuStreamingCardInput): Promise<boolean> {
     const pending = this.registry.getCreation(input.chatId);
     if (pending) {
@@ -208,6 +221,7 @@ export class FeishuStreamingCardLifecycle {
         },
         input.summary,
         input.mentions ?? [],
+        state.agentProgress,
       );
 
       state.sequence += 1;
@@ -230,7 +244,10 @@ export class FeishuStreamingCardLifecycle {
     const sourceText = state.pendingText ?? '';
     const currentStep = this.getCurrentStep(sourceText, state.toolCalls);
     const toolKey = state.toolCalls.map((tool) => `${tool.id}:${tool.name}:${tool.status}`).join('|');
-    const typewriterKey = `${currentStep}\u0000${toolKey}`;
+    const agentKey = state.agentProgress
+      ? `${state.agentProgress.runId}:${state.agentProgress.status}:${state.agentProgress.injectedIntoPrimary}:${state.agentProgress.agents.map((agent) => `${agent.taskId}:${agent.status}:${agent.durationMs ?? ''}`).join('|')}`
+      : '';
+    const typewriterKey = `${currentStep}\u0000${toolKey}\u0000${agentKey}`;
     if (state.typewriterKey === typewriterKey && state.typewriterTimer) return;
 
     if (state.typewriterTimer) {
@@ -243,7 +260,7 @@ export class FeishuStreamingCardLifecycle {
     const runTypewriter = (visibleChars: number) => {
       const latest = this.registry.get(chatId);
       if (!latest || latest.typewriterKey !== typewriterKey) return;
-      const content = this.renderStreamingContent(sourceText, latest.toolCalls, visibleChars);
+      const content = this.renderStreamingContent(sourceText, latest.toolCalls, visibleChars, latest.agentProgress);
       this.push(chatId, latest, content);
       if (visibleChars < totalChars) {
         latest.typewriterTimer = this.setTimer(

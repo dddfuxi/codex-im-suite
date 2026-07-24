@@ -41,6 +41,8 @@ type ArchitecturePageProps = {
   collaboration?: AgentCollaborationPanelState;
   selectedRunId?: string;
   selectedWorkflowRunId?: string;
+  modeChangePending?: boolean;
+  onSetMode?: (mode: 'off' | 'shadow' | 'assist') => void;
   onSelectRun?: (runId: string, workflowRunId?: string) => void;
 };
 
@@ -144,6 +146,8 @@ export function ArchitecturePage({
   collaboration,
   selectedRunId,
   selectedWorkflowRunId,
+  modeChangePending,
+  onSetMode,
   onSelectRun,
 }: ArchitecturePageProps) {
   const state = normalizeAgentCollaborationState(collaboration);
@@ -187,7 +191,20 @@ export function ArchitecturePage({
             <h2>Agent 职责拓扑</h2>
             <p>Manifest 声明与 Runtime 运行事实分开显示；Bridge、Primary Agent 和 Delivery 保持唯一收发与执行边界。</p>
           </div>
-          <span className={`agent-mode-badge mode-${state.mode}`}>{agentModeLabel(state.mode)}</span>
+          <div className="agent-mode-actions" aria-label="Agent 协作模式控制">
+            {(['off', 'shadow', 'assist'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                className={`agent-mode-button mode-${mode}${state.mode === mode ? ' active' : ''}`}
+                onClick={() => onSetMode?.(mode)}
+                disabled={modeChangePending || state.mode === mode || !onSetMode}
+                aria-pressed={state.mode === mode}
+              >
+                {mode === 'off' ? '关闭' : mode === 'shadow' ? 'Shadow' : 'Assist'}
+              </button>
+            ))}
+          </div>
         </div>
         <p className="agent-mode-description">{agentModeDescription(state.mode)}</p>
 

@@ -1,3 +1,4 @@
+import type { AgentCardProgressItem, AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type { OutboundMention, RunSummary, ToolCallInfo } from '../types.js';
 
 /**
@@ -422,13 +423,68 @@ function buildLiveToolTrace(tools: ToolCallInfo[]): string {
   ].join('\n');
 }
 
-export function buildStreamingStepContent(step: string, tools: ToolCallInfo[] = []): string {
-  const currentStep = step.trim() || '正在根据这条消息判断下一步。';
-  const title = inferStreamingStepTitle(currentStep, tools);
-  return buildStreamingStepContentWithTitle(title, currentStep, tools);
+function agentProgressStatusText(agent: AgentCardProgressItem): string {
+  if (agent.kind === 'coordinator') {
+    if (agent.status === 'running') return '正在规划协作';
+    if (agent.status === 'succeeded') return '协作规划完成';
+  }
+  if (agent.kind === 'primary_agent') {
+    if (agent.status === 'running') return '正在生成最终回答';
+    if (agent.status === 'succeeded') return '最终回答已完成';
+  }
+  return ({
+    pending: '等待中',
+    running: '工作中',
+    succeeded: '已完成',
+    failed: '执行失败',
+    cancelled: '已取消',
+    skipped: '已跳过',
+    fallback: '已回退',
+  } as const)[agent.status];
 }
 
-function buildStreamingStepContentWithTitle(title: string, step: string, tools: ToolCallInfo[]): string {
+function agentProgressMarker(status: AgentCardProgressItem['status']): string {
+  if (status === 'succeeded') return '<font color="green">✓</font>';
+  if (status === 'running') return '<font color="purple">●</font>';
+  if (status === 'failed' || status === 'fallback') return '<font color="red">△</font>';
+  if (status === 'cancelled') return '<font color="red">×</font>';
+  if (status === 'skipped') return '<font color="grey">—</font>';
+  return '<font color="grey">○</font>';
+}
+
+export function buildAgentCollaborationProgressMarkdown(progress?: AgentCardProgressSnapshot): string {
+  // Shadow 与未注入的 Assist 都不影响本轮回答，只保留在控制面板运行快照中。
+  // 飞书只折叠展示真正参与回答的协作节点，且不重复展示正常 Primary Agent。
+  if (!progress || progress.mode !== 'assist' || !progress.injectedIntoPrimary) return '';
+  const visibleAgents = progress.agents.filter((agent) => agent.kind !== 'primary_agent').slice(0, 4);
+  if (visibleAgents.length === 0) return '';
+  const lines = visibleAgents.map((agent) => {
+    const durationText = typeof agent.durationMs === 'number' ? ` · ${formatElapsed(agent.durationMs)}` : '';
+    const errorText = agent.errorCode ? ` · ${escapeFeishuInlineMarkdown(agent.errorCode)}` : '';
+    return `${agentProgressMarker(agent.status)} **${escapeFeishuInlineMarkdown(agent.displayName)}**：${agentProgressStatusText(agent)}${durationText}${errorText}`;
+  });
+  return [
+    '<font color="grey">**Agent 协作 · 已参与回答**</font>',
+    ...lines,
+  ].join('\n');
+}
+
+export function buildStreamingStepContent(
+  step: string,
+  tools: ToolCallInfo[] = [],
+  agentProgress?: AgentCardProgressSnapshot,
+): string {
+  const currentStep = step.trim() || '正在根据这条消息判断下一步。';
+  const title = inferStreamingStepTitle(currentStep, tools);
+  return buildStreamingStepContentWithTitle(title, currentStep, tools, agentProgress);
+}
+
+function buildStreamingStepContentWithTitle(
+  title: string,
+  step: string,
+  tools: ToolCallInfo[],
+  _agentProgress?: AgentCardProgressSnapshot,
+): string {
   const blocks = [
     `<font color="purple">**${title}**</font>`,
     `<font color="grey">${escapeFeishuInlineMarkdown(step)}</font>`,
@@ -447,18 +503,27 @@ export function getStreamingCurrentStep(text: string, tools: ToolCallInfo[]): st
     || (activeTool ? `正在根据 ${formatVisibleToolName(activeTool.name)} 的状态推进。` : '正在根据这条消息判断下一步。');
 }
 
-export function buildStreamingTypewriterContent(text: string, tools: ToolCallInfo[], visibleChars: number): string {
+export function buildStreamingTypewriterContent(
+  text: string,
+  tools: ToolCallInfo[],
+  visibleChars: number,
+  agentProgress?: AgentCardProgressSnapshot,
+): string {
   const currentStep = getStreamingCurrentStep(text, tools);
   const visibleStep = [...currentStep].slice(0, Math.max(0, visibleChars)).join('');
-  return buildStreamingStepContentWithTitle(inferStreamingStepTitle(currentStep, tools), visibleStep, tools);
+  return buildStreamingStepContentWithTitle(inferStreamingStepTitle(currentStep, tools), visibleStep, tools, agentProgress);
 }
 
 /**
  * Build the body elements array for a streaming card update.
  * Shows one current user-visible planning step, refreshed as new progress arrives.
  */
-export function buildStreamingContent(text: string, tools: ToolCallInfo[]): string {
-  return buildStreamingStepContent(getStreamingCurrentStep(text, tools), tools);
+export function buildStreamingContent(
+  text: string,
+  tools: ToolCallInfo[],
+  agentProgress?: AgentCardProgressSnapshot,
+): string {
+  return buildStreamingStepContent(getStreamingCurrentStep(text, tools), tools, agentProgress);
 }
 
 /**
@@ -490,6 +555,7 @@ export function buildFinalCardJson(
   footer: { status: string; elapsed: string } | null,
   summary?: RunSummary,
   mentions: OutboundMention[] = [],
+  agentProgress?: AgentCardProgressSnapshot,
 ): string {
   const elements: Array<Record<string, unknown>> = [];
 
@@ -517,6 +583,10 @@ export function buildFinalCardJson(
   });
 
   const executionDetailBlocks: string[] = [];
+  const agentProgressMarkdown = buildAgentCollaborationProgressMarkdown(agentProgress);
+  if (agentProgressMarkdown) {
+    executionDetailBlocks.push(agentProgressMarkdown);
+  }
   if (splitContent.detail) {
     executionDetailBlocks.push(renderFeishuMarkdownMentions(splitContent.detail, mentions));
   }

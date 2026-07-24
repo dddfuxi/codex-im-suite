@@ -25,7 +25,7 @@ export const BRIDGE_CHARACTERIZATION_CATALOG: readonly BridgeCharacterizationEnt
   {
     domain: 'inbound',
     testFile: 'bridge-feishu-adapter.test.ts',
-    testTitle: 'enqueues accepted text before slow chat and history evidence is prepared',
+    testTitle: 'does not block a context-free greeting on chat metadata or history hydration',
   },
   {
     domain: 'permission',

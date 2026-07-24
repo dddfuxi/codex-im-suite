@@ -1,4 +1,5 @@
 import * as esbuild from 'esbuild';
+import { spawnSync } from 'node:child_process';
 
 const sharedExternals = [
   // SDKs must stay external because they resolve their own CLI/runtime files.
@@ -110,5 +111,24 @@ await esbuild.build({
   external: sharedExternals,
   banner: sharedBanner,
 });
+
+// esbuild 能生成包含重复顶层标识符的 ESM 文本，但不会执行 Node 的最终语法解析。
+// 对所有运行入口补一次 `node --check`，避免 bundle 构建成功、live 重启后才暴露语法错误。
+for (const bundle of [
+  'dist/daemon.mjs',
+  'dist/agent-worker.mjs',
+  'dist/memory-optimizer-cli.mjs',
+  'dist/skill-lifecycle-cli.mjs',
+  'dist/memory-layout-migration-cli.mjs',
+  'dist/scheduled-task-cli.mjs',
+  'dist/memory-item-cli.mjs',
+  'dist/sticker-semantic-cli.mjs',
+  'dist/cleanup-cli.mjs',
+]) {
+  const checked = spawnSync(process.execPath, ['--check', bundle], { stdio: 'inherit' });
+  if (checked.status !== 0) {
+    throw new Error(`Bundle syntax check failed: ${bundle}`);
+  }
+}
 
 console.log('Built daemon, agent worker, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');

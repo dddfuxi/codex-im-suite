@@ -11,6 +11,7 @@ import type {
   ArtifactPromotionRequest,
   ArtifactPromotionResult,
   ArtifactSource,
+  AgentCardProgressSnapshot,
   AgentCollaborationMode,
   AgentPromptSection,
   TurnArtifactRecord,
@@ -437,6 +438,7 @@ export interface AgentCollaborationTurnInput {
   hasAttachments: boolean;
   memoryIntentCandidate: boolean;
   abortSignal?: AbortSignal;
+  onProgress?: (snapshot: AgentCardProgressSnapshot) => void;
 }
 
 export interface AgentCollaborationTurnResult {
@@ -463,6 +465,7 @@ export interface AgentCollaborationCompletionInput {
 export interface AgentCollaborationHost {
   prepareTurn(input: AgentCollaborationTurnInput): Promise<AgentCollaborationTurnResult>;
   markPrimaryStarted(runId: string): void;
+  markPrimaryCompleted(input: AgentCollaborationCompletionInput): void;
   completeTurn(input: AgentCollaborationCompletionInput): void;
   linkWorkflowRun?(runId: string, workflowRunId: string): void;
 }

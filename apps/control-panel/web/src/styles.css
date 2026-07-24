@@ -385,6 +385,44 @@ textarea::placeholder {
   color: var(--text-soft);
 }
 
+.agent-mode-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.agent-mode-button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: var(--text-soft);
+  background: transparent;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.agent-mode-button:hover:not(:disabled),
+.agent-mode-button.active {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.agent-mode-button.mode-assist.active {
+  color: var(--success-text);
+  background: var(--success-bg);
+}
+
+.agent-mode-button:disabled:not(.active) {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .agent-summary-grid,
 .agent-performance-metrics {
   display: grid;
@@ -1741,7 +1779,7 @@ button:disabled {
 
 .blueprint-child {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
   padding: 8px;
@@ -1750,12 +1788,48 @@ button:disabled {
   color: inherit;
   background: color-mix(in srgb, var(--panel-strong) 78%, transparent);
   text-align: left;
+}
+
+.blueprint-child-select {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
   cursor: pointer;
 }
 
-.blueprint-child > span {
+.blueprint-child-select > span {
   display: inline-flex;
   color: var(--accent-strong);
+}
+
+.blueprint-child-quick {
+  min-width: 66px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.blueprint-child-quick.enabled {
+  color: var(--warning-text);
+  border-color: color-mix(in srgb, var(--warning-text) 34%, var(--border));
+  background: var(--warning-bg);
+}
+
+.blueprint-child-quick:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 .blueprint-action-panel {
@@ -4141,6 +4215,26 @@ button:disabled {
   .message-card header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .agent-section-heading {
+    flex-direction: column;
+  }
+
+  .agent-mode-actions {
+    width: 100%;
+  }
+
+  .agent-mode-button {
+    flex: 1 1 90px;
+  }
+
+  .blueprint-child {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .blueprint-child-quick {
+    width: 100%;
   }
 
   .kv {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import type { AgentTaskRequest, AgentTaskResult } from '@codex-im-suite/contracts';
+import type { AgentCardProgressSnapshot, AgentTaskRequest, AgentTaskResult } from '@codex-im-suite/contracts';
 import type { AgentCollaborationTurnInput } from 'claude-to-im/host';
 
 import { RuntimeAgentCollaborationHost } from '../agent-workers/collaboration-host.js';
@@ -98,6 +98,7 @@ function makeHarness(mode: 'shadow' | 'assist', handler: (request: AgentTaskRequ
 
 describe('runtime agent collaboration host', () => {
   it('runs two specialists in parallel and injects only in assist mode', async () => {
+    const progress: AgentCardProgressSnapshot[] = [];
     const harness = makeHarness('assist', (request) => {
       if (request.agentId === 'coordinator') return result(request, {
         shouldCollaborate: true,
@@ -114,16 +115,25 @@ describe('runtime agent collaboration host', () => {
       });
     });
     try {
-      const prepared = await harness.host.prepareTurn(turnInput());
+      const prepared = await harness.host.prepareTurn({
+        ...turnInput(),
+        onProgress: (snapshot) => progress.push(snapshot),
+      });
       assert.equal(prepared.status, 'assisted');
       assert.equal(prepared.promptSections.length, 2);
       assert.ok(prepared.runId);
       harness.host.markPrimaryStarted(prepared.runId!);
+      harness.host.markPrimaryCompleted({ runId: prepared.runId!, status: 'succeeded', answerSummary: '完成' });
       harness.host.completeTurn({ runId: prepared.runId!, status: 'succeeded', answerSummary: '完成' });
       const run = harness.state.snapshot().recentRuns.at(-1)!;
       assert.equal(run.nodes.filter((node) => node.kind === 'specialist').length, 2);
       assert.equal(run.status, 'succeeded');
       assert.equal(run.injectedIntoPrimary, true);
+      assert.equal(progress[0]?.agents[0]?.status, 'running');
+      assert.ok(progress.some((snapshot) => snapshot.agents.some((agent) => agent.agentId === 'context' && agent.status === 'succeeded')));
+      assert.ok(progress.some((snapshot) => snapshot.agents.some((agent) => agent.kind === 'primary_agent' && agent.status === 'succeeded')));
+      const cardJson = JSON.stringify(progress);
+      assert.doesNotMatch(cardJson, /辅助内容|当前消息|历史证据|promptSections|evidenceRefs/u);
     } finally {
       fs.rmSync(harness.tempDir, { recursive: true, force: true });
     }
