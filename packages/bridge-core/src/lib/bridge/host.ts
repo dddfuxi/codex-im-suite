@@ -18,7 +18,10 @@ import type {
 } from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
-import type { FeishuCliUserAuthorizationChallenge } from './feishu-cli-user-auth.js';
+import type {
+  FeishuCliUserAuthorizationChallenge,
+  FeishuCliUserAuthorizationPolicyViolation,
+} from './feishu-cli-user-auth.js';
 import type { TurnWorkspacePlan } from './workspace-plan.js';
 import type {
   StickerDeliveryEvidence,
@@ -78,6 +81,21 @@ export interface TurnStorageHost {
     toolName: string;
     content: unknown;
     isError: boolean;
+  }): TurnArtifactRecord[];
+  /**
+   * Runtime-owned verification for final output files declared by the provider.
+   * A declaration is accepted only when it is tied to a successful tool result,
+   * was created during the current attempt, and remains inside an allowed root.
+   */
+  verifyDeclaredOutputArtifacts?(input: TurnStorageScope & {
+    declaredFiles: Array<{ filePath: string; mediaType?: string }>;
+    successfulToolResults: Array<{
+      toolUseId: string;
+      toolName: string;
+      content: unknown;
+    }>;
+    allowedRoots: string[];
+    createdAfter: string;
   }): TurnArtifactRecord[];
   promoteArtifact?(input: ArtifactPromotionRequest): ArtifactPromotionResult;
 }
@@ -258,6 +276,7 @@ export interface AnswerReviewInput {
     acceptedInputEvidenceIds?: string[];
     inputEvidenceProvider?: string;
     feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
+    feishuCliUserAuthorizationViolations?: FeishuCliUserAuthorizationPolicyViolation[];
   };
 }
 

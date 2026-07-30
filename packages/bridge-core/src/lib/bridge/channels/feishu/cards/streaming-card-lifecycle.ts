@@ -18,6 +18,12 @@ import {
 
 export type FeishuStreamingCardStatus = 'completed' | 'interrupted' | 'error';
 
+export interface FeishuStreamingCardResolvedResponse {
+  text: string;
+  /** 成功的原生媒体动作可替代最终卡片；只允许 completed 回合使用。 */
+  suppressCard?: boolean;
+}
+
 type TimerHandle = ReturnType<typeof setTimeout>;
 
 export interface FeishuStreamingCardLifecycleOptions {
@@ -60,7 +66,9 @@ export interface FeishuStreamingCardFinalizationHooks {
     state: FeishuStreamingCardState,
     visibleText: string,
     originalText: string,
-  ) => Promise<string>;
+  ) => Promise<string | FeishuStreamingCardResolvedResponse>;
+  /** 删除机器人自己的临时进度卡；失败时生命周期会回退为正常最终卡片。 */
+  discardFinalCard?: (state: FeishuStreamingCardState) => Promise<boolean>;
   updateFinalCard: (
     state: FeishuStreamingCardState,
     cardJson: string,
@@ -210,10 +218,22 @@ export class FeishuStreamingCardLifecycle {
       await input.hooks.closeStreaming(state, state.sequence);
 
       const visibleText = this.extractFinalResponse(input.responseText);
-      const finalText = await input.hooks.resolveFinalResponse(state, visibleText, input.responseText);
+      const resolved = await input.hooks.resolveFinalResponse(state, visibleText, input.responseText);
+      const finalText = typeof resolved === 'string' ? resolved : resolved.text;
       const elapsedMs = this.now() - state.startTime;
+      if (
+        input.status === 'completed'
+        && typeof resolved !== 'string'
+        && resolved.suppressCard === true
+        && input.hooks.discardFinalCard
+        && await input.hooks.discardFinalCard(state)
+      ) {
+        input.hooks.persistContinuation?.(state, input.status, finalText);
+        input.hooks.onFinalized?.(state, input.status, finalText, elapsedMs);
+        return true;
+      }
       const finalCardJson = this.renderFinalCard(
-        finalText,
+        finalText || '已回应。',
         state.toolCalls,
         {
           status: STATUS_LABELS[input.status],

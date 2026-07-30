@@ -1,11 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractFeishuCliUserAuthorizationChallenge } from '../../lib/bridge/feishu-cli-user-auth';
+import {
+  extractFeishuBotMissingAppScopes,
+  extractFeishuCliUserAuthorizationChallenge,
+  extractFeishuCliUserAuthorizationPolicyViolation,
+} from '../../lib/bridge/feishu-cli-user-auth';
 
 const validToolInput = {
   command: [
     '$env:LARKSUITE_CLI_NO_UPDATE_NOTIFIER="1";',
-    'lark-cli auth login --scope "task:task:read calendar:calendar:readonly" --no-wait --json',
+    'lark-cli auth login --scope "task:task:read" --no-wait --json',
   ].join(' '),
 };
 
@@ -30,7 +34,7 @@ describe('Feishu CLI user authorization challenge evidence', () => {
       toolUseId: 'tool-auth-1',
       verificationUrl: 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=ABCD-EFGH',
       deviceCode: 'device-secret-value',
-      requestedScopes: ['calendar:calendar:readonly', 'task:task:read'],
+      requestedScopes: ['task:task:read'],
       expiresInSeconds: 600,
     });
   });
@@ -91,5 +95,52 @@ describe('Feishu CLI user authorization challenge evidence', () => {
       toolResultContent: JSON.stringify({ verification_url: 'https://accounts.feishu.cn/oauth/v1/device/verify' }),
       toolResultIsError: false,
     }), null);
+  });
+
+  it('rejects recommend, domain bundles, and multiple scopes before any authorization card is accepted', () => {
+    const broadCommands = [
+      'lark-cli auth login --recommend --no-wait --json',
+      'lark-cli auth login --domain contact --no-wait --json',
+      'lark-cli auth login --scope "task:task:read calendar:calendar:readonly" --no-wait --json',
+    ];
+    const expectedCodes = ['broad_recommend', 'domain_bundle', 'multiple_scopes'];
+    broadCommands.forEach((command, index) => {
+      const input = {
+        toolUseId: `tool-broad-${index}`,
+        toolName: 'Bash',
+        toolInput: { command },
+        toolResultContent: validToolResult,
+        toolResultIsError: false,
+      };
+      assert.equal(extractFeishuCliUserAuthorizationPolicyViolation(input)?.code, expectedCodes[index]);
+      assert.equal(extractFeishuCliUserAuthorizationChallenge(input), null);
+    });
+  });
+
+  it('keeps bot app-scope approval separate from user OAuth', () => {
+    const botError = JSON.stringify({
+      ok: false,
+      identity: 'bot',
+      error: {
+        subtype: 'app_scope_not_applied',
+        code: 99991672,
+        identity: 'bot',
+        missing_scopes: ['contact:contact.base:readonly', 'contact:contact:readonly'],
+      },
+    });
+    const botScopes = extractFeishuBotMissingAppScopes(botError);
+    assert.deepEqual(botScopes, ['contact:contact.base:readonly', 'contact:contact:readonly']);
+    const input = {
+      toolUseId: 'tool-bot-scope',
+      toolName: 'Bash',
+      toolInput: { command: 'lark-cli auth login --scope "contact:contact.base:readonly" --no-wait --json' },
+      toolResultContent: validToolResult,
+      toolResultIsError: false,
+    };
+    assert.equal(
+      extractFeishuCliUserAuthorizationPolicyViolation(input, botScopes)?.code,
+      'bot_scope_requires_admin',
+    );
+    assert.equal(extractFeishuCliUserAuthorizationChallenge(input, botScopes), null);
   });
 });

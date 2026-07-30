@@ -305,6 +305,44 @@ describe('workflow status store', () => {
     assert.equal(recovered?.retry?.status, 'unavailable');
   });
 
+  it('does not auto-replay runs that already entered execution or a retry attempt', () => {
+    const executing = startWorkflowRun({
+      sessionId: 'session-executing-interrupted',
+      prompt: '截一张当前 Unity 的图',
+      channelType: 'feishu',
+      chatId: 'chat-executing-interrupted',
+    });
+    recordWorkflowRecoveryInfo(executing.id, {
+      prompt: '截一张当前 Unity 的图',
+      workingDirectory: 'C:\\unity\\ST3',
+      maxAutoAttempts: 2,
+    });
+    appendWorkflowEvent(executing.id, 'executing', 'executor.executing', '执行器开始处理');
+
+    const retrying = startWorkflowRun({
+      sessionId: 'session-retrying-interrupted',
+      prompt: '继续上一轮',
+    });
+    recordWorkflowRecoveryInfo(retrying.id, {
+      prompt: '继续上一轮',
+      workingDirectory: 'C:\\workspace',
+      maxAutoAttempts: 2,
+    });
+    requestWorkflowRetry(retrying.id, 'manual');
+    claimNextWorkflowRetry('worker-before-restart');
+
+    const marked = markInterruptedWorkflowRuns('runtime-after-restart');
+    const executingAfter = marked.find((item) => item.id === executing.id);
+    const retryingAfter = marked.find((item) => item.id === retrying.id);
+
+    assert.equal(executingAfter?.status, 'failed');
+    assert.equal(executingAfter?.recovery?.kind, 'not_recoverable');
+    assert.match(executingAfter?.recovery?.reason || '', /禁止跨重启自动重放/);
+    assert.equal(retryingAfter?.status, 'failed');
+    assert.equal(retryingAfter?.retry?.status, 'unavailable');
+    assert.equal(claimNextWorkflowRetry('worker-after-restart'), null);
+  });
+
   it('lets the control panel request and claim a manual retry for a failed run', () => {
     const run = startWorkflowRun({
       sessionId: 'session-manual',

@@ -501,6 +501,57 @@ test('delegates successful tool-result artifact registration to the runtime host
   }]);
 });
 
+test('uses runtime-verified declared artifacts to suppress the redundant no-evidence retry', () => {
+  const calls: unknown[] = [];
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+    turnStorage: {
+      stageInputFiles: () => [],
+      getArtifactDirectory: () => 'C:\\runtime\\artifacts\\session-1\\turn-1',
+      getScratchDirectory: () => 'C:\\runtime\\workspaces\\session-1\\turn-1',
+      verifyDeclaredOutputArtifacts: (input: unknown) => {
+        calls.push(input);
+        return [{
+          id: 'artifact-123', sessionId: 'session-1', turnId: 'turn-1',
+          fileName: 'capture.png', relativePath: 'capture.png', filePath: 'C:\\unity\\ST3\\capture.png',
+          sizeBytes: 7, sha256: 'abc123', createdAt: '2026-07-30T09:00:00.000Z',
+          source: { kind: 'tool_result', toolUseId: 'tool-1', toolName: 'shell_command' },
+        }];
+      },
+    },
+  } as any);
+
+  const verified = _testOnly.verifyDeclaredOutputArtifactsSafely({
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    responseText: '```cti-final\n{"kind":"image","text":"截好啦","images":["C:\\\\unity\\\\ST3\\\\capture.png"],"files":[],"reply_mode":"plain"}\n```',
+    successfulToolResults: [{
+      toolUseId: 'tool-1', toolName: 'shell_command', content: '{"Path":"C:\\\\unity\\\\ST3\\\\capture.png"}',
+    }],
+    allowedRoots: ['C:\\unity\\ST3'],
+    createdAfter: '2026-07-30T08:59:59.000Z',
+  });
+  assert.equal(verified.length, 1);
+  assert.equal(calls.length, 1);
+
+  const requirement = {
+    kind: 'artifact_required' as const,
+    reason: 'generated artifact requested',
+    requiredToolFamilies: ['unity-mcp', 'artifact'],
+    strictToolEvidence: true,
+  };
+  assert.equal(_testOnly.shouldRetryForMissingExecutionEvidence(requirement, {
+    responseText: '```cti-final\n{"kind":"image","text":"截好啦","images":["C:\\\\unity\\\\ST3\\\\capture.png"],"files":[],"reply_mode":"plain"}\n```',
+    executionEvidence: {
+      toolUseCount: 1, toolResultCount: 1, successfulToolResultCount: 1, failedToolResultCount: 0,
+      toolNames: ['shell_command'], permissionRequestCount: 0, verifiedOutputArtifactCount: verified.length,
+    },
+  }, false), false);
+});
+
 test('adds stable managed artifact ids to structured tool results without replacing tool data', () => {
   const content = _testOnly.attachManagedArtifactsToToolResult(JSON.stringify({
     ok: true,

@@ -521,6 +521,7 @@ export function isExecutionEvidenceSatisfied(
   evidence: {
     successfulToolResultCount: number;
     toolNames?: string[];
+    verifiedOutputArtifactCount?: number;
     acceptedInputEvidenceIds?: string[];
     acceptedInputEvidenceKinds?: InputEvidenceKind[];
   },
@@ -535,6 +536,11 @@ export function isExecutionEvidenceSatisfied(
       && requiredKinds.every((kind) => acceptedKinds.has(kind));
   }
   if (!requiresSuccessfulToolEvidence(requirement)) return true;
+  // 产物任务允许由 Runtime 验证后的本轮新产物满足证据要求。这里不再机械
+  // 绑定某个工具名称，但普通 tool_required / local_read_required 仍走 family 门禁。
+  if (requirement.kind === 'artifact_required' && (evidence.verifiedOutputArtifactCount || 0) > 0) {
+    return evidence.successfulToolResultCount > 0;
+  }
   return hasRequiredToolFamilyEvidence(requirement, evidence);
 }
 
@@ -578,6 +584,7 @@ export function shouldReplaceWithNoExecutionEvidenceText(
   evidence: {
     toolResultCount: number;
     successfulToolResultCount: number;
+    verifiedOutputArtifactCount?: number;
     acceptedInputEvidenceIds?: string[];
     acceptedInputEvidenceKinds?: InputEvidenceKind[];
   },

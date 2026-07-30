@@ -90,6 +90,35 @@ describe('Feishu sticker selection policy', () => {
     }), 'sticker_sad');
   });
 
+  it('throttles autonomous stickers per relevant chat while explicit requests can bypass upstream', async () => {
+    const {
+      canAutoSendFeishuSticker,
+      FEISHU_AUTONOMOUS_STICKER_COOLDOWN_MS,
+    } = await loadStickerSelectionPolicy();
+    const nowMs = Date.parse('2026-07-20T02:00:00.000Z');
+    const data = store([
+      sticker('recent_same_chat', {
+        chatId: 'oc_p2p',
+        label: '挥手',
+        annotationSource: 'manual',
+        lastUsedAt: new Date(nowMs - 60_000).toISOString(),
+      }),
+      sticker('old_other_chat', {
+        chatId: 'oc_other',
+        label: '点赞',
+        annotationSource: 'manual',
+        lastUsedAt: new Date(nowMs - FEISHU_AUTONOMOUS_STICKER_COOLDOWN_MS * 2).toISOString(),
+      }),
+    ]);
+
+    assert.equal(canAutoSendFeishuSticker(data, { chatId: 'oc_p2p', nowMs }), false);
+    assert.equal(canAutoSendFeishuSticker(data, { chatId: 'oc_other', nowMs }), true);
+    assert.equal(canAutoSendFeishuSticker(data, {
+      chatId: 'oc_p2p',
+      nowMs: nowMs + FEISHU_AUTONOMOUS_STICKER_COOLDOWN_MS,
+    }), true);
+  });
+
   it('never selects disabled, archived, avoided, user-only, or unknown exact keys', async () => {
     const { resolveFeishuStickerFileKey } = await loadStickerSelectionPolicy();
     const data = store([

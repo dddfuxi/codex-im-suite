@@ -47,9 +47,13 @@ import { getAgentPolicyPromptLines } from './agent-architecture.js';
 import { createBridgeMemoryArtifactStore } from './memory-artifact-store.js';
 import { composePromptSections, type ComposedBridgePrompt, type PromptSection } from './prompt-composer.js';
 import { createPromptSnapshot } from './prompt-snapshot.js';
+import { extractFinalReplyEnvelope } from './application/delivery-preparation.js';
 import {
+  extractFeishuBotMissingAppScopes,
   extractFeishuCliUserAuthorizationChallenge,
+  extractFeishuCliUserAuthorizationPolicyViolation,
   type FeishuCliUserAuthorizationChallenge,
+  type FeishuCliUserAuthorizationPolicyViolation,
 } from './feishu-cli-user-auth.js';
 import {
   formatTurnWorkspacePlanPrompt,
@@ -105,6 +109,8 @@ export interface ConversationResult {
     toolUseCount: number;
     toolResultCount: number;
     successfulToolResultCount: number;
+    /** Runtime 已按本轮工具结果、时间和工作区边界验证的最终输出产物数量。 */
+    verifiedOutputArtifactCount?: number;
     failedToolResultCount: number;
     failedToolErrors?: string[];
     toolNames: string[];
@@ -119,12 +125,18 @@ export interface ConversationResult {
     acceptedInputEvidenceIds?: string[];
     inputEvidenceProvider?: string;
     feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
+    feishuCliUserAuthorizationViolations?: FeishuCliUserAuthorizationPolicyViolation[];
   };
 }
 
 interface InternalConversationResult extends ConversationResult {
   assistantStorageContent?: string;
   assistantStorageTokenUsage?: TokenUsage | null;
+  successfulToolResults?: Array<{
+    toolUseId: string;
+    toolName: string;
+    content: unknown;
+  }>;
 }
 
 export interface ConversationProcessOptions {
@@ -250,6 +262,7 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
     acceptedInputEvidenceKinds: [],
     acceptedInputEvidenceIds: [],
     feishuCliUserAuthorizationChallenges: [],
+    feishuCliUserAuthorizationViolations: [],
     ...(requirement ? {
       requiredEvidenceKind: requirement.kind,
       evidenceSatisfied: requirement.kind === 'none',
@@ -342,6 +355,7 @@ function buildBridgeScopedPrompt(
       'policy_registry.scheduled_task_actions',
       'policy_registry.artifact_promotion',
       'memory_system.partitioned_memory_intent',
+      'delivery_layer.result_envelope',
     ]),
     '- Low-risk proactive context policy: when the request names an explicit readable context object such as current chat history, a replied message, an attachment, a URL/link, a local path, the current workspace, config/mcp.d, or an available MCP manifest, make a bounded low-risk read/list/check before asking for clarification.',
     '- Do not ask the user to restate context that is already present in the inbound chat, reply target, attachment, link, current workspace, or manifest. Use the available context first; ask only when the target is absent or still ambiguous after the bounded check.',
@@ -484,6 +498,50 @@ function registerToolResultArtifactsSafely(input: {
     console.warn('[conversation-engine] Tool result artifact registration failed:', error instanceof Error ? error.message : error);
     return [];
   }
+}
+
+function verifyDeclaredOutputArtifactsSafely(input: {
+  sessionId: string;
+  turnId: string;
+  responseText: string;
+  successfulToolResults: Array<{ toolUseId: string; toolName: string; content: unknown }>;
+  allowedRoots: string[];
+  createdAfter: string;
+}): TurnArtifactRecord[] {
+  const envelope = extractFinalReplyEnvelope(input.responseText);
+  const declaredFiles = envelope
+    ? [
+        ...envelope.images.map((filePath) => ({ filePath })),
+        ...envelope.files.map((filePath) => ({ filePath })),
+      ]
+    : [];
+  if (declaredFiles.length === 0 || input.successfulToolResults.length === 0) return [];
+  try {
+    const verify = getBridgeContext().turnStorage?.verifyDeclaredOutputArtifacts;
+    return verify ? verify({
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      declaredFiles,
+      successfulToolResults: input.successfulToolResults,
+      allowedRoots: input.allowedRoots,
+      createdAfter: input.createdAfter,
+    }) : [];
+  } catch (error) {
+    // 最终产物验证失败必须保持缺证据状态，但不应破坏原始模型结果或工具审计。
+    console.warn('[conversation-engine] Declared output artifact verification failed:', error instanceof Error ? error.message : error);
+    return [];
+  }
+}
+
+function shouldRetryForMissingExecutionEvidence(
+  requirement: ExecutionRequirement,
+  result: Pick<InternalConversationResult, 'responseText' | 'executionEvidence'>,
+  aborted: boolean,
+): boolean {
+  return requiresSuccessfulToolEvidence(requirement)
+    && !isExecutionEvidenceSatisfied(requirement, result.executionEvidence)
+    && !hasDeferredBridgeExecutionAction(result.responseText)
+    && !aborted;
 }
 
 function attachManagedArtifactsToToolResult(content: unknown, artifacts: TurnArtifactRecord[]): string {
@@ -935,6 +993,7 @@ export async function processMessage(
     }
 
     const runAttempt = async (attempt: 'initial' | 'no_evidence_retry'): Promise<InternalConversationResult> => {
+      const attemptStartedAt = new Date().toISOString();
       const retryPrompt = attempt === 'no_evidence_retry' ? buildNoEvidenceRetryPrompt(executionRequirement) : '';
       const composedPrompt = buildBridgeScopedPrompt(binding, session?.system_prompt || undefined, [
         { id: 'channel.extra', kind: 'identity', source: 'channel.extra_system_prompt', priority: 10, content: options?.extraSystemPrompt || '' },
@@ -1000,7 +1059,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-      return await consumeStream(
+      const result = await consumeStream(
         stream,
         sessionId,
         turnId,
@@ -1011,15 +1070,31 @@ export async function processMessage(
         executionRequirement,
         attempt === 'no_evidence_retry',
       );
+      if (executionRequirement.kind === 'artifact_required') {
+        const verifiedArtifacts = verifyDeclaredOutputArtifactsSafely({
+          sessionId,
+          turnId,
+          responseText: result.responseText,
+          successfulToolResults: result.successfulToolResults || [],
+          allowedRoots: [
+            workspacePlan.primaryWorkspace.path,
+            ...workspacePlan.temporaryMounts.map((item) => item.path),
+            ...(artifactDirectory ? [artifactDirectory] : []),
+            ...(scratchDirectory ? [scratchDirectory] : []),
+          ],
+          createdAfter: attemptStartedAt,
+        });
+        result.executionEvidence.verifiedOutputArtifactCount = verifiedArtifacts.length;
+        result.executionEvidence.evidenceSatisfied = isExecutionEvidenceSatisfied(
+          executionRequirement,
+          result.executionEvidence,
+        );
+      }
+      return result;
     };
 
     let result = await runAttempt('initial');
-    if (
-      requiresSuccessfulToolEvidence(executionRequirement)
-      && !isExecutionEvidenceSatisfied(executionRequirement, result.executionEvidence)
-      && !hasDeferredBridgeExecutionAction(result.responseText)
-      && !abortController.signal.aborted
-    ) {
+    if (shouldRetryForMissingExecutionEvidence(executionRequirement, result, abortController.signal.aborted)) {
       result = await runAttempt('no_evidence_retry');
     }
 
@@ -1080,6 +1155,8 @@ export const _testOnly = {
   resolveConversationWorkspacePlan,
   recordPromptSnapshotSafely,
   registerToolResultArtifactsSafely,
+  verifyDeclaredOutputArtifactsSafely,
+  shouldRetryForMissingExecutionEvidence,
   attachManagedArtifactsToToolResult,
   persistFileAttachmentsForHistory,
   loadAgentHomePromptSections,
@@ -1115,8 +1192,10 @@ async function consumeStream(
   let capturedSdkSessionId: string | null = null;
   let shouldRefreshSession = false;
   const executionEvidence = emptyExecutionEvidence(executionRequirement, noEvidenceRetryAttempted);
+  const observedFeishuBotMissingScopes = new Set<string>();
   const seenToolNames = new Set<string>();
   const toolUsesById = new Map<string, { name: string; input: unknown }>();
+  const successfulToolResultsById = new Map<string, { toolUseId: string; toolName: string; content: unknown }>();
   let assistantStorageContent = '';
   let assistantStorageTokenUsage: TokenUsage | null = null;
 
@@ -1203,14 +1282,34 @@ async function consumeStream(
               const storedToolResultContent = managedArtifacts.length > 0
                 ? attachManagedArtifactsToToolResult(resultData.content, managedArtifacts)
                 : resultData.content;
+              for (const scope of extractFeishuBotMissingAppScopes(resultData.content)) {
+                observedFeishuBotMissingScopes.add(scope);
+              }
               if (matchingToolUse) {
+                const authorizationViolation = extractFeishuCliUserAuthorizationPolicyViolation({
+                  toolUseId: String(resultData.tool_use_id || ''),
+                  toolName: matchingToolUse.name,
+                  toolInput: matchingToolUse.input,
+                  toolResultContent: resultData.content,
+                  toolResultIsError: !resultQuality.ok,
+                }, observedFeishuBotMissingScopes);
+                if (
+                  authorizationViolation
+                  && !(executionEvidence.feishuCliUserAuthorizationViolations || [])
+                    .some((item) => item.toolUseId === authorizationViolation.toolUseId)
+                ) {
+                  executionEvidence.feishuCliUserAuthorizationViolations = [
+                    ...(executionEvidence.feishuCliUserAuthorizationViolations || []),
+                    authorizationViolation,
+                  ];
+                }
                 const challenge = extractFeishuCliUserAuthorizationChallenge({
                   toolUseId: String(resultData.tool_use_id || ''),
                   toolName: matchingToolUse.name,
                   toolInput: matchingToolUse.input,
                   toolResultContent: resultData.content,
                   toolResultIsError: !resultQuality.ok,
-                });
+                }, observedFeishuBotMissingScopes);
                 if (
                   challenge
                   && !(executionEvidence.feishuCliUserAuthorizationChallenges || [])
@@ -1248,6 +1347,11 @@ async function consumeStream(
                   }
                 } else {
                   executionEvidence.successfulToolResultCount += 1;
+                  successfulToolResultsById.set(String(resultData.tool_use_id || ''), {
+                    toolUseId: String(resultData.tool_use_id || ''),
+                    toolName: matchingToolUse?.name || '',
+                    content: resultData.content,
+                  });
                 }
               }
               if (shouldRefreshForToolResult(resultData.content)) {
@@ -1400,6 +1504,7 @@ async function consumeStream(
       executionEvidence,
       assistantStorageContent,
       assistantStorageTokenUsage,
+      successfulToolResults: [...successfulToolResultsById.values()],
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -1446,6 +1551,7 @@ async function consumeStream(
       executionEvidence,
       assistantStorageContent,
       assistantStorageTokenUsage,
+      successfulToolResults: [...successfulToolResultsById.values()],
     };
   }
 }

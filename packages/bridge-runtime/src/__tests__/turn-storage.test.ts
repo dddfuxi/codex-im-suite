@@ -220,4 +220,78 @@ describe('RuntimeTurnStorage', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('verifies a fresh final artifact from a successful CLI wrapper inside the allowed workspace', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-final-artifact-'));
+    const workspace = path.join(root, 'workspace');
+    const generated = path.join(workspace, 'captures', 'current.png');
+    fs.mkdirSync(path.dirname(generated), { recursive: true });
+    const createdAfter = new Date(Date.now() - 500).toISOString();
+    fs.writeFileSync(generated, 'generated');
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'), artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+      });
+      const artifacts = storage.verifyDeclaredOutputArtifacts({
+        sessionId: 'session-1', turnId: 'turn-1', createdAfter, allowedRoots: [workspace],
+        declaredFiles: [{ filePath: generated }],
+        successfulToolResults: [{
+          toolUseId: 'tool-1', toolName: 'shell_command',
+          content: `Exit code: 0\nWall time: 0.6 seconds\nOutput:\n${JSON.stringify({ Path: generated, Width: 1935 })}`,
+        }],
+      });
+      assert.equal(artifacts.length, 1);
+      assert.equal(artifacts[0].source.toolName, 'shell_command');
+      assert.equal(path.relative(path.join(root, 'artifacts'), artifacts[0].filePath).startsWith('..'), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects missing, stale, model-only, and outside-root final artifact declarations', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-final-artifact-reject-'));
+    const workspace = path.join(root, 'workspace');
+    const stale = path.join(workspace, 'stale.png');
+    const modelOnly = path.join(workspace, 'model-only.png');
+    const outside = path.join(root, 'outside.png');
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(stale, 'stale');
+    fs.writeFileSync(modelOnly, 'model-only');
+    fs.writeFileSync(outside, 'outside');
+    const oldTime = new Date(Date.now() - 60_000);
+    fs.utimesSync(stale, oldTime, oldTime);
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'), artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+      });
+      const common = {
+        sessionId: 'session-1', turnId: 'turn-1', allowedRoots: [workspace],
+        createdAfter: new Date(Date.now() - 1_000).toISOString(),
+      };
+      assert.deepEqual(storage.verifyDeclaredOutputArtifacts({
+        ...common,
+        declaredFiles: [{ filePath: path.join(workspace, 'missing.png') }],
+        successfulToolResults: [{ toolUseId: 'tool-1', toolName: 'shell_command', content: JSON.stringify({ Path: path.join(workspace, 'missing.png') }) }],
+      }), []);
+      assert.deepEqual(storage.verifyDeclaredOutputArtifacts({
+        ...common,
+        declaredFiles: [{ filePath: stale }],
+        successfulToolResults: [{ toolUseId: 'tool-1', toolName: 'shell_command', content: JSON.stringify({ Path: stale }) }],
+      }), []);
+      assert.deepEqual(storage.verifyDeclaredOutputArtifacts({
+        ...common,
+        declaredFiles: [{ filePath: modelOnly }],
+        successfulToolResults: [{ toolUseId: 'tool-1', toolName: 'shell_command', content: JSON.stringify({ ok: true }) }],
+      }), []);
+      assert.deepEqual(storage.verifyDeclaredOutputArtifacts({
+        ...common,
+        declaredFiles: [{ filePath: outside }],
+        successfulToolResults: [{ toolUseId: 'tool-1', toolName: 'shell_command', content: JSON.stringify({ Path: outside }) }],
+      }), []);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

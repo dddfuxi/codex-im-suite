@@ -58,7 +58,9 @@ function isValidChallenge(input: FeishuCliUserAuthBeginInput): boolean {
   if (input.challenge.protocol !== 'cti-feishu-cli-user-auth/v1') return false;
   if (!input.userId?.trim()) return false;
   if (!/^[A-Za-z0-9._~-]{16,2048}$/.test(input.challenge.deviceCode)) return false;
-  if (normalizeScopes(input.challenge.requestedScopes).length === 0) return false;
+  // Runtime 再次保证一次只授权一个精确 scope，避免旧 Core 或伪造 Host
+  // 绕过最小权限门禁后把宽授权卡投递给 Owner。
+  if (normalizeScopes(input.challenge.requestedScopes).length !== 1) return false;
   if (!Number.isFinite(input.challenge.expiresInSeconds) || input.challenge.expiresInSeconds <= 0) return false;
   try {
     const url = new URL(input.challenge.verificationUrl);

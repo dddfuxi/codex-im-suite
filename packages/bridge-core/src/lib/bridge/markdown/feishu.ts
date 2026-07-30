@@ -567,6 +567,13 @@ export function buildFinalCardJson(
   const effectiveStatus = inferVisibleFinalCardStatus(footer?.status || '', content);
   const splitContent = splitFinalCardContentForDisplay(content);
   const titledContent = extractFinalCardTitleAndBody(splitContent.result || content);
+  const omitHeader = shouldOmitFinalCardHeader({
+    content: splitContent.result || content,
+    detail: splitContent.detail,
+    status: effectiveStatus,
+    tools,
+    agentProgress,
+  });
 
   elements.push({
     tag: 'markdown',
@@ -616,12 +623,12 @@ export function buildFinalCardJson(
     }
   }
 
-  const header = buildFinalCardHeader(effectiveStatus, titledContent.title);
+  const header = omitHeader ? null : buildFinalCardHeader(effectiveStatus, titledContent.title);
 
   return JSON.stringify({
     schema: '2.0',
     config: { wide_screen_mode: true },
-    header,
+    ...(header ? { header } : {}),
     body: { elements },
   });
 }
@@ -780,7 +787,7 @@ function extractFinalCardTitleAndBody(content: string): { title: string; body: s
     const body = stripStandaloneCompletionMarkLines(heading[2]).trim();
     if (hasSubstantiveFinalBody(body)) {
       return {
-        title: summarizeFinalCardTitle(heading[1], false),
+        title: summarizeFinalCardTitle(heading[1]),
         body,
       };
     }
@@ -808,21 +815,49 @@ function hasSubstantiveFinalBody(content: string): boolean {
     .some((line) => line.trim().length > 0);
 }
 
-function summarizeFinalCardTitle(content: string, allowLightweightChat = true): string {
+interface FinalCardHeaderDecisionInput {
+  content: string;
+  detail: string;
+  status: string;
+  tools: ToolCallInfo[];
+  agentProgress?: AgentCardProgressSnapshot;
+}
+
+/**
+ * 轻聊不需要为了卡片形式强行生成标题栏。这里仅使用可观察的交付结构、
+ * 执行证据和文本形态判断，不把某个机器人、群聊、表情名称或固定话术写死。
+ */
+function shouldOmitFinalCardHeader(input: FinalCardHeaderDecisionInput): boolean {
+  if (/失败|未完成|中断|error|interrupted/iu.test(input.status || '')) return false;
+  if (input.tools.length > 0 || input.detail.trim() || buildAgentCollaborationProgressMarkdown(input.agentProgress)) {
+    return false;
+  }
+
+  const normalized = stripStandaloneCompletionMarkLines(input.content.replace(/\r\n/g, '\n')).trim();
+  if (!normalized) return false;
+  const visible = stripFeishuInlineHintText(normalized);
+  const lines = visible.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0 || lines.length > 2 || [...visible].length > 96) return false;
+  if (lines.length === 2 && [...visible].length > 32) return false;
+
+  // 标题、列表、引用、表格、代码和字段式结果都属于结构化交付，不视为轻聊。
+  if (/<at\b|(?:^|\s)@[\p{L}\p{N}_-]+/iu.test(visible)
+    || /(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>|```|\|.+\||[^\n]{1,24}[：:]\s*\S)/u.test(visible)) {
+    return false;
+  }
+  if (/^\s*(?:自我介绍|我是|我能帮你|我可以帮你|处理结果|执行结果|最终结果|结论|摘要|说明|建议|方案|步骤|未完成|失败|阻塞)(?:\s*[:：]?|$)/u.test(visible)) {
+    return false;
+  }
+
+  return true;
+}
+
+function summarizeFinalCardTitle(content: string): string {
   const cleaned = sanitizeFinalCardTitle(stripFeishuInlineHintText(content));
   if (!cleaned) return '回复';
 
   if (/自我介绍|^我是|能帮你|可以帮你|主要帮你|帮你处理|陪你聊天/u.test(cleaned)) {
     return '自我介绍';
-  }
-  if (/表情|贴纸|sticker|满月脸/iu.test(cleaned)) {
-    return '表情回复';
-  }
-  const isLightweightChat = cleaned.length <= 48
-    && cleaned.split('\n').filter((line) => line.trim()).length <= 2
-    && !/(?:^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|```|\|.+\|)/u.test(cleaned);
-  if (allowLightweightChat && isLightweightChat && /收到|在这儿|在这里|嘿|哈哈|啦|呢|呀|~|～/u.test(cleaned)) {
-    return '表情回复';
   }
   if (/^(?:已|已经)?(?:完成|处理|修复|更新|生成|同步|检查|整理|创建|删除|恢复)/u.test(cleaned)) {
     return '处理结果';

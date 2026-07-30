@@ -671,6 +671,36 @@ describe('execution requirement classifier', () => {
     assert.doesNotMatch(text, /tool_use|tool_result|tool_required|JsonTool:mcp_call/);
   });
 
+  it('accepts a runtime-verified current-turn artifact without weakening non-artifact tool gates', () => {
+    const artifactRequirement = classifyExecutionRequirement({
+      userText: '截一张当前 Unity 的图',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.equal(artifactRequirement.kind, 'artifact_required');
+    assert.equal(
+      isExecutionEvidenceSatisfied(artifactRequirement, {
+        successfulToolResultCount: 1,
+        toolNames: ['shell_command'],
+        verifiedOutputArtifactCount: 1,
+      }),
+      true,
+    );
+
+    const toolRequirement = classifyExecutionRequirement({
+      userText: '检查一下当前 Unity MCP 连接状态',
+      workingDirectory: 'C:\\unity\\ST3',
+    });
+    assert.notEqual(toolRequirement.kind, 'artifact_required');
+    assert.equal(
+      isExecutionEvidenceSatisfied(toolRequirement, {
+        successfulToolResultCount: 1,
+        toolNames: ['shell_command'],
+        verifiedOutputArtifactCount: 1,
+      }),
+      false,
+    );
+  });
+
   it('does not expose local-read evidence protocol details in user-visible blockers', () => {
     const text = buildNoExecutionEvidenceText({
       kind: 'local_read_required',

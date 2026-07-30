@@ -8,7 +8,9 @@ import {
   extractStickerCandidateAnalysisFromReply,
   isExplicitStickerSendRequest,
   isGenericSingleStickerSendRequest,
+  isRedundantStickerCompanionText,
   resolveTurnScopedAttachedStickerSelection,
+  shouldUseStickerOnlyReply,
   suppressFeishuStickerHintForInboundStickerReply,
 } from '../../lib/bridge/application/stickers.js';
 
@@ -39,6 +41,15 @@ describe('bridge sticker policy', () => {
       addFeishuStickerHintForExplicitRequest('发个表情包', '[表情包] 给你一个', '', { allowBareFallback: false }),
       '这个表情包候选还没有可靠语义，我先不乱发。',
     );
+  });
+
+  it('lets a sticker replace redundant social text without replacing substantive answers', () => {
+    assert.equal(isRedundantStickerCompanionText('给你一个～'), true);
+    assert.equal(isRedundantStickerCompanionText('已根据日志定位到配置错误。'), false);
+    assert.equal(shouldUseStickerOnlyReply('发个表情包', '给你一个～', true), true);
+    assert.equal(shouldUseStickerOnlyReply('哈哈哈', '', false), true);
+    assert.equal(shouldUseStickerOnlyReply('帮我检查项目报错', '', false), false);
+    assert.equal(shouldUseStickerOnlyReply('哈哈哈', '这个问题需要修改配置。', false), false);
   });
 
   it('parses current-sticker annotations without exposing machine-only protocol text', () => {

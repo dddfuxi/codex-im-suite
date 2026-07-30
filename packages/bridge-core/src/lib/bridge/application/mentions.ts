@@ -204,12 +204,13 @@ function isFeishuDirectMentionExecutionClause(clause: string, options: FeishuMen
   if (!FEISHU_MENTION_ACTION_RE.test(compact)) return false;
   FEISHU_MENTION_ACTION_RE.lastIndex = 0;
   if (isFeishuNarrativeMentionClause(clause, options)) return false;
+  if (/^(?:重发|补发|重新发送|再发(?:一次)?)(?:一下)?(?:并|后|然后)?(?:请|麻烦)?(?:艾特|@|＠|\bat\b|mention|点名|通知)/iu.test(directCompact)) return true;
   return /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)
     || FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact)
     || /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot).{0,16}(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人|一个(?:成员|群成员|机器人|参与者|玩家|用户|人)|一位(?:成员|群成员|机器人|参与者|玩家|用户|人)|某个(?:成员|群成员|机器人|参与者|玩家|用户|人))/iu.test(directCompact);
 }
 
-function extractFeishuOrchestratedStarterTargets(userText: string): string[] {
+export function extractFeishuOrchestratedStarterTargets(userText: string): string[] {
   const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!normalized) return [];
   const compact = normalized.replace(/\s+/g, '');
@@ -258,6 +259,15 @@ function extractFeishuOrchestratedStarterTargets(userText: string): string[] {
     }
   }
   return [...targets.values()];
+}
+
+/** 只识别当前轮次的“发言后交接给对方”语义，具体人物由平台身份策略解析。 */
+export function hasFeishuCounterpartyMentionHandoff(userText: string): boolean {
+  const compact = (userText || '').normalize('NFKC').replace(/\s+/g, '').trim();
+  if (!compact) return false;
+  const repeatedMentionHandoff = /(?:每次|每轮|每回合|发言完|说完|回复完|观点后|结束前).{0,48}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  const mandatoryMentionHandoff = /(?:必须|需要|要|务必|记得|都得|都要|应当|应该).{0,24}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  return repeatedMentionHandoff || mandatoryMentionHandoff;
 }
 
 function isFeishuTaskSchedulingContext(userText: string): boolean {

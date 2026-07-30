@@ -276,6 +276,13 @@ export abstract class BaseChannelAdapter {
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;
 
+  /**
+   * Return the channel-preferred delay before user-visible turn feedback starts.
+   * Explicit store/environment settings still take precedence. Channels with a
+   * multi-request feedback surface can request zero delay to hide platform RTT.
+   */
+  getPreferredTurnFeedbackDelayMs?(): number;
+
   /** Called when message processing ends. */
   onMessageEnd?(_chatId: string): void;
 

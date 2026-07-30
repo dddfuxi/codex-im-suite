@@ -191,6 +191,33 @@ function looksLikeExecutionIntent(text: string): boolean {
   return /(执行|运行|重启|同步|修复|修改|更新|部署|构建|测试|检查|查询|查一下|读取|搜索|创建|删除|发送|上传|下载|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
 }
 
+/**
+ * “测试 / 检查”也常用于跟机器人轻聊式确认响应速度，例如“检查一下你快没快”。
+ * 这类消息本身就是测试，不需要因为单个执行动词直接进入完整工具链；具体 API、
+ * 服务、文件或 MCP 等目标仍会被上方硬门禁和可读对象门禁拦截。
+ */
+function isAssistantResponsivenessProbe(text: string): boolean {
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+  const addressesAssistant = /(?:你|机器人|助手|小虾米|\bbot\b|\bassistant\b)/iu.test(normalized);
+  const asksAboutResponsiveness = /(?:快没快|快不快|慢不慢|快(?:吗|了没|点了吗)|反应|响应|回复速度|响应速度|反应速度|延迟|卡顿|卡不卡|秒回|灵不灵|活没活|恢复没|在不在)/iu.test(normalized);
+  if (addressesAssistant && asksAboutResponsiveness) {
+    return !/(?:API|接口|服务|进程|文件|路径|目录|仓库|TAPD|Unity|Blender|MCP|附件|图片|配置|状态|网络|数据库|模型|Provider|工具)/iu.test(normalized);
+  }
+
+  // 中文轻聊经常省略“你 / 机器人”主语，例如“测试一下现在回复快不快”。
+  // 只有同时具备对话响应对象、性能语义和现场探测语境时才补全该主语；
+  // API、服务、文件、MCP 等具体对象继续留给 Primary 走真实工具/evidence 链。
+  const hasConversationResponseTarget = /(?:回复|回话|回消息|接话|应答|响应|反应|出卡|首卡)/iu.test(normalized);
+  const hasPerformanceMeaning = /(?:快没快|快不快|慢不慢|快(?:吗|了没|点了吗)|速度|延迟|耗时|反应时间|响应时间|卡顿|卡不卡|秒回)/iu.test(normalized);
+  const hasLiveProbeContext = /(?:现在|当前|这次|这回|刚才|试试|测试|测一下|测测|体验一下)/iu.test(normalized);
+  const hasConcreteTaskTarget = /(?:API|接口|服务|进程|文件|路径|目录|仓库|TAPD|Unity|Blender|MCP|附件|图片|配置|状态|网络|数据库|模型|Provider|工具)/iu.test(normalized);
+  return hasConversationResponseTarget
+    && hasPerformanceMeaning
+    && hasLiveProbeContext
+    && !hasConcreteTaskTarget;
+}
+
 function hasReadableContextObject(text: string): boolean {
   return READABLE_CONTEXT_ACTION_RE.test(text) && READABLE_CONTEXT_OBJECT_RE.test(text);
 }
@@ -240,6 +267,14 @@ function extractSystemSectionUntilHeadings(
     if (boundary === heading) continue;
     const boundaryStart = findSystemHeadingStart(afterHeading, boundary);
     if (boundaryStart >= 0) end = Math.min(end, start + heading.length + boundaryStart);
+  }
+  // Agent Home 文档以 Markdown 标题注入，不能因为标题不是英文 Prompt
+  // section 就被拼进轻聊 actor context。这里使用通用 Markdown 标题边界，
+  // 同时覆盖未来新增的 Agent Home 文档，避免继续维护中文标题特例清单。
+  const markdownHeading = /(?:^|\n)#{1,6}[ \t]+\S/u.exec(afterHeading);
+  if (markdownHeading) {
+    const markdownStart = markdownHeading.index + (markdownHeading[0].startsWith('\n') ? 1 : 0);
+    end = Math.min(end, start + heading.length + markdownStart);
   }
   return text.slice(start, end).trim();
 }
@@ -364,7 +399,9 @@ export function isLightChatCandidate(params: StreamChatParams, config: Config): 
     if (rule.pattern.test(combinedInput)) return false;
   }
   if (hasReadableContextObject(combinedInput)) return false;
-  if (looksLikeExecutionIntent(combinedInput)) return false;
+  // 响应速度探测属于对话元信息，应交给受限协调器自己回复或升级；不能被
+  // “测试 / 检查”两个词机械劫持。其他执行意图继续保守进入 Primary。
+  if (!isAssistantResponsivenessProbe(prompt) && looksLikeExecutionIntent(combinedInput)) return false;
   if (/(执行|运行|命令|文件|读取|搜索|截图|图片|附件|MCP|Unity|Blender|发布|报错|错误|阻塞|日志|git\s+(?:status|pull|fetch|branch|log)|Feishu doc|飞书文档|docx|sheets|base)/iu.test(combinedInput)) {
     return false;
   }
@@ -393,7 +430,9 @@ export function buildLightChatParams(params: StreamChatParams, config: Config): 
     'Light chat reply contract:',
     '- Reply as a natural Feishu chat message.',
     '- Keep the reply concise and emotionally appropriate.',
-    '- Prefer semantically matching sticker hints when the sticker library supports them.',
+    '- Sticker hints are optional, not a default decoration. Use them only when a verified sticker adds clear social meaning.',
+    '- When a sticker fully carries a short casual reply, you may output only the sticker hint with no visible companion text.',
+    '- Do not use sticker or reaction hints for every turn, or for substantive answers, tasks, errors, and neutral/formal replies.',
     '- Do not explain sticker or reaction sending intentions.',
     '- Do not include formal delivery, command output, file paths, or diagnostic process text.',
     replyStyle ? `- Required reply style: ${replyStyle}` : '',

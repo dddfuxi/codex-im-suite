@@ -134,6 +134,11 @@ export interface OutboundMessage {
   feishuCardJson?: string;
   /** Bridge-owned proof for an otherwise gated native-media delivery. */
   verifiedMediaAction?: VerifiedMediaAction;
+  /** Bridge-owned source context used only to gate optional sticker presentation. */
+  stickerDeliveryContext?: {
+    sourceText?: string;
+    explicitRequest?: boolean;
+  };
 }
 
 /** Inline keyboard button for permission prompts */
@@ -296,6 +301,7 @@ export interface StreamingCardTurnContext {
   codepilotSessionId?: string;
   sourceMessageId?: string;
   sourceText?: string;
+  chatType?: string;
 }
 
 // ── Config ─────────────────────────────────────────────────────

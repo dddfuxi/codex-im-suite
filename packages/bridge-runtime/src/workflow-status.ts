@@ -410,36 +410,49 @@ export function markInterruptedWorkflowRuns(runtimeRunId: string): WorkflowRun[]
   let changed = false;
   const marked: WorkflowRun[] = [];
   const runs = current.runs.map((run) => {
-    if (run.status !== 'running') return run;
+    if (run.status !== 'running' && run.status !== 'retrying') return run;
     changed = true;
     const input = run.recovery?.input;
     const retryAttempts = run.retry?.attempts || 0;
     const maxAttempts = run.retry?.maxAttempts ?? DEFAULT_MAX_AUTO_ATTEMPTS;
-    const recoverable = !!input?.prompt && retryAttempts < maxAttempts;
+    const interruptedBeforeExecution = run.status === 'running'
+      && (run.stage === 'received' || run.stage === 'authorized' || run.stage === 'contextualized' || run.stage === 'routed');
+    // executing/finalizing/retrying 可能已经产生外部副作用。Bridge 重启后不能
+    // 仅凭原 prompt 自动重放；保留 recovery input 供用户显式手动重试即可。
+    const recoverable = interruptedBeforeExecution && !!input?.prompt && retryAttempts < maxAttempts;
+    const interruptionReason = recoverable
+      ? 'bridge 重启后可用持久化输入重试'
+      : input?.prompt
+        ? '任务已进入执行阶段，禁止跨重启自动重放'
+        : '缺少 prompt 等最小恢复信息';
     const next: WorkflowRun = {
       ...run,
       stage: 'failed',
       status: recoverable ? 'retry_pending' : 'failed',
       error: recoverable
         ? 'bridge 重启时发现上一轮仍在处理中，已排队自动重试。'
-        : 'bridge 重启时发现上一轮仍在处理中，但缺少可重试输入。',
+        : input?.prompt
+          ? 'bridge 重启时发现上一轮已进入执行阶段；为避免重复副作用，未自动重试。'
+          : 'bridge 重启时发现上一轮仍在处理中，但缺少可重试输入。',
       updatedAt: timestamp,
       endedAt: timestamp,
       recovery: {
         kind: recoverable ? 'recoverable' : 'not_recoverable',
-        reason: recoverable ? 'bridge 重启后可用持久化输入重试' : '缺少 prompt 等最小恢复信息',
+        reason: interruptionReason,
         input,
         runtimeRunId,
         markedAt: timestamp,
       },
       retry: recoverable
         ? makeRetryState('auto_pending', retryAttempts, maxAttempts, 'auto', 'bridge 重启自动重试')
-        : makeRetryState('unavailable', retryAttempts, maxAttempts, undefined, '缺少可重试输入'),
+        : makeRetryState('unavailable', retryAttempts, maxAttempts, undefined, interruptionReason),
       events: [
         ...run.events,
-        event(run.id, 'failed', recoverable ? 'workflow.interrupted.recoverable' : 'workflow.interrupted.not_recoverable', recoverable ? 'bridge 重启，自动重试已排队' : 'bridge 重启，但该 run 不可恢复', {
+        event(run.id, 'failed', recoverable ? 'workflow.interrupted.recoverable' : 'workflow.interrupted.not_recoverable', recoverable ? 'bridge 重启，自动重试已排队' : 'bridge 重启，已阻止执行中任务自动重放', {
           runtimeRunId,
           retryable: recoverable,
+          interruptedStage: run.stage,
+          interruptedStatus: run.status,
         }),
       ].slice(-MAX_EVENTS_PER_RUN),
     };

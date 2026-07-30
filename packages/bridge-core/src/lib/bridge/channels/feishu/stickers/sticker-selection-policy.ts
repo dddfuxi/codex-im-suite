@@ -5,6 +5,7 @@ import type {
 } from './sticker-store-schema.js';
 
 export const FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE = 0.45;
+export const FEISHU_AUTONOMOUS_STICKER_COOLDOWN_MS = 10 * 60 * 1000;
 
 const FEISHU_STICKER_SEMANTIC_STOP_TOKENS = new Set([
   '表达', '表示', '代表', '用于', '用来', '适合', '时候', '场景', '回复', '聊天',
@@ -21,6 +22,30 @@ export interface FeishuStickerSelectionOptions {
 export interface FeishuStickerRetentionOptions {
   hasCachedMedia?: (fileKey: string) => boolean;
   maxRecords?: number;
+}
+
+export interface FeishuAutonomousStickerDeliveryOptions {
+  chatId?: string;
+  nowMs?: number;
+  cooldownMs?: number;
+}
+
+/**
+ * 非明确请求的贴纸必须经过会话级冷却，防止模型在连续轻聊中每回合都附带贴纸。
+ * 明确的“发个表情包”请求由调用方绕过此门禁；这里仅裁决自主表达。
+ */
+export function canAutoSendFeishuSticker(
+  store: FeishuStickerStore,
+  options: FeishuAutonomousStickerDeliveryOptions = {},
+): boolean {
+  const nowMs = options.nowMs ?? Date.now();
+  const cooldownMs = Math.max(0, options.cooldownMs ?? FEISHU_AUTONOMOUS_STICKER_COOLDOWN_MS);
+  const relevantLastUse = store.stickers
+    .filter(isFeishuStickerActive)
+    .filter((record) => !options.chatId || !record.chatId || record.chatId === options.chatId)
+    .map((record) => Date.parse(record.lastUsedAt || '') || 0)
+    .reduce((latest, value) => Math.max(latest, value), 0);
+  return relevantLastUse <= 0 || nowMs - relevantLastUse >= cooldownMs;
 }
 
 export function looksLikeFeishuStickerFileKey(value: string): boolean {

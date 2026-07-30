@@ -1676,7 +1676,8 @@ describe('bridge-manager result block delivery', () => {
 
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /未完成/);
-    assert.match(sent[0].text, /没有检测到真实工具执行成功记录/);
+    assert.match(sent[0].text, /没有获得可验证的执行结果/);
+    assert.doesNotMatch(sent[0].text, /tool_use|tool_result|成功结果|本地工具证据/);
     assert.doesNotMatch(sent[0].text, /已成功在工作区新建/);
   });
 
@@ -1709,7 +1710,8 @@ describe('bridge-manager result block delivery', () => {
 
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /未完成/);
-    assert.match(sent[0].text, /路径不存在/);
+    assert.match(sent[0].text, /没有生成可验证的文件、图片或其他交付结果/);
+    assert.doesNotMatch(sent[0].text, /C:\\definitely-missing|路径不存在|tool_use|tool_result/);
     assert.doesNotMatch(sent[0].text, /我已生成一张卡通小猫/);
   });
 
@@ -4400,6 +4402,157 @@ describe('bridge-manager policy helpers', () => {
       hasPreExecutionProgress: false,
       textLength: 20,
     }), 'plain_delivery');
+  });
+
+  it('uses the adapter feedback timing preference unless an explicit setting overrides it', async () => {
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const immediateAdapter = {
+      getPreferredTurnFeedbackDelayMs: () => 0,
+    } as BaseChannelAdapter;
+    const previousEnvDelay = process.env.CTI_TURN_FEEDBACK_DELAY_MS;
+    delete process.env.CTI_TURN_FEEDBACK_DELAY_MS;
+
+    try {
+      initBridgeContext({
+        store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+        llm: { streamChat: () => createTextStream('ok') },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+      assert.equal(_testOnly.getTurnFeedbackDelayMs(immediateAdapter), 0);
+
+      initBridgeContext({
+        store: createStatefulStore({
+          remote_bridge_enabled: 'true',
+          bridge_turn_feedback_delay_ms: '120',
+        }),
+        llm: { streamChat: () => createTextStream('ok') },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+      assert.equal(_testOnly.getTurnFeedbackDelayMs(immediateAdapter), 120);
+    } finally {
+      if (previousEnvDelay === undefined) delete process.env.CTI_TURN_FEEDBACK_DELAY_MS;
+      else process.env.CTI_TURN_FEEDBACK_DELAY_MS = previousEnvDelay;
+    }
+  });
+
+  it('starts 0ms adapter feedback synchronously before adapter preparation begins', async () => {
+    let resolvePreparation!: () => void;
+    const preparation = new Promise<void>((resolve) => {
+      resolvePreparation = resolve;
+    });
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('已处理。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const order: string[] = [];
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_immediate_feedback' })) as BaseChannelAdapter & {
+      onMessageStart?: (chatId: string) => void;
+      onStreamText?: (chatId: string, text: string) => void;
+      onStreamEnd?: (chatId: string, status: string, text: string) => Promise<boolean>;
+      onMessageEnd?: (chatId: string) => void;
+      getPreferredTurnFeedbackDelayMs?: () => number;
+    };
+    adapter.getPreferredTurnFeedbackDelayMs = () => 0;
+    adapter.onMessageStart = () => { order.push('feedback'); };
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async () => true;
+    adapter.onMessageEnd = () => {};
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const message = {
+      ...createInboundMessage('请结合最近群聊回答这个问题', 'ou_1', 'oc_immediate_feedback'),
+      prepareForAgent: async () => {
+        order.push('prepare');
+        await preparation;
+      },
+    };
+    const pending = _testOnly.handleMessage(adapter, message as any);
+
+    assert.deepEqual(order, ['feedback', 'prepare']);
+    resolvePreparation();
+    await pending;
+  });
+
+  it('starts 0ms feedback before session routing and presentation prompt preparation', async () => {
+    const order: string[] = [];
+    const baseStore = createStatefulStore({ remote_bridge_enabled: 'true' });
+    const store = {
+      ...baseStore,
+      getChannelBinding: (...args: Parameters<BridgeStore['getChannelBinding']>) => {
+        order.push('route');
+        return baseStore.getChannelBinding(...args);
+      },
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('已处理。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_prompt_order' })) as BaseChannelAdapter & {
+      onMessageStart?: (chatId: string) => void;
+      onStreamText?: (chatId: string, text: string) => void;
+      onStreamEnd?: (chatId: string, status: string, text: string) => Promise<boolean>;
+      onMessageEnd?: (chatId: string) => void;
+      getPreferredTurnFeedbackDelayMs?: () => number;
+      getEmojiPresentationPrompt?: () => string;
+    };
+    adapter.getPreferredTurnFeedbackDelayMs = () => 0;
+    adapter.onMessageStart = () => { order.push('feedback'); };
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async () => true;
+    adapter.onMessageEnd = () => {};
+    adapter.getEmojiPresentationPrompt = () => {
+      order.push('presentation');
+      return 'Feishu emoji presentation: test';
+    };
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    await _testOnly.handleMessage(adapter, createInboundMessage('测试一下现在回复快不快', 'ou_1', 'oc_prompt_order'));
+
+    assert.ok(order.indexOf('feedback') >= 0);
+    assert.ok(order.indexOf('route') > order.indexOf('feedback'));
+    assert.ok(order.indexOf('presentation') > order.indexOf('feedback'));
+  });
+
+  it('does not wait for outcome self-maintenance before releasing the turn', async () => {
+    let outcomeStarted = false;
+    let outcomeSettled = false;
+    let releaseOutcome!: () => void;
+    const outcomeGate = new Promise<void>((resolve) => {
+      releaseOutcome = resolve;
+    });
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('回复完成。') },
+      selfMaintenance: {
+        maintain: async (input) => {
+          if (input.phase === 'outcome') {
+            outcomeStarted = true;
+            await outcomeGate;
+            outcomeSettled = true;
+          }
+          return { applied: false, reason: 'test completed' };
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_outcome_background' }));
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('普通问题', 'ou_1', 'oc_outcome_background'));
+
+    assert.equal(outcomeStarted, true, 'outcome maintenance should still be invoked');
+    assert.equal(outcomeSettled, false, 'turn completion must not wait for outcome maintenance');
+    releaseOutcome();
+    await outcomeGate;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(outcomeSettled, true);
   });
 
   it('does not start a workflow card before lightweight sticker replies finish', async () => {
@@ -7960,6 +8113,111 @@ describe('bridge-manager policy helpers', () => {
     assert.deepEqual(finalized[0][4], [{ userId: 'ou_george', name: '乔治' }]);
   });
 
+  it('understands a natively mentioned self starter as the speaker and mentions only the other participant', async () => {
+    const sent: OutboundMessage[] = [];
+    const systemPrompts: string[] = [];
+    const resolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params: any) => {
+          systemPrompts.push(params.systemPrompt || '');
+          return createTextStream([
+            '```cti-final',
+              JSON.stringify({
+                kind: 'text',
+                text: '@乔治，装聋作哑、故弄玄虚，小虾米先声夺人！该你接招～',
+                images: [],
+                files: [],
+                reply_mode: 'plain',
+              }),
+            '```',
+          ].join('\n'));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_orchestrated_self_turn' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+    };
+    adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_shrimp' });
+    adapter.resolveOutboundMentions = async (message) => {
+      resolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage(
+        '你们两个互相用成语吵架，每轮需要艾特对方再说话，小虾米先来，乔治第一轮不要at',
+        'ou_owner',
+        'oc_orchestrated_self_turn',
+      ),
+      messageId: 'om_orchestrated_self_turn_inbound',
+      raw: {
+        feishuMentions: [
+          { name: '乔治', openId: 'ou_george', unionId: 'on_george' },
+          { name: '小虾米', openId: 'ou_shrimp', unionId: 'on_shrimp' },
+        ],
+      },
+    });
+
+    assert.equal(resolverInputs.length, 1);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    assert.doesNotMatch(sent[0].text, /@小虾米/u);
+    assert.match(sent[0].text, /@乔治/u);
+    assert.match(systemPrompts[0], /当前机器人.*先发言.*发言角色.*不是 mention 目标/u);
+    assert.match(systemPrompts[0], /原生 @.*乔治/u);
+  });
+
+  it('keeps the non-starter assistant silent until the named starter mentions it', async () => {
+    const sent: OutboundMessage[] = [];
+    let providerCalls = 0;
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          providerCalls += 1;
+          return createTextStream('不应执行到这里。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_orchestrated_wait' };
+    });
+    adapter.getAssistantIdentity = () => ({ displayName: '乔治', botOpenId: 'ou_george' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage(
+        '你们俩开始用成语吵架，必须 at 对方，小虾米先开始',
+        'ou_owner',
+        'oc_orchestrated_wait',
+      ),
+      messageId: 'om_orchestrated_wait_inbound',
+      raw: {
+        feishuMentions: [
+          { name: '乔治', openId: 'ou_george' },
+          { name: '小虾米', openId: 'ou_shrimp' },
+        ],
+      },
+    });
+
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 0);
+  });
+
   it('preserves an already verified mention while resolving the assigned responder for an immediate game turn', async () => {
     const finalized: unknown[][] = [];
     const resolverInputs: OutboundMessage[] = [];
@@ -8033,14 +8291,11 @@ describe('bridge-manager policy helpers', () => {
 
     assert.equal(resolverInputs.length, 1);
     assert.match(resolverInputs[0].text, /^@乔治/u);
-    assert.deepEqual(resolverInputs[0].mentions, [{ userId: 'ou_current_bot', name: '小虾米' }]);
+    assert.equal(resolverInputs[0].mentions, undefined);
     assert.equal(finalized.length, 1);
     assert.match(String(finalized[0][2]), /@乔治/u);
-    assert.match(String(finalized[0][2]), /@小虾米/u);
-    assert.deepEqual(finalized[0][4], [
-      { userId: 'ou_current_bot', name: '小虾米' },
-      { userId: 'ou_george', name: '乔治' },
-    ]);
+    assert.doesNotMatch(String(finalized[0][2]), /@小虾米/u);
+    assert.deepEqual(finalized[0][4], [{ userId: 'ou_george', name: '乔治' }]);
   });
 
   it('resolves a bot-to-bot reply mention back to the verified inbound bot sender', async () => {
@@ -8088,6 +8343,54 @@ describe('bridge-manager policy helpers', () => {
 
     assert.equal(replyResolverInputs.length, 1);
     assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('keeps the bot-to-bot handoff mention on later turns even when the provider omits every mention field', async () => {
+    const sent: OutboundMessage[] = [];
+    const replyResolverInputs: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('胸有成竹？我看是肚里空空还硬撑！乔治，接招吧。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_reply_without_model_mention' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundReplyToSenderMention?: (
+        message: OutboundMessage,
+        sourceMessage?: InboundMessage,
+      ) => Promise<OutboundMessage>;
+    };
+    adapter.resolveOutboundReplyToSenderMention = async (message) => {
+      replyResolverInputs.push(message);
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你才是井底之蛙，我这叫胸有成竹。', 'ou_george', 'oc_bot_debate_continuation'),
+      address: {
+        channelType: 'feishu',
+        chatId: 'oc_bot_debate_continuation',
+        userId: 'ou_george',
+        displayName: '成语吵架群',
+        chatType: 'group',
+      },
+      raw: {
+        feishuSender: { openId: 'ou_george', senderType: 'bot', chatType: 'group' },
+        feishuBotToBot: { chainCount: 2, maxTurns: 8, senderType: 'bot' },
+        feishuMentions: [{ name: '小虾米', openId: 'ou_current_bot' }],
+      },
+    });
+
+    assert.equal(replyResolverInputs.length, 1);
+    assert.match(replyResolverInputs[0].text, /^胸有成竹？我看是肚里空空还硬撑！乔治，接招吧。/u);
     assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 

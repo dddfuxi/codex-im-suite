@@ -1532,6 +1532,60 @@ describe('CodexProvider image input', () => {
     }]);
   });
 
+  it('emits image evidence receipt when resuming a thread without thread.started', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    const freshThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'thread-image-resume' };
+          yield { type: 'turn.completed', usage: { input_tokens: 0, output_tokens: 0 } };
+        })(),
+      }),
+    };
+    const resumedThread = {
+      runStreamed: () => ({
+        // Codex 恢复线程时可能不再重复发送 thread.started。
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 0, output_tokens: 0 } };
+        })(),
+      }),
+    };
+    (provider as any).sdk = {
+      Codex: class { constructor() {} },
+    };
+    (provider as any).codex = {
+      startThread: () => freshThread,
+      resumeThread: () => resumedThread,
+    };
+
+    await collectStream(provider.streamChat({
+      prompt: '先建立会话',
+      sessionId: 'img-resume-session',
+    }));
+
+    const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
+    const imageFile = makeFile('image/png', pngBase64, 'resume.png');
+    const events = parseSSEChunks(await collectStream(provider.streamChat({
+      prompt: '描述这张图',
+      sessionId: 'img-resume-session',
+      files: [imageFile],
+    })));
+
+    const receiptStatus = events
+      .filter((event) => event.type === 'status')
+      .map((event) => JSON.parse(event.data) as Record<string, any>)
+      .find((data) => data.inputEvidence?.protocol === 'cti-input-evidence/v1');
+    assert.ok(receiptStatus, 'Resumed thread should still emit the accepted image evidence receipt');
+    assert.deepEqual(receiptStatus.inputEvidence.accepted, [{
+      id: imageFile.id,
+      kind: 'image',
+      mediaType: 'image/png',
+    }]);
+  });
+
   it('passes plain string when no images attached', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');

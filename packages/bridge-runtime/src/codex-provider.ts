@@ -607,7 +607,9 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- kind must be one of: text, image, file, mixed.',
     '- Put all final user-visible content only inside that JSON block. Do not place the final answer outside the block.',
     '- text must contain the complete final text to send. For mappings, lists, and tables, include all actual items in text.',
-    '- images and files must be arrays of local paths when applicable, otherwise use empty arrays.',
+    '- images and files must contain only requested output deliverables. Attachments supplied only for recognition, description, analysis, or context are input evidence and must not be copied into these arrays unless the user\'s actual result objective requires delivering that same source attachment.',
+    '- Judge source-attachment delivery from the current request purpose rather than a fixed phrase or filename. New generated/edited/annotated/exported artifacts may use their new verified local paths.',
+    '- Otherwise images and files must be empty arrays.',
     '- reply_mode must be one of: plain, markdown, html.',
     '- Optional keys mentions and reply_to may be included when needed.',
     '- When the user must choose one of 2-8 concrete known alternatives, optional choices may be an array of objects with only label and optional description; optional choice_title names the decision.',
@@ -937,6 +939,13 @@ export class CodexProvider implements LLMProvider {
                   ...(params.abortController?.signal ? { signal: params.abortController.signal } : {}),
                 });
 
+                // `thread.started` 只保证在新线程出现；恢复既有线程时 Codex SDK
+                // 可能直接返回 turn 事件。图片已经被本轮 runStreamed 接收后就在这里
+                // 发出结构化回执，避免复用会话被误判成“模型没有收到附件”。
+                if (inputEvidenceReceipt) {
+                  controller.enqueue(sseEvent('status', { inputEvidence: inputEvidenceReceipt }));
+                }
+
                 let emittedAgentMessage = false;
                 for await (const event of events) {
                   sawAnyEvent = true;
@@ -956,7 +965,6 @@ export class CodexProvider implements LLMProvider {
 
                       controller.enqueue(sseEvent('status', {
                         session_id: threadId,
-                        ...(inputEvidenceReceipt ? { inputEvidence: inputEvidenceReceipt } : {}),
                       }));
                       break;
                     }

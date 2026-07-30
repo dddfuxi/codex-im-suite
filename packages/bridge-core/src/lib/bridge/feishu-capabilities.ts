@@ -1,8 +1,12 @@
 import { spawnSync } from 'node:child_process';
 
 import type { SettingsProvider } from './host.js';
+import {
+  resolvePreferredFeishuScopeRequirements,
+  type FeishuScopeRequirement,
+} from './channels/feishu/permissions/scope-policy.js';
 
-type ScopeRequirement = string | string[];
+type ScopeRequirement = FeishuScopeRequirement;
 
 interface FeishuCapability {
   id: string;
@@ -197,12 +201,12 @@ function parseBoolSetting(raw: string, defaultValue = false): boolean {
 }
 
 function satisfiesRequirement(scopeSet: Set<string>, requirement: ScopeRequirement): boolean {
-  if (Array.isArray(requirement)) return requirement.some((scope) => scopeSet.has(scope));
-  return scopeSet.has(requirement);
+  if (typeof requirement === 'string') return scopeSet.has(requirement);
+  return requirement.some((scope) => scopeSet.has(scope));
 }
 
 function formatRequirement(requirement: ScopeRequirement): string {
-  return Array.isArray(requirement) ? requirement.join(' 或 ') : requirement;
+  return typeof requirement === 'string' ? requirement : requirement.join(' 或 ');
 }
 
 function missingRequirements(scopeSet: Set<string>, requirements: ScopeRequirement[]): string[] {
@@ -299,13 +303,7 @@ function defaultFeishuCliProbe(cliPath: string): FeishuCliProbeResult {
 export function getFeishuRecommendedScopes(): string[] {
   const all = new Set<string>();
   for (const capability of CAPABILITIES) {
-    for (const requirement of capability.requiredScopes) {
-      if (Array.isArray(requirement)) {
-        for (const scope of requirement) all.add(scope);
-      } else {
-        all.add(requirement);
-      }
-    }
+    for (const scope of resolvePreferredFeishuScopeRequirements(capability.requiredScopes)) all.add(scope);
   }
   return Array.from(all).sort();
 }

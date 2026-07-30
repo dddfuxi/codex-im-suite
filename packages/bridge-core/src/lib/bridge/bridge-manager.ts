@@ -67,11 +67,12 @@ import {
   extractBareFeishuAtTargets,
   extractExplicitFeishuMentionTargetsFromRequest,
   hasStructuredMentions,
+  isFeishuMentionExecutionRequest,
   isFeishuPlaceholderMentionTarget,
   needsExplicitFeishuMentionTarget,
   normalizeFeishuMentionTargetKey,
   parseEnvelopeMentions,
-  readFeishuMentionIds,
+  readFeishuMentionId,
   replaceBareFeishuAtTarget,
   stripBareFeishuAtTarget,
   stripFeishuGenericBareMentionText,
@@ -118,6 +119,10 @@ import {
   type FeishuContextualMentionResolution,
 } from './channels/feishu/mentions/contextual-mention-resolution.js';
 import {
+  resolveFeishuOrchestratedInteraction,
+  type FeishuOrchestratedInteractionPlan,
+} from './channels/feishu/mentions/orchestrated-interaction.js';
+import {
   decideAdaptiveActionPolicy,
   normalizeAdaptiveSafetyProfile,
   type AdaptiveEvidenceStrength,
@@ -132,6 +137,7 @@ import {
   type DeliveryCandidatePayload,
   type FinalReplyKind,
 } from './application/delivery-preparation.js';
+import { enforceInputEvidenceDeliveryBoundary } from './application/input-evidence-delivery-policy.js';
 import {
   CHOICE_CALLBACK_PREFIX,
   ChoicePromptRegistry,
@@ -148,6 +154,7 @@ import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { formatVisibleToolName } from './markdown/feishu.js';
 import {
+  buildNoExecutionEvidenceText,
   classifyExecutionRequirement,
   isFeishuStickerMessageKind,
   isExecutionEvidenceSatisfied,
@@ -1791,14 +1798,35 @@ function selectReplySurfaceMode(input: ReplySurfaceModeInput): ReplySurfaceMode 
   return input.textLength <= 280 ? 'light_status' : 'plain_delivery';
 }
 
-function getTurnFeedbackDelayMs(): number {
+function getTurnFeedbackDelayMs(adapter?: BaseChannelAdapter): number {
   const { store } = getBridgeContext();
-  const raw = store.getSetting('bridge_turn_feedback_delay_ms')
-    || process.env.CTI_TURN_FEEDBACK_DELAY_MS
-    || '250';
+  const configured = store.getSetting('bridge_turn_feedback_delay_ms')?.trim()
+    || process.env.CTI_TURN_FEEDBACK_DELAY_MS?.trim();
+  const preferred = adapter?.getPreferredTurnFeedbackDelayMs?.();
+  const raw = configured || String(
+    typeof preferred === 'number' && Number.isFinite(preferred) ? preferred : 250,
+  );
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return 250;
   return Math.max(0, Math.min(parsed, 2000));
+}
+
+/**
+ * 0ms 是“立即反馈”语义，必须在后续同步初始化前直接执行；如果仍交给
+ * setTimeout(0)，manifest、Provider 等同步准备会把首屏继续推迟数百毫秒。
+ * 非零延迟保留可取消 timer，避免确定性秒回路径闪出无意义卡片。
+ */
+function scheduleTurnFeedback(
+  delayMs: number,
+  start: () => void,
+): ReturnType<typeof setTimeout> | null {
+  if (delayMs <= 0) {
+    start();
+    return null;
+  }
+  const timer = setTimeout(start, delayMs);
+  timer.unref?.();
+  return timer;
 }
 
 function getInboundMessageKind(msg: InboundMessage, rawData: Record<string, any> | null | undefined): string | undefined {
@@ -2258,25 +2286,21 @@ function existingLocalFile(filePath: string): boolean {
   }
 }
 
-function formatPathList(paths: string[], limit = 4): string {
-  const listed = paths.slice(0, limit).map((item) => `- ${item}`);
-  if (paths.length > limit) listed.push(`- 另外 ${paths.length - limit} 个路径`);
-  return listed.join('\n');
-}
-
-function buildNoExecutionEvidenceReply(reason: string, evidence: ExecutionEvidence): string {
-  const details = [
-    `未完成：${reason}`,
-    '我已拦截这条可能的假完成回复，没有把它当成真实结果发送。',
-    `本轮工具证据：tool_use=${evidence.toolUseCount}，tool_result=${evidence.toolResultCount}，成功结果=${evidence.successfulToolResultCount}。`,
-  ];
-  if (evidence.toolNames.length > 0) {
-    details.push(`工具：${evidence.toolNames.slice(0, 6).join('、')}`);
-  }
-  if (evidence.failedToolErrors?.length) {
-    details.push(`失败原因：${evidence.failedToolErrors.slice(0, 3).join('；')}`);
-  }
-  return appendReplyEndMarker(details.join('\n'));
+function buildNoExecutionEvidenceReply(
+  requirement: ExecutionRequirement,
+  evidence: ExecutionEvidence,
+): string {
+  // 内部计数、工具名、绝对路径和 Provider 诊断只进入 workflow/audit。
+  // 用户卡片只保留与当前 evidence 类型相符的可行动失败说明。
+  return appendReplyEndMarker(buildNoExecutionEvidenceText(requirement, {
+    toolUseCount: evidence.toolUseCount,
+    toolResultCount: evidence.toolResultCount,
+    successfulToolResultCount: evidence.successfulToolResultCount,
+    toolNames: evidence.toolNames,
+    acceptedInputEvidenceIds: evidence.acceptedInputEvidenceIds,
+    acceptedInputEvidenceKinds: evidence.acceptedInputEvidenceKinds,
+    inputEvidenceProvider: evidence.inputEvidenceProvider,
+  }));
 }
 
 function verifyPreparedReplyExecution(
@@ -2294,7 +2318,7 @@ function verifyPreparedReplyExecution(
     const missing = [...missingImages, ...missingFiles];
     return {
       ...payload,
-      text: buildNoExecutionEvidenceReply(`模型声称有本地产物，但这些路径不存在：\n${formatPathList(missing)}`, context.executionEvidence),
+      text: buildNoExecutionEvidenceReply(context.executionRequirement, context.executionEvidence),
       parseMode: 'plain',
       images: payload.images.filter((item) => !missingImages.includes(item)),
       files: payload.files.filter((item) => !missingFiles.includes(item)),
@@ -2309,7 +2333,7 @@ function verifyPreparedReplyExecution(
   ) {
     return {
       ...payload,
-      text: buildNoExecutionEvidenceReply('模型回答了需要本地工具证据的任务，但本轮没有检测到真实工具执行成功记录。', context.executionEvidence),
+      text: buildNoExecutionEvidenceReply(context.executionRequirement, context.executionEvidence),
       parseMode: 'plain',
       images: [],
       files: [],
@@ -2323,7 +2347,7 @@ function verifyPreparedReplyExecution(
   ) {
     return {
       ...payload,
-      text: buildNoExecutionEvidenceReply('模型声称已经执行或创建了结果，但本轮没有检测到真实工具执行成功记录。', context.executionEvidence),
+      text: buildNoExecutionEvidenceReply(context.executionRequirement, context.executionEvidence),
       parseMode: 'plain',
       images: [],
       files: [],
@@ -2354,17 +2378,68 @@ function getNativeFeishuMentionEvidence(msg: InboundMessage): OutboundMention[] 
   const nativeMentions = Array.isArray(rawData?.feishuMentions) ? rawData.feishuMentions : [];
   const uniqueMentions = new Map<string, OutboundMention>();
   for (const mention of nativeMentions) {
-    const ids = readFeishuMentionIds(mention);
+    // 一条原生 mention 对象代表一个平台参与者；open_id / union_id / user_id
+    // 是同一身份的别名，不能展开成多个“参与者”，否则同名先手会被误判为歧义。
+    const userId = readFeishuMentionId(mention);
     const name = typeof mention?.name === 'string' ? mention.name.trim() : '';
-    for (const userId of ids) {
-      if (isFeishuPlaceholderMentionTarget(userId)) continue;
-      uniqueMentions.set(userId, {
-        userId,
-        ...(name ? { name } : {}),
-      });
-    }
+    if (!userId || isFeishuPlaceholderMentionTarget(userId)) continue;
+    uniqueMentions.set(userId, {
+      userId,
+      ...(name ? { name } : {}),
+    });
   }
   return [...uniqueMentions.values()];
+}
+
+function getFeishuOrchestratedInteractionPlan(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  userText: string,
+): FeishuOrchestratedInteractionPlan {
+  if (adapter.channelType !== 'feishu') {
+    return { status: 'not_applicable', reason: '非飞书回合。', participants: [] };
+  }
+  return resolveFeishuOrchestratedInteraction({
+    userText,
+    nativeMentions: getNativeFeishuMentionEvidence(msg),
+    assistantIdentity: adapter.getAssistantIdentity?.(),
+  });
+}
+
+function getFeishuSemanticMentionTargets(
+  adapter: BaseChannelAdapter,
+  message: InboundMessage,
+  userText: string,
+  mentionIntentOptions: FeishuMentionIntentOptions | undefined,
+  orchestration: FeishuOrchestratedInteractionPlan,
+): string[] {
+  if (orchestration.status === 'self_turn') {
+    return orchestration.counterparty?.name?.trim() ? [orchestration.counterparty.name.trim()] : [];
+  }
+  if (orchestration.status === 'wait_turn' || orchestration.status === 'ambiguous') return [];
+  const explicitTargets = extractExplicitFeishuMentionTargetsFromRequest(userText, mentionIntentOptions)
+    .filter((target) => !/^_user_/iu.test(normalizeFeishuMentionTargetKey(target)));
+  if (explicitTargets.length > 0 || !isFeishuMentionExecutionRequest(userText, mentionIntentOptions)) {
+    return explicitTargets;
+  }
+
+  // 飞书会把真正点选的人替换成 @_user_N，adapter 清理可见正文后可能只剩“艾特”。
+  // 此时从同一消息的原生 mention 中识别“当前机器人以外的唯一被点选者”，
+  // 这是当前轮次的目标理解，不依赖模型猜姓名，也不把它固化成末端排除门禁。
+  const identity = adapter.getAssistantIdentity?.();
+  const selfId = identity?.botOpenId?.trim() || '';
+  const selfNameKey = normalizeFeishuMentionTargetKey(identity?.displayName || '');
+  const candidates = new Map<string, string>();
+  for (const mention of getNativeFeishuMentionEvidence(message)) {
+    const userId = mention.userId?.trim() || '';
+    const name = mention.name?.trim() || '';
+    if (!userId || !name) continue;
+    if ((selfId && userId === selfId) || (!selfId && selfNameKey && normalizeFeishuMentionTargetKey(name) === selfNameKey)) {
+      continue;
+    }
+    candidates.set(userId, name);
+  }
+  return candidates.size === 1 ? [[...candidates.values()][0]] : [];
 }
 
 function sanitizeFeishuPlaceholderMentions(
@@ -2399,6 +2474,7 @@ function validateFeishuStructuredMentions(
     channelType: string;
     message: InboundMessage;
     additionalTrustedMentions?: OutboundMention[];
+    requestedTargets?: string[];
   },
 ): PreparedBridgeReplyPayload {
   const mentionsToValidate = [
@@ -2417,6 +2493,22 @@ function validateFeishuStructuredMentions(
   );
   const acceptedMentions = new Map<string, OutboundMention>();
   const rejectedTargets = new Set<string>();
+  const trustedMentionIds = new Set((context.additionalTrustedMentions || [])
+    .map((mention) => mention.userId?.trim() || '')
+    .filter(Boolean));
+  const requestedTargetKeys = new Set((context.requestedTargets || [])
+    .map(normalizeFeishuMentionTargetKey)
+    .filter(Boolean));
+  const requestedTargetIds = new Set<string>();
+  for (const requestedTargetKey of requestedTargetKeys) {
+    const matches = [...nativeEvidenceById.entries()].filter(([, mention]) => {
+      const evidenceKey = normalizeFeishuMentionTargetKey(mention.name || '');
+      return evidenceKey === requestedTargetKey
+        || (requestedTargetKey.length >= 2 && evidenceKey.includes(requestedTargetKey))
+        || (evidenceKey.length >= 2 && requestedTargetKey.includes(evidenceKey));
+    });
+    if (matches.length === 1) requestedTargetIds.add(matches[0][0]);
+  }
   let text = payload.text;
 
   for (const mention of mentionsToValidate) {
@@ -2439,6 +2531,16 @@ function validateFeishuStructuredMentions(
 
     const modelName = mention.name?.trim() || '';
     const evidenceName = nativeEvidence.name?.trim() || '';
+    const evidenceNameKey = normalizeFeishuMentionTargetKey(evidenceName || modelName);
+    // 原生 ID 只证明“这个人是谁”，不能证明“这一轮应该艾特谁”。目标必须来自
+    // Provider 前完成的轮次/指代语义，或来自已单独验证的 contextual mention。
+    if (!trustedMentionIds.has(userId)
+      && !requestedTargetIds.has(userId)
+      && !requestedTargetKeys.has(evidenceNameKey)) {
+      const rejectedTarget = evidenceName || modelName || userId;
+      if (rejectedTarget) rejectedTargets.add(rejectedTarget);
+      continue;
+    }
     if (modelName && evidenceName && modelName !== evidenceName) {
       text = replaceBareFeishuAtTarget(text, modelName, evidenceName);
     }
@@ -2652,6 +2754,18 @@ async function runSelfMaintenanceSafely(input: SelfMaintenanceInput): Promise<Se
   }
 }
 
+/**
+ * 结果阶段自维护属于回合后的旁路治理，不得占用消息 FIFO、投递完成或下一轮会话锁。
+ * 不沿用本轮 task abort signal，避免正常回合释放时把已启动的 classifier 误中止；
+ * Host 自身仍负责超时、写锁、事务恢复和 Bridge 停止后的失败关闭。
+ */
+function launchOutcomeSelfMaintenance(input: SelfMaintenanceInput): void {
+  void runSelfMaintenanceSafely({
+    ...input,
+    abortSignal: undefined,
+  });
+}
+
 async function recordSelfMaintenanceSkipSafely(input: {
   phase: 'correction' | 'outcome';
   sessionId: string;
@@ -2682,11 +2796,12 @@ async function resolveFeishuAgentSelectedMentions(
     userText: string;
     message: InboundMessage;
     mentionIntentOptions?: FeishuMentionIntentOptions;
+    requestedTargets?: string[];
   },
 ): Promise<PreparedBridgeReplyPayload> {
   if (context.channelType !== 'feishu') return payload;
 
-  const requestedTargets = extractExplicitFeishuMentionTargetsFromRequest(
+  const requestedTargets = context.requestedTargets || extractExplicitFeishuMentionTargetsFromRequest(
     context.userText,
     context.mentionIntentOptions,
   );
@@ -2705,7 +2820,6 @@ async function resolveFeishuAgentSelectedMentions(
       const key = normalizeFeishuMentionTargetKey(target);
       if (key) botReplyTargets.set(key, target);
     }
-    if (botReplyTargets.size === 0) return payload;
     let resolverText = payload.text;
     const presentTargetKeys = new Set(
       extractBareFeishuAtTargets(resolverText).map(normalizeFeishuMentionTargetKey).filter(Boolean),
@@ -2890,6 +3004,7 @@ function enforceFeishuMentionTargetSafety(
     senderDisplayName?: string;
     mentionIntentOptions?: FeishuMentionIntentOptions;
     contextualResolution?: FeishuContextualMentionResolution;
+    requestedTargets?: string[];
   },
 ): PreparedBridgeReplyPayload {
   if (context.channelType !== 'feishu') return payload;
@@ -2916,7 +3031,10 @@ function enforceFeishuMentionTargetSafety(
     return preserveReplyWithFeishuMentionNonDelivery(payload);
   }
 
-  const [target] = extractExplicitFeishuMentionTargetsFromRequest(context.userText, context.mentionIntentOptions);
+  const [target] = context.requestedTargets || extractExplicitFeishuMentionTargetsFromRequest(
+    context.userText,
+    context.mentionIntentOptions,
+  );
   if (!target) return payload;
 
   // 到这里说明 Agent 没有选择同名裸 @，或官方 resolver 没有唯一命中；
@@ -2997,9 +3115,17 @@ async function prepareBridgeReplyPayload(
   workingDirectory: string,
   additionalDirectories: string[] = [],
   sourcePrompt = '',
+  inputAttachments?: readonly FileAttachment[],
+  executionRequirement?: ExecutionRequirement,
 ): Promise<PreparedBridgeReplyPayload> {
   const candidate = prepareDeliveryCandidate(text, workingDirectory, additionalDirectories);
-  const encodingSafePayload = await enforceArtifactEncodingBeforeDelivery(candidate.payload);
+  const inputSafePayload = enforceInputEvidenceDeliveryBoundary({
+    payload: candidate.payload,
+    userText: sourcePrompt,
+    inputAttachments,
+    executionRequirementKind: executionRequirement?.kind,
+  }).payload;
+  const encodingSafePayload = await enforceArtifactEncodingBeforeDelivery(inputSafePayload);
   writeFinalEnvelopeStatus({
     ...candidate.status,
     updatedAt: new Date().toISOString(),
@@ -3245,6 +3371,7 @@ async function deliverResponse(
   mentions?: OutboundMention[],
   feishuCardJson?: string,
   verifiedMediaAction?: VerifiedMediaAction,
+  sourceText?: string,
 ): Promise<SendResult> {
   const prepared = alreadyPrepared
     ? {
@@ -3290,6 +3417,10 @@ async function deliverResponse(
       mentions: prepared.mentions,
       feishuCardJson,
       verifiedMediaAction,
+      stickerDeliveryContext: sourceText ? {
+        sourceText,
+        explicitRequest: isExplicitStickerSendRequest(sourceText),
+      } : undefined,
     }, { sessionId });
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
@@ -4327,14 +4458,42 @@ async function buildFeishuMentionResolutionPrompt(
     userText: string;
     message: InboundMessage;
     mentionIntentOptions?: FeishuMentionIntentOptions;
+    requestedTargets?: string[];
+    orchestration?: FeishuOrchestratedInteractionPlan;
   },
 ): Promise<string> {
-  if (context.channelType !== 'feishu' || !adapter.inspectOutboundMentionTarget) return '';
-  const targets = extractExplicitFeishuMentionTargetsFromRequest(
+  if (context.channelType !== 'feishu') return '';
+  const targets = context.requestedTargets || extractExplicitFeishuMentionTargetsFromRequest(
     context.userText,
     context.mentionIntentOptions,
   );
-  if (targets.length === 0) return '';
+
+  const orchestrationLines = context.orchestration?.status === 'self_turn'
+    ? [
+        `- 本轮指定由当前机器人“${context.orchestration.selfParticipant?.name || '当前机器人'}”先发言；这是发言角色，不是 mention 目标。`,
+        `- 发言结束后应把原生 @ 交接给唯一对方“${context.orchestration.counterparty?.name || '未解析'}”。`,
+      ]
+    : context.orchestration?.status === 'ambiguous'
+      ? [`- 本轮参与者/先手/对方无法唯一解析：${context.orchestration.reason} 不要猜测原生 @ 目标。`]
+      : [];
+  const raw = context.message.raw && typeof context.message.raw === 'object'
+    ? context.message.raw as Record<string, unknown>
+    : {};
+  const botToBot = raw.feishuBotToBot && typeof raw.feishuBotToBot === 'object'
+    ? raw.feishuBotToBot as Record<string, unknown>
+    : {};
+  const botToBotLines = typeof botToBot.senderType === 'string' && botToBot.senderType.trim()
+    ? [
+        '- 当前消息由另一机器人或应用原生 mention 唤醒；本轮是在继续回应同一真实发送方。',
+        '- Delivery 会按事件 sender 身份与当前群成员唯一复核并原生回艾特发送方；不要改为其他参与者，也不要把交接约束当成只执行一轮。',
+      ]
+    : [];
+  if (targets.length === 0 && orchestrationLines.length === 0 && botToBotLines.length === 0) return '';
+  if (!adapter.inspectOutboundMentionTarget) {
+    return orchestrationLines.length > 0 || botToBotLines.length > 0
+      ? ['Feishu orchestrated interaction (authoritative, current turn only):', ...orchestrationLines, ...botToBotLines].join('\n')
+      : '';
+  }
 
   const results = await Promise.all(targets.map(async (target) => {
     try {
@@ -4362,10 +4521,12 @@ async function buildFeishuMentionResolutionPrompt(
     }
     return [`- 显示名“${result.target}”的平台查询失败；不要声称已完成原生 @。`];
   });
-  if (lines.length === 0) return '';
+  if (lines.length === 0 && orchestrationLines.length === 0) return '';
 
   return [
     'Feishu mention resolution evidence (authoritative, current turn only):',
+    ...orchestrationLines,
+    ...botToBotLines,
     ...lines,
     '- 对已唯一确认且用户本轮明确要求执行的目标，在最终可见回复中写出同名裸 @（例如 @显示名）；delivery 会再次核验并转换成原生提及。',
     '- 不要输出、猜测或复述平台用户 ID；普通叙述、广播对象、角色和关系称呼仍不得触发身份查询。',
@@ -5486,6 +5647,13 @@ async function handleMessage(
       failedCount?: number;
       truncated?: boolean;
     };
+    feishuMemberProfileEvidence?: {
+      prompt?: string;
+      requestedCount?: number;
+      successfulCount?: number;
+      failedCount?: number;
+      truncated?: boolean;
+    };
     feishuHistoryContext?: {
       responseMode?: string;
       scopeText?: string;
@@ -5929,11 +6097,37 @@ async function handleMessage(
     return;
   }
 
-  const binding = router.resolve(msg.address);
   const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const adapterIdentity = adapter.getAssistantIdentity?.() ?? null;
-  const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter, msg.address);
-  const feishuMentionIntentOptions = getFeishuMentionIntentOptions(adapter, msg);
+  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
+  if (smallTalkReply) {
+    const binding = router.resolve(msg.address);
+    store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
+    store.addMessage(binding.codepilotSessionId, 'assistant', smallTalkReply);
+    recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
+    recordConversationMemoryEvent(msg, binding, 'assistant', smallTalkReply);
+    await deliverResponse(adapter, msg.address, smallTalkReply, binding.codepilotSessionId, msg.messageId);
+    ack();
+    return;
+  }
+
+  const feishuOrchestrationPlan = getFeishuOrchestratedInteractionPlan(adapter, msg, rawText);
+  if (feishuOrchestrationPlan.status === 'wait_turn') {
+    try {
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[ORCHESTRATED_TURN] status=wait starter=${feishuOrchestrationPlan.starterName || ''} reason=${feishuOrchestrationPlan.reason}`,
+      });
+    } catch {
+      // 轮次审计是旁路证据，失败不能把“等待对方先发言”变成一条多余回复。
+    }
+    ack();
+    return;
+  }
+
   let activeTask: ActiveBridgeTask | null = null;
   let processingCardStarted = false;
   let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -5957,22 +6151,11 @@ async function handleMessage(
     processingCardStarted = false;
     adapter.onMessageEnd?.(msg.address.chatId);
   };
-  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
-  if (smallTalkReply) {
-    store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
-    store.addMessage(binding.codepilotSessionId, 'assistant', smallTalkReply);
-    recordConversationMemoryEvent(msg, binding, 'user', text || rawText);
-    recordConversationMemoryEvent(msg, binding, 'assistant', smallTalkReply);
-    await deliverResponse(adapter, msg.address, smallTalkReply, binding.codepilotSessionId, msg.messageId);
-    ack();
-    return;
-  }
-
-  // Arm user-visible feedback before any model-backed preflight. The delayed
-  // start avoids flashing a card for truly immediate replies, while ensuring
-  // memory, cloud and provider waits cannot leave the user without a signal.
+  // 确定性命令、权限、危险请求、空消息和真正的本地秒回都已在上方收口。
+  // 从这里开始立即挂首屏反馈，必须早于 session 路由、身份/表情 Prompt、
+  // adapter evidence 和 Provider 预检，尽量与这些准备及 CardKit RTT 并行。
   if (typeof adapter.onStreamText === 'function') {
-    lightStatusTimer = setTimeout(() => {
+    lightStatusTimer = scheduleTurnFeedback(getTurnFeedbackDelayMs(adapter), () => {
       lightStatusTimer = null;
       lightStatusCardStarted = true;
       startProcessingCard();
@@ -5980,9 +6163,19 @@ async function handleMessage(
       console.log(`[bridge-manager] Turn feedback started: messageId=${msg.messageId}, elapsed=${feedbackElapsedMs}ms`);
       updateBridgeRuntimeActiveRequest(activeRequest, 'feedback_started');
       try { adapter.onStreamText!(msg.address.chatId, '正在处理…'); } catch { /* non-critical */ }
-    }, getTurnFeedbackDelayMs());
-    lightStatusTimer.unref?.();
+    });
   }
+
+  const binding = router.resolve(msg.address);
+  const adapterIdentityPrompt = buildAdapterAssistantIdentityPrompt(adapter, msg.address);
+  const feishuMentionIntentOptions = getFeishuMentionIntentOptions(adapter, msg);
+  const feishuSemanticMentionTargets = getFeishuSemanticMentionTargets(
+    adapter,
+    msg,
+    rawText,
+    feishuMentionIntentOptions,
+    feishuOrchestrationPlan,
+  );
 
   if (msg.prepareForAgent) {
     const prepareForAgent = msg.prepareForAgent;
@@ -6194,7 +6387,7 @@ async function handleMessage(
     sourceMessageId: msg.messageId,
     sourceText: rawText,
     lifecycleTaskKey: messageLifecycleTask?.key,
-    cardStarted: false,
+    cardStarted: processingCardStarted,
     interruptionFinalized: false,
   };
   if (messageLifecycleTask) {
@@ -6230,6 +6423,7 @@ async function handleMessage(
     ? rawData.feishuStickerLibraryContext.preferredFileKey.trim()
     : '';
   const feishuAvatarEvidencePrompt = rawData?.feishuAvatarEvidence?.prompt?.trim() || '';
+  const feishuMemberProfileEvidencePrompt = rawData?.feishuMemberProfileEvidence?.prompt?.trim() || '';
   const stickerCandidateAnalysisSystemPrompt = feishuStickerLibraryContextPrompt
     ? buildStickerCandidateAnalysisSystemPrompt(feishuStickerLibraryAttachedFileKeys, rawText)
     : '';
@@ -6268,7 +6462,8 @@ async function handleMessage(
     || feishuHistoryEvidencePrompt
     || feishuDocumentMemoryPrompt
     || feishuStickerLibraryContextPrompt
-    || feishuAvatarEvidencePrompt,
+    || feishuAvatarEvidencePrompt
+    || feishuMemberProfileEvidencePrompt,
   );
   const uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
@@ -6371,13 +6566,12 @@ async function handleMessage(
   const progressCardSteps: string[] = [];
   let providerProgressText = '';
   if (hasLightStatusCard && typeof adapter.onStreamText === 'function' && !lightStatusTimer && !lightStatusCardStarted) {
-    lightStatusTimer = setTimeout(() => {
+    lightStatusTimer = scheduleTurnFeedback(getTurnFeedbackDelayMs(adapter), () => {
       lightStatusTimer = null;
       lightStatusCardStarted = true;
       if (activeTask) activeTask.cardStarted = true;
       try { adapter.onStreamText!(msg.address.chatId, '正在回复…'); } catch { /* non-critical */ }
-    }, getTurnFeedbackDelayMs());
-    lightStatusTimer.unref?.();
+    });
   }
 
   const ensureWorkflowCard = (): boolean => {
@@ -6613,6 +6807,8 @@ async function handleMessage(
       userText: rawText,
       message: msg,
       mentionIntentOptions: feishuMentionIntentOptions,
+      requestedTargets: feishuSemanticMentionTargets,
+      orchestration: feishuOrchestrationPlan,
     });
     if (taskAbort.signal.aborted) return;
     let stickerExpressionPromptSection: Awaited<ReturnType<NonNullable<ReturnType<typeof getBridgeContext>['stickerSemantics']>['buildExpressionPromptSection']>> = null;
@@ -6633,6 +6829,7 @@ async function handleMessage(
       structuredTurnContextPrompt,
       inboundActorContextPrompt,
       feishuMentionResolutionPrompt,
+      feishuMemberProfileEvidencePrompt,
       feishuAvatarEvidencePrompt,
     ].filter(Boolean).join('\n\n');
     if (collaborationRunId) collaborationHost?.markPrimaryStarted(collaborationRunId);
@@ -6668,6 +6865,7 @@ async function handleMessage(
         // imagegen) cannot replace a bridge-owned sticker delivery action.
         feishuStickerLibraryContextPrompt,
         stickerCandidateAnalysisSystemPrompt,
+        feishuMemberProfileEvidencePrompt,
         feishuAvatarEvidencePrompt,
         adapterIdentityPrompt,
         assistantMaintainerContextPrompt,
@@ -6707,6 +6905,57 @@ async function handleMessage(
       collaborationRunId: collaborationRunId || undefined,
     });
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
+
+    const feishuCliAuthorizationViolation = adapter.channelType === 'feishu'
+      ? result.executionEvidence.feishuCliUserAuthorizationViolations?.[0]
+      : undefined;
+    if (feishuCliAuthorizationViolation) {
+      clearLightStatusTimer();
+      const violationText = feishuCliAuthorizationViolation.userMessage;
+      store.insertAuditLog({
+        channelType: msg.address.channelType,
+        chatId: msg.address.chatId,
+        direction: 'outbound',
+        messageId: msg.messageId,
+        summary: [
+          '[FEISHU_CLI_USER_AUTH_REJECTED]',
+          `code=${feishuCliAuthorizationViolation.code}`,
+          `scopeCount=${feishuCliAuthorizationViolation.requestedScopes.length}`,
+        ].join(' '),
+      });
+
+      let statusCardFinalized = false;
+      if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd) {
+        try {
+          statusCardFinalized = await adapter.onStreamEnd(
+            msg.address.chatId,
+            'error',
+            violationText,
+            result.runSummary,
+            undefined,
+            undefined,
+            {
+              codepilotSessionId: effectiveBinding.codepilotSessionId,
+              sourceMessageId: msg.messageId,
+              sourceText: storedUserText,
+            },
+          );
+        } catch (error) {
+          console.warn('[bridge-manager] Feishu CLI broad auth rejection card finalize failed:', error instanceof Error ? error.message : error);
+        }
+      }
+      if (!statusCardFinalized) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: violationText,
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        }, { sessionId: effectiveBinding.codepilotSessionId });
+      }
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', violationText);
+      ack();
+      return;
+    }
 
     const feishuCliAuthorizationChallenge = adapter.channelType === 'feishu'
       ? result.executionEvidence.feishuCliUserAuthorizationChallenges?.[0]
@@ -6955,7 +7204,14 @@ async function handleMessage(
       uiExecutionRequirement,
     );
     let preparedReply = responseText
-      ? await prepareBridgeReplyPayload(responseText, resolvedWorkingDirectory, accessibleWorkspaceDirectories, rawText)
+      ? await prepareBridgeReplyPayload(
+        responseText,
+        resolvedWorkingDirectory,
+        accessibleWorkspaceDirectories,
+        rawText,
+        providerAttachments,
+        uiExecutionRequirement,
+      )
       : null;
     const bridgeActionCardJson = bridgeControlAction.feishuCardJson
       || directMessageAction.feishuCardJson
@@ -6986,12 +7242,14 @@ async function handleMessage(
         channelType: adapter.channelType,
         message: msg,
         additionalTrustedMentions: contextualMentionVerification.trustedMentions,
+        requestedTargets: feishuSemanticMentionTargets,
       });
       preparedReply = await resolveFeishuAgentSelectedMentions(adapter, preparedReply, {
         channelType: adapter.channelType,
         userText: rawText,
         message: msg,
         mentionIntentOptions: feishuMentionIntentOptions,
+        requestedTargets: feishuSemanticMentionTargets,
       });
       preparedReply = enforceFeishuMentionTargetSafety(preparedReply, {
         channelType: adapter.channelType,
@@ -6999,6 +7257,7 @@ async function handleMessage(
         senderDisplayName: msg.address.displayName,
         mentionIntentOptions: feishuMentionIntentOptions,
         contextualResolution: contextualMentionVerification.resolution,
+        requestedTargets: feishuSemanticMentionTargets,
       });
       preparedReply = enforceFeishuAvatarEvidenceCompletion(preparedReply, rawData?.feishuAvatarEvidence);
     }
@@ -7122,6 +7381,7 @@ async function handleMessage(
             codepilotSessionId: effectiveBinding.codepilotSessionId,
             sourceMessageId: msg.messageId,
             sourceText: storedUserText,
+            chatType: msg.address.chatType,
           },
         );
         if (status === 'interrupted' && activeTask) activeTask.interruptionFinalized = cardFinalized;
@@ -7196,6 +7456,7 @@ async function handleMessage(
           preparedReply?.mentions,
           preparedReply?.feishuCardJson,
           verifiedStickerAction,
+          rawText,
         );
       }
       const localImagePaths = Array.from(new Set([
@@ -7303,7 +7564,7 @@ async function handleMessage(
 
     if (!taskAbort.signal.aborted) {
       const maintainedAssistantText = stickerSafeUserFacingResponseText || safeProviderErrorText || result.responseText;
-      await runSelfMaintenanceSafely({
+      launchOutcomeSelfMaintenance({
         phase: 'outcome',
         sessionId: effectiveBinding.codepilotSessionId,
         channelType: adapter.channelType,
@@ -7320,7 +7581,6 @@ async function handleMessage(
           successfulToolResultCount: responseExecutionEvidence.successfulToolResultCount,
           failedToolResultCount: responseExecutionEvidence.failedToolResultCount,
         },
-        abortSignal: taskAbort.signal,
       });
     }
 
@@ -7796,6 +8056,8 @@ export const _testOnly = {
   isFeishuDocumentListRequest,
   isFeishuDocGenerationRequestStrict,
   selectReplySurfaceMode,
+  getTurnFeedbackDelayMs,
+  scheduleTurnFeedback,
   notifyQueuedBehindActiveTurn,
   buildUnityScreenshotPolicyInstructions,
   sanitizeOutsourcedToolReply,
@@ -7811,6 +8073,7 @@ export const _testOnly = {
   parseNaturalReminderRequest,
   pollAdapterMessageForTest: pollAdapterMessage,
   runSelfMaintenanceSafely,
+  launchOutcomeSelfMaintenance,
   recordSelfMaintenanceSkipSafely,
   enforceMemoryIntentOutcome,
 };

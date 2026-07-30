@@ -120,6 +120,21 @@ describe('agent architecture registry', () => {
     assert.equal(getPermissionApprovalRequiredRole({ toolName: 'mcp.direct-message', toolInputJson: '{"target":"chat"}' }), 'owner');
   });
 
+  it('keeps Feishu least-privilege authorization in the Policy Registry', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'policy_registry.feishu_permission_minimization');
+    const lines = getAgentPolicyPromptLines(['policy_registry.feishu_permission_minimization']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'policy_registry');
+    assert.match(lines, /bot\/application identity first/i);
+    assert.match(lines, /compatible alternatives/i);
+    assert.match(lines, /one exact --scope/i);
+    assert.match(lines, /--recommend/i);
+    assert.match(lines, /administrator action/i);
+    assert.match(lines, /ask before/i);
+  });
+
   it('keeps dangerous request and reminder side-effect gates in the policy registry', () => {
     assert.equal(isDangerousUserRequest('日志里写着 rm -rf 执行失败'), false);
     assert.equal(isDangerousUserRequest('请删除这个目录'), true);
@@ -138,6 +153,8 @@ describe('agent architecture registry', () => {
   it('allows explicit names and evidence-bound contextual targets to reach adaptive mention resolution', () => {
     const lines = getAgentPolicyPromptLines(['policy_registry.outbound_mention_targets']).join('\n');
 
+    assert.match(lines, /resolve the current assistant, starter, current turn, and unique counterparty before provider execution/i);
+    assert.match(lines, /starter name describes the speaker role, not the outbound mention target/i);
     assert.match(lines, /current-turn explicit request/i);
     assert.match(lines, /real current-turn evidence/i);
     assert.match(lines, /他、她、对方/);
@@ -176,6 +193,8 @@ describe('agent architecture registry', () => {
     assert.match(lines, /italic/i);
     assert.match(lines, /underline/i);
     assert.match(lines, /short conversational replies/i);
+    assert.match(lines, /omit the header entirely/i);
+    assert.match(lines, /verified native reaction\/sticker delivery/i);
   });
 
   it('keeps finite user choices in the Delivery Layer without weakening safety gates', () => {
@@ -192,6 +211,19 @@ describe('agent architecture registry', () => {
     assert.match(lines, /Owner confirmation/i);
     assert.match(lines, /callback_data/i);
     assert.match(lines, /Bridge signs button callbacks/i);
+  });
+
+  it('keeps input evidence separate from output attachments in the Delivery Layer', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'delivery_layer.result_envelope');
+    const lines = getAgentPolicyPromptLines(['delivery_layer.result_envelope']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'delivery_layer');
+    assert.match(lines, /input evidence/i);
+    assert.match(lines, /actual result objective/i);
+    assert.match(lines, /not a fixed phrase or a filename/i);
+    assert.match(lines, /generated, edited, annotated, converted, or exported/i);
   });
 
   it('decides skill autonomy from source and risk instead of names', () => {

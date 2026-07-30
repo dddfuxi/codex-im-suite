@@ -170,6 +170,12 @@ describe('FeishuAdapter authorization', () => {
 
     assert.equal(adapter.isAuthorized('ou_random_user', 'oc_target_group'), true);
   });
+
+  it('requests immediate model-backed turn feedback to hide CardKit round trips', () => {
+    const adapter = new FeishuAdapter();
+
+    assert.equal(adapter.getPreferredTurnFeedbackDelayMs(), 0);
+  });
 });
 
 describe('FeishuAdapter deferred agent preparation', () => {
@@ -799,9 +805,29 @@ describe('FeishuAdapter bot name wake classification', () => {
     await adapter.processIncomingEvent(event);
 
     assert.equal(queued.length, 1);
-    assert.equal((queued[0] as any).text, '跟乔治说句话，尽量发普通文本，别发卡片。 已完成 · 3.4s');
+    assert.equal((queued[0] as any).text, '跟乔治说句话，尽量发普通文本，别发卡片。');
+    assert.equal((queued[0] as any).raw?.feishuInteractiveCard?.presentationMetadataRemoved, true);
+    assert.deepEqual(
+      (queued[0] as any).raw?.feishuInteractiveCard?.presentationTextParts,
+      ['已完成 · 3.4s'],
+    );
     assert.equal((queued[0] as any).raw?.feishuSender?.senderType, 'app');
     assert.equal((queued[0] as any).raw?.feishuBotToBot?.senderType, 'app');
+  });
+
+  it('keeps elapsed-time wording in ordinary text messages', async () => {
+    setupContext({ bridge_feishu_require_mention: 'false' });
+    const adapter = new FeishuAdapter() as any;
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent(
+      'om_plain_elapsed_text',
+      '任务已完成，用时 5.6 秒，主要瓶颈是网络。',
+    ));
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).text, '任务已完成，用时 5.6 秒，主要瓶颈是网络。');
   });
 
   it('passes interactive card image resources to the agent when Feishu only returns an upgrade placeholder', async () => {
@@ -1142,6 +1168,396 @@ describe('FeishuAdapter assistant identity', () => {
   });
 });
 
+describe('FeishuAdapter member profile evidence', () => {
+  beforeEach(() => {
+    setupContext({
+      bridge_feishu_require_mention: 'false',
+      bridge_feishu_app_id: 'cli_current_bot',
+      bridge_feishu_app_secret: 'secret',
+    });
+  });
+
+  async function buildProfileEvidenceScenario(input: {
+    users: Array<{ member_id: string; member_id_type: 'open_id'; name: string }>;
+    userPayloads: Record<string, { body: unknown; status?: number }>;
+    departmentPayloads?: Record<string, { body: unknown; status?: number }>;
+    requestText?: string;
+  }): Promise<{ result: any; calls: string[] }> {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { users: input.users, bots: [], has_more: false },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      for (const [userId, response] of Object.entries(input.userPayloads)) {
+        if (text.includes(`/open-apis/contact/v3/users/${userId}`)) {
+          return new Response(JSON.stringify(response.body), {
+            status: response.status ?? 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+      }
+      for (const [departmentId, response] of Object.entries(input.departmentPayloads || {})) {
+        if (text.includes(`/open-apis/contact/v3/departments/${departmentId}`)) {
+          return new Response(JSON.stringify(response.body), {
+            status: response.status ?? 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    try {
+      const adapter = new FeishuAdapter() as any;
+      return {
+        result: await adapter.buildMemberProfileEvidenceForRequest(
+          'oc_group',
+          input.requestText || '列出群成员的部门、职位和激活状态',
+        ),
+        calls,
+      };
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  it('resolves user department, job title and activation status with the bot application identity', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+            bots: [{ member_id: 'ou_other_bot', member_id_type: 'open_id', name: '乔治', app_id: 'cli_george' }],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/users/ou_user')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            user: {
+              name: '刘丹',
+              job_title: '高级技术美术',
+              department_ids: ['od_art'],
+              status: { is_activated: true },
+            },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/departments/od_art')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { department: { name: 'GOG Global 外包' } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      const result = await adapter.buildMemberProfileEvidenceForRequest(
+        'oc_group',
+        '列出群成员的身份、部门、职位和激活状态',
+      );
+
+      assert.equal(result.requestedCount, 2);
+      assert.equal(result.successfulCount, 2);
+      assert.equal(result.failedCount, 0);
+      assert.deepEqual(result.items[0], {
+        actorType: 'user',
+        displayName: '刘丹',
+        status: 'resolved',
+        jobTitle: '高级技术美术',
+        departmentNames: ['GOG Global 外包'],
+        activationStatus: 'active',
+        userOAuthRequired: false,
+      });
+      assert.equal(result.items[1].actorType, 'bot');
+      assert.equal(result.items[1].displayName, '乔治');
+      assert.equal(result.items[1].status, 'resolved');
+      assert.match(result.prompt, /部门=GOG Global 外包；职位=高级技术美术；状态=已激活/u);
+      assert.match(result.prompt, /机器人“乔治”.*不进入员工通讯录查询/u);
+      assert.match(result.prompt, /禁止为此向普通用户发起 user OAuth/u);
+      assert.equal(calls.filter((item) => item.includes('/contact/v3/users/')).length, 1);
+      assert.equal(calls.some((item) => /auth\/login|oauth/iu.test(item)), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('uses the roster only for identity classification and never opens Contact field permissions', async () => {
+    const { result, calls } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+      userPayloads: {},
+      requestText: '检查群成员分别是用户还是机器人',
+    });
+
+    assert.deepEqual(result.requestedFields, ['identity']);
+    assert.equal(result.items[0].actorType, 'user');
+    assert.equal(result.items[0].status, 'resolved');
+    assert.equal(calls.some((item) => item.includes('/open-apis/contact/v3/')), false);
+    assert.match(result.prompt, /刘丹.*成员类型=用户/u);
+    assert.doesNotMatch(result.prompt, /部门=|职位=|状态=|当前唯一下一项权限动作/u);
+  });
+
+  it('checks only the requested employee field when Contact omits optional fields', async () => {
+    const { result } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+      userPayloads: {
+        ou_user: { body: { code: 0, data: { user: { open_id: 'ou_user' } } } },
+      },
+      requestText: '查看群成员的岗位',
+    });
+
+    assert.deepEqual(result.requestedFields, ['job_title']);
+    assert.deepEqual(result.items[0].missingFields, ['job_title']);
+    assert.equal(result.items[0].recommendedScope, 'contact:user.employee:readonly');
+    assert.match(result.prompt, /职位=未授权/u);
+    assert.doesNotMatch(result.prompt, /部门=|状态=/u);
+  });
+
+  it('keeps compatible Contact scopes as alternatives but recommends only one minimum administrator scope', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+            bots: [],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/users/ou_user')) {
+        return new Response(JSON.stringify({
+          code: 99991672,
+          msg: 'Access denied. One of the following scopes is required: contact:contact.base:readonly, contact:contact:access_as_app, contact:contact:readonly, contact:contact:readonly_as_app',
+          error: {
+            missing_scopes: [
+              'contact:contact.base:readonly',
+              'contact:contact:access_as_app',
+              'contact:contact:readonly',
+              'contact:contact:readonly_as_app',
+            ],
+          },
+        }), { status: 403, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      const result = await adapter.buildMemberProfileEvidenceForRequest(
+        'oc_group',
+        '列出群成员的职位',
+      );
+      const blocked = result.items[0];
+
+      assert.equal(result.successfulCount, 0);
+      assert.equal(result.failedCount, 1);
+      assert.equal(blocked.reasonCode, 'missing_app_scope');
+      assert.deepEqual(blocked.scopeAlternatives, [
+        'contact:contact.base:readonly',
+        'contact:contact:access_as_app',
+        'contact:contact:readonly',
+        'contact:contact:readonly_as_app',
+      ]);
+      assert.equal(blocked.recommendedScope, 'contact:contact.base:readonly');
+      assert.equal(blocked.userOAuthRequired, false);
+      assert.match(decodeURIComponent(blocked.consoleUrl), /scopes=contact:contact\.base:readonly(?:&|$)/u);
+      assert.doesNotMatch(decodeURIComponent(blocked.consoleUrl), /contact:contact:access_as_app/u);
+      assert.match(result.prompt, /当前唯一下一项权限动作.*contact:contact\.base:readonly/u);
+      assert.doesNotMatch(result.prompt, /contact:contact:access_as_app/u);
+      assert.doesNotMatch(result.prompt, /contact:contact:readonly_as_app/u);
+      assert.doesNotMatch(result.prompt, /auth login|--recommend|user OAuth.*申请/iu);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('treats omitted profile fields as missing field scopes and recommends employee scope first', async () => {
+    const { result, calls } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+      userPayloads: {
+        ou_user: { body: { code: 0, data: { user: { open_id: 'ou_user', union_id: 'on_user' } } } },
+      },
+    });
+
+    assert.deepEqual(result.items[0].missingFields, ['job_title', 'activation_status', 'department_ids']);
+    assert.equal(result.items[0].recommendedScope, 'contact:user.employee:readonly');
+    assert.match(result.prompt, /当前唯一下一项权限动作.*contact:user\.employee:readonly/u);
+    assert.doesNotMatch(result.prompt, /当前唯一下一项权限动作.*contact:user\.department:readonly/u);
+    assert.doesNotMatch(result.prompt, /当前唯一下一项权限动作.*contact:department\.base:readonly/u);
+    assert.match(result.prompt, /部门=未授权；职位=未授权；状态=未授权/u);
+    assert.equal(calls.some((item) => item.includes('/contact/v3/departments/')), false);
+  });
+
+  it('advances to department-id scope only after employee fields are available', async () => {
+    const { result } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '小明' }],
+      userPayloads: {
+        ou_user: {
+          body: {
+            code: 0,
+            data: { user: { job_title: '', status: { is_activated: false } } },
+          },
+        },
+      },
+    });
+
+    assert.deepEqual(result.items[0].missingFields, ['department_ids']);
+    assert.deepEqual(result.items[0].emptyFields, ['job_title']);
+    assert.equal(result.items[0].recommendedScope, 'contact:user.department:readonly');
+    assert.match(result.prompt, /部门=未授权；职位=未填写；状态=未激活/u);
+    assert.match(result.prompt, /当前唯一下一项权限动作.*contact:user\.department:readonly/u);
+    assert.doesNotMatch(result.prompt, /当前唯一下一项权限动作.*contact:user\.employee:readonly/u);
+  });
+
+  it('surfaces department-name permission failures instead of swallowing them as empty data', async () => {
+    const { result } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+      userPayloads: {
+        ou_user: {
+          body: {
+            code: 0,
+            data: {
+              user: {
+                job_title: '技术美术',
+                department_ids: ['od_art'],
+                status: { is_activated: true },
+              },
+            },
+          },
+        },
+      },
+      departmentPayloads: {
+        od_art: {
+          status: 403,
+          body: {
+            code: 99991672,
+            msg: 'Access denied. Required scope: contact:department.base:readonly',
+            error: { missing_scopes: ['contact:department.base:readonly'] },
+          },
+        },
+      },
+      requestText: '群成员的部门都是什么',
+    });
+
+    assert.deepEqual(result.items[0].missingFields, ['department_name']);
+    assert.equal(result.items[0].recommendedScope, 'contact:department.base:readonly');
+    assert.match(result.prompt, /部门=未授权/u);
+    assert.doesNotMatch(result.prompt, /职位=|状态=|contact:user\.employee:readonly/u);
+    assert.match(result.prompt, /当前唯一下一项权限动作.*contact:department\.base:readonly/u);
+  });
+
+  it('does not request department scopes when only activation status was requested', async () => {
+    const { result, calls } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '小明' }],
+      userPayloads: {
+        ou_user: { body: { code: 0, data: { user: { status: { is_activated: true } } } } },
+      },
+      requestText: '核对群友的启用状态',
+    });
+
+    assert.deepEqual(result.requestedFields, ['activation_status']);
+    assert.equal(result.items[0].activationStatus, 'active');
+    assert.equal(result.items[0].missingFields, undefined);
+    assert.equal(result.items[0].recommendedScope, undefined);
+    assert.equal(calls.some((item) => item.includes('/contact/v3/departments/')), false);
+    assert.match(result.prompt, /状态=已激活/u);
+    assert.doesNotMatch(result.prompt, /部门=|职位=|当前唯一下一项权限动作/u);
+  });
+
+  it('renders present-but-empty fields as unfilled without requesting another scope', async () => {
+    const { result } = await buildProfileEvidenceScenario({
+      users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '小明' }],
+      userPayloads: {
+        ou_user: {
+          body: {
+            code: 0,
+            data: {
+              user: {
+                job_title: '',
+                department_ids: [],
+                status: { is_activated: null },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    assert.equal(result.items[0].missingFields, undefined);
+    assert.deepEqual(result.items[0].emptyFields, ['job_title', 'activation_status', 'department_ids']);
+    assert.equal(result.items[0].recommendedScope, undefined);
+    assert.match(result.prompt, /部门=未填写；职位=未填写；状态=未填写/u);
+    assert.doesNotMatch(result.prompt, /当前唯一下一项权限动作/u);
+  });
+
+  it('prioritizes one employee field scope when a data-range blocker also exists', async () => {
+    const { result } = await buildProfileEvidenceScenario({
+      users: [
+        { member_id: 'ou_visible', member_id_type: 'open_id', name: '刘丹' },
+        { member_id: 'ou_hidden', member_id_type: 'open_id', name: '苏庆华' },
+      ],
+      userPayloads: {
+        ou_visible: { body: { code: 0, data: { user: { open_id: 'ou_visible' } } } },
+        ou_hidden: {
+          status: 403,
+          body: { code: 41050, msg: 'Current app has no access to this user' },
+        },
+      },
+    });
+
+    assert.equal(result.items[0].recommendedScope, 'contact:user.employee:readonly');
+    assert.equal(result.items[1].reasonCode, 'contact_data_scope_denied');
+    assert.match(result.prompt, /苏庆华.*通讯录数据权限范围不包含/u);
+    assert.match(result.prompt, /当前唯一下一项权限动作.*contact:user\.employee:readonly/u);
+    assert.doesNotMatch(result.prompt, /当前唯一下一项权限动作.*纳入应用通讯录数据权限范围/u);
+    assert.equal((result.prompt.match(/当前唯一下一项权限动作/gu) || []).length, 1);
+  });
+});
+
 describe('FeishuAdapter avatar evidence', () => {
   beforeEach(() => {
     setupContext({
@@ -1225,6 +1641,355 @@ describe('FeishuAdapter avatar evidence', () => {
       );
       assert.match(evidence.prompt, new RegExp(`刘丹.*${attachmentNames[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u'));
       assert.match(evidence.prompt, new RegExp(`乔治.*${attachmentNames[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u'));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('treats collective assistant self-reference as bot-only and reuses the current bot avatar without admin app scope', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [{ member_id: 'ou_user', member_id_type: 'open_id', name: '刘丹' }],
+            bots: [{ member_id: 'ou_current_bot', member_id_type: 'open_id', name: '小虾米', app_id: 'cli_current_bot' }],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text === 'https://avatar.example.com/current-bot.png') {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.botOpenId = 'ou_current_bot';
+      adapter.botAvatarUrl = 'https://avatar.example.com/current-bot.png';
+      adapter.resolveChatDisplayName = async () => '头像测试群';
+      adapter.persistChatIndex = () => {};
+      adapter.syncIndexedChatHistory = async () => {};
+      adapter.buildLightConversationContext = async () => null;
+      adapter.ensureStickerHistoryBackfilledForRequest = async () => {};
+      adapter.buildStickerLibraryEvidenceForRequest = async () => null;
+      const queued: any[] = [];
+      adapter.enqueue = (message: unknown) => queued.push(message);
+
+      await adapter.processIncomingEvent(createFeishuTextEvent('om_collective_avatar', '你们各自看看自己的头像并描述一下'));
+      assert.equal(queued.length, 1);
+      await queued[0].prepareForAgent();
+
+      const evidence = queued[0].raw.feishuAvatarEvidence;
+      assert.deepEqual(evidence.targetActorTypes, ['bot']);
+      assert.equal(evidence.successfulCount, 1);
+      assert.equal(evidence.failedCount, 0);
+      assert.equal(evidence.items[0].displayName, '小虾米');
+      assert.equal(evidence.items[0].sourceApi, 'GET /open-apis/bot/v3/info');
+      assert.equal(calls.some((item) => item.includes('/open-apis/contact/v3/users/')), false);
+      assert.equal(calls.some((item) => item.includes('/open-apis/application/v6/applications/')), false);
+      assert.doesNotMatch(evidence.prompt, /admin:app\.info:readonly/u);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('resolves a named avatar question through the current roster and queries only the uniquely matched member', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [
+              { member_id: 'ou_su', member_id_type: 'open_id', name: '苏庆华' },
+              { member_id: 'ou_liu', member_id_type: 'open_id', name: '刘丹' },
+            ],
+            bots: [{ member_id: 'ou_bot', member_id_type: 'open_id', name: '小虾米', app_id: 'cli_current_bot' }],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/users/ou_su')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { user: { avatar: { avatar_240: 'https://avatar.example.com/suqinghua.png' } } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text === 'https://avatar.example.com/suqinghua.png') {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.resolveChatDisplayName = async () => '头像测试群';
+      adapter.persistChatIndex = () => {};
+      adapter.syncIndexedChatHistory = async () => {};
+      adapter.buildLightConversationContext = async () => null;
+      adapter.ensureStickerHistoryBackfilledForRequest = async () => {};
+      adapter.buildStickerLibraryEvidenceForRequest = async () => null;
+      const queued: any[] = [];
+      adapter.enqueue = (message: unknown) => queued.push(message);
+
+      await adapter.processIncomingEvent(createFeishuTextEvent('om_named_avatar', '苏庆华的头像是什么'));
+      assert.equal(queued.length, 1);
+      await queued[0].prepareForAgent();
+
+      const evidence = queued[0].raw.feishuAvatarEvidence;
+      assert.deepEqual(evidence.targetDisplayNames, ['苏庆华']);
+      assert.equal(evidence.successfulCount, 1);
+      assert.equal(evidence.failedCount, 0);
+      assert.equal(evidence.items[0].displayName, '苏庆华');
+      assert.equal(calls.filter((item) => item.includes('/open-apis/contact/v3/users/')).length, 1);
+      assert.equal(calls.some((item) => item.includes('/open-apis/contact/v3/users/ou_liu')), false);
+      assert.equal(calls.some((item) => item.includes('/open-apis/application/v6/applications/')), false);
+      assert.match(evidence.prompt, /具名目标：苏庆华/u);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('accepts a terse related display name and continues through transient APIs and avatar size candidates', async () => {
+    const originalFetch = globalThis.fetch;
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    let tokenCalls = 0;
+    let rosterCalls = 0;
+    let profileCalls = 0;
+    let largeAvatarCalls = 0;
+    let smallAvatarCalls = 0;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        tokenCalls += 1;
+        if (tokenCalls === 1) {
+          return new Response(JSON.stringify({ code: 50001, msg: 'temporary' }), {
+            status: 503,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        rosterCalls += 1;
+        if (rosterCalls === 1) {
+          return new Response(JSON.stringify({ code: 50001, msg: 'temporary' }), {
+            status: 500,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [{ member_id: 'ou_su', member_id_type: 'open_id', name: '苏庆华' }],
+            bots: [],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/users/ou_su')) {
+        profileCalls += 1;
+        if (profileCalls === 1) throw new Error('socket reset');
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            user: {
+              avatar: {
+                avatar_640: 'https://avatar.example.com/large.png',
+                avatar_240: 'https://avatar.example.com/small.png',
+              },
+            },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text === 'https://avatar.example.com/large.png') {
+        largeAvatarCalls += 1;
+        return new Response(null, { status: 503 });
+      }
+      if (text === 'https://avatar.example.com/small.png') {
+        smallAvatarCalls += 1;
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      const result = await adapter.buildAvatarEvidenceForRequest('oc_group', '苏庆华老师头像');
+
+      assert.deepEqual(result.context.targetDisplayNames, ['苏庆华老师']);
+      assert.equal(result.context.successfulCount, 1);
+      assert.equal(result.context.failedCount, 0);
+      assert.equal(result.context.items[0].displayName, '苏庆华');
+      assert.equal(tokenCalls, 2);
+      assert.equal(rosterCalls, 2);
+      assert.equal(profileCalls, 2);
+      assert.equal(largeAvatarCalls, 1);
+      assert.equal(smallAvatarCalls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('does not treat an avatar capability question as a member display name', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.resolveChatDisplayName = async () => '头像测试群';
+    adapter.persistChatIndex = () => {};
+    adapter.syncIndexedChatHistory = async () => {};
+    adapter.buildLightConversationContext = async () => null;
+    adapter.ensureStickerHistoryBackfilledForRequest = async () => {};
+    adapter.buildStickerLibraryEvidenceForRequest = async () => null;
+    const queued: any[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent('om_avatar_capability_now', '这会你能看到头像了吗'));
+    assert.equal(queued.length, 1);
+    await queued[0].prepareForAgent();
+    assert.equal(queued[0].raw.feishuAvatarEvidence, undefined);
+  });
+
+  it('binds 我的头像 to the current sender id instead of extracting a fake display name', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [
+              { member_id: 'ou_user', member_id_type: 'open_id', name: '当前发送者' },
+              { member_id: 'ou_other', member_id_type: 'open_id', name: '其他成员' },
+            ],
+            bots: [],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text.includes('/open-apis/contact/v3/users/ou_user')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { user: { avatar: { avatar_240: 'https://avatar.example.com/current-sender.png' } } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (text === 'https://avatar.example.com/current-sender.png') {
+        return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      adapter.resolveChatDisplayName = async () => '头像测试群';
+      adapter.persistChatIndex = () => {};
+      adapter.syncIndexedChatHistory = async () => {};
+      adapter.buildLightConversationContext = async () => null;
+      adapter.ensureStickerHistoryBackfilledForRequest = async () => {};
+      adapter.buildStickerLibraryEvidenceForRequest = async () => null;
+      const queued: any[] = [];
+      adapter.enqueue = (message: unknown) => queued.push(message);
+
+      await adapter.processIncomingEvent(createFeishuTextEvent('om_current_sender_avatar', '想办法，看到我的头像'));
+      assert.equal(queued.length, 1);
+      await queued[0].prepareForAgent();
+
+      const evidence = queued[0].raw.feishuAvatarEvidence;
+      assert.equal(evidence.targetCurrentSender, true);
+      assert.equal(evidence.targetDisplayNames, undefined);
+      assert.equal(evidence.successfulCount, 1);
+      assert.equal(evidence.items[0].platformId, 'ou_user');
+      assert.equal(calls.some((item) => item.includes('/open-apis/contact/v3/users/ou_other')), false);
+      assert.match(evidence.prompt, /当前消息发送者/u);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('keeps same-name roster ambiguity blocked even after related-name fallback', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      calls.push(text);
+      if (text.includes('/auth/v3/tenant_access_token/internal')) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant_token' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (text.includes('/open-apis/im/v1/chats/oc_group/members/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            users: [
+              { member_id: 'ou_same_1', member_id_type: 'open_id', name: '小明' },
+              { member_id: 'ou_same_2', member_id_type: 'open_id', name: '小明' },
+            ],
+            bots: [],
+            has_more: false,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ code: 404, msg: 'not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const adapter = new FeishuAdapter() as any;
+      const result = await adapter.buildAvatarEvidenceForRequest('oc_group', '小明头像');
+
+      assert.equal(result.context.successfulCount, 0);
+      assert.equal(result.context.failedCount, 1);
+      assert.equal(result.context.blockers[0].reasonCode, 'avatar_target_ambiguous');
+      assert.equal(calls.some((item) => item.includes('/open-apis/contact/v3/users/')), false);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -2720,6 +3485,7 @@ describe('FeishuAdapter light conversation context', () => {
 
     assert.ok(context);
     assert.match(context.prompt, /构建失败：缺少飞书消息读取权限/);
+    assert.doesNotMatch(context.prompt, /3\.4s/);
     assert.doesNotMatch(context.prompt, /\[卡片消息\]/);
   });
 
@@ -3155,6 +3921,7 @@ describe('FeishuAdapter history intent and bot event guards', () => {
                   { tag: 'markdown', content: '真正正文：机器人确认请求' },
                   { tag: 'button', text: { tag: 'plain_text', content: '查看详情' } },
                   { tag: 'text', text: '请升级至最新版本客户端，以查看内容' },
+                  { tag: 'markdown', content: '已完成 · 5.6s' },
                 ]],
               }),
             },
@@ -3173,6 +3940,7 @@ describe('FeishuAdapter history intent and bot event guards', () => {
     assert.match(upserts[0].messages[0].text, /表情回复/);
     assert.match(upserts[0].messages[0].text, /真正正文：机器人确认请求/);
     assert.match(upserts[0].messages[0].text, /查看详情/);
+    assert.doesNotMatch(upserts[0].messages[0].text, /5\.6s/);
     assert.doesNotMatch(upserts[0].messages[0].text, /\{\"title\"/);
     assert.doesNotMatch(upserts[0].messages[0].text, /请升级/);
   });
@@ -4135,6 +4903,154 @@ describe('FeishuAdapter CardKit compatibility', () => {
       .find((item) => item.data?.msg_type === 'sticker');
     const stickerContent = JSON.parse(String(stickerCall?.data?.content || '{}')) as { file_key?: string };
     assert.equal(stickerContent.file_key, 'sticker_generic_annotated');
+  });
+
+  it('uses a native sticker as the entire p2p reply and removes the temporary progress card', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_p2p_wave',
+        aliases: ['表情包', '挥手'],
+        chatId: 'oc_p2p',
+        label: '挥手',
+        intent: '友好打招呼',
+        tone: 'friendly',
+        usage: '轻松问候或回应时使用',
+        annotationSource: 'manual',
+        annotationConfidence: 0.9,
+        firstSeenAt: '2026-07-20T00:00:00.000Z',
+        lastSeenAt: '2026-07-20T00:00:00.000Z',
+        useCount: 0,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: Array<{ kind: string; payload: any }> = [];
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_p2p' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push({ kind: 'card.update', payload });
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: any) => {
+            calls.push({ kind: 'message.reply', payload });
+            return { data: { message_id: payload?.data?.msg_type === 'sticker' ? 'om_sticker' : 'om_progress' } };
+          },
+          delete: async (payload: unknown) => {
+            calls.push({ kind: 'message.delete', payload });
+            return { code: 0 };
+          },
+        },
+      },
+    };
+
+    assert.equal(await adapter._doCreateStreamingCard('oc_p2p', 'om_user'), true);
+    assert.equal(await adapter.finalizeCard(
+      'oc_p2p',
+      'completed',
+      '[表情包:挥手] 给你一个～',
+      undefined,
+      [],
+      undefined,
+      {
+        codepilotSessionId: 'session_p2p',
+        sourceMessageId: 'om_user',
+        sourceText: '发个表情包',
+        chatType: 'p2p',
+      },
+    ), true);
+
+    const stickerReply = calls.find((item) => item.kind === 'message.reply' && item.payload?.data?.msg_type === 'sticker');
+    assert.ok(stickerReply);
+    assert.equal(JSON.parse(stickerReply?.payload?.data?.content || '{}').file_key, 'sticker_p2p_wave');
+    assert.equal(calls.some((item) => item.kind === 'message.delete' && item.payload?.path?.message_id === 'om_progress'), true);
+    assert.equal(calls.some((item) => item.kind === 'card.update'), false);
+  });
+
+  it('suppresses repeated autonomous stickers during the chat cooldown and keeps readable text', async () => {
+    const ctiHome = useTempCtiHome();
+    fs.mkdirSync(path.join(ctiHome, 'data'), { recursive: true });
+    fs.writeFileSync(getTestFeishuStickerStorePath(ctiHome), JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      stickers: [{
+        fileKey: 'sticker_recent_wave',
+        aliases: ['表情包', '挥手'],
+        chatId: 'oc_p2p',
+        label: '挥手',
+        intent: '友好回应',
+        tone: 'friendly',
+        usage: '轻松接话',
+        annotationSource: 'manual',
+        annotationConfidence: 0.9,
+        firstSeenAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        lastUsedAt: new Date(Date.now() - 60_000).toISOString(),
+        useCount: 1,
+      }],
+    }), 'utf8');
+    const adapter = new FeishuAdapter() as any;
+    const calls: Array<{ kind: string; payload: any }> = [];
+    adapter.restClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => ({ data: { card_id: 'card_p2p' } }),
+            settings: async () => ({ data: {} }),
+            update: async (payload: unknown) => {
+              calls.push({ kind: 'card.update', payload });
+              return { data: {} };
+            },
+          },
+          cardElement: { content: async () => ({ data: {} }) },
+        },
+      },
+      im: {
+        message: {
+          reply: async (payload: any) => {
+            calls.push({ kind: 'message.reply', payload });
+            return { data: { message_id: 'om_progress' } };
+          },
+          delete: async (payload: unknown) => {
+            calls.push({ kind: 'message.delete', payload });
+            return { code: 0 };
+          },
+        },
+      },
+    };
+
+    assert.equal(await adapter._doCreateStreamingCard('oc_p2p', 'om_user'), true);
+    assert.equal(await adapter.finalizeCard(
+      'oc_p2p',
+      'completed',
+      '[表情包:挥手] 哈哈～',
+      undefined,
+      [],
+      undefined,
+      {
+        codepilotSessionId: 'session_p2p',
+        sourceMessageId: 'om_user',
+        sourceText: '哈哈哈',
+        chatType: 'p2p',
+      },
+    ), true);
+
+    assert.equal(calls.some((item) => item.kind === 'message.reply' && item.payload?.data?.msg_type === 'sticker'), false);
+    assert.equal(calls.some((item) => item.kind === 'message.delete'), false);
+    const finalCard = calls.find((item) => item.kind === 'card.update');
+    assert.match(JSON.stringify(finalCard?.payload || {}), /哈哈/u);
   });
 
   it('sends an unannotated sticker in a streaming card only when bridge supplies a matching verified action', async () => {
@@ -6876,6 +7792,31 @@ describe('FeishuAdapter p2p reply media recovery', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('restores the native return mention from the verified bot sender when the model omits bare at text', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async () => [
+      { userId: 'ou_george', name: '乔治', aliases: ['乔治'], platformIds: ['ou_george'], appIds: ['cli_george'] },
+    ];
+
+    const resolved = await adapter.resolveOutboundReplyToSenderMention({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '胸有成竹？我看是肚里空空还硬撑！乔治，接招吧。',
+      parseMode: 'Markdown',
+    }, {
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_george', chatType: 'group' },
+      messageId: 'om_live_continuation',
+      timestamp: Date.now(),
+      text: '你才是井底之蛙，我这叫胸有成竹。',
+      raw: {
+        feishuSender: { openId: 'ou_george', senderType: 'bot' },
+        feishuBotToBot: { chainCount: 2, maxTurns: 8, senderType: 'bot' },
+      },
+    });
+
+    assert.equal(resolved.text, '胸有成竹？我看是肚里空空还硬撑！乔治，接招吧。');
+    assert.deepEqual(resolved.mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 
   it('does not turn an unrelated model-selected name into a bot-to-bot return mention', async () => {

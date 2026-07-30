@@ -83,6 +83,44 @@ function isStickerSendPlaceholderText(text: string): boolean {
   return /(?:给你(?:来)?一个|发(?:你)?一个|丢一个|上一个|贴一个|安排|来啦|来了|好呀|可以)/u.test(normalized);
 }
 
+/**
+ * 判断贴纸旁边的文字是否只是重复“已经发表情”这一动作。
+ * 这类文字可以在贴纸成功投递后省略，避免出现“表情包已发送/给你一个”式机械回复。
+ */
+export function isRedundantStickerCompanionText(text: string): boolean {
+  const normalized = String(text || '')
+    .normalize('NFKC')
+    .replace(/^\s*(?:✅|✔|☑|❌|×)\s*$/gmu, '')
+    .replace(/[~～!！。.,，\s]+/gu, '')
+    .trim();
+  if (!normalized) return true;
+  if (normalized.length > 24) return false;
+  return /^(?:给你(?:来)?一个|发(?:你)?一个|丢一个|上一个|贴一个|安排|来啦|来了|来咯|好呀|好嘞|可以|收到|懂了|哈哈|嘿嘿|喏|拿去|表情包已发送|已回应)$/u.test(normalized);
+}
+
+function isCasualStickerOnlyContext(text: string): boolean {
+  const normalized = String(text || '').normalize('NFKC').replace(/\s+/g, '').trim();
+  if (!normalized || normalized.length > 48) return false;
+  if (/(?:怎么|如何|为什么|为何|能否|是否|哪里|多少|谁|什么|查|读取|写入|修改|修复|生成|创建|删除|同步|重启|运行|执行|处理|分析|总结|文件|代码|项目|任务|bug|报错|错误|mcp|unity|blender|文档|表格|日程|会议|私发|发送给)/iu.test(normalized)) {
+    return false;
+  }
+  if (/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\p{P}\p{S}]+$/u.test(normalized)) return true;
+  return /^(?:哈+|哈哈哈*|嘿嘿|收到|好的|好呀|好嘞|行|可以|嗯+|哦+|嗨|你好|早呀|早安|晚安|谢谢|谢啦|辛苦|牛|厉害|真棒|笑死|离谱|可爱|爱你|拜拜|在吗|干嘛|来啦|冲呀|加油)(?:呀|啊|啦|咯|呢|嘛|哇|哦|噢|哈|～|~|!|！)*$/iu.test(normalized);
+}
+
+/**
+ * 贴纸可以独立完成回复，但不能取代需要信息、执行结果或错误说明的正文。
+ * 明确“发个表情包”请求允许省略动作复述；自主贴纸只在轻量社交语境中成立。
+ */
+export function shouldUseStickerOnlyReply(
+  userText: string,
+  companionText: string,
+  explicitRequest: boolean,
+): boolean {
+  if (!isRedundantStickerCompanionText(companionText)) return false;
+  return explicitRequest || isCasualStickerOnlyContext(userText);
+}
+
 export function addFeishuStickerHintForExplicitRequest(
   userText: string,
   answerText: string,

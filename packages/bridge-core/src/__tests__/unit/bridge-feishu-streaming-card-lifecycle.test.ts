@@ -267,6 +267,67 @@ describe('Feishu streaming card lifecycle', () => {
     assert.equal(harness.renderFinalCalls.length, 1);
   });
 
+  it('discards the temporary progress card when a completed native sticker fully replaces text', async () => {
+    const { FeishuStreamingCardLifecycle } = await loadLifecycle();
+    const harness = createHarness();
+    const lifecycle = new FeishuStreamingCardLifecycle(harness.options);
+    harness.registry.activate('oc_p2p', {
+      cardId: 'card_sticker',
+      messageId: 'om_progress',
+      startTime: 900,
+    });
+    const calls: string[] = [];
+
+    const result = await lifecycle.finalize({
+      chatId: 'oc_p2p',
+      status: 'completed',
+      responseText: '[表情包:挥手]',
+      hooks: {
+        closeStreaming: async () => { calls.push('close'); },
+        resolveFinalResponse: async () => ({ text: '', suppressCard: true }),
+        discardFinalCard: async (state) => {
+          calls.push(`discard:${state.messageId}`);
+          return true;
+        },
+        updateFinalCard: async () => { calls.push('update'); },
+        persistContinuation: (_state, status, finalText) => calls.push(`persist:${status}:${finalText}`),
+      },
+    });
+
+    assert.equal(result, true);
+    assert.deepEqual(calls, ['close', 'discard:om_progress', 'persist:completed:']);
+    assert.equal(harness.renderFinalCalls.length, 0);
+    assert.equal(harness.registry.has('oc_p2p'), false);
+  });
+
+  it('falls back to a normal final card when temporary-card deletion fails', async () => {
+    const { FeishuStreamingCardLifecycle } = await loadLifecycle();
+    const harness = createHarness();
+    const lifecycle = new FeishuStreamingCardLifecycle(harness.options);
+    harness.registry.activate('oc_p2p', {
+      cardId: 'card_sticker',
+      messageId: 'om_progress',
+      startTime: 900,
+    });
+    const calls: string[] = [];
+
+    const result = await lifecycle.finalize({
+      chatId: 'oc_p2p',
+      status: 'completed',
+      responseText: '[表情包:挥手]',
+      hooks: {
+        closeStreaming: async () => {},
+        resolveFinalResponse: async () => ({ text: '', suppressCard: true }),
+        discardFinalCard: async () => false,
+        updateFinalCard: async (_state, cardJson) => { calls.push(cardJson); },
+      },
+    });
+
+    assert.equal(result, true);
+    assert.match(calls[0] || '', /已回应/u);
+    assert.equal(harness.renderFinalCalls.length, 1);
+  });
+
   it('removes card state when final delivery fails', async () => {
     const { FeishuStreamingCardLifecycle } = await loadLifecycle();
     const harness = createHarness();

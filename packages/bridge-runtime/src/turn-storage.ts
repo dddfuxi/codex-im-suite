@@ -97,7 +97,13 @@ function parseToolResultContent(content: unknown): unknown {
   if (typeof content !== 'string') return content;
   const trimmed = content.trim();
   if (!trimmed) return null;
-  try { return JSON.parse(trimmed) as unknown; } catch { return null; }
+  try { return JSON.parse(trimmed) as unknown; } catch { /* 继续解析 CLI 包装输出 */ }
+  const outputMarker = /(?:^|\r?\n)Output:\s*\r?\n/gu;
+  let lastMarker: RegExpExecArray | null = null;
+  for (const match of trimmed.matchAll(outputMarker)) lastMarker = match;
+  if (!lastMarker || lastMarker.index === undefined) return null;
+  const output = trimmed.slice(lastMarker.index + lastMarker[0].length).trim();
+  try { return JSON.parse(output) as unknown; } catch { return null; }
 }
 
 function collectArtifactFilePaths(value: unknown, active = false, out = new Set<string>()): Set<string> {
@@ -115,6 +121,50 @@ function collectArtifactFilePaths(value: unknown, active = false, out = new Set<
     collectArtifactFilePaths(nested, active || artifactField, out);
   }
   return out;
+}
+
+/**
+ * 最终结果核验允许识别常见结构化 Path/outputPath 字段，但该结果只能与
+ * cti-final 的精确路径求交，不能直接进入普通 tool-result artifact 注册。
+ */
+function collectDeclaredOutputPathCandidates(value: unknown, active = false, out = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const item of value) collectDeclaredOutputPathCandidates(item, active, out);
+    return out;
+  }
+  if (typeof value === 'string') {
+    if (active && path.isAbsolute(value) && fs.existsSync(value)) out.add(path.resolve(value));
+    return out;
+  }
+  if (!value || typeof value !== 'object') return out;
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const outputPathField = /^(?:artifacts?|artifactPaths|images|files|filePath|localFiles|path|outputPath|outputFile)$/iu.test(key);
+    collectDeclaredOutputPathCandidates(nested, active || outputPathField, out);
+  }
+  return out;
+}
+
+function pathComparisonKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function toolResultContainsExactDeclaredPath(content: unknown, filePath: string): boolean {
+  if (typeof content !== 'string' || !content.trim()) return false;
+  const candidates = [filePath, path.normalize(filePath), filePath.replace(/\\/gu, '/')];
+  const haystack = process.platform === 'win32' ? content.toLowerCase() : content;
+  return candidates.some((candidate) => {
+    const needle = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    return !!needle && haystack.includes(needle);
+  });
+}
+
+function isRealPathInsideAllowedRoot(filePath: string, allowedRoots: readonly string[]): boolean {
+  const realFilePath = fs.realpathSync.native(filePath);
+  return allowedRoots.some((root) => {
+    if (!root?.trim() || !fs.existsSync(root)) return false;
+    return isPathInside(fs.realpathSync.native(root), realFilePath);
+  });
 }
 
 export class RuntimeTurnStorage implements TurnStorageHost {
@@ -221,6 +271,67 @@ export class RuntimeTurnStorage implements TurnStorageHost {
       files: paths.map((filePath) => ({ filePath })),
       source: { kind: 'tool_result', toolUseId: input.toolUseId, toolName: input.toolName },
     });
+  }
+
+  verifyDeclaredOutputArtifacts(input: TurnStorageScope & {
+    declaredFiles: Array<{ filePath: string; mediaType?: string }>;
+    successfulToolResults: Array<{ toolUseId: string; toolName: string; content: unknown }>;
+    allowedRoots: string[];
+    createdAfter: string;
+  }): TurnArtifactRecord[] {
+    const createdAfterMs = Date.parse(input.createdAfter);
+    if (!Number.isFinite(createdAfterMs)) return [];
+
+    const toolPathSources = new Map<string, { toolUseId: string; toolName: string }>();
+    for (const toolResult of input.successfulToolResults) {
+      const parsed = parseToolResultContent(toolResult.content);
+      if (!parsed || typeof parsed !== 'object') continue;
+      for (const filePath of collectDeclaredOutputPathCandidates(parsed)) {
+        toolPathSources.set(pathComparisonKey(filePath), {
+          toolUseId: toolResult.toolUseId,
+          toolName: toolResult.toolName,
+        });
+      }
+    }
+
+    const verified = new Map<string, {
+      filePath: string;
+      mediaType?: string;
+      source: { toolUseId: string; toolName: string };
+    }>();
+    for (const declared of input.declaredFiles) {
+      if (!declared.filePath?.trim() || !path.isAbsolute(declared.filePath)) continue;
+      const filePath = path.resolve(declared.filePath);
+      const rawMatchingToolResult = input.successfulToolResults
+        .find((toolResult) => toolResultContainsExactDeclaredPath(toolResult.content, filePath));
+      const source = toolPathSources.get(pathComparisonKey(filePath))
+        || (rawMatchingToolResult ? {
+          toolUseId: rawMatchingToolResult.toolUseId,
+          toolName: rawMatchingToolResult.toolName,
+        } : undefined);
+      if (!source || !fs.existsSync(filePath)) continue;
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || fs.lstatSync(filePath).isSymbolicLink()) continue;
+      // 给 Windows 文件时间戳写回留 2 秒容差；超出当前 attempt 的旧文件不能冒充新产物。
+      if (stat.mtimeMs + 2_000 < createdAfterMs) continue;
+      if (!isRealPathInsideAllowedRoot(filePath, input.allowedRoots)) continue;
+      verified.set(pathComparisonKey(filePath), {
+        filePath,
+        ...(declared.mediaType ? { mediaType: declared.mediaType } : {}),
+        source,
+      });
+    }
+
+    const records: TurnArtifactRecord[] = [];
+    for (const item of verified.values()) {
+      records.push(...this.registerArtifacts({
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        files: [{ filePath: item.filePath, mediaType: item.mediaType }],
+        source: { kind: 'tool_result', ...item.source },
+      }));
+    }
+    return records;
   }
 
   promoteArtifact(input: ArtifactPromotionRequest): ArtifactPromotionResult {

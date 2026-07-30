@@ -60,6 +60,24 @@ describe('Feishu CLI user auth runtime broker', () => {
     finishAuthorization({ ok: true });
   });
 
+  it('rejects a forged multi-scope challenge even when it reaches the runtime host', async () => {
+    const host = createFeishuCliUserAuthHost({
+      runner: { waitForAuthorization: async () => ({ ok: true }) },
+      onResume: async () => {},
+      onNotify: async () => {},
+    });
+    const result = await host.beginAuthorization({
+      ...request('m_multi'),
+      challenge: {
+        ...challenge,
+        requestedScopes: ['task:task:read', 'calendar:calendar:readonly'],
+      },
+    });
+    assert.equal(result.status, 'error');
+    assert.match(result.userMessage, /证据无效/);
+    assert.equal(result.feishuCardJson, undefined);
+  });
+
   it('deduplicates same Owner and scopes, then resumes every merged task after authorization', async () => {
     let runnerCalls = 0;
     let finishAuthorization!: (value: { ok: true }) => void;

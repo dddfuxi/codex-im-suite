@@ -604,7 +604,7 @@ describe('Feishu streaming card markdown', () => {
     assert.match(content, /耗时：48\.4s/);
   });
 
-  it('keeps lightweight reply text in the final body when only a status mark follows', () => {
+  it('omits the header for lightweight reply text while keeping the final body', () => {
     const card = JSON.parse(buildFinalCardJson([
       '收到满月脸啦，小虾米在这儿呢~',
       '',
@@ -617,14 +617,14 @@ describe('Feishu streaming card markdown', () => {
     const main = String(elements[0]?.content || '');
     const footer = elements.find((element) => String(element.content || '').includes('耗时'));
 
-    assert.equal(card.header?.title?.content, '表情回复');
+    assert.equal(card.header, undefined);
     assert.match(main, /收到满月脸啦，小虾米在这儿呢~/);
     assert.doesNotMatch(main, /^\s*✅\s*$/);
     assert.doesNotMatch(main, /✅/);
     assert.match(String(footer?.content || ''), /✅/);
   });
 
-  it('ignores reaction hints when summarizing final card titles', () => {
+  it('omits the header when an optional reaction hint remains in lightweight text', () => {
     const card = JSON.parse(buildFinalCardJson([
       '[表情] 收到满月脸啦，小虾米在这儿呢~',
       '',
@@ -635,10 +635,24 @@ describe('Feishu streaming card markdown', () => {
     };
     const main = String(card.body?.elements?.[0]?.content || '');
 
-    assert.equal(card.header?.title?.content, '表情回复');
-    assert.doesNotMatch(String(card.header?.title?.content || ''), /表情\]/);
+    assert.equal(card.header, undefined);
     assert.match(main, /\[表情\] 收到满月脸啦/);
     assert.doesNotMatch(main, /✅/);
+  });
+
+  it('omits the header for a short social reply without pretending a sticker was delivered', () => {
+    const card = JSON.parse(buildFinalCardJson(
+      '嘿嘿，这个赞我接住啦～👍',
+      [],
+      { status: '已完成', elapsed: '1.8s' },
+    )) as {
+      header?: unknown;
+      body?: { elements?: Array<{ content?: string }> };
+    };
+
+    assert.equal(card.header, undefined);
+    assert.match(String(card.body?.elements?.[0]?.content || ''), /这个赞我接住啦/);
+    assert.match(String(card.body?.elements?.[1]?.content || ''), /仅文本回复/);
   });
 
   it('does not classify a substantive game result as an emoji reply because it contains tone particles', () => {
@@ -654,7 +668,22 @@ describe('Feishu streaming card markdown', () => {
       header?: { title?: { content?: string } };
     };
 
+    assert.ok(card.header?.title?.content);
     assert.notEqual(card.header?.title?.content, '表情回复');
+  });
+
+  it('keeps a title when a short reply has real tool evidence', () => {
+    const card = JSON.parse(buildFinalCardJson('检查完成，可以继续。', [{
+      id: 'tool-1',
+      name: 'Read',
+      status: 'complete',
+      startedAt: 1_000,
+      completedAt: 1_020,
+    }], { status: '已完成', elapsed: '0.1s' })) as {
+      header?: { title?: { content?: string } };
+    };
+
+    assert.ok(card.header?.title?.content);
   });
 
   it('keeps checklist marks inside the final body', () => {
