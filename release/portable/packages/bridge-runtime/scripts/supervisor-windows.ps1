@@ -26,6 +26,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 # Paths
 $DefaultCtiHome = Join-Path $HOME '.claude-to-im'
@@ -41,6 +44,8 @@ $StopFlagFile = Join-Path $RuntimeDir 'bridge.stop'
 $StatusFile = Join-Path $RuntimeDir 'status.json'
 $LogFile    = Join-Path (Join-Path $CtiHome 'logs') 'bridge.log'
 $ErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-error.log'
+$SupervisorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor.log'
+$SupervisorErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor-error.log'
 $DaemonMjs  = Join-Path (Join-Path $SkillDir 'dist') 'daemon.mjs'
 
 $ServiceName = 'ClaudeToIMBridge'
@@ -164,6 +169,15 @@ function Get-NodePath {
     return $nodePath
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    # Start-Process on Windows joins ArgumentList into one command line. Quote
+    # path-like values explicitly so spaces are not split into extra argv items.
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
+
 # WinSW / NSSM detection
 
 function Find-ServiceManager {
@@ -259,17 +273,32 @@ function Install-NSSMService {
 
 function Start-Fallback {
     if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
-    $supervisorProc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @(
-            '-NoLogo',
-            '-NoProfile',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $PSCommandPath,
-            '-Command', 'run-supervisor'
-        ) `
-        -WorkingDirectory $SkillDir `
-        -WindowStyle Hidden `
-        -PassThru
+    # Give the supervisor independent file handles. Otherwise daemon restart can
+    # inherit an anonymous output pipe and wait forever for EOF.
+    # Windows PowerShell 5.1 joins Start-Process ArgumentList without quoting
+    # array items. Encode the command so repository paths containing spaces or
+    # non-ASCII characters can never be split at the -File boundary.
+    $escapedSupervisorScript = $PSCommandPath.Replace("'", "''")
+    $supervisorCommand = "`$ErrorActionPreference='Stop'; `$OutputEncoding=[System.Text.UTF8Encoding]::new(`$false); [Console]::InputEncoding=[System.Text.UTF8Encoding]::new(`$false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(`$false); & '$escapedSupervisorScript' -Command 'run-supervisor'"
+    $encodedSupervisorCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($supervisorCommand))
+    $supervisorArgumentList = @(
+        '-NoLogo'
+        '-NoProfile'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-EncodedCommand'
+        $encodedSupervisorCommand
+    )
+    $startSupervisorArgs = @{
+        FilePath = 'powershell.exe'
+        ArgumentList = $supervisorArgumentList
+        WorkingDirectory = $SkillDir
+        WindowStyle = 'Hidden'
+        RedirectStandardOutput = $SupervisorLogFile
+        RedirectStandardError = $SupervisorErrorLogFile
+        PassThru = $true
+    }
+    $supervisorProc = Start-Process @startSupervisorArgs
 
     Set-Content -Path $SupervisorPidFile -Value $supervisorProc.Id
     return $supervisorProc.Id
@@ -284,12 +313,13 @@ function Run-SupervisorLoop {
     $nodePath = Get-NodePath
     [System.Environment]::SetEnvironmentVariable('CLAUDECODE', $null)
     [System.Environment]::SetEnvironmentVariable('CTI_HOME', $CtiHome)
+    $daemonArgument = ConvertTo-WindowsCommandLineArgument $DaemonMjs
 
     while ($true) {
         if (Test-Path $StopFlagFile) { break }
 
         $proc = Start-Process -FilePath $nodePath `
-            -ArgumentList $DaemonMjs `
+            -ArgumentList $daemonArgument `
             -WorkingDirectory $SkillDir `
             -WindowStyle Hidden `
             -RedirectStandardOutput $LogFile `
@@ -374,7 +404,7 @@ switch ($Command) {
         } else {
             $bridgePid = Read-Pid
             $supervisorPid = Read-SupervisorPid
-            if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; exit 0 }
+            if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; break }
             $bridgeStopped = Stop-PidIfAlive $bridgePid 'Bridge'
             if ($bridgePid -and -not $bridgeStopped) {
                 Write-Host "Bridge was not running (stale PID file)"

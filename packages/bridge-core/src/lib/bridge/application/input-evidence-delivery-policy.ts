@@ -139,11 +139,16 @@ export function enforceInputEvidenceDeliveryBoundary(input: {
     || input.executionRequirementKind === 'input_evidence_required';
   const images = filterInputAttachmentPaths(input.payload.images, identity, allowWeakNameMatch);
   const files = filterInputAttachmentPaths(input.payload.files, identity, allowWeakNameMatch);
+  const cardHero = input.payload.cardHero
+    && images.kept.some((imagePath) => normalizeComparablePath(imagePath) === normalizeComparablePath(input.payload.cardHero!.imagePath))
+    ? input.payload.cardHero
+    : undefined;
   return {
     payload: {
       ...input.payload,
       images: images.kept,
       files: files.kept,
+      cardHero,
     },
     purpose,
     filteredImages: images.filtered,

@@ -21,6 +21,8 @@ function createRetryRun(input: Partial<NonNullable<WorkflowRun['recovery']>['inp
       markedAt: '2026-05-09T00:01:00.000Z',
       input: {
         prompt: '总结 https://example.feishu.cn/sheets/sht_abc',
+        turnId: 'turn_retry',
+        executionRequirement: { kind: 'none', reason: 'test', requiredToolFamilies: [] },
         channelType: 'feishu',
         chatId: 'oc_retry',
         userId: 'ou_liudan',
@@ -88,5 +90,102 @@ describe('workflow retry cloud document precheck', () => {
     assert.equal(result.status, 'blocked');
     assert.match(result.text, /需要刘丹登录飞书授权/);
     assert.equal(result.feishuCardJson, '{"card":"login"}');
+  });
+
+  it('restores managed attachments and the original execution boundary for a manual retry', async () => {
+    const refs = [{
+      id: 'input-image',
+      name: 'scene.png',
+      type: 'image/png',
+      size: 68,
+      filePath: 'C:/managed/scene.png',
+      sha256: 'a'.repeat(64),
+      createdAt: '2026-05-09T00:00:00.000Z',
+      expiresAt: '2026-05-10T00:00:00.000Z',
+    }];
+    const restoredFiles = [{
+      id: 'input-image',
+      name: 'scene.png',
+      type: 'image/png',
+      size: 68,
+      data: 'aW1hZ2U=',
+      filePath: 'C:/managed/scene.png',
+    }];
+    const calls: unknown[] = [];
+    const result = await prepareWorkflowRetryExecution({
+      run: createRetryRun({
+        prompt: '分析这张图片',
+        workingDirectory: 'C:/workspace',
+        additionalDirectories: ['C:/workspace/shared'],
+        permissionMode: 'default',
+        noEvidenceRetryAttempted: true,
+        executionRequirement: {
+          kind: 'input_evidence_required',
+          reason: '图片是当前请求的输入证据',
+          requiredToolFamilies: [],
+          requiredInputEvidenceKinds: ['image'],
+          requiredInputEvidenceIds: ['input-image'],
+        },
+        inputEvidenceRefs: refs,
+      }),
+      turnStorage: {
+        restoreRecoveryInputEvidence: (input: unknown) => {
+          calls.push(input);
+          return restoredFiles;
+        },
+      } as any,
+    });
+
+    assert.equal(result.status, 'ready');
+    assert.equal(result.params.turnId, 'turn_retry');
+    assert.equal(result.params.forceFreshThread, true);
+    assert.equal(result.params.noEvidenceRetryAttempted, true);
+    assert.deepEqual(result.params.executionRequirement?.requiredInputEvidenceIds, ['input-image']);
+    assert.deepEqual(result.params.files, restoredFiles);
+    assert.deepEqual(calls, [{ sessionId: 'session_1', turnId: 'turn_retry', refs }]);
+  });
+
+  it('fails closed when managed retry evidence is expired or cannot be verified', async () => {
+    const result = await prepareWorkflowRetryExecution({
+      run: createRetryRun({
+        prompt: '分析这张图片',
+        executionRequirement: {
+          kind: 'input_evidence_required',
+          reason: '图片是当前请求的输入证据',
+          requiredToolFamilies: [],
+          requiredInputEvidenceKinds: ['image'],
+          requiredInputEvidenceIds: ['input-image'],
+        },
+        inputEvidenceRefs: [{
+          id: 'input-image', name: 'scene.png', type: 'image/png', size: 68, filePath: 'C:/managed/scene.png',
+          sha256: 'a'.repeat(64), createdAt: '2026-05-09T00:00:00.000Z', expiresAt: '2026-05-10T00:00:00.000Z',
+        }],
+      }),
+      turnStorage: {
+        restoreRecoveryInputEvidence: () => { throw new Error('workflow_input_evidence_expired'); },
+      } as any,
+    });
+
+    assert.equal(result.status, 'blocked');
+    assert.match(result.text, /过期|校验失败/u);
+  });
+
+  it('refuses a bare retry when the original turn required input evidence', async () => {
+    const result = await prepareWorkflowRetryExecution({
+      run: createRetryRun({
+        prompt: '分析这张图片',
+        executionRequirement: {
+          kind: 'input_evidence_required',
+          reason: '图片是当前请求的输入证据',
+          requiredToolFamilies: [],
+          requiredInputEvidenceKinds: ['image'],
+          requiredInputEvidenceIds: ['input-image'],
+        },
+        inputEvidenceRefs: [],
+      }),
+    });
+
+    assert.equal(result.status, 'blocked');
+    assert.match(result.text, /未执行裸重试/u);
   });
 });

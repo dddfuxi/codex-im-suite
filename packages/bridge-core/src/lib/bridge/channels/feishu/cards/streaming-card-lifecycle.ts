@@ -1,5 +1,6 @@
 import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type {
+  FeishuCardHeroImage,
   OutboundMention,
   RunSummary,
   ToolCallInfo,
@@ -54,6 +55,7 @@ export interface FeishuStreamingCardLifecycleOptions {
     summary?: RunSummary,
     mentions?: OutboundMention[],
     agentProgress?: AgentCardProgressSnapshot,
+    cardHero?: FeishuCardHeroImage,
   ) => string;
   formatElapsed?: (elapsedMs: number) => string;
   onStreamingUpdate?: (state: FeishuStreamingCardState, sequence: number) => void;
@@ -94,6 +96,7 @@ export interface FinalizeFeishuStreamingCardInput {
   responseText: string;
   summary?: RunSummary;
   mentions?: OutboundMention[];
+  cardHero?: FeishuCardHeroImage;
   hooks: FeishuStreamingCardFinalizationHooks;
 }
 
@@ -242,6 +245,7 @@ export class FeishuStreamingCardLifecycle {
         input.summary,
         input.mentions ?? [],
         state.agentProgress,
+        input.cardHero,
       );
 
       state.sequence += 1;

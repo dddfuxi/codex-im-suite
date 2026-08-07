@@ -43,6 +43,21 @@ export interface McpManifestRecord {
   manifestPath: string;
 }
 
+/**
+ * 投影给隔离 Codex Home 的最小 MCP 连接描述。
+ *
+ * 该结构只能由 Runtime 根据已安装 manifest 和工作区边界生成，不能采信模型
+ * 返回的 URL、命令或 manifest id，避免任意 Bash 文本冒充受管 MCP 证据。
+ */
+export interface CodexMcpServerProjection {
+  manifestId: string;
+  name: string;
+  type: McpType;
+  url?: string;
+  command?: string;
+  env?: Record<string, string>;
+}
+
 interface McpJsonRpcSuccess<T> {
   jsonrpc: '2.0';
   id?: string | number | null;
@@ -496,6 +511,49 @@ export class McpBridge {
       }
     }
     return [...byId.values()];
+  }
+
+  /**
+   * 将已启用且通过工作区校验的 MCP manifest 转成 Codex 可消费的连接配置。
+   * 全局 Codex MCP 仍保持隔离；这里只投影 suite / 用户扩展目录中明确登记的
+   * manifest，确保 config/mcp.d 继续是唯一事实源。
+   */
+  listCodexServerProjections(): CodexMcpServerProjection[] {
+    const projections: CodexMcpServerProjection[] = [];
+    for (const manifest of this.listManifests()) {
+      if (manifest.enabled === false) continue;
+      const name = (manifest.registerName || manifest.id || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/u.test(name)) continue;
+      if (!this.validateManifestWorkspace(manifest).ok) continue;
+
+      try {
+        if (manifest.type === 'http') {
+          const url = this.getHttpEndpoint(manifest);
+          const parsed = new URL(url);
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+          projections.push({ manifestId: manifest.id, name, type: 'http', url: parsed.toString() });
+          continue;
+        }
+
+        const command = expandManifestValue(manifest.launcher, this.config);
+        if (!command || !path.isAbsolute(command) || !fs.existsSync(command)) continue;
+        const env = Object.fromEntries(
+          Object.entries(manifest.env || {})
+            .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(key))
+            .map(([key, value]) => [key, expandManifestValue(value, this.config)]),
+        );
+        projections.push({
+          manifestId: manifest.id,
+          name,
+          type: 'stdio',
+          command,
+          ...(Object.keys(env).length > 0 ? { env } : {}),
+        });
+      } catch {
+        // 单个可选 MCP 配置错误不能阻断 Primary；它只是不进入本次受管投影。
+      }
+    }
+    return projections;
   }
 
   private getManifestSearchTerms(manifest: McpManifestRecord): string[] {

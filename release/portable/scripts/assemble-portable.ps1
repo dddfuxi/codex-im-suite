@@ -13,6 +13,13 @@ $manifest = Get-SuiteManifest -SuiteRoot $suiteRoot
 if (-not $ControlPanelArtifactDir) {
     $ControlPanelArtifactDir = Join-Path $artifactsDir 'control-panel'
 }
+$ControlPanelArtifactDir = [System.IO.Path]::GetFullPath($ControlPanelArtifactDir)
+$controlPanelExecutable = Join-Path $ControlPanelArtifactDir 'CodexImSuiteControlPanel.exe'
+$controlPanelWebRoot = Join-Path $ControlPanelArtifactDir 'wwwroot\index.html'
+if (-not (Test-Path -LiteralPath $controlPanelExecutable -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $controlPanelWebRoot -PathType Leaf)) {
+    throw "Control panel artifact is incomplete: $ControlPanelArtifactDir"
+}
 
 function Remove-FileWithRetry {
     param(
@@ -44,11 +51,19 @@ if (Test-Path -LiteralPath $portableDir) {
 }
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
-Get-ChildItem -LiteralPath $ControlPanelArtifactDir -Force |
-    Where-Object { $_.Name -notlike '*.pdb' } |
-    ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $portableDir -Recurse -Force
-    }
+# Exclude WebView2 user-data directories because they contain locked runtime state.
+# Copy every top-level artifact to an explicit same-name target so PowerShell host
+# differences cannot flatten a directory or omit the formal release entry point.
+$controlPanelArtifacts = @(Get-ChildItem -LiteralPath $ControlPanelArtifactDir -Force |
+    Where-Object { $_.Name -notlike '*.pdb' -and $_.Name -notlike '*.WebView2' })
+foreach ($artifact in $controlPanelArtifacts) {
+    $artifactTarget = Join-Path $portableDir $artifact.Name
+    Copy-Item -LiteralPath $artifact.FullName -Destination $artifactTarget -Recurse -Force
+}
+if (-not (Test-Path -LiteralPath (Join-Path $portableDir 'CodexImSuiteControlPanel.exe') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $portableDir 'wwwroot\index.html') -PathType Leaf)) {
+    throw "Portable control panel copy is incomplete: $portableDir"
+}
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'suite.manifest.json') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'README.md') -Destination $portableDir -Force
 Copy-Item -LiteralPath (Join-Path $suiteRoot 'AGENTS.md') -Destination $portableDir -Force

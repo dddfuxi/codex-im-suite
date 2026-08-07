@@ -66,6 +66,53 @@ describe('Feishu inbound mention wake', () => {
     assert.equal(stripFeishuMentionMarkers('<at id="ou_bot"/> 请继续'), '请继续');
   });
 
+  it('normalizes a human native mention-only wake without deciding the final reply', async () => {
+    const { resolveFeishuNativeMentionOnlyWake } = await loadInboundMentionWake();
+
+    assert.deepEqual(resolveFeishuNativeMentionOnlyWake({
+      isGroup: true,
+      isOtherBotSender: false,
+      messageType: 'text',
+      nativeBotMentioned: true,
+      hasVisibleText: false,
+      hasAttachments: false,
+    }), {
+      kind: 'light_chat',
+      reason: 'native_mention_only_light_chat',
+      text: '在吗？',
+    });
+  });
+
+  it('keeps reply targets ahead of light chat and does not broaden bot-to-bot wake', async () => {
+    const { resolveFeishuNativeMentionOnlyWake } = await loadInboundMentionWake();
+    const base = {
+      isGroup: true,
+      messageType: 'text',
+      nativeBotMentioned: true,
+      hasVisibleText: false,
+      hasAttachments: false,
+    };
+
+    assert.deepEqual(resolveFeishuNativeMentionOnlyWake({
+      ...base,
+      isOtherBotSender: false,
+      replyTargetMessageId: 'om_reply',
+    }), {
+      kind: 'reply_target',
+      reason: 'native_mention_only_reply',
+      text: '请处理我在本条飞书话题中回复或引用的消息。',
+    });
+    assert.equal(resolveFeishuNativeMentionOnlyWake({
+      ...base,
+      isOtherBotSender: true,
+    }), null);
+    assert.equal(resolveFeishuNativeMentionOnlyWake({
+      ...base,
+      isOtherBotSender: false,
+      nativeBotMentioned: false,
+    }), null);
+  });
+
   it('rejects corrective native mentions but leaves actionable instructions unclassified', async () => {
     const { classifyFeishuNativeBotMentionText } = await loadInboundMentionWake();
     const aliases = ['小虾米'];

@@ -98,6 +98,85 @@ function useTempCtiHome(): string {
   return dir;
 }
 
+describe('FeishuAdapter group choice participant roster', () => {
+  it('returns the verified human roster and falls back without inventing a total', async () => {
+    setupContext();
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatHumanMembers = async () => [
+      { member_id: 'ou_a', member_id_type: 'open_id', name: '成员 A' },
+      { member_id: 'ou_b', member_id_type: 'open_id', name: '' },
+    ];
+
+    assert.deepEqual(await adapter.verifyChoiceParticipant('oc_group', 'ou_a'), {
+      allowed: true,
+      source: 'member_api',
+      eligibleParticipantKeys: ['ou_a', 'ou_b'],
+    });
+    assert.equal((await adapter.verifyChoiceParticipant('oc_group', 'ou_outsider')).allowed, false);
+
+    adapter.fetchChatHumanMembers = async () => { throw new Error('member api unavailable'); };
+    const fallback = await adapter.verifyChoiceParticipant('oc_group', 'ou_a');
+    assert.equal(fallback.allowed, true);
+    assert.equal(fallback.source, 'callback_event');
+    assert.equal(fallback.eligibleParticipantKeys, undefined);
+  });
+});
+
+describe('FeishuAdapter named conversation target resolution', () => {
+  it('resolves a named group from the real bot chat list without downgrading to a user', async () => {
+    setupContext();
+    const adapter = new FeishuAdapter() as any;
+    adapter.getAuthContext = () => ({
+      appId: 'cli_test',
+      appSecret: 'secret',
+      baseUrl: 'https://open.feishu.cn',
+    });
+    adapter.fetchTenantAccessToken = async () => 'tenant-token';
+    const originalFetch = globalThis.fetch;
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({
+        code: 0,
+        msg: 'success',
+        data: {
+          items: [
+            { chat_id: 'oc_battle', name: '机器人大乱斗', chat_type: 'group' },
+            { chat_id: 'oc_other', name: '项目讨论群', chat_type: 'group' },
+          ],
+          has_more: false,
+          page_token: '',
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+
+    try {
+      const result = await adapter.resolveConversationTarget({
+        sourceMessage: {
+          messageId: 'om_source',
+          text: '测试',
+          address: { channelType: 'feishu', chatId: 'oc_source', userId: 'ou_owner' },
+        },
+        targetText: '机器人大乱斗群',
+        targetKind: 'chat',
+      });
+
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.target, {
+        kind: 'chat',
+        id: 'oc_battle',
+        displayName: '机器人大乱斗',
+        chatType: 'group',
+      });
+      assert.equal(urls.length, 1);
+      assert.match(urls[0], /\/open-apis\/im\/v1\/chats/u);
+      assert.match(urls[0], /page_size=100/u);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 function getTestFeishuStickerStorePath(ctiHome = process.env.CTI_HOME!): string {
   return path.join(ctiHome, 'memory-repo', 'data', 'im', 'feishu', 'stickers', 'stickers.json');
 }
@@ -686,7 +765,7 @@ describe('FeishuAdapter bot name wake classification', () => {
     assert.equal(queued[0].raw?.feishuConversationContext?.prompt, '话题根消息：优化回复格式');
   });
 
-  it('keeps a mention-only group message without a reply target silent', async () => {
+  it('turns a human mention-only group message into a model-backed light chat wake', async () => {
     const store = createMockStore({
       bridge_feishu_require_mention: 'true',
       bridge_feishu_bot_aliases: '小虾米',
@@ -705,6 +784,53 @@ describe('FeishuAdapter bot name wake classification', () => {
     const event = createFeishuTextEvent('om_plain_mention_only', '@_user_1') as any;
     event.message.mentions = [
       { key: '@_user_1', id: { open_id: 'ou_bot' }, name: '小虾米' },
+    ];
+
+    await adapter.processIncomingEvent(event);
+
+    assert.equal(queued.length, 1);
+    assert.equal((queued[0] as any).text, '在吗？');
+    assert.deepEqual((queued[0] as any).raw?.feishuPureMentionWake, {
+      reason: 'native_mention_only_light_chat',
+    });
+    assert.equal((queued[0] as any).attachments?.length, 0);
+  });
+
+  it('does not synthesize a light chat wake for an empty group message without a native mention', async () => {
+    setupContext({ bridge_feishu_require_mention: 'false' });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+
+    await adapter.processIncomingEvent(createFeishuTextEvent('om_plain_empty', ''));
+
+    assert.equal(queued.length, 0);
+  });
+
+  it('does not let a bot or app mention-only message bypass bot-to-bot content handling', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'true',
+      bridge_feishu_bot_aliases: '小虾米',
+    }) as any;
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = new FeishuAdapter() as any;
+    adapter.botIds.add('ou_current_bot');
+    const queued: unknown[] = [];
+    adapter.enqueue = (message: unknown) => queued.push(message);
+    const event = createFeishuTextEvent('om_bot_mention_only', '@_user_1') as any;
+    event.sender = {
+      sender_type: 'app',
+      sender_id: { open_id: 'ou_other_bot' },
+    };
+    event.message.mentions = [
+      { key: '@_user_1', id: { open_id: 'ou_current_bot' }, name: '小虾米' },
     ];
 
     await adapter.processIncomingEvent(event);
@@ -3607,6 +3733,68 @@ describe('FeishuAdapter light conversation context', () => {
     assert.ok(replyEvidence);
     assert.match(replyEvidence.content, /原始请求：查看当前群里的机器人/);
     assert.match(replyEvidence.content, /上一轮结果：未完成/);
+  });
+
+  it('keeps durable continuation details when the visible bot title is already contained in the summary', async () => {
+    const store = createMockStore({ bridge_feishu_light_context_limit: '4' }) as any;
+    store.listAuditLogs = () => [];
+    store.listOutboundRefs = (filter: any = {}) => [{
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      platformMessageId: 'om_rank_card',
+      codepilotSessionId: 'session_rank',
+      purpose: 'streaming_card',
+      messageKind: 'interactive',
+      continuationContext: [
+        '原始请求：给附近餐饮做个排行图表，按味道和性价比排序。',
+        '上一轮状态：已完成',
+        '上一轮结果：榜单做好啦，直接看图。',
+      ].join('\n'),
+    }].filter((entry) => (!filter.channelType || entry.channelType === filter.channelType)
+      && (!filter.chatId || entry.chatId === filter.chatId)
+      && (!filter.platformMessageId || entry.platformMessageId === filter.platformMessageId));
+    delete (globalThis as Record<string, unknown>).__bridge_context__;
+    initBridgeContext({
+      store: store as BridgeStore,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const adapter = new FeishuAdapter() as any;
+    const now = Date.now();
+    const makeItem = (messageId: string, text: string, senderType: string, offset: number) => ({
+      message_id: messageId,
+      chat_id: 'oc_group',
+      create_time: String(now + offset),
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      sender: { id: senderType === 'app' ? 'cli_bot' : 'ou_liu', sender_type: senderType },
+    });
+    const botTitle = '榜单做好啦，直接看图。';
+    adapter.fetchChatMemberNames = async () => new Map([
+      ['ou_liu', '刘丹'],
+      ['cli_bot', '小虾米'],
+    ]);
+    adapter.fetchMessageById = async () => makeItem('om_rank_card', botTitle, 'app', -1_000);
+    adapter.fetchRecentMessages = async () => [
+      makeItem('om_current', '打到人均30左右', 'user', 0),
+      makeItem('om_rank_card', botTitle, 'app', -1_000),
+    ];
+
+    const context = await adapter.buildLightConversationContext(
+      'oc_group',
+      'om_current',
+      'om_rank_card',
+      '打到人均30左右',
+      [],
+    );
+
+    assert.ok(context);
+    assert.match(context.prompt, /原始请求：给附近餐饮做个排行图表/);
+    const replyEvidence = context.evidence.find((item: any) => item.relation === 'native_reply');
+    assert.equal(replyEvidence?.metadata?.continuationContextRecovered, true);
+    assert.match(replyEvidence?.content || '', /上一轮状态：已完成/);
   });
 
   it('enriches bot card shells from local outbound audit for continuation image tasks', async () => {
@@ -8368,5 +8556,141 @@ describe('FeishuAdapter message reactions', () => {
     assert.equal(result.ok, true);
     assert.equal(calls[0], 'reaction');
     assert.match(calls[1], /\[UNKNOWN_EMOJI\] 收到~/);
+  });
+
+  it('uploads a validated local image once and embeds its returned key in a Card 2.0 hero', async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-card-hero-'));
+    const imagePath = path.join(tempDir, 'scene.png');
+    fs.writeFileSync(imagePath, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ));
+    const adapter = new FeishuAdapter() as any;
+    let uploadCount = 0;
+    let sentCard: any = null;
+    adapter.restClient = {
+      im: {
+        image: {
+          create: async (payload: any) => {
+            uploadCount += 1;
+            for await (const _chunk of payload.data.image) {
+              // 模拟 SDK 在上传返回前消费完文件流，避免测试清理目录后仍有迟到读取。
+            }
+            return { image_key: 'img_v3_scene' };
+          },
+        },
+        message: {
+          reply: async (payload: any) => {
+            sentCard = JSON.parse(payload.data.content);
+            return { data: { message_id: 'om_card' } };
+          },
+        },
+      },
+    };
+
+    try {
+      const prepared = await adapter.prepareLocalImageForCard(imagePath);
+      assert.deepEqual(prepared, { ok: true, imageKey: 'img_v3_scene' });
+      const sent = await adapter.send({
+        address: { channelType: 'feishu', chatId: 'oc_group' },
+        text: '剧情正文',
+        parseMode: 'Markdown',
+        replyToMessageId: 'om_source',
+        feishuCardHero: { imageKey: prepared.imageKey, alt: '遗迹入口' },
+      });
+
+      assert.equal(uploadCount, 1);
+      assert.equal(sent.ok, true);
+      assert.equal(sent.cardHeroEmbedded, true);
+      assert.equal(sentCard.body.elements[0].tag, 'img');
+      assert.equal(sentCard.body.elements[0].img_key, 'img_v3_scene');
+      assert.equal(sentCard.body.elements[0].margin, '4px -12px');
+      assert.equal('size' in sentCard.body.elements[0], false);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries a rejected hero choice card without the hero and preserves buttons', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const sentCards: any[] = [];
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: any) => {
+            const card = JSON.parse(payload.data.content);
+            sentCards.push(card);
+            if (card.body.elements[0]?.tag === 'img') {
+              throw new Error('Failed to create card content: invalid image component');
+            }
+            return { data: { message_id: 'om_without_hero' } };
+          },
+        },
+      },
+    };
+
+    const cardJson = JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'img', img_key: 'img_v3_scene' },
+          { tag: 'markdown', content: '**剧情正文**' },
+          { tag: 'button', text: { tag: 'plain_text', content: '继续' }, value: { callback_data: 'choice:1' } },
+        ],
+      },
+    });
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group' },
+      text: '**剧情正文**',
+      parseMode: 'Markdown',
+      replyToMessageId: 'om_source',
+      feishuCardJson: cardJson,
+      feishuCardHero: { imageKey: 'img_v3_scene', alt: '遗迹入口' },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.messageId, 'om_without_hero');
+    assert.equal(result.cardHeroEmbedded, undefined);
+    assert.equal(sentCards.length, 2);
+    assert.equal(sentCards[0].body.elements[0].tag, 'img');
+    assert.deepEqual(sentCards[1].body.elements.map((element: any) => element.tag), ['markdown', 'button']);
+  });
+
+  it('uses a rich post when both hero card attempts fail', async () => {
+    const adapter = new FeishuAdapter() as any;
+    const calls: any[] = [];
+    adapter.restClient = {
+      im: {
+        message: {
+          reply: async (payload: any) => {
+            calls.push(payload.data);
+            if (payload.data.msg_type === 'interactive') throw new Error('card rejected');
+            return { data: { message_id: 'om_post' } };
+          },
+        },
+      },
+    };
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'oc_group' },
+      text: '**剧情正文**\n\n1. 继续',
+      parseMode: 'Markdown',
+      replyToMessageId: 'om_source',
+      feishuCardJson: JSON.stringify({
+        schema: '2.0',
+        body: { elements: [
+          { tag: 'img', img_key: 'img_v3_scene' },
+          { tag: 'button', text: { tag: 'plain_text', content: '继续' }, value: { callback_data: 'choice:1' } },
+        ] },
+      }),
+      feishuCardHero: { imageKey: 'img_v3_scene', alt: '遗迹入口' },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.messageId, 'om_post');
+    assert.deepEqual(calls.map((call) => call.msg_type), ['interactive', 'interactive', 'post']);
+    const post = JSON.parse(calls[2].content);
+    assert.equal(post.zh_cn.content[0][0].tag, 'md');
+    assert.match(post.zh_cn.content[0][0].text, /\*\*剧情正文\*\*/u);
   });
 });

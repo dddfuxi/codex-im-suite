@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/workflow-panel-state.schema.json",
+  "title": "WorkflowPanelStateContract",
+  "type": "object",
+  "required": ["protocol", "updatedAt", "runs"],
+  "properties": {
+    "protocol": { "const": "workflow-runtime/v1" },
+    "updatedAt": { "type": "string" },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "sessionId", "promptPreview", "stage", "status", "startedAt", "updatedAt", "events"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "sessionId": { "type": "string", "minLength": 1 },
+          "promptPreview": { "type": "string" },
+          "stage": { "enum": ["received", "authorized", "contextualized", "routed", "executing", "finalizing", "delivered", "failed"] },
+          "status": { "enum": ["running", "succeeded", "failed", "cancelled", "retry_pending", "retrying"] },
+          "startedAt": { "type": "string" },
+          "updatedAt": { "type": "string" },
+          "execution": {
+            "type": "object",
+            "properties": {
+              "verifiedOutputArtifactCount": { "type": "integer", "minimum": 0 },
+              "replaySafety": { "enum": ["safe_no_tools", "safe_read_only", "unsafe_side_effects", "unsafe_unknown"] },
+              "retryDisposition": { "enum": ["not_needed", "retry_in_turn", "artifact_recovery", "manual_retry_required", "exhausted", "not_retryable"] }
+            },
+            "additionalProperties": true
+          },
+          "recovery": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "object",
+                "properties": {
+                  "turnId": { "type": "string", "minLength": 1 },
+                  "executionRequirement": { "type": "object" },
+                  "inputEvidenceRefs": { "type": "array" }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          },
+          "events": { "type": "array" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

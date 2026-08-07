@@ -1,0 +1,4 @@
+interface:
+  display_name: "Roguelike Turn-Based Game Host"
+  short_description: "Hosts fair solo or group-choice roguelikes with auditable checks"
+  default_prompt: "Use $roguelike-turn-based-game to start a short roguelike adventure, using trusted vote, claim, or parallel choice sessions only when explicitly requested."

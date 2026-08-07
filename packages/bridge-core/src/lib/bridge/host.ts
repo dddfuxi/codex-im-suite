@@ -15,6 +15,9 @@ import type {
   AgentCollaborationMode,
   AgentPromptSection,
   TurnArtifactRecord,
+  WorkflowRecoveryInputEvidenceRefContract,
+  WorkflowReplaySafety,
+  WorkflowRetryDisposition,
 } from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
@@ -97,6 +100,18 @@ export interface TurnStorageHost {
     allowedRoots: string[];
     createdAfter: string;
   }): TurnArtifactRecord[];
+  /** 为后台人工重试签发只含受管路径与 Hash 的输入引用。 */
+  createRecoveryInputEvidenceRefs?(input: TurnStorageScope & {
+    files: FileAttachment[];
+  }): WorkflowRecoveryInputEvidenceRefContract[];
+  /** 恢复前重新验证引用、TTL、真实路径、Hash 与文件可读性。 */
+  restoreRecoveryInputEvidence?(input: TurnStorageScope & {
+    refs: WorkflowRecoveryInputEvidenceRefContract[];
+  }): FileAttachment[];
+  /** Provider 中断且禁止重放时，恢复并复核本轮已登记输出产物。 */
+  recoverVerifiedArtifacts?(input: TurnStorageScope & {
+    createdAfter: string;
+  }): TurnArtifactRecord[];
   promoteArtifact?(input: ArtifactPromotionRequest): ArtifactPromotionResult;
 }
 
@@ -128,11 +143,21 @@ export type SSEEventType =
   | 'status'
   | 'result'
   | 'error'
+  | 'retry_advice'
   | 'permission_request'
   | 'mode_changed'
   | 'task_update'
   | 'keep_alive'
   | 'done';
+
+export interface ProviderRetryAdvice {
+  protocol: 'cti-retry-advice/v1';
+  diagnosticCode: string;
+  retryable: boolean;
+  replaySafety: WorkflowReplaySafety;
+  retryDisposition: WorkflowRetryDisposition;
+  verifiedOutputArtifacts?: TurnArtifactRecord[];
+}
 
 /** Content block in an LLM response message. */
 export type MessageContentBlock =
@@ -487,6 +512,80 @@ export interface AgentCollaborationHost {
   markPrimaryCompleted(input: AgentCollaborationCompletionInput): void;
   completeTurn(input: AgentCollaborationCompletionInput): void;
   linkWorkflowRun?(runId: string, workflowRunId: string): void;
+}
+
+export interface ChoicePromptStateEntrySnapshot {
+  nonce: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  sessionId: string;
+  prompt: string;
+  title?: string;
+  options: Array<{ label: string; description?: string }>;
+  flowId?: string;
+  flowMode?: 'continuous';
+  continuationGroupMode?: 'vote' | 'claim' | 'parallel';
+  /** Bridge 签发的匿名分支键，不是平台用户 ID。 */
+  continuationParticipantKey?: string;
+  choiceSession?: {
+    mode: 'single_user' | 'vote' | 'claim' | 'parallel';
+    audience: 'initiator' | 'chat_members';
+    state: 'active' | 'complete';
+    durationSeconds?: number;
+    allowChange?: boolean;
+  };
+  openedAt?: number;
+  closesAt?: number;
+  selections?: Array<{
+    participantKey: string;
+    optionIndex: number;
+    selectedAt: number;
+  }>;
+  /** 首次成功成员复核时冻结的真实可参与成员 ID；仅用于覆盖判断，不交给模型。 */
+  eligibleParticipantKeys?: string[];
+  cardMessageId?: string;
+  cardHero?: { imageKey: string; alt: string };
+  expiresAt: number;
+}
+
+export interface ChoicePromptConsumedSnapshot {
+  nonce: string;
+  expiresAt: number;
+}
+
+export interface ChoicePromptFinalizationSnapshot {
+  nonce: string;
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  choiceMode: 'vote';
+  prompt: string;
+  title?: string;
+  participantCount: number;
+  eligibleParticipantCount?: number;
+  tally: Array<{ label: string; description?: string; count: number }>;
+  winningOptions: Array<{ label: string; description?: string; count: number }>;
+  finalizationReason?: 'deadline' | 'all_participants_selected';
+  finalizedAt: number;
+  cardMessageId?: string;
+  cardHero?: { imageKey: string; alt: string };
+}
+
+/** Runtime-owned durable state for short-lived, Bridge-signed choice callbacks. */
+export interface ChoicePromptStateSnapshot {
+  protocol: 'cti-choice-prompts/v1' | 'cti-choice-prompts/v2';
+  updatedAt: string;
+  entries: ChoicePromptStateEntrySnapshot[];
+  consumed: ChoicePromptConsumedSnapshot[];
+  /** 已原子收口、等待进入 adapter FIFO 的后台结果；成功入队后才确认删除。 */
+  finalizations?: ChoicePromptFinalizationSnapshot[];
+}
+
+export interface ChoicePromptStateHost {
+  readSnapshot(): ChoicePromptStateSnapshot | null;
+  writeSnapshot(snapshot: ChoicePromptStateSnapshot): void;
 }
 
 export interface MemoryGraphNode {
@@ -940,8 +1039,11 @@ export interface StreamChatParams {
     requiredInputEvidenceKinds?: InputEvidenceKind[];
     requiredInputEvidenceIds?: string[];
     strictToolEvidence?: boolean;
+    inheritedFromContinuation?: boolean;
   };
   noEvidenceRetryAttempted?: boolean;
+  /** 仅用于观测同一回合内的 Provider 恢复次数；不改变缺证据重试计数。 */
+  providerRecoveryAttempt?: number;
 }
 
 export interface LLMProvider {
@@ -961,6 +1063,14 @@ export type ScheduledTaskScheduleInput =
 
 export type ScheduledTaskActionInput =
   | { kind: 'notify'; text: string }
+  | {
+      kind: 'check_in';
+      text: string;
+      buttonText?: string;
+      successText?: string;
+      audience?: 'owner' | 'chat_members';
+      windowMs?: number;
+    }
   | { kind: 'agent_turn'; prompt: string; sessionMode: 'isolated' | 'bound'; timeoutMs?: number }
   | { kind: 'controlled_tool'; toolName: string; input: unknown; timeoutMs?: number };
 
@@ -968,6 +1078,7 @@ export interface ScheduledTaskActorInput {
   role: 'viewer' | 'operator' | 'owner';
   channelType: string;
   userId: string;
+  chatId?: string;
   messageId?: string;
 }
 
@@ -1013,6 +1124,15 @@ export interface ScheduledTaskRetryDeliveryInput {
   actor: ScheduledTaskActorInput;
 }
 
+export interface ScheduledTaskCheckInInput {
+  taskId: string;
+  slotKey: string;
+  actor: ScheduledTaskActorInput;
+  callbackMessageId?: string;
+  /** 由渠道基于原生 callback 和当前群成员证据设置，模型不能提供。 */
+  verifiedChatMember?: boolean;
+}
+
 export interface ScheduledTaskDeleteInput extends ScheduledTaskMutationInput {}
 
 export interface ScheduledTaskMutationResult {
@@ -1023,6 +1143,8 @@ export interface ScheduledTaskMutationResult {
   message?: string;
   error?: string;
   feishuCardJson?: string;
+  checkInStatus?: 'recorded' | 'already_recorded' | 'expired';
+  checkInCount?: number;
 }
 
 export interface ScheduledTaskListResult {
@@ -1056,6 +1178,8 @@ export interface ScheduledTaskActionHost {
   delete(input: ScheduledTaskDeleteInput): Promise<ScheduledTaskMutationResult>;
   history(input: ScheduledTaskHistoryInput): Promise<ScheduledTaskHistoryResult>;
   retryDelivery(input: ScheduledTaskRetryDeliveryInput): Promise<ScheduledTaskMutationResult>;
+  /** 可选能力用于兼容尚未升级的 Runtime Host。 */
+  checkIn?(input: ScheduledTaskCheckInInput): Promise<ScheduledTaskMutationResult>;
 }
 
 // ── Host Interface: Reminder Actions ────────────────────────

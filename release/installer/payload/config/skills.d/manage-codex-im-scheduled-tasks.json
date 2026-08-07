@@ -1,0 +1,23 @@
+{
+  "id": "manage-codex-im-scheduled-tasks",
+  "displayName": "管理飞书计划任务",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\manage-codex-im-scheduled-tasks",
+  "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.automation",
+  "optional": true,
+  "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
+  "aliases": [
+    "scheduled task",
+    "Feishu scheduled task",
+    "飞书计划任务",
+    "周期任务"
+  ],
+  "enabled": true,
+  "description": "Create and manage persistent Feishu-compatible scheduled tasks through the unified runtime scheduler and trusted evidence boundaries."
+}

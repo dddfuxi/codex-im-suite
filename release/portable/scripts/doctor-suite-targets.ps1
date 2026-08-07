@@ -131,6 +131,19 @@ $checks += [pscustomobject]@{
     SuiteHash = 'expected=removed'
     OtherHash = "path=$legacyInstaller"
 }
+$powershellUtf8ProfileScript = Join-Path $PSScriptRoot 'windows-powershell-utf8-profile.ps1'
+$powershellUtf8Output = (& $powershellUtf8ProfileScript -Mode Check 2>&1 | Out-String).Trim()
+$powershellUtf8ExitCode = $LASTEXITCODE
+$checks += [pscustomobject]@{
+    Check = 'powershell-utf8'
+    Status = if ($powershellUtf8ExitCode -eq 0) { 'healthy' } else { 'failed' }
+    SuiteHash = if ($powershellUtf8ExitCode -eq 0) { 'stdin=utf8' } else { 'stdin=unsafe' }
+    OtherHash = if ($powershellUtf8ExitCode -eq 0) {
+        $powershellUtf8Output
+    } else {
+        "repair=powershell -ExecutionPolicy Bypass -File `"$powershellUtf8ProfileScript`" -Mode Apply"
+    }
+}
 
 Write-Host 'Key file checks:'
 $checks | Format-Table -AutoSize | Out-String | Write-Host

@@ -7,6 +7,7 @@ import type {
   ArtifactPromotionResult,
   RegisteredProject,
   TurnArtifactRecord,
+  WorkflowRecoveryInputEvidenceRefContract,
 } from '@codex-im-suite/contracts';
 
 import type {
@@ -104,6 +105,12 @@ function parseToolResultContent(content: unknown): unknown {
   if (!lastMarker || lastMarker.index === undefined) return null;
   const output = trimmed.slice(lastMarker.index + lastMarker[0].length).trim();
   try { return JSON.parse(output) as unknown; } catch { return null; }
+}
+
+function getRecoveryInputTtlMs(): number {
+  const fallback = 24 * 60 * 60 * 1000;
+  const configured = Number.parseInt(process.env.CTI_WORKFLOW_RECOVERY_INPUT_TTL_MS || `${fallback}`, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : fallback;
 }
 
 function collectArtifactFilePaths(value: unknown, active = false, out = new Set<string>()): Set<string> {
@@ -332,6 +339,69 @@ export class RuntimeTurnStorage implements TurnStorageHost {
       }));
     }
     return records;
+  }
+
+  createRecoveryInputEvidenceRefs(input: TurnStorageScope & {
+    files: FileAttachment[];
+  }): WorkflowRecoveryInputEvidenceRefContract[] {
+    const turnDirectory = resolveRuntimeTurnDirectory(this.uploadRoot, input);
+    const allowedRoots = [turnDirectory, ...this.durableInputRoots].filter((root) => fs.existsSync(root));
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + getRecoveryInputTtlMs()).toISOString();
+    return input.files.flatMap((file) => {
+      try {
+        if (!file.filePath?.trim()) return [];
+        const filePath = path.resolve(file.filePath);
+        if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile() || fs.lstatSync(filePath).isSymbolicLink()) return [];
+        const realPath = fs.realpathSync.native(filePath);
+        if (!allowedRoots.some((root) => isPathInside(fs.realpathSync.native(root), realPath))) return [];
+        const buffer = fs.readFileSync(realPath);
+        return [{
+          id: file.id,
+          name: file.name,
+          type: file.type,
+          size: buffer.length,
+          filePath: realPath,
+          sha256: sha256(buffer),
+          createdAt,
+          expiresAt,
+        }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  restoreRecoveryInputEvidence(input: TurnStorageScope & {
+    refs: WorkflowRecoveryInputEvidenceRefContract[];
+  }): FileAttachment[] {
+    const turnDirectory = resolveRuntimeTurnDirectory(this.uploadRoot, input);
+    const allowedRoots = [turnDirectory, ...this.durableInputRoots].filter((root) => fs.existsSync(root));
+    return input.refs.map((ref) => {
+      if (Date.parse(ref.expiresAt) <= Date.now()) throw new Error('workflow_input_evidence_expired');
+      const filePath = path.resolve(ref.filePath);
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile() || fs.lstatSync(filePath).isSymbolicLink()) {
+        throw new Error('workflow_input_evidence_missing');
+      }
+      const realPath = fs.realpathSync.native(filePath);
+      if (!allowedRoots.some((root) => isPathInside(fs.realpathSync.native(root), realPath))) {
+        throw new Error('workflow_input_evidence_outside_managed_root');
+      }
+      const buffer = fs.readFileSync(realPath);
+      if (buffer.length !== ref.size || sha256(buffer) !== ref.sha256) throw new Error('workflow_input_evidence_hash_mismatch');
+      return {
+        id: ref.id,
+        name: ref.name,
+        type: ref.type,
+        size: buffer.length,
+        filePath: realPath,
+        data: buffer.toString('base64'),
+      };
+    });
+  }
+
+  recoverVerifiedArtifacts(input: TurnStorageScope & { createdAfter: string }): TurnArtifactRecord[] {
+    return this.artifactStore.recoverVerifiedArtifacts(input, input.createdAfter);
   }
 
   promoteArtifact(input: ArtifactPromotionRequest): ArtifactPromotionResult {

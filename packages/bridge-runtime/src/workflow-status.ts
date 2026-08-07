@@ -15,6 +15,13 @@ import type {
 } from '@codex-im-suite/contracts';
 
 import { CTI_HOME } from './config.js';
+import {
+  diagnoseWorkflowFailures,
+  mergeWorkflowFailureDiagnostics,
+} from './workflow-failure-diagnostics.js';
+import { writeUtf8TextAtomic } from './atomic-text-file.js';
+import { normalizeWellFormedUtf16, truncateUtf16Safe } from './unicode-text.js';
+import { recordWorkflowFailureLedgerEntryBestEffort } from './workflow-failure-ledger.js';
 
 export type WorkflowEvent = WorkflowRuntimeEventContract;
 export type WorkflowExecutionSummary = WorkflowExecutionSummaryContract;
@@ -30,7 +37,6 @@ const MAX_RUNS = 80;
 const MAX_EVENTS_PER_RUN = 80;
 const DEFAULT_MAX_AUTO_ATTEMPTS = 1;
 const MAX_RECOVERY_PROMPT_CHARS = 12_000;
-const FILE_WRITE_RETRY_DELAYS_MS = [20, 50, 100, 200, 400];
 
 function getStatusPathInternal(): string {
   const ctiHome = process.env.CTI_HOME?.trim() || CTI_HOME;
@@ -43,14 +49,12 @@ function nowIso(): string {
 
 function preview(text: string, limit = 180): string {
   const normalized = (text || '').replace(/\s+/g, ' ').trim();
-  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}...` : normalized;
+  return truncateUtf16Safe(normalized, limit, '...');
 }
 
 function truncateRecoveryText(text: string | undefined): string | undefined {
   if (text === undefined) return undefined;
-  return text.length > MAX_RECOVERY_PROMPT_CHARS
-    ? `${text.slice(0, MAX_RECOVERY_PROMPT_CHARS - 3)}...`
-    : text;
+  return truncateUtf16Safe(text, MAX_RECOVERY_PROMPT_CHARS, '...');
 }
 
 function getAutoRetryMaxAgeMs(): number {
@@ -150,37 +154,52 @@ function readStringList(value: unknown): string[] | undefined {
   return items.length > 0 ? Array.from(new Set(items)) : undefined;
 }
 
-function getFsErrorCode(error: unknown): string {
-  return error && typeof error === 'object' && 'code' in error
-    ? String((error as { code?: unknown }).code || '')
-    : '';
+function readReplaySafety(value: unknown): WorkflowExecutionSummary['replaySafety'] | undefined {
+  return value === 'safe_no_tools' || value === 'safe_read_only' || value === 'unsafe_side_effects' || value === 'unsafe_unknown'
+    ? value
+    : undefined;
 }
 
-function isRetryableWindowsFileLock(error: unknown): boolean {
-  const code = getFsErrorCode(error);
-  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES';
+function readRetryDisposition(value: unknown): WorkflowExecutionSummary['retryDisposition'] | undefined {
+  return value === 'not_needed' || value === 'retry_in_turn' || value === 'artifact_recovery'
+    || value === 'manual_retry_required' || value === 'exhausted' || value === 'not_retryable'
+    ? value
+    : undefined;
 }
 
-function sleepSync(ms: number): void {
-  const buffer = new SharedArrayBuffer(4);
-  const view = new Int32Array(buffer);
-  Atomics.wait(view, 0, 0, ms);
-}
-
-function retryLockedFileOperation<T>(operation: () => T): T {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= FILE_WRITE_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      return operation();
-    } catch (error) {
-      if (!isRetryableWindowsFileLock(error) || attempt >= FILE_WRITE_RETRY_DELAYS_MS.length) {
-        throw error;
-      }
-      lastError = error;
-      sleepSync(FILE_WRITE_RETRY_DELAYS_MS[attempt]);
-    }
-  }
-  throw lastError;
+function readFailureDiagnostics(value: unknown): WorkflowExecutionSummary['failureDiagnostics'] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const diagnostics = value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const source = (item as Record<string, unknown>).source;
+    const category = (item as Record<string, unknown>).category;
+    const code = readStringField((item as Record<string, unknown>).code);
+    const summary = readStringField((item as Record<string, unknown>).summary);
+    if ((source !== 'provider' && source !== 'tool') || !code || !summary) return [];
+    const allowedCategories = new Set([
+      'authentication',
+      'usage_limit',
+      'provider_protocol',
+      'invalid_request',
+      'cancelled',
+      'transient',
+      'dependency_unavailable',
+      'runtime_incompatible',
+      'runtime_unavailable',
+      'unknown',
+    ]);
+    if (typeof category !== 'string' || !allowedCategories.has(category)) return [];
+    const autoRetry = readBooleanField((item as Record<string, unknown>).autoRetry);
+    const diagnostic: NonNullable<WorkflowExecutionSummary['failureDiagnostics']>[number] = {
+      source: source as NonNullable<WorkflowExecutionSummary['failureDiagnostics']>[number]['source'],
+      category: category as NonNullable<WorkflowExecutionSummary['failureDiagnostics']>[number]['category'],
+      code,
+      summary,
+      ...(autoRetry === undefined ? {} : { autoRetry }),
+    };
+    return [diagnostic];
+  });
+  return diagnostics.length > 0 ? mergeWorkflowFailureDiagnostics(diagnostics) : undefined;
 }
 
 function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExecutionSummary | undefined {
@@ -210,6 +229,9 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     requiredEvidenceKind: readEvidenceKind(source.requiredEvidenceKind),
     evidenceSatisfied: readBooleanField(source.evidenceSatisfied),
     noEvidenceRetryAttempted: readBooleanField(source.noEvidenceRetryAttempted),
+    verifiedOutputArtifactCount: readNumberField(source.verifiedOutputArtifactCount),
+    replaySafety: readReplaySafety(source.replaySafety),
+    retryDisposition: readRetryDisposition(source.retryDisposition),
     requiredToolFamilies: readStringList(source.requiredToolFamilies),
     requiredInputEvidenceKinds: readStringList(source.requiredInputEvidenceKinds),
     requiredInputEvidenceIds: readStringList(source.requiredInputEvidenceIds),
@@ -221,6 +243,7 @@ function normalizeExecutionSummary(data?: Record<string, unknown>): WorkflowExec
     successfulToolResultCount: readNumberField(source.successfulToolResultCount),
     failedToolResultCount: readNumberField(source.failedToolResultCount),
     failedToolErrors: readStringList(source.failedToolErrors),
+    failureDiagnostics: readFailureDiagnostics(source.failureDiagnostics),
     toolNames: readStringList(source.toolNames),
     evidenceProtocol: readStringField(source.evidenceProtocol),
     requestedTool: readStringField(source.requestedTool),
@@ -282,6 +305,21 @@ export function getWorkflowStatusPath(): string {
   return getStatusPathInternal();
 }
 
+function serializeWorkflowStatus(value: unknown): { serialized: string; replacementCount: number } {
+  let replacementCount = 0;
+  const serialized = JSON.stringify(
+    value,
+    (_key, item) => {
+      if (typeof item !== 'string') return item;
+      const normalized = normalizeWellFormedUtf16(item);
+      if (normalized !== item) replacementCount += 1;
+      return normalized;
+    },
+    2,
+  );
+  return { serialized, replacementCount };
+}
+
 export function readWorkflowStatus(): WorkflowStatusFile {
   const statusPath = getStatusPathInternal();
   try {
@@ -289,10 +327,25 @@ export function readWorkflowStatus(): WorkflowStatusFile {
       return { protocol: 'workflow-runtime/v1', updatedAt: nowIso(), runs: [] };
     }
     const parsed = JSON.parse(fs.readFileSync(statusPath, 'utf-8')) as Partial<WorkflowStatusFile>;
+    const normalized = serializeWorkflowStatus(parsed);
+    const safeParsed = normalized.replacementCount > 0
+      ? JSON.parse(normalized.serialized) as Partial<WorkflowStatusFile>
+      : parsed;
+    if (normalized.replacementCount > 0) {
+      // 只有检测到确凿的非法 UTF-16 才做一次迁移；先保留原始状态库备份，
+      // 任何备份/写入失败都只放弃落盘自愈，不丢弃已经可供本轮使用的内存状态。
+      try {
+        const backupPath = `${statusPath}.unicode-repair-${Date.now()}.bak`;
+        fs.copyFileSync(statusPath, backupPath, fs.constants.COPYFILE_EXCL);
+        writeUtf8TextAtomic(statusPath, normalized.serialized);
+      } catch {
+        // best effort compatibility migration
+      }
+    }
     return {
       protocol: 'workflow-runtime/v1',
-      updatedAt: parsed.updatedAt || nowIso(),
-      runs: Array.isArray(parsed.runs) ? parsed.runs : [],
+      updatedAt: safeParsed.updatedAt || nowIso(),
+      runs: Array.isArray(safeParsed.runs) ? safeParsed.runs : [],
     };
   } catch {
     return { protocol: 'workflow-runtime/v1', updatedAt: nowIso(), runs: [] };
@@ -301,23 +354,12 @@ export function readWorkflowStatus(): WorkflowStatusFile {
 
 function writeWorkflowStatus(next: WorkflowStatusFile): WorkflowStatusFile {
   const statusPath = getStatusPathInternal();
-  fs.mkdirSync(path.dirname(statusPath), { recursive: true });
-  const tmp = `${statusPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  const serialized = JSON.stringify({ ...next, updatedAt: nowIso() }, null, 2);
-  retryLockedFileOperation(() => fs.writeFileSync(tmp, serialized, 'utf-8'));
-  try {
-    retryLockedFileOperation(() => fs.renameSync(tmp, statusPath));
-  } catch (error) {
-    if (!isRetryableWindowsFileLock(error)) {
-      throw error;
-    }
-    retryLockedFileOperation(() => fs.writeFileSync(statusPath, serialized, 'utf-8'));
-    try {
-      retryLockedFileOperation(() => fs.unlinkSync(tmp));
-    } catch {
-      // ignore cleanup failure
-    }
-  }
+  // 防御所有 workflow 字段，而不只保护 promptPreview；Provider、工具和历史数据
+  // 都可能携带外部生成的字符串，状态文件必须始终可被跨语言 JSON 消费者读取。
+  const { serialized } = serializeWorkflowStatus(
+    { ...next, updatedAt: nowIso() },
+  );
+  writeUtf8TextAtomic(statusPath, serialized);
   return next;
 }
 
@@ -380,10 +422,15 @@ export function recordWorkflowRecoveryInfo(
       reason: '运行时已持久化最小重试输入',
       input: {
         prompt: truncateRecoveryText(input.prompt) || '',
+        turnId: input.turnId,
         workingDirectory: input.workingDirectory,
+        additionalDirectories: input.additionalDirectories,
         model: input.model,
         systemPrompt: truncateRecoveryText(input.systemPrompt),
         permissionMode: input.permissionMode,
+        executionRequirement: input.executionRequirement,
+        noEvidenceRetryAttempted: input.noEvidenceRetryAttempted,
+        inputEvidenceRefs: input.inputEvidenceRefs,
         channelType: input.channelType || current.runs[index].channelType,
         chatId: input.chatId || current.runs[index].chatId,
         userId: input.userId,
@@ -409,6 +456,7 @@ export function markInterruptedWorkflowRuns(runtimeRunId: string): WorkflowRun[]
   const timestamp = nowIso();
   let changed = false;
   const marked: WorkflowRun[] = [];
+  const ledgerEntries: Array<{ run: WorkflowRun; interruptedStage: WorkflowStage }> = [];
   const runs = current.runs.map((run) => {
     if (run.status !== 'running' && run.status !== 'retrying') return run;
     changed = true;
@@ -419,7 +467,11 @@ export function markInterruptedWorkflowRuns(runtimeRunId: string): WorkflowRun[]
       && (run.stage === 'received' || run.stage === 'authorized' || run.stage === 'contextualized' || run.stage === 'routed');
     // executing/finalizing/retrying 可能已经产生外部副作用。Bridge 重启后不能
     // 仅凭原 prompt 自动重放；保留 recovery input 供用户显式手动重试即可。
-    const recoverable = interruptedBeforeExecution && !!input?.prompt && retryAttempts < maxAttempts;
+    const recoverable = interruptedBeforeExecution
+      && !!input?.prompt
+      && !!input.turnId
+      && !!input.executionRequirement
+      && retryAttempts < maxAttempts;
     const interruptionReason = recoverable
       ? 'bridge 重启后可用持久化输入重试'
       : input?.prompt
@@ -457,10 +509,24 @@ export function markInterruptedWorkflowRuns(runtimeRunId: string): WorkflowRun[]
       ].slice(-MAX_EVENTS_PER_RUN),
     };
     marked.push(next);
+    ledgerEntries.push({ run: next, interruptedStage: run.stage });
     return next;
   });
   if (changed) {
     writeWorkflowStatus({ ...current, runs });
+    for (const item of ledgerEntries) {
+      recordWorkflowFailureLedgerEntryBestEffort({
+        kind: 'restart_interrupted',
+        stage: item.interruptedStage,
+        workflowStatus: item.run.status,
+        failureCodes: [item.interruptedStage === 'executing' || item.interruptedStage === 'finalizing' || item.run.status === 'retrying'
+          ? 'runtime.restart_during_execution'
+          : 'runtime.restart_before_execution'],
+        replaySafety: item.run.execution?.replaySafety,
+        retryDisposition: item.run.execution?.retryDisposition,
+        occurredAt: timestamp,
+      });
+    }
   }
   return marked;
 }
@@ -512,6 +578,8 @@ export function completeWorkflowRun(runId: string, message = 'workflow completed
   const current = readWorkflowStatus();
   const index = current.runs.findIndex((run) => run.id === runId);
   if (index < 0) return null;
+  // 控制面板终止已经成为本轮唯一终态后，迟到的 Provider close 不能覆盖它。
+  if (current.runs[index].status === 'cancelled') return current.runs[index];
   const timestamp = nowIso();
   const run = {
     ...current.runs[index],
@@ -531,11 +599,21 @@ export function failWorkflowRun(runId: string, error: unknown): WorkflowRun | nu
   const current = readWorkflowStatus();
   const index = current.runs.findIndex((run) => run.id === runId);
   if (index < 0) return null;
+  // Abort 后 Provider 往往还会抛出一个迟到错误；保留更准确的取消终态。
+  if (current.runs[index].status === 'cancelled') return current.runs[index];
   const timestamp = nowIso();
   const message = error instanceof Error ? error.message : String(error);
   const existingRetry = current.runs[index].retry;
+  const failureDiagnostics = mergeWorkflowFailureDiagnostics(
+    current.runs[index].execution?.failureDiagnostics,
+    diagnoseWorkflowFailures({ providerError: error }),
+  );
   const run = {
     ...current.runs[index],
+    execution: {
+      ...(current.runs[index].execution || {}),
+      failureDiagnostics,
+    },
     stage: 'failed' as WorkflowStage,
     status: 'failed' as const,
     error: message,
@@ -549,7 +627,63 @@ export function failWorkflowRun(runId: string, error: unknown): WorkflowRun | nu
         lastError: message,
       }
       : existingRetry,
-    events: [...current.runs[index].events, event(runId, 'failed', 'workflow.failed', message)].slice(MAX_EVENTS_PER_RUN * -1),
+    events: [...current.runs[index].events, event(runId, 'failed', 'workflow.failed', message, {
+      failureCodes: failureDiagnostics.map((item) => item.code),
+    })].slice(MAX_EVENTS_PER_RUN * -1),
+  };
+  const runs = [...current.runs];
+  runs[index] = run;
+  writeWorkflowStatus({ ...current, runs });
+  recordWorkflowFailureLedgerEntryBestEffort({
+    kind: 'workflow_failed',
+    stage: current.runs[index].stage,
+    workflowStatus: run.status,
+    failureCodes: failureDiagnostics.map((item) => item.code),
+    replaySafety: run.execution?.replaySafety,
+    retryDisposition: run.execution?.retryDisposition,
+    occurredAt: timestamp,
+  });
+  return run;
+}
+
+export function cancelWorkflowRun(runId: string, message = '用户从控制面板终止了当前回复'): WorkflowRun | null {
+  const current = readWorkflowStatus();
+  const index = current.runs.findIndex((run) => run.id === runId);
+  if (index < 0) return null;
+  const existing = current.runs[index];
+  if (existing.status === 'cancelled') return existing;
+  const timestamp = nowIso();
+  const run: WorkflowRun = {
+    ...existing,
+    stage: 'failed',
+    status: 'cancelled',
+    error: message,
+    updatedAt: timestamp,
+    endedAt: timestamp,
+    execution: {
+      ...(existing.execution || {}),
+      retryDisposition: 'not_retryable',
+      failureDiagnostics: mergeWorkflowFailureDiagnostics(
+        existing.execution?.failureDiagnostics,
+        [{
+          source: 'provider',
+          category: 'cancelled',
+          code: 'provider.user_cancelled',
+          summary: '当前回复已由用户终止。',
+          autoRetry: false,
+        }],
+      ),
+    },
+    retry: existing.retry ? {
+      ...existing.retry,
+      status: 'unavailable',
+      lastAttemptAt: timestamp,
+      lastError: message,
+    } : existing.retry,
+    events: [
+      ...existing.events,
+      event(runId, 'failed', 'workflow.cancelled', message, { requestedBy: 'control_panel' }),
+    ].slice(-MAX_EVENTS_PER_RUN),
   };
   const runs = [...current.runs];
   runs[index] = run;
@@ -566,7 +700,7 @@ export function requestWorkflowRetry(runId: string, requestedBy: 'auto' | 'manua
   const attempts = existing.retry?.attempts || 0;
   const maxAttempts = Math.max(1, existing.retry?.maxAttempts ?? DEFAULT_MAX_AUTO_ATTEMPTS);
   const timestamp = nowIso();
-  const retryable = !!input?.prompt;
+  const retryable = !!input?.prompt && !!input.turnId && !!input.executionRequirement;
   const status: WorkflowRun['status'] = retryable ? 'retry_pending' : 'failed';
   const retryStatus: WorkflowRetryState['status'] = retryable
     ? requestedBy === 'auto' ? 'auto_pending' : 'manual_pending'
@@ -582,11 +716,11 @@ export function requestWorkflowRetry(runId: string, requestedBy: 'auto' | 'manua
       maxAttempts,
       requestedBy,
       requestedAt: timestamp,
-      lastError: retryable ? existing.retry?.lastError : '缺少可重试输入',
+      lastError: retryable ? existing.retry?.lastError : '缺少 prompt、turnId 或原始执行要求',
     },
     events: [
       ...existing.events,
-      event(runId, retryable ? existing.stage : 'failed', retryable ? 'workflow.retry.requested' : 'workflow.retry.unavailable', retryable ? '已请求 workflow 重试' : '缺少可重试输入，无法重试', {
+      event(runId, retryable ? existing.stage : 'failed', retryable ? 'workflow.retry.requested' : 'workflow.retry.unavailable', retryable ? '已请求 workflow 重试' : '缺少 prompt、turnId 或原始执行要求，无法重试', {
         requestedBy,
       }),
     ].slice(-MAX_EVENTS_PER_RUN),
@@ -605,6 +739,8 @@ export function claimNextWorkflowRetry(workerId: string): WorkflowRun | null {
       run.status === 'retry_pending'
       && (run.retry?.status === 'auto_pending' || run.retry?.status === 'manual_pending')
       && !!run.recovery?.input?.prompt
+      && !!run.recovery?.input?.turnId
+      && !!run.recovery?.input?.executionRequirement
       && isAutoRetryStillFresh(run)
     )
     .sort((left, right) => {
@@ -682,8 +818,16 @@ export function failWorkflowRetry(runId: string, error: unknown): WorkflowRun | 
   const attempts = existing.retry?.attempts || 0;
   const maxAttempts = existing.retry?.maxAttempts ?? DEFAULT_MAX_AUTO_ATTEMPTS;
   const exhausted = attempts >= maxAttempts;
+  const failureDiagnostics = mergeWorkflowFailureDiagnostics(
+    existing.execution?.failureDiagnostics,
+    diagnoseWorkflowFailures({ providerError: error }),
+  );
   const run: WorkflowRun = {
     ...existing,
+    execution: {
+      ...(existing.execution || {}),
+      failureDiagnostics,
+    },
     status: exhausted ? 'failed' : 'retry_pending',
     stage: 'failed',
     error: message,
@@ -704,11 +848,21 @@ export function failWorkflowRetry(runId: string, error: unknown): WorkflowRun | 
       event(runId, 'failed', exhausted ? 'workflow.retry.exhausted' : 'workflow.retry.failed', exhausted ? 'workflow 重试次数已耗尽' : 'workflow 重试失败，等待下一次自动重试', {
         attempts,
         maxAttempts,
+        failureCodes: failureDiagnostics.map((item) => item.code),
       }),
     ].slice(-MAX_EVENTS_PER_RUN),
   };
   const runs = [...current.runs];
   runs[index] = run;
   writeWorkflowStatus({ ...current, runs });
+  recordWorkflowFailureLedgerEntryBestEffort({
+    kind: 'retry_failed',
+    stage: existing.stage,
+    workflowStatus: run.status,
+    failureCodes: failureDiagnostics.map((item) => item.code),
+    replaySafety: run.execution?.replaySafety,
+    retryDisposition: run.execution?.retryDisposition,
+    occurredAt: timestamp,
+  });
   return run;
 }

@@ -144,6 +144,42 @@ describe('file scheduled task store', () => {
     }
   });
 
+  it('records at most one check-in per participant for each run slot', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-check-in-store-'));
+    try {
+      const store = makeStore(root);
+      const task = await store.createTask(makeTaskCreate());
+      const run = makeScheduledRun({
+        taskId: task.id,
+        runId: `${task.id}:2026-07-18T09:00:00.000Z:1`,
+        slotKey: 'slot_check_in_001',
+        queuedAt: '2026-07-18T09:00:00.000Z',
+      });
+      await store.appendRun(run);
+
+      const first = await store.recordCheckIn({
+        taskId: task.id, runId: run.runId, slotKey: run.slotKey,
+        channelType: 'feishu', userId: 'ou_a', checkedInAt: '2026-07-18T09:01:00.000Z',
+      });
+      const duplicate = await store.recordCheckIn({
+        taskId: task.id, runId: run.runId, slotKey: run.slotKey,
+        channelType: 'feishu', userId: 'ou_a', checkedInAt: '2026-07-18T09:02:00.000Z',
+      });
+      const second = await store.recordCheckIn({
+        taskId: task.id, runId: run.runId, slotKey: run.slotKey,
+        channelType: 'feishu', userId: 'ou_b', checkedInAt: '2026-07-18T09:03:00.000Z',
+      });
+
+      assert.equal(first.recorded, true);
+      assert.equal(duplicate.recorded, false);
+      assert.equal(second.state.entries.length, 2);
+      assert.equal((await store.getRunBySlotKey(task.id, run.slotKey))?.runId, run.runId);
+      assert.equal((await store.getCheckIns(task.id, run.slotKey))?.entries.length, 2);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not leave temporary files after successful writes', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-temp-'));
     try {

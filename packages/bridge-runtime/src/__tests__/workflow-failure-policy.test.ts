@@ -35,6 +35,20 @@ describe('workflow failure retry policy', () => {
     assert.equal(decision.category, 'cancelled');
   });
 
+  it('does not retry usage limits, protocol mismatches, or invalid parameters', () => {
+    const failures = [
+      ['usage limit reached', 'usage_limit'],
+      ['unexpected status 405 from /v1/responses', 'provider_protocol'],
+      ['invalid request parameter: reasoning_effort', 'invalid_request'],
+    ] as const;
+
+    for (const [message, category] of failures) {
+      const decision = decideWorkflowFailureRetry(new Error(message));
+      assert.equal(decision.category, category);
+      assert.equal(decision.autoRetry, false);
+    }
+  });
+
   it('keeps one automatic retry for transient network failures', () => {
     const decision = decideWorkflowFailureRetry(new Error('fetch failed: ECONNRESET'));
 

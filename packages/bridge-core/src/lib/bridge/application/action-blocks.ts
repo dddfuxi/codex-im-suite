@@ -105,6 +105,16 @@ function getRecordField(value: unknown): Record<string, unknown> | null {
 }
 
 function parseScheduledTaskSchedule(value: unknown): ScheduledTaskScheduleInput | null {
+  if (typeof value === 'string') {
+    // Codex occasionally emits the standard crontab inline timezone form instead
+    // of the canonical object. Normalize only an explicit TZ assignment; a bare
+    // cron string remains invalid because the Bridge must not guess a timezone.
+    const match = /^(?:CRON_TZ|TZ)\s*=\s*([^\s]+)\s+([^\r\n]+)$/iu.exec(value.trim());
+    if (!match) return null;
+    const timezone = match[1].replace(/^["']|["']$/gu, '').trim();
+    const expression = match[2].trim().replace(/\s+/gu, ' ');
+    return timezone && expression ? { kind: 'cron', expression, timezone } : null;
+  }
   const raw = getRecordField(value);
   if (!raw) return null;
   const kind = getStringField(raw, ['kind']).toLowerCase();
@@ -136,9 +146,38 @@ function parseScheduledTaskAction(value: unknown): ScheduledTaskActionInput | nu
     const text = getStringField(raw, ['text', 'message', 'content']);
     return text ? { kind: 'notify', text } : null;
   }
+  if (kind === 'check_in' || kind === 'check-in' || kind === 'checkin') {
+    const text = getStringField(raw, ['text', 'message', 'content']);
+    if (!text) return null;
+    const requestedAudience = getStringField(raw, ['audience']).toLowerCase();
+    const audience = requestedAudience === 'owner' ? 'owner' : 'chat_members';
+    const buttonText = getStringField(raw, ['buttonText', 'button_text', 'label']);
+    const successText = getStringField(raw, ['successText', 'success_text', 'confirmation']);
+    const windowMs = Number(raw.windowMs ?? raw.window_ms);
+    return {
+      kind: 'check_in',
+      text,
+      audience,
+      ...(buttonText ? { buttonText } : {}),
+      ...(successText ? { successText } : {}),
+      ...(Number.isFinite(windowMs) && windowMs > 0 ? { windowMs: Math.floor(windowMs) } : {}),
+    };
+  }
+  if (kind === 'direct_message' || kind === 'direct-message') {
+    const text = getStringField(raw, ['text', 'message', 'content']);
+    const targetType = getStringField(raw, ['targetType', 'target_type', 'targetKind', 'target_kind']).toLowerCase();
+    // 计划任务的真实投递目标始终由当前入站会话绑定。这里只兼容模型常见的
+    // “向当前群发消息”协议变体；指定用户的私发不能静默降级为当前群通知。
+    const targetsCurrentChat = /^(?:chat|group|channel|conversation|current_chat|current-chat|群|群聊|当前群|当前会话)$/u.test(targetType);
+    return text && targetsCurrentChat ? { kind: 'notify', text } : null;
+  }
   if (kind === 'agent_turn') {
     const prompt = getStringField(raw, ['prompt', 'text', 'request']);
-    const sessionMode = getStringField(raw, ['sessionMode', 'session_mode']).toLowerCase();
+    const requestedSessionMode = getStringField(raw, ['sessionMode', 'session_mode']).toLowerCase();
+    // Missing mode defaults to the least-privileged empty workspace. Only an
+    // explicit `bound` may attach the scheduled turn to the trusted workspace
+    // resolved later by the Host; unknown values still fail closed.
+    const sessionMode = requestedSessionMode || 'isolated';
     if (!prompt || (sessionMode !== 'isolated' && sessionMode !== 'bound')) return null;
     const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms);
     return {
@@ -172,6 +211,20 @@ function collectIgnoredScheduledTaskFields(value: unknown): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
   return Object.keys(value as Record<string, unknown>)
     .filter((key) => ignoredNames.has(key.replace(/[-\s]/gu, '_').toLowerCase()))
+    .sort();
+}
+
+function collectIgnoredScheduledTaskActionFields(value: unknown): string[] {
+  const raw = getRecordField(value);
+  if (!raw) return [];
+  const ignoredNames = new Set([
+    'target', 'targetid', 'target_id', 'targettype', 'target_type', 'targetkind', 'target_kind',
+    'chatid', 'chat_id', 'userid', 'user_id', 'openid', 'open_id', 'receiveid', 'receive_id',
+    'channeltype', 'channel_type', 'sessionid', 'session_id', 'messageid', 'message_id',
+  ]);
+  return Object.keys(raw)
+    .filter((key) => ignoredNames.has(key.replace(/[-\s]/gu, '_').toLowerCase()))
+    .map((key) => `taskAction.${key}`)
     .sort();
 }
 
@@ -239,13 +292,24 @@ export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledT
     }
     const name = getStringField(raw, ['name', 'title']);
     const schedule = parseScheduledTaskSchedule(raw.schedule);
-    const taskAction = parseScheduledTaskAction(raw.taskAction ?? raw.task_action);
+    const rawTaskAction = raw.taskAction ?? raw.task_action;
+    const taskAction = parseScheduledTaskAction(rawTaskAction);
     const requestedDeliveryMode = getStringField(raw, ['deliveryMode', 'delivery_mode']).toLowerCase();
     const deliveryMode = requestedDeliveryMode === 'summary' || requestedDeliveryMode === 'none'
       ? requestedDeliveryMode
       : 'result';
-    if (!name || !schedule || !taskAction) {
-      return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name、schedule 或 taskAction' };
+    if (!name) return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name' };
+    if (!schedule) return { action: null, text: cleaned, hadBlock: true, error: '计划任务 schedule 无效或缺少必要字段' };
+    if (!taskAction) {
+      const taskActionKind = getStringField(getRecordField(rawTaskAction) || {}, ['kind']);
+      return {
+        action: null,
+        text: cleaned,
+        hadBlock: true,
+        error: taskActionKind
+          ? `计划任务 taskAction 无效或不支持 kind=${taskActionKind}`
+          : '计划任务动作缺少 taskAction',
+      };
     }
     return {
       action: {
@@ -254,7 +318,10 @@ export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledT
         schedule,
         taskAction,
         deliveryMode,
-        ignoredTrustedFields: collectIgnoredScheduledTaskFields(parsed),
+        ignoredTrustedFields: [
+          ...collectIgnoredScheduledTaskFields(parsed),
+          ...collectIgnoredScheduledTaskActionFields(rawTaskAction),
+        ],
       },
       text: cleaned,
       hadBlock: true,

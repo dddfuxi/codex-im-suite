@@ -3,16 +3,83 @@ import { describe, it } from 'node:test';
 
 import {
   buildAgentCollaborationProgressMarkdown,
+  buildCardContent,
   buildToolProgressMarkdown,
   buildFinalCardJson,
   buildPostContent,
   buildStreamingContent,
   extractStreamingFinalResponse,
   preprocessFeishuMarkdown,
+  renderFeishuAnalysisView,
 } from '../../lib/bridge/markdown/feishu.js';
 import { buildFeishuCapabilityReport } from '../../lib/bridge/feishu-capabilities.js';
 
 describe('Feishu streaming card markdown', () => {
+  it('renders a compact generic analysis view and removes repeated presentation lines', () => {
+    const markdown = renderFeishuAnalysisView([
+      '# 服务运行盘面',
+      '主链路稳定，延迟仍需观察。',
+      '补充说明：数据来自真实健康检查。',
+    ].join('\n'), {
+      title: '服务运行盘面',
+      verdict: '主链路稳定，延迟仍需观察。',
+      tone: 'positive',
+      metrics: [
+        { label: 'Bridge|状态', value: '在线', change: 'connected', tone: 'positive' },
+        { label: '响应耗时', value: '2.1s', change: '↑ 0.3s', tone: 'warning' },
+      ],
+      sections: [
+        { title: '风险观察', items: ['队列在高峰期可能堆积'], tone: 'warning' },
+        { title: '下一步', items: ['观察三轮真实消息'], tone: 'info' },
+      ],
+    });
+
+    assert.match(markdown, /^# 服务运行盘面/u);
+    assert.match(markdown, /<text_tag color='green'>盘面结论<\/text_tag>/u);
+    assert.match(markdown, /\| 指标 \| 状态 \/ 信号 \|/u);
+    assert.match(markdown, /Bridge\\\|状态/u);
+    assert.match(markdown, /<font color='orange'>2\.1s<\/font> · <font color='orange'>↑ 0\.3s<\/font>/u);
+    assert.match(markdown, /<text_tag color='orange'>风险观察<\/text_tag>/u);
+    assert.match(markdown, /补充说明：数据来自真实健康检查/u);
+    assert.equal(markdown.match(/服务运行盘面/gu)?.length, 1);
+    assert.equal(markdown.match(/主链路稳定，延迟仍需观察。/gu)?.length, 1);
+  });
+
+  it('preserves duplicate-looking lines inside code fences while pruning display duplicates', () => {
+    const markdown = renderFeishuAnalysisView([
+      '盘面标题',
+      '```text',
+      '盘面标题',
+      '```',
+    ].join('\n'), {
+      title: '盘面标题',
+      verdict: '状态正常',
+      tone: 'info',
+      metrics: [{ label: '状态', value: '正常' }],
+      sections: [],
+    });
+
+    assert.match(markdown, /```text\n盘面标题\n```/u);
+    assert.equal(markdown.match(/盘面标题/gu)?.length, 2);
+  });
+
+  it('keeps ordinary text unchanged when no analysis view is present', () => {
+    assert.equal(renderFeishuAnalysisView('轻聊正文'), '轻聊正文');
+  });
+
+  it('places a trusted hero image before ordinary and final card markdown', () => {
+    const hero = { imageKey: 'img_v3_scene', alt: '遗迹入口' };
+    const ordinary = JSON.parse(buildCardContent('剧情正文', [], hero)) as any;
+    const final = JSON.parse(buildFinalCardJson('剧情正文', [], null, undefined, [], undefined, hero)) as any;
+
+    for (const card of [ordinary, final]) {
+      assert.equal(card.body.elements[0].tag, 'img');
+      assert.equal(card.body.elements[0].img_key, 'img_v3_scene');
+      assert.equal(card.body.elements[1].tag, 'markdown');
+      assert.match(card.body.elements[1].content, /剧情正文/u);
+    }
+  });
+
   it('hides Shadow and folds only Assist collaboration that actually joined the answer', () => {
     const shadow = buildAgentCollaborationProgressMarkdown({
       runId: 'run-shadow',

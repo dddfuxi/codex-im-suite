@@ -1,0 +1,4 @@
+interface:
+  display_name: "管理飞书计划任务"
+  short_description: "创建、管理、迁移和诊断飞书统一计划任务、运行账本与投递失败"
+  default_prompt: "Use $manage-codex-im-scheduled-tasks to create or manage a Feishu scheduled task from verified current-turn evidence."

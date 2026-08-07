@@ -16,6 +16,12 @@ import {
   setWorkflowExecutor,
   startWorkflowRun,
 } from '../workflow-status.js';
+import { readWorkflowFailureLedger } from '../workflow-failure-ledger.js';
+
+const retryRecovery = {
+  turnId: 'turn-retry',
+  executionRequirement: { kind: 'none' as const, reason: 'test', requiredToolFamilies: [] },
+};
 
 describe('workflow status store', () => {
   let tempHome = '';
@@ -192,6 +198,35 @@ describe('workflow status store', () => {
     assert.ok(readWorkflowStatus().runs.some((item) => item.id === run.id));
   });
 
+  it('keeps a monotonic, content-free failure watermark beyond the rolling workflow view', () => {
+    const first = startWorkflowRun({ sessionId: 'ledger-1', prompt: '敏感正文一' });
+    appendWorkflowEvent(first.id, 'executing', 'executor.started', '开始执行');
+    failWorkflowRun(first.id, new Error('dynamic failure text one'));
+
+    const second = startWorkflowRun({ sessionId: 'ledger-2', prompt: '敏感正文二' });
+    appendWorkflowEvent(second.id, 'executing', 'executor.started', '开始执行');
+    failWorkflowRun(second.id, new Error('dynamic failure text two'));
+
+    const ledger = readWorkflowFailureLedger();
+    assert.deepEqual(ledger.entries.map((entry) => entry.sequence), [1, 2]);
+    assert.equal(ledger.nextSequence, 3);
+    assert.equal(ledger.retainedFromSequence, 1);
+    assert.equal(ledger.entries[0].fingerprint, ledger.entries[1].fingerprint);
+    const raw = fs.readFileSync(path.join(tempHome, 'runtime', 'workflow-failure-ledger.json'), 'utf8');
+    assert.doesNotMatch(raw, /敏感正文|dynamic failure text/u);
+  });
+
+  it('records restart-during-execution as a stable runtime failure code', () => {
+    const run = startWorkflowRun({ sessionId: 'ledger-restart', prompt: '执行任务' });
+    appendWorkflowEvent(run.id, 'executing', 'executor.started', '开始执行');
+    markInterruptedWorkflowRuns('runtime-after-restart');
+
+    const entry = readWorkflowFailureLedger().entries.at(-1);
+    assert.equal(entry?.kind, 'restart_interrupted');
+    assert.equal(entry?.stage, 'executing');
+    assert.deepEqual(entry?.failureCodes, ['runtime.restart_during_execution']);
+  });
+
   it('retries transient Windows file locks while writing workflow status', () => {
     const originalRenameSync = fs.renameSync;
     let attempts = 0;
@@ -238,6 +273,85 @@ describe('workflow status store', () => {
     assert.equal(failed?.tokenUsage, undefined);
   });
 
+  it('keeps workflow JSON valid when truncation meets an emoji surrogate pair', () => {
+    const prompt = `${'x'.repeat(176)}🇨🇳 后续文本`;
+    const run = startWorkflowRun({
+      sessionId: 'session-unicode-preview',
+      prompt,
+    });
+    appendWorkflowEvent(run.id, 'executing', 'unicode.evidence', '包含孤立代理项的外部数据', {
+      malformed: `before-${String.fromCharCode(0xD83C)}-after`,
+    });
+
+    const statusPath = path.join(tempHome, 'runtime', 'workflow-runs.json');
+    const raw = fs.readFileSync(statusPath, 'utf8');
+    const parsed = JSON.parse(raw) as { runs: Array<{ promptPreview: string; events: Array<{ data?: { malformed?: string } }> }> };
+    const stored = parsed.runs.at(-1);
+
+    assert.ok(stored?.promptPreview.endsWith('...'));
+    assert.doesNotMatch(stored?.promptPreview || '', /[\uD800-\uDFFF]$/u);
+    assert.equal(stored?.events.at(-1)?.data?.malformed, 'before-\uFFFD-after');
+  });
+
+  it('backs up and repairs a historical workflow file with malformed UTF-16', () => {
+    const runtimeDir = path.join(tempHome, 'runtime');
+    const statusPath = path.join(runtimeDir, 'workflow-runs.json');
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.writeFileSync(statusPath, JSON.stringify({
+      protocol: 'workflow-runtime/v1',
+      updatedAt: '2026-08-01T00:00:00.000Z',
+      runs: [{ id: 'legacy-unicode', promptPreview: String.fromCharCode(0xD83C), events: [] }],
+    }), 'utf8');
+
+    const status = readWorkflowStatus();
+    const repairedRaw = fs.readFileSync(statusPath, 'utf8');
+    const backups = fs.readdirSync(runtimeDir).filter((name) => name.startsWith('workflow-runs.json.unicode-repair-'));
+
+    assert.equal(status.runs[0]?.promptPreview, '\uFFFD');
+    assert.doesNotMatch(repairedRaw, /\\ud83c/iu);
+    assert.equal(backups.length, 1);
+    assert.match(fs.readFileSync(path.join(runtimeDir, backups[0]), 'utf8'), /\\ud83c/iu);
+  });
+
+  it('merges provider and tool failure diagnostics without exposing raw paths as codes', () => {
+    const run = startWorkflowRun({
+      sessionId: 'session-layered-failure',
+      prompt: '执行桌面工具',
+    });
+    appendWorkflowEvent(run.id, 'finalizing', 'execution.evidence', '执行证据已记录', {
+      failedToolResultCount: 2,
+      failedToolErrors: [
+        "Cannot find path 'C:\\secret\\tool\\SKILL.md' because it does not exist.",
+        'ERR_UNSUPPORTED_ESM_URL_SCHEME',
+      ],
+      failureDiagnostics: [
+        {
+          source: 'tool',
+          category: 'dependency_unavailable',
+          code: 'tool.dependency_path_missing',
+          summary: '工具依赖路径不存在或未安装',
+        },
+        {
+          source: 'tool',
+          category: 'runtime_incompatible',
+          code: 'tool.module_loader_incompatible',
+          summary: '工具模块加载方式与当前运行时不兼容',
+        },
+      ],
+    });
+
+    const failed = failWorkflowRun(run.id, new Error('Codex 登录已失效，请重新登录。'));
+    const codes = failed?.execution?.failureDiagnostics?.map((item) => item.code);
+
+    assert.deepEqual(codes, [
+      'tool.dependency_path_missing',
+      'tool.module_loader_incompatible',
+      'provider.authentication_requires_user_action',
+    ]);
+    assert.ok(codes?.every((code) => !code.includes('secret')));
+    assert.deepEqual(failed?.events.at(-1)?.data?.failureCodes, codes);
+  });
+
   it('marks interrupted running runs as recoverable when retry input was persisted', () => {
     const run = startWorkflowRun({
       sessionId: 'session-recoverable',
@@ -246,6 +360,7 @@ describe('workflow status store', () => {
       chatId: 'chat-recoverable',
     });
     recordWorkflowRecoveryInfo(run.id, {
+      ...retryRecovery,
       prompt: '继续处理这条消息',
       workingDirectory: 'C:\\workspace',
       model: 'gpt-test',
@@ -272,6 +387,7 @@ describe('workflow status store', () => {
       chatId: 'oc_retry',
     });
     recordWorkflowRecoveryInfo(run.id, {
+      ...retryRecovery,
       prompt: '总结 https://example.feishu.cn/sheets/sht_abc',
       workingDirectory: 'C:\\workspace',
       channelType: 'feishu',
@@ -313,6 +429,7 @@ describe('workflow status store', () => {
       chatId: 'chat-executing-interrupted',
     });
     recordWorkflowRecoveryInfo(executing.id, {
+      ...retryRecovery,
       prompt: '截一张当前 Unity 的图',
       workingDirectory: 'C:\\unity\\ST3',
       maxAutoAttempts: 2,
@@ -324,6 +441,7 @@ describe('workflow status store', () => {
       prompt: '继续上一轮',
     });
     recordWorkflowRecoveryInfo(retrying.id, {
+      ...retryRecovery,
       prompt: '继续上一轮',
       workingDirectory: 'C:\\workspace',
       maxAutoAttempts: 2,
@@ -351,6 +469,7 @@ describe('workflow status store', () => {
       chatId: 'chat-manual',
     });
     recordWorkflowRecoveryInfo(run.id, {
+      ...retryRecovery,
       prompt: '手动重试这条消息',
       workingDirectory: 'C:\\workspace',
       maxAutoAttempts: 1,
@@ -379,6 +498,7 @@ describe('workflow status store', () => {
         chatId: 'chat-stale-auto-retry',
       });
       recordWorkflowRecoveryInfo(run.id, {
+        ...retryRecovery,
         prompt: '桥接断开后继续旧任务',
         workingDirectory: 'C:\\workspace',
         maxAutoAttempts: 1,

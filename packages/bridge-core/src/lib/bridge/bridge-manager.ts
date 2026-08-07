@@ -7,9 +7,10 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, ChannelBinding, InboundLifecycleControl, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink, VerifiedMediaAction } from './types.js';
+import type { BridgeStatus, ChannelBinding, ChannelType, FeishuCardHeroImage, InboundLifecycleControl, InboundMessage, OutboundMessage, OutboundMention, StreamingPreviewState, ToolCallInfo, UploadedFileLink, VerifiedMediaAction } from './types.js';
 import type {
   AnswerReviewInput,
+  AgentCollaborationCompletionInput,
   ConversationMemoryEvent,
   DirectReminderCreateResult,
   ExtensionActionActor,
@@ -57,6 +58,11 @@ import {
   extractCtiReminderAction as parseCtiReminderActionBlock,
   extractCtiScheduledTaskAction as parseCtiScheduledTaskActionBlock,
 } from './application/action-blocks.js';
+import {
+  hasTrustedDirectMessageContinuationAuthorization,
+  isCurrentConversationTargetId,
+  isExplicitDirectMessageRequestText,
+} from './application/direct-message-policy.js';
 import {
   containsUnverifiedReminderCompletion,
   hasSchedulingTimeHint,
@@ -112,6 +118,7 @@ import {
   buildFeishuDocumentGuideSyncPlan,
   buildFeishuDocumentRecordInput,
   buildFeishuDocumentSuccessMessage,
+  decideFeishuDocumentCreation,
 } from './channels/feishu/documents/document-delivery-policy.js';
 import {
   resolveFeishuContextualMention,
@@ -141,7 +148,12 @@ import { enforceInputEvidenceDeliveryBoundary } from './application/input-eviden
 import {
   CHOICE_CALLBACK_PREFIX,
   ChoicePromptRegistry,
+  buildChoiceSessionFinalizationFooter,
   buildChoiceSelectionText,
+  buildVoteFinalizationText,
+  type ActiveChoiceContinuation,
+  type ChoicePromptView,
+  type FinalizedChoiceSession,
 } from './application/choice-prompts.js';
 import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -152,10 +164,11 @@ import * as broker from './permission-broker.js';
 import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
-import { formatVisibleToolName } from './markdown/feishu.js';
+import { formatVisibleToolName, renderFeishuAnalysisView } from './markdown/feishu.js';
 import {
   buildNoExecutionEvidenceText,
   classifyExecutionRequirement,
+  inheritContinuationExecutionRequirement,
   isFeishuStickerMessageKind,
   isExecutionEvidenceSatisfied,
   type ExecutionRequirement,
@@ -193,6 +206,7 @@ import {
 } from './workspace-chat-policy.js';
 
 const choicePromptRegistry = new ChoicePromptRegistry();
+const choiceDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -411,38 +425,59 @@ function formatArtifactPromotionError(error: unknown): string {
   return messages[code] || code.replace(/[_-]+/gu, ' ').trim() || '产物提升失败。';
 }
 
-function isExplicitBridgeRestartRequestText(text: string): boolean {
+function isShortBridgeRestartConfirmationText(text: string): boolean {
   const normalized = (text || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
-  if (!normalized) return false;
-  return /(重启|重新启动|restart|reboot)/iu.test(normalized)
-    && /(live\s*bridge|bridge|桥接|机器人(?:服务)?|daemon|守护进程)/iu.test(normalized);
+  return /^(?:请)?(?:现在|立即|马上)?(?:确认)?(?:重启|重新启动|restart|reboot)(?:一下|吧|即可|确认)?[。.!！]?$/iu.test(normalized);
 }
 
-function containsUnverifiedBridgeRestartCompletion(rawReply: string, rawPrompt: string): boolean {
-  if (!isExplicitBridgeRestartRequestText(rawPrompt)) return false;
+function hasTrustedBridgeRestartInvitation(
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
+): boolean {
+  if (!envelope || !focus || focus.focus !== 'reply_target' || focus.confidence < 0.8) return false;
+  if (focus.primaryEvidenceIds.length !== 1 || focus.conflictingEvidenceIds.length > 0) return false;
+  const evidence = envelope.evidence.find((item) => item.id === focus.primaryEvidenceIds[0]);
+  if (
+    !evidence
+    || evidence.relation !== 'native_reply'
+    || evidence.confidence < 0.8
+    || evidence.metadata?.contentRecovered === false
+    || !['bot', 'app', 'system'].includes(evidence.actor?.type || '')
+  ) return false;
+  const normalized = evidence.content.normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const namesBridge = /(live\s*bridge|bridge|桥接|机器人(?:服务)?|daemon|守护进程)/iu.test(normalized);
+  const explicitlyInvitesRestart = /(?:回复|回我|回复我|输入|发送|发我|确认|点击).{0,24}(?:重启|重新启动|restart|reboot)/iu.test(normalized)
+    || /(?:重启|重新启动|restart|reboot).{0,20}(?:后|即可|就会|我(?:马上|立即)?(?:执行|继续|安排))/iu.test(normalized);
+  return namesBridge && explicitlyInvitesRestart;
+}
+
+function isExplicitBridgeRestartRequestText(
+  text: string,
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
+): boolean {
+  const normalized = (text || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const directRequest = /(重启|重新启动|restart|reboot)/iu.test(normalized)
+    && /(live\s*bridge|bridge|桥接|机器人(?:服务)?|daemon|守护进程)/iu.test(normalized);
+  if (directRequest) return true;
+  // “重启”本身不能泛化成任意系统重启授权；只有它原生回复了机器人刚发出的
+  // 明确 Bridge 重启邀请，且引用正文可靠恢复时，才视为当前回合的短确认。
+  return isShortBridgeRestartConfirmationText(normalized)
+    && hasTrustedBridgeRestartInvitation(envelope, focus);
+}
+
+function containsUnverifiedBridgeRestartCompletion(
+  rawReply: string,
+  rawPrompt: string,
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
+): boolean {
+  if (!isExplicitBridgeRestartRequestText(rawPrompt, envelope, focus)) return false;
   const visible = stripDeliveryProtocolArtifacts(rawReply).trim();
   return /(?:已|已经|成功).{0,16}(?:重启|重新启动|restart).{0,16}(?:完成|成功|好了|完毕|生效)/iu.test(visible)
     || /(?:live\s*bridge|bridge|桥接|机器人(?:服务)?).{0,16}(?:已|已经|成功).{0,12}(?:重启|重新启动|restart)/iu.test(visible);
-}
-
-function isExplicitDirectMessageRequestText(text: string, targetText = ''): boolean {
-  const normalized = (text || '').normalize('NFKC').replace(/\s+/g, '');
-  if (!normalized) return false;
-  const broadIntent = /(?:私发|私信|单独发|悄悄发|发私聊|DM|directmessage|给.{1,32}发(?:一条)?消息|发(?:一条)?消息给|转告|转发给|发到(?:会话|群|群聊|chat|channel|session)|发送到(?:会话|群|群聊|chat|channel|session)|跨群发|跨会话发)/iu;
-  const target = (targetText || '').normalize('NFKC').replace(/\s+/g, '').replace(/^[@＠]+/u, '').trim();
-  if (!target) return broadIntent.test(normalized);
-
-  const safeTarget = escapeRegExp(target);
-  const targetAppears = new RegExp(`(?:@|＠)?${safeTarget}`, 'iu').test(normalized);
-  if (targetAppears && broadIntent.test(normalized)) return true;
-
-  // “给张三发个表情包/图片/文件”本身就是明确的本轮发送授权；
-  // 必须与动作目标同名，避免模型把用户提到的其他名字升级成私发对象。
-  const mediaOrContent = '(?:表情包|表情|sticker|图片|照片|图|文件|附件|消息|文字|文本|链接|内容)';
-  const sendToTarget = new RegExp(`(?:给|向)(?:@|＠)?${safeTarget}(?:发|发送|来|回)(?:一|1)?(?:个|张|份|条)?${mediaOrContent}`, 'iu');
-  const targetAfterContent = new RegExp(`(?:发|发送)(?:一|1)?(?:个|张|份|条)?${mediaOrContent}(?:给|到)(?:@|＠)?${safeTarget}`, 'iu');
-  const explicitlyNegated = new RegExp(`(?:不要|别|不想|不用|禁止)(?:给|向)(?:@|＠)?${safeTarget}(?:发|发送|来|回)`, 'iu').test(normalized);
-  return !explicitlyNegated && (sendToTarget.test(normalized) || targetAfterContent.test(normalized));
 }
 
 function containsUnverifiedDirectMessageCompletion(rawReply: string, rawPrompt: string): boolean {
@@ -510,18 +545,20 @@ async function executeBridgeControlActionFromReply(
   rawReply: string,
   msg: InboundMessage,
   rawPrompt: string,
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
 ): Promise<BridgeActionReplyResult> {
   const extracted = extractCtiBridgeControlAction(rawReply);
   if (!extracted.action) {
     if (extracted.hadBlock) {
       return { handled: true, text: `未完成：${extracted.error || 'Bridge 控制动作无效'}` };
     }
-    if (containsUnverifiedBridgeRestartCompletion(rawReply, rawPrompt)) {
+    if (containsUnverifiedBridgeRestartCompletion(rawReply, rawPrompt, envelope, focus)) {
       return { handled: true, text: '未完成：模型声称已重启 live Bridge，但没有使用受控重启动作，已拦截这条伪完成回复。' };
     }
     return { handled: false, text: rawReply };
   }
-  if (!isExplicitBridgeRestartRequestText(rawPrompt)) {
+  if (!isExplicitBridgeRestartRequestText(rawPrompt, envelope, focus)) {
     return { handled: true, text: '未完成：本轮用户没有明确要求重启 live Bridge，已拦截重启动作。' };
   }
   if (!isOwnerMessage(msg)) return { handled: true, text: buildOwnerRequiredMessage(msg) };
@@ -553,11 +590,64 @@ async function executeDirectMessageActionFromReply(
   msg: InboundMessage,
   rawPrompt: string,
   verifiedMediaAction?: VerifiedMediaAction,
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
 ): Promise<BridgeActionReplyResult> {
   const extracted = extractCtiDirectMessageAction(rawReply);
   if (extracted.action) {
-    if (!isExplicitDirectMessageRequestText(rawPrompt, extracted.action.targetText)) {
-      return { handled: true, text: '未完成：本轮用户没有明确授权私发消息，已拦截私发动作。' };
+    const explicitlyAuthorized = isExplicitDirectMessageRequestText(
+      rawPrompt,
+      extracted.action.targetText,
+      extracted.action.targetKind || 'any',
+    );
+    const continuationAuthorized = hasTrustedDirectMessageContinuationAuthorization({
+      userText: rawPrompt,
+      envelope,
+      focus,
+    });
+    if (!explicitlyAuthorized && !continuationAuthorized) {
+      return {
+        handled: true,
+        text: extracted.action.targetKind === 'chat'
+          ? '未完成：本轮用户没有明确授权向目标群聊发送消息，已拦截跨会话发送动作。'
+          : '未完成：本轮用户没有明确授权私发消息，已拦截私发动作。',
+      };
+    }
+    const sendToCurrentConversation = async (
+      target: ResolvedConversationTarget,
+    ): Promise<BridgeActionReplyResult> => {
+      if (typeof adapter.sendConversationMessage !== 'function') {
+        return { handled: true, text: '未完成：当前渠道暂不支持当前会话受控发送。' };
+      }
+      const result = await adapter.sendConversationMessage({
+        sourceMessage: msg,
+        target,
+        text: extracted.action!.text,
+        parseMode: extracted.action!.parseMode,
+      });
+      const failureReason = (result.error || '当前会话发送失败')
+        .replace(/```[\s\S]*?```/g, '')
+        .replace(/\s+/g, ' ')
+        .trim() || '当前会话发送失败';
+      return {
+        handled: true,
+        text: result.ok
+          ? '已发送到当前会话。'
+          : `未完成：${failureReason}`,
+        bridgeActionToolName: result.ok ? DIRECT_MESSAGE_ACTION_FENCE : undefined,
+      };
+    };
+    // 与本轮可信来源 chatId 完全相同的目标属于当前会话，不应升级成跨会话确认。
+    if (
+      extracted.action.targetKind !== 'user'
+      && isCurrentConversationTargetId(extracted.action.targetId, msg.address.chatId)
+    ) {
+      return sendToCurrentConversation({
+        kind: 'chat',
+        id: msg.address.chatId,
+        displayName: '当前会话',
+        chatType: msg.address.chatType,
+      });
     }
     // name-only 的 targetType=user 只是模型对人员类型的补充说明；目标仍必须由
     // 当前群成员 evidence 唯一解析，不应误升为跨会话 Owner 二次确认。
@@ -583,6 +673,16 @@ async function executeDirectMessageActionFromReply(
       if (!resolved.ok || !resolved.target) {
         const reason = (resolved.error || '无法确认目标会话').replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
         return { handled: true, text: `未完成：${reason || '无法确认目标会话'}` };
+      }
+      if (
+        resolved.target.kind === 'chat'
+        && isCurrentConversationTargetId(resolved.target.id, msg.address.chatId)
+      ) {
+        return sendToCurrentConversation({
+          ...resolved.target,
+          id: msg.address.chatId,
+          displayName: resolved.target.displayName || '当前群聊',
+        });
       }
       pruneExpiredPendingConversationSends();
       const nonce = crypto.randomUUID();
@@ -771,6 +871,7 @@ function buildScheduledTaskActor(msg: InboundMessage): ScheduledTaskCreateInput[
     role: getPermissionRoleForMessage(msg) || 'viewer',
     channelType: msg.address.channelType,
     userId: msg.address.userId?.trim() || '',
+    chatId: msg.address.chatId,
     messageId: msg.messageId,
   };
 }
@@ -783,7 +884,13 @@ function buildScheduledTaskResultText(
   if (!result.ok) {
     return `未完成：计划任务没有进入统一调度系统。\n原因：${result.error || '未知错误'}`;
   }
-  const kindLabel = kind === 'agent_turn' ? '动态 Agent 任务' : kind === 'controlled_tool' ? '受控工具任务' : '固定通知';
+  const kindLabel = kind === 'check_in'
+    ? '互动打卡'
+    : kind === 'agent_turn'
+      ? '动态 Agent 任务'
+      : kind === 'controlled_tool'
+        ? '受控工具任务'
+        : '固定通知';
   return [
     `已创建计划任务：${result.name || fallbackName}`,
     `类型：${kindLabel}`,
@@ -2131,6 +2238,11 @@ function addBridgeActionExecutionEvidence(
     toolUseCount: executionEvidence.toolUseCount + 1,
     toolResultCount: executionEvidence.toolResultCount + 1,
     successfulToolResultCount: executionEvidence.successfulToolResultCount + 1,
+    // Artifact Store 的 promote 成功回执已经验证了受管源产物、目标边界和哈希；
+    // 它是 Bridge 执行后的真实产物证据，不是模型单方面声明。
+    verifiedOutputArtifactCount: toolName === ARTIFACT_PROMOTION_ACTION_FENCE
+      ? Math.max(1, executionEvidence.verifiedOutputArtifactCount || 0)
+      : executionEvidence.verifiedOutputArtifactCount,
     toolNames: executionEvidence.toolNames.includes(toolName)
       ? executionEvidence.toolNames
       : [...executionEvidence.toolNames, toolName],
@@ -2303,6 +2415,40 @@ function buildNoExecutionEvidenceReply(
   }));
 }
 
+function sameLocalPath(left: string, right: string): boolean {
+  const normalize = (value: string) => {
+    const normalized = path.normalize(value).replace(/[\\/]+$/u, '');
+    return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized;
+  };
+  return normalize(left) === normalize(right);
+}
+
+interface PreparedFeishuCardHero {
+  localPath: string;
+  cardHero: FeishuCardHeroImage;
+}
+
+async function prepareFeishuCardHero(
+  adapter: BaseChannelAdapter,
+  payload: PreparedBridgeReplyPayload,
+): Promise<PreparedFeishuCardHero | null> {
+  const requested = payload.cardHero;
+  if (adapter.channelType !== 'feishu' || !requested) return null;
+  // 只能提升最终仍获准发送的同一张图片；输入 evidence 或失败门禁清掉图片后，
+  // cardHero 不能独立存活。
+  if (!payload.images.some((imagePath) => sameLocalPath(imagePath, requested.imagePath))) return null;
+  if (!existingLocalFile(requested.imagePath)) return null;
+  const result = await adapter.prepareLocalImageForCard(requested.imagePath);
+  if (!result.ok || !result.imageKey) {
+    console.warn('[bridge-manager] Card hero preparation failed, falling back to image attachment:', result.error || 'unknown error');
+    return null;
+  }
+  return {
+    localPath: requested.imagePath,
+    cardHero: { imageKey: result.imageKey, alt: requested.alt },
+  };
+}
+
 function verifyPreparedReplyExecution(
   payload: PreparedBridgeReplyPayload,
   context: {
@@ -2322,6 +2468,7 @@ function verifyPreparedReplyExecution(
       parseMode: 'plain',
       images: payload.images.filter((item) => !missingImages.includes(item)),
       files: payload.files.filter((item) => !missingFiles.includes(item)),
+      cardHero: undefined,
     };
   }
 
@@ -2337,6 +2484,7 @@ function verifyPreparedReplyExecution(
       parseMode: 'plain',
       images: [],
       files: [],
+      cardHero: undefined,
     };
   }
 
@@ -2351,6 +2499,7 @@ function verifyPreparedReplyExecution(
       parseMode: 'plain',
       images: [],
       files: [],
+      cardHero: undefined,
     };
   }
 
@@ -3094,6 +3243,7 @@ async function enforceArtifactEncodingBeforeDelivery(
       ].filter(Boolean).join('\n'),
       images: [],
       files: [],
+      cardHero: undefined,
     };
   } catch (error) {
     console.warn('[bridge-manager] Artifact encoding inspection failed closed:', error instanceof Error ? error.message : error);
@@ -3106,6 +3256,7 @@ async function enforceArtifactEncodingBeforeDelivery(
       ].filter(Boolean).join('\n'),
       images: [],
       files: [],
+      cardHero: undefined,
     };
   }
 }
@@ -3372,6 +3523,7 @@ async function deliverResponse(
   feishuCardJson?: string,
   verifiedMediaAction?: VerifiedMediaAction,
   sourceText?: string,
+  feishuCardHero?: FeishuCardHeroImage,
 ): Promise<SendResult> {
   const prepared = alreadyPrepared
     ? {
@@ -3416,6 +3568,7 @@ async function deliverResponse(
       replyToMessageId,
       mentions: prepared.mentions,
       feishuCardJson,
+      feishuCardHero,
       verifiedMediaAction,
       stickerDeliveryContext: sourceText ? {
         sourceText,
@@ -3689,9 +3842,14 @@ function attachAgentChoicePresentation(input: {
   sessionId: string;
   payload: PreparedBridgeReplyPayload;
   visibleText: string;
-}): { payload: PreparedBridgeReplyPayload; deliveryText: string } {
+  continuation?: ActiveChoiceContinuation;
+  cardHero?: FeishuCardHeroImage;
+}): { payload: PreparedBridgeReplyPayload; deliveryText: string; registeredChoice?: ChoicePromptView } {
   const choicePrompt = input.payload.choicePrompt;
-  if (!choicePrompt || input.payload.feishuCardJson) {
+  if (!choicePrompt
+    || input.payload.feishuCardJson
+    || input.payload.choiceFlow?.state === 'complete'
+    || input.payload.choiceSession?.state === 'complete') {
     return { payload: input.payload, deliveryText: input.visibleText };
   }
   const deliveryText = appendChoiceTextFallback(input.visibleText, input.payload);
@@ -3700,6 +3858,8 @@ function attachAgentChoicePresentation(input: {
   }
 
   const prompt = stripConfiguredReplyEndMarker(input.visibleText) || '请选择一个选项。';
+  const continuingParallelBranch = input.continuation?.groupMode === 'parallel'
+    && Boolean(input.continuation.participantKey);
   const registered = choicePromptRegistry.register({
     channelType: input.adapter.channelType,
     chatId: input.msg.address.chatId,
@@ -3707,7 +3867,41 @@ function attachAgentChoicePresentation(input: {
     sessionId: input.sessionId,
     prompt,
     choicePrompt,
+    // 初始 parallel 卡面向全群；一旦进入个人分支，后续卡必须绑定真实点击者，
+    // 但仍通过 flow 元数据把匿名分支语义持续交给 Provider。
+    choiceSession: continuingParallelBranch
+      ? { mode: 'single_user', audience: 'initiator', state: 'active' }
+      : input.payload.choiceSession || (input.continuation?.groupMode && input.continuation.groupMode !== 'vote' ? {
+        mode: input.continuation.groupMode,
+        audience: 'chat_members' as const,
+        state: 'active' as const,
+      } : undefined),
+    ...(input.cardHero ? { cardHero: { imageKey: input.cardHero.imageKey, alt: input.cardHero.alt } } : {}),
+    ...(input.continuation || input.payload.choiceFlow?.state === 'active' ? {
+      flow: {
+        mode: 'continuous' as const,
+        flowId: input.continuation?.flowId,
+        groupMode: input.continuation?.groupMode,
+        participantKey: input.continuation?.participantKey,
+      },
+    } : {}),
   });
+  const registeredView: ChoicePromptView = {
+    nonce: registered.nonce,
+    channelType: input.adapter.channelType,
+    chatId: input.msg.address.chatId,
+    sessionId: input.sessionId,
+    prompt,
+    title: registered.title,
+    options: registered.options,
+    choiceSession: registered.choiceSession,
+    openedAt: Date.now(),
+    closesAt: registered.closesAt,
+    expiresAt: registered.closesAt ? registered.closesAt + 2 * 60_000 : Date.now() + 15 * 60_000,
+    participantCount: 0,
+    tally: registered.options.map((option) => ({ label: option.label, description: option.description, count: 0 })),
+    cardHero: input.cardHero ? { imageKey: input.cardHero.imageKey, alt: input.cardHero.alt } : undefined,
+  };
   return {
     payload: {
       ...input.payload,
@@ -3720,11 +3914,172 @@ function attachAgentChoicePresentation(input: {
           callbackData: option.callbackData,
           type: 'primary',
         })),
-        footer: '点击按钮后，机器人会按你的选择继续当前对话。',
+        footer: registered.choiceSession.mode === 'vote'
+          ? '每位群成员一票；全员选择完会立即继续，最晚在截止时统一继续。收口前再次点击可改票。'
+          : registered.choiceSession.mode === 'claim'
+            ? '全员可抢选，首个合法点击者成功后立即收口。'
+            : registered.choiceSession.mode === 'parallel'
+              ? '全员可参与，每位成员独立选择一条分线。'
+              : '点击按钮后，机器人会按你的选择继续当前对话。',
+        cardHero: input.cardHero,
+        choiceMode: registered.choiceSession.mode,
+        closesAt: registered.closesAt,
+        participantCount: registered.choiceSession.mode === 'single_user' ? undefined : 0,
       }),
     },
     deliveryText,
+    registeredChoice: registeredView,
   };
+}
+
+function applyFeishuAnalysisPresentation(
+  channelType: ChannelType,
+  payload: PreparedBridgeReplyPayload,
+): PreparedBridgeReplyPayload {
+  if (channelType !== 'feishu' || !payload.analysisView || payload.feishuCardJson) return payload;
+  const visibleText = stripConfiguredReplyEndMarker(payload.text);
+  // 任何后置门禁改写出的失败答复都优先于模型原先的分析盘面，避免展示过期结论。
+  if (isExplicitUnfinishedReplyText(visibleText)) {
+    return { ...payload, analysisView: undefined };
+  }
+  return {
+    ...payload,
+    text: appendReplyEndMarker(renderFeishuAnalysisView(visibleText, payload.analysisView)),
+    parseMode: 'Markdown',
+  };
+}
+
+function buildChoiceSessionCard(view: ChoicePromptView, finalized = false): string {
+  return buildFeishuChoiceCard({
+    title: view.title || (view.choiceSession.mode === 'vote' ? '全员投票' : '请选择'),
+    prompt: view.prompt,
+    options: view.options.map((option, index) => ({
+      label: option.label,
+      description: option.description,
+      callbackData: option.callbackData,
+      type: 'primary',
+      count: view.tally[index]?.count || 0,
+    })),
+    choiceMode: view.choiceSession.mode,
+    closesAt: view.closesAt,
+    participantCount: view.participantCount,
+    eligibleParticipantCount: view.eligibleParticipantCount,
+    finalized,
+    footer: finalized
+      ? buildChoiceSessionFinalizationFooter(view)
+      : view.choiceSession.mode === 'vote'
+        ? '每位群成员一票；全员选择完会立即继续，收口前再次点击可改票，最晚截止后统一继续。'
+        : view.choiceSession.mode === 'claim'
+          ? '首个合法点击者成功后立即收口。'
+          : view.choiceSession.mode === 'parallel'
+            ? '每位群成员可选择一次，并分别继续自己的分线。'
+            : '点击后按当前选择继续。',
+    cardHero: view.cardHero ? { imageKey: view.cardHero.imageKey, alt: view.cardHero.alt } : undefined,
+  });
+}
+
+async function updateChoiceSessionCard(adapter: BaseChannelAdapter, view: ChoicePromptView, finalized = false): Promise<boolean> {
+  if (!view.cardMessageId || adapter.channelType !== view.channelType) return false;
+  try {
+    const result = await adapter.updateInteractiveCard(view.cardMessageId, buildChoiceSessionCard(view, finalized));
+    if (!result.ok) {
+      console.warn('[bridge-manager] Choice card update failed:', result.error || 'unknown error');
+    }
+    return result.ok;
+  } catch (error) {
+    console.warn('[bridge-manager] Choice card update failed:', error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+
+function clearChoiceDeadlineTimer(nonce: string): void {
+  const timer = choiceDeadlineTimers.get(nonce);
+  if (timer) clearTimeout(timer);
+  choiceDeadlineTimers.delete(nonce);
+}
+
+function finalizedChoiceToView(result: FinalizedChoiceSession): ChoicePromptView {
+  return {
+    nonce: result.nonce,
+    channelType: result.channelType,
+    chatId: result.chatId,
+    sessionId: result.sessionId,
+    prompt: result.prompt,
+    title: result.title,
+    options: result.tally.map((option, index) => ({
+      label: option.label,
+      description: option.description,
+      callbackData: `${CHOICE_CALLBACK_PREFIX}${result.nonce}:${index}`,
+    })),
+    choiceSession: { mode: 'vote', audience: 'chat_members', state: 'complete' },
+    openedAt: result.finalizedAt,
+    closesAt: result.finalizedAt,
+    expiresAt: result.finalizedAt + 2 * 60_000,
+    participantCount: result.participantCount,
+    eligibleParticipantCount: result.eligibleParticipantCount,
+    tally: result.tally,
+    cardMessageId: result.cardMessageId,
+    cardHero: result.cardHero,
+  };
+}
+
+async function dispatchFinalizedChoice(
+  result: FinalizedChoiceSession,
+  activeAdapter?: BaseChannelAdapter,
+): Promise<boolean> {
+  const state = getState();
+  // 点击回调路径直接复用本轮已验证 adapter；后台截止/重启恢复再从运行态 Registry 查找。
+  const adapter = activeAdapter?.channelType === result.channelType
+    ? activeAdapter
+    : state.adapters.get(result.channelType as ChannelType);
+  if (!adapter || !adapter.isRunning()) return false;
+  await updateChoiceSessionCard(adapter, finalizedChoiceToView(result), true);
+  const binding = getBridgeContext().store.getChannelBinding(result.channelType, result.chatId);
+  if (!binding || binding.codepilotSessionId !== result.sessionId) {
+    choicePromptRegistry.acknowledgeFinalization(result.nonce);
+    return true;
+  }
+  if (!adapter.enqueueSyntheticInbound) {
+    return false;
+  }
+  const queued = adapter.enqueueSyntheticInbound({
+    messageId: `choice_vote_${result.nonce}_${result.finalizedAt}`,
+    address: {
+      channelType: result.channelType as ChannelType,
+      chatId: result.chatId,
+      userId: result.userId,
+    },
+    text: buildVoteFinalizationText(result),
+    timestamp: result.finalizedAt,
+    messageKind: 'group_choice_finalized',
+  });
+  if (queued) choicePromptRegistry.acknowledgeFinalization(result.nonce);
+  return queued;
+}
+
+function scheduleChoiceDeadline(view: ChoicePromptView): void {
+  if (view.choiceSession.mode !== 'vote' || !view.closesAt) return;
+  clearChoiceDeadlineTimer(view.nonce);
+  const delay = Math.max(0, Math.min(2_147_000_000, view.closesAt - Date.now()));
+  const timer = setTimeout(() => {
+    choiceDeadlineTimers.delete(view.nonce);
+    const finalized = choicePromptRegistry.finalizeVote(view.nonce, Date.now());
+    if (!finalized) return;
+    void dispatchFinalizedChoice(finalized).catch((error) => {
+      console.warn('[bridge-manager] Choice deadline dispatch failed:', error instanceof Error ? error.message : error);
+    });
+  }, delay);
+  timer.unref?.();
+  choiceDeadlineTimers.set(view.nonce, timer);
+}
+
+function restoreChoiceDeadlineTasks(): void {
+  const { choicePrompts } = getBridgeContext();
+  choicePromptRegistry.setStateHost(choicePrompts);
+  for (const result of choicePromptRegistry.listPendingFinalizations()) {
+    void dispatchFinalizedChoice(result).catch(() => {});
+  }
+  for (const view of choicePromptRegistry.listPendingVotes()) scheduleChoiceDeadline(view);
 }
 
 function parseWorkspaceCallback(callbackData: string): { action: 'switch'; projectId: string } | null {
@@ -4829,6 +5184,20 @@ interface ActiveBridgeTask {
   interruptionFinalized: boolean;
 }
 
+export interface ActiveReplyCancelRequest {
+  sessionId: string;
+  turnId: string;
+  channelType?: string;
+  chatId?: string;
+}
+
+export interface ActiveReplyCancelResult {
+  disposition: 'accepted' | 'already_cancelled' | 'not_found' | 'conflict';
+  sessionId: string;
+  turnId: string;
+  detail: string;
+}
+
 interface MessageLifecycleTask {
   key: string;
   adapter: BaseChannelAdapter;
@@ -4921,6 +5290,32 @@ async function interruptActiveBridgeTask(
   if (!task) return null;
   await finalizeInterruptedTaskCard(task, responseText);
   return task;
+}
+
+/**
+ * 终止一个由 Runtime 已验证定位的当前回复。调用方必须同时提供 sessionId
+ * 与原始 turnId；channel/chat 作为额外约束，防止面板陈旧状态误停其他会话。
+ */
+export async function cancelActiveReply(request: ActiveReplyCancelRequest): Promise<ActiveReplyCancelResult> {
+  const sessionId = request.sessionId.trim();
+  const turnId = request.turnId.trim();
+  if (!sessionId || !turnId) {
+    return { disposition: 'conflict', sessionId, turnId, detail: '缺少 sessionId 或 turnId。' };
+  }
+  const task = getState().activeTasks.get(sessionId);
+  if (!task) {
+    return { disposition: 'not_found', sessionId, turnId, detail: '当前进程中没有匹配的活动回复。' };
+  }
+  if (task.sourceMessageId !== turnId
+    || (request.channelType && task.channelType !== request.channelType)
+    || (request.chatId && task.chatId !== request.chatId)) {
+    return { disposition: 'conflict', sessionId, turnId, detail: '活动回复身份与请求不一致，已拒绝终止。' };
+  }
+  if (task.abort.signal.aborted) {
+    return { disposition: 'already_cancelled', sessionId, turnId, detail: '该回复已经在终止中。' };
+  }
+  await finalizeInterruptedTaskCard(task, '已终止：已从控制面板停止当前回复。');
+  return { disposition: 'accepted', sessionId, turnId, detail: '终止信号已送达当前回复。' };
 }
 
 async function interruptAllActiveBridgeTasks(responseText = DEFAULT_INTERRUPTED_CARD_TEXT): Promise<void> {
@@ -5183,6 +5578,9 @@ export async function start(): Promise<void> {
     }
   }
 
+  // adapter 已在线后再恢复倒计时；到期结果先进入各 channel FIFO，避免绕过会话串行化。
+  restoreChoiceDeadlineTasks();
+
   console.log(`[bridge-manager] Bridge started with ${startedCount} adapter(s)`);
 }
 
@@ -5196,6 +5594,9 @@ export async function stop(): Promise<void> {
   const { lifecycle } = getBridgeContext();
 
   state.running = false;
+
+  for (const timer of choiceDeadlineTimers.values()) clearTimeout(timer);
+  choiceDeadlineTimers.clear();
 
   await interruptAllActiveBridgeTasks();
 
@@ -5294,13 +5695,16 @@ export async function deliverProactiveMessage(input: {
     return { ok: false, error: `adapter unavailable: ${input.address.channelType}` };
   }
 
-  const prepared = input.prepareFinalReply
+  const preparedCandidate = input.prepareFinalReply
     ? await prepareBridgeReplyPayload(
       input.text,
       input.workingDirectory || '',
       input.additionalDirectories || [],
       input.sourcePrompt || '',
     )
+    : null;
+  const prepared = preparedCandidate
+    ? applyFeishuAnalysisPresentation(input.address.channelType, preparedCandidate)
     : null;
   const outboundText = prepared?.text || input.text;
   const outboundParseMode = prepared?.parseMode || input.parseMode || 'plain';
@@ -5313,6 +5717,9 @@ export async function deliverProactiveMessage(input: {
   const localFilePaths = input.prepareFinalReply
     ? Array.from(new Set(prepared?.files || []))
     : [];
+  const preparedCardHero = prepared && !input.feishuCardJson
+    ? await prepareFeishuCardHero(adapter, prepared)
+    : null;
 
   const sent = await deliver(adapter, {
     address: input.address,
@@ -5321,13 +5728,17 @@ export async function deliverProactiveMessage(input: {
     replyToMessageId: prepared?.replyTo || input.replyToMessageId,
     mentions: prepared?.mentions || input.mentions,
     feishuCardJson: input.feishuCardJson,
+    feishuCardHero: preparedCardHero?.cardHero,
   }, {
     dedupKey: input.dedupKey,
     sessionId: input.sessionId,
   });
   if (!sent.ok) return sent;
 
-  for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
+  const imagePathsToSend = sent.cardHeroEmbedded && preparedCardHero
+    ? localImagePaths.filter((imagePath) => !sameLocalPath(imagePath, preparedCardHero.localPath))
+    : localImagePaths;
+  for (const imagePath of imagePathsToSend.slice(0, getAutoReplyImageLimit())) {
     const imageSend = await adapter.sendLocalImage(input.address.chatId, imagePath, prepared?.replyTo || input.replyToMessageId);
     if (!imageSend.ok) {
       console.warn(`[bridge-manager] Failed to send proactive local image: ${imagePath}`, imageSend.error);
@@ -5525,6 +5936,58 @@ async function handleReminderCompleteCallback(
 
 type ScheduledTaskCallbackAction = 'pause' | 'resume' | 'run' | 'history' | 'delete' | 'retry-delivery';
 
+function parseScheduledTaskCheckInCallback(callbackData: string): { taskId: string; slotKey: string } | null {
+  const match = /^scheduled-check-in:([a-z0-9][a-z0-9_-]{5,80}):([a-z0-9][a-z0-9_-]{5,128})$/iu.exec(callbackData.trim());
+  return match ? { taskId: match[1], slotKey: match[2] } : null;
+}
+
+async function handleScheduledTaskCheckInCallback(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  callback: { taskId: string; slotKey: string },
+): Promise<void> {
+  const host = getBridgeContext().scheduledTasks;
+  if (!host?.checkIn) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: '未完成：当前计划任务服务尚未加载打卡能力。',
+      parseMode: 'plain',
+      replyToMessageId: msg.callbackMessageId || msg.messageId,
+    });
+    return;
+  }
+  // 普通群成员不具备“查看/管理他人任务”的权限，因此这里不能先调用 get。
+  // 只把原生 callback 点击者交给渠道成员校验；最终 audience、会话和卡片回执
+  // 仍由 Runtime Host 对真实任务与运行记录重新核对。
+  const participant = await adapter.verifyChoiceParticipant(msg.address.chatId, msg.address.userId || '');
+
+  const result = await host.checkIn({
+    taskId: callback.taskId,
+    slotKey: callback.slotKey,
+    actor: buildScheduledTaskActor(msg),
+    callbackMessageId: msg.callbackMessageId,
+    verifiedChatMember: participant.allowed,
+  });
+  let cardRefreshFailed = false;
+  if (result.ok && result.feishuCardJson && msg.callbackMessageId) {
+    const updated = await adapter.updateInteractiveCard(msg.callbackMessageId, result.feishuCardJson);
+    cardRefreshFailed = !updated.ok;
+  }
+  const text = result.ok
+    ? result.checkInStatus === 'already_recorded'
+      ? `你已完成过本轮打卡；当前共 ${result.checkInCount ?? 0} 人。`
+      : result.checkInStatus === 'expired'
+        ? `本轮打卡已截止；共 ${result.checkInCount ?? 0} 人。`
+        : `${result.message || '打卡成功。'} 当前共 ${result.checkInCount ?? 0} 人。${cardRefreshFailed ? ' 卡片人数刷新暂时失败，但打卡记录已保存。' : ''}`
+    : `未完成：${result.error || '打卡记录失败。'}`;
+  await deliver(adapter, {
+    address: msg.address,
+    text,
+    parseMode: 'plain',
+    replyToMessageId: msg.callbackMessageId || msg.messageId,
+  });
+}
+
 function resolveScheduledTaskRequiredRole(actionKind: string | undefined): PermissionRole | null {
   return actionKind === 'controlled_tool' ? 'owner' : null;
 }
@@ -5564,9 +6027,9 @@ async function handleScheduledTaskCallback(
   }
   if (callback.action === 'history') {
     const history = await host.history({ taskId: callback.id, actor, limit: 10 });
-    const runs = history.runs as Array<{ queuedAt?: string; executionStatus?: string; deliveryStatus?: string; error?: string }>;
+    const runs = history.runs as Array<{ queuedAt?: string; executionStatus?: string; deliveryStatus?: string; error?: string; checkInCount?: number }>;
     const text = history.ok
-      ? [`计划任务历史：${task.name || callback.id}`, ...runs.map((run) => `- ${run.queuedAt || '-'} · 执行 ${run.executionStatus || '-'} · 投递 ${run.deliveryStatus || '-'}${run.error ? ` · ${run.error}` : ''}`)].join('\n')
+      ? [`计划任务历史：${task.name || callback.id}`, ...runs.map((run) => `- ${run.queuedAt || '-'} · 执行 ${run.executionStatus || '-'} · 投递 ${run.deliveryStatus || '-'}${typeof run.checkInCount === 'number' ? ` · 打卡 ${run.checkInCount} 人` : ''}${run.error ? ` · ${run.error}` : ''}`)].join('\n')
       : `未完成：${history.error || '读取运行历史失败。'}`;
     await deliver(adapter, { address: msg.address, text, parseMode: 'plain', replyToMessageId: msg.callbackMessageId });
     return;
@@ -5594,7 +6057,9 @@ async function handleMessage(
   msg: InboundMessage,
 ): Promise<void> {
   const turnStartedAt = Date.now();
-  const { store } = getBridgeContext();
+  const { store, choicePrompts } = getBridgeContext();
+  choicePromptRegistry.setStateHost(choicePrompts);
+  let activeChoiceContinuation: ActiveChoiceContinuation | undefined;
   recordBridgeRuntimeInbound(makeInboundSummary({
     messageId: msg.messageId,
     chatId: msg.address.chatId,
@@ -5719,14 +6184,66 @@ async function handleMessage(
   // 通用选择按钮会被还原成当前用户的一条结构化自然语言消息，再进入正常 Agent 链路。
   // 回调必须命中 Bridge 短期注册表，并与原聊天、原用户和原会话一致。
   if (msg.callbackData?.startsWith(CHOICE_CALLBACK_PREFIX)) {
+    const inspectedChoice = choicePromptRegistry.inspect(msg.callbackData);
+    let chatMemberVerified = false;
+    let eligibleParticipantKeys: string[] | undefined;
+    if (inspectedChoice?.choiceSession.audience === 'chat_members') {
+      const participant = await adapter.verifyChoiceParticipant(msg.address.chatId, msg.address.userId || '');
+      chatMemberVerified = participant.allowed;
+      if (participant.source === 'callback_event' && participant.error) {
+        console.warn('[bridge-manager] Choice participant accepted from native callback evidence:', participant.error);
+      }
+      eligibleParticipantKeys = participant.eligibleParticipantKeys;
+    }
     const selected = choicePromptRegistry.consume(msg.callbackData, {
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
       userId: msg.address.userId,
+      chatMemberVerified,
+      eligibleParticipantKeys,
     });
+    if (selected.kind === 'recorded') {
+      if (selected.allParticipantsSelected) {
+        const finalized = choicePromptRegistry.finalizeVoteIfAllSelected(selected.view.nonce, Date.now());
+        if (finalized) {
+          clearChoiceDeadlineTimer(selected.view.nonce);
+          await dispatchFinalizedChoice(finalized, adapter);
+          ack();
+          return;
+        }
+      }
+      const cardUpdated = await updateChoiceSessionCard(adapter, selected.view);
+      if (!cardUpdated) {
+        // 选票已经在 Registry 中持久化；呈现失败不能回滚事实，只给点击者最小确认。
+        await deliver(adapter, {
+          address: msg.address,
+          text: '已记录你的投票，卡片刷新暂时失败，截止结果不受影响。',
+          parseMode: 'plain',
+          replyToMessageId: msg.callbackMessageId || msg.messageId,
+        });
+      }
+      ack();
+      return;
+    }
+    if (selected.kind === 'already_participated') {
+      await deliver(adapter, {
+        address: msg.address,
+        text: selected.view.choiceSession.mode === 'vote'
+          ? '你已经投过票了，本轮不允许改票。'
+          : '你已经完成这一轮选择，请等待其他参与者。',
+        parseMode: 'plain',
+        replyToMessageId: msg.callbackMessageId || msg.messageId,
+      });
+      ack();
+      return;
+    }
     if (selected.kind !== 'resolved') {
       const text = selected.kind === 'forbidden'
-        ? '这个选择按钮属于原发起人，不能代替对方选择。'
+        ? inspectedChoice?.choiceSession.audience === 'chat_members'
+          ? '当前点击者未通过本群成员校验，不能参与这轮选择。'
+          : '这个选择按钮属于原发起人，不能代替对方选择。'
+        : selected.kind === 'consumed'
+          ? '这个选择已经处理过了，请使用最新一轮的选项。'
         : selected.kind === 'expired'
           ? '这个选择已经过期或已处理，请重新发起选择。'
           : '这个选择按钮无效，请重新发起选择。';
@@ -5750,11 +6267,24 @@ async function handleMessage(
       ack();
       return;
     }
+    if (selected.choiceMode === 'claim') {
+      clearChoiceDeadlineTimer(selected.view.nonce);
+      await updateChoiceSessionCard(adapter, selected.view, true);
+    } else if (selected.choiceMode === 'parallel') {
+      await updateChoiceSessionCard(adapter, selected.view);
+    }
+    const participantBranchKey = selected.choiceMode === 'parallel'
+      ? crypto.createHash('sha256').update(selected.participantKey || '').digest('hex').slice(0, 8)
+      : undefined;
     msg.text = [
-      buildChoiceSelectionText(selected.option),
+      buildChoiceSelectionText(selected.option, {
+        mode: selected.choiceMode,
+        participantKey: participantBranchKey,
+      }),
       selected.prompt ? `对应上一条选择：${selected.prompt}` : '',
     ].filter(Boolean).join('\n');
     msg.messageKind = 'choice_selection';
+    activeChoiceContinuation = selected.continuation;
     msg.callbackData = undefined;
     activeRequest = makeRequestSummary({
       messageId: msg.messageId,
@@ -5771,6 +6301,12 @@ async function handleMessage(
   if (msg.callbackData) {
     if (msg.callbackData.startsWith('reminder:complete:')) {
       await handleReminderCompleteCallback(adapter, msg);
+      ack();
+      return;
+    }
+    const scheduledTaskCheckIn = parseScheduledTaskCheckInCallback(msg.callbackData);
+    if (scheduledTaskCheckIn) {
+      await handleScheduledTaskCheckInCallback(adapter, msg, scheduledTaskCheckIn);
       ack();
       return;
     }
@@ -6465,7 +7001,7 @@ async function handleMessage(
     || feishuAvatarEvidencePrompt
     || feishuMemberProfileEvidencePrompt,
   );
-  const uiExecutionRequirement = classifyExecutionRequirement({
+  let uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
     workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
     files: executionEvidenceAttachments,
@@ -6648,6 +7184,25 @@ async function handleMessage(
 
   for (const step of preExecutionProgressSteps) emitProgressCardStep?.(step);
   let collaborationRunId = '';
+  let collaborationTurnFinalized = false;
+  let pendingCollaborationCompletion: AgentCollaborationCompletionInput | undefined;
+
+  // 协作快照属于观察链，状态库短暂失败不能打断 Primary 或 Delivery；
+  // 同时保留期望终态，finally 会对提前 return 和瞬时写锁再兜底一次。
+  const completeCollaborationTurnSafely = (
+    input: Omit<AgentCollaborationCompletionInput, 'runId'>,
+  ): void => {
+    if (!collaborationRunId || collaborationTurnFinalized) return;
+    pendingCollaborationCompletion = { runId: collaborationRunId, ...input };
+    const host = getBridgeContext().agentCollaboration;
+    if (!host) return;
+    try {
+      host.completeTurn(pendingCollaborationCompletion);
+      collaborationTurnFinalized = true;
+    } catch (error) {
+      console.warn('[bridge-manager] Agent collaboration completion unavailable:', error instanceof Error ? error.message : error);
+    }
+  };
 
   try {
     // Pass permission callback so requests are forwarded to IM immediately
@@ -6659,7 +7214,7 @@ async function handleMessage(
         ? buildStickerChatPrompt(text || rawText, Boolean(providerAttachments?.length))
         : (rawData?.feishuHistoryContext?.originalPrompt?.trim() || text || (providerAttachments?.length ? buildImageOnlyIntentPrompt() : ''));
     let fastPathOptions = getFastPathOptions(rawText);
-    const providerMemoryMode: engine.ConversationProcessOptions['memoryMode'] = memoryRecallExtraSystemPrompt
+    let providerMemoryMode: engine.ConversationProcessOptions['memoryMode'] = memoryRecallExtraSystemPrompt
       ? 'recall'
       : uiExecutionRequirement.kind !== 'none'
         ? 'augment'
@@ -6771,6 +7326,21 @@ async function handleMessage(
     if (taskAbort.signal.aborted) return;
     const structuredTurnContextPrompt = resolvedTurnContext.prompt;
     const hasStructuredConversationEvidence = resolvedTurnContext.hasPlatformEvidence;
+    uiExecutionRequirement = inheritContinuationExecutionRequirement({
+      currentRequirement: uiExecutionRequirement,
+      userText: text || rawText,
+      workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
+      files: executionEvidenceAttachments,
+      memoryPlan: memoryReviewContext.memoryPlan,
+      memoryIntentHandled: Boolean(memoryIntentPreflight),
+      messageKind: inboundMessageKind,
+      hasPreResolvedEvidence,
+      envelope: resolvedTurnContext.envelope,
+      focus: resolvedTurnContext.decision,
+    });
+    if (providerMemoryMode === 'off' && uiExecutionRequirement.kind !== 'none') {
+      providerMemoryMode = 'augment';
+    }
     let collaborationPromptSections: Array<{ id: string; kind: 'collaboration'; source: string; priority: number; content: string }> = [];
     const collaborationHost = getBridgeContext().agentCollaboration;
     if (collaborationHost) {
@@ -6832,7 +7402,13 @@ async function handleMessage(
       feishuMemberProfileEvidencePrompt,
       feishuAvatarEvidencePrompt,
     ].filter(Boolean).join('\n\n');
-    if (collaborationRunId) collaborationHost?.markPrimaryStarted(collaborationRunId);
+    if (collaborationRunId) {
+      try {
+        collaborationHost?.markPrimaryStarted(collaborationRunId);
+      } catch (error) {
+        console.warn('[bridge-manager] Agent collaboration primary-start update unavailable:', error instanceof Error ? error.message : error);
+      }
+    }
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
       updateBridgeRuntimeActiveRequest({
@@ -6894,7 +7470,9 @@ async function handleMessage(
       ],
       memoryPlan: memoryReviewContext.memoryPlan,
       memoryIntentHandled: Boolean(memoryIntentPreflight),
-      responseOnly: Boolean(memoryIntentPreflight),
+      // “把已有结果整理成飞书文档”是内部纯文本改写，不是新的执行任务。
+      // 即使改写提示中出现 Unity、截图或失败说明，也必须禁止 Manifest/MCP 路由。
+      responseOnly: Boolean(memoryIntentPreflight || directFeishuDocRequest),
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
@@ -6902,8 +7480,16 @@ async function handleMessage(
       sourceChatId: msg.address.chatId,
       messageKind: inboundMessageKind,
       hasPreResolvedEvidence,
+      executionRequirementOverride: uiExecutionRequirement,
       collaborationRunId: collaborationRunId || undefined,
+      choiceContinuation: activeChoiceContinuation,
     });
+    // 控制面板取消与 Provider 结束可能并发。Abort 一旦生效，本轮不能继续
+    // 记忆、附件或文本投递，也不能让迟到结果覆盖已经定稿的中断卡片。
+    if (taskAbort.signal.aborted) {
+      ack();
+      return;
+    }
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
 
     const feishuCliAuthorizationViolation = adapter.channelType === 'feishu'
@@ -7152,7 +7738,13 @@ async function handleMessage(
     }
     const providerVisibleResponseText = stickerCandidateAnalysisResult.text;
     const bridgeControlAction = providerVisibleResponseText
-      ? await executeBridgeControlActionFromReply(providerVisibleResponseText, msg, rawText)
+      ? await executeBridgeControlActionFromReply(
+        providerVisibleResponseText,
+        msg,
+        rawText,
+        resolvedTurnContext.envelope,
+        resolvedTurnContext.decision,
+      )
       : { handled: false, text: '' };
     const artifactPromotionAction = !bridgeControlAction.handled && providerVisibleResponseText
       ? await executeArtifactPromotionActionFromReply(providerVisibleResponseText, msg, rawText)
@@ -7164,6 +7756,8 @@ async function handleMessage(
         msg,
         rawText,
         verifiedStickerAction,
+        resolvedTurnContext.envelope,
+        resolvedTurnContext.decision,
       )
       : { handled: false, text: '' };
     const scheduledTaskAction = !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && providerVisibleResponseText
@@ -7261,6 +7855,9 @@ async function handleMessage(
       });
       preparedReply = enforceFeishuAvatarEvidenceCompletion(preparedReply, rawData?.feishuAvatarEvidence);
     }
+    if (preparedReply) {
+      preparedReply = applyFeishuAnalysisPresentation(adapter.channelType, preparedReply);
+    }
     if (workflowCardStarted) {
       emitProgressCardStep?.('正在整理为最终回复。');
     }
@@ -7297,7 +7894,7 @@ async function handleMessage(
     const providerSelectedStickerFileKey = stickerCandidateAnalysisResult.selectedFileKey
       || turnScopedAttachedStickerFileKey
       || (!isStickerMessage && providerRequestedStickerHint ? feishuStickerLibraryPreferredFileKey : '');
-    const deliveryResponseText = adapter.channelType === 'feishu'
+    let deliveryResponseText = adapter.channelType === 'feishu'
       ? isStickerMessage
         ? stickerSafeUserFacingResponseText
         : addFeishuStickerHintForExplicitRequest(
@@ -7310,8 +7907,61 @@ async function handleMessage(
           },
         )
       : stickerSafeUserFacingResponseText;
+    let handledAsDoc = false;
+    let documentDeliveryFailed = false;
+    if (feishuDocRequest && adapter.channelType === 'feishu') {
+      handledAsDoc = true;
+      // 文档链只交付创建结果链接或明确失败；Provider 的原始附件、按钮和卡片
+      // 不能在同一 source message 下再形成第二份终态。
+      preparedReply = null;
+      const creationDecision = decideFeishuDocumentCreation({
+        markdown: userFacingResponseText || responseText,
+        providerHasError: result.hasError,
+        unexpectedToolUse: directFeishuDocRequest && result.executionEvidence.toolUseCount > 0,
+        requireHeading: directFeishuDocRequest,
+      });
+      const createDoc = (adapter as BaseChannelAdapter & {
+        createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
+      }).createDocumentFromMarkdown;
+
+      if (!creationDecision.allowed) {
+        documentDeliveryFailed = true;
+        deliveryResponseText = buildFeishuDocumentFailureMessage(creationDecision.reason);
+      } else if (typeof createDoc !== 'function') {
+        documentDeliveryFailed = true;
+        deliveryResponseText = buildFeishuDocumentFailureMessage('当前飞书适配器未提供文档创建能力。');
+      } else {
+        try {
+          const ownerUserId = getConfiguredOwnerIds(adapter.channelType)[0];
+          const creationPlan = buildFeishuDocumentCreationPlan({
+            markdown: creationDecision.markdown,
+            requestedTitle: feishuDocRequest.title,
+            ownerUserId,
+            chatId: msg.address.chatId,
+            requesterId: msg.address.userId,
+            workspace: resolvedWorkingDirectory,
+            sourceText: rawText,
+          });
+          const docInfo = await createDoc.call(adapter, creationPlan.markdown, creationPlan.createOptions);
+          recordFeishuDocumentMemory(store, buildFeishuDocumentRecordInput(creationPlan, docInfo));
+          const guideInfo = await syncFeishuDocumentGuideBestEffort(
+            adapter,
+            store,
+            ownerUserId,
+          );
+          deliveryResponseText = buildFeishuDocumentSuccessMessage(docInfo, guideInfo);
+        } catch (err) {
+          documentDeliveryFailed = true;
+          deliveryResponseText = buildFeishuDocumentFailureMessage(err);
+        }
+      }
+    }
     let outboundDeliveryResponseText = deliveryResponseText;
     let agentChoiceCardAttached = false;
+    let registeredChoiceForDelivery: ChoicePromptView | undefined;
+    const preparedCardHero = preparedReply && !feishuDocRequest
+      ? await prepareFeishuCardHero(adapter, preparedReply)
+      : null;
     if (preparedReply) {
       const hadCardBeforeChoice = Boolean(preparedReply.feishuCardJson);
       const choicePresentation = attachAgentChoicePresentation({
@@ -7320,9 +7970,12 @@ async function handleMessage(
         sessionId: effectiveBinding.codepilotSessionId,
         payload: preparedReply,
         visibleText: deliveryResponseText,
+        continuation: activeChoiceContinuation,
+        cardHero: preparedCardHero?.cardHero,
       });
       preparedReply = choicePresentation.payload;
       outboundDeliveryResponseText = choicePresentation.deliveryText;
+      registeredChoiceForDelivery = choicePresentation.registeredChoice;
       agentChoiceCardAttached = !hadCardBeforeChoice && Boolean(preparedReply.feishuCardJson);
     }
     const safeProviderErrorText = result.hasError
@@ -7331,24 +7984,35 @@ async function handleMessage(
         channelType: adapter.channelType,
       })
       : '';
-    if (stickerSafeUserFacingResponseText) {
-      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', stickerSafeUserFacingResponseText);
+    const conversationMemoryResponseText = handledAsDoc
+      ? deliveryResponseText
+      : stickerSafeUserFacingResponseText;
+    if (conversationMemoryResponseText) {
+      recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', conversationMemoryResponseText);
     } else if (safeProviderErrorText) {
       recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', safeProviderErrorText);
     }
 
     if (collaborationRunId) {
-      collaborationHost?.markPrimaryCompleted({
-        runId: collaborationRunId,
-        status: result.hasError ? 'failed' : 'succeeded',
-        answerSummary: deliveryResponseText || safeProviderErrorText,
-        errorCode: result.hasError ? 'primary_agent_error' : undefined,
-        tokenUsage: result.tokenUsage ? {
-          inputTokens: result.tokenUsage.input_tokens,
-          outputTokens: result.tokenUsage.output_tokens,
-          totalTokens: result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
-        } : undefined,
-      });
+      try {
+        collaborationHost?.markPrimaryCompleted({
+          runId: collaborationRunId,
+          status: result.hasError || documentDeliveryFailed ? 'failed' : 'succeeded',
+          answerSummary: deliveryResponseText || safeProviderErrorText,
+          errorCode: result.hasError
+            ? 'primary_agent_error'
+            : documentDeliveryFailed
+              ? 'feishu_document_delivery_failed'
+              : undefined,
+          tokenUsage: result.tokenUsage ? {
+            inputTokens: result.tokenUsage.input_tokens,
+            outputTokens: result.tokenUsage.output_tokens,
+            totalTokens: result.tokenUsage.input_tokens + result.tokenUsage.output_tokens,
+          } : undefined,
+        });
+      } catch (error) {
+        console.warn('[bridge-manager] Agent collaboration primary-completion update unavailable:', error instanceof Error ? error.message : error);
+      }
     }
 
     // Finalize streaming card if adapter supports it.
@@ -7367,7 +8031,7 @@ async function handleMessage(
         // 卡片状态和耐久 continuation 也必须记录为 error，不能展示紫色完成态。
         const status = taskAbort.signal.aborted
           ? 'interrupted'
-          : result.hasError || isExplicitUnfinishedReplyText(finalText)
+          : result.hasError || documentDeliveryFailed || isExplicitUnfinishedReplyText(finalText)
             ? 'error'
             : 'completed';
         cardFinalized = await adapter.onStreamEnd(
@@ -7382,6 +8046,9 @@ async function handleMessage(
             sourceMessageId: msg.messageId,
             sourceText: storedUserText,
             chatType: msg.address.chatType,
+            ...(!agentChoiceCardAttached && preparedCardHero
+              ? { feishuCardHero: preparedCardHero.cardHero }
+              : {}),
           },
         );
         if (status === 'interrupted' && activeTask) activeTask.interruptionFinalized = cardFinalized;
@@ -7392,60 +8059,16 @@ async function handleMessage(
 
     // Send response text — render via channel-appropriate format.
     // Skip if streaming card was finalized (content already in card).
-    let handledAsDoc = false;
-    if (feishuDocRequest && adapter.channelType === 'feishu' && responseText) {
-      handledAsDoc = true;
-      const createDoc = (adapter as BaseChannelAdapter & {
-        createDocumentFromMarkdown?: (markdown: string, options?: { title?: string; ownerUserId?: string }) => Promise<{ documentId?: string; title: string; url: string }>;
-      }).createDocumentFromMarkdown;
-
-      if (typeof createDoc !== 'function') {
-        await deliver(adapter, {
-          address: msg.address,
-          text: buildFeishuDocumentFailureMessage('当前飞书适配器未提供文档创建能力。'),
-          parseMode: 'plain',
-          replyToMessageId: msg.messageId,
-        }, { sessionId: effectiveBinding.codepilotSessionId });
-      } else {
-        try {
-          const ownerUserId = getConfiguredOwnerIds(adapter.channelType)[0];
-          const creationPlan = buildFeishuDocumentCreationPlan({
-            markdown: userFacingResponseText || responseText,
-            requestedTitle: feishuDocRequest.title,
-            ownerUserId,
-            chatId: msg.address.chatId,
-            requesterId: msg.address.userId,
-            workspace: resolvedWorkingDirectory,
-            sourceText: rawText,
-          });
-          const docInfo = await createDoc.call(adapter, creationPlan.markdown, creationPlan.createOptions);
-          recordFeishuDocumentMemory(store, buildFeishuDocumentRecordInput(creationPlan, docInfo));
-          const guideInfo = await syncFeishuDocumentGuideBestEffort(
-            adapter,
-            store,
-            ownerUserId,
-          );
-          await deliver(adapter, {
-            address: msg.address,
-            text: buildFeishuDocumentSuccessMessage(docInfo, guideInfo),
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          }, { sessionId: effectiveBinding.codepilotSessionId });
-        } catch (err) {
-          await deliver(adapter, {
-            address: msg.address,
-            text: buildFeishuDocumentFailureMessage(err),
-            parseMode: 'plain',
-            replyToMessageId: msg.messageId,
-          }, { sessionId: effectiveBinding.codepilotSessionId });
-        }
-      }
-    }
-
-    if (responseText) {
-      if ((!cardFinalized || agentChoiceCardAttached) && !handledAsDoc) {
+    let responseDeliveryResult: SendResult | null = null;
+    let cardHeroEmbedded = Boolean(preparedCardHero && cardFinalized && !agentChoiceCardAttached);
+    if (responseText || handledAsDoc) {
+      if (!cardFinalized || agentChoiceCardAttached) {
         updateBridgeRuntimeActiveRequest(activeRequest, 'reply_sending');
-        await deliverResponse(
+        const deliveryCardHero = preparedCardHero
+          && (!preparedReply?.feishuCardJson || agentChoiceCardAttached)
+          ? preparedCardHero.cardHero
+          : undefined;
+        responseDeliveryResult = await deliverResponse(
           adapter,
           msg.address,
           outboundDeliveryResponseText,
@@ -7457,7 +8080,22 @@ async function handleMessage(
           preparedReply?.feishuCardJson,
           verifiedStickerAction,
           rawText,
+          deliveryCardHero,
         );
+        if (registeredChoiceForDelivery) {
+          if (responseDeliveryResult.ok
+            && responseDeliveryResult.interactiveCardSent !== false
+            && responseDeliveryResult.messageId) {
+            const bound = choicePromptRegistry.bindCardMessage(
+              registeredChoiceForDelivery.nonce,
+              responseDeliveryResult.messageId,
+            );
+            if (bound) scheduleChoiceDeadline(bound);
+          } else {
+            choicePromptRegistry.cancel(registeredChoiceForDelivery.nonce);
+          }
+        }
+        cardHeroEmbedded = cardHeroEmbedded || responseDeliveryResult.cardHeroEmbedded === true;
       }
       const localImagePaths = Array.from(new Set([
         ...(preparedReply?.images || []),
@@ -7466,7 +8104,11 @@ async function handleMessage(
           resolvedWorkingDirectory,
           accessibleWorkspaceDirectories,
         ),
-      ]));
+      ])).filter((imagePath) => !(
+        cardHeroEmbedded
+        && preparedCardHero
+        && sameLocalPath(imagePath, preparedCardHero.localPath)
+      ));
       const localFilePaths = Array.from(new Set(preparedReply?.files || []));
       if (localImagePaths.length > 0 && typeof adapter.sendLocalImage === 'function') {
         for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
@@ -7563,7 +8205,9 @@ async function handleMessage(
     }
 
     if (!taskAbort.signal.aborted) {
-      const maintainedAssistantText = stickerSafeUserFacingResponseText || safeProviderErrorText || result.responseText;
+      const maintainedAssistantText = (handledAsDoc ? deliveryResponseText : stickerSafeUserFacingResponseText)
+        || safeProviderErrorText
+        || result.responseText;
       launchOutcomeSelfMaintenance({
         phase: 'outcome',
         sessionId: effectiveBinding.codepilotSessionId,
@@ -7600,11 +8244,14 @@ async function handleMessage(
       } catch { /* best effort */ }
     }
     if (collaborationRunId) {
-      collaborationHost?.completeTurn({
-        runId: collaborationRunId,
-        status: result.hasError ? 'failed' : 'succeeded',
+      completeCollaborationTurnSafely({
+        status: result.hasError || documentDeliveryFailed ? 'failed' : 'succeeded',
         answerSummary: deliveryResponseText || safeProviderErrorText,
-        errorCode: result.hasError ? 'primary_agent_error' : undefined,
+        errorCode: result.hasError
+          ? 'primary_agent_error'
+          : documentDeliveryFailed
+            ? 'feishu_document_delivery_failed'
+            : undefined,
         tokenUsage: result.tokenUsage ? {
           inputTokens: result.tokenUsage.input_tokens,
           outputTokens: result.tokenUsage.output_tokens,
@@ -7616,8 +8263,7 @@ async function handleMessage(
   } catch (err) {
     auditTerminalState = 'failed';
     if (collaborationRunId) {
-      getBridgeContext().agentCollaboration?.completeTurn({
-        runId: collaborationRunId,
+      completeCollaborationTurnSafely({
         status: taskAbort.signal.aborted ? 'cancelled' : 'failed',
         errorCode: taskAbort.signal.aborted ? 'turn_cancelled' : 'bridge_turn_failed',
       });
@@ -7627,6 +8273,21 @@ async function handleMessage(
   } finally {
     progressPulse?.stop();
     clearLightStatusTimer();
+
+    if (collaborationRunId && !collaborationTurnFinalized) {
+      const expected = pendingCollaborationCompletion;
+      completeCollaborationTurnSafely(expected ? {
+        status: expected.status,
+        answerSummary: expected.answerSummary,
+        errorCode: expected.errorCode,
+        tokenUsage: expected.tokenUsage,
+      } : {
+        status: taskAbort.signal.aborted ? 'cancelled' : 'failed',
+        errorCode: taskAbort.signal.aborted
+          ? 'turn_cancelled'
+          : 'turn_ended_before_collaboration_completion',
+      });
+    }
 
     // Clean up preview state
     if (previewState) {

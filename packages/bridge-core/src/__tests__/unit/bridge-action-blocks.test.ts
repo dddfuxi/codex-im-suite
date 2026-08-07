@@ -52,6 +52,120 @@ describe('bridge action block parsing', () => {
     assert.deepEqual(result.action?.ignoredTrustedFields, ['actor', 'chatId']);
   });
 
+  it('normalizes a current-chat direct_message scheduled action without trusting its target id', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '工作日整点提醒',
+        schedule: { kind: 'cron', expression: '0 10-12,14-19 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'direct_message',
+          targetType: 'chat',
+          targetId: 'oc_model_supplied',
+          text: '大家别忘了起来活动一下。',
+        },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.taskAction, {
+      kind: 'notify',
+      text: '大家别忘了起来活动一下。',
+    });
+    assert.deepEqual(result.action?.ignoredTrustedFields, [
+      'taskAction.targetId',
+      'taskAction.targetType',
+    ]);
+  });
+
+  it('parses a per-run check-in action without accepting participant identities', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '每日喝水打卡',
+        schedule: { kind: 'cron', expression: '0 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'check_in',
+          text: '喝水后请点击下方按钮打卡。',
+          audience: 'chat_members',
+          buttonText: '我喝水了',
+          successText: '喝水打卡成功。',
+          windowMs: 3_600_000,
+          userId: 'ou_model_forged',
+        },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.taskAction, {
+      kind: 'check_in',
+      text: '喝水后请点击下方按钮打卡。',
+      audience: 'chat_members',
+      buttonText: '我喝水了',
+      successText: '喝水打卡成功。',
+      windowMs: 3_600_000,
+    });
+    assert.deepEqual(result.action?.ignoredTrustedFields, ['taskAction.userId']);
+  });
+
+  it('normalizes a CRON_TZ schedule string and defaults an omitted agent session to isolated', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '工作日整点提醒',
+        schedule: 'CRON_TZ=Asia/Shanghai 0 10-12,14-19 * * 1-5',
+        taskAction: { kind: 'agent_turn', prompt: '生成一条简短的群提醒。' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.schedule, {
+      kind: 'cron',
+      expression: '0 10-12,14-19 * * 1-5',
+      timezone: 'Asia/Shanghai',
+    });
+    assert.deepEqual(result.action?.taskAction, {
+      kind: 'agent_turn',
+      prompt: '生成一条简短的群提醒。',
+      sessionMode: 'isolated',
+    });
+  });
+
+  it('does not guess a timezone for a bare cron schedule string', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '无时区任务',
+        schedule: '0 10 * * 1-5',
+        taskAction: { kind: 'notify', text: '提醒内容' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.equal(result.action, null);
+    assert.match(result.error || '', /schedule/u);
+  });
+
+  it('does not redirect a user-targeted direct_message scheduled action into the current chat', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '错误目标提醒',
+        schedule: { kind: 'cron', expression: '0 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: { kind: 'direct_message', targetType: 'user', targetId: 'ou_someone', text: '提醒内容' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.equal(result.action, null);
+    assert.match(result.error || '', /taskAction.+direct_message/u);
+  });
+
   it('keeps a named direct-message target on resolver flow instead of trusting a model id', () => {
     const result = extractCtiDirectMessageAction([
       '```cti-direct-message',

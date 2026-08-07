@@ -83,6 +83,17 @@ function buildRunCheckpoints(run: WorkflowRun): WorkflowCheckpoint[] {
     });
   }
 
+  if (run.status === 'cancelled') {
+    checkpoints.push({
+      id: stableCheckpointId(run.id, 'finalizer', 'cancelled'),
+      kind: 'finalizer',
+      stage: 'failed',
+      createdAt: run.endedAt || run.updatedAt,
+      summary: run.error || '当前回复已终止',
+      recoverable: false,
+    });
+  }
+
   return checkpoints;
 }
 
@@ -100,6 +111,9 @@ export function toWorkflowRunContract(run: WorkflowRun, nodeId = 'local'): Workf
     sessionId: run.sessionId,
     chatId: run.chatId,
     executorId: run.executorId,
+    verifiedOutputArtifactCount: run.execution?.verifiedOutputArtifactCount,
+    replaySafety: run.execution?.replaySafety,
+    retryDisposition: run.execution?.retryDisposition,
     createdAt: run.startedAt,
     updatedAt: run.updatedAt,
     checkpoints,

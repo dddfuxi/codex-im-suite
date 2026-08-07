@@ -1,0 +1,16 @@
+{
+  "protocol": "codex-im-suite/agent-collaboration/v1",
+  "id": "memory",
+  "displayName": "记忆 Agent",
+  "enabled": true,
+  "responsibilities": ["判断记忆写入意图", "对父进程已检索的记忆做排序和受控摘要"],
+  "owns": ["记忆意图分类", "候选记忆相关性排序", "只读摘要"],
+  "excludes": ["不直接读取 Store", "不写入记忆", "不接受模型角色为可信身份", "不执行工具"],
+  "capabilities": ["classify_memory_intent", "rank_memory", "summarize_memory"],
+  "inputEvidenceKinds": ["message", "history", "memory", "conversation_state"],
+  "outputSchemaId": "codex-im-suite/agent-task-result/v1",
+  "sideEffectLevel": "none",
+  "timeoutMs": 30000,
+  "concurrency": 1,
+  "modelProfile": "classifier"
+}

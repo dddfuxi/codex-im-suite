@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { StreamChatParams } from 'claude-to-im/host';
+import { initBridgeContext } from 'claude-to-im';
 
 import type { Config } from '../config.js';
 import { MavisExecutorProvider } from '../mavis-executor-provider.js';
@@ -188,6 +189,63 @@ describe('hub-llm-provider dispatch contract', () => {
 
     assert.equal(localCalls, 0);
     assert.equal(fallbackCalls, 1);
+  });
+
+  it('converts a fatal provider SSE into retry advice for the active turn without queuing background retry', async () => {
+    const { HubLlmProvider } = await import('../main.js');
+    const { JsonFileStore } = await import('../store.js');
+    const { readWorkflowStatus } = await import('../workflow-status.js');
+    const config: Config = {
+      ...baseConfig,
+      mavisEnabled: false,
+      ollamaEnabled: false,
+      localLlmEnabled: false,
+      localLlmRouterEnabled: false,
+      localLlmForceHub: false,
+      localLlmRouterMode: 'codex_only',
+    };
+    const fallbackProvider: LLMProvider = {
+      streamChat: () => new ReadableStream<string>({
+        start(controller) {
+          controller.enqueue('data: {"type":"error","data":"stream closed before response.completed"}\n');
+          controller.close();
+        },
+      }),
+    };
+    const store = new JsonFileStore(new Map());
+    initBridgeContext({
+      store,
+      llm: fallbackProvider,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const hub = new HubLlmProvider(
+      config,
+      store,
+      {} as never,
+      {} as never,
+      fallbackProvider,
+      null,
+      'codex',
+      fallbackProvider,
+    );
+
+    const parts = await collectSse(hub.streamChat(params({
+      prompt: '你好',
+      turnId: 'turn-active-retry-advice',
+      sourceMessageId: 'om_active_retry_advice',
+      sourceChannelType: 'feishu',
+      sourceChatId: 'oc_active_retry_advice',
+      executionRequirement: { kind: 'none', reason: 'chat', requiredToolFamilies: [] },
+    })));
+    const joined = parts.join('');
+    const workflowRuns = readWorkflowStatus().runs;
+
+    assert.match(JSON.stringify(workflowRuns.slice(-2)), /workflow\.retry\.advice/u);
+    assert.match(joined, /"type":"retry_advice"/u);
+    assert.match(joined, /\\"retryDisposition\\":\\"retry_in_turn\\"/u);
+    assert.match(joined, /"type":"error"/u);
+    assert.equal(workflowRuns.some((run) => run.retry?.status === 'auto_pending'), false);
   });
 
   it('uses the selected provider for light chat without invoking the raw local model', async () => {
@@ -684,15 +742,9 @@ describe('hub-llm-provider dispatch contract', () => {
     assert.equal(compute(undefined, undefined), undefined);
   });
 
-  // v3.8 P2 fix: explicit per-terminal retryability for the external
-  // dispatch path. The previous implementation routed every non-`finished`
-  // terminal through `shouldAutoRetryWorkflowError(workflowFailureError)`
-  // (generic text heuristic that defaults to `true` for unknown errors),
-  // which meant an `aborted` turn would still enter
-  // `requestWorkflowRetry('auto')` and the daemon would claim and
-  // re-execute a cancelled prompt. These two tests pin the per-terminal
-  // behavior end-to-end through HubLlmProvider → streamExternalDispatch
-  // → workflow-runs.json.
+  // 外部 executor 的 terminal 失败不能进入后台自动重放。活跃用户回合
+  // 只能交给同回合 retry_advice；这里固定 aborted/timeout 不会生成
+  // retry_pending，避免 daemon 领取并重新执行已取消或已超时的 prompt。
   describe('v3.8 P2 — explicit per-terminal retryability', () => {
     function readWorkflowRunsFile(): { runs: Array<Record<string, unknown>> } {
       // workflow-status.ts writes to `${CTI_HOME}/runtime/workflow-runs.json`

@@ -1,5 +1,7 @@
 import type { AgentCardProgressItem, AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
-import type { OutboundMention, RunSummary, ToolCallInfo } from '../types.js';
+import type { AnalysisView, AnalysisViewTone } from '../application/analysis-view.js';
+import type { FeishuCardHeroImage, OutboundMention, RunSummary, ToolCallInfo } from '../types.js';
+import { buildFeishuCardHeroElement } from '../channels/feishu/cards/card-hero.js';
 
 /**
  * Feishu-specific Markdown processing.
@@ -49,24 +51,116 @@ export function preprocessFeishuMarkdown(text: string): string {
     .join('');
 }
 
+const ANALYSIS_TONE_COLORS: Record<AnalysisViewTone, 'green' | 'red' | 'orange' | 'grey' | 'blue'> = {
+  positive: 'green',
+  negative: 'red',
+  warning: 'orange',
+  neutral: 'grey',
+  info: 'blue',
+};
+
+function escapeAnalysisCell(text: string): string {
+  return escapeFeishuInlineMarkdown(text)
+    .replace(/\\/gu, '\\\\')
+    .replace(/\|/gu, '\\|')
+    .replace(/`/gu, '\\`');
+}
+
+function renderAnalysisToneText(text: string, tone: AnalysisViewTone | undefined): string {
+  const escaped = escapeAnalysisCell(text);
+  if (!tone || tone === 'neutral') return escaped;
+  return `<font color='${ANALYSIS_TONE_COLORS[tone]}'>${escaped}</font>`;
+}
+
+function normalizeComparableAnalysisText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/^\s{0,3}#{1,6}\s+/u, '')
+    .replace(/^\s*[-*>]\s*/u, '')
+    .replace(/[*_`~]/gu, '')
+    .replace(/<[^>]+>/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase();
+}
+
+/** 去掉正文中与结构化标题/结论完全相同的展示行，保留代码块和其他依据。 */
+function pruneDuplicateAnalysisDetail(text: string, view: AnalysisView): string {
+  const duplicateKeys = new Set([
+    normalizeComparableAnalysisText(view.title),
+    normalizeComparableAnalysisText(view.verdict),
+  ].filter(Boolean));
+  let inFence = false;
+  const retained = text.trim().split('\n').filter((line) => {
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      return true;
+    }
+    if (inFence) return true;
+    return !duplicateKeys.has(normalizeComparableAnalysisText(line));
+  });
+  while (retained.length > 0 && /^\s*(?:---+)?\s*$/u.test(retained[0])) retained.shift();
+  while (retained.length > 0 && /^\s*(?:---+)?\s*$/u.test(retained[retained.length - 1])) retained.pop();
+  return retained.join('\n').trim();
+}
+
+/**
+ * 把通用分析 DTO 投影成飞书稳定支持的 Markdown：结论标签、指标表和观察分区。
+ * 不接受模型 Card JSON，因此普通卡、流式卡、头图卡和选择卡可复用同一输出。
+ */
+export function renderFeishuAnalysisView(text: string, view?: AnalysisView): string {
+  if (!view) return text;
+  const blocks: string[] = [
+    `# ${escapeAnalysisCell(view.title)}`,
+    `<text_tag color='${ANALYSIS_TONE_COLORS[view.tone]}'>盘面结论</text_tag> **${escapeAnalysisCell(view.verdict)}**`,
+  ];
+
+  if (view.metrics.length > 0) {
+    blocks.push([
+      '| 指标 | 状态 / 信号 |',
+      '| --- | --- |',
+      ...view.metrics.map((metric) => (
+        `| ${escapeAnalysisCell(metric.label)} | ${renderAnalysisToneText(metric.value, metric.tone)}${metric.change ? ` · ${renderAnalysisToneText(metric.change, metric.tone)}` : ''} |`
+      )),
+    ].join('\n'));
+  }
+
+  for (const section of view.sections) {
+    const color = ANALYSIS_TONE_COLORS[section.tone || 'neutral'];
+    blocks.push([
+      `<text_tag color='${color}'>${escapeAnalysisCell(section.title)}</text_tag>`,
+      ...section.items.map((item) => `- ${escapeAnalysisCell(item)}`),
+    ].join('\n'));
+  }
+
+  const detail = pruneDuplicateAnalysisDetail(text, view);
+  if (detail) blocks.push(`---\n${detail}`);
+  return blocks.join('\n\n');
+}
+
 /**
  * Build Feishu interactive card content (schema 2.0 markdown).
  * Renders code blocks, tables, bold, italic, links, inline code properly.
  * Aligned with Openclaw's buildMarkdownCard().
  */
-export function buildCardContent(text: string, mentions: OutboundMention[] = []): string {
+export function buildCardContent(
+  text: string,
+  mentions: OutboundMention[] = [],
+  cardHero?: FeishuCardHeroImage,
+): string {
+  const elements: Array<Record<string, unknown>> = [];
+  if (cardHero) elements.push(buildFeishuCardHeroElement(cardHero));
+  elements.push({
+    tag: 'markdown',
+    content: renderFeishuMarkdownMentions(text, mentions),
+  });
   return JSON.stringify({
     schema: '2.0',
     config: {
       wide_screen_mode: true,
     },
     body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: renderFeishuMarkdownMentions(text, mentions),
-        },
-      ],
+      elements,
     },
   });
 }
@@ -556,8 +650,10 @@ export function buildFinalCardJson(
   summary?: RunSummary,
   mentions: OutboundMention[] = [],
   agentProgress?: AgentCardProgressSnapshot,
+  cardHero?: FeishuCardHeroImage,
 ): string {
   const elements: Array<Record<string, unknown>> = [];
+  if (cardHero) elements.push(buildFeishuCardHeroElement(cardHero));
 
   // Main result content stays result-first; detailed rationale is folded below.
   let content = stripStandaloneCompletionMarkLines(preprocessFeishuMarkdown(extractStreamingFinalResponse(text)));

@@ -221,6 +221,41 @@ describe('RuntimeTurnStorage', () => {
     }
   });
 
+  it('restores manual-retry input evidence only while path, ttl and hash remain valid', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-recovery-input-'));
+    try {
+      const storage = new RuntimeTurnStorage({
+        uploadRoot: path.join(root, 'uploads'),
+        artifactRoot: path.join(root, 'artifacts'),
+        scratchRoot: path.join(root, 'workspaces'),
+      });
+      const [staged] = storage.stageInputFiles({
+        sessionId: 'session-1', turnId: 'turn-1',
+        files: [{ id: 'file-1', name: 'evidence.txt', type: 'text/plain', size: 8, data: Buffer.from('evidence').toString('base64') }],
+      });
+      const refs = storage.createRecoveryInputEvidenceRefs({
+        sessionId: 'session-1', turnId: 'turn-1',
+        files: [{ id: 'file-1', name: 'evidence.txt', type: 'text/plain', size: staged.size, data: '', filePath: staged.filePath }],
+      });
+      const restored = storage.restoreRecoveryInputEvidence({ sessionId: 'session-1', turnId: 'turn-1', refs });
+      assert.equal(Buffer.from(restored[0].data, 'base64').toString('utf8'), 'evidence');
+
+      fs.writeFileSync(staged.filePath, 'tampered', 'utf8');
+      assert.throws(
+        () => storage.restoreRecoveryInputEvidence({ sessionId: 'session-1', turnId: 'turn-1', refs }),
+        /workflow_input_evidence_hash_mismatch/u,
+      );
+      assert.throws(
+        () => storage.restoreRecoveryInputEvidence({
+          sessionId: 'session-1', turnId: 'turn-1', refs: [{ ...refs[0], expiresAt: '2020-01-01T00:00:00.000Z' }],
+        }),
+        /workflow_input_evidence_expired/u,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('verifies a fresh final artifact from a successful CLI wrapper inside the allowed workspace', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-turn-storage-final-artifact-'));
     const workspace = path.join(root, 'workspace');

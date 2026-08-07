@@ -273,4 +273,28 @@ describe('turn artifact store', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('recovers only hash-valid, fresh and openable managed artifacts', async () => {
+    const module = await loadArtifactStore();
+    assert.ok(module, 'artifact store should exist');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-artifact-recovery-'));
+    const source = path.join(root, 'result.png');
+    fs.writeFileSync(source, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlZsAAAAASUVORK5CYII=', 'base64'));
+    try {
+      const store = new module.ArtifactStore({
+        artifactRoot: path.join(root, 'artifacts'), scratchRoot: path.join(root, 'scratch'), registeredProjects: [],
+      });
+      const startedAt = new Date(Date.now() - 1_000).toISOString();
+      const [artifact] = store.registerArtifacts({
+        sessionId: 'session-1', turnId: 'turn-1', files: [{ filePath: source, mediaType: 'image/png' }],
+        source: { kind: 'tool_result', toolUseId: 'tool-1', toolName: 'image_gen' },
+      });
+      assert.deepEqual(store.recoverVerifiedArtifacts({ sessionId: 'session-1', turnId: 'turn-1' }, startedAt).map((item) => item.id), [artifact.id]);
+
+      fs.writeFileSync(artifact.filePath, 'not-an-image', 'utf8');
+      assert.deepEqual(store.recoverVerifiedArtifacts({ sessionId: 'session-1', turnId: 'turn-1' }, startedAt), []);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

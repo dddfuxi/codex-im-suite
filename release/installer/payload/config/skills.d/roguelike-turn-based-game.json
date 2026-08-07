@@ -1,0 +1,24 @@
+{
+  "id": "roguelike-turn-based-game",
+  "displayName": "回合制肉鸽游戏",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\roguelike-turn-based-game",
+  "type": "skill",
+  "version": "1.1.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.entertainment",
+  "optional": true,
+  "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
+  "aliases": [
+    "roguelike",
+    "肉鸽",
+    "回合制游戏",
+    "全员投票肉鸽",
+    "多人多线肉鸽"
+  ],
+  "enabled": true,
+  "description": "Host solo, illustrated, voting, first-claim, and parallel-branch roguelike sessions through Bridge-owned structured choices."
+}

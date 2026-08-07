@@ -27,6 +27,28 @@ export interface FeishuBotNameWakeClassification {
   shouldHandle: boolean;
 }
 
+export interface FeishuNativeMentionOnlyWakeInput {
+  isGroup: boolean;
+  isOtherBotSender: boolean;
+  messageType: string;
+  nativeBotMentioned: boolean;
+  hasVisibleText: boolean;
+  hasAttachments: boolean;
+  replyTargetMessageId?: string | null;
+}
+
+export type FeishuNativeMentionOnlyWakeResolution =
+  | {
+    kind: 'light_chat';
+    reason: 'native_mention_only_light_chat';
+    text: string;
+  }
+  | {
+    kind: 'reply_target';
+    reason: 'native_mention_only_reply';
+    text: string;
+  };
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -118,6 +140,41 @@ export function stripFeishuMentionMarkers(text: string): string {
     .replace(/@_user_\d+/giu, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * 将人类在群里只原生 @ 当前机器人的动作还原成可进入会话层的明确意图。
+ * 这里只生成平台无副作用的语义输入，不直接决定最终回复；普通轻聊仍由
+ * 当前已选 Provider 的轻量协调器处理，原生 reply 则继续优先处理引用目标。
+ */
+export function resolveFeishuNativeMentionOnlyWake(
+  input: FeishuNativeMentionOnlyWakeInput,
+): FeishuNativeMentionOnlyWakeResolution | null {
+  if (
+    !input.isGroup
+    || input.isOtherBotSender
+    || input.messageType !== 'text'
+    || !input.nativeBotMentioned
+    || input.hasVisibleText
+    || input.hasAttachments
+  ) {
+    return null;
+  }
+
+  if (input.replyTargetMessageId?.trim()) {
+    return {
+      kind: 'reply_target',
+      reason: 'native_mention_only_reply',
+      text: '请处理我在本条飞书话题中回复或引用的消息。',
+    };
+  }
+
+  return {
+    kind: 'light_chat',
+    reason: 'native_mention_only_light_chat',
+    // 使用自然的等价轻聊输入，避免 adapter 写死最终回复或触发工具链。
+    text: '在吗？',
+  };
 }
 
 function normalizeWakeText(text: string): string {

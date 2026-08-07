@@ -92,6 +92,7 @@ import { ScheduledTasksPage } from './pages/ScheduledTasksPage.js';
 import type { PromptSnapshotPanelState } from './prompt-view-model.js';
 import type { SkillGovernancePanelState } from './skill-view-model.js';
 import type { ScheduledTaskPanelState } from './scheduled-task-view-model.js';
+import { canCancelActiveReply, cancelActiveReplyTitle } from './workflow-control-view-model.js';
 import {
   buildAgentHomeEntries,
   buildMemoryLayoutSummary,
@@ -1153,6 +1154,7 @@ const commandLabels: Record<string, string> = {
   'scheduledTasks.cancelRun': '取消计划任务运行',
   'scheduledTasks.delete': '删除计划任务',
   'scheduledTasks.retryDelivery': '重试计划任务投递',
+  'workflow.cancelActiveReply': '终止回复',
 };
 const trackedCommands = new Set(Object.keys(commandLabels));
 
@@ -1308,6 +1310,7 @@ function channelLabel(channelType: string) {
 
 function workflowStatusKind(run: WorkflowRun): StatusKind {
   if (run.status === 'succeeded') return 'ok';
+  if (run.status === 'cancelled') return 'idle';
   if (run.status === 'failed') return run.recovery?.kind === 'recoverable' ? 'warning' : 'error';
   if (run.status === 'retry_pending' || run.status === 'retrying') return 'warning';
   return 'warning';
@@ -1846,6 +1849,7 @@ function buildMemoryRelationGroups(item: KnowledgeSearchItem | undefined, remind
 }
 
 function workflowStatusLabel(run: WorkflowRun) {
+  if (run.status === 'cancelled') return '已终止';
   if (run.retry?.status === 'auto_pending') return '自动重试排队';
   if (run.retry?.status === 'manual_pending') return '手动重试排队';
   if (run.retry?.status === 'retrying') return '重试中';
@@ -1986,9 +1990,35 @@ function workflowEvidenceSummaryV2(run: WorkflowRun) {
 
 function canRetryWorkflow(run: WorkflowRun) {
   return !!run.recovery?.input?.prompt
+    && !!run.recovery?.input?.turnId
+    && !!run.recovery?.input?.executionRequirement
     && run.status !== 'succeeded'
     && run.status !== 'retry_pending'
     && run.status !== 'retrying';
+}
+
+function workflowReplaySafetyLabel(run: WorkflowRun) {
+  const value = run.execution?.replaySafety;
+  if (!value) return '';
+  return ({
+    safe_no_tools: '无工具，可安全续跑',
+    safe_read_only: '仅只读，可安全续跑',
+    unsafe_side_effects: '已有副作用，禁止重放',
+    unsafe_unknown: '工具副作用未知，禁止重放',
+  } as const)[value];
+}
+
+function workflowRetryDispositionLabel(run: WorkflowRun) {
+  const value = run.execution?.retryDisposition;
+  if (!value) return '';
+  return ({
+    not_needed: '无需恢复',
+    retry_in_turn: '原回合内续跑',
+    artifact_recovery: '已恢复受管产物',
+    manual_retry_required: '需要人工确认后重试',
+    exhausted: '自动重试已耗尽',
+    not_retryable: '不可自动重试',
+  } as const)[value];
 }
 
 type WorkflowRunLink = {
@@ -3551,6 +3581,14 @@ function ExecutorsPage({ state, run, pending }: PageProps) {
               <div className="row-actions">
                 <StatusPill status={workflowStatusKind(runItem)} label={workflowStatusLabel(runItem)} />
                 <MiniButton
+                  label={pending['workflow.cancelActiveReply'] ? '正在终止' : '终止回复'}
+                  icon={<Square size={14} />}
+                  onClick={() => void run('workflow.cancelActiveReply', { id: runItem.id }).then(() => run('state.refresh'))}
+                  pending={pending['workflow.cancelActiveReply']}
+                  disabled={!canCancelActiveReply(runItem)}
+                  title={cancelActiveReplyTitle(runItem)}
+                />
+                <MiniButton
                   label="重试"
                   icon={<RotateCw size={14} />}
                   onClick={() => void run('workflow.retryRun', { id: runItem.id }).then(() => run('state.refresh'))}
@@ -4471,6 +4509,24 @@ function WorkflowRunCard({
           <dt>证据</dt>
           <dd>{workflowEvidenceSummaryV2(runItem)}</dd>
         </div>
+        {runItem.execution?.replaySafety && (
+          <div>
+            <dt>重放安全</dt>
+            <dd>{workflowReplaySafetyLabel(runItem)}</dd>
+          </div>
+        )}
+        {runItem.execution?.retryDisposition && (
+          <div>
+            <dt>重试处置</dt>
+            <dd>{workflowRetryDispositionLabel(runItem)}</dd>
+          </div>
+        )}
+        {typeof runItem.execution?.verifiedOutputArtifactCount === 'number' && (
+          <div>
+            <dt>已验证产物</dt>
+            <dd>{runItem.execution.verifiedOutputArtifactCount}</dd>
+          </div>
+        )}
         {workflowCacheTokenSummary(runItem) && (
           <div>
             <dt>Cache</dt>
@@ -4483,6 +4539,14 @@ function WorkflowRunCard({
       )}
       <span>{runItem.id}</span>
       <div className="command-band tight">
+        <MiniButton
+          label={pending['workflow.cancelActiveReply'] ? '正在终止' : '终止回复'}
+          icon={<Square size={14} />}
+          onClick={() => void run('workflow.cancelActiveReply', { id: runItem.id }).then(() => refreshDetail())}
+          pending={pending['workflow.cancelActiveReply']}
+          disabled={!canCancelActiveReply(runItem)}
+          title={cancelActiveReplyTitle(runItem)}
+        />
         <MiniButton
           label="重试"
           icon={<RotateCw size={14} />}

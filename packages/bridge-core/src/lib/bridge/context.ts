@@ -28,6 +28,7 @@ import type {
   TurnStorageHost,
   ArtifactEncodingInspectorHost,
   AgentCollaborationHost,
+  ChoicePromptStateHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -50,6 +51,7 @@ export interface BridgeContext {
   turnStorage?: TurnStorageHost;
   artifactEncoding?: ArtifactEncodingInspectorHost;
   agentCollaboration?: AgentCollaborationHost;
+  choicePrompts?: ChoicePromptStateHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

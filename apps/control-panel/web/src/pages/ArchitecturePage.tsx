@@ -431,7 +431,13 @@ export function ArchitecturePage({
               {state.latestPerformanceSuggestion ? (
                 <>
                   <p>{redactAgentDisplayText(state.latestPerformanceSuggestion.summary, 520)}</p>
-                  <small>{formatTimestamp(state.latestPerformanceSuggestion.generatedAt)} · {state.latestPerformanceSuggestion.evidenceWindow.runCount} 个协作回合</small>
+                  <small>
+                    {formatTimestamp(state.latestPerformanceSuggestion.generatedAt)} · {state.latestPerformanceSuggestion.evidenceWindow.runCount} 个已完成协作回合
+                    {state.latestPerformanceSuggestion.evidenceRefs.length > 0 ? ` · ${state.latestPerformanceSuggestion.evidenceRefs.join(', ')}` : ''}
+                    {state.latestPerformanceSuggestion.evidenceWindow.analyzedThroughRunId
+                      ? ` · 水位 ${state.latestPerformanceSuggestion.evidenceWindow.analyzedThroughRunId.slice(0, 8)}`
+                      : ''}
+                  </small>
                   <ul>{state.latestPerformanceSuggestion.metricBasis.map((basis) => <li key={basis}>{redactAgentDisplayText(basis, 180)}</li>)}</ul>
                 </>
               ) : <p>尚未达到批次阈值，或 Performance Agent 尚未生成建议。</p>}

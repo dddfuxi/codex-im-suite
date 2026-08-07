@@ -2,10 +2,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { cleanupStaleAtomicWriteTemps, writeUtf8TextAtomic } from '../atomic-text-file.js';
 import { normalizeScheduledTaskSchedule } from './schedule.js';
 import {
   SCHEDULED_TASK_RUN_SCHEMA,
   SCHEDULED_TASK_SCHEMA,
+  SCHEDULED_TASK_CHECK_IN_SCHEMA,
+  type ScheduledTaskCheckInState,
   type ScheduledTask,
   type ScheduledTaskAction,
   type ScheduledTaskCreate,
@@ -22,6 +25,7 @@ import {
 } from './types.js';
 
 const TASK_ID_RE = /^[a-z0-9][a-z0-9_-]{5,80}$/iu;
+const SLOT_KEY_RE = /^[a-z0-9][a-z0-9_-]{5,128}$/iu;
 
 export type ScheduledTaskPatch = Partial<{
   name: string;
@@ -53,6 +57,16 @@ export interface ScheduledTaskStore {
   ): Promise<VersionedScheduledTaskState>;
   appendRun(run: ScheduledTaskRun): Promise<void>;
   listRuns(taskId: string, limit?: number): Promise<ScheduledTaskRun[]>;
+  getRunBySlotKey(taskId: string, slotKey: string): Promise<ScheduledTaskRun | null>;
+  getCheckIns(taskId: string, slotKey: string): Promise<ScheduledTaskCheckInState | null>;
+  recordCheckIn(input: {
+    taskId: string;
+    runId: string;
+    slotKey: string;
+    channelType: string;
+    userId: string;
+    checkedInAt: string;
+  }): Promise<{ recorded: boolean; state: ScheduledTaskCheckInState }>;
 }
 
 export type FileScheduledTaskStoreOptions = {
@@ -65,6 +79,7 @@ type StorePaths = {
   tasks: string;
   states: string;
   runs: string;
+  checkIns: string;
   quarantine: string;
 };
 
@@ -75,6 +90,7 @@ function buildPaths(root: string): StorePaths {
     tasks: path.join(resolved, 'tasks'),
     states: path.join(resolved, 'states'),
     runs: path.join(resolved, 'runs'),
+    checkIns: path.join(resolved, 'check-ins'),
     quarantine: path.join(resolved, 'quarantine'),
   };
 }
@@ -88,6 +104,12 @@ function ensureStoreDirectories(paths: StorePaths): void {
 function assertTaskId(taskId: string): string {
   const normalized = taskId.trim();
   if (!TASK_ID_RE.test(normalized)) throw new Error(`无效计划任务 ID：${taskId}`);
+  return normalized;
+}
+
+function assertSlotKey(slotKey: string): string {
+  const normalized = slotKey.trim();
+  if (!SLOT_KEY_RE.test(normalized)) throw new Error(`无效计划任务运行槽位：${slotKey}`);
   return normalized;
 }
 
@@ -121,20 +143,8 @@ function validateTaskCreate(input: ScheduledTaskCreate): ScheduledTaskCreate {
 }
 
 function writeJsonAtomic(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  const handle = fs.openSync(tempPath, 'wx');
-  try {
-    fs.writeFileSync(handle, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    fs.fsyncSync(handle);
-  } finally {
-    fs.closeSync(handle);
-  }
-  try {
-    fs.renameSync(tempPath, filePath);
-  } finally {
-    if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { force: true });
-  }
+  cleanupStaleAtomicWriteTemps(filePath);
+  writeUtf8TextAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function parseJsonFile(filePath: string): unknown {
@@ -212,6 +222,34 @@ function runDirectory(paths: StorePaths, taskId: string): string {
 function runPath(paths: StorePaths, run: ScheduledTaskRun): string {
   const name = crypto.createHash('sha256').update(run.runId).digest('hex');
   return path.join(runDirectory(paths, run.taskId), `${name}.json`);
+}
+
+function checkInDirectory(paths: StorePaths, taskId: string): string {
+  return path.join(paths.checkIns, assertTaskId(taskId));
+}
+
+function checkInPath(paths: StorePaths, taskId: string, slotKey: string): string {
+  const normalizedSlotKey = assertSlotKey(slotKey);
+  const name = crypto.createHash('sha256').update(normalizedSlotKey).digest('hex');
+  return path.join(checkInDirectory(paths, taskId), `${name}.json`);
+}
+
+function parseCheckInState(value: unknown, taskId: string, slotKey: string): ScheduledTaskCheckInState {
+  if (!isRecord(value)) throw new Error('计划任务打卡记录不是对象');
+  if (value.schema !== SCHEDULED_TASK_CHECK_IN_SCHEMA) throw new Error('计划任务打卡 schema 不受支持');
+  if (value.taskId !== taskId || value.slotKey !== slotKey) throw new Error('计划任务打卡记录边界不匹配');
+  if (typeof value.runId !== 'string' || !value.runId.trim()) throw new Error('计划任务打卡记录缺少 runId');
+  if (typeof value.updatedAt !== 'string') throw new Error('计划任务打卡记录缺少更新时间');
+  assertIsoTime(value.updatedAt, '打卡更新时间');
+  if (!Array.isArray(value.entries)) throw new Error('计划任务打卡条目无效');
+  for (const entry of value.entries) {
+    if (!isRecord(entry) || typeof entry.channelType !== 'string' || !entry.channelType.trim()
+      || typeof entry.userId !== 'string' || !entry.userId.trim() || typeof entry.checkedInAt !== 'string') {
+      throw new Error('计划任务打卡参与者无效');
+    }
+    assertIsoTime(entry.checkedInAt, '打卡时间');
+  }
+  return value as ScheduledTaskCheckInState;
 }
 
 export function createFileScheduledTaskStore(
@@ -351,6 +389,62 @@ export function createFileScheduledTaskStore(
       return runs
         .sort((left, right) => right.queuedAt.localeCompare(left.queuedAt) || right.runId.localeCompare(left.runId))
         .slice(0, Math.max(0, Math.floor(limit)));
+    },
+
+    async getRunBySlotKey(taskId, slotKey) {
+      const id = assertTaskId(taskId);
+      const normalizedSlotKey = assertSlotKey(slotKey);
+      const directory = runDirectory(paths, id);
+      if (!fs.existsSync(directory)) return null;
+      for (const name of fs.readdirSync(directory).filter((item) => item.endsWith('.json'))) {
+        const filePath = path.join(directory, name);
+        try {
+          const run = parseRun(parseJsonFile(filePath), id);
+          if (run.slotKey === normalizedSlotKey) return run;
+        } catch (error) {
+          quarantineInvalidFile(paths, filePath, error, now());
+        }
+      }
+      return null;
+    },
+
+    async getCheckIns(taskId, slotKey) {
+      const id = assertTaskId(taskId);
+      const normalizedSlotKey = assertSlotKey(slotKey);
+      const filePath = checkInPath(paths, id, normalizedSlotKey);
+      if (!fs.existsSync(filePath)) return null;
+      return parseCheckInState(parseJsonFile(filePath), id, normalizedSlotKey);
+    },
+
+    async recordCheckIn(input) {
+      const taskId = assertTaskId(input.taskId);
+      const slotKey = assertSlotKey(input.slotKey);
+      const channelType = input.channelType.trim();
+      const userId = input.userId.trim();
+      if (!channelType || !userId) throw new Error('计划任务打卡缺少真实参与者身份');
+      const checkedInAt = assertIsoTime(input.checkedInAt, '打卡时间');
+      const filePath = checkInPath(paths, taskId, slotKey);
+      const current = fs.existsSync(filePath)
+        ? parseCheckInState(parseJsonFile(filePath), taskId, slotKey)
+        : null;
+      if (current && current.runId !== input.runId) throw new Error('计划任务打卡 runId 与槽位不匹配');
+      const alreadyRecorded = current?.entries.some((entry) => (
+        entry.channelType === channelType && entry.userId === userId
+      )) ?? false;
+      if (alreadyRecorded) return { recorded: false, state: current! };
+      const state: ScheduledTaskCheckInState = {
+        schema: SCHEDULED_TASK_CHECK_IN_SCHEMA,
+        taskId,
+        runId: input.runId,
+        slotKey,
+        updatedAt: checkedInAt,
+        entries: [
+          ...(current?.entries || []),
+          { channelType, userId, checkedInAt },
+        ],
+      };
+      writeJsonAtomic(filePath, state);
+      return { recorded: true, state };
     },
   };
 }

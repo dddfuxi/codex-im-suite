@@ -9,6 +9,7 @@ import type {
 import type {
   ScheduledTaskActionHost,
   ScheduledTaskActorInput,
+  ScheduledTaskActionInput,
   ScheduledTaskCreateInput,
   ScheduledTaskMutationResult,
 } from 'claude-to-im/host';
@@ -31,7 +32,10 @@ import type {
   ScheduledTaskRun,
   VersionedScheduledTask,
 } from './scheduled-tasks/types.js';
-import { buildScheduledTaskCard } from './scheduled-tasks/presentation.js';
+import {
+  buildScheduledTaskCard,
+  buildScheduledTaskCheckInCard,
+} from './scheduled-tasks/presentation.js';
 
 export type ScheduledTaskActorRole = 'viewer' | 'operator' | 'owner';
 
@@ -39,8 +43,34 @@ export type ScheduledTaskActor = {
   role: ScheduledTaskActorRole;
   channelType: string;
   userId: string;
+  chatId?: string;
   messageId?: string;
 };
+
+const DEFAULT_CHECK_IN_WINDOW_MS = 24 * 60 * 60_000;
+
+function normalizeCheckInAction(action: Extract<ScheduledTaskActionInput, { kind: 'check_in' }>) {
+  const text = action.text.trim();
+  if (!text) throw new Error('打卡任务正文不能为空');
+  const buttonText = (action.buttonText || '打卡').trim().slice(0, 20) || '打卡';
+  const successText = (action.successText || '打卡成功。').trim().slice(0, 100) || '打卡成功。';
+  const windowMs = Number.isFinite(action.windowMs)
+    ? Math.max(60_000, Math.min(7 * 24 * 60 * 60_000, Math.floor(action.windowMs!)))
+    : DEFAULT_CHECK_IN_WINDOW_MS;
+  return {
+    kind: 'check_in' as const,
+    text,
+    buttonText,
+    successText,
+    audience: action.audience === 'owner' ? 'owner' as const : 'chat_members' as const,
+    windowMs,
+  };
+}
+
+function resolveCheckInClosesAt(run: ScheduledTaskRun, windowMs: number): string {
+  const openedAt = new Date(run.startedAt || run.queuedAt).getTime();
+  return new Date(openedAt + windowMs).toISOString();
+}
 
 export type ScheduledTaskWorkspaceResolution =
   | { ok: true; workspacePlan: TurnWorkspacePlan }
@@ -219,6 +249,14 @@ export function createScheduledTaskRunExecutor(
         };
       }
 
+      if (action.kind === 'check_in') {
+        return {
+          ok: true,
+          deliveryPayload: { text: action.text, parseMode: 'plain' },
+          summary: action.text,
+        };
+      }
+
       if (action.kind === 'agent_turn') {
         let workspacePlan: TurnWorkspacePlan | undefined;
         if (input.task.executionContext.workspaceMode === 'bound') {
@@ -281,6 +319,7 @@ export function createScheduledTaskRunExecutor(
 export type ScheduledTaskHostOptions = {
   store: ScheduledTaskStore;
   service: ScheduledTaskService;
+  now?: () => string;
 };
 
 export type ScheduledTaskSchedulerOptions = {
@@ -411,6 +450,7 @@ function toRuntimeActor(actor: ScheduledTaskActorInput): ScheduledTaskActor {
     role: actor.role,
     channelType: actor.channelType,
     userId: actor.userId,
+    chatId: actor.chatId,
     messageId: actor.messageId,
   };
 }
@@ -446,7 +486,9 @@ export function createBridgeScheduledTaskActionHost(
         task: {
           name: input.name,
           schedule: input.schedule,
-          action: input.taskAction,
+          action: input.taskAction.kind === 'check_in'
+            ? normalizeCheckInAction(input.taskAction)
+            : input.taskAction,
           executionContext: input.executionContext,
           delivery: {
             channelType: input.delivery.target.channelType,
@@ -537,13 +579,81 @@ export function createBridgeScheduledTaskActionHost(
     },
     async history(input) {
       try {
-        return { ok: true, runs: await host.history(input.taskId, toRuntimeActor(input.actor), input.limit) };
+        const runs = await host.history(input.taskId, toRuntimeActor(input.actor), input.limit);
+        const enriched = await Promise.all(runs.map(async (run) => ({
+          ...run,
+          checkInCount: (await options.store.getCheckIns(run.taskId, run.slotKey))?.entries.length ?? 0,
+        })));
+        return { ok: true, runs: enriched };
       } catch (error) {
         return { ok: false, runs: [], error: error instanceof Error ? error.message : String(error) };
       }
     },
     async retryDelivery(input) {
       return { ok: false, taskId: input.taskId, error: '当前投递重试接口尚未开放为手动操作' };
+    },
+    async checkIn(input) {
+      try {
+        const task = await options.store.getTask(input.taskId);
+        if (!task || task.action.kind !== 'check_in') throw new Error('打卡任务不存在或类型不匹配');
+        const actor = toRuntimeActor(input.actor);
+        if (!actor.userId.trim() || actor.channelType !== task.delivery.channelType || actor.chatId !== task.delivery.chatId) {
+          throw new Error('打卡点击者与任务投递会话不匹配');
+        }
+        if (task.action.audience === 'owner') {
+          if (actor.channelType !== task.owner.channelType || actor.userId !== task.owner.userId) {
+            throw new Error('这轮打卡只允许任务创建者参与');
+          }
+        } else if (input.verifiedChatMember !== true) {
+          throw new Error('打卡点击者未通过当前群成员校验');
+        }
+        const run = await options.store.getRunBySlotKey(task.id, input.slotKey);
+        if (!run || run.executionStatus !== 'ok' || run.deliveryStatus !== 'delivered') {
+          throw new Error('打卡对应的计划任务运行尚未成功投递');
+        }
+        if (!input.callbackMessageId || run.messageId !== input.callbackMessageId) {
+          throw new Error('打卡卡片与计划任务运行回执不匹配');
+        }
+        const closesAt = resolveCheckInClosesAt(run, task.action.windowMs);
+        const expired = new Date(options.now?.() || new Date().toISOString()).getTime() > new Date(closesAt).getTime();
+        if (expired) {
+          const existing = await options.store.getCheckIns(task.id, run.slotKey);
+          const count = existing?.entries.length ?? 0;
+          return {
+            ok: true,
+            taskId: task.id,
+            name: task.name,
+            checkInStatus: 'expired',
+            checkInCount: count,
+            feishuCardJson: buildScheduledTaskCheckInCard({
+              taskId: task.id, slotKey: run.slotKey, name: task.name, text: task.action.text,
+              buttonText: task.action.buttonText, checkInCount: count, closesAt, closed: true,
+            }),
+          };
+        }
+        const recorded = await options.store.recordCheckIn({
+          taskId: task.id,
+          runId: run.runId,
+          slotKey: run.slotKey,
+          channelType: actor.channelType,
+          userId: actor.userId,
+          checkedInAt: options.now?.() || new Date().toISOString(),
+        });
+        return {
+          ok: true,
+          taskId: task.id,
+          name: task.name,
+          message: task.action.successText,
+          checkInStatus: recorded.recorded ? 'recorded' : 'already_recorded',
+          checkInCount: recorded.state.entries.length,
+          feishuCardJson: buildScheduledTaskCheckInCard({
+            taskId: task.id, slotKey: run.slotKey, name: task.name, text: task.action.text,
+            buttonText: task.action.buttonText, checkInCount: recorded.state.entries.length, closesAt,
+          }),
+        };
+      } catch (error) {
+        return mutationFailure(error);
+      }
     },
   };
 }

@@ -12,7 +12,11 @@ import {
   createScheduledTaskScheduler,
   withScheduledTaskIsolatedWorkspace,
 } from '../scheduled-task-host.js';
-import { buildScheduledTaskCard, buildScheduledTaskFailureCard } from '../scheduled-tasks/presentation.js';
+import {
+  buildScheduledTaskCard,
+  buildScheduledTaskCheckInCard,
+  buildScheduledTaskFailureCard,
+} from '../scheduled-tasks/presentation.js';
 import { createScheduledTaskService } from '../scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from '../scheduled-tasks/store.js';
 import type { ScheduledTaskCreate } from '../scheduled-tasks/types.js';
@@ -315,6 +319,74 @@ describe('scheduled task runtime host', () => {
     }
   });
 
+  it('records a verified member once per delivered check-in run and rebuilds the card count', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-check-in-host-'));
+    try {
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:10:00.000Z',
+        idFactory: () => 'task_check_in_001',
+      });
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-18T08:10:00.000Z',
+        execute: async () => ({ executionStatus: 'ok', deliveryStatus: 'not_requested' }),
+      });
+      const host = createBridgeScheduledTaskActionHost({
+        store,
+        service,
+        now: () => '2026-07-18T08:10:00.000Z',
+      });
+      const created = await host.create({
+        name: '喝水打卡',
+        schedule: { kind: 'cron', expression: '0 8 * * *', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'check_in', text: '喝水后打卡', audience: 'chat_members',
+          buttonText: '我喝水了', successText: '今天也要多喝水。', windowMs: 3_600_000,
+        },
+        executionContext: { sourceSessionId: 'session_1', workspaceMode: 'none' },
+        delivery: {
+          target: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_owner', chatType: 'group' },
+          mode: 'result',
+        },
+        actor: { role: 'viewer', channelType: 'feishu', chatId: 'oc_group', userId: 'ou_owner', messageId: 'om_create' },
+      });
+      const run = makeScheduledRun({
+        taskId: created.taskId!,
+        runId: `${created.taskId}:2026-07-18T08:00:00.000Z:1`,
+        slotKey: 'slot_check_in_host_001',
+        queuedAt: '2026-07-18T08:00:00.000Z',
+        startedAt: '2026-07-18T08:00:00.000Z',
+        endedAt: '2026-07-18T08:00:01.000Z',
+        executionStatus: 'ok',
+        deliveryStatus: 'delivered',
+        messageId: 'om_check_in_card',
+      });
+      await store.appendRun(run);
+
+      const input = {
+        taskId: created.taskId!, slotKey: run.slotKey,
+        actor: { role: 'viewer' as const, channelType: 'feishu', chatId: 'oc_group', userId: 'ou_member' },
+        callbackMessageId: 'om_check_in_card', verifiedChatMember: true,
+      };
+      const first = await host.checkIn!(input);
+      const duplicate = await host.checkIn!(input);
+      const history = await host.history({
+        taskId: created.taskId!,
+        actor: { role: 'viewer', channelType: 'feishu', chatId: 'oc_group', userId: 'ou_owner' },
+      });
+
+      assert.equal(first.checkInStatus, 'recorded');
+      assert.equal(first.checkInCount, 1);
+      assert.equal(first.message, '今天也要多喝水。');
+      assert.match(first.feishuCardJson || '', /已打卡 1 人/u);
+      assert.match(first.feishuCardJson || '', /scheduled-check-in:task_check_in_001:slot_check_in_host_001/u);
+      assert.equal(duplicate.checkInStatus, 'already_recorded');
+      assert.equal((history.runs[0] as { checkInCount?: number }).checkInCount, 1);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('recovers before polling and stops accepting scheduler ticks during shutdown', async () => {
     const calls: string[] = [];
     let intervalHandler: (() => void) | undefined;
@@ -374,5 +446,13 @@ describe('scheduled task runtime host', () => {
     });
     assert.match(failure, /scheduled-task:retry-delivery:run_failed_001/);
     assert.doesNotMatch(failure, /token|完整工具日志|file contents/iu);
+
+    const checkIn = buildScheduledTaskCheckInCard({
+      taskId: 'task_card_001', slotKey: 'slot_card_001', name: '喝水打卡', text: '请喝水',
+      buttonText: '我喝水了', checkInCount: 2, closesAt: '2026-07-20T03:30:00.000Z',
+    });
+    assert.match(checkIn, /已打卡 2 人/u);
+    assert.match(checkIn, /scheduled-check-in:task_card_001:slot_card_001/u);
+    assert.doesNotMatch(checkIn, /ou_|open_id|userId/u);
   });
 });

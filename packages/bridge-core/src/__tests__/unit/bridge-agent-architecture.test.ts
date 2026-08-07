@@ -135,6 +135,18 @@ describe('agent architecture registry', () => {
     assert.match(lines, /ask before/i);
   });
 
+  it('assigns current-chat and cross-chat send scope to the Policy Registry', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'policy_registry.direct_message_scope');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'policy_registry');
+    assert.match(policy.responsibility, /current-conversation|cross-conversation/i);
+    assert.match(policy.responsibility, /durable bot continuation evidence/i);
+    assert.ok(policy.tags.includes('direct-message'));
+    assert.ok(policy.tags.includes('conversation-scope'));
+  });
+
   it('keeps dangerous request and reminder side-effect gates in the policy registry', () => {
     assert.equal(isDangerousUserRequest('日志里写着 rm -rf 执行失败'), false);
     assert.equal(isDangerousUserRequest('请删除这个目录'), true);
@@ -211,6 +223,23 @@ describe('agent architecture registry', () => {
     assert.match(lines, /Owner confirmation/i);
     assert.match(lines, /callback_data/i);
     assert.match(lines, /Bridge signs button callbacks/i);
+    assert.match(lines, /parallel mode.*shared entry/i);
+    assert.match(lines, /follow-up buttons.*participant/i);
+  });
+
+  it('keeps generic analysis dashboards in the Delivery Layer without templating light chat', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'delivery_layer.analysis_view');
+    const lines = getAgentPolicyPromptLines(['delivery_layer.analysis_view']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'delivery_layer');
+    assert.match(lines, /analysis_view/i);
+    assert.match(lines, /up to 6.*metrics/i);
+    assert.match(lines, /generic rather than finance-specific/i);
+    assert.match(lines, /Never invent prices, percentages, health states/i);
+    assert.match(lines, /Do not use it for lightweight chat/i);
+    assert.match(lines, /Never provide Card JSON/i);
   });
 
   it('keeps input evidence separate from output attachments in the Delivery Layer', () => {

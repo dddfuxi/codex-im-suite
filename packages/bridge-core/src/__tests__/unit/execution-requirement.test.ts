@@ -6,6 +6,7 @@ import {
   buildNoEvidenceRetryPrompt,
   classifyToolResultQuality,
   classifyExecutionRequirement,
+  inheritContinuationExecutionRequirement,
   isExecutionEvidenceSatisfied,
   shouldReplaceWithNoExecutionEvidenceText,
   buildNoExecutionEvidenceText,
@@ -24,6 +25,115 @@ function withStrictToolRouting<T>(fn: () => T): T {
 }
 
 describe('execution requirement classifier', () => {
+  it('requires a verified artifact for explicit visual deliverables', () => {
+    const requirement = classifyExecutionRequirement({
+      userText: '给北辰附近的餐饮做个排行图表，按性价比排序',
+      workingDirectory: 'C:\\workspace',
+    });
+
+    assert.equal(requirement.kind, 'artifact_required');
+    assert.equal(requirement.strictToolEvidence, true);
+    assert.ok(requirement.requiredToolFamilies.includes('artifact'));
+  });
+
+  it('inherits artifact evidence for short constraint changes on a recovered completed result', () => {
+    const envelope = {
+      protocol: 'cti-turn-context/v1' as const,
+      channelType: 'feishu',
+      chatId: 'oc_group',
+      messageId: 'om_current',
+      currentText: '打到人均30左右',
+      evidence: [{
+        id: 'message:om_result',
+        kind: 'message' as const,
+        relation: 'native_reply' as const,
+        source: 'platform_api' as const,
+        confidence: 1,
+        content: [
+          '机器人：榜单做好啦',
+          '本地已发送内容摘要：原始请求：给附近餐饮做个排行图表，按性价比排序',
+          '上一轮状态：已完成',
+          '上一轮结果：榜单做好啦，直接看图。',
+        ].join('\n'),
+        metadata: {
+          contentRecovered: true,
+          continuationContextRecovered: true,
+        },
+      }],
+    };
+    const focus = {
+      protocol: 'cti-turn-focus/v1' as const,
+      mode: 'deterministic' as const,
+      focus: 'reply_target' as const,
+      primaryEvidenceIds: ['message:om_result'],
+      supportingEvidenceIds: [],
+      conflictingEvidenceIds: [],
+      confidence: 1,
+      requiresAgentResolution: false,
+      reason: 'test',
+    };
+
+    for (const userText of ['打到人均30左右', '换成红色', '去掉第三项']) {
+      const currentRequirement = classifyExecutionRequirement({ userText, workingDirectory: 'C:\\workspace' });
+      assert.equal(currentRequirement.kind, 'none');
+      const inherited = inheritContinuationExecutionRequirement({
+        currentRequirement,
+        userText,
+        workingDirectory: 'C:\\workspace',
+        envelope: { ...envelope, currentText: userText },
+        focus,
+      });
+      assert.equal(inherited.kind, 'artifact_required', userText);
+      assert.equal(inherited.inheritedFromContinuation, true, userText);
+      assert.match(buildExecutionRequirementPrompt(inherited), /Deliver the revised result now/u);
+    }
+
+    const acknowledgement = inheritContinuationExecutionRequirement({
+      currentRequirement: classifyExecutionRequirement({ userText: '看到了，谢谢' }),
+      userText: '看到了，谢谢',
+      envelope,
+      focus,
+    });
+    assert.equal(acknowledgement.kind, 'none');
+  });
+
+  it('does not inherit execution requirements from an unverified card title', () => {
+    const currentRequirement = classifyExecutionRequirement({ userText: '换成红色' });
+    const inherited = inheritContinuationExecutionRequirement({
+      currentRequirement,
+      userText: '换成红色',
+      envelope: {
+        protocol: 'cti-turn-context/v1',
+        channelType: 'feishu',
+        chatId: 'oc_group',
+        messageId: 'om_current',
+        currentText: '换成红色',
+        evidence: [{
+          id: 'message:om_card',
+          kind: 'message',
+          relation: 'native_reply',
+          source: 'platform_api',
+          confidence: 1,
+          content: '机器人：结果做好啦',
+          metadata: { contentRecovered: true },
+        }],
+      },
+      focus: {
+        protocol: 'cti-turn-focus/v1',
+        mode: 'deterministic',
+        focus: 'reply_target',
+        primaryEvidenceIds: ['message:om_card'],
+        supportingEvidenceIds: [],
+        conflictingEvidenceIds: [],
+        confidence: 1,
+        requiresAgentResolution: false,
+        reason: 'test',
+      },
+    });
+
+    assert.equal(inherited.kind, 'none');
+  });
+
   it('classifies tool result quality from structured protocol fields instead of text phrases', () => {
     const protocolError = classifyToolResultQuality('plain diagnostic text', true);
     assert.equal(protocolError.ok, false);
@@ -86,9 +196,24 @@ describe('execution requirement classifier', () => {
     assert.match(initialPrompt, /routing metadata.*not.*tool evidence/i);
     assert.match(initialPrompt, /Get-Location|pwd/i);
 
-    const retryPrompt = buildNoEvidenceRetryPrompt(terseRequirement);
+    const retryPrompt = buildNoEvidenceRetryPrompt(terseRequirement, {
+      recoveryAttempt: 1,
+      maxRecoveryAttempts: 2,
+      previousEvidence: { toolUseCount: 0, toolResultCount: 0, successfulToolResultCount: 0 },
+    });
     assert.match(retryPrompt, /routing metadata.*not.*tool evidence/i);
     assert.match(retryPrompt, /Get-Location|pwd/i);
+    assert.match(retryPrompt, /recovery attempt 1 of 2/i);
+    assert.match(retryPrompt, /did not call any real tool/i);
+
+    const finalRetryPrompt = buildNoEvidenceRetryPrompt(terseRequirement, {
+      recoveryAttempt: 2,
+      maxRecoveryAttempts: 2,
+      previousEvidence: { toolUseCount: 0, toolResultCount: 0, successfulToolResultCount: 0 },
+    });
+    assert.match(finalRetryPrompt, /final recovery attempt \(2 of 2\)/i);
+    assert.match(finalRetryPrompt, /different compatible route/i);
+    assert.match(finalRetryPrompt, /Do not repeat the previous acknowledgement/i);
   });
 
   it('requires tool evidence for local directory listing requests', () => {
@@ -457,6 +582,14 @@ describe('execution requirement classifier', () => {
           successfulToolResultCount: 1,
           toolNames: ['JsonTool:mcp_call'],
         }),
+        false,
+      );
+      assert.equal(
+        isExecutionEvidenceSatisfied(requirement, {
+          successfulToolResultCount: 1,
+          toolNames: ['JsonTool:mcp_call'],
+          verifiedOutputArtifactCount: 1,
+        }),
         true,
       );
     } finally {
@@ -651,7 +784,7 @@ describe('execution requirement classifier', () => {
     assert.equal(hasDeferredBridgeExecutionAction('产物已经保存到项目。'), false);
   });
 
-  it('keeps no-evidence blockers user-facing while preserving one actionable failure reason', () => {
+  it('keeps no-evidence blockers actionable without leaking raw tool output', () => {
     const requirement = {
       kind: 'tool_required' as const,
       reason: 'compatibility test requirement',
@@ -667,8 +800,34 @@ describe('execution requirement classifier', () => {
     });
 
     assert.match(text, /未完成：这次没有获得可验证的执行结果/);
-    assert.match(text, /具体原因：Network Error: fetch failed/);
-    assert.doesNotMatch(text, /tool_use|tool_result|tool_required|JsonTool:mcp_call/);
+    assert.match(text, /本轮没有通过MCP获得可验证结果/);
+    assert.doesNotMatch(text, /Network Error|service URL|tool_use|tool_result|tool_required|JsonTool:mcp_call/);
+  });
+
+  it('treats Unity scene and Prefab mutations as external tool state, not output artifacts', () => {
+    const referenceImage = [{
+      id: 'reference-1',
+      name: 'reference.png',
+      type: 'image/png',
+      size: 128,
+      data: 'aW1hZ2U=',
+    }];
+    const prompts = [
+      '根据这个，在ST4的unity里，HSScene场景的SceneRoot里创建H_Area09，并给房间添加RoomLock和RoomUnlock',
+      '在刚刚创建的每一个节点的RoomLock和RoomUnlock里面，添加一个prefab，命名规则为H_RoomLock_xxx、H_RoomUnlock_xxx',
+    ];
+
+    for (const userText of prompts) {
+      const requirement = classifyExecutionRequirement({
+        userText,
+        workingDirectory: 'F:\\unity\\ST4',
+        files: referenceImage,
+      });
+
+      assert.equal(requirement.kind, 'tool_required', userText);
+      assert.ok(requirement.requiredToolFamilies.includes('unity-mcp'), userText);
+      assert.equal(requirement.requiredToolFamilies.includes('artifact'), false, userText);
+    }
   });
 
   it('accepts a runtime-verified current-turn artifact without weakening non-artifact tool gates', () => {
@@ -696,6 +855,20 @@ describe('execution requirement classifier', () => {
         successfulToolResultCount: 1,
         toolNames: ['shell_command'],
         verifiedOutputArtifactCount: 1,
+      }),
+      false,
+    );
+    assert.equal(
+      isExecutionEvidenceSatisfied(toolRequirement, {
+        successfulToolResultCount: 1,
+        toolNames: ['mcp__unityMCP__manage_scene'],
+      }),
+      true,
+    );
+    assert.equal(
+      isExecutionEvidenceSatisfied(toolRequirement, {
+        successfulToolResultCount: 1,
+        toolNames: ['mcp__pictureMCP__generate_image'],
       }),
       false,
     );

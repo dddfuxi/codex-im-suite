@@ -2,6 +2,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuCloudLinkResolveResult,
   StreamChatParams,
+  TurnStorageHost,
 } from 'claude-to-im/host';
 import type { WorkflowRun } from './workflow-status.js';
 
@@ -12,22 +13,54 @@ export type WorkflowRetryExecutionPreparation =
 export async function prepareWorkflowRetryExecution(options: {
   run: WorkflowRun;
   cloudDocuments?: FeishuCloudDocumentHost;
+  turnStorage?: TurnStorageHost;
 }): Promise<WorkflowRetryExecutionPreparation> {
   const input = options.run.recovery?.input;
   if (!input?.prompt) {
     return { status: 'blocked', text: '缺少可重试输入' };
   }
 
+  if (!input.turnId || !input.executionRequirement) {
+    return { status: 'blocked', text: '缺少原始 turnId 或执行要求，不能在丢失证据门禁的情况下重试。' };
+  }
+  let files: StreamChatParams['files'];
+  const refs = input.inputEvidenceRefs || [];
+  if (refs.length > 0) {
+    if (!options.turnStorage?.restoreRecoveryInputEvidence) {
+      return { status: 'blocked', text: '受管输入证据恢复能力不可用，未执行重试。' };
+    }
+    try {
+      files = options.turnStorage.restoreRecoveryInputEvidence({
+        sessionId: options.run.sessionId,
+        turnId: input.turnId,
+        refs,
+      });
+    } catch (error) {
+      const code = error instanceof Error ? error.message : String(error);
+      return { status: 'blocked', text: `受管输入证据已缺失、过期或校验失败（${code}），未执行重试。` };
+    }
+  } else if (input.executionRequirement.kind === 'input_evidence_required') {
+    return { status: 'blocked', text: '原始请求依赖附件或输入证据，但恢复记录为空，未执行裸重试。' };
+  }
+
   const params: StreamChatParams = {
     prompt: input.prompt,
     sessionId: options.run.sessionId,
+    turnId: input.turnId,
+    forceFreshThread: true,
     model: input.model,
     systemPrompt: input.systemPrompt,
     workingDirectory: input.workingDirectory,
+    additionalDirectories: input.additionalDirectories,
     permissionMode: input.permissionMode,
+    executionRequirement: input.executionRequirement,
+    noEvidenceRetryAttempted: input.noEvidenceRetryAttempted,
+    files,
     sourceUserId: input.userId,
     sourceUserDisplayName: input.userDisplayName,
     sourceMessageId: input.messageId,
+    sourceChannelType: input.channelType || options.run.channelType,
+    sourceChatId: input.chatId || options.run.chatId,
   };
 
   const channelType = input.channelType || options.run.channelType || '';

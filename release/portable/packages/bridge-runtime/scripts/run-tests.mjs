@@ -14,6 +14,10 @@ const env = {
   ...process.env,
   CTI_HOME: tmpHome,
 };
+const configuredWatchdogMs = Number.parseInt(process.env.CTI_RUNTIME_TEST_WATCHDOG_MS || '180000', 10);
+const watchdogMs = Number.isFinite(configuredWatchdogMs)
+  ? Math.max(60_000, Math.min(300_000, configuredWatchdogMs))
+  : 180_000;
 
 const result = spawnSync(
   process.execPath,
@@ -24,7 +28,7 @@ const result = spawnSync(
     // Child-level test timeouts cannot fire if a regression starves the event
     // loop. The parent watchdog guarantees the suite returns control instead
     // of leaving a permanent high-CPU Node worker behind.
-    timeout: 120_000,
+    timeout: watchdogMs,
     killSignal: 'SIGKILL',
   },
 );

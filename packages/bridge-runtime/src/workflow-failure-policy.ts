@@ -108,6 +108,8 @@ const WORKFLOW_FAILURE_RULES: readonly WorkflowFailureRule[] = [
       /network\s+(?:error|timeout)/iu,
       /\b(?:502|503|504)\b/iu,
       /service\s+unavailable/iu,
+      /stream\s+closed\s+before\s+response\.completed/iu,
+      /(?:prematurely|unexpectedly)\s+closed\s+(?:the\s+)?stream/iu,
     ],
   },
 ];

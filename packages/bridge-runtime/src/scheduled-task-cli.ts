@@ -87,7 +87,14 @@ export async function executeScheduledTaskCli(
     if (command === 'history') {
       const taskId = requireTaskId(argv);
       const limit = Math.max(1, Math.min(200, Number(option(argv, '--limit')) || 50));
-      return jsonResult({ taskId, runs: await store.listRuns(taskId, limit) });
+      const runs = await store.listRuns(taskId, limit);
+      return jsonResult({
+        taskId,
+        runs: await Promise.all(runs.map(async (run) => ({
+          ...run,
+          checkInCount: (await store.getCheckIns(taskId, run.slotKey))?.entries.length ?? 0,
+        }))),
+      });
     }
     if (command === 'status') {
       const tasks = await store.listTasks();

@@ -6,6 +6,7 @@
 
 export const SCHEDULED_TASK_SCHEMA = 'codex-im-suite/scheduled-task/v1' as const;
 export const SCHEDULED_TASK_RUN_SCHEMA = 'codex-im-suite/scheduled-task-run/v1' as const;
+export const SCHEDULED_TASK_CHECK_IN_SCHEMA = 'codex-im-suite/scheduled-task-check-in/v1' as const;
 
 export type ScheduledTaskSchedule =
   | {
@@ -30,6 +31,16 @@ export type ScheduledTaskAction =
   | {
       kind: 'notify';
       text: string;
+    }
+  | {
+      /** 每次计划运行各生成一轮独立打卡，不会把整个周期任务标记完成。 */
+      kind: 'check_in';
+      text: string;
+      buttonText: string;
+      successText: string;
+      audience: 'owner' | 'chat_members';
+      /** 从本轮运行开始时刻起算的打卡窗口。 */
+      windowMs: number;
     }
   | {
       kind: 'agent_turn';
@@ -182,4 +193,19 @@ export type ScheduledTaskState = {
 
 export type VersionedScheduledTaskState = ScheduledTaskState & {
   version: number;
+};
+
+export type ScheduledTaskCheckInEntry = {
+  channelType: string;
+  userId: string;
+  checkedInAt: string;
+};
+
+export type ScheduledTaskCheckInState = {
+  schema: typeof SCHEDULED_TASK_CHECK_IN_SCHEMA;
+  taskId: string;
+  runId: string;
+  slotKey: string;
+  updatedAt: string;
+  entries: ScheduledTaskCheckInEntry[];
 };

@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 
 import {
   extractExplicitFeishuMentionTargetsFromRequest,
+  hasFeishuCounterpartyMentionHandoff,
   isFeishuMentionExecutionRequest,
   normalizeFeishuMentionTargetKey,
   parseEnvelopeMentionTargets,
@@ -44,6 +45,19 @@ describe('bridge mention parsing', () => {
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('让 George 说话'), ['George']);
     assert.equal(isFeishuMentionExecutionRequest('把她艾特一下'), true);
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('把她艾特一下'), []);
+  });
+
+  it('accepts compact latin at commands beside Chinese without matching latin word fragments', () => {
+    assert.equal(isFeishuMentionExecutionRequest('你先at乔治啊'), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('你先at乔治啊'), ['乔治']);
+    assert.equal(isFeishuMentionExecutionRequest('请ATGeorge'), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('请ATGeorge'), ['George']);
+    assert.equal(hasFeishuCounterpartyMentionHandoff('必须at对方'), true);
+
+    for (const text of ['format乔治', 'status乔治', 'chat乔治', 'atmosphere']) {
+      assert.equal(isFeishuMentionExecutionRequest(text), false, text);
+      assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest(text), [], text);
+    }
   });
 
   it('keeps workflow narration and delivery diagnostics out of execution intent', () => {

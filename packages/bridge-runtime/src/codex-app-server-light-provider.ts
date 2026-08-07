@@ -81,6 +81,7 @@ interface CodexAppServerLightProviderOptions {
   spawnProcess?: (file: string, args: string[], options: Parameters<typeof spawn>[2]) => AppServerProcess;
   terminateProcess?: (child: AppServerProcess) => void;
   isolatedDirectory?: string;
+  restrictedCodexHome?: string;
 }
 
 const TARGETS: Record<string, { packageName: string; triple: string }> = {
@@ -175,6 +176,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
   private readonly spawnProcess: NonNullable<CodexAppServerLightProviderOptions['spawnProcess']>;
   private readonly terminateProcess: NonNullable<CodexAppServerLightProviderOptions['terminateProcess']>;
   private readonly isolatedDirectory: string;
+  private readonly restrictedCodexHome: string;
 
   constructor(options: CodexAppServerLightProviderOptions = {}) {
     this.profile = options.profile || 'official';
@@ -189,6 +191,10 @@ export class CodexAppServerLightProvider implements LLMProvider {
     this.terminateProcess = options.terminateProcess || terminateProcessTree;
     this.isolatedDirectory = path.resolve(
       options.isolatedDirectory || path.join(CTI_HOME, 'runtime', 'codex-light-chat'),
+    );
+    this.restrictedCodexHome = path.resolve(
+      options.restrictedCodexHome
+      || path.join(this.isolatedDirectory, `codex-home-${this.profile}`),
     );
   }
 
@@ -257,7 +263,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
       const signal = params.abortController?.signal;
       await this.waitWithAbort(this.warmup(), signal);
       const result = await this.runSerialized(params.sessionId, () => this.runTurn(params));
-      const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile);
+      const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile, this.restrictedCodexHome);
       controller.enqueue(sseEvent('status', {
         provider: 'codex_app_server',
         codexProfile: this.profile,
@@ -288,7 +294,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
   private async ensureProcess(): Promise<void> {
     if (this.initialized && this.child && this.child.exitCode === null) return;
     if (this.disposed) throw new Error('Codex app-server 已关闭');
-    const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile);
+    const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile, this.restrictedCodexHome);
     const env = {
       ...runtimeProfile.env,
       ...(runtimeProfile.apiKey ? { CODEX_API_KEY: runtimeProfile.apiKey } : {}),
@@ -326,7 +332,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
   }
 
   private async startThread(): Promise<string> {
-    const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile);
+    const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile, this.restrictedCodexHome);
     const response = getObject(await this.request('thread/start', {
       model: runtimeProfile.executionProfile.submittedModel || null,
       cwd: this.isolatedDirectory,

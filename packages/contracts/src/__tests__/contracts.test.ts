@@ -8,6 +8,7 @@ import type {
   ExtensionTrustPolicy,
   NodeAgentHeartbeat,
   WorkflowPanelRunContract,
+  WorkflowFailureLedgerContract,
   WorkflowRunContract,
 } from '../index.js';
 
@@ -92,12 +93,41 @@ test('workflow panel run records Codex SDK parameter evidence', () => {
       submittedReasoningEffort: 'xhigh',
       threadMode: 'fresh_profile_changed',
       parameterEvidence: 'sdk_thread_options',
+      verifiedOutputArtifactCount: 1,
+      replaySafety: 'safe_read_only',
+      retryDisposition: 'retry_in_turn',
     },
     events: [],
   };
 
   assert.equal(run.execution?.submittedModel, 'gpt-5.4');
   assert.equal(run.execution?.parameterEvidence, 'sdk_thread_options');
+  assert.equal(run.execution?.verifiedOutputArtifactCount, 1);
+  const panelSchema = readSchema('workflow-panel-state.schema.json');
+  assert.equal(panelSchema.$id, 'https://codex-im-suite.local/schemas/workflow-panel-state.schema.json');
+});
+
+test('workflow failure ledger exposes a monotonic watermark without message content', () => {
+  const schema = readSchema('workflow-failure-ledger.schema.json');
+  const ledger: WorkflowFailureLedgerContract = {
+    protocol: 'workflow-failure-ledger/v1',
+    updatedAt: '2026-08-03T06:47:00.000Z',
+    nextSequence: 2,
+    retainedFromSequence: 1,
+    entries: [{
+      sequence: 1,
+      fingerprint: `sha256:${'a'.repeat(64)}`,
+      occurredAt: '2026-08-03T06:46:00.000Z',
+      kind: 'restart_interrupted',
+      state: 'observed',
+      stage: 'executing',
+      workflowStatus: 'failed',
+      failureCodes: ['runtime.restart_during_execution'],
+    }],
+  };
+
+  assert.equal((schema.properties as Record<string, { const?: string }>).protocol.const, ledger.protocol);
+  assert.equal(ledger.entries[0].sequence, 1);
 });
 
 test('extension trust policy exposes capability risk and credential scope', () => {

@@ -116,6 +116,12 @@ export interface VerifiedStickerDeliveryReceipt {
   contextHash: string;
 }
 
+/** Bridge 通过平台上传接口取得的可信卡片头图引用；模型不能直接提供 imageKey。 */
+export interface FeishuCardHeroImage {
+  imageKey: string;
+  alt: string;
+}
+
 /** Outbound message to send to an IM channel */
 export interface OutboundMessage {
   /** Target address */
@@ -132,6 +138,8 @@ export interface OutboundMessage {
   mentions?: OutboundMention[];
   /** Feishu-specific interactive card payload. Non-Feishu adapters ignore it. */
   feishuCardJson?: string;
+  /** 飞书 Card 2.0 的可信头图。非飞书渠道忽略并继续发送普通图片附件。 */
+  feishuCardHero?: FeishuCardHeroImage;
   /** Bridge-owned proof for an otherwise gated native-media delivery. */
   verifiedMediaAction?: VerifiedMediaAction;
   /** Bridge-owned source context used only to gate optional sticker presentation. */
@@ -154,6 +162,10 @@ export interface SendResult {
   messageId?: string;
   /** Platform-specific card ID when the channel returns one. */
   cardId?: string;
+  /** 真实平台回执确认发送的是可交互卡片，而不是纯文本降级。 */
+  interactiveCardSent?: boolean;
+  /** 仅在图片已经进入成功发送/更新的卡片时返回，供 Bridge 避免重复发图。 */
+  cardHeroEmbedded?: boolean;
   /** Bridge-owned receipt emitted only after a verified sticker action succeeds. */
   verifiedMediaDelivery?: VerifiedStickerDeliveryReceipt;
   error?: string;
@@ -302,6 +314,8 @@ export interface StreamingCardTurnContext {
   sourceMessageId?: string;
   sourceText?: string;
   chatType?: string;
+  /** 最终卡片使用的可信平台图片引用。 */
+  feishuCardHero?: FeishuCardHeroImage;
 }
 
 // ── Config ─────────────────────────────────────────────────────

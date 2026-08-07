@@ -71,9 +71,15 @@ function isFeishuCliAuthLoginCommand(command: string): boolean {
   return /\blark-cli(?:\.cmd|\.exe)?\s+auth\s+login\b/i.test(command);
 }
 
+function hasBooleanFlag(command: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Codex 在 Windows 上经常把 lark-cli 包在 PowerShell -Command 的引号中，
+  // 因此末尾布尔参数后可能直接跟闭合引号或分号，而不一定是空白/字符串结尾。
+  return new RegExp(`(?:^|\\s)--${escaped}(?=$|[\\s'\";)])`, 'iu').test(command);
+}
+
 function hasNonBlockingJsonContract(command: string): boolean {
-  return /(?:^|\s)--no-wait(?:\s|$)/i.test(command)
-    && /(?:^|\s)--json(?:\s|$)/i.test(command);
+  return hasBooleanFlag(command, 'no-wait') && hasBooleanFlag(command, 'json');
 }
 
 function parseJsonObject(content: unknown): Record<string, unknown> | null {

@@ -4,6 +4,7 @@ import {
   describeInputEvidence,
   type InputEvidenceKind,
 } from './input-evidence.js';
+import type { TurnEvidenceEnvelope, TurnFocusDecision } from './turn-context.js';
 
 export type ExecutionRequirementKind = 'none' | 'input_evidence_required' | 'local_read_required' | 'tool_required' | 'artifact_required';
 
@@ -14,6 +15,8 @@ export interface ExecutionRequirement {
   requiredInputEvidenceKinds?: InputEvidenceKind[];
   requiredInputEvidenceIds?: string[];
   strictToolEvidence?: boolean;
+  /** 当前短句是在修改已完成结果；最终回复必须在本轮交付修订结果，不能只承诺稍后处理。 */
+  inheritedFromContinuation?: boolean;
 }
 
 export interface ExecutionRequirementInput {
@@ -48,6 +51,10 @@ const TOOL_REQUIRED_RE = /(unity|unitymcp|unity mcp|mcp|blender|prefab|game\s*vi
 const ARTIFACT_RE = /(生成|创建|导出|保存|截图|截个图|截一张|文件|文档|上传|下载|game\s*view|scene\s*view|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码)/iu;
 const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|停止|重启|安装|导入|导出|生成|创建|新建|写入|保存|删除|移动|复制|修改|替换|提交|发布)/iu;
 const INPUT_ARTIFACT_ACTION_RE = /(生成|创建|导出|保存|截个图|截一张|上传|下载|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码|写入|修改|替换)/iu;
+const OUTPUT_ARTIFACT_REQUEST_RE = /(?:(?:做(?:个|一(?:个|张|份))|制作|绘制|产出|生成|创建|导出).{0,24}(?:图表|排行图|图片|图像|截图|表格|海报|幻灯片|演示文稿|可视化)|(?:图表|排行图|图片|图像|截图|表格|海报|幻灯片|演示文稿|可视化).{0,16}(?:做出来|制作|绘制|产出|生成|创建|导出))/iu;
+const EXTERNAL_STATE_MUTATION_RE = /(修复|修一下|修改|改一下|调整|处理|重建|创建|新建|删除|添加|挂载|放置|写入|保存|导入|导出|替换|同步)/iu;
+const CONTINUATION_ADJUSTMENT_ACTION_RE = /(?:改成|改为|换成|换为|调整|调到|压到|降到|提高到|控制在|限制为|设为|变成|打到|重排|重做|重干|再做|只保留|去掉|删掉|移除|增加|加上|减少|缩小|放大|替换)/iu;
+const CONTINUATION_QUANTITATIVE_CONSTRAINT_RE = /(?:(?:人均|预算|价格|成本|数量|比例|尺寸|宽度|高度|长度|时长|大小|上限|下限|阈值).{0,12}\d)|(?:\d+(?:\.\d+)?\s*(?:元|块|%|％|px|厘米|毫米|米|秒|分钟|小时|个|项|条)?\s*(?:左右|以内|以下|以上|至多|至少|封顶))/iu;
 const READ_ONLY_IMAGE_ANALYSIS_RE = /(分析|总结|识别|查看|看看|看一下|看一眼|解释|读取|提取|判断|检查|诊断).{0,24}(?:图片|图像|照片|截图|画面|附件)|(?:图片|图像|照片|截图|画面|附件).{0,24}(?:分析|总结|识别|查看|看看|解释|读取|提取|判断|检查|诊断)/iu;
 const EXTERNAL_MUTATION_ACTION_RE = /(?:(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出).{0,32}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出))/iu;
 const EXTERNAL_READ_STATE_RE = /(?:(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索).{0,32}(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索))/iu;
@@ -279,11 +286,15 @@ function classifyExecutionRequirementInternal(
   const affirmativeActionText = normalizeAffirmativeActionText(text);
   if (!text && imageEvidence.length === 0) return NONE_REQUIREMENT;
 
-  if (imageEvidence.length > 0 && INPUT_ARTIFACT_ACTION_RE.test(affirmativeActionText)) {
+  if (
+    imageEvidence.length > 0
+    && INPUT_ARTIFACT_ACTION_RE.test(affirmativeActionText)
+    && !hasExternalStateMutation(affirmativeActionText)
+  ) {
     return makeExecutionRequirement(
       'artifact_required',
       'request asks to create or modify an output artifact from structured input evidence',
-      inferToolFamilies(text, input.files),
+      [...new Set([...inferToolFamilies(text, input.files), 'artifact'])],
     );
   }
 
@@ -303,7 +314,10 @@ function classifyExecutionRequirementInternal(
     );
   }
 
-  const asksForExternalExecution = TOOL_REQUIRED_RE.test(text) || (TOOL_DOMAIN_RE.test(text) && INSPECTION_ACTION_RE.test(text));
+  const externalStateMutation = hasExternalStateMutation(affirmativeActionText);
+  const asksForExternalExecution = externalStateMutation
+    || TOOL_REQUIRED_RE.test(text)
+    || (TOOL_DOMAIN_RE.test(text) && INSPECTION_ACTION_RE.test(text));
   if (imageEvidence.length > 0 && !asksForExternalExecution) {
     return makeExecutionRequirement(
       'input_evidence_required',
@@ -330,6 +344,24 @@ function classifyExecutionRequirementInternal(
 
   if (DEFERRED_REMINDER_INTENT_RE.test(text)) {
     return NONE_REQUIREMENT;
+  }
+
+  // “做个图表 / 制作海报 / 生成表格”等明确可视产物请求不能依赖模型
+  // 自觉调用工具；它们需要真实的新产物才能算完成。
+  if (OUTPUT_ARTIFACT_REQUEST_RE.test(text)) {
+    return makeExecutionRequirement(
+      'artifact_required',
+      'request asks to produce a concrete visual or document artifact',
+      inferToolFamilies(text, input.files),
+    );
+  }
+
+  if (externalStateMutation) {
+    return makeExecutionRequirement(
+      'tool_required',
+      'request mutates state in an external editor or managed tool',
+      inferToolFamilies(text),
+    );
   }
 
   if (shouldUseLowRiskLocalProbe(text, input)) {
@@ -388,12 +420,73 @@ export function classifyExecutionRequirement(input: ExecutionRequirementInput): 
   return classifyExecutionRequirementInternal(input, { respectStrictToolRouting: true });
 }
 
-function inferToolFamilies(text: string, files?: FileAttachment[]): string[] {
+function hasExternalStateMutation(actionText: string): boolean {
+  // 外部编辑器状态的验收对象是场景/Prefab/节点本身，不是额外导出的图片或文件。
+  // 按“领域对象 + 肯定修改动作”组合判断，避免依赖固定句式或业务名称。
+  return TOOL_DOMAIN_RE.test(actionText) && EXTERNAL_STATE_MUTATION_RE.test(actionText);
+}
+
+export interface ContinuationExecutionRequirementInput extends ExecutionRequirementInput {
+  currentRequirement: ExecutionRequirement;
+  envelope: TurnEvidenceEnvelope;
+  focus: TurnFocusDecision;
+}
+
+function hasContinuationAdjustmentSignal(text: string): boolean {
+  const normalized = text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+  if (!normalized || normalized.length > 120) return false;
+  return CONTINUATION_ADJUSTMENT_ACTION_RE.test(normalized)
+    || CONTINUATION_QUANTITATIVE_CONSTRAINT_RE.test(normalized);
+}
+
+/**
+ * 用户回复一个已完成结果并只补充“预算降到… / 换成红色 / 去掉第三项”时，
+ * 当前短句本身通常不再重复“生成文件”等动作。这里从受控 outbound-ref
+ * 恢复的原始任务继承证据要求，避免把真实返工降级成一句口头确认。
+ */
+export function inheritContinuationExecutionRequirement(
+  input: ContinuationExecutionRequirementInput,
+): ExecutionRequirement {
+  if (input.currentRequirement.kind !== 'none') return input.currentRequirement;
+  if (!['reply_target', 'continuation'].includes(input.focus.focus)) return input.currentRequirement;
+  if (input.focus.requiresAgentResolution || !hasContinuationAdjustmentSignal(input.userText)) {
+    return input.currentRequirement;
+  }
+
+  const primaryIds = new Set(input.focus.primaryEvidenceIds);
+  const recoveredContext = input.envelope.evidence
+    .filter((item) => primaryIds.has(item.id))
+    .filter((item) => item.source === 'local_outbound_ref' || item.metadata?.continuationContextRecovered === true)
+    .map((item) => item.content.trim())
+    .filter(Boolean)
+    .join('\n');
+  if (!recoveredContext) return input.currentRequirement;
+
+  const inherited = classifyExecutionRequirementInternal({
+    userText: recoveredContext,
+    workingDirectory: input.workingDirectory,
+    messageKind: input.messageKind,
+    hasPreResolvedEvidence: false,
+  }, { respectStrictToolRouting: true });
+  if (inherited.kind === 'none' || inherited.kind === 'input_evidence_required') {
+    return input.currentRequirement;
+  }
+
+  return {
+    ...inherited,
+    reason: 'current reply adjusts a previously completed task and inherits its execution evidence requirement',
+    inheritedFromContinuation: true,
+  };
+}
+
+function inferToolFamilies(text: string, _files?: FileAttachment[]): string[] {
   const families = new Set<string>();
   if (/unity|unitymcp|unity mcp|prefab|预制体|场景|节点|game\s*(?:view|视角)|scene\s*view/iu.test(text)) families.add('unity-mcp');
   if (/mcp/iu.test(text)) families.add('mcp');
   if (/blender/iu.test(text)) families.add('blender');
-  if (/截图|截个图|截一张|图片|图像/iu.test(text) || (files?.length || 0) > 0) families.add('artifact');
+  // 输入附件只是上下文，不能自动变成输出产物要求；只有用户明确要求可交付
+  // 图片/文档时才增加 artifact family。
+  if (/截图|截个图|截一张|图片|图像|图表|排行图|表格|海报|幻灯片|演示文稿|可视化/iu.test(text)) families.add('artifact');
   if (/文件|文档|目录|文件夹|项目|仓库|路径|读取|查看|列出|搜索|写入|保存|删除|移动|复制|修改|替换/iu.test(text)) families.add('filesystem');
   if (/powershell|pwsh|cmd\s*\/c|node\s+-|python|py\s+-|npm|npx|dotnet|git\s+|运行|执行|命令|启动|停止|重启|安装|发布/iu.test(text)) families.add('shell');
   if (families.size === 0) families.add('tool');
@@ -424,6 +517,9 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
       '- For a current-directory question, call an available shell/current-directory tool (for example Get-Location on PowerShell or pwd on POSIX) in the supplied workspace, then answer from that result.',
     ]
     : [];
+  const continuationGuidance = requirement.inheritedFromContinuation
+    ? ['- This turn modifies a previously completed result. Deliver the revised result now; do not merely promise to redo it later.']
+    : [];
   if (requirement.strictToolEvidence === false) {
     return [
       'Execution evidence preference for this turn:',
@@ -431,6 +527,7 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
       `- Reason: ${requirement.reason}.`,
       `- Preferred tool families: ${families}.`,
       ...localReadGuidance,
+      ...continuationGuidance,
       '- Prefer a real tool when it is available.',
       '- If the preferred tool path is unavailable, you may still answer using the best available model knowledge, but do not claim that a tool succeeded.',
       '- When possible, include source names, dates, and uncertainty instead of fabricating tool evidence.',
@@ -442,16 +539,53 @@ export function buildExecutionRequirementPrompt(requirement: ExecutionRequiremen
     `- Reason: ${requirement.reason}.`,
     `- Required tool families: ${families}.`,
     ...localReadGuidance,
+    ...continuationGuidance,
     '- You must call an appropriate real tool before answering with local facts or completion claims.',
     '- Do not answer from memory, guesses, examples, or prior screenshots when the request asks for current local state.',
     '- If the required tool path is unavailable, answer with "未完成：" followed by the concrete blocker and the attempted tool path.',
   ].join('\n');
 }
 
-export function buildNoEvidenceRetryPrompt(requirement: ExecutionRequirement): string {
+export interface NoEvidenceRetryPromptContext {
+  /** 1-based recovery attempt index; the initial provider attempt is not included. */
+  recoveryAttempt?: number;
+  maxRecoveryAttempts?: number;
+  previousEvidence?: {
+    toolUseCount: number;
+    toolResultCount: number;
+    successfulToolResultCount: number;
+  };
+}
+
+export function buildNoEvidenceRetryPrompt(
+  requirement: ExecutionRequirement,
+  context: NoEvidenceRetryPromptContext = {},
+): string {
+  const recoveryAttempt = Math.max(1, Math.floor(context.recoveryAttempt || 1));
+  const maxRecoveryAttempts = Math.max(recoveryAttempt, Math.floor(context.maxRecoveryAttempts || 1));
+  const previousEvidence = context.previousEvidence;
+  const previousAttemptGuidance = !previousEvidence
+    ? []
+    : previousEvidence.toolUseCount <= 0
+      ? ['The previous attempt did not call any real tool. A text-only promise or plan is not a resolution strategy.']
+      : previousEvidence.successfulToolResultCount <= 0
+        ? ['The previous attempt called a tool but obtained no successful result. Do not repeat the unchanged route; adapt the approach safely.']
+        : ['The previous attempt obtained a tool result but still did not satisfy the required evidence. Resolve the missing verification or delivery boundary instead of repeating the same action.'];
+  const recoveryStrategy = recoveryAttempt >= maxRecoveryAttempts
+    ? [
+      `This is the final recovery attempt (${recoveryAttempt} of ${maxRecoveryAttempts}).`,
+      'Use a different compatible route from the previous attempt: switch to another available tool or manifest-backed action, or correct the missing parameters, permissions, or output verification.',
+      'Do not repeat the previous acknowledgement, promise, or unchanged plan.',
+    ]
+    : [
+      `This is recovery attempt ${recoveryAttempt} of ${maxRecoveryAttempts}.`,
+      'Re-plan from the original user request, inspect the available capabilities, select one concrete execution route, and use it now.',
+    ];
   if (requirement.kind === 'input_evidence_required') {
     return [
       'The previous attempt did not confirm provider acceptance of the required structured input evidence.',
+      ...recoveryStrategy,
+      ...previousAttemptGuidance,
       `Required input evidence IDs: ${(requirement.requiredInputEvidenceIds || []).join(', ') || 'unknown'}.`,
       'Retry with a provider that supports the required input evidence. Do not infer content from filenames, metadata, memory, or nearby messages.',
       'If the input cannot be accepted, reply only with "未完成：" and the concrete input blocker.',
@@ -466,7 +600,12 @@ export function buildNoEvidenceRetryPrompt(requirement: ExecutionRequirement): s
   return [
     'No successful tool result was detected in the previous attempt.',
     `This request still requires execution evidence: ${requirement.kind}.`,
+    ...recoveryStrategy,
+    ...previousAttemptGuidance,
     ...localReadGuidance,
+    ...(requirement.inheritedFromContinuation
+      ? ['This is a revision of a previous result. Produce the revised result in this turn; do not return another promise or acknowledgement.']
+      : []),
     'Retry now by calling the required real tool first. Do not provide a factual local answer without a successful tool result.',
     'If you cannot call the tool, reply only with "未完成：" and the concrete blocker.',
   ].join('\n');
@@ -486,7 +625,6 @@ function hasUnityMcpToolEvidence(toolNames: string[]): boolean {
     return normalized.includes('jsontool:mcp_call')
       || normalized.includes('jsontool:unity_mcp_execute_code')
       || normalized.includes('unity')
-      || normalized.includes('mcp')
       || /(^|[:/._-])(manage_camera|manage_scene|manage_asset|manage_gameobject|find_gameobjects|execute_code|batch_execute)(?:$|[:/._-])/.test(normalized);
   });
 }
@@ -538,8 +676,9 @@ export function isExecutionEvidenceSatisfied(
   if (!requiresSuccessfulToolEvidence(requirement)) return true;
   // 产物任务允许由 Runtime 验证后的本轮新产物满足证据要求。这里不再机械
   // 绑定某个工具名称，但普通 tool_required / local_read_required 仍走 family 门禁。
-  if (requirement.kind === 'artifact_required' && (evidence.verifiedOutputArtifactCount || 0) > 0) {
-    return evidence.successfulToolResultCount > 0;
+  if (requirement.kind === 'artifact_required') {
+    return (evidence.verifiedOutputArtifactCount || 0) > 0
+      && evidence.successfulToolResultCount > 0;
   }
   return hasRequiredToolFamilyEvidence(requirement, evidence);
 }
@@ -611,7 +750,7 @@ export function shouldReplaceWithNoExecutionEvidenceText(
 
 export function buildNoExecutionEvidenceText(
   requirement: ExecutionRequirement,
-  evidence: {
+  _evidence: {
     toolUseCount: number;
     toolResultCount: number;
     successfulToolResultCount: number;
@@ -632,8 +771,17 @@ export function buildNoExecutionEvidenceText(
       ? '未完成：这次没有生成可验证的文件、图片或其他交付结果。'
       : '未完成：这次没有获得可验证的执行结果。';
   const lines = [summary];
-  // 详细证据计数、内部 requirement 名称与 Provider 原因继续保留在 workflow/audit，
-  // 用户正文只展示一条有行动价值的失败原因，避免把内部协议直接暴露到聊天卡片。
-  if (evidence.failedToolErrors?.length) lines.push(`具体原因：${evidence.failedToolErrors[0]}`);
+  // 原始 tool output 可能同时包含目录列表、命令回显、绝对路径和末尾错误；
+  // 它只进入 workflow/audit，不能直接取第一段外发。这里仅按受控 requirement
+  // 生成稳定、可行动且不泄露内部协议的用户原因。
+  if (requirement.kind === 'tool_required') {
+    const families = new Set(requirement.requiredToolFamilies.map((family) => family.trim().toLowerCase()));
+    const capability = families.has('unity-mcp')
+      ? 'Unity MCP'
+      : families.has('mcp')
+        ? 'MCP'
+        : '受控工具';
+    lines.push(`具体原因：本轮没有通过${capability}获得可验证结果；详细诊断已保留在执行日志。`);
+  }
   return lines.join('\n');
 }

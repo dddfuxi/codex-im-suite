@@ -102,7 +102,7 @@ export type MavisSseErrorCode =
  * Now every exit path of `streamUntilFinish` returns a `MavisStreamResult`
  * whose `terminal` discriminates between `finished` and the failure
  * modes. Callers use this to drive workflow outcome
- * (`completeWorkflowRun` vs `failWorkflowRun` + auto-retry).
+ * (`completeWorkflowRun` vs `failWorkflowRun` + active-turn retry advice).
  */
 export type MavisTerminalState =
   | 'finished'
@@ -129,6 +129,8 @@ export interface MavisStreamResult {
  * `requestWorkflowRetry(..., 'auto')`, and the daemon's retry worker
  * would claim and re-execute a cancelled prompt. Same risk for
  * `error` / `partial_result` if the prompt was a deterministic failure.
+ * 当前后台自动重放已移除；这份全 false 映射继续固定外部终态本身不能
+ * 授权重放，活跃回合是否续跑还必须通过统一失败分类与工具重放安全裁决。
  *
  * This map pins the policy per terminal state. Callers
  * (`streamExternalDispatch`) MUST consult it instead of falling back to

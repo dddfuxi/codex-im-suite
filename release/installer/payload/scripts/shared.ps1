@@ -162,6 +162,7 @@ function Get-ReleaseManifestRelativeDirectories {
         Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.extensionProtocol.manifestDirs
         Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.actionProtocol.manifestDirs
         Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.actionProtocol.legacyManifestDirs
+        Add-ReleaseManifestDirectory -Directories $directories -Seen $seen -Value $manifest.agentCollaborationProtocol.manifestDirs
 
         if ($null -ne $manifest.config) {
             foreach ($property in $manifest.config.PSObject.Properties) {
@@ -184,7 +185,8 @@ function Get-ReleaseManifestRelativeDirectories {
         'plugins.d',
         'runtime.d',
         'action-manifests.d',
-        'local-agent-tools.d'
+        'local-agent-tools.d',
+        'agents.d'
     )
     foreach ($baseRelative in @('', 'config')) {
         $base = if ([string]::IsNullOrWhiteSpace($baseRelative)) { $Root } else { Join-Path $Root $baseRelative }

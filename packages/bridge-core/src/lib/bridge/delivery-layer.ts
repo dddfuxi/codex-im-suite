@@ -206,6 +206,7 @@ export async function deliver(
 
   let lastMessageId: string | undefined;
   let lastVerifiedMediaDelivery: SendResult['verifiedMediaDelivery'];
+  let cardHeroEmbedded = false;
 
   for (let i = 0; i < chunks.length; i++) {
     // Rate limit: wait if this chat is sending too fast
@@ -221,6 +222,8 @@ export async function deliver(
       text: chunks[i],
       // Only attach inline buttons to the last chunk
       inlineButtons: i === chunks.length - 1 ? message.inlineButtons : undefined,
+      // 一张回复只提升一次头图；超长正文后续分片不重复横幅。
+      feishuCardHero: i === 0 ? message.feishuCardHero : undefined,
       // Pass through replyToMessageId for platforms that need it (e.g. QQ passive reply)
       replyToMessageId: platformReplyToMessageId(message.replyToMessageId),
     };
@@ -231,6 +234,7 @@ export async function deliver(
     }
     lastMessageId = result.messageId;
     lastVerifiedMediaDelivery = result.verifiedMediaDelivery;
+    cardHeroEmbedded = cardHeroEmbedded || result.cardHeroEmbedded === true;
 
     if (
       adapter.channelType === 'feishu'
@@ -292,7 +296,12 @@ export async function deliver(
     });
   } catch { /* best effort */ }
 
-  return { ok: true, messageId: lastMessageId, verifiedMediaDelivery: lastVerifiedMediaDelivery };
+  return {
+    ok: true,
+    messageId: lastMessageId,
+    verifiedMediaDelivery: lastVerifiedMediaDelivery,
+    ...(cardHeroEmbedded ? { cardHeroEmbedded: true } : {}),
+  };
 }
 
 /**

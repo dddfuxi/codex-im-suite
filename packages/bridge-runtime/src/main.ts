@@ -41,16 +41,18 @@ import type {
   TurnReferenceResolutionInput,
   TurnReferenceResolverHost,
 } from 'claude-to-im/host';
+import type { ProviderRetryAdvice } from 'claude-to-im/host';
 import {
   createTurnReferenceResolverSnapshot,
   type AgentTurnFocusDecisionInput,
 } from 'claude-to-im/evidence';
 import { hydrateProcessEnvironmentFromConfigFile, loadConfig, configToSettings, CTI_HOME } from './config.js';
 import type { Config } from './config.js';
-import { getOrdinaryCodexExecutionProfile } from './codex-provider.js';
+import { ensureBridgeCodexHome, getOrdinaryCodexExecutionProfile } from './codex-provider.js';
 import { JsonFileStore } from './store.js';
 import { readAgentHomePromptSections } from './agent-home.js';
 import { ArtifactEncodingInspector } from './artifact-encoding-inspector.js';
+import { RuntimeChoicePromptStateHost } from './choice-prompt-state-host.js';
 import { DeterministicEvidenceRecoveryProvider } from './deterministic-evidence-recovery-provider.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
 import {
@@ -79,6 +81,7 @@ import {
 } from './scheduled-task-host.js';
 import { createScheduledTaskService } from './scheduled-tasks/service.js';
 import { createFileScheduledTaskStore } from './scheduled-tasks/store.js';
+import { buildScheduledTaskCheckInCard } from './scheduled-tasks/presentation.js';
 import { setupLogger } from './logger.js';
 import { OllamaProvider } from './local-llm-provider.js';
 import { LocalAgentProvider } from './local-agent-provider.js';
@@ -137,8 +140,9 @@ import {
 } from './executor-registry.js';
 import { ExecutorProviderRegistry, type ResolvedDispatch } from './executor-provider-registry.js';
 import type { ExecutorSelection } from './executor-types.js';
+import { decideWorkflowReplaySafety, type WorkflowToolObservation } from './workflow-replay-safety.js';
 import { createMavisClient } from './mavis-cli-client.js';
-import { MavisExecutorProvider, isMavisTerminalAutoRetryable, type MavisTerminalState } from './mavis-executor-provider.js';
+import { MavisExecutorProvider, type MavisTerminalState } from './mavis-executor-provider.js';
 import { summarizeMavisFailureMessage } from './mavis-failure-summarizer.js';
 import { shouldRetrieveMemoryForPrompt } from './memory-routing.js';
 import { startKnowledgeIndexWatcher } from './knowledge-index-service.js';
@@ -152,6 +156,7 @@ import {
 } from './todo-reminders.js';
 import { createExtensionCatalogHost } from './extension-catalog-host.js';
 import { createBridgeControlHost } from './bridge-control-host.js';
+import { startActiveReplyControlService } from './active-reply-control.js';
 import { createOfficialSkillTools } from './official-skill-tools.js';
 import { createSkillLifecycleService } from './skill-lifecycle.js';
 import { createSkillRegistry } from './skill-registry.js';
@@ -168,11 +173,13 @@ import {
 } from './feishu-cli-user-auth.js';
 import { prepareWorkflowRetryExecution } from './workflow-retry.js';
 import { decideWorkflowFailureRetry } from './workflow-failure-policy.js';
+import { diagnoseWorkflowFailures } from './workflow-failure-diagnostics.js';
 import { createRuntimeTurnStorage, type RuntimeTurnStorage } from './turn-storage.js';
 import { writeExecutorStatus } from './executor-status.js';
 import {
   appendWorkflowEvent,
   claimNextWorkflowRetry,
+  cancelWorkflowRun,
   completeWorkflowRun,
   completeWorkflowRetry,
   failWorkflowRun,
@@ -180,7 +187,6 @@ import {
   markInterruptedWorkflowRuns,
   readWorkflowStatus,
   recordWorkflowRecoveryInfo,
-  requestWorkflowRetry,
   setWorkflowExecutor,
   startWorkflowRun,
 } from './workflow-status.js';
@@ -826,22 +832,99 @@ function summarizeCodexFailureMessage(message: string): string {
   return truncatePreview(message, 180) || 'Codex 当前不可用。';
 }
 
-function applyWorkflowFailureRetryPolicy(runId: string, error: unknown): void {
-  const decision = decideWorkflowFailureRetry(error);
+function isActiveUserTurn(params: Parameters<LLMProvider['streamChat']>[0]): boolean {
+  return !!(
+    params.turnId?.trim()
+    && params.sourceMessageId?.trim()
+    && params.sourceChannelType?.trim()
+    && params.sourceChatId?.trim()
+  );
+}
+
+function emitWorkflowRetryAdvice(input: {
+  runId: string;
+  error: unknown;
+  params: Parameters<LLMProvider['streamChat']>[0];
+  evidence: StreamEvidence;
+  config: Config;
+  controller: ReadableStreamDefaultController<string>;
+  attemptStartedAt: string;
+}): ProviderRetryAdvice {
+  const failure = decideWorkflowFailureRetry(input.error);
+  const executorRiskLevel = buildExecutorManifests(input.config)
+    .find((item) => item.id === input.evidence.executorId)?.riskLevel;
+  const replay = decideWorkflowReplaySafety({
+    tools: input.evidence.toolObservations,
+    executorRiskLevel,
+  });
+  const turnStorage = getBridgeContext().turnStorage;
+  const verifiedOutputArtifacts = replay.replaySafety === 'unsafe_side_effects' || replay.replaySafety === 'unsafe_unknown'
+    ? turnStorage?.recoverVerifiedArtifacts?.({
+      sessionId: input.params.sessionId,
+      turnId: input.params.turnId || input.params.sourceMessageId || '',
+      createdAfter: input.attemptStartedAt,
+    }) || []
+    : [];
+  const canReplay = replay.replaySafety === 'safe_no_tools' || replay.replaySafety === 'safe_read_only';
+  // 是否允许 Provider 恢复由统一失败策略裁决；重放安全仍由实际工具轨迹
+  // 独立收紧，避免在这里再维护一份容易漂移的失败类别白名单。
+  const providerRetryable = failure.autoRetry;
+  const retryDisposition = providerRetryable && canReplay
+    ? 'retry_in_turn'
+    : providerRetryable && verifiedOutputArtifacts.length > 0
+      ? 'artifact_recovery'
+      : providerRetryable
+        ? 'manual_retry_required'
+        : 'not_retryable';
+  const advice: ProviderRetryAdvice = {
+    protocol: 'cti-retry-advice/v1',
+    diagnosticCode: `provider.${failure.reasonCode}`,
+    retryable: providerRetryable && canReplay,
+    replaySafety: replay.replaySafety,
+    retryDisposition,
+    ...(verifiedOutputArtifacts.length > 0 ? { verifiedOutputArtifacts } : {}),
+  };
   appendWorkflowEvent(
-    runId,
+    input.runId,
     'failed',
-    decision.autoRetry ? 'workflow.retry.policy' : 'workflow.retry.skipped',
-    decision.autoRetry
-      ? `自动重试策略允许一次重试：${decision.reasonCode}`
-      : `自动重试已跳过：${decision.reasonCode}`,
+    'workflow.retry.advice',
+    advice.retryable ? '活跃回合将在原卡内同步续跑' : '活跃回合不允许自动重放',
     {
-      category: decision.category,
-      reasonCode: decision.reasonCode,
-      autoRetry: decision.autoRetry,
+      diagnosticCode: advice.diagnosticCode,
+      replaySafety: advice.replaySafety,
+      retryDisposition: advice.retryDisposition,
+      verifiedOutputArtifactCount: verifiedOutputArtifacts.length,
+      replayReasonCode: replay.reasonCode,
     },
   );
-  if (decision.autoRetry) requestWorkflowRetry(runId, 'auto');
+  input.controller.enqueue(sseEvent('retry_advice', advice));
+  return advice;
+}
+
+function handleObservedWorkflowFailure(input: {
+  runId: string;
+  error: unknown;
+  params: Parameters<LLMProvider['streamChat']>[0];
+  evidence: StreamEvidence;
+  config: Config;
+  controller: ReadableStreamDefaultController<string>;
+  attemptStartedAt: string;
+}): void {
+  if (input.params.abortController?.signal.aborted) {
+    cancelWorkflowRun(input.runId);
+    input.controller.enqueue(sseEvent('error', '当前回复已终止'));
+    input.controller.close();
+    return;
+  }
+  if (isActiveUserTurn(input.params)) {
+    emitWorkflowRetryAdvice(input);
+    failWorkflowRun(input.runId, input.error);
+    input.controller.enqueue(sseEvent('error', input.error instanceof Error ? input.error.message : String(input.error)));
+    input.controller.close();
+    return;
+  }
+  failWorkflowRun(input.runId, input.error);
+  appendWorkflowEvent(input.runId, 'failed', 'workflow.retry.skipped', '后台执行失败不自动重放；仅保留人工重试或执行前重启恢复。');
 }
 
 type CodexModelSource = 'local_api' | 'external_api' | 'official';
@@ -1446,12 +1529,19 @@ class HubLlmProvider implements LLMProvider {
         lastDecision: 'codex_only',
         lastRouteReason: routerEnabled ? '当前模式为仅 Codex' : '本地中枢未启用',
       });
-      return this.fallbackProvider.streamChat(params);
+      return new ObservedLLMProvider(
+        this.config,
+        this.store,
+        this.fallbackProvider,
+        this.primaryExecutorId,
+        this.executorRegistry,
+      ).streamChat(params);
     }
 
     return new ReadableStream<string>({
       start: async (controller) => {
         const workflowRun = this.startObservedWorkflow(params, 'hybrid');
+        const attemptStartedAt = new Date().toISOString();
         const evidence = emptyStreamEvidence();
         seedExecutionRequirementEvidence(evidence, params);
         const observedController = createObservedController(controller, evidence);
@@ -1501,8 +1591,16 @@ class HubLlmProvider implements LLMProvider {
         } catch (error) {
           workflowFailed = true;
           flushWorkflowEvidence(workflowRun.id, evidence);
-          failWorkflowRun(workflowRun.id, error);
-          applyWorkflowFailureRetryPolicy(workflowRun.id, error);
+          handleObservedWorkflowFailure({
+            runId: workflowRun.id,
+            error,
+            params,
+            evidence,
+            config: this.config,
+            controller: observedController,
+            attemptStartedAt,
+          });
+          if (isActiveUserTurn(params)) return;
           throw error;
         } finally {
           if (!workflowFailed) {
@@ -1575,15 +1673,14 @@ class HubLlmProvider implements LLMProvider {
    * `status: succeeded` for what was actually a failed turn. That is a
    * live-pre blocker. Now `streamUntilFinish` returns a
    * `MavisStreamResult`; this method reads its `terminal` field and
-   * routes to `failWorkflowRun` + optional auto-retry when it is not
-   * `'finished'`.
+   * routes to `failWorkflowRun` when it is not `'finished'`. Active user
+   * turns receive the same strict retry_advice as the Codex path so Core
+   * can continue inside the original card; background runs are not
+   * automatically replayed after dispatch.
    *
-   * v3.8 P2 fix: replaced `shouldAutoRetryWorkflowError(workflowFailureError)`
-   * (a generic text-based heuristic that defaults to `true` for unknown
-   * errors) with `isMavisTerminalAutoRetryable(terminal)` — an explicit
-   * per-terminal map. Without this, an `aborted` turn (user / remote
-   * explicit cancel) would enter `requestWorkflowRetry('auto')` and the
-   * daemon would claim and re-execute the cancelled prompt.
+   * v3.8 P2 fix: terminal failures no longer enter the background auto
+   * retry queue. In particular, an aborted turn must never be claimed and
+   * re-executed after the original user-facing terminal state was shown.
    */
   private streamExternalDispatch(
     params: Parameters<LLMProvider['streamChat']>[0],
@@ -1599,10 +1696,9 @@ class HubLlmProvider implements LLMProvider {
         observedController.enqueue(sseEvent('status', buildExecutorSourceStatus(dispatch.selection)));
         let workflowFailed = false;
         let workflowFailureError: unknown = null;
-        // v3.8: declared at outer scope so `finally` (which lives outside
-        // the post-dispatch `try`) can read it for `isMavisTerminalAutoRetryable`.
-        // Defaults to `'finished'` — only overwritten inside the post-dispatch
-        // try/catch (or by the catch when `streamUntilFinish` itself throws).
+        // 终态必须跨越 post-dispatch try/finally 保存，供统一 workflow
+        // 失败收口与活跃回合 retry_advice 使用。默认 finished，只在真实
+        // terminal 或异常路径上覆盖。
         let terminal: MavisTerminalState = 'finished';
         try {
           // Pre-dispatch: probe + createSession / communicationSend.
@@ -1674,13 +1770,12 @@ class HubLlmProvider implements LLMProvider {
             const summarized = summarizeMavisFailureMessage(
               error instanceof Error ? error.message : String(error),
             );
-            observedController.enqueue(sseEvent('error', summarized));
             terminal = 'error';
+            workflowFailureError = new Error(summarized);
           }
-          try { observedController.close(); } catch { /* already closed */ }
           if (terminal !== 'finished') {
             workflowFailed = true;
-            workflowFailureError = new Error(`mavis executor 终态失败：${terminal}`);
+            workflowFailureError ??= new Error(`mavis executor 终态失败：${terminal}`);
           }
         } catch (error) {
           workflowFailed = true;
@@ -1688,19 +1783,26 @@ class HubLlmProvider implements LLMProvider {
         } finally {
           flushWorkflowEvidence(workflowRun.id, evidence);
           if (workflowFailed) {
-            failWorkflowRun(workflowRun.id, workflowFailureError ?? new Error('external executor failed'));
-            // v3.8 P2 fix: drive auto-retry off the terminal state, NOT
-            // off `shouldAutoRetryWorkflowError(workflowFailureError)`
-            // (a generic text-based heuristic that defaults to true for
-            // unknown errors). An `aborted` turn must NOT be auto-retried
-            // — re-running would re-execute the cancelled prompt. See
-            // `MAVIS_TERMINAL_AUTO_RETRYABLE` for the per-terminal
-            // rationale.
-            if (isMavisTerminalAutoRetryable(terminal)) {
-              requestWorkflowRetry(workflowRun.id, 'auto');
+            const failure = workflowFailureError ?? new Error('external executor failed');
+            if (isActiveUserTurn(params)) {
+              handleObservedWorkflowFailure({
+                runId: workflowRun.id,
+                error: failure,
+                params,
+                evidence,
+                config: this.config,
+                controller: observedController,
+                attemptStartedAt: workflowRun.startedAt,
+              });
+              return;
             }
+            failWorkflowRun(workflowRun.id, failure);
+            // 已经进入外部 executor 的后台回合不自动重放。活跃用户回合
+            // 已在上方通过 retry_advice 交给原回合状态机收口；这里仅关闭流。
+            try { observedController.close(); } catch { /* already closed */ }
           } else {
             completeWorkflowRun(workflowRun.id);
+            try { observedController.close(); } catch { /* already closed */ }
           }
         }
       },
@@ -1747,18 +1849,14 @@ class HubLlmProvider implements LLMProvider {
       channelType: binding?.channelType,
       chatId: binding?.chatId,
     });
-    recordWorkflowRecoveryInfo(workflowRun.id, {
-      prompt: params.prompt,
-      workingDirectory: params.workingDirectory,
-      model: params.model,
-      systemPrompt: params.systemPrompt,
-      permissionMode: params.permissionMode,
-      channelType: binding?.channelType,
-      chatId: binding?.chatId,
-      userId: params.sourceUserId,
-      userDisplayName: params.sourceUserDisplayName,
-      messageId: params.sourceMessageId,
-    });
+    if (params.collaborationRunId) {
+      try {
+        getBridgeContext().agentCollaboration?.linkWorkflowRun?.(params.collaborationRunId, workflowRun.id);
+      } catch {
+        // 协作状态是观察数据；关联失败不能阻断主 Provider。
+      }
+    }
+    recordWorkflowRecoveryFromParams(workflowRun.id, params, binding);
     appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
     appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话、记忆和工作区上下文已准备');
     // v3.3 P1 必修：@hint 优先于 sessionDefault（hintedExecutorId ?? sessionDefaultId ?? undefined）
@@ -2405,6 +2503,38 @@ class HubLlmProvider implements LLMProvider {
   }
 }
 
+function recordWorkflowRecoveryFromParams(
+  runId: string,
+  params: Parameters<LLMProvider['streamChat']>[0],
+  binding?: { channelType?: string; chatId?: string },
+): void {
+  const turnId = params.turnId?.trim();
+  const refs = turnId && params.files?.length
+    ? getBridgeContext().turnStorage?.createRecoveryInputEvidenceRefs?.({
+      sessionId: params.sessionId,
+      turnId,
+      files: params.files,
+    }) || []
+    : [];
+  recordWorkflowRecoveryInfo(runId, {
+    prompt: params.prompt,
+    turnId,
+    workingDirectory: params.workingDirectory,
+    additionalDirectories: params.additionalDirectories,
+    model: params.model,
+    systemPrompt: params.systemPrompt,
+    permissionMode: params.permissionMode,
+    executionRequirement: params.executionRequirement,
+    noEvidenceRetryAttempted: params.noEvidenceRetryAttempted,
+    inputEvidenceRefs: refs,
+    channelType: params.sourceChannelType || binding?.channelType,
+    chatId: params.sourceChatId || binding?.chatId,
+    userId: params.sourceUserId,
+    userDisplayName: params.sourceUserDisplayName,
+    messageId: params.sourceMessageId,
+  });
+}
+
 function collectTsFiles(rootDir: string): string[] {
   if (!fs.existsSync(rootDir)) return [];
   const entries = fs.readdirSync(rootDir, { withFileTypes: true });
@@ -2471,6 +2601,7 @@ interface StreamEvidence {
   failedToolResultCount: number;
   failedToolErrors: string[];
   toolNames: string[];
+  toolObservations: WorkflowToolObservation[];
   executionRequirement?: ExecutionRequirement;
   executorId?: string;
   executorName?: string;
@@ -2527,6 +2658,7 @@ function emptyStreamEvidence(): StreamEvidence {
     failedToolResultCount: 0,
     failedToolErrors: [],
     toolNames: [],
+    toolObservations: [],
     acceptedInputEvidenceKinds: [],
     acceptedInputEvidenceIds: [],
   };
@@ -2580,6 +2712,7 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       evidence.toolUseCount += 1;
       const name = typeof data?.name === 'string' ? data.name.trim() : '';
       if (name && !evidence.toolNames.includes(name)) evidence.toolNames.push(name);
+      evidence.toolObservations.push({ name, input: data?.input });
       refreshStreamEvidenceSatisfaction(evidence);
       continue;
     }
@@ -2675,12 +2808,14 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
 }
 
 function flushWorkflowEvidence(runId: string, evidence: StreamEvidence): void {
+  const failureDiagnostics = diagnoseWorkflowFailures({ toolErrors: evidence.failedToolErrors });
   const payload: Record<string, unknown> = {
     toolUseCount: evidence.toolUseCount,
     toolResultCount: evidence.toolResultCount,
     successfulToolResultCount: evidence.successfulToolResultCount,
     failedToolResultCount: evidence.failedToolResultCount,
     failedToolErrors: evidence.failedToolErrors,
+    failureDiagnostics,
     toolNames: evidence.toolNames,
   };
   if (evidence.provider) payload.provider = evidence.provider;
@@ -2765,6 +2900,7 @@ class ObservedLLMProvider implements LLMProvider {
           channelType: binding?.channelType,
           chatId: binding?.chatId,
         });
+        const attemptStartedAt = new Date().toISOString();
         if (params.collaborationRunId) {
           try {
             getBridgeContext().agentCollaboration?.linkWorkflowRun?.(params.collaborationRunId, workflowRun.id);
@@ -2772,18 +2908,7 @@ class ObservedLLMProvider implements LLMProvider {
             // 协作状态是观察数据；关联失败不能阻断主 Provider。
           }
         }
-        recordWorkflowRecoveryInfo(workflowRun.id, {
-          prompt: params.prompt,
-          workingDirectory: params.workingDirectory,
-          model: params.model,
-          systemPrompt: params.systemPrompt,
-          permissionMode: params.permissionMode,
-          channelType: binding?.channelType,
-          chatId: binding?.chatId,
-          userId: params.sourceUserId,
-          userDisplayName: params.sourceUserDisplayName,
-          messageId: params.sourceMessageId,
-        });
+        recordWorkflowRecoveryFromParams(workflowRun.id, params, binding);
         const evidence = emptyStreamEvidence();
         seedExecutionRequirementEvidence(evidence, params);
         const observedController = createObservedController(controller, evidence);
@@ -2826,6 +2951,8 @@ class ObservedLLMProvider implements LLMProvider {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            const fatalError = extractCodexFatalStreamError(value);
+            if (fatalError) throw new Error(fatalError);
             observedController.enqueue(value);
           }
           flushWorkflowEvidence(workflowRun.id, evidence);
@@ -2833,8 +2960,20 @@ class ObservedLLMProvider implements LLMProvider {
           observedController.close();
         } catch (error) {
           flushWorkflowEvidence(workflowRun.id, evidence);
+          if (isActiveUserTurn(params)) {
+            handleObservedWorkflowFailure({
+              runId: workflowRun.id,
+              error,
+              params,
+              evidence,
+              config: this.config,
+              controller: observedController,
+              attemptStartedAt,
+            });
+            return;
+          }
           failWorkflowRun(workflowRun.id, error);
-          applyWorkflowFailureRetryPolicy(workflowRun.id, error);
+          appendWorkflowEvent(workflowRun.id, 'failed', 'workflow.retry.skipped', '后台执行失败不自动重放；仅保留人工重试或执行前重启恢复。');
           try {
             observedController.enqueue(sseEvent('error', error instanceof Error ? error.message : String(error)));
             observedController.close();
@@ -2894,6 +3033,9 @@ async function resolveProvider(
   // HubLlmProvider / ObservedLLMProvider. External executors (currently
   // mavis-agent) are registered here based on the live `Config` snapshot.
   const executorRegistry = buildExecutorRegistry(config, turnStorage);
+  // 官方 / 外部 Codex Home 继续隔离用户全局 MCP，只接收由 Runtime 根据
+  // config/mcp.d 与当前工作区边界生成的受管投影。模型不能自行提供这些连接。
+  const managedCodexMcpServers = new McpBridge(config).listCodexServerProjections();
 
   const wrapWithLocalHub = (
     provider: LLMProvider,
@@ -2948,11 +3090,17 @@ async function resolveProvider(
   if (runtime === 'codex') {
     const { CodexProvider } = await import('./codex-provider.js');
     const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
-    const createCodexProvider = (source: CodexModelSource): LLMProvider => source === 'local_api'
-      ? new CodexLocalCliProvider(config)
-      : new CodexProvider(pendingPerms, {
-        profile: source === 'official' ? 'official' : 'external',
+    const createCodexProvider = (source: CodexModelSource): LLMProvider => {
+      if (source === 'local_api') return new CodexLocalCliProvider(config);
+      const profile = source === 'official' ? 'official' : 'external';
+      // 启动时先固化 Primary 的受管 MCP 配置，避免把首条复杂消息当成
+      // 配置初始化时机；受限轻聊和 classifier 使用各自独立 Home。
+      ensureBridgeCodexHome(profile, managedCodexMcpServers);
+      return new CodexProvider(pendingPerms, {
+        profile,
+        managedMcpServers: managedCodexMcpServers,
       });
+    };
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
       .filter((source) => isCodexSourceConfigured(config, source));
     const selectedSource = config.codexModelSource || 'official';
@@ -2983,11 +3131,17 @@ async function resolveProvider(
     }
     const { CodexProvider } = await import('./codex-provider.js');
     const { CodexLocalCliProvider } = await import('./codex-local-cli-provider.js');
-    const createCodexProvider = (source: CodexModelSource): LLMProvider => source === 'local_api'
-      ? new CodexLocalCliProvider(config)
-      : new CodexProvider(pendingPerms, {
-        profile: source === 'official' ? 'official' : 'external',
+    const createCodexProvider = (source: CodexModelSource): LLMProvider => {
+      if (source === 'local_api') return new CodexLocalCliProvider(config);
+      const profile = source === 'official' ? 'official' : 'external';
+      // auto runtime 的 Codex fallback 也必须在启动时准备同一受管配置，
+      // 不能只修手动 codex 模式。
+      ensureBridgeCodexHome(profile, managedCodexMcpServers);
+      return new CodexProvider(pendingPerms, {
+        profile,
+        managedMcpServers: managedCodexMcpServers,
       });
+    };
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
       .filter((source) => isCodexSourceConfigured(config, source));
     const selectedSource = config.codexModelSource || 'official';
@@ -3146,6 +3300,7 @@ function startWorkflowRetryService(
       const prepared = await prepareWorkflowRetryExecution({
         run: claimed,
         cloudDocuments,
+        turnStorage: getBridgeContext().turnStorage,
       });
       const channelType = input.channelType || claimed.channelType;
       const chatId = input.chatId || claimed.chatId;
@@ -3256,6 +3411,7 @@ async function main(): Promise<void> {
     : null;
   let todoReminderService: TodoReminderService | null = null;
   let workflowRetryTimer: NodeJS.Timeout | null = null;
+  let activeReplyControlService: ReturnType<typeof startActiveReplyControlService> | null = null;
   if (knowledgeWatcher) {
     const status = knowledgeWatcher.status();
     console.log(`[claude-to-im] Knowledge index: ${status.itemCount} items, watching=${status.watching}, root=${status.memoryRoot}`);
@@ -3421,6 +3577,20 @@ async function main(): Promise<void> {
     },
     deliver: async ({ task, run, payload }) => {
       const sourceSession = store.getSession(task.executionContext.sourceSessionId);
+      const feishuCardJson = task.action.kind === 'check_in' && task.delivery.channelType === 'feishu'
+        ? buildScheduledTaskCheckInCard({
+            taskId: task.id,
+            slotKey: run.slotKey,
+            name: task.name,
+            text: task.action.text,
+            buttonText: task.action.buttonText,
+            checkInCount: 0,
+            closesAt: new Date(new Date(run.startedAt || run.queuedAt).getTime() + task.action.windowMs).toISOString(),
+          })
+        : undefined;
+      if (task.action.kind === 'check_in' && !feishuCardJson) {
+        return { ok: false, error: `当前渠道 ${task.delivery.channelType} 尚不支持计划任务原生打卡卡片` };
+      }
       const delivered = await bridgeManager.deliverProactiveMessage({
         address: {
           channelType: task.delivery.channelType,
@@ -3435,6 +3605,7 @@ async function main(): Promise<void> {
         prepareFinalReply: true,
         workingDirectory: sourceSession?.working_directory,
         sourcePrompt: task.action.kind === 'agent_turn' ? task.action.prompt : task.name,
+        feishuCardJson,
       });
       return delivered.ok
         ? { ok: true, messageId: delivered.messageId, cardId: delivered.cardId }
@@ -3566,6 +3737,7 @@ async function main(): Promise<void> {
     agentCollaboration: agentCollaborationHost,
     turnStorage,
     artifactEncoding: new ArtifactEncodingInspector(),
+    choicePrompts: new RuntimeChoicePromptStateHost(path.join(CTI_HOME, 'runtime')),
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
@@ -3622,6 +3794,10 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
+  activeReplyControlService = startActiveReplyControlService({
+    cancelActiveReply: (request) => bridgeManager.cancelActiveReply(request),
+  });
+  console.log('[claude-to-im] Active reply control: ready');
   if (config.scheduledTasksEnabled !== false) {
     await scheduledTaskScheduler.start();
     console.log(`[claude-to-im] Scheduled tasks: enabled, root=${path.join(CTI_HOME, 'data', 'scheduled-tasks')}`);
@@ -3664,6 +3840,7 @@ async function main(): Promise<void> {
     const reason = signal ? `signal: ${signal}` : 'shutdown requested';
     console.log(`[claude-to-im] Shutting down (${reason})...`);
     pendingPerms.denyAll();
+    activeReplyControlService?.stop();
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(reason);
     await bridgeManager.stop();
@@ -3690,6 +3867,7 @@ async function main(): Promise<void> {
   });
   process.on('uncaughtException', (err) => {
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
+    activeReplyControlService?.stop();
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(`uncaughtException: ${err.message}`);
     void disposeRuntimeProviders();
@@ -3707,6 +3885,7 @@ async function main(): Promise<void> {
   });
   process.on('exit', (code) => {
     console.log(`[claude-to-im] exit (code: ${code})`);
+    activeReplyControlService?.stop();
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(`process exit: ${code}`);
     todoReminderService?.close();

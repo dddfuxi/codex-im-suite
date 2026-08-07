@@ -27,6 +27,7 @@ import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
 import type {
   ChannelType,
   ChannelAddress,
+  FeishuCardHeroImage,
   InboundMessage,
   InboundLifecycleControl,
   OutboundMention,
@@ -61,6 +62,8 @@ import {
   FeishuStickerMediaCache,
   sniffImageMimeType,
 } from '../channels/feishu/media/sticker-media-cache.js';
+import { inspectFeishuCardImageFile } from '../channels/feishu/media/card-image-file.js';
+import { buildFeishuCardWithoutHero } from '../channels/feishu/cards/card-hero.js';
 import {
   createEmptyFeishuStickerStore,
   isUnsafeFeishuStickerSemanticText,
@@ -157,6 +160,7 @@ import {
   classifyFeishuNativeBotMentionText,
   isFeishuBotMentionedFromMessage,
   normalizeFeishuBotNameAliases,
+  resolveFeishuNativeMentionOnlyWake,
   stripFeishuMentionMarkers,
   type FeishuBotNameWakeClassification,
 } from '../channels/feishu/mentions/inbound-mention-wake.js';
@@ -1928,6 +1932,68 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.inboundQueue.enqueue(msg);
   }
 
+  enqueueSyntheticInbound(message: InboundMessage): boolean {
+    if (!this.running || message.address.channelType !== 'feishu') return false;
+    this.enqueue(message);
+    return true;
+  }
+
+  async verifyChoiceParticipant(chatId: string, userId: string): Promise<{
+    allowed: boolean;
+    source: 'member_api' | 'callback_event' | 'rejected';
+    eligibleParticipantKeys?: string[];
+    error?: string;
+  }> {
+    const normalizedChatId = chatId.trim();
+    const normalizedUserId = userId.trim();
+    if (!normalizedChatId || !normalizedUserId) {
+      return { allowed: false, source: 'rejected', error: '群或点击者身份缺失' };
+    }
+    try {
+      // 群体选择只允许真人成员；/members 是用户成员名单，不把同群机器人算入
+      // “全员已选择”的分母。名单只在 Registry 首次合法点击时冻结。
+      const participantKeys = Array.from(new Set((await this.fetchChatHumanMembers(normalizedChatId))
+        .map((item) => item.member_id?.trim() || '')
+        .filter(Boolean)));
+      const matched = participantKeys.includes(normalizedUserId);
+      return matched
+        ? { allowed: true, source: 'member_api', eligibleParticipantKeys: participantKeys }
+        : { allowed: false, source: 'rejected', error: '点击者不在当前群成员列表' };
+    } catch (error) {
+      // 低风险群体选择允许原生 card.action 的 operator + open_chat_id 作为强 evidence 降级。
+      // 此降级绝不用于权限批准、Owner、高风险确认或身份解析。
+      return {
+        allowed: true,
+        source: 'callback_event',
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async updateInteractiveCard(messageId: string, cardJson: string): Promise<SendResult> {
+    if (!this.restClient) return { ok: false, error: 'Feishu client not initialized' };
+    const target = messageId.trim();
+    if (!target) return { ok: false, error: 'Card message ID is empty' };
+    try {
+      const client = this.restClient as unknown as {
+        im: { message: { patch: (input: unknown) => Promise<{ code?: number; msg?: string; data?: { message_id?: string } }> } };
+      };
+      if (typeof client.im?.message?.patch !== 'function') {
+        return { ok: false, error: 'Feishu message patch API is unavailable' };
+      }
+      const response = await client.im.message.patch({
+        path: { message_id: target },
+        data: { content: cardJson },
+      });
+      if (response?.code === undefined || response.code === 0) {
+        return { ok: true, messageId: response.data?.message_id || target, interactiveCardSent: true };
+      }
+      return { ok: false, error: response.msg || `Feishu card update failed [${response.code}]` };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   private removeQueuedInboundByMessageId(messageId: string): InboundMessage | null {
     const target = messageId.trim();
     if (!target) return null;
@@ -2366,6 +2432,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       responseText,
       summary,
       mentions,
+      cardHero: turnContext?.feishuCardHero,
       hooks: {
         closeStreaming: async (state, sequence) => {
           if (!this.restClient) throw new Error('Feishu REST client is unavailable');
@@ -2684,6 +2751,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         message.feishuCardJson,
         text,
         message.replyToMessageId,
+        message.feishuCardHero,
       );
       if (result.ok) {
         console.log('[feishu-adapter] Interactive card send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
@@ -2693,8 +2761,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return result;
     }
 
-    if (message.parseMode === 'Markdown') {
-      const result = await this.sendAsCard(message.address.chatId, text, message.replyToMessageId, message.mentions);
+    if (message.parseMode === 'Markdown' || message.feishuCardHero) {
+      const result = await this.sendAsCard(
+        message.address.chatId,
+        text,
+        message.replyToMessageId,
+        message.mentions,
+        message.feishuCardHero,
+      );
       if (result.ok) {
         console.log('[feishu-adapter] Markdown send ok:', JSON.stringify({ chatId: message.address.chatId, messageId: result.messageId }));
       } else {
@@ -2836,31 +2910,65 @@ export class FeishuAdapter extends BaseChannelAdapter {
     cardJson: string,
     fallbackText: string,
     replyToMessageId?: string,
+    cardHero?: FeishuCardHeroImage,
   ): Promise<SendResult> {
-    try {
-      const res = replyToMessageId
+    const sendInteractive = async (content: string) => (
+      replyToMessageId
         ? await this.restClient!.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { msg_type: 'interactive', content: cardJson },
+          data: { msg_type: 'interactive', content },
         })
         : await this.restClient!.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
             msg_type: 'interactive',
-            content: cardJson,
+            content,
           },
-        });
+        })
+    );
+
+    try {
+      const res = await sendInteractive(cardJson);
 
       if (res?.data?.message_id) {
-        return { ok: true, messageId: res.data.message_id, cardId: (res.data as { card_id?: string }).card_id };
+        return {
+          ok: true,
+          messageId: res.data.message_id,
+          cardId: (res.data as { card_id?: string }).card_id,
+          interactiveCardSent: true,
+          ...(cardHero ? { cardHeroEmbedded: true } : {}),
+        };
       }
       console.warn('[feishu-adapter] Raw interactive card send failed:', res?.msg, res?.code);
     } catch (err) {
-      console.warn('[feishu-adapter] Raw interactive card error, falling back to text:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] Raw interactive card error:', err instanceof Error ? err.message : err);
     }
 
-    return this.sendAsPlainText(chatId, fallbackText, replyToMessageId);
+    // 头图是可选呈现增强。若平台拒绝图片组件，保留同一张卡的正文和按钮，
+    // 让 Delivery Layer 后续把原图片作为独立附件交付，避免退化成裸 Markdown。
+    const cardWithoutHero = cardHero ? buildFeishuCardWithoutHero(cardJson, cardHero) : null;
+    if (cardWithoutHero) {
+      try {
+        const res = await sendInteractive(cardWithoutHero);
+        if (res?.data?.message_id) {
+          console.warn('[feishu-adapter] Interactive card hero rejected; sent compatible card without hero');
+          return {
+            ok: true,
+            messageId: res.data.message_id,
+            cardId: (res.data as { card_id?: string }).card_id,
+            interactiveCardSent: true,
+          };
+        }
+        console.warn('[feishu-adapter] Hero-free interactive card send failed:', res?.msg, res?.code);
+      } catch (err) {
+        console.warn('[feishu-adapter] Hero-free interactive card error:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    // 最终兼容回退仍使用富文本 post，不能把 ** 等 Markdown 标记直接暴露给用户。
+    const fallback = await this.sendAsPost(chatId, fallbackText, replyToMessageId);
+    return { ...fallback, interactiveCardSent: false };
   }
 
   /**
@@ -2872,8 +2980,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     text: string,
     replyToMessageId?: string,
     mentions: OutboundMention[] = [],
+    cardHero?: FeishuCardHeroImage,
   ): Promise<SendResult> {
-    const cardContent = buildCardContent(text, mentions);
+    const cardContent = buildCardContent(text, mentions, cardHero);
 
     try {
       const res = replyToMessageId
@@ -2891,13 +3000,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
         });
 
       if (res?.data?.message_id) {
-        return { ok: true, messageId: res.data.message_id };
+        return { ok: true, messageId: res.data.message_id, ...(cardHero ? { cardHeroEmbedded: true } : {}) };
       }
       console.warn('[feishu-adapter] Card send failed:', res?.msg, res?.code);
     } catch (err) {
       if (replyToMessageId && this.isInvalidReplyTargetError(err)) {
         console.warn('[feishu-adapter] Card reply target missing, retrying as direct chat send');
-        return this.sendAsCard(chatId, text, undefined, mentions);
+        return this.sendAsCard(chatId, text, undefined, mentions, cardHero);
       }
       console.warn('[feishu-adapter] Card send error, falling back to post:', err instanceof Error ? err.message : err);
     }
@@ -3234,6 +3343,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     let botNameWake: FeishuBotNameWakeClassification | null = null;
     let replyToBotMediaWake: { messageId: string; messageType: string } | null = null;
     let implicitReplyMentionWake: { messageId: string; threadId?: string } | null = null;
+    let pureNativeMentionWake: { reason: 'native_mention_only_light_chat' } | null = null;
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
@@ -3465,22 +3575,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Strip @mention markers from text
     text = stripFeishuMentionMarkers(text);
-    if (
-      isGroup
-      && !isOtherBotSender
-      && messageType === 'text'
-      && !text.trim()
-      && replyTargetMessageId
-      && this.isBotMentionedFromMessage(msg)
-    ) {
-      // 话题/原生回复里只 @ 当前 bot，语义是让 bot 处理被回复内容。
-      // 仅在本轮同时具备原生 mention 与平台 reply/root ID 时生成隐式请求；
-      // 普通群里单独发一个 @ 仍保持静默，避免扩大唤醒范围。
-      text = '请处理我在本条飞书话题中回复或引用的消息。';
+    const mentionOnlyWake = resolveFeishuNativeMentionOnlyWake({
+      isGroup,
+      isOtherBotSender,
+      messageType,
+      nativeBotMentioned: this.isBotMentionedFromMessage(msg),
+      hasVisibleText: Boolean(text.trim()),
+      hasAttachments: attachments.length > 0,
+      replyTargetMessageId,
+    });
+    if (mentionOnlyWake?.kind === 'reply_target' && replyTargetMessageId) {
+      text = mentionOnlyWake.text;
       implicitReplyMentionWake = {
         messageId: replyTargetMessageId,
         threadId: msg.thread_id?.trim() || undefined,
       };
+    } else if (mentionOnlyWake?.kind === 'light_chat') {
+      text = mentionOnlyWake.text;
+      pureNativeMentionWake = { reason: mentionOnlyWake.reason };
+      console.log(
+        '[feishu-adapter] Pure native mention accepted as light chat, chatId:',
+        chatId,
+        'msgId:',
+        msg.message_id,
+      );
     }
     if (this.isWithdrawnPlaceholderText(text)) {
       this.insertInboundFilterAudit(
@@ -3544,6 +3662,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
           messageId: implicitReplyMentionWake.messageId,
           threadId: implicitReplyMentionWake.threadId,
         },
+      } : {}),
+      ...(pureNativeMentionWake ? {
+        feishuPureMentionWake: pureNativeMentionWake,
       } : {}),
       ...(stickerInfo ? { sticker: stickerInfo } : {}),
       ...(stickerInfo ? { messageKind: stickerInfo.messageKind } : {}),
@@ -4568,6 +4689,85 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  /**
+   * 按真实飞书群列表解析群名。绑定表可能只有 chat_id，不能因为本地索引缺少
+   * displayName 就把群目标降级成用户私聊。这里只接受精确名称，或仅忽略末尾
+   * “群/群聊/群组”的安全别名；多结果继续交给上层澄清。
+   */
+  private async findBotChatsByName(targetText: string): Promise<ResolvedConversationTarget[]> {
+    const targetName = cleanMentionName(targetText, '');
+    const normalizedTarget = normalizeMentionAlias(targetName);
+    if (!normalizedTarget) return [];
+
+    const stripGroupSuffix = (value: string) => value.replace(/(?:群聊|群组|群)$/u, '');
+    const targetAlias = stripGroupSuffix(normalizedTarget);
+    const candidates = new Map<string, ResolvedConversationTarget>();
+
+    try {
+      const { appId, appSecret, baseUrl } = this.getAuthContext();
+      const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+      let pageToken = '';
+      // 飞书单页上限为 100；最多扫描 5 页，避免目标解析演变成无界外部读取。
+      for (let page = 0; page < 5; page += 1) {
+        const url = new URL(`${baseUrl.replace(/\/+$/u, '')}/open-apis/im/v1/chats`);
+        url.searchParams.set('page_size', '100');
+        url.searchParams.set('user_id_type', 'open_id');
+        if (pageToken) url.searchParams.set('page_token', pageToken);
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${tenantAccessToken}` },
+          signal: AbortSignal.timeout(10_000),
+        });
+        const payload = await response.json() as {
+          code?: number;
+          msg?: string;
+          data?: {
+            items?: Array<{
+              chat_id?: string;
+              name?: string;
+              chat_type?: string;
+              chat_mode?: string;
+            }>;
+            page_token?: string;
+            has_more?: boolean;
+          };
+        };
+        if (!response.ok || payload.code !== 0) {
+          throw new Error(payload.msg || response.statusText || 'Feishu chat list failed');
+        }
+        for (const item of payload.data?.items || []) {
+          const chatId = item.chat_id?.trim() || '';
+          const displayName = item.name?.trim() || '';
+          if (!chatId || !displayName) continue;
+          const normalizedName = normalizeMentionAlias(displayName);
+          const exact = normalizedName === normalizedTarget;
+          const safeAlias = Boolean(targetAlias) && stripGroupSuffix(normalizedName) === targetAlias;
+          if (!exact && !safeAlias) continue;
+          candidates.set(chatId, {
+            kind: 'chat',
+            id: chatId,
+            displayName,
+            chatType: item.chat_type || item.chat_mode || 'group',
+          });
+          this.chatMetaCache.set(chatId, {
+            displayName,
+            chatType: item.chat_type || item.chat_mode || 'group',
+            cachedAt: Date.now(),
+          });
+        }
+        pageToken = payload.data?.page_token?.trim() || '';
+        if (!payload.data?.has_more || !pageToken) break;
+      }
+    } catch (error) {
+      console.warn('[feishu-adapter] named chat lookup failed:', error instanceof Error ? error.message : error);
+      return [];
+    }
+
+    const all = [...candidates.values()];
+    const exact = all.filter((candidate) => normalizeMentionAlias(candidate.displayName) === normalizedTarget);
+    return exact.length > 0 ? exact : all;
+  }
+
   async resolveConversationTarget(request: ConversationTargetResolveRequest): Promise<ConversationTargetResolveResult> {
     if (request.sourceMessage.address.channelType !== 'feishu') {
       return { ok: false, error: '当前来源不是飞书会话，无法解析跨会话目标' };
@@ -4603,6 +4803,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
       if (bindingCandidates.length > 1) {
         return { ok: false, error: '目标会话匹配到多个结果，请提供准确群名或 chat_id', candidates: bindingCandidates };
+      }
+      if (targetText) {
+        const platformCandidates = await this.findBotChatsByName(targetText);
+        if (platformCandidates.length === 1) {
+          return { ok: true, target: platformCandidates[0] };
+        }
+        if (platformCandidates.length > 1) {
+          return {
+            ok: false,
+            error: '目标群名匹配到多个飞书群，请提供更准确的群名或 chat_id',
+            candidates: platformCandidates,
+          };
+        }
       }
       if (targetId && (targetKind === 'chat' || /^oc_/i.test(targetId))) {
         const displayName = await this.resolveChatDisplayName(targetId, 'group');
@@ -4687,7 +4900,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       };
 
     try {
-      // 这里使用已确认的目标 ID，不复用 source chat_id，避免跨会话发送误回当前群。
+      // 跨会话调用使用已确认目标；当前会话调用则由 manager 先验证目标 ID 与
+      // source chat_id 完全一致。两种路径都不接受模型任意改写收件目标。
       const res = await this.restClient.im.message.create({
         params: { receive_id_type: receiveIdType },
         data,
@@ -5158,9 +5372,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private async fetchChatMemberNames(chatId: string): Promise<Map<string, string>> {
+    const names = new Map<string, string>();
+    for (const item of await this.fetchChatHumanMembers(chatId)) {
+      const candidate = buildFeishuMentionCandidateFromMember(item, true);
+      if (candidate) names.set(candidate.userId, candidate.name);
+    }
+    return names;
+  }
+
+  /**
+   * 返回官方群真人成员原始项。选择会话直接使用 member_id，不能因为成员缺显示名
+   * 就把对方从“全员”分母中静默排除；名称解析则由上层按需处理。
+   */
+  private async fetchChatHumanMembers(chatId: string): Promise<FeishuChatMemberItem[]> {
     const { appId, appSecret, baseUrl } = this.getAuthContext();
     const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
-    const names = new Map<string, string>();
+    const members: FeishuChatMemberItem[] = [];
     let pageToken = '';
 
     while (true) {
@@ -5193,12 +5420,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         throw new Error(`Feishu chats.members failed [${payload.code ?? response.status}]: ${payload.msg || response.statusText}`);
       }
 
-      for (const item of payload.data?.items ?? []) {
-        const candidate = buildFeishuMentionCandidateFromMember(item, true);
-        if (candidate) {
-          names.set(candidate.userId, candidate.name);
-        }
-      }
+      members.push(...(payload.data?.items ?? []));
 
       if (!payload.data?.has_more || !payload.data.page_token) {
         break;
@@ -5206,7 +5428,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       pageToken = payload.data.page_token;
     }
 
-    return names;
+    return members;
   }
 
   private buildFeishuScopeApplyUrl(appId: string, scopes: readonly string[], baseUrl: string): string | undefined {
@@ -6605,7 +6827,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const summary = this.normalizeLightContextAuditSummary(durableContinuation || audit?.summary || '');
     if (!summary) return '';
     const normalizedMessage = messageText.replace(/\s+/g, ' ').trim();
-    if (normalizedMessage && summary.includes(normalizedMessage)) return '';
+    // continuationContext 通常包含卡片可见标题，但还带有原始请求和上一轮结果。
+    // 只有两者完全相同时才去重，不能因为“包含标题”就把整段耐久续办上下文丢掉。
+    if (normalizedMessage && summary === normalizedMessage) return '';
     if (!this.isLowInformationHistoryText(normalizedMessage) && normalizedMessage.length >= 80) return '';
     return summary;
   }
@@ -6777,6 +7001,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         metadata: {
           messageType: item.msg_type,
           contentRecovered,
+          continuationContextRecovered: Boolean(localOutboundSummary),
         },
       });
     }
@@ -6987,21 +7212,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
-      if (!fs.existsSync(filePath)) {
-        return { ok: false, error: `Image file not found: ${filePath}` };
-      }
-
-      const uploadRes = await this.restClient.im.image.create({
-        data: {
-          image_type: 'message',
-          image: fs.createReadStream(filePath),
-        },
-      });
-
-      const imageKey = uploadRes?.image_key;
-      if (!imageKey) {
-        return { ok: false, error: 'Feishu image upload did not return image_key' };
-      }
+      const prepared = await this.prepareLocalImageForCard(filePath);
+      if (!prepared.ok || !prepared.imageKey) return { ok: false, error: prepared.error || 'Feishu image upload failed' };
+      const imageKey = prepared.imageKey;
 
       const sendRes = replyToMessageId
         ? await this.restClient.im.message.reply({
@@ -7029,6 +7242,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
       };
+    }
+  }
+
+  async prepareLocalImageForCard(filePath: string): Promise<{ ok: boolean; imageKey?: string; error?: string }> {
+    if (!this.restClient) return { ok: false, error: 'Feishu client not initialized' };
+    const inspection = inspectFeishuCardImageFile(filePath);
+    if (!inspection) {
+      return { ok: false, error: '图片文件头、尺寸、大小或符号链接检查未通过' };
+    }
+    try {
+      const uploadRes = await this.restClient.im.image.create({
+        data: {
+          image_type: 'message',
+          image: fs.createReadStream(filePath),
+        },
+      });
+      const imageKey = uploadRes?.image_key;
+      return imageKey
+        ? { ok: true, imageKey }
+        : { ok: false, error: 'Feishu image upload did not return image_key' };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 

@@ -18,6 +18,10 @@ const FEISHU_MENTION_ID_FIELDS = [
   'id',
 ] as const;
 const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu;
+// JavaScript 的 `\b` 只按 ASCII 单词边界工作，`at乔治` / `必须at对方`
+// 这类中英紧邻写法不会形成可靠边界。先把可信的 Latin `at` 动词归一为
+// “艾特”，同时用 ASCII 左边界及右侧小写单词保护避免误吃 format/status/chat。
+const FEISHU_COMPACT_LATIN_AT_ACTION_RE = /(?<![A-Za-z0-9_])[Aa][Tt](?=$|[^A-Za-z0-9_]|[A-Z])/gu;
 const FEISHU_OTHER_PERSON_TARGET_RE = /(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人|一个(?:成员|群成员|机器人|参与者|玩家|用户|人)|一位(?:成员|群成员|机器人|参与者|玩家|用户|人)|某个(?:成员|群成员|机器人|参与者|玩家|用户|人))/iu;
 const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【,，.。!！?？~～:：;；])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
 const FEISHU_BARE_AT_BOUNDARY_CLASS = '[\\s([{（【,，.。!！?？~～:：;；]';
@@ -45,6 +49,13 @@ const FEISHU_PLACEHOLDER_MENTION_TEXT_RE = /(^|[^\p{L}\p{N}_])@?_user_\d+(?=$|[^
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeFeishuMentionActionSyntax(text: string): string {
+  return (text || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(FEISHU_COMPACT_LATIN_AT_ACTION_RE, '艾特');
 }
 
 /** 只归一化字段拼写；是否可信仍必须与当前回合原生 evidence 求交集。 */
@@ -137,14 +148,14 @@ function getFeishuMentionInvocationAliases(options: FeishuMentionIntentOptions =
 }
 
 function stripLeadingFeishuMentionInvocation(text: string, options: FeishuMentionIntentOptions = {}): string {
-  const compact = (text || '').normalize('NFKC').replace(/\s+/g, '').trim();
+  const compact = normalizeFeishuMentionActionSyntax(text).replace(/\s+/g, '').trim();
   if (!compact) return compact;
   const lowerCompact = compact.toLocaleLowerCase();
   for (const alias of getFeishuMentionInvocationAliases(options)) {
     const aliasKey = normalizeFeishuMentionTargetKey(alias);
     if (!aliasKey || !lowerCompact.startsWith(aliasKey)) continue;
     const rest = compact.slice(aliasKey.length).replace(/^[,，、:：]+/u, '');
-    if (/^(?:请|帮我|帮忙|麻烦|劳驾|直接|去|艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊|让|找)/iu.test(rest)) return rest;
+    if (/^(?:请|帮我|帮忙|麻烦|劳驾|直接|去|先|再|立即|马上|现在|艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊|让|找)/iu.test(rest)) return rest;
   }
   return compact;
 }
@@ -155,7 +166,7 @@ function hasFeishuDirectInvocationPrefix(compact: string, options: FeishuMention
 }
 
 function isFeishuMentionDeliveryDiagnosticText(userText: string): boolean {
-  const compact = (userText || '').normalize('NFKC').replace(/\s+/g, '');
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '');
   if (!compact || !/(?:艾特|@|＠|\bat\b|mention|提到|点名)/iu.test(compact)) return false;
   const startsWithCurrentMentionCommand = /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:艾特|@|＠|\bat\b|mention|提到|点名|叫|喊)/iu.test(compact);
   const hasPlatformDeliveryDiagnosticSignal = /(?:技术诊断|事件管线|事件订阅|事件回调|回调事件|长连接|webhook|入站|路由规则|消息投递|通知投递|投递失败|未投递|未送达|没送进来|未送进来|群内@|群里@|群聊@|@通知|艾特通知)/iu.test(compact);
@@ -168,7 +179,7 @@ function isFeishuMentionDeliveryDiagnosticText(userText: string): boolean {
 }
 
 function isFeishuMentionHowToOrDiagnosticRequest(userText: string): boolean {
-  const compact = (userText || '').normalize('NFKC').replace(/\s+/g, '');
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '');
   if (!compact) return false;
   return /(?:怎么|如何|怎样|咋|教(?:一教|一下)?|教程|方法|做到).{0,32}(?:艾特|@|＠|at|mention|提到|点名)/iu.test(compact)
     || /(?:艾特|@|＠|at|mention|提到|点名).{0,32}(?:怎么|如何|怎样|为什么|为啥|不行|不能|失败|没反应|不回复|教程|方法)/iu.test(compact)
@@ -177,7 +188,7 @@ function isFeishuMentionHowToOrDiagnosticRequest(userText: string): boolean {
 }
 
 function splitFeishuMentionIntentClauses(text: string): string[] {
-  return (text || '').normalize('NFKC')
+  return normalizeFeishuMentionActionSyntax(text)
     .split(/[\r\n。！？!?；;]+/u)
     .flatMap((part) => part.split(/(?<=[，,、])\s*/u))
     .map((part) => part.replace(/^[，,、\s]+|[，,、\s]+$/gu, '').trim())
@@ -185,7 +196,7 @@ function splitFeishuMentionIntentClauses(text: string): string[] {
 }
 
 function isFeishuNarrativeMentionClause(clause: string, options: FeishuMentionIntentOptions = {}): boolean {
-  const compact = (clause || '').normalize('NFKC').replace(/\s+/g, '');
+  const compact = normalizeFeishuMentionActionSyntax(clause).replace(/\s+/g, '');
   if (!compact || !FEISHU_MENTION_ACTION_RE.test(compact)) return false;
   FEISHU_MENTION_ACTION_RE.lastIndex = 0;
   if (/^(?:当|等|等待|直到|如果|若|每当|轮到|之后|然后|接下来|随后|后面|这时|此时|按顺序|依次|轮流)/u.test(compact)) return true;
@@ -196,7 +207,7 @@ function isFeishuNarrativeMentionClause(clause: string, options: FeishuMentionIn
 }
 
 function isFeishuDirectMentionExecutionClause(clause: string, options: FeishuMentionIntentOptions = {}): boolean {
-  const compact = (clause || '').normalize('NFKC').replace(/\s+/g, '');
+  const compact = normalizeFeishuMentionActionSyntax(clause).replace(/\s+/g, '');
   if (!compact) return false;
   const directCompact = stripLeadingFeishuMentionInvocation(compact, options);
   if (FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact) && !isFeishuNarrativeMentionClause(clause, options)) return true;
@@ -205,18 +216,22 @@ function isFeishuDirectMentionExecutionClause(clause: string, options: FeishuMen
   FEISHU_MENTION_ACTION_RE.lastIndex = 0;
   if (isFeishuNarrativeMentionClause(clause, options)) return false;
   if (/^(?:重发|补发|重新发送|再发(?:一次)?)(?:一下)?(?:并|后|然后)?(?:请|麻烦)?(?:艾特|@|＠|\bat\b|mention|点名|通知)/iu.test(directCompact)) return true;
-  return /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)
+  return /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:先|再|立即|马上|现在)?(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)
     || FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact)
     || /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot).{0,16}(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人|一个(?:成员|群成员|机器人|参与者|玩家|用户|人)|一位(?:成员|群成员|机器人|参与者|玩家|用户|人)|某个(?:成员|群成员|机器人|参与者|玩家|用户|人))/iu.test(directCompact);
 }
 
 export function extractFeishuOrchestratedStarterTargets(userText: string): string[] {
-  const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  const normalized = normalizeFeishuMentionActionSyntax(userText).trim();
   if (!normalized) return [];
   const compact = normalized.replace(/\s+/g, '');
   // “每次要 @ 某人”通常只是流程说明；只有用户同时要求现在开局，并把该人
   // 指定为首位参与者/回答者时，开局回复才需要立即执行这次 mention。
-  if (/(?:先不要|暂不|暂时不|不要|别|无需|不用).{0,16}(?:开始|开局|执行|进行|发起|艾特|@|＠|mention)/iu.test(compact)) {
+  // 参与者自己的局部否定（如“乔治第一轮不要 at”）不能扩大成整轮禁令，
+  // 否则会把另一位明确先手的当前动作一并抹掉。
+  const suppressesSessionStart = /(?:先不要|暂不|暂时不|不要|别|无需|不用).{0,16}(?:开始|开局|执行|进行|发起)/iu.test(compact);
+  const suppressesCurrentMention = /(?:^|[，,。！？!?；;])(?:现在|当前|这轮|本轮|第一轮)?(?:先不要|暂不|暂时不|不要|别|无需|不用).{0,16}(?:艾特|@|＠|mention)/iu.test(compact);
+  if (suppressesSessionStart || suppressesCurrentMention) {
     return [];
   }
   const directlyStartsInteraction = /(?:你们(?:俩|两个|几位)?|两位|双方|机器人们?).{0,24}(?:开始|开辩|辩论|讨论|对话|轮流|互相)/u.test(compact)
@@ -263,7 +278,7 @@ export function extractFeishuOrchestratedStarterTargets(userText: string): strin
 
 /** 只识别当前轮次的“发言后交接给对方”语义，具体人物由平台身份策略解析。 */
 export function hasFeishuCounterpartyMentionHandoff(userText: string): boolean {
-  const compact = (userText || '').normalize('NFKC').replace(/\s+/g, '').trim();
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '').trim();
   if (!compact) return false;
   const repeatedMentionHandoff = /(?:每次|每轮|每回合|发言完|说完|回复完|观点后|结束前).{0,48}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
   const mandatoryMentionHandoff = /(?:必须|需要|要|务必|记得|都得|都要|应当|应该).{0,24}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
@@ -334,7 +349,7 @@ export function extractExplicitFeishuMentionTargetsFromRequest(
   userText: string,
   options: FeishuMentionIntentOptions = {},
 ): string[] {
-  const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  const normalized = normalizeFeishuMentionActionSyntax(userText).trim();
   if (!isFeishuMentionExecutionRequest(normalized, options)) return [];
   const targets = new Map<string, string>();
   const addTarget = (target: string) => {

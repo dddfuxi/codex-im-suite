@@ -28,6 +28,7 @@ import {
 } from './codex-execution-profile.js';
 import { resolveProviderWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
+import type { CodexMcpServerProjection } from './mcp-bridge.js';
 
 export type { CodexProviderProfile } from './codex-execution-profile.js';
 
@@ -47,6 +48,13 @@ const SYSTEM_PROMPT_CHAR_BUDGET = 4000;
 const MAX_HISTORY_ENTRY_CHARS = 800;
 const MAX_TOOL_RESULT_CHARS = 240;
 const FINAL_REPLY_FENCE = 'cti-final';
+const DEFAULT_FINAL_DRAIN_TIMEOUT_MS = 5_000;
+const MIN_FINAL_DRAIN_TIMEOUT_MS = 1_000;
+const MAX_FINAL_DRAIN_TIMEOUT_MS = 60_000;
+const FINAL_DRAIN_TIMEOUT = Symbol('codex-final-drain-timeout');
+const DEFAULT_STREAM_RECOVERY_TIMEOUT_MS = 15 * 60_000;
+const MAX_STREAM_RECOVERY_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_STREAM_RECOVERY_POLL_MS = 500;
 const SHARED_CODEX_HOME_PATHS = ['skills', 'plugins', 'vendor_imports', 'rules'];
 const DEFAULT_BRIDGE_BLOCKED_SKILLS = ['github-memory-protocol'];
 const LOCAL_CODEX_HOME_BLOCKED_PATHS = ['plugins', path.join('.tmp', 'plugins')];
@@ -64,6 +72,247 @@ type CodexInstance = any;
 type ThreadInstance = any;
 interface CodexProviderOptions {
   profile?: CodexProviderProfile;
+  /** Runtime 从受管 MCP manifest 生成的可信连接；不接受模型侧动态输入。 */
+  managedMcpServers?: readonly CodexMcpServerProjection[];
+  /** classifier 必须使用独立 Home，测试或受控宿主可显式覆盖。 */
+  classifierCodexHome?: string;
+  /** 完整最终协议出现后等待 SDK 正常结束的时长；测试可注入更短值。 */
+  finalDrainTimeoutMs?: number;
+  /** SDK 断流后等待同一受管 rollout 收口的时长；不会重放原任务。 */
+  streamRecoveryTimeoutMs?: number;
+  /** 测试或受控宿主可覆盖 rollout 所在 Codex Home。 */
+  codexHome?: string;
+  /** 测试可降低轮询间隔。 */
+  streamRecoveryPollMs?: number;
+}
+
+function resolveFinalDrainTimeoutMs(configured?: number): number {
+  if (Number.isFinite(configured) && Number(configured) > 0) {
+    return Math.max(1, Math.floor(Number(configured)));
+  }
+  const fromEnv = Number(process.env.CTI_CODEX_FINAL_DRAIN_TIMEOUT_MS);
+  if (!Number.isFinite(fromEnv) || fromEnv <= 0) return DEFAULT_FINAL_DRAIN_TIMEOUT_MS;
+  return Math.min(
+    MAX_FINAL_DRAIN_TIMEOUT_MS,
+    Math.max(MIN_FINAL_DRAIN_TIMEOUT_MS, Math.floor(fromEnv)),
+  );
+}
+
+function resolveStreamRecoveryTimeoutMs(configured?: number): number {
+  if (Number.isFinite(configured) && Number(configured) > 0) {
+    return Math.max(1, Math.floor(Number(configured)));
+  }
+  const fromEnv = Number(process.env.CTI_CODEX_STREAM_RECOVERY_TIMEOUT_MS);
+  if (!Number.isFinite(fromEnv) || fromEnv <= 0) return DEFAULT_STREAM_RECOVERY_TIMEOUT_MS;
+  return Math.min(MAX_STREAM_RECOVERY_TIMEOUT_MS, Math.max(1_000, Math.floor(fromEnv)));
+}
+
+function resolveStreamRecoveryPollMs(configured?: number): number {
+  if (!Number.isFinite(configured) || Number(configured) <= 0) return DEFAULT_STREAM_RECOVERY_POLL_MS;
+  return Math.max(5, Math.floor(Number(configured)));
+}
+
+/**
+ * 只把完整、严格且具备可交付内容的 cti-final 视为收尾信号。
+ * 裸 JSON、截断 fence 和普通进度文字都不能启动 watchdog。
+ */
+export function hasCompleteFinalReplyEnvelope(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const fencePattern = /```cti-final[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```/giu;
+  for (const match of text.matchAll(fencePattern)) {
+    try {
+      const parsed = JSON.parse(match[1].trim()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      const envelope = parsed as Record<string, unknown>;
+      if (!['text', 'image', 'file', 'mixed'].includes(String(envelope.kind || '').toLowerCase())) continue;
+      if (!['plain', 'markdown', 'html'].includes(String(envelope.reply_mode || '').toLowerCase())) continue;
+      if (typeof envelope.text !== 'string') continue;
+      if (!Array.isArray(envelope.images) || !envelope.images.every((item) => typeof item === 'string')) continue;
+      if (!Array.isArray(envelope.files) || !envelope.files.every((item) => typeof item === 'string')) continue;
+      if (!envelope.text.trim() && envelope.images.length === 0 && envelope.files.length === 0) continue;
+      return true;
+    } catch {
+      // 继续检查同一消息中的后续完整 fence。
+    }
+  }
+  return false;
+}
+
+/**
+ * Shell 只是承载层。只有命令明确调用受控 Unity bridge/CLI 时，才把它提升为
+ * Unity 工具证据；普通 Bash/PowerShell 成功不能冒充场景写入成功。
+ */
+export function inferCommandExecutionToolName(command: string): string {
+  const normalized = command.normalize('NFKC').replace(/\\/gu, '/').toLowerCase();
+  if (
+    /(?:^|[\s"'])[^\s"']*\/\.aibridge\/cli\/aibridgecli(?:\.exe)?(?:[\s"']|$)/u.test(normalized)
+    || /(?:^|[\s"'])[^\s"']*\/mcp-for-unity(?:\.exe)?(?:[\s"']|$)/u.test(normalized)
+    || /(?:^|[\s"'])unity(?:\.exe)?[\s"'][^\r\n]*-batchmode\b/u.test(normalized)
+  ) {
+    return 'unity-mcp:managed-cli';
+  }
+  return 'Bash';
+}
+
+function findManagedRolloutFile(codexHome: string, threadId: string): string | undefined {
+  const roots = [path.join(codexHome, 'sessions'), path.join(codexHome, 'archived_sessions')];
+  const stack = roots.filter((root) => fs.existsSync(root));
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const target = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(target);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl') && entry.name.includes(threadId)) {
+        return target;
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseRolloutToolInput(raw: unknown): unknown {
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return { raw };
+  }
+}
+
+function readRolloutCommand(input: unknown): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '';
+  const command = (input as Record<string, unknown>).command;
+  return typeof command === 'string' ? command : '';
+}
+
+function isRolloutToolOutputError(output: string): boolean {
+  const exitCode = output.match(/(?:^|\n)Exit code:\s*(-?\d+)/iu)?.[1];
+  return exitCode !== undefined && Number(exitCode) !== 0;
+}
+
+interface DisconnectedTurnRecoveryInput {
+  codexHome: string;
+  threadId: string;
+  turnStartedAtMs: number;
+  controller: ReadableStreamDefaultController<string>;
+  signal: AbortSignal;
+  timeoutMs: number;
+  pollMs: number;
+  seenItemIds: Set<string>;
+}
+
+/**
+ * SDK 的 HTTP/事件流偶尔会先断开，但受管 Codex 子进程仍继续写同一 rollout。
+ * 这里只跟随同一 thread 的耐久事件，不重新提交 prompt，因此不会重复副作用。
+ */
+async function recoverDisconnectedTurn(input: DisconnectedTurnRecoveryInput): Promise<boolean> {
+  const deadline = Date.now() + input.timeoutMs;
+  let rolloutPath: string | undefined;
+  let offset = 0;
+  const pendingCalls = new Map<string, { name: string; toolName: string; toolInput: unknown }>();
+  const emittedCommentary = new Set<string>();
+
+  while (Date.now() < deadline && !input.signal.aborted) {
+    rolloutPath ||= findManagedRolloutFile(input.codexHome, input.threadId);
+    if (rolloutPath) {
+      let buffer: Buffer;
+      try {
+        buffer = fs.readFileSync(rolloutPath);
+      } catch {
+        buffer = Buffer.alloc(0);
+      }
+      if (buffer.length < offset) offset = 0;
+      const unread = buffer.subarray(offset);
+      const lastNewline = unread.lastIndexOf(0x0a);
+      if (lastNewline >= 0) {
+        const complete = unread.subarray(0, lastNewline + 1).toString('utf8');
+        offset += lastNewline + 1;
+        for (const line of complete.split(/\r?\n/gu)) {
+          if (!line.trim()) continue;
+          let record: Record<string, unknown>;
+          try {
+            record = JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          const timestamp = Date.parse(String(record.timestamp || ''));
+          if (Number.isFinite(timestamp) && timestamp + 1_000 < input.turnStartedAtMs) continue;
+          const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+            ? record.payload as Record<string, unknown>
+            : undefined;
+          if (!payload) continue;
+
+          if (record.type === 'response_item' && payload.type === 'function_call') {
+            const callId = String(payload.call_id || '');
+            if (!callId || input.seenItemIds.has(callId)) continue;
+            const name = String(payload.name || 'tool');
+            const toolInput = parseRolloutToolInput(payload.arguments);
+            const command = name === 'shell_command' ? readRolloutCommand(toolInput) : '';
+            const toolName = name === 'shell_command' ? inferCommandExecutionToolName(command) : name;
+            pendingCalls.set(callId, { name, toolName, toolInput });
+            input.controller.enqueue(sseEvent('tool_use', {
+              id: callId,
+              name: toolName,
+              input: toolInput,
+            }));
+            continue;
+          }
+
+          if (record.type === 'response_item' && payload.type === 'function_call_output') {
+            const callId = String(payload.call_id || '');
+            if (!callId || input.seenItemIds.has(callId)) continue;
+            const pending = pendingCalls.get(callId);
+            if (!pending) continue;
+            const output = typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output ?? 'Done');
+            input.seenItemIds.add(callId);
+            pendingCalls.delete(callId);
+            input.controller.enqueue(sseEvent('tool_result', {
+              tool_use_id: callId,
+              content: output || 'Done',
+              is_error: isRolloutToolOutputError(output),
+            }));
+            continue;
+          }
+
+          if (record.type === 'event_msg' && payload.type === 'agent_message' && payload.phase === 'commentary') {
+            const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+            if (message && !emittedCommentary.has(message)) {
+              emittedCommentary.add(message);
+              input.controller.enqueue(sseEvent('text', message));
+            }
+            continue;
+          }
+
+          if (record.type === 'event_msg' && payload.type === 'task_complete') {
+            const finalText = typeof payload.last_agent_message === 'string'
+              ? payload.last_agent_message.trim()
+              : '';
+            if (finalText) input.controller.enqueue(sseEvent('text', finalText));
+            input.controller.enqueue(sseEvent('result', { session_id: input.threadId }));
+            return true;
+          }
+        }
+      }
+    }
+
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        input.signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, input.pollMs);
+      input.signal.addEventListener('abort', finish, { once: true });
+    });
+  }
+  return false;
 }
 
 /**
@@ -168,6 +417,13 @@ function getExternalCodexHome(): string {
 
 function getLocalPrimaryCodexHome(): string {
   return process.env.CTI_CODEX_LOCAL_PRIMARY_HOME || path.join(CTI_HOME, 'runtime', 'codex-home-local-primary');
+}
+
+function getCodexHomeForProfile(profile: CodexProviderProfile): string {
+  if (profile === 'official') return getOfficialCodexHome();
+  if (profile === 'external') return getExternalCodexHome();
+  if (profile === 'local_primary') return getLocalPrimaryCodexHome();
+  return getBridgeCodexHome();
 }
 
 function normalizeLocalFallbackBaseUrl(baseUrl: string, kind: string): string {
@@ -300,18 +556,24 @@ function syncFileIfNewer(sourcePath: string, targetPath: string): void {
 }
 
 function getSharedCodexHomePaths(profile: CodexProviderProfile): string[] {
-  const shared = SHARED_CODEX_HOME_PATHS.filter((relativePath) => relativePath !== 'skills');
-  if (profile === 'local_primary') return shared.filter((relativePath) => relativePath !== 'plugins');
+  const inheritGlobalPlugins = profile !== 'local_primary'
+    && process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS === 'true';
+  const shared = SHARED_CODEX_HOME_PATHS.filter((relativePath) => relativePath !== 'skills'
+    && (inheritGlobalPlugins || relativePath !== 'plugins'));
   return shared;
 }
 
-function removeLocalCodexPluginState(bridgeHome: string, profile: CodexProviderProfile): void {
-  if (profile !== 'local_primary') return;
+function removeUnsupportedCodexPluginState(bridgeHome: string, profile: CodexProviderProfile): void {
+  const inheritGlobalPlugins = profile !== 'local_primary'
+    && process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS === 'true';
+  if (inheritGlobalPlugins) return;
   for (const relativePath of LOCAL_CODEX_HOME_BLOCKED_PATHS) {
     try {
-      fs.rmSync(path.join(bridgeHome, relativePath), { recursive: true, force: true });
+      // Bridge Home 是生成目录；遇到 junction/symlink 时只解除生成入口，不能
+      // 递归触碰用户全局插件缓存。
+      removeGeneratedSharedPath(path.join(bridgeHome, relativePath));
     } catch {
-      // best effort; local agent must not depend on plugin sync state
+      // best effort; CLI/SDK Bridge 不应依赖桌面专用插件运行态
     }
   }
 }
@@ -323,6 +585,8 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: 
   let skipSection = false;
   let inTopLevel = true;
   const inheritGlobalMcp = process.env.CTI_CODEX_INHERIT_GLOBAL_MCP === 'true';
+  const inheritGlobalPlugins = profile !== 'local_primary'
+    && process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS === 'true';
   const isolateLocalAgent = profile === 'local_primary';
 
   for (const line of lines) {
@@ -337,7 +601,8 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: 
       const isMemoriesSection = sectionName === 'memories' || sectionName.startsWith('memories.');
       skipSection = isFeatureSection
         || (!inheritGlobalMcp && isMcpSection)
-        || (isolateLocalAgent && (isPluginSection || isMarketplaceSection || isDesktopSection || isMemoriesSection));
+        || (!inheritGlobalPlugins && (isPluginSection || isMarketplaceSection || isDesktopSection))
+        || (isolateLocalAgent && isMemoriesSection);
       inTopLevel = false;
       if (!skipSection) sections.push(line);
       continue;
@@ -361,6 +626,53 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: 
     .concat('\n');
 }
 
+function renderManagedCodexMcpConfig(
+  content: string,
+  profile: CodexProviderProfile,
+  servers: readonly CodexMcpServerProjection[] = [],
+): string {
+  // 受限本地 Agent / classifier 不能因为 Primary 的能力投影获得 MCP。
+  if (profile === 'local_primary' || servers.length === 0) return content;
+  const sections: string[] = [];
+  const seen = new Set<string>();
+
+  for (const server of servers) {
+    const name = server.name.trim();
+    const key = name.toLowerCase();
+    if (!/^[A-Za-z0-9_-]{1,64}$/u.test(name) || seen.has(key)) continue;
+    seen.add(key);
+    const sectionPattern = new RegExp(`\\[mcp_servers\\.(?:"${name}"|${name})\\]`, 'iu');
+    if (sectionPattern.test(content)) continue;
+
+    if (server.type === 'http') {
+      if (!server.url || !/^https?:\/\//iu.test(server.url)) continue;
+      sections.push([
+        `[mcp_servers.${name}]`,
+        `url = ${JSON.stringify(server.url)}`,
+      ].join('\n'));
+      continue;
+    }
+
+    if (!server.command || !path.isAbsolute(server.command)) continue;
+    const lines = [
+      `[mcp_servers.${name}]`,
+      `command = ${JSON.stringify(server.command)}`,
+    ];
+    const envEntries = Object.entries(server.env || {})
+      .filter(([envKey]) => /^[A-Za-z_][A-Za-z0-9_]*$/u.test(envKey));
+    if (envEntries.length > 0) {
+      lines.push(`[mcp_servers.${name}.env]`);
+      for (const [envKey, value] of envEntries) {
+        lines.push(`${envKey} = ${JSON.stringify(value)}`);
+      }
+    }
+    sections.push(lines.join('\n'));
+  }
+
+  if (sections.length === 0) return content;
+  return `${content.trimEnd()}\n\n# Managed by codex-im-suite from config/mcp.d\n${sections.join('\n\n')}\n`;
+}
+
 function resetBridgeStateDatabases(bridgeHome: string): void {
   // Codex 会从 sessions 回填 state DB。若每次创建主客户端/分类器都删除它，
   // 冷启动回填会与短超时互相打断，并留下持续的 backfill 锁。
@@ -378,8 +690,14 @@ function resetBridgeStateDatabases(bridgeHome: string): void {
   }
 }
 
-export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
-  const bridgeHome = profile === 'local_primary'
+export function ensureBridgeCodexHome(
+  profile: CodexProviderProfile,
+  managedMcpServers: readonly CodexMcpServerProjection[] = [],
+  homeOverride?: string,
+): string {
+  const bridgeHome = homeOverride
+    ? path.resolve(homeOverride)
+    : profile === 'local_primary'
       ? getLocalPrimaryCodexHome()
       : profile === 'official'
         ? getOfficialCodexHome()
@@ -394,7 +712,7 @@ export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
   fs.mkdirSync(path.join(bridgeHome, 'archived_sessions'), { recursive: true });
   fs.mkdirSync(path.join(bridgeHome, 'tmp'), { recursive: true });
   resetBridgeStateDatabases(bridgeHome);
-  removeLocalCodexPluginState(bridgeHome, profile);
+  removeUnsupportedCodexPluginState(bridgeHome, profile);
 
   syncFileIfNewer(path.join(globalHome, 'auth.json'), path.join(bridgeHome, 'auth.json'));
 
@@ -405,9 +723,10 @@ export function ensureBridgeCodexHome(profile: CodexProviderProfile): string {
 
   const globalConfigPath = path.join(globalHome, 'config.toml');
   const bridgeConfigPath = path.join(bridgeHome, 'config.toml');
-  const bridgeConfig = fs.existsSync(globalConfigPath)
+  const sanitizedBridgeConfig = fs.existsSync(globalConfigPath)
     ? sanitizeCodexConfig(fs.readFileSync(globalConfigPath, 'utf-8'), reasoningEffort, profile)
     : `model_reasoning_effort = "${reasoningEffort}"\n`;
+  const bridgeConfig = renderManagedCodexMcpConfig(sanitizedBridgeConfig, profile, managedMcpServers);
   fs.writeFileSync(bridgeConfigPath, bridgeConfig, 'utf-8');
 
   return bridgeHome;
@@ -451,7 +770,11 @@ export function getOrdinaryCodexExecutionProfile(
   return resolveExecutionProfile(profile, false);
 }
 
-function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): CodexClientOptions & {
+function buildCodexClientOptions(
+  profile: CodexProviderProfile = 'primary',
+  managedMcpServers: readonly CodexMcpServerProjection[] = [],
+  homeOverride?: string,
+): CodexClientOptions & {
   executionProfile: CodexExecutionProfile;
   modelOverride?: string;
   passModel: boolean;
@@ -467,7 +790,7 @@ function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): Cod
       || process.env.OPENAI_API_KEY
       || undefined)
       : undefined;
-  const bridgeCodexHome = ensureBridgeCodexHome(profile);
+  const bridgeCodexHome = ensureBridgeCodexHome(profile, managedMcpServers, homeOverride);
   process.env.CODEX_HOME = bridgeCodexHome;
   const env = {
     ...toTextEnv(process.env),
@@ -492,26 +815,35 @@ function buildCodexClientOptions(profile: CodexProviderProfile = 'primary'): Cod
   };
 }
 
-export function buildCodexClientOptionsForTest(profile: CodexProviderProfile = 'primary'): CodexClientOptions & {
+export function buildCodexClientOptionsForTest(
+  profile: CodexProviderProfile = 'primary',
+  managedMcpServers: readonly CodexMcpServerProjection[] = [],
+): CodexClientOptions & {
   executionProfile: CodexExecutionProfile;
   modelOverride?: string;
   passModel: boolean;
   profile: CodexProviderProfile;
 } {
-  return buildCodexClientOptions(profile);
+  return buildCodexClientOptions(profile, managedMcpServers);
 }
 
 /**
  * 常驻 app-server 与一次性 Codex SDK 必须复用同一模型、认证和隔离 Home。
  * 该出口只暴露启动受限会话所需的运行参数，避免第二套 Provider 配置漂移。
  */
-export function buildRestrictedCodexRuntimeProfile(profile: CodexProviderProfile = 'official'): {
+export function buildRestrictedCodexRuntimeProfile(
+  profile: CodexProviderProfile = 'official',
+  restrictedCodexHome?: string,
+): {
   executionProfile: CodexExecutionProfile;
   env: Record<string, string>;
   apiKey?: string;
   config: Record<string, unknown>;
 } {
-  const clientOptions = buildCodexClientOptions(profile);
+  // 轻聊协调器不能复用 Primary 的可变 config.toml：否则它每次按无 MCP
+  // 配置初始化时都会覆盖 official / external Home 的受管 manifest 投影。
+  // 独立 Home 同步认证与受控基础配置，但继续保持无 MCP、无工具边界。
+  const clientOptions = buildCodexClientOptions(profile, [], restrictedCodexHome);
   return {
     executionProfile: resolveExecutionProfile(profile, true),
     env: clientOptions.env,
@@ -588,6 +920,7 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- If only part of the task can be completed, keep the useful partial result, explain the exact blocker, and give one concrete next confirmation or option.',
     '- Do not answer executable tasks with generic instructions, suggested manual steps, placeholder tables, or sample scripts unless the user explicitly asks for a tutorial or draft.',
     '- For Unity/Blender/MCP/repository/file tasks, the final answer must be based on real tool output, a real command result, or an explicit blocker from a concrete attempt.',
+    '- Use only tools and skills actually exposed by the current runtime. Do not guess skill paths or manually execute files from plugin caches; if an exposed capability lacks its required helper/runtime, report that concrete blocker and use a verified non-plugin alternative only when one exists.',
     '- For a concrete Unity/Prefab/scene request, never answer with "please specify MCP entry" or an MCP entry list if the user already named Unity, Unity MCP, unitymcp, prefab, a scene, or a prefab/object name. Attempt Unity tooling, or report the exact blocker.',
     '- For screenshot requests, only send images that were captured or regenerated during the current turn, or images that the user explicitly asked to resend by exact path/name. Do not search old capture folders and reuse a historical screenshot as proof of a new scene refresh.',
     '- If Unity scene refresh or preview capture fails, return a text-only "未完成" blocker. Do not attach a previous screenshot to make the task look complete.',
@@ -610,9 +943,17 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- images and files must contain only requested output deliverables. Attachments supplied only for recognition, description, analysis, or context are input evidence and must not be copied into these arrays unless the user\'s actual result objective requires delivering that same source attachment.',
     '- Judge source-attachment delivery from the current request purpose rather than a fixed phrase or filename. New generated/edited/annotated/exported artifacts may use their new verified local paths.',
     '- Otherwise images and files must be empty arrays.',
+    '- Optional card_hero may be {"image":"<one exact path already present in images>","alt":"<short description>"} when one delivered image should appear as a wide card banner above the reply text and controls. Use it based on the requested presentation goal, not fixed keywords.',
+    '- card_hero never creates or fetches an image. Its image must exactly match one entry in images. Never put an image_key, URL, callback data, platform identity, or an input-only attachment in card_hero.',
     '- reply_mode must be one of: plain, markdown, html.',
     '- Optional keys mentions and reply_to may be included when needed.',
+    '- For Feishu market-style overviews, monitoring/status analysis, comparisons, reviews, or incident situation reports with several real indicators, optional analysis_view may contain visible-only title, verdict, tone, metrics, and sections. Do not use it for lightweight chat or invent metrics to fill a template.',
+    '- analysis_view tone is positive|negative|warning|neutral|info; metrics contains at most 6 objects with label/value and optional change/tone; sections contains at most 4 objects with title/items and optional tone. Never include Card JSON, colors, callbacks, URLs, commands, paths, platform IDs, or trusted actions.',
+    '- Keep the normal text as useful fallback detail, but do not repeat the same analysis_view title, verdict, and all metrics verbatim. Use it for supporting evidence or context.',
     '- When the user must choose one of 2-8 concrete known alternatives, optional choices may be an array of objects with only label and optional description; optional choice_title names the decision.',
+    '- For a multi-turn finite-choice interaction, include choice_flow={"mode":"continuous","state":"active"} with 2-8 choices on every non-terminal turn. On the terminal turn include choice_flow={"mode":"continuous","state":"complete"}. Never invent a flow ID; the Bridge owns it.',
+    '- Only when the user explicitly requests group participation, include choice_session: vote={"mode":"vote","state":"active","duration_seconds":10..3600}, claim={"mode":"claim","state":"active"}, or parallel={"mode":"parallel","state":"active"}. Ordinary choices omit it and remain initiator-only.',
+    '- Group choice is never a permission, Owner/high-risk confirmation, credential, or identity mechanism. Never include participant IDs or callback/action fields.',
     '- Do not use choices for free-form input, permissions, Owner/high-risk confirmation, secrets, identity resolution, or arbitrary commands. Never include callback_data or platform/action parameters; the Bridge creates safe buttons.',
     '- Never output a naked JSON object outside the fenced result block.',
     `- Example:\n\`\`\`${FINAL_REPLY_FENCE}\n{"kind":"text","text":"对应关系再发你一次：\\n| Key | Label |\\n|---|---|\\n| \`ITEM_A\` | 标签A |","images":[],"files":[],"reply_mode":"markdown"}\n\`\`\``,
@@ -756,7 +1097,10 @@ export class CodexProvider implements LLMProvider {
       );
     }
 
-    const clientOptions = buildCodexClientOptions(this.options.profile || 'primary');
+    const clientOptions = buildCodexClientOptions(
+      this.options.profile || 'primary',
+      this.options.managedMcpServers,
+    );
 
     const CodexClass = this.sdk.Codex;
     this.codex = new CodexClass({
@@ -772,7 +1116,12 @@ export class CodexProvider implements LLMProvider {
   private async ensureClassifierSDK(): Promise<{ sdk: CodexModule; codex: CodexInstance }> {
     const { sdk } = await this.ensureSDK();
     if (!this.classifierCodex) {
-      const clientOptions = buildCodexClientOptions(this.options.profile || 'primary');
+      const profile = this.options.profile || 'primary';
+      const classifierCodexHome = this.options.classifierCodexHome
+        || path.join(CTI_HOME, 'runtime', 'codex-classifier', `codex-home-${profile}`);
+      // classifier 与轻聊协调器一样是无工具受限回合，不能用“无 MCP 配置”
+      // 重写 Primary official / external Home；两者必须物理隔离。
+      const clientOptions = buildCodexClientOptions(profile, [], classifierCodexHome);
       this.classifierCodex = new sdk.Codex({
         ...(clientOptions.apiKey ? { apiKey: clientOptions.apiKey } : {}),
         ...(clientOptions.baseUrl ? { baseUrl: clientOptions.baseUrl } : {}),
@@ -853,6 +1202,11 @@ export class CodexProvider implements LLMProvider {
               : providerWorkspace?.source === 'workspace_plan'
                 ? providerWorkspace.additionalDirectories
                 : normalizeAdditionalDirectories(params.additionalDirectories);
+            // 官方 Codex 的 Web Search 是服务端只读能力，不依赖 Desktop Browser
+            // helper。仅在正常官方回合开放；受限分类器、外部端点和本地模型继续禁用。
+            const webSearchMode = !restrictedMode && executionProfile.modelSource === 'official'
+              ? 'live'
+              : 'disabled';
             controller.enqueue(sseEvent('status', {
               provider: 'codex',
               codexProfile: profile,
@@ -869,9 +1223,9 @@ export class CodexProvider implements LLMProvider {
               approvalPolicy,
               sandboxMode,
               modelReasoningEffort: executionProfile.submittedReasoningEffort,
+              webSearchMode,
               ...(restrictedMode ? {
                 networkAccessEnabled: false,
-                webSearchMode: 'disabled',
                 skipGitRepoCheck: true,
               } : {}),
             };
@@ -934,10 +1288,28 @@ export class CodexProvider implements LLMProvider {
 
               let sawAnyEvent = false;
               try {
-                const { events } = await thread.runStreamed(input, {
-                  ...(params.responseSchema ? { outputSchema: params.responseSchema } : {}),
-                  ...(params.abortController?.signal ? { signal: params.abortController.signal } : {}),
-                });
+                const upstreamSignal = params.abortController?.signal;
+                const runAbortController = new AbortController();
+                const turnStartedAtMs = Date.now();
+                let activeThreadId = savedThreadId;
+                const seenItemIds = new Set<string>();
+                const relayUpstreamAbort = () => runAbortController.abort(upstreamSignal?.reason);
+                if (upstreamSignal?.aborted) {
+                  relayUpstreamAbort();
+                } else {
+                  upstreamSignal?.addEventListener('abort', relayUpstreamAbort, { once: true });
+                }
+                let events: AsyncIterable<any>;
+                try {
+                  ({ events } = await thread.runStreamed(input, {
+                    ...(params.responseSchema ? { outputSchema: params.responseSchema } : {}),
+                    signal: runAbortController.signal,
+                  }));
+                } catch (err) {
+                  upstreamSignal?.removeEventListener('abort', relayUpstreamAbort);
+                  runAbortController.abort(err);
+                  throw err;
+                }
 
                 // `thread.started` 只保证在新线程出现；恢复既有线程时 Codex SDK
                 // 可能直接返回 turn 事件。图片已经被本轮 runStreamed 接收后就在这里
@@ -947,15 +1319,64 @@ export class CodexProvider implements LLMProvider {
                 }
 
                 let emittedAgentMessage = false;
-                for await (const event of events) {
-                  sawAnyEvent = true;
-                  if (params.abortController?.signal.aborted) {
-                    break;
-                  }
+                let sawCompleteFinalEnvelope = false;
+                let sawTurnCompleted = false;
+                let streamTerminalError = '';
+                let postFinalDrainTriggered = false;
+                let finalDrainTimer: ReturnType<typeof setTimeout> | undefined;
+                let resolveFinalDrain: (() => void) | undefined;
+                let finalDrainPromise: Promise<typeof FINAL_DRAIN_TIMEOUT> | undefined;
+                const clearFinalDrain = () => {
+                  if (finalDrainTimer) clearTimeout(finalDrainTimer);
+                  finalDrainTimer = undefined;
+                  finalDrainPromise = undefined;
+                  resolveFinalDrain = undefined;
+                };
+                const invalidateFinalDrain = () => {
+                  if (!sawCompleteFinalEnvelope) return;
+                  sawCompleteFinalEnvelope = false;
+                  clearFinalDrain();
+                };
+                const armFinalDrain = () => {
+                  if (restrictedMode || finalDrainPromise || upstreamSignal?.aborted) return;
+                  finalDrainPromise = new Promise<typeof FINAL_DRAIN_TIMEOUT>((resolve) => {
+                    resolveFinalDrain = () => resolve(FINAL_DRAIN_TIMEOUT);
+                  });
+                  finalDrainTimer = setTimeout(() => {
+                    if (sawTurnCompleted || upstreamSignal?.aborted) return;
+                    postFinalDrainTriggered = true;
+                    // 先终止 SDK 子进程，再独立唤醒本地迭代循环；即使 SDK 没有
+                    // 因 signal 产出 EOF，也能用已经验证的最终协议正常收口。
+                    runAbortController.abort(new Error('Codex final drain timeout'));
+                    resolveFinalDrain?.();
+                  }, resolveFinalDrainTimeoutMs(self.options.finalDrainTimeoutMs));
+                };
+                const iterator = events[Symbol.asyncIterator]();
+                try {
+                  eventLoop: while (true) {
+                    const nextEvent = finalDrainPromise
+                      ? await Promise.race([iterator.next(), finalDrainPromise])
+                      : await iterator.next();
+                    if (nextEvent === FINAL_DRAIN_TIMEOUT) {
+                      void Promise.resolve(iterator.return?.()).catch(() => undefined);
+                      break;
+                    }
+                    if (nextEvent.done) {
+                      if (!sawTurnCompleted && !sawCompleteFinalEnvelope) {
+                        streamTerminalError ||= 'Codex SDK stream ended before a verified turn completion.';
+                      }
+                      break;
+                    }
+                    const event = nextEvent.value;
+                    sawAnyEvent = true;
+                    if (upstreamSignal?.aborted) {
+                      break;
+                    }
 
-                  switch (event.type) {
+                    switch (event.type) {
                     case 'thread.started': {
                       const threadId = event.thread_id as string;
+                      activeThreadId = threadId;
                       if (!restrictedMode) {
                         self.threadBindings.set(params.sessionId, {
                           threadId,
@@ -969,58 +1390,127 @@ export class CodexProvider implements LLMProvider {
                       break;
                     }
 
-                    case 'item.completed': {
-                      const item = event.item as Record<string, unknown>;
-                      if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
-                        params.abortController?.abort();
-                        throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                      case 'item.completed': {
+                        const item = event.item as Record<string, unknown>;
+                        if (typeof item.id === 'string' && item.id) seenItemIds.add(item.id);
+                        // final 之后若又出现任何 completed item，说明它不是实际末尾；
+                        // 先撤销旧 watchdog，只有当前 item 自身是新 final 才重新启动。
+                        invalidateFinalDrain();
+                        if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                          params.abortController?.abort();
+                          throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                        }
+                        const emitted = self.handleCompletedItem(controller, item, emittedAgentMessage);
+                        if (emitted) {
+                          emittedAgentMessage = true;
+                        }
+                        if (
+                          !restrictedMode
+                          && item.type === 'agent_message'
+                          && hasCompleteFinalReplyEnvelope(String(item.text || ''))
+                        ) {
+                          sawCompleteFinalEnvelope = true;
+                          armFinalDrain();
+                        }
+                        break;
                       }
-                      const emitted = self.handleCompletedItem(controller, item, emittedAgentMessage);
-                      if (emitted) {
-                        emittedAgentMessage = true;
+
+                      case 'item.started':
+                      case 'item.updated': {
+                        const item = event.item as Record<string, unknown>;
+                        invalidateFinalDrain();
+                        if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
+                          params.abortController?.abort();
+                          throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                        }
+                        break;
                       }
-                      break;
-                    }
 
-                    case 'item.started':
-                    case 'item.updated': {
-                      const item = event.item as Record<string, unknown>;
-                      if (restrictedMode && CLASSIFIER_FORBIDDEN_ITEM_TYPES.has(String(item.type || ''))) {
-                        params.abortController?.abort();
-                        throw new Error(`classifier attempted forbidden tool item: ${String(item.type || 'unknown')}`);
+                      case 'turn.completed': {
+                        sawTurnCompleted = true;
+                        clearFinalDrain();
+                        const usage = event.usage as Record<string, unknown> | undefined;
+                        const threadId = self.threadBindings.get(params.sessionId)?.threadId;
+
+                        controller.enqueue(sseEvent('result', {
+                          usage: usage ? {
+                            input_tokens: usage.input_tokens ?? 0,
+                            output_tokens: usage.output_tokens ?? 0,
+                            cache_read_input_tokens: usage.cached_input_tokens ?? 0,
+                          } : undefined,
+                          ...(threadId ? { session_id: threadId } : {}),
+                        }));
+                        break;
                       }
-                      break;
+
+                      case 'turn.failed': {
+                        sawTurnCompleted = true;
+                        clearFinalDrain();
+                        const error = (event as { message?: string }).message;
+                        controller.enqueue(sseEvent('error', error || 'Turn failed'));
+                        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+                        break eventLoop;
+                      }
+
+                      case 'error': {
+                        clearFinalDrain();
+                        const error = (event as { message?: string }).message;
+                        streamTerminalError = error || 'Thread error';
+                        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+                        break eventLoop;
+                      }
+
+                      // turn.started — no action needed
                     }
-
-                    case 'turn.completed': {
-                      const usage = event.usage as Record<string, unknown> | undefined;
-                      const threadId = self.threadBindings.get(params.sessionId)?.threadId;
-
-                      controller.enqueue(sseEvent('result', {
-                        usage: usage ? {
-                          input_tokens: usage.input_tokens ?? 0,
-                          output_tokens: usage.output_tokens ?? 0,
-                          cache_read_input_tokens: usage.cached_input_tokens ?? 0,
-                        } : undefined,
-                        ...(threadId ? { session_id: threadId } : {}),
-                      }));
-                      break;
-                    }
-
-                    case 'turn.failed': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Turn failed'));
-                      break;
-                    }
-
-                    case 'error': {
-                      const error = (event as { message?: string }).message;
-                      controller.enqueue(sseEvent('error', error || 'Thread error'));
-                      break;
-                    }
-
-                    // turn.started — no action needed
                   }
+                } catch (err) {
+                  if (!(postFinalDrainTriggered && sawCompleteFinalEnvelope && !upstreamSignal?.aborted)) {
+                    streamTerminalError = err instanceof Error ? err.message : String(err);
+                  }
+                } finally {
+                  clearFinalDrain();
+                  upstreamSignal?.removeEventListener('abort', relayUpstreamAbort);
+                }
+                if (postFinalDrainTriggered && sawCompleteFinalEnvelope && !upstreamSignal?.aborted) {
+                  const threadId = self.threadBindings.get(params.sessionId)?.threadId;
+                  console.warn('[codex-provider] Complete final reply was recovered after the SDK drain timeout.');
+                  controller.enqueue(sseEvent('result', {
+                    ...(threadId ? { session_id: threadId } : {}),
+                  }));
+                  break;
+                }
+                if (!sawTurnCompleted) {
+                  if (upstreamSignal?.aborted) {
+                    runAbortController.abort(upstreamSignal.reason);
+                    if (streamTerminalError) throw new Error(streamTerminalError);
+                    throw upstreamSignal.reason instanceof Error
+                      ? upstreamSignal.reason
+                      : new Error('Codex turn was cancelled.');
+                  }
+                  upstreamSignal?.addEventListener('abort', relayUpstreamAbort, { once: true });
+                  let recovered = false;
+                  try {
+                    recovered = !restrictedMode && !!activeThreadId
+                      && await recoverDisconnectedTurn({
+                        codexHome: self.options.codexHome || getCodexHomeForProfile(profile),
+                        threadId: activeThreadId,
+                        turnStartedAtMs,
+                        controller,
+                        signal: runAbortController.signal,
+                        timeoutMs: resolveStreamRecoveryTimeoutMs(self.options.streamRecoveryTimeoutMs),
+                        pollMs: resolveStreamRecoveryPollMs(self.options.streamRecoveryPollMs),
+                        seenItemIds,
+                      });
+                  } finally {
+                    upstreamSignal?.removeEventListener('abort', relayUpstreamAbort);
+                  }
+                  if (recovered) {
+                    console.warn('[codex-provider] Recovered a disconnected turn from its managed rollout.');
+                    break;
+                  }
+                  // 不能确认同一线程终态时必须先终止底层进程，禁止卡片结束后继续写入。
+                  runAbortController.abort(new Error('Codex disconnected turn recovery timed out'));
+                  throw new Error(streamTerminalError || 'Codex execution stream disconnected before completion.');
                 }
                 break;
               } catch (err) {
@@ -1088,7 +1578,7 @@ export class CodexProvider implements LLMProvider {
 
         controller.enqueue(sseEvent('tool_use', {
           id: toolId,
-          name: 'Bash',
+          name: inferCommandExecutionToolName(command),
           input: { command },
         }));
 
@@ -1141,6 +1631,26 @@ export class CodexProvider implements LLMProvider {
           tool_use_id: toolId,
           content: error?.message || resultText || 'Done',
           is_error: !!error,
+        }));
+        break;
+      }
+
+      case 'web_search': {
+        const toolId = (item.id as string) || `web-search-${Date.now()}`;
+        const query = (item.query as string) || '';
+
+        // completed web_search 表示服务端检索已结束，搜索结果已回到模型上下文。
+        // 只在这里补 Bridge 工具回执，不能把模型声明或“准备搜索”冒充为 evidence。
+        controller.enqueue(sseEvent('tool_use', {
+          id: toolId,
+          name: 'web_search',
+          input: { query },
+        }));
+
+        controller.enqueue(sseEvent('tool_result', {
+          tool_use_id: toolId,
+          content: JSON.stringify({ status: 'completed', query }),
+          is_error: false,
         }));
         break;
       }

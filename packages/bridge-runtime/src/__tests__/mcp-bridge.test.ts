@@ -234,6 +234,56 @@ async function withFakeUnityMcpHttpServer(
 }
 
 describe('McpBridge manifest discovery', () => {
+  it('projects only enabled workspace-valid manifests into isolated Codex MCP config', () => {
+    const previousSuiteRoot = process.env.CODEX_IM_SUITE_ROOT;
+    const previousCtiHome = process.env.CTI_HOME;
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-mcp-codex-projection-'));
+    const suiteRoot = path.join(tempRoot, 'suite');
+    const ctiHome = path.join(tempRoot, 'cti-home');
+    const unityProject = path.join(tempRoot, 'unity-project');
+    try {
+      fs.mkdirSync(unityProject, { recursive: true });
+      writeJson(path.join(suiteRoot, 'suite.manifest.json'), { name: 'suite' });
+      writeJson(path.join(suiteRoot, 'config', 'mcp.d', 'unity.json'), {
+        id: 'unityMCP',
+        displayName: 'Unity MCP',
+        type: 'http',
+        enabled: true,
+        cwd: '${CTI_UNITY_PROJECT_PATH}',
+        healthCheck: { url: 'http://127.0.0.1:8081/mcp' },
+      });
+      writeJson(path.join(suiteRoot, 'config', 'mcp.d', 'disabled.json'), {
+        id: 'disabledMcp',
+        type: 'http',
+        enabled: false,
+        cwd: '${CTI_UNITY_PROJECT_PATH}',
+        healthCheck: { url: 'http://127.0.0.1:9090/mcp' },
+      });
+      process.env.CODEX_IM_SUITE_ROOT = suiteRoot;
+      process.env.CTI_HOME = ctiHome;
+
+      const projections = new McpBridge({
+        ...baseConfig,
+        defaultWorkDir: unityProject,
+        allowedWorkspaceRoots: [tempRoot],
+        unityProjectPath: unityProject,
+      }).listCodexServerProjections();
+
+      assert.deepEqual(projections, [{
+        manifestId: 'unityMCP',
+        name: 'unityMCP',
+        type: 'http',
+        url: 'http://127.0.0.1:8081/mcp',
+      }]);
+    } finally {
+      if (previousSuiteRoot === undefined) delete process.env.CODEX_IM_SUITE_ROOT;
+      else process.env.CODEX_IM_SUITE_ROOT = previousSuiteRoot;
+      if (previousCtiHome === undefined) delete process.env.CTI_HOME;
+      else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('loads bundled suite manifests and user overlay manifests', () => {
     const previousSuiteRoot = process.env.CODEX_IM_SUITE_ROOT;
     const previousCtiHome = process.env.CTI_HOME;

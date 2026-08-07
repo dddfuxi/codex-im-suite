@@ -242,18 +242,21 @@
     },
     "AgentPerformanceSuggestion": {
       "type": "object",
-      "required": ["id", "generatedAt", "summary", "evidenceWindow", "metricBasis"],
+      "required": ["id", "generatedAt", "summary", "evidenceRefs", "evidenceWindow", "metricBasis"],
       "properties": {
         "id": { "type": "string" },
         "generatedAt": { "type": "string" },
         "summary": { "type": "string" },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
         "evidenceWindow": {
           "type": "object",
           "required": ["runCount"],
           "properties": {
             "runCount": { "type": "integer", "minimum": 0 },
             "startedAt": { "type": "string" },
-            "endedAt": { "type": "string" }
+            "endedAt": { "type": "string" },
+            "analyzedThroughRunId": { "type": "string" },
+            "snapshotUpdatedAt": { "type": "string" }
           },
           "additionalProperties": false
         },

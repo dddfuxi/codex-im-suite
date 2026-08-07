@@ -16,6 +16,10 @@ export interface FeishuDocumentCreationPlan {
   recordContext: Omit<FeishuDocumentMemoryInput, 'title' | 'url' | 'documentId'>;
 }
 
+export type FeishuDocumentCreationDecision =
+  | { allowed: true; markdown: string }
+  | { allowed: false; reason: string };
+
 export type FeishuDocumentGuideSyncPlan =
   | {
     mode: 'replace';
@@ -60,6 +64,43 @@ export function buildFeishuDocumentCreationPlan(input: {
       markdown: input.markdown,
     },
   };
+}
+
+/**
+ * 文档创建属于真实外部写入，不能把 Provider/MCP 的诊断错误或空壳文本
+ * 当作文档正文继续落库。内部“整理已有材料”链还要求完整 Markdown 标题，
+ * 从而让 response-only 协议异常在写入前失败关闭。
+ */
+export function decideFeishuDocumentCreation(input: {
+  markdown: string;
+  providerHasError?: boolean;
+  unexpectedToolUse?: boolean;
+  requireHeading?: boolean;
+}): FeishuDocumentCreationDecision {
+  if (input.providerHasError) {
+    return { allowed: false, reason: '正文生成失败，未创建文档。' };
+  }
+  if (input.unexpectedToolUse) {
+    return { allowed: false, reason: '内部正文整理错误触发了工具执行，未创建文档。' };
+  }
+
+  const markdown = (input.markdown || '').replace(/^\uFEFF/u, '').trim();
+  if (!markdown) {
+    return { allowed: false, reason: '没有生成可写入的 Markdown 正文。' };
+  }
+
+  const firstLine = markdown.split(/\r?\n/u).find((line) => line.trim())?.trim() || '';
+  const diagnosticOnly = /^(?:未完成|执行失败|失败|error|failed)\b/iu.test(firstLine)
+    || /^MCP\s+tool\b.{0,160}\b(?:reported\s+failure|failed|error)\b/iu.test(firstLine)
+    || /^(?:tool|工具)\b.{0,160}\b(?:reported\s+failure|执行失败|调用失败|failed|error)\b/iu.test(firstLine);
+  if (diagnosticOnly) {
+    return { allowed: false, reason: '正文只包含工具失败诊断，未创建文档。' };
+  }
+  if (input.requireHeading && !/^#\s+\S/u.test(firstLine)) {
+    return { allowed: false, reason: '正文整理未返回完整的 Markdown 文档结构。' };
+  }
+
+  return { allowed: true, markdown };
 }
 
 export function buildFeishuDocumentRecordInput(

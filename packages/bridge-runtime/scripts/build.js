@@ -112,6 +112,17 @@ await esbuild.build({
   banner: sharedBanner,
 });
 
+await esbuild.build({
+  entryPoints: ['src/active-reply-control-cli.ts'],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: 'dist/active-reply-control-cli.mjs',
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
 // esbuild 能生成包含重复顶层标识符的 ESM 文本，但不会执行 Node 的最终语法解析。
 // 对所有运行入口补一次 `node --check`，避免 bundle 构建成功、live 重启后才暴露语法错误。
 for (const bundle of [
@@ -121,6 +132,7 @@ for (const bundle of [
   'dist/skill-lifecycle-cli.mjs',
   'dist/memory-layout-migration-cli.mjs',
   'dist/scheduled-task-cli.mjs',
+  'dist/active-reply-control-cli.mjs',
   'dist/memory-item-cli.mjs',
   'dist/sticker-semantic-cli.mjs',
   'dist/cleanup-cli.mjs',
@@ -131,4 +143,4 @@ for (const bundle of [
   }
 }
 
-console.log('Built daemon, agent worker, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, and scheduled task CLI bundles');
+console.log('Built daemon, agent worker, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, scheduled task, and active reply control CLI bundles');

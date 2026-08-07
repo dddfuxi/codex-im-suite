@@ -1,7 +1,15 @@
 import path from 'node:path';
 
 import type { OutboundMention } from '../types.js';
-import { parseChoicePrompt, type ChoicePrompt } from './choice-prompts.js';
+import { parseAnalysisView, type AnalysisView } from './analysis-view.js';
+import {
+  parseChoiceFlowDirective,
+  parseChoicePrompt,
+  parseChoiceSessionDirective,
+  type ChoiceFlowDirective,
+  type ChoicePrompt,
+  type ChoiceSessionDirective,
+} from './choice-prompts.js';
 import {
   ARTIFACT_PROMOTION_ACTION_FENCE,
   BRIDGE_CONTROL_ACTION_FENCE,
@@ -19,6 +27,12 @@ export const FINAL_REPLY_FENCE = 'cti-final';
 export type FinalReplyKind = 'text' | 'image' | 'file' | 'mixed';
 export type FinalReplyMode = 'plain' | 'markdown' | 'html';
 
+export interface DeliveryCardHero {
+  /** 仅允许引用同一 cti-final.images 中的受管图片路径。 */
+  imagePath: string;
+  alt: string;
+}
+
 export interface FinalReplyEnvelope {
   kind: FinalReplyKind;
   text: string;
@@ -28,7 +42,11 @@ export interface FinalReplyEnvelope {
   mentions?: OutboundMention[];
   mention_targets?: string[];
   reply_to?: string;
+  card_hero?: DeliveryCardHero;
   choice_prompt?: ChoicePrompt;
+  choice_flow?: ChoiceFlowDirective;
+  choice_session?: ChoiceSessionDirective;
+  analysis_view?: AnalysisView;
 }
 
 export interface DeliveryCandidatePayload {
@@ -40,8 +58,12 @@ export interface DeliveryCandidatePayload {
   /** 模型选择的显示名提示；不含可信平台身份，只能交给 delivery 再解析。 */
   mentionTargets?: string[];
   replyTo?: string;
+  cardHero?: DeliveryCardHero;
   feishuCardJson?: string;
   choicePrompt?: ChoicePrompt;
+  choiceFlow?: ChoiceFlowDirective;
+  choiceSession?: ChoiceSessionDirective;
+  analysisView?: AnalysisView;
 }
 
 export interface DeliveryCandidateStatus {
@@ -88,6 +110,7 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
   if (!kind || !['text', 'image', 'file', 'mixed'].includes(kind)) return null;
   if (!replyMode || !['plain', 'markdown', 'html'].includes(replyMode)) return null;
   if (!text.trim() && images.length === 0 && files.length === 0) return null;
+  const cardHero = parseDeliveryCardHero(raw.card_hero, images);
   return {
     kind,
     text,
@@ -97,8 +120,25 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     mentions: parseEnvelopeMentions(raw.mentions),
     mention_targets: parseEnvelopeMentionTargets(raw.mentions),
     reply_to: typeof raw.reply_to === 'string' && raw.reply_to.trim() ? raw.reply_to.trim() : undefined,
+    card_hero: cardHero,
     choice_prompt: parseChoicePrompt(raw.choices, raw.choice_title),
+    choice_flow: parseChoiceFlowDirective(raw.choice_flow),
+    choice_session: parseChoiceSessionDirective(raw.choice_session),
+    analysis_view: parseAnalysisView(raw.analysis_view),
   };
+}
+
+function parseDeliveryCardHero(candidate: unknown, images: readonly string[]): DeliveryCardHero | undefined {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined;
+  const raw = candidate as Record<string, unknown>;
+  const imagePath = typeof raw.image === 'string' ? raw.image.trim() : '';
+  if (!imagePath || /^(?:https?:|data:|file:)/iu.test(imagePath)) return undefined;
+  // 头图只是现有图片交付的一种呈现方式，不能另开任意路径或平台 image_key 旁路。
+  if (!images.some((image) => image.trim() === imagePath)) return undefined;
+  const alt = typeof raw.alt === 'string'
+    ? raw.alt.replace(/[\r\n\t]+/gu, ' ').replace(/\s{2,}/gu, ' ').trim().slice(0, 120)
+    : '';
+  return { imagePath, alt: alt || '卡片头图' };
 }
 
 export function extractFinalReplyEnvelope(text: string): FinalReplyEnvelope | null {
@@ -242,6 +282,13 @@ function payloadFromEnvelope(
   workingDirectory: string,
   additionalDirectories: string[],
 ): DeliveryCandidatePayload {
+  const resolvedCardHeroPath = envelope.card_hero
+    ? (path.isAbsolute(envelope.card_hero.imagePath)
+      ? envelope.card_hero.imagePath
+      : workingDirectory
+        ? path.resolve(workingDirectory, envelope.card_hero.imagePath)
+        : '')
+    : '';
   return {
     text: envelope.text || '',
     parseMode: parseDeliveryReplyMode(envelope.reply_mode),
@@ -250,7 +297,16 @@ function payloadFromEnvelope(
     mentions: envelope.mentions,
     mentionTargets: envelope.mention_targets,
     replyTo: envelope.reply_to,
+    ...(resolvedCardHeroPath ? {
+      cardHero: {
+        imagePath: resolvedCardHeroPath,
+        alt: envelope.card_hero?.alt || '卡片头图',
+      },
+    } : {}),
     choicePrompt: envelope.choice_prompt,
+    choiceFlow: envelope.choice_flow,
+    choiceSession: envelope.choice_session,
+    analysisView: envelope.analysis_view,
   };
 }
 

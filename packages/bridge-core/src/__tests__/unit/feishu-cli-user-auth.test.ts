@@ -117,6 +117,39 @@ describe('Feishu CLI user authorization challenge evidence', () => {
     });
   });
 
+  it('accepts the non-blocking JSON flags when PowerShell wrapper quotes close immediately after them', () => {
+    const wrappedInput = {
+      command: [
+        '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command',
+        "'$env:LARKSUITE_CLI_NO_UPDATE_NOTIFIER=\"1\";",
+        "lark-cli auth login --scope 'task:task:write' --no-wait --json'",
+      ].join(' '),
+    };
+
+    const challenge = extractFeishuCliUserAuthorizationChallenge({
+      toolUseId: 'tool-auth-powershell-wrapper',
+      toolName: 'Bash',
+      toolInput: wrappedInput,
+      toolResultContent: validToolResult,
+      toolResultIsError: false,
+    });
+
+    assert.equal(challenge?.requestedScopes[0], 'task:task:write');
+    assert.equal(challenge?.verificationUrl, 'https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=flow-1&user_code=ABCD-EFGH');
+  });
+
+  it('does not confuse longer option names with the required boolean flags', () => {
+    assert.equal(extractFeishuCliUserAuthorizationChallenge({
+      toolUseId: 'tool-auth-lookalike-flags',
+      toolName: 'Bash',
+      toolInput: {
+        command: 'lark-cli auth login --scope "task:task:read" --no-waiting --json-output',
+      },
+      toolResultContent: validToolResult,
+      toolResultIsError: false,
+    }), null);
+  });
+
   it('keeps bot app-scope approval separate from user OAuth', () => {
     const botError = JSON.stringify({
       ok: false,

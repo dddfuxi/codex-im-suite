@@ -215,10 +215,13 @@ export interface AgentPerformanceSuggestion {
   id: string;
   generatedAt: string;
   summary: string;
+  evidenceRefs: string[];
   evidenceWindow: {
     runCount: number;
     startedAt?: string;
     endedAt?: string;
+    analyzedThroughRunId?: string;
+    snapshotUpdatedAt?: string;
   };
   metricBasis: string[];
 }

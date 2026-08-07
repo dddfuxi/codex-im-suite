@@ -238,6 +238,7 @@ describe('Feishu streaming card lifecycle', () => {
       chatId: 'oc_chat',
       status: 'completed',
       responseText: 'FINAL:结果正文',
+      cardHero: { imageKey: 'img_v3_scene', alt: '遗迹入口' },
       hooks: {
         closeStreaming: async (_state, sequence) => { calls.push(`close:${sequence}`); },
         resolveFinalResponse: async (_state, visibleText) => `${visibleText}-resolved`,
@@ -265,6 +266,7 @@ describe('Feishu streaming card lifecycle', () => {
     ]);
     assert.equal(harness.registry.has('oc_chat'), false);
     assert.equal(harness.renderFinalCalls.length, 1);
+    assert.deepEqual(harness.renderFinalCalls[0]?.[6], { imageKey: 'img_v3_scene', alt: '遗迹入口' });
   });
 
   it('discards the temporary progress card when a completed native sticker fully replaces text', async () => {

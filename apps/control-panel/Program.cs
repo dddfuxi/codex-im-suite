@@ -536,6 +536,8 @@ internal sealed partial class MainForm : Form
     {
         var scheduledTaskRole = ScheduledTaskCommandPolicy.GetRequiredRole(command);
         if (!string.IsNullOrWhiteSpace(scheduledTaskRole)) return scheduledTaskRole;
+        var activeReplyRole = ActiveReplyCommandPolicy.GetRequiredRole(command);
+        if (!string.IsNullOrWhiteSpace(activeReplyRole)) return activeReplyRole;
         var skillRole = SkillControlCommandPolicy.GetRequiredRole(command);
         if (!string.IsNullOrWhiteSpace(skillRole)) return skillRole;
         if (string.Equals(command, "runtime.invokeAction", StringComparison.OrdinalIgnoreCase)
@@ -1131,6 +1133,9 @@ internal sealed partial class MainForm : Form
                 return GetWorkflowEvents(payload);
             case "workflow.retryRun":
                 return RetryWorkflowRun(payload);
+            case "workflow.cancelActiveReply":
+                return await CreateActiveReplyGateway().CancelAsync(
+                    ReadPayloadString(payload, "id", ReadPayloadString(payload, "runId", "")));
             case "scheduledTasks.list":
                 return await RunScheduledTaskCliAsync("list", payload);
             case "scheduledTasks.get":
@@ -2470,6 +2475,10 @@ internal sealed partial class MainForm : Form
         {
             throw new InvalidOperationException("该 workflow run 缺少可重试输入，不能断点续跑。");
         }
+        if (string.IsNullOrWhiteSpace(ReadJsonString(input, "turnId", "")) || input?["executionRequirement"] is not JsonObject)
+        {
+            throw new InvalidOperationException("该 workflow run 缺少原始 turnId 或执行要求，不能在丢失附件/证据门禁的情况下重试。");
+        }
 
         var timestamp = DateTime.UtcNow.ToString("o");
         var retry = run["retry"] as JsonObject ?? new JsonObject();
@@ -2578,12 +2587,17 @@ internal sealed partial class MainForm : Form
         return new { ok = true, sessionId, executorId, sessionDefaults = defaults };
     }
 
-    private static JsonObject? ReadJsonObjectFile(string path)
+    private JsonObject? ReadJsonObjectFile(string path)
     {
         try
         {
             if (!File.Exists(path)) return null;
-            return JsonNode.Parse(File.ReadAllText(path, Encoding.UTF8)) as JsonObject;
+            var parsed = ControlPanelJsonBoundary.ParseObject(File.ReadAllText(path, Encoding.UTF8), out var replacementCount);
+            if (replacementCount > 0)
+            {
+                AppendWebDiagnostics($"json unicode repaired file={Path.GetFileName(path)} replacements={replacementCount}");
+            }
+            return parsed;
         }
         catch
         {
@@ -5298,8 +5312,9 @@ internal sealed partial class MainForm : Form
     private async Task RestartBridgeAfterModelChangeAsync(string reason)
     {
         UpdateInstallJobsMessage($"正在重启 Bridge：{reason}");
-        var result = await RunPowerShellFileAsync(_daemonScript, "restart", _skillDir, 120000);
-        AppendCommand("daemon restart", result);
+        // 模型更新后的自动重启也必须复用面板统一入口，确保 Supervisor、
+        // Bridge、运行审计、心跳和已启用回调通道全部恢复后才对外报成功。
+        await RestartBridgeAsync();
         await PushWebStateFromAnyThreadAsync();
     }
 
@@ -6358,18 +6373,37 @@ exit $LASTEXITCODE
 
     private void PostWebMessage(object message)
     {
-        var json = JsonSerializer.Serialize(message, WebJsonOptions);
-        if (InvokeRequired)
+        string json;
+        try
         {
-            BeginInvoke(() =>
+            json = JsonSerializer.Serialize(message, WebJsonOptions);
+        }
+        catch (Exception ex)
+        {
+            AppendWebDiagnostics($"web message serialization skipped type={ex.GetType().Name}");
+            return;
+        }
+
+        void PostSafely()
+        {
+            try
             {
                 if (!_webReady || _webView.CoreWebView2 is null) return;
                 _webView.CoreWebView2.PostWebMessageAsJson(json);
-            });
+            }
+            catch (Exception ex)
+            {
+                // WebView2 的 JSON 边界异常不能逃逸到 WinForms UI 线程。
+                AppendWebDiagnostics($"web message delivery skipped type={ex.GetType().Name}");
+            }
+        }
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(PostSafely);
             return;
         }
-        if (!_webReady || _webView.CoreWebView2 is null) return;
-        _webView.CoreWebView2.PostWebMessageAsJson(json);
+        PostSafely();
     }
 
     private void AddWebActivity(string level, string title, string message)
@@ -7425,22 +7459,98 @@ exit $LASTEXITCODE
 
     private async Task RunDaemonAsync(string action)
     {
-        var result = await RunPowerShellFileAsync(_daemonScript, action, _skillDir, 90000);
-        AppendCommand($"daemon {action}", result);
+        var preserveManagedChildren = BridgeLifecycleProcessPolicy.PreserveManagedChildrenOnTimeout(action);
+        var daemonArguments = action is "start" or "stop" or "restart"
+            ? $"{action} -Source control_panel"
+            : action;
+        var result = await RunPowerShellFileAsync(
+            _daemonScript,
+            daemonArguments,
+            _skillDir,
+            90000,
+            killEntireProcessTreeOnTimeout: !preserveManagedChildren,
+            isolateBackgroundOutput: preserveManagedChildren);
+        AppendCommand($"daemon {daemonArguments}", result);
+        if (result.ExitCode == -1 && preserveManagedChildren)
+        {
+            // PowerShell 包装器可能仍持有后台进程句柄；只结束包装器后，以
+            // 新进程、运行审计、心跳和回调通道的真实状态决定是否成功。
+            await WaitForBridgeRestartReadinessAsync();
+            AppendLog("Bridge 命令包装器超时，但托管进程组已完整恢复。");
+            return;
+        }
         if (result.ExitCode != 0)
         {
             var detail = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
             throw new InvalidOperationException($"Bridge {action} 失败：{detail}".Trim());
+        }
+        if (preserveManagedChildren)
+        {
+            await WaitForBridgeRestartReadinessAsync();
         }
         await CheckBridgeAsync();
     }
 
     private async Task RestartBridgeAsync()
     {
-        await RunDaemonAsync("stop");
-        await RunDaemonAsync("start");
+        // 所有“重启”统一走 daemon restart，让 Workflow drain 在停止进程前
+        // 有机会等待 executing/finalizing/retrying 安全收口。
+        await RunDaemonAsync("restart");
         await CheckCodexAsync(true);
         await CheckLocalLlmAsync(true);
+    }
+
+    private async Task WaitForBridgeRestartReadinessAsync()
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
+        BridgeRestartReadinessResult? last = null;
+        do
+        {
+            var daemon = await RunPowerShellFileAsync(_daemonScript, "status", _skillDir, 60000);
+            BridgeRuntimeStatus? status = null;
+            try
+            {
+                var raw = File.Exists(_statusJsonPath) ? File.ReadAllText(_statusJsonPath, Encoding.UTF8) : "";
+                status = string.IsNullOrWhiteSpace(raw)
+                    ? null
+                    : JsonSerializer.Deserialize<BridgeRuntimeStatus>(raw, JsonOptions);
+            }
+            catch
+            {
+                // 状态文件可能正处于原子替换窗口，下一次探针会重新读取。
+            }
+
+            var audit = ReadBridgeRuntimeAudit();
+            var callbackStates = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            if (status?.Channels?.Contains("feishu", StringComparer.OrdinalIgnoreCase) == true)
+            {
+                callbackStates["feishu"] = audit?.FeishuWs?.State;
+            }
+            var managerAlive = daemon.Stdout.Contains("Supervisor process is running", StringComparison.OrdinalIgnoreCase)
+                || Regex.IsMatch(daemon.Stdout, @"Windows Service '[^']+':\s*Running", RegexOptions.IgnoreCase);
+            last = BridgeRestartReadiness.Evaluate(new BridgeRestartReadinessInput(
+                DaemonReportsRunning: daemon.ExitCode == 0 && daemon.Stdout.Contains("Bridge status: running", StringComparison.OrdinalIgnoreCase),
+                BridgeProcessAlive: status is not null && status.Pid > 0 && IsProcessAlive(status.Pid),
+                ProcessManagerAlive: managerAlive,
+                StatusPid: status?.Pid ?? 0,
+                AuditPid: audit?.Pid ?? 0,
+                StatusRunId: status?.RunId,
+                AuditRunId: audit?.RunId,
+                LastHeartbeatAt: audit?.LastHeartbeatAt,
+                EnabledChannels: status?.Channels,
+                CallbackStates: callbackStates,
+                ObservedAt: DateTimeOffset.UtcNow));
+            if (last.Ready)
+            {
+                AppendLog(last.Reason);
+                await CheckBridgeAsync();
+                return;
+            }
+            await Task.Delay(500);
+        }
+        while (DateTimeOffset.UtcNow < deadline);
+
+        throw new InvalidOperationException($"Bridge 重启后未完整恢复：{last?.Reason ?? "未取得运行状态"}");
     }
 
     private static bool IsProcessAlive(int pid)
@@ -10318,6 +10428,13 @@ exit $LASTEXITCODE
             _ctiHome,
             nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
 
+    private ActiveReplyGateway CreateActiveReplyGateway()
+        => new(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
     private MemoryItemGateway CreateMemoryItemGateway()
         => new(
             _suiteRoot,
@@ -10522,8 +10639,25 @@ exit $LASTEXITCODE
         return "lark-cli";
     }
 
-    private static async Task<ProcessResult> RunPowerShellFileAsync(string scriptPath, string trailingArgs, string workingDirectory, int timeoutMs, Dictionary<string, string?>? environment = null)
+    private static async Task<ProcessResult> RunPowerShellFileAsync(
+        string scriptPath,
+        string trailingArgs,
+        string workingDirectory,
+        int timeoutMs,
+        Dictionary<string, string?>? environment = null,
+        bool killEntireProcessTreeOnTimeout = true,
+        bool isolateBackgroundOutput = false)
     {
+        if (isolateBackgroundOutput)
+        {
+            return await RunPowerShellFileWithIsolatedOutputAsync(
+                scriptPath,
+                trailingArgs,
+                workingDirectory,
+                timeoutMs,
+                environment,
+                killEntireProcessTreeOnTimeout);
+        }
         var command = new StringBuilder();
         command.Append("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ");
         command.Append("$OutputEncoding = [Console]::OutputEncoding; ");
@@ -10535,13 +10669,73 @@ exit $LASTEXITCODE
         command.Append("; if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }");
         var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(command.ToString()));
         var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encodedCommand}";
-        return await RunProcessAsync("powershell.exe", arguments, workingDirectory, environment, timeoutMs);
+        return await RunProcessAsync(
+            "powershell.exe",
+            arguments,
+            workingDirectory,
+            environment,
+            timeoutMs,
+            killEntireProcessTreeOnTimeout);
+    }
+
+    private static async Task<ProcessResult> RunPowerShellFileWithIsolatedOutputAsync(
+        string scriptPath,
+        string trailingArgs,
+        string workingDirectory,
+        int timeoutMs,
+        Dictionary<string, string?>? environment,
+        bool killEntireProcessTreeOnTimeout)
+    {
+        var outputDirectory = Path.Combine(Path.GetTempPath(), "codex-im-suite", "control-command");
+        Directory.CreateDirectory(outputDirectory);
+        var outputPath = Path.Combine(outputDirectory, $"{Guid.NewGuid():N}.log");
+        try
+        {
+            var command = new StringBuilder();
+            command.Append("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ");
+            command.Append("$OutputEncoding = [Console]::OutputEncoding; ");
+            command.Append("$ProgressPreference = 'SilentlyContinue'; ");
+            command.Append("$InformationPreference = 'Continue'; ");
+            command.Append("$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'; ");
+            command.Append("& ").Append(QuotePowerShellLiteral(scriptPath));
+            if (!string.IsNullOrWhiteSpace(trailingArgs)) command.Append(' ').Append(trailingArgs);
+            command.Append(" *> ").Append(QuotePowerShellLiteral(outputPath));
+            var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(command.ToString()));
+            var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encodedCommand}";
+            var result = await RunProcessWithoutRedirectedOutputAsync(
+                "powershell.exe",
+                arguments,
+                workingDirectory,
+                environment,
+                timeoutMs,
+                killEntireProcessTreeOnTimeout);
+            var output = ReadSharedUtf8Text(outputPath);
+            return new ProcessResult(result.ExitCode, NormalizeProcessOutput(output), result.Stderr);
+        }
+        finally
+        {
+            try { File.Delete(outputPath); } catch { }
+        }
+    }
+
+    private static string ReadSharedUtf8Text(string path)
+    {
+        if (!File.Exists(path)) return "";
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return reader.ReadToEnd();
     }
 
     private static string QuotePowerShellLiteral(string value)
         => "'" + value.Replace("'", "''") + "'";
 
-    private static async Task<ProcessResult> RunProcessAsync(string fileName, string arguments, string workingDirectory, Dictionary<string, string?>? environment = null, int timeoutMs = 30000)
+    private static async Task<ProcessResult> RunProcessAsync(
+        string fileName,
+        string arguments,
+        string workingDirectory,
+        Dictionary<string, string?>? environment = null,
+        int timeoutMs = 30000,
+        bool killEntireProcessTreeOnTimeout = true)
     {
         using var process = new Process();
         var outputEncoding = fileName.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase) ? new UTF8Encoding(false) : Encoding.UTF8;
@@ -10572,10 +10766,51 @@ exit $LASTEXITCODE
         try { await process.WaitForExitAsync(cts.Token); }
         catch (OperationCanceledException)
         {
-            try { process.Kill(entireProcessTree: true); } catch { }
+            try { process.Kill(entireProcessTree: killEntireProcessTreeOnTimeout); } catch { }
             return new ProcessResult(-1, NormalizeProcessOutput(stdout.ToString()), NormalizeProcessOutput(stderr + $"Timeout after {timeoutMs} ms."));
         }
         return new ProcessResult(process.ExitCode, NormalizeProcessOutput(stdout.ToString()), NormalizeProcessOutput(stderr.ToString()));
+    }
+
+    private static async Task<ProcessResult> RunProcessWithoutRedirectedOutputAsync(
+        string fileName,
+        string arguments,
+        string workingDirectory,
+        Dictionary<string, string?>? environment,
+        int timeoutMs,
+        bool killEntireProcessTreeOnTimeout)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                WorkingDirectory = Directory.Exists(workingDirectory)
+                    ? workingDirectory
+                    : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                UseShellExecute = false,
+                RedirectStandardOutput = false,
+                RedirectStandardError = false,
+                CreateNoWindow = true,
+            },
+        };
+        if (environment is not null)
+        {
+            foreach (var pair in environment) process.StartInfo.Environment[pair.Key] = pair.Value ?? "";
+        }
+        process.Start();
+        using var cts = new CancellationTokenSource(timeoutMs);
+        try
+        {
+            await process.WaitForExitAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            try { process.Kill(entireProcessTree: killEntireProcessTreeOnTimeout); } catch { }
+            return new ProcessResult(-1, "", $"Timeout after {timeoutMs} ms.");
+        }
+        return new ProcessResult(process.ExitCode, "", "");
     }
 
     private static string NormalizeProcessOutput(string text)
@@ -11279,6 +11514,8 @@ internal sealed class BridgeRuntimeStatus
 {
     public bool Running { get; set; }
     public int Pid { get; set; }
+    public string? RunId { get; set; }
+    public string? StartedAt { get; set; }
     public string[]? Channels { get; set; }
 }
 

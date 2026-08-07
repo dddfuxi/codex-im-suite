@@ -52,6 +52,8 @@ describe('workflow contract adapter', () => {
       prompt: '失败后重试',
     });
     recordWorkflowRecoveryInfo(run.id, {
+      turnId: 'turn-contract-retry',
+      executionRequirement: { kind: 'none', reason: 'test', requiredToolFamilies: [] },
       prompt: '失败后重试',
       workingDirectory: 'C:\\workspace',
       maxAutoAttempts: 1,

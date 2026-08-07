@@ -121,6 +121,55 @@ function inferMediaType(filePath: string): string | undefined {
   } as Record<string, string>)[extension];
 }
 
+function readJpegDimensions(buffer: Buffer): { width: number; height: number } | null {
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xff) return null;
+    const marker = buffer[offset + 1];
+    const length = buffer.readUInt16BE(offset + 2);
+    if (length < 2 || offset + 2 + length > buffer.length) return null;
+    if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+      return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+    }
+    offset += 2 + length;
+  }
+  return null;
+}
+
+function readImageDimensions(buffer: Buffer): { width: number; height: number } | null {
+  if (buffer.length >= 24 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (buffer.length >= 10 && (buffer.subarray(0, 6).toString('ascii') === 'GIF87a' || buffer.subarray(0, 6).toString('ascii') === 'GIF89a')) {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) return readJpegDimensions(buffer);
+  if (buffer.length >= 30 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+    const kind = buffer.subarray(12, 16).toString('ascii');
+    if (kind === 'VP8X') return { width: 1 + buffer.readUIntLE(24, 3), height: 1 + buffer.readUIntLE(27, 3) };
+    if (kind === 'VP8L' && buffer[20] === 0x2f) {
+      const bits = buffer.readUInt32LE(21);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+  }
+  return null;
+}
+
+function hasValidKnownFileHeader(filePath: string, mediaType: string | undefined, buffer: Buffer): boolean {
+  if (buffer.length === 0) return false;
+  const normalizedType = (mediaType || inferMediaType(filePath) || '').toLowerCase();
+  if (normalizedType.startsWith('image/')) {
+    const dimensions = readImageDimensions(buffer);
+    return !!dimensions && dimensions.width > 0 && dimensions.height > 0;
+  }
+  if (normalizedType === 'application/pdf') return buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+  if (normalizedType === 'application/zip') return buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+  if (normalizedType === 'application/json') {
+    try { JSON.parse(buffer.toString('utf8')); return true; } catch { return false; }
+  }
+  return true;
+}
+
 function readManifest(manifestPath: string, scope: TurnScope): TurnArtifactManifestV1 {
   if (!fs.existsSync(manifestPath)) {
     return {
@@ -268,6 +317,35 @@ export class ArtifactStore {
         throw error;
       }
     });
+  }
+
+  recoverVerifiedArtifacts(scope: TurnScope, createdAfter: string): TurnArtifactRecord[] {
+    const createdAfterMs = Date.parse(createdAfter);
+    if (!Number.isFinite(createdAfterMs)) return [];
+    const turnDirectory = this.getArtifactDirectory(scope);
+    const manifest = readManifest(path.join(turnDirectory, MANIFEST_NAME), scope);
+    const realTurnDirectory = fs.realpathSync.native(turnDirectory);
+    const recovered: TurnArtifactRecord[] = [];
+    for (const artifact of manifest.artifacts) {
+      try {
+        const createdAtMs = Date.parse(artifact.createdAt);
+        if (!Number.isFinite(createdAtMs) || createdAtMs + 2_000 < createdAfterMs) continue;
+        const filePath = path.resolve(turnDirectory, ...artifact.relativePath.split('/'));
+        if (!isPathInside(realTurnDirectory, filePath) || path.resolve(artifact.filePath) !== filePath) continue;
+        if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile() || fs.lstatSync(filePath).isSymbolicLink()) continue;
+        assertNoSymlinkPath(realTurnDirectory, path.dirname(filePath));
+        if (!isPathInside(realTurnDirectory, fs.realpathSync.native(filePath))) continue;
+        const buffer = fs.readFileSync(filePath);
+        const digest = crypto.createHash('sha256').update(buffer).digest('hex');
+        if (digest !== artifact.sha256 || artifact.sizeBytes !== buffer.length) continue;
+        if (makeArtifactId(scope, artifact.relativePath, digest) !== artifact.id) continue;
+        if (!hasValidKnownFileHeader(filePath, artifact.mediaType, buffer)) continue;
+        recovered.push({ ...artifact, filePath });
+      } catch {
+        // 单个产物损坏不应阻断其他已验证产物恢复；损坏项直接排除。
+      }
+    }
+    return recovered;
   }
 
   promoteArtifact(rawRequest: ArtifactPromotionRequest): ArtifactPromotionResult {

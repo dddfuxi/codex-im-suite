@@ -6,6 +6,40 @@ async function loadPolicy() {
 }
 
 describe('Feishu document delivery policy', () => {
+  it('rejects provider failures and incomplete rewrite shells before document creation', async () => {
+    const { decideFeishuDocumentCreation } = await loadPolicy();
+
+    assert.deepEqual(decideFeishuDocumentCreation({
+      markdown: '# 完整复盘\n\n## 结论\n已完成。',
+      requireHeading: true,
+    }), {
+      allowed: true,
+      markdown: '# 完整复盘\n\n## 结论\n已完成。',
+    });
+    assert.deepEqual(decideFeishuDocumentCreation({
+      markdown: 'MCP tool managecamera reported failure',
+      requireHeading: true,
+    }), {
+      allowed: false,
+      reason: '正文只包含工具失败诊断，未创建文档。',
+    });
+    assert.deepEqual(decideFeishuDocumentCreation({
+      markdown: '# 看似完整的正文',
+      unexpectedToolUse: true,
+      requireHeading: true,
+    }), {
+      allowed: false,
+      reason: '内部正文整理错误触发了工具执行，未创建文档。',
+    });
+    assert.deepEqual(decideFeishuDocumentCreation({
+      markdown: '只有一句普通回复',
+      requireHeading: true,
+    }), {
+      allowed: false,
+      reason: '正文整理未返回完整的 Markdown 文档结构。',
+    });
+  });
+
   it('builds one creation plan without forwarding generic draft titles', async () => {
     const { buildFeishuDocumentCreationPlan } = await loadPolicy();
 

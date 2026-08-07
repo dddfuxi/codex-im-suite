@@ -146,7 +146,7 @@ function toCardProgressSnapshot(run: AgentCollaborationRun): AgentCardProgressSn
 
 export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
   private performanceRunning = false;
-  private lastPerformanceAt = 0;
+  private lastPerformanceAt: number;
   private readonly progressListeners = new Map<string, NonNullable<AgentCollaborationTurnInput['onProgress']>>();
 
   constructor(
@@ -154,7 +154,11 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
     private readonly registry: AgentManifestRegistry,
     private readonly supervisor: AgentWorkerSupervisor,
     private readonly stateStore: AgentCollaborationStateStore,
-  ) {}
+  ) {
+    const generatedAt = this.stateStore.snapshot().latestPerformanceSuggestion?.generatedAt;
+    const parsed = Date.parse(generatedAt || '');
+    this.lastPerformanceAt = Number.isFinite(parsed) ? parsed : 0;
+  }
 
   async prepareTurn(input: AgentCollaborationTurnInput): Promise<AgentCollaborationTurnResult> {
     const mode = this.config.agentCollaborationMode || 'off';
@@ -408,11 +412,24 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
     if (this.performanceRunning || !this.registry.byId.get('performance')?.enabled) return;
     const snapshot = this.stateStore.snapshot();
     const completedRuns = snapshot.recentRuns.filter((run) => run.endedAt);
+    const previousMarker = snapshot.latestPerformanceSuggestion?.evidenceWindow.analyzedThroughRunId;
+    const previousIndex = previousMarker
+      ? completedRuns.findIndex((run) => run.runId === previousMarker)
+      : -1;
+    const completedSinceLastAnalysis = previousIndex >= 0
+      ? completedRuns.slice(previousIndex + 1)
+      : completedRuns;
+    if (completedSinceLastAnalysis.length === 0) return;
     const intervalDue = Date.now() - this.lastPerformanceAt >= (this.config.agentPerformanceIntervalMs || 1_800_000);
-    const batchDue = completedRuns.length >= (this.config.agentPerformanceBatchSize || 20);
+    const batchDue = completedSinceLastAnalysis.length >= (this.config.agentPerformanceBatchSize || 20);
     if (!intervalDue && !batchDue) return;
     this.performanceRunning = true;
     this.lastPerformanceAt = Date.now();
+    const analyzedThroughRunId = completedRuns.at(-1)?.runId;
+    const frozenMetrics = {
+      ...snapshot.metrics,
+      windowRunCount: completedRuns.length,
+    };
     const runId = `performance-${crypto.randomUUID()}`;
     const request: AgentTaskRequest = {
       protocol: 'codex-im-suite/agent-worker/v1',
@@ -424,7 +441,13 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
       deadlineAt: new Date(Date.now() + (this.config.agentTaskTimeoutMs || 30_000)).toISOString(),
       evidenceRefs: ['metrics:window'],
       input: {
-        metrics: snapshot.metrics,
+        evidence: {
+          id: 'metrics:window',
+          snapshotUpdatedAt: snapshot.updatedAt,
+          analyzedThroughRunId,
+          runCount: completedRuns.length,
+        },
+        metrics: frozenMetrics,
         agentStats: snapshot.agents.map((agent) => ({
           agentId: agent.manifest.id,
           successCount: agent.successCount,
@@ -443,10 +466,13 @@ export class RuntimeAgentCollaborationHost implements AgentCollaborationHost {
           id: crypto.randomUUID(),
           generatedAt: nowIso(),
           summary: output.summary.slice(0, 2_000),
+          evidenceRefs: ['metrics:window'],
           evidenceWindow: {
-            runCount: completedRuns.length,
+            runCount: frozenMetrics.windowRunCount,
             startedAt: completedRuns[0]?.startedAt,
             endedAt: completedRuns.at(-1)?.endedAt,
+            analyzedThroughRunId,
+            snapshotUpdatedAt: snapshot.updatedAt,
           },
           metricBasis: Array.isArray(output.metricBasis)
             ? output.metricBasis.filter((item): item is string => typeof item === 'string').slice(0, 12)

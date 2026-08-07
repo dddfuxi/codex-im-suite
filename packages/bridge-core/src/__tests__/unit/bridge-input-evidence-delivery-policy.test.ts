@@ -33,7 +33,7 @@ describe('input evidence delivery boundary', () => {
   it('keeps an avatar as recognition evidence instead of replaying it', () => {
     const inputPath = 'C:\\runtime\\inputs\\avatar.png';
     const result = enforceInputEvidenceDeliveryBoundary({
-      payload: payload({ images: [inputPath] }),
+      payload: payload({ images: [inputPath], cardHero: { imagePath: inputPath, alt: '头像' } }),
       userText: '看一下我的头像',
       inputAttachments: [imageAttachment(inputPath)],
       executionRequirementKind: 'input_evidence_required',
@@ -42,6 +42,7 @@ describe('input evidence delivery boundary', () => {
     assert.equal(result.purpose, 'inspect_input');
     assert.equal(result.payload.text, '识别结果：这是一个蓝色头像。');
     assert.deepEqual(result.payload.images, []);
+    assert.equal(result.payload.cardHero, undefined);
     assert.deepEqual(result.filteredImages, [inputPath]);
   });
 

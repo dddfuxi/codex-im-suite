@@ -68,6 +68,30 @@
       "compatibility"
     ]
   },
+  "agentCollaborationProtocol": {
+    "version": "1.0.0",
+    "id": "codex-im-suite/agent-collaboration/v1",
+    "workerProtocol": "codex-im-suite/agent-worker/v1",
+    "manifestDirs": [
+      "./config/agents.d"
+    ],
+    "requiredFields": [
+      "protocol",
+      "id",
+      "displayName",
+      "enabled",
+      "responsibilities",
+      "owns",
+      "excludes",
+      "capabilities",
+      "inputEvidenceKinds",
+      "outputSchemaId",
+      "sideEffectLevel",
+      "timeoutMs",
+      "concurrency",
+      "modelProfile"
+    ]
+  },
   "packages": {
     "contracts": {
       "path": "./packages/contracts",
@@ -117,7 +141,8 @@
     "runtimeManifestDir": "./config/runtime.d",
     "actionManifestDir": "./config/action-manifests.d",
     "legacyLocalAgentToolManifestDir": "./config/local-agent-tools.d",
-    "feishuEmojiCatalogDir": "./config/feishu-emoji.d"
+    "feishuEmojiCatalogDir": "./config/feishu-emoji.d",
+    "agentManifestDir": "./config/agents.d"
   },
   "extensions": {
     "skills": {

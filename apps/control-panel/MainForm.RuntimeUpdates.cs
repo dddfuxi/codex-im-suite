@@ -570,7 +570,15 @@ internal sealed partial class MainForm
 
     private static bool HasCopyInstallContentDrift(string sourceRoot, string installRoot)
     {
-        foreach (var relativePath in new[] { "package.json", "package-lock.json", "SKILL.md", Path.Combine("dist", "daemon.mjs"), Path.Combine("scripts", "daemon.ps1") })
+        foreach (var relativePath in new[]
+        {
+            "package.json",
+            "package-lock.json",
+            "SKILL.md",
+            Path.Combine("dist", "daemon.mjs"),
+            Path.Combine("scripts", "daemon.ps1"),
+            Path.Combine("scripts", "workflow-drain.ps1")
+        })
         {
             var sourcePath = Path.Combine(sourceRoot, relativePath);
             var targetPath = Path.Combine(installRoot, relativePath);

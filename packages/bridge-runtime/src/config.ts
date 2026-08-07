@@ -52,6 +52,7 @@ export interface Config {
   codexPassModel?: boolean;
   codexReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   codexInheritGlobalMcp?: boolean;
+  codexInheritGlobalPlugins?: boolean;
   memoryOptimizerEnabled?: boolean;
   memoryOptimizerIntervalDays?: number;
   memoryOptimizerModelSource?: 'codex_primary' | 'local_ai' | 'external_api';
@@ -586,6 +587,7 @@ export function loadConfig(): Config {
     codexPassModel: env.has("CTI_CODEX_PASS_MODEL") ? env.get("CTI_CODEX_PASS_MODEL") === "true" : undefined,
     codexReasoningEffort,
     codexInheritGlobalMcp: env.has("CTI_CODEX_INHERIT_GLOBAL_MCP") ? env.get("CTI_CODEX_INHERIT_GLOBAL_MCP") === "true" : false,
+    codexInheritGlobalPlugins: env.has("CTI_CODEX_INHERIT_GLOBAL_PLUGINS") ? env.get("CTI_CODEX_INHERIT_GLOBAL_PLUGINS") === "true" : false,
     memoryOptimizerEnabled: env.has("CTI_MEMORY_OPTIMIZER_ENABLED") ? env.get("CTI_MEMORY_OPTIMIZER_ENABLED") === "true" : false,
     memoryOptimizerIntervalDays: Number.isFinite(memoryOptimizerIntervalDays) ? Math.max(1, Math.floor(memoryOptimizerIntervalDays)) : 7,
     memoryOptimizerModelSource,
@@ -803,6 +805,8 @@ export function saveConfig(config: Config): void {
   out += formatEnvLine("CTI_CODEX_REASONING_EFFORT", config.codexReasoningEffort);
   if (config.codexInheritGlobalMcp !== undefined)
     out += formatEnvLine("CTI_CODEX_INHERIT_GLOBAL_MCP", String(config.codexInheritGlobalMcp));
+  if (config.codexInheritGlobalPlugins !== undefined)
+    out += formatEnvLine("CTI_CODEX_INHERIT_GLOBAL_PLUGINS", String(config.codexInheritGlobalPlugins));
   if (config.memoryOptimizerEnabled !== undefined)
     out += formatEnvLine("CTI_MEMORY_OPTIMIZER_ENABLED", String(config.memoryOptimizerEnabled));
   if (config.memoryOptimizerIntervalDays !== undefined)
@@ -1218,6 +1222,7 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_codex_reasoning_effort", config.codexReasoningEffort);
   }
   m.set("bridge_codex_inherit_global_mcp", String(config.codexInheritGlobalMcp === true));
+  m.set("bridge_codex_inherit_global_plugins", String(config.codexInheritGlobalPlugins === true));
   m.set("bridge_memory_optimizer_enabled", String(config.memoryOptimizerEnabled === true));
   m.set("bridge_memory_optimizer_interval_days", String(config.memoryOptimizerIntervalDays ?? 7));
   m.set("bridge_memory_optimizer_model_source", config.memoryOptimizerModelSource || "codex_primary");

@@ -6,7 +6,8 @@
   "scripts": {
     "mcp": "tsx src/mcp-stdio.ts",
     "cli": "tsx src/cli.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "node --test --import tsx src/__tests__/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",

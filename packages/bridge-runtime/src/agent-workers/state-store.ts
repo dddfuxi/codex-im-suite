@@ -1,6 +1,4 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
 
 import type {
   AgentCollaborationMode,
@@ -13,7 +11,11 @@ import type {
   CollaborationAgentManifest,
 } from '@codex-im-suite/contracts';
 
+import { cleanupStaleAtomicWriteTemps, writeUtf8TextAtomic } from '../atomic-text-file.js';
+
 const MAX_RUNS = 80;
+const RESTART_RECOVERY_CODE = 'bridge_restart_recovered';
+const RESTART_RECOVERY_REASON = 'Bridge 启动时发现上次进程未收口，已结束旧观察记录；未自动重放任务。';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -31,6 +33,93 @@ function agentDurations(runs: AgentCollaborationRun[], agentId: string): number[
     .map((node) => node.durationMs as number));
 }
 
+export function buildAgentCollaborationMetrics(
+  runs: AgentCollaborationRun[],
+  workers: AgentWorkerView[],
+): AgentCollaborationPanelState['metrics'] {
+  // Performance 指标只消费已经结束的回合，避免 currentRun 同时存在于
+  // recentRuns 时造成实时窗口、建议正文和 evidenceWindow 分母不一致。
+  const completedRuns = runs.filter((run) => Boolean(run.endedAt));
+  const triggeredRuns = completedRuns.filter((run) => run.nodes.some((node) => node.kind === 'coordinator' && node.status !== 'skipped'));
+  const fallbackRuns = completedRuns.filter((run) => run.status === 'fallback');
+  const specialistCallDistribution: Record<string, number> = {};
+  for (const node of completedRuns.flatMap((run) => run.nodes.filter((item) => item.kind === 'specialist' && item.agentId))) {
+    specialistCallDistribution[node.agentId!] = (specialistCallDistribution[node.agentId!] || 0) + 1;
+  }
+  return {
+    windowRunCount: completedRuns.length,
+    coordinatorTriggerRate: completedRuns.length > 0 ? triggeredRuns.length / completedRuns.length : 0,
+    fallbackRate: completedRuns.length > 0 ? fallbackRuns.length / completedRuns.length : 0,
+    workerRestartCount: workers.reduce((sum, worker) => sum + worker.restartCount, 0),
+    workerTimeoutCount: workers.reduce((sum, worker) => sum + worker.timeoutCount, 0),
+    circuitOpenCount: workers.reduce((sum, worker) => sum + worker.circuitOpenCount, 0),
+    specialistCallDistribution,
+  };
+}
+
+function normalizePerformanceSuggestion(
+  value: AgentPerformanceSuggestion | undefined,
+  runs: AgentCollaborationRun[],
+): AgentPerformanceSuggestion | undefined {
+  if (!value || typeof value.summary !== 'string' || !value.evidenceWindow) return undefined;
+  const endedAt = value.evidenceWindow.endedAt;
+  const analyzedThroughRunId = value.evidenceWindow.analyzedThroughRunId
+    || [...runs].reverse().find((run) => run.endedAt && (!endedAt || run.endedAt <= endedAt))?.runId;
+  return {
+    ...value,
+    evidenceRefs: Array.isArray(value.evidenceRefs) && value.evidenceRefs.length > 0
+      ? [...new Set(value.evidenceRefs)]
+      : ['metrics:window'],
+    evidenceWindow: {
+      ...value.evidenceWindow,
+      analyzedThroughRunId,
+      snapshotUpdatedAt: value.evidenceWindow.snapshotUpdatedAt || value.generatedAt,
+    },
+  };
+}
+
+function recoverInterruptedRun(run: AgentCollaborationRun, recoveredAt: string): AgentCollaborationRun {
+  const needsRecovery = !run.endedAt && (
+    run.status === 'running'
+    || run.nodes.some((node) => node.status === 'running' || node.status === 'pending')
+  );
+  if (!needsRecovery) return run;
+  return {
+    ...run,
+    status: 'fallback',
+    fallbackReason: RESTART_RECOVERY_REASON,
+    endedAt: recoveredAt,
+    // 进程退出前没有可靠结束时间，禁止用“恢复时间 - 开始时间”伪造耗时。
+    durationMs: undefined,
+    nodes: run.nodes.map((node) => {
+      if (node.status === 'running') {
+        const endedAt = node.startedAt || recoveredAt;
+        return {
+          ...node,
+          status: 'fallback',
+          endedAt,
+          durationMs: node.startedAt ? 0 : undefined,
+          fallbackReason: RESTART_RECOVERY_REASON,
+          errorCode: RESTART_RECOVERY_CODE,
+          summary: node.summary || '上次进程结束前未写入终态，已在本次启动时收口。',
+        };
+      }
+      if (node.status === 'pending') {
+        return {
+          ...node,
+          status: 'skipped',
+          fallbackReason: RESTART_RECOVERY_REASON,
+          errorCode: RESTART_RECOVERY_CODE,
+        };
+      }
+      return node;
+    }),
+    edges: run.edges.map((edge) => edge.status === 'pending' || edge.status === 'active'
+      ? { ...edge, status: 'fallback' }
+      : edge),
+  };
+}
+
 export class AgentCollaborationStateStore {
   private state: AgentCollaborationPanelState;
 
@@ -40,6 +129,8 @@ export class AgentCollaborationStateStore {
     private readonly manifests: CollaborationAgentManifest[],
   ) {
     this.state = this.read(mode);
+    this.recoverPersistedRuns();
+    cleanupStaleAtomicWriteTemps(this.statusPath);
     this.persist();
   }
 
@@ -157,7 +248,10 @@ export class AgentCollaborationStateStore {
             circuitOpenCount: 0,
             specialistCallDistribution: {},
           },
-          latestPerformanceSuggestion: parsed.latestPerformanceSuggestion,
+          latestPerformanceSuggestion: normalizePerformanceSuggestion(
+            parsed.latestPerformanceSuggestion,
+            Array.isArray(parsed.recentRuns) ? parsed.recentRuns.slice(-MAX_RUNS) : [],
+          ),
         };
       }
     } catch {
@@ -182,6 +276,19 @@ export class AgentCollaborationStateStore {
         specialistCallDistribution: {},
       },
     };
+  }
+
+  private recoverPersistedRuns(): void {
+    const recoveredAt = nowIso();
+    const recoveredRecentRuns = this.state.recentRuns.map((run) => recoverInterruptedRun(run, recoveredAt));
+    if (this.state.currentRun) {
+      const recoveredCurrent = recoverInterruptedRun(this.state.currentRun, recoveredAt);
+      const existingIndex = recoveredRecentRuns.findIndex((run) => run.runId === recoveredCurrent.runId);
+      if (existingIndex >= 0) recoveredRecentRuns[existingIndex] = recoveredCurrent;
+      else recoveredRecentRuns.push(recoveredCurrent);
+    }
+    this.state.currentRun = undefined;
+    this.state.recentRuns = recoveredRecentRuns.slice(-MAX_RUNS);
   }
 
   private findRun(runId: string): AgentCollaborationRun | undefined {
@@ -239,29 +346,12 @@ export class AgentCollaborationStateStore {
       };
     });
 
-    const triggeredRuns = runs.filter((run) => run.nodes.some((node) => node.kind === 'coordinator' && node.status !== 'skipped'));
-    const fallbackRuns = runs.filter((run) => run.status === 'fallback');
-    const specialistCallDistribution: Record<string, number> = {};
-    for (const node of runs.flatMap((run) => run.nodes.filter((item) => item.kind === 'specialist' && item.agentId))) {
-      specialistCallDistribution[node.agentId!] = (specialistCallDistribution[node.agentId!] || 0) + 1;
-    }
-    this.state.metrics = {
-      windowRunCount: runs.length,
-      coordinatorTriggerRate: runs.length > 0 ? triggeredRuns.length / runs.length : 0,
-      fallbackRate: runs.length > 0 ? fallbackRuns.length / runs.length : 0,
-      workerRestartCount: workers.reduce((sum, worker) => sum + worker.restartCount, 0),
-      workerTimeoutCount: workers.reduce((sum, worker) => sum + worker.timeoutCount, 0),
-      circuitOpenCount: workers.reduce((sum, worker) => sum + worker.circuitOpenCount, 0),
-      specialistCallDistribution,
-    };
+    this.state.metrics = buildAgentCollaborationMetrics(runs, workers);
     this.state.updatedAt = nowIso();
   }
 
   private persist(): void {
     this.refreshDerived();
-    fs.mkdirSync(path.dirname(this.statusPath), { recursive: true });
-    const tempPath = `${this.statusPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(this.state, null, 2), 'utf8');
-    fs.renameSync(tempPath, this.statusPath);
+    writeUtf8TextAtomic(this.statusPath, JSON.stringify(this.state, null, 2));
   }
 }

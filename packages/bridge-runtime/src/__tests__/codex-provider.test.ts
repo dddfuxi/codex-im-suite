@@ -64,6 +64,7 @@ describe('CodexProvider', () => {
 
     assert.match(prompt, /Bridge reply style/);
     assert.match(prompt, /Required custom reply style: 像项目助理/);
+    assert.match(prompt, /Do not guess skill paths or manually execute files from plugin caches/);
   });
 
   it('keeps priority turn context when the regular system prompt exceeds its budget', async () => {
@@ -435,6 +436,159 @@ describe('CodexProvider', () => {
     }
   });
 
+  it('does not inherit desktop plugins into the primary Bridge Codex Home by default', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      bridgeHome: process.env.CTI_CODEX_HOME,
+      inheritPlugins: process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-plugin-isolation-'));
+    const globalHome = path.join(root, 'global');
+    const bridgeHome = path.join(root, 'bridge');
+    fs.mkdirSync(path.join(globalHome, 'plugins', 'cache', 'desktop-only'), { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'plugins', 'cache', 'desktop-only', 'plugin.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), [
+      '[plugins."desktop-only"]',
+      'enabled = true',
+      '[marketplaces.desktop]',
+      'source_type = "bundled"',
+      '[desktop]',
+      'localeOverride = "zh-CN"',
+    ].join('\n'), 'utf8');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_HOME = bridgeHome;
+    delete process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS;
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('primary');
+      const bridgeConfig = fs.readFileSync(path.join(options.env.CODEX_HOME, 'config.toml'), 'utf8');
+
+      assert.equal(fs.existsSync(path.join(bridgeHome, 'plugins')), false);
+      assert.ok(!bridgeConfig.includes('[plugins.'));
+      assert.ok(!bridgeConfig.includes('[marketplaces.'));
+      assert.ok(!bridgeConfig.includes('[desktop]'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.bridgeHome === undefined) delete process.env.CTI_CODEX_HOME;
+      else process.env.CTI_CODEX_HOME = saved.bridgeHome;
+      if (saved.inheritPlugins === undefined) delete process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS;
+      else process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS = saved.inheritPlugins;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
+  it('projects trusted suite MCP servers into official Codex while keeping global MCP isolated', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      officialHome: process.env.CTI_CODEX_OFFICIAL_HOME,
+      inheritMcp: process.env.CTI_CODEX_INHERIT_GLOBAL_MCP,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-managed-mcp-'));
+    const globalHome = path.join(root, 'global');
+    const officialHome = path.join(root, 'official');
+    fs.mkdirSync(globalHome, { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), [
+      '[mcp_servers.untrustedGlobal]',
+      'url = "http://127.0.0.1:9999/mcp"',
+    ].join('\n'), 'utf8');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_OFFICIAL_HOME = officialHome;
+    delete process.env.CTI_CODEX_INHERIT_GLOBAL_MCP;
+    try {
+      const {
+        buildCodexClientOptionsForTest,
+        buildRestrictedCodexRuntimeProfile,
+      } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('official', [{
+        manifestId: 'unityMCP',
+        name: 'unityMCP',
+        type: 'http',
+        url: 'http://127.0.0.1:8081/mcp',
+      }]);
+      const bridgeConfig = fs.readFileSync(path.join(options.env.CODEX_HOME, 'config.toml'), 'utf8');
+
+      assert.match(bridgeConfig, /Managed by codex-im-suite from config\/mcp\.d/u);
+      assert.match(bridgeConfig, /\[mcp_servers\.unityMCP\]/u);
+      assert.match(bridgeConfig, /http:\/\/127\.0\.0\.1:8081\/mcp/u);
+      assert.doesNotMatch(bridgeConfig, /untrustedGlobal|9999/u);
+
+      const restrictedHome = path.join(root, 'light-official');
+      const restricted = buildRestrictedCodexRuntimeProfile('official', restrictedHome);
+      const restrictedConfig = fs.readFileSync(path.join(restricted.env.CODEX_HOME, 'config.toml'), 'utf8');
+      const bridgeConfigAfterRestrictedInit = fs.readFileSync(path.join(officialHome, 'config.toml'), 'utf8');
+
+      assert.equal(path.resolve(restricted.env.CODEX_HOME), path.resolve(restrictedHome));
+      assert.doesNotMatch(restrictedConfig, /mcp_servers|unityMCP|untrustedGlobal/u);
+      assert.match(bridgeConfigAfterRestrictedInit, /\[mcp_servers\.unityMCP\]/u);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.officialHome === undefined) delete process.env.CTI_CODEX_OFFICIAL_HOME;
+      else process.env.CTI_CODEX_OFFICIAL_HOME = saved.officialHome;
+      if (saved.inheritMcp === undefined) delete process.env.CTI_CODEX_INHERIT_GLOBAL_MCP;
+      else process.env.CTI_CODEX_INHERIT_GLOBAL_MCP = saved.inheritMcp;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
+  it('allows explicit plugin inheritance for a confirmed compatible runtime', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const saved = {
+      globalHome: process.env.CTI_CODEX_GLOBAL_HOME,
+      bridgeHome: process.env.CTI_CODEX_HOME,
+      inheritPlugins: process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS,
+      codeHome: process.env.CODEX_HOME,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-plugin-opt-in-'));
+    const globalHome = path.join(root, 'global');
+    const bridgeHome = path.join(root, 'bridge');
+    fs.mkdirSync(path.join(globalHome, 'plugins', 'compatible-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(globalHome, 'plugins', 'compatible-plugin', 'plugin.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf8');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), [
+      '[plugins."compatible-plugin"]',
+      'enabled = true',
+    ].join('\n'), 'utf8');
+    process.env.CTI_CODEX_GLOBAL_HOME = globalHome;
+    process.env.CTI_CODEX_HOME = bridgeHome;
+    process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS = 'true';
+    try {
+      const { buildCodexClientOptionsForTest } = await import('../codex-provider.js');
+      const options = buildCodexClientOptionsForTest('primary');
+      const bridgeConfig = fs.readFileSync(path.join(options.env.CODEX_HOME, 'config.toml'), 'utf8');
+
+      assert.equal(fs.existsSync(path.join(bridgeHome, 'plugins', 'compatible-plugin', 'plugin.json')), true);
+      assert.ok(bridgeConfig.includes('[plugins."compatible-plugin"]'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      if (saved.globalHome === undefined) delete process.env.CTI_CODEX_GLOBAL_HOME;
+      else process.env.CTI_CODEX_GLOBAL_HOME = saved.globalHome;
+      if (saved.bridgeHome === undefined) delete process.env.CTI_CODEX_HOME;
+      else process.env.CTI_CODEX_HOME = saved.bridgeHome;
+      if (saved.inheritPlugins === undefined) delete process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS;
+      else process.env.CTI_CODEX_INHERIT_GLOBAL_PLUGINS = saved.inheritPlugins;
+      if (saved.codeHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved.codeHome;
+    }
+  });
+
   it('emits error when SDK init fails', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');
@@ -512,6 +666,267 @@ describe('CodexProvider', () => {
       '我来判断一下～',
       '\n```cti-final\n{"kind":"final","text":"不是"}\n```',
     ].join(''));
+  });
+
+  it('recognizes only complete and structurally valid final envelopes', async () => {
+    const { hasCompleteFinalReplyEnvelope } = await import('../codex-provider.js');
+    const valid = [
+      '```cti-final',
+      '{"kind":"text","text":"完成。","images":[],"files":[],"reply_mode":"plain"}',
+      '```',
+    ].join('\n');
+
+    assert.equal(hasCompleteFinalReplyEnvelope(valid), true);
+    assert.equal(hasCompleteFinalReplyEnvelope('正在处理，请稍候。'), false);
+    assert.equal(hasCompleteFinalReplyEnvelope('```cti-final\n{"kind":"text"'), false);
+    assert.equal(hasCompleteFinalReplyEnvelope([
+      '```cti-final',
+      '{"kind":"text","text":"完成。","images":"not-an-array","files":[],"reply_mode":"plain"}',
+      '```',
+    ].join('\n')), false);
+  });
+
+  it('closes a hung SDK stream after a complete final envelope without emitting an error', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions(), { finalDrainTimeoutMs: 10 });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: {
+                type: 'agent_message',
+                text: '```cti-final\n{"kind":"text","text":"已完成。","images":[],"files":[],"reply_mode":"plain"}\n```',
+              },
+            };
+            await new Promise<void>(() => undefined);
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat({
+      prompt: '执行任务',
+      sessionId: 'post-final-hang',
+    })));
+
+    assert.equal(runSignal?.aborted, true, 'watchdog 应终止仍未退出的 SDK 子进程');
+    assert.ok(events.some((event) => event.type === 'text' && event.data.includes('已完成')));
+    assert.equal(events.filter((event) => event.type === 'result').length, 1);
+    assert.equal(events.some((event) => event.type === 'error'), false);
+  });
+
+  it('keeps normal turn completion authoritative after a complete final envelope', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions(), { finalDrainTimeoutMs: 10 });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: {
+                type: 'agent_message',
+                text: '```cti-final\n{"kind":"text","text":"正常完成。","images":[],"files":[],"reply_mode":"plain"}\n```',
+              },
+            };
+            yield { type: 'turn.completed', usage: { input_tokens: 2, output_tokens: 3, cached_input_tokens: 1 } };
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat({
+      prompt: '执行任务',
+      sessionId: 'normal-final-drain',
+    })));
+
+    assert.equal(runSignal?.aborted, false);
+    assert.equal(events.filter((event) => event.type === 'result').length, 1);
+    assert.equal(events.some((event) => event.type === 'error'), false);
+  });
+
+  it('invalidates an earlier final envelope when later SDK work appears', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions(), { finalDrainTimeoutMs: 10 });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: {
+                type: 'agent_message',
+                text: '```cti-final\n{"kind":"text","text":"过早结果。","images":[],"files":[],"reply_mode":"plain"}\n```',
+              },
+            };
+            yield { type: 'item.started', item: { type: 'command_execution', id: 'late-tool' } };
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat({
+      prompt: '执行任务',
+      sessionId: 'late-work-after-final',
+    })));
+
+    assert.equal(runSignal?.aborted, false, 'final 后仍有真实工作时不得强制成功收口');
+    assert.equal(events.filter((event) => event.type === 'result').length, 1);
+    assert.equal(events.some((event) => event.type === 'error'), false);
+  });
+
+  it('does not convert an external cancellation after final output into success', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions(), { finalDrainTimeoutMs: 500 });
+    const abortController = new AbortController();
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => ({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: {
+              type: 'agent_message',
+              text: '```cti-final\n{"kind":"text","text":"尚未确认完成。","images":[],"files":[],"reply_mode":"plain"}\n```',
+            },
+          };
+          await new Promise<void>((_resolve, reject) => {
+            options.signal?.addEventListener('abort', () => reject(new Error('external cancellation')), { once: true });
+          });
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    const chunksPromise = collectStream(provider.streamChat({
+      prompt: '执行任务',
+      sessionId: 'external-cancel-after-final',
+      abortController,
+    }));
+    setTimeout(() => abortController.abort(new Error('user cancelled')), 10);
+    const events = parseSSEChunks(await chunksPromise);
+
+    assert.equal(events.some((event) => event.type === 'result'), false);
+    assert.ok(events.some((event) => event.type === 'error' && event.data.includes('external cancellation')));
+  });
+
+  it('keeps a disconnected turn open and recovers its real terminal result from the same rollout', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-rollout-recovery-'));
+    const sessions = path.join(codexHome, 'sessions', '2026', '08', '06');
+    const threadId = '019fd5fe-71dd-7061-a51a-61a0145a3bf8';
+    fs.mkdirSync(sessions, { recursive: true });
+    const rollout = path.join(sessions, `rollout-test-${threadId}.jsonl`);
+    fs.writeFileSync(rollout, '', 'utf8');
+    const provider = new CodexProvider(new PendingPermissions(), {
+      codexHome,
+      streamRecoveryTimeoutMs: 500,
+      streamRecoveryPollMs: 5,
+    });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            yield { type: 'thread.started', thread_id: threadId };
+            setTimeout(() => {
+              const timestamp = new Date().toISOString();
+              const finalText = '```cti-final\n{"kind":"text","text":"Prefab 已挂载并复验。","images":[],"files":[],"reply_mode":"plain"}\n```';
+              const records = [
+                { timestamp, type: 'response_item', payload: { type: 'function_call', name: 'shell_command', arguments: JSON.stringify({ command: '.\\.aibridge\\cli\\AIBridgeCLI.exe save-scene' }), call_id: 'call-recovered' } },
+                { timestamp, type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-recovered', output: 'Exit code: 0\nSaved' } },
+                { timestamp, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-recovered', last_agent_message: finalText } },
+              ];
+              fs.appendFileSync(rollout, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`, 'utf8');
+            }, 20);
+            yield { type: 'error', message: 'stream closed before response.completed' };
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    try {
+      const events = parseSSEChunks(await collectStream(provider.streamChat({
+        prompt: '给 Unity 节点挂 Prefab',
+        sessionId: 'recover-disconnected-turn',
+      })));
+
+      assert.equal(runSignal?.aborted, false);
+      assert.ok(events.some((event) => event.type === 'tool_use' && parseSSEData(event)?.name === 'unity-mcp:managed-cli'));
+      assert.ok(events.some((event) => event.type === 'text' && event.data.includes('Prefab 已挂载并复验')));
+      assert.equal(events.filter((event) => event.type === 'result').length, 1);
+      assert.equal(events.some((event) => event.type === 'error'), false);
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts the underlying run before reporting a disconnected turn that cannot be recovered', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-rollout-timeout-'));
+    const provider = new CodexProvider(new PendingPermissions(), {
+      codexHome,
+      streamRecoveryTimeoutMs: 20,
+      streamRecoveryPollMs: 5,
+    });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            yield { type: 'thread.started', thread_id: 'unrecoverable-thread' };
+            yield { type: 'error', message: 'stream closed before response.completed' };
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    try {
+      const events = parseSSEChunks(await collectStream(provider.streamChat({
+        prompt: '执行一个写入任务',
+        sessionId: 'unrecoverable-disconnected-turn',
+      })));
+
+      assert.equal(runSignal?.aborted, true, '用户终态出现前必须终止失联的底层执行');
+      assert.ok(events.some((event) => event.type === 'error' && event.data.includes('stream closed before response.completed')));
+      assert.equal(events.some((event) => event.type === 'result'), false);
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('maps command_execution item to tool_use + tool_result', async () => {
@@ -844,10 +1259,16 @@ describe('CodexProvider', () => {
     }
   });
 
-  it('runs classifier turns in an isolated tool-disabled Codex client', async () => {
+  it('runs classifier turns in an isolated tool-disabled Codex client', async (t) => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');
-    const provider = new CodexProvider(new PendingPermissions());
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-classifier-home-'));
+    const classifierCodexHome = path.join(root, 'classifier');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const provider = new CodexProvider(new PendingPermissions(), { classifierCodexHome });
     let classifierClientOptions: Record<string, any> | undefined;
     let threadOptions: Record<string, unknown> | undefined;
     let turnOptions: Record<string, unknown> | undefined;
@@ -894,6 +1315,11 @@ describe('CodexProvider', () => {
     assert.equal(classifierClientOptions?.config?.features?.plugins, false);
     assert.equal(classifierClientOptions?.config?.model_reasoning_effort, 'low');
     assert.equal(classifierClientOptions?.config?.project_doc_max_bytes, 0);
+    assert.equal(path.resolve(classifierClientOptions?.env?.CODEX_HOME), path.resolve(classifierCodexHome));
+    assert.doesNotMatch(
+      fs.readFileSync(path.join(classifierCodexHome, 'config.toml'), 'utf8'),
+      /mcp_servers/u,
+    );
     assert.equal(threadOptions?.sandboxMode, 'read-only');
     assert.equal(threadOptions?.approvalPolicy, 'untrusted');
     assert.equal(threadOptions?.networkAccessEnabled, false);
@@ -1532,6 +1958,67 @@ describe('CodexProvider image input', () => {
     }]);
   });
 
+  it('promotes only recognized Unity bridge commands to Unity tool evidence', async () => {
+    const { inferCommandExecutionToolName } = await import('../codex-provider.js');
+
+    assert.equal(
+      inferCommandExecutionToolName('.\\.aibridge\\cli\\AIBridgeCLI.exe hierarchy get --path SceneRoot'),
+      'unity-mcp:managed-cli',
+    );
+    assert.equal(
+      inferCommandExecutionToolName('& "C:\\tools\\mcp-for-unity.exe" execute --command save_scene'),
+      'unity-mcp:managed-cli',
+    );
+    assert.equal(inferCommandExecutionToolName('git status --short'), 'Bash');
+    assert.equal(inferCommandExecutionToolName('Select-String -Path HSScene.unity -Pattern RoomLock'), 'Bash');
+  });
+
+  it('exposes live web search only on normal official turns and records completed searches as tool evidence', async () => {
+    const savedSource = process.env.CTI_CODEX_MODEL_SOURCE;
+    process.env.CTI_CODEX_MODEL_SOURCE = 'official';
+    try {
+      const { CodexProvider } = await import('../codex-provider.js');
+      const { PendingPermissions } = await import('../permission-gateway.js');
+      const provider = new CodexProvider(new PendingPermissions(), { profile: 'official' });
+      let options: Record<string, unknown> | undefined;
+      const mockThread = {
+        runStreamed: () => ({
+          events: (async function* () {
+            yield {
+              type: 'item.completed',
+              item: { id: 'search-1', type: 'web_search', query: 'site:meituan.com 望京 餐厅' },
+            };
+            yield { type: 'item.completed', item: { type: 'agent_message', text: '已完成检索' } };
+            yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+          })(),
+        }),
+      };
+      (provider as any).sdk = { Codex: class { constructor() {} } };
+      (provider as any).codex = {
+        startThread(value: Record<string, unknown>) {
+          options = value;
+          return mockThread;
+        },
+      };
+
+      const events = parseSSEChunks(await collectStream(provider.streamChat({
+        prompt: '查一下望京附近的餐厅',
+        sessionId: 'official-web-search',
+      })));
+      const toolUse = parseSSEData(events.find((event) => event.type === 'tool_use'));
+      const toolResult = parseSSEData(events.find((event) => event.type === 'tool_result'));
+
+      assert.equal(options?.webSearchMode, 'live');
+      assert.equal(toolUse?.name, 'web_search');
+      assert.deepEqual(toolUse?.input, { query: 'site:meituan.com 望京 餐厅' });
+      assert.equal(toolResult?.tool_use_id, 'search-1');
+      assert.equal(toolResult?.is_error, false);
+    } finally {
+      if (savedSource === undefined) delete process.env.CTI_CODEX_MODEL_SOURCE;
+      else process.env.CTI_CODEX_MODEL_SOURCE = savedSource;
+    }
+  });
+
   it('emits image evidence receipt when resuming a thread without thread.started', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');
@@ -1624,6 +2111,12 @@ describe('CodexProvider image input', () => {
     assert.match(capturedInput as string, /ask only for the smallest missing detail/);
     assert.match(capturedInput as string, /keep the useful partial result/);
     assert.match(capturedInput as string, /2-8 concrete known alternatives.*choices/is);
+    assert.match(capturedInput as string, /analysis_view.*visible-only title, verdict, tone, metrics, and sections/is);
+    assert.match(capturedInput as string, /Do not use it for lightweight chat/i);
+    assert.match(capturedInput as string, /Never include Card JSON/i);
+    assert.match(capturedInput as string, /do not repeat the same analysis_view title, verdict, and all metrics verbatim/i);
+    assert.match(capturedInput as string, /choice_flow=.*continuous.*active/is);
+    assert.match(capturedInput as string, /terminal turn.*complete/is);
     assert.match(capturedInput as string, /Never include callback_data/i);
     assert.match(capturedInput as string, /Current user request:\nHello$/);
   });

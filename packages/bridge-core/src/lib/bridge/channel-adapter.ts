@@ -136,6 +136,14 @@ export abstract class BaseChannelAdapter {
   }
 
   /**
+   * 上传一张已通过交付边界的本地图片，供平台原生卡片引用。
+   * 默认不支持；实现方必须返回平台真实回执，不能接受模型提供的资源 key。
+   */
+  async prepareLocalImageForCard(_filePath: string): Promise<{ ok: boolean; imageKey?: string; error?: string }> {
+    return { ok: false, error: 'Card image preparation is not supported by this adapter' };
+  }
+
+  /**
    * Send a local file to the channel when the adapter supports outbound files.
    * Default implementation is unsupported.
    */
@@ -167,6 +175,31 @@ export abstract class BaseChannelAdapter {
   async answerCallback(_callbackQueryId: string, _text?: string): Promise<void> {
     // No-op by default; override in adapters that support callback queries
   }
+
+  /** 更新已由本机器人发送的通用交互卡片；调用方必须传入受控状态重建的完整卡片。 */
+  async updateInteractiveCard(_messageId: string, _cardJson: string): Promise<SendResult> {
+    return { ok: false, error: 'Interactive card update is not supported by this adapter' };
+  }
+
+  /**
+   * 复核群体选择点击者。原生 callback 已是强平台 evidence；成员 API 暂时不可用时，
+   * adapter 可明确返回 callback_event 降级，但不得信任模型或正文提供的 ID。
+   */
+  async verifyChoiceParticipant(_chatId: string, _userId: string): Promise<{
+    allowed: boolean;
+    source: 'member_api' | 'callback_event' | 'rejected';
+    /**
+     * 成员接口成功时返回本轮可参与的稳定身份集合。Registry 只使用真实平台 ID
+     * 判断是否全员完成；接口降级时省略，继续依赖截止时间，避免按猜测人数提前收口。
+     */
+    eligibleParticipantKeys?: string[];
+    error?: string;
+  }> {
+    return { allowed: false, source: 'rejected', error: 'Choice participant verification is not supported' };
+  }
+
+  /** 将后台倒计时收口恢复为普通入站，复用 adapter FIFO 与会话锁。 */
+  enqueueSyntheticInbound?(_message: InboundMessage): boolean;
 
   /**
    * Validate that the adapter's configuration is complete.
@@ -268,8 +301,9 @@ export abstract class BaseChannelAdapter {
   resolveConversationTarget?(_request: ConversationTargetResolveRequest): Promise<ConversationTargetResolveResult>;
 
   /**
-   * Send to a previously resolved and owner-confirmed conversation target.
-   * Callers must not invoke this before confirmation.
+   * Send to a controlled conversation target. Cross-conversation targets must
+   * be resolved and owner-confirmed first; an exact current-chat target may be
+   * sent after the bridge verifies current-turn or durable continuation intent.
    */
   sendConversationMessage?(_request: ConversationMessageRequest): Promise<ConversationMessageSendResult>;
 

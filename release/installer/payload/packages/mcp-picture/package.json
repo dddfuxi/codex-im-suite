@@ -8,7 +8,8 @@
     "start": "tsx src/server.ts",
     "mcp": "tsx src/mcp-stdio.ts",
     "cli": "tsx src/cli.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "node --test --import tsx src/__tests__/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
