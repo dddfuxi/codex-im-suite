@@ -83,6 +83,7 @@
 - 每轮默认只挂载当前会话工作区；`CTI_ALLOWED_WORKSPACE_ROOTS` 和项目注册根只作为权限上界，禁止自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
 - 当前会话工作区不得被消息中出现的其他项目路径替换；其他已注册项目只能作为本轮临时挂载。当前绑定目录命中禁止根或超出注册上界时必须选择安全回退，所有候选均不安全时失败关闭。
 - 聊天中的持久工作区列出/切换必须复用结构化项目注册表与真实 Owner 角色门禁；飞书中明确提到查看、选择或切换工作区时优先发送带按钮的 Card 2.0，按钮只携带稳定项目 ID，回调必须重新核验真实点击者 Owner 身份、当前注册表、启用状态和路径存在性。只展示启用项目，只接受稳定项目 ID、列表编号、注册名称或注册路径解析出的唯一目标。切换时必须创建新的项目会话并清理旧 SDK session/活动任务，禁止把模型输出路径、伪造回调、未注册绝对路径或普通临时挂载直接写回会话绑定。
+- 聊天工作区切换的 `sessions.json` 与 `bindings.json` 必须作为跨进程事实源事务更新：锁内先回读磁盘、修改目标记录并原子写回，迟到的旧 session 回执不得覆盖新绑定；只有聊天 binding、实际 session 和两处 cwd 从持久状态回读后都与目标一致，才允许回复切换成功。重复或重叠 Bridge 进程仍应单独审计，文件事务只负责防止状态回退，不能伪装成单实例运行。
 - 只有本轮当前消息中的明确绝对路径等强证据才能临时挂载其他项目；临时挂载必须记录 evidence、reason、accessMode 和 `expiresAfterTurn=true`，不能沉淀成全局附加目录。
 - 记忆库、`CTI_HOME` 运行态、上传缓存、日志和发布产物不得提升为普通 workspace。它们只能通过各自的受控检索、附件、审计或发布能力访问。
 - `packages/bridge-runtime/src/turn-storage.ts` 与 `artifacts/*` 是 Upload、Artifact、Scratch 的唯一运行时所有者；入站附件、Provider 生成物和工具结果必须按 `sessionId/turnId` 归属并记录来源、稳定 `artifactId`、SHA-256 和 TTL，不得回退 `process.cwd()`、项目 `.codepilot-uploads` 或平铺 `runtime/ignis-assets|asset-pipeline`。

@@ -11508,6 +11508,60 @@ describe('bridge-manager workspace chat commands', () => {
     assert.match(sent[0].text, /访问模式：只读/u);
   });
 
+  it('does not report workspace switch success when the persisted binding fails read-back verification', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-switch-verify-'));
+    const projectA = path.join(root, 'ProjectA');
+    const projectB = path.join(root, 'ProjectB');
+    fs.mkdirSync(projectA);
+    fs.mkdirSync(projectB);
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      bridge_feishu_owner_users: 'ou_owner',
+      bridge_default_work_dir: projectA,
+      bridge_project_registry_json: JSON.stringify({
+        schema: 'codex-im-suite/project-registry/v1',
+        projects: [
+          { id: 'project-a', displayName: '项目 A', type: 'generic', workspaceRoot: projectA, accessMode: 'read_write', enabled: true },
+          { id: 'project-b', displayName: '项目 B', type: 'generic', workspaceRoot: projectB, accessMode: 'read_write', enabled: true },
+        ],
+      }),
+    });
+    const originalGetBinding = store.getChannelBinding.bind(store);
+    const originalUpsertBinding = store.upsertChannelBinding.bind(store);
+    let simulateStaleRead = false;
+    store.upsertChannelBinding = (input) => {
+      const binding = originalUpsertBinding(input);
+      if (input.workingDirectory === projectB) simulateStaleRead = true;
+      return binding;
+    };
+    store.getChannelBinding = (channelType, chatId) => {
+      const binding = originalGetBinding(channelType, chatId);
+      if (!simulateStaleRead || !binding) return binding;
+      return {
+        ...binding,
+        codepilotSessionId: 'session_1',
+        workingDirectory: projectA,
+      };
+    };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('不应调用') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `workspace-switch-verify-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('切换工作区到 project-b', 'ou_owner'));
+
+    assert.match(sent[0].text, /未完成/u);
+    assert.match(sent[0].text, /绑定写入后复验失败/u);
+    assert.doesNotMatch(sent[0].text, /已切换到工作区/u);
+  });
+
   it('rejects persistent workspace switching from a non-Owner', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-workspace-owner-'));
     const project = path.join(root, 'Project');

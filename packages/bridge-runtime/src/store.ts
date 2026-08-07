@@ -55,6 +55,7 @@ import {
 } from './memory-source-policy.js';
 import { repairLikelyMojibakeText } from './mojibake.js';
 import { createPromptSnapshotStore } from './prompt-snapshot-store.js';
+import { writeUtf8TextAtomic } from './atomic-text-file.js';
 import {
   decideMemoryReply as decideMemoryReplyFromHits,
   inferStructuredMemories,
@@ -73,6 +74,10 @@ const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.js
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
 const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
 const ANSWER_REVIEW_AUDIT_PATH = path.join(DATA_DIR, 'answer-review-audit.json');
+const SESSIONS_PATH = path.join(DATA_DIR, 'sessions.json');
+const BINDINGS_PATH = path.join(DATA_DIR, 'bindings.json');
+const STATE_FILE_LOCK_STALE_MS = 30_000;
+const STATE_FILE_LOCK_RETRY_DELAYS_MS = [10, 20, 50, 100, 200, 400, 800, 1_000] as const;
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
 const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '36', 10) || 36);
 const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '12000', 10) || 12000);
@@ -95,9 +100,64 @@ function ensureDir(dir: string): void {
 }
 
 function atomicWrite(filePath: string, data: string): void {
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, data, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeUtf8TextAtomic(filePath, data);
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+function isProcessAlive(processId: number): boolean {
+  if (!Number.isInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+function removeStaleStateFileLock(lockPath: string): boolean {
+  try {
+    const stat = fs.statSync(lockPath);
+    if ((Date.now() - stat.mtimeMs) < STATE_FILE_LOCK_STALE_MS) return false;
+    const ownerPid = Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    if (isProcessAlive(ownerPid)) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+  }
+}
+
+/**
+ * sessions/bindings 是多个 Bridge 进程共享的运行态事实源。锁内必须先回读
+ * 磁盘，再修改目标记录并原子写回，防止重启重叠期的旧内存快照覆盖新工作区。
+ */
+function withStateFileLock<T>(filePath: string, operation: () => T): T {
+  ensureDir(DATA_DIR);
+  const lockPath = `${filePath}.lock`;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= STATE_FILE_LOCK_RETRY_DELAYS_MS.length; attempt += 1) {
+    let fileDescriptor: number | undefined;
+    try {
+      fileDescriptor = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fileDescriptor, String(process.pid), 'utf8');
+      return operation();
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST' || attempt >= STATE_FILE_LOCK_RETRY_DELAYS_MS.length) throw error;
+      if (!removeStaleStateFileLock(lockPath)) sleepSync(STATE_FILE_LOCK_RETRY_DELAYS_MS[attempt]);
+    } finally {
+      if (fileDescriptor !== undefined) {
+        try { fs.closeSync(fileDescriptor); } catch { /* best effort */ }
+        try { fs.unlinkSync(lockPath); } catch { /* best effort */ }
+      }
+    }
+  }
+  throw lastError;
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
@@ -379,19 +439,13 @@ export class JsonFileStore implements BridgeStore {
 
   private loadAll(): void {
     // Sessions
-    const sessions = readJson<Record<string, BridgeSession>>(
-      path.join(DATA_DIR, 'sessions.json'),
-      {},
-    );
+    const sessions = readJson<Record<string, BridgeSession>>(SESSIONS_PATH, {});
     for (const [id, s] of Object.entries(sessions)) {
       this.sessions.set(id, s);
     }
 
     // Bindings
-    const bindings = readJson<Record<string, ChannelBinding>>(
-      path.join(DATA_DIR, 'bindings.json'),
-      {},
-    );
+    const bindings = readJson<Record<string, ChannelBinding>>(BINDINGS_PATH, {});
     for (const [key, b] of Object.entries(bindings)) {
       this.bindings.set(key, b);
     }
@@ -483,18 +537,44 @@ export class JsonFileStore implements BridgeStore {
     this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
   }
 
-  private persistSessions(): void {
-    writeJson(
-      path.join(DATA_DIR, 'sessions.json'),
-      Object.fromEntries(this.sessions),
-    );
+  private refreshSessionsFromDisk(): void {
+    if (!fs.existsSync(SESSIONS_PATH)) return;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8')) as Record<string, BridgeSession>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      this.sessions = new Map(Object.entries(parsed));
+    } catch {
+      // 保留最后一份有效内存快照；短暂文件锁或坏 JSON 不能把全部会话清空。
+    }
   }
 
-  private persistBindings(): void {
-    writeJson(
-      path.join(DATA_DIR, 'bindings.json'),
-      Object.fromEntries(this.bindings),
-    );
+  private mutateSessions<T>(operation: () => T): T {
+    return withStateFileLock(SESSIONS_PATH, () => {
+      this.refreshSessionsFromDisk();
+      const result = operation();
+      writeJson(SESSIONS_PATH, Object.fromEntries(this.sessions));
+      return result;
+    });
+  }
+
+  private refreshBindingsFromDisk(): void {
+    if (!fs.existsSync(BINDINGS_PATH)) return;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(BINDINGS_PATH, 'utf8')) as Record<string, ChannelBinding>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      this.bindings = new Map(Object.entries(parsed));
+    } catch {
+      // 保留最后一份有效内存快照；短暂文件锁或坏 JSON 不能把全部绑定清空。
+    }
+  }
+
+  private mutateBindings<T>(operation: () => T): T {
+    return withStateFileLock(BINDINGS_PATH, () => {
+      this.refreshBindingsFromDisk();
+      const result = operation();
+      writeJson(BINDINGS_PATH, Object.fromEntries(this.bindings));
+      return result;
+    });
   }
 
   private persistPermissions(): void {
@@ -1477,67 +1557,70 @@ export class JsonFileStore implements BridgeStore {
   // Channel Bindings
 
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null {
+    this.refreshBindingsFromDisk();
     return this.bindings.get(`${channelType}:${chatId}`) ?? null;
   }
 
   upsertChannelBinding(data: UpsertChannelBindingInput): ChannelBinding {
-    const key = `${data.channelType}:${data.chatId}`;
-    const existing = this.bindings.get(key);
-    const nextMode = (data.mode as ChannelBinding['mode'] | undefined)
-      ?? existing?.mode
-      ?? (this.settings.get('bridge_default_mode') as ChannelBinding['mode'] | null)
-      ?? 'code';
-    if (existing) {
-      const updated: ChannelBinding = {
-        ...existing,
-        displayName: data.displayName ?? existing.displayName,
-        chatType: data.chatType ?? existing.chatType,
+    return this.mutateBindings(() => {
+      const key = `${data.channelType}:${data.chatId}`;
+      const existing = this.bindings.get(key);
+      const nextMode = (data.mode as ChannelBinding['mode'] | undefined)
+        ?? existing?.mode
+        ?? (this.settings.get('bridge_default_mode') as ChannelBinding['mode'] | null)
+        ?? 'code';
+      if (existing) {
+        const updated: ChannelBinding = {
+          ...existing,
+          displayName: data.displayName ?? existing.displayName,
+          chatType: data.chatType ?? existing.chatType,
+          codepilotSessionId: data.codepilotSessionId,
+          sdkSessionId: data.sdkSessionId ?? existing.sdkSessionId,
+          workingDirectory: data.workingDirectory,
+          model: data.model,
+          mode: nextMode,
+          bridgeFingerprint: data.bridgeFingerprint ?? existing.bridgeFingerprint,
+          toolingFingerprint: data.toolingFingerprint ?? existing.toolingFingerprint,
+          updatedAt: now(),
+        };
+        this.bindings.set(key, updated);
+        return updated;
+      }
+      const binding: ChannelBinding = {
+        id: uuid(),
+        channelType: data.channelType,
+        chatId: data.chatId,
+        displayName: data.displayName,
+        chatType: data.chatType,
         codepilotSessionId: data.codepilotSessionId,
-        sdkSessionId: data.sdkSessionId ?? existing.sdkSessionId,
+        sdkSessionId: data.sdkSessionId || '',
         workingDirectory: data.workingDirectory,
         model: data.model,
         mode: nextMode,
-        bridgeFingerprint: data.bridgeFingerprint ?? existing.bridgeFingerprint,
-        toolingFingerprint: data.toolingFingerprint ?? existing.toolingFingerprint,
+        bridgeFingerprint: data.bridgeFingerprint,
+        toolingFingerprint: data.toolingFingerprint,
+        active: true,
+        createdAt: now(),
         updatedAt: now(),
       };
-      this.bindings.set(key, updated);
-      this.persistBindings();
-      return updated;
-    }
-    const binding: ChannelBinding = {
-      id: uuid(),
-      channelType: data.channelType,
-      chatId: data.chatId,
-      displayName: data.displayName,
-      chatType: data.chatType,
-      codepilotSessionId: data.codepilotSessionId,
-      sdkSessionId: data.sdkSessionId || '',
-      workingDirectory: data.workingDirectory,
-      model: data.model,
-      mode: nextMode,
-      bridgeFingerprint: data.bridgeFingerprint,
-      toolingFingerprint: data.toolingFingerprint,
-      active: true,
-      createdAt: now(),
-      updatedAt: now(),
-    };
-    this.bindings.set(key, binding);
-    this.persistBindings();
-    return binding;
+      this.bindings.set(key, binding);
+      return binding;
+    });
   }
 
   updateChannelBinding(id: string, updates: Partial<ChannelBinding>): void {
-    for (const [key, b] of this.bindings) {
-      if (b.id === id) {
-        this.bindings.set(key, { ...b, ...updates, updatedAt: now() });
-        this.persistBindings();
-        break;
+    this.mutateBindings(() => {
+      for (const [key, b] of this.bindings) {
+        if (b.id === id) {
+          this.bindings.set(key, { ...b, ...updates, updatedAt: now() });
+          break;
+        }
       }
-    }
+    });
   }
 
   listChannelBindings(channelType?: ChannelType): ChannelBinding[] {
+    this.refreshBindingsFromDisk();
     const all = Array.from(this.bindings.values());
     if (!channelType) return all;
     return all.filter((b) => b.channelType === channelType);
@@ -1722,6 +1805,7 @@ export class JsonFileStore implements BridgeStore {
   // Sessions
 
   getSession(id: string): BridgeSession | null {
+    this.refreshSessionsFromDisk();
     return this.sessions.get(id) ?? null;
   }
 
@@ -1732,23 +1816,23 @@ export class JsonFileStore implements BridgeStore {
     cwd?: string,
     _mode?: string,
   ): BridgeSession {
-    const session: BridgeSession = {
-      id: uuid(),
-      working_directory: cwd || this.settings.get('bridge_default_work_dir') || process.cwd(),
-      model,
-      system_prompt: systemPrompt,
-    };
-    this.sessions.set(session.id, session);
-    this.persistSessions();
-    return session;
+    return this.mutateSessions(() => {
+      const session: BridgeSession = {
+        id: uuid(),
+        working_directory: cwd || this.settings.get('bridge_default_work_dir') || process.cwd(),
+        model,
+        system_prompt: systemPrompt,
+      };
+      this.sessions.set(session.id, session);
+      return session;
+    });
   }
 
   updateSessionProviderId(sessionId: string, providerId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      s.provider_id = providerId;
-      this.persistSessions();
-    }
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) session.provider_id = providerId;
+    });
   }
 
   // Messages
@@ -2109,27 +2193,28 @@ export class JsonFileStore implements BridgeStore {
   // SDK Session
 
   updateSdkSessionId(sessionId: string, sdkSessionId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      // Store sdkSessionId on the session object
-      (s as unknown as Record<string, unknown>)['sdk_session_id'] = sdkSessionId;
-      this.persistSessions();
-    }
-    // Also update any bindings that reference this session
-    for (const [key, b] of this.bindings) {
-      if (b.codepilotSessionId === sessionId) {
-        this.bindings.set(key, { ...b, sdkSessionId, updatedAt: now() });
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        (session as unknown as Record<string, unknown>)['sdk_session_id'] = sdkSessionId;
       }
-    }
-    this.persistBindings();
+    });
+    // 绑定可能刚被另一个 Bridge 切到新工作区；事务内先回读，旧 session
+    // 的迟到 SDK 回执只能更新仍然引用它的绑定，不能把新绑定覆盖回去。
+    this.mutateBindings(() => {
+      for (const [key, b] of this.bindings) {
+        if (b.codepilotSessionId === sessionId) {
+          this.bindings.set(key, { ...b, sdkSessionId, updatedAt: now() });
+        }
+      }
+    });
   }
 
   updateSessionModel(sessionId: string, model: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      s.model = model;
-      this.persistSessions();
-    }
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) session.model = model;
+    });
   }
 
   syncSdkTasks(_sessionId: string, _todos: unknown): void {

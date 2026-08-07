@@ -76,6 +76,46 @@ describe('JsonFileStore', () => {
     assert.equal(b2.codepilotSessionId, 'sess-2');
   });
 
+  it('preserves the new session and binding when a stale process reports an old SDK session late', () => {
+    const firstProcess = new JsonFileStore(makeSettings());
+    const staleProcess = new JsonFileStore(makeSettings());
+    const oldSession = firstProcess.createSession('feishu', 'model', '', '/workspace/old');
+    firstProcess.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_workspace',
+      codepilotSessionId: oldSession.id,
+      sdkSessionId: 'sdk_old',
+      workingDirectory: '/workspace/old',
+      model: 'model',
+    });
+    assert.equal(staleProcess.getChannelBinding('feishu', 'oc_workspace')?.workingDirectory, '/workspace/old');
+    assert.equal(staleProcess.getSession(oldSession.id)?.working_directory, '/workspace/old');
+
+    const newSession = firstProcess.createSession('feishu', 'model', '', '/workspace/new');
+    firstProcess.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_workspace',
+      codepilotSessionId: newSession.id,
+      sdkSessionId: '',
+      workingDirectory: '/workspace/new',
+      model: 'model',
+    });
+
+    assert.equal(staleProcess.getChannelBinding('feishu', 'oc_workspace')?.codepilotSessionId, newSession.id);
+    staleProcess.updateSdkSessionId(oldSession.id, 'late_sdk_result');
+
+    const restartedProcess = new JsonFileStore(makeSettings());
+    const persisted = restartedProcess.getChannelBinding('feishu', 'oc_workspace');
+    assert.equal(persisted?.codepilotSessionId, newSession.id);
+    assert.equal(persisted?.workingDirectory, '/workspace/new');
+    assert.equal(persisted?.sdkSessionId, '');
+    assert.equal(restartedProcess.getSession(newSession.id)?.working_directory, '/workspace/new');
+    assert.equal(
+      (restartedProcess.getSession(oldSession.id) as unknown as Record<string, unknown>)?.sdk_session_id,
+      'late_sdk_result',
+    );
+  });
+
   it('upsertChannelBinding uses default mode from settings', () => {
     const settings = makeSettings();
     settings.set('bridge_default_mode', 'plan');

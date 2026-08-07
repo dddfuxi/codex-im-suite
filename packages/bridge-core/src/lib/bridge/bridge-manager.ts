@@ -4165,7 +4165,39 @@ async function handleWorkspaceChatCommand(
 
   // 工作区切换使用新会话，避免旧项目历史、SDK session 和工具状态污染新项目。
   const newBinding = router.createBinding(msg.address, target.workspaceRoot);
-  getBridgeContext().store.insertAuditLog({
+  const store = getBridgeContext().store;
+  const verifiedBinding = store.getChannelBinding(msg.address.channelType, msg.address.chatId);
+  const verifiedSession = verifiedBinding
+    ? store.getSession(verifiedBinding.codepilotSessionId)
+    : null;
+  const switchPersisted = Boolean(
+    verifiedBinding
+    && verifiedSession
+    && verifiedBinding.codepilotSessionId === newBinding.codepilotSessionId
+    && sameLocalPath(verifiedBinding.workingDirectory, target.workspaceRoot)
+    && sameLocalPath(verifiedSession.working_directory, target.workspaceRoot),
+  );
+  if (!switchPersisted) {
+    store.insertAuditLog({
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `工作区切换复验失败：目标=${target.id}`,
+    });
+    await deliver(adapter, {
+      address: msg.address,
+      text: [
+        `未完成：工作区“${target.displayName}”的绑定写入后复验失败。`,
+        '系统没有确认聊天绑定、新会话和真实工作目录三者一致，因此不会报告切换成功。',
+        '请先检查是否存在重复 Bridge 进程，再重新选择工作区。',
+      ].join('\n'),
+      parseMode: 'plain',
+      replyToMessageId,
+    });
+    return;
+  }
+  store.insertAuditLog({
     channelType: msg.address.channelType,
     chatId: msg.address.chatId,
     direction: 'inbound',
@@ -4177,7 +4209,7 @@ async function handleWorkspaceChatCommand(
     text: [
       `已切换到工作区“${target.displayName}” [${target.id}]。`,
       `路径：${target.workspaceRoot}`,
-      `新会话：${newBinding.codepilotSessionId.slice(0, 8)}...`,
+      `新会话：${verifiedBinding!.codepilotSessionId.slice(0, 8)}...`,
       target.accessMode === 'read_only' ? '访问模式：只读；涉及写入时会被工作区策略拒绝。' : '访问模式：读写。',
     ].join('\n'),
     parseMode: 'plain',
