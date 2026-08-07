@@ -155,6 +155,7 @@ internal sealed record ControlPanelStateContract(
     object LiveSync,
     object Settings,
     object History,
+    SpeechPanelStateContract Speech,
     object Workflow,
     object? AgentCollaboration,
     object ProjectRegistry,

@@ -10,6 +10,7 @@
 
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +24,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuOAuthManualHost,
   LifecycleHooks,
+  SpeechHost,
   StreamChatParams,
   UpsertChannelBindingInput,
 } from '../../lib/bridge/host';
@@ -11692,6 +11694,513 @@ describe('bridge-manager workspace chat commands', () => {
 
     assert.equal(store.getChannelBinding('feishu', 'oc_123')?.workingDirectory, projectB);
     assert.match(sent[0].text, /Working directory set/u);
+  });
+});
+
+function createManagedSpeechReceipt(text: string, suffix = 'reply') {
+  return {
+    protocol: 'cti-speech-synthesis/v1' as const,
+    path: path.join(os.tmpdir(), `cti-managed-${suffix}.ogg`),
+    mediaType: 'audio/ogg',
+    format: 'opus',
+    durationMs: 900,
+    textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
+    fileSha256: 'f'.repeat(64),
+    validated: true as const,
+  };
+}
+
+const TEST_SPEECH_INPUT_SHA256 = 'a'.repeat(64);
+
+function createTrustedInboundSpeechMessage(messageId: string, chatId: string) {
+  const attachmentId = `attachment-${messageId}`;
+  const bytes = Buffer.from('OggSdata', 'utf8');
+  return {
+    ...createInboundMessage('', 'ou_speech', chatId),
+    messageId,
+    messageKind: 'feishu_audio',
+    attachments: [{
+      id: attachmentId,
+      name: 'voice.ogg',
+      type: 'audio/ogg',
+      size: bytes.length,
+      data: bytes.toString('base64'),
+    }],
+    raw: {
+      messageKind: 'feishu_audio',
+      feishuInboundAudio: {
+        protocol: 'cti-feishu-inbound-audio/v1',
+        messageId,
+        fileKey: `file-${messageId}`,
+        attachmentId,
+        messageType: 'audio',
+      },
+    },
+  };
+}
+
+function createSpeechTurnStorage() {
+  return {
+    stageInputFiles: ({ sessionId, turnId, files }: {
+      sessionId: string;
+      turnId: string;
+      files: Array<{ id: string; name: string; type: string; size: number }>;
+    }) => files.map((file) => ({
+      id: file.id,
+      sessionId,
+      turnId,
+      fileName: file.name,
+      relativePath: file.name,
+      filePath: path.join(os.tmpdir(), `cti-staged-${turnId}.ogg`),
+      mediaType: file.type,
+      sizeBytes: file.size,
+      sha256: TEST_SPEECH_INPUT_SHA256,
+      createdAt: '2026-08-07T00:00:00.000Z',
+      source: { kind: 'input' as const },
+    })),
+    getArtifactDirectory: () => os.tmpdir(),
+    getScratchDirectory: () => os.tmpdir(),
+    recoverVerifiedArtifacts: () => [],
+  };
+}
+
+function createSpeechAbortError(): Error {
+  const error = new Error('speech input cancelled in test');
+  error.name = 'AbortError';
+  return error;
+}
+
+describe('bridge-manager speech integration', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('缺少可信音频 evidence 时不调用 Provider，且只返回一次可行动错误', async () => {
+    let providerCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => { providerCalls += 1; return createTextStream('不应调用'); } },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `missing-audio-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_speech', 'oc_speech_missing'),
+      messageId: 'om_speech_missing',
+      messageKind: 'feishu_audio',
+      raw: { messageKind: 'feishu_audio' },
+    });
+
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /重新发送语音/u);
+  });
+
+  it('控制面板精确终止会把 signal 传入 ASR，且不产生第二条转写错误终态', async () => {
+    let providerCalls = 0;
+    let transcribeSignal: AbortSignal | undefined;
+    let rejectTranscription: ((reason?: unknown) => void) | undefined;
+    let transcriptionStartedResolve!: () => void;
+    const transcriptionStarted = new Promise<void>((resolve) => { transcriptionStartedResolve = resolve; });
+    let feedbackStartedResolve!: () => void;
+    const feedbackStarted = new Promise<void>((resolve) => { feedbackStartedResolve = resolve; });
+    const finalized: Array<{ status: string; text: string }> = [];
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({
+      remote_bridge_enabled: 'true',
+      bridge_turn_feedback_delay_ms: '0',
+    });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => { providerCalls += 1; return createTextStream('不应调用'); } },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        transcribe: ({ signal }) => {
+          transcribeSignal = signal;
+          return new Promise<never>((_resolve, reject) => {
+            rejectTranscription = reject;
+            const rejectAbort = () => reject(createSpeechAbortError());
+            if (signal?.aborted) rejectAbort();
+            else signal?.addEventListener('abort', rejectAbort, { once: true });
+            transcriptionStartedResolve();
+          });
+        },
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `unexpected-${sent.length}` };
+    }) as BaseChannelAdapter & {
+      onStreamText?: (chatId: string, text: string) => void;
+      onStreamEnd?: (...args: any[]) => Promise<boolean>;
+    };
+    adapter.onStreamText = () => { feedbackStartedResolve(); };
+    adapter.onStreamEnd = async (_chatId, status, text) => {
+      finalized.push({ status, text });
+      return true;
+    };
+    const { _testOnly, cancelActiveReply } = await import('../../lib/bridge/bridge-manager');
+    const message = createTrustedInboundSpeechMessage('om_asr_panel_cancel', 'oc_asr_panel_cancel');
+
+    const handling = _testOnly.handleMessage(adapter, message);
+    await Promise.all([transcriptionStarted, feedbackStarted]);
+    const sessionId = store.getChannelBinding('feishu', 'oc_asr_panel_cancel')?.codepilotSessionId;
+    assert.ok(sessionId);
+
+    const result = await cancelActiveReply({
+      sessionId,
+      turnId: message.messageId,
+      channelType: 'feishu',
+      chatId: 'oc_asr_panel_cancel',
+    });
+    if (!transcribeSignal?.aborted) rejectTranscription?.(createSpeechAbortError());
+    await handling;
+
+    assert.equal(result.disposition, 'accepted');
+    assert.equal(transcribeSignal?.aborted, true);
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(finalized.map((item) => item.status), ['interrupted']);
+    assert.match(finalized[0].text, /控制面板停止当前回复/u);
+    assert.equal(sent.length, 0);
+  });
+
+  it('原消息撤回会中断 ASR，只保留撤回暂停终态', async () => {
+    let providerCalls = 0;
+    let transcribeSignal: AbortSignal | undefined;
+    let rejectTranscription: ((reason?: unknown) => void) | undefined;
+    let transcriptionStartedResolve!: () => void;
+    const transcriptionStarted = new Promise<void>((resolve) => { transcriptionStartedResolve = resolve; });
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => { providerCalls += 1; return createTextStream('不应调用'); } },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        transcribe: ({ signal }) => {
+          transcribeSignal = signal;
+          return new Promise<never>((_resolve, reject) => {
+            rejectTranscription = reject;
+            const rejectAbort = () => reject(createSpeechAbortError());
+            if (signal?.aborted) rejectAbort();
+            else signal?.addEventListener('abort', rejectAbort, { once: true });
+            transcriptionStartedResolve();
+          });
+        },
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `withdraw-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const message = createTrustedInboundSpeechMessage('om_asr_withdraw', 'oc_asr_withdraw');
+
+    const handling = _testOnly.handleMessage(adapter, message);
+    await transcriptionStarted;
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('', 'ou_speech', 'oc_asr_withdraw'),
+      messageId: 'om_asr_withdraw_control',
+      raw: {
+        bridgeControl: {
+          type: 'message_withdrawn',
+          targetMessageId: message.messageId,
+          reason: 'recalled',
+          notifyIfUnknown: true,
+        },
+      },
+    } as any);
+    if (!transcribeSignal?.aborted) rejectTranscription?.(createSpeechAbortError());
+    await handling;
+
+    assert.equal(transcribeSignal?.aborted, true);
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].replyToMessageId, message.messageId);
+    assert.match(sent[0].text, /撤回/u);
+    assert.match(sent[0].text, /暂停/u);
+    assert.doesNotMatch(sent[0].text, /重新发送语音|转写失败/u);
+  });
+
+  it('/voice off 在真实会话中阻止本轮明确语音要求', async () => {
+    let synthesisCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const speech: SpeechHost = {
+      transcribe: async () => { throw new Error('not used'); },
+      synthesize: async ({ text }) => {
+        synthesisCalls += 1;
+        return createManagedSpeechReceipt(text, 'voice-off');
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('这是应保留的完整文字结果。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech,
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `voice-off-${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/voice off', 'ou_speech', 'oc_voice_off'));
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('请用语音回答这个项目结论。', 'ou_speech', 'oc_voice_off'),
+      messageId: 'om_voice_off_explicit',
+    });
+
+    assert.equal(synthesisCalls, 0);
+    assert.match(sent[0]?.text || '', /直到发送 \/voice on 前.*只使用文字/u);
+    assert.match(sent.at(-1)?.text || '', /完整文字结果/u);
+  });
+
+  it('最终正文含代码围栏时跳过 TTS，并保留完整文字与稳定审计原因', async () => {
+    let synthesisCalls = 0;
+    const audits: any[] = [];
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    store.insertAuditLog = (input: any) => { audits.push(input); };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('结果如下：\n\n```ts\nconst value = 1;\n```') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'code');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'code-text-result' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音解释这段实现代码。',
+      'ou_speech',
+      'oc_speech_code',
+    ));
+
+    assert.equal(synthesisCalls, 0);
+    assert.match(sent[0].text, /const value = 1/u);
+    assert.ok(audits.some((entry) => entry.summary === '[SPEECH_SYNTHESIS_SKIPPED] reason=fenced_code'));
+  });
+
+  it('纯文本语音成功时发送原生音频、绑定真实消息 ID，并在终态后释放产物', async () => {
+    const visibleText = '这是完整语音结果。';
+    let receipt: ReturnType<typeof createManagedSpeechReceipt> | null = null;
+    const released: unknown[] = [];
+    const outboundRefs: any[] = [];
+    const textMessages: OutboundMessage[] = [];
+    let audioOptions: { expectedSha256?: string } | undefined;
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    store.insertOutboundRef = (input: any) => { outboundRefs.push(input); };
+    const speech: SpeechHost = {
+      transcribe: async () => { throw new Error('not used'); },
+      synthesize: async ({ text }) => {
+        receipt = createManagedSpeechReceipt(text, 'success');
+        return receipt;
+      },
+      releaseSynthesis: async (managed) => { released.push(managed); },
+    };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream(visibleText) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech,
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-text' };
+    });
+    adapter.sendLocalAudio = async (_chatId, _filePath, _replyTo, options) => {
+      audioOptions = options;
+      return { ok: true, messageId: 'om_native_voice' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音回答项目验收结论。',
+      'ou_speech',
+      'oc_speech_success',
+    ));
+
+    assert.equal(audioOptions?.expectedSha256, receipt?.fileSha256, JSON.stringify(textMessages));
+    assert.equal(textMessages.length, 0, JSON.stringify(textMessages));
+    assert.equal(released.length, 1);
+    assert.equal(outboundRefs.find((entry) => entry.messageKind === 'audio')?.platformMessageId, 'om_native_voice');
+    assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /完整语音结果/u);
+  });
+
+  it('合成产物释放失败只写观察审计，不覆盖已经成功的音频终态', async () => {
+    const audits: any[] = [];
+    let audioMessages = 0;
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    store.insertAuditLog = (input: any) => { audits.push(input); };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream('释放失败也不能覆盖音频结果。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'release-error'),
+        releaseSynthesis: async () => { throw new Error('private runtime path'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'unexpected-text' }));
+    adapter.sendLocalAudio = async () => {
+      audioMessages += 1;
+      return { ok: true, messageId: 'om_release_error_audio' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音回答释放异常测试。',
+      'ou_speech',
+      'oc_speech_release_error',
+    ));
+
+    assert.equal(audioMessages, 1);
+    assert.ok(audits.some((entry) => entry.summary === '[SPEECH_SYNTHESIS_RELEASE_FAILED]'));
+    assert.ok(audits.every((entry) => !String(entry.summary).includes('private runtime path')));
+  });
+
+  it('原生音频上传失败时只发送一次完整文字，并释放合成产物', async () => {
+    const visibleText = '上传失败也必须保留这段完整文字。';
+    let releaseCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(visibleText) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'fallback'),
+        releaseSynthesis: async () => { releaseCalls += 1; },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_text_fallback' };
+    });
+    adapter.sendLocalAudio = async () => ({ ok: false, error: 'upload failed' });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音回答本次上传结果。',
+      'ou_speech',
+      'oc_speech_fallback',
+    ));
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /上传失败也必须保留这段完整文字/u);
+    assert.match(sent[0].text, /已改为发送完整文字/u);
+    assert.equal(releaseCalls, 1);
+  });
+
+  it('流式卡终态消费语音回执后再释放，Manager 不额外发送第二终态', async () => {
+    const events: string[] = [];
+    const sent: OutboundMessage[] = [];
+    let cardSpeechPath = '';
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_turn_feedback_delay_ms: '0',
+      }),
+      llm: { streamChat: () => createTextStream('卡片链路的完整文字结果。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'card'),
+        releaseSynthesis: async () => { events.push('release'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'unexpected-card-text' };
+    }) as BaseChannelAdapter & {
+      onStreamText?: (chatId: string, text: string) => void;
+      onStreamEnd?: (...args: any[]) => Promise<boolean>;
+    };
+    adapter.onStreamText = () => {};
+    adapter.onStreamEnd = async (...args: any[]) => {
+      events.push('card-final');
+      cardSpeechPath = args[6]?.speechDelivery?.receipt?.path || '';
+      return true;
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音汇报卡片链路结果。',
+      'ou_speech',
+      'oc_speech_card',
+    ));
+
+    assert.match(cardSpeechPath, /cti-managed-card\.ogg$/u);
+    assert.deepEqual(events, ['card-final', 'release']);
+    assert.equal(sent.length, 0);
+  });
+
+  it('本轮出现权限确认时不触发 TTS', async () => {
+    let synthesisCalls = 0;
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createEventStream([
+          {
+            type: 'permission_request',
+            data: JSON.stringify({
+              permissionRequestId: 'perm-speech-1',
+              toolName: 'Bash',
+              toolInput: { command: 'npm test' },
+            }),
+          },
+          { type: 'text', data: '请确认权限后继续。' },
+          { type: 'result', data: '{}' },
+        ]),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'permission');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_permission' }));
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音执行这个需要权限的检查。',
+      'ou_speech',
+      'oc_speech_permission',
+    ));
+
+    assert.equal(synthesisCalls, 0);
   });
 });
 

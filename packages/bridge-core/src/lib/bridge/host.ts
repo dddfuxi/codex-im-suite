@@ -53,6 +53,68 @@ export interface FileAttachment {
   filePath?: string;
 }
 
+/** 会话级语音回复偏好；`off` 是硬禁用，直到用户显式切回 `on`。 */
+export type SpeechReplyPreference = 'on' | 'off';
+/** Runtime 级默认语音触发策略；未知值必须回退到兼容默认。 */
+export type SpeechReplyPolicy = 'explicit_or_inbound_audio' | 'explicit_only';
+
+/** Runtime 对当前真实入站音频完成校验与转写后返回的受控回执。 */
+export interface SpeechTranscriptReceipt {
+  protocol: 'cti-speech-transcript/v1';
+  attachmentId: string;
+  text: string;
+  /** 实际完成本次转写的 Runtime 模型身份，仅作受控来源记录。 */
+  model: string;
+  mediaType?: string;
+  durationMs?: number;
+  /** Runtime 从当前音频实际识别出的受控短语言标识。 */
+  language: string;
+  sourceMessageId: string;
+  fileSha256: string;
+  validated: true;
+}
+
+/** Runtime 对合成音频完成文件头、时长、哈希与路径边界校验后的受管回执。 */
+export interface SpeechSynthesisReceipt {
+  protocol: 'cti-speech-synthesis/v1';
+  path: string;
+  mediaType: string;
+  format: string;
+  durationMs: number;
+  textSha256: string;
+  fileSha256: string;
+  validated: true;
+  voiceProfileId?: string;
+}
+
+/**
+ * 可选本地语音能力边界。Core 只传受控文件与最终可见正文；
+ * Provider、模型路径、命令和平台 file_key 均由 Runtime 自己管理。
+ * 失败通过 reject 返回，由 Core 按稳定错误码收口，不能泄露原始路径或异常。
+ */
+export interface SpeechHost {
+  getReplyPolicy?(): SpeechReplyPolicy;
+  transcribe(input: {
+    attachmentId: string;
+    path: string;
+    mediaType: string;
+    sha256: string;
+    sourceMessageId: string;
+    signal?: AbortSignal;
+  }): Promise<SpeechTranscriptReceipt>;
+  synthesize(input: {
+    text: string;
+    voiceProfileId?: string;
+    scratchDir?: string;
+    signal?: AbortSignal;
+  }): Promise<SpeechSynthesisReceipt>;
+  /**
+   * 释放 Runtime 自己创建并登记的合成产物。Runtime 必须重新校验回执、
+   * 受管目录、普通文件与哈希；未知、越界或已变化的文件不得删除。
+   */
+  releaseSynthesis?(receipt: SpeechSynthesisReceipt): void | Promise<void>;
+}
+
 export interface StoredTurnFile {
   id: string;
   name: string;
@@ -877,6 +939,11 @@ export interface UpsertChannelBindingInput {
 export interface BridgeStore {
   // ── Settings ──
   getSetting(key: string): string | null;
+
+  // ── Session speech preference ──
+  // 独立于 session.mode 和普通 settings，避免语音呈现偏好污染执行语义。
+  getSpeechReplyPreference?(sessionId: string): SpeechReplyPreference | null;
+  setSpeechReplyPreference?(sessionId: string, preference: SpeechReplyPreference): void;
 
   // ── Channel bindings ──
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null;

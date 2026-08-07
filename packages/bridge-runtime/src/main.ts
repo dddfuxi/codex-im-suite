@@ -195,6 +195,7 @@ import { AgentCollaborationStateStore } from './agent-workers/state-store.js';
 import { AgentWorkerSupervisor } from './agent-workers/supervisor.js';
 import { RuntimeAgentCollaborationHost } from './agent-workers/collaboration-host.js';
 import { WorkerMemoryIntentHost, WorkerTurnReferenceResolverHost } from './agent-workers/worker-adapters.js';
+import { createSpeechRuntime } from './speech/speech-runtime.js';
 
 const RUNTIME_DIR = path.join(CTI_HOME, 'runtime');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'status.json');
@@ -3378,6 +3379,22 @@ async function main(): Promise<void> {
   hydrateProcessEnvironmentFromConfigFile();
   const config = loadConfig();
   const turnStorage = createRuntimeTurnStorage(config);
+  let speechRuntime: ReturnType<typeof createSpeechRuntime> | undefined;
+  if (config.speech) {
+    try {
+      speechRuntime = createSpeechRuntime({
+        config: config.speech,
+        ctiHome: CTI_HOME,
+        skillRoot: SKILL_ROOT,
+      });
+      speechRuntime.startLivePrewarm();
+    } catch (error) {
+      const code = error instanceof Error && /^[a-z0-9_]+$/i.test(error.message)
+        ? error.message
+        : 'speech_runtime_init_failed';
+      console.warn(`[claude-to-im] Speech runtime unavailable: ${code}`);
+    }
+  }
   setupLogger();
   clearLocalLlmTransientStatus(config);
 
@@ -3739,6 +3756,7 @@ async function main(): Promise<void> {
     artifactEncoding: new ArtifactEncodingInspector(),
     choicePrompts: new RuntimeChoicePromptStateHost(path.join(CTI_HOME, 'runtime')),
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
+    speech: speechRuntime?.host,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         void input;
@@ -3846,6 +3864,8 @@ async function main(): Promise<void> {
     await bridgeManager.stop();
     await agentSupervisor.stop(reason);
     await disposeRuntimeProviders();
+    speechRuntime?.stopLiveStatus();
+    await speechRuntime?.host.stop();
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();
@@ -3871,6 +3891,8 @@ async function main(): Promise<void> {
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(`uncaughtException: ${err.message}`);
     void disposeRuntimeProviders();
+    speechRuntime?.stopLiveStatus();
+    void speechRuntime?.host.stop();
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();
@@ -3888,6 +3910,8 @@ async function main(): Promise<void> {
     activeReplyControlService?.stop();
     scheduledTaskScheduler.stop();
     scheduledTaskRuntimeAbort.abort(`process exit: ${code}`);
+    speechRuntime?.stopLiveStatus();
+    void speechRuntime?.host.stop();
     todoReminderService?.close();
     knowledgeWatcher?.close();
     memoryOptimizer?.close();

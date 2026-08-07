@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/speech.schema.json",
+  "title": "Codex IM Suite Speech Control Contracts",
+  "$defs": {
+    "SpeechState": {
+      "enum": ["ready", "optional_missing", "blocked", "error"]
+    },
+    "SpeechSelectionOptionContract": {
+      "type": "object",
+      "required": ["id", "displayName", "state", "enabled"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "enabled": { "type": "boolean" },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechSelectionContract": {
+      "type": "object",
+      "required": ["value", "options"],
+      "properties": {
+        "value": { "type": "string" },
+        "options": { "type": "array", "items": { "$ref": "#/$defs/SpeechSelectionOptionContract" } }
+      },
+      "additionalProperties": false
+    },
+    "SpeechChannelContract": {
+      "type": "object",
+      "required": ["id", "displayName", "state", "enabled", "inputSupported", "outputSupported", "selected"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "enabled": { "type": "boolean" },
+        "diagnosticCode": { "type": "string" },
+        "inputSupported": { "type": "boolean" },
+        "outputSupported": { "type": "boolean" },
+        "selected": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechCapabilityContract": {
+      "type": "object",
+      "required": ["id", "displayName", "state", "supported"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "supported": { "type": "boolean" },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechComponentContract": {
+      "type": "object",
+      "required": ["id", "displayName", "kind", "state", "installable", "capabilities"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "kind": { "type": "string" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "installable": { "type": "boolean" },
+        "version": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechVoiceProfileContract": {
+      "type": "object",
+      "required": ["id", "displayName", "kind", "state", "active", "license", "sourceLabel", "authorizationConfirmed"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "kind": { "enum": ["preset", "reference"] },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "active": { "type": "boolean" },
+        "license": { "type": "string" },
+        "sourceLabel": { "type": "string" },
+        "authorizationConfirmed": { "type": "boolean" },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechLimitsContract": {
+      "type": "object",
+      "required": ["maxInputBytes", "maxInputDurationSeconds", "maxOutputCharacters"],
+      "properties": {
+        "maxInputBytes": { "type": "integer", "minimum": 0 },
+        "maxInputDurationSeconds": { "type": "number", "minimum": 0 },
+        "maxOutputCharacters": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "SpeechActionContract": {
+      "type": "object",
+      "required": ["id", "label", "enabled"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechSettingsContract": {
+      "type": "object",
+      "required": ["schema", "inputEnabled", "outputEnabled", "channelIds", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "activeVoiceProfileId"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/speech-settings/v1" },
+        "inputEnabled": { "type": "boolean" },
+        "outputEnabled": { "type": "boolean" },
+        "channelIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "replyPolicy": { "type": "string" },
+        "deliveryMode": { "type": "string" },
+        "asrProvider": { "type": "string" },
+        "ttsProvider": { "type": "string" },
+        "activeVoiceProfileId": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechStatusContract": {
+      "type": "object",
+      "required": ["protocol", "state", "inputEnabled", "outputEnabled", "channels", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "activeVoiceProfileId", "capabilities", "components", "voiceProfiles", "limits", "actions", "lastCheckedAt"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/speech-status/v1" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "inputEnabled": { "type": "boolean" },
+        "outputEnabled": { "type": "boolean" },
+        "channels": { "type": "array", "items": { "$ref": "#/$defs/SpeechChannelContract" } },
+        "replyPolicy": { "$ref": "#/$defs/SpeechSelectionContract" },
+        "deliveryMode": { "$ref": "#/$defs/SpeechSelectionContract" },
+        "asrProvider": { "$ref": "#/$defs/SpeechSelectionContract" },
+        "ttsProvider": { "$ref": "#/$defs/SpeechSelectionContract" },
+        "activeVoiceProfileId": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "$ref": "#/$defs/SpeechCapabilityContract" } },
+        "components": { "type": "array", "items": { "$ref": "#/$defs/SpeechComponentContract" } },
+        "voiceProfiles": { "type": "array", "items": { "$ref": "#/$defs/SpeechVoiceProfileContract" } },
+        "limits": { "$ref": "#/$defs/SpeechLimitsContract" },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/SpeechActionContract" } },
+        "diagnosticCode": { "type": "string" },
+        "lastCheckedAt": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechPanelStateContract": {
+      "type": "object",
+      "required": ["available", "status"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "unavailableCode": { "type": "string" },
+        "status": {
+          "oneOf": [
+            { "$ref": "#/$defs/SpeechStatusContract" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpeechPreviewReceiptContract": {
+      "type": "object",
+      "required": ["protocol", "mediaType", "base64", "bytes", "sha256", "durationMs", "voiceProfileId", "validated"],
+      "properties": {
+        "protocol": { "const": "codex-im-suite/speech-preview/v1" },
+        "mediaType": { "const": "audio/ogg; codecs=opus" },
+        "base64": { "type": "string", "minLength": 4 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "durationMs": { "type": "number", "exclusiveMinimum": 0 },
+        "voiceProfileId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9._-]+$" },
+        "validated": { "const": true }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/SpeechSettingsContract" },
+    { "$ref": "#/$defs/SpeechStatusContract" },
+    { "$ref": "#/$defs/SpeechPanelStateContract" },
+    { "$ref": "#/$defs/SpeechPreviewReceiptContract" }
+  ]
+}

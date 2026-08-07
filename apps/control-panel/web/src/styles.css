@@ -4249,6 +4249,248 @@ button:disabled {
   }
 }
 
+.speech-unavailable,
+.speech-title-row,
+.speech-card-head,
+.speech-card-actions,
+.speech-profile-facts,
+.speech-limit-row,
+.speech-diagnostic,
+.speech-authorization {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.speech-unavailable {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.speech-unavailable > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.speech-unavailable code,
+.speech-card code,
+.speech-diagnostic code {
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.speech-title-row,
+.speech-card-head {
+  justify-content: space-between;
+}
+
+.speech-summary {
+  margin-top: 14px;
+}
+
+.speech-diagnostic {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning-text) 22%, var(--border));
+  border-radius: 10px;
+  color: var(--warning-text);
+  background: color-mix(in srgb, var(--warning-bg) 46%, var(--panel-bg));
+}
+
+.speech-toggle-grid,
+.speech-settings-grid,
+.speech-card-grid,
+.speech-channel-list {
+  display: grid;
+  gap: 12px;
+}
+
+.speech-toggle-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 14px;
+}
+
+.speech-toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.speech-toggle span,
+.speech-card-head > div,
+.speech-field,
+.speech-channel-option span {
+  display: grid;
+  gap: 5px;
+}
+
+.speech-toggle small,
+.speech-card small,
+.speech-channel-option small,
+.speech-limit-row,
+.speech-profile-facts,
+.speech-capability-list,
+.speech-save-row span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.speech-toggle input,
+.speech-channel-option input,
+.speech-authorization input {
+  width: 17px;
+  height: 17px;
+}
+
+.speech-settings-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.speech-field {
+  min-width: 0;
+}
+
+.speech-field > span,
+.speech-channel-field > legend {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.speech-field input,
+.speech-field select,
+.speech-field textarea {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--panel-strong);
+}
+
+.speech-field textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.speech-channel-field {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.speech-channel-list {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.speech-channel-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+}
+
+.speech-channel-option:has(input:checked) {
+  border-color: var(--border-strong);
+  background: var(--accent-soft);
+}
+
+.speech-preview-text,
+.speech-reference-transcript {
+  grid-column: 1 / -1;
+}
+
+.speech-preview-player {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.speech-preview-player audio {
+  width: 100%;
+}
+
+.speech-limit-row {
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.speech-limit-row span,
+.speech-capability-list .token-chip {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--idle-bg);
+}
+
+.speech-save-row {
+  margin-top: 14px;
+}
+
+.speech-card-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.speech-card {
+  display: grid;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.speech-card-actions,
+.speech-capability-list,
+.speech-profile-facts {
+  flex-wrap: wrap;
+}
+
+.speech-capability-list {
+  display: flex;
+  gap: 6px;
+}
+
+.speech-authorization {
+  align-items: flex-start;
+  margin: 14px 0;
+  color: var(--text-soft);
+}
+
+@media (max-width: 1099px) {
+  .speech-settings-grid,
+  .speech-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 759px) {
+  .speech-unavailable,
+  .speech-toggle-grid,
+  .speech-settings-grid,
+  .speech-card-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .speech-unavailable {
+    display: grid;
+  }
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);

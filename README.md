@@ -27,6 +27,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
 - 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务收口成声明式运行单元；服务页和非 Skill 扩展继续复用通用 `update` 协议与白名单执行模板。
+- 本地语音开发预览：开发版 `0.3.0` 新增飞书首发的可选本地 ASR/TTS、会话 `/voice on|off`、原生 Opus 语音投递和控制面板“能力 → 语音”入口；语音默认关闭，模型与二进制不随包安装，也不会在首条语音消息到达时隐式下载。
 - Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
 - 点餐顾问扩展：开发版内置 `food-ordering-advisor` Skill，通过美团、大众点评或其他可验证本地生活来源完成多轮问答、餐厅推荐、跨平台比选和购物车准备；正常官方 Codex 回合可用服务端只读实时网页搜索获取公开页面证据，不依赖默认隔离的 Desktop Browser 插件。实时价格、配送、优惠与订单结果必须来自当前工具证据，提交及支付保留用户确认/接管边界，安装或同步后才进入对应运行环境。
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
@@ -227,6 +228,36 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - `release`：portable、installer、zip 等发布产物。
 
 控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d`、`extensions\manifests\plugins.d` 和 `extensions\manifests\action-manifests.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
+
+## 本地语音（开发版 0.3.0）
+
+截至 2026-08-07，本地语音是开发版预览，不代表 live 或 release 已验收。首期只支持飞书；语音输入、语音输出默认都是关闭状态，不影响现有文字消息和其他渠道。
+
+- 无会话覆盖时，真实飞书语音由本地 ASR 转写后交给 Primary Agent，并默认以语音回复；普通文字默认仍以文字回复。
+- 飞书会话中发送 `/voice on` 可把当前会话设为默认语音回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，明确要求语音、真实入站语音和模型语音提示都只返回文字。完整优先级为：明确文字 → `/voice off` → 明确语音 → `/voice on` → Runtime 策略 → 入站语音 / 模型提示。
+- 语音成功只发送一个飞书原生 Opus 终态。转写、合成、产物校验、进度卡替换或平台上传任一步失败，都只发送一次完整文字错误或结果，不产生“语音失败后又重复发多份文字”的双终态。
+- 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装，或显式配置本机依赖路径后，Runtime 才会使用它们。
+- 这条链路不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`；ST4 和其他外部项目的历史音频缓存不会成为 Bridge 的默认来源。
+
+模块边界保持单向：
+
+| 层 | 语音职责 |
+|---|---|
+| `packages/bridge-core` | 校验当前飞书 `messageId + fileKey + attachmentId` 证据，裁决回复模式，调用可选 Speech Host，并保证唯一用户可见终态。 |
+| `packages/bridge-runtime` | 加载语音配置，解析受管/显式依赖，管理本机 Sidecar，执行媒体校验与转换、ASR/TTS 和音色注册表。 |
+| `apps/control-panel` | 通过共享 Contract 展示 Runtime 状态与动作；不实现 ASR/TTS、不复制 Provider 枚举，也不先行伪造设置已生效。 |
+
+Runtime 数据只放在 `CTI_HOME` 的受控目录：
+
+| 内容 | 路径 |
+|---|---|
+| 受管模型与二进制 | `CTI_HOME\runtime-deps\speech` |
+| 音色注册表与授权参考音频 | `CTI_HOME\runtime\speech\voices` |
+| 请求临时文件与默认输出 | `CTI_HOME\runtime\speech` |
+
+控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。
+
+当前尚未执行开发版到 live 的同步/重启、RTX 显卡性能与显存验收，以及重启后真实飞书新语音端到端验收；在这些证据齐全前，不应把开发版构建或测试结果描述为现场机器人已具备语音能力。
 
 ## 当前运行模型
 

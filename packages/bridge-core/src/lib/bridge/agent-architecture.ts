@@ -408,6 +408,18 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['delivery', 'feishu', 'analysis', 'dashboard', 'cti-final'],
   },
   {
+    id: 'delivery_layer.speech_reply',
+    layerId: 'delivery_layer',
+    title: 'Speech Reply Presentation',
+    responsibility: 'Declare voice-only presentation without selecting a provider, local path, voice identity, command, or platform resource.',
+    promptLines: [
+      '- Speech reply policy: when the user explicitly asks for a voice reply, you may include optional cti-final `speech` with exactly `speech.mode=voice_only`. Keep the complete final visible answer in `text`; the Bridge may fall back to that text if local synthesis or platform delivery fails.',
+      '- Never put a provider, model, command, local path, URL, voice or speaker ID, reference audio, file_key, message ID, user ID, chat ID, token, or platform identity inside `speech`. The Bridge and Runtime own synthesis, validation, upload, and fallback.',
+      '- Do not request voice merely as decoration. An explicit user request and Bridge-owned session/channel policy take precedence; a user request for text must remain text.',
+    ],
+    tags: ['delivery', 'speech', 'voice', 'cti-final'],
+  },
+  {
     id: 'delivery_layer.result_envelope',
     layerId: 'delivery_layer',
     title: 'Result Envelope',

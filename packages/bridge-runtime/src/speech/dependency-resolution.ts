@@ -1,0 +1,176 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { readManagedInstallMarker } from './managed-install-marker.js';
+
+export type ResolvedDependencyState = 'ready' | 'optional_missing' | 'blocked';
+
+export interface ResolvedDependencyPath {
+  id: string;
+  displayName: string;
+  state: ResolvedDependencyState;
+  source?: 'explicit' | 'managed' | 'path' | 'bundled';
+  path?: string;
+  diagnosticCode?: string;
+}
+
+function inspectFile(candidate: string): 'ready' | 'missing' | 'unsafe' {
+  try {
+    const comparable = (value: string) => process.platform === 'win32'
+      ? path.normalize(value).toLowerCase()
+      : path.normalize(value);
+    if (comparable(fs.realpathSync.native(candidate)) !== comparable(path.resolve(candidate))) return 'unsafe';
+    const stat = fs.lstatSync(candidate);
+    return !stat.isSymbolicLink() && stat.isFile() ? 'ready' : 'unsafe';
+  } catch (error) {
+    return error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ENOENT'
+      ? 'missing'
+      : 'unsafe';
+  }
+}
+
+function executableNames(baseName: string): string[] {
+  if (process.platform !== 'win32') return [baseName];
+  const suffixes = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+    .split(';')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return [baseName, ...suffixes.map((suffix) => `${baseName}${suffix}`)];
+}
+
+function managedVersionRoots(root: string, id: string): string[] {
+  const roots: string[] = [];
+  for (const componentRoot of [path.join(root, 'speech', id), path.join(root, id)]) {
+    try {
+      const componentStat = fs.lstatSync(componentRoot);
+      if (componentStat.isSymbolicLink() || !componentStat.isDirectory()) continue;
+      for (const entry of fs.readdirSync(componentRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[a-z0-9._-]+$/i.test(entry.name)) continue;
+        const versionRoot = path.join(componentRoot, entry.name);
+        if (readManagedInstallMarker(versionRoot, {
+          id,
+          version: entry.name,
+          platform: `${process.platform}-${process.arch}`,
+        })) roots.push(versionRoot);
+      }
+    } catch {
+      // 未安装是正常的 optional_missing。
+    }
+  }
+  return roots;
+}
+
+function managedExecutableCandidates(root: string, id: string, names: string[]): string[] {
+  return managedVersionRoots(root, id).flatMap((base) => names.flatMap((name) => [
+    path.join(base, 'bin', name),
+    path.join(base, name),
+  ]));
+}
+
+export function resolveExecutableDependency(input: {
+  id: string;
+  displayName: string;
+  executableName?: string;
+  explicitPath?: string;
+  runtimeDepsRoot: string;
+}): ResolvedDependencyPath {
+  const explicit = input.explicitPath?.trim();
+  if (explicit) {
+    if (!path.isAbsolute(explicit)) {
+      return { id: input.id, displayName: input.displayName, state: 'blocked', source: 'explicit', diagnosticCode: 'explicit_path_not_absolute' };
+    }
+    const candidate = path.resolve(explicit);
+    const inspected = inspectFile(candidate);
+    return inspected === 'ready'
+      ? { id: input.id, displayName: input.displayName, state: 'ready', source: 'explicit', path: candidate }
+      : { id: input.id, displayName: input.displayName, state: 'blocked', source: 'explicit', diagnosticCode: inspected === 'missing' ? 'explicit_path_missing' : 'explicit_path_unsafe' };
+  }
+
+  const names = executableNames(input.executableName || input.id);
+  for (const candidate of managedExecutableCandidates(input.runtimeDepsRoot, input.id, names)) {
+    if (inspectFile(candidate) === 'ready') {
+      return { id: input.id, displayName: input.displayName, state: 'ready', source: 'managed', path: path.resolve(candidate) };
+    }
+  }
+  for (const directory of (process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    for (const name of names) {
+      const candidate = path.join(directory, name);
+      if (inspectFile(candidate) === 'ready') {
+        return { id: input.id, displayName: input.displayName, state: 'ready', source: 'path', path: path.resolve(candidate) };
+      }
+    }
+  }
+  return { id: input.id, displayName: input.displayName, state: 'optional_missing', diagnosticCode: 'executable_not_found' };
+}
+
+export function resolveSidecarDependency(input: {
+  explicitPath?: string;
+  runtimeDepsRoot: string;
+  bundledCandidates: string[];
+}): ResolvedDependencyPath {
+  const explicit = input.explicitPath?.trim();
+  if (explicit) {
+    if (!path.isAbsolute(explicit)) {
+      return { id: 'sidecar', displayName: '语音 Sidecar', state: 'blocked', source: 'explicit', diagnosticCode: 'explicit_path_not_absolute' };
+    }
+    const candidate = path.resolve(explicit);
+    const inspected = inspectFile(candidate);
+    return inspected === 'ready'
+      ? { id: 'sidecar', displayName: '语音 Sidecar', state: 'ready', source: 'explicit', path: candidate }
+      : { id: 'sidecar', displayName: '语音 Sidecar', state: 'blocked', source: 'explicit', diagnosticCode: inspected === 'missing' ? 'explicit_path_missing' : 'explicit_path_unsafe' };
+  }
+  for (const root of managedVersionRoots(input.runtimeDepsRoot, 'sidecar')) {
+    const managed = path.join(root, 'server.py');
+    if (inspectFile(managed) === 'ready') {
+      return { id: 'sidecar', displayName: '语音 Sidecar', state: 'ready', source: 'managed', path: path.resolve(managed) };
+    }
+  }
+  for (const candidate of input.bundledCandidates) {
+    if (inspectFile(candidate) === 'ready') {
+      return { id: 'sidecar', displayName: '语音 Sidecar', state: 'ready', source: 'bundled', path: path.resolve(candidate) };
+    }
+  }
+  return { id: 'sidecar', displayName: '语音 Sidecar', state: 'optional_missing', diagnosticCode: 'sidecar_not_found' };
+}
+
+export function assertRegularNonSymlink(filePath: string): fs.Stats {
+  if (!path.isAbsolute(filePath)) throw new Error('path_not_absolute');
+  const stat = fs.lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('path_unsafe');
+  return stat;
+}
+
+export function ensureNonSymlinkDirectory(directoryPath: string): void {
+  if (!path.isAbsolute(directoryPath)) throw new Error('directory_not_absolute');
+  const resolved = path.resolve(directoryPath);
+  const parsed = path.parse(resolved);
+  let current = parsed.root;
+  const segments = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('directory_unsafe');
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? (error as { code?: string }).code
+        : undefined;
+      if (code !== 'ENOENT') throw error;
+      // 逐段创建，先验证父目录不是 junction/symlink，避免 recursive mkdir 穿透到边界外。
+      fs.mkdirSync(current);
+      const created = fs.lstatSync(current);
+      if (created.isSymbolicLink() || !created.isDirectory()) throw new Error('directory_unsafe');
+    }
+  }
+  const real = fs.realpathSync.native(resolved);
+  const comparable = (value: string) => process.platform === 'win32'
+    ? path.normalize(value).toLowerCase()
+    : path.normalize(value);
+  if (comparable(real) !== comparable(resolved)) throw new Error('directory_unsafe');
+}
+
+export function isWithinRoot(candidatePath: string, rootPath: string): boolean {
+  const candidate = path.resolve(candidatePath);
+  const root = path.resolve(rootPath);
+  return candidate === root || candidate.startsWith(root + path.sep);
+}

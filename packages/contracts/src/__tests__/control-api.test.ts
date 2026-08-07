@@ -14,6 +14,8 @@ describe('control panel shared contracts', () => {
     assert.equal(contracts.CONTROL_PANEL_STATE_SCHEMA, 'codex-im-suite/control-panel-state/v1');
     assert.equal(contracts.CONTROL_COMMAND_SCHEMA, 'codex-im-suite/control-command/v1');
     assert.equal(contracts.CONTROL_RESULT_SCHEMA, 'codex-im-suite/control-result/v1');
+    assert.equal(contracts.SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v1');
+    assert.equal(contracts.SPEECH_SETTINGS_SCHEMA, 'codex-im-suite/speech-settings/v1');
     assert.equal(contracts.WORKFLOW_PANEL_STATE_PROTOCOL, 'workflow-runtime/v1');
     assert.equal(contracts.AGENT_COLLABORATION_PROTOCOL, 'codex-im-suite/agent-collaboration/v1');
     assert.equal(contracts.AGENT_WORKER_PROTOCOL, 'codex-im-suite/agent-worker/v1');
@@ -23,10 +25,12 @@ describe('control panel shared contracts', () => {
     const controlApiPath = path.join(schemaDir, 'control-api.schema.json');
     const projectRegistryPath = path.join(schemaDir, 'project-registry.schema.json');
     const agentCollaborationPath = path.join(schemaDir, 'agent-collaboration.schema.json');
+    const speechPath = path.join(schemaDir, 'speech.schema.json');
 
     assert.equal(fs.existsSync(controlApiPath), true, 'control-api.schema.json should exist');
     assert.equal(fs.existsSync(projectRegistryPath), true, 'project-registry.schema.json should exist');
     assert.equal(fs.existsSync(agentCollaborationPath), true, 'agent-collaboration.schema.json should exist');
+    assert.equal(fs.existsSync(speechPath), true, 'speech.schema.json should exist');
 
     const controlApi = JSON.parse(fs.readFileSync(controlApiPath, 'utf8')) as {
       $id?: string;
@@ -40,6 +44,10 @@ describe('control panel shared contracts', () => {
       $id?: string;
       $defs?: Record<string, { required?: string[] }>;
     };
+    const speech = JSON.parse(fs.readFileSync(speechPath, 'utf8')) as {
+      $id?: string;
+      $defs?: Record<string, { required?: string[] }>;
+    };
 
     assert.equal(controlApi.$id, 'https://codex-im-suite.local/schemas/control-api.schema.json');
     assert.deepEqual(controlApi.$defs?.RuntimeUnitContract?.required, [
@@ -49,7 +57,7 @@ describe('control panel shared contracts', () => {
     assert.deepEqual(controlApi.$defs?.ControlPanelStateContract?.required, [
       'schema', 'generatedAt', 'suite', 'services', 'nodes', 'extensions', 'skillGovernance',
       'promptSnapshots', 'scheduledTasks', 'mcp', 'release', 'liveSync', 'settings', 'history',
-      'workflow', 'projectRegistry', 'memory', 'memorySkillAssets', 'memoryReminders', 'executors',
+      'speech', 'workflow', 'projectRegistry', 'memory', 'memorySkillAssets', 'memoryReminders', 'executors',
       'permissions', 'paths', 'activities',
     ]);
     assert.deepEqual(controlApi.$defs?.ProjectRegistrySnapshotContract?.required, [
@@ -62,6 +70,11 @@ describe('control panel shared contracts', () => {
     ]);
     assert.deepEqual(agentCollaboration.$defs?.AgentCollaborationPanelState?.required, [
       'protocol', 'updatedAt', 'mode', 'poolHealth', 'activeTaskCount', 'workers', 'agents', 'recentRuns', 'metrics',
+    ]);
+    assert.equal(speech.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
+    assert.deepEqual(speech.$defs?.SpeechSettingsContract?.required, [
+      'schema', 'inputEnabled', 'outputEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
+      'asrProvider', 'ttsProvider', 'activeVoiceProfileId',
     ]);
   });
 });

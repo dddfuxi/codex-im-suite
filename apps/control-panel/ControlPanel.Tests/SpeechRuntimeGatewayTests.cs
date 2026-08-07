@@ -1,0 +1,375 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using ClaudeToImControlPanel;
+using Xunit;
+
+namespace CodexImSuite.ControlPanel.Tests;
+
+public sealed class SpeechRuntimeGatewayTests
+{
+    [Theory]
+    [InlineData("speech.refresh", "viewer")]
+    [InlineData("speech.saveSettings", "operator")]
+    [InlineData("speech.previewVoice", "operator")]
+    [InlineData("speech.activateVoiceProfile", "operator")]
+    [InlineData("speech.installComponent", "owner")]
+    [InlineData("speech.installPresetVoice", "owner")]
+    [InlineData("speech.importReferenceVoice", "owner")]
+    public void Policy_UsesExplicitSpeechRoles(string command, string expected)
+        => Assert.Equal(expected, SpeechCommandPolicy.GetRequiredRole(command));
+
+    [Theory]
+    [InlineData("speech.saveSettings", true)]
+    [InlineData("speech.installComponent", true)]
+    [InlineData("speech.installPresetVoice", true)]
+    [InlineData("speech.importReferenceVoice", true)]
+    [InlineData("speech.activateVoiceProfile", true)]
+    [InlineData("speech.refresh", false)]
+    [InlineData("speech.previewVoice", false)]
+    public void Policy_MarksStateChangingSpeechActionsAsRestartRequired(string command, bool expected)
+        => Assert.Equal(expected, SpeechCommandPolicy.RequiresBridgeRestart(command));
+
+    [Fact]
+    public async Task RunActionAsync_ReportsRestartRequirementWithoutRestartingAnything()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", "")));
+
+        var writeReceipt = await gateway.RunActionAsync("speech.saveSettings", new { });
+        var readReceipt = await gateway.RunActionAsync("speech.refresh", new { });
+
+        Assert.True(writeReceipt.RestartRequired);
+        Assert.Contains("重启 Bridge", writeReceipt.Notice);
+        Assert.False(readReceipt.RestartRequired);
+        Assert.Null(readReceipt.Notice);
+    }
+
+    [Fact]
+    public async Task RunAsync_UsesWhitelistCliAndUtf8Base64UrlPayload()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        SpeechCliInvocation? captured = null;
+        var gateway = fixture.CreateGateway(invocation =>
+        {
+            captured = invocation;
+            return Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{\"saved\":true}}", ""));
+        });
+
+        using var result = await gateway.RunAsync("speech.saveSettings", new { channelIds = new[] { "飞书" }, outputEnabled = true });
+
+        Assert.True(result.RootElement.GetProperty("saved").GetBoolean());
+        Assert.NotNull(captured);
+        Assert.Equal(fixture.DevelopmentCliPath, captured.Arguments[0]);
+        Assert.Equal("speech.saveSettings", captured.Arguments[1]);
+        Assert.Equal("--input-json", captured.Arguments[2]);
+        var payload = DecodeBase64Url(captured.Arguments[3]);
+        using var document = JsonDocument.Parse(payload);
+        Assert.Equal("飞书", document.RootElement.GetProperty("channelIds")[0].GetString());
+        Assert.Equal(fixture.CtiHome, captured.Environment["CTI_HOME"]);
+        Assert.False(captured.UseShellExecute);
+    }
+
+    [Fact]
+    public async Task ReadPanelStateAsync_DeserializesOnlySharedStatusFields()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var status = JsonNode.Parse(ValidStatusJson)!.AsObject();
+        status["sourcePath"] = "C:/must-not-leak.wav";
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, $"{{\"ok\":true,\"data\":{status}}}", "")));
+
+        var panel = await gateway.ReadPanelStateAsync();
+        var serialized = JsonSerializer.Serialize(panel);
+
+        Assert.True(panel.Available);
+        Assert.Equal("ready", panel.Status?.State);
+        Assert.DoesNotContain("must-not-leak", serialized, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("sourcePath", serialized, StringComparison.OrdinalIgnoreCase);
+        Assert.True(panel.Status?.Components.Single().Installable);
+    }
+
+    [Theory]
+    [InlineData("nested_state")]
+    [InlineData("negative_limit")]
+    [InlineData("empty_id")]
+    [InlineData("duplicate_action")]
+    [InlineData("selection_value_missing")]
+    [InlineData("duplicate_selection_option")]
+    [InlineData("installable_missing")]
+    public async Task ReadPanelStateAsync_RejectsMalformedNestedStatus(string mutation)
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var status = JsonNode.Parse(ValidStatusJson)!.AsObject();
+        switch (mutation)
+        {
+            case "nested_state":
+                status["channels"]![0]!["state"] = "invented";
+                break;
+            case "negative_limit":
+                status["limits"]!["maxInputDurationSeconds"] = -1;
+                break;
+            case "empty_id":
+                status["components"]![0]!["id"] = " ";
+                break;
+            case "duplicate_action":
+                status["actions"]!.AsArray().Add(status["actions"]![0]!.DeepClone());
+                break;
+            case "selection_value_missing":
+                status["replyPolicy"]!["value"] = "not-declared";
+                break;
+            case "duplicate_selection_option":
+                status["replyPolicy"]!["options"]!.AsArray().Add(status["replyPolicy"]!["options"]![0]!.DeepClone());
+                break;
+            case "installable_missing":
+                status["components"]![0]!.AsObject().Remove("installable");
+                break;
+            default:
+                throw new InvalidOperationException($"未知测试变体：{mutation}");
+        }
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            0,
+            $"{{\"ok\":true,\"data\":{status}}}",
+            "")));
+
+        var panel = await gateway.ReadPanelStateAsync();
+
+        Assert.False(panel.Available);
+        Assert.Equal("speech_status_invalid", panel.UnavailableCode);
+        Assert.Null(panel.Status);
+    }
+
+    [Fact]
+    public async Task ReadPanelStateAsync_FailsClosedWithStableCode()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(1, "", $"failure at {fixture.Root}")));
+
+        var panel = await gateway.ReadPanelStateAsync();
+
+        Assert.False(panel.Available);
+        Assert.Equal("speech_cli_failed", panel.UnavailableCode);
+        Assert.Null(panel.Status);
+        Assert.DoesNotContain(fixture.Root, JsonSerializer.Serialize(panel), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunAsync_PreservesTrustedRuntimeErrorCodeOnNonZeroExit()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            1,
+            "{\"ok\":false,\"errorCode\":\"speech_dependency_install_failed\"}",
+            $"failure at {fixture.Root}")));
+
+        var error = await Assert.ThrowsAsync<SpeechRuntimeGatewayException>(() =>
+            gateway.RunAsync("speech.installComponent", new { componentId = "asr" }));
+
+        Assert.Equal("speech_dependency_install_failed", error.Code);
+        Assert.DoesNotContain(fixture.Root, error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunAsync_RejectsNonZeroExitThatClaimsSuccess()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            1,
+            "{\"ok\":true,\"data\":{\"saved\":true}}",
+            "")));
+
+        var error = await Assert.ThrowsAsync<SpeechRuntimeGatewayException>(() =>
+            gateway.RunAsync("speech.saveSettings", new { }));
+
+        Assert.Equal("speech_cli_failed", error.Code);
+    }
+
+    [Fact]
+    public async Task RunAsync_RejectsUnknownActionBeforeExecuting()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var called = false;
+        var gateway = fixture.CreateGateway(_ =>
+        {
+            called = true;
+            return Task.FromResult(new SpeechCliExecutionResult(0, "{}", ""));
+        });
+
+        var error = await Assert.ThrowsAsync<SpeechRuntimeGatewayException>(() => gateway.RunAsync("speech.deleteEverything", new { }));
+
+        Assert.Equal("speech_action_not_allowed", error.Code);
+        Assert.False(called);
+    }
+
+    [Fact]
+    public async Task ExecuteProcessAsync_DrainsStdoutAndStderrConcurrently()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var script = """
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $OutputEncoding = $utf8
+        [Console]::InputEncoding = $utf8
+        [Console]::OutputEncoding = $utf8
+        for ($i = 0; $i -lt 5000; $i++) {
+          [Console]::Out.WriteLine("stdout-$i")
+          [Console]::Error.WriteLine("stderr-$i")
+        }
+        """;
+        var result = await SpeechRuntimeGateway.ExecuteProcessAsync(new SpeechCliInvocation(
+            PowerShellPath,
+            ["-NoProfile", "-NonInteractive", "-Command", script],
+            fixture.Root,
+            new Dictionary<string, string?>(),
+            15_000));
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("stdout-4999", result.Stdout);
+        Assert.Contains("stderr-4999", result.Stderr);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExecuteProcessAsync_KillsEntireProcessTreeOnTimeoutOrCancellation(bool externalCancellation)
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var childPidPath = Path.Combine(fixture.Root, $"child-{Guid.NewGuid():N}.pid");
+        var script = """
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $OutputEncoding = $utf8
+        [Console]::InputEncoding = $utf8
+        [Console]::OutputEncoding = $utf8
+        $child = Start-Process -FilePath $env:SPEECH_CHILD_EXE -ArgumentList @('127.0.0.1', '-n', '30') -PassThru -WindowStyle Hidden
+        [System.IO.File]::WriteAllText($env:SPEECH_CHILD_PID_FILE, [string]$child.Id, $utf8)
+        [Console]::Out.WriteLine('parent-stdout-ready')
+        [Console]::Error.WriteLine('parent-stderr-ready')
+        Start-Sleep -Seconds 30
+        """;
+        using var cancellation = new CancellationTokenSource();
+        if (externalCancellation) cancellation.CancelAfter(1_500);
+        var invocation = new SpeechCliInvocation(
+            PowerShellPath,
+            ["-NoProfile", "-NonInteractive", "-Command", script],
+            fixture.Root,
+            new Dictionary<string, string?>
+            {
+                ["SPEECH_CHILD_EXE"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "ping.exe"),
+                ["SPEECH_CHILD_PID_FILE"] = childPidPath,
+            },
+            externalCancellation ? 30_000 : 1_500,
+            CancellationToken: cancellation.Token);
+
+        var stopwatch = Stopwatch.StartNew();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SpeechRuntimeGateway.ExecuteProcessAsync(invocation));
+        stopwatch.Stop();
+
+        Assert.True(File.Exists(childPidPath), "父进程应在取消前创建真实子进程并记录 PID。");
+        var childPid = int.Parse(File.ReadAllText(childPidPath, Encoding.UTF8));
+        try
+        {
+            Assert.True(await WaitForProcessExitAsync(childPid, TimeSpan.FromSeconds(5)), $"子进程 {childPid} 未被进程树清理。");
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(10), "取消清理不应因 stdout/stderr drain 永久阻塞。");
+        }
+        finally
+        {
+            TryKillTestProcess(childPid);
+        }
+    }
+
+    [Fact]
+    public void ReferenceVoiceImportMetadata_RequiresIndependentSafetyConfirmations()
+    {
+        using var valid = JsonDocument.Parse("""
+        {"displayName":"授权音色","transcript":"这是一段准确转写。","sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":true}
+        """);
+        var metadata = MainForm.ReadSpeechReferenceVoiceImportMetadata(valid.RootElement);
+        Assert.True(metadata.AuthorizationConfirmed);
+        Assert.True(metadata.CleanSingleSpeakerConfirmed);
+
+        using var missingClean = JsonDocument.Parse("""
+        {"displayName":"授权音色","transcript":"这是一段准确转写。","sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":false}
+        """);
+        var error = Assert.Throws<SpeechRuntimeGatewayException>(() =>
+            MainForm.ReadSpeechReferenceVoiceImportMetadata(missingClean.RootElement));
+        Assert.Equal("speech_reference_clean_single_speaker_confirmation_required", error.Code);
+    }
+
+    private static string DecodeBase64Url(string value)
+    {
+        var normalized = value.Replace('-', '+').Replace('_', '/');
+        normalized += new string('=', (4 - normalized.Length % 4) % 4);
+        return Encoding.UTF8.GetString(Convert.FromBase64String(normalized));
+    }
+
+    private static string PowerShellPath
+        => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe");
+
+    private static async Task<bool> WaitForProcessExitAsync(int processId, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(processId);
+                if (process.HasExited) return true;
+            }
+            catch (ArgumentException)
+            {
+                return true;
+            }
+            await Task.Delay(50);
+        }
+        return false;
+    }
+
+    private static void TryKillTestProcess(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // 测试兜底清理：目标已退出或 PID 已失效时无需处理。
+        }
+    }
+
+    private const string ValidStatusJson = """
+    {"protocol":"codex-im-suite/speech-status/v1","state":"ready","inputEnabled":true,"outputEnabled":true,"channels":[{"id":"feishu","displayName":"飞书","state":"ready","enabled":true,"inputSupported":true,"outputSupported":true,"selected":true}],"replyPolicy":{"value":"on","options":[{"id":"on","displayName":"开启","state":"ready","enabled":true}]},"deliveryMode":{"value":"voice_only","options":[{"id":"voice_only","displayName":"仅语音","state":"ready","enabled":true}]},"asrProvider":{"value":"asr","options":[{"id":"asr","displayName":"ASR","state":"ready","enabled":true}]},"ttsProvider":{"value":"tts","options":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true}]},"activeVoiceProfileId":"voice","capabilities":[{"id":"speech.input","displayName":"语音输入","state":"ready","supported":true}],"components":[{"id":"sensevoice","displayName":"SenseVoice","kind":"model","state":"optional_missing","installable":true,"capabilities":["asr"]}],"voiceProfiles":[{"id":"voice","displayName":"预设音色","kind":"preset","state":"ready","active":true,"license":"内置","sourceLabel":"Runtime","authorizationConfirmed":true}],"limits":{"maxInputBytes":1024,"maxInputDurationSeconds":60,"maxOutputCharacters":500},"actions":[{"id":"speech.previewVoice","label":"试听","enabled":true}],"lastCheckedAt":"2026-08-07T00:00:00.000Z"}
+    """;
+
+    private sealed class SpeechRuntimeGatewayFixture : IDisposable
+    {
+        public SpeechRuntimeGatewayFixture()
+        {
+            Root = Path.Combine(Path.GetTempPath(), $"speech-gateway-{Guid.NewGuid():N}");
+            SuiteRoot = Path.Combine(Root, "suite");
+            SkillRoot = Path.Combine(Root, "live-skill");
+            CtiHome = Path.Combine(Root, "cti-home");
+            DevelopmentCliPath = Path.Combine(SuiteRoot, "packages", "bridge-runtime", "dist", "speech-control-cli.mjs");
+            Directory.CreateDirectory(Path.GetDirectoryName(DevelopmentCliPath)!);
+            Directory.CreateDirectory(CtiHome);
+            File.WriteAllText(DevelopmentCliPath, "// fixture", new UTF8Encoding(false));
+        }
+
+        public string Root { get; }
+        public string SuiteRoot { get; }
+        public string SkillRoot { get; }
+        public string CtiHome { get; }
+        public string DevelopmentCliPath { get; }
+
+        public SpeechRuntimeGateway CreateGateway(SpeechCliCommandExecutor executor)
+            => new(SuiteRoot, SkillRoot, CtiHome, executor, "node");
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root)) Directory.Delete(Root, true);
+        }
+    }
+}

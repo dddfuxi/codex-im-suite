@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import { isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { Agent } from 'undici';
 import type { AgentCardProgressSnapshot } from '@codex-im-suite/contracts';
@@ -48,6 +49,7 @@ import type {
   ConversationTargetResolveResult,
   DirectMessageRequest,
   DirectMessageSendResult,
+  LocalAudioDeliveryOptions,
   OutboundMentionIdentityVerification,
   OutboundMentionResolutionInspection,
   ResolvedConversationTarget,
@@ -77,6 +79,7 @@ import {
   isExplicitStickerSendRequest,
   shouldUseStickerOnlyReply,
 } from '../application/stickers.js';
+import { replaceProgressCardWithSpeech } from '../application/speech-delivery-transaction.js';
 import {
   FEISHU_STICKER_AUTO_SEND_MIN_CONFIDENCE,
   canAutoSendFeishuSticker,
@@ -2426,6 +2429,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   ): Promise<boolean> {
     if (!this.restClient) return false;
     let stickerOnlyResult: SendResult | null = null;
+    let speechOnlyPending = false;
+    let speechReplacement: { messageId: string; messageKind: 'audio' | 'text'; resultText: string } | null = null;
     return this.streamingCardLifecycle.finalize({
       chatId,
       status,
@@ -2442,6 +2447,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         },
         resolveFinalResponse: async (state, visibleFinalText, originalText) => {
           let finalResponseText = originalText;
+          if (status === 'completed' && turnContext?.speechDelivery?.receipt.validated === true) {
+            speechOnlyPending = true;
+            return { text: turnContext.speechDelivery.fallbackText || originalText, suppressCard: true };
+          }
           const stickerHint = extractFeishuStickerHint(visibleFinalText);
           if (stickerHint) {
             const deliveryGate = this.resolveStickerDeliveryGate({
@@ -2493,6 +2502,31 @@ export class FeishuAdapter extends BaseChannelAdapter {
           return finalResponseText;
         },
         discardFinalCard: async (state) => {
+          if (speechOnlyPending && turnContext?.speechDelivery) {
+            const replacement = await replaceProgressCardWithSpeech({
+              recallProgressCard: () => this.recallMessage(chatId, state.messageId),
+              sendAudio: () => this.sendLocalAudio(
+                chatId,
+                turnContext.speechDelivery!.receipt.path,
+                state.sourceMessageId,
+                { expectedSha256: turnContext.speechDelivery!.receipt.fileSha256 },
+              ),
+              sendTextFallback: () => this.send({
+                address: { channelType: 'feishu', chatId },
+                text: turnContext.speechDelivery!.fallbackText,
+                parseMode: 'plain',
+                replyToMessageId: state.sourceMessageId,
+              }),
+            });
+            if (replacement.kind === 'card_preserved') return false;
+            if (replacement.kind === 'unresolved') return false;
+            speechReplacement = {
+              messageId: replacement.messageId,
+              messageKind: replacement.kind === 'audio' ? 'audio' : 'text',
+              resultText: turnContext.speechDelivery.fallbackText,
+            };
+            return true;
+          }
           if (!stickerOnlyResult?.ok || !stickerOnlyResult.messageId) return false;
           const recalled = await this.recallMessage(chatId, state.messageId);
           if (!recalled.ok) {
@@ -2514,9 +2548,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
             finalStatus,
             finalText,
             turnContext,
-            stickerOnlyResult?.messageId
+            speechReplacement || (stickerOnlyResult?.messageId
               ? { messageId: stickerOnlyResult.messageId, messageKind: 'sticker', resultText: '已用表情包回应。' }
-              : undefined,
+              : undefined),
           );
           if (stickerOnlyResult?.messageId && stickerOnlyResult.verifiedMediaDelivery) {
             this.persistStreamingStickerDeliveryEvidence(
@@ -2551,9 +2585,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const outboundMessageId = replacement?.messageId?.trim() || state.messageId;
     if (!sessionId || !outboundMessageId) return;
 
-    const sourceText = this.normalizeLightContextAuditSummary(turnContext?.sourceText || '');
+    const continuationLimit = replacement?.messageKind === 'audio' ? 30_000 : 900;
+    const sourceText = this.normalizeLightContextAuditSummary(turnContext?.sourceText || '', continuationLimit);
     const resultText = this.normalizeLightContextAuditSummary(
       replacement?.resultText || extractStreamingFinalResponse(responseText),
+      continuationLimit,
     );
     const continuationContext = [
       sourceText ? `原始请求：${sourceText}` : '',
@@ -3452,7 +3488,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Extract content based on message type
     let text = '';
+    const isNativeAudioMessage = messageType === 'audio';
     const attachments: FileAttachment[] = [];
+    let inboundAudioEvidence: {
+      protocol: 'cti-feishu-inbound-audio/v1';
+      messageId: string;
+      fileKey: string;
+      attachmentId: string;
+      messageType: 'audio';
+    } | null = null;
     let stickerInfo: ParsedFeishuStickerContent | null = null;
     let interactiveInfo: ParsedFeishuInteractiveContent | null = null;
     let interactiveDownloadedAttachmentCount = 0;
@@ -3509,6 +3553,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
         const attachment = await this.downloadResource(msg.message_id, fileKey, resourceType);
         if (attachment) {
           attachments.push(attachment);
+          if (messageType === 'audio') {
+            // ASR 入口只信当前事件真实 message_id + file_key 成功下载出的同一附件。
+            inboundAudioEvidence = {
+              protocol: 'cti-feishu-inbound-audio/v1',
+              messageId: msg.message_id,
+              fileKey,
+              attachmentId: attachment.id,
+              messageType: 'audio',
+            };
+          }
         } else {
           text = `[${messageType} download failed]`;
           try {
@@ -3629,6 +3683,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         senderType: sender.sender_type,
         chatType: msg.chat_type,
       },
+      ...(isNativeAudioMessage ? { messageKind: 'feishu_audio' } : {}),
+      ...(inboundAudioEvidence ? {
+        feishuInboundAudio: inboundAudioEvidence,
+      } : {}),
       ...(botToBotTurn ? {
         feishuBotToBot: botToBotTurn,
       } : {}),
@@ -3853,7 +3911,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
     };
 
-    if (!text.trim() && attachments.length === 0) return;
+    if (!text.trim() && attachments.length === 0 && !isNativeAudioMessage) return;
 
     // [P1] Check for /perm text command (permission approval fallback)
     const trimmedText = text.trim();
@@ -3881,7 +3939,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       messageId: msg.message_id,
       address,
       text: text.trim(),
-      messageKind: stickerInfo?.messageKind,
+      messageKind: isNativeAudioMessage ? 'feishu_audio' : stickerInfo?.messageKind,
       timestamp,
       raw: rawMetadata,
       // Keep the shared array reference so deferred evidence can append a
@@ -6834,13 +6892,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return summary;
   }
 
-  private normalizeLightContextAuditSummary(summary: string): string {
+  private normalizeLightContextAuditSummary(summary: string, maxChars = 900): string {
     return summary
       .replace(/```cti-final\s*/giu, '')
       .replace(/```\s*$/u, '')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 900);
+      .slice(0, Math.max(1, maxChars));
   }
 
   private isLowInformationHistoryText(text: string): boolean {
@@ -7203,6 +7261,70 @@ export class FeishuAdapter extends BaseChannelAdapter {
         return '[视频]';
       default:
         return `[${item.msg_type}]`;
+    }
+  }
+
+  async sendLocalAudio(
+    chatId: string,
+    filePath: string,
+    replyToMessageId?: string,
+    options?: LocalAudioDeliveryOptions,
+  ): Promise<SendResult> {
+    if (!this.restClient) return { ok: false, error: 'Feishu client not initialized' };
+    try {
+      if (!fs.existsSync(filePath)) return { ok: false, error: 'Audio file not found' };
+      const pathStat = fs.lstatSync(filePath);
+      if (!pathStat.isFile() || pathStat.isSymbolicLink()) return { ok: false, error: 'Audio path is not a regular file' };
+      const noFollow = (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW || 0;
+      const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+      let audioBytes: Buffer;
+      try {
+        const openedStat = fs.fstatSync(descriptor);
+        if (!openedStat.isFile() || openedStat.size <= 0 || openedStat.size > MAX_UPLOAD_FILE_SIZE) {
+          return { ok: false, error: 'Audio file size is invalid' };
+        }
+        // 哈希、文件头和最终上传共用同一份已打开字节，防止路径在校验后被替换。
+        audioBytes = fs.readFileSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      if (audioBytes.length < 4 || audioBytes.subarray(0, 4).toString('ascii') !== 'OggS') {
+        return { ok: false, error: 'Audio file header is not Ogg/Opus' };
+      }
+      const expectedSha256 = options?.expectedSha256?.trim().toLowerCase();
+      if (expectedSha256 && !/^[a-f0-9]{64}$/u.test(expectedSha256)) {
+        return { ok: false, error: 'Expected audio SHA-256 is invalid' };
+      }
+      if (expectedSha256 && crypto.createHash('sha256').update(audioBytes).digest('hex') !== expectedSha256) {
+        return { ok: false, error: 'Audio file SHA-256 does not match the Runtime receipt' };
+      }
+      const uploadRes = await this.restClient.im.file.create({
+        data: {
+          file_type: 'opus',
+          file_name: path.basename(filePath),
+          file: Readable.from(audioBytes) as fs.ReadStream,
+        },
+      });
+      const fileKey = uploadRes?.file_key;
+      if (!fileKey) return { ok: false, error: 'Feishu audio upload did not return file_key' };
+      const sendRes = replyToMessageId
+        ? await this.restClient.im.message.reply({
+            path: { message_id: replyToMessageId },
+            data: { msg_type: 'audio', content: JSON.stringify({ file_key: fileKey }) },
+          })
+        : await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'audio',
+              content: JSON.stringify({ file_key: fileKey }),
+            },
+          });
+      return sendRes?.data?.message_id
+        ? { ok: true, messageId: sendRes.data.message_id }
+        : { ok: false, error: `Feishu audio send failed: ${sendRes?.msg || 'unknown error'}` };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 

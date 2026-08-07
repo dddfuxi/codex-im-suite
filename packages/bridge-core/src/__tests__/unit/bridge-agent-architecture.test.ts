@@ -209,6 +209,22 @@ describe('agent architecture registry', () => {
     assert.match(lines, /verified native reaction\/sticker delivery/i);
   });
 
+  it('keeps speech reply declarations constrained to the Delivery Layer protocol', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'delivery_layer.speech_reply');
+    const lines = getAgentPolicyPromptLines(['delivery_layer.speech_reply']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'delivery_layer');
+    assert.match(policy.responsibility, /without selecting a provider, local path, voice identity, command, or platform resource/i);
+    assert.match(lines, /exactly .*speech\.mode=voice_only/i);
+    assert.match(lines, /complete final visible answer in .*text/i);
+    assert.match(lines, /Never put a provider, model, command, local path, URL, voice or speaker ID/i);
+    assert.match(lines, /file_key, message ID, user ID, chat ID, token, or platform identity/i);
+    assert.ok(policy.tags.includes('speech'));
+    assert.ok(policy.tags.includes('cti-final'));
+  });
+
   it('keeps finite user choices in the Delivery Layer without weakening safety gates', () => {
     const compiled = compileAgentArchitectureRegistry();
     const policy = compiled.policies.find((item) => item.id === 'delivery_layer.structured_choice_prompt');

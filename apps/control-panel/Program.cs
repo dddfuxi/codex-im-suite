@@ -534,6 +534,8 @@ internal sealed partial class MainForm : Form
 
     private static string RequiredRoleForControlCommand(string command, JsonElement payload = default)
     {
+        var speechRole = SpeechCommandPolicy.GetRequiredRole(command);
+        if (!string.IsNullOrWhiteSpace(speechRole)) return speechRole;
         var scheduledTaskRole = ScheduledTaskCommandPolicy.GetRequiredRole(command);
         if (!string.IsNullOrWhiteSpace(scheduledTaskRole)) return scheduledTaskRole;
         var activeReplyRole = ActiveReplyCommandPolicy.GetRequiredRole(command);
@@ -592,7 +594,10 @@ internal sealed partial class MainForm : Form
     private void AddControlApiAudit(HttpContext context, string command, JsonElement payload, bool ok, string error)
     {
         var role = RequiredRoleForControlCommand(command, payload);
-        var summary = payload.ValueKind == JsonValueKind.Undefined ? "" : payload.GetRawText();
+        // 参考音频元数据和本机路径不得进入活动日志；审计只保留动作类型与结果。
+        var summary = string.Equals(command, "speech.importReferenceVoice", StringComparison.OrdinalIgnoreCase)
+            ? "{\"redacted\":\"authorized-reference-voice-metadata\"}"
+            : payload.ValueKind == JsonValueKind.Undefined ? "" : payload.GetRawText();
         if (summary.Length > 500) summary = summary[..500] + "...";
         AddWebActivity(ok ? "info" : "error", $"Control API {command}", $"{role} · {context.Connection.RemoteIpAddress} · {(ok ? "ok" : error)} · {MaskSecrets(summary)}");
     }
@@ -827,6 +832,14 @@ internal sealed partial class MainForm : Form
             case "bridge.status":
                 await CheckBridgeAsync();
                 return _bridgeStatus.Text;
+            case "speech.refresh":
+            case "speech.saveSettings":
+            case "speech.installComponent":
+            case "speech.installPresetVoice":
+            case "speech.importReferenceVoice":
+            case "speech.previewVoice":
+            case "speech.activateVoiceProfile":
+                return await RunSpeechControlCommandAsync(command, payload);
             case "agentCollaboration.setMode":
                 return await SetAgentCollaborationModeAsync(payload);
             case "codex.check":
@@ -1211,6 +1224,7 @@ internal sealed partial class MainForm : Form
         var skillGovernance = await BuildSkillGovernanceStateAsync();
         var promptSnapshots = BuildPromptSnapshotState();
         var scheduledTasks = await CreateScheduledTaskGateway().ReadPanelStateAsync();
+        var speech = await BuildSpeechPanelStateAsync();
         var memorySkillAssets = MemoryArtifactStore.BuildSkillAssetIndex(skillGovernance.Snapshot ?? default);
         var services = new[]
         {
@@ -1270,6 +1284,7 @@ internal sealed partial class MainForm : Form
                 status = GetFeishuHistorySyncStatusText(full: false),
                 sessions = sessionItems.Take(80).ToArray(),
             },
+            Speech: speech,
             Workflow: ListWorkflowRuns(),
             AgentCollaboration: ReadAgentCollaborationState(),
             ProjectRegistry: BuildProjectRegistrySnapshot(),

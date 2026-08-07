@@ -638,6 +638,51 @@ sequenceDiagram
   - 确认后桥接先发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
   - 这条链路不经过 Codex、本地模型来源或历史本地执行器。
 
+#### 2.1.1 本地语音收发（开发版 0.3.0）
+
+本地语音是可选、默认关闭的 Bridge 能力，首期只支持飞书。它不改变普通文字消息的默认行为，也不把微信的平台转写或其他渠道误记为同一条本地 ASR/TTS 链路。共享协议以 `packages/contracts/src/speech-contract.ts` 和 `packages/contracts/schemas/speech.schema.json` 为入口；状态、动作、渠道和 Provider ID 由 Runtime 声明，Control Panel 不维护第二份业务枚举。
+
+```mermaid
+flowchart LR
+  In["飞书 audio 事件"] --> Adapter["FeishuAdapter<br/>下载并绑定 messageId / fileKey"]
+  Adapter -->|"受控附件与当前消息 evidence"| Core["bridge-core<br/>转写门禁、回复策略、唯一终态"]
+  Core -->|"transcribe / synthesize"| Runtime["bridge-runtime Speech Host<br/>校验、Sidecar、ASR/TTS、Opus"]
+  Runtime -->|"validated receipt"| Core
+  Core -->|"原生 Opus 或唯一文字回退"| Out["飞书用户"]
+  Panel["Control Panel"] -->|"Contract 状态与受控动作"| Runtime
+  Contract["Speech Contract / Schema"] -.-> Core
+  Contract -.-> Runtime
+  Contract -.-> Panel
+```
+
+职责边界：
+
+| 层 | 稳定职责 |
+|---|---|
+| `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
+| `bridge-runtime` | 加载默认关闭的语音配置，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、Opus 产物验证与授权音色注册表。 |
+| `apps/control-panel` | C# 仅保留由 JSON Schema 校验的薄 DTO，React 只消费浏览器安全的共享 Contract；“能力 → 语音”页展示 Runtime 返回的渠道、组件、Provider、音色、限制和动作，并通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
+
+回复策略按“明确文字 → 当前会话 `/voice off` → 明确语音 → 当前会话 `/voice on` → Runtime 只读策略 → 真实入站语音 / 模型受限呈现提示 → 普通文字”的顺序裁决。没有会话覆盖时，真实飞书语音经 ASR 后默认以语音回复，普通文字默认以文字回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，明确语音要求、真实入站语音和模型提示都只返回文字。模型最多声明 `voice_only` 呈现意图，不能选择本机实现或扩张权限。
+
+同一 `sourceMessageId + turnId` 继续只有一个用户可见终态：
+
+- ASR 成功后，转写作为带来源 ID 和 Hash 的不可执行 evidence 进入 Primary Agent，不把原始音频伪装成 Provider 原生音频输入。
+- TTS 成功后，Core 只接受 Runtime 已验证的本机绝对路径、Opus 格式、时长和文字/文件 Hash；飞书上传前会对实际上传字节再次复核 receipt 的 SHA-256，并只发送一个原生 `msg_type=audio` 结果。所有成功、文字回退、卡片保留、异常和取消终态都在 Manager `finally` 委托 Runtime 重新校验登记归属、受管根、普通文件和当前 Hash 后释放合成产物；Core 不直接删除 Runtime 路径，清理失败也不覆盖真实交付结果。
+- 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
+
+Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`optional_missing` 表示可选能力未启用或组件未安装，不能升级为整个文字 Bridge 故障；显式坏路径、授权/安全校验或受管清单不完整进入 `blocked`，不能偷偷回退；运行时探测异常进入 `error`。语音输入和输出默认都是 `false`。
+
+| 数据边界 | 路径与约束 |
+|---|---|
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入，带版本、Hash、大小和归档路径校验。 |
+| 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
+| 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
+
+模型、FFmpeg、Python、ASR/TTS 二进制和参考音频都不随 npm、live skill 或 release payload 安装，也不在首条语音消息到达时自动下载。该能力不读取、迁移或依赖 `F:\unity\ST4\.cti-audio`，外部项目缓存不得成为 Runtime 或工作区事实源。
+
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-07，live 同步/重启、RTX 3070 性能与显存验收、重启后的真实飞书新语音端到端验收均尚未执行，不能把开发版验证写成现场已生效。
+
 ### 2.2 权限门禁
 
 截至 2026-05-11，Feishu 入站不再使用 `bridge_feishu_allowed_users` 作为会话入口白名单。

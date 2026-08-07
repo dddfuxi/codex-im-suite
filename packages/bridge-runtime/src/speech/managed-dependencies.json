@@ -1,0 +1,64 @@
+{
+  "protocol": "cti-speech-managed-dependencies/v1",
+  "components": [
+    {
+      "id": "sensevoice_gguf",
+      "displayName": "SenseVoiceSmall GGUF Q8",
+      "kind": "model",
+      "capabilities": ["asr"],
+      "source": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/cebc2cdd171e895d783040dbd15f10f3a76f7151/sensevoice-small-q8.gguf",
+      "version": "cebc2cdd171e895d783040dbd15f10f3a76f7151",
+      "sha256": "4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5",
+      "size": 254208320,
+      "license": "Apache-2.0",
+      "archive": "file",
+      "fileName": "sensevoice-small-q8.gguf",
+      "availability": "ready"
+    },
+    {
+      "id": "sensevoice_runtime",
+      "displayName": "SenseVoice llama.cpp Runtime（Windows x64）",
+      "kind": "binary",
+      "capabilities": ["asr_runtime"],
+      "source": "https://github.com/modelscope/FunASR/releases/download/runtime-llamacpp-v0.1.9/funasr-llamacpp-windows-x64.zip",
+      "version": "runtime-llamacpp-v0.1.9",
+      "sha256": "6767af74e42c8b928742e12d5995c139636d9482ea151cdbb51f1b7573667772",
+      "size": 4685477,
+      "license": "Apache-2.0",
+      "archive": "zip",
+      "fileName": "llama-funasr-sensevoice.exe",
+      "availability": "ready",
+      "platforms": ["win32-x64"]
+    },
+    {
+      "id": "cosyvoice",
+      "displayName": "CosyVoice 300M SFT（内置中文女声）",
+      "kind": "model",
+      "capabilities": ["tts"],
+      "source": "https://huggingface.co/FunAudioLLM/CosyVoice-300M-SFT",
+      "version": null,
+      "sha256": null,
+      "size": null,
+      "license": "Apache-2.0",
+      "archive": "file",
+      "fileName": null,
+      "availability": "blocked",
+      "diagnosticCode": "manifest_incomplete"
+    },
+    {
+      "id": "cosyvoice_clone",
+      "displayName": "Fun-CosyVoice3 0.5B 2512",
+      "kind": "model",
+      "capabilities": ["tts", "voice_clone"],
+      "source": "https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+      "version": null,
+      "sha256": null,
+      "size": null,
+      "license": "Apache-2.0",
+      "archive": "file",
+      "fileName": null,
+      "availability": "blocked",
+      "diagnosticCode": "manifest_incomplete"
+    }
+  ]
+}

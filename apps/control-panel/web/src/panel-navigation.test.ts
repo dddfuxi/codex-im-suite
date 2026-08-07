@@ -12,7 +12,7 @@ describe('panel navigation', () => {
     assert.deepEqual(panelNavigation.map((group) => group.id), ['run', 'robot', 'capability', 'governance']);
     assert.deepEqual(panelNavigation[0].pages, ['overview', 'services', 'sessions', 'scheduledTasks']);
     assert.deepEqual(panelNavigation[1].pages, ['architecture', 'prompts', 'memory']);
-    assert.deepEqual(panelNavigation[2].pages, ['skills', 'mcp', 'modelsPlugins']);
+    assert.deepEqual(panelNavigation[2].pages, ['skills', 'mcp', 'modelsPlugins', 'speech']);
     assert.deepEqual(panelNavigation[3].pages, ['permissions', 'release', 'logs', 'settings']);
   });
 
@@ -22,6 +22,7 @@ describe('panel navigation', () => {
     assert.equal(resolvePageId('executors'), 'services');
     assert.equal(resolvePageId('memory'), 'memory');
     assert.equal(resolvePageId('scheduledTasks'), 'scheduledTasks');
+    assert.equal(resolvePageId('speech'), 'speech');
     assert.equal(resolvePageId('unknown'), 'overview');
     assert.equal(resolveLegacyServiceTab('nodes'), 'nodes');
     assert.equal(resolveLegacyServiceTab('executors'), 'executors');

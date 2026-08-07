@@ -98,6 +98,50 @@ test('instructs Feishu turns to decide intent state without exposing tool proces
   assert.match(prompt, /cti-direct-message/);
 });
 
+test('injects the speech reply protocol only for Feishu turns', () => {
+  initBridgeContext({
+    store: { getSetting: () => '' },
+    llm: {},
+    permissions: {},
+    lifecycle: {},
+  } as any);
+
+  const baseBinding = {
+    id: 'binding-speech',
+    codepilotSessionId: 'session-speech',
+    chatId: 'chat-speech',
+    sdkSessionId: '',
+    workingDirectory: '',
+    model: '',
+    mode: 'code' as const,
+    active: true,
+    createdAt: '2026-08-07T00:00:00.000Z',
+    updatedAt: '2026-08-07T00:00:00.000Z',
+  };
+  const feishuPrompt = _testOnly.buildBridgeScopedSystemPrompt(
+    { ...baseBinding, channelType: 'feishu' },
+    'base',
+    '',
+  );
+  const discordPrompt = _testOnly.buildBridgeScopedSystemPrompt(
+    { ...baseBinding, channelType: 'discord' },
+    'base',
+    '',
+  );
+  const qqPrompt = _testOnly.buildBridgeScopedSystemPrompt(
+    { ...baseBinding, channelType: 'qq' },
+    'base',
+    '',
+  );
+
+  assert.match(feishuPrompt, /Speech reply policy/i);
+  assert.match(feishuPrompt, /speech\.mode=voice_only/i);
+  assert.doesNotMatch(discordPrompt, /Speech reply policy/i);
+  assert.doesNotMatch(discordPrompt, /speech\.mode=voice_only/i);
+  assert.doesNotMatch(qqPrompt, /Speech reply policy/i);
+  assert.doesNotMatch(qqPrompt, /speech\.mode=voice_only/i);
+});
+
 test('encourages proactive completion instead of unnecessary retreat', () => {
   initBridgeContext({
     store: {

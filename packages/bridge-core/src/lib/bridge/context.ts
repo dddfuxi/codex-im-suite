@@ -29,6 +29,7 @@ import type {
   ArtifactEncodingInspectorHost,
   AgentCollaborationHost,
   ChoicePromptStateHost,
+  SpeechHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -52,6 +53,8 @@ export interface BridgeContext {
   artifactEncoding?: ArtifactEncodingInspectorHost;
   agentCollaboration?: AgentCollaborationHost;
   choicePrompts?: ChoicePromptStateHost;
+  /** 可选 Runtime 本地语音 Host；缺失时语音入口失败关闭为可行动文字提示。 */
+  speech?: SpeechHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

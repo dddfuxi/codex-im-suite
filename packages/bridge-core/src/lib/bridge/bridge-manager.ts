@@ -20,6 +20,10 @@ import type {
   FeishuCloudLinkResolveResult,
   FeishuOAuthManualResumeRequest,
   FileAttachment,
+  SpeechHost,
+  SpeechReplyPolicy,
+  SpeechReplyPreference,
+  SpeechSynthesisReceipt,
   MemoryWriteCandidate,
   MemoryWriteClassification,
   MemoryWriteIntentDecision,
@@ -145,6 +149,19 @@ import {
   type FinalReplyKind,
 } from './application/delivery-preparation.js';
 import { enforceInputEvidenceDeliveryBoundary } from './application/input-evidence-delivery-policy.js';
+import {
+  buildSpeechTranscriptContext,
+  decideSpeechReply,
+  evaluateSpeechSynthesisEligibility,
+  mergeTranscriptWithUserText,
+  normalizeSpeechSynthesisText,
+  parseSpeechSynthesisReceipt,
+  parseSpeechTranscriptReceipt,
+  parseVoiceCommandPreference,
+  resolveTrustedInboundAudio,
+  speechFailureMessage,
+} from './application/speech-policy.js';
+import { deliverSpeechWithTextFallback } from './application/speech-delivery-transaction.js';
 import {
   CHOICE_CALLBACK_PREFIX,
   ChoicePromptRegistry,
@@ -5257,6 +5274,9 @@ interface BridgeManagerState {
   messageTasks: Map<string, MessageLifecycleTask>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
+  /** 仅供尚未升级专用 Store 接口的旧 Runtime 使用；新 Runtime 必须持久化。 */
+  speechReplyPreferences: Map<string, SpeechReplyPreference>;
+  speechPreferenceFallbackAudited: Set<string>;
   autoStartChecked: boolean;
 }
 
@@ -5272,6 +5292,8 @@ function getState(): BridgeManagerState {
       activeTasks: new Map(),
       messageTasks: new Map(),
       sessionLocks: new Map(),
+      speechReplyPreferences: new Map(),
+      speechPreferenceFallbackAudited: new Set(),
       autoStartChecked: false,
     };
   }
@@ -5282,7 +5304,63 @@ function getState(): BridgeManagerState {
   if (!g[GLOBAL_KEY].messageTasks) {
     g[GLOBAL_KEY].messageTasks = new Map();
   }
+  if (!g[GLOBAL_KEY].speechReplyPreferences) {
+    g[GLOBAL_KEY].speechReplyPreferences = new Map();
+  }
+  if (!g[GLOBAL_KEY].speechPreferenceFallbackAudited) {
+    g[GLOBAL_KEY].speechPreferenceFallbackAudited = new Set();
+  }
   return g[GLOBAL_KEY];
+}
+
+function auditSpeechPreferenceFallback(msg: InboundMessage, sessionId: string, reason: 'unsupported' | 'store_error'): void {
+  const state = getState();
+  const key = `${sessionId}:${reason}`;
+  if (state.speechPreferenceFallbackAudited.has(key)) return;
+  state.speechPreferenceFallbackAudited.add(key);
+  try {
+    getBridgeContext().store.insertAuditLog({
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[SPEECH_PREFERENCE_FALLBACK] session=${sessionId.slice(0, 12)} reason=${reason}`,
+    });
+  } catch { /* compatibility observation must not block the user turn */ }
+}
+
+function readSpeechReplyPreference(msg: InboundMessage, sessionId: string): SpeechReplyPreference | null {
+  const store = getBridgeContext().store;
+  if (typeof store.getSpeechReplyPreference === 'function' && typeof store.setSpeechReplyPreference === 'function') {
+    try {
+      return store.getSpeechReplyPreference(sessionId);
+    } catch {
+      auditSpeechPreferenceFallback(msg, sessionId, 'store_error');
+    }
+  } else {
+    auditSpeechPreferenceFallback(msg, sessionId, 'unsupported');
+  }
+  return getState().speechReplyPreferences.get(sessionId) ?? null;
+}
+
+function writeSpeechReplyPreference(
+  msg: InboundMessage,
+  sessionId: string,
+  preference: SpeechReplyPreference,
+): { persisted: boolean } {
+  const store = getBridgeContext().store;
+  if (typeof store.getSpeechReplyPreference === 'function' && typeof store.setSpeechReplyPreference === 'function') {
+    try {
+      store.setSpeechReplyPreference(sessionId, preference);
+      return { persisted: true };
+    } catch {
+      auditSpeechPreferenceFallback(msg, sessionId, 'store_error');
+    }
+  } else {
+    auditSpeechPreferenceFallback(msg, sessionId, 'unsupported');
+  }
+  getState().speechReplyPreferences.set(sessionId, preference);
+  return { persisted: false };
 }
 
 const DEFAULT_INTERRUPTED_CARD_TEXT = [
@@ -5451,6 +5529,56 @@ function cleanupMessageLifecycleTask(task: MessageLifecycleTask | null | undefin
   if (managerState.messageTasks.get(task.key) === task) {
     managerState.messageTasks.delete(task.key);
   }
+}
+
+interface RegisteredActiveBridgeTask {
+  activeTask: ActiveBridgeTask;
+  lifecycleTask: MessageLifecycleTask | null;
+}
+
+/**
+ * 把“可取消工作”统一登记到 session 与原始消息两个索引。
+ * ASR、Provider 等阶段都复用这一入口，避免某个前置阶段落在 /stop、
+ * 控制面板终止和消息撤回的取消边界之外。
+ */
+function registerActiveBridgeTask(input: {
+  adapter: BaseChannelAdapter;
+  msg: InboundMessage;
+  sessionId: string;
+  sourceText: string;
+  cardStarted: boolean;
+  lifecycleTask?: MessageLifecycleTask | null;
+}): RegisteredActiveBridgeTask {
+  const lifecycleTask = input.lifecycleTask === undefined
+    ? registerMessageLifecycleTask(input.adapter, input.msg, input.sessionId, 'running')
+    : input.lifecycleTask;
+  const abort = new AbortController();
+  const activeTask: ActiveBridgeTask = {
+    abort,
+    adapter: input.adapter,
+    channelType: input.adapter.channelType,
+    chatId: input.msg.address.chatId,
+    sessionId: input.sessionId,
+    sourceMessageId: input.msg.messageId,
+    sourceText: input.sourceText,
+    lifecycleTaskKey: lifecycleTask?.key,
+    cardStarted: input.cardStarted,
+    interruptionFinalized: false,
+  };
+  if (lifecycleTask) {
+    lifecycleTask.abort = abort;
+    lifecycleTask.activeTask = activeTask;
+  }
+  getState().activeTasks.set(input.sessionId, activeTask);
+  return { activeTask, lifecycleTask };
+}
+
+function cleanupRegisteredActiveBridgeTask(registration: RegisteredActiveBridgeTask): void {
+  const state = getState();
+  if (state.activeTasks.get(registration.activeTask.sessionId) === registration.activeTask) {
+    state.activeTasks.delete(registration.activeTask.sessionId);
+  }
+  cleanupMessageLifecycleTask(registration.lifecycleTask);
 }
 
 function findMessageLifecycleTask(control: InboundLifecycleControl, msg: InboundMessage): MessageLifecycleTask | null {
@@ -6184,6 +6312,13 @@ async function handleMessage(
       alias?: string;
       reason?: string;
     };
+    feishuInboundAudio?: {
+      protocol?: string;
+      messageId?: string;
+      fileKey?: string;
+      attachmentId?: string;
+      messageType?: string;
+    };
     messageKind?: string;
     sticker?: { fileKey?: string; known?: boolean; imageAvailable?: boolean };
   } | undefined;
@@ -6386,7 +6521,8 @@ async function handleMessage(
     return;
   }
 
-  const rawText = msg.text.trim();
+  const inboundMessageKind = getInboundMessageKind(msg, rawData);
+  let rawText = msg.text.trim();
   let hasAttachments = !!(msg.attachments && msg.attachments.length > 0);
   const ownerMessage = isOwnerMessage(msg);
 
@@ -6403,7 +6539,7 @@ async function handleMessage(
   }
 
   // Handle attachment-only download failures — surface error to user instead of silently dropping
-  if (!rawText && !hasAttachments) {
+  if (!rawText && !hasAttachments && inboundMessageKind !== 'feishu_audio') {
     if (rawData?.userVisibleError) {
       await deliver(adapter, {
         address: msg.address,
@@ -6642,7 +6778,7 @@ async function handleMessage(
   }
 
   // Sanitize general message text before routing to conversation engine
-  const { text, truncated } = sanitizeInput(rawText);
+  let { text, truncated } = sanitizeInput(rawText);
   if (truncated) {
     console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
     store.insertAuditLog({
@@ -6654,7 +6790,7 @@ async function handleMessage(
     });
   }
 
-  if (!text && !hasAttachments) { ack(); return; }
+  if (!text && !hasAttachments && inboundMessageKind !== 'feishu_audio') { ack(); return; }
 
   if (isDangerousUserRequest(rawText) && !ownerMessage) {
     await deliver(adapter, {
@@ -6667,9 +6803,8 @@ async function handleMessage(
     return;
   }
 
-  const inboundMessageKind = getInboundMessageKind(msg, rawData);
   const adapterIdentity = adapter.getAssistantIdentity?.() ?? null;
-  const smallTalkReply = !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
+  const smallTalkReply = inboundMessageKind !== 'feishu_audio' && !hasAttachments ? buildSmallTalkReply(rawText, adapterIdentity) : '';
   if (smallTalkReply) {
     const binding = router.resolve(msg.address);
     store.addMessage(binding.codepilotSessionId, 'user', text || rawText);
@@ -6720,6 +6855,24 @@ async function handleMessage(
     if (!processingCardStarted) return;
     processingCardStarted = false;
     adapter.onMessageEnd?.(msg.address.chatId);
+  };
+  const finishSpeechInputError = async (message: string): Promise<void> => {
+    clearLightStatusTimer();
+    let cardFinalized = false;
+    if (lightStatusCardStarted && adapter.onStreamEnd) {
+      try {
+        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, 'error', message);
+      } catch { /* fall through to one ordinary text result */ }
+    }
+    if (!cardFinalized) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: message,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+    }
+    endProcessingCard();
   };
   // 确定性命令、权限、危险请求、空消息和真正的本地秒回都已在上方收口。
   // 从这里开始立即挂首屏反馈，必须早于 session 路由、身份/表情 Prompt、
@@ -6784,6 +6937,111 @@ async function handleMessage(
         });
       }
       endProcessingCard();
+      ack();
+      return;
+    }
+  }
+
+  let speechTranscriptContext = '';
+  const inboundSpeechReceived = inboundMessageKind === 'feishu_audio';
+  if (inboundSpeechReceived) {
+    const speechPlan = resolveTrustedInboundAudio({
+      channelType: adapter.channelType,
+      sourceMessageId: msg.messageId,
+      raw: msg.raw,
+      attachments: msg.attachments || [],
+    });
+    const speechHost = getBridgeContext().speech;
+    const turnStorage = getBridgeContext().turnStorage;
+    if (!speechPlan) {
+      await finishSpeechInputError(speechFailureMessage({ errorCode: 'speech_input_unavailable' }, 'transcribe'));
+      ack();
+      return;
+    }
+    if (!speechHost || !turnStorage) {
+      await finishSpeechInputError(speechFailureMessage({ errorCode: 'speech_not_ready' }, 'transcribe'));
+      ack();
+      return;
+    }
+
+    // 转写属于当前回复的一部分：在调用 Runtime 前就登记取消控制，
+    // 让面板终止、/stop、bridge stop 与原消息撤回都能中断 ASR。
+    const speechTaskRegistration = registerActiveBridgeTask({
+      adapter,
+      msg,
+      sessionId: binding.codepilotSessionId,
+      sourceText: rawText,
+      cardStarted: processingCardStarted,
+    });
+    const speechTaskAbort = speechTaskRegistration.activeTask.abort;
+    const speechLifecycleTask = speechTaskRegistration.lifecycleTask;
+    activeTask = speechTaskRegistration.activeTask;
+    if (speechLifecycleTask?.cancelled) {
+      await pauseMessageLifecycleTask(speechLifecycleTask);
+      cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
+      if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
+      endProcessingCard();
+      ack();
+      return;
+    }
+
+    try {
+      const [stagedAudio] = turnStorage.stageInputFiles({
+        sessionId: binding.codepilotSessionId,
+        turnId: msg.messageId,
+        files: [speechPlan.attachment],
+      });
+      if (!stagedAudio?.filePath || !stagedAudio.sha256) {
+        throw { errorCode: 'speech_input_staging_failed' };
+      }
+      const rawReceipt = await speechHost.transcribe({
+        attachmentId: speechPlan.evidence.attachmentId,
+        path: stagedAudio.filePath,
+        mediaType: speechPlan.attachment.type,
+        sha256: stagedAudio.sha256,
+        sourceMessageId: msg.messageId,
+        signal: speechTaskAbort.signal,
+      });
+      if (speechTaskAbort.signal.aborted || speechLifecycleTask?.cancelled) {
+        const interruption = new Error('speech input cancelled');
+        interruption.name = 'AbortError';
+        throw interruption;
+      }
+      const receipt = parseSpeechTranscriptReceipt(rawReceipt, {
+        attachmentId: speechPlan.evidence.attachmentId,
+        sourceMessageId: msg.messageId,
+        fileSha256: stagedAudio.sha256,
+      });
+      if (!receipt) {
+        throw { errorCode: 'speech_invalid_transcript_receipt' };
+      }
+      speechTranscriptContext = buildSpeechTranscriptContext(receipt);
+      const mergedText = mergeTranscriptWithUserText(receipt.text, rawText);
+      const sanitizedSpeechText = sanitizeInput(mergedText);
+      rawText = sanitizedSpeechText.text;
+      text = sanitizedSpeechText.text;
+      truncated = truncated || sanitizedSpeechText.truncated;
+      msg.attachments = (msg.attachments || []).filter((item) => item.id !== speechPlan.evidence.attachmentId);
+      hasAttachments = msg.attachments.length > 0;
+      if (!rawText) throw { errorCode: 'speech_empty_transcript' };
+    } catch (error) {
+      const interrupted = speechTaskAbort.signal.aborted || speechLifecycleTask?.cancelled === true;
+      if (interrupted) {
+        // 取消入口已经负责唯一可见终态；这里不能再降级成泛化 ASR 错误。
+        endProcessingCard();
+      } else {
+        await finishSpeechInputError(speechFailureMessage(error, 'transcribe'));
+      }
+      cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
+      if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
+      ack();
+      return;
+    }
+    cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
+    if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
+
+    if (isDangerousUserRequest(rawText) && !ownerMessage) {
+      await finishSpeechInputError(buildOwnerRequiredMessage(msg));
       ack();
       return;
     }
@@ -6945,28 +7203,19 @@ async function handleMessage(
     }
   }
 
-  // Create an AbortController so /stop can cancel this task externally
-  const taskAbort = new AbortController();
-  const state = getState();
-  activeTask = {
-    abort: taskAbort,
+  const providerTaskRegistration = registerActiveBridgeTask({
     adapter,
-    channelType: adapter.channelType,
-    chatId: msg.address.chatId,
+    msg,
     sessionId: effectiveBinding.codepilotSessionId,
-    sourceMessageId: msg.messageId,
     sourceText: rawText,
-    lifecycleTaskKey: messageLifecycleTask?.key,
     cardStarted: processingCardStarted,
-    interruptionFinalized: false,
-  };
-  if (messageLifecycleTask) {
-    messageLifecycleTask.abort = taskAbort;
-    messageLifecycleTask.activeTask = activeTask;
-  }
-  state.activeTasks.set(effectiveBinding.codepilotSessionId, activeTask);
+    lifecycleTask: messageLifecycleTask,
+  });
+  activeTask = providerTaskRegistration.activeTask;
+  const taskAbort = activeTask.abort;
   if (messageLifecycleTask?.cancelled) {
     await pauseMessageLifecycleTask(messageLifecycleTask);
+    cleanupRegisteredActiveBridgeTask(providerTaskRegistration);
     ack();
     return;
   }
@@ -7238,6 +7487,10 @@ async function handleMessage(
     }
   };
 
+  let permissionRequestedThisTurn = false;
+  // 合成文件由 Runtime 持有；Core 只保存本轮已验证回执，并在所有终态后委托 Runtime 释放。
+  let managedSpeechReceipt: SpeechSynthesisReceipt | null = null;
+  let managedSpeechHost: SpeechHost | undefined;
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
@@ -7435,6 +7688,7 @@ async function handleMessage(
       feishuMentionResolutionPrompt,
       feishuMemberProfileEvidencePrompt,
       feishuAvatarEvidencePrompt,
+      speechTranscriptContext,
     ].filter(Boolean).join('\n\n');
     if (collaborationRunId) {
       try {
@@ -7444,6 +7698,7 @@ async function handleMessage(
       }
     }
     const result = await engine.processMessage(effectiveBinding, providerPromptText, async (perm) => {
+      permissionRequestedThisTurn = true;
       emitProgressCardStep?.(`等待 ${formatVisibleToolName(perm.toolName) || '工具'} 授权。`);
       updateBridgeRuntimeActiveRequest({
         permissionRequestId: perm.permissionRequestId,
@@ -8018,6 +8273,96 @@ async function handleMessage(
         channelType: adapter.channelType,
       })
       : '';
+    // TTS 资格与后续真实附件发送复用同一组路径，避免语音判定和交付各算一套。
+    const pendingLocalImagePaths = Array.from(new Set([
+      ...(preparedReply?.images || []),
+      ...extractLocalImagePaths(
+        responseText,
+        resolvedWorkingDirectory,
+        accessibleWorkspaceDirectories,
+      ),
+    ]));
+    const pendingLocalFilePaths = Array.from(new Set(preparedReply?.files || []));
+    const speechText = normalizeSpeechSynthesisText(deliveryResponseText);
+    managedSpeechHost = getBridgeContext().speech;
+    let runtimeReplyPolicy: SpeechReplyPolicy | undefined;
+    try {
+      runtimeReplyPolicy = managedSpeechHost?.getReplyPolicy?.();
+    } catch {
+      // Runtime policy 是可选呈现配置；读取异常时使用 Core 的兼容默认。
+    }
+    const speechDecision = decideSpeechReply({
+      userText: rawText,
+      sessionPreference: readSpeechReplyPreference(msg, effectiveBinding.codepilotSessionId),
+      inboundAudio: inboundSpeechReceived,
+      modelDirective: preparedReply?.speech,
+      replyPolicy: runtimeReplyPolicy,
+    });
+    const speechContentEligibility = evaluateSpeechSynthesisEligibility({
+      text: deliveryResponseText,
+      imageCount: pendingLocalImagePaths.length,
+      fileCount: pendingLocalFilePaths.length,
+      hasInteractiveContent: Boolean(
+        agentChoiceCardAttached
+        || registeredChoiceForDelivery
+        || preparedReply?.feishuCardJson
+        || preparedReply?.choicePrompt
+        || preparedReply?.choiceFlow
+        || preparedReply?.choiceSession
+        || preparedReply?.analysisView
+      ),
+      mentionCount: preparedReply?.mentions?.length || 0,
+      permissionRequested: permissionRequestedThisTurn,
+    });
+    if (speechDecision.mode === 'voice' && !speechContentEligibility.eligible) {
+      try {
+        store.insertAuditLog({
+          channelType: adapter.channelType,
+          chatId: msg.address.chatId,
+          direction: 'outbound',
+          messageId: msg.messageId,
+          summary: `[SPEECH_SYNTHESIS_SKIPPED] reason=${speechContentEligibility.reason}`,
+        });
+      } catch { /* 语音资格审计失败不能阻断原始文字/结构化交付。 */ }
+    }
+    const speechEligible = adapter.channelType === 'feishu'
+      && speechDecision.mode === 'voice'
+      && speechContentEligibility.eligible
+      && Boolean(speechText)
+      && !result.hasError
+      && !documentDeliveryFailed
+      && !handledAsDoc
+      && !agentChoiceCardAttached
+      && !preparedReply?.feishuCardJson
+      && !verifiedStickerAction
+      && !taskAbort.signal.aborted;
+    if (speechEligible) {
+      if (managedSpeechHost) {
+        try {
+          let scratchDir: string | undefined;
+          try {
+            scratchDir = getBridgeContext().turnStorage?.getScratchDirectory({
+              sessionId: effectiveBinding.codepilotSessionId,
+              turnId: msg.messageId,
+            });
+          } catch { /* Runtime may choose its own managed scratch root */ }
+          managedSpeechReceipt = parseSpeechSynthesisReceipt(await managedSpeechHost.synthesize({
+            text: speechText,
+            scratchDir,
+            signal: taskAbort.signal,
+          }), speechText);
+          if (!managedSpeechReceipt) throw { errorCode: 'speech_invalid_synthesis_receipt' };
+        } catch (error) {
+          const notice = speechFailureMessage(error, 'synthesize');
+          deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+          outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+        }
+      } else {
+        const notice = speechFailureMessage({ errorCode: 'speech_not_ready' }, 'synthesize');
+        deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+        outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+      }
+    }
     const conversationMemoryResponseText = handledAsDoc
       ? deliveryResponseText
       : stickerSafeUserFacingResponseText;
@@ -8083,6 +8428,12 @@ async function handleMessage(
             ...(!agentChoiceCardAttached && preparedCardHero
               ? { feishuCardHero: preparedCardHero.cardHero }
               : {}),
+            ...(managedSpeechReceipt ? {
+              speechDelivery: {
+                receipt: managedSpeechReceipt,
+                fallbackText: deliveryResponseText,
+              },
+            } : {}),
           },
         );
         if (status === 'interrupted' && activeTask) activeTask.interruptionFinalized = cardFinalized;
@@ -8102,20 +8453,79 @@ async function handleMessage(
           && (!preparedReply?.feishuCardJson || agentChoiceCardAttached)
           ? preparedCardHero.cardHero
           : undefined;
-        responseDeliveryResult = await deliverResponse(
-          adapter,
-          msg.address,
-          outboundDeliveryResponseText,
-          effectiveBinding.codepilotSessionId,
-          preparedReply?.replyTo || msg.messageId,
-          true,
-          preparedReply?.parseMode,
-          preparedReply?.mentions,
-          preparedReply?.feishuCardJson,
-          verifiedStickerAction,
-          rawText,
-          deliveryCardHero,
-        );
+        const canUseDirectSpeech = Boolean(managedSpeechReceipt)
+          && !workflowCardStarted
+          && !lightStatusCardStarted
+          && !agentChoiceCardAttached;
+        if (canUseDirectSpeech && managedSpeechReceipt) {
+          const speechDelivery = await deliverSpeechWithTextFallback({
+            sendAudio: () => adapter.sendLocalAudio(
+              msg.address.chatId,
+              managedSpeechReceipt!.path,
+              preparedReply?.replyTo || msg.messageId,
+              { expectedSha256: managedSpeechReceipt!.fileSha256 },
+            ),
+            sendTextFallback: () => deliverResponse(
+              adapter,
+              msg.address,
+              [outboundDeliveryResponseText, speechFailureMessage({ errorCode: 'speech_delivery_failed' }, 'synthesize')]
+                .filter(Boolean)
+                .join('\n\n'),
+              effectiveBinding.codepilotSessionId,
+              preparedReply?.replyTo || msg.messageId,
+              true,
+              preparedReply?.parseMode,
+              preparedReply?.mentions,
+              preparedReply?.feishuCardJson,
+              verifiedStickerAction,
+              rawText,
+              deliveryCardHero,
+            ),
+          });
+          responseDeliveryResult = speechDelivery.kind === 'unresolved'
+            ? { ok: false, error: speechDelivery.error }
+            : { ok: true, messageId: speechDelivery.messageId };
+          if (speechDelivery.kind === 'audio') {
+            try {
+              const continuationContext = [
+                storedUserText ? `原始请求：${storedUserText}` : '',
+                '上一轮状态：已完成',
+                deliveryResponseText ? `上一轮结果：${deliveryResponseText}` : '',
+              ].filter(Boolean).join('\n');
+              store.insertOutboundRef({
+                channelType: adapter.channelType,
+                chatId: msg.address.chatId,
+                codepilotSessionId: effectiveBinding.codepilotSessionId,
+                platformMessageId: speechDelivery.messageId,
+                purpose: 'response',
+                messageKind: 'audio',
+                continuationContext,
+              });
+              store.insertAuditLog({
+                channelType: adapter.channelType,
+                chatId: msg.address.chatId,
+                direction: 'outbound',
+                messageId: speechDelivery.messageId,
+                summary: continuationContext.slice(0, 900),
+              });
+            } catch { /* delivery success cannot be rolled back by observation persistence */ }
+          }
+        } else {
+          responseDeliveryResult = await deliverResponse(
+            adapter,
+            msg.address,
+            outboundDeliveryResponseText,
+            effectiveBinding.codepilotSessionId,
+            preparedReply?.replyTo || msg.messageId,
+            true,
+            preparedReply?.parseMode,
+            preparedReply?.mentions,
+            preparedReply?.feishuCardJson,
+            verifiedStickerAction,
+            rawText,
+            deliveryCardHero,
+          );
+        }
         if (registeredChoiceForDelivery) {
           if (responseDeliveryResult.ok
             && responseDeliveryResult.interactiveCardSent !== false
@@ -8131,19 +8541,12 @@ async function handleMessage(
         }
         cardHeroEmbedded = cardHeroEmbedded || responseDeliveryResult.cardHeroEmbedded === true;
       }
-      const localImagePaths = Array.from(new Set([
-        ...(preparedReply?.images || []),
-        ...extractLocalImagePaths(
-          responseText,
-          resolvedWorkingDirectory,
-          accessibleWorkspaceDirectories,
-        ),
-      ])).filter((imagePath) => !(
+      const localImagePaths = pendingLocalImagePaths.filter((imagePath) => !(
         cardHeroEmbedded
         && preparedCardHero
         && sameLocalPath(imagePath, preparedCardHero.localPath)
       ));
-      const localFilePaths = Array.from(new Set(preparedReply?.files || []));
+      const localFilePaths = pendingLocalFilePaths;
       if (localImagePaths.length > 0 && typeof adapter.sendLocalImage === 'function') {
         for (const imagePath of localImagePaths.slice(0, getAutoReplyImageLimit())) {
           const imageSend = await adapter.sendLocalImage(msg.address.chatId, imagePath, msg.messageId);
@@ -8344,8 +8747,25 @@ async function handleMessage(
       } catch { /* best effort */ }
     }
 
-    state.activeTasks.delete(effectiveBinding.codepilotSessionId);
-    cleanupMessageLifecycleTask(messageLifecycleTask);
+    if (managedSpeechReceipt && managedSpeechHost?.releaseSynthesis) {
+      try {
+        await managedSpeechHost.releaseSynthesis(managedSpeechReceipt);
+      } catch {
+        // 清理失败只进入观察链，不能覆盖已经完成的语音、文字或卡片终态。
+        try {
+          store.insertAuditLog({
+            channelType: adapter.channelType,
+            chatId: msg.address.chatId,
+            direction: 'outbound',
+            messageId: msg.messageId,
+            summary: '[SPEECH_SYNTHESIS_RELEASE_FAILED]',
+          });
+        } catch { /* best effort */ }
+        console.warn('[bridge-manager] Managed speech synthesis artifact release failed');
+      }
+    }
+
+    cleanupRegisteredActiveBridgeTask(providerTaskRegistration);
     // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
     // Commit the offset only after full processing (success or failure)
@@ -8413,6 +8833,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
+        '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
         '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
@@ -8568,6 +8989,24 @@ async function handleCommand(
       break;
     }
 
+    case '/voice': {
+      const preference = parseVoiceCommandPreference(args);
+      if (!preference) {
+        response = '用法：/voice on 或 /voice off';
+        break;
+      }
+      const binding = router.resolve(msg.address);
+      const stored = writeSpeechReplyPreference(msg, binding.codepilotSessionId, preference);
+      response = preference === 'on'
+        ? stored.persisted
+          ? '已为当前会话开启默认语音回复。明确要求文字时，本轮仍会使用文字。'
+          : '已在当前进程临时开启默认语音回复；当前 Runtime 尚未提供会话偏好持久化，重启后需重新设置。'
+        : stored.persisted
+          ? '已为当前会话关闭语音回复。直到发送 /voice on 前，后续消息（包括明确要求语音和入站语音）都只使用文字。'
+          : '已在当前进程临时关闭语音回复；直到发送 /voice on 前都只使用文字。当前 Runtime 尚未提供会话偏好持久化，重启后需重新设置。';
+      break;
+    }
+
     case '/status': {
       const binding = router.resolve(msg.address);
       response = [
@@ -8683,6 +9122,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
+        '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
         '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',

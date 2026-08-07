@@ -1,3 +1,5 @@
+import type { SpeechPanelStateContract } from './speech-contract.js';
+
 export type ControlApiRole = 'viewer' | 'operator' | 'owner';
 
 export const CONTROL_PANEL_STATE_SCHEMA = 'codex-im-suite/control-panel-state/v1' as const;
@@ -76,6 +78,7 @@ export interface ControlPanelStateSections {
   liveSync: unknown;
   settings: unknown;
   history: unknown;
+  speech: SpeechPanelStateContract;
   workflow: unknown;
   agentCollaboration?: unknown;
   projectRegistry: unknown;
@@ -106,6 +109,7 @@ export interface ControlPanelStateContract<
   liveSync: TSections['liveSync'];
   settings: TSections['settings'];
   history: TSections['history'];
+  speech: TSections['speech'];
   workflow: TSections['workflow'];
   agentCollaboration?: TSections['agentCollaboration'];
   projectRegistry: TSections['projectRegistry'];

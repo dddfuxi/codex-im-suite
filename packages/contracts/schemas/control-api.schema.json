@@ -94,9 +94,12 @@
     "AgentCollaborationPanelState": {
       "$ref": "agent-collaboration.schema.json#/$defs/AgentCollaborationPanelState"
     },
+    "SpeechPanelStateContract": {
+      "$ref": "speech.schema.json#/$defs/SpeechPanelStateContract"
+    },
     "ControlPanelStateContract": {
       "type": "object",
-      "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
+      "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "speech", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
       "properties": {
         "schema": { "const": "codex-im-suite/control-panel-state/v1" },
         "generatedAt": { "type": "string" },
@@ -125,6 +128,7 @@
         "liveSync": {},
         "settings": {},
         "history": {},
+        "speech": { "$ref": "#/$defs/SpeechPanelStateContract" },
         "workflow": {},
         "agentCollaboration": { "$ref": "#/$defs/AgentCollaborationPanelState" },
         "projectRegistry": { "$ref": "#/$defs/ProjectRegistrySnapshotContract" },

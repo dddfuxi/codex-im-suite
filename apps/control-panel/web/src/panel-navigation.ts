@@ -9,6 +9,7 @@ export const panelPageMeta = {
   skills: { label: 'Skills' },
   mcp: { label: 'MCP' },
   modelsPlugins: { label: '模型与插件' },
+  speech: { label: '语音' },
   permissions: { label: '权限' },
   release: { label: '发布' },
   logs: { label: '日志' },
@@ -21,7 +22,7 @@ export type ServiceTabId = 'services' | 'nodes' | 'executors';
 export const panelNavigation = [
   { id: 'run', label: '运行', pages: ['overview', 'services', 'sessions', 'scheduledTasks'] },
   { id: 'robot', label: '机器人', pages: ['architecture', 'prompts', 'memory'] },
-  { id: 'capability', label: '能力', pages: ['skills', 'mcp', 'modelsPlugins'] },
+  { id: 'capability', label: '能力', pages: ['skills', 'mcp', 'modelsPlugins', 'speech'] },
   { id: 'governance', label: '治理', pages: ['permissions', 'release', 'logs', 'settings'] },
 ] as const satisfies ReadonlyArray<{
   id: string;

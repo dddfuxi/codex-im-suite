@@ -1835,6 +1835,26 @@ export class JsonFileStore implements BridgeStore {
     });
   }
 
+  getSpeechReplyPreference(sessionId: string): 'on' | 'off' | null {
+    this.refreshSessionsFromDisk();
+    const session = this.sessions.get(sessionId) as (BridgeSession & { speech_reply_preference?: unknown }) | undefined;
+    return session?.speech_reply_preference === 'on' || session?.speech_reply_preference === 'off'
+      ? session.speech_reply_preference
+      : null;
+  }
+
+  /**
+   * 会话语音偏好复用 sessions.json 的跨进程锁与原子写入；不能落到普通
+   * settings、session.mode 或独立无锁 JSON，否则会污染执行语义或状态回退。
+   */
+  setSpeechReplyPreference(sessionId: string, preference: 'on' | 'off'): void {
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId) as (BridgeSession & { speech_reply_preference?: 'on' | 'off' }) | undefined;
+      if (!session) throw new Error('speech_preference_session_not_found');
+      session.speech_reply_preference = preference;
+    });
+  }
+
   // Messages
 
   addMessage(sessionId: string, role: string, content: string, _usage?: string | null): void {

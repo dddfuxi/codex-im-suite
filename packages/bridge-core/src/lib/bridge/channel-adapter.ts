@@ -95,6 +95,11 @@ export interface OutboundMentionIdentityVerification {
   error?: string;
 }
 
+export interface LocalAudioDeliveryOptions {
+  /** Runtime 已验证产物的 SHA-256；平台上传前必须对实际上传字节再次核对。 */
+  expectedSha256?: string;
+}
+
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
   abstract readonly channelType: ChannelType;
@@ -133,6 +138,16 @@ export abstract class BaseChannelAdapter {
    */
   async sendLocalImage(_chatId: string, _filePath: string, _replyToMessageId?: string): Promise<SendResult> {
     return { ok: false, error: 'Local image sending is not supported by this adapter' };
+  }
+
+  /** Send one Runtime-validated local audio result through a platform-native voice message. */
+  async sendLocalAudio(
+    _chatId: string,
+    _filePath: string,
+    _replyToMessageId?: string,
+    _options?: LocalAudioDeliveryOptions,
+  ): Promise<SendResult> {
+    return { ok: false, error: 'Local audio sending is not supported by this adapter' };
   }
 
   /**

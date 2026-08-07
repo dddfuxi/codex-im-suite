@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
+import type { ActiveReplyCancelRequest } from 'claude-to-im';
 import { ACTIVE_REPLY_CONTROL_PROTOCOL, handleActiveReplyControlRequest } from '../active-reply-control.js';
 import { completeWorkflowRun, readWorkflowStatus, recordWorkflowRecoveryInfo, startWorkflowRun } from '../workflow-status.js';
 
@@ -34,7 +35,7 @@ describe('active reply control', () => {
       turnId: 'message-a',
       executionRequirement: { kind: 'none', reason: 'test', requiredToolFamilies: [] },
     });
-    const seen: Array<Record<string, unknown>> = [];
+    const seen: ActiveReplyCancelRequest[] = [];
     const result = await handleActiveReplyControlRequest({
       protocol: ACTIVE_REPLY_CONTROL_PROTOCOL,
       requestId: 'request-a',

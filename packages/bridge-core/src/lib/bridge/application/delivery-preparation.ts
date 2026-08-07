@@ -2,6 +2,7 @@ import path from 'node:path';
 
 import type { OutboundMention } from '../types.js';
 import { parseAnalysisView, type AnalysisView } from './analysis-view.js';
+import { parseSpeechReplyDirective, type SpeechReplyDirective } from './speech-policy.js';
 import {
   parseChoiceFlowDirective,
   parseChoicePrompt,
@@ -47,6 +48,8 @@ export interface FinalReplyEnvelope {
   choice_flow?: ChoiceFlowDirective;
   choice_session?: ChoiceSessionDirective;
   analysis_view?: AnalysisView;
+  /** 仅为呈现意图；Bridge 不接受模型提供的 provider、路径、音色或平台身份。 */
+  speech?: SpeechReplyDirective;
 }
 
 export interface DeliveryCandidatePayload {
@@ -64,6 +67,7 @@ export interface DeliveryCandidatePayload {
   choiceFlow?: ChoiceFlowDirective;
   choiceSession?: ChoiceSessionDirective;
   analysisView?: AnalysisView;
+  speech?: SpeechReplyDirective;
 }
 
 export interface DeliveryCandidateStatus {
@@ -125,6 +129,7 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     choice_flow: parseChoiceFlowDirective(raw.choice_flow),
     choice_session: parseChoiceSessionDirective(raw.choice_session),
     analysis_view: parseAnalysisView(raw.analysis_view),
+    speech: parseSpeechReplyDirective(raw.speech),
   };
 }
 
@@ -307,6 +312,7 @@ function payloadFromEnvelope(
     choiceFlow: envelope.choice_flow,
     choiceSession: envelope.choice_session,
     analysisView: envelope.analysis_view,
+    speech: envelope.speech,
   };
 }
 

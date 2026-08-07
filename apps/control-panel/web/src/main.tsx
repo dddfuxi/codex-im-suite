@@ -11,6 +11,7 @@ import {
 } from '@codex-im-suite/contracts/control-api';
 import type { AgentCollaborationPanelState } from '@codex-im-suite/contracts/agent-collaboration';
 import type { ProjectRegistrySnapshotContract } from '@codex-im-suite/contracts/project-registry';
+import type { SpeechPanelStateContract } from '@codex-im-suite/contracts/speech';
 import type {
   WorkflowPanelRunContract as WorkflowRun,
   WorkflowPanelStateContract as WorkflowStatus,
@@ -50,6 +51,7 @@ import {
   ListChecks,
   Logs,
   MessageCircle,
+  Mic,
   MoonStar,
   Network,
   Play,
@@ -88,6 +90,7 @@ import { McpPage } from './pages/McpPage.js';
 import { ModelsPluginsPage } from './pages/ModelsPluginsPage.js';
 import { PromptPage } from './pages/PromptPage.js';
 import { SkillsPage } from './pages/SkillsPage.js';
+import { SpeechPage } from './pages/SpeechPage.js';
 import { ScheduledTasksPage } from './pages/ScheduledTasksPage.js';
 import type { PromptSnapshotPanelState } from './prompt-view-model.js';
 import type { SkillGovernancePanelState } from './skill-view-model.js';
@@ -947,6 +950,7 @@ type PanelState = ControlPanelStateContract<{
     status: string;
     sessions: SessionItem[];
   };
+  speech: SpeechPanelStateContract;
   workflow: WorkflowStatus;
   agentCollaboration: AgentCollaborationPanelState;
   projectRegistry: ProjectRegistrySnapshotContract;
@@ -1004,6 +1008,7 @@ const pageIcons = {
   skills: Layers3,
   mcp: PlugZap,
   modelsPlugins: Bot,
+  speech: Mic,
   permissions: ShieldCheck,
   release: GitBranch,
   logs: Terminal,
@@ -1073,6 +1078,7 @@ const fallbackState: PanelState = {
     safetyPolicyProfile: 'balanced',
   },
   history: { status: '', sessions: [] },
+  speech: { available: false, unavailableCode: 'speech_runtime_unavailable', status: null },
   workflow: { protocol: 'workflow-runtime/v1', updatedAt: '', runs: [] },
   agentCollaboration: createEmptyAgentCollaborationState(),
   projectRegistry: {
@@ -1154,6 +1160,13 @@ const commandLabels: Record<string, string> = {
   'scheduledTasks.cancelRun': '取消计划任务运行',
   'scheduledTasks.delete': '删除计划任务',
   'scheduledTasks.retryDelivery': '重试计划任务投递',
+  'speech.refresh': '检查语音组件',
+  'speech.saveSettings': '保存语音设置',
+  'speech.installComponent': '安装语音组件',
+  'speech.installPresetVoice': '下载预设音色',
+  'speech.importReferenceVoice': '导入授权参考音频',
+  'speech.previewVoice': '试听音色',
+  'speech.activateVoiceProfile': '切换音色',
   'workflow.cancelActiveReply': '终止回复',
 };
 const trackedCommands = new Set(Object.keys(commandLabels));
@@ -2829,6 +2842,14 @@ function App() {
               pending={pending}
             />
           </ModelsPluginsPage>
+        )}
+        {page === 'speech' && (
+          <SpeechPage
+            state={state.speech}
+            run={run}
+            refresh={async () => { await run('state.refresh'); }}
+            pending={pending}
+          />
         )}
         {page === 'release' && <ReleasePage state={state} run={run} pending={pending} />}
         {page === 'sessions' && (

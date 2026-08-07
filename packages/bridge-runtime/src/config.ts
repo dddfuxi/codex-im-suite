@@ -4,9 +4,12 @@ import path from "node:path";
 import type { RegisteredProject } from "@codex-im-suite/contracts";
 import { getLocalCodexProviderCapabilities } from "./local-codex-provider-registry.js";
 import { loadRegisteredProjectRegistry } from "./projects/project-registry.js";
+import { loadSpeechRuntimeConfig, speechConfigToEnvEntries } from "./speech/runtime-config.js";
+import type { SpeechRuntimeConfig } from "./speech/runtime-types.js";
 
 export interface Config {
   runtime: 'claude' | 'codex' | 'auto';
+  speech?: SpeechRuntimeConfig;
   enabledChannels: string[];
   defaultWorkDir: string;
   bridgeProcessingTimeoutMs?: number;
@@ -522,6 +525,7 @@ export function loadConfig(): Config {
 
   return {
     runtime,
+    speech: loadSpeechRuntimeConfig(env),
     enabledChannels: splitCsv(env.get("CTI_ENABLED_CHANNELS")) ?? [],
     defaultWorkDir,
     bridgeProcessingTimeoutMs,
@@ -739,6 +743,11 @@ function formatEnvLine(key: string, value: string | undefined): string {
 
 export function saveConfig(config: Config): void {
   let out = "";
+  if (config.speech) {
+    for (const [key, value] of speechConfigToEnvEntries(config.speech)) {
+      out += formatEnvLine(key, value);
+    }
+  }
   out += formatEnvLine("CTI_RUNTIME", config.runtime);
   out += formatEnvLine(
     "CTI_ENABLED_CHANNELS",

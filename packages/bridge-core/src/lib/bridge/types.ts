@@ -316,6 +316,11 @@ export interface StreamingCardTurnContext {
   chatType?: string;
   /** 最终卡片使用的可信平台图片引用。 */
   feishuCardHero?: FeishuCardHeroImage;
+  /** Bridge 基于受管 TTS 回执签发的唯一终态替换计划；模型不能提供。 */
+  speechDelivery?: {
+    receipt: import('./host.js').SpeechSynthesisReceipt;
+    fallbackText: string;
+  };
 }
 
 // ── Config ─────────────────────────────────────────────────────
