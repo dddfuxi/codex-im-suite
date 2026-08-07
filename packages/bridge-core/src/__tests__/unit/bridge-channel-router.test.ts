@@ -206,6 +206,62 @@ describe('channel-router', () => {
     assert.equal(second.workingDirectory, '/tmp/test');
   });
 
+  it('keeps bindings inside an enabled registered project even when the legacy allowlist is narrower', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'registered-project' });
+    const registeredRoot = '/registered/project';
+    const session = store.sessions.get(first.codepilotSessionId);
+    assert.ok(session);
+    if (session) session.working_directory = registeredRoot;
+    store.bindings.set('telegram:registered-project', {
+      ...first,
+      workingDirectory: registeredRoot,
+    });
+    store.settings.set('bridge_project_registry_json', JSON.stringify({
+      schema: 'codex-im-suite/project-registry/v1',
+      projects: [{
+        id: 'registered-project',
+        displayName: 'Registered Project',
+        type: 'generic',
+        workspaceRoot: registeredRoot,
+        accessMode: 'read_only',
+        enabled: true,
+      }],
+    }));
+
+    const resolved = router.resolve({ channelType: 'telegram', chatId: 'registered-project' });
+
+    assert.equal(resolved.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(resolved.workingDirectory, registeredRoot);
+  });
+
+  it('still rejects a binding when its matching registered project is disabled', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'disabled-project' });
+    const disabledRoot = '/registered/disabled';
+    const session = store.sessions.get(first.codepilotSessionId);
+    assert.ok(session);
+    if (session) session.working_directory = disabledRoot;
+    store.bindings.set('telegram:disabled-project', {
+      ...first,
+      workingDirectory: disabledRoot,
+    });
+    store.settings.set('bridge_project_registry_json', JSON.stringify({
+      schema: 'codex-im-suite/project-registry/v1',
+      projects: [{
+        id: 'disabled-project',
+        displayName: 'Disabled Project',
+        type: 'generic',
+        workspaceRoot: disabledRoot,
+        accessMode: 'read_write',
+        enabled: false,
+      }],
+    }));
+
+    const resolved = router.resolve({ channelType: 'telegram', chatId: 'disabled-project' });
+
+    assert.notEqual(resolved.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(resolved.workingDirectory, '/tmp/test');
+  });
+
   it('resolve() rebinds to a fresh session after the binding has been idle too long', () => {
     const oldIdleMs = process.env.CTI_SESSION_IDLE_FRESH_MS;
     process.env.CTI_SESSION_IDLE_FRESH_MS = '3600000';

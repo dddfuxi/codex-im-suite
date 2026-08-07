@@ -82,8 +82,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 ## 工作区与记忆入口
 
 - 当前工作区：每轮唯一默认挂载，对应 `CTI_DEFAULT_WORKDIR` 或会话绑定目录。
-- 项目注册表：默认读取 `CTI_HOME\project-registry.json`，也可用 `CTI_PROJECT_REGISTRY_PATH` 指定其他 JSON 文件。结构化记录是项目 ID、类型、工作区根、Unity 工程根、访问模式和 MCP Profile 的唯一协议来源；`CTI_ALLOWED_WORKSPACE_ROOTS` 只兼容导入为 `generic` 项目并继续充当权限上界，不自动进入 Prompt、Provider 或附加目录。
-- 聊天切换工作区：Owner 在飞书中发送“工作区”“列出当前可用工作区”或“我想切换工作区”时，会收到带项目按钮的选择卡片；点击按钮即可切换，也可发送“切换工作区到 `<编号 / 项目 ID / 名称>`”。卡片只展示启用的结构化注册项目并标记当前项和读写模式；按钮回调会重新核验点击者 Owner 身份、注册表和目录状态。成功切换会创建新的项目会话，避免旧项目上下文、SDK session 或工具状态串入。非 Owner 不能通过文字或伪造卡片回调持久修改会话绑定。
+- 项目注册表：默认读取 `CTI_HOME\project-registry.json`，也可用 `CTI_PROJECT_REGISTRY_PATH` 指定其他 JSON 文件。结构化记录是项目 ID、类型、工作区根、Unity 工程根、访问模式和 MCP Profile 的唯一协议来源；启用的结构化项目根与 `CTI_ALLOWED_WORKSPACE_ROOTS` 导入的兼容 `generic` 项目共同构成会话路由的授权上界。允许访问不等于默认挂载：未被当前会话或本轮计划选中的项目不会自动进入 Prompt、Provider 或附加目录。
+- 聊天切换工作区：Owner 在飞书中发送“工作区”“列出当前可用工作区”或“我想切换工作区”时，会收到带项目按钮的选择卡片；点击按钮即可切换，也可发送“切换工作区到 `<编号 / 项目 ID / 名称>`”。卡片只展示启用的结构化注册项目并标记当前项和读写模式；按钮回调会重新核验点击者 Owner 身份、注册表和目录状态。成功切换会创建新的项目会话，并通过下一条普通消息使用的同一路由策略复验绑定、会话与目录，避免旧项目上下文、SDK session、工具状态或旧 allowlist 口径把新工作区静默回退。非 Owner 不能通过文字或伪造卡片回调持久修改会话绑定。
 - 项目禁止根：`CTI_PROJECT_DENIED_ROOTS` 可追加明确禁止注册和挂载的目录；Agent Home、`CTI_HOME`、上传缓存和记忆库仍由运行时自动加入禁止集合。禁止根会同时约束普通会话和计划任务。
 - 临时挂载：只由本轮消息中的明确绝对路径等强证据生成，随当前回合结束失效。
 - Agent Home / 记忆库：默认 `E:\cli-md`，集中放置 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md`。

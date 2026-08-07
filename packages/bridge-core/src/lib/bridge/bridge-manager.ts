@@ -4166,7 +4166,9 @@ async function handleWorkspaceChatCommand(
   // 工作区切换使用新会话，避免旧项目历史、SDK session 和工具状态污染新项目。
   const newBinding = router.createBinding(msg.address, target.workspaceRoot);
   const store = getBridgeContext().store;
-  const verifiedBinding = store.getChannelBinding(msg.address.channelType, msg.address.chatId);
+  // 使用下一条普通入站会实际经过的路由策略复验，避免只验证落库成功，
+  // 却在下一轮被 allowlist / 项目注册表口径差异静默回退。
+  const verifiedBinding = router.resolve(msg.address);
   const verifiedSession = verifiedBinding
     ? store.getSession(verifiedBinding.codepilotSessionId)
     : null;

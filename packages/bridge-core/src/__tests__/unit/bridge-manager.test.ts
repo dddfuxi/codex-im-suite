@@ -11605,6 +11605,7 @@ describe('bridge-manager workspace chat commands', () => {
     const store = createStatefulStore({
       bridge_feishu_owner_users: 'ou_owner',
       bridge_default_work_dir: projectA,
+      bridge_allowed_workspace_roots: projectA,
       bridge_project_registry_json: JSON.stringify({
         schema: 'codex-im-suite/project-registry/v1',
         projects: [
@@ -11635,6 +11636,17 @@ describe('bridge-manager workspace chat commands', () => {
     assert.match(sent[0].text, /已切换到工作区“项目 B”/u);
     assert.equal(sent[0].replyToMessageId, 'om_workspace_card');
 
+    // 真实故障发生在按钮成功后的下一条普通消息：旧 allowlist 比项目注册表窄，
+    // 会话路由不得再把已注册项目静默回退到默认目录。
+    const switchedSessionId = store.getChannelBinding('feishu', 'oc_123')?.codepilotSessionId;
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('你好', 'ou_owner'),
+      messageId: 'm_after_workspace_switch',
+    });
+    const bindingAfterNextMessage = store.getChannelBinding('feishu', 'oc_123');
+    assert.equal(bindingAfterNextMessage?.codepilotSessionId, switchedSessionId);
+    assert.equal(bindingAfterNextMessage?.workingDirectory, projectB);
+
     await _testOnly.handleMessage(adapter, {
       ...createInboundMessage('', 'ou_viewer'),
       messageId: 'm_workspace_forged',
@@ -11643,7 +11655,7 @@ describe('bridge-manager workspace chat commands', () => {
     });
 
     assert.equal(store.getChannelBinding('feishu', 'oc_123')?.workingDirectory, projectB);
-    assert.match(sent[1].text, /只允许 owner/u);
+    assert.match(sent[2].text, /只允许 owner/u);
   });
 
   it('keeps /cwd compatible with structured project IDs shown by /projects', async () => {
@@ -11738,7 +11750,7 @@ function createStatefulStore(settings: Record<string, string> = {}): BridgeStore
     upsertChannelBinding: (input: UpsertChannelBindingInput) => {
       const key = `${input.channelType}:${input.chatId}`;
       const existing = bindings.get(key);
-      const now = new Date('2026-05-07T00:00:00.000Z').toISOString();
+      const now = new Date().toISOString();
       const mode = input.mode === 'plan' || input.mode === 'ask' || input.mode === 'code'
         ? input.mode
         : existing?.mode ?? 'code';
@@ -11765,7 +11777,7 @@ function createStatefulStore(settings: Record<string, string> = {}): BridgeStore
     updateChannelBinding: (id: string, updates: Partial<ChannelBinding>) => {
       for (const [key, binding] of bindings) {
         if (binding.id === id) {
-          bindings.set(key, { ...binding, ...updates, updatedAt: new Date('2026-05-07T00:00:00.000Z').toISOString() });
+          bindings.set(key, { ...binding, ...updates, updatedAt: new Date().toISOString() });
           return;
         }
       }

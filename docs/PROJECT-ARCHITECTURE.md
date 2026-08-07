@@ -295,7 +295,7 @@ flowchart LR
 
 ### 1.6 回合工作区与可见记忆
 
-`packages/contracts/src/project-registry.ts` 定义结构化项目协议，`packages/bridge-runtime/src/projects/project-registry.ts` 从 `CTI_HOME\project-registry.json` 或 `CTI_PROJECT_REGISTRY_PATH` 加载并校验记录，再由 Config 注入 Bridge settings。`packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区解析的唯一入口；Conversation Engine 根据当前消息、会话绑定目录、结构化项目、legacy 允许根和禁止根生成 `TurnWorkspacePlan`，所有 Provider 和本地文件工具消费同一计划。`workspace-chat-policy.ts` 只解析明确的工作区/工作目录/工作路径查看、选择或切换表达和稳定项目目标；裸“工作目录”仍作为 Agent 的真实当前目录查询，不进入管理快捷入口。`bridge-manager.ts` 为真实 Owner 通过通用选择卡片生成 Feishu Card 2.0 项目按钮，按钮只携带稳定项目 ID，点击回调再次核验真实 Owner、启用状态与本地目录存在性后，才允许更新当前聊天绑定。新会话和聊天绑定写入后还必须从持久状态回读，只有绑定指向的新会话、绑定目录、会话目录和目标项目四者一致，才可对用户报告切换成功。
+`packages/contracts/src/project-registry.ts` 定义结构化项目协议，`packages/bridge-runtime/src/projects/project-registry.ts` 从 `CTI_HOME\project-registry.json` 或 `CTI_PROJECT_REGISTRY_PATH` 加载并校验记录，再由 Config 注入 Bridge settings。`packages/bridge-core/src/lib/bridge/workspace-plan.ts` 是每轮工作区解析的唯一入口；Conversation Engine 根据当前消息、会话绑定目录、结构化项目、legacy 允许根和禁止根生成 `TurnWorkspacePlan`，所有 Provider 和本地文件工具消费同一计划。`channel-router.ts` 把启用的结构化项目根与 legacy 允许根合并为同一会话授权上界；这只允许已选中的绑定继续路由，不会把其他项目自动挂载。`workspace-chat-policy.ts` 只解析明确的工作区/工作目录/工作路径查看、选择或切换表达和稳定项目目标；裸“工作目录”仍作为 Agent 的真实当前目录查询，不进入管理快捷入口。`bridge-manager.ts` 为真实 Owner 通过通用选择卡片生成 Feishu Card 2.0 项目按钮，按钮只携带稳定项目 ID，点击回调再次核验真实 Owner、启用状态与本地目录存在性后，才允许更新当前聊天绑定。新会话和聊天绑定写入后必须再走下一条普通入站所使用的 `channel-router.resolve` 复验；只有绑定指向的新会话、绑定目录、会话目录和目标项目四者一致，才可对用户报告切换成功。
 
 控制面板的 `projectRegistry` 字段只读取同一个结构化 Registry 文件并报告路径、存在性、项目列表或解析错误，供人工核对；它不导入 legacy roots、不改写文件，也不参与回合挂载裁决。真正的 legacy 合并、禁止根和重叠优先级仍只由 Runtime Registry Loader 执行。
 
@@ -310,9 +310,10 @@ flowchart LR
   Card --> Callback["按钮回调<br/>稳定项目 ID"]
   Callback --> OwnerCheck["重新核验 Owner + Registry + 路径"]
   OwnerCheck --> FreshBinding["新项目会话 + 绑定事务"]
-  FreshBinding --> ReadBack["持久状态回读复验"]
-  ReadBack -->|"会话、绑定、目录一致"| Session
-  ReadBack -->|"任一不一致"| Failed["明确未完成，不报告成功"]
+  Config --> RoutePolicy["Channel Router 授权上界<br/>启用注册项目 + legacy roots"]
+  FreshBinding --> RoutePolicy
+  RoutePolicy -->|"会话、绑定、目录一致"| Session
+  RoutePolicy -->|"任一不一致或越界"| Failed["明确未完成，不报告成功"]
   Config --> Resolver
   Evidence[当前消息与结构化路径证据] --> Resolver[TurnWorkspacePlan Resolver]
   Session[会话绑定或默认工作区] --> Resolver
@@ -326,10 +327,10 @@ flowchart LR
 ```
 
 - 结构化项目记录包含稳定 `id`、显示名、类型、`workspaceRoot`、`accessMode`、可选 `unityProjectRoot / mcpProfileIds` 和启用状态；无效 JSON、重复 ID/根、越界 Unity 根或命中禁止根时启动失败关闭。
-- `CTI_ALLOWED_WORKSPACE_ROOTS` 只兼容导入为 `generic` 项目；与结构化项目重叠时结构化记录优先，宽泛 legacy 父目录不能重新取得挂载资格。注册项目和 legacy 允许根都不能自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
+- `CTI_ALLOWED_WORKSPACE_ROOTS` 只兼容导入为 `generic` 项目；与结构化项目重叠时结构化记录优先，宽泛 legacy 父目录不能重新取得挂载资格。启用的结构化项目根与 legacy 允许根共同构成会话路由授权上界；两者都不能自动进入 Prompt、`additionalDirectories` 或普通文件工具根。
 - Unity 项目命中 `unityProjectRoot` 或其内部路径时，挂载目标仍是 `workspaceRoot`。读取回合一律生成 `read_only` mount；写入回合只有项目 `accessMode=read_write` 才能继续，显式写只读项目返回 `project_read_only`。
 - 当前会话工作区始终优先作为唯一主工作区；本轮明确引用的其他已注册项目只成为临时挂载，不得抢占或替换当前工作区。当前绑定目录若命中禁止根或超出项目注册上界，会跳过并选择安全默认根；所有候选都不安全时失败关闭。
-- 聊天中的持久工作区管理是独立确定性入口：只有真实 Owner 可查看启用注册项目或按按钮、编号、稳定项目 ID、完整名称、唯一名称片段切换。飞书管理意图优先返回 Card 2.0 按钮卡片，当前项目与读写模式在卡片中可观察；回调不信任旧卡片上下文，必须用本轮真实点击者身份和当前 Registry 重新解析。模型输出路径、伪造回调、未注册绝对路径、禁用项目和不可访问目录都不能改变绑定。切换前中断旧会话仍在执行的任务，并创建新的 CodePilot/SDK 会话，避免跨项目历史和工具状态污染。`sessions.json` 与 `bindings.json` 的修改都在文件锁内先回读磁盘事实、只改目标记录并原子写回；重启重叠期旧进程的迟到 SDK 回执只能更新仍引用旧会话的绑定，不能恢复已经切走的工作区。写入后复验失败时明确返回未完成。现有 `/projects` 继续兼容 Operator 查询，但自然语言和卡片持久切换保持 Owner 门禁。
+- 聊天中的持久工作区管理是独立确定性入口：只有真实 Owner 可查看启用注册项目或按按钮、编号、稳定项目 ID、完整名称、唯一名称片段切换。飞书管理意图优先返回 Card 2.0 按钮卡片，当前项目与读写模式在卡片中可观察；回调不信任旧卡片上下文，必须用本轮真实点击者身份和当前 Registry 重新解析。模型输出路径、伪造回调、未注册绝对路径、禁用项目和不可访问目录都不能改变绑定。切换前中断旧会话仍在执行的任务，并创建新的 CodePilot/SDK 会话，避免跨项目历史和工具状态污染。`sessions.json` 与 `bindings.json` 的修改都在文件锁内先回读磁盘事实、只改目标记录并原子写回；重启重叠期旧进程的迟到 SDK 回执只能更新仍引用旧会话的绑定，不能恢复已经切走的工作区。写入后必须通过普通入站相同的路由策略复验，防止结构化 Registry 已允许而 legacy allowlist 未包含时下一轮静默回退；复验失败明确返回未完成。现有 `/projects` 继续兼容 Operator 查询，但自然语言和卡片持久切换保持 Owner 门禁。
 - `temporaryMounts` 带访问模式、证据 ID、理由和 `expiresAfterTurn=true`；回合结束后不形成长期挂载。
 - 记忆仓库、`CTI_HOME` 运行态、上传缓存、日志和 `release/*` 按各自受控能力访问，不能提升为普通项目工作区。
 - classifier 继续无工作目录、无 MCP、无附加根，避免条件解析 Agent 扩权。
