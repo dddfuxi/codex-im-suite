@@ -29,7 +29,7 @@ export interface SpeechPreviewControlRequest {
   protocol: typeof SPEECH_PREVIEW_CONTROL_PROTOCOL;
   requestId: string;
   clientNonce: string;
-  action: 'preview_voice';
+  action: 'preview_voice' | 'preview_singing_voice';
   requestedAt: string;
   expiresAt: string;
   input: {
@@ -135,7 +135,7 @@ function validateRequest(
   const expiresAt = typeof request.expiresAt === 'string' ? Date.parse(request.expiresAt) : Number.NaN;
   if (
     request.protocol !== SPEECH_PREVIEW_CONTROL_PROTOCOL
-    || request.action !== 'preview_voice'
+    || (request.action !== 'preview_voice' && request.action !== 'preview_singing_voice')
     || request.requestId !== expectedRequestId
     || !safeOpaqueId(request.requestId)
     || !safeNonce(request.clientNonce)
@@ -196,13 +196,17 @@ function validatePreviewReceipt(
   ) {
     throw new RuntimeSpeechError('speech_preview_response_invalid', 'error', '语音试听媒体校验失败');
   }
+  // 上面的完整门禁已经把可选 DTO 字段收窄为确定值；重新构造安全回执，
+  // 避免把 Runtime 返回对象上的额外字段跨过控制面板边界。
+  const bytes = receipt.bytes as number;
+  const durationMs = receipt.durationMs as number;
   return {
     protocol: SPEECH_PREVIEW_PROTOCOL,
     mediaType: 'audio/ogg; codecs=opus',
     base64: receipt.base64,
-    bytes: receipt.bytes,
+    bytes,
     sha256: receipt.sha256,
-    durationMs: receipt.durationMs,
+    durationMs,
     voiceProfileId: receipt.voiceProfileId,
     validated: true,
   };
@@ -233,6 +237,11 @@ function cleanupStaleFiles(directories: SpeechPreviewControlDirectories, nowMs: 
 export function startSpeechPreviewControlService(options: {
   runtimeStateRoot: string;
   previewVoice: (input: {
+    text: string;
+    voiceProfileId: string;
+    signal: AbortSignal;
+  }) => Promise<SpeechPreviewReceipt>;
+  previewSingingVoice?: (input: {
     text: string;
     voiceProfileId: string;
     signal: AbortSignal;
@@ -295,7 +304,11 @@ export function startSpeechPreviewControlService(options: {
             );
             expiryTimer.unref?.();
             try {
-              const result = await options.previewVoice({
+              const preview = request.action === 'preview_singing_voice'
+                ? options.previewSingingVoice
+                : options.previewVoice;
+              if (!preview) throw new RuntimeSpeechError('singing_preview_live_runtime_unavailable', 'blocked', '实时歌声试听通道不可用');
+              const result = await preview({
                 ...request.input,
                 signal: currentAbort.signal,
               });
@@ -373,11 +386,12 @@ export function startSpeechPreviewControlService(options: {
   };
 }
 
-export async function requestSpeechVoicePreview(input: {
+async function requestPreview(input: {
   runtimeStateRoot: string;
   text: string;
   voiceProfileId: string;
   timeoutMs: number;
+  action: SpeechPreviewControlRequest['action'];
   now?: () => Date;
 }): Promise<SpeechPreviewReceipt> {
   if (!safePreviewText(input.text) || !safeVoiceProfileId(input.voiceProfileId)) {
@@ -393,7 +407,7 @@ export async function requestSpeechVoicePreview(input: {
     protocol: SPEECH_PREVIEW_CONTROL_PROTOCOL,
     requestId,
     clientNonce,
-    action: 'preview_voice',
+    action: input.action,
     requestedAt: requestedAt.toISOString(),
     expiresAt: new Date(requestedAt.getTime() + timeoutMs).toISOString(),
     input: {
@@ -468,6 +482,26 @@ export async function requestSpeechVoicePreview(input: {
       // consumer 已取走请求或请求文件已不存在。
     }
   }
+}
+
+export function requestSpeechVoicePreview(input: {
+  runtimeStateRoot: string;
+  text: string;
+  voiceProfileId: string;
+  timeoutMs: number;
+  now?: () => Date;
+}): Promise<SpeechPreviewReceipt> {
+  return requestPreview({ ...input, action: 'preview_voice' });
+}
+
+export function requestSingingVoicePreview(input: {
+  runtimeStateRoot: string;
+  text: string;
+  voiceProfileId: string;
+  timeoutMs: number;
+  now?: () => Date;
+}): Promise<SpeechPreviewReceipt> {
+  return requestPreview({ ...input, action: 'preview_singing_voice' });
 }
 
 export function getSpeechPreviewControlDirectories(runtimeStateRoot: string) {

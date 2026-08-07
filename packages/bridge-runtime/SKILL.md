@@ -42,13 +42,16 @@ Local speech is a Feishu-first development feature and is disabled by default. D
 
 - With no session override, trusted inbound Feishu audio is transcribed locally and defaults to a voice reply. Ordinary text defaults to text. `/voice off` is a hard disable until `/voice on` is sent again, including for explicit voice requests, inbound audio, and model voice hints. Priority is explicit text → `/voice off` → explicit voice → `/voice on` → Runtime policy → inbound audio / model hint. These are IM commands, not skill-management subcommands.
 - Speech output must have exactly one terminal delivery: one native Feishu Opus message on success, or one complete text fallback when synthesis, validation, progress-card replacement, or upload fails. A failed inbound transcription similarly returns one clear text error and must not execute a guessed transcript.
+- Singing uses the independent `SingingHost` backed by the local ACE-Step 1.5 API. Never route singing through ordinary TTS. Only a bounded style prompt, lyrics, language, and duration may cross the Core boundary; provider/model/profile/path/URL/token/command/platform fields fail closed.
 - Optional models, FFmpeg, Python, and speech binaries are not npm/live/release dependencies and must never be downloaded by the first speech message. Inspect Runtime status first and require an explicit user install/configuration action; do not promise installation when the managed component reports `blocked`.
 - Treat `ready / optional_missing / blocked / error` as the complete shared state set. The Control Panel renders the Contract and invokes Runtime actions; it must not reimplement Core policy or Runtime dependency logic.
 - `bridge-core` owns trusted message evidence, reply policy, and the unique terminal result. `bridge-runtime` owns configuration, dependency resolution, sidecar/media processing, ASR/TTS, and voice profiles. The Control Panel owns orchestration and presentation only.
+- The Control Panel selects and previews speech and singing voices separately. Preview media may reach the browser only through the exact bounded Base64 Ogg/Opus receipt after Runtime and C# verification; never expose a local path, reference file, model parameter, or token.
+- A successful settings save means only that UTF-8 `CTI_HOME\config.env` was written. Do not claim live activation until a controlled restart yields a new PID, refreshed Runtime status, a healthy Feishu connection, matching development/live bundle hashes, and a post-restart real message.
 - Managed components belong under `CTI_HOME\runtime-deps\speech`, authorized voice data under `CTI_HOME\runtime\speech\voices`, and request scratch/default output under `CTI_HOME\runtime\speech`. None of these paths is a project workspace.
 - Never read, migrate, or depend on `F:\unity\ST4\.cti-audio` for this feature.
 
-As of 2026-08-07, live sync/restart, RTX 3070 performance/memory acceptance, and a post-restart real Feishu audio end-to-end test have not been run. Report those as pending until real evidence exists.
+As of 2026-08-07, the managed ACE-Step runtime/model manifest remains `blocked / manifest_incomplete`; its RTX 3070 performance/memory benchmark, live sync/restart, and a post-restart real Feishu audio end-to-end test have not been run. Keep singing blocked and report all of those as pending until real evidence exists.
 
 The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
 In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.

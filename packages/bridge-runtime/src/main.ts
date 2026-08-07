@@ -3757,6 +3757,7 @@ async function main(): Promise<void> {
     choicePrompts: new RuntimeChoicePromptStateHost(path.join(CTI_HOME, 'runtime')),
     scheduledTasks: config.scheduledTasksEnabled !== false ? scheduledTasks : undefined,
     speech: speechRuntime?.host,
+    singing: speechRuntime?.singingHost,
     reminders: config.memoryRepoDir && config.directReminderEnabled !== false ? {
       createDirectReminder: async (input) => {
         void input;

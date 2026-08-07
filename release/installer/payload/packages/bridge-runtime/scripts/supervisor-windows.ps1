@@ -22,7 +22,9 @@ param(
     [string]$Command = 'help',
 
     [Parameter(Position=1)]
-    [int]$LogLines = 50
+    [int]$LogLines = 50,
+
+    [string]$CommandCompletionPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +49,13 @@ $ErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-error.log'
 $SupervisorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor.log'
 $SupervisorErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor-error.log'
 $DaemonMjs  = Join-Path (Join-Path $SkillDir 'dist') 'daemon.mjs'
+$script:IsolatedCommandCompletionPath = if ([string]::IsNullOrWhiteSpace($CommandCompletionPath)) {
+    $env:CTI_DAEMON_COMMAND_COMPLETION_PATH
+} else {
+    $CommandCompletionPath
+}
+# 该回执只属于当前 start 命令包装器，禁止让长驻 Supervisor/Bridge 继承。
+[System.Environment]::SetEnvironmentVariable('CTI_DAEMON_COMMAND_COMPLETION_PATH', $null)
 
 $ServiceName = 'ClaudeToIMBridge'
 
@@ -167,6 +176,15 @@ function Get-NodePath {
         exit 1
     }
     return $nodePath
+}
+
+function Publish-IsolatedCommandCompletion {
+    param([int]$ExitCode)
+    if ([string]::IsNullOrWhiteSpace($script:IsolatedCommandCompletionPath)) { return }
+    [IO.File]::WriteAllText(
+        $script:IsolatedCommandCompletionPath,
+        [string]$ExitCode,
+        [Text.UTF8Encoding]::new($false))
 }
 
 function ConvertTo-WindowsCommandLineArgument {
@@ -349,6 +367,7 @@ switch ($Command) {
         if (($existingPid -and (Test-PidAlive $existingPid)) -or ($existingSupervisorPid -and (Test-PidAlive $existingSupervisorPid))) {
             Write-Host "Bridge already running"
             if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
+            Publish-IsolatedCommandCompletion 1
             exit 1
         }
 
@@ -361,12 +380,15 @@ switch ($Command) {
 
             $newPid = Read-Pid
             if ($newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+                Write-Output 'CTI_DAEMON_START_READY_V1'
+                Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, managed by Windows Service)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
                 Write-Host "Failed to start bridge via service."
                 Show-LastExitReason
                 Show-FailureHelp
+                Publish-IsolatedCommandCompletion 1
                 exit 1
             }
         } else {
@@ -377,6 +399,8 @@ switch ($Command) {
             $newPid = Read-Pid
             $newSupervisorPid = Read-SupervisorPid
             if ($newSupervisorPid -and (Test-PidAlive $newSupervisorPid) -and $newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+                Write-Output 'CTI_DAEMON_START_READY_V1'
+                Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, supervisor: $newSupervisorPid)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
@@ -388,9 +412,12 @@ switch ($Command) {
                 }
                 Show-LastExitReason
                 Show-FailureHelp
+                Publish-IsolatedCommandCompletion 1
                 exit 1
             }
         }
+        # 成功回执在完整启动检查后立即发布，避免后续主机输出刷新被后台
+        # 句柄拖住；daemon 只会结束短命包装器，不终止受管进程组。
     }
 
     'stop' {

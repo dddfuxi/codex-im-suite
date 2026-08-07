@@ -716,6 +716,7 @@ function buildReplyPresentationPrompt(replyStyleHint: string, channelType: strin
   if (channelType === 'feishu') {
     lines.push(...getAgentPolicyPromptLines([
       'delivery_layer.speech_reply',
+      'delivery_layer.singing_reply',
       'delivery_layer.feishu_text_presentation',
       'delivery_layer.structured_choice_prompt',
       'delivery_layer.analysis_view',

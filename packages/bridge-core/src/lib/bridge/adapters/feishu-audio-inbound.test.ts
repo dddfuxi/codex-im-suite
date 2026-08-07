@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { initBridgeContext } from '../context.js';
 import type { BridgeStore } from '../host.js';
-import { FeishuAdapter } from './feishu-adapter.js';
+import { FeishuAdapter, readBoundedFeishuResponseBody } from './feishu-adapter.js';
 
 function createMockStore(): BridgeStore {
   return {
@@ -129,4 +129,29 @@ test('飞书语音缺少 file_key 仍入队失败关闭，且不创建附件或�
   assert.equal(inbound.raw.feishuInboundAudio, undefined);
   assert.deepEqual(inbound.attachments, []);
   assert.equal(inbound.text, '');
+});
+
+test('飞书 HTTP 资源下载先检查 Content-Length，并对伪造小长度继续执行流式上限', async () => {
+  let oversizedPulled = false;
+  const oversized = new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      oversizedPulled = true;
+      controller.enqueue(new Uint8Array([1]));
+      controller.close();
+    },
+  }), { headers: { 'content-length': '99' } });
+  await assert.rejects(readBoundedFeishuResponseBody(oversized, 4), /resource_download_too_large/);
+  assert.equal(oversizedPulled, false);
+
+  const forgedSmallLength = new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+      controller.enqueue(new Uint8Array([4, 5, 6]));
+      controller.close();
+    },
+  }), { headers: { 'content-length': '1' } });
+  await assert.rejects(readBoundedFeishuResponseBody(forgedSmallLength, 4), /resource_download_too_large/);
+
+  const valid = new Response(new Uint8Array([1, 2, 3]), { headers: { 'content-length': '3' } });
+  assert.deepEqual(await readBoundedFeishuResponseBody(valid, 4), Buffer.from([1, 2, 3]));
 });

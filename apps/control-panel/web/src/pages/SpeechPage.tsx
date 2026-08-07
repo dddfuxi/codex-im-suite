@@ -116,6 +116,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
   const displayState = describeSpeechDisplayState(state);
   const [draft, setDraft] = useState<SpeechSettingsContract | null>(() => status ? createSpeechSettingsDraft(status) : null);
   const [previewText, setPreviewText] = useState('你好，这是一段语音试听。');
+  const [singingPreviewText, setSingingPreviewText] = useState('你好，今天一起向前走。');
   const [referenceVoice, setReferenceVoice] = useState<SpeechReferenceVoiceDraft>(emptyReferenceVoice);
   const [localError, setLocalError] = useState('');
   const [localNotice, setLocalNotice] = useState('');
@@ -162,6 +163,30 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
     }
   };
 
+  const previewSingingVoice = async () => {
+    if (!draft) return;
+    const voiceProfileId = draft.activeSingingVoiceProfileId || 'acestep.default';
+    const result = await runAction('speech.previewSingingVoice', {
+      voiceProfileId,
+      text: singingPreviewText.trim(),
+    });
+    if (!result) return;
+    try {
+      const { receipt, media } = decodeSpeechPreviewReceipt(result);
+      if (receipt.voiceProfileId !== voiceProfileId) throw new Error('singing_preview_profile_mismatch');
+      const audioBytes = new ArrayBuffer(media.byteLength);
+      new Uint8Array(audioBytes).set(media);
+      const url = URL.createObjectURL(new Blob([audioBytes], { type: receipt.mediaType }));
+      const profileName = voiceProfileId === 'acestep.default'
+        ? 'ACE-Step 默认歌声音色'
+        : status?.voiceProfiles.find((profile) => profile.id === voiceProfileId)?.displayName || voiceProfileId;
+      setPreviewPlayback({ url, profileName });
+      setLocalNotice(`已生成「${profileName}」10 秒歌声试听。`);
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : 'singing_preview_response_invalid');
+    }
+  };
+
   const importReady = useMemo(() => canImportSpeechReferenceVoice(referenceVoice), [referenceVoice]);
 
   if (!state.available || !status || !draft) {
@@ -204,6 +229,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         <div className="summary-grid speech-summary">
           <article className="metric compact"><span>输入</span><strong>{status.inputEnabled ? '开启' : '关闭'}</strong></article>
           <article className="metric compact"><span>输出</span><strong>{status.outputEnabled ? '开启' : '关闭'}</strong></article>
+          <article className="metric compact"><span>唱歌</span><strong>{status.singingEnabled ? '开启' : '关闭'}</strong></article>
           <article className="metric compact"><span>组件</span><strong>{status.components.filter((item) => item.state === 'ready').length}/{status.components.length}</strong></article>
           <article className="metric compact"><span>音色</span><strong>{status.voiceProfiles.length}</strong></article>
         </div>
@@ -214,6 +240,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         <div className="speech-toggle-grid">
           <label className="speech-toggle"><Mic size={18} /><span><strong>语音输入</strong><small>允许渠道音频进入 ASR。</small></span><input type="checkbox" checked={draft.inputEnabled} onChange={(event) => setDraft({ ...draft, inputEnabled: event.target.checked })} /></label>
           <label className="speech-toggle"><Volume2 size={18} /><span><strong>语音输出</strong><small>允许受控 TTS 生成语音回复。</small></span><input type="checkbox" checked={draft.outputEnabled} onChange={(event) => setDraft({ ...draft, outputEnabled: event.target.checked })} /></label>
+          <label className="speech-toggle"><Volume2 size={18} /><span><strong>歌声合成</strong><small>只使用独立 SingingHost，不以 TTS 冒充唱歌。</small></span><input type="checkbox" checked={draft.singingEnabled} onChange={(event) => setDraft({ ...draft, singingEnabled: event.target.checked })} /></label>
         </div>
         <div className="speech-settings-grid">
           <fieldset className="speech-field speech-channel-field">
@@ -251,12 +278,15 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
           <SelectionField label="交付模式" selection={status.deliveryMode} value={draft.deliveryMode} onChange={(value) => setDraft({ ...draft, deliveryMode: value })} />
           <SelectionField label="ASR Provider" selection={status.asrProvider} value={draft.asrProvider} disabled={!draft.inputEnabled || !selectedChannelsSupportInput} onChange={(value) => setDraft({ ...draft, asrProvider: value })} />
           <SelectionField label="TTS Provider" selection={status.ttsProvider} value={draft.ttsProvider} disabled={!draft.outputEnabled || !selectedChannelsSupportOutput} onChange={(value) => setDraft({ ...draft, ttsProvider: value })} />
-          <label className="speech-field"><span>默认音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">Runtime 内置默认音色</option>{status.voiceProfiles.map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
+          <SelectionField label="Singing Provider" selection={status.singingProvider} value={draft.singingProvider} disabled={!draft.singingEnabled || !selectedChannelsSupportOutput} onChange={(value) => setDraft({ ...draft, singingProvider: value })} />
+          <label className="speech-field"><span>说话音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">Runtime 内置默认音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('speech')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
+          <label className="speech-field"><span>歌声音色</span><select value={draft.activeSingingVoiceProfileId} disabled={!draft.singingEnabled} onChange={(event) => setDraft({ ...draft, activeSingingVoiceProfileId: event.target.value })}><option value="">ACE-Step 默认歌声音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('singing')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
         </div>
         <div className="speech-limit-row">
           <span>输入上限 {status.limits.maxInputBytes.toLocaleString()} bytes</span>
           <span>时长 {status.limits.maxInputDurationSeconds}s</span>
           <span>输出 {status.limits.maxOutputCharacters} 字</span>
+          <span>歌曲最长 {status.limits.maxSongDurationSeconds}s</span>
         </div>
         <div className="command-band dense speech-save-row"><button className="command-button" disabled={!settingsValid || pending['speech.saveSettings']} onClick={() => void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>)}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或尚未 ready，不能提交。</span>}</div>
       </section>
@@ -275,7 +305,11 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
 
       <section className="panel">
         <div className="section-header"><div><h2>音色 Profile</h2><p className="panel-intro">状态只展示授权与来源标签，不展示参考音频、转写、文件路径或密钥。</p></div></div>
-        <label className="speech-field speech-preview-text"><span>试听文本</span><input value={previewText} maxLength={status.limits.maxOutputCharacters} onChange={(event) => setPreviewText(event.target.value)} /></label>
+        <label className="speech-field speech-preview-text"><span>试听文本</span><input value={previewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setPreviewText(event.target.value)} /></label>
+        <div className="speech-singing-preview">
+          <label className="speech-field speech-preview-text"><span>歌声试听歌词（固定 10 秒）</span><input value={singingPreviewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setSingingPreviewText(event.target.value)} /></label>
+          <button className="mini-button" disabled={!getSpeechAction(status, 'speech.previewSingingVoice').enabled || !singingPreviewText.trim() || pending['speech.previewSingingVoice']} title={getSpeechAction(status, 'speech.previewSingingVoice').diagnosticCode || ''} onClick={() => void previewSingingVoice()}><Play size={14} />试听歌声</button>
+        </div>
         {previewPlayback && (
           <div className="speech-preview-player">
             <strong>{previewPlayback.profileName}</strong>
@@ -285,7 +319,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         {status.voiceProfiles.length === 0 ? <div className="empty-inline">Runtime 未返回音色 Profile。</div> : <div className="speech-card-grid">{status.voiceProfiles.map((profile) => (
           <article className="speech-card" key={profile.id}>
             <div className="speech-card-head"><div><strong>{profile.displayName}</strong><small>{profile.kind === 'preset' ? '预设音色' : '授权参考音色'} · {profile.sourceLabel}</small></div><span className={`status-pill ${profile.state === 'ready' ? 'ok' : profile.state === 'optional_missing' ? 'warning' : 'error'}`}>{profile.state}</span></div>
-            <div className="speech-profile-facts"><span>许可证：{profile.license || '未声明'}</span><span>授权：{profile.authorizationConfirmed ? '已确认' : '未确认'}</span></div>
+            <div className="speech-profile-facts"><span>许可证：{profile.license || '未声明'}</span><span>授权：{profile.authorizationConfirmed ? '已确认' : '未确认'}</span><span>能力：{profile.capabilities.join(' / ')}</span></div>
             {profile.diagnosticCode && <code>{profile.diagnosticCode}</code>}
             <VoiceProfileActions profile={profile} status={status} previewText={previewText} runAction={runAction} previewVoice={previewVoice} pending={pending} />
           </article>

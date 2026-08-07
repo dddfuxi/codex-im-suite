@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 
 import { readManagedInstallMarker } from './managed-install-marker.js';
@@ -173,4 +174,49 @@ export function isWithinRoot(candidatePath: string, rootPath: string): boolean {
   const candidate = path.resolve(candidatePath);
   const root = path.resolve(rootPath);
   return candidate === root || candidate.startsWith(root + path.sep);
+}
+
+function comparablePath(value: string): string {
+  const normalized = path.normalize(value);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * 只清理受管根目录的直接子目录。先将已复验对象原子改名到随机隔离名，
+ * 再核对目录身份后递归删除；目标在复验与删除间被替换时会保留并失败关闭。
+ */
+export function removeManagedTempDirectorySafely(input: {
+  targetPath: string;
+  managedRoot: string;
+  requiredNamePrefix: string;
+}): void {
+  const root = path.resolve(input.managedRoot);
+  const target = path.resolve(input.targetPath);
+  if (!input.requiredNamePrefix || path.dirname(target) !== root || !path.basename(target).startsWith(input.requiredNamePrefix)) {
+    throw new Error('managed_cleanup_target_invalid');
+  }
+  const rootStat = fs.lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
+    || comparablePath(fs.realpathSync.native(root)) !== comparablePath(root)) {
+    throw new Error('managed_cleanup_root_unsafe');
+  }
+  const targetStat = fs.lstatSync(target);
+  if (!targetStat.isDirectory() || targetStat.isSymbolicLink()
+    || comparablePath(fs.realpathSync.native(target)) !== comparablePath(target)
+    || !isWithinRoot(target, root)) {
+    throw new Error('managed_cleanup_target_unsafe');
+  }
+
+  const quarantine = path.join(root, `.delete-${crypto.randomUUID()}`);
+  fs.renameSync(target, quarantine);
+  const quarantineStat = fs.lstatSync(quarantine);
+  const sameIdentity = targetStat.dev === quarantineStat.dev && targetStat.ino === quarantineStat.ino;
+  if (!sameIdentity
+    || !quarantineStat.isDirectory()
+    || quarantineStat.isSymbolicLink()
+    || comparablePath(fs.realpathSync.native(quarantine)) !== comparablePath(path.resolve(quarantine))
+    || !isWithinRoot(quarantine, root)) {
+    throw new Error('managed_cleanup_identity_changed');
+  }
+  fs.rmSync(quarantine, { recursive: true, force: false });
 }

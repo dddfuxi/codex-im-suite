@@ -73,8 +73,8 @@ describe('control panel shared contracts', () => {
     ]);
     assert.equal(speech.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(speech.$defs?.SpeechSettingsContract?.required, [
-      'schema', 'inputEnabled', 'outputEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
-      'asrProvider', 'ttsProvider', 'activeVoiceProfileId',
+      'schema', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
+      'asrProvider', 'ttsProvider', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId',
     ]);
   });
 });

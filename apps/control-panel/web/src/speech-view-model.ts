@@ -43,12 +43,15 @@ export function createSpeechSettingsDraft(status: SpeechStatusContract): SpeechS
     schema: SPEECH_SETTINGS_SCHEMA,
     inputEnabled: status.inputEnabled,
     outputEnabled: status.outputEnabled,
+    singingEnabled: status.singingEnabled,
     channelIds: status.channels.filter((channel) => channel.selected).map((channel) => channel.id),
     replyPolicy: status.replyPolicy.value,
     deliveryMode: status.deliveryMode.value,
     asrProvider: status.asrProvider.value,
     ttsProvider: status.ttsProvider.value,
+    singingProvider: status.singingProvider.value,
     activeVoiceProfileId: status.activeVoiceProfileId,
+    activeSingingVoiceProfileId: status.activeSingingVoiceProfileId,
   };
 }
 
@@ -69,14 +72,18 @@ export function canSaveSpeechSettings(status: SpeechStatusContract, draft: Speec
     || (new Set(draft.channelIds).size === draft.channelIds.length
       && draft.channelIds.every((id) => status.channels.some((channel) => channel.id === id && channel.enabled)));
   const voiceProfileValid = !draft.activeVoiceProfileId
-    || status.voiceProfiles.some((profile) => profile.id === draft.activeVoiceProfileId && profile.state === 'ready');
+    || status.voiceProfiles.some((profile) => profile.id === draft.activeVoiceProfileId && profile.state === 'ready' && profile.capabilities.includes('speech'));
+  const singingVoiceProfileValid = !draft.activeSingingVoiceProfileId
+    || status.voiceProfiles.some((profile) => profile.id === draft.activeSingingVoiceProfileId && profile.state === 'ready' && profile.capabilities.includes('singing'));
   return draft.schema === SPEECH_SETTINGS_SCHEMA
     && channelValid
     && selectionAccepts(status.replyPolicy, draft.replyPolicy)
     && selectionAccepts(status.deliveryMode, draft.deliveryMode)
     && (!draft.inputEnabled || selectionAccepts(status.asrProvider, draft.asrProvider))
     && (!draft.outputEnabled || selectionAccepts(status.ttsProvider, draft.ttsProvider))
-    && (!draft.outputEnabled || voiceProfileValid);
+    && (!draft.outputEnabled || voiceProfileValid)
+    && (!draft.singingEnabled || selectionAccepts(status.singingProvider, draft.singingProvider))
+    && (!draft.singingEnabled || singingVoiceProfileValid);
 }
 
 export function getSpeechAction(status: SpeechStatusContract, id: string): SpeechActionContract {
@@ -130,7 +137,15 @@ export function decodeSpeechPreviewReceipt(value: unknown): {
     throw new Error('speech_preview_response_invalid');
   }
   const media = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  if (media.byteLength !== receipt.bytes || btoa(binary) !== receipt.base64) {
+  if (
+    media.byteLength !== receipt.bytes
+    || btoa(binary) !== receipt.base64
+    || media.byteLength < 4
+    || media[0] !== 0x4f
+    || media[1] !== 0x67
+    || media[2] !== 0x67
+    || media[3] !== 0x53
+  ) {
     throw new Error('speech_preview_response_invalid');
   }
   return { receipt: receipt as SpeechPreviewReceiptContract, media };

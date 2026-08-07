@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { Readable } from 'node:stream';
 import yauzl from 'yauzl';
 
-import { ensureNonSymlinkDirectory, isWithinRoot } from './dependency-resolution.js';
+import { ensureNonSymlinkDirectory, isWithinRoot, removeManagedTempDirectorySafely } from './dependency-resolution.js';
 import { MANAGED_INSTALL_PROTOCOL, readManagedInstallMarker } from './managed-install-marker.js';
 import type { ManagedSpeechComponentStatus } from './speech-status.js';
 
@@ -163,6 +163,22 @@ async function fetchHttps(input: { url: string; targetPath: string; expectedSha2
   if (hash.digest('hex') !== input.expectedSha256.toLowerCase()) throw new Error('download_sha256_mismatch');
 }
 
+function hashFileSha256Sync(filePath: string): string {
+  const descriptor = fs.openSync(filePath, 'r');
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 export class ManagedSpeechDependencyManager {
   private readonly manifest: ManagedDependencyManifest;
 
@@ -251,6 +267,7 @@ export class ManagedSpeechDependencyManager {
       if (!isWithinRoot(entryPoint, payloadRoot)) throw new Error('component_path_escape');
       const entryPointStat = fs.lstatSync(entryPoint);
       if (entryPointStat.isSymbolicLink() || !entryPointStat.isFile()) throw new Error('component_entry_point_missing_or_unsafe');
+      const entryPointSha256 = hashFileSha256Sync(entryPoint);
       fs.writeFileSync(path.join(payloadRoot, '.installed.json'), `${JSON.stringify({
         protocol: MANAGED_INSTALL_PROTOCOL,
         id: item.id,
@@ -261,13 +278,19 @@ export class ManagedSpeechDependencyManager {
         license: item.license,
         platform: this.runtimePlatform,
         entryPoint: assertSafeRelativePath(item.fileName),
+        entryPointSha256,
+        entryPointSize: entryPointStat.size,
         installedAt: new Date().toISOString(),
       }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(payloadRoot, targetRoot);
     } finally {
-      if (isWithinRoot(stageRoot, componentRoot)) {
-        try { fs.rmSync(stageRoot, { recursive: true, force: true }); } catch { /* 失败 stage 不会被 resolver 采用。 */ }
-      }
+      try {
+        removeManagedTempDirectorySafely({
+          targetPath: stageRoot,
+          managedRoot: componentRoot,
+          requiredNamePrefix: '.stage-',
+        });
+      } catch { /* 失败 stage 不会被 resolver 采用，也绝不放宽递归删除边界。 */ }
       releaseInstallLock();
     }
   }

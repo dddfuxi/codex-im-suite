@@ -32,7 +32,7 @@ internal sealed partial class MainForm
             {
                 componentId = ReadRequiredSpeechString(payload, "componentId"),
             },
-            "speech.previewVoice" => new
+            "speech.previewVoice" or "speech.previewSingingVoice" => new
             {
                 voiceProfileId = ReadOptionalSpeechString(payload, "voiceProfileId"),
                 text = ReadRequiredSpeechString(payload, "text"),
@@ -45,8 +45,8 @@ internal sealed partial class MainForm
             _ => throw new SpeechRuntimeGatewayException("speech_action_not_allowed"),
         };
         var gateway = CreateSpeechRuntimeGateway();
-        return string.Equals(command, "speech.previewVoice", StringComparison.Ordinal)
-            ? await gateway.RunPreviewAsync(input)
+        return command is "speech.previewVoice" or "speech.previewSingingVoice"
+            ? await gateway.RunPreviewAsync(command, input)
             : await gateway.RunActionAsync(command, input);
     }
 

@@ -10,6 +10,7 @@ import {
   parseSpeechSynthesisReceipt,
   parseSpeechTranscriptReceipt,
   resolveTrustedInboundAudio,
+  resolveTrustedNativeReplyAudio,
   speechFailureMessage,
 } from './speech-policy.js';
 
@@ -57,6 +58,82 @@ test('ASR 只接受当前飞书 audio 事件签发且唯一绑定的附件', () 
     sourceMessageId: 'msg-1',
     raw,
     attachments: [attachment],
+  }), null);
+});
+
+test('回复旧语音只接受当前消息、原生 reply、fileKey 与 reply 附件范围的唯一绑定', () => {
+  const attachment = {
+    id: 'reply-audio-1',
+    name: 'old-voice.ogg',
+    type: 'audio/ogg',
+    size: 256,
+    data: 'b2dn',
+  };
+  const raw = {
+    feishuReplyTo: { messageId: 'old-message', attachmentCount: 1 },
+    feishuNativeReplyAttachments: [{
+      protocol: 'cti-feishu-native-reply-attachment/v1',
+      relation: 'native_reply',
+      sourceMessageId: 'new-message',
+      messageId: 'old-message',
+      fileKey: 'old-file-key',
+      resourceType: 'audio',
+      attachmentId: 'reply-audio-1',
+    }],
+  };
+  const resolved = resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'new-message',
+    raw,
+    attachments: [attachment],
+  });
+  assert.equal(resolved?.relation, 'native_reply');
+  assert.equal(resolved?.attachment.id, 'reply-audio-1');
+  assert.match(buildSpeechTranscriptContext({
+    protocol: 'cti-speech-transcript/v1',
+    attachmentId: attachment.id,
+    text: '旧语音内容',
+    model: 'sensevoice',
+    language: 'zh',
+    sourceMessageId: 'new-message',
+    fileSha256: HASH_A,
+    validated: true,
+  }, { relation: 'native_reply', repliedMessageId: 'old-message' }), /"relation":"native_reply"/u);
+  assert.equal(resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'forged-message',
+    raw,
+    attachments: [attachment],
+  }), null);
+  assert.equal(resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'new-message',
+    raw: { ...raw, feishuReplyTo: { messageId: 'other-message', attachmentCount: 1 } },
+    attachments: [attachment],
+  }), null);
+  assert.equal(resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'new-message',
+    raw: { ...raw, feishuReplyTo: { messageId: 'old-message', attachmentCount: 0 } },
+    attachments: [attachment],
+  }), null);
+  assert.equal(resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'new-message',
+    raw,
+    attachments: [{ ...attachment, type: 'application/octet-stream' }],
+  }), null);
+  assert.equal(resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'new-message',
+    raw: {
+      ...raw,
+      feishuNativeReplyAttachments: [
+        ...raw.feishuNativeReplyAttachments,
+        { ...raw.feishuNativeReplyAttachments[0], attachmentId: 'reply-audio-2' },
+      ],
+    },
+    attachments: [attachment, { ...attachment, id: 'reply-audio-2' }],
   }), null);
 });
 

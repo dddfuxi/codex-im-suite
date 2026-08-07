@@ -6,8 +6,10 @@ import type {
 } from '@codex-im-suite/contracts/speech';
 
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
+import type { AceStepSingingHost } from './ace-step-singing-host.js';
 import { RuntimeSpeechHost } from './runtime-speech-host.js';
 import { DEFAULT_PRESET_PROFILE_ID, DEFAULT_PRESET_VOICE, SpeechVoiceRegistry } from './voice-registry.js';
+import { MAX_SPEECH_PREVIEW_TEXT_CHARACTERS } from './speech-preview.js';
 
 export interface ManagedSpeechComponentStatus {
   id: string;
@@ -48,6 +50,7 @@ export class SpeechRuntimeStatusService {
     listManagedComponents?: () => ManagedSpeechComponentStatus[];
     now?: () => Date;
     previewAvailable?: () => boolean;
+    singingHost?: AceStepSingingHost;
   }) {}
 
   async refresh(input: { probeSidecar?: boolean; signal?: AbortSignal } = {}): Promise<SpeechStatusContract> {
@@ -67,6 +70,7 @@ export class SpeechRuntimeStatusService {
     let asrReady = false;
     let ttsReady = false;
     const speechEnabled = config.inputEnabled || config.outputEnabled;
+    const anyAudioCapabilityEnabled = speechEnabled || config.singingEnabled;
     const dependenciesReady = Object.values(dependencies).every((item) => item.state === 'ready');
     if (speechEnabled && dependenciesReady && input.probeSidecar !== false) {
       try {
@@ -100,22 +104,39 @@ export class SpeechRuntimeStatusService {
     const ttsState: SpeechState = ttsReady ? 'ready' : unavailableCapabilityState(sidecarState, ttsManifest?.state);
     const asrDiagnostic = asrReady ? undefined : (asrManifest?.state !== 'ready' ? asrManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'asr_backend_missing';
     const ttsDiagnostic = ttsReady ? undefined : (ttsManifest?.state !== 'ready' ? ttsManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'tts_backend_missing';
+    const singingManifest = managed.find((item) => item.id === config.singingProvider || item.capabilities.includes('singing'));
+    const singingHealth = config.singingEnabled && this.options.singingHost
+      ? await this.options.singingHost.health(input.signal)
+      : { state: 'blocked' as const, diagnosticCode: config.singingEnabled ? 'singing_host_unavailable' : 'singing_disabled' };
+    const singingReady = singingHealth.state === 'ready' && config.singingBenchmarkPassed;
+    const singingState: SpeechState = singingReady
+      ? 'ready'
+      : unavailableCapabilityState(singingHealth.state, singingManifest?.state);
+    const singingDiagnostic = singingReady
+      ? undefined
+      : (singingManifest?.state !== 'ready' ? singingManifest?.diagnosticCode : undefined)
+        || (!config.singingBenchmarkPassed ? 'singing_benchmark_not_verified' : singingHealth.diagnosticCode)
+        || 'singing_backend_missing';
 
-    const activeStates: SpeechState[] = [];
-    if (config.inputEnabled) activeStates.push(asrState);
-    if (config.outputEnabled) activeStates.push(ttsState);
-    const state = speechEnabled ? worstState(activeStates) : 'optional_missing';
-    const diagnosticCode = speechEnabled
-      ? (state === 'ready' ? undefined : (config.inputEnabled && asrState !== 'ready' ? asrDiagnostic : ttsDiagnostic))
+    const activeCapabilities: Array<{ state: SpeechState; diagnosticCode?: string }> = [];
+    if (config.inputEnabled) activeCapabilities.push({ state: asrState, diagnosticCode: asrDiagnostic });
+    if (config.outputEnabled) activeCapabilities.push({ state: ttsState, diagnosticCode: ttsDiagnostic });
+    if (config.singingEnabled) activeCapabilities.push({ state: singingState, diagnosticCode: singingDiagnostic });
+    const state = anyAudioCapabilityEnabled ? worstState(activeCapabilities.map((item) => item.state)) : 'optional_missing';
+    const diagnosticCode = anyAudioCapabilityEnabled
+      ? (state === 'ready'
+        ? undefined
+        : activeCapabilities.find((item) => item.state === state)?.diagnosticCode || 'speech_dependency_missing')
       : 'speech_disabled';
-    const profiles = this.options.voiceRegistry.listSummaries(config.voiceProfileId).map((profile) => {
+    const profiles = this.options.voiceRegistry.listSummaries().map((profile) => {
+      const active = profile.id === config.voiceProfileId || profile.id === config.singingVoiceProfileId;
       if (profile.kind === 'reference' && !config.voiceCloneBenchmarkPassed) {
-        return { ...profile, state: 'blocked' as const, diagnosticCode: 'voice_clone_benchmark_not_verified' };
+        return { ...profile, active, state: 'blocked' as const, diagnosticCode: 'voice_clone_benchmark_not_verified' };
       }
-      if (profile.state === 'ready' && !ttsReady) {
-        return { ...profile, state: ttsState, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) };
+      if (profile.state === 'ready' && !ttsReady && !(profile.capabilities.includes('singing') && singingReady)) {
+        return { ...profile, active, state: ttsState, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) };
       }
-      return profile;
+      return { ...profile, active };
     });
     const knownChannels = [...new Set(['feishu', ...config.channels])];
     const hasInstallable = managed.some((item) => item.installable);
@@ -134,6 +155,7 @@ export class SpeechRuntimeStatusService {
         license: DEFAULT_PRESET_VOICE.license,
         sourceLabel: DEFAULT_PRESET_VOICE.sourceLabel,
         authorizationConfirmed: true,
+        capabilities: ['speech'],
         diagnosticCode: presetInstallDiagnostic || 'preset_voice_not_registered',
       });
     }
@@ -153,6 +175,7 @@ export class SpeechRuntimeStatusService {
       state,
       inputEnabled: config.inputEnabled,
       outputEnabled: config.outputEnabled,
+      singingEnabled: config.singingEnabled,
       channels: knownChannels.map((id) => {
         const supported = id === 'feishu';
         return {
@@ -179,10 +202,15 @@ export class SpeechRuntimeStatusService {
       ttsProvider: selection(config.ttsProvider, [
         { id: 'cosyvoice', displayName: 'CosyVoice', state: ttsState, enabled: true, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) },
       ]),
+      singingProvider: selection(config.singingProvider, [
+        { id: 'ace_step_1_5', displayName: 'ACE-Step 1.5', state: singingState, enabled: true, ...(singingDiagnostic ? { diagnosticCode: singingDiagnostic } : {}) },
+      ]),
       activeVoiceProfileId: config.voiceProfileId || '',
+      activeSingingVoiceProfileId: config.singingVoiceProfileId || '',
       capabilities: [
         { id: 'speech.input', displayName: '语音输入', state: asrState, supported: asrReady, ...(asrDiagnostic ? { diagnosticCode: asrDiagnostic } : {}) },
         { id: 'speech.output', displayName: '语音输出', state: ttsState, supported: ttsReady, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) },
+        { id: 'speech.singing', displayName: '歌声合成', state: singingState, supported: singingReady, ...(singingDiagnostic ? { diagnosticCode: singingDiagnostic } : {}) },
       ],
       components: [...dependencyComponents, ...managedComponents],
       voiceProfiles: profiles,
@@ -190,6 +218,8 @@ export class SpeechRuntimeStatusService {
         maxInputBytes: config.maxInputBytes,
         maxInputDurationSeconds: config.maxDurationMs / 1000,
         maxOutputCharacters: config.maxTextChars,
+        maxPreviewCharacters: MAX_SPEECH_PREVIEW_TEXT_CHARACTERS,
+        maxSongDurationSeconds: config.maxSongDurationSeconds,
       },
       actions: [
         { id: 'speech.refresh', label: '刷新语音状态', enabled: true },
@@ -198,6 +228,7 @@ export class SpeechRuntimeStatusService {
         { id: 'speech.installPresetVoice', label: '安装预设音色', enabled: presetInstallEnabled, ...(presetInstallDiagnostic ? { diagnosticCode: presetInstallDiagnostic } : {}) },
         { id: 'speech.importReferenceVoice', label: '导入参考音色', enabled: true },
         { id: 'speech.previewVoice', label: '试听音色', enabled: previewEnabled, ...(previewDiagnostic ? { diagnosticCode: previewDiagnostic } : {}) },
+        { id: 'speech.previewSingingVoice', label: '试听歌声', enabled: singingReady && previewTransportReady, ...(!(singingReady && previewTransportReady) ? { diagnosticCode: singingDiagnostic || 'speech_preview_live_runtime_unavailable' } : {}) },
         { id: 'speech.activateVoiceProfile', label: '启用音色', enabled: profiles.some((item) => item.state === 'ready') },
       ],
       ...(diagnosticCode ? { diagnosticCode } : {}),

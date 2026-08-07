@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { resolveExecutableDependency } from '../speech/dependency-resolution.js';
+import { removeManagedTempDirectorySafely, resolveExecutableDependency } from '../speech/dependency-resolution.js';
 
 describe('speech dependency resolution', () => {
   it('fails closed for a bad explicit path instead of falling back', () => {
@@ -42,6 +43,8 @@ describe('speech dependency resolution', () => {
       license: 'test',
       platform: `${process.platform}-${process.arch}`,
       entryPoint: `bin/${executableName}`,
+      entryPointSha256: crypto.createHash('sha256').update('managed').digest('hex'),
+      entryPointSize: Buffer.byteLength('managed'),
       installedAt: '2026-08-07T00:00:00.000Z',
     }), 'utf8');
     try {
@@ -51,6 +54,63 @@ describe('speech dependency resolution', () => {
       assert.equal(result.path, path.resolve(managed));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('only recursively removes an ordinary direct child with the required prefix', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-'));
+    const target = path.join(root, 'asr-owned');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'input.wav'), 'audio', 'utf8');
+    try {
+      assert.throws(() => removeManagedTempDirectorySafely({
+        targetPath: target,
+        managedRoot: root,
+        requiredNamePrefix: '.stage-',
+      }), /managed_cleanup_target_invalid/);
+      assert.equal(fs.existsSync(target), true);
+      removeManagedTempDirectorySafely({ targetPath: target, managedRoot: root, requiredNamePrefix: 'asr-' });
+      assert.equal(fs.existsSync(target), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a target replaced by a junction/symlink before the atomic quarantine rename', (context) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-race-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-outside-'));
+    const target = path.join(root, 'asr-owned');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep', 'utf8');
+    const originalRename = fs.renameSync;
+    let replaced = false;
+    try {
+      try {
+        const probe = path.join(root, 'probe-link');
+        fs.symlinkSync(outside, probe, process.platform === 'win32' ? 'junction' : 'dir');
+        fs.unlinkSync(probe);
+      } catch {
+        context.skip('当前环境不允许创建 junction/symlink');
+        return;
+      }
+      fs.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+        if (!replaced && path.resolve(String(oldPath)) === path.resolve(target)) {
+          replaced = true;
+          fs.rmdirSync(target);
+          fs.symlinkSync(outside, target, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+        return originalRename(oldPath, newPath);
+      }) as typeof fs.renameSync;
+      assert.throws(() => removeManagedTempDirectorySafely({
+        targetPath: target,
+        managedRoot: root,
+        requiredNamePrefix: 'asr-',
+      }), /managed_cleanup_identity_changed/);
+      assert.equal(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8'), 'keep');
+    } finally {
+      fs.renameSync = originalRename;
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 

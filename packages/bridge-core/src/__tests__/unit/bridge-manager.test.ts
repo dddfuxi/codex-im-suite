@@ -24,6 +24,7 @@ import type {
   FeishuCloudDocumentHost,
   FeishuOAuthManualHost,
   LifecycleHooks,
+  SingingHost,
   SpeechHost,
   StreamChatParams,
   UpsertChannelBindingInput,
@@ -11710,6 +11711,29 @@ function createManagedSpeechReceipt(text: string, suffix = 'reply') {
   };
 }
 
+function createManagedSingingReceipt(input: {
+  prompt: string;
+  lyrics: string;
+  vocalLanguage: string;
+  durationSeconds: number;
+}, suffix: string) {
+  return {
+    protocol: 'cti-singing-synthesis/v1' as const,
+    path: path.join(os.tmpdir(), `cti-managed-song-${suffix}.ogg`),
+    mediaType: 'audio/ogg; codecs=opus' as const,
+    format: 'opus' as const,
+    durationMs: 10_000,
+    requestSha256: crypto.createHash('sha256').update(JSON.stringify({
+      prompt: input.prompt,
+      lyrics: input.lyrics,
+      vocalLanguage: input.vocalLanguage,
+      durationSeconds: input.durationSeconds,
+    }), 'utf8').digest('hex'),
+    fileSha256: 'e'.repeat(64),
+    validated: true as const,
+  };
+}
+
 const TEST_SPEECH_INPUT_SHA256 = 'a'.repeat(64);
 
 function createTrustedInboundSpeechMessage(messageId: string, chatId: string) {
@@ -11824,7 +11848,7 @@ describe('bridge-manager speech integration', () => {
       lifecycle: {},
       turnStorage: createSpeechTurnStorage(),
       speech: {
-        transcribe: ({ signal }) => {
+        transcribe: ({ signal }: { signal?: AbortSignal }) => {
           transcribeSignal = signal;
           return new Promise<never>((_resolve, reject) => {
             rejectTranscription = reject;
@@ -11888,7 +11912,7 @@ describe('bridge-manager speech integration', () => {
       lifecycle: {},
       turnStorage: createSpeechTurnStorage(),
       speech: {
-        transcribe: ({ signal }) => {
+        transcribe: ({ signal }: { signal?: AbortSignal }) => {
           transcribeSignal = signal;
           return new Promise<never>((_resolve, reject) => {
             rejectTranscription = reject;
@@ -12006,7 +12030,7 @@ describe('bridge-manager speech integration', () => {
 
   it('纯文本语音成功时发送原生音频、绑定真实消息 ID，并在终态后释放产物', async () => {
     const visibleText = '这是完整语音结果。';
-    let receipt: ReturnType<typeof createManagedSpeechReceipt> | null = null;
+    let receiptSha256: string | undefined;
     const released: unknown[] = [];
     const outboundRefs: any[] = [];
     const textMessages: OutboundMessage[] = [];
@@ -12016,7 +12040,8 @@ describe('bridge-manager speech integration', () => {
     const speech: SpeechHost = {
       transcribe: async () => { throw new Error('not used'); },
       synthesize: async ({ text }) => {
-        receipt = createManagedSpeechReceipt(text, 'success');
+        const receipt = createManagedSpeechReceipt(text, 'success');
+        receiptSha256 = receipt.fileSha256;
         return receipt;
       },
       releaseSynthesis: async (managed) => { released.push(managed); },
@@ -12044,7 +12069,7 @@ describe('bridge-manager speech integration', () => {
       'oc_speech_success',
     ));
 
-    assert.equal(audioOptions?.expectedSha256, receipt?.fileSha256, JSON.stringify(textMessages));
+    assert.equal(audioOptions?.expectedSha256, receiptSha256, JSON.stringify(textMessages));
     assert.equal(textMessages.length, 0, JSON.stringify(textMessages));
     assert.equal(released.length, 1);
     assert.equal(outboundRefs.find((entry) => entry.messageKind === 'audio')?.platformMessageId, 'om_native_voice');
@@ -12161,6 +12186,133 @@ describe('bridge-manager speech integration', () => {
     assert.match(cardSpeechPath, /cti-managed-card\.ogg$/u);
     assert.deepEqual(events, ['card-final', 'release']);
     assert.equal(sent.length, 0);
+  });
+
+  it('唱歌指令只调用独立 SingingHost，成功时只投递一条飞书原生音频', async () => {
+    let speechCalls = 0;
+    let singingCalls = 0;
+    let releaseCalls = 0;
+    const textMessages: OutboundMessage[] = [];
+    const singing: SingingHost = {
+      synthesizeSong: async (input) => {
+        singingCalls += 1;
+        return createManagedSingingReceipt(input, 'success');
+      },
+      releaseSynthesis: async () => { releaseCalls += 1; },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text',
+          text: '为你演唱一段原创小调；若本地歌声不可用，这里仍保留完整说明。',
+          images: [], files: [], reply_mode: 'plain',
+          singing: {
+            mode: 'song_only', prompt: '温暖中文民谣', lyrics: '[Verse]\n今天认真唱歌',
+            vocal_language: 'zh', duration_seconds: 10,
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async () => { speechCalls += 1; throw new Error('TTS 不应被调用'); },
+      },
+      singing,
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-song-text' };
+    });
+    let audioOptions: { expectedSha256?: string } | undefined;
+    adapter.sendLocalAudio = async (_chatId, _filePath, _replyTo, options) => {
+      audioOptions = options;
+      return { ok: true, messageId: 'om_native_song' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请唱一小段原创民谣。', 'ou_speech', 'oc_song_success'));
+
+    assert.equal(singingCalls, 1);
+    assert.equal(speechCalls, 0);
+    assert.equal(textMessages.length, 0);
+    assert.equal(audioOptions?.expectedSha256, 'e'.repeat(64));
+    assert.equal(releaseCalls, 1);
+  });
+
+  it('歌声合成失败时只发送一次完整文字，不用 TTS 冒充', async () => {
+    let speechCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text', text: '这是完整歌词：今天开始认真唱歌。', images: [], files: [], reply_mode: 'plain',
+          singing: {
+            mode: 'song_only', prompt: '轻快流行', lyrics: '今天开始认真唱歌',
+            vocal_language: 'zh', duration_seconds: 10,
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async () => { speechCalls += 1; throw new Error('TTS 不应被调用'); },
+      },
+      singing: { synthesizeSong: async () => { throw new Error('ACE-Step offline'); } },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_song_text_fallback' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('请唱歌。', 'ou_speech', 'oc_song_failure'));
+
+    assert.equal(speechCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /完整歌词/u);
+    assert.match(sent[0].text, /不会用普通语音合成冒充唱歌/u);
+    assert.doesNotMatch(sent[0].text, /ACE-Step offline/u);
+  });
+
+  it('模型在唱歌字段夹带 provider 或路径时整段拒绝', async () => {
+    let singingCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text', text: '这次只保留安全文字结果。', images: [], files: [], reply_mode: 'plain',
+          singing: {
+            mode: 'song_only', prompt: '流行', lyrics: '测试', vocal_language: 'zh', duration_seconds: 10,
+            provider: 'invented', reference_path: 'C:\\unsafe.wav',
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      singing: { synthesizeSong: async () => { singingCalls += 1; throw new Error('不应调用'); } },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_safe_text' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('处理这段结果。', 'ou_speech', 'oc_song_untrusted'));
+
+    assert.equal(singingCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /安全文字结果/u);
   });
 
   it('本轮出现权限确认时不触发 TTS', async () => {

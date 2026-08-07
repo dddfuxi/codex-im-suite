@@ -16,6 +16,7 @@ export const SPEECH_CONTROL_ACTIONS = [
   'speech.installPresetVoice',
   'speech.importReferenceVoice',
   'speech.previewVoice',
+  'speech.previewSingingVoice',
   'speech.activateVoiceProfile',
 ] as const;
 
@@ -33,7 +34,7 @@ function stringValue(value: unknown, field: string, allowEmpty = false): string 
   return normalized;
 }
 
-function hasOption(status: SpeechStatusContract, field: 'replyPolicy' | 'deliveryMode' | 'asrProvider' | 'ttsProvider', value: string): boolean {
+function hasOption(status: SpeechStatusContract, field: 'replyPolicy' | 'deliveryMode' | 'asrProvider' | 'ttsProvider' | 'singingProvider', value: string): boolean {
   return status[field].options.some((option) => option.id === value);
 }
 
@@ -47,6 +48,10 @@ export class SpeechControlService {
     probeSidecar?: boolean;
     readLiveStatus?: () => SpeechStatusContract | null;
     previewVoice?: (input: {
+      text: string;
+      voiceProfileId: string;
+    }) => Promise<SpeechPreviewReceipt>;
+    previewSingingVoice?: (input: {
       text: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
@@ -113,6 +118,24 @@ export class SpeechControlService {
         );
       }
       return this.options.previewVoice({ text, voiceProfileId });
+    } else if (action === 'speech.previewSingingVoice') {
+      const current = await this.refreshStatus();
+      const previewAction = current.actions.find((item) => item.id === action);
+      if (!previewAction?.enabled || !this.options.previewSingingVoice) {
+        throw new RuntimeSpeechError(previewAction?.diagnosticCode || 'singing_preview_unavailable', 'blocked', '当前实时歌声服务无法安全试听');
+      }
+      const text = stringValue(input.text, 'singing_preview_text');
+      if (Array.from(text).length > MAX_SPEECH_PREVIEW_TEXT_CHARACTERS) {
+        throw new RuntimeSpeechError('singing_preview_text_too_long', 'blocked', '歌声试听歌词超过长度限制');
+      }
+      const voiceProfileId = stringValue(input.voiceProfileId, 'singing_voice_profile_id');
+      if (voiceProfileId !== 'acestep.default') {
+        const profile = current.voiceProfiles.find((item) => item.id === voiceProfileId);
+        if (!profile || profile.state !== 'ready' || !profile.capabilities.includes('singing')) {
+          throw new RuntimeSpeechError(profile?.diagnosticCode || 'singing_preview_voice_profile_unavailable', 'blocked', '所选歌声音色当前不可试听');
+        }
+      }
+      return this.options.previewSingingVoice({ text, voiceProfileId });
     } else if (action === 'speech.activateVoiceProfile') {
       const voiceProfileId = stringValue(input.voiceProfileId, 'voice_profile_id');
       const profile = this.options.voiceRegistry.resolveProfile(voiceProfileId);
@@ -135,28 +158,38 @@ export class SpeechControlService {
     if (requestedChannels.length === 0 || requestedChannels.some((id) => !current.channels.some((channel) => channel.id === id && channel.enabled))) {
       throw new RuntimeSpeechError('speech_channel_invalid', 'blocked', '所选渠道不在 Runtime 能力列表中');
     }
-    for (const field of ['replyPolicy', 'deliveryMode', 'asrProvider', 'ttsProvider'] as const) {
+    for (const field of ['replyPolicy', 'deliveryMode', 'asrProvider', 'ttsProvider', 'singingProvider'] as const) {
       if (!hasOption(current, field, stringValue(canonical[field], field))) {
         throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '所选语音能力不在 Runtime 声明列表中');
       }
     }
     const activeVoiceProfileId = stringValue(canonical.activeVoiceProfileId, 'voice_profile_id', true);
+    const activeSingingVoiceProfileId = stringValue(canonical.activeSingingVoiceProfileId, 'singing_voice_profile_id', true);
     if (activeVoiceProfileId) {
       const profile = this.options.voiceRegistry.resolveProfile(activeVoiceProfileId);
       if (profile.kind === 'reference' && !this.options.config.voiceCloneBenchmarkPassed) {
         throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
       }
     }
+    if (activeSingingVoiceProfileId) {
+      const profile = current.voiceProfiles.find((item) => item.id === activeSingingVoiceProfileId);
+      if (!profile || !profile.capabilities.includes('singing')) {
+        throw new RuntimeSpeechError('singing_voice_profile_invalid', 'blocked', '所选音色不能用于歌声合成');
+      }
+    }
     const next: SpeechRuntimeConfig = {
       ...this.options.config,
       inputEnabled: canonical.inputEnabled === true,
       outputEnabled: canonical.outputEnabled === true,
+      singingEnabled: canonical.singingEnabled === true,
       channels: [...new Set(requestedChannels)],
       replyPolicy: canonical.replyPolicy,
       deliveryMode: canonical.deliveryMode,
       asrProvider: canonical.asrProvider,
       ttsProvider: canonical.ttsProvider,
+      singingProvider: canonical.singingProvider,
       voiceProfileId: activeVoiceProfileId || undefined,
+      singingVoiceProfileId: activeSingingVoiceProfileId || undefined,
     };
     Object.assign(this.options.config, next);
     this.options.saveConfig(next);

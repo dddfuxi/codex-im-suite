@@ -4,6 +4,7 @@ export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v1' as con
 
 export type SpeechState = 'ready' | 'optional_missing' | 'blocked' | 'error';
 export type SpeechVoiceProfileKind = 'preset' | 'reference';
+export type SpeechVoiceCapability = 'speech' | 'singing';
 
 /**
  * provider、策略和渠道的 ID 均由 Runtime 声明；面板只回传 options 中的
@@ -57,6 +58,7 @@ export interface SpeechVoiceProfileContract {
   license: string;
   sourceLabel: string;
   authorizationConfirmed: boolean;
+  capabilities: SpeechVoiceCapability[];
   diagnosticCode?: string;
 }
 
@@ -64,6 +66,8 @@ export interface SpeechLimitsContract {
   maxInputBytes: number;
   maxInputDurationSeconds: number;
   maxOutputCharacters: number;
+  maxPreviewCharacters: number;
+  maxSongDurationSeconds: number;
 }
 
 export interface SpeechActionContract {
@@ -78,12 +82,15 @@ export interface SpeechSettingsContract {
   schema: typeof SPEECH_SETTINGS_SCHEMA;
   inputEnabled: boolean;
   outputEnabled: boolean;
+  singingEnabled: boolean;
   channelIds: string[];
   replyPolicy: string;
   deliveryMode: string;
   asrProvider: string;
   ttsProvider: string;
+  singingProvider: string;
   activeVoiceProfileId: string;
+  activeSingingVoiceProfileId: string;
 }
 
 export interface SpeechStatusContract {
@@ -91,12 +98,15 @@ export interface SpeechStatusContract {
   state: SpeechState;
   inputEnabled: boolean;
   outputEnabled: boolean;
+  singingEnabled: boolean;
   channels: SpeechChannelContract[];
   replyPolicy: SpeechSelectionContract;
   deliveryMode: SpeechSelectionContract;
   asrProvider: SpeechSelectionContract;
   ttsProvider: SpeechSelectionContract;
+  singingProvider: SpeechSelectionContract;
   activeVoiceProfileId: string;
+  activeSingingVoiceProfileId: string;
   capabilities: SpeechCapabilityContract[];
   components: SpeechComponentContract[];
   voiceProfiles: SpeechVoiceProfileContract[];

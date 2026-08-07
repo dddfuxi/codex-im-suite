@@ -26,6 +26,7 @@ Claude Code / Codex → 读写你的代码库
 - **交互式配置** — 引导式向导逐步收集 token，附带详细获取说明
 - **权限控制** — 工具调用需要在聊天中通过内联按钮（Telegram/Discord）或文本 `/perm` 命令 / 快捷 `1/2/3` 回复（飞书/QQ/微信）明确批准
 - **流式预览** — 实时查看 Claude 的输出（Telegram 和 Discord 支持）
+- **可选本地语音与歌声预览** — 开发版 `0.3.0` 新增飞书首发的本地 ASR/TTS、独立 ACE-Step 歌声、原生 Opus 回复和可分开选音色/试听的控制面板页面；能力默认关闭
 - **会话持久化** — 对话在守护进程重启后保留
 - **密钥保护** — token 以 `chmod 600` 存储，日志中自动脱敏
 - **无需编写代码** — 安装 Skill 后运行 `/claude-to-im setup`，或直接对 Codex 说 `claude-to-im setup`
@@ -289,6 +290,39 @@ start bridge
 - 语音消息只使用微信自带的语音转文字结果
 - 如果微信没有提供 `voice_item.text`，桥会直接报错，不会自行下载或转写原始语音
 - 权限确认使用文本 `/perm ...` 命令或快捷 `1/2/3` 回复
+
+## 本地语音（开发版 0.3.0 预览）
+
+截至 2026-08-07，这是源码中的本地语音与歌声能力，不代表 live skill 或 release 包已经验收。首期渠道只有飞书；微信继续使用平台提供的转写，其他渠道保持现状。
+
+- 语音输入和语音输出均默认关闭；缺少可选语音依赖不能阻断纯文字 Bridge。
+- 没有会话覆盖时，可信飞书语音会在本地转写，并默认以语音回复；普通文字默认仍以文字回复。
+- 在已连接的飞书会话内发送 `/voice on` 或 `/voice off` 可修改当前会话回复格式。`/voice off` 是硬禁用，直到再次发送 `/voice on` 前都只返回文字；完整优先级为：明确文字 → `/voice off` → 明确语音 → `/voice on` → Runtime 策略 → 入站语音 / 模型提示。这两个命令是 IM 聊天命令，不是 `claude-to-im` 守护进程子命令。
+- 语音成功只保留一个飞书原生 Opus 终态。转写、合成、校验、进度卡替换或上传失败时，只收口一次完整文字错误或结果，不再发送相互竞争的第二个终态。
+- 明确唱歌请求使用独立 `SingingHost` 和本机 ACE-Step 1.5，不经过普通 TTS。ACE-Step 或歌声交付失败时只保留一次完整文字，不能把普通语音冒充歌声。
+- 模型、FFmpeg、Python 和 ASR/TTS 二进制都是可选依赖，不随 npm、live skill 或 release 包安装，首条语音消息也不会触发下载；必须由用户显式安装或配置路径。
+- 语音 Runtime 不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`。
+- 控制面板分别提供说话音色和歌声音色选择、普通语音试听与固定 10 秒歌声试听。受限 Base64 Ogg/Opus 试听回执经 Runtime 与 C# 复验后才进入浏览器内存播放器，不包含本地路径、参考音频或密钥。
+
+职责边界固定如下：
+
+| 层 | 职责 |
+|---|---|
+| `packages/bridge-core` | 校验当前消息的飞书语音证据、裁决回复模式、调用可选 Speech Host / Singing Host，并保证唯一用户可见终态。 |
+| `packages/bridge-runtime` | 负责配置、依赖解析、本机 Sidecar、媒体校验与转换、ASR/TTS、ACE-Step 客户端和音色注册表。 |
+| `apps/control-panel` | 渲染共享 Contract 状态并调用 Runtime 动作；不实现语音策略、不复制 Provider 枚举，也不在 Runtime 确认前伪造设置已生效。 |
+
+语音数据只位于 `CTI_HOME` 的受控目录：
+
+| 数据 | 路径 |
+|---|---|
+| 受管模型与二进制 | `CTI_HOME\runtime-deps\speech` |
+| 音色注册表与授权参考音频 | `CTI_HOME\runtime\speech\voices` |
+| 请求临时文件与默认输出 | `CTI_HOME\runtime\speech` |
+
+共享状态协议只有四态：`ready`、`optional_missing`、`blocked`、`error`。可选组件缺失不会被报告成整个 Bridge 故障；显式错误路径、授权失败或校验失败也不会被静默绕过。控制面板保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；受控重启、新 PID、Runtime 状态、飞书长连接和开发/live bundle Hash 才是 live 已加载证据。
+
+ACE-Step Runtime/模型的受管 manifest 当前仍为 `blocked / manifest_incomplete`，RTX 3070 歌声性能与显存 benchmark 也未执行，所以唱歌必须保持 blocked。当前尚未执行 live 同步/重启，以及重启后的真实飞书语音端到端验收。不能把开发版构建或单元测试通过写成现场已可用。
 
 ## 架构
 

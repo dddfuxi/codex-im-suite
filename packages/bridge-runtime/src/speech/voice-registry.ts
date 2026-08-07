@@ -205,6 +205,7 @@ export class SpeechVoiceRegistry {
     license: string;
     sourceLabel: string;
     authorizationConfirmed: boolean;
+    capabilities: Array<'speech' | 'singing'>;
   }> {
     return this.list().map((profile) => {
       let state: 'ready' | 'optional_missing' | 'blocked' | 'error' = 'ready';
@@ -225,6 +226,7 @@ export class SpeechVoiceRegistry {
         license: profile.license,
         sourceLabel: profile.sourceLabel,
         authorizationConfirmed: profile.authorizationConfirmed,
+        capabilities: profile.kind === 'reference' ? ['speech', 'singing'] : ['speech'],
       };
     });
   }

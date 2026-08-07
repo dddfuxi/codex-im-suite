@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 
 export const MANAGED_INSTALL_PROTOCOL = 'cti-speech-component-install/v1' as const;
@@ -13,6 +14,8 @@ export interface ManagedInstallMarker {
   license: string;
   platform: string;
   entryPoint: string;
+  entryPointSha256: string;
+  entryPointSize: number;
   installedAt: string;
 }
 
@@ -25,6 +28,8 @@ export interface ManagedInstallExpectation {
   license?: string;
   platform?: string;
   entryPoint?: string;
+  entryPointSha256?: string;
+  entryPointSize?: number;
 }
 
 function comparable(value: string): string {
@@ -44,6 +49,22 @@ function safeRelativePath(value: unknown): string | null {
   const normalized = path.posix.normalize(value).replace(/^\.\//, '');
   if (!normalized || normalized === '..' || normalized.startsWith('../') || normalized.split('/').includes('..')) return null;
   return normalized;
+}
+
+function hashFileSha256Sync(filePath: string): string {
+  const descriptor = fs.openSync(filePath, 'r');
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 /** 校验既有路径的每一层都不是 symlink/junction，并确认 realpath 未逃逸。 */
@@ -99,6 +120,10 @@ export function readManagedInstallMarker(
       || typeof value.platform !== 'string'
       || !/^[a-z0-9][a-z0-9._-]{1,31}$/i.test(value.platform)
       || !entryPoint
+      || typeof value.entryPointSha256 !== 'string'
+      || !/^[a-f0-9]{64}$/i.test(value.entryPointSha256)
+      || !Number.isSafeInteger(value.entryPointSize)
+      || value.entryPointSize! <= 0
       || typeof value.installedAt !== 'string'
       || !Number.isFinite(Date.parse(value.installedAt))
     ) return null;
@@ -112,6 +137,8 @@ export function readManagedInstallMarker(
     if (!isWithinRoot(entryPointPath, root) || !isExistingPathTreeSafe(entryPointPath)) return null;
     const entryStat = fs.lstatSync(entryPointPath);
     if (!entryStat.isFile() || entryStat.isSymbolicLink()) return null;
+    if (entryStat.size !== marker.entryPointSize
+      || hashFileSha256Sync(entryPointPath) !== marker.entryPointSha256.toLowerCase()) return null;
     return { marker, entryPointPath };
   } catch {
     return null;

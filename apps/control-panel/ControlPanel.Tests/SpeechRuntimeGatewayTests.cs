@@ -13,6 +13,7 @@ public sealed class SpeechRuntimeGatewayTests
     [InlineData("speech.refresh", "viewer")]
     [InlineData("speech.saveSettings", "operator")]
     [InlineData("speech.previewVoice", "operator")]
+    [InlineData("speech.previewSingingVoice", "operator")]
     [InlineData("speech.activateVoiceProfile", "operator")]
     [InlineData("speech.installComponent", "owner")]
     [InlineData("speech.installPresetVoice", "owner")]
@@ -28,6 +29,7 @@ public sealed class SpeechRuntimeGatewayTests
     [InlineData("speech.activateVoiceProfile", true)]
     [InlineData("speech.refresh", false)]
     [InlineData("speech.previewVoice", false)]
+    [InlineData("speech.previewSingingVoice", false)]
     public void Policy_MarksStateChangingSpeechActionsAsRestartRequired(string command, bool expected)
         => Assert.Equal(expected, SpeechCommandPolicy.RequiresBridgeRestart(command));
 
@@ -201,6 +203,77 @@ public sealed class SpeechRuntimeGatewayTests
         Assert.False(called);
     }
 
+    [Theory]
+    [InlineData("speech.previewVoice")]
+    [InlineData("speech.previewSingingVoice")]
+    public async Task RunPreviewAsync_ProjectsOnlyValidatedOggOpusMedia(string command)
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var media = Encoding.ASCII.GetBytes("OggS-safe-preview");
+        var base64 = Convert.ToBase64String(media);
+        var sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(media)).ToLowerInvariant();
+        var response = JsonSerializer.Serialize(new
+        {
+            ok = true,
+            data = new
+            {
+                protocol = "codex-im-suite/speech-preview/v1",
+                mediaType = "audio/ogg; codecs=opus",
+                base64,
+                bytes = media.Length,
+                sha256,
+                durationMs = 1000,
+                voiceProfileId = "acestep.default",
+                validated = true,
+            },
+        });
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            0,
+            response,
+            "")));
+
+        var receipt = await gateway.RunPreviewAsync(command, new { text = "试听", voiceProfileId = "acestep.default" });
+
+        Assert.Equal(base64, receipt.Base64);
+        Assert.Equal(media.Length, receipt.Bytes);
+        Assert.True(receipt.Validated);
+    }
+
+    [Theory]
+    [InlineData("extra", "OggS-safe-preview")]
+    [InlineData("bad_hash", "OggS-safe-preview")]
+    [InlineData("bad_header", "RIFF-not-ogg-data")]
+    public async Task RunPreviewAsync_RejectsUntrustedMediaVariants(string mutation, string content)
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var media = Encoding.ASCII.GetBytes(content);
+        var base64 = Convert.ToBase64String(media);
+        var sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(media)).ToLowerInvariant();
+        if (mutation == "bad_hash") sha256 = new string('0', 64);
+        var data = new JsonObject
+        {
+            ["protocol"] = "codex-im-suite/speech-preview/v1",
+            ["mediaType"] = "audio/ogg; codecs=opus",
+            ["base64"] = base64,
+            ["bytes"] = media.Length,
+            ["sha256"] = sha256,
+            ["durationMs"] = 1000,
+            ["voiceProfileId"] = "acestep.default",
+            ["validated"] = true,
+        };
+        if (mutation == "extra") data["path"] = "C:/must-not-leak.ogg";
+        var response = new JsonObject { ["ok"] = true, ["data"] = data }.ToJsonString();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            0,
+            response,
+            "")));
+
+        var error = await Assert.ThrowsAsync<SpeechRuntimeGatewayException>(() =>
+            gateway.RunPreviewAsync("speech.previewSingingVoice", new { text = "试听", voiceProfileId = "acestep.default" }));
+
+        Assert.Equal("speech_preview_response_invalid", error.Code);
+    }
+
     [Fact]
     public async Task ExecuteProcessAsync_DrainsStdoutAndStderrConcurrently()
     {
@@ -341,7 +414,7 @@ public sealed class SpeechRuntimeGatewayTests
     }
 
     private const string ValidStatusJson = """
-    {"protocol":"codex-im-suite/speech-status/v1","state":"ready","inputEnabled":true,"outputEnabled":true,"channels":[{"id":"feishu","displayName":"飞书","state":"ready","enabled":true,"inputSupported":true,"outputSupported":true,"selected":true}],"replyPolicy":{"value":"on","options":[{"id":"on","displayName":"开启","state":"ready","enabled":true}]},"deliveryMode":{"value":"voice_only","options":[{"id":"voice_only","displayName":"仅语音","state":"ready","enabled":true}]},"asrProvider":{"value":"asr","options":[{"id":"asr","displayName":"ASR","state":"ready","enabled":true}]},"ttsProvider":{"value":"tts","options":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true}]},"activeVoiceProfileId":"voice","capabilities":[{"id":"speech.input","displayName":"语音输入","state":"ready","supported":true}],"components":[{"id":"sensevoice","displayName":"SenseVoice","kind":"model","state":"optional_missing","installable":true,"capabilities":["asr"]}],"voiceProfiles":[{"id":"voice","displayName":"预设音色","kind":"preset","state":"ready","active":true,"license":"内置","sourceLabel":"Runtime","authorizationConfirmed":true}],"limits":{"maxInputBytes":1024,"maxInputDurationSeconds":60,"maxOutputCharacters":500},"actions":[{"id":"speech.previewVoice","label":"试听","enabled":true}],"lastCheckedAt":"2026-08-07T00:00:00.000Z"}
+    {"protocol":"codex-im-suite/speech-status/v1","state":"ready","inputEnabled":true,"outputEnabled":true,"singingEnabled":false,"channels":[{"id":"feishu","displayName":"飞书","state":"ready","enabled":true,"inputSupported":true,"outputSupported":true,"selected":true}],"replyPolicy":{"value":"on","options":[{"id":"on","displayName":"开启","state":"ready","enabled":true}]},"deliveryMode":{"value":"voice_only","options":[{"id":"voice_only","displayName":"仅语音","state":"ready","enabled":true}]},"asrProvider":{"value":"asr","options":[{"id":"asr","displayName":"ASR","state":"ready","enabled":true}]},"ttsProvider":{"value":"tts","options":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true}]},"singingProvider":{"value":"ace_step_1_5","options":[{"id":"ace_step_1_5","displayName":"ACE-Step 1.5","state":"blocked","enabled":true}]},"activeVoiceProfileId":"voice","activeSingingVoiceProfileId":"","capabilities":[{"id":"speech.input","displayName":"语音输入","state":"ready","supported":true}],"components":[{"id":"sensevoice","displayName":"SenseVoice","kind":"model","state":"optional_missing","installable":true,"capabilities":["asr"]}],"voiceProfiles":[{"id":"voice","displayName":"预设音色","kind":"preset","state":"ready","active":true,"license":"内置","sourceLabel":"Runtime","authorizationConfirmed":true,"capabilities":["speech"]}],"limits":{"maxInputBytes":1024,"maxInputDurationSeconds":60,"maxOutputCharacters":500,"maxPreviewCharacters":240,"maxSongDurationSeconds":60},"actions":[{"id":"speech.previewVoice","label":"试听","enabled":true},{"id":"speech.previewSingingVoice","label":"试听歌声","enabled":false,"diagnosticCode":"singing_benchmark_not_verified"}],"lastCheckedAt":"2026-08-07T00:00:00.000Z"}
     """;
 
     private sealed class SpeechRuntimeGatewayFixture : IDisposable

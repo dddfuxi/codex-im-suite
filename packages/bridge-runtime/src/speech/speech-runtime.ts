@@ -2,12 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { resolveExecutableDependency } from './dependency-resolution.js';
+import { AceStepSingingHost } from './ace-step-singing-host.js';
 import { ManagedSpeechDependencyManager } from './managed-dependency-manager.js';
 import { validateAudio } from './media-pipeline.js';
 import { RuntimeSpeechHost } from './runtime-speech-host.js';
 import { SpeechLiveStatusStore } from './speech-live-status.js';
 import { SpeechRuntimeStatusService } from './speech-status.js';
 import { createSpeechVoicePreview } from './speech-preview.js';
+import { createSingingVoicePreview } from './singing-preview.js';
 import { startSpeechPreviewControlService } from './speech-preview-control.js';
 import type { SpeechRuntimeConfig } from './runtime-types.js';
 import { SpeechVoiceRegistry } from './voice-registry.js';
@@ -66,6 +68,12 @@ export function createSpeechRuntime(input: {
     bundledSidecarCandidates: sidecarCandidates,
     voiceRegistry,
   });
+  const singingHost = new AceStepSingingHost({
+    config: input.config,
+    ctiHome: input.ctiHome,
+    runtimeDepsRoot,
+    voiceRegistry,
+  });
   let previewControlService: ReturnType<typeof startSpeechPreviewControlService> | undefined;
   const status = new SpeechRuntimeStatusService({
     config: input.config,
@@ -73,6 +81,7 @@ export function createSpeechRuntime(input: {
     voiceRegistry,
     listManagedComponents: () => dependencies.listStatuses(),
     previewAvailable: () => previewControlService?.isRunning() === true,
+    singingHost,
   });
   const liveStatus = new SpeechLiveStatusStore(runtimeSpeechStateRoot, input.config);
   let liveStatusTimer: NodeJS.Timeout | undefined;
@@ -102,6 +111,12 @@ export function createSpeechRuntime(input: {
             voiceProfileId,
             signal,
           }),
+          previewSingingVoice: ({ text, voiceProfileId, signal }) => createSingingVoicePreview({
+            host: singingHost,
+            lyrics: text,
+            voiceProfileId,
+            signal,
+          }),
         });
       } catch {
         // mailbox 归属失败时保持不可试听，绝不启动第二个 Sidecar。
@@ -121,6 +136,7 @@ export function createSpeechRuntime(input: {
   };
   return {
     host,
+    singingHost,
     status,
     voiceRegistry,
     dependencies,

@@ -87,6 +87,21 @@ export interface SpeechSynthesisReceipt {
   voiceProfileId?: string;
 }
 
+/** Runtime 对独立歌声模型产物完成校验后的受管回执。 */
+export interface SingingSynthesisReceipt {
+  protocol: 'cti-singing-synthesis/v1';
+  path: string;
+  mediaType: string;
+  format: 'opus';
+  durationMs: number;
+  requestSha256: string;
+  fileSha256: string;
+  validated: true;
+  voiceProfileId?: string;
+}
+
+export type LocalAudioSynthesisReceipt = SpeechSynthesisReceipt | SingingSynthesisReceipt;
+
 /**
  * 可选本地语音能力边界。Core 只传受控文件与最终可见正文；
  * Provider、模型路径、命令和平台 file_key 均由 Runtime 自己管理。
@@ -113,6 +128,22 @@ export interface SpeechHost {
    * 受管目录、普通文件与哈希；未知、越界或已变化的文件不得删除。
    */
   releaseSynthesis?(receipt: SpeechSynthesisReceipt): void | Promise<void>;
+}
+
+/**
+ * 独立本地歌声生成边界。它不接受模型名、API 地址、路径或命令；这些只由
+ * Runtime 的受管配置与 SingingHost 实现掌握，不能回退为普通 TTS。
+ */
+export interface SingingHost {
+  synthesizeSong(input: {
+    prompt: string;
+    lyrics: string;
+    vocalLanguage: string;
+    durationSeconds: number;
+    scratchDir?: string;
+    signal?: AbortSignal;
+  }): Promise<SingingSynthesisReceipt>;
+  releaseSynthesis?(receipt: SingingSynthesisReceipt): void | Promise<void>;
 }
 
 export interface StoredTurnFile {

@@ -24,12 +24,15 @@ describe('speech shared contract', () => {
       schema: SPEECH_SETTINGS_SCHEMA,
       inputEnabled: true,
       outputEnabled: true,
+      singingEnabled: false,
       channelIds: ['runtime-channel'],
       replyPolicy: 'runtime-policy',
       deliveryMode: 'runtime-delivery',
       asrProvider: 'runtime-asr',
       ttsProvider: 'runtime-tts',
+      singingProvider: 'runtime-singing',
       activeVoiceProfileId: 'runtime-profile',
+      activeSingingVoiceProfileId: '',
     };
 
     assert.equal(SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v1');
@@ -46,8 +49,8 @@ describe('speech shared contract', () => {
 
     assert.equal(schema.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(schema.$defs?.SpeechStatusContract?.required, [
-      'protocol', 'state', 'inputEnabled', 'outputEnabled', 'channels', 'replyPolicy',
-      'deliveryMode', 'asrProvider', 'ttsProvider', 'activeVoiceProfileId', 'capabilities',
+      'protocol', 'state', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channels', 'replyPolicy',
+      'deliveryMode', 'asrProvider', 'ttsProvider', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
       'components', 'voiceProfiles', 'limits', 'actions', 'lastCheckedAt',
     ]);
     const statusFields = Object.keys(schema.$defs?.SpeechStatusContract?.properties ?? {});

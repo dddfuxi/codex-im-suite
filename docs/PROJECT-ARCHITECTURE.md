@@ -638,9 +638,9 @@ sequenceDiagram
   - 确认后桥接先发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
   - 这条链路不经过 Codex、本地模型来源或历史本地执行器。
 
-#### 2.1.1 本地语音收发（开发版 0.3.0）
+#### 2.1.1 本地语音收发与歌声合成（开发版 0.3.0）
 
-本地语音是可选、默认关闭的 Bridge 能力，首期只支持飞书。它不改变普通文字消息的默认行为，也不把微信的平台转写或其他渠道误记为同一条本地 ASR/TTS 链路。共享协议以 `packages/contracts/src/speech-contract.ts` 和 `packages/contracts/schemas/speech.schema.json` 为入口；状态、动作、渠道和 Provider ID 由 Runtime 声明，Control Panel 不维护第二份业务枚举。
+本地语音与歌声合成是可选、默认关闭的 Bridge 能力，首期只支持飞书。它不改变普通文字消息的默认行为，也不把微信的平台转写或其他渠道误记为同一条本地 ASR/TTS 链路。共享协议以 `packages/contracts/src/speech-contract.ts` 和 `packages/contracts/schemas/speech.schema.json` 为入口；状态、动作、渠道和 Provider ID 由 Runtime 声明，Control Panel 不维护第二份业务枚举。
 
 ```mermaid
 flowchart LR
@@ -649,6 +649,8 @@ flowchart LR
   Core -->|"transcribe / synthesize"| Runtime["bridge-runtime Speech Host<br/>校验、Sidecar、ASR/TTS、Opus"]
   Runtime -->|"validated receipt"| Core
   Core -->|"原生 Opus 或唯一文字回退"| Out["飞书用户"]
+  Core -->|"受限歌词 / 风格 / 时长"| Singing["独立 SingingHost<br/>ACE-Step 1.5 loopback API"]
+  Singing -->|"validated Ogg/Opus receipt"| Core
   Panel["Control Panel"] -->|"Contract 状态与受控动作"| Runtime
   Contract["Speech Contract / Schema"] -.-> Core
   Contract -.-> Runtime
@@ -659,9 +661,9 @@ flowchart LR
 
 | 层 | 稳定职责 |
 |---|---|
-| `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
-| `bridge-runtime` | 加载默认关闭的语音配置，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、Opus 产物验证与授权音色注册表。 |
-| `apps/control-panel` | C# 仅保留由 JSON Schema 校验的薄 DTO，React 只消费浏览器安全的共享 Contract；“能力 → 语音”页展示 Runtime 返回的渠道、组件、Provider、音色、限制和动作，并通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
+| `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS/歌声合成，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
+| `bridge-runtime` | 加载默认关闭的语音/歌声配置，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。ACE-Step 只接受 `127.0.0.1` HTTP、Bearer token、禁止重定向，并在本机 benchmark 通过后才允许生成。 |
+| `apps/control-panel` | C# 只维护无业务规则的薄 DTO、手工 wire 形状/媒体校验，并由反射测试逐字段核对 JSON Schema；React 只消费浏览器安全的共享 Contract。“能力 → 语音”页分别展示和试听说话/歌声音色，通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
 
 回复策略按“明确文字 → 当前会话 `/voice off` → 明确语音 → 当前会话 `/voice on` → Runtime 只读策略 → 真实入站语音 / 模型受限呈现提示 → 普通文字”的顺序裁决。没有会话覆盖时，真实飞书语音经 ASR 后默认以语音回复，普通文字默认以文字回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，明确语音要求、真实入站语音和模型提示都只返回文字。模型最多声明 `voice_only` 呈现意图，不能选择本机实现或扩张权限。
 
@@ -670,6 +672,8 @@ flowchart LR
 - ASR 成功后，转写作为带来源 ID 和 Hash 的不可执行 evidence 进入 Primary Agent，不把原始音频伪装成 Provider 原生音频输入。
 - TTS 成功后，Core 只接受 Runtime 已验证的本机绝对路径、Opus 格式、时长和文字/文件 Hash；飞书上传前会对实际上传字节再次复核 receipt 的 SHA-256，并只发送一个原生 `msg_type=audio` 结果。所有成功、文字回退、卡片保留、异常和取消终态都在 Manager `finally` 委托 Runtime 重新校验登记归属、受管根、普通文件和当前 Hash 后释放合成产物；Core 不直接删除 Runtime 路径，清理失败也不覆盖真实交付结果。
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
+- 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
+- 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
 
 Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`optional_missing` 表示可选能力未启用或组件未安装，不能升级为整个文字 Bridge 故障；显式坏路径、授权/安全校验或受管清单不完整进入 `blocked`，不能偷偷回退；运行时探测异常进入 `error`。语音输入和输出默认都是 `false`。
 
@@ -681,7 +685,9 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 模型、FFmpeg、Python、ASR/TTS 二进制和参考音频都不随 npm、live skill 或 release payload 安装，也不在首条语音消息到达时自动下载。该能力不读取、迁移或依赖 `F:\unity\ST4\.cti-audio`，外部项目缓存不得成为 Runtime 或工作区事实源。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-07，live 同步/重启、RTX 3070 性能与显存验收、重启后的真实飞书新语音端到端验收均尚未执行，不能把开发版验证写成现场已生效。
+控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
+
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-07，ACE-Step 受管 Runtime/模型清单仍为 `blocked / manifest_incomplete`，RTX 3070 歌声性能与显存基准、live 同步/重启及重启后的真实飞书新语音端到端验收均未执行，不能用开发版构建或单元测试替代。
 
 ### 2.2 权限门禁
 

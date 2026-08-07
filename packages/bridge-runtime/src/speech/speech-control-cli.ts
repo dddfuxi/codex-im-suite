@@ -5,7 +5,7 @@ import { CTI_HOME, hydrateProcessEnvironmentFromConfigFile, loadConfig, saveConf
 import { createSpeechRuntime } from './speech-runtime.js';
 import { RuntimeSpeechError } from './runtime-types.js';
 import { SpeechControlService } from './speech-control-service.js';
-import { requestSpeechVoicePreview } from './speech-preview-control.js';
+import { requestSingingVoicePreview, requestSpeechVoicePreview } from './speech-preview-control.js';
 
 function decodePayload(argv: string[]): unknown {
   if (argv.length === 0) return {};
@@ -49,6 +49,12 @@ export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
         voiceProfileId,
         // C# 网关总超时为 120 秒；为清理与 JSON 回传预留固定余量。
         timeoutMs: Math.min(110_000, config.speech!.requestTimeoutMs + 10_000),
+      }),
+      previewSingingVoice: ({ text, voiceProfileId }) => requestSingingVoicePreview({
+        runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
+        text,
+        voiceProfileId,
+        timeoutMs: Math.min(110_000, config.speech!.singingTimeoutMs + 10_000),
       }),
     });
     return await service.execute(argv[0] || '', decodePayload(argv.slice(1)));

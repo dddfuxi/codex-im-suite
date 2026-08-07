@@ -21,6 +21,15 @@
 - [x] 核验新 Supervisor/Bridge/Worker PID、Feishu 长连接、runtime audit、health 和 suite/live SHA-256。
 - [x] 使用重启后的真实私聊入口发送结果并记录现场证据。
 
+### 2026-08-03 追加整改
+
+- [x] 将普通 `stop / restart / uninstall-service` 收口到同一 Workflow drain，并保留显式 `-Force` 恢复入口。
+- [x] 增加脱敏生命周期审计，记录来源、动作、活动数量、阶段和 drain 裁决。
+- [x] 增加 `workflow-failure-ledger/v1` 单调失败水位和稳定指纹，不保存正文、身份或绝对路径。
+- [x] 补齐 Hub Provider 主路径的 `workflowRunId` 协作关联。
+- [x] 补齐 Contracts、Workflow status 与 drain 定向回归。
+- [ ] 同步 live、重启 Bridge 并用重启后的新消息复测（本次未获“同步运行版/现场生效”的明确指令）。
+
 ## 验收口径
 
 1. 活动 Workflow 存在时，普通 restart 不停止 live 进程；排空后才允许重启。

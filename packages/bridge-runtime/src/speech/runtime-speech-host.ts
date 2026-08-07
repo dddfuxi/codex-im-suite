@@ -6,6 +6,7 @@ import {
   assertRegularNonSymlink,
   ensureNonSymlinkDirectory,
   isWithinRoot,
+  removeManagedTempDirectorySafely,
   resolveExecutableDependency,
   type ResolvedDependencyPath,
 } from './dependency-resolution.js';
@@ -325,7 +326,13 @@ export class RuntimeSpeechHost {
     } catch (error) {
       throw normalizeFailure(error);
     } finally {
-      try { fs.rmSync(requestRoot, { recursive: true, force: true }); } catch { /* 临时文件保留不影响事实回执。 */ }
+      try {
+        removeManagedTempDirectorySafely({
+          targetPath: requestRoot,
+          managedRoot: tempRoot,
+          requiredNamePrefix: 'asr-',
+        });
+      } catch { /* 临时文件保留不影响事实回执，也绝不越过受管根。 */ }
       release();
     }
   }

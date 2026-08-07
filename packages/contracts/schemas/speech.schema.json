@@ -71,7 +71,7 @@
     },
     "SpeechVoiceProfileContract": {
       "type": "object",
-      "required": ["id", "displayName", "kind", "state", "active", "license", "sourceLabel", "authorizationConfirmed"],
+      "required": ["id", "displayName", "kind", "state", "active", "license", "sourceLabel", "authorizationConfirmed", "capabilities"],
       "properties": {
         "id": { "type": "string" },
         "displayName": { "type": "string" },
@@ -81,17 +81,25 @@
         "license": { "type": "string" },
         "sourceLabel": { "type": "string" },
         "authorizationConfirmed": { "type": "boolean" },
+        "capabilities": {
+          "type": "array",
+          "items": { "enum": ["speech", "singing"] },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "diagnosticCode": { "type": "string" }
       },
       "additionalProperties": false
     },
     "SpeechLimitsContract": {
       "type": "object",
-      "required": ["maxInputBytes", "maxInputDurationSeconds", "maxOutputCharacters"],
+      "required": ["maxInputBytes", "maxInputDurationSeconds", "maxOutputCharacters", "maxPreviewCharacters", "maxSongDurationSeconds"],
       "properties": {
         "maxInputBytes": { "type": "integer", "minimum": 0 },
         "maxInputDurationSeconds": { "type": "number", "minimum": 0 },
-        "maxOutputCharacters": { "type": "integer", "minimum": 0 }
+        "maxOutputCharacters": { "type": "integer", "minimum": 0 },
+        "maxPreviewCharacters": { "type": "integer", "minimum": 1, "maximum": 240 },
+        "maxSongDurationSeconds": { "type": "integer", "minimum": 10, "maximum": 600 }
       },
       "additionalProperties": false
     },
@@ -108,34 +116,40 @@
     },
     "SpeechSettingsContract": {
       "type": "object",
-      "required": ["schema", "inputEnabled", "outputEnabled", "channelIds", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "activeVoiceProfileId"],
+      "required": ["schema", "inputEnabled", "outputEnabled", "singingEnabled", "channelIds", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "singingProvider", "activeVoiceProfileId", "activeSingingVoiceProfileId"],
       "properties": {
         "schema": { "const": "codex-im-suite/speech-settings/v1" },
         "inputEnabled": { "type": "boolean" },
         "outputEnabled": { "type": "boolean" },
+        "singingEnabled": { "type": "boolean" },
         "channelIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "replyPolicy": { "type": "string" },
         "deliveryMode": { "type": "string" },
         "asrProvider": { "type": "string" },
         "ttsProvider": { "type": "string" },
-        "activeVoiceProfileId": { "type": "string" }
+        "singingProvider": { "type": "string" },
+        "activeVoiceProfileId": { "type": "string" },
+        "activeSingingVoiceProfileId": { "type": "string" }
       },
       "additionalProperties": false
     },
     "SpeechStatusContract": {
       "type": "object",
-      "required": ["protocol", "state", "inputEnabled", "outputEnabled", "channels", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "activeVoiceProfileId", "capabilities", "components", "voiceProfiles", "limits", "actions", "lastCheckedAt"],
+      "required": ["protocol", "state", "inputEnabled", "outputEnabled", "singingEnabled", "channels", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "singingProvider", "activeVoiceProfileId", "activeSingingVoiceProfileId", "capabilities", "components", "voiceProfiles", "limits", "actions", "lastCheckedAt"],
       "properties": {
         "protocol": { "const": "codex-im-suite/speech-status/v1" },
         "state": { "$ref": "#/$defs/SpeechState" },
         "inputEnabled": { "type": "boolean" },
         "outputEnabled": { "type": "boolean" },
+        "singingEnabled": { "type": "boolean" },
         "channels": { "type": "array", "items": { "$ref": "#/$defs/SpeechChannelContract" } },
         "replyPolicy": { "$ref": "#/$defs/SpeechSelectionContract" },
         "deliveryMode": { "$ref": "#/$defs/SpeechSelectionContract" },
         "asrProvider": { "$ref": "#/$defs/SpeechSelectionContract" },
         "ttsProvider": { "$ref": "#/$defs/SpeechSelectionContract" },
+        "singingProvider": { "$ref": "#/$defs/SpeechSelectionContract" },
         "activeVoiceProfileId": { "type": "string" },
+        "activeSingingVoiceProfileId": { "type": "string" },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/SpeechCapabilityContract" } },
         "components": { "type": "array", "items": { "$ref": "#/$defs/SpeechComponentContract" } },
         "voiceProfiles": { "type": "array", "items": { "$ref": "#/$defs/SpeechVoiceProfileContract" } },

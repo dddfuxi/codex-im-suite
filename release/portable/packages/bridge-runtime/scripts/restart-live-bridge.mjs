@@ -21,6 +21,8 @@ const child = isWindows
       '-File',
       daemonScript,
       'restart',
+      '-Source',
+      'bridge_control',
     ], { detached: true, stdio: 'ignore', windowsHide: true })
   : spawn('/bin/sh', [daemonScript, 'restart'], { detached: true, stdio: 'ignore' });
 

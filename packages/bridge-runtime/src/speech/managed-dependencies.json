@@ -59,6 +59,36 @@
       "fileName": null,
       "availability": "blocked",
       "diagnosticCode": "manifest_incomplete"
+    },
+    {
+      "id": "ace_step_1_5",
+      "displayName": "ACE-Step 1.5 Runtime",
+      "kind": "runtime",
+      "capabilities": ["singing", "music_generation"],
+      "source": "https://github.com/ace-step/ACE-Step-1.5",
+      "version": null,
+      "sha256": null,
+      "size": null,
+      "license": "MIT",
+      "archive": "file",
+      "fileName": null,
+      "availability": "blocked",
+      "diagnosticCode": "manifest_incomplete"
+    },
+    {
+      "id": "ace_step_1_5_models",
+      "displayName": "ACE-Step 1.5 2B Turbo + 0.6B LM",
+      "kind": "model",
+      "capabilities": ["singing"],
+      "source": "https://github.com/ace-step/ACE-Step-1.5",
+      "version": null,
+      "sha256": null,
+      "size": null,
+      "license": "MIT",
+      "archive": "file",
+      "fileName": null,
+      "availability": "blocked",
+      "diagnosticCode": "manifest_incomplete"
     }
   ]
 }

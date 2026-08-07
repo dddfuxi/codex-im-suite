@@ -1,6 +1,6 @@
 ---
 name: manage-codex-im-scheduled-tasks
-description: Use when a Feishu user asks to create, inspect, pause, resume, run, delete, migrate, or diagnose one-time or recurring scheduled tasks, reminders, cron jobs, agent jobs, delivery retries, or failures after Bridge restarts.
+description: Use when a Feishu user asks to create, inspect, pause, resume, run, delete, migrate, or diagnose one-time or recurring scheduled tasks, reminders, check-ins, attendance buttons, cron jobs, agent jobs, delivery retries, or failures after Bridge restarts.
 ---
 
 # 管理飞书计划任务
@@ -14,10 +14,12 @@ description: Use when a Feishu user asks to create, inspect, pause, resume, run,
 | 用户目标 | 动作 |
 |---|---|
 | 到点发送固定文字 | `notify` |
+| 到点让创建者或当前群成员逐人打卡 | `check_in` |
 | 到点重新查询、汇总、生成动态结果 | `agent_turn` |
 | 到点调用具备副作用的受控工具 | `controlled_tool`，必须通过 Owner 门禁 |
 
 - 周期任务必须输出 `cti-scheduled-task`，不要降级为单次 reminder。
+- 用户明确要求“打卡 / 签到 / 点完成并统计人数”时使用 `check_in`，不要用普通 `notify` 后让 Agent 口头回复“打卡成功”，也不要借用通用投票或旧 reminder 完成按钮。
 - 单次低风险固定通知可以输出 `cti-reminder`；Runtime 会兼容转换为单次 `notify` 计划任务。
 - “工作日 10:30”使用 `30 10 * * 1-5` 和 `Asia/Shanghai`；这只表示周一至周五，法定节假日不会自动排除。
 - 相对时间、绝对时间或时区不明确时，只追问最小缺口，不猜测。
@@ -43,6 +45,31 @@ description: Use when a Feishu user asks to create, inspect, pause, resume, run,
   "deliveryMode": "result"
 }
 ```
+
+打卡示例：
+
+```cti-scheduled-task
+{
+  "action": "create",
+  "name": "工作日喝水打卡",
+  "schedule": {
+    "kind": "cron",
+    "expression": "0 10 * * 1-5",
+    "timezone": "Asia/Shanghai"
+  },
+  "taskAction": {
+    "kind": "check_in",
+    "text": "喝水后请点击按钮打卡。",
+    "audience": "chat_members",
+    "buttonText": "我喝水了",
+    "successText": "喝水打卡成功。",
+    "windowMs": 3600000
+  },
+  "deliveryMode": "result"
+}
+```
+
+`audience` 只允许 `owner / chat_members`。每次运行独立统计，重复点击不重复计数；点击者、当前群和卡片 message ID 由 Bridge/Runtime 从真实回调重建，动作 JSON 不得携带用户 ID、群 ID 或 callback data。
 
 时间类型：
 

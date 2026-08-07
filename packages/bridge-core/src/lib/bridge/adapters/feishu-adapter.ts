@@ -206,11 +206,55 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_UPLOAD_FILE_SIZE = 30 * 1024 * 1024;
 type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
 
+interface FeishuNativeReplyAttachmentBinding {
+  protocol: 'cti-feishu-native-reply-attachment/v1';
+  relation: 'native_reply';
+  sourceMessageId: string;
+  messageId: string;
+  fileKey: string;
+  resourceType: 'image' | 'file' | 'audio' | 'video' | 'media';
+  attachmentId: string;
+}
+
+interface FeishuNativeReplyAttachmentResult {
+  attachments: FileAttachment[];
+  bindings: FeishuNativeReplyAttachmentBinding[];
+}
+
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 const FEISHU_BOT_TO_BOT_LOOP_TTL_MS = 5 * 60 * 1000;
 const FEISHU_BOT_TO_BOT_MAX_TURNS_DEFAULT = 2;
 const FEISHU_STICKER_MEDIA_DOWNLOAD_RETRY_INTERVAL_MS = 15 * 60 * 1000;
+
+/** Content-Length 只作预检，真实上限始终按流式累计字节数执行。 */
+export async function readBoundedFeishuResponseBody(
+  response: Response,
+  maxBytes = MAX_FILE_SIZE,
+): Promise<Buffer> {
+  const declaredRaw = response.headers.get('content-length');
+  const declared = declaredRaw === null ? Number.NaN : Number(declaredRaw);
+  if (Number.isFinite(declared) && declared >= 0 && declared > maxBytes) {
+    await response.body?.cancel('resource size limit exceeded').catch(() => {});
+    throw new Error('resource_download_too_large');
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    totalBytes += chunk.length;
+    if (totalBytes > maxBytes) {
+      await reader.cancel('resource size limit exceeded').catch(() => {});
+      throw new Error('resource_download_too_large');
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, totalBytes);
+}
 
 interface FeishuReactionHint {
   raw: string;
@@ -3752,7 +3796,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
           messageId: replyTargetMessageId,
         },
       });
-      const replyAttachments = await this.downloadAttachmentsFromMessageId(replyTargetMessageId);
+      const replyRecovery = await this.downloadAttachmentsFromMessageId(
+        replyTargetMessageId,
+        msg.message_id,
+      );
+      const replyAttachments = replyRecovery.attachments;
       if (replyAttachments.length > 0) {
         // 回复附件必须排在当前消息附件之前，Context Broker 才能用
         // attachmentCount 以平台无关方式标注 reply_attachment 归属。
@@ -3762,6 +3810,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
             messageId: replyTargetMessageId,
             attachmentCount: replyAttachments.length,
           },
+          feishuNativeReplyAttachments: replyRecovery.bindings,
         });
       }
     }
@@ -7202,13 +7251,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  private async downloadAttachmentsFromMessageId(messageId: string): Promise<FileAttachment[]> {
+  private async downloadAttachmentsFromMessageId(
+    messageId: string,
+    sourceMessageId: string,
+  ): Promise<FeishuNativeReplyAttachmentResult> {
     const item = await this.fetchMessageById(messageId);
-    if (!item || item.deleted) return [];
-    return this.downloadAttachmentsFromMessageItem(item);
+    if (!item || item.deleted) return { attachments: [], bindings: [] };
+    return this.downloadNativeReplyAttachmentsFromMessageItem(item, sourceMessageId);
   }
 
+  /**
+   * 保留平台附件下载的通用数组接口；原生回复专用绑定由下方方法另行构造，
+   * 避免 ASR evidence 扩展改变 sticker/image/file 的既有调用契约。
+   */
   private async downloadAttachmentsFromMessageItem(item: FeishuMessageListItem): Promise<FileAttachment[]> {
+    return (await this.downloadNativeReplyAttachmentsFromMessageItem(item, item.message_id)).attachments;
+  }
+
+  private async downloadNativeReplyAttachmentsFromMessageItem(
+    item: FeishuMessageListItem,
+    sourceMessageId: string,
+  ): Promise<FeishuNativeReplyAttachmentResult> {
     const content = item.body?.content || '';
     const parsedPost = item.msg_type === 'post' ? this.parsePostContent(content) : null;
     const parsedInteractive = item.msg_type === 'interactive'
@@ -7225,6 +7288,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // 回复资源必须严格绑定被回复消息自身的 message_id/file_key；计划层不允许
     // 退回近邻图片或历史候选，adapter 只负责逐项执行真实平台下载。
     const attachments: FileAttachment[] = [];
+    const bindings: FeishuNativeReplyAttachmentBinding[] = [];
     for (const request of plan) {
       const attachment = item.msg_type === 'sticker'
         ? await this.downloadStickerResource(request.messageId, request.fileKey)
@@ -7233,9 +7297,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
           request.fileKey,
           request.resourceType,
         );
-      if (attachment) attachments.push(attachment);
+      if (attachment) {
+        attachments.push(attachment);
+        bindings.push({
+          protocol: 'cti-feishu-native-reply-attachment/v1',
+          relation: 'native_reply',
+          sourceMessageId,
+          messageId: request.messageId,
+          fileKey: request.fileKey,
+          resourceType: request.resourceType,
+          attachmentId: attachment.id,
+        });
+      }
     }
-    return attachments;
+    return { attachments, bindings };
   }
 
   private extractHistoryText(item: FeishuMessageListItem): string {
@@ -8066,20 +8141,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         };
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      if (buffer.length > MAX_FILE_SIZE) {
-        return {
-          attachment: null,
-          failure: {
-            resourceType,
-            key: fileKey,
-            endpoint,
-            status: response.status,
-            error: `resource too large > ${MAX_FILE_SIZE} bytes`,
-          },
-        };
-      }
+      const buffer = await readBoundedFeishuResponseBody(response, MAX_FILE_SIZE);
       if (buffer.length === 0) {
         return {
           attachment: null,

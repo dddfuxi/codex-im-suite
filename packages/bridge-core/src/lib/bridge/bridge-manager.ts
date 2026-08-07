@@ -20,6 +20,8 @@ import type {
   FeishuCloudLinkResolveResult,
   FeishuOAuthManualResumeRequest,
   FileAttachment,
+  LocalAudioSynthesisReceipt,
+  SingingHost,
   SpeechHost,
   SpeechReplyPolicy,
   SpeechReplyPreference,
@@ -159,8 +161,13 @@ import {
   parseSpeechTranscriptReceipt,
   parseVoiceCommandPreference,
   resolveTrustedInboundAudio,
+  resolveTrustedNativeReplyAudio,
   speechFailureMessage,
 } from './application/speech-policy.js';
+import {
+  parseSingingSynthesisReceipt,
+  singingFailureMessage,
+} from './application/singing-policy.js';
 import { deliverSpeechWithTextFallback } from './application/speech-delivery-transaction.js';
 import {
   CHOICE_CALLBACK_PREFIX,
@@ -6259,6 +6266,15 @@ async function handleMessage(
       messageId?: string;
       attachmentCount?: number;
     };
+    feishuNativeReplyAttachments?: Array<{
+      protocol?: string;
+      relation?: string;
+      sourceMessageId?: string;
+      messageId?: string;
+      fileKey?: string;
+      resourceType?: string;
+      attachmentId?: string;
+    }>;
     feishuStickerLibraryContext?: {
       prompt?: string;
       candidateCount?: number;
@@ -6944,13 +6960,29 @@ async function handleMessage(
 
   let speechTranscriptContext = '';
   const inboundSpeechReceived = inboundMessageKind === 'feishu_audio';
-  if (inboundSpeechReceived) {
-    const speechPlan = resolveTrustedInboundAudio({
+  const currentSpeechPlan = inboundSpeechReceived
+    ? resolveTrustedInboundAudio({
       channelType: adapter.channelType,
       sourceMessageId: msg.messageId,
       raw: msg.raw,
       attachments: msg.attachments || [],
-    });
+    })
+    : null;
+  const nativeReplyAudioClaimed = Array.isArray(rawData?.feishuNativeReplyAttachments)
+    && rawData.feishuNativeReplyAttachments.some((item) => item?.resourceType === 'audio');
+  const nativeReplySpeechPlan = nativeReplyAudioClaimed
+    ? resolveTrustedNativeReplyAudio({
+      channelType: adapter.channelType,
+      sourceMessageId: msg.messageId,
+      raw: msg.raw,
+      attachments: msg.attachments || [],
+    })
+    : null;
+  const speechInputRequested = inboundSpeechReceived || nativeReplyAudioClaimed;
+  const speechPlan = currentSpeechPlan && nativeReplySpeechPlan
+    ? null
+    : currentSpeechPlan || nativeReplySpeechPlan;
+  if (speechInputRequested) {
     const speechHost = getBridgeContext().speech;
     const turnStorage = getBridgeContext().turnStorage;
     if (!speechPlan) {
@@ -7015,13 +7047,27 @@ async function handleMessage(
       if (!receipt) {
         throw { errorCode: 'speech_invalid_transcript_receipt' };
       }
-      speechTranscriptContext = buildSpeechTranscriptContext(receipt);
-      const mergedText = mergeTranscriptWithUserText(receipt.text, rawText);
+      speechTranscriptContext = buildSpeechTranscriptContext(receipt, {
+        relation: speechPlan.relation,
+        ...(speechPlan.relation === 'native_reply'
+          ? { repliedMessageId: speechPlan.evidence.messageId }
+          : {}),
+      });
+      const mergedText = speechPlan.relation === 'current_message'
+        ? mergeTranscriptWithUserText(receipt.text, rawText)
+        : (rawText.trim() || receipt.text);
       const sanitizedSpeechText = sanitizeInput(mergedText);
       rawText = sanitizedSpeechText.text;
       text = sanitizedSpeechText.text;
       truncated = truncated || sanitizedSpeechText.truncated;
       msg.attachments = (msg.attachments || []).filter((item) => item.id !== speechPlan.evidence.attachmentId);
+      const replyMetadata = rawData?.feishuReplyTo;
+      if (speechPlan.relation === 'native_reply' && replyMetadata) {
+        replyMetadata.attachmentCount = Math.max(
+          0,
+          (replyMetadata.attachmentCount || 0) - 1,
+        );
+      }
       hasAttachments = msg.attachments.length > 0;
       if (!rawText) throw { errorCode: 'speech_empty_transcript' };
     } catch (error) {
@@ -7489,8 +7535,10 @@ async function handleMessage(
 
   let permissionRequestedThisTurn = false;
   // 合成文件由 Runtime 持有；Core 只保存本轮已验证回执，并在所有终态后委托 Runtime 释放。
-  let managedSpeechReceipt: SpeechSynthesisReceipt | null = null;
+  let managedSpeechReceipt: LocalAudioSynthesisReceipt | null = null;
   let managedSpeechHost: SpeechHost | undefined;
+  let managedSingingHost: SingingHost | undefined;
+  let releaseManagedAudio: (() => void | Promise<void>) | undefined;
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
@@ -8326,6 +8374,7 @@ async function handleMessage(
       } catch { /* 语音资格审计失败不能阻断原始文字/结构化交付。 */ }
     }
     const speechEligible = adapter.channelType === 'feishu'
+      && !preparedReply?.singing
       && speechDecision.mode === 'voice'
       && speechContentEligibility.eligible
       && Boolean(speechText)
@@ -8352,6 +8401,10 @@ async function handleMessage(
             signal: taskAbort.signal,
           }), speechText);
           if (!managedSpeechReceipt) throw { errorCode: 'speech_invalid_synthesis_receipt' };
+          if (managedSpeechHost.releaseSynthesis) {
+            const receipt = managedSpeechReceipt as SpeechSynthesisReceipt;
+            releaseManagedAudio = () => managedSpeechHost!.releaseSynthesis!(receipt);
+          }
         } catch (error) {
           const notice = speechFailureMessage(error, 'synthesize');
           deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
@@ -8359,6 +8412,52 @@ async function handleMessage(
         }
       } else {
         const notice = speechFailureMessage({ errorCode: 'speech_not_ready' }, 'synthesize');
+        deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+        outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+      }
+    }
+    const singingDirective = preparedReply?.singing;
+    const singingEligible = adapter.channelType === 'feishu'
+      && Boolean(singingDirective)
+      && speechContentEligibility.eligible
+      && !result.hasError
+      && !documentDeliveryFailed
+      && !handledAsDoc
+      && !agentChoiceCardAttached
+      && !preparedReply?.feishuCardJson
+      && !verifiedStickerAction
+      && !taskAbort.signal.aborted;
+    if (singingEligible && singingDirective) {
+      managedSingingHost = getBridgeContext().singing;
+      if (managedSingingHost) {
+        try {
+          let scratchDir: string | undefined;
+          try {
+            scratchDir = getBridgeContext().turnStorage?.getScratchDirectory({
+              sessionId: effectiveBinding.codepilotSessionId,
+              turnId: msg.messageId,
+            });
+          } catch { /* Runtime 可选择自己的受管 scratch 根 */ }
+          managedSpeechReceipt = parseSingingSynthesisReceipt(await managedSingingHost.synthesizeSong({
+            prompt: singingDirective.prompt,
+            lyrics: singingDirective.lyrics,
+            vocalLanguage: singingDirective.vocalLanguage,
+            durationSeconds: singingDirective.durationSeconds,
+            scratchDir,
+            signal: taskAbort.signal,
+          }), singingDirective);
+          if (!managedSpeechReceipt) throw { errorCode: 'singing_invalid_synthesis_receipt' };
+          if (managedSingingHost.releaseSynthesis) {
+            const receipt = managedSpeechReceipt;
+            releaseManagedAudio = () => managedSingingHost!.releaseSynthesis!(receipt as import('./host.js').SingingSynthesisReceipt);
+          }
+        } catch {
+          const notice = singingFailureMessage();
+          deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+          outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+        }
+      } else {
+        const notice = singingFailureMessage();
         deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
         outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
       }
@@ -8458,6 +8557,9 @@ async function handleMessage(
           && !lightStatusCardStarted
           && !agentChoiceCardAttached;
         if (canUseDirectSpeech && managedSpeechReceipt) {
+          const audioDeliveryFailureNotice = managedSpeechReceipt.protocol === 'cti-singing-synthesis/v1'
+            ? singingFailureMessage()
+            : speechFailureMessage({ errorCode: 'speech_delivery_failed' }, 'synthesize');
           const speechDelivery = await deliverSpeechWithTextFallback({
             sendAudio: () => adapter.sendLocalAudio(
               msg.address.chatId,
@@ -8468,7 +8570,7 @@ async function handleMessage(
             sendTextFallback: () => deliverResponse(
               adapter,
               msg.address,
-              [outboundDeliveryResponseText, speechFailureMessage({ errorCode: 'speech_delivery_failed' }, 'synthesize')]
+              [outboundDeliveryResponseText, audioDeliveryFailureNotice]
                 .filter(Boolean)
                 .join('\n\n'),
               effectiveBinding.codepilotSessionId,
@@ -8490,6 +8592,7 @@ async function handleMessage(
               const continuationContext = [
                 storedUserText ? `原始请求：${storedUserText}` : '',
                 '上一轮状态：已完成',
+                managedSpeechReceipt.protocol === 'cti-singing-synthesis/v1' ? '交付类型：完整歌声结果' : '交付类型：完整语音结果',
                 deliveryResponseText ? `上一轮结果：${deliveryResponseText}` : '',
               ].filter(Boolean).join('\n');
               store.insertOutboundRef({
@@ -8747,9 +8850,9 @@ async function handleMessage(
       } catch { /* best effort */ }
     }
 
-    if (managedSpeechReceipt && managedSpeechHost?.releaseSynthesis) {
+    if (managedSpeechReceipt && releaseManagedAudio) {
       try {
-        await managedSpeechHost.releaseSynthesis(managedSpeechReceipt);
+        await releaseManagedAudio();
       } catch {
         // 清理失败只进入观察链，不能覆盖已经完成的语音、文字或卡片终态。
         try {
@@ -8761,7 +8864,7 @@ async function handleMessage(
             summary: '[SPEECH_SYNTHESIS_RELEASE_FAILED]',
           });
         } catch { /* best effort */ }
-        console.warn('[bridge-manager] Managed speech synthesis artifact release failed');
+        console.warn('[bridge-manager] Managed local audio synthesis artifact release failed');
       }
     }
 

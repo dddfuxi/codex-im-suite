@@ -27,11 +27,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
 - 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务收口成声明式运行单元；服务页和非 Skill 扩展继续复用通用 `update` 协议与白名单执行模板。
+- 本地语音与歌声开发预览：开发版 `0.3.0` 新增飞书首发的可选本地 ASR/TTS、独立 ACE-Step 歌声、会话 `/voice on|off`、原生 Opus 投递，以及可分开选音色/试听的控制面板入口；所有能力默认关闭，模型与二进制不随包安装，也不会在首条消息到达时隐式下载。
 - Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
-- 点餐顾问扩展：开发版内置 `food-ordering-advisor` Skill，通过美团、大众点评或其他可验证本地生活来源完成多轮问答、餐厅推荐、跨平台比选和购物车准备；实时价格、配送、优惠与订单结果必须来自当前工具证据，提交及支付保留用户确认/接管边界，安装或同步后才进入对应运行环境。
+- 点餐顾问扩展：开发版内置 `food-ordering-advisor` Skill，通过美团、大众点评或其他可验证本地生活来源完成多轮问答、餐厅推荐、跨平台比选和购物车准备；正常官方 Codex 回合可用服务端只读实时网页搜索获取公开页面证据，不依赖默认隔离的 Desktop Browser 插件。实时价格、配送、优惠与订单结果必须来自当前工具证据，提交及支付保留用户确认/接管边界，安装或同步后才进入对应运行环境。
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
+- Workflow 当前回复可受控终止：执行器页和会话详情对仍在生成的 run 显示“终止回复”，请求经 Runtime 本机命令通道核对 run、session 与原 turn 后触发该回合真实 AbortController；不会停止 Bridge 或影响其他会话。面板会显示“正在终止 / 已终止”，已经结束或身份不完整的 run 不会被宽松取消，终止后也不会自动重试或补发迟到结果。
 - 运行时多 Agent 协作：新增共享常驻 Worker 池和 `Coordinator / Context / Memory / Performance` 四类只读 Agent；默认 `off`，按 `off → shadow → assist` 灰度。Primary Agent 保持唯一执行者，Bridge 保持唯一发送者；总览卡片可一键以安全的 Shadow 开启或关闭，机器人架构页可显式切换三档模式并查看职责、Worker、工作流和性能。Shadow 只在控制面板保留旁路观测，不占飞书卡片；只有真正注入 Primary 的 Assist 协作才会在最终卡片默认折叠的“执行轨迹”中显示。
 - 飞书表情表达支持“只发表情包”：当可信 sticker 已完整表达问候、确认或玩笑语气时，不再额外发送“给你一个 / 表情包已发送”等文字，流式回合会在原生 sticker 成功后撤回临时进度卡。非明确请求有会话冷却，不会每条消息机械附带表情；任务结果、错误、正式说明仍保留文字。群聊与私聊复用同一语义和频率门禁。
 - 飞书卡片支持受控横幅头图：Provider 可用 `cti-final.card_hero` 从同一结果的 `images` 中选择一张已验证图片，Bridge 上传后把真实 `image_key` 嵌入普通卡、流式终态卡或有限选择按钮卡；嵌入成功不再重复发同一图片。组合卡若被平台拒绝，会先去掉可选头图并保留原正文与按钮，图片改走普通附件；卡片仍不可用时再以飞书富文本回退，不会裸露 Markdown。模型声明的 URL、`image_key`、输入证据或未交付路径不会被提升成头图。
@@ -41,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
 - 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
-- 统一计划任务：`notify / agent_turn / controlled_tool` 共用 Scheduler、原子 Store、slot 幂等和运行账本；`cti-reminder` 与 `/remind` 兼容转换为单次 `notify`，周期任务使用 `cti-scheduled-task`。执行成功但飞书投递失败时只重试投递，不重跑 Agent；运行态固定写入 `CTI_HOME\data\scheduled-tasks`，不进入工作区或记忆库。
+- 统一计划任务：`notify / check_in / agent_turn / controlled_tool` 共用 Scheduler、原子 Store、slot 幂等和运行账本；`check_in` 每次触发生成独立飞书打卡卡片，按本轮真实点击者去重并在历史中保留人数，不会把整个周期任务标记完成。`cti-reminder` 与 `/remind` 兼容转换为单次 `notify`，周期任务使用 `cti-scheduled-task`。执行成功但飞书投递失败时只重试投递，不重跑 Agent；运行态固定写入 `CTI_HOME\data\scheduled-tasks`，不进入工作区或记忆库。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 飞书群成员取证按请求字段最小化：成员类型只使用当前群成员列表区分用户/机器人，不进入 Contact；除“查/列出”和“是什么/有哪些/分别属于”等完整问句外，“群成员部门情况”“某成员头像”这类短名词式低风险读取也会进入明确字段计划，不依赖固定动作词。头像请求会先解析目标是用户、机器人、全体、当前消息发送者或当前群具名成员；“我/我的头像”绑定入站 sender ID，再用当前群 roster 唯一复核，禁止从句子片段猜姓名；“现在你能看到头像了吗”一类能力/状态问句不会被截成成员名。具名显示名先在当前群 roster 精确复核，精确失败后只允许唯一的规范化相关名称命中，零命中或同名/多候选仍阻塞，不跨群猜人、不申请权限。“你们/各自/自己的头像”等机器人集合自指只读取机器人头像，当前机器人复用 Bot v3 信息，不扩张到用户头像或 Application v6 管理员权限。成员 evidence 官方 API 对网络异常、限流和 5xx 最多自动续试一次；头像下载会依次尝试官方返回的多个尺寸，单个成员、部门或头像尺寸失败不影响其余已明确目标继续处理。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
@@ -51,8 +53,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 控制面板共享协议：`PanelState`、`RuntimeUnit`、Control Command/Result、面板消费的完整 Workflow Run 和项目注册表快照统一由 `packages/contracts` 提供；React 只从浏览器安全的 `@codex-im-suite/contracts/control-api|workflow|project-registry` 子路径导入。`control-api.schema.json` 与 `project-registry.schema.json` 是 C# 薄 DTO 的跨语言字段约束，.NET 测试会逐字段检查 schema 对齐；控制面板只读展示项目注册表，不维护第二份项目事实。
 - AI 执行来源收口：设置页支持选择默认 executor 来源，执行器页可一键设为默认或恢复自动；Codex 内部仍支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源。Feishu 最终卡片底部会分开展示“来源”（executor/provider）与“模型 / token”，便于确认本轮到底由 Codex、Claude CLI 还是外部 agent 执行。
 - Codex 模型设置真实生效：官方 Codex 的模型可以留空（跟随 Codex 默认）或填写显式模型，普通任务推理强度支持 `minimal / low / medium / high / xhigh`。“保存并重启 Bridge”后后续任务使用新配置；会话页 Workflow 展示本轮已提交给 Codex 的模型、推理强度、受限覆盖和 thread 切换原因。classifier / response-only 固定使用 `low`，并明确标注，不会冒充全局设置失效。
-- Workflow 失败反思链补齐：运行记录会把 Provider 与工具失败归一为稳定脱敏诊断码，Performance Agent 只按已完成协作回合的冻结指标窗口生成建议，并记录证据引用、快照时间和分析水位，避免活跃任务污染分母或重复分析同一批次。
-- Bridge 重启默认先等待运行中的 Workflow 排空；超时会取消重启而不是中断任务。Bridge Codex SDK/CLI 默认不继承 Codex Desktop 全局插件，只有确认插件不依赖 Desktop helper 时才建议显式开启 `CTI_CODEX_INHERIT_GLOBAL_PLUGINS=true`。
+- Workflow 失败反思链补齐：运行记录会把 Provider 与工具失败归一为稳定脱敏诊断码；另用 `runtime/workflow-failure-ledger.json` 保存不含正文、身份和绝对路径的单调失败水位、稳定指纹与最小状态，避免最近 80 条 Workflow 滚动后丢失每日扫描边界。Performance Agent 只按已完成协作回合的冻结指标窗口生成建议，并记录证据引用、快照时间和分析水位；协作 run 会在所有 Provider 主路径写入真实 `workflowRunId`，无法关联时仍按系统趋势处理。
+- Bridge 的普通 `stop`、`restart` 和运行中服务卸载默认共用 Workflow drain；超时会延期终止而不是中断任务。显式 `-Force` 是人工恢复逃生口，每次 drain 裁决只把来源、动作、活动数量、阶段和 allowed/postponed/forced 结果写入脱敏生命周期审计。Bridge Codex SDK/CLI 默认不继承 Codex Desktop 全局插件，只有确认插件不依赖 Desktop helper 时才建议显式开启 `CTI_CODEX_INHERIT_GLOBAL_PLUGINS=true`。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
 
 ## 快速入口
@@ -81,8 +83,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 ## 工作区与记忆入口
 
 - 当前工作区：每轮唯一默认挂载，对应 `CTI_DEFAULT_WORKDIR` 或会话绑定目录。
-- 项目注册表：默认读取 `CTI_HOME\project-registry.json`，也可用 `CTI_PROJECT_REGISTRY_PATH` 指定其他 JSON 文件。结构化记录是项目 ID、类型、工作区根、Unity 工程根、访问模式和 MCP Profile 的唯一协议来源；`CTI_ALLOWED_WORKSPACE_ROOTS` 只兼容导入为 `generic` 项目并继续充当权限上界，不自动进入 Prompt、Provider 或附加目录。
-- 聊天切换工作区：Owner 在飞书中发送“工作区”“列出当前可用工作区”或“我想切换工作区”时，会收到带项目按钮的选择卡片；点击按钮即可切换，也可发送“切换工作区到 `<编号 / 项目 ID / 名称>`”。卡片只展示启用的结构化注册项目并标记当前项和读写模式；按钮回调会重新核验点击者 Owner 身份、注册表和目录状态。成功切换会创建新的项目会话，避免旧项目上下文、SDK session 或工具状态串入。非 Owner 不能通过文字或伪造卡片回调持久修改会话绑定。
+- 项目注册表：默认读取 `CTI_HOME\project-registry.json`，也可用 `CTI_PROJECT_REGISTRY_PATH` 指定其他 JSON 文件。结构化记录是项目 ID、类型、工作区根、Unity 工程根、访问模式和 MCP Profile 的唯一协议来源；启用的结构化项目根与 `CTI_ALLOWED_WORKSPACE_ROOTS` 导入的兼容 `generic` 项目共同构成会话路由的授权上界。允许访问不等于默认挂载：未被当前会话或本轮计划选中的项目不会自动进入 Prompt、Provider 或附加目录。
+- 聊天切换工作区：Owner 在飞书中发送“工作区”“列出当前可用工作区”或“我想切换工作区”时，会收到带项目按钮的选择卡片；点击按钮即可切换，也可发送“切换工作区到 `<编号 / 项目 ID / 名称>`”。卡片只展示启用的结构化注册项目并标记当前项和读写模式；按钮回调会重新核验点击者 Owner 身份、注册表和目录状态。成功切换会创建新的项目会话，并通过下一条普通消息使用的同一路由策略复验绑定、会话与目录，避免旧项目上下文、SDK session、工具状态或旧 allowlist 口径把新工作区静默回退。非 Owner 不能通过文字或伪造卡片回调持久修改会话绑定。
 - 项目禁止根：`CTI_PROJECT_DENIED_ROOTS` 可追加明确禁止注册和挂载的目录；Agent Home、`CTI_HOME`、上传缓存和记忆库仍由运行时自动加入禁止集合。禁止根会同时约束普通会话和计划任务。
 - 临时挂载：只由本轮消息中的明确绝对路径等强证据生成，随当前回合结束失效。
 - Agent Home / 记忆库：默认 `E:\cli-md`，集中放置 `机器人身份.md`、`行为与安全规则.md`、`工具与环境.md`、`记忆总索引.md`、`记忆库说明.md`。
@@ -227,6 +229,38 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 控制面板下载安装到本机的数据不进入仓库，默认落在 `C:\Users\admin\.claude-to-im\extensions`；其中用户 manifest overlay 位于 `extensions\manifests\mcp.d`、`extensions\manifests\skills.d`、`extensions\manifests\plugins.d` 和 `extensions\manifests\action-manifests.d`，会和 `config/*.d` 一起被面板、MCP 注册脚本和 skill 同步脚本读取。
 
+## 本地语音（开发版 0.3.0）
+
+截至 2026-08-07，本地语音与歌声是开发版预览，不代表 live 或 release 已验收。首期只支持飞书；语音输入、语音输出和歌声合成都默认关闭，不影响现有文字消息和其他渠道。
+
+- 无会话覆盖时，真实飞书语音由本地 ASR 转写后交给 Primary Agent，并默认以语音回复；普通文字默认仍以文字回复。
+- 飞书会话中发送 `/voice on` 可把当前会话设为默认语音回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，明确要求语音、真实入站语音和模型语音提示都只返回文字。完整优先级为：明确文字 → `/voice off` → 明确语音 → `/voice on` → Runtime 策略 → 入站语音 / 模型提示。
+- 语音成功只发送一个飞书原生 Opus 终态。转写、合成、产物校验、进度卡替换或平台上传任一步失败，都只发送一次完整文字错误或结果，不产生“语音失败后又重复发多份文字”的双终态。
+- 用户明确要求唱歌时，模型只能提交受限的歌词、音乐风格、语言和时长；Bridge 通过独立 `SingingHost` 调用本机 ACE-Step 1.5。歌声与普通 TTS 完全分离，ACE-Step 不可用时只返回一次完整文字，不会把拉长音调的 TTS 冒充唱歌。
+- 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装，或显式配置本机依赖路径后，Runtime 才会使用它们。
+- 这条链路不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`；ST4 和其他外部项目的历史音频缓存不会成为 Bridge 的默认来源。
+- 控制面板可分别选择说话音色和歌声音色，并分别生成普通语音试听与固定 10 秒歌声试听；试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。
+
+模块边界保持单向：
+
+| 层 | 语音职责 |
+|---|---|
+| `packages/bridge-core` | 校验当前飞书 `messageId + fileKey + attachmentId` 证据，裁决回复模式，调用可选 Speech Host / Singing Host，并保证唯一用户可见终态。 |
+| `packages/bridge-runtime` | 加载语音与歌声配置，解析受管/显式依赖，管理本机 Sidecar，执行媒体校验与转换、ASR/TTS、ACE-Step 客户端和音色注册表。 |
+| `apps/control-panel` | 通过共享 Contract 展示 Runtime 状态与动作；不实现 ASR/TTS、不复制 Provider 枚举，也不先行伪造设置已生效。 |
+
+Runtime 数据只放在 `CTI_HOME` 的受控目录：
+
+| 内容 | 路径 |
+|---|---|
+| 受管模型与二进制 | `CTI_HOME\runtime-deps\speech` |
+| 音色注册表与授权参考音频 | `CTI_HOME\runtime\speech\voices` |
+| 请求临时文件与默认输出 | `CTI_HOME\runtime\speech` |
+
+控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
+
+ACE-Step Runtime 与模型的受管 manifest 当前仍为 `blocked / manifest_incomplete`，RTX 3070 歌声性能与显存基准也尚未通过，因此“唱歌”必须保持 blocked；这不影响预设说话音色或纯文字 Bridge。当前尚未执行开发版到 live 的同步/重启，以及重启后真实飞书新语音端到端验收；在这些证据齐全前，不应把开发版构建或测试结果描述为现场机器人已具备语音或歌声能力。
+
 ## 当前运行模型
 
 默认是 `自动 executor 选择 + Codex CLI agent 模型来源链`：
@@ -249,7 +283,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - Ignis 模型请求如果明确要求拆成 FBX/贴图，会在下载 GLB 后调用 Blender 导出脚本，并通过 `cti-final.files` 回传可上传文件。
 - 本地模型只在控制面板当前模型来源明确选择 `local_api`，或用户显式选择本地执行模式时参与回答；不会再作为 official Codex / external API 的隐藏轻聊辅助。飞书短消息仍可启用受限轻量会话协调器，但它只缩减 Prompt、历史、工作区、附件和工具权限，并始终复用设置中选中的 Provider/模型来源。manual official/external 会在 Bridge 启动后后台预热同源 Codex `app-server`，按会话复用隔离的 ephemeral thread，避免每条轻聊重新启动 `codex exec`；自动 failover 和 `local_api` 不会被这条常驻链暗中固定来源。轻聊 actor context 会在后续任意 Markdown/Agent Home 标题处确定性截断，只保留真实 sender、chat、wake/mention 与解释门禁，不把机器人身份文档、工作区或工具规则带入受限 Prompt。明确任务、查询、路径、附件、同步、重启、读写或 MCP 请求直接进入 Primary；“检查一下你快没快 / 测试机器人回复速度 / 测试一下现在回复快不快”这类对话式测速即使省略“你/机器人”主语，也可依据“对话响应对象 + 快慢/延迟语义 + 当前现场探测语境”进入协调器。真实 API、服务、文件、TAPD、Unity/MCP 等对象仍直接进入 Primary。协调器输出 `reply / delegate / clarify`，其中 `reply / clarify` 可在第一轮形成可见回复，`delegate` 会把完整原始回合交回 Primary 和真实工具链。最终结果投递后，outcome 自维护继续运行但不再占用本轮消息 FIFO 或阻塞下一条消息；纠错阶段自维护仍在 Provider 前同步执行。
 - 记忆关键词不再触发快捷最终回复；明确回忆/搜索类请求和符合记忆键形态的短问题会先做通用记忆规划与结构化检索。`quality=high` 的高置信结构化命中会作为 `high_confidence_evidence` 注入 agent system prompt，由 agent 按当前问题整理最终回复；关系图候选和其他低确定性结果只注入主执行链。
-- 自然语言计划任务不走 provider 前关键词快路：Agent 必须区分固定通知、动态 Agent turn 和受控工具。周期任务输出 `cti-scheduled-task`；单次低风险提醒可输出 `cti-reminder` 或使用 `/remind`，随后由统一 Scheduled Task Host 创建。没有 Host success 时不能声称已创建，Codex 也不能自行写 Windows 计划任务或直接调用飞书 API 伪装完成。
+- 自然语言计划任务不走 provider 前关键词快路：Agent 必须区分固定通知、逐轮打卡、动态 Agent turn 和受控工具。周期任务输出 `cti-scheduled-task`；单次低风险提醒可输出 `cti-reminder` 或使用 `/remind`，随后由统一 Scheduled Task Host 创建。没有 Host success 时不能声称已创建，Codex 也不能自行写 Windows 计划任务、伪造打卡账本或直接调用飞书 API 伪装完成。
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
 ## 关键命令
@@ -281,7 +315,7 @@ CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS=24
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、计划任务状态/历史/暂停/恢复/删除、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。面板会读取 runtime capabilities；尚未接通 daemon 控制面的“立即运行 / 取消运行 / 仅重试投递”保持禁用并显示原因。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、计划任务状态/历史/暂停/恢复/删除、Workflow 当前回复终止、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。面板会读取 runtime capabilities；尚未接通 daemon 控制面的计划任务“立即运行 / 取消运行 / 仅重试投递”保持禁用并显示原因。
 
 打包 portable 和 installer：
 
@@ -428,9 +462,10 @@ CTI_TODO_PUSH_WINDOW_MS=300000
 ```text
 定个任务，每个工作日早上十点半给我发一下每日的单子。
 每天 18:00 提醒我提交日报。
+每个工作日 10:00 发喝水待办，让群成员点按钮打卡，1 小时内有效。
 ```
 
-第一条会创建 `cron 30 10 * * 1-5 + Asia/Shanghai` 的动态 `agent_turn`；第二条属于固定 `notify`。单次低风险提醒继续兼容：
+第一条会创建 `cron 30 10 * * 1-5 + Asia/Shanghai` 的动态 `agent_turn`；第二条属于固定 `notify`；第三条使用 `check_in`，每次运行生成一轮独立打卡。飞书成员点击原生按钮后按真实平台用户去重，卡片只展示汇总人数；`history` 同时返回每轮 `checkInCount`。单次低风险提醒继续兼容：
 
 ```text
 /remind 10分钟后 看电脑
@@ -447,7 +482,7 @@ CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER=3
 CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS=3600000
 ```
 
-任务定义、状态、运行记录、隔离区和迁移清单统一位于 `CTI_HOME\data\scheduled-tasks`。当前调度 tick 仍按安全串行方式执行；`MAX_CONCURRENT_RUNS` 和连续失败告警配置已经保留，但并发与主动告警尚未开放为完成能力，面板和文档不把它们伪装为已生效。
+任务定义、状态、运行记录、逐轮打卡账本、隔离区和迁移清单统一位于 `CTI_HOME\data\scheduled-tasks`。打卡账本绑定 `taskId + runId + slotKey`，卡片 callback 还会复核真实投递 message ID、当前 chat 和平台点击者；普通文字回复不计入打卡。当前调度 tick 仍按安全串行方式执行；`MAX_CONCURRENT_RUNS` 和连续失败告警配置已经保留，但并发与主动告警尚未开放为完成能力，面板和文档不把它们伪装为已生效。
 
 CLI 示例：
 

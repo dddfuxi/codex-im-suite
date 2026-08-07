@@ -26,6 +26,16 @@ export interface SpeechRuntimeConfig {
   ttsReferenceModel?: string;
   voiceCloneBenchmarkPassed: boolean;
   voiceProfileId?: string;
+  singingEnabled: boolean;
+  singingProvider: string;
+  singingApiUrl?: string;
+  singingApiToken?: string;
+  singingVoiceProfileId?: string;
+  singingBenchmarkPassed: boolean;
+  singingModel: string;
+  singingLmModel: string;
+  singingTimeoutMs: number;
+  maxSongDurationSeconds: number;
   ffmpegPath?: string;
   ffprobePath?: string;
   pythonPath?: string;

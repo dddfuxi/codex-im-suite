@@ -1,15 +1,15 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-01 12:06:04",
-    "releaseRunId":  "9adc72927c7e4810a252ebc8bcecd387",
+    "generatedAt":  "2026-08-07 23:14:10",
+    "releaseRunId":  "2764c0558e794244b2325fb358858c33",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
                   "name":  "codex-im-suite",
-                  "version":  "0.2.0",
+                  "version":  "0.3.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "2cb7bc9",
+                  "commit":  "d1063a8",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,24 +27,24 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "B27E24F82C48",
-                  "Length":  2143715,
-                  "Modified":  "2026-08-01 12:05:32"
+                  "Hash":  "F83B5C288A93",
+                  "Length":  2237923,
+                  "Modified":  "2026-08-07 23:13:49"
               },
     "content":  {
-                    "runtime.package":  "60335CA275E5",
-                    "runtime.dist":  "08666C8E0AA8",
-                    "runtime.scripts":  "33BF9685A14F",
-                    "runtime.configExample":  "C76DA7737CE1",
-                    "runtime.skill":  "694176DD633B",
-                    "core.package":  "1EA233B134C8",
-                    "core.dist":  "D7B80BAFFC32",
-                    "suite.manifest":  "0BF386FEDB3A",
+                    "runtime.package":  "2EA290631166",
+                    "runtime.dist":  "8A21662019A9",
+                    "runtime.scripts":  "4A1B7FD297E9",
+                    "runtime.configExample":  "8A4160B5D3AC",
+                    "runtime.skill":  "46D452F0C9FB",
+                    "core.package":  "D62438537072",
+                    "core.dist":  "845FC322F863",
+                    "suite.manifest":  "1CD4F70148CE",
                     "config.manifests":  "23A4B67737D5",
-                    "extensions.skills":  "4487F9DA1BA4",
-                    "release.scripts":  "9B29F484811D",
-                    "docs":  "1DB395400907",
-                    "panel.exe":  "B27E24F82C48",
-                    "panel.wwwroot":  "718E418C0D93"
+                    "extensions.skills":  "10C132A894D3",
+                    "release.scripts":  "87953C3590F1",
+                    "docs":  "DDE5BFD36A4B",
+                    "panel.exe":  "F83B5C288A93",
+                    "panel.wwwroot":  "717D0FD13AD9"
                 }
 }

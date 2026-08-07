@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -92,7 +93,16 @@ describe('managed speech dependency archive safety', () => {
 
       fs.mkdirSync(path.dirname(entryPoint), { recursive: true });
       fs.writeFileSync(entryPoint, 'runtime', 'utf8');
+      assert.equal(manager.listStatuses()[0]?.state, 'optional_missing', '旧 marker 缺少入口哈希时失败关闭');
+      fs.writeFileSync(markerPath, JSON.stringify({
+        ...marker,
+        entryPointSha256: crypto.createHash('sha256').update('runtime').digest('hex'),
+        entryPointSize: Buffer.byteLength('runtime'),
+      }), 'utf8');
       assert.equal(manager.listStatuses()[0]?.state, 'ready');
+
+      fs.writeFileSync(entryPoint, 'tampered', 'utf8');
+      assert.equal(manager.listStatuses()[0]?.state, 'optional_missing', '入口内容变化不能继续冒充已安装');
 
       fs.rmSync(entryPoint);
       assert.equal(manager.listStatuses()[0]?.state, 'optional_missing');

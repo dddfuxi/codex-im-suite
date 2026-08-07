@@ -91,12 +91,28 @@ function terminateProcessTree(child: ChildProcessWithoutNullStreams): void {
       windowsHide: true,
       stdio: 'ignore',
     });
-    killer.on('error', () => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+    const fallback = () => {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    };
+    killer.once('error', fallback);
+    // taskkill 可以成功启动但因 ACL/进程竞态返回非零；这时必须回收直接子进程，
+    // 否则 Provider 的 close Promise 与 Runtime 全量测试都会永久等待。
+    killer.once('close', (code) => {
+      if (code !== 0) fallback();
     });
+    killer.unref();
     return;
   }
   try { child.kill('SIGTERM'); } catch { /* ignore */ }
+}
+
+function detachTerminatedChild(child: ChildProcessWithoutNullStreams): void {
+  // 进程树终止在 Windows 上可能被 ACL 或竞态延迟；先断开当前 Node 持有的
+  // stdio/IPC 句柄，保证超时和取消能立即收口，后台 taskkill 继续负责整树回收。
+  try { child.stdin.destroy(); } catch { /* ignore */ }
+  try { child.stdout.destroy(); } catch { /* ignore */ }
+  try { child.stderr.destroy(); } catch { /* ignore */ }
+  child.unref();
 }
 
 function buildJsonToolCatalogForRequirement(requirement: StreamChatParams['executionRequirement']): Array<JsonToolRequest['tool']> {
@@ -718,12 +734,8 @@ export class CodexLocalCliProvider implements LLMProvider {
           const timeoutMs = resolveCodexExecTimeoutMs(config);
           let timedOut = false;
           const abort = () => terminateProcessTree(child);
-          const timeoutTimer = timeoutMs
-            ? setTimeout(() => {
-              timedOut = true;
-              terminateProcessTree(child);
-            }, timeoutMs)
-            : undefined;
+          let timeoutTimer: NodeJS.Timeout | undefined;
+          let terminationGraceTimer: NodeJS.Timeout | undefined;
           params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
           const prompt = buildTurnPrompt(params);
@@ -791,10 +803,22 @@ export class CodexLocalCliProvider implements LLMProvider {
           });
 
           await new Promise<void>((resolve, reject) => {
+            timeoutTimer = timeoutMs
+              ? setTimeout(() => {
+                timedOut = true;
+                params.abortController?.signal.removeEventListener('abort', abort);
+                terminateProcessTree(child);
+                terminationGraceTimer = setTimeout(() => {
+                  detachTerminatedChild(child);
+                  reject(new Error(`codex exec local provider timed out after ${timeoutMs}ms`));
+                }, 2_000);
+              }, timeoutMs)
+              : undefined;
             child.on('error', reject);
             child.on('close', (code) => {
               params.abortController?.signal.removeEventListener('abort', abort);
               if (timeoutTimer) clearTimeout(timeoutTimer);
+              if (terminationGraceTimer) clearTimeout(terminationGraceTimer);
               if (classifierViolation) {
                 reject(new Error(classifierViolation));
                 return;
@@ -1377,12 +1401,8 @@ export class CodexLocalCliProvider implements LLMProvider {
       const timeoutMs = resolveCodexExecTimeoutMs(this.config);
       let timedOut = false;
       const abort = () => terminateProcessTree(child);
-      const timeoutTimer = timeoutMs
-        ? setTimeout(() => {
-          timedOut = true;
-          terminateProcessTree(child);
-        }, timeoutMs)
-        : undefined;
+      let timeoutTimer: NodeJS.Timeout | undefined;
+      let terminationGraceTimer: NodeJS.Timeout | undefined;
       input.params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
       const systemPrompt = input.replaceSystemPrompt
@@ -1454,10 +1474,22 @@ export class CodexLocalCliProvider implements LLMProvider {
       });
 
       await new Promise<void>((resolve, reject) => {
+        timeoutTimer = timeoutMs
+          ? setTimeout(() => {
+            timedOut = true;
+            input.params.abortController?.signal.removeEventListener('abort', abort);
+            terminateProcessTree(child);
+            terminationGraceTimer = setTimeout(() => {
+              detachTerminatedChild(child);
+              reject(new Error(`codex exec local provider timed out after ${timeoutMs}ms`));
+            }, 2_000);
+          }, timeoutMs)
+          : undefined;
         child.on('error', reject);
         child.on('close', (code) => {
           input.params.abortController?.signal.removeEventListener('abort', abort);
           if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (terminationGraceTimer) clearTimeout(terminationGraceTimer);
           const tailEvent = parseCodexExecJsonLine(stdoutRemainder);
           if (tailEvent) handleJsonEvent(tailEvent);
           if (timedOut) {

@@ -49,6 +49,10 @@ Inspect available tools before claiming access to a platform. Follow this source
 
 Read [references/platform-evidence.md](references/platform-evidence.md) before live discovery, cross-platform comparison, browser/app operation, or order preparation.
 
+Treat interactive browser access as an optional per-turn evidence source, not as an installed Meituan/Dianping API. Before using it, verify that the current runtime actually exposes a controllable browser, that the browser target matches the platform and account scope authorized by the user, and that the required values are visibly unmasked on the current page. Do not enable or inherit an entire desktop plugin set merely to satisfy this Skill.
+
+For promotions and group-buying deals, `商家团购套餐`, `商户优惠`, `￥**`, `打开App查看`, a QR code, or an app deep link proves at most that the page advertises a promotion entry. It does not verify the package name, sale price, validity window, purchase rules, inventory, or eligibility. A browser verification challenge succeeding does not upgrade app-only fields into browser evidence.
+
 Do not reverse-engineer private APIs, import cookies, ask the user to paste credentials, bypass CAPTCHA or anti-bot controls, or scrape at scale. If the available source cannot verify current availability, price, discount, delivery time, or rating, omit that field or label it unknown.
 
 ## Build the Shortlist
@@ -127,4 +131,3 @@ For a shortlist, use:
 ```
 
 For a cart, show the itemized draft first, then the explicit confirmation boundary. Do not bury fees, uncertainties, or the need for user takeover in prose.
-

@@ -56,7 +56,8 @@ describe('speech status and control actions', () => {
       });
       const value = await status.refresh();
       assert.notEqual(value.asrProvider.options[0]?.state, 'ready');
-      assert.equal(value.asrProvider.options[0]?.enabled, false);
+      // enabled 表示配置项可选择；真实可用性必须由 state/capability 表达。
+      assert.equal(value.asrProvider.options[0]?.enabled, true);
       assert.notEqual(value.state, 'ready');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -78,7 +79,7 @@ describe('speech status and control actions', () => {
       const value = await status.refresh();
       assert.equal(value.actions.find((item) => item.id === 'speech.installComponent')?.enabled, true);
       assert.equal(value.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, false);
-      assert.equal(value.actions.find((item) => item.id === 'speech.previewVoice')?.diagnosticCode, 'preview_transport_unavailable');
+      assert.equal(value.actions.find((item) => item.id === 'speech.previewVoice')?.diagnosticCode, 'cosyvoice_dependency_missing');
       const preset = value.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID);
       assert.ok(preset, '未注册 preset 仍需投影为可见 catalog 卡片');
       assert.notEqual(preset.state, 'ready');
@@ -105,13 +106,17 @@ describe('speech status and control actions', () => {
         saveConfig: () => undefined,
       });
       const after = await service.execute('speech.installPresetVoice', {});
+      assert.equal(after.protocol, 'codex-im-suite/speech-status/v1');
+      if (after.protocol !== 'codex-im-suite/speech-status/v1') {
+        throw new Error('安装预设音色必须返回语音状态协议');
+      }
       assert.equal(registry.resolveProfile(DEFAULT_PRESET_PROFILE_ID).kind, 'preset');
       assert.equal(after.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, false);
       assert.equal(after.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID)?.state, 'ready');
       await assert.rejects(
         service.execute('speech.previewVoice', {}),
         (error: unknown) => Boolean(error && typeof error === 'object'
-          && (error as { code?: string; status?: string }).code === 'preview_transport_unavailable'
+          && (error as { code?: string; status?: string }).code === 'speech_preview_live_runtime_unavailable'
           && (error as { status?: string }).status === 'blocked'),
       );
 

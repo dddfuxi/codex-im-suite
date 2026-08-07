@@ -26,7 +26,7 @@ Claude Code / Codex → reads/writes your codebase
 - **Interactive setup** — guided wizard collects tokens with step-by-step instructions
 - **Permission control** — tool calls require explicit approval via inline buttons (Telegram/Discord) or text `/perm` commands / quick `1/2/3` replies (Feishu/QQ/WeChat)
 - **Streaming preview** — see Claude's response as it types (Telegram & Discord)
-- **Optional local speech preview** — development version `0.3.0` adds Feishu-first local ASR/TTS, native Opus replies, and a Contract-driven Control Panel page; speech stays off by default
+- **Optional local speech and singing preview** — development version `0.3.0` adds Feishu-first local ASR/TTS, an independent ACE-Step singing host, native Opus replies, and separate voice selection/previews in the Contract-driven Control Panel; all capabilities stay off by default
 - **Session persistence** — conversations survive daemon restarts
 - **Secret protection** — tokens stored with `chmod 600`, auto-redacted in all logs
 - **Zero code required** — install the skill and run `/claude-to-im setup`, or tell Codex `claude-to-im setup`
@@ -293,21 +293,23 @@ Additional notes:
 
 ## Local Speech (0.3.0 development preview)
 
-This is a source-tree development feature as of 2026-08-07, not a claim that the live skill or a release package has passed acceptance. The first channel is Feishu/Lark. WeChat keeps using its platform-provided transcript and the other channels keep their existing behavior.
+This is a source-tree local speech and singing feature as of 2026-08-07, not a claim that the live skill or a release package has passed acceptance. The first channel is Feishu/Lark. WeChat keeps using its platform-provided transcript and the other channels keep their existing behavior.
 
 - Speech input and output are both disabled by default. Missing optional speech dependencies never block the text-only bridge.
 - With no session override, a trusted inbound Feishu audio message is transcribed locally and defaults to a voice reply; an ordinary text message defaults to a text reply.
 - Send `/voice on` or `/voice off` inside the connected Feishu chat to change that session's reply format. `/voice off` is a hard disable: until `/voice on` is sent again, explicit voice requests, inbound audio, and model voice hints all remain text-only. The full priority is explicit text → `/voice off` → explicit voice → `/voice on` → Runtime policy → inbound audio / model hint. These are IM chat commands, not `claude-to-im` daemon subcommands.
 - A successful voice turn has one native Feishu Opus terminal message. If transcription, synthesis, validation, progress-card replacement, or upload fails, the bridge closes the turn with one complete text error/result and does not send a second competing terminal response.
+- An explicit singing request uses an independent `SingingHost` and local ACE-Step 1.5, never ordinary TTS. If ACE-Step or song delivery fails, the bridge keeps one complete text fallback and never disguises speech as singing.
 - Models, FFmpeg, Python, and ASR/TTS binaries are optional. They are not installed with npm, the live skill, or release payloads, and the first speech message never downloads them. Installation or path configuration must be an explicit user action.
 - The speech runtime does not read, migrate, or depend on `F:\unity\ST4\.cti-audio`.
+- The Control Panel selects speech and singing voices separately and provides a normal speech preview plus a fixed 10-second singing preview. A bounded Base64 Ogg/Opus receipt reaches the in-memory browser player only after Runtime and C# verification; local paths, reference audio, and tokens are never projected.
 
 The ownership boundary is deliberate:
 
 | Layer | Responsibility |
 |---|---|
-| `packages/bridge-core` | Validate current-message Feishu audio evidence, decide the reply mode, call the optional Speech Host, and enforce one user-visible terminal result. |
-| `packages/bridge-runtime` | Own configuration, dependency resolution, the local sidecar, media validation/conversion, ASR/TTS, and the voice registry. |
+| `packages/bridge-core` | Validate current-message Feishu audio evidence, decide the reply mode, call the optional Speech Host / Singing Host, and enforce one user-visible terminal result. |
+| `packages/bridge-runtime` | Own configuration, dependency resolution, the local sidecar, media validation/conversion, ASR/TTS, the ACE-Step client, and the voice registry. |
 | `apps/control-panel` | Render shared Contract state and invoke Runtime actions; it does not implement speech policy, duplicate provider enums, or pretend a setting is live before Runtime confirms it. |
 
 Speech data stays below `CTI_HOME`:
@@ -318,9 +320,9 @@ Speech data stays below `CTI_HOME`:
 | Voice registry and authorized reference audio | `CTI_HOME\runtime\speech\voices` |
 | Request temporary files and default output | `CTI_HOME\runtime\speech` |
 
-The shared status protocol uses exactly four states: `ready`, `optional_missing`, `blocked`, and `error`. An absent optional component is not reported as a general Bridge failure; an invalid explicit path or failed authorization/validation is not silently bypassed.
+The shared status protocol uses exactly four states: `ready`, `optional_missing`, `blocked`, and `error`. An absent optional component is not reported as a general Bridge failure; an invalid explicit path or failed authorization/validation is not silently bypassed. Saving in the Control Panel only writes UTF-8 `CTI_HOME\config.env`; a controlled restart, new PID, refreshed Runtime status, Feishu connection, and matching development/live bundle hashes are required evidence that live loaded it.
 
-Live sync/restart, RTX 3070 performance and memory acceptance, and a post-restart real Feishu audio end-to-end test have not been run yet. Do not describe development builds or unit tests as live availability.
+The managed ACE-Step runtime/model manifest is still `blocked / manifest_incomplete`, and the RTX 3070 singing performance/memory benchmark has not been run, so singing must remain blocked. Live sync/restart and a post-restart real Feishu audio end-to-end test have not been run yet. Do not describe development builds or unit tests as live availability.
 
 ## Architecture
 

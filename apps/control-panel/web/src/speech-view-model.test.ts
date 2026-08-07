@@ -7,6 +7,7 @@ import {
   canInstallSpeechComponent,
   canSaveSpeechSettings,
   createSpeechSettingsDraft,
+  decodeSpeechPreviewReceipt,
   describeSpeechDisplayState,
   getSpeechAction,
   getSpeechCommandNotice,
@@ -19,16 +20,19 @@ const readyStatus: SpeechStatusContract = {
   state: 'ready',
   inputEnabled: true,
   outputEnabled: true,
+  singingEnabled: false,
   channels: [{ id: 'feishu', displayName: '飞书', state: 'ready', enabled: true, inputSupported: true, outputSupported: true, selected: true }],
   replyPolicy: { value: 'on', options: [{ id: 'on', displayName: '开启', state: 'ready', enabled: true }] },
   deliveryMode: { value: 'voice_only', options: [{ id: 'voice_only', displayName: '仅语音', state: 'ready', enabled: true }] },
   asrProvider: { value: 'asr-a', options: [{ id: 'asr-a', displayName: 'ASR A', state: 'ready', enabled: true }] },
   ttsProvider: { value: 'tts-a', options: [{ id: 'tts-a', displayName: 'TTS A', state: 'ready', enabled: true }] },
+  singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'blocked', enabled: true }] },
   activeVoiceProfileId: 'voice-a',
+  activeSingingVoiceProfileId: '',
   capabilities: [],
   components: [],
-  voiceProfiles: [{ id: 'voice-a', displayName: '音色 A', kind: 'preset', state: 'ready', active: true, license: '内置', sourceLabel: 'Runtime', authorizationConfirmed: true }],
-  limits: { maxInputBytes: 1024, maxInputDurationSeconds: 60, maxOutputCharacters: 500 },
+  voiceProfiles: [{ id: 'voice-a', displayName: '音色 A', kind: 'preset', state: 'ready', active: true, license: '内置', sourceLabel: 'Runtime', authorizationConfirmed: true, capabilities: ['speech'] }],
+  limits: { maxInputBytes: 1024, maxInputDurationSeconds: 60, maxOutputCharacters: 500, maxPreviewCharacters: 240, maxSongDurationSeconds: 60 },
   actions: [{ id: 'speech.previewVoice', label: '试听', enabled: true }],
   lastCheckedAt: '2026-08-07T00:00:00.000Z',
 };
@@ -102,5 +106,26 @@ describe('speech view model', () => {
     assert.match(getSpeechCommandNotice({ restartRequired: true }), /重启 Bridge/u);
     assert.equal(getSpeechCommandNotice({ restartRequired: false, notice: '不应显示' }), '');
     assert.equal(getSpeechCommandNotice(null), '');
+  });
+
+  it('only decodes the exact validated Ogg preview projection', () => {
+    const base = {
+      protocol: 'codex-im-suite/speech-preview/v1',
+      mediaType: 'audio/ogg; codecs=opus',
+      base64: Buffer.from('OggS-safe-preview', 'ascii').toString('base64'),
+      bytes: Buffer.byteLength('OggS-safe-preview', 'ascii'),
+      sha256: 'a'.repeat(64),
+      durationMs: 1000,
+      voiceProfileId: 'acestep.default',
+      validated: true,
+    };
+    assert.equal(decodeSpeechPreviewReceipt(base).media.byteLength, base.bytes);
+    assert.throws(() => decodeSpeechPreviewReceipt({ ...base, path: 'C:/unsafe.ogg' }), /speech_preview_response_invalid/u);
+    const badHeader = Buffer.from('RIFF-not-ogg-data', 'ascii');
+    assert.throws(() => decodeSpeechPreviewReceipt({
+      ...base,
+      base64: badHeader.toString('base64'),
+      bytes: badHeader.length,
+    }), /speech_preview_response_invalid/u);
   });
 });

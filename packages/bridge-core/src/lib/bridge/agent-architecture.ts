@@ -420,6 +420,18 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['delivery', 'speech', 'voice', 'cti-final'],
   },
   {
+    id: 'delivery_layer.singing_reply',
+    layerId: 'delivery_layer',
+    title: 'Singing Reply Presentation',
+    responsibility: 'Request a real local song render through the independent SingingHost without disguising TTS as singing or selecting runtime identities.',
+    promptLines: [
+      '- Singing reply policy: when the user explicitly asks the robot to sing or generate a sung result, include optional cti-final `singing` with `mode="song_only"`, a concise visible music-style `prompt`, complete `lyrics`, `vocal_language`, and `duration_seconds` from 10 to 600. Keep a useful complete text fallback in cti-final `text`.',
+      '- Singing is a separate local music-generation capability, never ordinary TTS with stretched pitch. Do not put a provider, model, voice/profile ID, reference path, local path, URL, token, command, file_key, message ID, user ID, or chat ID inside `singing`.',
+      '- Do not emit `singing` for ordinary voice replies. If the user did not request singing or a song, use normal text/speech presentation instead.',
+    ],
+    tags: ['delivery', 'singing', 'music', 'voice', 'cti-final'],
+  },
+  {
     id: 'delivery_layer.result_envelope',
     layerId: 'delivery_layer',
     title: 'Result Envelope',

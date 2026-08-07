@@ -1,6 +1,6 @@
 {
   "name": "@codex-im-suite/contracts",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared JSON contracts for codex-im-suite control plane, node agents, workflow runs, and extensions.",
   "type": "module",
   "main": "dist/index.js",
@@ -21,6 +21,10 @@
     "./project-registry": {
       "types": "./src/project-registry.ts",
       "import": "./dist/project-registry.js"
+    },
+    "./speech": {
+      "types": "./src/speech-contract.ts",
+      "import": "./dist/speech-contract.js"
     },
     "./workflow": {
       "types": "./src/workflow.ts",
