@@ -224,9 +224,12 @@ export class AceStepSingingHost {
       audio_format: 'opus',
       audio_duration: input.durationSeconds,
       model: this.options.config.singingModel,
-      thinking: true,
-      lm_model_path: this.options.config.singingLmModel,
-      lm_backend: 'pt',
+      // Bridge 已经完成风格、歌词、语言和时长的受限裁决；这里使用 ACE-Step
+      // 官方直接 DiT 路径，避免低显存设备再启动 LM 补写元数据或生成语义码。
+      // 这条路径仍由独立歌声模型合成，不会降级为普通 TTS。
+      thinking: false,
+      use_cot_caption: false,
+      use_cot_language: false,
       batch_size: 1,
       ...(reference.referenceAudioPath ? { reference_audio_path: reference.referenceAudioPath } : {}),
     }, input.signal);

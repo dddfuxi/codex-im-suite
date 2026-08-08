@@ -134,7 +134,13 @@ describe('ACE-Step singing host', () => {
       const releaseBody = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
       assert.equal(releaseBody.audio_format, 'opus');
       assert.equal(releaseBody.batch_size, 1);
-      assert.equal(releaseBody.lm_backend, 'pt');
+      assert.equal(releaseBody.thinking, false);
+      assert.equal(releaseBody.use_cot_caption, false);
+      assert.equal(releaseBody.use_cot_language, false);
+      assert.equal('lm_model_path' in releaseBody, false);
+      assert.equal('lm_backend' in releaseBody, false);
+      assert.equal(releaseBody.prompt, songInput().prompt);
+      assert.equal(releaseBody.lyrics, songInput().lyrics);
       assert.ok(calls.every((call) => call.init?.redirect === 'error'));
       host.releaseSynthesis(receipt);
       assert.equal(fs.existsSync(receipt.path), false);

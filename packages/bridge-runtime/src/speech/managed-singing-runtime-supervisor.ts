@@ -18,6 +18,13 @@ const ACE_MODEL_COMPONENT_ID = 'ace_step_1_5_models';
 // 官方下载与模型代码同步均被失败关闭，避免离线运行时改写受管权重目录。
 const ACE_SERVER_BOOTSTRAP = [
   'import os',
+  'from acestep.gpu_config import get_gpu_config',
+  '_gpu_config=get_gpu_config()',
+  // 官方 API 的 offload_to_cpu 会按显存自动开启，但 offload_dit_to_cpu 的
+  // 环境默认值仍是 false；显式复用官方 GPU 档位，避免低显存设备在 VAE
+  // 解码时继续让 DiT 常驻显存，同时不拖慢高显存设备。
+  'os.environ["ACESTEP_OFFLOAD_TO_CPU"]="true" if _gpu_config.offload_to_cpu_default else "false"',
+  'os.environ["ACESTEP_OFFLOAD_DIT_TO_CPU"]="true" if _gpu_config.offload_dit_to_cpu_default else "false"',
   'import acestep.api_server as server',
   'import acestep.api.startup_model_init as startup_model_init',
   'state_root=os.environ["CTI_ACESTEP_STATE_ROOT"]',
@@ -151,7 +158,8 @@ function createIsolatedEnvironment(input: {
   environment.ACESTEP_CONFIG_PATH = input.modelId;
   environment.ACESTEP_LM_MODEL_PATH = input.lmModelId;
   environment.ACESTEP_LM_BACKEND = 'pt';
-  environment.ACESTEP_INIT_LLM = 'true';
+  // 当前受限歌声请求使用官方直接 DiT 路径；不在启动阶段常驻加载 LM。
+  environment.ACESTEP_INIT_LLM = 'false';
   environment.ACESTEP_NO_INIT = 'false';
   environment.ACESTEP_QUEUE_WORKERS = '1';
   environment.ACESTEP_API_WORKERS = '1';
@@ -246,7 +254,6 @@ export class ManagedSingingRuntimeSupervisor {
         // ACE-Step 官方入口直接读取 ACESTEP_API_KEY；令牌只进入子进程环境，
         // 禁止出现在 Windows CommandLine、诊断进程列表或状态文件中。
         '--host', '127.0.0.1', '--port', String(port),
-        '--init-llm', '--lm-model-path', this.options.config.singingLmModel,
       ], {
         cwd: this.stateRoot,
         env: environment,

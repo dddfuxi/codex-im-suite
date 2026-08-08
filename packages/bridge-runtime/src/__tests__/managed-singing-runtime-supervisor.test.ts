@@ -95,8 +95,14 @@ describe('managed singing runtime supervisor', () => {
       assert.equal(environment.HF_HUB_OFFLINE, '1');
       assert.equal(environment.TRANSFORMERS_OFFLINE, '1');
       assert.equal(environment.ACESTEP_QUEUE_WORKERS, '1');
+      assert.equal(environment.ACESTEP_INIT_LLM, 'false');
       assert.equal(environment.PYTHONNOUSERSITE, '1');
+      assert.equal(calls[0].args.includes('--init-llm'), false);
+      assert.equal(calls[0].args.includes('--lm-model-path'), false);
       const bootstrap = calls[0].args[calls[0].args.indexOf('-c') + 1];
+      assert.match(bootstrap, /_gpu_config=get_gpu_config\(\)/u);
+      assert.match(bootstrap, /ACESTEP_OFFLOAD_TO_CPU/u);
+      assert.match(bootstrap, /ACESTEP_OFFLOAD_DIT_TO_CPU/u);
       assert.match(bootstrap, /server\._ensure_model_downloaded=_managed_model/u);
       assert.match(bootstrap, /kwargs\["checkpoint_dir"\]=model_root/u);
       assert.match(bootstrap, /kwargs\["get_project_root"\]=lambda: state_root/u);
