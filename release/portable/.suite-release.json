@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-08 22:37:13",
-    "releaseRunId":  "5f6577ac3e344ade972f196cf40a1f5d",
+    "generatedAt":  "2026-08-08 22:44:45",
+    "releaseRunId":  "ce7357c7fd564568ad4540e662f2ccaa",
     "targetName":  "portable artifact",
     "targetRole":  "generated portable artifact",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "4da77cb",
+                  "commit":  "0c5da21",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,13 +27,13 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "50ABED83D831",
+                  "Hash":  "089CDD76B14E",
                   "Length":  2254307,
-                  "Modified":  "2026-08-08 22:37:02"
+                  "Modified":  "2026-08-08 22:44:35"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
-                    "runtime.dist":  "3701980454CA",
+                    "runtime.dist":  "C5DD8725C046",
                     "runtime.scripts":  "095079B2A6B2",
                     "runtime.configExample":  "4D54ACC8AD1B",
                     "runtime.skill":  "673DF1F96A84",
@@ -43,8 +43,8 @@
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
                     "release.scripts":  "87953C3590F1",
-                    "docs":  "402CAD3FF28B",
-                    "panel.exe":  "50ABED83D831",
+                    "docs":  "9B4E444B4DA3",
+                    "panel.exe":  "089CDD76B14E",
                     "panel.wwwroot":  "4FE0D71AD3B9"
                 }
 }
