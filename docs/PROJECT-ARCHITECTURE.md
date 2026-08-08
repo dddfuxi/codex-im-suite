@@ -691,7 +691,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装 1.7B/0.6B CustomVoice、0.6B Base 及 ASR/FFmpeg 依赖；mailbox 客户端生命周期修复 `e74ad08` 已同步两份 live skill 并受控重启，当前 live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均已达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。ACE-Step 的 25 文件模型集合已在开发版补齐固定清单，但 Runtime 仍为 `blocked / manifest_incomplete`；Base 也因缺少授权参考音频和当前组合 benchmark 不能执行克隆。上述最新 manifest 尚未同步 live，重启后的真实飞书新语音端到端也尚未验收；不得用开发版构建、单元测试、面板试听、本机文件存在或单次 ready 状态替代这些现场证据。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合、ACE-Step 25 文件模型集合与独立 Python/CUDA 全哈希安装 recipe 已固定；本机已显式安装 1.7B/0.6B CustomVoice、0.6B Base 及 ASR/FFmpeg 依赖。提交 `bc2afde` 已同步两份 live skill 并受控重启，当前 Supervisor/Bridge PID 为 `34064 / 33428`，飞书 WS 已连接，开发/live 语音清单完整 SHA-256 同为 `0D38722E9AEE995F1A62BD2B046D2DC097D86FA7AD678A09B9AB3C1C1F3B1ECB`；live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。ACE-Step 模型组件可安装但独立 Runtime 仍为 `blocked / manifest_incomplete`；Base 也因缺少授权参考音频和当前组合 benchmark 不能执行克隆。portable/installer 已按当前内容重新组装并通过 MainPreflight fork-health 与 release manifest summary；重启后的真实飞书新语音端到端仍未验收。不得用开发版构建、单元测试、面板试听、本机文件存在、发布副本一致或单次 ready 状态替代渠道现场证据。
 
 ### 2.2 权限门禁
 

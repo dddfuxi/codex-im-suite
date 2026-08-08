@@ -671,9 +671,11 @@ flowchart LR
 
 - ASR 成功后，转写作为带来源 ID 和 Hash 的不可执行 evidence 进入 Primary Agent，不把原始音频伪装成 Provider 原生音频输入。
 - TTS 成功后，Core 只接受 Runtime 已验证的本机绝对路径、Opus 格式、时长和文字/文件 Hash；飞书上传前会对实际上传字节再次复核 receipt 的 SHA-256，并只发送一个原生 `msg_type=audio` 结果。所有成功、文字回退、卡片保留、异常和取消终态都在 Manager `finally` 委托 Runtime 重新校验登记归属、受管根、普通文件和当前 Hash 后释放合成产物；Core 不直接删除 Runtime 路径，清理失败也不覆盖真实交付结果。
+- Sidecar 可使用受管隔离 CPython；入口只把自身解析后的白名单发布目录加入模块搜索路径，以加载同包 `backends.py`。它不会恢复外部 `PYTHONPATH`、用户 site-packages 或全局 Python 环境，受管 `_pth` 的隔离边界保持有效。
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
+- 面板 CLI 与 live Bridge 之间的试听/benchmark mailbox 由 Runtime 独占：服务端长期轮询句柄可以 `unref` 以免阻止 Bridge 退出，但一次性客户端在收到归属匹配的响应或有界超时前必须持有活动等待句柄；CLI 只能在主 Promise 终态后输出一条 JSON，禁止以退出码 0、空 stdout 把未执行伪装成成功。
 - TTS 默认选择 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`；`0.6B-CustomVoice` 是显式低显存选项，`1.7B/0.6B-Base` 只用于已授权参考音色复刻。SenseVoice 与 ACE-Step 的职责不变。Runtime 在合成前签发当前 live `modelId + revision + voiceProfileId`，Core 将请求和回执逐项绑定，模型切换、重启竞态或音色不一致都会失败关闭到文字。
 - 模型 benchmark 按 `provider + model + revision + hardware hash` 存储，记录热态耗时、音频时长、RTF 与峰值显存。Base 参考音色在当前组合未通过 benchmark 前不能进入普通合成；benchmark 本身走独立认证 mailbox，不向浏览器暴露模型路径、参考音频或内部指标对象。
 
@@ -681,7 +683,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 | 数据边界 | 路径与约束 |
 |---|---|
-| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。 |
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。ACE-Step 模型与 Runtime 分成两个组件：Turbo DiT、Embedding、VAE 和 0.6B LM 可以形成独立固定文件集，但在独立 Runtime 仍缺安全固定安装资产时，模型文件 ready 也不能提升歌声能力。 |
 | 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
 | 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
 
@@ -689,7 +691,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装默认 1.7B CustomVoice 及 ASR/FFmpeg 依赖；RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单、live 同步/重启及重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建、单元测试或本机文件存在替代。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合、ACE-Step 25 文件模型集合与独立 Python/CUDA 全哈希安装 recipe 已固定；本机已显式安装 1.7B/0.6B CustomVoice、0.6B Base 及 ASR/FFmpeg 依赖。提交 `bc2afde` 已同步两份 live skill 并受控重启，当前 Supervisor/Bridge PID 为 `34064 / 33428`，飞书 WS 已连接，开发/live 语音清单完整 SHA-256 同为 `0D38722E9AEE995F1A62BD2B046D2DC097D86FA7AD678A09B9AB3C1C1F3B1ECB`；live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。ACE-Step 模型组件可安装但独立 Runtime 仍为 `blocked / manifest_incomplete`；Base 也因缺少授权参考音频和当前组合 benchmark 不能执行克隆。portable/installer 已按当前内容重新组装并通过 MainPreflight fork-health 与 release manifest summary；重启后的真实飞书新语音端到端仍未验收。不得用开发版构建、单元测试、面板试听、本机文件存在、发布副本一致或单次 ready 状态替代渠道现场证据。
 
 ### 2.2 权限门禁
 

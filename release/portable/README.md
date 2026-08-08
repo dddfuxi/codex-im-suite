@@ -27,7 +27,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 版本治理收口：`main` 定位为稳定主干，`codex/dev` 用于日常集成；主干发布预检、独立打 tag、扩展协议校验和架构检查都已经脚本化。
 - 扩展协议通用化：`config/mcp.d`、`config/skills.d`、`config/plugins.d` 统一升级到 `extension-manifest/v1`，MCP / Skill / Plugin 不再靠硬编码名称驱动。
 - 运行单元协议落地：新增 `config/runtime.d` 和 `runtime-manifest/v1`，把内建服务收口成声明式运行单元；服务页和非 Skill 扩展继续复用通用 `update` 协议与白名单执行模板。
-- 本地语音与歌声开发预览：开发版 `0.3.0` 新增飞书首发的可选本地 ASR/TTS、独立 ACE-Step 歌声、会话 `/voice on|off`、原生 Opus 投递，以及可分开选音色/试听的控制面板入口；所有能力默认关闭，模型与二进制不随包安装，也不会在首条消息到达时隐式下载。
+- 本地语音与歌声开发预览：开发版 `0.4.0` 新增飞书首发的可选本地 ASR/TTS、独立 ACE-Step 歌声、会话 `/voice on|off`、原生 Opus 投递，以及可分开选音色/试听的控制面板入口；所有能力默认关闭，模型与二进制不随包安装，也不会在首条消息到达时隐式下载。
 - Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
 - 点餐顾问扩展：开发版内置 `food-ordering-advisor` Skill，通过美团、大众点评或其他可验证本地生活来源完成多轮问答、餐厅推荐、跨平台比选和购物车准备；正常官方 Codex 回合可用服务端只读实时网页搜索获取公开页面证据，不依赖默认隔离的 Desktop Browser 插件。实时价格、配送、优惠与订单结果必须来自当前工具证据，提交及支付保留用户确认/接管边界，安装或同步后才进入对应运行环境。
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
@@ -261,7 +261,7 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 
 控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
 
-截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8 模型、Qwen 独立 Python/CUDA Runtime 和 Qwen3-TTS 1.7B CustomVoice；这只证明依赖安装完成，不代表运行中的 live Bridge 已加载。RTX 3070 模型 benchmark、ACE-Step Runtime/模型清单、歌声性能门禁、授权 Base 克隆模型和重启后真实飞书新语音端到端验收仍未完成；在这些证据齐全前，不应把开发版构建或安装结果描述为现场机器人已具备语音、克隆或歌声能力。
+截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8、Qwen 独立 Python/CUDA Runtime、Qwen3-TTS 1.7B/0.6B CustomVoice 和 0.6B Base；live 当前加载 `0.6B CustomVoice + Serena`，面板普通语音试听已真实播放。0.6B Base 只表示克隆模型文件已就绪，没有用户授权参考音频、当前组合 benchmark 和 live 切换证据时仍不能执行克隆。ACE-Step 的 Turbo/Embedding/VAE/0.6B LM 已在开发版形成 25 个文件、约 7.71GB 的固定 revision/大小/SHA-256 清单，但独立 Runtime 尚无满足安全门禁的固定安装资产，歌声继续 `blocked / manifest_incomplete`，也不会首条消息自动下载。RTX 3070 上两种 CustomVoice 均未达到 20 秒性能目标，重启后真实飞书新语音端到端也未验收；在这些证据齐全前，不应把可试听或模型安装结果描述为现场机器人已具备完整语音、克隆或歌声能力。
 
 ## 当前运行模型
 
