@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-09 01:10:52",
-    "releaseRunId":  "70be7fde22e54703b37fdc8ebcf97b19",
+    "generatedAt":  "2026-08-09 01:27:33",
+    "releaseRunId":  "a55c78b55cef4f4488c2bea9dd7277c1",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "d3ecc80",
+                  "commit":  "cf62df4",
                   "dirty":  true
               },
     "manifest":  {
@@ -29,7 +29,7 @@
                   "Exists":  true,
                   "Hash":  "68136F456FD2",
                   "Length":  2254307,
-                  "Modified":  "2026-08-09 01:10:26"
+                  "Modified":  "2026-08-09 01:27:05"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
@@ -43,8 +43,8 @@
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
                     "release.scripts":  "75DE5A74235B",
-                    "docs":  "32C97FB37AC4",
+                    "docs":  "E0C8437F7688",
                     "panel.exe":  "68136F456FD2",
-                    "panel.wwwroot":  "4FE0D71AD3B9"
+                    "panel.wwwroot":  "99C8DA0E9A97"
                 }
 }
