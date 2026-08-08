@@ -37,6 +37,7 @@ import type {
   SelfMaintenanceResult,
   ScheduledTaskActionInput,
   ScheduledTaskCreateInput,
+  ScheduledTaskListResult,
   ScheduledTaskMutationResult,
   ScheduledTaskScheduleInput,
 } from './host.js';
@@ -77,6 +78,11 @@ import {
   parseNaturalReminderRequest,
   parseSlashReminderArgs,
 } from './application/reminders.js';
+import { reviewDeferredBridgeActionProtocol } from './application/deferred-action-review.js';
+import {
+  buildScheduledTaskReadEvidencePrompt,
+  resolveScheduledTaskReadIntent,
+} from './application/scheduled-task-read-policy.js';
 import {
   extractBareFeishuAtTargets,
   extractExplicitFeishuMentionTargetsFromRequest,
@@ -7490,13 +7496,33 @@ async function handleMessage(
   const stickerAnnotationSystemPrompt = isStickerMessage && providerAttachments?.length
     ? buildStickerAnnotationSystemPrompt(currentStickerFileKey)
     : '';
+  const scheduledTaskReadIntent = resolveScheduledTaskReadIntent(text || rawText);
+  let scheduledTaskReadEvidencePrompt = '';
+  if (scheduledTaskReadIntent === 'list') {
+    const scheduledTasks = getBridgeContext().scheduledTasks;
+    let listResult: ScheduledTaskListResult = {
+      ok: false,
+      tasks: [],
+      error: 'scheduled task host unavailable',
+    };
+    if (scheduledTasks) {
+      try {
+        listResult = await scheduledTasks.list({ actor: buildScheduledTaskActor(msg) });
+      } catch {
+        // Host 原始异常可能包含本机路径，只把稳定错误状态交给 Agent。
+        listResult = { ok: false, tasks: [], error: 'scheduled task list failed' };
+      }
+    }
+    scheduledTaskReadEvidencePrompt = buildScheduledTaskReadEvidencePrompt(listResult);
+  }
   const hasPreResolvedEvidence = Boolean(
     feishuCloudSystemPrompt
     || feishuHistoryEvidencePrompt
     || feishuDocumentMemoryPrompt
     || feishuStickerLibraryContextPrompt
     || feishuAvatarEvidencePrompt
-    || feishuMemberProfileEvidencePrompt,
+    || feishuMemberProfileEvidencePrompt
+    || scheduledTaskReadEvidencePrompt,
   );
   let uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
@@ -7966,6 +7992,13 @@ async function handleMessage(
         recentConversationMediaPrompt,
       ].filter(Boolean).join('\n\n'),
       additionalPromptSections: [
+        ...(scheduledTaskReadEvidencePrompt ? [{
+          id: 'scheduled-task.read-evidence',
+          kind: 'execution' as const,
+          source: 'runtime.scheduled-task-host',
+          priority: 17,
+          content: scheduledTaskReadEvidencePrompt,
+        }] : []),
         ...(stickerExpressionPromptSection ? [{
           id: stickerExpressionPromptSection.id,
           kind: 'expression' as const,
@@ -7990,6 +8023,9 @@ async function handleMessage(
       executionRequirementOverride: uiExecutionRequirement,
       collaborationRunId: collaborationRunId || undefined,
       choiceContinuation: activeChoiceContinuation,
+      // 动作尚未执行前先做纯协议审查。Conversation Engine 只会在无工具、无权限
+      // 流程的安全回合自动重写一次；Owner、身份与高风险校验仍在真实执行入口完成。
+      postGenerationReview: ({ responseText }) => reviewDeferredBridgeActionProtocol(responseText),
     });
     // 控制面板取消与 Provider 结束可能并发。Abort 一旦生效，本轮不能继续
     // 记忆、附件或文本投递，也不能让迟到结果覆盖已经定稿的中断卡片。

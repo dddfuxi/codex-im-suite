@@ -27,6 +27,8 @@ export interface CtiReminderAction {
 export interface ExtractedReminderAction {
   action: CtiReminderAction | null;
   text: string;
+  hadBlock: boolean;
+  error?: string;
 }
 
 export interface CtiScheduledTaskCreateAction {
@@ -409,7 +411,7 @@ function parseConversationTargetKind(value: unknown): ConversationTargetKind | '
 export function extractCtiReminderAction(text: string, options: ActionBlockParseOptions = {}): ExtractedReminderAction {
   const fencePattern = buildFencePattern(REMINDER_ACTION_FENCE);
   const match = text.match(fencePattern);
-  if (!match) return { action: null, text };
+  if (!match) return { action: null, text, hadBlock: false };
   const cleaned = removeFence(text, fencePattern);
   try {
     const parsed = JSON.parse(match[2].trim()) as Partial<CtiReminderAction> & { notify_targets?: unknown };
@@ -420,7 +422,7 @@ export function extractCtiReminderAction(text: string, options: ActionBlockParse
       || !parsed.dueAt.trim()
       || parsed.target !== 'current_chat'
     ) {
-      return { action: null, text: cleaned };
+      return { action: null, text: cleaned, hadBlock: true, error: '提醒动作缺少有效 title、dueAt 或 current_chat 目标' };
     }
     return {
       action: {
@@ -432,9 +434,10 @@ export function extractCtiReminderAction(text: string, options: ActionBlockParse
         sourcePrompt: typeof parsed.sourcePrompt === 'string' ? parsed.sourcePrompt.trim() : undefined,
       },
       text: cleaned,
+      hadBlock: true,
     };
   } catch {
-    return { action: null, text: cleaned };
+    return { action: null, text: cleaned, hadBlock: true, error: '提醒动作 JSON 解析失败' };
   }
 }
 

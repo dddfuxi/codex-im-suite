@@ -993,6 +993,67 @@ describe('bridge-manager lifecycle', () => {
     assert.doesNotMatch(result.responseText, /处理思路/);
   });
 
+  it('automatically re-evaluates a tool-free deferred-action review failure once', async () => {
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    let calls = 0;
+    const prompts: string[] = [];
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: ({ prompt }: { prompt: string }) => {
+          calls += 1;
+          prompts.push(prompt);
+          const text = calls === 1
+            ? '已成功创建提醒：明天九点开会。'
+            : [
+              '```cti-reminder',
+              '{"title":"开会","dueAt":"2026-08-10T01:00:00.000Z","target":"current_chat"}',
+              '```',
+            ].join('\n');
+          return createEventStream([
+            { type: 'text', data: text },
+            { type: 'result', data: JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }) },
+          ]);
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const session = store.createSession('post-review-retry', '', undefined, process.cwd());
+    const binding = store.upsertChannelBinding({
+      channelType: 'feishu',
+      chatId: 'oc_post_review',
+      displayName: 'post-review-user',
+      codepilotSessionId: session.id,
+      model: '',
+      workingDirectory: process.cwd(),
+    });
+    const { processMessage } = await import('../../lib/bridge/conversation-engine');
+    const { reviewDeferredBridgeActionProtocol } = await import('../../lib/bridge/application/deferred-action-review');
+    const result = await processMessage(
+      binding,
+      '明天九点提醒我开会',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        executionRequirementOverride: { kind: 'none', reason: 'deferred bridge action', requiredToolFamilies: [] },
+        postGenerationReview: ({ responseText }) => reviewDeferredBridgeActionProtocol(responseText),
+      },
+    );
+
+    assert.equal(calls, 2);
+    assert.match(prompts[1], /Re-evaluate and repair/i);
+    assert.match(prompts[1], /明天九点提醒我开会/u);
+    assert.match(result.responseText, /cti-reminder/u);
+    assert.equal(result.executionEvidence.postGenerationReviewRetryAttempted, true);
+    assert.equal(result.hasError, false);
+  });
+
   it('embeds a requested card hero and does not send the same image twice', async () => {
     const store = createMinimalStore({ remote_bridge_enabled: 'true' });
     initBridgeContext({
@@ -2619,6 +2680,65 @@ describe('bridge-manager result block delivery', () => {
     assert.ok(auditLogs.some((entry) => /chatId|sourceSessionId|workingDirectory|actor/.test(entry.summary)));
   });
 
+  it('reads scheduled tasks from the trusted Host before the Agent formats the answer', async () => {
+    const sent: OutboundMessage[] = [];
+    const listInputs: any[] = [];
+    const systemPrompts: string[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (input: { systemPrompt?: string }) => {
+          systemPrompts.push(input.systemPrompt || '');
+          return createTextStream('共有 1 个计划任务：每日单子（启用，下一次 2026-08-10 09:00）。');
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      scheduledTasks: {
+        list: async (input: unknown) => {
+          listInputs.push(input);
+          return {
+            ok: true,
+            tasks: [],
+            items: [{
+              task: {
+                id: 'task_daily',
+                name: '每日单子',
+                enabled: true,
+                version: 2,
+                schedule: { kind: 'cron', expression: '0 9 * * *', timezone: 'Asia/Shanghai' },
+                action: { kind: 'agent_turn', prompt: '不应暴露的执行正文' },
+                owner: { userId: 'ou_private' },
+              },
+              state: { nextRunAt: '2026-08-10T01:00:00.000Z' },
+            }],
+          };
+        },
+      },
+      lifecycle: {},
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('列出你的所有计划任务'));
+
+    assert.equal(listInputs.length, 1);
+    assert.deepEqual(listInputs[0].actor, {
+      role: 'viewer',
+      channelType: 'feishu',
+      userId: 'ou_1',
+      chatId: 'oc_123',
+      messageId: 'm_1',
+    });
+    assert.ok(systemPrompts.some((prompt) => /cti-scheduled-task-list-evidence\/v1/u.test(prompt)));
+    assert.ok(systemPrompts.some((prompt) => /task_daily/u.test(prompt)));
+    assert.ok(systemPrompts.every((prompt) => !/不应暴露的执行正文|ou_private/u.test(prompt)));
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /共有 1 个计划任务/u);
+  });
+
   it('creates the observed weekday group reminder from a direct_message protocol variant', async () => {
     const sent: OutboundMessage[] = [];
     const created: any[] = [];
@@ -4083,8 +4203,8 @@ describe('bridge-manager result block delivery', () => {
     await _testOnly.handleMessage(adapter, createInboundMessage('提醒我看电脑'));
 
     assert.equal(sent.length, 1);
-    assert.match(sent[0].text, /未完成：这条回复声称已经创建提醒或系统计划任务/);
-    assert.match(sent[0].text, /没有进入 bridge 的统一提醒系统/);
+    assert.match(sent[0].text, /未完成：模型输出缺少可由统一调度系统验证的提醒或计划任务动作/);
+    assert.match(sent[0].text, /自动协议修复后结果仍不完整/);
     assert.doesNotMatch(sent[0].text, /CodexFeishuReminder_20260507_1230|稍后会提醒你/);
   });
 
@@ -4122,8 +4242,8 @@ describe('bridge-manager result block delivery', () => {
 
     assert.equal(created.length, 0);
     assert.equal(sent.length, 1);
-    assert.match(sent[0].text, /未完成：这条回复声称已经创建提醒或系统计划任务/);
-    assert.match(sent[0].text, /没有进入 bridge 的统一提醒系统/);
+    assert.match(sent[0].text, /未完成：模型输出缺少可由统一调度系统验证的提醒或计划任务动作/);
+    assert.match(sent[0].text, /自动协议修复后结果仍不完整/);
     assert.doesNotMatch(sent[0].text, /已设置提醒：看电脑|rem_should_not_exist/);
   });
 

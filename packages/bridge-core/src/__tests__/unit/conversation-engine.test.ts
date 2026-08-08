@@ -8,6 +8,43 @@ import { initBridgeContext } from '../../lib/bridge/context';
 import { _testOnly } from '../../lib/bridge/conversation-engine';
 import type { PromptSnapshotRecord } from '../../lib/bridge/host';
 
+test('post-generation repair is limited to tool-free turns and preserves the original task', () => {
+  assert.equal(_testOnly.canRetryPostGenerationReview({
+    responseText: '已创建提醒',
+    toolUseCount: 0,
+    successfulToolResultCount: 0,
+    permissionRequestCount: 0,
+  }, false), true);
+  assert.equal(_testOnly.canRetryPostGenerationReview({
+    responseText: '已执行写入',
+    toolUseCount: 1,
+    successfulToolResultCount: 1,
+    permissionRequestCount: 0,
+  }, false), false);
+  assert.equal(_testOnly.canRetryPostGenerationReview({
+    responseText: '等待授权',
+    toolUseCount: 0,
+    successfulToolResultCount: 0,
+    permissionRequestCount: 1,
+  }, false), false);
+
+  const prompt = _testOnly.buildPostGenerationRepairPrompt({
+    originalUserText: '明天九点提醒我开会',
+    previousResponse: '已成功创建提醒。',
+    failure: {
+      code: 'unverified_reminder_completion',
+      retryable: true,
+      repairInstruction: 'Return a valid deferred action.',
+      userMessage: '未完成',
+    },
+  });
+  assert.match(prompt, /明天九点提醒我开会/u);
+  assert.match(prompt, /已成功创建提醒/u);
+  assert.match(prompt, /unverified_reminder_completion/u);
+  assert.match(prompt, /do not call tools/i);
+  assert.match(prompt, /do not ask the user to resend/i);
+});
+
 test('prompt snapshot observation failures never interrupt the chat path', () => {
   const snapshot: PromptSnapshotRecord = {
     protocol: 'cti-prompt-snapshot/v1',

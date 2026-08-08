@@ -1323,6 +1323,8 @@ export interface ScheduledTaskMutationResult {
 export interface ScheduledTaskListResult {
   ok: boolean;
   tasks: unknown[];
+  /** Runtime 可附带与每个任务同源读取的状态；Core 仍会投影为受限 evidence。 */
+  items?: Array<{ task: unknown; state?: unknown }>;
   error?: string;
 }
 

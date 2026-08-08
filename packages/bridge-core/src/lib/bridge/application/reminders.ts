@@ -232,15 +232,27 @@ function buildAbsoluteReminderDueAt(
 }
 
 export function containsUnverifiedReminderCompletion(text: string): boolean {
-  const normalized = text.replace(/\s+/g, ' ').trim();
+  const normalized = text.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!normalized) return false;
-  const completionClaim = /(已|已经|成功|实际|真的).{0,16}(创建|设好|设置|登记|安排).{0,32}(系统计划任务|计划任务|提醒|消息提醒|定时提醒)/i;
   const schedulerArtifact = /(CodexFeishuReminder_|Register-ScheduledTask|schtasks\s+\/Create)/i;
   if (schedulerArtifact.test(normalized)) return true;
-  if (!completionClaim.test(normalized)) return false;
-  // 只拦截“已经创建”的伪完成；能力边界说明或明确否定不能被误判。
-  const negatedClaim = /(?:不能|不可|不要|无法|没有|没能|未能|还没有|不能假装|不能硬说).{0,32}(?:已|已经|成功|实际|真的).{0,16}(?:创建|设好|设置|登记|安排)/iu;
-  return !negatedClaim.test(normalized);
+
+  // 完成声明只能在同一自然语言分句或列表项内成立。禁止把上一项的“已安排”
+  // 与下一项的“提醒：未创建”跨行拼成伪完成声明。
+  const clauses = normalized
+    .split(/(?:\r?\n)+|[。！？!?；;]+/u)
+    .map((clause) => clause.replace(/^\s*(?:[-*•·]|\d+[.)、])\s*/u, '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const completionClaims = [
+    /(?:已|已经|成功|实际|真的).{0,16}(?:创建|设好|设置|登记|安排).{0,32}(?:系统计划任务|计划任务|提醒|消息提醒|定时提醒)/iu,
+    /(?:系统计划任务|计划任务|提醒|消息提醒|定时提醒).{0,24}(?:已|已经|成功|实际|真的).{0,16}(?:创建|设好|设置|登记|安排)/iu,
+  ];
+  const negativeState = /(?:不能|不可|不要|无法|没能|未能|不能假装|不能硬说).{0,32}(?:创建|设好|设置|登记|安排)|(?:尚未|还未|未|没有|尚无|还没有).{0,12}(?:创建|设好|设置|登记|安排)|(?:系统计划任务|计划任务|提醒|消息提醒|定时提醒)(?:列表)?\s*(?:为|是|[:：])?\s*(?:空|为空|无|没有|不存在|未创建|尚未创建|0\s*个|零个)|(?:已安排|待执行|正在运行)\s*[:：]\s*(?:空|无|没有|0\s*个|零个)|(?:创建|设好|设置|登记|安排).{0,12}(?:失败|未成功|没有成功)/iu;
+
+  return clauses.some((clause) => (
+    !negativeState.test(clause)
+    && completionClaims.some((pattern) => pattern.test(clause))
+  ));
 }
 
 export function hasRecurringReminderHint(text: string): boolean {

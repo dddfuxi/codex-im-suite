@@ -548,7 +548,15 @@ export function createBridgeScheduledTaskActionHost(
     create,
     async list(input) {
       try {
-        return { ok: true, tasks: await host.list(toRuntimeActor(input.actor)) };
+        const tasks = await host.list(toRuntimeActor(input.actor));
+        return {
+          ok: true,
+          tasks,
+          items: await Promise.all(tasks.map(async (task) => ({
+            task,
+            state: await options.store.getState(task.id),
+          }))),
+        };
       } catch (error) {
         return { ok: false, tasks: [], error: error instanceof Error ? error.message : String(error) };
       }

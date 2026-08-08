@@ -63,5 +63,17 @@ describe('bridge reminder parsing', () => {
     assert.equal(hasSchedulingTimeHint('新建任务，明天8点叫刘丹起床'), true);
     assert.equal(containsUnverifiedReminderCompletion('已实际创建系统计划任务：CodexFeishuReminder_20260429_1942。'), true);
     assert.equal(containsUnverifiedReminderCompletion('不能假装已经创建每日任务。'), false);
+    assert.equal(containsUnverifiedReminderCompletion([
+      '目前计划任务列表是空的哦～',
+      '',
+      '- 正在运行：无',
+      '- 已安排待执行：无',
+      '- 喝水休息提醒：未创建',
+    ].join('\n')), false);
+    assert.equal(containsUnverifiedReminderCompletion('已成功创建提醒：喝水。'), true);
+    assert.equal(containsUnverifiedReminderCompletion('提醒已经设置好了。'), true);
+    assert.equal(containsUnverifiedReminderCompletion('提醒尚未创建。'), false);
+    assert.equal(containsUnverifiedReminderCompletion('计划任务列表为空。'), false);
+    assert.equal(containsUnverifiedReminderCompletion('已安排待执行：无。'), false);
   });
 });

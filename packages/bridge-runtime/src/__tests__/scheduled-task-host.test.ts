@@ -311,6 +311,15 @@ describe('scheduled task runtime host', () => {
       assert.equal(stored?.owner.userId, 'ou_1');
       assert.equal(stored?.executionContext.sourceSessionId, 'session_1');
 
+      const listed = await host.list({
+        actor: { role: 'viewer', channelType: 'feishu', userId: 'ou_1' },
+      });
+      assert.equal(listed.ok, true);
+      assert.equal(listed.tasks.length, 1);
+      assert.equal(listed.items?.length, 1);
+      assert.equal((listed.items?.[0].task as { id?: string }).id, 'task_bridge_001');
+      assert.equal((listed.items?.[0].state as { nextRunAt?: string }).nextRunAt, '2026-07-20T02:30:00.000Z');
+
       const paused = await host.pause({ taskId: 'task_bridge_001', actor: { role: 'viewer', channelType: 'feishu', userId: 'ou_1' } });
       assert.equal(paused.ok, true);
       assert.equal((await store.getTask('task_bridge_001'))?.enabled, false);
