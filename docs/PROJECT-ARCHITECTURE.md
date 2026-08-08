@@ -683,7 +683,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 | 数据边界 | 路径与约束 |
 |---|---|
-| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。 |
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。ACE-Step 模型与 Runtime 分成两个组件：Turbo DiT、Embedding、VAE 和 0.6B LM 可以形成独立固定文件集，但在独立 Runtime 仍缺安全固定安装资产时，模型文件 ready 也不能提升歌声能力。 |
 | 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
 | 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
 
@@ -691,7 +691,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装 1.7B/0.6B CustomVoice 及 ASR/FFmpeg 依赖；mailbox 客户端生命周期修复 `e74ad08` 已同步两份 live skill 并受控重启，当前 live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均已达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。Base 授权克隆模型尚未安装，ACE-Step 受管 Runtime/模型清单仍为 `blocked / manifest_incomplete`，重启后的真实飞书新语音端到端也尚未验收；不得用开发版构建、单元测试、面板试听、本机文件存在或单次 ready 状态替代这些现场证据。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装 1.7B/0.6B CustomVoice、0.6B Base 及 ASR/FFmpeg 依赖；mailbox 客户端生命周期修复 `e74ad08` 已同步两份 live skill 并受控重启，当前 live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均已达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。ACE-Step 的 25 文件模型集合已在开发版补齐固定清单，但 Runtime 仍为 `blocked / manifest_incomplete`；Base 也因缺少授权参考音频和当前组合 benchmark 不能执行克隆。上述最新 manifest 尚未同步 live，重启后的真实飞书新语音端到端也尚未验收；不得用开发版构建、单元测试、面板试听、本机文件存在或单次 ready 状态替代这些现场证据。
 
 ### 2.2 权限门禁
 

@@ -77,7 +77,7 @@ describe('managed speech dependency archive safety', () => {
     }
   });
 
-  it('exposes only pinned SenseVoice assets as installable and keeps CosyVoice blocked', () => {
+  it('exposes only fully pinned speech assets as installable and keeps incomplete runtimes blocked', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-manifest-'));
     const manifestPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../speech/managed-dependencies.json');
     try {
@@ -97,6 +97,9 @@ describe('managed speech dependency archive safety', () => {
       }
       assert.equal(statuses.get('cosyvoice')?.state, 'blocked');
       assert.equal(statuses.get('cosyvoice_clone')?.diagnosticCode, 'manifest_incomplete');
+      assert.equal(statuses.get('ace_step_1_5')?.diagnosticCode, 'manifest_incomplete');
+      assert.equal(statuses.get('ace_step_1_5_models')?.installable, true);
+      assert.equal(statuses.get('ace_step_1_5_models')?.state, 'optional_missing');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
