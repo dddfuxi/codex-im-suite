@@ -75,11 +75,10 @@ export function canSaveSpeechSettings(status: SpeechStatusContract, draft: Speec
       && draft.channelIds.every((id) => status.channels.some((channel) => channel.id === id && channel.enabled)));
   const voiceProfileValid = !draft.activeVoiceProfileId
     || status.voiceProfiles.some((profile) => profile.id === draft.activeVoiceProfileId
-      && profile.state === 'ready'
       && profile.capabilities.includes('speech')
       && profile.compatibleTtsModelIds.includes(draft.ttsModelId));
   const singingVoiceProfileValid = !draft.activeSingingVoiceProfileId
-    || status.voiceProfiles.some((profile) => profile.id === draft.activeSingingVoiceProfileId && profile.state === 'ready' && profile.capabilities.includes('singing'));
+    || status.voiceProfiles.some((profile) => profile.id === draft.activeSingingVoiceProfileId && profile.capabilities.includes('singing'));
   const model = status.ttsModel.options.find((option) => option.id === draft.ttsModelId && option.enabled);
   const modelValid = Boolean(model && model.providerId === draft.ttsProvider);
   return draft.schema === SPEECH_SETTINGS_SCHEMA
@@ -107,6 +106,44 @@ export function getSpeechAction(status: SpeechStatusContract, id: string): Speec
 export function getSpeechPanelDiagnostic(panel: SpeechPanelStateContract): string {
   if (!panel.available || !panel.status) return panel.unavailableCode || 'speech_runtime_unavailable';
   return panel.status.diagnosticCode || '';
+}
+
+const speechDiagnosticMessages: Record<string, string> = {
+  speech_disabled: '语音输入、输出和唱歌当前都处于关闭状态；可先开启需要的能力并保存。',
+  speech_action_unavailable: '当前 Runtime 没有提供这个动作，请先更新并重启控制面板。',
+  speech_preview_unavailable: '当前语音试听链尚未就绪。',
+  speech_preview_live_runtime_unavailable: 'Bridge 尚未运行或未加载试听 mailbox；请受控重启 Bridge 后重新检查。',
+  speech_preview_voice_profile_unavailable: '所选音色尚未 ready；请先安装兼容模型并完成模型加载。',
+  tts_backend_missing: 'TTS 运行环境或当前模型尚未安装。请先安装当前模型，并配置受管 Python/CUDA 与 FFmpeg。',
+  tts_model_not_loaded: '模型文件尚未安装或尚未由 live Runtime 加载。',
+  tts_model_restart_or_load_required: '请先保存当前模型并受控重启 Bridge，确认 live 模型加载后再执行。',
+  tts_provider_not_loaded: '当前 TTS Provider 尚未由 live Runtime 加载。',
+  voice_profile_model_incompatible: '该音色与当前 TTS 模型不兼容，请切换到兼容模型。',
+  voice_clone_benchmark_not_verified: '参考音色需先通过当前模型与硬件绑定的克隆性能门禁。',
+  preset_voice_is_model_capability: 'Qwen 预设音色随兼容模型提供，不需要单独下载音色；请安装对应模型。',
+  manifest_incomplete: '该组件缺少完整固定来源、版本、大小与 SHA-256 清单，暂不能安全自动安装。',
+  component_not_installed: '该受管组件尚未安装。',
+  executable_not_found: '未找到可执行文件；请安装受管组件或在 Runtime 配置中指定有效路径。',
+  backend_dependency_not_installed: '本机受管依赖尚未安装。',
+  singing_backend_missing: '独立歌声 Runtime/模型尚未安装或未通过门禁。',
+  singing_benchmark_not_verified: '歌声模型尚未通过当前硬件性能门禁。',
+};
+
+/** 灰色协议码对普通用户不可行动；面板统一投影为中文处理建议，同时保留原始码供诊断。 */
+export function describeSpeechDiagnostic(code?: string): string {
+  const normalized = code?.trim() || 'speech_action_unavailable';
+  return `${speechDiagnosticMessages[normalized] || `语音能力尚未就绪（${normalized}）。`} [${normalized}]`;
+}
+
+export function describeReferenceVoiceMissing(draft: SpeechReferenceVoiceDraft): string {
+  const missing: string[] = [];
+  if (!draft.displayName.trim()) missing.push('Profile 名称');
+  if (!draft.sourceLabel.trim()) missing.push('来源标签');
+  if (!draft.license.trim()) missing.push('许可证/授权依据');
+  if (!draft.transcript.trim()) missing.push('准确转写');
+  if (!draft.authorizationConfirmed) missing.push('音频及音色使用授权确认');
+  if (!draft.cleanSingleSpeakerConfirmed) missing.push('3–30 秒单人干净录音确认');
+  return missing.length > 0 ? `请先补齐：${missing.join('、')}。` : '';
 }
 
 /** WebView 只把 C# 复验后的精确试听协议转换为内存媒体，不接受夹带字段。 */

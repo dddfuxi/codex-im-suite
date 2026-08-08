@@ -174,6 +174,93 @@ describe('RuntimeSpeechHost', () => {
     }
   });
 
+  it('fails closed when reference-voice authorization, transcript binding, or source bytes are changed', async () => {
+    const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-reference-reject-'));
+    const sourcePath = path.join(ctiHome, 'reply.wav');
+    writeMinimalWav(sourcePath);
+    const sourceSha256 = hashFileSha256(sourcePath);
+    const registry = new SpeechVoiceRegistry(
+      path.join(ctiHome, 'runtime', 'speech', 'voices'),
+      undefined,
+      async (candidate) => ({ format: 'wav', durationMs: 5_000, sha256: hashFileSha256(candidate) }),
+    );
+    const host = new RuntimeSpeechHost({
+      config: loadSpeechRuntimeConfig(new Map()),
+      ctiHome,
+      runtimeDepsRoot: path.join(ctiHome, 'runtime-deps'),
+      bundledSidecarCandidates: [],
+      voiceRegistry: registry,
+    });
+    const authorizedAt = new Date();
+    const baseInput = {
+      profileName: '应被拒绝的音色',
+      path: sourcePath,
+      mediaType: 'audio/wav',
+      sha256: sourceSha256,
+      requestMessageId: 'om_request',
+      sourceMessageId: 'om_voice',
+      fileKey: 'file_key',
+      attachmentId: 'attachment_voice',
+      transcript: {
+        protocol: 'cti-speech-transcript/v1' as const,
+        attachmentId: 'attachment_voice',
+        text: '这是参考音色文本。',
+        model: 'sensevoice-small-q8.gguf',
+        language: 'zh',
+        relation: 'native_reply' as const,
+        requestMessageId: 'om_request',
+        sourceMessageId: 'om_voice',
+        fileSha256: sourceSha256,
+        validated: true as const,
+      },
+      authorization: {
+        protocol: 'cti-speech-reference-voice-authorization/v1' as const,
+        scope: 'current_native_reply_audio' as const,
+        ownerUserId: 'owner_user',
+        authorizedAt: authorizedAt.toISOString(),
+        expiresAt: new Date(authorizedAt.getTime() + 5 * 60_000).toISOString(),
+        rightsBasis: 'self_or_authorized' as const,
+        usageScope: 'local_tts_only' as const,
+        cleanSingleSpeakerConfirmed: true as const,
+      },
+    };
+    const rejectsWithCode = async (input: Parameters<RuntimeSpeechHost['importReferenceVoice']>[0], code: string) => {
+      await assert.rejects(
+        host.importReferenceVoice(input),
+        (error: unknown) => Boolean(error && typeof error === 'object' && (error as { code?: string }).code === code),
+      );
+    };
+    try {
+      for (const authorization of [
+        { ...baseInput.authorization, ownerUserId: '' },
+        { ...baseInput.authorization, rightsBasis: undefined },
+        { ...baseInput.authorization, usageScope: undefined },
+        { ...baseInput.authorization, cleanSingleSpeakerConfirmed: undefined },
+      ]) {
+        await rejectsWithCode({ ...baseInput, authorization }, 'voice_authorization_invalid');
+      }
+
+      for (const transcript of [
+        { ...baseInput.transcript, relation: 'current_message' as const },
+        { ...baseInput.transcript, requestMessageId: 'om_other_request' },
+        { ...baseInput.transcript, sourceMessageId: 'om_other_voice' },
+        { ...baseInput.transcript, attachmentId: 'other_attachment' },
+        { ...baseInput.transcript, fileSha256: 'f'.repeat(64) },
+        { ...baseInput.transcript, text: '   ' },
+      ]) {
+        await rejectsWithCode({ ...baseInput, transcript }, 'voice_transcript_binding_invalid');
+      }
+
+      await rejectsWithCode({ ...baseInput, mediaType: 'image/png' }, 'voice_source_binding_invalid');
+      fs.appendFileSync(sourcePath, 'changed-after-authorization', 'utf8');
+      await rejectsWithCode(baseInput, 'voice_source_sha256_mismatch');
+      assert.equal(registry.list().filter((item) => item.source === 'feishu_native_reply').length, 0);
+    } finally {
+      await host.stop();
+      fs.rmSync(ctiHome, { recursive: true, force: true });
+    }
+  });
+
   it('removes both intermediate WAV and partial Ogg after a media pipeline failure', async () => {
     const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-'));
     const ffmpegPath = path.join(ctiHome, 'ffmpeg.exe');

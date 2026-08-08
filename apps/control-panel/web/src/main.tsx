@@ -1167,6 +1167,7 @@ const commandLabels: Record<string, string> = {
   'speech.benchmarkTtsModel': '测试语音模型',
   'speech.importReferenceVoice': '导入授权参考音频',
   'speech.previewVoice': '试听音色',
+  'bridge.restart': '重启 Bridge',
   'speech.activateVoiceProfile': '切换音色',
   'workflow.cancelActiveReply': '终止回复',
 };

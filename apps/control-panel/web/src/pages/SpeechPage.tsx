@@ -6,6 +6,7 @@ import {
   Mic,
   Play,
   RefreshCw,
+  RotateCw,
   Save,
   Upload,
   Volume2,
@@ -24,6 +25,8 @@ import {
   canSaveSpeechSettings,
   createSpeechSettingsDraft,
   decodeSpeechPreviewReceipt,
+  describeReferenceVoiceMissing,
+  describeSpeechDiagnostic,
   describeSpeechDisplayState,
   getSpeechAction,
   getSpeechCommandNotice,
@@ -82,6 +85,7 @@ function VoiceProfileActions({
   previewText,
   runAction,
   previewVoice,
+  showDiagnostic,
   pending,
 }: {
   profile: SpeechVoiceProfileContract;
@@ -89,22 +93,47 @@ function VoiceProfileActions({
   previewText: string;
   runAction: (command: string, payload?: Record<string, unknown>) => Promise<unknown>;
   previewVoice: (profile: SpeechVoiceProfileContract) => Promise<void>;
+  showDiagnostic: (message: string) => void;
   pending: Record<string, boolean>;
 }) {
   const install = getSpeechAction(status, 'speech.installPresetVoice');
+  const installComponent = getSpeechAction(status, 'speech.installComponent');
   const preview = getSpeechAction(status, 'speech.previewVoice');
   const activate = getSpeechAction(status, 'speech.activateVoiceProfile');
+  const compatibleModel = status.ttsModel.options.find((model) => profile.compatibleTtsModelIds.includes(model.id));
+  const modelComponent = compatibleModel
+    ? status.components.find((component) => component.id === compatibleModel.componentId)
+    : undefined;
+  const canInstallModel = Boolean(modelComponent && canInstallSpeechComponent(modelComponent, installComponent));
+  const previewBlocker = !previewText.trim()
+    ? '请先填写试听文本。'
+    : profile.state !== 'ready'
+      ? describeSpeechDiagnostic(profile.diagnosticCode || compatibleModel?.diagnosticCode || preview.diagnosticCode)
+      : !preview.enabled
+        ? describeSpeechDiagnostic(preview.diagnosticCode)
+        : '';
   return (
     <div className="speech-card-actions">
-      {profile.kind === 'preset' && profile.state !== 'ready' && (
-        <button className="mini-button" disabled={!install.enabled || pending[install.id]} title={install.diagnosticCode || ''} onClick={() => void runAction(install.id, { componentId: profile.id })}>
-          <Download size={14} />下载预设音色
+      {profile.kind === 'preset' && profile.state !== 'ready' && canInstallModel && modelComponent && (
+        <button className="mini-button" disabled={pending[installComponent.id]} onClick={() => void runAction(installComponent.id, { componentId: modelComponent.id })}>
+          <Download size={14} />安装配套模型
         </button>
       )}
-      <button className="mini-button" disabled={!preview.enabled || profile.state !== 'ready' || !previewText.trim() || pending[preview.id]} title={preview.diagnosticCode || ''} onClick={() => void previewVoice(profile)}>
+      {profile.kind === 'preset' && profile.state !== 'ready' && !canInstallModel && (
+        <button className="mini-button" disabled={pending[install.id]} onClick={() => showDiagnostic(describeSpeechDiagnostic(profile.diagnosticCode || install.diagnosticCode))}>
+          <AlertTriangle size={14} />查看缺失项
+        </button>
+      )}
+      <button className="mini-button" disabled={pending[preview.id]} title={previewBlocker} onClick={() => previewBlocker ? showDiagnostic(previewBlocker) : void previewVoice(profile)}>
         <Play size={14} />试听
       </button>
-      <button className="mini-button" disabled={!activate.enabled || profile.active || profile.state !== 'ready' || pending[activate.id]} title={activate.diagnosticCode || ''} onClick={() => void runAction(activate.id, { voiceProfileId: profile.id })}>
+      <button className="mini-button" disabled={profile.active || pending[activate.id]} title={profile.active ? '当前已启用' : ''} onClick={() => {
+        const blocker = profile.state !== 'ready'
+          ? describeSpeechDiagnostic(profile.diagnosticCode)
+          : !activate.enabled ? describeSpeechDiagnostic(activate.diagnosticCode) : '';
+        if (blocker) showDiagnostic(blocker);
+        else void runAction(activate.id, { voiceProfileId: profile.id });
+      }}>
         <CheckCircle2 size={14} />{profile.active ? '当前音色' : '切换音色'}
       </button>
     </div>
@@ -142,6 +171,11 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
       setLocalError(error instanceof Error ? error.message : String(error));
       return undefined;
     }
+  };
+
+  const showDiagnostic = (message: string) => {
+    setLocalNotice('');
+    setLocalError(message);
   };
 
   const previewVoice = async (profile: SpeechVoiceProfileContract) => {
@@ -213,10 +247,15 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
   const selectedChannelsSupportInput = selectedChannels.length === 0 || selectedChannels.some((channel) => channel.inputSupported);
   const selectedChannelsSupportOutput = selectedChannels.length === 0 || selectedChannels.some((channel) => channel.outputSupported);
   const selectedTtsModel = status.ttsModel.options.find((model) => model.id === draft.ttsModelId);
+  const selectedModelComponent = selectedTtsModel
+    ? status.components.find((component) => component.id === selectedTtsModel.componentId)
+    : undefined;
   const compatibleSpeechProfiles = status.voiceProfiles.filter((profile) =>
     profile.capabilities.includes('speech') && profile.compatibleTtsModelIds.includes(draft.ttsModelId));
   const benchmarkModel = getSpeechAction(status, 'speech.benchmarkTtsModel');
   const settingsValid = canSaveSpeechSettings(status, draft);
+  const canInstallSelectedModel = Boolean(selectedModelComponent
+    && canInstallSpeechComponent(selectedModelComponent, installComponent));
 
   return (
     <section className="content-stack speech-page">
@@ -322,10 +361,19 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             benchmark：{selectedTtsModel.benchmark.state}
             {selectedTtsModel.benchmark.warmSynthesisMs !== undefined ? ` · 热态 ${Math.round(selectedTtsModel.benchmark.warmSynthesisMs)}ms` : ''}
           </span>
-          <button className="mini-button" disabled={!benchmarkModel.enabled || draft.ttsModelId !== status.ttsModel.value || pending[benchmarkModel.id]} title={benchmarkModel.diagnosticCode || ''} onClick={() => void runAction(benchmarkModel.id, { modelId: status.ttsModel.value })}><Play size={14} />性能测试</button>
+          {selectedModelComponent && selectedModelComponent.state !== 'ready' && canInstallSelectedModel && (
+            <button className="mini-button" disabled={pending[installComponent.id]} onClick={() => void runAction(installComponent.id, { componentId: selectedModelComponent.id })}><Download size={14} />安装当前模型</button>
+          )}
+          <button className="mini-button" disabled={pending[benchmarkModel.id]} title={benchmarkModel.diagnosticCode || ''} onClick={() => {
+            const blocker = draft.ttsModelId !== status.ttsModel.value
+              ? '请先保存当前模型选择。'
+              : !benchmarkModel.enabled ? describeSpeechDiagnostic(benchmarkModel.diagnosticCode) : '';
+            if (blocker) showDiagnostic(blocker);
+            else void runAction(benchmarkModel.id, { modelId: status.ttsModel.value });
+          }}><Play size={14} />性能测试</button>
         </div>}
-        {status.ttsModel.restartRequired && <div className="speech-diagnostic"><AlertTriangle size={15} /><span>已保存模型尚未由 live Runtime 加载，请受控重启 Bridge 后再试听或测试。</span></div>}
-        <div className="command-band dense speech-save-row"><button className="command-button" disabled={!settingsValid || pending['speech.saveSettings']} onClick={() => void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>)}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或尚未 ready，不能提交。</span>}</div>
+        {status.ttsModel.restartRequired && <div className="speech-diagnostic"><AlertTriangle size={15} /><span>已保存模型尚未由 live Runtime 加载。</span><button className="mini-button" disabled={pending['bridge.restart']} onClick={() => void runAction('bridge.restart')}><RotateCw size={14} />重启 Bridge 并重载</button></div>}
+        <div className="command-band dense speech-save-row"><button className="command-button" disabled={pending['speech.saveSettings']} onClick={() => settingsValid ? void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>) : showDiagnostic('当前设置包含 Runtime 未声明或不兼容的选项，请检查渠道、Provider、模型与音色组合。')}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或不兼容；点击保存可查看处理提示。</span>}</div>
       </section>
 
       <section className="panel">
@@ -336,6 +384,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             <div className="speech-capability-list">{component.capabilities.length > 0 ? component.capabilities.map((capability) => <span className="token-chip" key={capability}>{capability}</span>) : <span>未声明能力</span>}</div>
             {component.diagnosticCode && <code>{component.diagnosticCode}</code>}
             {component.installable && component.state !== 'ready' && <button className="mini-button" disabled={!canInstallSpeechComponent(component, installComponent) || pending[installComponent.id]} title={installComponent.diagnosticCode || ''} onClick={() => void runAction(installComponent.id, { componentId: component.id })}><Download size={14} />安装组件</button>}
+            {!component.installable && component.state !== 'ready' && <button className="mini-button" onClick={() => showDiagnostic(describeSpeechDiagnostic(component.diagnosticCode))}><AlertTriangle size={14} />查看处理方法</button>}
           </article>
         ))}</div>}
       </section>
@@ -345,7 +394,12 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         <label className="speech-field speech-preview-text"><span>试听文本</span><input value={previewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setPreviewText(event.target.value)} /></label>
         <div className="speech-singing-preview">
           <label className="speech-field speech-preview-text"><span>歌声试听歌词（固定 10 秒）</span><input value={singingPreviewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setSingingPreviewText(event.target.value)} /></label>
-          <button className="mini-button" disabled={!getSpeechAction(status, 'speech.previewSingingVoice').enabled || !singingPreviewText.trim() || pending['speech.previewSingingVoice']} title={getSpeechAction(status, 'speech.previewSingingVoice').diagnosticCode || ''} onClick={() => void previewSingingVoice()}><Play size={14} />试听歌声</button>
+          <button className="mini-button" disabled={pending['speech.previewSingingVoice']} title={getSpeechAction(status, 'speech.previewSingingVoice').diagnosticCode || ''} onClick={() => {
+            const action = getSpeechAction(status, 'speech.previewSingingVoice');
+            const blocker = !singingPreviewText.trim() ? '请先填写歌声试听歌词。' : !action.enabled ? describeSpeechDiagnostic(action.diagnosticCode) : '';
+            if (blocker) showDiagnostic(blocker);
+            else void previewSingingVoice();
+          }}><Play size={14} />试听歌声</button>
         </div>
         {previewPlayback && (
           <div className="speech-preview-player">
@@ -358,7 +412,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             <div className="speech-card-head"><div><strong>{profile.displayName}</strong><small>{profile.kind === 'preset' ? '预设音色' : '授权参考音色'} · {profile.sourceLabel}</small></div><span className={`status-pill ${profile.state === 'ready' ? 'ok' : profile.state === 'optional_missing' ? 'warning' : 'error'}`}>{profile.state}</span></div>
             <div className="speech-profile-facts"><span>许可证：{profile.license || '未声明'}</span><span>授权：{profile.authorizationConfirmed ? '已确认' : '未确认'}</span><span>能力：{profile.capabilities.join(' / ')}</span></div>
             {profile.diagnosticCode && <code>{profile.diagnosticCode}</code>}
-            <VoiceProfileActions profile={profile} status={status} previewText={previewText} runAction={runAction} previewVoice={previewVoice} pending={pending} />
+            <VoiceProfileActions profile={profile} status={status} previewText={previewText} runAction={runAction} previewVoice={previewVoice} showDiagnostic={showDiagnostic} pending={pending} />
           </article>
         ))}</div>}
       </section>
@@ -373,7 +427,13 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         </div>
         <label className="speech-authorization"><input type="checkbox" checked={referenceVoice.authorizationConfirmed} onChange={(event) => setReferenceVoice({ ...referenceVoice, authorizationConfirmed: event.target.checked })} /><span>我确认拥有该参考音频及其音色使用授权，并允许 Runtime 进行本机校验和受控导入。</span></label>
         <label className="speech-authorization"><input type="checkbox" checked={referenceVoice.cleanSingleSpeakerConfirmed} onChange={(event) => setReferenceVoice({ ...referenceVoice, cleanSingleSpeakerConfirmed: event.target.checked })} /><span>我确认音频为 3–30 秒、单人且干净的录音，不含背景音乐或其他说话人。</span></label>
-        <button className="command-button" disabled={!importReference.enabled || !importReady || pending[importReference.id]} title={importReference.diagnosticCode || ''} onClick={() => void runAction(importReference.id, referenceVoice as unknown as Record<string, unknown>)}><Upload size={15} />选择并导入参考音频</button>
+        <button className="command-button" disabled={pending[importReference.id]} title={importReference.diagnosticCode || ''} onClick={() => {
+          const blocker = !importReference.enabled
+            ? describeSpeechDiagnostic(importReference.diagnosticCode)
+            : !importReady ? describeReferenceVoiceMissing(referenceVoice) : '';
+          if (blocker) showDiagnostic(blocker);
+          else void runAction(importReference.id, referenceVoice as unknown as Record<string, unknown>);
+        }}><Upload size={15} />选择并导入参考音频</button>
       </section>
     </section>
   );

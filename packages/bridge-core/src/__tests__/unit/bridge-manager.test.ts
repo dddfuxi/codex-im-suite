@@ -12163,6 +12163,68 @@ describe('bridge-manager speech integration', () => {
     assert.doesNotMatch(sent.at(-1)?.text || '', /模型预写的成功文案/u);
   });
 
+  it('非 Owner 即使模型返回完整参考音色动作也不能签发授权或调用 Runtime', async () => {
+    let importCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const full = createTrustedCurrentAndNativeReplySpeechMessage('om_clone_denied', 'oc_clone_denied') as any;
+    const message = {
+      ...createInboundMessage('请把我回复的语音创建成参考音色。', 'ou_not_owner', 'oc_clone_denied'),
+      messageId: 'om_clone_denied',
+      attachments: [full.attachments[0]],
+      raw: {
+        feishuReplyTo: full.raw.feishuReplyTo,
+        feishuNativeReplyAttachments: full.raw.feishuNativeReplyAttachments,
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text', text: '不可信的预写成功文案。', images: [], files: [], reply_mode: 'plain',
+          speech_action: {
+            action: 'create_reference_voice',
+            rights_basis: 'self_or_authorized',
+            usage_scope: 'local_tts_only',
+            clean_single_speaker_confirmed: true,
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => ({
+          protocol: 'cti-speech-transcript/v1', attachmentId: input.attachmentId,
+          relation: input.relation, requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId, text: '未授权发送者的语音',
+          model: 'test-asr', language: 'zh', fileSha256: input.sha256, validated: true,
+        }),
+        importReferenceVoice: async () => {
+          importCalls += 1;
+          throw new Error('非 Owner 不应进入 Runtime');
+        },
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (outbound) => {
+      sent.push(outbound);
+      return { ok: true, messageId: `om_clone_denied_result_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.equal(importCalls, 0);
+    assert.match(sent.at(-1)?.text || '', /只允许当前 Bridge Owner/u);
+    assert.doesNotMatch(sent.at(-1)?.text || '', /不可信的预写成功文案/u);
+  });
+
   it('控制面板精确终止会把 signal 传入 ASR，且不产生第二条转写错误终态', async () => {
     let providerCalls = 0;
     let transcribeSignal: AbortSignal | undefined;
