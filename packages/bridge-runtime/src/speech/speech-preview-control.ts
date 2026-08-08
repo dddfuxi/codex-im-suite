@@ -495,9 +495,10 @@ async function requestPreview(input: {
         }
         return validatePreviewReceipt(response.result, input.modelId, input.voiceProfileId, input.action === 'benchmark_voice');
       }
+      // CLI 通过 Promise 完成后才输出唯一 JSON 回执；这里的等待句柄必须保持
+      // 进程存活，否则没有其他活动句柄时 Node 会以退出码 0 静默提前结束。
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 50);
-        timer.unref?.();
+        setTimeout(resolve, 50);
       });
     }
     throw new RuntimeSpeechError(

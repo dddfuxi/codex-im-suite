@@ -675,6 +675,7 @@ flowchart LR
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
+- 面板 CLI 与 live Bridge 之间的试听/benchmark mailbox 由 Runtime 独占：服务端长期轮询句柄可以 `unref` 以免阻止 Bridge 退出，但一次性客户端在收到归属匹配的响应或有界超时前必须持有活动等待句柄；CLI 只能在主 Promise 终态后输出一条 JSON，禁止以退出码 0、空 stdout 把未执行伪装成成功。
 - TTS 默认选择 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`；`0.6B-CustomVoice` 是显式低显存选项，`1.7B/0.6B-Base` 只用于已授权参考音色复刻。SenseVoice 与 ACE-Step 的职责不变。Runtime 在合成前签发当前 live `modelId + revision + voiceProfileId`，Core 将请求和回执逐项绑定，模型切换、重启竞态或音色不一致都会失败关闭到文字。
 - 模型 benchmark 按 `provider + model + revision + hardware hash` 存储，记录热态耗时、音频时长、RTF 与峰值显存。Base 参考音色在当前组合未通过 benchmark 前不能进入普通合成；benchmark 本身走独立认证 mailbox，不向浏览器暴露模型路径、参考音频或内部指标对象。
 
@@ -690,7 +691,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装默认 1.7B CustomVoice 及 ASR/FFmpeg 依赖；RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单、live 同步/重启及重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建、单元测试或本机文件存在替代。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装默认 1.7B CustomVoice 及 ASR/FFmpeg 依赖；首轮 live 同步/重启后的 SpeechStatus 已达到 `ready`，但最新 mailbox 客户端生命周期修复仍待重新同步。RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单和重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建、单元测试、本机文件存在或单次 ready 状态替代。
 
 ### 2.2 权限门禁
 
