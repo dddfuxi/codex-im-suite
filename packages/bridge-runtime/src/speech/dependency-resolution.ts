@@ -62,10 +62,22 @@ function managedVersionRoots(root: string, id: string): string[] {
 }
 
 function managedExecutableCandidates(root: string, componentIds: string[], names: string[]): string[] {
-  return componentIds.flatMap((id) => managedVersionRoots(root, id).flatMap((base) => names.flatMap((name) => [
-    path.join(base, 'bin', name),
-    path.join(base, name),
-  ])));
+  return componentIds.flatMap((id) => managedVersionRoots(root, id).flatMap((base) => {
+    const roots = [base];
+    try {
+      // 部分官方 ZIP 带一个版本化顶层目录。只检查一层普通目录，既支持这类
+      // 稳定发行物，也不把任意深层树或 reparse point 变成可执行搜索路径。
+      for (const entry of fs.readdirSync(base, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+        if (entry.isDirectory() && !entry.isSymbolicLink() && /^[a-z0-9._-]+$/i.test(entry.name)) {
+          roots.push(path.join(base, entry.name));
+        }
+      }
+    } catch { /* marker 已校验，目录枚举失败按找不到处理。 */ }
+    return roots.flatMap((candidateRoot) => names.flatMap((name) => [
+      path.join(candidateRoot, 'bin', name),
+      path.join(candidateRoot, name),
+    ]));
+  }));
 }
 
 export function resolveExecutableDependency(input: {

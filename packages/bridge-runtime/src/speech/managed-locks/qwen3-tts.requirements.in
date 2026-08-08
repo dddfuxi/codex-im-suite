@@ -1,0 +1,8 @@
+# Qwen3-TTS Windows CUDA Runtime
+#
+# 该输入只用于生成带哈希的受管 requirements lock。实际安装必须由
+# ManagedSpeechDependencyManager 使用固定 Python、固定 uv 和 --require-hashes
+# 执行，禁止直接安装到系统 Python。
+qwen-tts==0.1.1
+torch==2.7.1+cu128
+torchaudio==2.7.1+cu128

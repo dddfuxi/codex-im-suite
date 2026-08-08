@@ -52,22 +52,22 @@ export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
         text,
         modelId,
         voiceProfileId,
-        // C# 网关总超时为 120 秒；为清理与 JSON 回传预留固定余量。
-        timeoutMs: Math.min(110_000, config.speech!.requestTimeoutMs + 10_000),
+        // 面板按动作设置总超时；Runtime 仍服从用户配置，并为清理与 JSON 回传留出余量。
+        timeoutMs: Math.min(4 * 60_000, config.speech!.requestTimeoutMs + 10_000),
       }),
       benchmarkVoice: ({ text, modelId, voiceProfileId }) => requestSpeechVoiceBenchmark({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
         text,
         modelId,
         voiceProfileId,
-        timeoutMs: Math.min(110_000, config.speech!.requestTimeoutMs + 10_000),
+        timeoutMs: Math.min(14 * 60_000, config.speech!.requestTimeoutMs + 10_000),
       }),
       previewSingingVoice: ({ text, modelId, voiceProfileId }) => requestSingingVoicePreview({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
         text,
         modelId,
         voiceProfileId,
-        timeoutMs: Math.min(110_000, config.speech!.singingTimeoutMs + 10_000),
+        timeoutMs: Math.min(4 * 60_000, config.speech!.singingTimeoutMs + 10_000),
       }),
       benchmarkStore: runtime.benchmarkStore,
       hardwareId: runtime.hardware.id,

@@ -85,6 +85,16 @@ internal static class SpeechCommandPolicy
         "speech.activateVoiceProfile" => true,
         _ => false,
     };
+
+    // 模型/Runtime 下载与全哈希安装可能持续数十分钟；其余动作继续使用短门禁，
+    // 避免为了安装放宽所有面板子进程的生命周期。
+    public static int GetTimeoutMs(string command) => command switch
+    {
+        "speech.installComponent" or "speech.installPresetVoice" => 60 * 60 * 1000,
+        "speech.benchmarkTtsModel" => 15 * 60 * 1000,
+        "speech.previewVoice" or "speech.previewSingingVoice" or "speech.importReferenceVoice" => 5 * 60 * 1000,
+        _ => 2 * 60 * 1000,
+    };
 }
 
 internal sealed class SpeechRuntimeGatewayException : InvalidOperationException
@@ -179,10 +189,10 @@ internal sealed class SpeechRuntimeGateway
     public async Task<SpeechCommandReceiptContract> RunActionAsync(
         string command,
         object? input,
-        int timeoutMs = 120_000,
+        int timeoutMs = 0,
         CancellationToken cancellationToken = default)
     {
-        using var data = await RunAsync(command, input, timeoutMs, cancellationToken);
+        using var data = await RunAsync(command, input, timeoutMs > 0 ? timeoutMs : SpeechCommandPolicy.GetTimeoutMs(command), cancellationToken);
         // 普通动作的 Runtime data 不直接外发。
         var restartRequired = SpeechCommandPolicy.RequiresBridgeRestart(command);
         return new SpeechCommandReceiptContract(
@@ -194,21 +204,21 @@ internal sealed class SpeechRuntimeGateway
 
     public Task<SpeechPreviewReceiptContract> RunPreviewAsync(
         object? input,
-        int timeoutMs = 120_000,
+        int timeoutMs = 0,
         CancellationToken cancellationToken = default)
         => RunPreviewAsync("speech.previewVoice", input, timeoutMs, cancellationToken);
 
     public async Task<SpeechPreviewReceiptContract> RunPreviewAsync(
         string command,
         object? input,
-        int timeoutMs = 120_000,
+        int timeoutMs = 0,
         CancellationToken cancellationToken = default)
     {
         if (command is not ("speech.previewVoice" or "speech.previewSingingVoice"))
         {
             throw new SpeechRuntimeGatewayException("speech_action_not_allowed");
         }
-        using var data = await RunAsync(command, input, timeoutMs, cancellationToken);
+        using var data = await RunAsync(command, input, timeoutMs > 0 ? timeoutMs : SpeechCommandPolicy.GetTimeoutMs(command), cancellationToken);
         var preview = JsonSerializer.Deserialize<SpeechPreviewReceiptContract>(data.RootElement.GetRawText(), JsonOptions);
         if (!IsValidPreviewReceipt(data.RootElement, preview))
         {

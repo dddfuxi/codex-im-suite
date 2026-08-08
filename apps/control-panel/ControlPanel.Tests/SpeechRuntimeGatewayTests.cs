@@ -34,6 +34,32 @@ public sealed class SpeechRuntimeGatewayTests
     public void Policy_MarksStateChangingSpeechActionsAsRestartRequired(string command, bool expected)
         => Assert.Equal(expected, SpeechCommandPolicy.RequiresBridgeRestart(command));
 
+    [Theory]
+    [InlineData("speech.installComponent", 3600000)]
+    [InlineData("speech.installPresetVoice", 3600000)]
+    [InlineData("speech.benchmarkTtsModel", 900000)]
+    [InlineData("speech.previewVoice", 300000)]
+    [InlineData("speech.refresh", 120000)]
+    public void Policy_UsesActionSpecificTimeouts(string command, int expected)
+        => Assert.Equal(expected, SpeechCommandPolicy.GetTimeoutMs(command));
+
+    [Fact]
+    public async Task RunActionAsync_UsesLongInstallTimeoutWithoutChangingOtherActions()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var timeouts = new List<int>();
+        var gateway = fixture.CreateGateway(invocation =>
+        {
+            timeouts.Add(invocation.TimeoutMs);
+            return Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", ""));
+        });
+
+        await gateway.RunActionAsync("speech.installComponent", new { componentId = "qwen3_tts_runtime" });
+        await gateway.RunActionAsync("speech.refresh", new { });
+
+        Assert.Equal(new[] { 3600000, 120000 }, timeouts);
+    }
+
     [Fact]
     public async Task RunActionAsync_ReportsRestartRequirementWithoutRestartingAnything()
     {

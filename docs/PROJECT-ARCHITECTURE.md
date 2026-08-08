@@ -681,7 +681,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 | 数据边界 | 路径与约束 |
 |---|---|
-| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。 |
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。 |
 | 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
 | 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
 
@@ -689,7 +689,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合已固定清单，但独立 Python/CUDA wheel 清单、RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单、live 同步/重启及重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建或单元测试替代。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合与独立 Python/CUDA 全哈希安装 recipe 已固定，本机已显式安装默认 1.7B CustomVoice 及 ASR/FFmpeg 依赖；RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单、live 同步/重启及重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建、单元测试或本机文件存在替代。
 
 ### 2.2 权限门禁
 

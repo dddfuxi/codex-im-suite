@@ -81,7 +81,9 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
       const hangScript = path.join(binDir, 'hang.js');
       fs.writeFileSync(hangScript, 'setInterval(() => {}, 1000);\n', 'utf-8');
       if (process.platform === 'win32') {
-        fs.writeFileSync(path.join(binDir, 'codex.cmd'), `@echo off\r\n"${process.execPath}" "${hangScript}"\r\n`, 'utf-8');
+        // 用 cmd 自身制造挂起，避免测试沙箱拒绝 taskkill /T 后遗留一个继承
+        // 测试管道的孙级 node.exe；生产路径仍覆盖真实 cmd -> codex 进程树终止。
+        fs.writeFileSync(path.join(binDir, 'codex.cmd'), '@echo off\r\n:hang\r\ngoto hang\r\n', 'utf-8');
         process.env.PATH = `${binDir};${oldPath}`;
       } else {
         const codexPath = path.join(binDir, 'codex');

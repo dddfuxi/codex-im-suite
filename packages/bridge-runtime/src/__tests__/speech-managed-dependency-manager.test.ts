@@ -8,6 +8,44 @@ import { describe, it } from 'node:test';
 
 import { assertSafeZipEntryName, ManagedSpeechDependencyManager } from '../speech/managed-dependency-manager.js';
 
+function sha256(value: string | Buffer): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function createPythonInstallerManifest(root: string, overrides: Record<string, unknown> = {}) {
+  const pythonArchive = Buffer.from('python-archive');
+  const toolArchive = Buffer.from('uv-archive');
+  const requirements = 'demo==1.0 --hash=sha256:' + 'a'.repeat(64) + '\n';
+  const requirementsDir = path.join(root, 'managed-locks');
+  fs.mkdirSync(requirementsDir, { recursive: true });
+  fs.writeFileSync(path.join(requirementsDir, 'runtime.lock'), requirements, 'utf8');
+  const installer = {
+    kind: 'python_target/v1',
+    python: {
+      source: 'https://example.invalid/python.zip', sha256: sha256(pythonArchive), size: pythonArchive.length,
+      archive: 'zip', entryPoint: 'python.exe', pthFile: 'python312._pth', stdlibZip: 'python312.zip',
+    },
+    tool: {
+      source: 'https://example.invalid/uv.zip', sha256: sha256(toolArchive), size: toolArchive.length,
+      archive: 'zip', entryPoint: 'uv.exe',
+    },
+    requirements: { path: 'managed-locks/runtime.lock', sha256: sha256(requirements), size: Buffer.byteLength(requirements) },
+    sitePackages: 'Lib/site-packages', pythonVersion: '3.12', probeModules: ['demo'],
+    requireCuda: true, cudaVersion: '12.8', requiredDiskBytes: 256 * 1024 * 1024,
+  };
+  const component = {
+    id: 'python_runtime', displayName: 'Python Runtime', kind: 'runtime', capabilities: ['tts_runtime'],
+    source: 'https://example.invalid/runtime', version: '1.0.0', sha256: sha256(JSON.stringify(installer)),
+    size: pythonArchive.length + toolArchive.length + Buffer.byteLength(requirements), license: 'Apache-2.0',
+    archive: 'file', fileName: 'python.exe', availability: 'ready', platforms: [`${process.platform}-${process.arch}`],
+    installer,
+    ...overrides,
+  };
+  const manifestPath = path.join(root, 'manifest.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ protocol: 'cti-speech-managed-dependencies/v2', components: [component] }), 'utf8');
+  return { manifestPath, pythonArchive, toolArchive, installer, component };
+}
+
 describe('managed speech dependency archive safety', () => {
   it('rejects Zip Slip, absolute, drive and backslash paths', () => {
     for (const candidate of ['../escape.bin', '/absolute.bin', 'C:/escape.bin', 'dir\\escape.bin']) {
@@ -47,6 +85,8 @@ describe('managed speech dependency archive safety', () => {
       const statuses = new Map(manager.listStatuses().map((item) => [item.id, item]));
       assert.equal(statuses.get('sensevoice_gguf')?.installable, true);
       assert.equal(statuses.get('sensevoice_runtime')?.installable, true);
+      assert.equal(statuses.get('qwen3_tts_runtime')?.installable, true);
+      assert.equal(statuses.get('ffmpeg_runtime')?.installable, true);
       for (const id of [
         'qwen3-tts-12hz-1.7b-custom-voice',
         'qwen3-tts-12hz-0.6b-custom-voice',
@@ -57,6 +97,93 @@ describe('managed speech dependency archive safety', () => {
       }
       assert.equal(statuses.get('cosyvoice')?.state, 'blocked');
       assert.equal(statuses.get('cosyvoice_clone')?.diagnosticCode, 'manifest_incomplete');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('installs a pinned Python target with fixed argv, isolated environment and a successful probe', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-python-target-'));
+    const depsRoot = path.join(root, 'deps');
+    const { manifestPath, pythonArchive, toolArchive } = createPythonInstallerManifest(root);
+    const calls: Array<{ executable: string; argv: readonly string[]; env?: NodeJS.ProcessEnv }> = [];
+    try {
+      const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot, undefined, undefined, undefined, {
+        fetchAsset: async ({ targetPath, url }) => fs.writeFileSync(targetPath, url.includes('python') ? pythonArchive : toolArchive),
+        extractZip: async (zipPath, destination) => {
+          if (zipPath.endsWith('download-python.zip')) {
+            fs.writeFileSync(path.join(destination, 'python.exe'), 'python');
+            fs.writeFileSync(path.join(destination, 'python312.zip'), 'stdlib');
+            fs.writeFileSync(path.join(destination, 'python312._pth'), 'original');
+          } else {
+            fs.writeFileSync(path.join(destination, 'uv.exe'), 'uv');
+          }
+        },
+        runProcess: async (executable, argv, options) => {
+          calls.push({ executable, argv, env: options.env });
+          return calls.length === 1
+            ? { code: 0, stdout: '', stderr: '' }
+            : { code: 0, stdout: '{"version":[3,12],"cuda_available":true,"cuda_version":"12.8"}\n', stderr: '' };
+        },
+      });
+      await manager.install('python_runtime');
+      assert.equal(manager.listStatuses()[0]?.state, 'ready');
+      assert.equal(calls.length, 2);
+      assert.deepEqual(calls[0]!.argv.slice(0, 2), ['pip', 'install']);
+      assert.equal(calls[0]!.argv.includes('--require-hashes'), true);
+      assert.equal(calls[0]!.argv.includes('--no-config'), true);
+      assert.equal(calls[0]!.argv.includes('--no-python-downloads'), true);
+      assert.equal(calls[1]!.argv[0], '-I');
+      assert.match(calls[1]!.argv[2]!, /if True else None/);
+      assert.equal(Object.keys(calls[0]!.env || {}).some((key) => /^(PIP_|PYTHONHOME$|PYTHONPATH$)/i.test(key)), false);
+      const pth = fs.readFileSync(path.join(depsRoot, 'speech', 'python_runtime', '1.0.0', 'python312._pth'), 'utf8');
+      assert.equal(pth, 'python312.zip\n.\nLib/site-packages\nimport site\n');
+      assert.equal(fs.readdirSync(path.join(depsRoot, 'speech', 'python_runtime')).some((name) => name.startsWith('.stage-')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects installer identity and bundled lock mismatches before publishing a runtime', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-python-invalid-'));
+    try {
+      const identity = createPythonInstallerManifest(path.join(root, 'identity'), { sha256: 'f'.repeat(64) });
+      assert.throws(() => new ManagedSpeechDependencyManager(identity.manifestPath, path.join(root, 'deps-identity')), /installer_identity_invalid/);
+
+      const lock = createPythonInstallerManifest(path.join(root, 'lock'));
+      fs.appendFileSync(path.join(root, 'lock', 'managed-locks', 'runtime.lock'), '# changed\n', 'utf8');
+      const manager = new ManagedSpeechDependencyManager(lock.manifestPath, path.join(root, 'deps-lock'), undefined, undefined, undefined, {
+        fetchAsset: async ({ targetPath, url }) => fs.writeFileSync(targetPath, url.includes('python') ? lock.pythonArchive : lock.toolArchive),
+      });
+      await assert.rejects(manager.install('python_runtime'), /requirements_size_mismatch/);
+      assert.equal(fs.existsSync(path.join(root, 'deps-lock', 'speech', 'python_runtime', '1.0.0')), false);
+      assert.equal(fs.readdirSync(path.join(root, 'deps-lock', 'speech', 'python_runtime')).some((name) => name.startsWith('.stage-')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not publish a Python target when the structured probe fails', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-python-probe-'));
+    const { manifestPath, pythonArchive, toolArchive } = createPythonInstallerManifest(root);
+    const depsRoot = path.join(root, 'deps');
+    try {
+      const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot, undefined, undefined, undefined, {
+        fetchAsset: async ({ targetPath, url }) => fs.writeFileSync(targetPath, url.includes('python') ? pythonArchive : toolArchive),
+        extractZip: async (zipPath, destination) => {
+          if (zipPath.endsWith('download-python.zip')) {
+            for (const [name, value] of [['python.exe', 'python'], ['python312.zip', 'stdlib'], ['python312._pth', 'pth']] as const) {
+              fs.writeFileSync(path.join(destination, name), value);
+            }
+          } else fs.writeFileSync(path.join(destination, 'uv.exe'), 'uv');
+        },
+        runProcess: async (_executable, argv) => argv[0] === 'pip'
+          ? { code: 0, stdout: '', stderr: '' }
+          : { code: 0, stdout: '{"version":[3,12],"cuda_available":false,"cuda_version":"12.8"}\n', stderr: '' },
+      });
+      await assert.rejects(manager.install('python_runtime'), /python_target_cuda_unavailable/);
+      assert.equal(fs.existsSync(path.join(depsRoot, 'speech', 'python_runtime', '1.0.0')), false);
+      assert.equal(fs.readdirSync(path.join(depsRoot, 'speech', 'python_runtime')).some((name) => name.startsWith('.stage-')), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

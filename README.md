@@ -239,7 +239,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 用户明确要求唱歌时，模型只能提交受限的歌词、音乐风格、语言和时长；Bridge 通过独立 `SingingHost` 调用本机 ACE-Step 1.5。歌声与普通 TTS 完全分离，ACE-Step 不可用时只返回一次完整文字，不会把拉长音调的 TTS 冒充唱歌。
 - 默认 TTS 是 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`，低显存可显式切换 `0.6B-CustomVoice`；授权音色复刻只使用对应 `1.7B/0.6B-Base`，不会把 CustomVoice 冒充克隆模型。SenseVoice 继续负责 ASR，ACE-Step 继续作为独立歌声模型。
 - 控制面板从 Runtime Catalog 动态展示 Provider、模型、音色、语气策略、安装状态和模型级 benchmark。四个 Qwen 模型使用固定官方 revision、逐文件 SHA-256 与大小的事务式清单；任一资源未完整校验都不会发布为受管模型。benchmark 绑定模型、revision 与硬件，换模型或换硬件后不会沿用旧结果。
-- 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装受管模型，或显式配置本机依赖路径后，Runtime 才会使用它们；Qwen 独立 Python/CUDA 环境尚未形成可发布的固定 wheel 清单时继续报告 `optional_missing`，不能污染全局 Python 或伪装安装完成。
+- 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装受管组件，或显式配置本机依赖路径后，Runtime 才会使用它们。Qwen 独立环境使用固定 CPython 3.12、固定 uv、全哈希 requirements lock 和固定 CUDA 12.8 wheel 集合；安装 argv、环境隔离、版本/CUDA 探针与 stage 发布均由 Runtime 固定，不污染全局 Python，也不允许 manifest 携带任意命令。
 - 这条链路不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`；ST4 和其他外部项目的历史音频缓存不会成为 Bridge 的默认来源。
 - 控制面板可分别选择说话音色和歌声音色，并分别生成普通语音试听与固定 10 秒歌声试听；试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。
 
@@ -261,7 +261,7 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 
 控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
 
-Qwen 模型文件清单已经固定，但独立 Python/CUDA wheel 清单、RTX 3070 模型 benchmark、ACE-Step Runtime/模型清单和歌声性能门禁仍待现场完成；对应能力必须保持 `optional_missing / blocked`。当前尚未执行本轮开发版到 live 的同步/重启，以及重启后真实飞书新语音端到端验收；在这些证据齐全前，不应把开发版构建或测试结果描述为现场机器人已具备语音、克隆或歌声能力。
+截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8 模型、Qwen 独立 Python/CUDA Runtime 和 Qwen3-TTS 1.7B CustomVoice；这只证明依赖安装完成，不代表运行中的 live Bridge 已加载。RTX 3070 模型 benchmark、ACE-Step Runtime/模型清单、歌声性能门禁、授权 Base 克隆模型和重启后真实飞书新语音端到端验收仍未完成；在这些证据齐全前，不应把开发版构建或安装结果描述为现场机器人已具备语音、克隆或歌声能力。
 
 ## 当前运行模型
 

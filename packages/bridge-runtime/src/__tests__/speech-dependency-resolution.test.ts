@@ -57,6 +57,33 @@ describe('speech dependency resolution', () => {
     }
   });
 
+  it('finds an executable inside one ordinary archive root directory', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-managed-nested-'));
+    const executableName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+    const versionRoot = path.join(root, 'speech', 'ffmpeg_runtime', 'v1');
+    const relativeEntry = `ffmpeg-build/bin/${executableName}`;
+    const managed = path.join(versionRoot, ...relativeEntry.split('/'));
+    fs.mkdirSync(path.dirname(managed), { recursive: true });
+    fs.writeFileSync(managed, 'nested', 'utf8');
+    if (process.platform !== 'win32') fs.chmodSync(managed, 0o700);
+    fs.writeFileSync(path.join(versionRoot, '.installed.json'), JSON.stringify({
+      protocol: 'cti-speech-component-install/v1', id: 'ffmpeg_runtime', version: 'v1',
+      sha256: 'd'.repeat(64), size: 6, source: 'https://example.invalid/ffmpeg.zip', license: 'LGPL',
+      platform: `${process.platform}-${process.arch}`, entryPoint: relativeEntry,
+      entryPointSha256: crypto.createHash('sha256').update('nested').digest('hex'), entryPointSize: 6,
+      installedAt: '2026-08-08T00:00:00.000Z',
+    }), 'utf8');
+    try {
+      const result = resolveExecutableDependency({
+        id: 'ffmpeg', displayName: 'FFmpeg', runtimeDepsRoot: root, componentIds: ['ffmpeg_runtime'],
+      });
+      assert.equal(result.state, 'ready');
+      assert.equal(result.path, path.resolve(managed));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('only recursively removes an ordinary direct child with the required prefix', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-'));
     const target = path.join(root, 'asr-owned');
