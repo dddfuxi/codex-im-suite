@@ -210,8 +210,15 @@ export class SpeechRuntimeStatusService {
             ? 'singing_benchmark_not_verified'
             : singingManifest?.diagnosticCode || 'singing_component_missing',
         };
+    const usesManagedSingingRuntime = !config.singingApiUrl?.trim() && !config.singingApiToken?.trim();
+    // 受管 ACE-Step 是重型可选 Runtime：状态刷新只核对受管组件与 benchmark，
+    // 真正试听/benchmark 时再启动。禁止 15 秒轮询为了“健康探测”常驻占用 GPU。
     const singingHealth = config.singingEnabled && this.options.singingHost
-      ? await this.options.singingHost.health(input.signal)
+      ? usesManagedSingingRuntime
+        ? (singingManifest?.state === 'ready'
+          ? { state: 'ready' as const }
+          : { state: 'blocked' as const, diagnosticCode: singingManifest?.diagnosticCode || 'singing_component_missing' })
+        : await this.options.singingHost.health(input.signal)
       : { state: 'blocked' as const, diagnosticCode: config.singingEnabled ? 'singing_host_unavailable' : 'singing_disabled' };
     const singingReady = singingHealth.state === 'ready' && singingBenchmark.state === 'ready';
     const singingState: SpeechState = singingReady

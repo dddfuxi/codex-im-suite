@@ -85,6 +85,35 @@ describe('ACE-Step singing host', () => {
     }
   });
 
+  it('受管 benchmark 被取消时终止 ACE Runtime，避免服务端继续占用本机资源', async () => {
+    const fixture = createFixture({ CTI_SINGING_API_URL: '', CTI_SINGING_API_TOKEN: '' });
+    const controller = new AbortController();
+    let stops = 0;
+    try {
+      const host = new AceStepSingingHost({
+        config: fixture.config,
+        ctiHome: fixture.root,
+        runtimeDepsRoot: path.join(fixture.root, 'runtime-deps'),
+        managedRuntime: {
+          ensureRunning: async () => ({
+            baseUrl: 'http://127.0.0.1:7865/',
+            token: '0123456789abcdef0123456789abcdef',
+          }),
+          stop: () => { stops += 1; },
+        },
+        fetchImpl: (async (_input, init) => new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+        })) as typeof fetch,
+      });
+      const pending = host.synthesizeSong({ ...songInput(), benchmarkMode: true, signal: controller.signal });
+      setImmediate(() => controller.abort(new Error('benchmark_expired')));
+      await assert.rejects(pending);
+      assert.equal(stops, 1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it('按官方 release/query/audio 流程生成并只释放受管 Opus 产物', async () => {
     const fixture = createFixture();
     const calls: Array<{ url: string; init?: RequestInit }> = [];

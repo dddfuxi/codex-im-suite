@@ -676,6 +676,7 @@ flowchart LR
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
 - 面板 CLI 与 live Bridge 之间的试听/benchmark mailbox 由 Runtime 独占：服务端长期轮询句柄可以 `unref` 以免阻止 Bridge 退出，但一次性客户端在收到归属匹配的响应或有界超时前必须持有活动等待句柄；CLI 只能在主 Promise 终态后输出一条 JSON，禁止以退出码 0、空 stdout 把未执行伪装成成功。
+- 受管歌声 Runtime 采用按需生命周期：周期状态刷新只核对固定 manifest、marker、组件状态和硬件绑定 benchmark，不得为健康探测启动或常驻 ACE-Step。实际歌声试听/benchmark 前先停止可按需重建的普通语音 Sidecar，避免 Qwen TTS 与 ACE-Step 同时占用本机 GPU；下一次 ASR/TTS 会通过原 Supervisor 重新建立 Sidecar。受管歌声请求的 Abort/超时必须同时终止本实例 ACE 子进程，不能只断开 HTTP 后让服务端继续 CPU/GPU 推理。外部显式 loopback 歌声服务仍按真实 `/health` 探测，不受此受管生命周期替代。
 - TTS 默认选择 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`；`0.6B-CustomVoice` 是显式低显存选项，`1.7B/0.6B-Base` 只用于已授权参考音色复刻。SenseVoice 与 ACE-Step 的职责不变。Runtime 在合成前签发当前 live `modelId + revision + voiceProfileId`，Core 将请求和回执逐项绑定，模型切换、重启竞态或音色不一致都会失败关闭到文字。
 - 模型 benchmark 按 `provider + model + revision + hardware hash` 存储，记录热态耗时、音频时长、RTF 与峰值显存。Base 参考音色在当前组合未通过 benchmark 前不能进入普通合成；benchmark 本身走独立认证 mailbox，不向浏览器暴露模型路径、参考音频或内部指标对象。
 

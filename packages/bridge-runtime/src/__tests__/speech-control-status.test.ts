@@ -131,4 +131,34 @@ describe('speech status and control actions', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('managed singing status is derived from pinned components without starting the heavy runtime', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-status-singing-'));
+    let healthCalls = 0;
+    try {
+      const config = loadSpeechRuntimeConfig(new Map([['CTI_SINGING_ENABLED', 'true']]));
+      const status = new SpeechRuntimeStatusService({
+        config,
+        host: fakeHost(false),
+        voiceRegistry: new SpeechVoiceRegistry(path.join(root, 'voices')),
+        previewAvailable: () => true,
+        singingHost: {
+          health: async () => { healthCalls += 1; return { state: 'ready' as const }; },
+        } as never,
+        listManagedComponents: () => [{
+          id: 'ace_step_1_5', displayName: 'ACE Runtime', kind: 'runtime', state: 'ready',
+          version: 'runtime-v1', capabilities: ['singing'], installable: false,
+        }, {
+          id: 'ace_step_1_5_models', displayName: 'ACE Models', kind: 'model', state: 'ready',
+          version: 'models-v1', capabilities: ['singing'], installable: false,
+        }],
+      });
+      const value = await status.refresh();
+      assert.equal(healthCalls, 0);
+      assert.equal(value.actions.find((item) => item.id === 'speech.benchmarkSingingModel')?.enabled, true);
+      assert.equal(value.actions.find((item) => item.id === 'speech.previewSingingVoice')?.enabled, false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

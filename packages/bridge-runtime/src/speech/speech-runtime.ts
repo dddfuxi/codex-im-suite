@@ -106,6 +106,7 @@ export function createSpeechRuntime(input: {
         if (!liveRuntimeStarted) throw new Error('singing_live_runtime_not_started');
         return managedSingingRuntime.ensureRunning(signal);
       },
+      stop: () => managedSingingRuntime.stop(),
     },
     isBenchmarkVerified: () => {
       const identity = singingIdentity();
@@ -162,16 +163,22 @@ export function createSpeechRuntime(input: {
             benchmarkMode: true,
             signal,
           }),
-          previewSingingVoice: ({ text, modelId, voiceProfileId, signal }) => createSingingVoicePreview({
-            host: singingHost,
-            lyrics: text,
-            modelId,
-            voiceProfileId,
-            signal,
-          }),
-          benchmarkSingingVoice: ({ text, modelId, voiceProfileId, signal }) => {
+          previewSingingVoice: async ({ text, modelId, voiceProfileId, signal }) => {
+            // Qwen TTS 与 ACE-Step 共用本机 GPU；歌声启动前释放空闲 Sidecar，
+            // 后续 ASR/TTS 请求会按需重建，避免两个模型常驻挤压 8GB 显存。
+            await host.sidecar.stop();
+            return createSingingVoicePreview({
+              host: singingHost,
+              lyrics: text,
+              modelId,
+              voiceProfileId,
+              signal,
+            });
+          },
+          benchmarkSingingVoice: async ({ text, modelId, voiceProfileId, signal }) => {
             const identity = singingIdentity();
             if (!identity) throw new Error('singing_managed_components_missing');
+            await host.sidecar.stop();
             return createSingingVoicePreview({
               host: singingHost,
               lyrics: text,

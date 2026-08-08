@@ -109,7 +109,11 @@ export class AceStepSingingHost {
     runtimeDepsRoot: string;
     voiceRegistry?: SpeechVoiceRegistry;
     fetchImpl?: FetchLike;
-    managedRuntime?: { ensureRunning(signal?: AbortSignal): Promise<ManagedSingingRuntimeEndpoint> };
+    managedRuntime?: {
+      ensureRunning(signal?: AbortSignal): Promise<ManagedSingingRuntimeEndpoint>;
+      /** 受管生成超时后终止本实例，避免服务端脱离 HTTP 请求继续占用 CPU/GPU。 */
+      stop?(): void;
+    };
     isBenchmarkVerified?: () => boolean;
     readGpuMemoryMiB?: () => number | undefined;
     /** 仅用于隔离媒体探针的测试缝；生产默认始终执行真实 ffprobe 门禁。 */
@@ -202,6 +206,9 @@ export class AceStepSingingHost {
     if (input.durationSeconds < 10 || input.durationSeconds > this.options.config.maxSongDurationSeconds) {
       throw new RuntimeSpeechError('singing_duration_invalid', 'blocked', '歌声时长超过配置上限');
     }
+    const stopManagedRuntimeOnAbort = () => this.options.managedRuntime?.stop?.();
+    if (input.signal?.aborted) stopManagedRuntimeOnAbort();
+    else input.signal?.addEventListener('abort', stopManagedRuntimeOnAbort, { once: true });
     const { base, token } = await this.resolveEndpoint(input.signal);
     const requestSha256 = canonicalRequestSha256(input);
     let peakVramMiB = this.options.readGpuMemoryMiB?.();
