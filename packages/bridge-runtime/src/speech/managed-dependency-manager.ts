@@ -497,6 +497,11 @@ export class ManagedSpeechDependencyManager {
     try {
       if (fs.existsSync(targetRoot)) {
         if (this.isInstalled(item, 'full')) return;
+        if (collectionReady && this.isRepairableFileSetMarker(item, targetRoot)) {
+          await this.repairFileSetComponent(item, targetRoot, componentRoot, signal);
+          this.installedStatusCache.delete(`${item.id}\0${item.version}`);
+          if (this.isInstalled(item, 'full')) return;
+        }
         throw new Error('component_target_conflict');
       }
       ensureNonSymlinkDirectory(stageRoot);
@@ -585,6 +590,149 @@ export class ManagedSpeechDependencyManager {
       } catch { /* 失败 stage 不会被 resolver 采用，也绝不放宽递归删除边界。 */ }
       releaseInstallLock();
     }
+  }
+
+  /**
+   * 只修复身份仍与当前 manifest 完全一致、但少量文件内容损坏的 v2 集合。
+   * 所有坏文件先进入同卷 stage 并完成 Hash，再逐文件原子替换；有效大权重不会重下或复制。
+   */
+  private async repairFileSetComponent(
+    item: ManagedDependencyRecord,
+    targetRoot: string,
+    componentRoot: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const files = item.files!;
+    const repairRoot = path.join(componentRoot, `.repair-${crypto.randomUUID()}`);
+    ensureNonSymlinkDirectory(repairRoot);
+    const stagedRoot = path.join(repairRoot, 'files');
+    const backupRoot = path.join(repairRoot, 'backups');
+    ensureNonSymlinkDirectory(stagedRoot);
+    ensureNonSymlinkDirectory(backupRoot);
+    const repairs: Array<{ relative: string; target: string; staged: string; backup?: string }> = [];
+    let cleanupRepairRoot = true;
+    try {
+      for (const file of files) {
+        const target = path.resolve(targetRoot, ...file.path.split('/'));
+        if (!isWithinRoot(target, targetRoot)) throw new Error('component_path_escape');
+        let valid = false;
+        try {
+          const existing = this.resolveOrdinaryFile(targetRoot, file.path, 'component_repair_source_unsafe');
+          const stat = fs.lstatSync(existing);
+          valid = stat.size === file.size && hashFileSha256Sync(existing) === file.sha256;
+        } catch {
+          valid = false;
+        }
+        if (valid) continue;
+        // 符号链接或特殊文件不能作为可修复目标，避免原子替换被重定向到受管根外。
+        if (fs.existsSync(target)) {
+          const stat = fs.lstatSync(target);
+          if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('component_repair_target_unsafe');
+        }
+        const staged = path.resolve(stagedRoot, ...file.path.split('/'));
+        if (!isWithinRoot(staged, stagedRoot)) throw new Error('component_path_escape');
+        ensureNonSymlinkDirectory(path.dirname(staged));
+        await this.operations.fetchAsset({
+          url: file.source,
+          targetPath: staged,
+          expectedSha256: file.sha256,
+          expectedBytes: file.size,
+          maxBytes: this.maxDownloadBytes,
+          signal,
+        });
+        repairs.push({ relative: file.path, target, staged });
+      }
+
+      const committed: typeof repairs = [];
+      try {
+        for (const [index, repair] of repairs.entries()) {
+          ensureNonSymlinkDirectory(path.dirname(repair.target));
+          if (fs.existsSync(repair.target)) {
+            repair.backup = path.join(backupRoot, `${index}.bak`);
+            fs.renameSync(repair.target, repair.backup);
+          }
+          // 先登记再发布；即使 staged rename 失败也能恢复已经移入 backup 的原文件。
+          committed.push(repair);
+          fs.renameSync(repair.staged, repair.target);
+        }
+        if (!this.readExpectedFileSetMarker(item, targetRoot)) throw new Error('component_repair_verification_failed');
+      } catch (error) {
+        for (const repair of committed.reverse()) {
+          try {
+            const current = fs.lstatSync(repair.target);
+            if (!current.isSymbolicLink() && current.isFile()) fs.unlinkSync(repair.target);
+          } catch { /* 继续尝试恢复原文件。 */ }
+          if (repair.backup && fs.existsSync(repair.backup)) {
+            try { fs.renameSync(repair.backup, repair.target); } catch { cleanupRepairRoot = false; }
+          }
+        }
+        throw error;
+      }
+    } finally {
+      try {
+        if (cleanupRepairRoot) {
+          removeManagedTempDirectorySafely({
+            targetPath: repairRoot,
+            managedRoot: componentRoot,
+            requiredNamePrefix: '.repair-',
+          });
+        }
+      } catch { /* 修复 stage 不会被 resolver 采用。 */ }
+    }
+  }
+
+  private isRepairableFileSetMarker(item: ManagedDependencyRecord, targetRoot: string): boolean {
+    try {
+      ensureNonSymlinkDirectory(targetRoot);
+      return this.readExpectedFileSetMarker(item, targetRoot, false);
+    } catch {
+      return false;
+    }
+  }
+
+  private readExpectedFileSetMarker(item: ManagedDependencyRecord, targetRoot: string, verifyFiles = true): boolean {
+    if (!item.version || !item.entryPoint || !item.files?.length) return false;
+    const markerPath = path.join(targetRoot, '.installed.json');
+    const stat = fs.lstatSync(markerPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) return false;
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as Record<string, unknown>;
+    const expectedFiles = item.files.map((file) => ({
+      path: file.path, sha256: file.sha256, size: file.size, source: file.source,
+    }));
+    const markerFilesMatch = Array.isArray(parsed.files)
+      && parsed.files.length === expectedFiles.length
+      && parsed.files.every((raw, index) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+        const record = raw as Record<string, unknown>;
+        const expected = expectedFiles[index]!;
+        return Object.keys(record).sort().join(',') === 'path,sha256,size,source'
+          && record.path === expected.path
+          && record.sha256 === expected.sha256
+          && record.size === expected.size
+          && record.source === expected.source;
+      });
+    const identityMatches = parsed.protocol === MANAGED_INSTALL_SET_PROTOCOL
+      && parsed.id === item.id
+      && parsed.version === item.version
+      && parsed.source === item.source
+      && parsed.license === item.license
+      && parsed.platform === this.runtimePlatform
+      && parsed.entryPoint === item.entryPoint
+      && parsed.manifestSha256 === this.computeFileSetHash(item.files)
+      && parsed.totalSize === item.files.reduce((sum, file) => sum + file.size, 0)
+      && markerFilesMatch;
+    if (!identityMatches) return false;
+    if (!verifyFiles) return true;
+    return readManagedInstallSetMarker(targetRoot, {
+      id: item.id,
+      version: item.version,
+      source: item.source,
+      license: item.license,
+      platform: this.runtimePlatform,
+      entryPoint: item.entryPoint,
+      manifestSha256: this.computeFileSetHash(item.files),
+      totalSize: item.files.reduce((sum, file) => sum + file.size, 0),
+    }) !== null;
   }
 
   private async installPythonTarget(

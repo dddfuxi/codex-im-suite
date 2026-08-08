@@ -431,7 +431,7 @@ describe('managed speech dependency archive safety', () => {
     }
   });
 
-  it('validates every file in a v2 install marker and fails after any file changes', () => {
+  it('validates every file and repairs only damaged files from an identity-matching v2 marker', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-file-set-marker-'));
     const manifestPath = path.join(root, 'manifest.json');
     const depsRoot = path.join(root, 'deps');
@@ -485,6 +485,17 @@ describe('managed speech dependency archive safety', () => {
 
       fs.writeFileSync(path.join(targetRoot, 'weights', 'model.bin'), 'changed', 'utf8');
       assert.equal(manager.listStatuses()[0]?.state, 'optional_missing');
+      const fetched: string[] = [];
+      const repairing = new ManagedSpeechDependencyManager(manifestPath, depsRoot, undefined, undefined, undefined, {
+        fetchAsset: async ({ url, targetPath }) => {
+          fetched.push(url);
+          fs.writeFileSync(targetPath, url.endsWith('model.bin') ? 'weights' : 'config', 'utf8');
+        },
+      });
+      await repairing.install(component.id);
+      assert.deepEqual(fetched, ['https://example.invalid/model.bin']);
+      assert.equal(repairing.listStatuses()[0]?.state, 'ready');
+      assert.ok(repairing.resolveInstalledComponent(component.id));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

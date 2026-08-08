@@ -100,6 +100,7 @@ describe('managed singing runtime supervisor', () => {
       assert.match(bootstrap, /server\._ensure_model_downloaded=_managed_model/u);
       assert.match(bootstrap, /kwargs\["checkpoint_dir"\]=model_root/u);
       assert.match(bootstrap, /kwargs\["get_project_root"\]=lambda: state_root/u);
+      assert.match(bootstrap, /handler\._ensure_models_present=lambda/u);
       assert.match(bootstrap, /handler\._sync_model_code_if_needed=lambda/u);
       assert.doesNotMatch(bootstrap, /lambda: model_root/u);
       const statePath = path.join(value.root, 'runtime', 'speech', 'ace-step-host', 'runtime.json');

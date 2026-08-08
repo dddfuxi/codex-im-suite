@@ -43,6 +43,7 @@ const ACE_SERVER_BOOTSTRAP = [
   '    kwargs["ensure_model_downloaded"]=_managed_model',
   '    for handler in (kwargs.get("handler"), kwargs.get("handler2"), kwargs.get("handler3")):',
   '        if handler is not None:',
+  '            handler._ensure_models_present=lambda **inner_kwargs: None',
   '            handler._sync_model_code_if_needed=lambda *args, **inner_kwargs: None',
   '    return _original_init(**kwargs)',
   'server.initialize_models_at_startup=_managed_init',
