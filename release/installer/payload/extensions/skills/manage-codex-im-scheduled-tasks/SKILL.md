@@ -81,11 +81,13 @@ description: Use when a Feishu user asks to create, inspect, pause, resume, run,
 
 ## 管理与诊断
 
-1. 列表、详情、暂停、恢复、立即运行、历史、删除和仅重试投递都通过统一 Scheduled Task Host 或正式 Control API。
-2. 诊断先读取任务状态和运行账本，分别报告 `executionStatus` 与 `deliveryStatus`；不要扫描工作区或记忆 Markdown 猜状态。
-3. 执行与投递分离：Agent 已成功但飞书失败时，只重试投递，不重新执行 Agent。
-4. Bridge 重启后，未知副作用运行不得自动重放；根据运行账本报告 `interrupted_by_restart` 或真实恢复结果。
-5. `controlled_tool` 只接受 Runtime 工具注册表确认的幂等性，模型不得自行声明可信幂等。
+1. 明确列表/查看请求优先使用 Bridge 注入的 `cti-scheduled-task-list-evidence/v1`；它已按当前真实 actor 通过统一 Scheduled Task Host 过滤。只能整理其中的受限任务与状态，不能直接读取 Store、工作区、记忆 Markdown 或无 actor 过滤的本机 CLI 来补数据。
+2. Host evidence 的 `status=error` 表示读取失败，不等于任务为空；`status=ready + tasks=[]` 才能回答当前可见任务为零。
+3. 详情、暂停、恢复、立即运行、历史、删除和仅重试投递都通过统一 Scheduled Task Host 或正式 Control API。
+4. 诊断先读取任务状态和运行账本，分别报告 `executionStatus` 与 `deliveryStatus`；不要扫描工作区或记忆 Markdown 猜状态。
+5. 执行与投递分离：Agent 已成功但飞书失败时，只重试投递，不重新执行 Agent。
+6. Bridge 重启后，未知副作用运行不得自动重放；根据运行账本报告 `interrupted_by_restart` 或真实恢复结果。
+7. `controlled_tool` 只接受 Runtime 工具注册表确认的幂等性，模型不得自行声明可信幂等。
 
 ## 回复规则
 

@@ -210,6 +210,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 - Codex 最终结果优先使用 `cti-final` 结果块协议。官方 Codex 同一回合返回多个 completed `agent_message` 时，Provider 必须保留消息边界，不能把进度文本和最终 fence 直接粘连；最终 envelope 解析必须按协议 fence/平衡 JSON 定位，兼容前置进度文本和嵌套对象，解析失败时也不得把 `cti-final`、`kind`、`reply_mode` 等内部协议外发。
 - 明确要求工具、MCP、文件、命令、截图、生成物或本地产物的任务，禁止降级成快问快答、闲聊短路或本地模型直答；必须进入 workflow / 工具证据链，成功时带真实 `tool_result`，失败时返回具体“未完成”阻塞原因。
 - `local_read_required` 首轮仍由 Agent 自主调用工具；只有 conversation engine 已发起一次 no-evidence retry、用户请求能唯一规划为 `list_dir / read_file / search_files` 且目标完全落在本轮 `TurnWorkspacePlan` 内时，runtime 才可执行一次确定性只读证据恢复。模糊请求、外部路径、shell、写入、MCP、Unity、Blender、产物和高风险动作不得借此降级。用户可见阻塞只说明未取得本地信息或可验证结果，内部 requirement 名称、英文 reason 和工具计数只保留在 workflow/audit。
+- IM bridge 的后置动作/证据审查失败不能只要求用户重发：若本轮没有任何工具调用、成功工具结果、权限请求或未知副作用，必须把稳定错误码、原任务和上一版结果交回同源 Agent，最多执行一次禁工具的完整协议修复；仍失败才输出单一明确阻塞。出现任何工具、权限、Owner、身份、授权、密钥、高风险或目标歧义时禁止自动重放，且修复不得绕过后续真实 Host 门禁。
 - 工具链成功后，用户可见正文应由 agent/model 基于真实工具历史整理成可读 Markdown/卡片内容；不要把原始 MCP JSON、运行时验证摘要或 `JsonTool/tool_request/tool_result` 协议名直接当最终回复。
 - agent/model 默认采用主动完成姿态：有安全、低风险、受控的上下文读取、工具调用或目标解析可推进任务时，应先尝试完成，而不是把可执行请求退回成教程、泛泛拒绝或让用户手动排查。确实缺少关键信息时只问最小缺口；只能部分完成时保留已验证进展，说明具体阻塞和下一步确认。该规则不能绕过 Owner/Operator 门禁、平台权限、真实工具证据或事实核验。
 - 普通自然语言内容不得再走 provider 前快捷出口：自然语言扩展/模型/skill 搜索、通用表情包请求、自然语言提醒、`git status`/`git pull` 这类命令式文本都必须进入 agent/provider 先判断意图；只有 slash 命令、权限按钮/数字、平台 callback、owner 二次确认、`/remind` 等明确系统入口可以由 bridge-manager 前置处理，并且仍要复用统一角色和风险门禁。
