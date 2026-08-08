@@ -1,6 +1,6 @@
 {
   "name": "@codex-im-suite/contracts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared JSON contracts for codex-im-suite control plane, node agents, workflow runs, and extensions.",
   "type": "module",
   "main": "dist/index.js",

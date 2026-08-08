@@ -26,7 +26,7 @@ Claude Code / Codex → reads/writes your codebase
 - **Interactive setup** — guided wizard collects tokens with step-by-step instructions
 - **Permission control** — tool calls require explicit approval via inline buttons (Telegram/Discord) or text `/perm` commands / quick `1/2/3` replies (Feishu/QQ/WeChat)
 - **Streaming preview** — see Claude's response as it types (Telegram & Discord)
-- **Optional local speech and singing preview** — development version `0.3.0` adds Feishu-first local ASR/TTS, an independent ACE-Step singing host, native Opus replies, and separate voice selection/previews in the Contract-driven Control Panel; all capabilities stay off by default
+- **Optional local speech and singing preview** — development version `0.4.0` adds Qwen3-TTS model/voice/tone selection, model-scoped benchmarks, Feishu-first local ASR/TTS, an independent ACE-Step singing host, and native Opus replies; all capabilities stay off by default
 - **Session persistence** — conversations survive daemon restarts
 - **Secret protection** — tokens stored with `chmod 600`, auto-redacted in all logs
 - **Zero code required** — install the skill and run `/claude-to-im setup`, or tell Codex `claude-to-im setup`
@@ -291,7 +291,9 @@ Additional notes:
 - If WeChat does not provide `voice_item.text`, the bridge replies with an error instead of downloading/transcribing raw voice audio
 - Permission approvals use text `/perm ...` commands or quick `1/2/3` replies
 
-## Local Speech (0.3.0 development preview)
+## Local Speech (0.4.0 development preview)
+
+The default voice model is Qwen3-TTS 12Hz 1.7B CustomVoice with Serena. The 0.6B CustomVoice variant is an explicit low-VRAM choice, while the 1.7B/0.6B Base variants are reserved for authorized voice cloning. Natural-language voice intent is a bounded Primary output that Bridge combines with trusted evidence, session state, role, and risk; keyword regexes are not authorization or completion gates.
 
 This is a source-tree local speech and singing feature as of 2026-08-07, not a claim that the live skill or a release package has passed acceptance. The first channel is Feishu/Lark. WeChat keeps using its platform-provided transcript and the other channels keep their existing behavior.
 
