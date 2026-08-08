@@ -52,7 +52,7 @@ Local speech is a Feishu-first development feature and is disabled by default. D
 - Managed components belong under `CTI_HOME\runtime-deps\speech`, authorized voice data under `CTI_HOME\runtime\speech\voices`, and request scratch/default output under `CTI_HOME\runtime\speech`. None of these paths is a project workspace.
 - Never read, migrate, or depend on `F:\unity\ST4\.cti-audio` for this feature.
 
-As of 2026-08-07, the managed ACE-Step runtime/model manifest remains `blocked / manifest_incomplete`; its RTX 3070 performance/memory benchmark, live sync/restart, and a post-restart real Feishu audio end-to-end test have not been run. Keep singing blocked and report all of those as pending until real evidence exists.
+As of 2026-08-09, the managed ACE-Step runtime/model, RTX 3070 performance/memory benchmark, live sync/restart, and bounded Ogg/Opus singing preview have passed. The verified 10-second benchmark recorded `warmSynthesisMs=94644`, `outputDurationMs=10007`, `peakVramMiB=7718`, and `realTimeFactor=9.4578`; the live preview receipt had a real `OggS` header, matching SHA-256, `validated=true`, and no exposed path. Do not generalize that evidence to inbound channel E2E: a post-restart Feishu audio message, `/voice off`, and forced TTS-failure single-text fallback still require real user-channel verification.
 
 The skill directory (SKILL_DIR) is at `~/.claude/skills/claude-to-im`.
 In Codex installs it may instead be `~/.codex/skills/Claude-to-IM-skill`.

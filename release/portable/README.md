@@ -231,7 +231,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ## 本地语音（开发版 0.4.0）
 
-截至 2026-08-07，本地语音与歌声是开发版预览，不代表 live 或 release 已验收。首期只支持飞书；语音输入、语音输出和歌声合成都默认关闭，不影响现有文字消息和其他渠道。
+截至 2026-08-09，本地语音与歌声仍是飞书首发的可选能力；功能默认关闭，不影响现有文字消息和其他渠道。本机 live 已完成受管组件、普通语音原生出站、RTX 3070 歌声性能门禁和控制面板试听链验收，但飞书入站新语音的完整 `ASR -> Primary -> 原生语音唯一终态` 仍需由用户发送一条重启后的真实语音完成现场复测。
 
 - 无会话覆盖时，真实飞书语音由本地 ASR 转写后交给 Primary Agent，并默认以语音回复；普通文字默认仍以文字回复。
 - 飞书会话中发送 `/voice on` 可把当前会话设为默认语音回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，真实入站语音和 Primary 的结构化语音意图都只能返回文字。普通自然语言不再由关键词正则直接触发语音或授权；Primary 只能输出受限 `speech.mode/style`，Bridge 再结合真实媒体 evidence、会话状态、角色和风险裁决。
@@ -261,7 +261,7 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 
 控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
 
-截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8、Qwen 独立 Python/CUDA Runtime、Qwen3-TTS 1.7B/0.6B CustomVoice、0.6B Base，以及 ACE-Step 1.5 独立 Runtime 与固定歌声模型集合。ACE Runtime 使用 CPython 3.11、固定 uv、仓库内全哈希 lock、固定官方源码 ZIP、声明式包树复制和 CUDA 12.8 探针；live Bridge 只在启用歌声后启动绑定 `127.0.0.1` 的单 Worker，并为每次进程生成不落盘的临时令牌。面板新增独立歌声 benchmark 动作，固定生成 10 秒中文片段并按模型 revision、硬件 Hash、耗时、输出时长和 `nvidia-smi` 实测峰值显存记录门禁；首次 benchmark 可运行，但普通歌声试听仍必须等待该记录为 `ready`。本机依赖安装成功不等于 live 已加载或性能通过；RTX 3070 歌声 benchmark、同步/新 PID/长连接/hash 和重启后真实飞书新消息仍需现场验收。0.6B Base 也仍需用户授权参考音频与当前组合 benchmark，不能把模型文件存在描述为克隆完成。
+截至 2026-08-09，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8、Qwen 独立 Python/CUDA Runtime、Qwen3-TTS 1.7B/0.6B CustomVoice、0.6B Base，以及 ACE-Step 1.5 独立 Runtime 与固定歌声模型集合。ACE Runtime 使用 CPython 3.11、固定 uv、仓库内全哈希 lock、固定官方源码 ZIP、声明式包树复制和 CUDA 12.8 探针；live Bridge 只在真实歌声动作期间启动绑定 `127.0.0.1` 的单 Worker，并为每次进程生成不落盘的临时令牌，动作结束后释放进程和中间文件。RTX 3070 已用真实 10 秒中文片段通过歌声门禁：热态合成 `94644ms`、输出 `10007ms`、峰值显存 `7718MiB`、RTF `9.4578`；随后同一 live Runtime 的歌声试听返回 `OggS`、`36979` bytes、Hash 一致且 `validated=true` 的无路径受限回执，面板按钮据此开放。开发版、两份 live、portable、installer 的发布指纹均已核对一致；普通 Serena 语音也已作为飞书原生 `audio` 私聊成功。尚未完成的是用户发送重启后的真实飞书入站语音、`/voice off` 和强制 TTS 失败单次文字回退的渠道 E2E。0.6B Base 仍需用户授权参考音频与当前组合 benchmark，不能把模型文件存在描述为克隆完成。
 
 ## 当前运行模型
 

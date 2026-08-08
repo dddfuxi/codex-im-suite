@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-09 00:03:14",
-    "releaseRunId":  "81da9b619bd24d8c93464c93bffe16b3",
+    "generatedAt":  "2026-08-09 00:47:15",
+    "releaseRunId":  "6d73e647af854b1fb8bc5fbe90e3344e",
     "targetName":  "portable artifact",
     "targetRole":  "generated portable artifact",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "edcda62",
+                  "commit":  "cbc04bc",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,24 +27,24 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\portable\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "48A3C48FBC75",
+                  "Hash":  "4B16D4AB98C2",
                   "Length":  2254307,
-                  "Modified":  "2026-08-08 23:52:01"
+                  "Modified":  "2026-08-09 00:47:03"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
-                    "runtime.dist":  "A45E8084F499",
+                    "runtime.dist":  "8D8A465F4F29",
                     "runtime.scripts":  "095079B2A6B2",
                     "runtime.configExample":  "4D54ACC8AD1B",
-                    "runtime.skill":  "673DF1F96A84",
+                    "runtime.skill":  "D29C8E3E49DE",
                     "core.package":  "6D9D04F8FD33",
                     "core.dist":  "17BEC5EB0759",
                     "suite.manifest":  "128080D023D4",
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
                     "release.scripts":  "75DE5A74235B",
-                    "docs":  "C12C1836ABC1",
-                    "panel.exe":  "48A3C48FBC75",
+                    "docs":  "928918A9C5C8",
+                    "panel.exe":  "4B16D4AB98C2",
                     "panel.wwwroot":  "4FE0D71AD3B9"
                 }
 }
