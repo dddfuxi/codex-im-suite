@@ -693,7 +693,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)。截至 2026-08-08，四个 Qwen 模型文件集合、ACE-Step 固定模型集合与独立 `python_target/v2` Runtime recipe 均已固定，本机也已通过正式安装动作发布 ACE Runtime 与模型 marker；这只证明受管依赖可用。提交、release 重建、live 同步与重启、新 PID/飞书长连接/开发-live Hash、RTX 3070 歌声 benchmark 和重启后真实飞书新语音仍按开发日志中的最新记录裁决。任何一项缺失时，不得用开发版构建、单元测试、面板按钮可见、本机文件存在或单次状态替代渠道现场证据。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)。截至 2026-08-09，四个 Qwen 模型文件集合、ACE-Step 固定模型集合与独立 `python_target/v2` Runtime recipe 均已固定并通过正式安装；RTX 3070 的 ACE-Step 10 秒真实 benchmark、无路径 Ogg/Opus 歌声试听、release/live 同步、受控重启、新 PID、飞书长连接和开发/live 指纹也已完成。此状态仍不能替代渠道入站 E2E：用户必须从飞书发送一条重启后的真实新语音，才能验证 `ASR -> Primary -> 原生语音唯一终态`；`/voice off` 和强制 TTS 失败单次文字回退也继续按开发日志中的最新记录裁决。任何一项缺失时，不得用开发版构建、单元测试、面板按钮可见、本机文件存在或单次状态替代对应现场证据。
 
 ### 2.2 权限门禁
 
