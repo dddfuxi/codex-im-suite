@@ -7,6 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>CodexImSuiteControlPanel</AssemblyName>
     <RootNamespace>CodexImSuiteControlPanel</RootNamespace>
+    <!-- 发布提交由 .suite-release.json 单点记录；禁止 SDK 把 HEAD 写入 EXE，
+         否则提交 release 产物后会再次改变面板 Hash，造成 live/portable 永久追赶。 -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
