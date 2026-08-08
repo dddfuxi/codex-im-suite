@@ -7,9 +7,17 @@ import argparse
 import hmac
 import json
 import os
+import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+
+# 受管 CPython 使用隔离 _pth，不会自动把入口脚本目录加入 sys.path。
+# 只加入当前发布目录，确保同包 backends.py 可导入，同时不恢复外部 PYTHONPATH。
+SIDECAR_MODULE_ROOT = str(Path(__file__).resolve().parent)
+if SIDECAR_MODULE_ROOT not in sys.path:
+    sys.path.insert(0, SIDECAR_MODULE_ROOT)
 
 from backends import BackendFailure, BackendRegistry
 

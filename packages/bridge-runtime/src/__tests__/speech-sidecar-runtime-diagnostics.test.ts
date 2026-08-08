@@ -65,6 +65,15 @@ describe('speech sidecar single-instance lock', () => {
 });
 
 describe('speech sidecar runtime diagnostics', () => {
+  it('bootstraps sibling modules under isolated managed Python before importing the backend', () => {
+    const entry = fs.readFileSync(path.resolve('src/speech/sidecar/runtime_server.py'), 'utf8');
+    const bootstrap = entry.indexOf('sys.path.insert(0, SIDECAR_MODULE_ROOT)');
+    const backendImport = entry.indexOf('from backends import BackendFailure, BackendRegistry');
+    assert.ok(bootstrap >= 0);
+    assert.ok(backendImport > bootstrap);
+    assert.match(entry, /Path\(__file__\)\.resolve\(\)\.parent/u);
+  });
+
   it('isolates concurrent supervisor PIDs and writes bounded logs without token or absolute paths', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-sidecar-state-'));
     try {
