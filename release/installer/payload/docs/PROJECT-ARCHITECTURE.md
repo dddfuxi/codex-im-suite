@@ -662,7 +662,7 @@ flowchart LR
 | 层 | 稳定职责 |
 |---|---|
 | `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS/歌声合成，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
-| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 受管 Supervisor 只由 live Bridge 持有，固定绑定 `127.0.0.1`、单 Worker、离线模型根和每次启动随机临时 Bearer token。token 只进入 ACE 子进程环境，由官方入口读取，不得进入 Windows CommandLine、状态文件、日志或控制面板协议；CLI 只经认证 mailbox 调用，不会刷新一次就启动第二个模型进程。普通生成必须命中当前模型 revision 与硬件 Hash 的 ready benchmark。 |
+| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 受管 Supervisor 只由 live Bridge 持有，固定绑定 `127.0.0.1`、单 Worker、可写 state root、只读模型根和每次启动随机临时 Bearer token。官方 `ACESTEP_CHECKPOINTS_DIR` 与固定 bootstrap 共同把 DiT/VAE/Embedding/LM 定位到已验 Hash 的模型根；外层下载回调只允许解析该根下已存在的单层普通目录，Handler 内部的 `_ensure_models_present` 与 `_sync_model_code_if_needed` 也同时禁用，不能把权重写入 state、在首轮补下载或反向改写受管组件。v2 文件集合若 marker 身份仍与当前 manifest 完全一致但少量文件损坏，受管安装器只下载损坏文件到同卷 stage、完成固定 Hash 后逐文件原子替换并支持失败回滚，不重下有效大权重，也不采纳身份不明的现有目录。token 只进入 ACE 子进程环境，由官方入口读取，不得进入 Windows CommandLine、状态文件、日志或控制面板协议；CLI 只经认证 mailbox 调用，不会刷新一次就启动第二个模型进程。普通生成必须命中当前模型 revision 与硬件 Hash 的 ready benchmark。 |
 | `apps/control-panel` | C# 只维护无业务规则的薄 DTO、手工 wire 形状/媒体校验，并由反射测试逐字段核对 JSON Schema；React 只消费浏览器安全的共享 Contract。“能力 → 语音”页分别展示和试听说话/歌声音色，通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
 
 回复策略不再扫描自然语言关键词。`/voice off` 是绝对硬禁用，`/voice on` 是确定性会话开启；其余自然语言请求只能由 Primary 在 `cti-final.speech` 中返回受限 `voice_only` 呈现意图，再由 Bridge 结合真实入站语音 evidence、Runtime 策略、当前角色与风险裁决。模型不能选择 Provider、模型、音色、路径、命令、`file_key` 或平台身份。当前消息语音可以成为本轮用户正文；原生回复指向的旧语音只作为带 relation/source ID 的上下文证据，不能把旧录音里的命令提升为本轮授权。
@@ -671,11 +671,12 @@ flowchart LR
 
 - ASR 成功后，转写作为带来源 ID 和 Hash 的不可执行 evidence 进入 Primary Agent，不把原始音频伪装成 Provider 原生音频输入。
 - TTS 成功后，Core 只接受 Runtime 已验证的本机绝对路径、Opus 格式、时长和文字/文件 Hash；飞书上传前会对实际上传字节再次复核 receipt 的 SHA-256，并只发送一个原生 `msg_type=audio` 结果。所有成功、文字回退、卡片保留、异常和取消终态都在 Manager `finally` 委托 Runtime 重新校验登记归属、受管根、普通文件和当前 Hash 后释放合成产物；Core 不直接删除 Runtime 路径，清理失败也不覆盖真实交付结果。
-- Sidecar 可使用受管隔离 CPython；入口只把自身解析后的白名单发布目录加入模块搜索路径，以加载同包 `backends.py`。它不会恢复外部 `PYTHONPATH`、用户 site-packages 或全局 Python 环境，受管 `_pth` 的隔离边界保持有效。
+- Sidecar 可使用受管隔离 CPython；入口只把自身解析后的白名单发布目录加入模块搜索路径，以加载同包 `backends.py`。Supervisor 固定使用 Python `-B`，不在 live `dist` 生成 `__pycache__`；同步脚本在核对根目录、相对边界与逐级 reparse point 后清理精确的历史 `dist/release` 与 sidecar 字节码目录。它不会恢复外部 `PYTHONPATH`、用户 site-packages 或全局 Python 环境，受管 `_pth` 的隔离边界保持有效。
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
 - 面板 CLI 与 live Bridge 之间的试听/benchmark mailbox 由 Runtime 独占：服务端长期轮询句柄可以 `unref` 以免阻止 Bridge 退出，但一次性客户端在收到归属匹配的响应或有界超时前必须持有活动等待句柄；CLI 只能在主 Promise 终态后输出一条 JSON，禁止以退出码 0、空 stdout 把未执行伪装成成功。
+- 受管歌声 Runtime 采用按需生命周期：周期状态刷新只核对固定 manifest、marker、组件状态和硬件绑定 benchmark，不得为健康探测启动或常驻 ACE-Step。实际歌声试听/benchmark 前先停止可按需重建的普通语音 Sidecar，避免 Qwen TTS 与 ACE-Step 同时占用本机 GPU；下一次 ASR/TTS 会通过原 Supervisor 重新建立 Sidecar。受管歌声请求的 Abort/超时必须同时终止本实例 ACE 子进程，不能只断开 HTTP 后让服务端继续 CPU/GPU 推理。外部显式 loopback 歌声服务仍按真实 `/health` 探测，不受此受管生命周期替代。
 - TTS 默认选择 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`；`0.6B-CustomVoice` 是显式低显存选项，`1.7B/0.6B-Base` 只用于已授权参考音色复刻。SenseVoice 与 ACE-Step 的职责不变。Runtime 在合成前签发当前 live `modelId + revision + voiceProfileId`，Core 将请求和回执逐项绑定，模型切换、重启竞态或音色不一致都会失败关闭到文字。
 - 模型 benchmark 按 `provider + model + revision + hardware hash` 存储，记录热态耗时、音频时长、RTF 与峰值显存。Base 参考音色在当前组合未通过 benchmark 前不能进入普通合成；benchmark 本身走独立认证 mailbox，不向浏览器暴露模型路径、参考音频或内部指标对象。
 

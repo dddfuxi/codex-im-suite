@@ -654,3 +654,50 @@ function Remove-PathForUpdate {
 
     throw "无法清理更新目录：$Path。请确认没有资源管理器、杀毒软件或外部进程占用后重试。原始错误：$lastError"
 }
+
+function Remove-ContainedPathForUpdate {
+    param(
+        [string]$Root,
+        [string]$RelativePath,
+        [string]$Purpose = 'contained release cleanup'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($RelativePath)) {
+        throw "受控清理缺少根目录或相对路径：$Purpose"
+    }
+    if ([System.IO.Path]::IsPathRooted($RelativePath)) {
+        throw "受控清理拒绝绝对目标：$RelativePath"
+    }
+
+    $segments = @($RelativePath -split '[\\/]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($segments.Count -eq 0 -or @($segments | Where-Object { $_ -eq '.' -or $_ -eq '..' }).Count -gt 0) {
+        throw "受控清理拒绝不明确的相对目标：$RelativePath"
+    }
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $targetFull = [System.IO.Path]::GetFullPath((Join-Path $rootFull ([string]::Join([System.IO.Path]::DirectorySeparatorChar, $segments))))
+    $expectedPrefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $targetFull.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "受控清理目标越出根目录：$targetFull"
+    }
+    if (-not (Test-Path -LiteralPath $rootFull)) {
+        return
+    }
+
+    # 从根到目标逐级拒绝 junction/symlink/mount point，不能只依赖字符串前缀。
+    $pathsToCheck = @($rootFull)
+    $currentPath = $rootFull
+    foreach ($segment in $segments) {
+        $currentPath = Join-Path $currentPath $segment
+        $pathsToCheck += $currentPath
+    }
+    foreach ($pathToCheck in $pathsToCheck) {
+        if (-not (Test-Path -LiteralPath $pathToCheck)) { continue }
+        $item = Get-Item -LiteralPath $pathToCheck -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "受控清理拒绝重解析点：$pathToCheck"
+        }
+    }
+
+    Remove-PathForUpdate -Path $targetFull -Purpose $Purpose
+}

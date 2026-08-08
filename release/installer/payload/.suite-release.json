@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-08 22:44:57",
-    "releaseRunId":  "ce7357c7fd564568ad4540e662f2ccaa",
+    "generatedAt":  "2026-08-09 00:03:25",
+    "releaseRunId":  "54e4c77a976d4ad6a0a77d3ae32d0a48",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "0c5da21",
+                  "commit":  "edcda62",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,13 +27,13 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "089CDD76B14E",
+                  "Hash":  "48A3C48FBC75",
                   "Length":  2254307,
-                  "Modified":  "2026-08-08 22:44:35"
+                  "Modified":  "2026-08-08 23:52:01"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
-                    "runtime.dist":  "C5DD8725C046",
+                    "runtime.dist":  "A45E8084F499",
                     "runtime.scripts":  "095079B2A6B2",
                     "runtime.configExample":  "4D54ACC8AD1B",
                     "runtime.skill":  "673DF1F96A84",
@@ -42,9 +42,9 @@
                     "suite.manifest":  "128080D023D4",
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
-                    "release.scripts":  "87953C3590F1",
-                    "docs":  "9B4E444B4DA3",
-                    "panel.exe":  "089CDD76B14E",
+                    "release.scripts":  "75DE5A74235B",
+                    "docs":  "C12C1836ABC1",
+                    "panel.exe":  "48A3C48FBC75",
                     "panel.wwwroot":  "4FE0D71AD3B9"
                 }
 }

@@ -57,6 +57,7 @@ $testRoot = Join-Path $env:TEMP ("cti-force-update-test-" + [guid]::NewGuid().To
 $forceRoot = Join-Path $testRoot 'force'
 $noForceRoot = Join-Path $testRoot 'noforce'
 $lockedRoot = Join-Path $testRoot 'locked-delete'
+$containedRoot = Join-Path $testRoot 'contained'
 $forceProcess = $null
 $noForceProcess = $null
 $lockProcess = $null
@@ -89,6 +90,20 @@ try {
     Start-Sleep -Milliseconds 300
     Remove-PathForUpdate -Path $lockedRoot -Purpose 'test retry remove' -RetryCount 20 -DelayMilliseconds 250
     Assert-Condition -Condition (-not (Test-Path -LiteralPath $lockedRoot)) -Message 'retry remove did not delete the locked directory after the handle was released'
+
+    $containedTarget = Join-Path $containedRoot 'dist\release'
+    New-Item -ItemType Directory -Force -Path $containedTarget | Out-Null
+    Set-Content -LiteralPath (Join-Path $containedTarget 'legacy.txt') -Value 'legacy' -Encoding UTF8
+    Remove-ContainedPathForUpdate -Root (Join-Path $containedRoot 'dist') -RelativePath 'release' -Purpose 'test contained cleanup'
+    Assert-Condition -Condition (-not (Test-Path -LiteralPath $containedTarget)) -Message 'contained cleanup did not remove the exact child'
+    $escapeBlocked = $false
+    try {
+        Remove-ContainedPathForUpdate -Root (Join-Path $containedRoot 'dist') -RelativePath '..\outside' -Purpose 'test escape rejection'
+    }
+    catch {
+        $escapeBlocked = $true
+    }
+    Assert-Condition -Condition $escapeBlocked -Message 'contained cleanup accepted a parent traversal target'
 }
 finally {
     if ($null -eq $previousForceSetting) {
