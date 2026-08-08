@@ -37,6 +37,7 @@ const readyStatus: SpeechStatusContract = {
   },
   tonePolicy: { value: 'adaptive_natural', options: [{ id: 'adaptive_natural', displayName: '自适应', state: 'ready', enabled: true }] },
   singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'blocked', enabled: true }] },
+  singingBenchmark: { state: 'optional_missing', revision: 'uninstalled', diagnosticCode: 'singing_benchmark_not_verified' },
   activeVoiceProfileId: 'voice-a',
   activeSingingVoiceProfileId: '',
   capabilities: [],

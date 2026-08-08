@@ -837,6 +837,7 @@ internal sealed partial class MainForm : Form
             case "speech.installComponent":
             case "speech.installPresetVoice":
             case "speech.benchmarkTtsModel":
+            case "speech.benchmarkSingingModel":
             case "speech.importReferenceVoice":
             case "speech.previewVoice":
             case "speech.previewSingingVoice":

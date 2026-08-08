@@ -6,6 +6,7 @@ import { createSpeechRuntime } from './speech-runtime.js';
 import { RuntimeSpeechError } from './runtime-types.js';
 import { SpeechControlService } from './speech-control-service.js';
 import {
+  requestSingingVoiceBenchmark,
   requestSingingVoicePreview,
   requestSpeechVoiceBenchmark,
   requestSpeechVoicePreview,
@@ -69,8 +70,16 @@ export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
         voiceProfileId,
         timeoutMs: Math.min(4 * 60_000, config.speech!.singingTimeoutMs + 10_000),
       }),
+      benchmarkSingingVoice: ({ text, modelId, voiceProfileId }) => requestSingingVoiceBenchmark({
+        runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
+        text,
+        modelId,
+        voiceProfileId,
+        timeoutMs: Math.min(14 * 60_000, config.speech!.singingTimeoutMs + 10_000),
+      }),
       benchmarkStore: runtime.benchmarkStore,
       hardwareId: runtime.hardware.id,
+      gpuMemoryMiB: runtime.hardware.gpuMemoryMiB,
     });
     return await service.execute(argv[0] || '', decodePayload(argv.slice(1)));
   } finally {

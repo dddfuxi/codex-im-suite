@@ -238,14 +238,65 @@
       "kind": "runtime",
       "capabilities": ["singing", "music_generation"],
       "source": "https://github.com/ace-step/ACE-Step-1.5",
-      "version": null,
-      "sha256": null,
-      "size": null,
+      "version": "0.1.8-dce621408bee8c31b4fcf4811682eb9359e1bc94",
+      "sha256": "e8960f061ea1b21851595dd45c990865e019bfb00205ea7fafb854110891afe5",
+      "size": 39495540,
       "license": "MIT",
       "archive": "file",
-      "fileName": null,
-      "availability": "blocked",
-      "diagnosticCode": "manifest_incomplete"
+      "fileName": "python.exe",
+      "availability": "ready",
+      "platforms": ["win32-x64"],
+      "installer": {
+        "kind": "python_target/v2",
+        "python": {
+          "source": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
+          "sha256": "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b",
+          "size": 11249023,
+          "archive": "zip",
+          "entryPoint": "python.exe",
+          "pthFile": "python311._pth",
+          "stdlibZip": "python311.zip"
+        },
+        "tool": {
+          "source": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip",
+          "sha256": "b23350c79e8ad0192b8124af13a0f17e8d4e4549524785e1aef389ae5a06990e",
+          "size": 19013455,
+          "archive": "zip",
+          "entryPoint": "uv.exe"
+        },
+        "requirements": {
+          "path": "managed-locks/acestep-1.5.requirements.lock",
+          "sha256": "242d271aa57f0a0031c79f8602c1a71c11edb0e7b541e7da7f94caa850f0b636",
+          "size": 108795
+        },
+        "sitePackages": "Lib/site-packages",
+        "pythonVersion": "3.11",
+        "probeModules": ["acestep", "nanovllm", "torch", "torchaudio"],
+        "requireCuda": true,
+        "cudaVersion": "12.8",
+        "requiredDiskBytes": 17179869184,
+        "source": {
+          "source": "https://codeload.github.com/ace-step/ACE-Step-1.5/zip/dce621408bee8c31b4fcf4811682eb9359e1bc94",
+          "sha256": "f968799d3b74032fa24b1e86cb4adfda45071daf4745d2ecd6ba24d8f0f23bc0",
+          "size": 9124267,
+          "archive": "zip",
+          "maxExtractedBytes": 536870912
+        },
+        "packageTrees": [
+          {
+            "source": "ACE-Step-1.5-dce621408bee8c31b4fcf4811682eb9359e1bc94/acestep",
+            "target": "acestep"
+          },
+          {
+            "source": "ACE-Step-1.5-dce621408bee8c31b4fcf4811682eb9359e1bc94/openrouter",
+            "target": "openrouter"
+          },
+          {
+            "source": "ACE-Step-1.5-dce621408bee8c31b4fcf4811682eb9359e1bc94/acestep/third_parts/nano-vllm/nanovllm",
+            "target": "nanovllm"
+          }
+        ]
+      }
     },
     {
       "id": "ace_step_1_5_models",

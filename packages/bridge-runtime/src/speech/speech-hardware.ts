@@ -28,6 +28,26 @@ function inspectNvidiaGpu(): Omit<SpeechHardwareIdentity, 'id'> {
   }
 }
 
+/**
+ * benchmark 期间只读取驱动公开的显存占用摘要。返回 undefined 时必须让
+ * 性能门禁失败关闭，不能用 0 或模型估算值冒充真实峰值。
+ */
+export function readNvidiaUsedMemoryMiB(): number | undefined {
+  try {
+    const result = spawnSync('nvidia-smi', [
+      '--query-gpu=memory.used',
+      '--format=csv,noheader,nounits',
+    ], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 5_000 });
+    if (result.status !== 0) return undefined;
+    const values = String(result.stdout || '').split(/\r?\n/u)
+      .map((line) => Number.parseInt(line.trim(), 10))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    return values.length > 0 ? Math.max(...values) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 只持久化不可逆硬件身份；设备名称仅用于当前面板状态，不写入模型目录。 */
 export function getSpeechHardwareIdentity(): SpeechHardwareIdentity {
   const gpu = inspectNvidiaGpu();

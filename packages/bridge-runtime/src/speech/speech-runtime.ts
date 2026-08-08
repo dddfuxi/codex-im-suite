@@ -4,11 +4,12 @@ import path from 'node:path';
 import { resolveExecutableDependency } from './dependency-resolution.js';
 import { AceStepSingingHost } from './ace-step-singing-host.js';
 import { ManagedSpeechDependencyManager } from './managed-dependency-manager.js';
+import { ManagedSingingRuntimeSupervisor } from './managed-singing-runtime-supervisor.js';
 import { validateAudio } from './media-pipeline.js';
 import { RuntimeSpeechHost } from './runtime-speech-host.js';
 import { SpeechLiveStatusStore } from './speech-live-status.js';
 import { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
-import { getSpeechHardwareIdentity } from './speech-hardware.js';
+import { getSpeechHardwareIdentity, readNvidiaUsedMemoryMiB } from './speech-hardware.js';
 import { SpeechRuntimeStatusService } from './speech-status.js';
 import { createSpeechVoicePreview } from './speech-preview.js';
 import { createSingingVoicePreview } from './singing-preview.js';
@@ -34,8 +35,10 @@ export function createSpeechRuntime(input: {
   const runtimeDepsRoot = path.join(input.ctiHome, 'runtime-deps');
   const runtimeSpeechStateRoot = path.join(input.ctiHome, 'runtime', 'speech');
   const manifestPath = firstExisting([
-    path.join(input.skillRoot, 'dist', 'speech-managed-dependencies.json'),
+    // 开发仓库可能保留上一次构建的 dist；源码 CLI 必须优先读取当前声明，
+    // live/portable 不携带 src 时自然回退到 bundle 内的固定副本。
     path.join(input.skillRoot, 'src', 'speech', 'managed-dependencies.json'),
+    path.join(input.skillRoot, 'dist', 'speech-managed-dependencies.json'),
   ]);
   const sidecarCandidates = [
     path.join(input.skillRoot, 'dist', 'speech-sidecar', 'runtime_server.py'),
@@ -65,6 +68,23 @@ export function createSpeechRuntime(input: {
   const dependencies = new ManagedSpeechDependencyManager(manifestPath, runtimeDepsRoot);
   const benchmarkStore = new SpeechModelBenchmarkStore(runtimeSpeechStateRoot);
   const hardware = getSpeechHardwareIdentity();
+  const managedSingingRuntime = new ManagedSingingRuntimeSupervisor({
+    config: input.config,
+    ctiHome: input.ctiHome,
+    dependencies,
+  });
+  let liveRuntimeStarted = false;
+  const singingIdentity = () => {
+    const runtime = dependencies.resolveInstalledComponent('ace_step_1_5');
+    const models = dependencies.resolveInstalledComponent('ace_step_1_5_models');
+    if (!runtime || !models) return undefined;
+    return {
+      modelId: input.config.singingModel,
+      providerId: input.config.singingProvider,
+      revision: `${runtime.version}.${models.version}`,
+      hardwareId: hardware.id,
+    };
+  };
   const host = new RuntimeSpeechHost({
     config: input.config,
     ctiHome: input.ctiHome,
@@ -79,6 +99,19 @@ export function createSpeechRuntime(input: {
     ctiHome: input.ctiHome,
     runtimeDepsRoot,
     voiceRegistry,
+    // 只有长期 live Bridge 持有歌声进程；面板 CLI 通过 mailbox 调用，
+    // 不得因刷新状态再启动第二份模型 Runtime。
+    managedRuntime: {
+      ensureRunning: (signal) => {
+        if (!liveRuntimeStarted) throw new Error('singing_live_runtime_not_started');
+        return managedSingingRuntime.ensureRunning(signal);
+      },
+    },
+    isBenchmarkVerified: () => {
+      const identity = singingIdentity();
+      return Boolean(identity && benchmarkStore.find(identity)?.state === 'ready');
+    },
+    readGpuMemoryMiB: readNvidiaUsedMemoryMiB,
   });
   let previewControlService: ReturnType<typeof startSpeechPreviewControlService> | undefined;
   const status = new SpeechRuntimeStatusService({
@@ -109,6 +142,7 @@ export function createSpeechRuntime(input: {
     }
   };
   const startLivePrewarm = () => {
+    liveRuntimeStarted = true;
     if (!previewControlService) {
       try {
         previewControlService = startSpeechPreviewControlService({
@@ -135,6 +169,19 @@ export function createSpeechRuntime(input: {
             voiceProfileId,
             signal,
           }),
+          benchmarkSingingVoice: ({ text, modelId, voiceProfileId, signal }) => {
+            const identity = singingIdentity();
+            if (!identity) throw new Error('singing_managed_components_missing');
+            return createSingingVoicePreview({
+              host: singingHost,
+              lyrics: text,
+              modelId,
+              voiceProfileId,
+              signal,
+              benchmarkMode: true,
+              modelRevision: identity.revision,
+            });
+          },
         });
       } catch {
         // mailbox 归属失败时保持不可试听，绝不启动第二个 Sidecar。
@@ -147,10 +194,12 @@ export function createSpeechRuntime(input: {
     }
   };
   const stopLiveStatus = () => {
+    liveRuntimeStarted = false;
     if (liveStatusTimer) clearInterval(liveStatusTimer);
     liveStatusTimer = undefined;
     previewControlService?.stop();
     previewControlService = undefined;
+    managedSingingRuntime.stop();
   };
   return {
     host,

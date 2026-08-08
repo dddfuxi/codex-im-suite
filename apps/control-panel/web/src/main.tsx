@@ -1165,6 +1165,7 @@ const commandLabels: Record<string, string> = {
   'speech.installComponent': '安装语音组件',
   'speech.installPresetVoice': '下载预设音色',
   'speech.benchmarkTtsModel': '测试语音模型',
+  'speech.benchmarkSingingModel': '测试歌声模型',
   'speech.importReferenceVoice': '导入授权参考音频',
   'speech.previewVoice': '试听音色',
   'bridge.restart': '重启 Bridge',

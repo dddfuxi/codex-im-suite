@@ -43,6 +43,7 @@ internal sealed record SpeechStatusContract(
     SpeechModelSelectionContract TtsModel,
     SpeechSelectionContract TonePolicy,
     SpeechSelectionContract SingingProvider,
+    SpeechModelBenchmarkContract SingingBenchmark,
     string ActiveVoiceProfileId,
     string ActiveSingingVoiceProfileId,
     SpeechCapabilityContract[] Capabilities,
@@ -70,7 +71,7 @@ internal static class SpeechCommandPolicy
     public static string? GetRequiredRole(string command) => command switch
     {
         "speech.refresh" => "viewer",
-        "speech.saveSettings" or "speech.previewVoice" or "speech.previewSingingVoice" or "speech.activateVoiceProfile" or "speech.benchmarkTtsModel" => "operator",
+        "speech.saveSettings" or "speech.previewVoice" or "speech.previewSingingVoice" or "speech.activateVoiceProfile" or "speech.benchmarkTtsModel" or "speech.benchmarkSingingModel" => "operator",
         "speech.installComponent" or "speech.installPresetVoice" or "speech.importReferenceVoice" => "owner",
         _ => null,
     };
@@ -91,7 +92,7 @@ internal static class SpeechCommandPolicy
     public static int GetTimeoutMs(string command) => command switch
     {
         "speech.installComponent" or "speech.installPresetVoice" => 60 * 60 * 1000,
-        "speech.benchmarkTtsModel" => 15 * 60 * 1000,
+        "speech.benchmarkTtsModel" or "speech.benchmarkSingingModel" => 15 * 60 * 1000,
         "speech.previewVoice" or "speech.previewSingingVoice" or "speech.importReferenceVoice" => 5 * 60 * 1000,
         _ => 2 * 60 * 1000,
     };
@@ -129,6 +130,7 @@ internal sealed class SpeechRuntimeGateway
         "speech.installComponent",
         "speech.installPresetVoice",
         "speech.benchmarkTtsModel",
+        "speech.benchmarkSingingModel",
         "speech.importReferenceVoice",
         "speech.previewVoice",
         "speech.previewSingingVoice",
@@ -506,6 +508,10 @@ internal sealed class SpeechRuntimeGateway
             && HasModelSelection(status, "ttsModel")
             && HasSelection(status, "tonePolicy")
             && HasSelection(status, "singingProvider")
+            && status.TryGetProperty("singingBenchmark", out var singingBenchmark)
+            && singingBenchmark.ValueKind == JsonValueKind.Object
+            && HasString(singingBenchmark, "state")
+            && HasString(singingBenchmark, "revision")
             && HasArray(status, "capabilities", item =>
                 HasString(item, "id")
                 && HasString(item, "displayName")

@@ -46,6 +46,34 @@ function createPythonInstallerManifest(root: string, overrides: Record<string, u
   return { manifestPath, pythonArchive, toolArchive, installer, component };
 }
 
+function createPythonV2InstallerManifest(root: string, packageTrees?: Array<{ source: string; target: string }>) {
+  const base = createPythonInstallerManifest(root);
+  const sourceArchive = Buffer.from('source-archive');
+  const installer = {
+    ...base.installer,
+    kind: 'python_target/v2',
+    source: {
+      source: 'https://example.invalid/source.zip', sha256: sha256(sourceArchive), size: sourceArchive.length,
+      archive: 'zip', maxExtractedBytes: 64 * 1024 * 1024,
+    },
+    packageTrees: packageTrees || [
+      { source: 'source-root/acestep', target: 'acestep' },
+      { source: 'source-root/vendor/nanovllm', target: 'nanovllm' },
+    ],
+  };
+  const component = {
+    ...base.component,
+    sha256: sha256(JSON.stringify(installer)),
+    size: base.pythonArchive.length + base.toolArchive.length
+      + base.installer.requirements.size + sourceArchive.length,
+    installer,
+  };
+  fs.writeFileSync(base.manifestPath, JSON.stringify({
+    protocol: 'cti-speech-managed-dependencies/v2', components: [component],
+  }), 'utf8');
+  return { ...base, installer, component, sourceArchive };
+}
+
 describe('managed speech dependency archive safety', () => {
   it('rejects Zip Slip, absolute, drive and backslash paths', () => {
     for (const candidate of ['../escape.bin', '/absolute.bin', 'C:/escape.bin', 'dir\\escape.bin']) {
@@ -97,9 +125,100 @@ describe('managed speech dependency archive safety', () => {
       }
       assert.equal(statuses.get('cosyvoice')?.state, 'blocked');
       assert.equal(statuses.get('cosyvoice_clone')?.diagnosticCode, 'manifest_incomplete');
-      assert.equal(statuses.get('ace_step_1_5')?.diagnosticCode, 'manifest_incomplete');
+      assert.equal(statuses.get('ace_step_1_5')?.installable, true);
+      assert.equal(statuses.get('ace_step_1_5')?.diagnosticCode, 'component_not_installed');
       assert.equal(statuses.get('ace_step_1_5_models')?.installable, true);
       assert.equal(statuses.get('ace_step_1_5_models')?.state, 'optional_missing');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('installs a v2 Python target from a pinned source archive and copies only declared package trees', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-python-v2-'));
+    const depsRoot = path.join(root, 'deps');
+    const { manifestPath, pythonArchive, toolArchive, sourceArchive } = createPythonV2InstallerManifest(root);
+    try {
+      const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot, undefined, undefined, undefined, {
+        fetchAsset: async ({ targetPath, url }) => fs.writeFileSync(
+          targetPath,
+          url.includes('python') ? pythonArchive : url.includes('source') ? sourceArchive : toolArchive,
+        ),
+        extractZip: async (zipPath, destination) => {
+          if (zipPath.endsWith('download-python.zip')) {
+            for (const [name, value] of [['python.exe', 'python'], ['python312.zip', 'stdlib'], ['python312._pth', 'pth']] as const) {
+              fs.writeFileSync(path.join(destination, name), value);
+            }
+          } else if (zipPath.endsWith('download-tool.zip')) {
+            fs.writeFileSync(path.join(destination, 'uv.exe'), 'uv');
+          } else {
+            fs.mkdirSync(path.join(destination, 'source-root', 'acestep'), { recursive: true });
+            fs.mkdirSync(path.join(destination, 'source-root', 'vendor', 'nanovllm'), { recursive: true });
+            fs.writeFileSync(path.join(destination, 'source-root', 'acestep', '__init__.py'), 'ACE = True\n', 'utf8');
+            fs.writeFileSync(path.join(destination, 'source-root', 'vendor', 'nanovllm', '__init__.py'), 'NANO = True\n', 'utf8');
+          }
+        },
+        runProcess: async (_executable, argv) => argv[0] === 'pip'
+          ? { code: 0, stdout: '', stderr: '' }
+          : { code: 0, stdout: '{"version":[3,12],"cuda_available":true,"cuda_version":"12.8"}\n', stderr: '' },
+      });
+      await manager.install('python_runtime');
+      const installed = manager.resolveInstalledComponent('python_runtime');
+      assert.ok(installed);
+      assert.equal(fs.readFileSync(path.join(installed.root, 'Lib', 'site-packages', 'acestep', '__init__.py'), 'utf8'), 'ACE = True\n');
+      assert.equal(fs.readFileSync(path.join(installed.root, 'Lib', 'site-packages', 'nanovllm', '__init__.py'), 'utf8'), 'NANO = True\n');
+      assert.equal(fs.existsSync(path.join(installed.root, 'Lib', 'site-packages', 'source-root')), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects escaping or overlapping v2 source mappings and cleans a conflicting stage', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-python-v2-invalid-'));
+    try {
+      for (const [name, mappings] of [
+        ['escape', [{ source: '../source', target: 'package' }]],
+        ['overlap', [{ source: 'root/a', target: 'package' }, { source: 'root/b', target: 'package/nested' }]],
+      ] as const) {
+        const invalidRoot = path.join(root, name);
+        const manifest = createPythonV2InstallerManifest(invalidRoot, [...mappings]);
+        assert.throws(
+          () => new ManagedSpeechDependencyManager(manifest.manifestPath, path.join(invalidRoot, 'deps')),
+          /archive_path_unsafe|mapping_overlap/,
+        );
+      }
+
+      const conflictRoot = path.join(root, 'conflict');
+      const { manifestPath, pythonArchive, toolArchive, sourceArchive } = createPythonV2InstallerManifest(conflictRoot);
+      const depsRoot = path.join(conflictRoot, 'deps');
+      const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot, undefined, undefined, undefined, {
+        fetchAsset: async ({ targetPath, url }) => fs.writeFileSync(
+          targetPath,
+          url.includes('python') ? pythonArchive : url.includes('source') ? sourceArchive : toolArchive,
+        ),
+        extractZip: async (zipPath, destination) => {
+          if (zipPath.endsWith('download-python.zip')) {
+            for (const [file, value] of [['python.exe', 'python'], ['python312.zip', 'stdlib'], ['python312._pth', 'pth']] as const) {
+              fs.writeFileSync(path.join(destination, file), value);
+            }
+          } else if (zipPath.endsWith('download-tool.zip')) fs.writeFileSync(path.join(destination, 'uv.exe'), 'uv');
+          else {
+            fs.mkdirSync(path.join(destination, 'source-root', 'acestep'), { recursive: true });
+            fs.mkdirSync(path.join(destination, 'source-root', 'vendor', 'nanovllm'), { recursive: true });
+          }
+        },
+        runProcess: async (_executable, argv) => {
+          if (argv[0] === 'pip') {
+            const target = String(argv[argv.indexOf('--target') + 1]);
+            fs.mkdirSync(path.join(target, 'acestep'), { recursive: true });
+            return { code: 0, stdout: '', stderr: '' };
+          }
+          return { code: 0, stdout: '{"version":[3,12],"cuda_available":true,"cuda_version":"12.8"}\n', stderr: '' };
+        },
+      });
+      await assert.rejects(manager.install('python_runtime'), /python_target_mapping_conflict/);
+      const componentRoot = path.join(depsRoot, 'speech', 'python_runtime');
+      assert.equal(fs.readdirSync(componentRoot).some((name) => name.startsWith('.stage-')), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -340,6 +459,26 @@ describe('managed speech dependency archive safety', () => {
       }), 'utf8');
       const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot);
       assert.equal(manager.listStatuses()[0]?.state, 'ready');
+
+      const originalReadSync = fs.readSync;
+      let contentReads = 0;
+      let largestReadRequest = 0;
+      fs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+        contentReads += 1;
+        if (typeof args[3] === 'number') largestReadRequest = Math.max(largestReadRequest, args[3]);
+        return originalReadSync(...args);
+      }) as typeof fs.readSync;
+      try {
+        assert.equal(manager.listStatuses()[0]?.state, 'ready');
+        assert.ok(largestReadRequest < 1024 * 1024, '状态缓存命中时不得重新读取大模型内容');
+        const cachedStatusReads = contentReads;
+        assert.ok(manager.resolveInstalledComponent(component.id));
+        assert.ok(contentReads > cachedStatusReads && largestReadRequest >= 1024 * 1024,
+          '启动解析必须绕过状态缓存并重新做完整 Hash');
+      } finally {
+        fs.readSync = originalReadSync;
+      }
+
       fs.writeFileSync(path.join(targetRoot, 'weights', 'model.bin'), 'changed', 'utf8');
       assert.equal(manager.listStatuses()[0]?.state, 'optional_missing');
     } finally {

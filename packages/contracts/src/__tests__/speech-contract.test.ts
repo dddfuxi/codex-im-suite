@@ -52,7 +52,7 @@ describe('speech shared contract', () => {
     assert.equal(schema.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(schema.$defs?.SpeechStatusContract?.required, [
       'protocol', 'state', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channels', 'replyPolicy',
-      'deliveryMode', 'asrProvider', 'ttsProvider', 'ttsModel', 'tonePolicy', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
+      'deliveryMode', 'asrProvider', 'ttsProvider', 'ttsModel', 'tonePolicy', 'singingProvider', 'singingBenchmark', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
       'components', 'voiceProfiles', 'limits', 'actions', 'lastCheckedAt',
     ]);
     const statusFields = Object.keys(schema.$defs?.SpeechStatusContract?.properties ?? {});

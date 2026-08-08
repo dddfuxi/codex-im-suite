@@ -146,6 +146,8 @@ export interface SpeechStatusContract {
   ttsModel: SpeechModelSelectionContract;
   tonePolicy: SpeechSelectionContract;
   singingProvider: SpeechSelectionContract;
+  /** 当前歌声模型、受管版本与本机硬件绑定的真实性能门禁。 */
+  singingBenchmark: SpeechModelBenchmarkContract;
   activeVoiceProfileId: string;
   activeSingingVoiceProfileId: string;
   capabilities: SpeechCapabilityContract[];

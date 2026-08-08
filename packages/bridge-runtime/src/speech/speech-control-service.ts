@@ -17,6 +17,7 @@ export const SPEECH_CONTROL_ACTIONS = [
   'speech.installComponent',
   'speech.installPresetVoice',
   'speech.benchmarkTtsModel',
+  'speech.benchmarkSingingModel',
   'speech.importReferenceVoice',
   'speech.previewVoice',
   'speech.previewSingingVoice',
@@ -60,6 +61,11 @@ export class SpeechControlService {
       modelId: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
+    benchmarkSingingVoice?: (input: {
+      text: string;
+      modelId: string;
+      voiceProfileId: string;
+    }) => Promise<SpeechPreviewReceipt>;
     previewSingingVoice?: (input: {
       text: string;
       modelId: string;
@@ -67,6 +73,7 @@ export class SpeechControlService {
     }) => Promise<SpeechPreviewReceipt>;
     benchmarkStore?: SpeechModelBenchmarkStore;
     hardwareId?: string;
+    gpuMemoryMiB?: number;
   }) {}
 
   private refreshStatus(preferLiveSnapshot = true): Promise<SpeechStatusContract> {
@@ -149,6 +156,64 @@ export class SpeechControlService {
           state: 'blocked',
           testedAt: new Date().toISOString(),
           diagnosticCode: error instanceof RuntimeSpeechError ? error.code : 'tts_model_benchmark_failed',
+        });
+      }
+    }
+    else if (action === 'speech.benchmarkSingingModel') {
+      const current = await this.refreshStatus();
+      const benchmarkAction = current.actions.find((item) => item.id === action);
+      const modelId = this.options.config.singingModel;
+      const revision = current.singingBenchmark.revision;
+      const voiceProfileId = this.options.config.singingVoiceProfileId || 'acestep.default';
+      if (!benchmarkAction?.enabled || !this.options.benchmarkSingingVoice
+        || !this.options.benchmarkStore || !this.options.hardwareId || revision === 'uninstalled') {
+        throw new RuntimeSpeechError(
+          benchmarkAction?.diagnosticCode || 'singing_benchmark_unavailable',
+          'blocked',
+          '当前歌声模型尚未由 live Runtime 安全加载，不能执行真实性能测试',
+        );
+      }
+      const startedAt = Date.now();
+      try {
+        const receipt = await this.options.benchmarkSingingVoice({
+          text: '[Verse]\n晚风轻轻经过窗前，我把今天唱成温柔的纪念。',
+          modelId,
+          voiceProfileId,
+        });
+        const warmSynthesisMs = Date.now() - startedAt;
+        const realTimeFactor = warmSynthesisMs / receipt.durationMs;
+        const peakVramMiB = receipt.peakVramMiB;
+        const memoryReady = Number.isFinite(peakVramMiB)
+          && peakVramMiB! > 0
+          && Number.isFinite(this.options.gpuMemoryMiB)
+          && peakVramMiB! <= this.options.gpuMemoryMiB!;
+        const ready = warmSynthesisMs <= 180_000 && memoryReady;
+        this.options.benchmarkStore.write({
+          modelId,
+          providerId: this.options.config.singingProvider,
+          revision,
+          hardwareId: this.options.hardwareId,
+          state: ready ? 'ready' : 'blocked',
+          testedAt: new Date().toISOString(),
+          warmSynthesisMs,
+          outputDurationMs: receipt.durationMs,
+          realTimeFactor,
+          ...(peakVramMiB !== undefined ? { peakVramMiB } : {}),
+          ...(ready ? {} : {
+            diagnosticCode: memoryReady
+              ? 'singing_warm_benchmark_too_slow'
+              : 'singing_vram_benchmark_unavailable_or_exceeded',
+          }),
+        });
+      } catch (error) {
+        this.options.benchmarkStore.write({
+          modelId,
+          providerId: this.options.config.singingProvider,
+          revision,
+          hardwareId: this.options.hardwareId,
+          state: 'blocked',
+          testedAt: new Date().toISOString(),
+          diagnosticCode: error instanceof RuntimeSpeechError ? error.code : 'singing_benchmark_failed',
         });
       }
     }

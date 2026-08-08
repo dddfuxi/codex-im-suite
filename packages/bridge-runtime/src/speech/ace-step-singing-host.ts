@@ -11,6 +11,7 @@ import {
 import { hashFileSha256, validateAudio } from './media-pipeline.js';
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
 import type { SpeechVoiceRegistry } from './voice-registry.js';
+import type { ManagedSingingRuntimeEndpoint } from './managed-singing-runtime-supervisor.js';
 
 export interface RuntimeSingingSynthesisReceipt {
   protocol: 'cti-singing-synthesis/v1';
@@ -22,6 +23,7 @@ export interface RuntimeSingingSynthesisReceipt {
   fileSha256: string;
   validated: true;
   voiceProfileId?: string;
+  peakVramMiB?: number;
 }
 
 interface ManagedSongOutput {
@@ -107,6 +109,9 @@ export class AceStepSingingHost {
     runtimeDepsRoot: string;
     voiceRegistry?: SpeechVoiceRegistry;
     fetchImpl?: FetchLike;
+    managedRuntime?: { ensureRunning(signal?: AbortSignal): Promise<ManagedSingingRuntimeEndpoint> };
+    isBenchmarkVerified?: () => boolean;
+    readGpuMemoryMiB?: () => number | undefined;
     /** 仅用于隔离媒体探针的测试缝；生产默认始终执行真实 ffprobe 门禁。 */
     validateAudioImpl?: typeof validateAudio;
     /** 允许测试缩短轮询间隔，生产默认保持温和的 750ms。 */
@@ -128,15 +133,26 @@ export class AceStepSingingHost {
     return candidate;
   }
 
-  private headers(): Record<string, string> {
-    const token = this.options.config.singingApiToken?.trim();
+  private headers(tokenValue?: string): Record<string, string> {
+    const token = tokenValue?.trim() || this.options.config.singingApiToken?.trim();
     if (!token || token.length < 16) throw new RuntimeSpeechError('singing_api_token_missing', 'blocked', '歌声 Runtime 临时令牌不可用');
     return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
   }
 
-  private async postJson(base: URL, endpoint: string, body: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private async resolveEndpoint(signal?: AbortSignal): Promise<{ base: URL; token: string }> {
+    const configuredUrl = this.options.config.singingApiUrl?.trim();
+    const configuredToken = this.options.config.singingApiToken?.trim();
+    if (configuredUrl || configuredToken) {
+      return { base: requireLoopbackBaseUrl(configuredUrl), token: configuredToken || '' };
+    }
+    if (!this.options.managedRuntime) throw new RuntimeSpeechError('singing_api_not_configured', 'blocked', '歌声 Runtime 尚未配置');
+    const endpoint = await this.options.managedRuntime.ensureRunning(signal);
+    return { base: requireLoopbackBaseUrl(endpoint.baseUrl), token: endpoint.token };
+  }
+
+  private async postJson(base: URL, token: string, endpoint: string, body: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const response = await (this.options.fetchImpl || fetch)(new URL(endpoint, base), {
-      method: 'POST', headers: this.headers(), body: JSON.stringify(body), signal, redirect: 'error',
+      method: 'POST', headers: this.headers(token), body: JSON.stringify(body), signal, redirect: 'error',
     });
     if (!response.ok) throw new Error('singing_api_request_failed');
     const wrapper = safeRecord(await response.json());
@@ -156,9 +172,9 @@ export class AceStepSingingHost {
   async health(signal?: AbortSignal): Promise<{ state: 'ready' | 'blocked'; diagnosticCode?: string }> {
     if (!this.options.config.singingEnabled) return { state: 'blocked', diagnosticCode: 'singing_disabled' };
     try {
-      const base = requireLoopbackBaseUrl(this.options.config.singingApiUrl);
+      const { base, token } = await this.resolveEndpoint(signal);
       const response = await (this.options.fetchImpl || fetch)(new URL('health', base), {
-        headers: this.headers(), signal, redirect: 'error',
+        headers: this.headers(token), signal, redirect: 'error',
       });
       return response.ok ? { state: 'ready' } : { state: 'blocked', diagnosticCode: 'singing_health_failed' };
     } catch (error) {
@@ -171,18 +187,30 @@ export class AceStepSingingHost {
     lyrics: string;
     vocalLanguage: string;
     durationSeconds: number;
+    /** 仅受控 benchmark mailbox 可设置，允许完成首次真实性能门禁。 */
+    benchmarkMode?: boolean;
     scratchDir?: string;
     signal?: AbortSignal;
   }): Promise<RuntimeSingingSynthesisReceipt> {
     if (!this.options.config.singingEnabled) throw new RuntimeSpeechError('singing_disabled', 'blocked', '歌声能力尚未启用');
-    if (!this.options.config.singingBenchmarkPassed) throw new RuntimeSpeechError('singing_benchmark_not_verified', 'blocked', '歌声能力尚未通过本机性能门禁');
+    const benchmarkVerified = this.options.isBenchmarkVerified
+      ? this.options.isBenchmarkVerified()
+      : this.options.config.singingBenchmarkPassed;
+    if (!input.benchmarkMode && !benchmarkVerified) {
+      throw new RuntimeSpeechError('singing_benchmark_not_verified', 'blocked', '歌声能力尚未通过当前模型与本机硬件性能门禁');
+    }
     if (input.durationSeconds < 10 || input.durationSeconds > this.options.config.maxSongDurationSeconds) {
       throw new RuntimeSpeechError('singing_duration_invalid', 'blocked', '歌声时长超过配置上限');
     }
-    const base = requireLoopbackBaseUrl(this.options.config.singingApiUrl);
+    const { base, token } = await this.resolveEndpoint(input.signal);
     const requestSha256 = canonicalRequestSha256(input);
+    let peakVramMiB = this.options.readGpuMemoryMiB?.();
+    const sampleGpu = () => {
+      const current = this.options.readGpuMemoryMiB?.();
+      if (current !== undefined) peakVramMiB = peakVramMiB === undefined ? current : Math.max(peakVramMiB, current);
+    };
     const reference = this.resolveReferenceVoice();
-    const released = await this.postJson(base, 'release_task', {
+    const released = await this.postJson(base, token, 'release_task', {
       prompt: input.prompt,
       lyrics: input.lyrics,
       vocal_language: input.vocalLanguage,
@@ -203,7 +231,8 @@ export class AceStepSingingHost {
     let audioPath = '';
     while (Date.now() < deadline) {
       await sleepWithAbort(this.options.pollIntervalMs ?? 750, input.signal);
-      const queried = await this.postJson(base, 'query_result', { task_id_list: [taskId] }, input.signal);
+      sampleGpu();
+      const queried = await this.postJson(base, token, 'query_result', { task_id_list: [taskId] }, input.signal);
       const entries = Array.isArray(queried.data) ? queried.data : [];
       const task = entries.map(safeRecord).find((item) => item?.task_id === taskId);
       const status = Number(task?.status);
@@ -219,7 +248,7 @@ export class AceStepSingingHost {
     const audioUrl = new URL(audioPath, base);
     if (audioUrl.origin !== base.origin || audioUrl.pathname !== '/v1/audio') throw new Error('singing_audio_url_invalid');
     const response = await (this.options.fetchImpl || fetch)(audioUrl, {
-      headers: this.headers(), signal: input.signal, redirect: 'error',
+      headers: this.headers(token), signal: input.signal, redirect: 'error',
     });
     if (!response.ok) throw new Error('singing_audio_download_failed');
     const media = await readBoundedBody(response, this.options.config.maxInputBytes);
@@ -251,6 +280,7 @@ export class AceStepSingingHost {
         requestSha256,
         fileSha256: hashFileSha256(inspected.path),
         validated: true,
+        ...(peakVramMiB !== undefined ? { peakVramMiB } : {}),
         ...(reference.voiceProfileId ? { voiceProfileId: reference.voiceProfileId } : {}),
       };
       this.managed.set(path.resolve(receipt.path), { outputRoot, requestSha256, fileSha256: receipt.fileSha256 });

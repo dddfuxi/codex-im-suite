@@ -253,6 +253,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
   const compatibleSpeechProfiles = status.voiceProfiles.filter((profile) =>
     profile.capabilities.includes('speech') && profile.compatibleTtsModelIds.includes(draft.ttsModelId));
   const benchmarkModel = getSpeechAction(status, 'speech.benchmarkTtsModel');
+  const benchmarkSingingModel = getSpeechAction(status, 'speech.benchmarkSingingModel');
   const settingsValid = canSaveSpeechSettings(status, draft);
   const canInstallSelectedModel = Boolean(selectedModelComponent
     && canInstallSpeechComponent(selectedModelComponent, installComponent));
@@ -372,6 +373,21 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             else void runAction(benchmarkModel.id, { modelId: status.ttsModel.value });
           }}><Play size={14} />性能测试</button>
         </div>}
+        <div className="speech-diagnostic">
+          <Volume2 size={15} />
+          <span>
+            歌声 benchmark：{status.singingBenchmark.state}
+            {status.singingBenchmark.warmSynthesisMs !== undefined ? ` · 10 秒测试耗时 ${Math.round(status.singingBenchmark.warmSynthesisMs)}ms` : ''}
+            {status.singingBenchmark.peakVramMiB !== undefined ? ` · 峰值显存 ${Math.round(status.singingBenchmark.peakVramMiB)}MiB` : ''}
+          </span>
+          <button className="mini-button" disabled={pending[benchmarkSingingModel.id]} title={benchmarkSingingModel.diagnosticCode || ''} onClick={() => {
+            const blocker = !draft.singingEnabled
+              ? '请先开启并保存歌声合成。'
+              : !benchmarkSingingModel.enabled ? describeSpeechDiagnostic(benchmarkSingingModel.diagnosticCode) : '';
+            if (blocker) showDiagnostic(blocker);
+            else void runAction(benchmarkSingingModel.id);
+          }}><Play size={14} />歌声性能测试</button>
+        </div>
         {status.ttsModel.restartRequired && <div className="speech-diagnostic"><AlertTriangle size={15} /><span>已保存模型尚未由 live Runtime 加载。</span><button className="mini-button" disabled={pending['bridge.restart']} onClick={() => void runAction('bridge.restart')}><RotateCw size={14} />重启 Bridge 并重载</button></div>}
         <div className="command-band dense speech-save-row"><button className="command-button" disabled={pending['speech.saveSettings']} onClick={() => settingsValid ? void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>) : showDiagnostic('当前设置包含 Runtime 未声明或不兼容的选项，请检查渠道、Provider、模型与音色组合。')}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或不兼容；点击保存可查看处理提示。</span>}</div>
       </section>

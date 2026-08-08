@@ -178,18 +178,49 @@ export class SpeechRuntimeStatusService {
     });
     const configuredModelOption = modelOptions.find((item) => item.id === config.ttsModelId);
     const configuredModelBenchmarkReady = configuredModelOption?.benchmark.state === 'ready';
-    const singingManifest = managed.find((item) => item.id === config.singingProvider || item.capabilities.includes('singing'));
+    const singingRuntimeManifest = managed.find((item) => item.id === 'ace_step_1_5');
+    const singingModelManifest = managed.find((item) => item.id === 'ace_step_1_5_models');
+    const singingManifest = singingModelManifest || singingRuntimeManifest
+      || managed.find((item) => item.id === config.singingProvider || item.capabilities.includes('singing'));
+    const singingRevision = singingRuntimeManifest?.state === 'ready' && singingModelManifest?.state === 'ready'
+      ? `${singingRuntimeManifest.version || 'unknown'}.${singingModelManifest.version || 'unknown'}`
+      : 'uninstalled';
+    const storedSingingBenchmark = this.options.benchmarkStore?.find({
+      modelId: config.singingModel,
+      providerId: config.singingProvider,
+      revision: singingRevision,
+      hardwareId,
+    });
+    const singingBenchmark: SpeechModelBenchmarkContract = storedSingingBenchmark
+      ? {
+          state: storedSingingBenchmark.state,
+          revision: storedSingingBenchmark.revision,
+          ...(storedSingingBenchmark.testedAt ? { testedAt: storedSingingBenchmark.testedAt } : {}),
+          ...(storedSingingBenchmark.warmSynthesisMs !== undefined ? { warmSynthesisMs: storedSingingBenchmark.warmSynthesisMs } : {}),
+          ...(storedSingingBenchmark.outputDurationMs !== undefined ? { outputDurationMs: storedSingingBenchmark.outputDurationMs } : {}),
+          ...(storedSingingBenchmark.realTimeFactor !== undefined ? { realTimeFactor: storedSingingBenchmark.realTimeFactor } : {}),
+          ...(storedSingingBenchmark.peakVramMiB !== undefined ? { peakVramMiB: storedSingingBenchmark.peakVramMiB } : {}),
+          ...(storedSingingBenchmark.diagnosticCode ? { diagnosticCode: storedSingingBenchmark.diagnosticCode } : {}),
+        }
+      : {
+          state: singingManifest?.state === 'blocked' || singingManifest?.state === 'error'
+            ? singingManifest.state : 'optional_missing',
+          revision: singingRevision,
+          diagnosticCode: singingManifest?.state === 'ready'
+            ? 'singing_benchmark_not_verified'
+            : singingManifest?.diagnosticCode || 'singing_component_missing',
+        };
     const singingHealth = config.singingEnabled && this.options.singingHost
       ? await this.options.singingHost.health(input.signal)
       : { state: 'blocked' as const, diagnosticCode: config.singingEnabled ? 'singing_host_unavailable' : 'singing_disabled' };
-    const singingReady = singingHealth.state === 'ready' && config.singingBenchmarkPassed;
+    const singingReady = singingHealth.state === 'ready' && singingBenchmark.state === 'ready';
     const singingState: SpeechState = singingReady
       ? 'ready'
       : unavailableCapabilityState(singingHealth.state, singingManifest?.state);
     const singingDiagnostic = singingReady
       ? undefined
       : (singingManifest?.state !== 'ready' ? singingManifest?.diagnosticCode : undefined)
-        || (!config.singingBenchmarkPassed ? 'singing_benchmark_not_verified' : singingHealth.diagnosticCode)
+        || (singingBenchmark.state !== 'ready' ? singingBenchmark.diagnosticCode || 'singing_benchmark_not_verified' : singingHealth.diagnosticCode)
         || 'singing_backend_missing';
 
     const activeCapabilities: Array<{ state: SpeechState; diagnosticCode?: string }> = [];
@@ -291,6 +322,7 @@ export class SpeechRuntimeStatusService {
       singingProvider: selection(config.singingProvider, [
         { id: 'ace_step_1_5', displayName: 'ACE-Step 1.5', state: singingState, enabled: true, ...(singingDiagnostic ? { diagnosticCode: singingDiagnostic } : {}) },
       ]),
+      singingBenchmark,
       activeVoiceProfileId: config.voiceProfileId || '',
       activeSingingVoiceProfileId: config.singingVoiceProfileId || '',
       capabilities: [
@@ -318,6 +350,17 @@ export class SpeechRuntimeStatusService {
           enabled: ttsReady && liveTtsModelId === config.ttsModelId,
           ...(!(ttsReady && liveTtsModelId === config.ttsModelId)
             ? { diagnosticCode: 'tts_model_restart_or_load_required' } : {}),
+        },
+        {
+          id: 'speech.benchmarkSingingModel',
+          label: '测试当前歌声模型',
+          enabled: config.singingEnabled
+            && singingHealth.state === 'ready'
+            && singingRevision !== 'uninstalled'
+            && previewTransportReady,
+          ...(!(config.singingEnabled && singingHealth.state === 'ready'
+            && singingRevision !== 'uninstalled' && previewTransportReady)
+            ? { diagnosticCode: singingHealth.diagnosticCode || singingManifest?.diagnosticCode || 'singing_runtime_not_ready' } : {}),
         },
         { id: 'speech.importReferenceVoice', label: '导入参考音色', enabled: true },
         { id: 'speech.previewVoice', label: '试听音色', enabled: previewEnabled, ...(previewDiagnostic ? { diagnosticCode: previewDiagnostic } : {}) },

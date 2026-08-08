@@ -22,14 +22,16 @@ export const SPEECH_PREVIEW_CONTROL_PROTOCOL = 'cti-speech-preview-control/v2' a
 
 const MAX_REQUEST_FILE_BYTES = 32 * 1024;
 const MAX_RESPONSE_FILE_BYTES = Math.ceil(MAX_SPEECH_PREVIEW_BYTES * 4 / 3) + 64 * 1024;
-const MAX_REQUEST_LIFETIME_MS = 110_000;
+// 普通试听仍由调用方使用短超时；歌声首次加载和 benchmark 需要更长上限。
+// 该上限只约束受限、无路径的本机 mailbox，不放宽媒体或文本门禁。
+const MAX_REQUEST_LIFETIME_MS = 15 * 60_000;
 const STALE_FILE_AGE_MS = 10 * 60_000;
 
 export interface SpeechPreviewControlRequest {
   protocol: typeof SPEECH_PREVIEW_CONTROL_PROTOCOL;
   requestId: string;
   clientNonce: string;
-  action: 'preview_voice' | 'benchmark_voice' | 'preview_singing_voice';
+  action: 'preview_voice' | 'benchmark_voice' | 'preview_singing_voice' | 'benchmark_singing_voice';
   requestedAt: string;
   expiresAt: string;
   input: {
@@ -138,7 +140,8 @@ function validateRequest(
   const expiresAt = typeof request.expiresAt === 'string' ? Date.parse(request.expiresAt) : Number.NaN;
   if (
     request.protocol !== SPEECH_PREVIEW_CONTROL_PROTOCOL
-    || (request.action !== 'preview_voice' && request.action !== 'benchmark_voice' && request.action !== 'preview_singing_voice')
+    || (request.action !== 'preview_voice' && request.action !== 'benchmark_voice'
+      && request.action !== 'preview_singing_voice' && request.action !== 'benchmark_singing_voice')
     || request.requestId !== expectedRequestId
     || !safeOpaqueId(request.requestId)
     || !safeNonce(request.clientNonce)
@@ -268,6 +271,12 @@ export function startSpeechPreviewControlService(options: {
     voiceProfileId: string;
     signal: AbortSignal;
   }) => Promise<SpeechPreviewReceipt>;
+  benchmarkSingingVoice?: (input: {
+    text: string;
+    modelId: string;
+    voiceProfileId: string;
+    signal: AbortSignal;
+  }) => Promise<SpeechPreviewReceipt>;
   pollMs?: number;
   now?: () => Date;
 }): {
@@ -328,6 +337,8 @@ export function startSpeechPreviewControlService(options: {
             try {
               const preview = request.action === 'preview_singing_voice'
                 ? options.previewSingingVoice
+                : request.action === 'benchmark_singing_voice'
+                  ? options.benchmarkSingingVoice
                 : request.action === 'benchmark_voice'
                   ? options.benchmarkVoice
                   : options.previewVoice;
@@ -346,7 +357,7 @@ export function startSpeechPreviewControlService(options: {
                     result,
                     request.input.modelId,
                     request.input.voiceProfileId,
-                    request.action === 'benchmark_voice',
+                    request.action === 'benchmark_voice' || request.action === 'benchmark_singing_voice',
                   ),
                   respondedAt: now().toISOString(),
                 };
@@ -493,7 +504,12 @@ async function requestPreview(input: {
               : '语音试听失败',
           );
         }
-        return validatePreviewReceipt(response.result, input.modelId, input.voiceProfileId, input.action === 'benchmark_voice');
+        return validatePreviewReceipt(
+          response.result,
+          input.modelId,
+          input.voiceProfileId,
+          input.action === 'benchmark_voice' || input.action === 'benchmark_singing_voice',
+        );
       }
       // CLI 通过 Promise 完成后才输出唯一 JSON 回执；这里的等待句柄必须保持
       // 进程存活，否则没有其他活动句柄时 Node 会以退出码 0 静默提前结束。
@@ -547,6 +563,17 @@ export function requestSingingVoicePreview(input: {
   now?: () => Date;
 }): Promise<SpeechPreviewReceipt> {
   return requestPreview({ ...input, action: 'preview_singing_voice' });
+}
+
+export function requestSingingVoiceBenchmark(input: {
+  runtimeStateRoot: string;
+  text: string;
+  modelId: string;
+  voiceProfileId: string;
+  timeoutMs: number;
+  now?: () => Date;
+}): Promise<SpeechPreviewReceipt> {
+  return requestPreview({ ...input, action: 'benchmark_singing_voice' });
 }
 
 export function getSpeechPreviewControlDirectories(runtimeStateRoot: string) {

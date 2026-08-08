@@ -17,6 +17,8 @@ export async function createSingingVoicePreview(input: {
   modelId: string;
   voiceProfileId: string;
   signal?: AbortSignal;
+  benchmarkMode?: boolean;
+  modelRevision?: string;
 }): Promise<SpeechPreviewReceipt> {
   let synthesis: RuntimeSingingSynthesisReceipt | undefined;
   try {
@@ -26,6 +28,7 @@ export async function createSingingVoicePreview(input: {
       vocalLanguage: 'zh',
       durationSeconds: 10,
       signal: input.signal,
+      ...(input.benchmarkMode ? { benchmarkMode: true } : {}),
     });
     if (synthesis.protocol !== 'cti-singing-synthesis/v1'
       || synthesis.mediaType !== 'audio/ogg; codecs=opus'
@@ -54,6 +57,10 @@ export async function createSingingVoicePreview(input: {
       durationMs: synthesis.durationMs,
       modelId: input.modelId,
       voiceProfileId: input.voiceProfileId,
+      ...(input.benchmarkMode ? {
+        modelRevision: input.modelRevision,
+        peakVramMiB: synthesis.peakVramMiB,
+      } : {}),
       validated: true,
     };
   } finally {

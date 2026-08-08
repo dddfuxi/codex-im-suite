@@ -27,7 +27,7 @@ interface ManagedDownloadAsset {
  * Manifest 只能提供数据；argv、探针与目录边界均由 Runtime 固定，
  * 因而不会成为可携带任意命令的包管理旁路。
  */
-interface ManagedPythonTargetInstaller {
+interface ManagedPythonTargetInstallerV1 {
   kind: 'python_target/v1';
   python: ManagedDownloadAsset & { pthFile: string; stdlibZip: string };
   tool: ManagedDownloadAsset;
@@ -39,6 +39,27 @@ interface ManagedPythonTargetInstaller {
   cudaVersion?: string;
   requiredDiskBytes: number;
 }
+
+interface ManagedSourceArchive {
+  source: string;
+  sha256: string;
+  size: number;
+  archive: 'zip';
+  maxExtractedBytes: number;
+}
+
+interface ManagedSourceTreeMapping {
+  source: string;
+  target: string;
+}
+
+interface ManagedPythonTargetInstallerV2 extends Omit<ManagedPythonTargetInstallerV1, 'kind'> {
+  kind: 'python_target/v2';
+  source: ManagedSourceArchive;
+  packageTrees: ManagedSourceTreeMapping[];
+}
+
+type ManagedPythonTargetInstaller = ManagedPythonTargetInstallerV1 | ManagedPythonTargetInstallerV2;
 
 interface ManagedDependencyRecord {
   id: string;
@@ -100,8 +121,9 @@ function readManifest(filePath: string): ManagedDependencyManifest {
       if (item.sha256?.toLowerCase() !== pythonInstallerIdentity(item.installer)) {
         throw new Error('dependency_manifest_installer_identity_invalid');
       }
+      const installerSourceBytes = item.installer.kind === 'python_target/v2' ? item.installer.source.size : 0;
       if (item.fileName !== item.installer.python.entryPoint
-        || item.size !== item.installer.python.size + item.installer.tool.size + item.installer.requirements.size) {
+        || item.size !== item.installer.python.size + item.installer.tool.size + item.installer.requirements.size + installerSourceBytes) {
         throw new Error('dependency_manifest_installer_metadata_invalid');
       }
     }
@@ -267,7 +289,7 @@ function validateDownloadAsset(raw: ManagedDownloadAsset): ManagedDownloadAsset 
 }
 
 function validatePythonTargetInstaller(raw: ManagedPythonTargetInstaller): ManagedPythonTargetInstaller {
-  if (!raw || typeof raw !== 'object' || raw.kind !== 'python_target/v1') {
+  if (!raw || typeof raw !== 'object' || (raw.kind !== 'python_target/v1' && raw.kind !== 'python_target/v2')) {
     throw new Error('dependency_manifest_installer_invalid');
   }
   const pythonAsset = validateDownloadAsset(raw.python);
@@ -283,8 +305,7 @@ function validatePythonTargetInstaller(raw: ManagedPythonTargetInstaller): Manag
     || raw.requiredDiskBytes > 32 * 1024 * 1024 * 1024) {
     throw new Error('dependency_manifest_installer_invalid');
   }
-  return {
-    kind: 'python_target/v1',
+  const common = {
     python: {
       ...pythonAsset,
       pthFile: assertSafeRelativePath(raw.python.pthFile),
@@ -302,6 +323,46 @@ function validatePythonTargetInstaller(raw: ManagedPythonTargetInstaller): Manag
     requireCuda: raw.requireCuda,
     ...(raw.cudaVersion ? { cudaVersion: raw.cudaVersion } : {}),
     requiredDiskBytes: raw.requiredDiskBytes,
+  };
+  if (raw.kind === 'python_target/v1') return { kind: 'python_target/v1', ...common };
+
+  const source = raw.source;
+  if (!source || typeof source !== 'object' || source.archive !== 'zip'
+    || new URL(source.source).protocol !== 'https:'
+    || !/^[a-f0-9]{64}$/i.test(source.sha256 || '')
+    || !Number.isSafeInteger(source.size) || source.size <= 0
+    || !Number.isSafeInteger(source.maxExtractedBytes) || source.maxExtractedBytes < source.size
+    || source.maxExtractedBytes > 2 * 1024 * 1024 * 1024
+    || !Array.isArray(raw.packageTrees) || raw.packageTrees.length === 0 || raw.packageTrees.length > 32) {
+    throw new Error('dependency_manifest_installer_source_invalid');
+  }
+  const sourcePaths = new Set<string>();
+  const targetPaths = new Set<string>();
+  const packageTrees = raw.packageTrees.map((mapping) => {
+    if (!mapping || typeof mapping !== 'object') throw new Error('dependency_manifest_installer_mapping_invalid');
+    const sourcePath = assertSafeRelativePath(mapping.source);
+    const targetPath = assertSafeRelativePath(mapping.target);
+    if (sourcePaths.has(sourcePath) || targetPaths.has(targetPath)) throw new Error('dependency_manifest_installer_mapping_duplicate');
+    for (const existing of targetPaths) {
+      if (targetPath.startsWith(`${existing}/`) || existing.startsWith(`${targetPath}/`)) {
+        throw new Error('dependency_manifest_installer_mapping_overlap');
+      }
+    }
+    sourcePaths.add(sourcePath);
+    targetPaths.add(targetPath);
+    return { source: sourcePath, target: targetPath };
+  });
+  return {
+    kind: 'python_target/v2',
+    ...common,
+    source: {
+      source: source.source,
+      sha256: source.sha256.toLowerCase(),
+      size: source.size,
+      archive: 'zip',
+      maxExtractedBytes: source.maxExtractedBytes,
+    },
+    packageTrees,
   };
 }
 
@@ -329,6 +390,7 @@ export class ManagedSpeechDependencyManager {
   private readonly manifest: ManagedDependencyManifest;
   private readonly manifestRoot: string;
   private readonly operations: ManagedDependencyOperations;
+  private readonly installedStatusCache = new Map<string, { fingerprint: string; installed: boolean }>();
 
   constructor(
     manifestPath: string,
@@ -366,11 +428,31 @@ export class ManagedSpeechDependencyManager {
     });
   }
 
-  private isInstalled(item: ManagedDependencyRecord): boolean {
+  /**
+   * 只释放已通过安装 marker 复验的受管组件位置。
+   * 调用方仍需按自身协议继续验证具体文件，不能把 manifest 路径当作运行授权。
+   */
+  resolveInstalledComponent(componentId: string): { id: string; version: string; root: string; entryPoint: string } | undefined {
+    const item = this.manifest.components.find((candidate) => candidate.id === componentId);
+    // 真正释放可执行/模型路径前始终重新做完整 Hash；状态页缓存不能成为启动授权。
+    if (!item?.version || !this.isInstalled(item, 'full')) return undefined;
+    const root = path.resolve(this.runtimeDepsRoot, 'speech', item.id, item.version);
+    const entryPointRelative = assertSafeRelativePath(item.entryPoint || item.fileName || '');
+    const entryPoint = this.resolveOrdinaryFile(root, entryPointRelative, 'component_entry_point_missing_or_unsafe');
+    return { id: item.id, version: item.version, root, entryPoint };
+  }
+
+  private isInstalled(item: ManagedDependencyRecord, verification: 'cached' | 'full' = 'cached'): boolean {
     if (!item.version) return false;
     const targetRoot = path.join(this.runtimeDepsRoot, 'speech', item.id, item.version);
-    if (item.files?.length) {
-      return readManagedInstallSetMarker(targetRoot, {
+    const cacheKey = `${item.id}\0${item.version}`;
+    const fingerprint = this.computeInstalledMetadataFingerprint(item, targetRoot);
+    if (verification === 'cached' && fingerprint) {
+      const cached = this.installedStatusCache.get(cacheKey);
+      if (cached?.fingerprint === fingerprint) return cached.installed;
+    }
+    const installed = item.files?.length
+      ? readManagedInstallSetMarker(targetRoot, {
         id: item.id,
         version: item.version,
         source: item.source,
@@ -379,9 +461,8 @@ export class ManagedSpeechDependencyManager {
         entryPoint: item.entryPoint,
         manifestSha256: this.computeFileSetHash(item.files),
         totalSize: item.files.reduce((sum, file) => sum + file.size, 0),
-      }) !== null;
-    }
-    return readManagedInstallMarker(targetRoot, {
+      }) !== null
+      : readManagedInstallMarker(targetRoot, {
       id: item.id,
       version: item.version,
       sha256: item.sha256 || undefined,
@@ -391,6 +472,13 @@ export class ManagedSpeechDependencyManager {
       platform: this.runtimePlatform,
       entryPoint: item.fileName || undefined,
     }) !== null;
+    const postVerificationFingerprint = this.computeInstalledMetadataFingerprint(item, targetRoot);
+    if (postVerificationFingerprint) {
+      this.installedStatusCache.set(cacheKey, { fingerprint: postVerificationFingerprint, installed });
+    } else {
+      this.installedStatusCache.delete(cacheKey);
+    }
+    return installed;
   }
 
   async install(componentId: string, signal?: AbortSignal): Promise<void> {
@@ -408,7 +496,7 @@ export class ManagedSpeechDependencyManager {
     const stageRoot = path.join(componentRoot, `.stage-${crypto.randomUUID()}`);
     try {
       if (fs.existsSync(targetRoot)) {
-        if (this.isInstalled(item)) return;
+        if (this.isInstalled(item, 'full')) return;
         throw new Error('component_target_conflict');
       }
       ensureNonSymlinkDirectory(stageRoot);
@@ -506,7 +594,8 @@ export class ManagedSpeechDependencyManager {
     payloadRoot: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (installer.python.size + installer.tool.size > this.maxTotalDownloadBytes) throw new Error('download_total_too_large');
+    const sourceBytes = installer.kind === 'python_target/v2' ? installer.source.size : 0;
+    if (installer.python.size + installer.tool.size + sourceBytes > this.maxTotalDownloadBytes) throw new Error('download_total_too_large');
     this.assertDiskSpace(payloadRoot, installer.requiredDiskBytes);
 
     const requirementsPath = this.resolveBundledRequirements(installer.requirements);
@@ -514,6 +603,9 @@ export class ManagedSpeechDependencyManager {
     const toolArchive = path.join(stageRoot, 'download-tool.zip');
     const toolRoot = path.join(stageRoot, 'tool');
     ensureNonSymlinkDirectory(toolRoot);
+    const sourceArchive = installer.kind === 'python_target/v2' ? path.join(stageRoot, 'download-source.zip') : undefined;
+    const sourceRoot = installer.kind === 'python_target/v2' ? path.join(stageRoot, 'source') : undefined;
+    if (sourceRoot) ensureNonSymlinkDirectory(sourceRoot);
 
     await this.operations.fetchAsset({
       url: installer.python.source,
@@ -533,8 +625,22 @@ export class ManagedSpeechDependencyManager {
       signal,
     });
     this.verifyDownloadedAsset(toolArchive, installer.tool);
+    if (installer.kind === 'python_target/v2' && sourceArchive && sourceRoot) {
+      await this.operations.fetchAsset({
+        url: installer.source.source,
+        targetPath: sourceArchive,
+        expectedSha256: installer.source.sha256,
+        expectedBytes: installer.source.size,
+        maxBytes: this.maxDownloadBytes,
+        signal,
+      });
+      this.verifyDownloadedArchive(sourceArchive, installer.source);
+    }
     await this.operations.extractZip(pythonArchive, payloadRoot, this.maxDownloadBytes);
     await this.operations.extractZip(toolArchive, toolRoot, this.maxDownloadBytes);
+    if (installer.kind === 'python_target/v2' && sourceArchive && sourceRoot) {
+      await this.operations.extractZip(sourceArchive, sourceRoot, installer.source.maxExtractedBytes);
+    }
 
     const pythonPath = this.resolveOrdinaryFile(payloadRoot, installer.python.entryPoint, 'component_entry_point_missing_or_unsafe');
     this.resolveOrdinaryFile(payloadRoot, installer.python.stdlibZip, 'python_stdlib_missing_or_unsafe');
@@ -554,6 +660,9 @@ export class ManagedSpeechDependencyManager {
     const cacheRoot = path.join(stageRoot, 'uv-cache');
     ensureNonSymlinkDirectory(cacheRoot);
     const cleanEnvironment = this.createIsolatedPythonEnvironment(cacheRoot);
+    const cudaWheelIndex = installer.requireCuda && installer.cudaVersion
+      ? `https://download.pytorch.org/whl/cu${installer.cudaVersion.replace('.', '')}`
+      : undefined;
     const installResult = await this.operations.runProcess(uvPath, [
       'pip', 'install',
       '--python', pythonPath,
@@ -561,6 +670,14 @@ export class ManagedSpeechDependencyManager {
       '--no-python-downloads',
       '--no-config',
       '--require-hashes',
+      // CUDA local-version wheel 不在 PyPI；索引地址由受限 cudaVersion 推导，
+      // 不接受 manifest URL 或任意附加 argv，所有 wheel 仍须命中锁文件 Hash。
+      ...(cudaWheelIndex ? [
+        '--index', cudaWheelIndex,
+        // PyPI 与 PyTorch 官方索引会有少量同名基础包。require-hashes 已把
+        // 最终 wheel 身份锁死，因此允许在两个固定可信索引中择优匹配。
+        '--index-strategy', 'unsafe-best-match',
+      ] : []),
       '-r', requirementsPath,
     ], {
       signal,
@@ -568,7 +685,16 @@ export class ManagedSpeechDependencyManager {
       maxOutputBytes: 1024 * 1024,
       env: cleanEnvironment,
     });
-    if (installResult.code !== 0) throw new Error('python_target_install_failed');
+    if (installResult.code !== 0) {
+      this.writeInstallerDiagnostic(item.id, 'install', installResult);
+      throw new Error('python_target_install_failed');
+    }
+
+    if (installer.kind === 'python_target/v2' && sourceRoot) {
+      for (const mapping of installer.packageTrees) {
+        this.copyOrdinaryTree(sourceRoot, mapping.source, sitePackagesPath, mapping.target);
+      }
+    }
 
     const probeScript = [
       'import importlib,json,sys',
@@ -583,7 +709,10 @@ export class ManagedSpeechDependencyManager {
       maxOutputBytes: 256 * 1024,
       env: cleanEnvironment,
     });
-    if (probeResult.code !== 0) throw new Error('python_target_probe_failed');
+    if (probeResult.code !== 0) {
+      this.writeInstallerDiagnostic(item.id, 'probe', probeResult);
+      throw new Error('python_target_probe_failed');
+    }
     const probeLine = probeResult.stdout.trim().split(/\r?\n/).at(-1) || '';
     let probe: { version?: unknown; cuda_available?: unknown; cuda_version?: unknown };
     try {
@@ -621,11 +750,72 @@ export class ManagedSpeechDependencyManager {
     return candidate;
   }
 
+  /** 安装器原始输出只进入本机 Runtime 诊断目录，绝不跨控制面板 DTO 外发。 */
+  private writeInstallerDiagnostic(
+    componentId: string,
+    phase: 'install' | 'probe',
+    result: { code: number; stdout: string; stderr: string },
+  ): void {
+    try {
+      const root = path.resolve(this.runtimeDepsRoot, '..', 'runtime', 'speech', 'install-logs');
+      ensureNonSymlinkDirectory(root);
+      const bounded = (value: string) => value.slice(-64 * 1024);
+      fs.writeFileSync(path.join(root, `${componentId}-${phase}.log`), [
+        `phase=${phase}`,
+        `exitCode=${result.code}`,
+        '--- stdout ---',
+        bounded(result.stdout),
+        '--- stderr ---',
+        bounded(result.stderr),
+        '',
+      ].join('\n'), { encoding: 'utf8', mode: 0o600 });
+    } catch {
+      // 诊断日志属于观察链，不能改变真实安装失败结果。
+    }
+  }
+
   private verifyDownloadedAsset(filePath: string, asset: ManagedDownloadAsset): void {
     const stat = fs.lstatSync(filePath);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('download_file_unsafe');
     if (stat.size !== asset.size) throw new Error('download_size_mismatch');
     if (hashFileSha256Sync(filePath) !== asset.sha256) throw new Error('download_sha256_mismatch');
+  }
+
+  private verifyDownloadedArchive(filePath: string, asset: ManagedSourceArchive): void {
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('download_file_unsafe');
+    if (stat.size !== asset.size) throw new Error('download_size_mismatch');
+    if (hashFileSha256Sync(filePath) !== asset.sha256) throw new Error('download_sha256_mismatch');
+  }
+
+  private copyOrdinaryTree(sourceRoot: string, sourceRelative: string, targetRoot: string, targetRelative: string): void {
+    const source = path.resolve(sourceRoot, ...sourceRelative.split('/'));
+    const target = path.resolve(targetRoot, ...targetRelative.split('/'));
+    if (!isWithinRoot(source, sourceRoot) || !isWithinRoot(target, targetRoot)) throw new Error('component_path_escape');
+    if (fs.existsSync(target)) throw new Error('python_target_mapping_conflict');
+
+    const copyDirectory = (currentSource: string, currentTarget: string): void => {
+      const stat = fs.lstatSync(currentSource);
+      const comparable = (value: string) => process.platform === 'win32'
+        ? path.normalize(value).toLowerCase()
+        : path.normalize(value);
+      if (stat.isSymbolicLink() || !stat.isDirectory()
+        || comparable(fs.realpathSync.native(currentSource)) !== comparable(currentSource)) {
+        throw new Error('python_target_mapping_source_unsafe');
+      }
+      ensureNonSymlinkDirectory(currentTarget);
+      for (const entry of fs.readdirSync(currentSource, { withFileTypes: true })) {
+        const childSource = path.join(currentSource, entry.name);
+        const childTarget = path.join(currentTarget, entry.name);
+        const childStat = fs.lstatSync(childSource);
+        if (childStat.isSymbolicLink()) throw new Error('python_target_mapping_source_unsafe');
+        if (childStat.isDirectory()) copyDirectory(childSource, childTarget);
+        else if (childStat.isFile()) fs.copyFileSync(childSource, childTarget, fs.constants.COPYFILE_EXCL);
+        else throw new Error('python_target_mapping_source_unsafe');
+      }
+    };
+
+    copyDirectory(source, target);
   }
 
   private resolveOrdinaryFile(root: string, relativePath: string, errorCode: string): string {
@@ -662,6 +852,51 @@ export class ManagedSpeechDependencyManager {
   private computeFileSetHash(files: readonly ManagedDependencyFileRecord[]): string {
     const canonical = files.map((file) => [file.path, file.sha256.toLowerCase(), file.size, file.source]);
     return crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+  }
+
+  /**
+   * 状态轮询只缓存完整校验的结果，并绑定 marker 内容及每个声明文件的元数据。
+   * 任一大小、mtime、ctime、文件类型或 realpath 变化都会使缓存失效；执行解析仍走完整 Hash。
+   */
+  private computeInstalledMetadataFingerprint(item: ManagedDependencyRecord, targetRoot: string): string | null {
+    try {
+      const root = path.resolve(targetRoot);
+      const comparable = (value: string) => process.platform === 'win32'
+        ? path.normalize(value).toLowerCase()
+        : path.normalize(value);
+      const rootStat = fs.lstatSync(root, { bigint: true });
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
+        || comparable(fs.realpathSync.native(root)) !== comparable(root)) return null;
+
+      const markerPath = path.join(root, '.installed.json');
+      const markerStat = fs.lstatSync(markerPath, { bigint: true });
+      if (!markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.size > 256n * 1024n
+        || comparable(fs.realpathSync.native(markerPath)) !== comparable(markerPath)) return null;
+      const markerBytes = fs.readFileSync(markerPath);
+      const records: Array<readonly [string, string, string, string]> = [[
+        '.installed.json',
+        markerStat.size.toString(),
+        markerStat.mtimeNs.toString(),
+        crypto.createHash('sha256').update(markerBytes).digest('hex'),
+      ]];
+
+      const declaredFiles = item.files?.length
+        ? item.files.map((file) => ({ path: file.path, size: file.size }))
+        : item.fileName && item.size ? [{ path: item.fileName, size: item.size }] : [];
+      if (declaredFiles.length === 0) return null;
+      for (const declared of declaredFiles) {
+        const relative = assertSafeRelativePath(declared.path);
+        const candidate = path.resolve(root, ...relative.split('/'));
+        if (!isWithinRoot(candidate, root)) return null;
+        const stat = fs.lstatSync(candidate, { bigint: true });
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== BigInt(declared.size)
+          || comparable(fs.realpathSync.native(candidate)) !== comparable(candidate)) return null;
+        records.push([relative, stat.size.toString(), stat.mtimeNs.toString(), stat.ctimeNs.toString()]);
+      }
+      return crypto.createHash('sha256').update(JSON.stringify(records), 'utf8').digest('hex');
+    } catch {
+      return null;
+    }
   }
 
   private assertDiskSpace(targetRoot: string, requiredBytes: number): void {

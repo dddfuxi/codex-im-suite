@@ -36,6 +36,7 @@ internal sealed partial class MainForm
             {
                 modelId = ReadRequiredSpeechString(payload, "modelId"),
             },
+            "speech.benchmarkSingingModel" => new { },
             "speech.previewVoice" or "speech.previewSingingVoice" => new
             {
                 modelId = ReadRequiredSpeechString(payload, "modelId"),

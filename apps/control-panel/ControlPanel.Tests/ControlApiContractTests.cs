@@ -32,6 +32,7 @@ public sealed class ControlApiContractTests
         var speechVoiceType = assembly.GetType("ClaudeToImControlPanel.SpeechVoiceProfileContract");
         var speechLimitsType = assembly.GetType("ClaudeToImControlPanel.SpeechLimitsContract");
         var speechActionType = assembly.GetType("ClaudeToImControlPanel.SpeechActionContract");
+        var speechBenchmarkType = assembly.GetType("ClaudeToImControlPanel.SpeechModelBenchmarkContract");
 
         Assert.NotNull(panelStateType);
         Assert.NotNull(commandType);
@@ -54,6 +55,7 @@ public sealed class ControlApiContractTests
         Assert.NotNull(speechVoiceType);
         Assert.NotNull(speechLimitsType);
         Assert.NotNull(speechActionType);
+        Assert.NotNull(speechBenchmarkType);
 
         var schemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "control-api.schema.json");
         Assert.True(File.Exists(schemaPath), $"共享协议 schema 不存在：{schemaPath}");
@@ -91,6 +93,7 @@ public sealed class ControlApiContractTests
         AssertDtoProperties(speechVoiceType!, speechDefinitions.GetProperty("SpeechVoiceProfileContract"));
         AssertDtoProperties(speechLimitsType!, speechDefinitions.GetProperty("SpeechLimitsContract"));
         AssertDtoProperties(speechActionType!, speechDefinitions.GetProperty("SpeechActionContract"));
+        AssertDtoProperties(speechBenchmarkType!, speechDefinitions.GetProperty("SpeechModelBenchmarkContract"));
     }
 
     private static void AssertDtoProperties(Type dtoType, JsonElement schema)
