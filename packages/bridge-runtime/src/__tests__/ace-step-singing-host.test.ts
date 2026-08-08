@@ -18,6 +18,7 @@ function createFixture(overrides: Record<string, string> = {}) {
     ['CTI_SINGING_BENCHMARK_PASSED', 'true'],
     ['CTI_SINGING_MAX_DURATION_SECONDS', '60'],
     ['CTI_SPEECH_MAX_INPUT_BYTES', '1024'],
+    ['CTI_SPEECH_FFMPEG_PATH', process.execPath],
     ['CTI_SPEECH_FFPROBE_PATH', process.execPath],
     ...Object.entries(overrides),
   ]);
@@ -34,10 +35,16 @@ function songInput() {
   };
 }
 
-function validatedOpus(filePath: string): ValidatedAudio {
+function validatedAudio(filePath: string): ValidatedAudio {
   const stat = fs.statSync(filePath);
   const sha256 = crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
-  return { path: filePath, format: 'ogg', size: stat.size, sha256, durationMs: 10_000, codec: 'opus', channels: 1 };
+  return path.extname(filePath) === '.wav'
+    ? { path: filePath, format: 'wav', size: stat.size, sha256, durationMs: 10_000, codec: 'pcm_s16le', channels: 2 }
+    : { path: filePath, format: 'ogg', size: stat.size, sha256, durationMs: 10_000, codec: 'opus', channels: 1 };
+}
+
+async function transcodeFixture(input: { outputPath: string }): Promise<void> {
+  fs.writeFileSync(input.outputPath, Buffer.from('OggS-safe-opus-fixture', 'ascii'), { flag: 'wx' });
 }
 
 function successfulFetch(calls: Array<{ url: string; init?: RequestInit }>): typeof fetch {
@@ -53,12 +60,12 @@ function successfulFetch(calls: Array<{ url: string; init?: RequestInit }>): typ
         data: [{
           task_id: 'task_12345678',
           status: 1,
-          result: JSON.stringify([{ status: 1, file: '/v1/audio?path=managed-song.opus' }]),
+          result: JSON.stringify([{ status: 1, file: '/v1/audio?path=managed-song.wav' }]),
         }],
       });
     }
     if (url.includes('/v1/audio?')) {
-      return new Response(Buffer.from('OggS-safe-opus-fixture', 'ascii'), { status: 200 });
+      return new Response(Buffer.from('RIFF-safeWAVE-fixture', 'ascii'), { status: 200 });
     }
     throw new Error(`unexpected fetch ${url}`);
   }) as typeof fetch;
@@ -124,7 +131,8 @@ describe('ACE-Step singing host', () => {
         runtimeDepsRoot: path.join(fixture.root, 'runtime-deps'),
         fetchImpl: successfulFetch(calls),
         pollIntervalMs: 1,
-        validateAudioImpl: async ({ filePath }) => validatedOpus(filePath),
+        validateAudioImpl: async ({ filePath }) => validatedAudio(filePath),
+        wavToMonoOpusImpl: transcodeFixture,
       });
       const receipt = await host.synthesizeSong(songInput());
       assert.equal(receipt.protocol, 'cti-singing-synthesis/v1');
@@ -132,7 +140,7 @@ describe('ACE-Step singing host', () => {
       assert.equal(receipt.validated, true);
       assert.equal(fs.existsSync(receipt.path), true);
       const releaseBody = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
-      assert.equal(releaseBody.audio_format, 'opus');
+      assert.equal(releaseBody.audio_format, 'wav');
       assert.equal(releaseBody.batch_size, 1);
       assert.equal(releaseBody.thinking, false);
       assert.equal(releaseBody.use_cot_caption, false);
@@ -142,6 +150,7 @@ describe('ACE-Step singing host', () => {
       assert.equal(releaseBody.prompt, songInput().prompt);
       assert.equal(releaseBody.lyrics, songInput().lyrics);
       assert.ok(calls.every((call) => call.init?.redirect === 'error'));
+      assert.deepEqual(fs.readdirSync(path.dirname(receipt.path)).filter((name) => name.endsWith('.wav')), []);
       host.releaseSynthesis(receipt);
       assert.equal(fs.existsSync(receipt.path), false);
       assert.throws(() => host.releaseSynthesis(receipt), /释放被拒绝/u);
@@ -185,7 +194,7 @@ describe('ACE-Step singing host', () => {
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(Buffer.from('OggS'));
-          controller.enqueue(Buffer.from('-too-large'));
+          controller.enqueue(Buffer.alloc(6 * 1024 * 1024, 0x61));
           controller.close();
         },
       });
@@ -208,7 +217,11 @@ describe('ACE-Step singing host', () => {
       const host = new AceStepSingingHost({
         config: fixture.config, ctiHome: fixture.root, runtimeDepsRoot: path.join(fixture.root, 'runtime-deps'),
         fetchImpl: successfulFetch([]), pollIntervalMs: 1,
-        validateAudioImpl: async ({ filePath }) => ({ ...validatedOpus(filePath), codec: 'vorbis' }),
+        validateAudioImpl: async ({ filePath }) => ({
+          ...validatedAudio(filePath),
+          ...(path.extname(filePath) === '.ogg' ? { codec: 'vorbis' } : {}),
+        }),
+        wavToMonoOpusImpl: transcodeFixture,
       });
       await assert.rejects(host.synthesizeSong(songInput()), /singing_output_not_opus/u);
       const outputRoot = path.join(fixture.root, 'runtime', 'speech', 'singing-output');
@@ -224,7 +237,8 @@ describe('ACE-Step singing host', () => {
       const host = new AceStepSingingHost({
         config: fixture.config, ctiHome: fixture.root, runtimeDepsRoot: path.join(fixture.root, 'runtime-deps'),
         fetchImpl: successfulFetch([]), pollIntervalMs: 1,
-        validateAudioImpl: async ({ filePath }) => validatedOpus(filePath),
+        validateAudioImpl: async ({ filePath }) => validatedAudio(filePath),
+        wavToMonoOpusImpl: transcodeFixture,
       });
       const receipt = await host.synthesizeSong(songInput());
       fs.appendFileSync(receipt.path, 'tampered', 'utf8');

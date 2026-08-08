@@ -96,6 +96,7 @@ describe('managed singing runtime supervisor', () => {
       assert.equal(environment.TRANSFORMERS_OFFLINE, '1');
       assert.equal(environment.ACESTEP_QUEUE_WORKERS, '1');
       assert.equal(environment.ACESTEP_INIT_LLM, 'false');
+      assert.equal(environment.PYTHONIOENCODING, 'utf-8');
       assert.equal(environment.PYTHONNOUSERSITE, '1');
       assert.equal(calls[0].args.includes('--init-llm'), false);
       assert.equal(calls[0].args.includes('--lm-model-path'), false);

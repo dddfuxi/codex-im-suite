@@ -8,7 +8,7 @@ import {
   isWithinRoot,
   resolveExecutableDependency,
 } from './dependency-resolution.js';
-import { hashFileSha256, validateAudio } from './media-pipeline.js';
+import { hashFileSha256, validateAudio, wavToMonoOpus } from './media-pipeline.js';
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
 import type { SpeechVoiceRegistry } from './voice-registry.js';
 import type { ManagedSingingRuntimeEndpoint } from './managed-singing-runtime-supervisor.js';
@@ -76,26 +76,39 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function readBoundedBody(response: Response, maxBytes: number): Promise<Buffer> {
+function maxIntermediateWavBytes(durationSeconds: number, configuredMaxBytes: number): number {
+  // ACE-Step 的稳定本地落盘格式是 WAV。按 48kHz、双声道、32-bit PCM
+  // 估算中间文件上限并保留少量封装余量；最终 Opus 仍服从配置的交付上限。
+  const estimated = Math.ceil(durationSeconds * 48_000 * 2 * 4 * 1.1) + 1024 * 1024;
+  return Math.min(512 * 1024 * 1024, Math.max(configuredMaxBytes, estimated));
+}
+
+async function writeBoundedBody(response: Response, maxBytes: number, targetPath: string): Promise<void> {
   const declaredRaw = response.headers.get('content-length');
   const declared = declaredRaw === null ? Number.NaN : Number(declaredRaw);
   if (Number.isFinite(declared) && declared > maxBytes) throw new Error('singing_output_too_large');
   const reader = response.body?.getReader();
   if (!reader) throw new Error('singing_output_empty');
-  const chunks: Buffer[] = [];
+  const descriptor = fs.openSync(targetPath, 'wx', 0o600);
   let total = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel('singing output too large').catch(() => {});
-      throw new Error('singing_output_too_large');
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel('singing output too large').catch(() => {});
+        throw new Error('singing_output_too_large');
+      }
+      fs.writeSync(descriptor, value);
     }
-    chunks.push(Buffer.from(value));
+    if (total <= 0) throw new Error('singing_output_empty');
+  } catch (error) {
+    try { fs.closeSync(descriptor); } catch { /* 只清理本轮受管文件。 */ }
+    try { fs.unlinkSync(targetPath); } catch { /* 失败产物不可投递。 */ }
+    throw error;
   }
-  if (total <= 0) throw new Error('singing_output_empty');
-  return Buffer.concat(chunks, total);
+  fs.closeSync(descriptor);
 }
 
 export class AceStepSingingHost {
@@ -118,6 +131,8 @@ export class AceStepSingingHost {
     readGpuMemoryMiB?: () => number | undefined;
     /** 仅用于隔离媒体探针的测试缝；生产默认始终执行真实 ffprobe 门禁。 */
     validateAudioImpl?: typeof validateAudio;
+    /** 仅用于隔离转码进程的测试缝；生产默认始终执行受管 FFmpeg。 */
+    wavToMonoOpusImpl?: typeof wavToMonoOpus;
     /** 允许测试缩短轮询间隔，生产默认保持温和的 750ms。 */
     pollIntervalMs?: number;
   }) {
@@ -206,10 +221,18 @@ export class AceStepSingingHost {
     if (input.durationSeconds < 10 || input.durationSeconds > this.options.config.maxSongDurationSeconds) {
       throw new RuntimeSpeechError('singing_duration_invalid', 'blocked', '歌声时长超过配置上限');
     }
-    const stopManagedRuntimeOnAbort = () => this.options.managedRuntime?.stop?.();
+    let managedRuntimeStopped = false;
+    const stopManagedRuntimeOnAbort = () => {
+      if (managedRuntimeStopped) return;
+      managedRuntimeStopped = true;
+      this.options.managedRuntime?.stop?.();
+    };
     if (input.signal?.aborted) stopManagedRuntimeOnAbort();
     else input.signal?.addEventListener('abort', stopManagedRuntimeOnAbort, { once: true });
+    const usesManagedRuntime = !this.options.config.singingApiUrl?.trim()
+      && !this.options.config.singingApiToken?.trim();
     const { base, token } = await this.resolveEndpoint(input.signal);
+    try {
     const requestSha256 = canonicalRequestSha256(input);
     let peakVramMiB = this.options.readGpuMemoryMiB?.();
     const sampleGpu = () => {
@@ -221,7 +244,9 @@ export class AceStepSingingHost {
       prompt: input.prompt,
       lyrics: input.lyrics,
       vocal_language: input.vocalLanguage,
-      audio_format: 'opus',
+      // ACE-Step/torchaudio 在不同平台可用的编码后端不同；稳定要求模型只
+      // 生成 WAV，再由 Suite 受管 FFmpeg 统一转成渠道需要的 Ogg/Opus。
+      audio_format: 'wav',
       audio_duration: input.durationSeconds,
       model: this.options.config.singingModel,
       // Bridge 已经完成风格、歌词、语言和时长的受限裁决；这里使用 ACE-Step
@@ -261,17 +286,41 @@ export class AceStepSingingHost {
       headers: this.headers(token), signal: input.signal, redirect: 'error',
     });
     if (!response.ok) throw new Error('singing_audio_download_failed');
-    const media = await readBoundedBody(response, this.options.config.maxInputBytes);
-
     const outputRoot = this.resolveOutputRoot(input.scratchDir);
+    const sourcePath = path.join(outputRoot, `${crypto.randomUUID()}.wav`);
     const outputPath = path.join(outputRoot, `${crypto.randomUUID()}.ogg`);
-    fs.writeFileSync(outputPath, media, { flag: 'wx', mode: 0o600 });
+    await writeBoundedBody(
+      response,
+      maxIntermediateWavBytes(input.durationSeconds, this.options.config.maxInputBytes),
+      sourcePath,
+    );
     try {
+      const ffmpeg = resolveExecutableDependency({
+        id: 'ffmpeg', displayName: 'FFmpeg', explicitPath: this.options.config.ffmpegPath,
+        runtimeDepsRoot: this.options.runtimeDepsRoot, componentIds: ['ffmpeg_runtime', 'ffmpeg'],
+      });
       const ffprobe = resolveExecutableDependency({
         id: 'ffprobe', displayName: 'ffprobe', explicitPath: this.options.config.ffprobePath,
-        runtimeDepsRoot: this.options.runtimeDepsRoot,
+        runtimeDepsRoot: this.options.runtimeDepsRoot, componentIds: ['ffmpeg_runtime', 'ffprobe'],
       });
+      if (ffmpeg.state !== 'ready' || !ffmpeg.path) throw new RuntimeSpeechError(ffmpeg.diagnosticCode || 'ffmpeg_missing', 'blocked', 'FFmpeg 不可用');
       if (ffprobe.state !== 'ready' || !ffprobe.path) throw new RuntimeSpeechError(ffprobe.diagnosticCode || 'ffprobe_missing', 'blocked', 'ffprobe 不可用');
+      const source = await (this.options.validateAudioImpl || validateAudio)({
+        filePath: sourcePath,
+        ffprobePath: ffprobe.path,
+        maxBytes: maxIntermediateWavBytes(input.durationSeconds, this.options.config.maxInputBytes),
+        maxDurationMs: this.options.config.maxSongDurationSeconds * 1000,
+        timeoutMs: this.options.config.requestTimeoutMs,
+        signal: input.signal,
+      });
+      if (source.format !== 'wav') throw new Error('singing_source_not_wav');
+      await (this.options.wavToMonoOpusImpl || wavToMonoOpus)({
+        ffmpegPath: ffmpeg.path,
+        sourcePath,
+        outputPath,
+        timeoutMs: this.options.config.requestTimeoutMs,
+        signal: input.signal,
+      });
       const inspected = await (this.options.validateAudioImpl || validateAudio)({
         filePath: outputPath,
         ffprobePath: ffprobe.path,
@@ -298,6 +347,14 @@ export class AceStepSingingHost {
     } catch (error) {
       try { fs.unlinkSync(outputPath); } catch { /* 失败产物不可投递。 */ }
       throw error;
+    } finally {
+      try { fs.unlinkSync(sourcePath); } catch { /* 中间 WAV 不进入交付与缓存。 */ }
+    }
+    } finally {
+      input.signal?.removeEventListener('abort', stopManagedRuntimeOnAbort);
+      // 受管 ACE-Step 只在单次歌声动作中占用 GPU；产物已下载到受管目录后
+      // 即释放进程，避免下一次普通 TTS 重建时两个模型同时常驻。
+      if (usesManagedRuntime) stopManagedRuntimeOnAbort();
     }
   }
 

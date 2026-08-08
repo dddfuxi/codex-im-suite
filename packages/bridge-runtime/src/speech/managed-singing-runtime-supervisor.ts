@@ -150,6 +150,7 @@ function createIsolatedEnvironment(input: {
   const cacheRoot = path.join(input.stateRoot, 'cache');
   for (const directory of [tempRoot, cacheRoot]) ensureNonSymlinkDirectory(directory);
   environment.PYTHONUTF8 = '1';
+  environment.PYTHONIOENCODING = 'utf-8';
   environment.PYTHONNOUSERSITE = '1';
   environment.CTI_ACESTEP_STATE_ROOT = input.stateRoot;
   environment.CTI_ACESTEP_MODEL_ROOT = input.modelRoot;
