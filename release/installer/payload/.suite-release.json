@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-09 00:47:25",
-    "releaseRunId":  "6d73e647af854b1fb8bc5fbe90e3344e",
+    "generatedAt":  "2026-08-09 01:04:06",
+    "releaseRunId":  "f9a884a3e28145d48d44898f04c78351",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "cbc04bc",
+                  "commit":  "2ed1107",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,9 +27,9 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "4B16D4AB98C2",
+                  "Hash":  "67E6E2D32D48",
                   "Length":  2254307,
-                  "Modified":  "2026-08-09 00:47:03"
+                  "Modified":  "2026-08-09 01:03:40"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
@@ -43,8 +43,8 @@
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
                     "release.scripts":  "75DE5A74235B",
-                    "docs":  "928918A9C5C8",
-                    "panel.exe":  "4B16D4AB98C2",
+                    "docs":  "A63951503BD0",
+                    "panel.exe":  "67E6E2D32D48",
                     "panel.wwwroot":  "4FE0D71AD3B9"
                 }
 }
