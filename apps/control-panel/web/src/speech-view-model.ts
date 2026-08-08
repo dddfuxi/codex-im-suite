@@ -22,6 +22,14 @@ export type SpeechReferenceVoiceDraft = {
   cleanSingleSpeakerConfirmed: boolean;
 };
 
+export type SpeechFeatureSummary = {
+  id: 'input' | 'output' | 'singing' | 'voice_clone' | 'channel';
+  title: string;
+  detail: string;
+  state: SpeechState;
+  enabled: boolean;
+};
+
 const displayStateMeta: Record<SpeechDisplayState, { label: string; tone: 'ok' | 'warning' | 'error' | 'idle' }> = {
   ready: { label: 'ready', tone: 'ok' },
   optional_missing: { label: 'optional_missing', tone: 'warning' },
@@ -55,6 +63,61 @@ export function createSpeechSettingsDraft(status: SpeechStatusContract): SpeechS
     activeVoiceProfileId: status.activeVoiceProfileId,
     activeSingingVoiceProfileId: status.activeSingingVoiceProfileId,
   };
+}
+
+/** 把 Runtime 的细粒度状态投影成普通用户关心的五项能力，不在面板复制 Provider 规则。 */
+export function getSpeechFeatureSummaries(status: SpeechStatusContract): SpeechFeatureSummary[] {
+  const capability = (id: string, fallback: SpeechState): SpeechState =>
+    status.capabilities.find((item) => item.id === id)?.state ?? fallback;
+  const currentModel = status.ttsModel.options.find((item) => item.id === status.ttsModel.value);
+  const currentVoice = status.voiceProfiles.find((item) => item.id === status.activeVoiceProfileId);
+  const readyCloneModel = status.ttsModel.options.find((item) => item.capabilities.includes('voice_clone') && item.state === 'ready');
+  const selectedChannels = status.channels.filter((item) => item.selected);
+  const channelState: SpeechState = selectedChannels.length > 0 && selectedChannels.every((item) => item.state === 'ready')
+    ? 'ready'
+    : selectedChannels.find((item) => item.state === 'error')?.state
+      ?? selectedChannels.find((item) => item.state === 'blocked')?.state
+      ?? 'optional_missing';
+  const channelNames = selectedChannels.map((item) => item.displayName).join('、');
+
+  return [
+    {
+      id: 'input',
+      title: '听懂语音',
+      detail: status.asrProvider.options.find((item) => item.id === status.asrProvider.value)?.displayName || '未选择识别模型',
+      state: capability('speech.input', status.asrProvider.options.find((item) => item.id === status.asrProvider.value)?.state || 'optional_missing'),
+      enabled: status.inputEnabled,
+    },
+    {
+      id: 'output',
+      title: '语音回复',
+      detail: [currentModel?.displayName, currentVoice?.displayName].filter(Boolean).join(' · ') || '未选择语音模型与音色',
+      state: capability('speech.output', currentModel?.state || 'optional_missing'),
+      enabled: status.outputEnabled,
+    },
+    {
+      id: 'singing',
+      title: '唱歌',
+      detail: status.singingProvider.options.find((item) => item.id === status.singingProvider.value)?.displayName || '未选择歌声模型',
+      state: capability('speech.singing', status.singingBenchmark.state),
+      enabled: status.singingEnabled,
+    },
+    {
+      id: 'voice_clone',
+      title: '克隆音色',
+      detail: readyCloneModel ? `${readyCloneModel.displayName} · 可导入授权录音` : '复刻模型尚未就绪',
+      state: readyCloneModel ? 'ready' : 'optional_missing',
+      // 克隆音色没有独立开关；缺少模型应显示“待安装”，不能误报为用户已关闭。
+      enabled: true,
+    },
+    {
+      id: 'channel',
+      title: '消息渠道',
+      detail: channelNames || '尚未选择渠道',
+      state: channelState,
+      enabled: selectedChannels.length > 0,
+    },
+  ];
 }
 
 /** 保留已有渠道顺序，并以集合语义增删单个 Runtime 声明的 opaque ID。 */

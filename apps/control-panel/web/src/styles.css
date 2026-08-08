@@ -4289,6 +4289,46 @@ button:disabled {
   margin-top: 14px;
 }
 
+.speech-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.speech-feature-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.speech-feature-card > div,
+.speech-quick-title > div,
+.speech-details > summary span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.speech-feature-card small,
+.speech-quick-title small,
+.speech-details > summary small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.speech-feature-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .speech-diagnostic {
   margin-top: 10px;
   padding: 9px 10px;
@@ -4307,8 +4347,67 @@ button:disabled {
 }
 
 .speech-toggle-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-bottom: 14px;
+}
+
+.speech-quick-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) repeat(2, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.speech-quick-card {
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-bg);
+}
+
+.speech-quick-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.speech-preview-button {
+  justify-self: start;
+}
+
+.speech-details {
+  margin-top: 14px;
+}
+
+.speech-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.speech-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.speech-details > summary::after {
+  content: "展开";
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.speech-details[open] > summary::after {
+  content: "收起";
+}
+
+.speech-details-content {
+  margin-top: 14px;
 }
 
 .speech-toggle {
@@ -4472,6 +4571,22 @@ button:disabled {
 }
 
 @media (max-width: 1099px) {
+  .speech-feature-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .speech-toggle-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .speech-quick-grid {
+    grid-template-columns: minmax(220px, 0.75fr) minmax(300px, 1.25fr);
+  }
+
+  .speech-quick-card:last-child {
+    grid-column: 1 / -1;
+  }
+
   .speech-settings-grid,
   .speech-card-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4480,10 +4595,16 @@ button:disabled {
 
 @media (max-width: 759px) {
   .speech-unavailable,
+  .speech-feature-grid,
   .speech-toggle-grid,
+  .speech-quick-grid,
   .speech-settings-grid,
   .speech-card-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .speech-quick-card:last-child {
+    grid-column: auto;
   }
 
   .speech-unavailable {

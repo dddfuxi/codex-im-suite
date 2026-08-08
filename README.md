@@ -241,7 +241,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 - 控制面板从 Runtime Catalog 动态展示 Provider、模型、音色、语气策略、安装状态和模型级 benchmark。四个 Qwen 模型使用固定官方 revision、逐文件 SHA-256 与大小的事务式清单；任一资源未完整校验都不会发布为受管模型。benchmark 绑定模型、revision 与硬件，换模型或换硬件后不会沿用旧结果。
 - 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装受管组件，或显式配置本机依赖路径后，Runtime 才会使用它们。Qwen 独立环境使用固定 CPython 3.12、固定 uv、全哈希 requirements lock 和固定 CUDA 12.8 wheel 集合；安装 argv、环境隔离、版本/CUDA 探针与 stage 发布均由 Runtime 固定，不污染全局 Python，也不允许 manifest 携带任意命令。
 - 这条链路不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`；ST4 和其他外部项目的历史音频缓存不会成为 Bridge 的默认来源。
-- 控制面板可分别选择说话音色和歌声音色，并分别生成普通语音试听与固定 10 秒歌声试听；试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。
+- 控制面板语音页默认汇总“听懂语音、语音回复、唱歌、克隆音色、消息渠道”五项能力，只展开日常开关、模型/音色选择和普通语音/固定 10 秒歌声试听；渠道、Provider、性能门禁、组件诊断、完整音色库和授权参考音频导入收进按需展开区。试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。
 
 模块边界保持单向：
 

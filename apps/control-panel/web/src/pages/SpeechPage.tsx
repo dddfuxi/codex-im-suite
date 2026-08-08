@@ -30,6 +30,7 @@ import {
   describeSpeechDisplayState,
   getSpeechAction,
   getSpeechCommandNotice,
+  getSpeechFeatureSummaries,
   getSpeechPanelDiagnostic,
   updateSpeechChannelIds,
   type SpeechReferenceVoiceDraft,
@@ -257,6 +258,22 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
   const settingsValid = canSaveSpeechSettings(status, draft);
   const canInstallSelectedModel = Boolean(selectedModelComponent
     && canInstallSpeechComponent(selectedModelComponent, installComponent));
+  const readyComponentCount = status.components.filter((component) => component.state === 'ready').length;
+  const featureSummaries = getSpeechFeatureSummaries(status);
+  const selectedSpeechProfile = compatibleSpeechProfiles.find((profile) => profile.id === draft.activeVoiceProfileId)
+    ?? compatibleSpeechProfiles.find((profile) => profile.state === 'ready');
+  const selectTtsModel = (modelId: string) => {
+    const model = status.ttsModel.options.find((item) => item.id === modelId);
+    const currentVoiceCompatible = compatibleSpeechProfiles.some((profile) =>
+      profile.id === draft.activeVoiceProfileId && profile.compatibleTtsModelIds.includes(modelId));
+    setDraft({
+      ...draft,
+      ttsModelId: modelId,
+      ttsProvider: model?.providerId || draft.ttsProvider,
+      activeVoiceProfileId: currentVoiceCompatible ? draft.activeVoiceProfileId : model?.defaultVoiceProfileId || '',
+      tonePolicy: model?.capabilities.includes('instruction_control') ? draft.tonePolicy : 'neutral_stable',
+    });
+  };
 
   return (
     <section className="content-stack speech-page">
@@ -272,22 +289,87 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
         </div>
         {(localError || status.diagnosticCode) && <div className="speech-diagnostic"><AlertTriangle size={15} /><code>{localError || status.diagnosticCode}</code></div>}
         {localNotice && <div className="speech-diagnostic"><RefreshCw size={15} /><span>{localNotice}</span></div>}
-        <div className="summary-grid speech-summary">
-          <article className="metric compact"><span>输入</span><strong>{status.inputEnabled ? '开启' : '关闭'}</strong></article>
-          <article className="metric compact"><span>输出</span><strong>{status.outputEnabled ? '开启' : '关闭'}</strong></article>
-          <article className="metric compact"><span>唱歌</span><strong>{status.singingEnabled ? '开启' : '关闭'}</strong></article>
-          <article className="metric compact"><span>组件</span><strong>{status.components.filter((item) => item.state === 'ready').length}/{status.components.length}</strong></article>
-          <article className="metric compact"><span>音色</span><strong>{status.voiceProfiles.length}</strong></article>
+        <div className="speech-feature-grid">
+          {featureSummaries.map((feature) => {
+            const stateMeta = !feature.enabled
+              ? { label: '已关闭', tone: 'idle' }
+              : feature.state === 'ready'
+                ? { label: '可用', tone: 'ok' }
+                : feature.state === 'optional_missing'
+                  ? { label: '待安装', tone: 'warning' }
+                  : { label: '需处理', tone: 'error' };
+            const FeatureIcon = feature.id === 'input'
+              ? Mic
+              : feature.id === 'output'
+                ? Volume2
+                : feature.id === 'voice_clone'
+                  ? Upload
+                  : feature.id === 'channel'
+                    ? CheckCircle2
+                    : Play;
+            return (
+              <article className="speech-feature-card" key={feature.id}>
+                <FeatureIcon size={19} />
+                <div><strong>{feature.title}</strong><small>{feature.detail}</small></div>
+                <span className={`status-pill ${stateMeta.tone}`}>{stateMeta.label}</span>
+              </article>
+            );
+          })}
         </div>
       </section>
 
       <section className="panel">
-        <div className="section-header"><div><h2>输入与输出策略</h2><p className="panel-intro">保存时只提交当前 Runtime 已声明的 opaque ID。</p></div></div>
+        <div className="section-header"><div><h2>常用设置</h2><p className="panel-intro">日常只需要开关功能、选择模型和音色，然后试听并保存。</p></div></div>
         <div className="speech-toggle-grid">
           <label className="speech-toggle"><Mic size={18} /><span><strong>语音输入</strong><small>允许渠道音频进入 ASR。</small></span><input type="checkbox" checked={draft.inputEnabled} onChange={(event) => setDraft({ ...draft, inputEnabled: event.target.checked })} /></label>
           <label className="speech-toggle"><Volume2 size={18} /><span><strong>语音输出</strong><small>允许受控 TTS 生成语音回复。</small></span><input type="checkbox" checked={draft.outputEnabled} onChange={(event) => setDraft({ ...draft, outputEnabled: event.target.checked })} /></label>
           <label className="speech-toggle"><Volume2 size={18} /><span><strong>歌声合成</strong><small>只使用独立 SingingHost，不以 TTS 冒充唱歌。</small></span><input type="checkbox" checked={draft.singingEnabled} onChange={(event) => setDraft({ ...draft, singingEnabled: event.target.checked })} /></label>
         </div>
+        <div className="speech-quick-grid">
+          <article className="speech-quick-card">
+            <div className="speech-quick-title"><Mic size={18} /><div><strong>收到语音</strong><small>识别后交给 Agent，并按会话策略回复。</small></div></div>
+            <SelectionField label="回复方式" selection={status.replyPolicy} value={draft.replyPolicy} onChange={(value) => setDraft({ ...draft, replyPolicy: value })} />
+          </article>
+          <article className="speech-quick-card">
+            <div className="speech-quick-title"><Volume2 size={18} /><div><strong>说话与试听</strong><small>选择模型、语气和音色。</small></div></div>
+            <label className="speech-field"><span>语音模型</span><select value={draft.ttsModelId} disabled={!draft.outputEnabled} onChange={(event) => selectTtsModel(event.target.value)}>{status.ttsModel.options.map((model) => <option key={model.id} value={model.id} disabled={!model.enabled}>{model.displayName} · {model.state}</option>)}</select></label>
+            <label className="speech-field"><span>说话音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">当前模型默认音色</option>{compatibleSpeechProfiles.map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
+            <SelectionField label="语气" selection={status.tonePolicy} value={draft.tonePolicy} disabled={!draft.outputEnabled} onChange={(value) => setDraft({ ...draft, tonePolicy: value })} />
+            <label className="speech-field"><span>试听文本</span><input value={previewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setPreviewText(event.target.value)} /></label>
+            <button className="mini-button speech-preview-button" disabled={!selectedSpeechProfile || pending['speech.previewVoice']} onClick={() => {
+              const action = getSpeechAction(status, 'speech.previewVoice');
+              const blocker = !previewText.trim()
+                ? '请先填写试听文本。'
+                : !selectedSpeechProfile
+                  ? '当前模型没有可试听的音色。'
+                  : selectedSpeechProfile.state !== 'ready'
+                    ? describeSpeechDiagnostic(selectedSpeechProfile.diagnosticCode)
+                    : !action.enabled ? describeSpeechDiagnostic(action.diagnosticCode) : '';
+              if (blocker) showDiagnostic(blocker);
+              else void previewVoice(selectedSpeechProfile!);
+            }}><Play size={14} />试听当前音色</button>
+          </article>
+          <article className="speech-quick-card">
+            <div className="speech-quick-title"><Play size={18} /><div><strong>唱歌与试听</strong><small>歌声模型独立运行，不使用普通 TTS。</small></div></div>
+            <label className="speech-field"><span>歌声音色</span><select value={draft.activeSingingVoiceProfileId} disabled={!draft.singingEnabled} onChange={(event) => setDraft({ ...draft, activeSingingVoiceProfileId: event.target.value })}><option value="">ACE-Step 默认歌声音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('singing')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
+            <label className="speech-field"><span>试听歌词（固定 10 秒）</span><input value={singingPreviewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setSingingPreviewText(event.target.value)} /></label>
+            <button className="mini-button speech-preview-button" disabled={pending['speech.previewSingingVoice']} onClick={() => {
+              const action = getSpeechAction(status, 'speech.previewSingingVoice');
+              const blocker = !singingPreviewText.trim() ? '请先填写歌声试听歌词。' : !action.enabled ? describeSpeechDiagnostic(action.diagnosticCode) : '';
+              if (blocker) showDiagnostic(blocker);
+              else void previewSingingVoice();
+            }}><Play size={14} />试听歌声</button>
+          </article>
+        </div>
+        {previewPlayback && (
+          <div className="speech-preview-player">
+            <strong>{previewPlayback.profileName}</strong>
+            <audio controls autoPlay src={previewPlayback.url}>当前 WebView 不支持音频播放。</audio>
+          </div>
+        )}
+        <details className="speech-details speech-advanced-settings">
+          <summary><span><strong>高级设置与性能诊断</strong><small>渠道、Provider、限制值、benchmark 和安装入口</small></span></summary>
+          <div className="speech-details-content">
         <div className="speech-settings-grid">
           <fieldset className="speech-field speech-channel-field">
             <legend>渠道（可多选）</legend>
@@ -320,7 +402,6 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
                 </div>
               )}
           </fieldset>
-          <SelectionField label="回复策略" selection={status.replyPolicy} value={draft.replyPolicy} onChange={(value) => setDraft({ ...draft, replyPolicy: value })} />
           <SelectionField label="交付模式" selection={status.deliveryMode} value={draft.deliveryMode} onChange={(value) => setDraft({ ...draft, deliveryMode: value })} />
           <SelectionField label="ASR Provider" selection={status.asrProvider} value={draft.asrProvider} disabled={!draft.inputEnabled || !selectedChannelsSupportInput} onChange={(value) => setDraft({ ...draft, asrProvider: value })} />
           <SelectionField label="TTS Provider" selection={status.ttsProvider} value={draft.ttsProvider} disabled={!draft.outputEnabled || !selectedChannelsSupportOutput} onChange={(value) => {
@@ -333,21 +414,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
               tonePolicy: model?.capabilities.includes('instruction_control') ? draft.tonePolicy : 'neutral_stable',
             });
           }} />
-          <label className="speech-field"><span>TTS 模型</span><select value={draft.ttsModelId} disabled={!draft.outputEnabled} onChange={(event) => {
-            const model = status.ttsModel.options.find((item) => item.id === event.target.value);
-            const currentVoiceCompatible = compatibleSpeechProfiles.some((profile) => profile.id === draft.activeVoiceProfileId && profile.compatibleTtsModelIds.includes(event.target.value));
-            setDraft({
-              ...draft,
-              ttsModelId: event.target.value,
-              ttsProvider: model?.providerId || draft.ttsProvider,
-              activeVoiceProfileId: currentVoiceCompatible ? draft.activeVoiceProfileId : model?.defaultVoiceProfileId || '',
-              tonePolicy: model?.capabilities.includes('instruction_control') ? draft.tonePolicy : 'neutral_stable',
-            });
-          }}>{status.ttsModel.options.map((model) => <option key={model.id} value={model.id} disabled={!model.enabled}>{model.displayName} · {model.state}</option>)}</select></label>
-          <SelectionField label="语气策略" selection={status.tonePolicy} value={draft.tonePolicy} disabled={!draft.outputEnabled} onChange={(value) => setDraft({ ...draft, tonePolicy: value })} />
           <SelectionField label="Singing Provider" selection={status.singingProvider} value={draft.singingProvider} disabled={!draft.singingEnabled || !selectedChannelsSupportOutput} onChange={(value) => setDraft({ ...draft, singingProvider: value })} />
-          <label className="speech-field"><span>说话音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">当前模型默认音色</option>{compatibleSpeechProfiles.map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
-          <label className="speech-field"><span>歌声音色</span><select value={draft.activeSingingVoiceProfileId} disabled={!draft.singingEnabled} onChange={(event) => setDraft({ ...draft, activeSingingVoiceProfileId: event.target.value })}><option value="">ACE-Step 默认歌声音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('singing')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
         </div>
         <div className="speech-limit-row">
           <span>输入上限 {status.limits.maxInputBytes.toLocaleString()} bytes</span>
@@ -388,12 +455,15 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             else void runAction(benchmarkSingingModel.id);
           }}><Play size={14} />歌声性能测试</button>
         </div>
+          </div>
+        </details>
         {status.ttsModel.restartRequired && <div className="speech-diagnostic"><AlertTriangle size={15} /><span>已保存模型尚未由 live Runtime 加载。</span><button className="mini-button" disabled={pending['bridge.restart']} onClick={() => void runAction('bridge.restart')}><RotateCw size={14} />重启 Bridge 并重载</button></div>}
         <div className="command-band dense speech-save-row"><button className="command-button" disabled={pending['speech.saveSettings']} onClick={() => settingsValid ? void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>) : showDiagnostic('当前设置包含 Runtime 未声明或不兼容的选项，请检查渠道、Provider、模型与音色组合。')}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或不兼容；点击保存可查看处理提示。</span>}</div>
       </section>
 
-      <section className="panel">
-        <div className="section-header"><div><h2>组件与能力</h2><p className="panel-intro">安装入口仅在 Runtime 显式开放对应 action 时启用。</p></div></div>
+      <details className="panel speech-details">
+        <summary><span><strong>组件与故障排查</strong><small>模型、Runtime、安装状态和诊断码</small></span><span>{readyComponentCount}/{status.components.length} ready</span></summary>
+        <div className="speech-details-content">
         {status.components.length === 0 ? <div className="empty-inline">Runtime 未返回组件。</div> : <div className="speech-card-grid">{status.components.map((component) => (
           <article className="speech-card" key={component.id}>
             <div className="speech-card-head"><div><strong>{component.displayName}</strong><small>{component.kind}{component.version ? ` · ${component.version}` : ''}</small></div><span className={`status-pill ${describeSpeechDisplayState({ available: true, status: { ...status, state: component.state } }).tone}`}>{component.state}</span></div>
@@ -403,26 +473,12 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             {!component.installable && component.state !== 'ready' && <button className="mini-button" onClick={() => showDiagnostic(describeSpeechDiagnostic(component.diagnosticCode))}><AlertTriangle size={14} />查看处理方法</button>}
           </article>
         ))}</div>}
-      </section>
-
-      <section className="panel">
-        <div className="section-header"><div><h2>音色 Profile</h2><p className="panel-intro">状态只展示授权与来源标签，不展示参考音频、转写、文件路径或密钥。</p></div></div>
-        <label className="speech-field speech-preview-text"><span>试听文本</span><input value={previewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setPreviewText(event.target.value)} /></label>
-        <div className="speech-singing-preview">
-          <label className="speech-field speech-preview-text"><span>歌声试听歌词（固定 10 秒）</span><input value={singingPreviewText} maxLength={status.limits.maxPreviewCharacters} onChange={(event) => setSingingPreviewText(event.target.value)} /></label>
-          <button className="mini-button" disabled={pending['speech.previewSingingVoice']} title={getSpeechAction(status, 'speech.previewSingingVoice').diagnosticCode || ''} onClick={() => {
-            const action = getSpeechAction(status, 'speech.previewSingingVoice');
-            const blocker = !singingPreviewText.trim() ? '请先填写歌声试听歌词。' : !action.enabled ? describeSpeechDiagnostic(action.diagnosticCode) : '';
-            if (blocker) showDiagnostic(blocker);
-            else void previewSingingVoice();
-          }}><Play size={14} />试听歌声</button>
         </div>
-        {previewPlayback && (
-          <div className="speech-preview-player">
-            <strong>{previewPlayback.profileName}</strong>
-            <audio controls autoPlay src={previewPlayback.url}>当前 WebView 不支持音频播放。</audio>
-          </div>
-        )}
+      </details>
+
+      <details className="panel speech-details">
+        <summary><span><strong>音色库</strong><small>查看全部预设与授权音色</small></span><span>{status.voiceProfiles.length} 个</span></summary>
+        <div className="speech-details-content">
         {status.voiceProfiles.length === 0 ? <div className="empty-inline">Runtime 未返回音色 Profile。</div> : <div className="speech-card-grid">{status.voiceProfiles.map((profile) => (
           <article className="speech-card" key={profile.id}>
             <div className="speech-card-head"><div><strong>{profile.displayName}</strong><small>{profile.kind === 'preset' ? '预设音色' : '授权参考音色'} · {profile.sourceLabel}</small></div><span className={`status-pill ${profile.state === 'ready' ? 'ok' : profile.state === 'optional_missing' ? 'warning' : 'error'}`}>{profile.state}</span></div>
@@ -431,10 +487,13 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
             <VoiceProfileActions profile={profile} status={status} previewText={previewText} runAction={runAction} previewVoice={previewVoice} showDiagnostic={showDiagnostic} pending={pending} />
           </article>
         ))}</div>}
-      </section>
+        </div>
+      </details>
 
-      <section className="panel">
-        <div className="section-header"><div><h2>导入授权参考音频</h2><p className="panel-intro">点击导入后由本机控制面板打开音频选择器；浏览器 payload 不接收或回显绝对路径。</p></div></div>
+      <details className="panel speech-details">
+        <summary><span><strong>添加克隆音色</strong><small>导入本人或明确授权的 3–30 秒单人录音</small></span></summary>
+        <div className="speech-details-content">
+        <p className="panel-intro">点击导入后由本机控制面板打开音频选择器；浏览器 payload 不接收或回显绝对路径。</p>
         <div className="speech-settings-grid">
           <label className="speech-field"><span>Profile 名称</span><input value={referenceVoice.displayName} onChange={(event) => setReferenceVoice({ ...referenceVoice, displayName: event.target.value })} /></label>
           <label className="speech-field"><span>来源标签</span><input value={referenceVoice.sourceLabel} onChange={(event) => setReferenceVoice({ ...referenceVoice, sourceLabel: event.target.value })} /></label>
@@ -450,7 +509,8 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
           if (blocker) showDiagnostic(blocker);
           else void runAction(importReference.id, referenceVoice as unknown as Record<string, unknown>);
         }}><Upload size={15} />选择并导入参考音频</button>
-      </section>
+        </div>
+      </details>
     </section>
   );
 }

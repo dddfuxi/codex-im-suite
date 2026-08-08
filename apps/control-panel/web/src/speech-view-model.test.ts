@@ -11,6 +11,7 @@ import {
   describeSpeechDisplayState,
   getSpeechAction,
   getSpeechCommandNotice,
+  getSpeechFeatureSummaries,
   getSpeechPanelDiagnostic,
   updateSpeechChannelIds,
 } from './speech-view-model.js';
@@ -70,6 +71,39 @@ describe('speech view model', () => {
     assert.deepEqual(updateSpeechChannelIds(draft.channelIds, 'channel-b', true), ['feishu', 'channel-b']);
     assert.equal(canSaveSpeechSettings(status, draft), true);
     assert.equal(canSaveSpeechSettings(status, { ...draft, ttsProvider: 'invented-provider' }), false);
+  });
+
+  it('summarizes user-facing speech capabilities without inventing providers', () => {
+    const status: SpeechStatusContract = {
+      ...readyStatus,
+      singingEnabled: true,
+      singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'ready', enabled: true }] },
+      singingBenchmark: { state: 'ready', revision: 'singing-revision' },
+      capabilities: [
+        { id: 'speech.input', displayName: '输入', state: 'ready', supported: true },
+        { id: 'speech.output', displayName: '输出', state: 'ready', supported: true },
+        { id: 'speech.singing', displayName: '唱歌', state: 'ready', supported: true },
+      ],
+      ttsModel: {
+        ...readyStatus.ttsModel,
+        options: [
+          ...readyStatus.ttsModel.options,
+          {
+            id: 'clone-a', displayName: '复刻模型 A', state: 'ready', enabled: true, providerId: 'tts-a',
+            variant: 'base', sizeLabel: '0.6B', componentId: 'clone-a', capabilities: ['voice_clone'],
+            defaultVoiceProfileId: '', benchmark: { state: 'ready', revision: 'clone-revision' },
+          },
+        ],
+      },
+    };
+    const summaries = getSpeechFeatureSummaries(status);
+    assert.deepEqual(summaries.map((item) => item.title), ['听懂语音', '语音回复', '唱歌', '克隆音色', '消息渠道']);
+    assert.equal(summaries.find((item) => item.id === 'voice_clone')?.state, 'ready');
+    assert.match(summaries.find((item) => item.id === 'output')?.detail || '', /模型 A/u);
+    assert.equal(getSpeechFeatureSummaries({ ...status, inputEnabled: false })[0]?.enabled, false);
+    const missingClone = getSpeechFeatureSummaries(readyStatus).find((item) => item.id === 'voice_clone');
+    assert.equal(missingClone?.state, 'optional_missing');
+    assert.equal(missingClone?.enabled, true);
   });
 
   it('fails closed when an action was not declared by Runtime', () => {
