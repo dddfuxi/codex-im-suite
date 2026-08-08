@@ -1845,7 +1845,7 @@ live skill 同步时，`scripts/sync-live-skill.ps1` 会先构建 `packages/brid
 
 其中 MCP / Skill / Plugin 扩展清单必须从开发版唯一来源 `config/mcp.d`、`config/skills.d`、`config/plugins.d` 复制到 live skill 顶层的 `mcp.d`、`skills.d`、`plugins.d`，工具动作清单必须从 `config/action-manifests.d` 复制到 live skill 的 `config\action-manifests.d`，供运行版控制面板在脱离 suiteRoot 时读取。同步脚本会清理 live 内置旧 `config\local-agent-tools.d`。发布指纹和 `test-release-fork-health.ps1` 会按逻辑 manifest 命名空间统计 extension / runtime / action 清单；开发版、portable 和 installer 使用 `config/*.d` 布局，live runtime 的顶层 `mcp.d` / `skills.d` / `plugins.d` 会规范化为同一逻辑路径后参与 hash，避免发布健康检查漏掉清单漂移。不要从旧 `packages/bridge-runtime/mcp.d` 或旧本地工具目录恢复运行版清单。
 
-控制面板 EXE 禁止由 .NET SDK 把当前 Git HEAD 自动拼进 `InformationalVersion`；提交与分支身份只由受控 `.suite-release.json` 记录。这样同一源码在 release-only 提交前后保持可复现 Hash，避免“提交产物改变 HEAD、HEAD 又改变 EXE、live 与 portable 永久互相追赶”的发布循环；fork-health 仍必须同时核对 EXE、Web bundle、Runtime 和发布指纹，不能用关闭源码 revision 嵌入来弱化发布门禁。
+控制面板 EXE 禁止由 .NET SDK 把当前 Git HEAD 自动拼进 `InformationalVersion` 或 SourceLink/PDB 调试标识；提交与分支身份只由受控 `.suite-release.json` 记录。项目同时关闭 `IncludeSourceRevisionInInformationalVersion` 与 `EnableSourceLink`，使同一源码在 release-only 提交前后保持可复现 Hash，避免“提交产物改变 HEAD、HEAD 又改变 EXE、live 与 portable 永久互相追赶”的发布循环；fork-health 仍必须同时核对 EXE、Web bundle、Runtime 和发布指纹，不能用关闭源码 revision 嵌入来弱化发布门禁。
 
 同步控制面板发布目录时必须排除 `CodexImSuiteControlPanel.exe.WebView2` 用户数据目录，避免 WebView2 Cookie/Cache 临时文件被 robocopy 镜像到 live skill。
 
