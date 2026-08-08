@@ -261,7 +261,7 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 
 控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
 
-截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8、Qwen 独立 Python/CUDA Runtime、Qwen3-TTS 1.7B/0.6B CustomVoice 和 0.6B Base；live 当前加载 `0.6B CustomVoice + Serena`，面板普通语音试听已真实播放。0.6B Base 只表示克隆模型文件已就绪，没有用户授权参考音频、当前组合 benchmark 和 live 切换证据时仍不能执行克隆。ACE-Step 的 Turbo/Embedding/VAE/0.6B LM 已在开发版形成 25 个文件、约 7.71GB 的固定 revision/大小/SHA-256 清单，但独立 Runtime 尚无满足安全门禁的固定安装资产，歌声继续 `blocked / manifest_incomplete`，也不会首条消息自动下载。RTX 3070 上两种 CustomVoice 均未达到 20 秒性能目标，重启后真实飞书新语音端到端也未验收；在这些证据齐全前，不应把可试听或模型安装结果描述为现场机器人已具备完整语音、克隆或歌声能力。
+截至 2026-08-08，本机已通过显式受管安装取得 FFmpeg/ffprobe、SenseVoice Runtime/Q8、Qwen 独立 Python/CUDA Runtime、Qwen3-TTS 1.7B/0.6B CustomVoice、0.6B Base，以及 ACE-Step 1.5 独立 Runtime 与固定歌声模型集合。ACE Runtime 使用 CPython 3.11、固定 uv、仓库内全哈希 lock、固定官方源码 ZIP、声明式包树复制和 CUDA 12.8 探针；live Bridge 只在启用歌声后启动绑定 `127.0.0.1` 的单 Worker，并为每次进程生成不落盘的临时令牌。面板新增独立歌声 benchmark 动作，固定生成 10 秒中文片段并按模型 revision、硬件 Hash、耗时、输出时长和 `nvidia-smi` 实测峰值显存记录门禁；首次 benchmark 可运行，但普通歌声试听仍必须等待该记录为 `ready`。本机依赖安装成功不等于 live 已加载或性能通过；RTX 3070 歌声 benchmark、同步/新 PID/长连接/hash 和重启后真实飞书新消息仍需现场验收。0.6B Base 也仍需用户授权参考音频与当前组合 benchmark，不能把模型文件存在描述为克隆完成。
 
 ## 当前运行模型
 

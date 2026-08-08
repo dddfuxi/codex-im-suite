@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "codex-im-suite/release-fingerprint/v1",
-    "generatedAt":  "2026-08-08 20:49:45",
-    "releaseRunId":  "6e8c4a1f9c994d78b6fb89fa905595f8",
+    "generatedAt":  "2026-08-08 22:37:28",
+    "releaseRunId":  "5f6577ac3e344ade972f196cf40a1f5d",
     "targetName":  "installer payload",
     "targetRole":  "generated installer payload",
     "suite":  {
@@ -9,7 +9,7 @@
                   "version":  "0.4.0",
                   "extensionProtocol":  "extension-manifest/v1",
                   "branch":  "codex/agent-collaboration-card-live",
-                  "commit":  "bc2afde",
+                  "commit":  "4da77cb",
                   "dirty":  true
               },
     "manifest":  {
@@ -27,13 +27,13 @@
     "panel":  {
                   "Path":  "C:\\Users\\admin\\Documents\\New project\\codex-im-suite\\release\\installer\\payload\\CodexImSuiteControlPanel.exe",
                   "Exists":  true,
-                  "Hash":  "7EAC86472DB9",
+                  "Hash":  "50ABED83D831",
                   "Length":  2254307,
-                  "Modified":  "2026-08-08 20:41:12"
+                  "Modified":  "2026-08-08 22:37:02"
               },
     "content":  {
                     "runtime.package":  "DCA0B504B590",
-                    "runtime.dist":  "2C50A89A4303",
+                    "runtime.dist":  "3701980454CA",
                     "runtime.scripts":  "095079B2A6B2",
                     "runtime.configExample":  "4D54ACC8AD1B",
                     "runtime.skill":  "673DF1F96A84",
@@ -43,8 +43,8 @@
                     "config.manifests":  "23A4B67737D5",
                     "extensions.skills":  "10C132A894D3",
                     "release.scripts":  "87953C3590F1",
-                    "docs":  "7A8FA11F7509",
-                    "panel.exe":  "7EAC86472DB9",
-                    "panel.wwwroot":  "08502AD36837"
+                    "docs":  "402CAD3FF28B",
+                    "panel.exe":  "50ABED83D831",
+                    "panel.wwwroot":  "4FE0D71AD3B9"
                 }
 }

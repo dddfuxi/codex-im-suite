@@ -662,7 +662,7 @@ flowchart LR
 | 层 | 稳定职责 |
 |---|---|
 | `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS/歌声合成，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
-| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 只接受 `127.0.0.1` HTTP、Bearer token、禁止重定向，并在本机 benchmark 通过后才允许生成。 |
+| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 受管 Supervisor 只由 live Bridge 持有，固定绑定 `127.0.0.1`、单 Worker、离线模型根和每次启动随机临时 Bearer token，CLI 只经认证 mailbox 调用，不会刷新一次就启动第二个模型进程。普通生成必须命中当前模型 revision 与硬件 Hash 的 ready benchmark。 |
 | `apps/control-panel` | C# 只维护无业务规则的薄 DTO、手工 wire 形状/媒体校验，并由反射测试逐字段核对 JSON Schema；React 只消费浏览器安全的共享 Contract。“能力 → 语音”页分别展示和试听说话/歌声音色，通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
 
 回复策略不再扫描自然语言关键词。`/voice off` 是绝对硬禁用，`/voice on` 是确定性会话开启；其余自然语言请求只能由 Primary 在 `cti-final.speech` 中返回受限 `voice_only` 呈现意图，再由 Bridge 结合真实入站语音 evidence、Runtime 策略、当前角色与风险裁决。模型不能选择 Provider、模型、音色、路径、命令、`file_key` 或平台身份。当前消息语音可以成为本轮用户正文；原生回复指向的旧语音只作为带 relation/source ID 的上下文证据，不能把旧录音里的命令提升为本轮授权。
@@ -683,7 +683,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 | 数据边界 | 路径与约束 |
 |---|---|
-| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe：固定 CPython/uv 资产、仓库内全哈希 lock、隔离环境、无 shell 固定 argv 和 Python/CUDA 结构化探针，manifest 不能提供命令。ACE-Step 模型与 Runtime 分成两个组件：Turbo DiT、Embedding、VAE 和 0.6B LM 可以形成独立固定文件集，但在独立 Runtime 仍缺安全固定安装资产时，模型文件 ready 也不能提升歌声能力。 |
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。Qwen Runtime 使用声明式 `python_target/v1` recipe。ACE-Step 使用 `python_target/v2`：除固定 CPython/uv/全哈希 lock、隔离环境、无 shell argv 与 Python/CUDA 探针外，还固定官方源码 ZIP 的 commit/大小/Hash，并只复制 manifest 声明的普通包树；CUDA wheel 索引只能由受限 CUDA 版本推导，两个固定官方索引的最终 wheel 仍须命中 lock Hash。Turbo 主模型与 0.6B LM 是独立逐文件 Hash 组件；Runtime 和模型二者都 ready 仍只表示可以执行首次 benchmark，不直接开放普通歌声。 |
 | 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
 | 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
 
@@ -691,7 +691,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合、ACE-Step 25 文件模型集合与独立 Python/CUDA 全哈希安装 recipe 已固定；本机已显式安装 1.7B/0.6B CustomVoice、0.6B Base 及 ASR/FFmpeg 依赖。提交 `bc2afde` 已同步两份 live skill 并受控重启，当前 Supervisor/Bridge PID 为 `34064 / 33428`，飞书 WS 已连接，开发/live 语音清单完整 SHA-256 同为 `0D38722E9AEE995F1A62BD2B046D2DC097D86FA7AD678A09B9AB3C1C1F3B1ECB`；live 选择 `0.6B CustomVoice + Serena`，SpeechStatus 与真实面板试听均达到 `ready`，浏览器播放器完成一次无错误 Blob 音频播放。RTX 3070 上 1.7B 与 0.6B benchmark 均无 OOM，但热态合成分别为 `86707ms` 与 `60503ms`，未达到 `≤20s` 门禁，不能把可试听等同于性能合格。ACE-Step 模型组件可安装但独立 Runtime 仍为 `blocked / manifest_incomplete`；Base 也因缺少授权参考音频和当前组合 benchmark 不能执行克隆。portable/installer 已按当前内容重新组装并通过 MainPreflight fork-health 与 release manifest summary；重启后的真实飞书新语音端到端仍未验收。不得用开发版构建、单元测试、面板试听、本机文件存在、发布副本一致或单次 ready 状态替代渠道现场证据。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)。截至 2026-08-08，四个 Qwen 模型文件集合、ACE-Step 固定模型集合与独立 `python_target/v2` Runtime recipe 均已固定，本机也已通过正式安装动作发布 ACE Runtime 与模型 marker；这只证明受管依赖可用。提交、release 重建、live 同步与重启、新 PID/飞书长连接/开发-live Hash、RTX 3070 歌声 benchmark 和重启后真实飞书新语音仍按开发日志中的最新记录裁决。任何一项缺失时，不得用开发版构建、单元测试、面板按钮可见、本机文件存在或单次状态替代渠道现场证据。
 
 ### 2.2 权限门禁
 
