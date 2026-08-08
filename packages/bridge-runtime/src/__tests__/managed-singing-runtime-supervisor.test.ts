@@ -86,8 +86,11 @@ describe('managed singing runtime supervisor', () => {
       assert.ok(endpoint.token.length >= 32);
       assert.equal(calls.length, 1);
       const hostIndex = calls[0].args.indexOf('--host');
-      assert.deepEqual(calls[0].args.slice(hostIndex, hostIndex + 6), ['--host', '127.0.0.1', '--port', '43123', '--api-key', endpoint.token]);
+      assert.deepEqual(calls[0].args.slice(hostIndex, hostIndex + 4), ['--host', '127.0.0.1', '--port', '43123']);
+      assert.equal(calls[0].args.includes('--api-key'), false);
+      assert.equal(calls[0].args.includes(endpoint.token), false);
       const environment = calls[0].options.env as NodeJS.ProcessEnv;
+      assert.equal(environment.ACESTEP_API_KEY, endpoint.token);
       assert.equal(environment.HF_HUB_OFFLINE, '1');
       assert.equal(environment.TRANSFORMERS_OFFLINE, '1');
       assert.equal(environment.ACESTEP_QUEUE_WORKERS, '1');

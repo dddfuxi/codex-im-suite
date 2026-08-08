@@ -221,7 +221,9 @@ export class ManagedSingingRuntimeSupervisor {
     try {
       child = this.operations.spawnProcess(runtime.entryPoint, [
         '-I', '-c', ACE_SERVER_BOOTSTRAP,
-        '--host', '127.0.0.1', '--port', String(port), '--api-key', token,
+        // ACE-Step 官方入口直接读取 ACESTEP_API_KEY；令牌只进入子进程环境，
+        // 禁止出现在 Windows CommandLine、诊断进程列表或状态文件中。
+        '--host', '127.0.0.1', '--port', String(port),
         '--init-llm', '--lm-model-path', this.options.config.singingLmModel,
       ], {
         cwd: this.stateRoot,
