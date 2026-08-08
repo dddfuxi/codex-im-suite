@@ -8,6 +8,16 @@ import {
   SpeechSidecarInstanceLock,
   SpeechSidecarRuntimeDiagnostics,
 } from '../speech/sidecar-runtime-diagnostics.js';
+import { buildSpeechSidecarSpawnArguments } from '../speech/sidecar-supervisor.js';
+
+describe('speech sidecar process boundary', () => {
+  it('以禁止字节码模式启动受管 sidecar，避免污染 live dist', () => {
+    assert.deepEqual(buildSpeechSidecarSpawnArguments('C:\\runtime\\runtime_server.py'), [
+      '-B', 'C:\\runtime\\runtime_server.py', '--host', '127.0.0.1', '--port', '0',
+      '--protocol', 'cti-speech-sidecar/v1',
+    ]);
+  });
+});
 
 describe('speech sidecar single-instance lock', () => {
   it('fails closed for a live holder and only lets the holder release the lock', () => {
@@ -66,7 +76,7 @@ describe('speech sidecar single-instance lock', () => {
 
 describe('speech sidecar runtime diagnostics', () => {
   it('bootstraps sibling modules under isolated managed Python before importing the backend', () => {
-    const entry = fs.readFileSync(path.resolve('src/speech/sidecar/runtime_server.py'), 'utf8');
+    const entry = fs.readFileSync(path.resolve(import.meta.dirname, '..', 'speech', 'sidecar', 'runtime_server.py'), 'utf8');
     const bootstrap = entry.indexOf('sys.path.insert(0, SIDECAR_MODULE_ROOT)');
     const backendImport = entry.indexOf('from backends import BackendFailure, BackendRegistry');
     assert.ok(bootstrap >= 0);

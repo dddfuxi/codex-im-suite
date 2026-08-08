@@ -276,6 +276,10 @@ Copy-ExistingFile -Source $suiteExtensionCatalog -Target (Join-Path $liveRuntime
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'references') -Target (Join-Path $liveRuntime 'references')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'evals') -Target (Join-Path $liveRuntime 'evals')
+$liveRuntimeDist = Join-Path $liveRuntime 'dist'
+Write-Host "remove live runtime-generated dist residues"
+Remove-ContainedPathForUpdate -Root $liveRuntimeDist -RelativePath 'release' -Purpose 'live runtime legacy release mirror cleanup'
+Remove-ContainedPathForUpdate -Root $liveRuntimeDist -RelativePath 'speech-sidecar\__pycache__' -Purpose 'live speech sidecar bytecode cleanup'
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'dist') -Target (Join-Path $liveRuntime 'dist')
 
 $runtimeFiles = @(

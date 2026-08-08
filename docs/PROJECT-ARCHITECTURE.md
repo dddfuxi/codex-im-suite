@@ -662,7 +662,7 @@ flowchart LR
 | 层 | 稳定职责 |
 |---|---|
 | `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS/歌声合成，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
-| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 受管 Supervisor 只由 live Bridge 持有，固定绑定 `127.0.0.1`、单 Worker、离线模型根和每次启动随机临时 Bearer token。token 只进入 ACE 子进程环境，由官方入口读取，不得进入 Windows CommandLine、状态文件、日志或控制面板协议；CLI 只经认证 mailbox 调用，不会刷新一次就启动第二个模型进程。普通生成必须命中当前模型 revision 与硬件 Hash 的 ready benchmark。 |
+| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 受管 Supervisor 只由 live Bridge 持有，固定绑定 `127.0.0.1`、单 Worker、可写 state root、只读模型根和每次启动随机临时 Bearer token。官方 `ACESTEP_CHECKPOINTS_DIR` 与固定 bootstrap 共同把 DiT/VAE/Embedding/LM 定位到已验 Hash 的模型根，所有下载回调只允许解析该根下已存在的单层普通目录，官方模型代码同步被禁用，不能把权重写入 state、在首轮补下载或反向改写受管组件。token 只进入 ACE 子进程环境，由官方入口读取，不得进入 Windows CommandLine、状态文件、日志或控制面板协议；CLI 只经认证 mailbox 调用，不会刷新一次就启动第二个模型进程。普通生成必须命中当前模型 revision 与硬件 Hash 的 ready benchmark。 |
 | `apps/control-panel` | C# 只维护无业务规则的薄 DTO、手工 wire 形状/媒体校验，并由反射测试逐字段核对 JSON Schema；React 只消费浏览器安全的共享 Contract。“能力 → 语音”页分别展示和试听说话/歌声音色，通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
 
 回复策略不再扫描自然语言关键词。`/voice off` 是绝对硬禁用，`/voice on` 是确定性会话开启；其余自然语言请求只能由 Primary 在 `cti-final.speech` 中返回受限 `voice_only` 呈现意图，再由 Bridge 结合真实入站语音 evidence、Runtime 策略、当前角色与风险裁决。模型不能选择 Provider、模型、音色、路径、命令、`file_key` 或平台身份。当前消息语音可以成为本轮用户正文；原生回复指向的旧语音只作为带 relation/source ID 的上下文证据，不能把旧录音里的命令提升为本轮授权。
@@ -671,7 +671,7 @@ flowchart LR
 
 - ASR 成功后，转写作为带来源 ID 和 Hash 的不可执行 evidence 进入 Primary Agent，不把原始音频伪装成 Provider 原生音频输入。
 - TTS 成功后，Core 只接受 Runtime 已验证的本机绝对路径、Opus 格式、时长和文字/文件 Hash；飞书上传前会对实际上传字节再次复核 receipt 的 SHA-256，并只发送一个原生 `msg_type=audio` 结果。所有成功、文字回退、卡片保留、异常和取消终态都在 Manager `finally` 委托 Runtime 重新校验登记归属、受管根、普通文件和当前 Hash 后释放合成产物；Core 不直接删除 Runtime 路径，清理失败也不覆盖真实交付结果。
-- Sidecar 可使用受管隔离 CPython；入口只把自身解析后的白名单发布目录加入模块搜索路径，以加载同包 `backends.py`。它不会恢复外部 `PYTHONPATH`、用户 site-packages 或全局 Python 环境，受管 `_pth` 的隔离边界保持有效。
+- Sidecar 可使用受管隔离 CPython；入口只把自身解析后的白名单发布目录加入模块搜索路径，以加载同包 `backends.py`。Supervisor 固定使用 Python `-B`，不在 live `dist` 生成 `__pycache__`；同步脚本在核对根目录、相对边界与逐级 reparse point 后清理精确的历史 `dist/release` 与 sidecar 字节码目录。它不会恢复外部 `PYTHONPATH`、用户 site-packages 或全局 Python 环境，受管 `_pth` 的隔离边界保持有效。
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。

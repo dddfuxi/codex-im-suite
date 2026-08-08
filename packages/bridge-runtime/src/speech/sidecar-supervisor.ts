@@ -10,6 +10,13 @@ import { SpeechSidecarInstanceLock, SpeechSidecarRuntimeDiagnostics } from './si
 
 const SIDECAR_PROTOCOL = 'cti-speech-sidecar/v1' as const;
 
+export function buildSpeechSidecarSpawnArguments(sidecarPath: string): string[] {
+  return [
+    // 禁止 Python 在 live dist 写入 __pycache__，保持发布指纹与运行前一致。
+    '-B', sidecarPath, '--host', '127.0.0.1', '--port', '0', '--protocol', SIDECAR_PROTOCOL,
+  ];
+}
+
 interface SidecarOperationEnvelope<T> {
   protocol: 'cti-speech-sidecar-result/v1';
   ok: boolean;
@@ -304,9 +311,7 @@ export class SpeechSidecarSupervisor {
     );
     let child: ChildProcessByStdio<null, Readable, Readable>;
     try {
-      child = spawn(dependencies.python.path!, [
-        dependencies.sidecar.path!, '--host', '127.0.0.1', '--port', '0', '--protocol', SIDECAR_PROTOCOL,
-      ], {
+      child = spawn(dependencies.python.path!, buildSpeechSidecarSpawnArguments(dependencies.sidecar.path!), {
         shell: false,
         windowsHide: true,
         detached: process.platform !== 'win32',

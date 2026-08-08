@@ -463,10 +463,14 @@ describe('managed speech dependency archive safety', () => {
       const originalReadSync = fs.readSync;
       let contentReads = 0;
       let largestReadRequest = 0;
-      fs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+      fs.readSync = ((...args: unknown[]) => {
         contentReads += 1;
         if (typeof args[3] === 'number') largestReadRequest = Math.max(largestReadRequest, args[3]);
-        return originalReadSync(...args);
+        const options = args[2];
+        if (options && typeof options === 'object' && 'length' in options && typeof options.length === 'number') {
+          largestReadRequest = Math.max(largestReadRequest, options.length);
+        }
+        return (originalReadSync as unknown as (...readArgs: unknown[]) => number)(...args);
       }) as typeof fs.readSync;
       try {
         assert.equal(manager.listStatuses()[0]?.state, 'ready');

@@ -91,10 +91,17 @@ describe('managed singing runtime supervisor', () => {
       assert.equal(calls[0].args.includes(endpoint.token), false);
       const environment = calls[0].options.env as NodeJS.ProcessEnv;
       assert.equal(environment.ACESTEP_API_KEY, endpoint.token);
+      assert.equal(environment.ACESTEP_CHECKPOINTS_DIR, path.join(value.root, 'model-component'));
       assert.equal(environment.HF_HUB_OFFLINE, '1');
       assert.equal(environment.TRANSFORMERS_OFFLINE, '1');
       assert.equal(environment.ACESTEP_QUEUE_WORKERS, '1');
       assert.equal(environment.PYTHONNOUSERSITE, '1');
+      const bootstrap = calls[0].args[calls[0].args.indexOf('-c') + 1];
+      assert.match(bootstrap, /server\._ensure_model_downloaded=_managed_model/u);
+      assert.match(bootstrap, /kwargs\["checkpoint_dir"\]=model_root/u);
+      assert.match(bootstrap, /kwargs\["get_project_root"\]=lambda: state_root/u);
+      assert.match(bootstrap, /handler\._sync_model_code_if_needed=lambda/u);
+      assert.doesNotMatch(bootstrap, /lambda: model_root/u);
       const statePath = path.join(value.root, 'runtime', 'speech', 'ace-step-host', 'runtime.json');
       const stateText = fs.readFileSync(statePath, 'utf8');
       assert.equal(stateText.includes(endpoint.token), false);

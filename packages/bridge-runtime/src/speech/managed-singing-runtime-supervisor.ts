@@ -13,17 +13,37 @@ const STATE_PROTOCOL = 'cti-managed-singing-runtime/v1' as const;
 const ACE_RUNTIME_COMPONENT_ID = 'ace_step_1_5';
 const ACE_MODEL_COMPONENT_ID = 'ace_step_1_5_models';
 
-// 固定 bootstrap 只改变官方 API 的两个根目录回调：缓存/产物进入 Runtime state，
-// 模型只从已经通过 marker 的受管模型根读取。它不接受 manifest 命令或任意 Python。
+// 固定 bootstrap 把官方 API 的可写 project root 与只读模型根彻底分开：
+// 缓存/产物进入 Runtime state，模型只从已经通过 marker 的受管模型根读取。
+// 官方下载与模型代码同步均被失败关闭，避免离线运行时改写受管权重目录。
 const ACE_SERVER_BOOTSTRAP = [
   'import os',
   'import acestep.api_server as server',
+  'import acestep.api.startup_model_init as startup_model_init',
   'state_root=os.environ["CTI_ACESTEP_STATE_ROOT"]',
-  'model_root=os.environ["CTI_ACESTEP_MODEL_ROOT"]',
+  'model_root=os.path.realpath(os.environ["CTI_ACESTEP_MODEL_ROOT"])',
   'server._get_project_root=lambda: state_root',
+  'def _managed_model(model_name, _checkpoint_dir):',
+  '    if not isinstance(model_name, str) or not model_name or model_name in (".", "..") or os.path.basename(model_name) != model_name:',
+  '        raise RuntimeError("managed_model_name_invalid")',
+  '    candidate=os.path.realpath(os.path.join(model_root, model_name))',
+  '    if os.path.commonpath((model_root, candidate)) != model_root or os.path.islink(candidate) or not os.path.isdir(candidate):',
+  '        raise RuntimeError("managed_model_missing_or_unsafe")',
+  '    return candidate',
+  'server._ensure_model_downloaded=_managed_model',
+  '_original_llm_init=startup_model_init.initialize_llm_at_startup',
+  'def _managed_llm_init(**kwargs):',
+  '    kwargs["checkpoint_dir"]=model_root',
+  '    kwargs["ensure_model_downloaded"]=_managed_model',
+  '    return _original_llm_init(**kwargs)',
+  'startup_model_init.initialize_llm_at_startup=_managed_llm_init',
   '_original_init=server.initialize_models_at_startup',
   'def _managed_init(**kwargs):',
-  '    kwargs["get_project_root"]=lambda: model_root',
+  '    kwargs["get_project_root"]=lambda: state_root',
+  '    kwargs["ensure_model_downloaded"]=_managed_model',
+  '    for handler in (kwargs.get("handler"), kwargs.get("handler2"), kwargs.get("handler3")):',
+  '        if handler is not None:',
+  '            handler._sync_model_code_if_needed=lambda *args, **inner_kwargs: None',
   '    return _original_init(**kwargs)',
   'server.initialize_models_at_startup=_managed_init',
   'server.run_api_server_main(env_bool=server._env_bool)',
@@ -125,6 +145,7 @@ function createIsolatedEnvironment(input: {
   environment.PYTHONNOUSERSITE = '1';
   environment.CTI_ACESTEP_STATE_ROOT = input.stateRoot;
   environment.CTI_ACESTEP_MODEL_ROOT = input.modelRoot;
+  environment.ACESTEP_CHECKPOINTS_DIR = input.modelRoot;
   environment.ACESTEP_API_KEY = input.token;
   environment.ACESTEP_CONFIG_PATH = input.modelId;
   environment.ACESTEP_LM_MODEL_PATH = input.lmModelId;
