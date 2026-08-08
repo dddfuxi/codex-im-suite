@@ -2,7 +2,12 @@ import path from 'node:path';
 
 import type { OutboundMention } from '../types.js';
 import { parseAnalysisView, type AnalysisView } from './analysis-view.js';
-import { parseSpeechReplyDirective, type SpeechReplyDirective } from './speech-policy.js';
+import {
+  parseSpeechReferenceVoiceAction,
+  parseSpeechReplyDirective,
+  type SpeechReferenceVoiceAction,
+  type SpeechReplyDirective,
+} from './speech-policy.js';
 import { parseSingingReplyDirective, type SingingReplyDirective } from './singing-policy.js';
 import {
   parseChoiceFlowDirective,
@@ -51,6 +56,8 @@ export interface FinalReplyEnvelope {
   analysis_view?: AnalysisView;
   /** 仅为呈现意图；Bridge 不接受模型提供的 provider、路径、音色或平台身份。 */
   speech?: SpeechReplyDirective;
+  /** 仅声明语义动作；真实音频、Owner 和授权窗口由 Bridge 绑定。 */
+  speech_action?: SpeechReferenceVoiceAction;
   /** 歌词/风格是可见请求内容；Runtime 独占 provider、模型、音色和文件。 */
   singing?: SingingReplyDirective;
 }
@@ -71,6 +78,7 @@ export interface DeliveryCandidatePayload {
   choiceSession?: ChoiceSessionDirective;
   analysisView?: AnalysisView;
   speech?: SpeechReplyDirective;
+  speechAction?: SpeechReferenceVoiceAction;
   singing?: SingingReplyDirective;
 }
 
@@ -134,6 +142,7 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     choice_session: parseChoiceSessionDirective(raw.choice_session),
     analysis_view: parseAnalysisView(raw.analysis_view),
     speech: parseSpeechReplyDirective(raw.speech),
+    speech_action: parseSpeechReferenceVoiceAction(raw.speech_action),
     singing: parseSingingReplyDirective(raw.singing),
   };
 }
@@ -318,6 +327,7 @@ function payloadFromEnvelope(
     choiceSession: envelope.choice_session,
     analysisView: envelope.analysis_view,
     speech: envelope.speech,
+    speechAction: envelope.speech_action,
     singing: envelope.singing,
   };
 }

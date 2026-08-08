@@ -134,6 +134,94 @@ describe('bridge action block parsing', () => {
     });
   });
 
+  it('normalizes the observed at plus datetime offset variant without guessing a region', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '今日补执行',
+        schedule: { kind: 'at', datetime: '2026-08-08T11:40:00+08:00' },
+        taskAction: { kind: 'agent_turn', prompt: '立即补执行。', sessionMode: 'bound' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.schedule, {
+      kind: 'at',
+      at: '2026-08-08T11:40:00+08:00',
+      timezone: 'UTC',
+    });
+    assert.deepEqual(result.action?.normalizedFields, [
+      'schedule.datetime->at',
+      'schedule.explicit_offset->timezone:UTC',
+    ]);
+  });
+
+  it('normalizes the observed once delay variant against the action parsing time', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '十秒倒计时',
+        schedule: { type: 'once', delay_seconds: 10 },
+        taskAction: { kind: 'notify', text: '时间到。' },
+      }),
+      '```',
+    ].join('\n'), { referenceTime: '2026-08-08T03:00:00.000Z' });
+
+    assert.deepEqual(result.action?.schedule, {
+      kind: 'at',
+      at: '2026-08-08T03:00:10.000Z',
+      timezone: 'UTC',
+    });
+    assert.deepEqual(result.action?.normalizedFields, [
+      'schedule.type->kind',
+      'schedule.kind:once->at',
+      'schedule.delay_seconds->at',
+      'schedule.reference_time->timezone:UTC',
+    ]);
+  });
+
+  it('normalizes the observed interval everyMinutes variant with a stable anchor', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '喝水活动提醒',
+        schedule: { kind: 'interval', everyMinutes: 40, timezone: 'Asia/Shanghai' },
+        taskAction: { kind: 'notify', text: '喝水活动一下。' },
+      }),
+      '```',
+    ].join('\n'), { referenceTime: '2026-08-08T03:00:00.000Z' });
+
+    assert.deepEqual(result.action?.schedule, {
+      kind: 'every',
+      everyMs: 2_400_000,
+      anchorAt: '2026-08-08T03:00:00.000Z',
+    });
+    assert.deepEqual(result.action?.normalizedFields, [
+      'schedule.kind:interval->every',
+      'schedule.everyMinutes->everyMs',
+      'schedule.reference_time->anchorAt',
+    ]);
+  });
+
+  it('returns a precise timezone error for a local at datetime instead of a generic incomplete result', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '无时区单次任务',
+        schedule: { kind: 'at', datetime: '2026-08-08T11:40:00' },
+        taskAction: { kind: 'notify', text: '提醒内容' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.equal(result.action, null);
+    assert.match(result.error || '', /kind=at.+timezone.+不能安全解析/u);
+  });
+
   it('does not guess a timezone for a bare cron schedule string', () => {
     const result = extractCtiScheduledTaskAction([
       '```cti-scheduled-task',

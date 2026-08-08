@@ -10,7 +10,7 @@ import { loadSpeechRuntimeConfig } from '../speech/runtime-config.js';
 import type { RuntimeSpeechHost } from '../speech/runtime-speech-host.js';
 import { SpeechControlService } from '../speech/speech-control-service.js';
 import { SpeechRuntimeStatusService } from '../speech/speech-status.js';
-import { DEFAULT_PRESET_PROFILE_ID, SpeechVoiceRegistry } from '../speech/voice-registry.js';
+import { SpeechVoiceRegistry } from '../speech/voice-registry.js';
 
 type ObjectSchema = { required?: string[]; properties?: Record<string, unknown> };
 
@@ -32,6 +32,11 @@ function fakeHost(ttsReady: boolean): RuntimeSpeechHost {
           protocol: 'cti-speech-sidecar/v1' as const,
           status: ttsReady ? 'ready' as const : 'optional_missing' as const,
           version: 'test', capabilities: { asr: false, tts: ttsReady },
+          ...(ttsReady ? { tts: {
+            providerId: 'qwen3_tts',
+            modelId: 'qwen3-tts-12hz-1.7b-custom-voice',
+            revision: 'a'.repeat(64),
+          } } : {}),
           ...(ttsReady ? {} : { diagnosticCode: 'cosyvoice_dependency_missing' }),
         }),
       }),
@@ -80,7 +85,7 @@ describe('speech status and control actions', () => {
       assert.equal(value.actions.find((item) => item.id === 'speech.installComponent')?.enabled, true);
       assert.equal(value.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, false);
       assert.equal(value.actions.find((item) => item.id === 'speech.previewVoice')?.diagnosticCode, 'cosyvoice_dependency_missing');
-      const preset = value.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID);
+      const preset = value.voiceProfiles.find((item) => item.id === 'qwen3.serena');
       assert.ok(preset, '未注册 preset 仍需投影为可见 catalog 卡片');
       assert.notEqual(preset.state, 'ready');
       assert.equal(value.components.find((item) => item.id === 'ffmpeg')?.installable, false);
@@ -90,29 +95,22 @@ describe('speech status and control actions', () => {
     }
   });
 
-  it('registers the built-in preset only after a real TTS probe and keeps preview blocked', async () => {
+  it('projects built-in model voices after a real TTS probe and keeps preview blocked without live transport', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-status-ready-'));
     try {
       const config = loadSpeechRuntimeConfig(new Map([['CTI_SPEECH_OUTPUT_ENABLED', 'true']]));
       const registry = new SpeechVoiceRegistry(path.join(root, 'voices'));
       const status = new SpeechRuntimeStatusService({ config, host: fakeHost(true), voiceRegistry: registry });
       const before = await status.refresh();
-      assert.equal(before.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, true);
-      assert.equal(before.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID)?.state, 'optional_missing');
-      assert.equal(before.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID)?.diagnosticCode, 'preset_voice_not_registered');
+      assert.equal(before.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, false);
+      assert.equal(before.voiceProfiles.find((item) => item.id === 'qwen3.serena')?.state, 'ready');
       const service = new SpeechControlService({
         config, status, voiceRegistry: registry,
         dependencies: { install: async () => undefined } as unknown as ManagedSpeechDependencyManager,
         saveConfig: () => undefined,
       });
-      const after = await service.execute('speech.installPresetVoice', {});
-      assert.equal(after.protocol, 'codex-im-suite/speech-status/v1');
-      if (after.protocol !== 'codex-im-suite/speech-status/v1') {
-        throw new Error('安装预设音色必须返回语音状态协议');
-      }
-      assert.equal(registry.resolveProfile(DEFAULT_PRESET_PROFILE_ID).kind, 'preset');
-      assert.equal(after.actions.find((item) => item.id === 'speech.installPresetVoice')?.enabled, false);
-      assert.equal(after.voiceProfiles.find((item) => item.id === DEFAULT_PRESET_PROFILE_ID)?.state, 'ready');
+      const after = before;
+      assert.equal(after.protocol, 'codex-im-suite/speech-status/v2');
       await assert.rejects(
         service.execute('speech.previewVoice', {}),
         (error: unknown) => Boolean(error && typeof error === 'object'
@@ -124,7 +122,7 @@ describe('speech status and control actions', () => {
       const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8')) as { $defs: Record<string, ObjectSchema> };
       assertObjectShape(after as unknown as Record<string, unknown>, schema.$defs.SpeechStatusContract);
       for (const channel of after.channels) assertObjectShape(channel as unknown as Record<string, unknown>, schema.$defs.SpeechChannelContract);
-      for (const selection of [after.replyPolicy, after.deliveryMode, after.asrProvider, after.ttsProvider]) {
+      for (const selection of [after.replyPolicy, after.deliveryMode, after.asrProvider, after.ttsProvider, after.tonePolicy]) {
         assertObjectShape(selection as unknown as Record<string, unknown>, schema.$defs.SpeechSelectionContract);
         for (const option of selection.options) assertObjectShape(option as unknown as Record<string, unknown>, schema.$defs.SpeechSelectionOptionContract);
       }

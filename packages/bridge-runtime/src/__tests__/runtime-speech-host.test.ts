@@ -8,6 +8,23 @@ import { RuntimeSpeechHost, validateSidecarTranscriptResult } from '../speech/ru
 import { loadSpeechRuntimeConfig } from '../speech/runtime-config.js';
 import { hashFileSha256 } from '../speech/media-pipeline.js';
 import type { SpeechSidecarSupervisor } from '../speech/sidecar-supervisor.js';
+import { SpeechVoiceRegistry } from '../speech/voice-registry.js';
+
+const TEST_TTS_IDENTITY = {
+  providerId: 'qwen3_tts',
+  modelId: 'qwen3-tts-12hz-1.7b-custom-voice',
+  revision: 'a'.repeat(64),
+};
+
+function testVoiceRegistry(ctiHome: string): SpeechVoiceRegistry {
+  return new SpeechVoiceRegistry(path.join(ctiHome, 'runtime', 'speech', 'voices'));
+}
+
+function writeMinimalWav(filePath: string): void {
+  fs.writeFileSync(filePath, Buffer.concat([
+    Buffer.from('RIFF', 'ascii'), Buffer.alloc(4), Buffer.from('WAVEfmt ', 'ascii'), Buffer.alloc(24), Buffer.from('data', 'ascii'), Buffer.alloc(8),
+  ]));
+}
 
 describe('RuntimeSpeechHost', () => {
   it('exposes only the supported read-only reply policy values', async () => {
@@ -74,6 +91,89 @@ describe('RuntimeSpeechHost', () => {
     }
   });
 
+  it('imports only a currently authorized native-reply voice and stores bounded source metadata', async () => {
+    const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-reference-import-'));
+    const sourcePath = path.join(ctiHome, 'reply.wav');
+    writeMinimalWav(sourcePath);
+    const sourceSha256 = hashFileSha256(sourcePath);
+    const registry = new SpeechVoiceRegistry(
+      path.join(ctiHome, 'runtime', 'speech', 'voices'),
+      undefined,
+      async (candidate) => ({ format: 'wav', durationMs: 5_000, sha256: hashFileSha256(candidate) }),
+    );
+    const host = new RuntimeSpeechHost({
+      config: loadSpeechRuntimeConfig(new Map()),
+      ctiHome,
+      runtimeDepsRoot: path.join(ctiHome, 'runtime-deps'),
+      bundledSidecarCandidates: [],
+      voiceRegistry: registry,
+    });
+    const authorizedAt = new Date();
+    const expiresAt = new Date(authorizedAt.getTime() + 5 * 60_000);
+    try {
+      const receipt = await host.importReferenceVoice({
+        profileName: '飞书测试音色',
+        path: sourcePath,
+        mediaType: 'audio/wav',
+        sha256: sourceSha256,
+        requestMessageId: 'om_request',
+        sourceMessageId: 'om_voice',
+        fileKey: 'file_key',
+        attachmentId: 'attachment_voice',
+        transcript: {
+          protocol: 'cti-speech-transcript/v1',
+          attachmentId: 'attachment_voice',
+          text: '这是参考音色文本。',
+          model: 'sensevoice-small-q8.gguf',
+          language: 'zh',
+          relation: 'native_reply',
+          requestMessageId: 'om_request',
+          sourceMessageId: 'om_voice',
+          fileSha256: sourceSha256,
+          validated: true,
+        },
+        authorization: {
+          protocol: 'cti-speech-reference-voice-authorization/v1',
+          scope: 'current_native_reply_audio',
+          ownerUserId: 'owner_user',
+          authorizedAt: authorizedAt.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+          rightsBasis: 'self_or_authorized',
+          usageScope: 'local_tts_only',
+          cleanSingleSpeakerConfirmed: true,
+        },
+      });
+      assert.equal(receipt.validated, true);
+      assert.equal(receipt.fileSha256, sourceSha256);
+      const record = registry.list().find((item) => item.id === receipt.voiceProfileId);
+      assert.equal(record?.source, 'feishu_native_reply');
+      assert.equal(record?.authorization?.scope, 'local_tts_only');
+      assert.match(record?.authorization?.ownerIdHash || '', /^[a-f0-9]{64}$/u);
+
+      await assert.rejects(host.importReferenceVoice({
+        ...{
+          profileName: '过期音色', path: sourcePath, mediaType: 'audio/wav', sha256: sourceSha256,
+          requestMessageId: 'om_request', sourceMessageId: 'om_voice', fileKey: 'file_key', attachmentId: 'attachment_voice',
+          transcript: {
+            protocol: 'cti-speech-transcript/v1' as const, attachmentId: 'attachment_voice', text: '参考文本',
+            model: 'sensevoice-small-q8.gguf', language: 'zh', relation: 'native_reply' as const,
+            requestMessageId: 'om_request', sourceMessageId: 'om_voice', fileSha256: sourceSha256, validated: true as const,
+          },
+        },
+        authorization: {
+          protocol: 'cti-speech-reference-voice-authorization/v1', scope: 'current_native_reply_audio', ownerUserId: 'owner_user',
+          authorizedAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+          expiresAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+          rightsBasis: 'self_or_authorized', usageScope: 'local_tts_only', cleanSingleSpeakerConfirmed: true,
+        },
+      }), (error: unknown) => Boolean(error && typeof error === 'object'
+        && (error as { code?: string }).code === 'voice_authorization_invalid'));
+    } finally {
+      await host.stop();
+      fs.rmSync(ctiHome, { recursive: true, force: true });
+    }
+  });
+
   it('removes both intermediate WAV and partial Ogg after a media pipeline failure', async () => {
     const ctiHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-cleanup-'));
     const ffmpegPath = path.join(ctiHome, 'ffmpeg.exe');
@@ -84,10 +184,16 @@ describe('RuntimeSpeechHost', () => {
     let opusPath = '';
     const sidecar = {
       ensureClient: async () => ({
+        health: async () => ({
+          protocol: 'cti-speech-sidecar/v1',
+          state: 'ready',
+          capabilities: { asr: false, tts: true },
+          tts: TEST_TTS_IDENTITY,
+        }),
         synthesize: async (input: { outputPath: string }) => {
           wavPath = input.outputPath;
           fs.writeFileSync(wavPath, 'partial-wav', 'utf8');
-          return {};
+          return { provider: TEST_TTS_IDENTITY.providerId, model: TEST_TTS_IDENTITY.modelId, revision: TEST_TTS_IDENTITY.revision };
         },
       }),
       resolveDependencies: () => ({
@@ -107,6 +213,7 @@ describe('RuntimeSpeechHost', () => {
       runtimeDepsRoot: path.join(ctiHome, 'runtime-deps'),
       bundledSidecarCandidates: [],
       sidecar,
+      voiceRegistry: testVoiceRegistry(ctiHome),
       mediaPipeline: {
         validateAudio: async (input) => ({
           path: input.filePath,
@@ -125,7 +232,14 @@ describe('RuntimeSpeechHost', () => {
       },
     });
     try {
-      await assert.rejects(host.synthesize({ text: '测试失败清理' }), /语音编码失败/);
+      await assert.rejects(host.synthesize({
+        text: '测试失败清理',
+        expectedIdentity: {
+          ttsModelId: TEST_TTS_IDENTITY.modelId,
+          modelRevision: TEST_TTS_IDENTITY.revision,
+          voiceProfileId: 'qwen3.serena',
+        },
+      }), /语音编码失败/);
       assert.ok(wavPath);
       assert.ok(opusPath);
       assert.equal(fs.existsSync(wavPath), false);
@@ -144,9 +258,15 @@ describe('RuntimeSpeechHost', () => {
     fs.writeFileSync(ffprobePath, 'fake', 'utf8');
     const sidecar = {
       ensureClient: async () => ({
+        health: async () => ({
+          protocol: 'cti-speech-sidecar/v1',
+          state: 'ready',
+          capabilities: { asr: false, tts: true },
+          tts: TEST_TTS_IDENTITY,
+        }),
         synthesize: async (input: { outputPath: string }) => {
           fs.writeFileSync(input.outputPath, 'managed-wav', 'utf8');
-          return {};
+          return { provider: TEST_TTS_IDENTITY.providerId, model: TEST_TTS_IDENTITY.modelId, revision: TEST_TTS_IDENTITY.revision };
         },
       }),
       resolveDependencies: () => ({
@@ -165,6 +285,7 @@ describe('RuntimeSpeechHost', () => {
       runtimeDepsRoot: path.join(ctiHome, 'runtime-deps'),
       bundledSidecarCandidates: [],
       sidecar,
+      voiceRegistry: testVoiceRegistry(ctiHome),
       mediaPipeline: {
         validateAudio: async (input) => {
           const isOgg = input.filePath.endsWith('.ogg');
@@ -186,13 +307,18 @@ describe('RuntimeSpeechHost', () => {
     });
     try {
       const scratchDir = path.join(ctiHome, 'runtime', 'workspaces', 'session-a', 'turn-a', 'scratch');
-      const receipt = await host.synthesize({ text: '交付后清理', scratchDir });
+      const identity = {
+        ttsModelId: TEST_TTS_IDENTITY.modelId,
+        modelRevision: TEST_TTS_IDENTITY.revision,
+        voiceProfileId: 'qwen3.serena',
+      };
+      const receipt = await host.synthesize({ text: '交付后清理', scratchDir, expectedIdentity: identity });
       assert.equal(fs.existsSync(receipt.path), true);
       host.releaseSynthesis(receipt);
       assert.equal(fs.existsSync(receipt.path), false);
       assert.doesNotThrow(() => host.releaseSynthesis(receipt));
 
-      const changed = await host.synthesize({ text: '哈希变化拒绝', scratchDir });
+      const changed = await host.synthesize({ text: '哈希变化拒绝', scratchDir, expectedIdentity: identity });
       fs.appendFileSync(changed.path, 'changed', 'utf8');
       assert.throws(
         () => host.releaseSynthesis(changed),
@@ -206,7 +332,7 @@ describe('RuntimeSpeechHost', () => {
           && (error as { code?: string }).code === 'speech_synthesis_release_out_of_bounds'),
       );
       await assert.rejects(
-        host.synthesize({ text: '越界目录', scratchDir: path.join(os.tmpdir(), 'cti-unmanaged-speech-output') }),
+        host.synthesize({ text: '越界目录', scratchDir: path.join(os.tmpdir(), 'cti-unmanaged-speech-output'), expectedIdentity: identity }),
         (error: unknown) => Boolean(error && typeof error === 'object'
           && (error as { code?: string }).code === 'speech_synthesis_root_out_of_bounds'),
       );

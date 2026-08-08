@@ -25,7 +25,9 @@ import type {
   SpeechHost,
   SpeechReplyPolicy,
   SpeechReplyPreference,
+  SpeechReferenceVoiceAuthorization,
   SpeechSynthesisReceipt,
+  SpeechTranscriptReceipt,
   MemoryWriteCandidate,
   MemoryWriteClassification,
   MemoryWriteIntentDecision,
@@ -153,10 +155,13 @@ import {
 import { enforceInputEvidenceDeliveryBoundary } from './application/input-evidence-delivery-policy.js';
 import {
   buildSpeechTranscriptContext,
+  composeInboundSpeechPlans,
   decideSpeechReply,
   evaluateSpeechSynthesisEligibility,
   mergeTranscriptWithUserText,
   normalizeSpeechSynthesisText,
+  parseSpeechReferenceVoiceImportReceipt,
+  parseSpeechSynthesisIdentity,
   parseSpeechSynthesisReceipt,
   parseSpeechTranscriptReceipt,
   parseVoiceCommandPreference,
@@ -408,8 +413,8 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function extractCtiScheduledTaskAction(text: string) {
-  return parseCtiScheduledTaskActionBlock(text);
+function extractCtiScheduledTaskAction(text: string, referenceTime: Date = new Date()) {
+  return parseCtiScheduledTaskActionBlock(text, { referenceTime });
 }
 
 function extractCtiDirectMessageAction(text: string) {
@@ -979,6 +984,15 @@ async function executeScheduledTaskActionFromReply(
         direction: 'inbound',
         messageId: msg.messageId,
         summary: `[IGNORED_SCHEDULED_TASK_FIELDS] fields=${extracted.action.ignoredTrustedFields.join(',')}`,
+      });
+    }
+    if (extracted.action.normalizedFields.length > 0) {
+      getBridgeContext().store.insertAuditLog({
+        channelType: msg.address.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[NORMALIZED_SCHEDULED_TASK_FIELDS] fields=${extracted.action.normalizedFields.join(',')}`,
       });
     }
     const notifyTargets = await resolveReminderNotifyTargets(msg, rawPrompt);
@@ -1583,6 +1597,7 @@ async function prepareModelPlannedMemoryWrite(
   binding: ChannelBinding,
   text: string,
   rawText: string,
+  signal?: AbortSignal,
 ): Promise<MemoryIntentPreflight | null> {
   const context = getBridgeContext();
   const { store } = context;
@@ -1590,6 +1605,7 @@ async function prepareModelPlannedMemoryWrite(
   let decision: MemoryWriteIntentDecision | null = null;
   if (context.memoryIntents?.classifyMemoryWrite) {
     try {
+      if (signal?.aborted) throw signal.reason || new Error('turn_cancelled');
       decision = await context.memoryIntents.classifyMemoryWrite({
         sessionId: binding.codepilotSessionId,
         channelType: binding.channelType,
@@ -1601,6 +1617,7 @@ async function prepareModelPlannedMemoryWrite(
         workingDirectory,
       });
     } catch (error) {
+      if (signal?.aborted) throw error;
       console.warn('[bridge-manager] Memory write intent classifier failed:', error instanceof Error ? error.message : error);
       if (isExplicitMemoryWriteRequestText(text || rawText)) {
         return {
@@ -1649,6 +1666,8 @@ async function prepareModelPlannedMemoryWrite(
   const modelCandidates = decision.confidence >= 0.55
     ? usableMemoryCandidates(decision.candidates)
     : [];
+  // 分类器可能在等待期间被取消；持久写入前必须再次取得当前回合授权。
+  if (signal?.aborted) throw signal.reason || new Error('turn_cancelled');
   const memoryWrite = persistMemoryWrite({
     sessionId: binding.codepilotSessionId,
     channelType: binding.channelType,
@@ -5240,6 +5259,9 @@ interface ActiveBridgeTask {
   lifecycleTaskKey?: string;
   cardStarted: boolean;
   interruptionFinalized: boolean;
+  deliveryCommitted?: boolean;
+  cardTerminalStatus?: 'completed' | 'interrupted' | 'error';
+  cardFinalization?: Promise<boolean>;
 }
 
 export interface ActiveReplyCancelRequest {
@@ -5376,28 +5398,56 @@ const DEFAULT_INTERRUPTED_CARD_TEXT = [
 ].join('\n');
 
 const MESSAGE_WITHDRAWN_PAUSED_TEXT = '已暂停：原始消息已被撤回，我不会继续处理这条任务。';
+const SPEECH_REFERENCE_AUTHORIZATION_TTL_MS = 5 * 60 * 1000;
+
+type StreamEndArgs = Parameters<NonNullable<BaseChannelAdapter['onStreamEnd']>>;
+
+/**
+ * 同一回合的卡片终态只能由第一个竞争者取得。即使正常完成与取消同时到达，
+ * 也只允许一次真实 onStreamEnd 网络调用，后续路径复用同一结果。
+ */
+function finalizeActiveTaskCardOnce(
+  task: ActiveBridgeTask,
+  args: StreamEndArgs,
+): Promise<boolean> {
+  if (task.cardFinalization) return task.cardFinalization;
+  if (!task.cardStarted || typeof task.adapter.onStreamEnd !== 'function') return Promise.resolve(false);
+  task.cardTerminalStatus = args[1];
+  task.cardFinalization = (async () => {
+    try {
+      const finalized = await task.adapter.onStreamEnd!(...args);
+      if (task.cardTerminalStatus === 'interrupted') task.interruptionFinalized = finalized;
+      return finalized;
+    } catch (err) {
+      console.warn('[bridge-manager] Active card terminal finalize failed:', err instanceof Error ? err.message : err);
+      return false;
+    }
+  })();
+  return task.cardFinalization;
+}
 
 async function finalizeInterruptedTaskCard(task: ActiveBridgeTask, responseText = DEFAULT_INTERRUPTED_CARD_TEXT): Promise<boolean> {
   task.abort.abort();
   if (task.interruptionFinalized) return true;
-  if (!task.cardStarted || typeof task.adapter.onStreamEnd !== 'function') return false;
-  try {
-    // Stop/restart can happen before handleMessage reaches its finally block.
-    // Finalize the user-visible card here while the adapter still has REST access.
-    const finalized = await task.adapter.onStreamEnd(task.chatId, 'interrupted', responseText, undefined, undefined, undefined, {
+  // Stop/restart can happen before handleMessage reaches its finally block.
+  // Finalize the user-visible card here while the adapter still has REST access.
+  const finalized = await finalizeActiveTaskCardOnce(task, [
+    task.chatId,
+    'interrupted',
+    responseText,
+    undefined,
+    undefined,
+    undefined,
+    {
       codepilotSessionId: task.sessionId,
       sourceMessageId: task.sourceMessageId,
       sourceText: task.sourceText,
-    });
-    task.interruptionFinalized = finalized;
-    if (finalized) {
-      task.adapter.onMessageEnd?.(task.chatId);
-    }
-    return finalized;
-  } catch (err) {
-    console.warn('[bridge-manager] Active card interruption finalize failed:', err instanceof Error ? err.message : err);
-    return false;
+    },
+  ]);
+  if (finalized) {
+    task.adapter.onMessageEnd?.(task.chatId);
   }
+  return finalized;
 }
 
 async function interruptActiveBridgeTask(
@@ -5432,6 +5482,22 @@ export async function cancelActiveReply(request: ActiveReplyCancelRequest): Prom
   }
   if (task.abort.signal.aborted) {
     return { disposition: 'already_cancelled', sessionId, turnId, detail: '该回复已经在终止中。' };
+  }
+  if (task.cardFinalization && task.cardTerminalStatus !== 'interrupted') {
+    return {
+      disposition: 'conflict',
+      sessionId,
+      turnId,
+      detail: '当前回复的唯一终态已经开始投递，无法再安全改写为中断。',
+    };
+  }
+  if (task.deliveryCommitted) {
+    return {
+      disposition: 'conflict',
+      sessionId,
+      turnId,
+      detail: '当前回复已经提交平台投递，无法保证撤回，因此未再发送取消信号。',
+    };
   }
   await finalizeInterruptedTaskCard(task, '已终止：已从控制面板停止当前回复。');
   return { disposition: 'accepted', sessionId, turnId, detail: '终止信号已送达当前回复。' };
@@ -6850,6 +6916,14 @@ async function handleMessage(
   }
 
   let activeTask: ActiveBridgeTask | null = null;
+  let turnTaskRegistration: RegisteredActiveBridgeTask | null = null;
+  const cleanupTurnTaskRegistration = () => {
+    if (!turnTaskRegistration) return;
+    const registration = turnTaskRegistration;
+    turnTaskRegistration = null;
+    cleanupRegisteredActiveBridgeTask(registration);
+    if (activeTask === registration.activeTask) activeTask = null;
+  };
   let processingCardStarted = false;
   let lightStatusTimer: ReturnType<typeof setTimeout> | null = null;
   let lightStatusCardStarted = false;
@@ -6871,6 +6945,17 @@ async function handleMessage(
     if (!processingCardStarted) return;
     processingCardStarted = false;
     adapter.onMessageEnd?.(msg.address.chatId);
+  };
+  const finishCancelledBeforeProvider = (): boolean => {
+    const registration = turnTaskRegistration;
+    if (!registration
+      || (!registration.activeTask.abort.signal.aborted && registration.lifecycleTask?.cancelled !== true)) {
+      return false;
+    }
+    endProcessingCard();
+    cleanupTurnTaskRegistration();
+    ack();
+    return true;
   };
   const finishSpeechInputError = async (message: string): Promise<void> => {
     clearLightStatusTimer();
@@ -6959,6 +7044,16 @@ async function handleMessage(
   }
 
   let speechTranscriptContext = '';
+  let trustedNativeReferenceSource: {
+    path: string;
+    mediaType: string;
+    sha256: string;
+    requestMessageId: string;
+    sourceMessageId: string;
+    fileKey: string;
+    attachmentId: string;
+    transcript: SpeechTranscriptReceipt;
+  } | null = null;
   const inboundSpeechReceived = inboundMessageKind === 'feishu_audio';
   const currentSpeechPlan = inboundSpeechReceived
     ? resolveTrustedInboundAudio({
@@ -6979,13 +7074,20 @@ async function handleMessage(
     })
     : null;
   const speechInputRequested = inboundSpeechReceived || nativeReplyAudioClaimed;
-  const speechPlan = currentSpeechPlan && nativeReplySpeechPlan
-    ? null
-    : currentSpeechPlan || nativeReplySpeechPlan;
+  const speechPlans = composeInboundSpeechPlans({
+    currentClaimed: inboundSpeechReceived,
+    nativeReplyClaimed: nativeReplyAudioClaimed,
+    current: currentSpeechPlan,
+    nativeReply: nativeReplySpeechPlan,
+  });
+  const speechPlansToProcess = [
+    ...(speechPlans?.primary ? [speechPlans.primary] : []),
+    ...(speechPlans?.contextual || []),
+  ];
   if (speechInputRequested) {
     const speechHost = getBridgeContext().speech;
     const turnStorage = getBridgeContext().turnStorage;
-    if (!speechPlan) {
+    if (!speechPlans || speechPlansToProcess.length === 0) {
       await finishSpeechInputError(speechFailureMessage({ errorCode: 'speech_input_unavailable' }, 'transcribe'));
       ack();
       return;
@@ -7007,6 +7109,7 @@ async function handleMessage(
     });
     const speechTaskAbort = speechTaskRegistration.activeTask.abort;
     const speechLifecycleTask = speechTaskRegistration.lifecycleTask;
+    turnTaskRegistration = speechTaskRegistration;
     activeTask = speechTaskRegistration.activeTask;
     if (speechLifecycleTask?.cancelled) {
       await pauseMessageLifecycleTask(speechLifecycleTask);
@@ -7018,58 +7121,92 @@ async function handleMessage(
     }
 
     try {
-      const [stagedAudio] = turnStorage.stageInputFiles({
+      const stagedAudioFiles = turnStorage.stageInputFiles({
         sessionId: binding.codepilotSessionId,
         turnId: msg.messageId,
-        files: [speechPlan.attachment],
+        files: speechPlansToProcess.map((plan) => plan.attachment),
       });
-      if (!stagedAudio?.filePath || !stagedAudio.sha256) {
+      if (stagedAudioFiles.length !== speechPlansToProcess.length) {
         throw { errorCode: 'speech_input_staging_failed' };
       }
-      const rawReceipt = await speechHost.transcribe({
-        attachmentId: speechPlan.evidence.attachmentId,
-        path: stagedAudio.filePath,
-        mediaType: speechPlan.attachment.type,
-        sha256: stagedAudio.sha256,
-        sourceMessageId: msg.messageId,
-        signal: speechTaskAbort.signal,
-      });
-      if (speechTaskAbort.signal.aborted || speechLifecycleTask?.cancelled) {
-        const interruption = new Error('speech input cancelled');
-        interruption.name = 'AbortError';
-        throw interruption;
+      const stagedAudioById = new Map(stagedAudioFiles.map((file) => [file.id, file]));
+      const transcriptResults = [] as Array<{
+        plan: (typeof speechPlansToProcess)[number];
+        receipt: SpeechTranscriptReceipt;
+      }>;
+      for (let index = 0; index < speechPlansToProcess.length; index += 1) {
+        const plan = speechPlansToProcess[index];
+        const stagedAudio = stagedAudioById.get(plan.evidence.attachmentId);
+        if (!stagedAudio?.filePath || !stagedAudio.sha256 || stagedAudio.id !== plan.evidence.attachmentId) {
+          throw { errorCode: 'speech_input_staging_failed' };
+        }
+        const sourceMessageId = plan.evidence.messageId;
+        const rawReceipt = await speechHost.transcribe({
+          attachmentId: plan.evidence.attachmentId,
+          path: stagedAudio.filePath,
+          mediaType: plan.attachment.type,
+          sha256: stagedAudio.sha256,
+          relation: plan.relation,
+          requestMessageId: msg.messageId,
+          sourceMessageId,
+          signal: speechTaskAbort.signal,
+        });
+        if (speechTaskAbort.signal.aborted || speechLifecycleTask?.cancelled) {
+          const interruption = new Error('speech input cancelled');
+          interruption.name = 'AbortError';
+          throw interruption;
+        }
+        const receipt = parseSpeechTranscriptReceipt(rawReceipt, {
+          attachmentId: plan.evidence.attachmentId,
+          relation: plan.relation,
+          requestMessageId: msg.messageId,
+          sourceMessageId,
+          fileSha256: stagedAudio.sha256,
+        });
+        if (!receipt) throw { errorCode: 'speech_invalid_transcript_receipt' };
+        transcriptResults.push({ plan, receipt });
+        if (plan.relation === 'native_reply') {
+          trustedNativeReferenceSource = {
+            path: stagedAudio.filePath,
+            mediaType: plan.attachment.type,
+            sha256: stagedAudio.sha256,
+            requestMessageId: msg.messageId,
+            sourceMessageId,
+            fileKey: plan.evidence.fileKey,
+            attachmentId: plan.evidence.attachmentId,
+            transcript: receipt,
+          };
+        }
       }
-      const receipt = parseSpeechTranscriptReceipt(rawReceipt, {
-        attachmentId: speechPlan.evidence.attachmentId,
-        sourceMessageId: msg.messageId,
-        fileSha256: stagedAudio.sha256,
-      });
-      if (!receipt) {
-        throw { errorCode: 'speech_invalid_transcript_receipt' };
-      }
-      speechTranscriptContext = buildSpeechTranscriptContext(receipt, {
-        relation: speechPlan.relation,
-        ...(speechPlan.relation === 'native_reply'
-          ? { repliedMessageId: speechPlan.evidence.messageId }
+
+      speechTranscriptContext = transcriptResults.map(({ plan, receipt }) => buildSpeechTranscriptContext(receipt, {
+        ...(plan.relation === 'native_reply'
+          ? { repliedMessageId: plan.evidence.messageId }
           : {}),
-      });
-      const mergedText = speechPlan.relation === 'current_message'
-        ? mergeTranscriptWithUserText(receipt.text, rawText)
-        : (rawText.trim() || receipt.text);
+      })).join('\n\n');
+      const primaryTranscript = transcriptResults.find(({ plan }) => plan === speechPlans.primary)?.receipt.text;
+      if (!primaryTranscript && !rawText.trim()) {
+        throw { errorCode: 'speech_reply_instruction_missing' };
+      }
+      const mergedText = primaryTranscript
+        ? mergeTranscriptWithUserText(primaryTranscript, rawText)
+        : rawText;
       const sanitizedSpeechText = sanitizeInput(mergedText);
       rawText = sanitizedSpeechText.text;
       text = sanitizedSpeechText.text;
       truncated = truncated || sanitizedSpeechText.truncated;
-      msg.attachments = (msg.attachments || []).filter((item) => item.id !== speechPlan.evidence.attachmentId);
+      const consumedAttachmentIds = new Set(speechPlansToProcess.map((plan) => plan.evidence.attachmentId));
+      msg.attachments = (msg.attachments || []).filter((item) => !consumedAttachmentIds.has(item.id));
       const replyMetadata = rawData?.feishuReplyTo;
-      if (speechPlan.relation === 'native_reply' && replyMetadata) {
+      if (speechPlans.contextual.length > 0 && replyMetadata) {
         replyMetadata.attachmentCount = Math.max(
           0,
-          (replyMetadata.attachmentCount || 0) - 1,
+          (replyMetadata.attachmentCount || 0) - speechPlans.contextual.length,
         );
       }
       hasAttachments = msg.attachments.length > 0;
       if (!rawText) throw { errorCode: 'speech_empty_transcript' };
+      speechTaskRegistration.activeTask.sourceText = rawText;
     } catch (error) {
       const interrupted = speechTaskAbort.signal.aborted || speechLifecycleTask?.cancelled === true;
       if (interrupted) {
@@ -7079,29 +7216,40 @@ async function handleMessage(
         await finishSpeechInputError(speechFailureMessage(error, 'transcribe'));
       }
       cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
+      turnTaskRegistration = null;
       if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
       ack();
       return;
     }
-    cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
-    if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
 
     if (isDangerousUserRequest(rawText) && !ownerMessage) {
       await finishSpeechInputError(buildOwnerRequiredMessage(msg));
+      cleanupRegisteredActiveBridgeTask(speechTaskRegistration);
+      turnTaskRegistration = null;
+      if (activeTask === speechTaskRegistration.activeTask) activeTask = null;
       ack();
       return;
     }
   }
 
   const memoryIntentCandidate = isMemoryIntentCandidateText(text || rawText);
-  const memoryIntentPreflight = memoryIntentCandidate && !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
-    ? await prepareModelPlannedMemoryWrite(
-      msg,
-      binding,
-      text || rawText,
-      rawText,
-    )
-    : null;
+  let memoryIntentPreflight: MemoryIntentPreflight | null = null;
+  try {
+    memoryIntentPreflight = memoryIntentCandidate && !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
+      ? await prepareModelPlannedMemoryWrite(
+        msg,
+        binding,
+        text || rawText,
+        rawText,
+        turnTaskRegistration?.activeTask.abort.signal,
+      )
+      : null;
+  } catch (error) {
+    if (finishCancelledBeforeProvider()) return;
+    cleanupTurnTaskRegistration();
+    throw error;
+  }
+  if (finishCancelledBeforeProvider()) return;
   const preparedMemoryWrite = memoryIntentPreflight?.preparedWrite;
 
   let memoryRecallExtraSystemPrompt = '';
@@ -7172,13 +7320,14 @@ async function handleMessage(
       parseMode: 'plain',
       replyToMessageId: msg.messageId,
     });
+    cleanupTurnTaskRegistration();
     ack();
     return;
   }
   const effectiveBinding = turnWorkspaceOverride && turnWorkspaceOverride !== binding.workingDirectory
     ? { ...binding, workingDirectory: turnWorkspaceOverride, sdkSessionId: '' }
     : binding;
-  const messageLifecycleTask = registerMessageLifecycleTask(
+  const messageLifecycleTask = turnTaskRegistration?.lifecycleTask ?? registerMessageLifecycleTask(
     adapter,
     msg,
     effectiveBinding.codepilotSessionId,
@@ -7186,7 +7335,8 @@ async function handleMessage(
   );
   if (messageLifecycleTask?.cancelled) {
     await pauseMessageLifecycleTask(messageLifecycleTask);
-    cleanupMessageLifecycleTask(messageLifecycleTask);
+    if (turnTaskRegistration) cleanupTurnTaskRegistration();
+    else cleanupMessageLifecycleTask(messageLifecycleTask);
     ack();
     return;
   }
@@ -7219,15 +7369,24 @@ async function handleMessage(
     const feishuCloudDocuments = getBridgeContext().feishuCloudDocuments;
     if (feishuCloudDocuments) {
       const feishuSender = rawData?.feishuSender;
-      const resolved = await feishuCloudDocuments.resolveFeishuCloudLinks({
-        text: rawText,
-        channelType: adapter.channelType,
-        chatId: msg.address.chatId,
-        userId: feishuSender?.openId || msg.address.userId,
-        userDisplayName: msg.address.displayName,
-        messageId: msg.messageId,
-        authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
-      });
+      let resolved: FeishuCloudLinkResolveResult;
+      try {
+        resolved = await feishuCloudDocuments.resolveFeishuCloudLinks({
+          text: rawText,
+          channelType: adapter.channelType,
+          chatId: msg.address.chatId,
+          userId: feishuSender?.openId || msg.address.userId,
+          userDisplayName: msg.address.displayName,
+          messageId: msg.messageId,
+          authorizationResume: rawData?.feishuOAuthResume?.authorized === true,
+        });
+      } catch (error) {
+        if (finishCancelledBeforeProvider()) return;
+        if (turnTaskRegistration) cleanupTurnTaskRegistration();
+        else cleanupMessageLifecycleTask(messageLifecycleTask);
+        throw error;
+      }
+      if (finishCancelledBeforeProvider()) return;
       const resolutionDecision = decideFeishuCloudResolution(resolved);
       if (resolutionDecision.kind === 'resolved') {
         feishuCloudSystemPrompt = resolutionDecision.systemPrompt;
@@ -7241,6 +7400,8 @@ async function handleMessage(
           replyToMessageId: msg.messageId,
           feishuCardJson: resolutionDecision.feishuCardJson,
         }, { sessionId: effectiveBinding.codepilotSessionId });
+        if (turnTaskRegistration) cleanupTurnTaskRegistration();
+        else cleanupMessageLifecycleTask(messageLifecycleTask);
         ack();
         return;
       }
@@ -7249,14 +7410,21 @@ async function handleMessage(
     }
   }
 
-  const providerTaskRegistration = registerActiveBridgeTask({
-    adapter,
-    msg,
-    sessionId: effectiveBinding.codepilotSessionId,
-    sourceText: rawText,
-    cardStarted: processingCardStarted,
-    lifecycleTask: messageLifecycleTask,
-  });
+  // ASR 已登记的同一 turn task 直接贯穿 Provider/TTS/Delivery，避免阶段切换时
+  // `/stop`、控制面板终止或撤回找不到活动任务。
+  if (turnTaskRegistration
+    && turnTaskRegistration.activeTask.sessionId !== effectiveBinding.codepilotSessionId) {
+    cleanupTurnTaskRegistration();
+  }
+  const providerTaskRegistration = turnTaskRegistration ?? registerActiveBridgeTask({
+      adapter,
+      msg,
+      sessionId: effectiveBinding.codepilotSessionId,
+      sourceText: rawText,
+      cardStarted: processingCardStarted,
+      lifecycleTask: messageLifecycleTask,
+    });
+  turnTaskRegistration = providerTaskRegistration;
   activeTask = providerTaskRegistration.activeTask;
   const taskAbort = activeTask.abort;
   if (messageLifecycleTask?.cancelled) {
@@ -7347,6 +7515,8 @@ async function handleMessage(
       parseMode: 'plain',
       replyToMessageId: msg.messageId,
     }, { sessionId: effectiveBinding.codepilotSessionId });
+    cleanupTurnTaskRegistration();
+    endProcessingCard();
     ack();
     return;
   }
@@ -8315,6 +8485,74 @@ async function handleMessage(
       registeredChoiceForDelivery = choicePresentation.registeredChoice;
       agentChoiceCardAttached = !hadCardBeforeChoice && Boolean(preparedReply.feishuCardJson);
     }
+    const referenceVoiceAction = preparedReply?.speechAction;
+    if (referenceVoiceAction && !result.hasError) {
+      let referenceVoiceResultText = '';
+      const speechHost = getBridgeContext().speech;
+      // 解析器已做严格 schema 清洗；这里仍在授权签发点复核三项用户确认，
+      // 防止其它内部调用方绕过 cti-final 解析后伪造动作对象。
+      const referenceVoiceConsentConfirmed = referenceVoiceAction.rightsBasis === 'self_or_authorized'
+        && referenceVoiceAction.usageScope === 'local_tts_only'
+        && referenceVoiceAction.cleanSingleSpeakerConfirmed === true;
+      if (!referenceVoiceConsentConfirmed) {
+        referenceVoiceResultText = '参考音色未创建：需要明确确认录音权利、本地 TTS 用途和干净单人录音。';
+      } else if (!ownerMessage || !msg.address.userId?.trim()) {
+        referenceVoiceResultText = '参考音色未创建：该动作只允许当前 Bridge Owner 显式授权。';
+      } else if (!trustedNativeReferenceSource) {
+        referenceVoiceResultText = '参考音色未创建：请原生回复一条可读取的语音，并在当前消息中明确要求创建参考音色。';
+      } else if (typeof speechHost?.importReferenceVoice !== 'function') {
+        referenceVoiceResultText = '参考音色未创建：当前 Runtime 尚未提供受管音色导入能力。';
+      } else {
+        const authorizedAt = new Date();
+        const expiresAt = new Date(authorizedAt.getTime() + SPEECH_REFERENCE_AUTHORIZATION_TTL_MS);
+        const authorization: SpeechReferenceVoiceAuthorization = {
+          protocol: 'cti-speech-reference-voice-authorization/v1',
+          scope: 'current_native_reply_audio',
+          rightsBasis: referenceVoiceAction.rightsBasis,
+          usageScope: referenceVoiceAction.usageScope,
+          cleanSingleSpeakerConfirmed: referenceVoiceAction.cleanSingleSpeakerConfirmed,
+          ownerUserId: msg.address.userId.trim(),
+          authorizedAt: authorizedAt.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+        };
+        try {
+          const source = trustedNativeReferenceSource;
+          const receipt = parseSpeechReferenceVoiceImportReceipt(
+            await speechHost.importReferenceVoice({
+              ...(referenceVoiceAction.profileName ? { profileName: referenceVoiceAction.profileName } : {}),
+              path: source.path,
+              mediaType: source.mediaType,
+              sha256: source.sha256,
+              requestMessageId: source.requestMessageId,
+              sourceMessageId: source.sourceMessageId,
+              fileKey: source.fileKey,
+              attachmentId: source.attachmentId,
+              transcript: source.transcript,
+              authorization,
+              signal: taskAbort.signal,
+            }),
+            {
+              requestMessageId: source.requestMessageId,
+              sourceMessageId: source.sourceMessageId,
+              fileKey: source.fileKey,
+              attachmentId: source.attachmentId,
+              fileSha256: source.sha256,
+              authorizationExpiresAt: authorization.expiresAt,
+            },
+          );
+          if (taskAbort.signal.aborted) return;
+          referenceVoiceResultText = receipt
+            ? `参考音色已创建：${receipt.voiceProfileId}`
+            : '参考音色未创建：Runtime 回执未通过当前消息、附件、哈希与授权时效绑定校验。';
+        } catch {
+          if (taskAbort.signal.aborted) return;
+          referenceVoiceResultText = '参考音色未创建：Runtime 导入失败，请检查本地音色注册与依赖状态。';
+        }
+      }
+      // 动作结果必须由真实 Host 回执收口，不能继续展示模型预先声称的成功文案。
+      deliveryResponseText = referenceVoiceResultText;
+      outboundDeliveryResponseText = referenceVoiceResultText;
+    }
     const safeProviderErrorText = result.hasError
       ? buildSafeProviderErrorMessage(result.errorMessage || 'Unknown provider error', {
         cardFinalized: false,
@@ -8340,7 +8578,6 @@ async function handleMessage(
       // Runtime policy 是可选呈现配置；读取异常时使用 Core 的兼容默认。
     }
     const speechDecision = decideSpeechReply({
-      userText: rawText,
       sessionPreference: readSpeechReplyPreference(msg, effectiveBinding.codepilotSessionId),
       inboundAudio: inboundSpeechReceived,
       modelDirective: preparedReply?.speech,
@@ -8395,20 +8632,41 @@ async function handleMessage(
               turnId: msg.messageId,
             });
           } catch { /* Runtime may choose its own managed scratch root */ }
-          managedSpeechReceipt = parseSpeechSynthesisReceipt(await managedSpeechHost.synthesize({
+          const synthesisIdentity = parseSpeechSynthesisIdentity(
+            await managedSpeechHost.getSynthesisIdentity({ signal: taskAbort.signal }),
+          );
+          if (!synthesisIdentity) throw { errorCode: 'speech_synthesis_identity_unavailable' };
+          const synthesisRequest = {
             text: speechText,
+            expectedIdentity: synthesisIdentity,
             scratchDir,
             signal: taskAbort.signal,
-          }), speechText);
-          if (!managedSpeechReceipt) throw { errorCode: 'speech_invalid_synthesis_receipt' };
+          };
+          const rawSynthesisReceipt = await managedSpeechHost.synthesize(synthesisRequest);
+          const parsedReceipt = parseSpeechSynthesisReceipt(rawSynthesisReceipt, synthesisRequest);
+          if (!parsedReceipt) {
+            // 原始回执来自受信 Runtime；即使 Core 的 CAS 比对拒绝它，也要让
+            // Runtime 用自己的登记表再次校验并释放，避免身份漂移造成临时文件泄漏。
+            try { await managedSpeechHost.releaseSynthesis?.(rawSynthesisReceipt as SpeechSynthesisReceipt); } catch { /* best effort */ }
+            throw { errorCode: 'speech_invalid_synthesis_receipt' };
+          }
+          if (taskAbort.signal.aborted) {
+            try { await managedSpeechHost.releaseSynthesis?.(parsedReceipt); } catch { /* 取消已赢得终态；清理失败只留给 Runtime 观察。 */ }
+            const interruption = new Error('speech synthesis cancelled');
+            interruption.name = 'AbortError';
+            throw interruption;
+          }
+          managedSpeechReceipt = parsedReceipt;
           if (managedSpeechHost.releaseSynthesis) {
             const receipt = managedSpeechReceipt as SpeechSynthesisReceipt;
             releaseManagedAudio = () => managedSpeechHost!.releaseSynthesis!(receipt);
           }
         } catch (error) {
-          const notice = speechFailureMessage(error, 'synthesize');
-          deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
-          outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+          if (!taskAbort.signal.aborted) {
+            const notice = speechFailureMessage(error, 'synthesize');
+            deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+            outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+          }
         }
       } else {
         const notice = speechFailureMessage({ errorCode: 'speech_not_ready' }, 'synthesize');
@@ -8438,7 +8696,7 @@ async function handleMessage(
               turnId: msg.messageId,
             });
           } catch { /* Runtime 可选择自己的受管 scratch 根 */ }
-          managedSpeechReceipt = parseSingingSynthesisReceipt(await managedSingingHost.synthesizeSong({
+          const singingReceipt = parseSingingSynthesisReceipt(await managedSingingHost.synthesizeSong({
             prompt: singingDirective.prompt,
             lyrics: singingDirective.lyrics,
             vocalLanguage: singingDirective.vocalLanguage,
@@ -8446,15 +8704,24 @@ async function handleMessage(
             scratchDir,
             signal: taskAbort.signal,
           }), singingDirective);
-          if (!managedSpeechReceipt) throw { errorCode: 'singing_invalid_synthesis_receipt' };
+          if (!singingReceipt) throw { errorCode: 'singing_invalid_synthesis_receipt' };
+          if (taskAbort.signal.aborted) {
+            try { await managedSingingHost.releaseSynthesis?.(singingReceipt); } catch { /* best effort */ }
+            const interruption = new Error('singing synthesis cancelled');
+            interruption.name = 'AbortError';
+            throw interruption;
+          }
+          managedSpeechReceipt = singingReceipt;
           if (managedSingingHost.releaseSynthesis) {
             const receipt = managedSpeechReceipt;
             releaseManagedAudio = () => managedSingingHost!.releaseSynthesis!(receipt as import('./host.js').SingingSynthesisReceipt);
           }
         } catch {
-          const notice = singingFailureMessage();
-          deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
-          outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+          if (!taskAbort.signal.aborted) {
+            const notice = singingFailureMessage();
+            deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
+            outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
+          }
         }
       } else {
         const notice = singingFailureMessage();
@@ -8462,6 +8729,9 @@ async function handleMessage(
         outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
       }
     }
+    // TTS/歌声 Host 可能忽略或延迟响应取消。任何模型后处理、记忆、协作成功
+    // 标记和平台交付前都必须重新检查，由 finally 统一收口 cancelled 终态。
+    if (taskAbort.signal.aborted) return;
     const conversationMemoryResponseText = handledAsDoc
       ? deliveryResponseText
       : stickerSafeUserFacingResponseText;
@@ -8512,7 +8782,7 @@ async function handleMessage(
           : result.hasError || documentDeliveryFailed || isExplicitUnfinishedReplyText(finalText)
             ? 'error'
             : 'completed';
-        cardFinalized = await adapter.onStreamEnd(
+        const streamEndArgs: StreamEndArgs = [
           msg.address.chatId,
           status,
           finalText,
@@ -8527,14 +8797,17 @@ async function handleMessage(
             ...(!agentChoiceCardAttached && preparedCardHero
               ? { feishuCardHero: preparedCardHero.cardHero }
               : {}),
-            ...(managedSpeechReceipt ? {
+            ...(managedSpeechReceipt && !taskAbort.signal.aborted ? {
               speechDelivery: {
                 receipt: managedSpeechReceipt,
                 fallbackText: deliveryResponseText,
               },
             } : {}),
           },
-        );
+        ];
+        cardFinalized = activeTask
+          ? await finalizeActiveTaskCardOnce(activeTask, streamEndArgs)
+          : await adapter.onStreamEnd(...streamEndArgs);
         if (status === 'interrupted' && activeTask) activeTask.interruptionFinalized = cardFinalized;
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
@@ -8545,9 +8818,10 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     let responseDeliveryResult: SendResult | null = null;
     let cardHeroEmbedded = Boolean(preparedCardHero && cardFinalized && !agentChoiceCardAttached);
-    if (responseText || handledAsDoc) {
+    if ((responseText || handledAsDoc) && !taskAbort.signal.aborted) {
       if (!cardFinalized || agentChoiceCardAttached) {
         updateBridgeRuntimeActiveRequest(activeRequest, 'reply_sending');
+        if (activeTask) activeTask.deliveryCommitted = true;
         const deliveryCardHero = preparedCardHero
           && (!preparedReply?.feishuCardJson || agentChoiceCardAttached)
           ? preparedCardHero.cardHero
@@ -8561,28 +8835,32 @@ async function handleMessage(
             ? singingFailureMessage()
             : speechFailureMessage({ errorCode: 'speech_delivery_failed' }, 'synthesize');
           const speechDelivery = await deliverSpeechWithTextFallback({
-            sendAudio: () => adapter.sendLocalAudio(
-              msg.address.chatId,
-              managedSpeechReceipt!.path,
-              preparedReply?.replyTo || msg.messageId,
-              { expectedSha256: managedSpeechReceipt!.fileSha256 },
-            ),
-            sendTextFallback: () => deliverResponse(
-              adapter,
-              msg.address,
-              [outboundDeliveryResponseText, audioDeliveryFailureNotice]
-                .filter(Boolean)
-                .join('\n\n'),
-              effectiveBinding.codepilotSessionId,
-              preparedReply?.replyTo || msg.messageId,
-              true,
-              preparedReply?.parseMode,
-              preparedReply?.mentions,
-              preparedReply?.feishuCardJson,
-              verifiedStickerAction,
-              rawText,
-              deliveryCardHero,
-            ),
+            sendAudio: () => taskAbort.signal.aborted
+              ? Promise.resolve({ ok: false, error: 'turn_cancelled_before_audio_send' })
+              : adapter.sendLocalAudio(
+                msg.address.chatId,
+                managedSpeechReceipt!.path,
+                preparedReply?.replyTo || msg.messageId,
+                { expectedSha256: managedSpeechReceipt!.fileSha256 },
+              ),
+            sendTextFallback: () => taskAbort.signal.aborted
+              ? Promise.resolve({ ok: false, error: 'turn_cancelled_before_text_fallback' })
+              : deliverResponse(
+                adapter,
+                msg.address,
+                [outboundDeliveryResponseText, audioDeliveryFailureNotice]
+                  .filter(Boolean)
+                  .join('\n\n'),
+                effectiveBinding.codepilotSessionId,
+                preparedReply?.replyTo || msg.messageId,
+                true,
+                preparedReply?.parseMode,
+                preparedReply?.mentions,
+                preparedReply?.feishuCardJson,
+                verifiedStickerAction,
+                rawText,
+                deliveryCardHero,
+              ),
           });
           responseDeliveryResult = speechDelivery.kind === 'unresolved'
             ? { ok: false, error: speechDelivery.error }
@@ -8614,20 +8892,22 @@ async function handleMessage(
             } catch { /* delivery success cannot be rolled back by observation persistence */ }
           }
         } else {
-          responseDeliveryResult = await deliverResponse(
-            adapter,
-            msg.address,
-            outboundDeliveryResponseText,
-            effectiveBinding.codepilotSessionId,
-            preparedReply?.replyTo || msg.messageId,
-            true,
-            preparedReply?.parseMode,
-            preparedReply?.mentions,
-            preparedReply?.feishuCardJson,
-            verifiedStickerAction,
-            rawText,
-            deliveryCardHero,
-          );
+          responseDeliveryResult = taskAbort.signal.aborted
+            ? { ok: false, error: 'turn_cancelled_before_text_send' }
+            : await deliverResponse(
+              adapter,
+              msg.address,
+              outboundDeliveryResponseText,
+              effectiveBinding.codepilotSessionId,
+              preparedReply?.replyTo || msg.messageId,
+              true,
+              preparedReply?.parseMode,
+              preparedReply?.mentions,
+              preparedReply?.feishuCardJson,
+              verifiedStickerAction,
+              rawText,
+              deliveryCardHero,
+            );
         }
         if (registeredChoiceForDelivery) {
           if (responseDeliveryResult.ok
@@ -8839,15 +9119,12 @@ async function handleMessage(
     }
 
     // If task was aborted and streaming card is still active, finalize as interrupted
-    if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd && taskAbort.signal.aborted && !activeTask?.interruptionFinalized) {
-      try {
-        const finalized = await adapter.onStreamEnd(msg.address.chatId, 'interrupted', DEFAULT_INTERRUPTED_CARD_TEXT, undefined, undefined, undefined, {
-          codepilotSessionId: effectiveBinding.codepilotSessionId,
-          sourceMessageId: msg.messageId,
-          sourceText: rawText,
-        });
-        if (activeTask) activeTask.interruptionFinalized = finalized;
-      } catch { /* best effort */ }
+    if ((workflowCardStarted || lightStatusCardStarted)
+      && adapter.onStreamEnd
+      && taskAbort.signal.aborted
+      && activeTask
+      && !activeTask.interruptionFinalized) {
+      await finalizeInterruptedTaskCard(activeTask);
     }
 
     if (managedSpeechReceipt && releaseManagedAudio) {

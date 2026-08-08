@@ -36,6 +36,7 @@ export interface CtiScheduledTaskCreateAction {
   taskAction: ScheduledTaskActionInput;
   deliveryMode: 'result' | 'summary' | 'none';
   ignoredTrustedFields: string[];
+  normalizedFields: string[];
 }
 
 export interface ExtractedScheduledTaskAction {
@@ -82,6 +83,11 @@ export interface ActionBlockParseOptions {
   parseMentions?: (value: unknown) => OutboundMention[] | undefined;
 }
 
+export interface ScheduledTaskActionParseOptions {
+  /** 相对时间只能在真实动作解析时刻落成绝对时间，测试可注入固定时钟。 */
+  referenceTime?: string | number | Date;
+}
+
 function buildFencePattern(fence: string): RegExp {
   return new RegExp(`(^|\\n)\\s*\`\`\`${fence}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\``, 'i');
 }
@@ -104,38 +110,191 @@ function getRecordField(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function parseScheduledTaskSchedule(value: unknown): ScheduledTaskScheduleInput | null {
+interface ParsedScheduledTaskSchedule {
+  schedule: ScheduledTaskScheduleInput | null;
+  normalizedFields: string[];
+  error?: string;
+}
+
+const EXPLICIT_OFFSET_SUFFIX_RE = /(?:Z|[+-]\d{2}:?\d{2})$/iu;
+
+function getPositiveNumberField(
+  raw: Record<string, unknown>,
+  candidates: Array<{ key: string; multiplier: number }>,
+): { valueMs: number; key: string } | null {
+  for (const candidate of candidates) {
+    const value = Number(raw[candidate.key]);
+    if (!Number.isFinite(value) || value <= 0) continue;
+    const valueMs = value * candidate.multiplier;
+    if (Number.isFinite(valueMs) && valueMs > 0) return { valueMs, key: candidate.key };
+  }
+  return null;
+}
+
+function resolveReferenceTime(value: ScheduledTaskActionParseOptions['referenceTime']): Date | null {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value ?? Date.now());
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function parseScheduledTaskSchedule(
+  value: unknown,
+  options: ScheduledTaskActionParseOptions = {},
+): ParsedScheduledTaskSchedule {
   if (typeof value === 'string') {
     // Codex occasionally emits the standard crontab inline timezone form instead
     // of the canonical object. Normalize only an explicit TZ assignment; a bare
     // cron string remains invalid because the Bridge must not guess a timezone.
     const match = /^(?:CRON_TZ|TZ)\s*=\s*([^\s]+)\s+([^\r\n]+)$/iu.exec(value.trim());
-    if (!match) return null;
+    if (!match) {
+      return {
+        schedule: null,
+        normalizedFields: [],
+        error: '计划任务 schedule 字符串缺少显式 CRON_TZ/TZ',
+      };
+    }
     const timezone = match[1].replace(/^["']|["']$/gu, '').trim();
     const expression = match[2].trim().replace(/\s+/gu, ' ');
-    return timezone && expression ? { kind: 'cron', expression, timezone } : null;
+    return timezone && expression
+      ? {
+          schedule: { kind: 'cron', expression, timezone },
+          normalizedFields: ['schedule:string_cron->cron'],
+        }
+      : {
+          schedule: null,
+          normalizedFields: [],
+          error: '计划任务 cron schedule 缺少 expression 或 timezone',
+        };
   }
   const raw = getRecordField(value);
-  if (!raw) return null;
-  const kind = getStringField(raw, ['kind']).toLowerCase();
+  if (!raw) {
+    return { schedule: null, normalizedFields: [], error: '计划任务 schedule 必须是对象' };
+  }
+  const normalizedFields: string[] = [];
+  const rawKind = getStringField(raw, ['kind', 'type']).toLowerCase();
+  if (!getStringField(raw, ['kind']) && getStringField(raw, ['type'])) {
+    normalizedFields.push('schedule.type->kind');
+  }
+  const kind = rawKind === 'once' || rawKind === 'one_time' || rawKind === 'one-time'
+    ? 'at'
+    : rawKind === 'interval'
+      ? 'every'
+      : rawKind;
+  if (kind !== rawKind && rawKind) normalizedFields.push(`schedule.kind:${rawKind}->${kind}`);
   if (kind === 'at') {
-    const at = getStringField(raw, ['at', 'dueAt', 'due_at']);
-    const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
-    return at && timezone ? { kind: 'at', at, timezone } : null;
+    const atKeys = ['at', 'dueAt', 'due_at', 'datetime', 'dateTime', 'date_time', 'runAt', 'run_at'];
+    const at = getStringField(raw, atKeys);
+    if (at) {
+      const sourceKey = atKeys.find((key) => typeof raw[key] === 'string' && String(raw[key]).trim()) || 'at';
+      if (sourceKey !== 'at') normalizedFields.push(`schedule.${sourceKey}->at`);
+      let timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
+      if (!timezone && EXPLICIT_OFFSET_SUFFIX_RE.test(at)) {
+        // RFC3339 偏移已经唯一确定执行时刻；内部统一用 UTC 展示，避免猜测用户所在地区。
+        timezone = 'UTC';
+        normalizedFields.push('schedule.explicit_offset->timezone:UTC');
+      }
+      if (!timezone) {
+        return {
+          schedule: null,
+          normalizedFields,
+          error: '计划任务 schedule.kind=at 缺少 timezone；无偏移本地时间不能安全解析',
+        };
+      }
+      if (EXPLICIT_OFFSET_SUFFIX_RE.test(at) && !Number.isFinite(new Date(at).getTime())) {
+        return {
+          schedule: null,
+          normalizedFields,
+          error: `计划任务 schedule.kind=at 的时间字段无效：${sourceKey}`,
+        };
+      }
+      return { schedule: { kind: 'at', at, timezone }, normalizedFields };
+    }
+
+    const delay = getPositiveNumberField(raw, [
+      { key: 'delayMs', multiplier: 1 },
+      { key: 'delay_ms', multiplier: 1 },
+      { key: 'delaySeconds', multiplier: 1_000 },
+      { key: 'delay_seconds', multiplier: 1_000 },
+      { key: 'delayMinutes', multiplier: 60_000 },
+      { key: 'delay_minutes', multiplier: 60_000 },
+      { key: 'delayHours', multiplier: 3_600_000 },
+      { key: 'delay_hours', multiplier: 3_600_000 },
+    ]);
+    const reference = resolveReferenceTime(options.referenceTime);
+    if (delay && reference) {
+      const atMs = reference.getTime() + delay.valueMs;
+      const atDate = new Date(atMs);
+      if (Number.isFinite(atDate.getTime())) {
+        normalizedFields.push(`schedule.${delay.key}->at`);
+        normalizedFields.push('schedule.reference_time->timezone:UTC');
+        return {
+          schedule: { kind: 'at', at: atDate.toISOString(), timezone: 'UTC' },
+          normalizedFields,
+        };
+      }
+    }
+    return {
+      schedule: null,
+      normalizedFields,
+      error: delay
+        ? '计划任务相对延时无法转换为有效绝对时间'
+        : '计划任务 schedule.kind=at 缺少 at/datetime 或正数 delay',
+    };
   }
   if (kind === 'every') {
-    const everyMs = Number(raw.everyMs ?? raw.every_ms);
-    const anchorAt = getStringField(raw, ['anchorAt', 'anchor_at']);
-    return Number.isFinite(everyMs) && everyMs > 0 && anchorAt
-      ? { kind: 'every', everyMs: Math.floor(everyMs), anchorAt }
-      : null;
+    const interval = getPositiveNumberField(raw, [
+      { key: 'everyMs', multiplier: 1 },
+      { key: 'every_ms', multiplier: 1 },
+      { key: 'everySeconds', multiplier: 1_000 },
+      { key: 'every_seconds', multiplier: 1_000 },
+      { key: 'everyMinutes', multiplier: 60_000 },
+      { key: 'every_minutes', multiplier: 60_000 },
+      { key: 'everyHours', multiplier: 3_600_000 },
+      { key: 'every_hours', multiplier: 3_600_000 },
+    ]);
+    if (!interval) {
+      return {
+        schedule: null,
+        normalizedFields,
+        error: '计划任务 schedule.kind=every 缺少正数 everyMs/everySeconds/everyMinutes/everyHours',
+      };
+    }
+    if (interval.key !== 'everyMs') normalizedFields.push(`schedule.${interval.key}->everyMs`);
+    let anchorAt = getStringField(raw, ['anchorAt', 'anchor_at']);
+    if (!anchorAt) {
+      const reference = resolveReferenceTime(options.referenceTime);
+      if (!reference) {
+        return {
+          schedule: null,
+          normalizedFields,
+          error: '计划任务 schedule.kind=every 缺少 anchorAt，且当前参考时间无效',
+        };
+      }
+      anchorAt = reference.toISOString();
+      normalizedFields.push('schedule.reference_time->anchorAt');
+    }
+    return {
+      schedule: { kind: 'every', everyMs: Math.floor(interval.valueMs), anchorAt },
+      normalizedFields,
+    };
   }
   if (kind === 'cron') {
     const expression = getStringField(raw, ['expression', 'cron']);
     const timezone = getStringField(raw, ['timezone', 'timeZone', 'tz']);
-    return expression && timezone ? { kind: 'cron', expression, timezone } : null;
+    return expression && timezone
+      ? { schedule: { kind: 'cron', expression, timezone }, normalizedFields }
+      : {
+          schedule: null,
+          normalizedFields,
+          error: '计划任务 schedule.kind=cron 缺少 expression 或 timezone',
+        };
   }
-  return null;
+  return {
+    schedule: null,
+    normalizedFields,
+    error: rawKind
+      ? `计划任务 schedule.kind=${rawKind} 不受支持；仅支持 at/every/cron`
+      : '计划任务 schedule 缺少 kind/type',
+  };
 }
 
 function parseScheduledTaskAction(value: unknown): ScheduledTaskActionInput | null {
@@ -279,7 +438,10 @@ export function extractCtiReminderAction(text: string, options: ActionBlockParse
   }
 }
 
-export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledTaskAction {
+export function extractCtiScheduledTaskAction(
+  text: string,
+  options: ScheduledTaskActionParseOptions = {},
+): ExtractedScheduledTaskAction {
   const fencePattern = buildFencePattern(SCHEDULED_TASK_ACTION_FENCE);
   const match = text.match(fencePattern);
   if (!match) return { action: null, text, hadBlock: false };
@@ -291,7 +453,8 @@ export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledT
       return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作仅支持 create' };
     }
     const name = getStringField(raw, ['name', 'title']);
-    const schedule = parseScheduledTaskSchedule(raw.schedule);
+    const scheduleResult = parseScheduledTaskSchedule(raw.schedule, options);
+    const schedule = scheduleResult.schedule;
     const rawTaskAction = raw.taskAction ?? raw.task_action;
     const taskAction = parseScheduledTaskAction(rawTaskAction);
     const requestedDeliveryMode = getStringField(raw, ['deliveryMode', 'delivery_mode']).toLowerCase();
@@ -299,7 +462,14 @@ export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledT
       ? requestedDeliveryMode
       : 'result';
     if (!name) return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name' };
-    if (!schedule) return { action: null, text: cleaned, hadBlock: true, error: '计划任务 schedule 无效或缺少必要字段' };
+    if (!schedule) {
+      return {
+        action: null,
+        text: cleaned,
+        hadBlock: true,
+        error: scheduleResult.error || '计划任务 schedule 无效或缺少必要字段',
+      };
+    }
     if (!taskAction) {
       const taskActionKind = getStringField(getRecordField(rawTaskAction) || {}, ['kind']);
       return {
@@ -318,6 +488,7 @@ export function extractCtiScheduledTaskAction(text: string): ExtractedScheduledT
         schedule,
         taskAction,
         deliveryMode,
+        normalizedFields: scheduleResult.normalizedFields,
         ignoredTrustedFields: [
           ...collectIgnoredScheduledTaskFields(parsed),
           ...collectIgnoredScheduledTaskActionFields(rawTaskAction),

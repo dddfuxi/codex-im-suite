@@ -14,8 +14,8 @@ describe('control panel shared contracts', () => {
     assert.equal(contracts.CONTROL_PANEL_STATE_SCHEMA, 'codex-im-suite/control-panel-state/v1');
     assert.equal(contracts.CONTROL_COMMAND_SCHEMA, 'codex-im-suite/control-command/v1');
     assert.equal(contracts.CONTROL_RESULT_SCHEMA, 'codex-im-suite/control-result/v1');
-    assert.equal(contracts.SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v1');
-    assert.equal(contracts.SPEECH_SETTINGS_SCHEMA, 'codex-im-suite/speech-settings/v1');
+    assert.equal(contracts.SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v2');
+    assert.equal(contracts.SPEECH_SETTINGS_SCHEMA, 'codex-im-suite/speech-settings/v2');
     assert.equal(contracts.WORKFLOW_PANEL_STATE_PROTOCOL, 'workflow-runtime/v1');
     assert.equal(contracts.AGENT_COLLABORATION_PROTOCOL, 'codex-im-suite/agent-collaboration/v1');
     assert.equal(contracts.AGENT_WORKER_PROTOCOL, 'codex-im-suite/agent-worker/v1');
@@ -74,7 +74,7 @@ describe('control panel shared contracts', () => {
     assert.equal(speech.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(speech.$defs?.SpeechSettingsContract?.required, [
       'schema', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
-      'asrProvider', 'ttsProvider', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId',
+      'asrProvider', 'ttsProvider', 'ttsModelId', 'tonePolicy', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId',
     ]);
   });
 });

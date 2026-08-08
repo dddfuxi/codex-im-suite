@@ -1,10 +1,11 @@
-export const SPEECH_STATUS_PROTOCOL = 'codex-im-suite/speech-status/v1' as const;
-export const SPEECH_SETTINGS_SCHEMA = 'codex-im-suite/speech-settings/v1' as const;
-export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v1' as const;
+export const SPEECH_STATUS_PROTOCOL = 'codex-im-suite/speech-status/v2' as const;
+export const SPEECH_SETTINGS_SCHEMA = 'codex-im-suite/speech-settings/v2' as const;
+export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v2' as const;
 
 export type SpeechState = 'ready' | 'optional_missing' | 'blocked' | 'error';
 export type SpeechVoiceProfileKind = 'preset' | 'reference';
 export type SpeechVoiceCapability = 'speech' | 'singing';
+export type SpeechModelCapability = 'preset_voice' | 'voice_clone' | 'instruction_control';
 
 /**
  * provider、策略和渠道的 ID 均由 Runtime 声明；面板只回传 options 中的
@@ -21,6 +22,41 @@ export interface SpeechSelectionOptionContract {
 export interface SpeechSelectionContract {
   value: string;
   options: SpeechSelectionOptionContract[];
+}
+
+/**
+ * benchmark 结果必须绑定具体模型版本与本机硬件；面板只接收脱敏指标，
+ * 不接收模型路径、命令、原始日志或设备序列号。
+ */
+export interface SpeechModelBenchmarkContract {
+  state: SpeechState;
+  revision: string;
+  testedAt?: string;
+  coldStartMs?: number;
+  warmSynthesisMs?: number;
+  outputDurationMs?: number;
+  realTimeFactor?: number;
+  peakVramMiB?: number;
+  diagnosticCode?: string;
+}
+
+export interface SpeechModelOptionContract extends SpeechSelectionOptionContract {
+  providerId: string;
+  variant: string;
+  sizeLabel: string;
+  componentId: string;
+  capabilities: SpeechModelCapability[];
+  defaultVoiceProfileId: string;
+  benchmark: SpeechModelBenchmarkContract;
+}
+
+export interface SpeechModelSelectionContract {
+  /** 已保存配置中的模型 ID。 */
+  value: string;
+  /** 当前 live Sidecar 实际加载的模型 ID；未加载时为空字符串。 */
+  liveValue: string;
+  restartRequired: boolean;
+  options: SpeechModelOptionContract[];
 }
 
 export interface SpeechChannelContract extends SpeechSelectionOptionContract {
@@ -59,6 +95,7 @@ export interface SpeechVoiceProfileContract {
   sourceLabel: string;
   authorizationConfirmed: boolean;
   capabilities: SpeechVoiceCapability[];
+  compatibleTtsModelIds: string[];
   diagnosticCode?: string;
 }
 
@@ -88,6 +125,8 @@ export interface SpeechSettingsContract {
   deliveryMode: string;
   asrProvider: string;
   ttsProvider: string;
+  ttsModelId: string;
+  tonePolicy: string;
   singingProvider: string;
   activeVoiceProfileId: string;
   activeSingingVoiceProfileId: string;
@@ -104,6 +143,8 @@ export interface SpeechStatusContract {
   deliveryMode: SpeechSelectionContract;
   asrProvider: SpeechSelectionContract;
   ttsProvider: SpeechSelectionContract;
+  ttsModel: SpeechModelSelectionContract;
+  tonePolicy: SpeechSelectionContract;
   singingProvider: SpeechSelectionContract;
   activeVoiceProfileId: string;
   activeSingingVoiceProfileId: string;
@@ -137,6 +178,7 @@ export interface SpeechPreviewReceiptContract {
   bytes: number;
   sha256: string;
   durationMs: number;
+  modelId: string;
   voiceProfileId: string;
   validated: true;
 }

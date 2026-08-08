@@ -49,6 +49,8 @@ export function createSpeechSettingsDraft(status: SpeechStatusContract): SpeechS
     deliveryMode: status.deliveryMode.value,
     asrProvider: status.asrProvider.value,
     ttsProvider: status.ttsProvider.value,
+    ttsModelId: status.ttsModel.value,
+    tonePolicy: status.tonePolicy.value,
     singingProvider: status.singingProvider.value,
     activeVoiceProfileId: status.activeVoiceProfileId,
     activeSingingVoiceProfileId: status.activeSingingVoiceProfileId,
@@ -72,15 +74,22 @@ export function canSaveSpeechSettings(status: SpeechStatusContract, draft: Speec
     || (new Set(draft.channelIds).size === draft.channelIds.length
       && draft.channelIds.every((id) => status.channels.some((channel) => channel.id === id && channel.enabled)));
   const voiceProfileValid = !draft.activeVoiceProfileId
-    || status.voiceProfiles.some((profile) => profile.id === draft.activeVoiceProfileId && profile.state === 'ready' && profile.capabilities.includes('speech'));
+    || status.voiceProfiles.some((profile) => profile.id === draft.activeVoiceProfileId
+      && profile.state === 'ready'
+      && profile.capabilities.includes('speech')
+      && profile.compatibleTtsModelIds.includes(draft.ttsModelId));
   const singingVoiceProfileValid = !draft.activeSingingVoiceProfileId
     || status.voiceProfiles.some((profile) => profile.id === draft.activeSingingVoiceProfileId && profile.state === 'ready' && profile.capabilities.includes('singing'));
+  const model = status.ttsModel.options.find((option) => option.id === draft.ttsModelId && option.enabled);
+  const modelValid = Boolean(model && model.providerId === draft.ttsProvider);
   return draft.schema === SPEECH_SETTINGS_SCHEMA
     && channelValid
     && selectionAccepts(status.replyPolicy, draft.replyPolicy)
     && selectionAccepts(status.deliveryMode, draft.deliveryMode)
     && (!draft.inputEnabled || selectionAccepts(status.asrProvider, draft.asrProvider))
     && (!draft.outputEnabled || selectionAccepts(status.ttsProvider, draft.ttsProvider))
+    && (!draft.outputEnabled || modelValid)
+    && (!draft.outputEnabled || selectionAccepts(status.tonePolicy, draft.tonePolicy))
     && (!draft.outputEnabled || voiceProfileValid)
     && (!draft.singingEnabled || selectionAccepts(status.singingProvider, draft.singingProvider))
     && (!draft.singingEnabled || singingVoiceProfileValid);
@@ -108,7 +117,7 @@ export function decodeSpeechPreviewReceipt(value: unknown): {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('speech_preview_response_invalid');
   const receipt = value as Partial<SpeechPreviewReceiptContract>;
   const keys = Object.keys(receipt).sort();
-  const expectedKeys = ['base64', 'bytes', 'durationMs', 'mediaType', 'protocol', 'sha256', 'validated', 'voiceProfileId'];
+  const expectedKeys = ['base64', 'bytes', 'durationMs', 'mediaType', 'modelId', 'protocol', 'sha256', 'validated', 'voiceProfileId'];
   if (
     keys.join('\n') !== expectedKeys.join('\n')
     || receipt.protocol !== SPEECH_PREVIEW_PROTOCOL
@@ -125,6 +134,8 @@ export function decodeSpeechPreviewReceipt(value: unknown): {
     || !/^[a-f0-9]{64}$/u.test(receipt.sha256)
     || !Number.isFinite(receipt.durationMs)
     || receipt.durationMs! <= 0
+    || typeof receipt.modelId !== 'string'
+    || !/^[A-Za-z0-9._-]{1,80}$/u.test(receipt.modelId)
     || typeof receipt.voiceProfileId !== 'string'
     || !/^[A-Za-z0-9._-]{1,80}$/u.test(receipt.voiceProfileId)
   ) {

@@ -8,12 +8,15 @@ import {
   type SpeechPreviewReceipt,
 } from './speech-preview.js';
 import { DEFAULT_PRESET_VOICE, type SpeechVoiceRegistry } from './voice-registry.js';
+import type { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
+import { findSpeechModel } from './speech-model-catalog.js';
 
 export const SPEECH_CONTROL_ACTIONS = [
   'speech.refresh',
   'speech.saveSettings',
   'speech.installComponent',
   'speech.installPresetVoice',
+  'speech.benchmarkTtsModel',
   'speech.importReferenceVoice',
   'speech.previewVoice',
   'speech.previewSingingVoice',
@@ -34,8 +37,8 @@ function stringValue(value: unknown, field: string, allowEmpty = false): string 
   return normalized;
 }
 
-function hasOption(status: SpeechStatusContract, field: 'replyPolicy' | 'deliveryMode' | 'asrProvider' | 'ttsProvider' | 'singingProvider', value: string): boolean {
-  return status[field].options.some((option) => option.id === value);
+function hasOption(status: SpeechStatusContract, field: 'replyPolicy' | 'deliveryMode' | 'asrProvider' | 'ttsProvider' | 'tonePolicy' | 'singingProvider', value: string): boolean {
+  return status[field].options.some((option) => option.id === value && option.enabled);
 }
 
 export class SpeechControlService {
@@ -49,12 +52,21 @@ export class SpeechControlService {
     readLiveStatus?: () => SpeechStatusContract | null;
     previewVoice?: (input: {
       text: string;
+      modelId: string;
+      voiceProfileId: string;
+    }) => Promise<SpeechPreviewReceipt>;
+    benchmarkVoice?: (input: {
+      text: string;
+      modelId: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
     previewSingingVoice?: (input: {
       text: string;
+      modelId: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
+    benchmarkStore?: SpeechModelBenchmarkStore;
+    hardwareId?: string;
   }) {}
 
   private refreshStatus(preferLiveSnapshot = true): Promise<SpeechStatusContract> {
@@ -80,6 +92,65 @@ export class SpeechControlService {
       this.options.voiceRegistry.registerPreset({
         ...DEFAULT_PRESET_VOICE,
       });
+    }
+    else if (action === 'speech.benchmarkTtsModel') {
+      const current = await this.refreshStatus();
+      const modelId = stringValue(input.modelId, 'model_id');
+      const model = current.ttsModel.options.find((item) => item.id === modelId);
+      const benchmarkAction = current.actions.find((item) => item.id === action);
+      if (!benchmarkAction?.enabled || !model || current.ttsModel.liveValue !== modelId || !this.options.benchmarkVoice
+        || !this.options.benchmarkStore || !this.options.hardwareId) {
+        throw new RuntimeSpeechError(
+          benchmarkAction?.diagnosticCode || 'tts_model_benchmark_unavailable',
+          'blocked',
+          '当前模型尚未由 live Runtime 加载，不能执行真实性能测试',
+        );
+      }
+      const configuredProfile = current.voiceProfiles.find((item) => item.id === this.options.config.voiceProfileId
+        && item.compatibleTtsModelIds.includes(modelId));
+      const voiceProfileId = model.defaultVoiceProfileId
+        || configuredProfile?.id
+        || current.voiceProfiles.find((item) => item.kind === 'reference' && item.compatibleTtsModelIds.includes(modelId))?.id
+        || '';
+      const profile = current.voiceProfiles.find((item) => item.id === voiceProfileId);
+      if (!profile || !profile.compatibleTtsModelIds.includes(modelId)
+        || (profile.state !== 'ready' && profile.diagnosticCode !== 'voice_clone_benchmark_not_verified')) {
+        throw new RuntimeSpeechError('tts_model_benchmark_voice_unavailable', 'blocked', '当前模型没有可用于测试的兼容音色');
+      }
+      const startedAt = Date.now();
+      try {
+        const receipt = await this.options.benchmarkVoice({
+          modelId,
+          voiceProfileId,
+          text: '这是一次本地语音模型性能测试。我们会验证中文自然度、稳定性、生成速度和最终音频格式，确保真实使用时能够清晰、自然并可靠地完成回复。',
+        });
+        const warmSynthesisMs = Date.now() - startedAt;
+        const realTimeFactor = warmSynthesisMs / receipt.durationMs;
+        const ready = warmSynthesisMs <= 20_000;
+        this.options.benchmarkStore.write({
+          modelId,
+          providerId: model.providerId,
+          revision: receipt.modelRevision || model.benchmark.revision,
+          hardwareId: this.options.hardwareId,
+          state: ready ? 'ready' : 'blocked',
+          testedAt: new Date().toISOString(),
+          warmSynthesisMs,
+          outputDurationMs: receipt.durationMs,
+          realTimeFactor,
+          ...(receipt.peakVramMiB !== undefined ? { peakVramMiB: receipt.peakVramMiB } : {}),
+          ...(ready ? {} : { diagnosticCode: 'tts_model_warm_benchmark_too_slow' }),
+        });
+      } catch (error) {
+        this.options.benchmarkStore.write({
+          modelId,
+          providerId: model.providerId,
+          revision: model.benchmark.revision,
+          hardwareId: this.options.hardwareId,
+          state: 'blocked',
+          testedAt: new Date().toISOString(),
+          diagnosticCode: error instanceof RuntimeSpeechError ? error.code : 'tts_model_benchmark_failed',
+        });
+      }
     }
     else if (action === 'speech.importReferenceVoice') {
       await this.options.voiceRegistry.importReferenceVoice({
@@ -109,15 +180,19 @@ export class SpeechControlService {
         throw new RuntimeSpeechError('speech_preview_text_too_long', 'blocked', '语音试听文本超过长度限制');
       }
       const voiceProfileId = stringValue(input.voiceProfileId, 'voice_profile_id');
+      const modelId = stringValue(input.modelId, 'model_id');
+      if (modelId !== current.ttsModel.value || modelId !== current.ttsModel.liveValue || current.ttsModel.restartRequired) {
+        throw new RuntimeSpeechError('speech_preview_model_not_loaded', 'blocked', '所选模型尚未由 live Runtime 加载');
+      }
       const profile = current.voiceProfiles.find((item) => item.id === voiceProfileId);
-      if (!profile || profile.state !== 'ready') {
+      if (!profile || profile.state !== 'ready' || !profile.compatibleTtsModelIds.includes(modelId)) {
         throw new RuntimeSpeechError(
           profile?.diagnosticCode || 'speech_preview_voice_profile_unavailable',
           'blocked',
           '所选音色当前不可试听',
         );
       }
-      return this.options.previewVoice({ text, voiceProfileId });
+      return this.options.previewVoice({ text, modelId, voiceProfileId });
     } else if (action === 'speech.previewSingingVoice') {
       const current = await this.refreshStatus();
       const previewAction = current.actions.find((item) => item.id === action);
@@ -135,11 +210,16 @@ export class SpeechControlService {
           throw new RuntimeSpeechError(profile?.diagnosticCode || 'singing_preview_voice_profile_unavailable', 'blocked', '所选歌声音色当前不可试听');
         }
       }
-      return this.options.previewSingingVoice({ text, voiceProfileId });
+      return this.options.previewSingingVoice({ text, modelId: this.options.config.singingModel, voiceProfileId });
     } else if (action === 'speech.activateVoiceProfile') {
       const voiceProfileId = stringValue(input.voiceProfileId, 'voice_profile_id');
       const profile = this.options.voiceRegistry.resolveProfile(voiceProfileId);
-      if (profile.kind === 'reference' && !this.options.config.voiceCloneBenchmarkPassed) {
+      const current = await this.refreshStatus();
+      const model = current.ttsModel.options.find((item) => item.id === current.ttsModel.value);
+      if (!model || !profile.compatibleTtsModelIds.includes(model.id)) {
+        throw new RuntimeSpeechError('voice_profile_model_incompatible', 'blocked', '所选音色与当前模型不兼容');
+      }
+      if (profile.kind === 'reference' && model.benchmark.state !== 'ready') {
         throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
       }
       this.options.config.voiceProfileId = voiceProfileId;
@@ -150,7 +230,7 @@ export class SpeechControlService {
 
   private async saveSettings(input: Record<string, unknown>): Promise<void> {
     const current = await this.refreshStatus();
-    if (input.schema !== 'codex-im-suite/speech-settings/v1') throw new RuntimeSpeechError('speech_settings_schema_invalid', 'blocked', '语音设置协议版本不匹配');
+    if (input.schema !== 'codex-im-suite/speech-settings/v2') throw new RuntimeSpeechError('speech_settings_schema_invalid', 'blocked', '语音设置协议版本不匹配');
     const canonical = input as unknown as SpeechSettingsContract & { channelIds?: string[]; channelId?: string };
     const requestedChannels = Array.isArray(canonical.channelIds)
       ? canonical.channelIds.map((item) => stringValue(item, 'channel_id'))
@@ -158,16 +238,24 @@ export class SpeechControlService {
     if (requestedChannels.length === 0 || requestedChannels.some((id) => !current.channels.some((channel) => channel.id === id && channel.enabled))) {
       throw new RuntimeSpeechError('speech_channel_invalid', 'blocked', '所选渠道不在 Runtime 能力列表中');
     }
-    for (const field of ['replyPolicy', 'deliveryMode', 'asrProvider', 'ttsProvider', 'singingProvider'] as const) {
+    for (const field of ['replyPolicy', 'deliveryMode', 'asrProvider', 'ttsProvider', 'tonePolicy', 'singingProvider'] as const) {
       if (!hasOption(current, field, stringValue(canonical[field], field))) {
         throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '所选语音能力不在 Runtime 声明列表中');
       }
+    }
+    const ttsModelId = stringValue(canonical.ttsModelId, 'tts_model_id');
+    const ttsModel = current.ttsModel.options.find((item) => item.id === ttsModelId && item.enabled);
+    if (!ttsModel || ttsModel.providerId !== canonical.ttsProvider || !findSpeechModel(ttsModelId)) {
+      throw new RuntimeSpeechError('speech_tts_model_invalid', 'blocked', '所选语音模型不属于当前 Provider 或当前不可用');
     }
     const activeVoiceProfileId = stringValue(canonical.activeVoiceProfileId, 'voice_profile_id', true);
     const activeSingingVoiceProfileId = stringValue(canonical.activeSingingVoiceProfileId, 'singing_voice_profile_id', true);
     if (activeVoiceProfileId) {
       const profile = this.options.voiceRegistry.resolveProfile(activeVoiceProfileId);
-      if (profile.kind === 'reference' && !this.options.config.voiceCloneBenchmarkPassed) {
+      if (!profile.compatibleTtsModelIds.includes(ttsModelId)) {
+        throw new RuntimeSpeechError('voice_profile_model_incompatible', 'blocked', '所选音色与语音模型不兼容');
+      }
+      if (profile.kind === 'reference' && ttsModel.benchmark.state !== 'ready') {
         throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
       }
     }
@@ -187,6 +275,8 @@ export class SpeechControlService {
       deliveryMode: canonical.deliveryMode,
       asrProvider: canonical.asrProvider,
       ttsProvider: canonical.ttsProvider,
+      ttsModelId,
+      tonePolicy: canonical.tonePolicy,
       singingProvider: canonical.singingProvider,
       voiceProfileId: activeVoiceProfileId || undefined,
       singingVoiceProfileId: activeSingingVoiceProfileId || undefined,

@@ -41,6 +41,7 @@ import {
   classifyExecutionRequirement,
   classifyToolResultQuality,
   hasDeferredBridgeExecutionAction,
+  inferNestedMcpToolEvidenceNames,
   isExecutionEvidenceSatisfied,
   requiresSuccessfulToolEvidence,
   shouldReplaceWithNoExecutionEvidenceText,
@@ -1610,6 +1611,18 @@ async function consumeStream(
                   }
                 } else {
                   executionEvidence.successfulToolResultCount += 1;
+                  if (matchingToolUse) {
+                    for (const evidenceName of inferNestedMcpToolEvidenceNames({
+                      outerToolName: matchingToolUse.name,
+                      toolInput: matchingToolUse.input,
+                      toolResultContent: resultData.content,
+                    })) {
+                      if (!seenToolNames.has(evidenceName)) {
+                        seenToolNames.add(evidenceName);
+                        executionEvidence.toolNames.push(evidenceName);
+                      }
+                    }
+                  }
                   successfulToolResultsById.set(String(resultData.tool_use_id || ''), {
                     toolUseId: String(resultData.tool_use_id || ''),
                     toolName: matchingToolUse?.name || '',

@@ -58,6 +58,25 @@ export type SpeechReplyPreference = 'on' | 'off';
 /** Runtime 级默认语音触发策略；未知值必须回退到兼容默认。 */
 export type SpeechReplyPolicy = 'explicit_or_inbound_audio' | 'explicit_only';
 
+/**
+ * Runtime 在合成前签发的可信模型身份。该身份只能来自本地 Runtime，不能由
+ * Provider 最终正文、模型工具参数或平台消息提供。
+ */
+export interface SpeechSynthesisIdentity {
+  ttsModelId: string;
+  modelRevision: string;
+  /** `null` 明确表示当前模型不使用独立音色；字段本身仍必须存在。 */
+  voiceProfileId: string | null;
+}
+
+export interface SpeechTranscriptSourceBinding {
+  relation: 'current_message' | 'native_reply';
+  /** 触发当前 Bridge 回合的平台消息。 */
+  requestMessageId: string;
+  /** 真正承载音频字节的平台消息；native reply 时与 request 不同。 */
+  sourceMessageId: string;
+}
+
 /** Runtime 对当前真实入站音频完成校验与转写后返回的受控回执。 */
 export interface SpeechTranscriptReceipt {
   protocol: 'cti-speech-transcript/v1';
@@ -69,6 +88,8 @@ export interface SpeechTranscriptReceipt {
   durationMs?: number;
   /** Runtime 从当前音频实际识别出的受控短语言标识。 */
   language: string;
+  relation: SpeechTranscriptSourceBinding['relation'];
+  requestMessageId: string;
   sourceMessageId: string;
   fileSha256: string;
   validated: true;
@@ -84,7 +105,35 @@ export interface SpeechSynthesisReceipt {
   textSha256: string;
   fileSha256: string;
   validated: true;
-  voiceProfileId?: string;
+  ttsModelId: string;
+  modelRevision: string;
+  voiceProfileId: string | null;
+}
+
+export interface SpeechReferenceVoiceAuthorization {
+  protocol: 'cti-speech-reference-voice-authorization/v1';
+  scope: 'current_native_reply_audio';
+  /** 用户确认自己拥有录音权利，或已获得被录音者的明确授权。 */
+  rightsBasis: 'self_or_authorized';
+  /** 参考音色只能留在本机 TTS 链路使用，不得扩展到其它用途。 */
+  usageScope: 'local_tts_only';
+  /** 用户确认回复中的录音是干净的单人语音。 */
+  cleanSingleSpeakerConfirmed: true;
+  ownerUserId: string;
+  authorizedAt: string;
+  expiresAt: string;
+}
+
+export interface SpeechReferenceVoiceImportReceipt {
+  protocol: 'cti-speech-reference-voice-import/v1';
+  voiceProfileId: string;
+  requestMessageId: string;
+  sourceMessageId: string;
+  fileKey: string;
+  attachmentId: string;
+  fileSha256: string;
+  authorizationExpiresAt: string;
+  validated: true;
 }
 
 /** Runtime 对独立歌声模型产物完成校验后的受管回执。 */
@@ -109,20 +158,46 @@ export type LocalAudioSynthesisReceipt = SpeechSynthesisReceipt | SingingSynthes
  */
 export interface SpeechHost {
   getReplyPolicy?(): SpeechReplyPolicy;
+  /**
+   * 返回当前 Runtime 实际就绪的模型/版本/音色快照。缺失或无效时 Core
+   * 失败关闭为文字交付，不允许自行猜默认模型或音色。
+   */
+  getSynthesisIdentity(input?: {
+    signal?: AbortSignal;
+  }): SpeechSynthesisIdentity | null | Promise<SpeechSynthesisIdentity | null>;
   transcribe(input: {
     attachmentId: string;
     path: string;
     mediaType: string;
     sha256: string;
+    relation: SpeechTranscriptSourceBinding['relation'];
+    requestMessageId: string;
     sourceMessageId: string;
     signal?: AbortSignal;
   }): Promise<SpeechTranscriptReceipt>;
   synthesize(input: {
     text: string;
-    voiceProfileId?: string;
+    expectedIdentity: SpeechSynthesisIdentity;
     scratchDir?: string;
     signal?: AbortSignal;
   }): Promise<SpeechSynthesisReceipt>;
+  /**
+   * 导入仅接受 Bridge 已绑定的 Owner 授权与 native reply 音频。Runtime
+   * 自行管理目标路径、模型和注册表；Core/模型均不得提供这些字段。
+   */
+  importReferenceVoice?(input: {
+    profileName?: string;
+    path: string;
+    mediaType: string;
+    sha256: string;
+    requestMessageId: string;
+    sourceMessageId: string;
+    fileKey: string;
+    attachmentId: string;
+    transcript: SpeechTranscriptReceipt;
+    authorization: SpeechReferenceVoiceAuthorization;
+    signal?: AbortSignal;
+  }): Promise<SpeechReferenceVoiceImportReceipt>;
   /**
    * 释放 Runtime 自己创建并登记的合成产物。Runtime 必须重新校验回执、
    * 受管目录、普通文件与哈希；未知、越界或已变化的文件不得删除。

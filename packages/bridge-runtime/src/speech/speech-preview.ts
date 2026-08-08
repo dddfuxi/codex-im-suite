@@ -9,7 +9,7 @@ import type {
   RuntimeSpeechSynthesisReceipt,
 } from './runtime-speech-host.js';
 
-export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v1' as const;
+export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v2' as const;
 export const MAX_SPEECH_PREVIEW_BYTES = 4 * 1024 * 1024;
 export const MAX_SPEECH_PREVIEW_TEXT_CHARACTERS = 240;
 
@@ -20,7 +20,11 @@ export interface SpeechPreviewReceipt {
   bytes: number;
   sha256: string;
   durationMs: number;
+  modelId: string;
   voiceProfileId: string;
+  /** 仅 benchmark mailbox 使用，不进入浏览器试听协议。 */
+  modelRevision?: string;
+  peakVramMiB?: number;
   validated: true;
 }
 
@@ -28,6 +32,8 @@ export interface SpeechPreviewHost {
   synthesize(input: {
     text: string;
     voiceProfileId?: string;
+    benchmarkMode?: boolean;
+    trustedPreviewMode?: boolean;
     signal?: AbortSignal;
   }): Promise<RuntimeSpeechSynthesisReceipt>;
   releaseSynthesis(receipt: RuntimeSpeechSynthesisReceipt): void;
@@ -35,6 +41,7 @@ export interface SpeechPreviewHost {
 
 function validateSynthesisReceipt(
   receipt: RuntimeSpeechSynthesisReceipt,
+  ttsModelId: string,
   voiceProfileId: string,
 ): void {
   if (
@@ -43,6 +50,7 @@ function validateSynthesisReceipt(
     || receipt.mediaType !== 'audio/ogg; codecs=opus'
     || receipt.format !== 'opus'
     || receipt.voiceProfileId !== voiceProfileId
+    || receipt.ttsModelId !== ttsModelId
     || !Number.isFinite(receipt.durationMs)
     || receipt.durationMs <= 0
     || !/^[a-f0-9]{64}$/u.test(receipt.fileSha256)
@@ -62,7 +70,9 @@ function validateSynthesisReceipt(
 export async function createSpeechVoicePreview(input: {
   host: SpeechPreviewHost;
   text: string;
+  ttsModelId: string;
   voiceProfileId: string;
+  benchmarkMode?: boolean;
   signal?: AbortSignal;
 }): Promise<SpeechPreviewReceipt> {
   let synthesis: RuntimeSpeechSynthesisReceipt | undefined;
@@ -70,9 +80,11 @@ export async function createSpeechVoicePreview(input: {
     synthesis = await input.host.synthesize({
       text: input.text,
       voiceProfileId: input.voiceProfileId,
+      trustedPreviewMode: true,
+      ...(input.benchmarkMode ? { benchmarkMode: true } : {}),
       signal: input.signal,
     });
-    validateSynthesisReceipt(synthesis, input.voiceProfileId);
+    validateSynthesisReceipt(synthesis, input.ttsModelId, input.voiceProfileId);
 
     let stat: fs.Stats;
     try {
@@ -113,7 +125,12 @@ export async function createSpeechVoicePreview(input: {
       bytes: bytes.length,
       sha256,
       durationMs: synthesis.durationMs,
+      modelId: input.ttsModelId,
       voiceProfileId: input.voiceProfileId,
+      ...(input.benchmarkMode ? {
+        modelRevision: synthesis.modelRevision,
+        ...(synthesis.peakVramMiB !== undefined ? { peakVramMiB: synthesis.peakVramMiB } : {}),
+      } : {}),
       validated: true,
     };
   } finally {

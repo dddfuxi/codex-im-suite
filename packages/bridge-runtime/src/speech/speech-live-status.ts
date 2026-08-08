@@ -8,7 +8,7 @@ import { writeUtf8TextAtomic } from '../atomic-text-file.js';
 import { ensureNonSymlinkDirectory } from './dependency-resolution.js';
 import type { SpeechRuntimeConfig } from './runtime-types.js';
 
-const LIVE_STATUS_PROTOCOL = 'cti-speech-live-status/v1' as const;
+const LIVE_STATUS_PROTOCOL = 'cti-speech-live-status/v2' as const;
 const DEFAULT_MAX_AGE_MS = 2 * 60 * 1000;
 
 interface LiveSpeechStatusEnvelope {
@@ -28,6 +28,8 @@ function configIdentity(config: SpeechRuntimeConfig): string {
     deliveryMode: config.deliveryMode,
     asrProvider: config.asrProvider,
     ttsProvider: config.ttsProvider,
+    ttsModelId: config.ttsModelId,
+    tonePolicy: config.tonePolicy,
     voiceProfileId: config.voiceProfileId || '',
     voiceCloneBenchmarkPassed: config.voiceCloneBenchmarkPassed,
     // 路径只参与不可逆身份 Hash，不进入持久化状态。
@@ -35,8 +37,8 @@ function configIdentity(config: SpeechRuntimeConfig): string {
       config.modelRoot || '',
       config.senseVoiceBinaryPath || '',
       config.asrModel || '',
-      config.ttsModel || '',
-      config.ttsReferenceModel || '',
+      config.ttsModelPath || '',
+      config.ttsReferenceModelPath || '',
       config.ffmpegPath || '',
       config.ffprobePath || '',
       config.pythonPath || '',
@@ -100,7 +102,7 @@ export class SpeechLiveStatusStore {
         || createdAt > this.now().getTime() + 5_000
         || this.now().getTime() - createdAt > this.maxAgeMs
         || !value.status
-        || value.status.protocol !== 'codex-im-suite/speech-status/v1'
+        || value.status.protocol !== 'codex-im-suite/speech-status/v2'
       ) return null;
       return value.status;
     } catch {

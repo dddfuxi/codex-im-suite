@@ -619,13 +619,15 @@ function normalizeToolEvidenceName(name: string): string {
   return name.trim().toLowerCase();
 }
 
+const UNITY_MCP_TOOL_EVIDENCE_RE = /(?:manage_camera|manage_scene|manage_asset|manage_gameobject|find_gameobjects|execute_code|batch_execute)/iu;
+
 function hasUnityMcpToolEvidence(toolNames: string[]): boolean {
   return toolNames.some((name) => {
     const normalized = normalizeToolEvidenceName(name);
     return normalized.includes('jsontool:mcp_call')
       || normalized.includes('jsontool:unity_mcp_execute_code')
       || normalized.includes('unity')
-      || /(^|[:/._-])(manage_camera|manage_scene|manage_asset|manage_gameobject|find_gameobjects|execute_code|batch_execute)(?:$|[:/._-])/.test(normalized);
+      || new RegExp(`(^|[:/._-])(${UNITY_MCP_TOOL_EVIDENCE_RE.source})(?:$|[:/._-])`, 'iu').test(normalized);
   });
 }
 
@@ -636,6 +638,61 @@ function hasMcpToolEvidence(toolNames: string[]): boolean {
       || normalized.includes('mcp')
       || /(^|[:/._-])(web_search|search|fetch|query)(?:$|[:/._-])/.test(normalized);
   });
+}
+
+function boundedEvidenceJson(value: unknown, maxChars = 32_000): string {
+  if (typeof value === 'string') return value.slice(0, maxChars);
+  try {
+    return JSON.stringify(value).slice(0, maxChars);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Codex 有时会通过受控 shell 直接调用本机 MCP HTTP 端点。此时外层事件名
+ * 只有 Bash/PowerShell，但真实请求仍是 MCP JSON-RPC。只在“命令确实发起
+ * MCP 网络请求 + 外层结果成功 + 内层没有明确失败”同时成立时补充证据别名；
+ * 单靠模型正文或工具输出里出现 Unity/MCP 字样不能获得该证据。
+ */
+export function inferNestedMcpToolEvidenceNames(input: {
+  outerToolName: string;
+  toolInput: unknown;
+  toolResultContent: unknown;
+  resultIsError?: boolean;
+}): string[] {
+  if (input.resultIsError) return [];
+  const outerName = normalizeToolEvidenceName(input.outerToolName);
+  if (!/(?:^|[:/._-])(bash|shell|shell_command|powershell|pwsh|cmd)(?:$|[:/._-])/.test(outerName)) {
+    return [];
+  }
+
+  const requestText = boundedEvidenceJson(input.toolInput);
+  const resultText = boundedEvidenceJson(input.toolResultContent);
+  if (!requestText || !resultText) return [];
+
+  const hasNetworkTransport = /(?:invoke-webrequest|invoke-restmethod|curl(?:\.exe)?|wget|fetch)\b/iu.test(requestText);
+  const hasMcpEndpoint = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?\/mcp\b/iu.test(requestText);
+  const hasMcpMethod = /(?:tools[\\/]call|resources[\\/]read|tools[\\/]list|resources[\\/]list|initialize)/iu.test(requestText);
+  if (!hasNetworkTransport || !hasMcpEndpoint || !hasMcpMethod) return [];
+
+  // shell 自身可能退出 0，但被调用的 MCP action 仍明确返回失败。
+  if (/(?:["']?success["']?\s*[:=]\s*false|["']?ok["']?\s*[:=]\s*false|one or more commands failed)/iu.test(resultText)) {
+    return [];
+  }
+  const hasSuccessfulMcpReceipt = /(?:["']?success["']?\s*[:=]\s*true|["']?ok["']?\s*[:=]\s*true|\bsave\s*=\s*true\b|saved successfully|batch execution completed)/iu.test(resultText)
+    || (/['"]jsonrpc['"]\s*:\s*['"]2\.0['"]/iu.test(resultText) && /['"]result['"]\s*:/iu.test(resultText));
+  if (!hasSuccessfulMcpReceipt) return [];
+
+  const names = ['nested-mcp:jsonrpc'];
+  const payloadText = `${requestText}\n${resultText}`;
+  const unityTool = payloadText.match(UNITY_MCP_TOOL_EVIDENCE_RE)?.[0]?.toLowerCase();
+  if (unityTool) {
+    names.push(`nested-mcp:${unityTool}`);
+  } else if (/(?:unity|mcpforunity)/iu.test(payloadText)) {
+    names.push('nested-mcp:unity-resource');
+  }
+  return names;
 }
 
 function hasRequiredToolFamilyEvidence(

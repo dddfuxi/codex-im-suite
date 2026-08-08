@@ -1,3 +1,12 @@
+import path from 'node:path';
+
+import {
+  DEFAULT_TONE_POLICY_ID,
+  DEFAULT_TTS_MODEL_ID,
+  DEFAULT_TTS_PROVIDER_ID,
+  DEFAULT_TTS_VOICE_PROFILE_ID,
+  findSpeechModel,
+} from './speech-model-catalog.js';
 import type { SpeechRuntimeConfig } from './runtime-types.js';
 
 const DEFAULT_MAX_INPUT_BYTES = 20 * 1024 * 1024;
@@ -37,6 +46,10 @@ function channels(env: ReadonlyMap<string, string>): string[] {
 
 /** 语音默认关闭；启用后才把缺依赖提升为语音链路阻塞，不影响普通文本 Bridge。 */
 export function loadSpeechRuntimeConfig(env: ReadonlyMap<string, string>): SpeechRuntimeConfig {
+  const legacyTtsModel = optional(env, 'CTI_SPEECH_TTS_MODEL');
+  const explicitModelId = optional(env, 'CTI_SPEECH_TTS_MODEL_ID');
+  const migratedModelId = legacyTtsModel && findSpeechModel(legacyTtsModel) ? legacyTtsModel : undefined;
+  const migratedModelPath = legacyTtsModel && path.isAbsolute(legacyTtsModel) ? legacyTtsModel : undefined;
   return {
     inputEnabled: bool(env, 'CTI_SPEECH_INPUT_ENABLED', false),
     outputEnabled: bool(env, 'CTI_SPEECH_OUTPUT_ENABLED', false),
@@ -44,15 +57,21 @@ export function loadSpeechRuntimeConfig(env: ReadonlyMap<string, string>): Speec
     replyPolicy: id(env, 'CTI_SPEECH_REPLY_POLICY', 'explicit_or_inbound_audio'),
     deliveryMode: id(env, 'CTI_SPEECH_DELIVERY_MODE', 'voice_only'),
     asrProvider: id(env, 'CTI_SPEECH_ASR_PROVIDER', 'sensevoice_gguf'),
-    ttsProvider: id(env, 'CTI_SPEECH_TTS_PROVIDER', 'cosyvoice'),
+    ttsProvider: id(env, 'CTI_SPEECH_TTS_PROVIDER', DEFAULT_TTS_PROVIDER_ID),
+    ttsModelId: explicitModelId && findSpeechModel(explicitModelId)
+      ? explicitModelId
+      : migratedModelId || DEFAULT_TTS_MODEL_ID,
+    tonePolicy: id(env, 'CTI_SPEECH_TONE_POLICY', DEFAULT_TONE_POLICY_ID),
     modelRoot: optional(env, 'CTI_SPEECH_MODEL_ROOT'),
     senseVoiceBinaryPath: optional(env, 'CTI_SPEECH_SENSEVOICE_BINARY_PATH'),
     asrModel: optional(env, 'CTI_SPEECH_ASR_MODEL'),
-    ttsModel: optional(env, 'CTI_SPEECH_TTS_MODEL'),
-    ttsReferenceModel: optional(env, 'CTI_SPEECH_TTS_REFERENCE_MODEL'),
+    ttsModelPath: optional(env, 'CTI_SPEECH_TTS_MODEL_PATH') || migratedModelPath,
+    ttsReferenceModelPath: optional(env, 'CTI_SPEECH_TTS_REFERENCE_MODEL_PATH')
+      || optional(env, 'CTI_SPEECH_TTS_REFERENCE_MODEL'),
     voiceCloneBenchmarkPassed: bool(env, 'CTI_SPEECH_VOICE_CLONE_BENCHMARK_PASSED', false),
     voiceProfileId: optional(env, 'CTI_SPEECH_VOICE_PROFILE')
-      || optional(env, 'CTI_SPEECH_ACTIVE_VOICE_PROFILE_ID'),
+      || optional(env, 'CTI_SPEECH_ACTIVE_VOICE_PROFILE_ID')
+      || DEFAULT_TTS_VOICE_PROFILE_ID,
     singingEnabled: bool(env, 'CTI_SINGING_ENABLED', false),
     singingProvider: id(env, 'CTI_SINGING_PROVIDER', 'ace_step_1_5'),
     singingApiUrl: optional(env, 'CTI_SINGING_API_URL'),
@@ -84,11 +103,16 @@ export function speechConfigToEnvEntries(config: SpeechRuntimeConfig): Array<[st
     ['CTI_SPEECH_DELIVERY_MODE', config.deliveryMode],
     ['CTI_SPEECH_ASR_PROVIDER', config.asrProvider],
     ['CTI_SPEECH_TTS_PROVIDER', config.ttsProvider],
+    ['CTI_SPEECH_TTS_MODEL_ID', config.ttsModelId],
+    ['CTI_SPEECH_TONE_POLICY', config.tonePolicy],
     ['CTI_SPEECH_MODEL_ROOT', config.modelRoot || ''],
     ['CTI_SPEECH_SENSEVOICE_BINARY_PATH', config.senseVoiceBinaryPath || ''],
     ['CTI_SPEECH_ASR_MODEL', config.asrModel || ''],
-    ['CTI_SPEECH_TTS_MODEL', config.ttsModel || ''],
-    ['CTI_SPEECH_TTS_REFERENCE_MODEL', config.ttsReferenceModel || ''],
+    ['CTI_SPEECH_TTS_MODEL_PATH', config.ttsModelPath || ''],
+    ['CTI_SPEECH_TTS_REFERENCE_MODEL_PATH', config.ttsReferenceModelPath || ''],
+    // v1 同名字段曾同时表示 ID 与路径；保存 v2 后清空，避免形成第二事实源。
+    ['CTI_SPEECH_TTS_MODEL', ''],
+    ['CTI_SPEECH_TTS_REFERENCE_MODEL', ''],
     ['CTI_SPEECH_VOICE_CLONE_BENCHMARK_PASSED', String(config.voiceCloneBenchmarkPassed)],
     ['CTI_SPEECH_VOICE_PROFILE', config.voiceProfileId || ''],
     ['CTI_SINGING_ENABLED', String(config.singingEnabled)],

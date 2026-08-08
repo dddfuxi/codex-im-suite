@@ -11,7 +11,7 @@ import { SpeechLiveStatusStore } from '../speech/speech-live-status.js';
 
 function statusFixture(): SpeechStatusContract {
   return {
-    protocol: 'codex-im-suite/speech-status/v1',
+    protocol: 'codex-im-suite/speech-status/v2',
     state: 'optional_missing',
     inputEnabled: true,
     outputEnabled: false,

@@ -17,6 +17,7 @@ import {
 } from 'claude-to-im/workspace';
 import {
   classifyToolResultQuality,
+  inferNestedMcpToolEvidenceNames,
   type ExecutionRequirement,
 } from 'claude-to-im/evidence';
 import { parseProviderInputEvidenceReceipt, type InputEvidenceKind } from 'claude-to-im/evidence';
@@ -2603,6 +2604,8 @@ interface StreamEvidence {
   failedToolErrors: string[];
   toolNames: string[];
   toolObservations: WorkflowToolObservation[];
+  /** 仅用于把 tool_result 关联回真实 tool_use，不进入持久化或用户输出。 */
+  toolUsesById: Map<string, { name: string; input: unknown }>;
   executionRequirement?: ExecutionRequirement;
   executorId?: string;
   executorName?: string;
@@ -2660,6 +2663,7 @@ function emptyStreamEvidence(): StreamEvidence {
     failedToolErrors: [],
     toolNames: [],
     toolObservations: [],
+    toolUsesById: new Map(),
     acceptedInputEvidenceKinds: [],
     acceptedInputEvidenceIds: [],
   };
@@ -2714,6 +2718,8 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
       const name = typeof data?.name === 'string' ? data.name.trim() : '';
       if (name && !evidence.toolNames.includes(name)) evidence.toolNames.push(name);
       evidence.toolObservations.push({ name, input: data?.input });
+      const toolUseId = typeof data?.id === 'string' ? data.id.trim() : '';
+      if (toolUseId) evidence.toolUsesById.set(toolUseId, { name, input: data?.input });
       refreshStreamEvidenceSatisfaction(evidence);
       continue;
     }
@@ -2728,6 +2734,17 @@ function collectStreamEvidence(value: string, evidence: StreamEvidence): void {
         }
       } else {
         evidence.successfulToolResultCount += 1;
+        const toolUseId = typeof data?.tool_use_id === 'string' ? data.tool_use_id.trim() : '';
+        const matchingToolUse = toolUseId ? evidence.toolUsesById.get(toolUseId) : undefined;
+        if (matchingToolUse) {
+          for (const evidenceName of inferNestedMcpToolEvidenceNames({
+            outerToolName: matchingToolUse.name,
+            toolInput: matchingToolUse.input,
+            toolResultContent: data?.content,
+          })) {
+            if (!evidence.toolNames.includes(evidenceName)) evidence.toolNames.push(evidenceName);
+          }
+        }
       }
       refreshStreamEvidenceSatisfaction(evidence);
       continue;

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { writeUtf8TextAtomic } from '../atomic-text-file.js';
 import { assertRegularNonSymlink, ensureNonSymlinkDirectory, isWithinRoot } from './dependency-resolution.js';
 import { hashFileSha256, sniffAudioHeader, type AudioFormat } from './media-pipeline.js';
+import { SPEECH_MODEL_CATALOG, SPEECH_PRESET_VOICE_CATALOG } from './speech-model-catalog.js';
 
 export const DEFAULT_PRESET_VOICE = Object.freeze({
   id: 'cosyvoice.sft.zh_female',
@@ -14,7 +15,13 @@ export const DEFAULT_PRESET_VOICE = Object.freeze({
   license: 'Apache-2.0',
 });
 export const DEFAULT_PRESET_PROFILE_ID = DEFAULT_PRESET_VOICE.id;
-const ALLOWED_PRESET_PROFILE_IDS = new Set<string>([DEFAULT_PRESET_PROFILE_ID]);
+const ALLOWED_PRESET_SPEAKER_IDS = new Set<string>([
+  DEFAULT_PRESET_PROFILE_ID,
+  ...SPEECH_PRESET_VOICE_CATALOG.map((item) => item.speakerId),
+]);
+const REFERENCE_MODEL_IDS = SPEECH_MODEL_CATALOG
+  .filter((item) => item.capabilities.includes('voice_clone'))
+  .map((item) => item.id);
 
 export interface VoiceProfileRecord {
   id: string;
@@ -28,6 +35,18 @@ export interface VoiceProfileRecord {
   sourceLabel: string;
   license: string;
   authorizationConfirmed: true;
+  /** Bridge 原生语音导入时保存受控授权与来源绑定；面板摘要不会投影这些字段。 */
+  authorization?: {
+    kind: 'bridge_owner_native_reply';
+    ownerIdHash: string;
+    scope: 'local_tts_only';
+    authorizedAt: string;
+    requestMessageId: string;
+    sourceMessageId: string;
+    attachmentId: string;
+    sourceFileSha256: string;
+  };
+  compatibleTtsModelIds: string[];
   cleanSingleSpeakerConfirmed?: true;
   createdAt: string;
 }
@@ -39,7 +58,7 @@ export interface ReferenceVoiceAudioEvidence {
 }
 
 interface VoiceRegistryDocument {
-  protocol: 'cti-speech-voice-registry/v1';
+  protocol: 'cti-speech-voice-registry/v2';
   revision: number;
   profiles: VoiceProfileRecord[];
 }
@@ -52,10 +71,12 @@ export interface ImportReferenceVoiceInput {
   license: string;
   authorizationConfirmed: boolean;
   cleanSingleSpeakerConfirmed: boolean;
+  sourceKind?: 'user_provided' | 'feishu_native_reply';
+  authorization?: VoiceProfileRecord['authorization'];
 }
 
 const EMPTY_REGISTRY: VoiceRegistryDocument = {
-  protocol: 'cti-speech-voice-registry/v1',
+  protocol: 'cti-speech-voice-registry/v2',
   revision: 0,
   profiles: [],
 };
@@ -138,7 +159,8 @@ export class SpeechVoiceRegistry {
     const stat = fs.lstatSync(this.registryPath);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('voice_registry_unsafe');
     const parsed = JSON.parse(fs.readFileSync(this.registryPath, 'utf8')) as Partial<VoiceRegistryDocument>;
-    if (parsed.protocol !== EMPTY_REGISTRY.protocol || !Number.isInteger(parsed.revision) || !Array.isArray(parsed.profiles)) {
+    if ((parsed.protocol !== EMPTY_REGISTRY.protocol && parsed.protocol !== 'cti-speech-voice-registry/v1')
+      || !Number.isInteger(parsed.revision) || !Array.isArray(parsed.profiles)) {
       throw new Error('voice_registry_invalid');
     }
     const ids = new Set<string>();
@@ -169,8 +191,11 @@ export class SpeechVoiceRegistry {
     };
     if (kind === 'preset') {
       const presetSpeakerId = sanitizeText(item.presetSpeakerId, 80, 'preset_speaker_id');
-      if (!ALLOWED_PRESET_PROFILE_IDS.has(presetSpeakerId)) throw new Error('voice_preset_speaker_invalid');
-      return { ...base, kind, presetSpeakerId };
+      if (!ALLOWED_PRESET_SPEAKER_IDS.has(presetSpeakerId)) throw new Error('voice_preset_speaker_invalid');
+      const catalogPreset = SPEECH_PRESET_VOICE_CATALOG.find((entry) => entry.speakerId === presetSpeakerId);
+      const compatibleTtsModelIds = catalogPreset?.compatibleTtsModelIds
+        || (Array.isArray(item.compatibleTtsModelIds) ? item.compatibleTtsModelIds : ['cosyvoice-300m-sft']);
+      return { ...base, kind, presetSpeakerId, compatibleTtsModelIds: this.validateCompatibleModels(compatibleTtsModelIds) };
     }
     const relativePath = String(item.relativePath || '').replace(/\\/g, '/');
     if (!relativePath || path.posix.isAbsolute(relativePath) || relativePath.split('/').includes('..')) throw new Error('voice_relative_path_invalid');
@@ -178,14 +203,52 @@ export class SpeechVoiceRegistry {
     if (!isWithinRoot(resolved, this.root)) throw new Error('voice_relative_path_escape');
     if (!/^[a-f0-9]{64}$/.test(String(item.sha256 || ''))) throw new Error('voice_sha256_invalid');
     if (item.cleanSingleSpeakerConfirmed !== true) throw new Error('voice_clean_single_speaker_confirmation_missing');
+    let authorization: VoiceProfileRecord['authorization'];
+    if (item.authorization !== undefined) {
+      const candidate = item.authorization;
+      if (!candidate
+        || candidate.kind !== 'bridge_owner_native_reply'
+        || candidate.scope !== 'local_tts_only'
+        || !/^[a-f0-9]{64}$/u.test(candidate.ownerIdHash || '')
+        || !Number.isFinite(Date.parse(candidate.authorizedAt || ''))
+        || !candidate.requestMessageId?.trim()
+        || !candidate.sourceMessageId?.trim()
+        || !candidate.attachmentId?.trim()
+        || !/^[a-f0-9]{64}$/u.test(candidate.sourceFileSha256 || '')) {
+        throw new Error('voice_authorization_metadata_invalid');
+      }
+      authorization = {
+        kind: 'bridge_owner_native_reply',
+        ownerIdHash: candidate.ownerIdHash,
+        scope: 'local_tts_only',
+        authorizedAt: candidate.authorizedAt,
+        requestMessageId: sanitizeText(candidate.requestMessageId, 200, 'authorization_request_message_id'),
+        sourceMessageId: sanitizeText(candidate.sourceMessageId, 200, 'authorization_source_message_id'),
+        attachmentId: sanitizeText(candidate.attachmentId, 200, 'authorization_attachment_id'),
+        sourceFileSha256: candidate.sourceFileSha256,
+      };
+    }
     return {
       ...base,
       kind,
       relativePath,
       sha256: item.sha256!,
       transcript: sanitizeText(item.transcript, 4_000, 'transcript'),
+      compatibleTtsModelIds: this.validateCompatibleModels(
+        Array.isArray(item.compatibleTtsModelIds) ? item.compatibleTtsModelIds : REFERENCE_MODEL_IDS,
+      ),
       cleanSingleSpeakerConfirmed: true,
+      ...(authorization ? { authorization } : {}),
     };
+  }
+
+  private validateCompatibleModels(values: unknown[]): string[] {
+    const known = new Set(SPEECH_MODEL_CATALOG.map((item) => item.id));
+    const normalized = values
+      .filter((value): value is string => typeof value === 'string' && known.has(value));
+    const unique = [...new Set(normalized)];
+    if (unique.length === 0) throw new Error('voice_compatible_models_invalid');
+    return unique;
   }
 
   private writeDocument(document: VoiceRegistryDocument): void {
@@ -206,8 +269,9 @@ export class SpeechVoiceRegistry {
     sourceLabel: string;
     authorizationConfirmed: boolean;
     capabilities: Array<'speech' | 'singing'>;
+    compatibleTtsModelIds: string[];
   }> {
-    return this.list().map((profile) => {
+    const persisted = this.list().map((profile) => {
       let state: 'ready' | 'optional_missing' | 'blocked' | 'error' = 'ready';
       if (profile.kind === 'reference') {
         try {
@@ -226,21 +290,55 @@ export class SpeechVoiceRegistry {
         license: profile.license,
         sourceLabel: profile.sourceLabel,
         authorizationConfirmed: profile.authorizationConfirmed,
-        capabilities: profile.kind === 'reference' ? ['speech', 'singing'] : ['speech'],
+        capabilities: (profile.kind === 'reference' ? ['speech', 'singing'] : ['speech']) as Array<'speech' | 'singing'>,
+        compatibleTtsModelIds: [...profile.compatibleTtsModelIds],
       };
     });
+    const persistedIds = new Set(persisted.map((item) => item.id));
+    const presets = SPEECH_PRESET_VOICE_CATALOG
+      .filter((item) => !persistedIds.has(item.id))
+      .map((item) => ({
+        id: item.id,
+        displayName: item.displayName,
+        kind: 'preset' as const,
+        state: 'ready' as const,
+        active: item.id === activeVoiceProfileId,
+        license: item.license,
+        sourceLabel: item.sourceLabel,
+        authorizationConfirmed: true,
+        capabilities: ['speech'] as Array<'speech' | 'singing'>,
+        compatibleTtsModelIds: [...item.compatibleTtsModelIds],
+      }));
+    return [...presets, ...persisted];
   }
 
   resolveProfile(profileId: string):
-    | { kind: 'preset'; presetSpeakerId: string }
-    | { kind: 'reference'; path: string; transcript: string } {
+    | { kind: 'preset'; presetSpeakerId: string; compatibleTtsModelIds: string[] }
+    | { kind: 'reference'; path: string; transcript: string; compatibleTtsModelIds: string[] } {
     const profile = this.list().find((item) => item.id === profileId);
-    if (!profile) throw new Error('voice_profile_not_found');
-    if (profile.kind === 'preset') return { kind: 'preset', presetSpeakerId: profile.presetSpeakerId! };
+    if (!profile) {
+      const preset = SPEECH_PRESET_VOICE_CATALOG.find((item) => item.id === profileId);
+      if (!preset) throw new Error('voice_profile_not_found');
+      return {
+        kind: 'preset',
+        presetSpeakerId: preset.speakerId,
+        compatibleTtsModelIds: [...preset.compatibleTtsModelIds],
+      };
+    }
+    if (profile.kind === 'preset') return {
+      kind: 'preset',
+      presetSpeakerId: profile.presetSpeakerId!,
+      compatibleTtsModelIds: [...profile.compatibleTtsModelIds],
+    };
     const referencePath = this.resolveProfilePath(profile);
     // listSummaries 只是展示检查；每次真正交给 Sidecar 前仍必须重新验证内容 Hash。
     if (hashFileSha256(referencePath) !== profile.sha256) throw new Error('voice_reference_sha256_mismatch');
-    return { kind: 'reference', path: referencePath, transcript: profile.transcript! };
+    return {
+      kind: 'reference',
+      path: referencePath,
+      transcript: profile.transcript!,
+      compatibleTtsModelIds: [...profile.compatibleTtsModelIds],
+    };
   }
 
   resolveProfilePath(profileOrId: VoiceProfileRecord | string): string {
@@ -276,20 +374,22 @@ export class SpeechVoiceRegistry {
     const fileName = `${sha256}${extensionFor(format)}`;
     const targetPath = path.join(this.filesRoot, fileName);
     const relativePath = path.posix.join('files', fileName);
-    const record: VoiceProfileRecord = {
+    const record = this.validateRecord({
       id: `reference-${sha256.slice(0, 16)}`,
       displayName: sanitizeText(input.displayName, 100, 'display_name'),
       kind: 'reference',
       relativePath,
       sha256,
       transcript: sanitizeText(input.transcript, 4_000, 'transcript'),
-      source: 'user_provided',
+      source: input.sourceKind === 'feishu_native_reply' ? 'feishu_native_reply' : 'user_provided',
       sourceLabel: sanitizeText(input.sourceLabel, 100, 'source_label'),
       license: sanitizeText(input.license, 200, 'license'),
       authorizationConfirmed: true,
+      compatibleTtsModelIds: [...REFERENCE_MODEL_IDS],
       cleanSingleSpeakerConfirmed: true,
+      ...(input.authorization ? { authorization: input.authorization } : {}),
       createdAt: new Date().toISOString(),
-    };
+    });
     return this.withLock(() => {
       const document = this.readDocument();
       if (!fs.existsSync(targetPath)) {
@@ -318,17 +418,21 @@ export class SpeechVoiceRegistry {
     presetSpeakerId: string;
     sourceLabel: string;
     license: string;
+    compatibleTtsModelIds?: string[];
   }): VoiceProfileRecord {
-    if (!ALLOWED_PRESET_PROFILE_IDS.has(input.presetSpeakerId)) throw new Error('voice_preset_speaker_invalid');
+    if (!ALLOWED_PRESET_SPEAKER_IDS.has(input.presetSpeakerId)) throw new Error('voice_preset_speaker_invalid');
     const record: VoiceProfileRecord = {
       id: sanitizeText(input.id, 80, 'id'),
       displayName: sanitizeText(input.displayName, 100, 'display_name'),
       kind: 'preset',
       presetSpeakerId: input.presetSpeakerId,
-      source: 'cosyvoice_builtin_sft',
+      source: 'builtin_preset',
       sourceLabel: sanitizeText(input.sourceLabel, 100, 'source_label'),
       license: sanitizeText(input.license, 200, 'license'),
       authorizationConfirmed: true,
+      compatibleTtsModelIds: this.validateCompatibleModels(
+        input.compatibleTtsModelIds || ['cosyvoice-300m-sft'],
+      ),
       createdAt: new Date().toISOString(),
     };
     return this.withLock(() => {

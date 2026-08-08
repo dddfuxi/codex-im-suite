@@ -16,19 +16,22 @@ from backends import BackendFailure, BackendRegistry
 
 PROTOCOL = "cti-speech-sidecar/v1"
 RESULT_PROTOCOL = "cti-speech-sidecar-result/v1"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MAX_REQUEST_BYTES = 64 * 1024
 
 
 def health_payload(backends: BackendRegistry) -> dict[str, Any]:
     payload = backends.health()
-    return {
+    result = {
         "protocol": PROTOCOL,
         "status": payload["status"],
         "version": VERSION,
         "capabilities": payload["capabilities"],
         "diagnosticCode": payload.get("diagnosticCode"),
     }
+    if payload.get("tts"):
+        result["tts"] = payload["tts"]
+    return result
 
 
 class SpeechHandler(BaseHTTPRequestHandler):

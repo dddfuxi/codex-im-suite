@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { readManagedInstallMarker } from './managed-install-marker.js';
+import { readAnyManagedInstallMarker } from './managed-install-marker.js';
+import { findSpeechModel } from './speech-model-catalog.js';
 import type { SpeechRuntimeConfig } from './runtime-types.js';
 
 export type SpeechBackendDependencyState = 'ready' | 'optional_missing' | 'blocked';
@@ -17,8 +18,8 @@ export interface SpeechBackendDependency {
 export interface SpeechBackendDependencies {
   senseVoiceBinary: SpeechBackendDependency;
   senseVoiceModel: SpeechBackendDependency;
-  cosyVoiceSftModel: SpeechBackendDependency;
-  cosyVoiceReferenceModel: SpeechBackendDependency;
+  ttsModel: SpeechBackendDependency;
+  ttsReferenceModel: SpeechBackendDependency;
 }
 
 type DependencyKind = 'executable' | 'file' | 'directory';
@@ -77,7 +78,7 @@ function managedBases(runtimeDepsRoot: string, componentIds: string[]): string[]
         for (const entry of fs.readdirSync(componentRoot, { withFileTypes: true })) {
           if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[a-z0-9._-]+$/i.test(entry.name)) continue;
           const versionRoot = path.join(componentRoot, entry.name);
-          if (readManagedInstallMarker(versionRoot, {
+          if (readAnyManagedInstallMarker(versionRoot, {
             id: componentId,
             version: entry.name,
             platform: `${process.platform}-${process.arch}`,
@@ -131,6 +132,7 @@ export function resolveSpeechBackendDependencies(
   config: SpeechRuntimeConfig,
   runtimeDepsRoot: string,
 ): SpeechBackendDependencies {
+  const selectedModel = findSpeechModel(config.ttsModelId);
   let modelDependencyRoot = path.resolve(runtimeDepsRoot);
   let modelRootBlocked = false;
   if (config.modelRoot) {
@@ -161,22 +163,28 @@ export function resolveSpeechBackendDependencies(
       'sensevoice-small.gguf',
     ],
   });
-  let cosyVoiceSftModel = resolveBackendDependency({
-    id: 'cosyvoice_sft_model',
+  let ttsModel = resolveBackendDependency({
+    id: 'tts_model',
     kind: 'directory',
-    explicitPath: config.ttsModel,
+    explicitPath: config.ttsModelPath,
     runtimeDepsRoot: modelDependencyRoot,
-    componentIds: ['cosyvoice'],
-    directoryMarkers: COSYVOICE_MARKERS,
+    componentIds: selectedModel ? [selectedModel.componentId] : [],
+    directoryMarkers: selectedModel?.providerId === 'cosyvoice' ? COSYVOICE_MARKERS : ['config.json'],
   });
-  let cosyVoiceReferenceModel = resolveBackendDependency({
-    id: 'cosyvoice_reference_model',
+  let ttsReferenceModel = resolveBackendDependency({
+    id: 'tts_reference_model',
     kind: 'directory',
-    explicitPath: config.ttsReferenceModel,
+    explicitPath: config.ttsReferenceModelPath,
     runtimeDepsRoot: modelDependencyRoot,
-    componentIds: ['cosyvoice_clone', 'cosyvoice'],
-    directoryMarkers: COSYVOICE_MARKERS,
+    componentIds: selectedModel?.capabilities.includes('voice_clone')
+      ? [selectedModel.componentId]
+      : selectedModel?.providerId === 'cosyvoice' ? ['cosyvoice_clone', 'cosyvoice'] : [],
+    directoryMarkers: selectedModel?.providerId === 'cosyvoice' ? COSYVOICE_MARKERS : ['config.json'],
   });
+  if (!selectedModel) {
+    ttsModel = { id: 'tts_model', state: 'blocked', diagnosticCode: 'tts_model_unknown' };
+    ttsReferenceModel = { id: 'tts_reference_model', state: 'blocked', diagnosticCode: 'tts_model_unknown' };
+  }
   if (modelRootBlocked) {
     const blocked = (id: string): SpeechBackendDependency => ({
       id,
@@ -185,23 +193,23 @@ export function resolveSpeechBackendDependencies(
       diagnosticCode: 'explicit_model_root_missing_or_unsafe',
     });
     if (!config.asrModel) senseVoiceModel = blocked('sensevoice_model');
-    if (!config.ttsModel) cosyVoiceSftModel = blocked('cosyvoice_sft_model');
-    if (!config.ttsReferenceModel) cosyVoiceReferenceModel = blocked('cosyvoice_reference_model');
+    if (!config.ttsModelPath) ttsModel = blocked('tts_model');
+    if (!config.ttsReferenceModelPath) ttsReferenceModel = blocked('tts_reference_model');
   }
-  // 同一份本地 CosyVoice 模型若同时支持 SFT 与 zero-shot，可安全复用；
-  // 是否真正支持仍由 Sidecar 加载和调用结果裁决，不能仅凭目录名宣称 ready。
-  if (!modelRootBlocked && !config.ttsReferenceModel && cosyVoiceReferenceModel.state !== 'ready' && cosyVoiceSftModel.state === 'ready') {
-    cosyVoiceReferenceModel = { ...cosyVoiceSftModel, id: 'cosyvoice_reference_model' };
+  // Base 模型的克隆能力和普通合成来自同一受管目录；是否真正支持仍由
+  // Sidecar health 与具体调用复核，不能仅凭目录名宣称 ready。
+  if (!modelRootBlocked && selectedModel?.capabilities.includes('voice_clone') && ttsModel.state === 'ready') {
+    ttsReferenceModel = { ...ttsModel, id: 'tts_reference_model' };
   }
   // 参考音色复刻必须经过现场性能/OOM 门禁；未确认前不把模型路径交给 Sidecar。
-  if (!config.voiceCloneBenchmarkPassed && cosyVoiceReferenceModel.state !== 'blocked') {
-    cosyVoiceReferenceModel = {
-      id: 'cosyvoice_reference_model',
+  if (selectedModel?.capabilities.includes('voice_clone') && !config.voiceCloneBenchmarkPassed && ttsReferenceModel.state !== 'blocked') {
+    ttsReferenceModel = {
+      id: 'tts_reference_model',
       state: 'blocked',
       diagnosticCode: 'voice_clone_benchmark_not_verified',
     };
   }
-  return { senseVoiceBinary, senseVoiceModel, cosyVoiceSftModel, cosyVoiceReferenceModel };
+  return { senseVoiceBinary, senseVoiceModel, ttsModel, ttsReferenceModel };
 }
 
 function aggregate(
@@ -215,19 +223,23 @@ function aggregate(
 }
 
 /** 仅把已验证的本地路径交给 Sidecar；缺失/坏路径只传稳定状态码。 */
-export function speechBackendEnvironment(dependencies: SpeechBackendDependencies): NodeJS.ProcessEnv {
+export function speechBackendEnvironment(
+  dependencies: SpeechBackendDependencies,
+  config?: SpeechRuntimeConfig,
+): NodeJS.ProcessEnv {
   const asr = aggregate(
     [dependencies.senseVoiceBinary, dependencies.senseVoiceModel],
     'sensevoice_dependency_missing',
   );
-  const ttsCandidates = [dependencies.cosyVoiceSftModel, dependencies.cosyVoiceReferenceModel];
+  const ttsCandidates = [dependencies.ttsModel, dependencies.ttsReferenceModel];
   const ttsReady = ttsCandidates.some((item) => item.state === 'ready');
   const ttsBlocked = ttsCandidates.find((item) => item.state === 'blocked');
   const tts = ttsReady
     ? { state: 'ready' as const }
     : ttsBlocked
-      ? { state: 'blocked' as const, diagnosticCode: ttsBlocked.diagnosticCode || 'cosyvoice_dependency_missing' }
-      : { state: 'optional_missing' as const, diagnosticCode: 'cosyvoice_dependency_missing' };
+      ? { state: 'blocked' as const, diagnosticCode: ttsBlocked.diagnosticCode || 'tts_dependency_missing' }
+      : { state: 'optional_missing' as const, diagnosticCode: 'tts_dependency_missing' };
+  const selectedModel = config ? findSpeechModel(config.ttsModelId) : undefined;
   return {
     CTI_SPEECH_ASR_DEPENDENCY_STATE: asr.state,
     CTI_SPEECH_ASR_DIAGNOSTIC: asr.diagnosticCode,
@@ -235,7 +247,11 @@ export function speechBackendEnvironment(dependencies: SpeechBackendDependencies
     CTI_SPEECH_TTS_DIAGNOSTIC: tts.diagnosticCode,
     CTI_SPEECH_SENSEVOICE_BINARY: dependencies.senseVoiceBinary.path,
     CTI_SPEECH_ASR_MODEL_PATH: dependencies.senseVoiceModel.path,
-    CTI_SPEECH_TTS_MODEL_PATH: dependencies.cosyVoiceSftModel.path,
-    CTI_SPEECH_TTS_REFERENCE_MODEL_PATH: dependencies.cosyVoiceReferenceModel.path,
+    CTI_SPEECH_TTS_PROVIDER: config?.ttsProvider,
+    CTI_SPEECH_TTS_MODEL_ID: config?.ttsModelId,
+    CTI_SPEECH_TTS_UPSTREAM_MODEL_ID: selectedModel?.upstreamModelId,
+    CTI_SPEECH_TONE_POLICY: config?.tonePolicy,
+    CTI_SPEECH_TTS_MODEL_PATH: dependencies.ttsModel.path,
+    CTI_SPEECH_TTS_REFERENCE_MODEL_PATH: dependencies.ttsReferenceModel.path,
   };
 }

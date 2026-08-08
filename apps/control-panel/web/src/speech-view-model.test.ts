@@ -16,7 +16,7 @@ import {
 } from './speech-view-model.js';
 
 const readyStatus: SpeechStatusContract = {
-  protocol: 'codex-im-suite/speech-status/v1',
+  protocol: 'codex-im-suite/speech-status/v2',
   state: 'ready',
   inputEnabled: true,
   outputEnabled: true,
@@ -26,12 +26,22 @@ const readyStatus: SpeechStatusContract = {
   deliveryMode: { value: 'voice_only', options: [{ id: 'voice_only', displayName: '仅语音', state: 'ready', enabled: true }] },
   asrProvider: { value: 'asr-a', options: [{ id: 'asr-a', displayName: 'ASR A', state: 'ready', enabled: true }] },
   ttsProvider: { value: 'tts-a', options: [{ id: 'tts-a', displayName: 'TTS A', state: 'ready', enabled: true }] },
+  ttsModel: {
+    value: 'model-a', liveValue: 'model-a', restartRequired: false,
+    options: [{
+      id: 'model-a', displayName: '模型 A', state: 'ready', enabled: true, providerId: 'tts-a',
+      variant: 'custom_voice', sizeLabel: '1.7B', componentId: 'model-a',
+      capabilities: ['preset_voice', 'instruction_control'], defaultVoiceProfileId: 'voice-a',
+      benchmark: { state: 'ready', revision: 'a'.repeat(64) },
+    }],
+  },
+  tonePolicy: { value: 'adaptive_natural', options: [{ id: 'adaptive_natural', displayName: '自适应', state: 'ready', enabled: true }] },
   singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'blocked', enabled: true }] },
   activeVoiceProfileId: 'voice-a',
   activeSingingVoiceProfileId: '',
   capabilities: [],
   components: [],
-  voiceProfiles: [{ id: 'voice-a', displayName: '音色 A', kind: 'preset', state: 'ready', active: true, license: '内置', sourceLabel: 'Runtime', authorizationConfirmed: true, capabilities: ['speech'] }],
+  voiceProfiles: [{ id: 'voice-a', displayName: '音色 A', kind: 'preset', state: 'ready', active: true, license: '内置', sourceLabel: 'Runtime', authorizationConfirmed: true, capabilities: ['speech'], compatibleTtsModelIds: ['model-a'] }],
   limits: { maxInputBytes: 1024, maxInputDurationSeconds: 60, maxOutputCharacters: 500, maxPreviewCharacters: 240, maxSongDurationSeconds: 60 },
   actions: [{ id: 'speech.previewVoice', label: '试听', enabled: true }],
   lastCheckedAt: '2026-08-07T00:00:00.000Z',
@@ -110,12 +120,13 @@ describe('speech view model', () => {
 
   it('only decodes the exact validated Ogg preview projection', () => {
     const base = {
-      protocol: 'codex-im-suite/speech-preview/v1',
+      protocol: 'codex-im-suite/speech-preview/v2',
       mediaType: 'audio/ogg; codecs=opus',
       base64: Buffer.from('OggS-safe-preview', 'ascii').toString('base64'),
       bytes: Buffer.byteLength('OggS-safe-preview', 'ascii'),
       sha256: 'a'.repeat(64),
       durationMs: 1000,
+      modelId: 'model-a',
       voiceProfileId: 'acestep.default',
       validated: true,
     };

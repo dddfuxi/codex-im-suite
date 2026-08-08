@@ -79,6 +79,8 @@ describe('agent architecture registry', () => {
     assert.match(lines.join('\n'), /do not read skills, call tools, or create assets/i);
     assert.match(lines.join('\n'), /cti-scheduled-task/i);
     assert.match(lines.join('\n'), /periodic|recurring|周期/i);
+    assert.match(lines.join('\n'), /kind:"at".*RFC3339.*kind:"every".*everyMs/i);
+    assert.match(lines.join('\n'), /Do not substitute datetime, delay, once, interval, everyMinutes, or type aliases/i);
     assert.match(lines.join('\n'), /Host success/i);
     assert.match(lines.join('\n'), /cti-artifact-promote/i);
     assert.match(lines.join('\n'), /artifactId.*targetProjectId.*targetRelativePath.*expectedSha256/i);
@@ -218,6 +220,11 @@ describe('agent architecture registry', () => {
     assert.equal(policy.layerId, 'delivery_layer');
     assert.match(policy.responsibility, /without selecting a provider, local path, voice identity, command, or platform resource/i);
     assert.match(lines, /exactly .*speech\.mode=voice_only/i);
+    assert.match(lines, /speech\.mode=text_only/i);
+    assert.match(lines, /rights_basis="self_or_authorized"/i);
+    assert.match(lines, /usage_scope="local_tts_only"/i);
+    assert.match(lines, /clean_single_speaker_confirmed=true/i);
+    assert.match(lines, /Do not claim creation succeeded/i);
     assert.match(lines, /complete final visible answer in .*text/i);
     assert.match(lines, /Never put a provider, model, command, local path, URL, voice or speaker ID/i);
     assert.match(lines, /file_key, message ID, user ID, chat ID, token, or platform identity/i);

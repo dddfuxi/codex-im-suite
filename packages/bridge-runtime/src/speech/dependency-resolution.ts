@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
-import { readManagedInstallMarker } from './managed-install-marker.js';
+import { readAnyManagedInstallMarker } from './managed-install-marker.js';
 
 export type ResolvedDependencyState = 'ready' | 'optional_missing' | 'blocked';
 
@@ -48,7 +48,7 @@ function managedVersionRoots(root: string, id: string): string[] {
       for (const entry of fs.readdirSync(componentRoot, { withFileTypes: true })) {
         if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[a-z0-9._-]+$/i.test(entry.name)) continue;
         const versionRoot = path.join(componentRoot, entry.name);
-        if (readManagedInstallMarker(versionRoot, {
+        if (readAnyManagedInstallMarker(versionRoot, {
           id,
           version: entry.name,
           platform: `${process.platform}-${process.arch}`,
@@ -61,11 +61,11 @@ function managedVersionRoots(root: string, id: string): string[] {
   return roots;
 }
 
-function managedExecutableCandidates(root: string, id: string, names: string[]): string[] {
-  return managedVersionRoots(root, id).flatMap((base) => names.flatMap((name) => [
+function managedExecutableCandidates(root: string, componentIds: string[], names: string[]): string[] {
+  return componentIds.flatMap((id) => managedVersionRoots(root, id).flatMap((base) => names.flatMap((name) => [
     path.join(base, 'bin', name),
     path.join(base, name),
-  ]));
+  ])));
 }
 
 export function resolveExecutableDependency(input: {
@@ -74,6 +74,8 @@ export function resolveExecutableDependency(input: {
   executableName?: string;
   explicitPath?: string;
   runtimeDepsRoot: string;
+  /** 允许一个受管运行包同时提供多个固定可执行文件，调用方不复制查找逻辑。 */
+  componentIds?: string[];
 }): ResolvedDependencyPath {
   const explicit = input.explicitPath?.trim();
   if (explicit) {
@@ -88,7 +90,8 @@ export function resolveExecutableDependency(input: {
   }
 
   const names = executableNames(input.executableName || input.id);
-  for (const candidate of managedExecutableCandidates(input.runtimeDepsRoot, input.id, names)) {
+  const componentIds = input.componentIds?.length ? input.componentIds : [input.id];
+  for (const candidate of managedExecutableCandidates(input.runtimeDepsRoot, componentIds, names)) {
     if (inspectFile(candidate) === 'ready') {
       return { id: input.id, displayName: input.displayName, state: 'ready', source: 'managed', path: path.resolve(candidate) };
     }

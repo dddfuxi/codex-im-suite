@@ -154,7 +154,7 @@ flowchart TD
 - `bridge-manager` 的 slash 命令最低角色表已迁入 Policy Registry 的 `getSlashCommandRequiredRole()`。
 - 权限批准风险、危险执行请求和系统副作用提醒边界已迁入 Policy Registry 的 `getPermissionApprovalRequiredRole()`、`isDangerousUserRequest()` 和 `isSystemAffectingReminderRequest()`，manager 只负责读取 evidence、执行角色门禁和调用提醒/权限链路。
 - `packages/bridge-core/src/lib/bridge/adaptive-action-policy.ts` 统一输出 `allow / allow_with_audit / clarify / confirm / deny`，输入只包含动作风险、evidence 强度、平台验证状态、歧义和 `strict / balanced / fluent` 档位。档位只扩大低风险动作的降级范围；伪造 evidence、身份冲突、明确查无目标、跨边界和高风险确认不受档位放宽影响。
-- `packages/bridge-core/src/lib/bridge/application/action-blocks.ts` 统一解析 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote`。该模块只做 fence 清理、JSON/字段归一化和安全字段过滤；`application/direct-message-policy.ts` 统一判断当前原文授权、可靠 outbound-ref 续办授权以及动作目标是否与本轮来源 `chatId` 完全一致，`bridge-manager` 只据此编排当前会话发送或跨会话确认。模型动作块中的用户 ID、角色、工作区和陌生目标字段不成为可信事实；只有目标 ID 与可信来源 `chatId` 精确相等时才可判为当前会话。计划任务的 cron 支持规范对象与显式 `CRON_TZ/TZ` 字符串两种等价输入；裸 cron 字符串因缺少时区继续失败关闭，`agent_turn` 缺省 `sessionMode` 时只允许归一为无工作区的 `isolated`，只有模型明确声明 `bound` 后才进入 Host 的可信工作区重建。`cti-direct-message` 兼容历史命名，但 `targetType=user` 与 `targetType=chat` 分别代表私聊和群投递；“在命名群里发”等明确群目标只进入 chat resolver，不能回落成用户私聊。原生回复本机器人已持久化结果的“现在测试一次 / 继续发送 / 确认”等短动作可继承进入裁决的授权；当前群直接受控发送，真正跨群仍保留 Owner、唯一目标解析和二次确认。Feishu adapter 先查本地绑定，再通过应用身份分页读取机器人真实所在群列表，仅按精确群名或忽略末尾“群/群聊/群组”的安全别名唯一解析；零结果或多结果失败关闭并要求准确群名/chat_id。
+- `packages/bridge-core/src/lib/bridge/application/action-blocks.ts` 统一解析 `cti-reminder`、`cti-scheduled-task`、`cti-direct-message`、`cti-bridge-control` 和 `cti-artifact-promote`。该模块只做 fence 清理、JSON/字段归一化和安全字段过滤；`application/direct-message-policy.ts` 统一判断当前原文授权、可靠 outbound-ref 续办授权以及动作目标是否与本轮来源 `chatId` 完全一致，`bridge-manager` 只据此编排当前会话发送或跨会话确认。模型动作块中的用户 ID、角色、工作区和陌生目标字段不成为可信事实；只有目标 ID 与可信来源 `chatId` 精确相等时才可判为当前会话。计划任务的规范协议保持 `at / every / cron`：cron 兼容规范对象与显式 `CRON_TZ/TZ` 字符串；`at.datetime` 只有携带显式 RFC3339 偏移或独立 timezone 时才转为 `at.at`，其中偏移已经唯一确定执行时刻时内部统一使用 UTC、不会猜地区；`once + delay*` 以真实动作解析时刻转换为单次 UTC；`interval + every*` 转换为 `everyMs`，缺少锚点时使用同一解析时刻。所有兼容转换写 `NORMALIZED_SCHEDULED_TASK_FIELDS` 审计；裸 cron、无偏移本地时间、非正间隔和未知枚举继续失败关闭，并返回具体字段错误。`agent_turn` 缺省 `sessionMode` 时只允许归一为无工作区的 `isolated`，只有模型明确声明 `bound` 后才进入 Host 的可信工作区重建。`cti-direct-message` 兼容历史命名，但 `targetType=user` 与 `targetType=chat` 分别代表私聊和群投递；“在命名群里发”等明确群目标只进入 chat resolver，不能回落成用户私聊。原生回复本机器人已持久化结果的“现在测试一次 / 继续发送 / 确认”等短动作可继承进入裁决的授权；当前群直接受控发送，真正跨群仍保留 Owner、唯一目标解析和二次确认。Feishu adapter 先查本地绑定，再通过应用身份分页读取机器人真实所在群列表，仅按精确群名或忽略末尾“群/群聊/群组”的安全别名唯一解析；零结果或多结果失败关闭并要求准确群名/chat_id。
 - `packages/bridge-core/src/lib/bridge/application/reminders.ts` 统一解析高置信单次提醒、`/remind` 固定参数、时间/任务意图提示和伪完成声明。周期表达继续交给 `cti-scheduled-task`，讨论/教程文本不会被提升为提醒；平台唤醒 alias、原生通知目标、系统副作用门禁、角色和真实 Scheduler/Reminder Host 仍由 Manager 基于当前消息 evidence 装配。
 - `packages/bridge-core/src/lib/bridge/application/mentions.ts` 统一处理飞书 mention ID 字段兼容、字符串/name-only 目标提示、唤醒 alias、直接执行/流程叙述/诊断语义区分、多人交互中“明确开始 + 指定首位/回答者 + 每轮原生 mention 交接”的当前动作识别、显示名目标提取以及占位符和非地址化裸 `@` 清理。字符串目标只表达模型选择，不成为可信身份；该模块不查询成员、不接受模型自造 ID，也不执行发送。Manager 在结构化 mention 校验后保留已经通过本轮 evidence 的目标，并仅把仍缺失的用户明确目标交给当前群官方 resolver，避免一个成功 mention 遮住另一个待解析目标；ID 求交集、Owner/广播门禁和最终交付仍留在平台编排边界。
 - `packages/bridge-core/src/lib/bridge/application/stickers.ts` 统一处理表情包发送意图、入站/出站 hint 隔离、标注与候选分析协议清理、置信度和具体语义门禁、仅允许本轮真实附件 fileKey 的一次性选择，以及“贴纸是否足以替代冗余伴随文字”的纯裁决。明确请求可把“给你一个 / 已发送”等动作复述折叠为 sticker-only；自主贴纸只有在短社交语境中才能替代文字，不能覆盖任务结果、信息回答或失败说明。图片附件真实性、视觉模型调用、语义 revision 授权与写入、平台投递和真实 messageId 回执仍由 Manager、Sticker Host 与 Feishu adapter 共同完成，纯策略模块不能自行发送或确认语义。
@@ -514,7 +514,7 @@ flowchart LR
 7. 如果消息里包含飞书 Docx、Sheets 或 Base 链接，bridge-core 调用 bridge-runtime 的云文档 host；runtime 先用应用 `tenant_access_token` 读取，只有应用无权时才按发起人 OAuth 用户 token 读取，并把真实内容作为本轮 system context 注入。OAuth 使用官方 `accounts.feishu.cn/open-apis/authen/v1/authorize`、PKCE 与 `accounts.feishu.cn/oauth/v3/token`，授权、换取和刷新 Token 都传入当前任务的最小规范化 scope；基础 scope 只保留刷新所需的 `offline_access`，官方 `user_info` 不需要的 `auth:user.id:read` 不再强制。Token 换取后必须用新 access token 调 `GET /open-apis/authen/v1/user_info`，返回 `open_id` 与 state 发起人完全一致才允许按用户隔离保存。自定义治理层以 `sender userId + scopes` 作为授权请求键：同一用户和 scope 只发送一张卡，后续任务合并到同一持久 state；Token、state 和等待任务按用户隔离，授权完成后逐个恢复原消息并写审计。callback/manual 两条恢复链都携带结构化 `authorizationResume`，恢复后仍缺资源分享或已发布 scope 时返回权限阻塞，不重复创建授权卡。`CTI_FEISHU_OAUTH_MODE=manual` 时不需要公网回调，用户把飞书授权后的 `code/state` 回调 URL 复制回飞书完成绑定。应用管理员权限只用于管理员身份诊断，不能替代云文档 scope 或文档本身授权。
 8. Feishu Owner 可用 `/feishu` 查看开放平台能力诊断：本地配置、应用 token 直读能力、OAuth fallback 请求 scope、`CTI_FEISHU_GRANTED_SCOPES` 声明的已开通权限，以及各能力缺口。这个清单只记录后台已开通并发布的预期权限，不会自动向飞书申请或生效权限；发现缺口时按“权限开通 -> 发布审批 -> 事件/回调配置 -> 重启 bridge -> 再诊断”的顺序处理。
 9. 构造上下文，只按检索命中的片段注入记忆和 Feishu 历史，不全量塞历史。普通“看一下今天群聊天记录在说什么 / 在聊什么 / 说什么”，以及“看我上面消息 / 上面那条卡片 / 上文 / 前面消息 / 上一条 / 上几条”这类明确回看上方消息的说法，会先命中 Feishu 历史意图，bridge-core 只使用 adapter/store 的历史索引和 `retrieveRelevantFeishuHistory()` 生成受控历史 evidence，由 agent 总结或回答；不把 `feishu-history/*.json` 路径交给 Codex 自行用 Bash 或 MCP 读取。当前 sender、角色、chat、原生 mention、reply、附件、近邻、历史和已解析文档会进入 `TurnEvidenceEnvelope`，Context Broker 先生成确定性 focus；只有低置信或证据冲突才调用解析 Agent。Prompt Composer 将普通历史放在结构化焦点之前，并把焦点紧贴当前请求；引用和检索文本始终只作 evidence，不能绕过权限、工具证据或当前用户明确改意图。流式最终卡片不走普通 `delivery` 时，FeishuAdapter 会以实际卡片消息 ID 写入耐久出站引用，保存有界的原始请求、终态和最终结果；用户原生回复该卡片而飞书只提供卡片资源壳时，adapter 优先从此引用精确回填续办上下文。
-10. 对带有明确可读对象且具有真实查询意图的请求，`ExecutionRequirement` 会启用低风险主动探查：例如独立的“工作目录”、询问当前路径、列出明确目录、读取文件名、MCP manifest 或 `config/mcp.d` 等对象会进入 `local_read_required`，让 provider 自主调用受控读取、搜索或 shell 工具；普通陈述、报错原文、配置字段讨论即使出现“工作目录/路径”也不触发工具门禁。工作区计划或 system prompt 中已有的路径只属于路由元数据，不算成功工具证据；首轮仍由 Agent 通过真实工具核验。若首次漏调，conversation engine 使用新线程发起一次 no-evidence retry；第二轮仅对可唯一规划为 `list_dir / read_file / search_files` 的明确请求，由 runtime 复用现有 JSON 工具校验器和执行器恢复真实证据，路径权限只来自本轮 `TurnWorkspacePlan`。模糊请求、计划外绝对路径、shell、写入、MCP、Unity、Blender、产物和高风险动作不进入恢复层。没有明确对象的时效或泛问继续保持普通回答或追问。
+10. 对带有明确可读对象且具有真实查询意图的请求，`ExecutionRequirement` 会启用低风险主动探查：例如独立的“工作目录”、询问当前路径、列出明确目录、读取文件名、MCP manifest 或 `config/mcp.d` 等对象会进入 `local_read_required`，让 provider 自主调用受控读取、搜索或 shell 工具；普通陈述、报错原文、配置字段讨论即使出现“工作目录/路径”也不触发工具门禁。工作区计划或 system prompt 中已有的路径只属于路由元数据，不算成功工具证据；首轮仍由 Agent 通过真实工具核验。若首次漏调，conversation engine 使用新线程发起一次 no-evidence retry；第二轮仅对可唯一规划为 `list_dir / read_file / search_files` 的明确请求，由 runtime 复用现有 JSON 工具校验器和执行器恢复真实证据，路径权限只来自本轮 `TurnWorkspacePlan`。模糊请求、计划外绝对路径、shell、写入、MCP、Unity、Blender、产物和高风险动作不进入恢复层。没有明确对象的时效或泛问继续保持普通回答或追问。official Codex 通过 Bash/PowerShell 直连本机 MCP HTTP 端点时，Core 与 Runtime 会把同一工具对中的真实网络请求、`/mcp` method 和成功回执归一化为嵌套 MCP evidence；只有用户可见正文、普通回显或内层失败不能补证据。Primary Agent 判断这些可信事实是否覆盖当前请求，确定性 family 层只校验事实来源，不再用孤立的外层 `Bash` 名称覆盖完整保存与复验结论。
 11. 调用运行时 provider。Codex provider 继续把普通 `systemPrompt` 控制在 4000 字符预算内；当完整提示超过预算时，会先从任意位置提取同时声明为 `protocol` 且包含 fenced `cti-*` 动作标识的规则行，去重后作为关键协议块保留，再用剩余预算裁剪身份和普通上下文。短提示不重排，`priorityTurnContext` 与 provider 自带的 `cti-final` 回复契约仍使用各自独立入口。classifier 使用独立 Codex client，固定低推理、禁工具/网络/项目文档加载，并只提交 classifier instructions 与受控输入，不携带普通 Bridge reply contract、会话历史或项目工作区；避免 daemon 当前目录中的 `AGENTS.md` 把简单 JSON 裁决膨胀成长任务。这样 `cti-reminder`、`cti-direct-message` 及后续同类结构化动作不会因为位于长提示后部而在到达模型前丢失，目标解析、Owner 门禁和真实发送仍由 bridge-core / FeishuAdapter 负责。
 12. Conversation Engine 会把 `tool_use_id -> tool input` 与对应 `tool_result` 配对；只有真实、成功且符合官方 URL 白名单的 `lark-cli auth login --scope ... --no-wait --json` 才生成飞书 CLI 用户授权 challenge。bridge-manager 在任何结果块或附件发送前优先接管该 challenge：非 Owner 返回红色阻塞；Owner 调用 runtime broker，禁止继续发送模型声明的二维码、本地 QR 图片或“回复好了”文案。runtime 只在内存中保留当前有效期内的 device challenge，以 `Owner userId + normalized scopes` 合并等待任务，后台执行官方 `lark-cli auth login --device-code ...`，成功后自动重新入队原请求，失败或过期则发送不含秘密的红色未完成卡。
 13. 对带图片附件的 Feishu 表情包结果，先解析并剥离 `cti-sticker-annotation` 语义标注块，交由 FeishuAdapter 持久化；如果本轮真实 sticker 图片已附加但主回复漏掉标注块，bridge-manager 会用同一附件发起一次隐藏视觉标注 fallback，仅补写 `source=vision` 语义，不进入聊天历史、不改变可见回复、不触发 sticker 出站动作。非表情包回复不经过该协议，避免影响 `cti-final` 等通用结果块。
@@ -638,7 +638,7 @@ sequenceDiagram
   - 确认后桥接先发送执行提示，再直接调用 Windows `shutdown /s /t 0`。
   - 这条链路不经过 Codex、本地模型来源或历史本地执行器。
 
-#### 2.1.1 本地语音收发与歌声合成（开发版 0.3.0）
+#### 2.1.1 本地语音收发与歌声合成（开发版 0.4.0）
 
 本地语音与歌声合成是可选、默认关闭的 Bridge 能力，首期只支持飞书。它不改变普通文字消息的默认行为，也不把微信的平台转写或其他渠道误记为同一条本地 ASR/TTS 链路。共享协议以 `packages/contracts/src/speech-contract.ts` 和 `packages/contracts/schemas/speech.schema.json` 为入口；状态、动作、渠道和 Provider ID 由 Runtime 声明，Control Panel 不维护第二份业务枚举。
 
@@ -662,10 +662,10 @@ flowchart LR
 | 层 | 稳定职责 |
 |---|---|
 | `bridge-core` | `FeishuAdapter` 只为当前真实 `audio` 事件下载资源并签发绑定 `messageId + fileKey + attachmentId` 的 evidence；应用层验证 Runtime receipt、解析 `/voice on|off` 会话偏好、裁决回复模式并保证唯一用户可见终态。Core 不加载模型、不执行 ASR/TTS/歌声合成，也不信任模型提供的路径、音色 ID、`file_key` 或平台身份。 |
-| `bridge-runtime` | 加载默认关闭的语音/歌声配置，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。ACE-Step 只接受 `127.0.0.1` HTTP、Bearer token、禁止重定向，并在本机 benchmark 通过后才允许生成。 |
+| `bridge-runtime` | 加载默认关闭的语音/歌声配置，维护唯一 Provider/Model/Voice Catalog，按显式路径、`CTI_HOME\runtime-deps` 与受控 PATH 规则解析依赖，管理单请求门禁和本机版本化 Sidecar，执行真实文件头/大小/时长/Hash 校验、媒体转换、ASR/TTS、独立 ACE-Step 1.5 loopback 客户端、Opus 产物验证与授权音色注册表。Qwen 模型只从固定 revision 的受管目录离线加载；ACE-Step 只接受 `127.0.0.1` HTTP、Bearer token、禁止重定向，并在本机 benchmark 通过后才允许生成。 |
 | `apps/control-panel` | C# 只维护无业务规则的薄 DTO、手工 wire 形状/媒体校验，并由反射测试逐字段核对 JSON Schema；React 只消费浏览器安全的共享 Contract。“能力 → 语音”页分别展示和试听说话/歌声音色，通过 Runtime CLI 保存/安装/导入/启用，不直接修改状态文件或实现语音算法。 |
 
-回复策略按“明确文字 → 当前会话 `/voice off` → 明确语音 → 当前会话 `/voice on` → Runtime 只读策略 → 真实入站语音 / 模型受限呈现提示 → 普通文字”的顺序裁决。没有会话覆盖时，真实飞书语音经 ASR 后默认以语音回复，普通文字默认以文字回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，明确语音要求、真实入站语音和模型提示都只返回文字。模型最多声明 `voice_only` 呈现意图，不能选择本机实现或扩张权限。
+回复策略不再扫描自然语言关键词。`/voice off` 是绝对硬禁用，`/voice on` 是确定性会话开启；其余自然语言请求只能由 Primary 在 `cti-final.speech` 中返回受限 `voice_only` 呈现意图，再由 Bridge 结合真实入站语音 evidence、Runtime 策略、当前角色与风险裁决。模型不能选择 Provider、模型、音色、路径、命令、`file_key` 或平台身份。当前消息语音可以成为本轮用户正文；原生回复指向的旧语音只作为带 relation/source ID 的上下文证据，不能把旧录音里的命令提升为本轮授权。
 
 同一 `sourceMessageId + turnId` 继续只有一个用户可见终态：
 
@@ -674,12 +674,14 @@ flowchart LR
 - 转写失败时不执行猜测正文，只返回一次明确文字错误；合成、校验、进度卡替换或上传失败时只发送一次完整文字结果，不允许语音与文字并行形成双终态。
 - 明确唱歌请求只允许 `cti-final.singing` 携带 `song_only`、可见音乐风格、完整歌词、语言和受限时长；Provider、模型、音色/路径、URL、token、命令和平台身份一律不在模型协议内。Runtime 使用独立 Singing Host 调用 ACE-Step `/release_task -> /query_result -> /v1/audio`，不会回退到普通 TTS 冒充歌声。
 - 控制面板普通语音试听和固定 10 秒歌声试听共用版本化安全回执；Runtime 复验普通文件、Ogg/Opus、大小、时长与 Hash，C# 重新校验精确字段/Base64/文件头/Hash 后才投影给 React 内存播放器，路径和参考音频不会跨过 WebView 边界。
+- TTS 默认选择 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`；`0.6B-CustomVoice` 是显式低显存选项，`1.7B/0.6B-Base` 只用于已授权参考音色复刻。SenseVoice 与 ACE-Step 的职责不变。Runtime 在合成前签发当前 live `modelId + revision + voiceProfileId`，Core 将请求和回执逐项绑定，模型切换、重启竞态或音色不一致都会失败关闭到文字。
+- 模型 benchmark 按 `provider + model + revision + hardware hash` 存储，记录热态耗时、音频时长、RTF 与峰值显存。Base 参考音色在当前组合未通过 benchmark 前不能进入普通合成；benchmark 本身走独立认证 mailbox，不向浏览器暴露模型路径、参考音频或内部指标对象。
 
 Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`optional_missing` 表示可选能力未启用或组件未安装，不能升级为整个文字 Bridge 故障；显式坏路径、授权/安全校验或受管清单不完整进入 `blocked`，不能偷偷回退；运行时探测异常进入 `error`。语音输入和输出默认都是 `false`。
 
 | 数据边界 | 路径与约束 |
 |---|---|
-| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入，带版本、Hash、大小和归档路径校验。 |
+| 受管模型和二进制 | `CTI_HOME\runtime-deps\speech`；只由显式安装动作写入。v2 模型集合固定官方 revision、每个文件的 HTTPS 来源、SHA-256、大小和相对路径，完整下载到 stage 并通过磁盘/Hash/路径门禁后才原子发布；失败保留旧版本。 |
 | 音色注册表和授权参考音频 | `CTI_HOME\runtime\speech\voices`；参考音频必须经过授权、单人干净音频确认、真实格式/时长/Hash 校验。 |
 | 请求临时文件和默认输出 | `CTI_HOME\runtime\speech`；可被 Turn Storage 的受管 scratch 覆盖，不得回退项目 cwd。 |
 
@@ -687,7 +689,7 @@ Runtime 统一暴露 `ready / optional_missing / blocked / error` 四态：`opti
 
 控制面板保存语音设置只表示 UTF-8 `CTI_HOME\config.env` 写入成功，不表示运行中的 live Bridge 已加载；生效证据必须包括受控重启后的新 PID、Runtime 状态、飞书长连接、开发/live bundle Hash 一致和重启后的真实新消息。
 
-本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-07，ACE-Step 受管 Runtime/模型清单仍为 `blocked / manifest_incomplete`，RTX 3070 歌声性能与显存基准、live 同步/重启及重启后的真实飞书新语音端到端验收均未执行，不能用开发版构建或单元测试替代。
+本节只维护代码与数据边界。日期化部署状态记录在 [`docs/DEVELOPMENT-LOG.md`](./DEVELOPMENT-LOG.md)：截至 2026-08-08，四个 Qwen 模型文件集合已固定清单，但独立 Python/CUDA wheel 清单、RTX 3070 语音/克隆 benchmark、ACE-Step 受管 Runtime/模型清单、live 同步/重启及重启后的真实飞书新语音端到端验收仍未完成，不能用开发版构建或单元测试替代。
 
 ### 2.2 权限门禁
 

@@ -30,13 +30,15 @@ describe('speech shared contract', () => {
       deliveryMode: 'runtime-delivery',
       asrProvider: 'runtime-asr',
       ttsProvider: 'runtime-tts',
+      ttsModelId: 'runtime-model',
+      tonePolicy: 'adaptive-natural',
       singingProvider: 'runtime-singing',
       activeVoiceProfileId: 'runtime-profile',
       activeSingingVoiceProfileId: '',
     };
 
-    assert.equal(SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v1');
-    assert.equal(settings.schema, 'codex-im-suite/speech-settings/v1');
+    assert.equal(SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v2');
+    assert.equal(settings.schema, 'codex-im-suite/speech-settings/v2');
     assert.equal(unavailable.status, null);
   });
 
@@ -50,7 +52,7 @@ describe('speech shared contract', () => {
     assert.equal(schema.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(schema.$defs?.SpeechStatusContract?.required, [
       'protocol', 'state', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channels', 'replyPolicy',
-      'deliveryMode', 'asrProvider', 'ttsProvider', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
+      'deliveryMode', 'asrProvider', 'ttsProvider', 'ttsModel', 'tonePolicy', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
       'components', 'voiceProfiles', 'limits', 'actions', 'lastCheckedAt',
     ]);
     const statusFields = Object.keys(schema.$defs?.SpeechStatusContract?.properties ?? {});
@@ -61,5 +63,8 @@ describe('speech shared contract', () => {
       'id', 'displayName', 'kind', 'state', 'installable', 'capabilities',
     ]);
     assert.deepEqual(schema.$defs?.SpeechComponentContract?.properties?.installable, { type: 'boolean' });
+    assert.deepEqual(schema.$defs?.SpeechModelSelectionContract?.required, [
+      'value', 'liveValue', 'restartRequired', 'options',
+    ]);
   });
 });

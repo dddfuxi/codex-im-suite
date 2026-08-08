@@ -32,8 +32,13 @@ internal sealed partial class MainForm
             {
                 componentId = ReadRequiredSpeechString(payload, "componentId"),
             },
+            "speech.benchmarkTtsModel" => new
+            {
+                modelId = ReadRequiredSpeechString(payload, "modelId"),
+            },
             "speech.previewVoice" or "speech.previewSingingVoice" => new
             {
+                modelId = ReadRequiredSpeechString(payload, "modelId"),
                 voiceProfileId = ReadOptionalSpeechString(payload, "voiceProfileId"),
                 text = ReadRequiredSpeechString(payload, "text"),
             },
@@ -66,7 +71,7 @@ internal sealed partial class MainForm
             throw new SpeechRuntimeGatewayException("speech_settings_invalid");
         }
         if (settings is null
-            || !string.Equals(settings.Schema, "codex-im-suite/speech-settings/v1", StringComparison.Ordinal)
+            || !string.Equals(settings.Schema, "codex-im-suite/speech-settings/v2", StringComparison.Ordinal)
             || settings.ChannelIds is null
             || settings.ChannelIds.Any(string.IsNullOrWhiteSpace)
             || settings.ChannelIds.Distinct(StringComparer.Ordinal).Count() != settings.ChannelIds.Length)

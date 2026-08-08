@@ -5,7 +5,11 @@ import { CTI_HOME, hydrateProcessEnvironmentFromConfigFile, loadConfig, saveConf
 import { createSpeechRuntime } from './speech-runtime.js';
 import { RuntimeSpeechError } from './runtime-types.js';
 import { SpeechControlService } from './speech-control-service.js';
-import { requestSingingVoicePreview, requestSpeechVoicePreview } from './speech-preview-control.js';
+import {
+  requestSingingVoicePreview,
+  requestSpeechVoiceBenchmark,
+  requestSpeechVoicePreview,
+} from './speech-preview-control.js';
 
 function decodePayload(argv: string[]): unknown {
   if (argv.length === 0) return {};
@@ -43,19 +47,30 @@ export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
       // CLI 可能与长期 live Bridge 并发；禁止为刷新面板再启动第二个模型 Sidecar。
       probeSidecar: false,
       readLiveStatus: runtime.readLiveStatus,
-      previewVoice: ({ text, voiceProfileId }) => requestSpeechVoicePreview({
+      previewVoice: ({ text, modelId, voiceProfileId }) => requestSpeechVoicePreview({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
         text,
+        modelId,
         voiceProfileId,
         // C# 网关总超时为 120 秒；为清理与 JSON 回传预留固定余量。
         timeoutMs: Math.min(110_000, config.speech!.requestTimeoutMs + 10_000),
       }),
-      previewSingingVoice: ({ text, voiceProfileId }) => requestSingingVoicePreview({
+      benchmarkVoice: ({ text, modelId, voiceProfileId }) => requestSpeechVoiceBenchmark({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
         text,
+        modelId,
+        voiceProfileId,
+        timeoutMs: Math.min(110_000, config.speech!.requestTimeoutMs + 10_000),
+      }),
+      previewSingingVoice: ({ text, modelId, voiceProfileId }) => requestSingingVoicePreview({
+        runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
+        text,
+        modelId,
         voiceProfileId,
         timeoutMs: Math.min(110_000, config.speech!.singingTimeoutMs + 10_000),
       }),
+      benchmarkStore: runtime.benchmarkStore,
+      hardwareId: runtime.hardware.id,
     });
     return await service.execute(argv[0] || '', decodePayload(argv.slice(1)));
   } finally {

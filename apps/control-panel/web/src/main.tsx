@@ -1164,6 +1164,7 @@ const commandLabels: Record<string, string> = {
   'speech.saveSettings': '保存语音设置',
   'speech.installComponent': '安装语音组件',
   'speech.installPresetVoice': '下载预设音色',
+  'speech.benchmarkTtsModel': '测试语音模型',
   'speech.importReferenceVoice': '导入授权参考音频',
   'speech.previewVoice': '试听音色',
   'speech.activateVoiceProfile': '切换音色',

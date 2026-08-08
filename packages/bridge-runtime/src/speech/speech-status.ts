@@ -1,5 +1,7 @@
 import type {
   SpeechComponentContract,
+  SpeechModelBenchmarkContract,
+  SpeechModelOptionContract,
   SpeechSelectionContract,
   SpeechState,
   SpeechStatusContract,
@@ -8,8 +10,15 @@ import type {
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
 import type { AceStepSingingHost } from './ace-step-singing-host.js';
 import { RuntimeSpeechHost } from './runtime-speech-host.js';
-import { DEFAULT_PRESET_PROFILE_ID, DEFAULT_PRESET_VOICE, SpeechVoiceRegistry } from './voice-registry.js';
+import { SpeechVoiceRegistry } from './voice-registry.js';
 import { MAX_SPEECH_PREVIEW_TEXT_CHARACTERS } from './speech-preview.js';
+import type { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
+import {
+  DEFAULT_TONE_POLICY_ID,
+  SPEECH_MODEL_CATALOG,
+  findSpeechModel,
+  listSpeechProviders,
+} from './speech-model-catalog.js';
 
 export interface ManagedSpeechComponentStatus {
   id: string;
@@ -51,6 +60,8 @@ export class SpeechRuntimeStatusService {
     now?: () => Date;
     previewAvailable?: () => boolean;
     singingHost?: AceStepSingingHost;
+    benchmarkStore?: SpeechModelBenchmarkStore;
+    hardwareId?: string;
   }) {}
 
   async refresh(input: { probeSidecar?: boolean; signal?: AbortSignal } = {}): Promise<SpeechStatusContract> {
@@ -69,6 +80,9 @@ export class SpeechRuntimeStatusService {
     let sidecarDiagnostic = 'speech_disabled';
     let asrReady = false;
     let ttsReady = false;
+    let liveTtsProviderId = '';
+    let liveTtsModelId = '';
+    let liveTtsRevision = '';
     const speechEnabled = config.inputEnabled || config.outputEnabled;
     const anyAudioCapabilityEnabled = speechEnabled || config.singingEnabled;
     const dependenciesReady = Object.values(dependencies).every((item) => item.state === 'ready');
@@ -79,7 +93,14 @@ export class SpeechRuntimeStatusService {
         sidecarState = health.status;
         sidecarDiagnostic = health.diagnosticCode || '';
         asrReady = health.capabilities.asr;
-        ttsReady = health.capabilities.tts;
+        liveTtsProviderId = health.tts?.providerId || '';
+        liveTtsModelId = health.tts?.modelId || '';
+        liveTtsRevision = health.tts?.revision || '';
+        ttsReady = health.capabilities.tts
+          && liveTtsProviderId === config.ttsProvider
+          && liveTtsModelId === config.ttsModelId
+          && Boolean(liveTtsRevision);
+        if (health.capabilities.tts && !ttsReady) sidecarDiagnostic = 'tts_live_model_identity_mismatch';
       } catch (error) {
         if (error instanceof RuntimeSpeechError) {
           sidecarState = error.status;
@@ -98,12 +119,65 @@ export class SpeechRuntimeStatusService {
     }
 
     const asrManifest = managed.find((item) => item.id === config.asrProvider || item.capabilities.includes('asr'));
-    const ttsManifest = managed.find((item) => item.id === config.ttsProvider || item.capabilities.includes('tts'));
+    const selectedModel = findSpeechModel(config.ttsModelId);
+    const ttsManifest = selectedModel
+      ? managed.find((item) => item.id === selectedModel.componentId)
+      : undefined;
     // manifest ready 只表示文件已安装；能力 ready 只能来自本轮真实 Sidecar health。
     const asrState: SpeechState = asrReady ? 'ready' : unavailableCapabilityState(sidecarState, asrManifest?.state);
     const ttsState: SpeechState = ttsReady ? 'ready' : unavailableCapabilityState(sidecarState, ttsManifest?.state);
     const asrDiagnostic = asrReady ? undefined : (asrManifest?.state !== 'ready' ? asrManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'asr_backend_missing';
     const ttsDiagnostic = ttsReady ? undefined : (ttsManifest?.state !== 'ready' ? ttsManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'tts_backend_missing';
+    const hardwareId = this.options.hardwareId || '0'.repeat(64);
+    const modelOptions: SpeechModelOptionContract[] = SPEECH_MODEL_CATALOG.map((model) => {
+      const component = managed.find((item) => item.id === model.componentId);
+      const isLive = liveTtsProviderId === model.providerId && liveTtsModelId === model.id && Boolean(liveTtsRevision);
+      const modelState: SpeechState = isLive && ttsReady
+        ? 'ready'
+        : component?.state || 'optional_missing';
+      const revision = isLive ? liveTtsRevision : component?.version || 'uninstalled';
+      const benchmark = this.options.benchmarkStore?.find({
+        modelId: model.id,
+        providerId: model.providerId,
+        revision,
+        hardwareId,
+      });
+      const benchmarkStatus: SpeechModelBenchmarkContract = benchmark
+        ? {
+            state: benchmark.state,
+            revision: benchmark.revision,
+            ...(benchmark.testedAt ? { testedAt: benchmark.testedAt } : {}),
+            ...(benchmark.coldStartMs !== undefined ? { coldStartMs: benchmark.coldStartMs } : {}),
+            ...(benchmark.warmSynthesisMs !== undefined ? { warmSynthesisMs: benchmark.warmSynthesisMs } : {}),
+            ...(benchmark.outputDurationMs !== undefined ? { outputDurationMs: benchmark.outputDurationMs } : {}),
+            ...(benchmark.realTimeFactor !== undefined ? { realTimeFactor: benchmark.realTimeFactor } : {}),
+            ...(benchmark.peakVramMiB !== undefined ? { peakVramMiB: benchmark.peakVramMiB } : {}),
+            ...(benchmark.diagnosticCode ? { diagnosticCode: benchmark.diagnosticCode } : {}),
+          }
+        : {
+            state: modelState === 'blocked' || modelState === 'error' ? modelState : 'optional_missing',
+            revision,
+            diagnosticCode: modelState === 'blocked' || modelState === 'error'
+              ? component?.diagnosticCode || 'tts_model_unavailable'
+              : 'tts_model_benchmark_not_run',
+          };
+      return {
+        id: model.id,
+        displayName: model.displayName,
+        state: modelState,
+        enabled: modelState !== 'blocked' && modelState !== 'error',
+        providerId: model.providerId,
+        variant: model.variant,
+        sizeLabel: model.sizeLabel,
+        componentId: model.componentId,
+        capabilities: [...model.capabilities],
+        defaultVoiceProfileId: model.defaultVoiceProfileId,
+        benchmark: benchmarkStatus,
+        ...(modelState !== 'ready' ? { diagnosticCode: component?.diagnosticCode || 'tts_model_not_loaded' } : {}),
+      };
+    });
+    const configuredModelOption = modelOptions.find((item) => item.id === config.ttsModelId);
+    const configuredModelBenchmarkReady = configuredModelOption?.benchmark.state === 'ready';
     const singingManifest = managed.find((item) => item.id === config.singingProvider || item.capabilities.includes('singing'));
     const singingHealth = config.singingEnabled && this.options.singingHost
       ? await this.options.singingHost.health(input.signal)
@@ -128,9 +202,12 @@ export class SpeechRuntimeStatusService {
         ? undefined
         : activeCapabilities.find((item) => item.state === state)?.diagnosticCode || 'speech_dependency_missing')
       : 'speech_disabled';
-    const profiles = this.options.voiceRegistry.listSummaries().map((profile) => {
+    const profiles = this.options.voiceRegistry.listSummaries(config.voiceProfileId).map((profile) => {
       const active = profile.id === config.voiceProfileId || profile.id === config.singingVoiceProfileId;
-      if (profile.kind === 'reference' && !config.voiceCloneBenchmarkPassed) {
+      if (!profile.compatibleTtsModelIds.includes(config.ttsModelId) && profile.capabilities.includes('speech')) {
+        return { ...profile, active, state: 'blocked' as const, diagnosticCode: 'voice_profile_model_incompatible' };
+      }
+      if (profile.kind === 'reference' && !configuredModelBenchmarkReady) {
         return { ...profile, active, state: 'blocked' as const, diagnosticCode: 'voice_clone_benchmark_not_verified' };
       }
       if (profile.state === 'ready' && !ttsReady && !(profile.capabilities.includes('singing') && singingReady)) {
@@ -140,25 +217,8 @@ export class SpeechRuntimeStatusService {
     });
     const knownChannels = [...new Set(['feishu', ...config.channels])];
     const hasInstallable = managed.some((item) => item.installable);
-    const presetRegistered = profiles.some((item) => item.id === DEFAULT_PRESET_PROFILE_ID);
-    const presetInstallEnabled = ttsReady && !presetRegistered;
-    const presetInstallDiagnostic = presetRegistered
-      ? 'preset_voice_already_registered'
-      : ttsReady ? undefined : (ttsDiagnostic || 'preset_voice_backend_unavailable');
-    if (!presetRegistered) {
-      profiles.push({
-        id: DEFAULT_PRESET_VOICE.id,
-        displayName: DEFAULT_PRESET_VOICE.displayName,
-        kind: 'preset',
-        state: ttsReady ? 'optional_missing' : ttsState,
-        active: false,
-        license: DEFAULT_PRESET_VOICE.license,
-        sourceLabel: DEFAULT_PRESET_VOICE.sourceLabel,
-        authorizationConfirmed: true,
-        capabilities: ['speech'],
-        diagnosticCode: presetInstallDiagnostic || 'preset_voice_not_registered',
-      });
-    }
+    const presetInstallEnabled = false;
+    const presetInstallDiagnostic = 'preset_voice_is_model_capability';
     const previewTransportReady = this.options.previewAvailable?.() === true;
     const hasReadyVoiceProfile = profiles.some((item) => item.state === 'ready');
     const previewEnabled = ttsReady && hasReadyVoiceProfile && previewTransportReady;
@@ -171,7 +231,7 @@ export class SpeechRuntimeStatusService {
           : undefined;
 
     return {
-      protocol: 'codex-im-suite/speech-status/v1',
+      protocol: 'codex-im-suite/speech-status/v2',
       state,
       inputEnabled: config.inputEnabled,
       outputEnabled: config.outputEnabled,
@@ -199,8 +259,34 @@ export class SpeechRuntimeStatusService {
       asrProvider: selection(config.asrProvider, [
         { id: 'sensevoice_gguf', displayName: 'SenseVoice GGUF', state: asrState, enabled: true, ...(asrDiagnostic ? { diagnosticCode: asrDiagnostic } : {}) },
       ]),
-      ttsProvider: selection(config.ttsProvider, [
-        { id: 'cosyvoice', displayName: 'CosyVoice', state: ttsState, enabled: true, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) },
+      ttsProvider: selection(config.ttsProvider, listSpeechProviders().map((provider) => {
+        const providerModels = modelOptions.filter((model) => model.providerId === provider.id);
+        const providerState = provider.id === liveTtsProviderId && ttsReady
+          ? 'ready' as const
+          : worstState(providerModels.map((model) => model.state));
+        return {
+          id: provider.id,
+          displayName: provider.displayName,
+          state: providerState,
+          enabled: providerModels.some((model) => model.enabled),
+          ...(providerState !== 'ready' ? { diagnosticCode: 'tts_provider_not_loaded' } : {}),
+        };
+      })),
+      ttsModel: {
+        value: config.ttsModelId,
+        liveValue: liveTtsModelId,
+        restartRequired: config.outputEnabled && liveTtsModelId !== config.ttsModelId,
+        options: modelOptions,
+      },
+      tonePolicy: selection(config.tonePolicy, [
+        {
+          id: DEFAULT_TONE_POLICY_ID,
+          displayName: '自适应自然语气',
+          state: selectedModel?.capabilities.includes('instruction_control') ? 'ready' : 'blocked',
+          enabled: selectedModel?.capabilities.includes('instruction_control') === true,
+          ...(!selectedModel?.capabilities.includes('instruction_control') ? { diagnosticCode: 'tts_model_instruction_control_unsupported' } : {}),
+        },
+        { id: 'neutral_stable', displayName: '稳定中性语气', state: 'ready', enabled: true },
       ]),
       singingProvider: selection(config.singingProvider, [
         { id: 'ace_step_1_5', displayName: 'ACE-Step 1.5', state: singingState, enabled: true, ...(singingDiagnostic ? { diagnosticCode: singingDiagnostic } : {}) },
@@ -226,6 +312,13 @@ export class SpeechRuntimeStatusService {
         { id: 'speech.saveSettings', label: '保存语音设置', enabled: true },
         { id: 'speech.installComponent', label: '安装受管组件', enabled: hasInstallable, ...(!hasInstallable ? { diagnosticCode: 'manifest_incomplete' } : {}) },
         { id: 'speech.installPresetVoice', label: '安装预设音色', enabled: presetInstallEnabled, ...(presetInstallDiagnostic ? { diagnosticCode: presetInstallDiagnostic } : {}) },
+        {
+          id: 'speech.benchmarkTtsModel',
+          label: '测试当前语音模型',
+          enabled: ttsReady && liveTtsModelId === config.ttsModelId,
+          ...(!(ttsReady && liveTtsModelId === config.ttsModelId)
+            ? { diagnosticCode: 'tts_model_restart_or_load_required' } : {}),
+        },
         { id: 'speech.importReferenceVoice', label: '导入参考音色', enabled: true },
         { id: 'speech.previewVoice', label: '试听音色', enabled: previewEnabled, ...(previewDiagnostic ? { diagnosticCode: previewDiagnostic } : {}) },
         { id: 'speech.previewSingingVoice', label: '试听歌声', enabled: singingReady && previewTransportReady, ...(!(singingReady && previewTransportReady) ? { diagnosticCode: singingDiagnostic || 'speech_preview_live_runtime_unavailable' } : {}) },

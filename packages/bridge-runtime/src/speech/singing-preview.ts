@@ -14,6 +14,7 @@ import {
 export async function createSingingVoicePreview(input: {
   host: AceStepSingingHost;
   lyrics: string;
+  modelId: string;
   voiceProfileId: string;
   signal?: AbortSignal;
 }): Promise<SpeechPreviewReceipt> {
@@ -51,6 +52,7 @@ export async function createSingingVoicePreview(input: {
       bytes: bytes.length,
       sha256,
       durationMs: synthesis.durationMs,
+      modelId: input.modelId,
       voiceProfileId: input.voiceProfileId,
       validated: true,
     };

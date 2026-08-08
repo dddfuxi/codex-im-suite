@@ -13,7 +13,9 @@ import {
 import { hashFileSha256, normalizeForAsr, validateAudio, wavToMonoOpus } from './media-pipeline.js';
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
 import { SpeechSidecarSupervisor, type SidecarTranscriptionResult } from './sidecar-supervisor.js';
-import { DEFAULT_PRESET_PROFILE_ID, SpeechVoiceRegistry } from './voice-registry.js';
+import { findSpeechModel, speechToneInstruction } from './speech-model-catalog.js';
+import type { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
+import { SpeechVoiceRegistry } from './voice-registry.js';
 
 export interface RuntimeSpeechTranscriptReceipt {
   protocol: 'cti-speech-transcript/v1';
@@ -23,6 +25,10 @@ export interface RuntimeSpeechTranscriptReceipt {
   language: string;
   mediaType?: string;
   durationMs?: number;
+  relation: 'current_message' | 'native_reply';
+  /** 触发当前 Bridge 回合的平台消息。 */
+  requestMessageId: string;
+  /** 真正承载音频字节的平台消息；native reply 时与 request 不同。 */
   sourceMessageId: string;
   fileSha256: string;
   validated: true;
@@ -37,7 +43,22 @@ export interface RuntimeSpeechSynthesisReceipt {
   textSha256: string;
   fileSha256: string;
   validated: true;
-  voiceProfileId?: string;
+  ttsModelId: string;
+  modelRevision: string;
+  voiceProfileId: string;
+  peakVramMiB?: number;
+}
+
+export interface RuntimeSpeechReferenceVoiceImportReceipt {
+  protocol: 'cti-speech-reference-voice-import/v1';
+  voiceProfileId: string;
+  requestMessageId: string;
+  sourceMessageId: string;
+  fileKey: string;
+  attachmentId: string;
+  fileSha256: string;
+  authorizationExpiresAt: string;
+  validated: true;
 }
 
 interface ManagedSynthesisOutput {
@@ -82,6 +103,8 @@ function synthesisReceiptFingerprint(receipt: RuntimeSpeechSynthesisReceipt): st
     receipt.textSha256,
     receipt.fileSha256,
     receipt.validated,
+    receipt.ttsModelId,
+    receipt.modelRevision,
     receipt.voiceProfileId || '',
   ]), 'utf8').digest('hex');
 }
@@ -190,6 +213,8 @@ export class RuntimeSpeechHost {
     runtimeDepsRoot: string;
     bundledSidecarCandidates: string[];
     voiceRegistry?: SpeechVoiceRegistry;
+    benchmarkStore?: SpeechModelBenchmarkStore;
+    hardwareId?: string;
     sidecar?: SpeechSidecarSupervisor;
     mediaPipeline?: RuntimeSpeechMediaPipeline;
   }) {
@@ -240,10 +265,12 @@ export class RuntimeSpeechHost {
       ffmpeg: resolveExecutableDependency({
         id: 'ffmpeg', displayName: 'FFmpeg', explicitPath: this.options.config.ffmpegPath,
         runtimeDepsRoot: this.options.runtimeDepsRoot,
+        componentIds: ['ffmpeg_runtime', 'ffmpeg'],
       }),
       ffprobe: resolveExecutableDependency({
         id: 'ffprobe', displayName: 'ffprobe', explicitPath: this.options.config.ffprobePath,
         runtimeDepsRoot: this.options.runtimeDepsRoot,
+        componentIds: ['ffmpeg_runtime', 'ffprobe'],
       }),
     };
   }
@@ -262,11 +289,38 @@ export class RuntimeSpeechHost {
     return this.options.config.replyPolicy === 'explicit_only' ? 'explicit_only' : 'explicit_or_inbound_audio';
   }
 
+  /** 只把 Sidecar 真实加载并与配置一致的模型身份签发给 Core。 */
+  async getSynthesisIdentity(input: { signal?: AbortSignal } = {}): Promise<{
+    ttsModelId: string;
+    modelRevision: string;
+    voiceProfileId: string;
+  } | null> {
+    if (!this.options.config.outputEnabled) return null;
+    const selectedModel = findSpeechModel(this.options.config.ttsModelId);
+    const voiceProfileId = this.options.config.voiceProfileId || selectedModel?.defaultVoiceProfileId || '';
+    if (!selectedModel || selectedModel.providerId !== this.options.config.ttsProvider || !voiceProfileId) return null;
+    try {
+      const profile = this.options.voiceRegistry?.resolveProfile(voiceProfileId);
+      if (!profile || !profile.compatibleTtsModelIds.includes(selectedModel.id)) return null;
+      const client = await this.sidecar.ensureClient(input.signal);
+      const health = await client.health(input.signal);
+      if (!health.capabilities.tts
+        || health.tts?.providerId !== selectedModel.providerId
+        || health.tts.modelId !== selectedModel.id
+        || !/^[a-z0-9][a-z0-9._-]{0,159}$/i.test(health.tts.revision || '')) return null;
+      return { ttsModelId: selectedModel.id, modelRevision: health.tts.revision, voiceProfileId };
+    } catch {
+      return null;
+    }
+  }
+
   async transcribe(input: {
     attachmentId: string;
     path: string;
     mediaType?: string;
     sha256: string;
+    relation?: 'current_message' | 'native_reply';
+    requestMessageId?: string;
     sourceMessageId: string;
     signal?: AbortSignal;
   }): Promise<RuntimeSpeechTranscriptReceipt> {
@@ -314,6 +368,8 @@ export class RuntimeSpeechHost {
       return {
         protocol: 'cti-speech-transcript/v1',
         attachmentId: input.attachmentId,
+        relation: input.relation || 'current_message',
+        requestMessageId: input.requestMessageId || input.sourceMessageId,
         sourceMessageId: input.sourceMessageId,
         text,
         model,
@@ -337,9 +393,134 @@ export class RuntimeSpeechHost {
     }
   }
 
+  /**
+   * 只把当前回合已转写并由 Owner 明确授权的 native reply 音频导入注册表。
+   * 模型不能提供平台 ID、文件路径、Provider、模型或最终 profile ID。
+   */
+  async importReferenceVoice(input: {
+    profileName?: string;
+    path: string;
+    mediaType: string;
+    sha256: string;
+    requestMessageId: string;
+    sourceMessageId: string;
+    fileKey: string;
+    attachmentId: string;
+    transcript: RuntimeSpeechTranscriptReceipt;
+    authorization: {
+      protocol: 'cti-speech-reference-voice-authorization/v1';
+      scope: 'current_native_reply_audio';
+      ownerUserId: string;
+      authorizedAt: string;
+      expiresAt: string;
+      rightsBasis?: 'self_or_authorized';
+      usageScope?: 'local_tts_only';
+      cleanSingleSpeakerConfirmed?: true;
+    };
+    signal?: AbortSignal;
+  }): Promise<RuntimeSpeechReferenceVoiceImportReceipt> {
+    if (!this.options.voiceRegistry) {
+      throw new RuntimeSpeechError('voice_registry_unavailable', 'optional_missing', '音色注册表不可用');
+    }
+    if (input.signal?.aborted) throw new RuntimeSpeechError('speech_request_aborted', 'error', '语音请求已取消');
+    const authorization = input.authorization;
+    const authorizedAtMs = Date.parse(authorization.authorizedAt || '');
+    const expiresAtMs = Date.parse(authorization.expiresAt || '');
+    const now = Date.now();
+    if (authorization.protocol !== 'cti-speech-reference-voice-authorization/v1'
+      || authorization.scope !== 'current_native_reply_audio'
+      || authorization.rightsBasis !== 'self_or_authorized'
+      || authorization.usageScope !== 'local_tts_only'
+      || authorization.cleanSingleSpeakerConfirmed !== true
+      || !authorization.ownerUserId?.trim()
+      || !Number.isFinite(authorizedAtMs)
+      || !Number.isFinite(expiresAtMs)
+      || authorizedAtMs > now + 5_000
+      || expiresAtMs <= now
+      || expiresAtMs <= authorizedAtMs
+      || expiresAtMs - authorizedAtMs > 10 * 60_000) {
+      throw new RuntimeSpeechError('voice_authorization_invalid', 'blocked', '参考音色授权无效或已过期');
+    }
+    if (!path.isAbsolute(input.path)
+      || !input.mediaType.toLowerCase().startsWith('audio/')
+      || !input.requestMessageId?.trim()
+      || !input.sourceMessageId?.trim()
+      || !input.fileKey?.trim()
+      || !input.attachmentId?.trim()
+      || !/^[a-f0-9]{64}$/u.test(input.sha256 || '')) {
+      throw new RuntimeSpeechError('voice_source_binding_invalid', 'blocked', '参考音色来源绑定无效');
+    }
+    const transcript = input.transcript;
+    if (transcript.protocol !== 'cti-speech-transcript/v1'
+      || transcript.validated !== true
+      || transcript.relation !== 'native_reply'
+      || transcript.requestMessageId !== input.requestMessageId
+      || transcript.sourceMessageId !== input.sourceMessageId
+      || transcript.attachmentId !== input.attachmentId
+      || transcript.fileSha256 !== input.sha256
+      || !transcript.text?.trim()) {
+      throw new RuntimeSpeechError('voice_transcript_binding_invalid', 'blocked', '参考音色转写与来源证据不一致');
+    }
+    assertRegularNonSymlink(input.path);
+    if (this.media.hashFileSha256(input.path) !== input.sha256) {
+      throw new RuntimeSpeechError('voice_source_sha256_mismatch', 'blocked', '参考音色源文件已发生变化');
+    }
+
+    const release = await this.gate.acquire(input.signal);
+    try {
+      if (input.signal?.aborted) throw new RuntimeSpeechError('speech_request_aborted', 'error', '语音请求已取消');
+      const profile = await this.options.voiceRegistry.importReferenceVoice({
+        sourcePath: input.path,
+        displayName: input.profileName?.trim() || `飞书参考音色 ${input.sha256.slice(0, 8)}`,
+        transcript: transcript.text,
+        sourceLabel: '飞书原生回复语音',
+        license: 'Owner 已确认本人或已获授权，仅限本地 TTS 使用',
+        authorizationConfirmed: true,
+        cleanSingleSpeakerConfirmed: true,
+        sourceKind: 'feishu_native_reply',
+        authorization: {
+          kind: 'bridge_owner_native_reply',
+          ownerIdHash: crypto.createHash('sha256').update(authorization.ownerUserId, 'utf8').digest('hex'),
+          scope: 'local_tts_only',
+          authorizedAt: authorization.authorizedAt,
+          requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId,
+          attachmentId: input.attachmentId,
+          sourceFileSha256: input.sha256,
+        },
+      });
+      return {
+        protocol: 'cti-speech-reference-voice-import/v1',
+        voiceProfileId: profile.id,
+        requestMessageId: input.requestMessageId,
+        sourceMessageId: input.sourceMessageId,
+        fileKey: input.fileKey,
+        attachmentId: input.attachmentId,
+        fileSha256: input.sha256,
+        authorizationExpiresAt: authorization.expiresAt,
+        validated: true,
+      };
+    } catch (error) {
+      throw normalizeFailure(error);
+    } finally {
+      release();
+    }
+  }
+
   async synthesize(input: {
     text: string;
+    /** Core 只使用这一份 Runtime 预签发身份；以下旧字段仅保留给受控面板试听。 */
+    expectedIdentity?: {
+      ttsModelId: string;
+      modelRevision: string;
+      voiceProfileId: string | null;
+    };
+    ttsModelId?: string;
+    modelRevision?: string;
     voiceProfileId?: string;
+    trustedPreviewMode?: boolean;
+    /** 仅由 live 试听控制通道建立模型级性能记录，Core 不可设置。 */
+    benchmarkMode?: boolean;
     scratchDir?: string;
     signal?: AbortSignal;
   }): Promise<RuntimeSpeechSynthesisReceipt> {
@@ -358,16 +539,49 @@ export class RuntimeSpeechHost {
       const requestId = crypto.randomUUID();
       wavPath = path.join(outputRoot, `${requestId}.wav`);
       opusPath = path.join(outputRoot, `${requestId}.ogg`);
-      const voiceProfileId = input.voiceProfileId || this.options.config.voiceProfileId;
+      const selectedModel = findSpeechModel(this.options.config.ttsModelId);
+      if (!selectedModel || selectedModel.providerId !== this.options.config.ttsProvider) {
+        throw new RuntimeSpeechError('tts_provider_model_mismatch', 'blocked', '语音 Provider 与模型不匹配');
+      }
+      const requestedTtsModelId = input.expectedIdentity?.ttsModelId || input.ttsModelId;
+      const requestedModelRevision = input.expectedIdentity?.modelRevision || input.modelRevision;
+      const requestedVoiceProfileId = input.expectedIdentity
+        ? input.expectedIdentity.voiceProfileId || undefined
+        : input.voiceProfileId;
+      const voiceProfileId = requestedVoiceProfileId || this.options.config.voiceProfileId || selectedModel.defaultVoiceProfileId;
+      if (!voiceProfileId) throw new RuntimeSpeechError('voice_profile_not_found', 'blocked', '当前模型尚未选择音色');
+      const client = await this.sidecar.ensureClient(input.signal);
+      const liveHealth = await client.health(input.signal);
+      if (!input.trustedPreviewMode && (
+        requestedTtsModelId !== selectedModel.id
+        || requestedModelRevision !== liveHealth.tts?.revision
+        || requestedVoiceProfileId !== (this.options.config.voiceProfileId || selectedModel.defaultVoiceProfileId)
+      )) {
+        throw new RuntimeSpeechError('tts_synthesis_identity_mismatch', 'blocked', '语音合成请求身份与当前 Runtime 不一致');
+      }
       let voiceReferencePath: string | undefined;
       let voiceReferenceTranscript: string | undefined;
-      let presetSpeakerId: string | undefined = DEFAULT_PRESET_PROFILE_ID;
+      let presetSpeakerId: string | undefined;
       if (voiceProfileId) {
         if (!this.options.voiceRegistry) throw new RuntimeSpeechError('voice_registry_unavailable', 'optional_missing', '音色注册表不可用');
         const profile = this.options.voiceRegistry.resolveProfile(voiceProfileId);
+        if (!profile.compatibleTtsModelIds.includes(selectedModel.id)) {
+          throw new RuntimeSpeechError('voice_profile_model_incompatible', 'blocked', '所选音色与当前模型不兼容');
+        }
         if (profile.kind === 'reference') {
-          if (!this.options.config.voiceCloneBenchmarkPassed) {
-            throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
+          if (!input.benchmarkMode) {
+            const revision = liveHealth.tts?.revision || '';
+            const passed = revision && this.options.benchmarkStore && this.options.hardwareId
+              ? this.options.benchmarkStore.find({
+                  modelId: selectedModel.id,
+                  providerId: selectedModel.providerId,
+                  revision,
+                  hardwareId: this.options.hardwareId,
+                })
+              : null;
+            if (passed?.state !== 'ready') {
+              throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '当前模型与硬件尚未通过参考音色性能门禁');
+            }
           }
           voiceReferencePath = profile.path;
           voiceReferenceTranscript = profile.transcript;
@@ -376,16 +590,25 @@ export class RuntimeSpeechHost {
           presetSpeakerId = profile.presetSpeakerId;
         }
       }
-      const client = await this.sidecar.ensureClient(input.signal);
-      await client.synthesize({
+      const synthesis = await client.synthesize({
         text,
         outputPath: wavPath,
         provider: this.options.config.ttsProvider,
+        modelId: selectedModel.id,
+        ...(selectedModel.capabilities.includes('instruction_control')
+          ? { toneInstruction: speechToneInstruction(this.options.config.tonePolicy) }
+          : {}),
         voiceProfileId,
         ...(presetSpeakerId ? { presetSpeakerId } : {}),
         voiceReferencePath,
         voiceReferenceTranscript,
       }, input.signal);
+      if (synthesis.provider !== selectedModel.providerId
+        || synthesis.model !== selectedModel.id
+        || synthesis.revision !== liveHealth.tts?.revision
+        || !/^[a-z0-9][a-z0-9._-]{0,159}$/i.test(synthesis.revision || '')) {
+        throw new RuntimeSpeechError('tts_model_identity_mismatch', 'error', '语音模型身份校验失败');
+      }
       await this.media.validateAudio({
         filePath: wavPath,
         ffprobePath,
@@ -419,7 +642,12 @@ export class RuntimeSpeechHost {
         textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
         fileSha256: this.media.hashFileSha256(output.path),
         validated: true,
-        ...(voiceProfileId ? { voiceProfileId } : {}),
+        ttsModelId: selectedModel.id,
+        modelRevision: synthesis.revision,
+        voiceProfileId,
+        ...(Number.isFinite(synthesis.peakVramMiB) && synthesis.peakVramMiB! >= 0
+          ? { peakVramMiB: synthesis.peakVramMiB }
+          : {}),
       };
       this.managedSynthesisOutputs.set(path.resolve(output.path), {
         outputRoot,
@@ -452,6 +680,9 @@ export class RuntimeSpeechHost {
       || receipt.durationMs <= 0
       || !/^[a-f0-9]{64}$/.test(receipt.textSha256 || '')
       || !/^[a-f0-9]{64}$/.test(receipt.fileSha256 || '')
+      || !/^[a-z0-9][a-z0-9._-]{0,159}$/i.test(receipt.ttsModelId || '')
+      || !/^[a-z0-9][a-z0-9._-]{0,159}$/i.test(receipt.modelRevision || '')
+      || !/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(receipt.voiceProfileId || '')
       || !path.isAbsolute(receipt.path || '')
     ) {
       throw new RuntimeSpeechError('speech_synthesis_release_rejected', 'blocked', '语音合成回执无效');

@@ -146,13 +146,14 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
 
   const previewVoice = async (profile: SpeechVoiceProfileContract) => {
     const result = await runAction('speech.previewVoice', {
+      modelId: status?.ttsModel.value || '',
       voiceProfileId: profile.id,
       text: previewText.trim(),
     });
     if (!result) return;
     try {
       const { receipt, media } = decodeSpeechPreviewReceipt(result);
-      if (receipt.voiceProfileId !== profile.id) throw new Error('speech_preview_profile_mismatch');
+      if (receipt.voiceProfileId !== profile.id || receipt.modelId !== status?.ttsModel.value) throw new Error('speech_preview_profile_mismatch');
       const audioBytes = new ArrayBuffer(media.byteLength);
       new Uint8Array(audioBytes).set(media);
       const url = URL.createObjectURL(new Blob([audioBytes], { type: receipt.mediaType }));
@@ -167,6 +168,7 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
     if (!draft) return;
     const voiceProfileId = draft.activeSingingVoiceProfileId || 'acestep.default';
     const result = await runAction('speech.previewSingingVoice', {
+      modelId: draft.singingProvider,
       voiceProfileId,
       text: singingPreviewText.trim(),
     });
@@ -210,6 +212,10 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
   const selectedChannels = status.channels.filter((channel) => draft.channelIds.includes(channel.id));
   const selectedChannelsSupportInput = selectedChannels.length === 0 || selectedChannels.some((channel) => channel.inputSupported);
   const selectedChannelsSupportOutput = selectedChannels.length === 0 || selectedChannels.some((channel) => channel.outputSupported);
+  const selectedTtsModel = status.ttsModel.options.find((model) => model.id === draft.ttsModelId);
+  const compatibleSpeechProfiles = status.voiceProfiles.filter((profile) =>
+    profile.capabilities.includes('speech') && profile.compatibleTtsModelIds.includes(draft.ttsModelId));
+  const benchmarkModel = getSpeechAction(status, 'speech.benchmarkTtsModel');
   const settingsValid = canSaveSpeechSettings(status, draft);
 
   return (
@@ -277,9 +283,30 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
           <SelectionField label="回复策略" selection={status.replyPolicy} value={draft.replyPolicy} onChange={(value) => setDraft({ ...draft, replyPolicy: value })} />
           <SelectionField label="交付模式" selection={status.deliveryMode} value={draft.deliveryMode} onChange={(value) => setDraft({ ...draft, deliveryMode: value })} />
           <SelectionField label="ASR Provider" selection={status.asrProvider} value={draft.asrProvider} disabled={!draft.inputEnabled || !selectedChannelsSupportInput} onChange={(value) => setDraft({ ...draft, asrProvider: value })} />
-          <SelectionField label="TTS Provider" selection={status.ttsProvider} value={draft.ttsProvider} disabled={!draft.outputEnabled || !selectedChannelsSupportOutput} onChange={(value) => setDraft({ ...draft, ttsProvider: value })} />
+          <SelectionField label="TTS Provider" selection={status.ttsProvider} value={draft.ttsProvider} disabled={!draft.outputEnabled || !selectedChannelsSupportOutput} onChange={(value) => {
+            const model = status.ttsModel.options.find((item) => item.providerId === value && item.enabled);
+            setDraft({
+              ...draft,
+              ttsProvider: value,
+              ttsModelId: model?.id || '',
+              activeVoiceProfileId: model?.defaultVoiceProfileId || '',
+              tonePolicy: model?.capabilities.includes('instruction_control') ? draft.tonePolicy : 'neutral_stable',
+            });
+          }} />
+          <label className="speech-field"><span>TTS 模型</span><select value={draft.ttsModelId} disabled={!draft.outputEnabled} onChange={(event) => {
+            const model = status.ttsModel.options.find((item) => item.id === event.target.value);
+            const currentVoiceCompatible = compatibleSpeechProfiles.some((profile) => profile.id === draft.activeVoiceProfileId && profile.compatibleTtsModelIds.includes(event.target.value));
+            setDraft({
+              ...draft,
+              ttsModelId: event.target.value,
+              ttsProvider: model?.providerId || draft.ttsProvider,
+              activeVoiceProfileId: currentVoiceCompatible ? draft.activeVoiceProfileId : model?.defaultVoiceProfileId || '',
+              tonePolicy: model?.capabilities.includes('instruction_control') ? draft.tonePolicy : 'neutral_stable',
+            });
+          }}>{status.ttsModel.options.map((model) => <option key={model.id} value={model.id} disabled={!model.enabled}>{model.displayName} · {model.state}</option>)}</select></label>
+          <SelectionField label="语气策略" selection={status.tonePolicy} value={draft.tonePolicy} disabled={!draft.outputEnabled} onChange={(value) => setDraft({ ...draft, tonePolicy: value })} />
           <SelectionField label="Singing Provider" selection={status.singingProvider} value={draft.singingProvider} disabled={!draft.singingEnabled || !selectedChannelsSupportOutput} onChange={(value) => setDraft({ ...draft, singingProvider: value })} />
-          <label className="speech-field"><span>说话音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">Runtime 内置默认音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('speech')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
+          <label className="speech-field"><span>说话音色</span><select value={draft.activeVoiceProfileId} disabled={!draft.outputEnabled} onChange={(event) => setDraft({ ...draft, activeVoiceProfileId: event.target.value })}><option value="">当前模型默认音色</option>{compatibleSpeechProfiles.map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
           <label className="speech-field"><span>歌声音色</span><select value={draft.activeSingingVoiceProfileId} disabled={!draft.singingEnabled} onChange={(event) => setDraft({ ...draft, activeSingingVoiceProfileId: event.target.value })}><option value="">ACE-Step 默认歌声音色</option>{status.voiceProfiles.filter((profile) => profile.capabilities.includes('singing')).map((profile) => <option key={profile.id} value={profile.id} disabled={profile.state !== 'ready'}>{profile.displayName} · {profile.state}</option>)}</select></label>
         </div>
         <div className="speech-limit-row">
@@ -288,6 +315,16 @@ export function SpeechPage({ state, run, refresh, pending }: SpeechPageProps) {
           <span>输出 {status.limits.maxOutputCharacters} 字</span>
           <span>歌曲最长 {status.limits.maxSongDurationSeconds}s</span>
         </div>
+        {selectedTtsModel && <div className="speech-diagnostic">
+          <Volume2 size={15} />
+          <span>
+            配置模型：{selectedTtsModel.displayName}；live：{status.ttsModel.liveValue || '未加载'}；
+            benchmark：{selectedTtsModel.benchmark.state}
+            {selectedTtsModel.benchmark.warmSynthesisMs !== undefined ? ` · 热态 ${Math.round(selectedTtsModel.benchmark.warmSynthesisMs)}ms` : ''}
+          </span>
+          <button className="mini-button" disabled={!benchmarkModel.enabled || draft.ttsModelId !== status.ttsModel.value || pending[benchmarkModel.id]} title={benchmarkModel.diagnosticCode || ''} onClick={() => void runAction(benchmarkModel.id, { modelId: status.ttsModel.value })}><Play size={14} />性能测试</button>
+        </div>}
+        {status.ttsModel.restartRequired && <div className="speech-diagnostic"><AlertTriangle size={15} /><span>已保存模型尚未由 live Runtime 加载，请受控重启 Bridge 后再试听或测试。</span></div>}
         <div className="command-band dense speech-save-row"><button className="command-button" disabled={!settingsValid || pending['speech.saveSettings']} onClick={() => void runAction('speech.saveSettings', draft as unknown as Record<string, unknown>)}><Save size={15} />保存语音设置</button>{!settingsValid && <span>当前选择未被 Runtime 声明或尚未 ready，不能提交。</span>}</div>
       </section>
 

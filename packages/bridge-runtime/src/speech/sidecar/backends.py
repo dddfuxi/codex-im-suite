@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 import subprocess
 import tempfile
@@ -19,6 +20,10 @@ from typing import Any, Callable, Iterable, Mapping
 
 
 PRESET_SPEAKERS = {"cosyvoice.sft.zh_female": "中文女"}
+QWEN_PRESET_SPEAKERS = frozenset({
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee",
+})
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SENSEVOICE_TAG = re.compile(r"<\|([^|<>\r\n]{1,64})\|>")
@@ -417,7 +422,12 @@ class CosyVoiceBackend:
             duration_ms = self._write_chunks(runtime, generated_chunks, temporary)
             os.replace(temporary, output)
             completed = True
-            return {"durationMs": duration_ms, "provider": "cosyvoice", "model": "cosyvoice"}
+            return {
+                "durationMs": duration_ms,
+                "provider": "cosyvoice",
+                "model": "cosyvoice-300m-sft",
+                "revision": _directory_revision(self.sft_model_path or self.reference_model_path),
+            }
         except BackendFailure:
             raise
         except Exception:
@@ -432,10 +442,196 @@ class CosyVoiceBackend:
                     pass
 
 
+def _directory_revision(raw_path: str | None) -> str:
+    model_dir = _safe_directory(raw_path, "tts_model_missing")
+    digest = hashlib.sha256()
+    candidates = sorted(
+        candidate for candidate in model_dir.rglob("*")
+        if candidate.is_file()
+        and candidate.name != ".installed.json"
+        and candidate.suffix.lower() in {".json", ".txt", ".yaml", ".safetensors"}
+    )
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise BackendFailure("tts_model_revision_unsafe", "blocked")
+        relative = candidate.relative_to(model_dir).as_posix()
+        digest.update(relative.encode("utf-8"))
+        with candidate.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    revision = digest.hexdigest()
+    if revision == hashlib.sha256().hexdigest():
+        raise BackendFailure("tts_model_revision_unavailable", "blocked")
+    return revision
+
+
+def _load_qwen_runtime(model_dir: str) -> tuple[Any, Any, Any]:
+    # 受管环境强制离线；from_pretrained 只接收已由 Node Runtime 验证的本地目录。
+    import soundfile  # type: ignore[import-not-found]
+    import torch  # type: ignore[import-not-found]
+    from qwen_tts import Qwen3TTSModel  # type: ignore[import-not-found]
+
+    if not torch.cuda.is_available():
+        raise BackendFailure("qwen_tts_cuda_unavailable", "blocked")
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    model = Qwen3TTSModel.from_pretrained(
+        model_dir,
+        device_map="cuda:0",
+        dtype=dtype,
+        attn_implementation="sdpa",
+        local_files_only=True,
+    )
+    return model, torch, soundfile
+
+
+def _qwen_language(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "Chinese"
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "Japanese"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "Korean"
+    return "English"
+
+
+class Qwen3TTSBackend:
+    def __init__(
+        self,
+        model_path: str | None,
+        provider_id: str,
+        model_id: str,
+        dependency_state: str = "optional_missing",
+        dependency_diagnostic: str = "qwen_tts_dependency_missing",
+        loader: Callable[[str], tuple[Any, Any, Any]] = _load_qwen_runtime,
+    ) -> None:
+        self.model_path = model_path
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.loader = loader
+        self.revision = ""
+        self._runtime: tuple[Any, Any, Any] | None = None
+        self._probe_lifecycle = _ProbeLifecycle(
+            dependency_state,
+            dependency_diagnostic,
+            "qwen_tts_probe_pending",
+        )
+
+    def snapshot(self) -> BackendSnapshot:
+        return self._probe_lifecycle.snapshot()
+
+    def probe(self) -> BackendSnapshot:
+        def execute() -> BackendSnapshot:
+            try:
+                model_dir = _safe_directory(self.model_path, "qwen_tts_model_missing")
+                config = model_dir / "config.json"
+                if config.is_symlink() or not config.is_file():
+                    raise BackendFailure("qwen_tts_model_marker_missing", "blocked")
+                self.revision = _directory_revision(str(model_dir))
+                self._runtime = self.loader(str(model_dir))
+                return BackendSnapshot("ready")
+            except BackendFailure as error:
+                return BackendSnapshot(error.status, error.code)
+            except (ImportError, ModuleNotFoundError):
+                return BackendSnapshot("optional_missing", "qwen_tts_runtime_missing")
+            except Exception:
+                return BackendSnapshot("error", "qwen_tts_model_load_failed")
+
+        return self._probe_lifecycle.run(execute, "qwen_tts_model_load_failed")
+
+    def synthesize(
+        self,
+        text: str,
+        output_path: str,
+        preset_speaker_id: str | None = None,
+        reference_path: str | None = None,
+        reference_transcript: str | None = None,
+        tone_instruction: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
+            raise BackendFailure("tts_text_invalid", "blocked")
+        segments = _split_tts_text(text)
+        if not segments:
+            raise BackendFailure("tts_text_invalid", "blocked")
+        if self.probe().state != "ready" or self._runtime is None:
+            snapshot = self.snapshot()
+            raise BackendFailure(snapshot.diagnostic_code or "tts_backend_optional_missing", snapshot.state)
+        output, temporary = CosyVoiceBackend._safe_output_path(output_path)
+        completed = False
+        model, torch_module, soundfile_module = self._runtime
+        try:
+            torch_module.cuda.reset_peak_memory_stats()
+            generated: list[Any] = []
+            sample_rate: int | None = None
+            for segment in segments:
+                language = _qwen_language(segment)
+                if self.model_id.endswith("-custom-voice"):
+                    if preset_speaker_id not in QWEN_PRESET_SPEAKERS:
+                        raise BackendFailure("tts_preset_unknown", "blocked")
+                    wavs, current_rate = model.generate_custom_voice(
+                        text=segment,
+                        language=language,
+                        speaker=preset_speaker_id,
+                        instruct=(tone_instruction or ""),
+                    )
+                elif self.model_id.endswith("-base"):
+                    if not reference_path or not isinstance(reference_transcript, str) or not reference_transcript.strip():
+                        raise BackendFailure("tts_reference_invalid", "blocked")
+                    reference = _safe_file(reference_path, "tts_reference_invalid")
+                    wavs, current_rate = model.generate_voice_clone(
+                        text=segment,
+                        language=language,
+                        ref_audio=str(reference),
+                        ref_text=reference_transcript.strip(),
+                    )
+                else:
+                    raise BackendFailure("tts_model_variant_unsupported", "blocked")
+                if not isinstance(wavs, list) or len(wavs) != 1:
+                    raise BackendFailure("qwen_tts_output_invalid")
+                if sample_rate is not None and sample_rate != int(current_rate):
+                    raise BackendFailure("qwen_tts_sample_rate_changed")
+                sample_rate = int(current_rate)
+                generated.append(wavs[0])
+            if sample_rate is None or not generated:
+                raise BackendFailure("qwen_tts_empty_output")
+            import numpy  # type: ignore[import-not-found]
+            combined = numpy.concatenate(generated)
+            soundfile_module.write(str(temporary), combined, sample_rate, subtype="PCM_16", format="WAV")
+            with wave.open(str(temporary), "rb") as created:
+                if created.getnframes() <= 0 or created.getframerate() <= 0:
+                    raise BackendFailure("qwen_tts_output_invalid")
+                duration_ms = round(created.getnframes() * 1000 / created.getframerate())
+            peak_vram_mib = round(torch_module.cuda.max_memory_allocated() / 1024 / 1024, 1)
+            os.replace(temporary, output)
+            completed = True
+            return {
+                "durationMs": duration_ms,
+                "provider": self.provider_id,
+                "model": self.model_id,
+                "revision": self.revision,
+                "peakVramMiB": peak_vram_mib,
+            }
+        except BackendFailure:
+            raise
+        except torch_module.cuda.OutOfMemoryError:
+            raise BackendFailure("qwen_tts_out_of_memory", "blocked") from None
+        except Exception:
+            raise BackendFailure("qwen_tts_synthesis_failed") from None
+        finally:
+            for candidate in (temporary, output if not completed else None):
+                if candidate is None:
+                    continue
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 class BackendRegistry:
-    def __init__(self, sensevoice: SenseVoiceBackend, cosyvoice: CosyVoiceBackend) -> None:
+    def __init__(self, sensevoice: SenseVoiceBackend, tts_backend: Any, provider_id: str = "cosyvoice", model_id: str = "cosyvoice-300m-sft") -> None:
         self.sensevoice = sensevoice
-        self.cosyvoice = cosyvoice
+        self.tts_backend = tts_backend
+        self.provider_id = provider_id
+        self.model_id = model_id
         # Sidecar 虽使用 ThreadingHTTPServer，模型执行仍严格串行，和 Node 侧单槽门禁互为防线。
         self._execution_lock = threading.Lock()
 
@@ -446,6 +642,31 @@ class BackendRegistry:
             timeout = max(10, min(600, int(env.get("CTI_SPEECH_BACKEND_TIMEOUT_SECONDS", "120"))))
         except ValueError:
             pass
+        provider_id = env.get("CTI_SPEECH_TTS_PROVIDER", "")
+        model_id = env.get("CTI_SPEECH_TTS_MODEL_ID", "")
+        if provider_id == "qwen3_tts" and model_id.startswith("qwen3-tts-"):
+            tts_backend: Any = Qwen3TTSBackend(
+                env.get("CTI_SPEECH_TTS_MODEL_PATH"),
+                provider_id,
+                model_id,
+                env.get("CTI_SPEECH_TTS_DEPENDENCY_STATE", "optional_missing"),
+                env.get("CTI_SPEECH_TTS_DIAGNOSTIC", "qwen_tts_dependency_missing"),
+            )
+        elif provider_id == "cosyvoice" and model_id == "cosyvoice-300m-sft":
+            tts_backend = CosyVoiceBackend(
+                env.get("CTI_SPEECH_TTS_MODEL_PATH"),
+                env.get("CTI_SPEECH_TTS_REFERENCE_MODEL_PATH"),
+                env.get("CTI_SPEECH_TTS_DEPENDENCY_STATE", "optional_missing"),
+                env.get("CTI_SPEECH_TTS_DIAGNOSTIC", "cosyvoice_dependency_missing"),
+            )
+        else:
+            tts_backend = Qwen3TTSBackend(
+                None,
+                provider_id or "unknown",
+                model_id or "unknown",
+                "blocked",
+                "tts_provider_model_unsupported",
+            )
         return BackendRegistry(
             SenseVoiceBackend(
                 env.get("CTI_SPEECH_SENSEVOICE_BINARY"),
@@ -454,21 +675,18 @@ class BackendRegistry:
                 env.get("CTI_SPEECH_ASR_DIAGNOSTIC", "sensevoice_dependency_missing"),
                 timeout,
             ),
-            CosyVoiceBackend(
-                env.get("CTI_SPEECH_TTS_MODEL_PATH"),
-                env.get("CTI_SPEECH_TTS_REFERENCE_MODEL_PATH"),
-                env.get("CTI_SPEECH_TTS_DEPENDENCY_STATE", "optional_missing"),
-                env.get("CTI_SPEECH_TTS_DIAGNOSTIC", "cosyvoice_dependency_missing"),
-            ),
+            tts_backend,
+            provider_id,
+            model_id,
         )
 
     def start_probe(self) -> None:
-        for backend in (self.sensevoice, self.cosyvoice):
+        for backend in (self.sensevoice, self.tts_backend):
             threading.Thread(target=backend.probe, daemon=True, name="cti-speech-backend-probe").start()
 
     def health(self) -> dict[str, Any]:
         asr = self.sensevoice.snapshot()
-        tts = self.cosyvoice.snapshot()
+        tts = self.tts_backend.snapshot()
         capabilities = {"asr": asr.state == "ready", "tts": tts.state == "ready"}
         if capabilities["asr"] or capabilities["tts"]:
             state = "ready"
@@ -482,7 +700,14 @@ class BackendRegistry:
         else:
             state = "optional_missing"
             diagnostic = asr.diagnostic_code or tts.diagnostic_code or "speech_backend_optional_missing"
-        return {"status": state, "capabilities": capabilities, "diagnosticCode": diagnostic}
+        result: dict[str, Any] = {"status": state, "capabilities": capabilities, "diagnosticCode": diagnostic}
+        if capabilities["tts"]:
+            result["tts"] = {
+                "providerId": self.provider_id,
+                "modelId": self.model_id,
+                "revision": getattr(self.tts_backend, "revision", "") or _directory_revision(getattr(self.tts_backend, "model_path", None) or getattr(self.tts_backend, "sft_model_path", None)),
+            }
+        return result
 
     def transcribe(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if payload.get("provider") != "sensevoice_gguf" or not isinstance(payload.get("audioPath"), str):
@@ -491,13 +716,16 @@ class BackendRegistry:
             return self.sensevoice.transcribe(payload["audioPath"])
 
     def synthesize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if payload.get("provider") != "cosyvoice" or not isinstance(payload.get("outputPath"), str):
+        if payload.get("provider") != self.provider_id or payload.get("modelId") != self.model_id or not isinstance(payload.get("outputPath"), str):
             raise BackendFailure("tts_request_invalid", "blocked")
         with self._execution_lock:
-            return self.cosyvoice.synthesize(
+            args = [
                 payload.get("text") if isinstance(payload.get("text"), str) else "",
                 payload["outputPath"],
                 payload.get("presetSpeakerId") if isinstance(payload.get("presetSpeakerId"), str) else None,
                 payload.get("voiceReferencePath") if isinstance(payload.get("voiceReferencePath"), str) else None,
                 payload.get("voiceReferenceTranscript") if isinstance(payload.get("voiceReferenceTranscript"), str) else None,
-            )
+            ]
+            if isinstance(self.tts_backend, Qwen3TTSBackend):
+                args.append(payload.get("toneInstruction") if isinstance(payload.get("toneInstruction"), str) else None)
+            return self.tts_backend.synthesize(*args)

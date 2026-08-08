@@ -7,6 +7,8 @@ import { ManagedSpeechDependencyManager } from './managed-dependency-manager.js'
 import { validateAudio } from './media-pipeline.js';
 import { RuntimeSpeechHost } from './runtime-speech-host.js';
 import { SpeechLiveStatusStore } from './speech-live-status.js';
+import { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
+import { getSpeechHardwareIdentity } from './speech-hardware.js';
 import { SpeechRuntimeStatusService } from './speech-status.js';
 import { createSpeechVoicePreview } from './speech-preview.js';
 import { createSingingVoicePreview } from './singing-preview.js';
@@ -61,12 +63,16 @@ export function createSpeechRuntime(input: {
     },
   );
   const dependencies = new ManagedSpeechDependencyManager(manifestPath, runtimeDepsRoot);
+  const benchmarkStore = new SpeechModelBenchmarkStore(runtimeSpeechStateRoot);
+  const hardware = getSpeechHardwareIdentity();
   const host = new RuntimeSpeechHost({
     config: input.config,
     ctiHome: input.ctiHome,
     runtimeDepsRoot,
     bundledSidecarCandidates: sidecarCandidates,
     voiceRegistry,
+    benchmarkStore,
+    hardwareId: hardware.id,
   });
   const singingHost = new AceStepSingingHost({
     config: input.config,
@@ -82,6 +88,8 @@ export function createSpeechRuntime(input: {
     listManagedComponents: () => dependencies.listStatuses(),
     previewAvailable: () => previewControlService?.isRunning() === true,
     singingHost,
+    benchmarkStore,
+    hardwareId: hardware.id,
   });
   const liveStatus = new SpeechLiveStatusStore(runtimeSpeechStateRoot, input.config);
   let liveStatusTimer: NodeJS.Timeout | undefined;
@@ -105,15 +113,25 @@ export function createSpeechRuntime(input: {
       try {
         previewControlService = startSpeechPreviewControlService({
           runtimeStateRoot: runtimeSpeechStateRoot,
-          previewVoice: ({ text, voiceProfileId, signal }) => createSpeechVoicePreview({
+          previewVoice: ({ text, modelId, voiceProfileId, signal }) => createSpeechVoicePreview({
             host,
             text,
+            ttsModelId: modelId,
             voiceProfileId,
             signal,
           }),
-          previewSingingVoice: ({ text, voiceProfileId, signal }) => createSingingVoicePreview({
+          benchmarkVoice: ({ text, modelId, voiceProfileId, signal }) => createSpeechVoicePreview({
+            host,
+            text,
+            ttsModelId: modelId,
+            voiceProfileId,
+            benchmarkMode: true,
+            signal,
+          }),
+          previewSingingVoice: ({ text, modelId, voiceProfileId, signal }) => createSingingVoicePreview({
             host: singingHost,
             lyrics: text,
+            modelId,
             voiceProfileId,
             signal,
           }),
@@ -140,6 +158,8 @@ export function createSpeechRuntime(input: {
     status,
     voiceRegistry,
     dependencies,
+    benchmarkStore,
+    hardware,
     readLiveStatus: () => liveStatus.read(),
     startLivePrewarm,
     stopLiveStatus,

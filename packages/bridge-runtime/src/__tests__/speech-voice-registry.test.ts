@@ -90,7 +90,8 @@ describe('speech voice registry', () => {
       assert.match(profile.sha256!, /^[a-f0-9]{64}$/);
       const raw = fs.readFileSync(registry.registryPath, 'utf8');
       assert.equal(raw.includes(source), false);
-      const summary = registry.listSummaries(profile.id)[0] as unknown as Record<string, unknown>;
+      const summary = registry.listSummaries(profile.id)
+        .find((item) => item.id === profile.id) as unknown as Record<string, unknown>;
       assert.equal(summary.active, true);
       assert.equal('transcript' in summary, false);
       assert.equal('sha256' in summary, false);
@@ -122,7 +123,7 @@ describe('speech voice registry', () => {
       fs.appendFileSync(managedPath, 'tampered', 'utf8');
 
       assert.throws(() => registry.resolveProfile(profile.id), /voice_reference_sha256_mismatch/);
-      assert.equal(registry.listSummaries(profile.id)[0]?.state, 'blocked');
+      assert.equal(registry.listSummaries(profile.id).find((item) => item.id === profile.id)?.state, 'blocked');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -142,7 +143,9 @@ describe('speech voice registry', () => {
       assert.equal(profile.kind, 'preset');
       assert.equal(profile.relativePath, undefined);
       assert.deepEqual(registry.resolveProfile(profile.id), {
-        kind: 'preset', presetSpeakerId: DEFAULT_PRESET_PROFILE_ID,
+        kind: 'preset',
+        presetSpeakerId: DEFAULT_PRESET_PROFILE_ID,
+        compatibleTtsModelIds: ['cosyvoice-300m-sft'],
       });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

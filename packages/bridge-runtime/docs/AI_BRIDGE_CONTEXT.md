@@ -2,7 +2,11 @@
 
 本文档是 `codex-im-suite` 项目内的 Bridge 上下文入口，仅跟随开发版仓库维护。完整架构单一事实源是 [`docs/PROJECT-ARCHITECTURE.md`](../../../docs/PROJECT-ARCHITECTURE.md)，阶段结果与未验收风险记录在 [`docs/DEVELOPMENT-LOG.md`](../../../docs/DEVELOPMENT-LOG.md)。
 
-## 本地语音与歌声边界（开发版 0.3.0）
+## 本地语音与歌声边界（开发版 0.4.0）
+
+- 默认 TTS 为 Qwen3-TTS 12Hz 1.7B CustomVoice + Serena，0.6B CustomVoice 为显式低显存选项，Base 变体只用于已授权复刻。
+- 普通自然语言不能通过关键词正则直接触发语音或克隆；Primary 只声明受限意图，Bridge 结合真实媒体 evidence、会话状态、角色和风险裁决。
+- 模型集合必须固定 revision 与逐文件 SHA-256 后事务式安装；模型级 benchmark 绑定 Provider、模型、完整内容 revision 和硬件。
 
 - 首期只接入飞书，语音输入、语音输出和歌声合成都默认关闭，不改变其他渠道和普通文字 Bridge。
 - 无会话覆盖时，真实飞书语音经本地 ASR 转写后交给 Primary Agent，并默认回复语音；普通文字默认回复文字。`/voice off` 是硬禁用，直到再次发送 `/voice on` 前都只返回文字；完整优先级为：明确文字 → `/voice off` → 明确语音 → `/voice on` → Runtime 策略 → 入站语音 / 模型提示。

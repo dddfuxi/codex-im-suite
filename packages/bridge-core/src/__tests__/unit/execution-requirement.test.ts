@@ -6,6 +6,7 @@ import {
   buildNoEvidenceRetryPrompt,
   classifyToolResultQuality,
   classifyExecutionRequirement,
+  inferNestedMcpToolEvidenceNames,
   inheritContinuationExecutionRequirement,
   isExecutionEvidenceSatisfied,
   shouldReplaceWithNoExecutionEvidenceText,
@@ -802,6 +803,59 @@ describe('execution requirement classifier', () => {
     assert.match(text, /未完成：这次没有获得可验证的执行结果/);
     assert.match(text, /本轮没有通过MCP获得可验证结果/);
     assert.doesNotMatch(text, /Network Error|service URL|tool_use|tool_result|tool_required|JsonTool:mcp_call/);
+  });
+
+  it('recognizes a successful Unity MCP JSON-RPC call nested inside a shell tool', () => {
+    const names = inferNestedMcpToolEvidenceNames({
+      outerToolName: 'Bash',
+      toolInput: {
+        command: "Invoke-WebRequest -Uri 'http://127.0.0.1:8081/mcp' -Method Post -Body '{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"manage_scene\"}}'",
+      },
+      toolResultContent: '{"jsonrpc":"2.0","result":{"structuredContent":{"success":true,"message":"Scene saved successfully"}}}',
+    });
+
+    assert.deepEqual(names, ['nested-mcp:jsonrpc', 'nested-mcp:manage_scene']);
+    assert.equal(isExecutionEvidenceSatisfied({
+      kind: 'tool_required',
+      reason: 'Unity scene change',
+      requiredToolFamilies: ['unity-mcp'],
+      strictToolEvidence: true,
+    }, {
+      successfulToolResultCount: 1,
+      toolNames: ['Bash', ...names],
+    }), true);
+  });
+
+  it('does not promote output text or an explicitly failed nested MCP result', () => {
+    assert.deepEqual(inferNestedMcpToolEvidenceNames({
+      outerToolName: 'Bash',
+      toolInput: { command: "Write-Output 'Unity MCP manage_scene saved successfully'" },
+      toolResultContent: 'Unity MCP manage_scene saved successfully',
+    }), []);
+
+    assert.deepEqual(inferNestedMcpToolEvidenceNames({
+      outerToolName: 'Bash',
+      toolInput: {
+        command: "curl http://localhost:8081/mcp -d '{\"method\":\"tools/call\",\"params\":{\"name\":\"batch_execute\"}}'",
+      },
+      toolResultContent: 'success=False message=One or more commands failed.',
+    }), []);
+
+    assert.deepEqual(inferNestedMcpToolEvidenceNames({
+      outerToolName: 'Bash',
+      toolInput: {
+        command: "curl https://example.com/mcp -d '{\"method\":\"tools/call\",\"params\":{\"name\":\"manage_scene\"}}'",
+      },
+      toolResultContent: '{"jsonrpc":"2.0","result":{"success":true}}',
+    }), []);
+
+    assert.deepEqual(inferNestedMcpToolEvidenceNames({
+      outerToolName: 'Bash',
+      toolInput: {
+        command: "curl http://localhost:8081/mcp -d '{\"method\":\"tools/call\",\"params\":{\"name\":\"manage_scene\"}}'",
+      },
+      toolResultContent: 'Done',
+    }), []);
   });
 
   it('treats Unity scene and Prefab mutations as external tool state, not output artifacts', () => {

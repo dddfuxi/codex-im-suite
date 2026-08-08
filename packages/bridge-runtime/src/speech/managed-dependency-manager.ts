@@ -5,7 +5,12 @@ import type { Readable } from 'node:stream';
 import yauzl from 'yauzl';
 
 import { ensureNonSymlinkDirectory, isWithinRoot, removeManagedTempDirectorySafely } from './dependency-resolution.js';
-import { MANAGED_INSTALL_PROTOCOL, readManagedInstallMarker } from './managed-install-marker.js';
+import {
+  MANAGED_INSTALL_PROTOCOL,
+  MANAGED_INSTALL_SET_PROTOCOL,
+  readManagedInstallMarker,
+  readManagedInstallSetMarker,
+} from './managed-install-marker.js';
 import type { ManagedSpeechComponentStatus } from './speech-status.js';
 
 interface ManagedDependencyRecord {
@@ -23,9 +28,17 @@ interface ManagedDependencyRecord {
   availability: 'ready' | 'blocked';
   platforms?: string[];
   diagnosticCode?: string;
+  entryPoint?: string;
+  files?: ManagedDependencyFileRecord[];
+}
+interface ManagedDependencyFileRecord {
+  source: string;
+  sha256: string;
+  size: number;
+  path: string;
 }
 interface ManagedDependencyManifest {
-  protocol: 'cti-speech-managed-dependencies/v1';
+  protocol: 'cti-speech-managed-dependencies/v1' | 'cti-speech-managed-dependencies/v2';
   components: ManagedDependencyRecord[];
 }
 
@@ -33,7 +46,7 @@ function readManifest(filePath: string): ManagedDependencyManifest {
   const stat = fs.lstatSync(filePath);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('dependency_manifest_unsafe');
   const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<ManagedDependencyManifest>;
-  if (parsed.protocol !== 'cti-speech-managed-dependencies/v1' || !Array.isArray(parsed.components)) throw new Error('dependency_manifest_invalid');
+  if ((parsed.protocol !== 'cti-speech-managed-dependencies/v1' && parsed.protocol !== 'cti-speech-managed-dependencies/v2') || !Array.isArray(parsed.components)) throw new Error('dependency_manifest_invalid');
   const seen = new Set<string>();
   const components = parsed.components.map((raw) => {
     if (!raw || typeof raw !== 'object') throw new Error('dependency_manifest_invalid');
@@ -51,14 +64,35 @@ function readManifest(filePath: string): ManagedDependencyManifest {
     const url = new URL(item.source);
     if (url.protocol !== 'https:') throw new Error('dependency_manifest_source_insecure');
     if (item.availability !== 'ready' && item.availability !== 'blocked') throw new Error('dependency_manifest_availability_invalid');
+    if (item.files !== undefined) {
+      if (parsed.protocol !== 'cti-speech-managed-dependencies/v2' || !Array.isArray(item.files) || item.files.length === 0 || item.files.length > 4096) {
+        throw new Error('dependency_manifest_files_invalid');
+      }
+      const filePaths = new Set<string>();
+      let totalSize = 0;
+      item.files = item.files.map((file) => {
+        if (!file || typeof file !== 'object') throw new Error('dependency_manifest_files_invalid');
+        const targetPath = assertSafeRelativePath(file.path);
+        if (filePaths.has(targetPath)) throw new Error('dependency_manifest_file_duplicate');
+        filePaths.add(targetPath);
+        if (new URL(file.source).protocol !== 'https:' || !/^[a-f0-9]{64}$/i.test(file.sha256 || '')
+          || !Number.isSafeInteger(file.size) || file.size <= 0) throw new Error('dependency_manifest_file_invalid');
+        totalSize += file.size;
+        if (!Number.isSafeInteger(totalSize)) throw new Error('dependency_manifest_total_size_invalid');
+        return { source: file.source, sha256: file.sha256.toLowerCase(), size: file.size, path: targetPath };
+      });
+      if (!item.entryPoint?.trim() || !filePaths.has(assertSafeRelativePath(item.entryPoint))) throw new Error('dependency_manifest_entry_point_invalid');
+    }
     if (item.availability === 'ready') {
-      if (!item.version?.trim() || !/^[a-f0-9]{64}$/i.test(item.sha256 || '') || !item.fileName?.trim()
-        || !Number.isSafeInteger(item.size) || Number(item.size) <= 0) throw new Error('dependency_manifest_install_metadata_invalid');
-      assertSafeRelativePath(item.fileName!);
+      const collectionReady = parsed.protocol === 'cti-speech-managed-dependencies/v2' && item.files?.length;
+      const legacyReady = /^[a-f0-9]{64}$/i.test(item.sha256 || '') && item.fileName?.trim()
+        && Number.isSafeInteger(item.size) && Number(item.size) > 0;
+      if (!item.version?.trim() || (!collectionReady && !legacyReady)) throw new Error('dependency_manifest_install_metadata_invalid');
+      if (legacyReady) assertSafeRelativePath(item.fileName!);
     }
     return { ...item, capabilities: [...item.capabilities], ...(item.platforms ? { platforms: [...item.platforms] } : {}) };
   });
-  return { protocol: 'cti-speech-managed-dependencies/v1', components };
+  return { protocol: parsed.protocol, components } as ManagedDependencyManifest;
 }
 
 export function assertSafeRelativePath(value: string): string {
@@ -185,8 +219,9 @@ export class ManagedSpeechDependencyManager {
   constructor(
     manifestPath: string,
     private readonly runtimeDepsRoot: string,
-    private readonly maxDownloadBytes = 2 * 1024 * 1024 * 1024,
+    private readonly maxDownloadBytes = 8 * 1024 * 1024 * 1024,
     private readonly runtimePlatform = `${process.platform}-${process.arch}`,
+    private readonly maxTotalDownloadBytes = 16 * 1024 * 1024 * 1024,
   ) {
     this.manifest = readManifest(path.resolve(manifestPath));
     ensureNonSymlinkDirectory(path.resolve(runtimeDepsRoot));
@@ -216,6 +251,18 @@ export class ManagedSpeechDependencyManager {
   private isInstalled(item: ManagedDependencyRecord): boolean {
     if (!item.version) return false;
     const targetRoot = path.join(this.runtimeDepsRoot, 'speech', item.id, item.version);
+    if (item.files?.length) {
+      return readManagedInstallSetMarker(targetRoot, {
+        id: item.id,
+        version: item.version,
+        source: item.source,
+        license: item.license,
+        platform: this.runtimePlatform,
+        entryPoint: item.entryPoint,
+        manifestSha256: this.computeFileSetHash(item.files),
+        totalSize: item.files.reduce((sum, file) => sum + file.size, 0),
+      }) !== null;
+    }
     return readManagedInstallMarker(targetRoot, {
       id: item.id,
       version: item.version,
@@ -232,7 +279,9 @@ export class ManagedSpeechDependencyManager {
     const item = this.manifest.components.find((candidate) => candidate.id === componentId);
     if (!item) throw new Error('component_not_found');
     if (item.platforms && !item.platforms.includes(this.runtimePlatform)) throw new Error('component_platform_unsupported');
-    if (item.availability !== 'ready' || !item.version || !item.sha256 || !item.fileName || !item.size) throw new Error(item.diagnosticCode || 'manifest_incomplete');
+    const collectionReady = item.files?.length && item.entryPoint;
+    const legacyReady = item.sha256 && item.fileName && item.size;
+    if (item.availability !== 'ready' || !item.version || (!collectionReady && !legacyReady)) throw new Error(item.diagnosticCode || 'manifest_incomplete');
     const componentRoot = path.join(this.runtimeDepsRoot, 'speech', item.id);
     const targetRoot = path.join(componentRoot, item.version);
     ensureNonSymlinkDirectory(componentRoot);
@@ -244,31 +293,64 @@ export class ManagedSpeechDependencyManager {
         throw new Error('component_target_conflict');
       }
       ensureNonSymlinkDirectory(stageRoot);
-      const downloadPath = path.join(stageRoot, 'download.bin');
-      await fetchHttps({
-        url: item.source,
-        targetPath: downloadPath,
-        expectedSha256: item.sha256,
-        expectedBytes: item.size,
-        maxBytes: this.maxDownloadBytes,
-        signal,
-      });
       const payloadRoot = path.join(stageRoot, 'payload');
       ensureNonSymlinkDirectory(payloadRoot);
-      if (item.archive === 'zip') {
-        await extractZipSafely(downloadPath, payloadRoot, this.maxDownloadBytes);
+      if (collectionReady) {
+        const totalSize = item.files!.reduce((sum, file) => sum + file.size, 0);
+        if (!Number.isSafeInteger(totalSize) || totalSize > this.maxTotalDownloadBytes) throw new Error('download_total_too_large');
+        this.assertDiskSpace(payloadRoot, totalSize);
+        // 所有资源先进入同一 stage；只有完整 Hash 集合通过后才原子发布版本目录。
+        for (const file of item.files!) {
+          const target = path.resolve(payloadRoot, ...file.path.split('/'));
+          if (!isWithinRoot(target, payloadRoot)) throw new Error('component_path_escape');
+          ensureNonSymlinkDirectory(path.dirname(target));
+          await fetchHttps({
+            url: file.source,
+            targetPath: target,
+            expectedSha256: file.sha256,
+            expectedBytes: file.size,
+            maxBytes: this.maxDownloadBytes,
+            signal,
+          });
+        }
       } else {
-        const target = path.resolve(payloadRoot, ...assertSafeRelativePath(item.fileName).split('/'));
-        if (!isWithinRoot(target, payloadRoot)) throw new Error('component_path_escape');
-        ensureNonSymlinkDirectory(path.dirname(target));
-        fs.renameSync(downloadPath, target);
+        const downloadPath = path.join(stageRoot, 'download.bin');
+        await fetchHttps({
+          url: item.source,
+          targetPath: downloadPath,
+          expectedSha256: item.sha256!,
+          expectedBytes: item.size!,
+          maxBytes: this.maxDownloadBytes,
+          signal,
+        });
+        if (item.archive === 'zip') {
+          await extractZipSafely(downloadPath, payloadRoot, this.maxDownloadBytes);
+        } else {
+          const target = path.resolve(payloadRoot, ...assertSafeRelativePath(item.fileName!).split('/'));
+          if (!isWithinRoot(target, payloadRoot)) throw new Error('component_path_escape');
+          ensureNonSymlinkDirectory(path.dirname(target));
+          fs.renameSync(downloadPath, target);
+        }
       }
-      const entryPoint = path.resolve(payloadRoot, ...assertSafeRelativePath(item.fileName).split('/'));
+      const entryPointRelative = collectionReady ? assertSafeRelativePath(item.entryPoint!) : assertSafeRelativePath(item.fileName!);
+      const entryPoint = path.resolve(payloadRoot, ...entryPointRelative.split('/'));
       if (!isWithinRoot(entryPoint, payloadRoot)) throw new Error('component_path_escape');
       const entryPointStat = fs.lstatSync(entryPoint);
       if (entryPointStat.isSymbolicLink() || !entryPointStat.isFile()) throw new Error('component_entry_point_missing_or_unsafe');
       const entryPointSha256 = hashFileSha256Sync(entryPoint);
-      fs.writeFileSync(path.join(payloadRoot, '.installed.json'), `${JSON.stringify({
+      const marker = collectionReady ? {
+        protocol: MANAGED_INSTALL_SET_PROTOCOL,
+        id: item.id,
+        version: item.version,
+        source: item.source,
+        license: item.license,
+        platform: this.runtimePlatform,
+        entryPoint: entryPointRelative,
+        manifestSha256: this.computeFileSetHash(item.files!),
+        totalSize: item.files!.reduce((sum, file) => sum + file.size, 0),
+        files: item.files!.map((file) => ({ path: file.path, sha256: file.sha256, size: file.size, source: file.source })),
+        installedAt: new Date().toISOString(),
+      } : {
         protocol: MANAGED_INSTALL_PROTOCOL,
         id: item.id,
         version: item.version,
@@ -277,11 +359,12 @@ export class ManagedSpeechDependencyManager {
         source: item.source,
         license: item.license,
         platform: this.runtimePlatform,
-        entryPoint: assertSafeRelativePath(item.fileName),
+        entryPoint: entryPointRelative,
         entryPointSha256,
         entryPointSize: entryPointStat.size,
         installedAt: new Date().toISOString(),
-      }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      };
+      fs.writeFileSync(path.join(payloadRoot, '.installed.json'), `${JSON.stringify(marker, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(payloadRoot, targetRoot);
     } finally {
       try {
@@ -292,6 +375,23 @@ export class ManagedSpeechDependencyManager {
         });
       } catch { /* 失败 stage 不会被 resolver 采用，也绝不放宽递归删除边界。 */ }
       releaseInstallLock();
+    }
+  }
+
+  private computeFileSetHash(files: readonly ManagedDependencyFileRecord[]): string {
+    const canonical = files.map((file) => [file.path, file.sha256.toLowerCase(), file.size, file.source]);
+    return crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+  }
+
+  private assertDiskSpace(targetRoot: string, requiredBytes: number): void {
+    try {
+      const statfs = fs.statfsSync(targetRoot);
+      const available = Number(statfs.bavail) * Number(statfs.bsize);
+      // 下载阶段和最终发布位于同一组件卷，rename 不会复制数据；仅预留少量 marker/目录开销。
+      if (Number.isFinite(available) && available < requiredBytes + 64 * 1024 * 1024) throw new Error('disk_space_insufficient');
+    } catch (error) {
+      if (error instanceof Error && error.message === 'disk_space_insufficient') throw error;
+      // 无法探测文件系统容量时继续依赖逐文件硬上限，避免把兼容性问题误报成安装成功。
     }
   }
 

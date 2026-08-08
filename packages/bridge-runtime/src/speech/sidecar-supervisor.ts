@@ -28,8 +28,10 @@ export interface SidecarTranscriptionResult {
 
 export interface SidecarSynthesisResult {
   durationMs?: number;
-  provider?: string;
-  model?: string;
+  peakVramMiB?: number;
+  provider: string;
+  model: string;
+  revision: string;
 }
 
 export type SpeechSidecarInterruption = 'abort' | 'timeout';
@@ -116,6 +118,12 @@ export class SpeechSidecarClient {
       });
       const payload = await response.json() as SpeechSidecarHealth;
       if (!response.ok || payload.protocol !== SIDECAR_PROTOCOL) throw new Error('health_invalid');
+      if (payload.capabilities?.tts && (
+        !payload.tts
+        || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(payload.tts.providerId)
+        || !/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(payload.tts.modelId)
+        || !/^[a-f0-9]{64}$/i.test(payload.tts.revision)
+      )) throw new Error('health_tts_identity_invalid');
       return payload;
     } catch {
       throw new RuntimeSpeechError('sidecar_health_failed', 'error', '本地语音服务健康检查失败');
@@ -132,6 +140,8 @@ export class SpeechSidecarClient {
     text: string;
     outputPath: string;
     provider: string;
+    modelId: string;
+    toneInstruction?: string;
     voiceProfileId?: string;
     presetSpeakerId?: string;
     voiceReferencePath?: string;
@@ -248,7 +258,11 @@ export class SpeechSidecarSupervisor {
     return {
       python: resolveExecutableDependency({
         id: 'python', displayName: 'Python', executableName: process.platform === 'win32' ? 'python' : 'python3',
-        explicitPath: this.options.config.pythonPath, runtimeDepsRoot: this.options.runtimeDepsRoot,
+        explicitPath: this.options.config.pythonPath,
+        runtimeDepsRoot: this.options.runtimeDepsRoot,
+        componentIds: this.options.config.ttsProvider === 'qwen3_tts'
+          ? ['qwen3_tts_runtime', 'python']
+          : ['python'],
       }),
       sidecar: resolveSidecarDependency({
         explicitPath: this.options.config.sidecarPath,
@@ -284,7 +298,10 @@ export class SpeechSidecarSupervisor {
       throw new RuntimeSpeechError('sidecar_instance_locked', 'blocked', '另一个 Bridge 正在使用本地语音服务');
     }
     const token = crypto.randomBytes(32).toString('base64url');
-    const backendEnvironment = speechBackendEnvironment(resolveSpeechBackendDependencies(this.options.config, this.options.runtimeDepsRoot));
+    const backendEnvironment = speechBackendEnvironment(
+      resolveSpeechBackendDependencies(this.options.config, this.options.runtimeDepsRoot),
+      this.options.config,
+    );
     let child: ChildProcessByStdio<null, Readable, Readable>;
     try {
       child = spawn(dependencies.python.path!, [

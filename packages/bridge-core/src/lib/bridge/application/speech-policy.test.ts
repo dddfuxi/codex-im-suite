@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import test from 'node:test';
 
 import {
   buildSpeechTranscriptContext,
+  composeInboundSpeechPlans,
   decideSpeechReply,
   evaluateSpeechSynthesisEligibility,
   mergeTranscriptWithUserText,
   parseSpeechReplyDirective,
+  parseSpeechReferenceVoiceAction,
+  parseSpeechReferenceVoiceImportReceipt,
+  parseSpeechSynthesisIdentity,
   parseSpeechSynthesisReceipt,
   parseSpeechTranscriptReceipt,
   resolveTrustedInboundAudio,
@@ -59,6 +64,12 @@ test('ASR 只接受当前飞书 audio 事件签发且唯一绑定的附件', () 
     raw,
     attachments: [attachment],
   }), null);
+  assert.equal(resolveTrustedInboundAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'msg-1',
+    raw,
+    attachments: [{ ...attachment, type: 'application/octet-stream' }],
+  }), null);
 });
 
 test('回复旧语音只接受当前消息、原生 reply、fileKey 与 reply 附件范围的唯一绑定', () => {
@@ -92,13 +103,15 @@ test('回复旧语音只接受当前消息、原生 reply、fileKey 与 reply �
   assert.match(buildSpeechTranscriptContext({
     protocol: 'cti-speech-transcript/v1',
     attachmentId: attachment.id,
+    relation: 'native_reply',
+    requestMessageId: 'new-message',
     text: '旧语音内容',
     model: 'sensevoice',
     language: 'zh',
-    sourceMessageId: 'new-message',
+    sourceMessageId: 'old-message',
     fileSha256: HASH_A,
     validated: true,
-  }, { relation: 'native_reply', repliedMessageId: 'old-message' }), /"relation":"native_reply"/u);
+  }, { repliedMessageId: 'old-message' }), /"relation":"native_reply"/u);
   assert.equal(resolveTrustedNativeReplyAudio({
     channelType: 'feishu',
     sourceMessageId: 'forged-message',
@@ -137,10 +150,74 @@ test('回复旧语音只接受当前消息、原生 reply、fileKey 与 reply �
   }), null);
 });
 
+test('当前语音与原生回复语音同时存在时只把当前语音设为 primary', () => {
+  const current = {
+    attachment: { id: 'current', name: 'current.ogg', type: 'audio/ogg', size: 1, data: 'YQ==' },
+    relation: 'current_message' as const,
+    evidence: {
+      protocol: 'cti-feishu-inbound-audio/v1' as const,
+      messageId: 'msg-current',
+      fileKey: 'file-current',
+      attachmentId: 'current',
+      messageType: 'audio' as const,
+    },
+  };
+  const nativeReply = {
+    attachment: { id: 'reply', name: 'reply.ogg', type: 'audio/ogg', size: 1, data: 'Yg==' },
+    relation: 'native_reply' as const,
+    evidence: {
+      protocol: 'cti-feishu-native-reply-attachment/v1' as const,
+      relation: 'native_reply' as const,
+      sourceMessageId: 'msg-current',
+      messageId: 'msg-old',
+      fileKey: 'file-old',
+      resourceType: 'audio' as const,
+      attachmentId: 'reply',
+    },
+  };
+
+  assert.deepEqual(composeInboundSpeechPlans({
+    currentClaimed: true,
+    nativeReplyClaimed: true,
+    current,
+    nativeReply,
+  }), {
+    primary: current,
+    contextual: [nativeReply],
+  });
+  assert.deepEqual(composeInboundSpeechPlans({
+    currentClaimed: false,
+    nativeReplyClaimed: true,
+    current: null,
+    nativeReply,
+  }), {
+    primary: null,
+    contextual: [nativeReply],
+  });
+  assert.equal(composeInboundSpeechPlans({
+    currentClaimed: true,
+    nativeReplyClaimed: true,
+    current: null,
+    nativeReply,
+  }), null);
+  assert.equal(composeInboundSpeechPlans({
+    currentClaimed: true,
+    nativeReplyClaimed: true,
+    current,
+    nativeReply: {
+      ...nativeReply,
+      attachment: current.attachment,
+      evidence: { ...nativeReply.evidence, attachmentId: current.evidence.attachmentId },
+    },
+  }), null);
+});
+
 test('转写回执必须绑定同一 attachmentId、sourceMessageId 与受管文件 SHA-256', () => {
   const rawReceipt = {
     protocol: 'cti-speech-transcript/v1',
     attachmentId: 'audio-1',
+    relation: 'current_message',
+    requestMessageId: 'msg-1',
     sourceMessageId: 'msg-1',
     text: '  帮我总结今天的会议  ',
     model: 'sense-voice-small-q8',
@@ -149,7 +226,13 @@ test('转写回执必须绑定同一 attachmentId、sourceMessageId 与受管文
     fileSha256: HASH_A,
     validated: true,
   };
-  const expected = { attachmentId: 'audio-1', sourceMessageId: 'msg-1', fileSha256: HASH_A };
+  const expected = {
+    attachmentId: 'audio-1',
+    relation: 'current_message' as const,
+    requestMessageId: 'msg-1',
+    sourceMessageId: 'msg-1',
+    fileSha256: HASH_A,
+  };
   const receipt = parseSpeechTranscriptReceipt(rawReceipt, expected);
   assert.equal(receipt?.text, '帮我总结今天的会议');
   assert.match(buildSpeechTranscriptContext(receipt!), /cti-speech-transcript\/v1/u);
@@ -159,6 +242,8 @@ test('转写回执必须绑定同一 attachmentId、sourceMessageId 与受管文
   assert.equal(mergeTranscriptWithUserText(receipt!.text, ''), '帮我总结今天的会议');
   assert.match(mergeTranscriptWithUserText(receipt!.text, '控制在三句话'), /用户随语音附言：控制在三句话/u);
   assert.equal(parseSpeechTranscriptReceipt({ ...rawReceipt, sourceMessageId: 'forged' }, expected), null);
+  assert.equal(parseSpeechTranscriptReceipt({ ...rawReceipt, requestMessageId: 'forged' }, expected), null);
+  assert.equal(parseSpeechTranscriptReceipt({ ...rawReceipt, relation: 'native_reply' }, expected), null);
   assert.equal(parseSpeechTranscriptReceipt(rawReceipt, { ...expected, fileSha256: HASH_B }), null);
   assert.equal(parseSpeechTranscriptReceipt({ ...rawReceipt, model: '' }, expected), null);
   assert.equal(parseSpeechTranscriptReceipt({ ...rawReceipt, language: undefined }, expected), null);
@@ -182,63 +267,49 @@ test('TTS 只接受可由单一语音完整替代的纯文本结果，并返回�
   assert.equal(evaluateSpeechSynthesisEligibility({ text: '请 @ 对方', mentionCount: 1 }).reason, 'platform_mention');
 });
 
-test('语音回复裁决遵循明确文字、会话关闭、明确语音、会话开启、Runtime 策略与默认触发优先级', () => {
+test('语音回复裁决只接受结构化 intent、会话命令和可信入站音频，不解析自然语言关键词', () => {
   assert.deepEqual(decideSpeechReply({
-    userText: '不要发语音，请用文字回答',
     sessionPreference: 'on',
     inboundAudio: true,
     modelDirective: { mode: 'voice_only' },
-  }), { mode: 'text', reason: 'explicit_text' });
+  }), { mode: 'voice', reason: 'model_directive' });
   assert.deepEqual(decideSpeechReply({
-    userText: '请用语音回答',
+    sessionPreference: 'on',
+    inboundAudio: true,
+    modelDirective: { mode: 'text_only' },
+  }), { mode: 'text', reason: 'model_text_directive' });
+  assert.deepEqual(decideSpeechReply({
     sessionPreference: 'off',
     inboundAudio: false,
   }), { mode: 'text', reason: 'session_off' });
-  assert.equal(decideSpeechReply({ userText: '继续', sessionPreference: 'off', inboundAudio: true }).mode, 'text');
+  assert.equal(decideSpeechReply({ sessionPreference: 'off', inboundAudio: true }).mode, 'text');
   assert.equal(decideSpeechReply({
-    userText: '继续',
     sessionPreference: 'off',
     inboundAudio: false,
     modelDirective: { mode: 'voice_only' },
   }).mode, 'text');
-  assert.equal(decideSpeechReply({ userText: '继续', sessionPreference: null, inboundAudio: true }).mode, 'voice');
+  assert.equal(decideSpeechReply({ sessionPreference: null, inboundAudio: true }).mode, 'voice');
   assert.equal(decideSpeechReply({
-    userText: '继续',
     sessionPreference: null,
     inboundAudio: false,
     modelDirective: { mode: 'voice_only' },
   }).mode, 'voice');
   assert.deepEqual(decideSpeechReply({
-    userText: '继续',
     sessionPreference: null,
     inboundAudio: true,
     replyPolicy: 'explicit_only',
   }), { mode: 'text', reason: 'reply_policy_explicit_only' });
-  assert.equal(decideSpeechReply({
-    userText: '继续',
+  assert.deepEqual(decideSpeechReply({
     sessionPreference: null,
     inboundAudio: false,
     modelDirective: { mode: 'voice_only' },
     replyPolicy: 'explicit_only',
-  }).mode, 'text');
-  assert.equal(decideSpeechReply({
-    userText: '请用语音回答',
+  }), { mode: 'voice', reason: 'model_directive' });
+  assert.deepEqual(decideSpeechReply({
     sessionPreference: null,
     inboundAudio: false,
-    replyPolicy: 'explicit_only',
-  }).mode, 'voice');
-  assert.deepEqual(decideSpeechReply({
-    userText: "Please don't send voice; reply in text.",
-    sessionPreference: 'on',
-    inboundAudio: true,
-  }), { mode: 'text', reason: 'explicit_text' });
-  assert.deepEqual(decideSpeechReply({
-    userText: 'Please reply by voice.',
-    sessionPreference: null,
-    inboundAudio: false,
-  }), { mode: 'voice', reason: 'explicit_voice' });
+  }), { mode: 'text', reason: 'default_text' });
   assert.equal(decideSpeechReply({
-    userText: '继续',
     sessionPreference: 'on',
     inboundAudio: false,
     replyPolicy: 'explicit_only',
@@ -247,6 +318,7 @@ test('语音回复裁决遵循明确文字、会话关闭、明确语音、会�
 
 test('模型 speech 对象只允许唯一 mode 字段，出现执行字段时整段拒绝', () => {
   assert.deepEqual(parseSpeechReplyDirective({ mode: 'voice_only' }), { mode: 'voice_only' });
+  assert.deepEqual(parseSpeechReplyDirective({ mode: 'text_only' }), { mode: 'text_only' });
   assert.equal(parseSpeechReplyDirective({
     mode: 'voice_only',
     provider: 'forged',
@@ -255,23 +327,102 @@ test('模型 speech 对象只允许唯一 mode 字段，出现执行字段时整
     file_key: 'forged',
   }), undefined);
   assert.equal(parseSpeechReplyDirective({ mode: 'voice_and_text' }), undefined);
+  assert.equal(parseSpeechReplyDirective('voice_only'), undefined);
 });
 
-test('TTS 回执只接受绝对路径、Opus、正时长和完整哈希', () => {
-  const receipt = parseSpeechSynthesisReceipt({
+test('TTS 身份快照和回执必须精确绑定模型、版本、音色与正文哈希', () => {
+  const identity = {
+    ttsModelId: 'generic-tts-model',
+    modelRevision: 'revision-2026.08',
+    voiceProfileId: 'voice.zh.default',
+  };
+  assert.deepEqual(parseSpeechSynthesisIdentity(identity), identity);
+  assert.equal(parseSpeechSynthesisIdentity({ ...identity, provider: 'forged' }), null);
+  assert.equal(parseSpeechSynthesisIdentity({ ...identity, modelRevision: '../unsafe' }), null);
+
+  const text = '受身份绑定的语音结果';
+  const rawReceipt = {
     protocol: 'cti-speech-synthesis/v1',
     path: 'C:\\managed\\reply.opus',
     mediaType: 'audio/ogg',
     format: 'opus',
     durationMs: 1_200,
-    textSha256: HASH_A,
+    textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
     fileSha256: HASH_B,
     validated: true,
-  });
+    ...identity,
+  };
+  const expected = { text, expectedIdentity: identity };
+  const receipt = parseSpeechSynthesisReceipt(rawReceipt, expected);
   assert.equal(receipt?.format, 'opus');
-  assert.equal(parseSpeechSynthesisReceipt({ ...receipt, format: 'wav' }), null);
-  assert.equal(parseSpeechSynthesisReceipt({ ...receipt, validated: false }), null);
-  assert.equal(parseSpeechSynthesisReceipt({ ...receipt, path: 'reply.opus' }), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, format: 'wav' }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, validated: false }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, path: 'reply.opus' }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, ttsModelId: 'other' }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, modelRevision: 'other' }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, voiceProfileId: 'other' }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, voiceProfileId: undefined }, expected), null);
+  assert.equal(parseSpeechSynthesisReceipt(rawReceipt, { ...expected, text: '其它正文' }), null);
+  const identityWithoutVoice = { ...identity, voiceProfileId: null };
+  assert.deepEqual(parseSpeechSynthesisIdentity(identityWithoutVoice), identityWithoutVoice);
+  assert.equal(parseSpeechSynthesisReceipt(
+    { ...rawReceipt, voiceProfileId: null },
+    { text, expectedIdentity: identityWithoutVoice },
+  )?.voiceProfileId, null);
+});
+
+test('参考音色动作只接受语义字段，导入回执绑定真实证据与 Bridge 授权时效', () => {
+  assert.deepEqual(parseSpeechReferenceVoiceAction({
+    action: 'create_reference_voice',
+    profile_name: '  我的\n音色  ',
+    rights_basis: 'self_or_authorized',
+    usage_scope: 'local_tts_only',
+    clean_single_speaker_confirmed: true,
+  }), {
+    action: 'create_reference_voice',
+    profileName: '我的 音色',
+    rightsBasis: 'self_or_authorized',
+    usageScope: 'local_tts_only',
+    cleanSingleSpeakerConfirmed: true,
+  });
+  assert.equal(parseSpeechReferenceVoiceAction({
+    action: 'create_reference_voice',
+    rights_basis: 'self_or_authorized',
+    usage_scope: 'local_tts_only',
+  }), undefined);
+  assert.equal(parseSpeechReferenceVoiceAction({
+    action: 'create_reference_voice',
+    rights_basis: 'public_domain',
+    usage_scope: 'local_tts_only',
+    clean_single_speaker_confirmed: true,
+  }), undefined);
+  assert.equal(parseSpeechReferenceVoiceAction({
+    action: 'create_reference_voice',
+    file_key: 'forged',
+  }), undefined);
+  assert.equal(parseSpeechReferenceVoiceAction({
+    action: 'create_reference_voice',
+    path: 'C:\\unsafe.wav',
+    provider: 'forged',
+  }), undefined);
+
+  const expected = {
+    requestMessageId: 'om_request',
+    sourceMessageId: 'om_source',
+    fileKey: 'file-key',
+    attachmentId: 'attachment-1',
+    fileSha256: HASH_A,
+    authorizationExpiresAt: '2026-08-08T02:05:00.000Z',
+  };
+  const raw = {
+    protocol: 'cti-speech-reference-voice-import/v1',
+    voiceProfileId: 'voice.reference.1',
+    ...expected,
+    validated: true,
+  };
+  assert.equal(parseSpeechReferenceVoiceImportReceipt(raw, expected)?.voiceProfileId, 'voice.reference.1');
+  assert.equal(parseSpeechReferenceVoiceImportReceipt({ ...raw, fileKey: 'forged' }, expected), null);
+  assert.equal(parseSpeechReferenceVoiceImportReceipt({ ...raw, authorizationExpiresAt: '2026-08-08T03:00:00.000Z' }, expected), null);
 });
 
 test('语音失败只映射稳定、可行动且不泄露内部路径的中文提示', () => {

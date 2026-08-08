@@ -47,6 +47,14 @@ describe('managed speech dependency archive safety', () => {
       const statuses = new Map(manager.listStatuses().map((item) => [item.id, item]));
       assert.equal(statuses.get('sensevoice_gguf')?.installable, true);
       assert.equal(statuses.get('sensevoice_runtime')?.installable, true);
+      for (const id of [
+        'qwen3-tts-12hz-1.7b-custom-voice',
+        'qwen3-tts-12hz-0.6b-custom-voice',
+        'qwen3-tts-12hz-1.7b-base',
+        'qwen3-tts-12hz-0.6b-base',
+      ]) {
+        assert.equal(statuses.get(id)?.installable, true, `${id} 必须来自固定 revision 的多文件清单`);
+      }
       assert.equal(statuses.get('cosyvoice')?.state, 'blocked');
       assert.equal(statuses.get('cosyvoice_clone')?.diagnosticCode, 'manifest_incomplete');
     } finally {
@@ -135,6 +143,75 @@ describe('managed speech dependency archive safety', () => {
       const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot);
       await assert.rejects(manager.install('locked_component'), /component_install_locked/);
       assert.equal(fs.existsSync(path.join(componentRoot, '.install.lock')), true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a pinned v2 file set and rejects duplicate or escaping targets', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-file-set-manifest-'));
+    const valid = {
+      protocol: 'cti-speech-managed-dependencies/v2',
+      components: [{
+        id: 'model_set', displayName: 'Model Set', kind: 'model', capabilities: ['tts'],
+        source: 'https://example.invalid/model', version: 'revision1', license: 'Apache-2.0',
+        archive: 'file', fileName: null, sha256: null, size: null, availability: 'ready',
+        entryPoint: 'config.json',
+        files: [
+          { source: 'https://example.invalid/config.json', path: 'config.json', sha256: 'a'.repeat(64), size: 10 },
+          { source: 'https://example.invalid/model.bin', path: 'weights/model.bin', sha256: 'b'.repeat(64), size: 20 },
+        ],
+      }],
+    };
+    try {
+      const validPath = path.join(root, 'valid.json');
+      fs.writeFileSync(validPath, JSON.stringify(valid), 'utf8');
+      const manager = new ManagedSpeechDependencyManager(validPath, path.join(root, 'deps'));
+      assert.equal(manager.listStatuses()[0]?.installable, true);
+
+      for (const [name, files] of [
+        ['duplicate', [valid.components[0]!.files[0], { ...valid.components[0]!.files[1], path: 'config.json' }]],
+        ['escape', [{ ...valid.components[0]!.files[0], path: '../config.json' }]],
+      ] as const) {
+        const invalidPath = path.join(root, `${name}.json`);
+        fs.writeFileSync(invalidPath, JSON.stringify({ ...valid, components: [{ ...valid.components[0], files }] }), 'utf8');
+        assert.throws(() => new ManagedSpeechDependencyManager(invalidPath, path.join(root, `deps-${name}`)), /dependency_manifest_|archive_path_unsafe/);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('validates every file in a v2 install marker and fails after any file changes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-file-set-marker-'));
+    const manifestPath = path.join(root, 'manifest.json');
+    const depsRoot = path.join(root, 'deps');
+    const files = [
+      { source: 'https://example.invalid/config.json', path: 'config.json', sha256: crypto.createHash('sha256').update('config').digest('hex'), size: 6 },
+      { source: 'https://example.invalid/model.bin', path: 'weights/model.bin', sha256: crypto.createHash('sha256').update('weights').digest('hex'), size: 7 },
+    ];
+    const component = {
+      id: 'model_set', displayName: 'Model Set', kind: 'model', capabilities: ['tts'],
+      source: 'https://example.invalid/model', version: 'revision1', license: 'Apache-2.0',
+      archive: 'file', fileName: null, sha256: null, size: null, availability: 'ready', entryPoint: 'config.json', files,
+    };
+    const targetRoot = path.join(depsRoot, 'speech', component.id, component.version);
+    const manifestSha256 = crypto.createHash('sha256').update(JSON.stringify(files.map((file) => [file.path, file.sha256, file.size, file.source]))).digest('hex');
+    try {
+      fs.writeFileSync(manifestPath, JSON.stringify({ protocol: 'cti-speech-managed-dependencies/v2', components: [component] }), 'utf8');
+      fs.mkdirSync(path.join(targetRoot, 'weights'), { recursive: true });
+      fs.writeFileSync(path.join(targetRoot, 'config.json'), 'config', 'utf8');
+      fs.writeFileSync(path.join(targetRoot, 'weights', 'model.bin'), 'weights', 'utf8');
+      fs.writeFileSync(path.join(targetRoot, '.installed.json'), JSON.stringify({
+        protocol: 'cti-speech-component-install/v2', id: component.id, version: component.version,
+        source: component.source, license: component.license, platform: `${process.platform}-${process.arch}`,
+        entryPoint: component.entryPoint, manifestSha256, totalSize: 13, files,
+        installedAt: '2026-08-08T00:00:00.000Z',
+      }), 'utf8');
+      const manager = new ManagedSpeechDependencyManager(manifestPath, depsRoot);
+      assert.equal(manager.listStatuses()[0]?.state, 'ready');
+      fs.writeFileSync(path.join(targetRoot, 'weights', 'model.bin'), 'changed', 'utf8');
+      assert.equal(manager.listStatuses()[0]?.state, 'optional_missing');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -63,6 +63,52 @@ class FakeAudio:
         write_wav(Path(target), 0.2)
 
 
+class FakeQwenModel:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def generate_custom_voice(self, **kwargs):
+        self.calls.append(("custom", kwargs))
+        return [[0.0, 0.1]], 16000
+
+    def generate_voice_clone(self, **kwargs):
+        self.calls.append(("clone", kwargs))
+        return [[0.1, 0.0]], 16000
+
+
+class FakeCuda:
+    class OutOfMemoryError(Exception):
+        pass
+
+    @staticmethod
+    def reset_peak_memory_stats():
+        return None
+
+    @staticmethod
+    def max_memory_allocated():
+        return 128 * 1024 * 1024
+
+
+class FakeQwenTorch:
+    cuda = FakeCuda()
+
+
+class FakeSoundFile:
+    @staticmethod
+    def write(target, _combined, sample_rate, **_kwargs):
+        with wave.open(str(target), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(sample_rate)
+            output.writeframes(b"\x00\x00" * 1600)
+
+
+class FakeNumpy:
+    @staticmethod
+    def concatenate(values):
+        return [sample for value in values for sample in value]
+
+
 class SpeechBackendTests(unittest.TestCase):
     def test_dependency_ready_is_probe_pending_until_a_real_probe_succeeds(self):
         registry = BACKENDS.BackendRegistry(
@@ -234,6 +280,71 @@ class SpeechBackendTests(unittest.TestCase):
                 backend.synthesize("失败清理", str(output), preset_speaker_id="cosyvoice.sft.zh_female")
             self.assertFalse(output.exists())
             self.assertEqual(list(root_path.glob("*.tmp.wav")), [])
+
+    def test_qwen_custom_voice_binds_model_speaker_tone_and_revision(self):
+        with tempfile.TemporaryDirectory(prefix="cti-sidecar-qwen-custom-") as root:
+            root_path = Path(root)
+            model_dir = root_path / "model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text('{"model":"custom"}', encoding="utf-8")
+            (model_dir / "model.safetensors").write_bytes(b"weights")
+            model = FakeQwenModel()
+            backend = BACKENDS.Qwen3TTSBackend(
+                str(model_dir), "qwen3_tts", "qwen3-tts-12hz-1.7b-custom-voice",
+                "ready", "", loader=lambda _path: (model, FakeQwenTorch, FakeSoundFile),
+            )
+            output = root_path / "custom.wav"
+            previous_numpy = sys.modules.get("numpy")
+            sys.modules["numpy"] = FakeNumpy
+            try:
+                result = backend.synthesize(
+                    "你好。", str(output), preset_speaker_id="Serena", tone_instruction="自然亲切",
+                )
+            finally:
+                if previous_numpy is None:
+                    sys.modules.pop("numpy", None)
+                else:
+                    sys.modules["numpy"] = previous_numpy
+            self.assertTrue(output.is_file())
+            self.assertEqual(result["provider"], "qwen3_tts")
+            self.assertEqual(result["model"], "qwen3-tts-12hz-1.7b-custom-voice")
+            self.assertRegex(result["revision"], r"^[a-f0-9]{64}$")
+            self.assertEqual(result["peakVramMiB"], 128.0)
+            self.assertEqual(model.calls[0][1]["speaker"], "Serena")
+            self.assertEqual(model.calls[0][1]["instruct"], "自然亲切")
+
+    def test_qwen_base_requires_and_uses_an_authorized_reference(self):
+        with tempfile.TemporaryDirectory(prefix="cti-sidecar-qwen-base-") as root:
+            root_path = Path(root)
+            model_dir = root_path / "model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text('{"model":"base"}', encoding="utf-8")
+            reference = root_path / "reference.wav"
+            write_wav(reference, 3.0)
+            model = FakeQwenModel()
+            backend = BACKENDS.Qwen3TTSBackend(
+                str(model_dir), "qwen3_tts", "qwen3-tts-12hz-0.6b-base",
+                "ready", "", loader=lambda _path: (model, FakeQwenTorch, FakeSoundFile),
+            )
+            with self.assertRaises(BACKENDS.BackendFailure) as missing:
+                backend.synthesize("克隆测试", str(root_path / "missing.wav"))
+            self.assertEqual(missing.exception.code, "tts_reference_invalid")
+
+            previous_numpy = sys.modules.get("numpy")
+            sys.modules["numpy"] = FakeNumpy
+            try:
+                result = backend.synthesize(
+                    "克隆测试", str(root_path / "clone.wav"),
+                    reference_path=str(reference), reference_transcript="参考文本",
+                )
+            finally:
+                if previous_numpy is None:
+                    sys.modules.pop("numpy", None)
+                else:
+                    sys.modules["numpy"] = previous_numpy
+            self.assertEqual(result["model"], "qwen3-tts-12hz-0.6b-base")
+            self.assertEqual(model.calls[-1][0], "clone")
+            self.assertEqual(model.calls[-1][1]["ref_text"], "参考文本")
 
 
 if __name__ == "__main__":

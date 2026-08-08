@@ -19,11 +19,13 @@ export interface SpeechRuntimeConfig {
   deliveryMode: string;
   asrProvider: string;
   ttsProvider: string;
+  ttsModelId: string;
+  tonePolicy: string;
   modelRoot?: string;
   senseVoiceBinaryPath?: string;
   asrModel?: string;
-  ttsModel?: string;
-  ttsReferenceModel?: string;
+  ttsModelPath?: string;
+  ttsReferenceModelPath?: string;
   voiceCloneBenchmarkPassed: boolean;
   voiceProfileId?: string;
   singingEnabled: boolean;
@@ -116,6 +118,11 @@ export interface SpeechSidecarHealth {
   status: SpeechRuntimeState;
   version: string;
   capabilities: { asr: boolean; tts: boolean };
+  tts?: {
+    providerId: string;
+    modelId: string;
+    revision: string;
+  };
   diagnosticCode?: string;
 }
 

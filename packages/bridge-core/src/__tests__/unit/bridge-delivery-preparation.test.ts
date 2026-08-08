@@ -56,6 +56,49 @@ describe('bridge delivery preparation', () => {
     assert.equal(result.status.parsed, true);
   });
 
+  it('只接受严格的结构化语音呈现 intent，拒绝模型、路径和平台字段', () => {
+    const valid = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '语音结果', images: [], files: [], reply_mode: 'plain',
+      speech: { mode: 'voice_only' },
+    }), '```'].join('\n'), 'C:/workspace');
+    const textOnly = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '文字结果', images: [], files: [], reply_mode: 'plain',
+      speech: { mode: 'text_only' },
+    }), '```'].join('\n'), 'C:/workspace');
+    const forged = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '安全文字结果', images: [], files: [], reply_mode: 'plain',
+      speech: { mode: 'voice_only', ttsModelId: 'forged', path: 'C:/unsafe.ogg', file_key: 'forged' },
+    }), '```'].join('\n'), 'C:/workspace');
+    const referenceVoice = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '创建音色', images: [], files: [], reply_mode: 'plain',
+      speech_action: {
+        action: 'create_reference_voice',
+        profile_name: '我的参考音色',
+        rights_basis: 'self_or_authorized',
+        usage_scope: 'local_tts_only',
+        clean_single_speaker_confirmed: true,
+      },
+    }), '```'].join('\n'), 'C:/workspace');
+    const forgedReferenceVoice = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '伪造动作', images: [], files: [], reply_mode: 'plain',
+      speech_action: {
+        action: 'create_reference_voice', profile_name: '伪造', file_key: 'fk', path: 'C:/x.wav', provider: 'x',
+      },
+    }), '```'].join('\n'), 'C:/workspace');
+
+    assert.deepEqual(valid.payload.speech, { mode: 'voice_only' });
+    assert.deepEqual(textOnly.payload.speech, { mode: 'text_only' });
+    assert.equal(forged.payload.speech, undefined);
+    assert.deepEqual(referenceVoice.payload.speechAction, {
+      action: 'create_reference_voice',
+      profileName: '我的参考音色',
+      rightsBasis: 'self_or_authorized',
+      usageScope: 'local_tts_only',
+      cleanSingleSpeakerConfirmed: true,
+    });
+    assert.equal(forgedReferenceVoice.payload.speechAction, undefined);
+  });
+
   it('accepts a card hero only when it selects the same delivered image path', () => {
     const cwd = path.resolve('C:/workspace/project');
     const result = prepareDeliveryCandidate(['```cti-final', JSON.stringify({

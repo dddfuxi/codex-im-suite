@@ -11,13 +11,16 @@ describe('speech runtime config', () => {
     assert.equal(config.replyPolicy, 'explicit_or_inbound_audio');
     assert.equal(config.deliveryMode, 'voice_only');
     assert.equal(config.asrProvider, 'sensevoice_gguf');
-    assert.equal(config.ttsProvider, 'cosyvoice');
+    assert.equal(config.ttsProvider, 'qwen3_tts');
+    assert.equal(config.ttsModelId, 'qwen3-tts-12hz-1.7b-custom-voice');
+    assert.equal(config.voiceProfileId, 'qwen3.serena');
+    assert.equal(config.tonePolicy, 'adaptive_natural');
     assert.equal(config.voiceCloneBenchmarkPassed, false);
     assert.equal(config.maxInputBytes, 20 * 1024 * 1024);
     assert.equal(config.maxDurationMs, 300_000);
   });
 
-  it('keeps reference voice cloning blocked until the operator records a passed benchmark', () => {
+  it('keeps the legacy clone benchmark flag readable only for config migration', () => {
     const config = loadSpeechRuntimeConfig(new Map([
       ['CTI_SPEECH_VOICE_CLONE_BENCHMARK_PASSED', 'true'],
     ]));

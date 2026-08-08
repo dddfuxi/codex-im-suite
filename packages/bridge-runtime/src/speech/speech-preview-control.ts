@@ -18,7 +18,7 @@ import {
 } from './speech-preview.js';
 import { SpeechSidecarInstanceLock } from './sidecar-runtime-diagnostics.js';
 
-export const SPEECH_PREVIEW_CONTROL_PROTOCOL = 'cti-speech-preview-control/v1' as const;
+export const SPEECH_PREVIEW_CONTROL_PROTOCOL = 'cti-speech-preview-control/v2' as const;
 
 const MAX_REQUEST_FILE_BYTES = 32 * 1024;
 const MAX_RESPONSE_FILE_BYTES = Math.ceil(MAX_SPEECH_PREVIEW_BYTES * 4 / 3) + 64 * 1024;
@@ -29,11 +29,12 @@ export interface SpeechPreviewControlRequest {
   protocol: typeof SPEECH_PREVIEW_CONTROL_PROTOCOL;
   requestId: string;
   clientNonce: string;
-  action: 'preview_voice' | 'preview_singing_voice';
+  action: 'preview_voice' | 'benchmark_voice' | 'preview_singing_voice';
   requestedAt: string;
   expiresAt: string;
   input: {
     text: string;
+    modelId: string;
     voiceProfileId: string;
   };
 }
@@ -67,6 +68,8 @@ function safeNonce(value: unknown): value is string {
 function safeVoiceProfileId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9._-]{1,80}$/u.test(value);
 }
+
+const safeModelId = safeVoiceProfileId;
 
 function safePreviewText(value: unknown): value is string {
   return typeof value === 'string'
@@ -135,7 +138,7 @@ function validateRequest(
   const expiresAt = typeof request.expiresAt === 'string' ? Date.parse(request.expiresAt) : Number.NaN;
   if (
     request.protocol !== SPEECH_PREVIEW_CONTROL_PROTOCOL
-    || (request.action !== 'preview_voice' && request.action !== 'preview_singing_voice')
+    || (request.action !== 'preview_voice' && request.action !== 'benchmark_voice' && request.action !== 'preview_singing_voice')
     || request.requestId !== expectedRequestId
     || !safeOpaqueId(request.requestId)
     || !safeNonce(request.clientNonce)
@@ -147,6 +150,7 @@ function validateRequest(
     || expiresAt - requestedAt > MAX_REQUEST_LIFETIME_MS
     || !request.input
     || !safePreviewText(request.input.text)
+    || !safeModelId(request.input.modelId)
     || !safeVoiceProfileId(request.input.voiceProfileId)
   ) {
     throw new RuntimeSpeechError('speech_preview_request_invalid', 'blocked', '语音试听请求无效或已过期');
@@ -156,14 +160,17 @@ function validateRequest(
 
 function validatePreviewReceipt(
   value: unknown,
+  expectedModelId: string,
   expectedVoiceProfileId: string,
+  benchmark = false,
 ): SpeechPreviewReceipt {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new RuntimeSpeechError('speech_preview_response_invalid', 'error', '语音试听响应无效');
   }
   const receipt = value as Partial<SpeechPreviewReceipt>;
   const expectedKeys = [
-    'base64', 'bytes', 'durationMs', 'mediaType',
+    'base64', 'bytes', 'durationMs', 'mediaType', 'modelId',
+    ...(benchmark ? ['modelRevision', 'peakVramMiB'] : []),
     'protocol', 'sha256', 'validated', 'voiceProfileId',
   ];
   if (
@@ -172,7 +179,12 @@ function validatePreviewReceipt(
     receipt.protocol !== SPEECH_PREVIEW_PROTOCOL
     || receipt.mediaType !== 'audio/ogg; codecs=opus'
     || receipt.validated !== true
+    || receipt.modelId !== expectedModelId
     || receipt.voiceProfileId !== expectedVoiceProfileId
+    || (benchmark && (typeof receipt.modelRevision !== 'string'
+      || !/^[a-z0-9][a-z0-9._-]{0,159}$/iu.test(receipt.modelRevision)
+      || !Number.isFinite(receipt.peakVramMiB)
+      || receipt.peakVramMiB! < 0))
     || typeof receipt.base64 !== 'string'
     || receipt.base64.length === 0
     || receipt.base64.length % 4 !== 0
@@ -207,7 +219,9 @@ function validatePreviewReceipt(
     bytes,
     sha256: receipt.sha256,
     durationMs,
+    modelId: receipt.modelId,
     voiceProfileId: receipt.voiceProfileId,
+    ...(benchmark ? { modelRevision: receipt.modelRevision!, peakVramMiB: receipt.peakVramMiB! } : {}),
     validated: true,
   };
 }
@@ -238,11 +252,19 @@ export function startSpeechPreviewControlService(options: {
   runtimeStateRoot: string;
   previewVoice: (input: {
     text: string;
+    modelId: string;
+    voiceProfileId: string;
+    signal: AbortSignal;
+  }) => Promise<SpeechPreviewReceipt>;
+  benchmarkVoice?: (input: {
+    text: string;
+    modelId: string;
     voiceProfileId: string;
     signal: AbortSignal;
   }) => Promise<SpeechPreviewReceipt>;
   previewSingingVoice?: (input: {
     text: string;
+    modelId: string;
     voiceProfileId: string;
     signal: AbortSignal;
   }) => Promise<SpeechPreviewReceipt>;
@@ -306,7 +328,9 @@ export function startSpeechPreviewControlService(options: {
             try {
               const preview = request.action === 'preview_singing_voice'
                 ? options.previewSingingVoice
-                : options.previewVoice;
+                : request.action === 'benchmark_voice'
+                  ? options.benchmarkVoice
+                  : options.previewVoice;
               if (!preview) throw new RuntimeSpeechError('singing_preview_live_runtime_unavailable', 'blocked', '实时歌声试听通道不可用');
               const result = await preview({
                 ...request.input,
@@ -318,7 +342,12 @@ export function startSpeechPreviewControlService(options: {
                   requestId,
                   clientNonce: request.clientNonce,
                   ok: true,
-                  result: validatePreviewReceipt(result, request.input.voiceProfileId),
+                  result: validatePreviewReceipt(
+                    result,
+                    request.input.modelId,
+                    request.input.voiceProfileId,
+                    request.action === 'benchmark_voice',
+                  ),
                   respondedAt: now().toISOString(),
                 };
               }
@@ -389,12 +418,13 @@ export function startSpeechPreviewControlService(options: {
 async function requestPreview(input: {
   runtimeStateRoot: string;
   text: string;
+  modelId: string;
   voiceProfileId: string;
   timeoutMs: number;
   action: SpeechPreviewControlRequest['action'];
   now?: () => Date;
 }): Promise<SpeechPreviewReceipt> {
-  if (!safePreviewText(input.text) || !safeVoiceProfileId(input.voiceProfileId)) {
+  if (!safePreviewText(input.text) || !safeModelId(input.modelId) || !safeVoiceProfileId(input.voiceProfileId)) {
     throw new RuntimeSpeechError('speech_preview_request_invalid', 'blocked', '语音试听参数无效');
   }
   const directories = controlDirectories(input.runtimeStateRoot);
@@ -412,6 +442,7 @@ async function requestPreview(input: {
     expiresAt: new Date(requestedAt.getTime() + timeoutMs).toISOString(),
     input: {
       text: input.text,
+      modelId: input.modelId,
       voiceProfileId: input.voiceProfileId,
     },
   };
@@ -462,7 +493,7 @@ async function requestPreview(input: {
               : '语音试听失败',
           );
         }
-        return validatePreviewReceipt(response.result, input.voiceProfileId);
+        return validatePreviewReceipt(response.result, input.modelId, input.voiceProfileId, input.action === 'benchmark_voice');
       }
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, 50);
@@ -487,6 +518,7 @@ async function requestPreview(input: {
 export function requestSpeechVoicePreview(input: {
   runtimeStateRoot: string;
   text: string;
+  modelId: string;
   voiceProfileId: string;
   timeoutMs: number;
   now?: () => Date;
@@ -494,9 +526,21 @@ export function requestSpeechVoicePreview(input: {
   return requestPreview({ ...input, action: 'preview_voice' });
 }
 
+export function requestSpeechVoiceBenchmark(input: {
+  runtimeStateRoot: string;
+  text: string;
+  modelId: string;
+  voiceProfileId: string;
+  timeoutMs: number;
+  now?: () => Date;
+}): Promise<SpeechPreviewReceipt> {
+  return requestPreview({ ...input, action: 'benchmark_voice' });
+}
+
 export function requestSingingVoicePreview(input: {
   runtimeStateRoot: string;
   text: string;
+  modelId: string;
   voiceProfileId: string;
   timeoutMs: number;
   now?: () => Date;

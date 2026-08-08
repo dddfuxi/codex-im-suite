@@ -836,8 +836,10 @@ internal sealed partial class MainForm : Form
             case "speech.saveSettings":
             case "speech.installComponent":
             case "speech.installPresetVoice":
+            case "speech.benchmarkTtsModel":
             case "speech.importReferenceVoice":
             case "speech.previewVoice":
+            case "speech.previewSingingVoice":
             case "speech.activateVoiceProfile":
                 return await RunSpeechControlCommandAsync(command, payload);
             case "agentCollaboration.setMode":

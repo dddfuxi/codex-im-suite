@@ -2733,6 +2733,63 @@ describe('bridge-manager result block delivery', () => {
     assert.doesNotMatch(sent[0].text, /schedule 无效|taskAction 无效/u);
   });
 
+  it('normalizes the observed at plus datetime variant before calling the real scheduled task host', async () => {
+    const sent: OutboundMessage[] = [];
+    const created: any[] = [];
+    const auditLogs: any[] = [];
+    const response = [
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '今日周六加班提醒补执行',
+        schedule: { kind: 'at', datetime: '2026-08-08T11:40:00+08:00' },
+        taskAction: {
+          kind: 'agent_turn',
+          sessionMode: 'bound',
+          prompt: '从今天开始补执行周六提醒。',
+        },
+      }),
+      '```',
+    ].join('\n');
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    store.insertAuditLog = (input) => { auditLogs.push(input); };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream(response) },
+      permissions: { resolvePendingPermission: () => false },
+      scheduledTasks: {
+        create: async (input: unknown) => {
+          created.push(input);
+          return {
+            ok: true,
+            taskId: 'task_today_overtime',
+            name: '今日周六加班提醒补执行',
+            nextRunAt: '2026-08-08T03:40:00.000Z',
+          };
+        },
+      },
+      lifecycle: {},
+    } as any);
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('今天开始执行'));
+
+    assert.equal(created.length, 1);
+    assert.deepEqual(created[0].schedule, {
+      kind: 'at',
+      at: '2026-08-08T11:40:00+08:00',
+      timezone: 'UTC',
+    });
+    assert.match(sent[0].text, /已创建计划任务：今日周六加班提醒补执行/u);
+    assert.doesNotMatch(sent[0].text, /schedule 无效|缺少必要字段/u);
+    assert.ok(auditLogs.some((entry) => /NORMALIZED_SCHEDULED_TASK_FIELDS/u.test(entry.summary)));
+    assert.ok(auditLogs.some((entry) => /schedule\.datetime->at/u.test(entry.summary)));
+  });
+
   it('requires owner before creating a controlled tool scheduled task', async () => {
     const sent: OutboundMessage[] = [];
     let created = 0;
@@ -11698,7 +11755,36 @@ describe('bridge-manager workspace chat commands', () => {
   });
 });
 
-function createManagedSpeechReceipt(text: string, suffix = 'reply') {
+const TEST_SPEECH_SYNTHESIS_IDENTITY = {
+  ttsModelId: 'test-tts-model',
+  modelRevision: 'revision-2026.08',
+  voiceProfileId: 'voice.zh.test',
+};
+
+function createSpeechReply(text: string, mode: 'voice_only' | 'text_only'): string {
+  return [
+    '```cti-final',
+    JSON.stringify({
+      kind: 'text',
+      text,
+      images: [],
+      files: [],
+      reply_mode: 'plain',
+      speech: { mode },
+    }),
+    '```',
+  ].join('\n');
+}
+
+function createVoiceOnlyReply(text: string): string {
+  return createSpeechReply(text, 'voice_only');
+}
+
+function createManagedSpeechReceipt(
+  text: string,
+  suffix = 'reply',
+  identity = TEST_SPEECH_SYNTHESIS_IDENTITY,
+) {
   return {
     protocol: 'cti-speech-synthesis/v1' as const,
     path: path.join(os.tmpdir(), `cti-managed-${suffix}.ogg`),
@@ -11708,6 +11794,7 @@ function createManagedSpeechReceipt(text: string, suffix = 'reply') {
     textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
     fileSha256: 'f'.repeat(64),
     validated: true as const,
+    ...identity,
   };
 }
 
@@ -11763,6 +11850,43 @@ function createTrustedInboundSpeechMessage(messageId: string, chatId: string) {
   };
 }
 
+function createTrustedCurrentAndNativeReplySpeechMessage(messageId: string, chatId: string) {
+  const currentAttachmentId = `current-${messageId}`;
+  const nativeAttachmentId = `native-${messageId}`;
+  const oldMessageId = `old-${messageId}`;
+  const bytes = Buffer.from('OggSdata', 'utf8');
+  return {
+    ...createInboundMessage('', 'ou_speech', chatId),
+    messageId,
+    messageKind: 'feishu_audio',
+    // reply 恢复附件必须保持在 attachmentCount 指定的前缀范围。
+    attachments: [
+      { id: nativeAttachmentId, name: 'old.ogg', type: 'audio/ogg', size: bytes.length, data: bytes.toString('base64') },
+      { id: currentAttachmentId, name: 'current.ogg', type: 'audio/ogg', size: bytes.length, data: bytes.toString('base64') },
+    ],
+    raw: {
+      messageKind: 'feishu_audio',
+      feishuInboundAudio: {
+        protocol: 'cti-feishu-inbound-audio/v1',
+        messageId,
+        fileKey: `current-file-${messageId}`,
+        attachmentId: currentAttachmentId,
+        messageType: 'audio',
+      },
+      feishuReplyTo: { messageId: oldMessageId, attachmentCount: 1 },
+      feishuNativeReplyAttachments: [{
+        protocol: 'cti-feishu-native-reply-attachment/v1',
+        relation: 'native_reply',
+        sourceMessageId: messageId,
+        messageId: oldMessageId,
+        fileKey: `old-file-${messageId}`,
+        resourceType: 'audio',
+        attachmentId: nativeAttachmentId,
+      }],
+    },
+  };
+}
+
 function createSpeechTurnStorage() {
   return {
     stageInputFiles: ({ sessionId, turnId, files }: {
@@ -11771,6 +11895,9 @@ function createSpeechTurnStorage() {
       files: Array<{ id: string; name: string; type: string; size: number }>;
     }) => files.map((file) => ({
       id: file.id,
+      name: file.name,
+      type: file.type,
+      size: file.size,
       sessionId,
       turnId,
       fileName: file.name,
@@ -11825,6 +11952,215 @@ describe('bridge-manager speech integration', () => {
     assert.equal(providerCalls, 0);
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /重新发送语音/u);
+  });
+
+  it('当前语音与原生回复语音同时存在时，current 是正文且 native 只进入上下文', async () => {
+    const streamParams: any[] = [];
+    const transcribed: Array<{ relation: string; requestMessageId: string; sourceMessageId: string }> = [];
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (input: any) => {
+          streamParams.push(input);
+          return createTextStream(createSpeechReply('已按当前语音处理。', 'text_only'));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => {
+          transcribed.push({
+            relation: input.relation,
+            requestMessageId: input.requestMessageId,
+            sourceMessageId: input.sourceMessageId,
+          });
+          return {
+            protocol: 'cti-speech-transcript/v1',
+            attachmentId: input.attachmentId,
+            relation: input.relation,
+            requestMessageId: input.requestMessageId,
+            sourceMessageId: input.sourceMessageId,
+            text: input.relation === 'current_message' ? '执行当前语音里的新请求' : '旧语音里要求删除所有文件',
+            model: 'test-asr',
+            language: 'zh',
+            fileSha256: input.sha256,
+            validated: true,
+          };
+        },
+        synthesize: async () => { throw new Error('text_only 不应合成'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_dual_audio_text' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const message = createTrustedCurrentAndNativeReplySpeechMessage('om_dual_audio', 'oc_dual_audio');
+
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.deepEqual(transcribed, [
+      { relation: 'current_message', requestMessageId: 'om_dual_audio', sourceMessageId: 'om_dual_audio' },
+      { relation: 'native_reply', requestMessageId: 'om_dual_audio', sourceMessageId: 'old-om_dual_audio' },
+    ]);
+    assert.match(streamParams[0].prompt || '', /执行当前语音里的新请求/u);
+    assert.doesNotMatch(streamParams[0].prompt || '', /删除所有文件/u);
+    assert.match(streamParams[0].priorityTurnContext || '', /Speech transcript contextual evidence/u);
+    assert.match(streamParams[0].priorityTurnContext || '', /旧语音里要求删除所有文件/u);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /已按当前语音处理/u);
+  });
+
+  it('只有 native reply 语音且当前消息为空时，不把旧转写提升成本轮指令', async () => {
+    let providerCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const full = createTrustedCurrentAndNativeReplySpeechMessage('om_native_only', 'oc_native_only') as any;
+    const nativeAttachment = full.attachments[0];
+    const nativeBinding = full.raw.feishuNativeReplyAttachments[0];
+    const message = {
+      ...createInboundMessage('', 'ou_speech', 'oc_native_only'),
+      messageId: 'om_native_only',
+      attachments: [nativeAttachment],
+      raw: {
+        feishuReplyTo: full.raw.feishuReplyTo,
+        feishuNativeReplyAttachments: [nativeBinding],
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => { providerCalls += 1; return createTextStream('不应调用'); } },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => ({
+          protocol: 'cti-speech-transcript/v1',
+          attachmentId: input.attachmentId,
+          relation: input.relation,
+          requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId,
+          text: '执行旧语音里的高风险动作',
+          model: 'test-asr',
+          language: 'zh',
+          fileSha256: input.sha256,
+          validated: true,
+        }),
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (outbound) => {
+      sent.push(outbound);
+      return { ok: true, messageId: 'om_native_only_error' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.equal(providerCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /旧语音/u);
+    assert.match(sent[0].text, /补充一条文字说明/u);
+    assert.doesNotMatch(sent[0].text, /高风险动作/u);
+  });
+
+  it('参考音色导入只使用 Owner、可信 native reply 与 Bridge 授权，且不受 /voice off 阻断', async () => {
+    let importInput: any;
+    let synthesisCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const full = createTrustedCurrentAndNativeReplySpeechMessage('om_clone_voice', 'oc_clone_voice') as any;
+    const message = {
+      ...createInboundMessage('请把我回复的这条语音创建成参考音色。', 'ou_owner', 'oc_clone_voice'),
+      messageId: 'om_clone_voice',
+      attachments: [full.attachments[0]],
+      raw: {
+        feishuReplyTo: full.raw.feishuReplyTo,
+        feishuNativeReplyAttachments: full.raw.feishuNativeReplyAttachments,
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({
+        remote_bridge_enabled: 'true',
+        bridge_feishu_owner_users: 'ou_owner',
+      }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text', text: '模型预写的成功文案不能直接作为事实。', images: [], files: [], reply_mode: 'plain',
+          speech: { mode: 'voice_only' },
+          speech_action: {
+            action: 'create_reference_voice',
+            profile_name: 'Owner 参考音色',
+            rights_basis: 'self_or_authorized',
+            usage_scope: 'local_tts_only',
+            clean_single_speaker_confirmed: true,
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => ({
+          protocol: 'cti-speech-transcript/v1',
+          attachmentId: input.attachmentId,
+          relation: input.relation,
+          requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId,
+          text: '这是一段经授权的参考语音',
+          model: 'test-asr',
+          language: 'zh',
+          fileSha256: input.sha256,
+          validated: true,
+        }),
+        importReferenceVoice: async (input: any) => {
+          importInput = input;
+          return {
+            protocol: 'cti-speech-reference-voice-import/v1',
+            voiceProfileId: 'voice.reference.owner',
+            requestMessageId: input.requestMessageId,
+            sourceMessageId: input.sourceMessageId,
+            fileKey: input.fileKey,
+            attachmentId: input.attachmentId,
+            fileSha256: input.sha256,
+            authorizationExpiresAt: input.authorization.expiresAt,
+            validated: true,
+          };
+        },
+        synthesize: async () => {
+          synthesisCalls += 1;
+          throw new Error('/voice off 后不应合成回复');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (outbound) => {
+      sent.push(outbound);
+      return { ok: true, messageId: `om_clone_result_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('/voice off', 'ou_owner', 'oc_clone_voice'));
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.equal(importInput.profileName, 'Owner 参考音色');
+    assert.equal(importInput.requestMessageId, 'om_clone_voice');
+    assert.equal(importInput.sourceMessageId, 'old-om_clone_voice');
+    assert.equal(importInput.fileKey, 'old-file-om_clone_voice');
+    assert.equal(importInput.attachmentId, 'native-om_clone_voice');
+    assert.equal(importInput.authorization.ownerUserId, 'ou_owner');
+    assert.equal(importInput.authorization.scope, 'current_native_reply_audio');
+    assert.equal(importInput.authorization.rightsBasis, 'self_or_authorized');
+    assert.equal(importInput.authorization.usageScope, 'local_tts_only');
+    assert.equal(importInput.authorization.cleanSingleSpeakerConfirmed, true);
+    assert.equal(Date.parse(importInput.authorization.expiresAt) - Date.parse(importInput.authorization.authorizedAt), 5 * 60 * 1000);
+    assert.equal(synthesisCalls, 0);
+    assert.match(sent.at(-1)?.text || '', /参考音色已创建：voice\.reference\.owner/u);
+    assert.doesNotMatch(sent.at(-1)?.text || '', /模型预写的成功文案/u);
   });
 
   it('控制面板精确终止会把 signal 传入 ASR，且不产生第二条转写错误终态', async () => {
@@ -11962,6 +12298,7 @@ describe('bridge-manager speech integration', () => {
     let synthesisCalls = 0;
     const sent: OutboundMessage[] = [];
     const speech: SpeechHost = {
+      getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
       transcribe: async () => { throw new Error('not used'); },
       synthesize: async ({ text }) => {
         synthesisCalls += 1;
@@ -11970,7 +12307,7 @@ describe('bridge-manager speech integration', () => {
     };
     initBridgeContext({
       store: createStatefulStore({ remote_bridge_enabled: 'true' }),
-      llm: { streamChat: () => createTextStream('这是应保留的完整文字结果。') },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('这是应保留的完整文字结果。')) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech,
@@ -11992,6 +12329,40 @@ describe('bridge-manager speech integration', () => {
     assert.match(sent.at(-1)?.text || '', /完整文字结果/u);
   });
 
+  it('普通正文里的语音关键词不会绕过 Primary 结构化呈现意图', async () => {
+    let synthesisCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('这是普通文字结果。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'keyword-must-not-trigger');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_keyword_text' };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '请用语音回答，但 Primary 没有给结构化 intent。',
+      'ou_speech',
+      'oc_speech_keyword',
+    ));
+
+    assert.equal(synthesisCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /普通文字结果/u);
+  });
+
   it('最终正文含代码围栏时跳过 TTS，并保留完整文字与稳定审计原因', async () => {
     let synthesisCalls = 0;
     const audits: any[] = [];
@@ -12000,11 +12371,12 @@ describe('bridge-manager speech integration', () => {
     store.insertAuditLog = (input: any) => { audits.push(input); };
     initBridgeContext({
       store,
-      llm: { streamChat: () => createTextStream('结果如下：\n\n```ts\nconst value = 1;\n```') },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('结果如下：\n\n```ts\nconst value = 1;\n```')) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
         transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         synthesize: async ({ text }) => {
           synthesisCalls += 1;
           return createManagedSpeechReceipt(text, 'code');
@@ -12035,11 +12407,15 @@ describe('bridge-manager speech integration', () => {
     const outboundRefs: any[] = [];
     const textMessages: OutboundMessage[] = [];
     let audioOptions: { expectedSha256?: string } | undefined;
+    let synthesisExpectedIdentity: unknown;
     const store = createStatefulStore({ remote_bridge_enabled: 'true' });
     store.insertOutboundRef = (input: any) => { outboundRefs.push(input); };
     const speech: SpeechHost = {
+      getReplyPolicy: () => 'explicit_only',
+      getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
       transcribe: async () => { throw new Error('not used'); },
-      synthesize: async ({ text }) => {
+      synthesize: async ({ text, expectedIdentity }) => {
+        synthesisExpectedIdentity = expectedIdentity;
         const receipt = createManagedSpeechReceipt(text, 'success');
         receiptSha256 = receipt.fileSha256;
         return receipt;
@@ -12048,7 +12424,7 @@ describe('bridge-manager speech integration', () => {
     };
     initBridgeContext({
       store,
-      llm: { streamChat: () => createTextStream(visibleText) },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply(visibleText)) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech,
@@ -12070,10 +12446,109 @@ describe('bridge-manager speech integration', () => {
     ));
 
     assert.equal(audioOptions?.expectedSha256, receiptSha256, JSON.stringify(textMessages));
+    assert.deepEqual(synthesisExpectedIdentity, TEST_SPEECH_SYNTHESIS_IDENTITY);
     assert.equal(textMessages.length, 0, JSON.stringify(textMessages));
     assert.equal(released.length, 1);
     assert.equal(outboundRefs.find((entry) => entry.messageKind === 'audio')?.platformMessageId, 'om_native_voice');
     assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /完整语音结果/u);
+  });
+
+  it('TTS 忽略取消并迟到返回时释放回执，且不再投递语音或文字', async () => {
+    let synthesisSignal: AbortSignal | undefined;
+    let resolveSynthesis!: (receipt: ReturnType<typeof createManagedSpeechReceipt>) => void;
+    let synthesisStartedResolve!: () => void;
+    const synthesisStarted = new Promise<void>((resolve) => { synthesisStartedResolve = resolve; });
+    const synthesisResult = new Promise<ReturnType<typeof createManagedSpeechReceipt>>((resolve) => {
+      resolveSynthesis = resolve;
+    });
+    const released: unknown[] = [];
+    const sent: OutboundMessage[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('取消后不能晚投递。')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ signal }) => {
+          synthesisSignal = signal;
+          synthesisStartedResolve();
+          return synthesisResult;
+        },
+        releaseSynthesis: async (receipt) => { released.push(receipt); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'unexpected-late-delivery' };
+    });
+    adapter.sendLocalAudio = async () => {
+      throw new Error('取消后不应调用音频发送');
+    };
+    const { _testOnly, cancelActiveReply } = await import('../../lib/bridge/bridge-manager');
+    const message = {
+      ...createInboundMessage('生成语音结果', 'ou_speech', 'oc_tts_cancel'),
+      messageId: 'om_tts_cancel',
+    };
+
+    const handling = _testOnly.handleMessage(adapter, message);
+    await synthesisStarted;
+    const sessionId = store.getChannelBinding('feishu', 'oc_tts_cancel')?.codepilotSessionId;
+    assert.ok(sessionId);
+    const cancellation = await cancelActiveReply({
+      sessionId,
+      turnId: message.messageId,
+      channelType: 'feishu',
+      chatId: 'oc_tts_cancel',
+    });
+    resolveSynthesis(createManagedSpeechReceipt('取消后不能晚投递。', 'late'));
+    await handling;
+
+    assert.equal(cancellation.disposition, 'accepted');
+    assert.equal(synthesisSignal?.aborted, true);
+    assert.equal(released.length, 1);
+    assert.equal(sent.length, 0);
+  });
+
+  it('Runtime 回执身份错配时拒绝音频、释放原始回执并回退完整文字', async () => {
+    const released: any[] = [];
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('身份错配时保留完整文字。')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'identity-mismatch', {
+          ...TEST_SPEECH_SYNTHESIS_IDENTITY,
+          modelRevision: 'unexpected-revision',
+        }),
+        releaseSynthesis: async (receipt) => { released.push(receipt); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_identity_fallback' };
+    });
+    let audioCalls = 0;
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'unexpected-audio' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('生成受控语音', 'ou_speech', 'oc_identity_mismatch'));
+
+    assert.equal(audioCalls, 0);
+    assert.equal(released.length, 1);
+    assert.equal(released[0].modelRevision, 'unexpected-revision');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /身份错配时保留完整文字/u);
+    assert.match(sent[0].text, /已改为发送完整文字/u);
   });
 
   it('合成产物释放失败只写观察审计，不覆盖已经成功的音频终态', async () => {
@@ -12083,11 +12558,12 @@ describe('bridge-manager speech integration', () => {
     store.insertAuditLog = (input: any) => { audits.push(input); };
     initBridgeContext({
       store,
-      llm: { streamChat: () => createTextStream('释放失败也不能覆盖音频结果。') },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('释放失败也不能覆盖音频结果。')) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
         transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'release-error'),
         releaseSynthesis: async () => { throw new Error('private runtime path'); },
       },
@@ -12116,11 +12592,12 @@ describe('bridge-manager speech integration', () => {
     const sent: OutboundMessage[] = [];
     initBridgeContext({
       store: createStatefulStore({ remote_bridge_enabled: 'true' }),
-      llm: { streamChat: () => createTextStream(visibleText) },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply(visibleText)) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
         transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'fallback'),
         releaseSynthesis: async () => { releaseCalls += 1; },
       },
@@ -12153,11 +12630,12 @@ describe('bridge-manager speech integration', () => {
         remote_bridge_enabled: 'true',
         bridge_turn_feedback_delay_ms: '0',
       }),
-      llm: { streamChat: () => createTextStream('卡片链路的完整文字结果。') },
+      llm: { streamChat: () => createTextStream(createVoiceOnlyReply('卡片链路的完整文字结果。')) },
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
         transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'card'),
         releaseSynthesis: async () => { events.push('release'); },
       },
@@ -12218,6 +12696,7 @@ describe('bridge-manager speech integration', () => {
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         transcribe: async () => { throw new Error('not used'); },
         synthesize: async () => { speechCalls += 1; throw new Error('TTS 不应被调用'); },
       },
@@ -12262,6 +12741,7 @@ describe('bridge-manager speech integration', () => {
       permissions: { resolvePendingPermission: () => false },
       lifecycle: {},
       speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         transcribe: async () => { throw new Error('not used'); },
         synthesize: async () => { speechCalls += 1; throw new Error('TTS 不应被调用'); },
       },
@@ -12329,7 +12809,7 @@ describe('bridge-manager speech integration', () => {
               toolInput: { command: 'npm test' },
             }),
           },
-          { type: 'text', data: '请确认权限后继续。' },
+          { type: 'text', data: createVoiceOnlyReply('请确认权限后继续。') },
           { type: 'result', data: '{}' },
         ]),
       },
@@ -12337,6 +12817,7 @@ describe('bridge-manager speech integration', () => {
       lifecycle: {},
       speech: {
         transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
         synthesize: async ({ text }) => {
           synthesisCalls += 1;
           return createManagedSpeechReceipt(text, 'permission');
