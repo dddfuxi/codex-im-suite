@@ -210,38 +210,7 @@ type ExtensionItem = {
   canRemove?: boolean;
 };
 
-type SettingsState = {
-  defaultWorkDir: string;
-  allowedRoots: string;
-  memoryRepo: string;
-  additionalDirs: string;
-  replyStyleHint: string;
-  defaultExecutorId: string;
-  localAiKind: string;
-  localAiBaseUrl: string;
-  ollamaModelsDir: string;
-  localAiModel: string;
-  localAiApiKeyAction: 'keep' | 'set' | 'clear';
-  localAiApiKeyValue: string;
-  localAiApiKeyMasked: string;
-  localAiApiKeySet: boolean;
-  localAiTimeoutMs: string;
-  codexModelSource: 'official' | 'local_api' | 'external_api' | string;
-  codexRoutingMode: 'manual' | 'auto_failover' | string;
-  codexApiFallbackChain: string;
-  codexBaseUrl: string;
-  codexModel: string;
-  codexPassModel: boolean;
-  codexReasoningEffort: string;
-  memoryOptimizerEnabled: boolean;
-  memoryOptimizerIntervalDays: string;
-  memoryOptimizerModelSource: 'codex_primary' | 'local_ai' | 'external_api' | string;
-  codexApiKeyAction: 'keep' | 'set' | 'clear';
-  codexApiKeyValue: string;
-  codexApiKeyMasked: string;
-  codexApiKeySet: boolean;
-  safetyPolicyProfile: 'strict' | 'balanced' | 'fluent' | string;
-};
+type SettingsState = import('@codex-im-suite/contracts/panel-settings').PanelSettingsStateContract;
 
 type AiStrategy = 'official' | 'local_api' | 'external_api' | 'auto_failover';
 type CodexSource = 'local_api' | 'external_api' | 'official';
@@ -1167,6 +1136,8 @@ const commandLabels: Record<string, string> = {
   'speech.benchmarkTtsModel': '测试语音模型',
   'speech.benchmarkSingingModel': '测试歌声模型',
   'speech.importReferenceVoice': '导入授权参考音频',
+  'speech.renameReferenceVoice': '重命名参考音色',
+  'speech.deleteReferenceVoice': '删除参考音色',
   'speech.previewVoice': '试听音色',
   'bridge.restart': '重启 Bridge',
   'speech.activateVoiceProfile': '切换音色',
@@ -7134,4 +7105,20 @@ function runtimeStatusText(unit: RuntimeUnit) {
 
 const rootElement = document.getElementById('root');
 if (!rootElement) throw new Error('Missing root element');
-createRoot(rootElement).render(<App />);
+
+class PanelErrorBoundary extends React.Component<React.PropsWithChildren, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error) { console.error('[control-panel] render failed', error); }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <main className="app-shell"><section className="panel error-panel">
+      <h1>中控面板暂时无法显示</h1>
+      <p>Runtime 返回的数据不完整或前端资源与接口版本不一致，已阻止白屏。</p>
+      <code>{this.state.error.message || 'panel_render_failed'}</code>
+      <button type="button" onClick={() => window.location.reload()}>重新加载</button>
+    </section></main>;
+  }
+}
+
+createRoot(rootElement).render(<PanelErrorBoundary><App /></PanelErrorBoundary>);

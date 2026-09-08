@@ -213,6 +213,25 @@ export abstract class BaseChannelAdapter {
     return { allowed: false, source: 'rejected', error: 'Choice participant verification is not supported' };
   }
 
+  /** 解析“定向给某人作答”的目标；身份必须由适配器使用当前平台证据解析。 */
+  async resolveChoiceParticipant(_input: {
+    chatId: string;
+    sourceMessage: InboundMessage;
+  }): Promise<{ ok: boolean; userId?: string; displayName?: string; error?: string }> {
+    return { ok: false, error: '当前渠道不支持定向选择人解析' };
+  }
+
+  /**
+   * 按真实平台用户 ID 解析当前会话成员名称。
+   * 该能力只返回适配器从平台成员接口确认过的名称，不能接受模型生成的 ID。
+   */
+  async resolveMemberDisplayNames(
+    _chatId: string,
+    _userIds: readonly string[],
+  ): Promise<Record<string, string>> {
+    return {};
+  }
+
   /** 将后台倒计时收口恢复为普通入站，复用 adapter FIFO 与会话锁。 */
   enqueueSyntheticInbound?(_message: InboundMessage): boolean;
 
@@ -271,6 +290,16 @@ export abstract class BaseChannelAdapter {
    * metadata using platform APIs or cached inbound context.
    */
   resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
+
+  /**
+   * 把已由 Agent 明确选择、且仍受用户本轮请求约束的显示名解析为原生 mention。
+   * 与正文裸 @ 解析分开，避免 Delivery 为了触发平台解析而改写用户可见文本。
+   */
+  resolveOutboundMentionTargets?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _targets: string[],
+  ): Promise<OutboundMessage>;
 
   /**
    * 按本轮真实 evidence 中的平台 ID 验证同群 mention 身份。

@@ -118,7 +118,10 @@ export function shouldUseStickerOnlyReply(
   explicitRequest: boolean,
 ): boolean {
   if (!isRedundantStickerCompanionText(companionText)) return false;
-  return explicitRequest || isCasualStickerOnlyContext(userText);
+  // 省略正文会丢失真实任务结果，因此只有用户明确要求“只发表情”时才允许。
+  // 泛化轻聊资格由上游 TurnFocus + 协调器裁决，不能从寒暄词表反推。
+  void userText;
+  return explicitRequest;
 }
 
 export function addFeishuStickerHintForExplicitRequest(

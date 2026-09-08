@@ -111,6 +111,11 @@ describe('provider workspace resolution', () => {
       assert.deepEqual(resolved.additionalDirectories, []);
       assert.deepEqual(resolved.allowedRoots, [sandbox]);
       assert.equal(resolved.source, 'workspace_plan');
+      assert.equal(module.shouldSkipGitRepoCheckForWorkspace(makePlan(sandbox)), true);
+      assert.equal(module.shouldSkipGitRepoCheckForWorkspace({
+        ...makePlan(sandbox),
+        primaryWorkspace: { ...makePlan(sandbox).primaryWorkspace, projectId: 'registered-project' },
+      }), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

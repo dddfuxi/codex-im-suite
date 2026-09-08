@@ -233,6 +233,22 @@
       "diagnosticCode": "manifest_incomplete"
     },
     {
+      "id": "vevo2_poc",
+      "displayName": "Amphion Vevo2 统一语音与歌声 PoC",
+      "kind": "experimental_provider",
+      "capabilities": ["speech", "tts", "voice_clone", "singing", "melody_control", "voice_conversion"],
+      "source": "https://github.com/open-mmlab/Amphion/tree/26f6883110181f1dbfe95c70a7c7dbaf4de5f42a/models/svc/vevo2",
+      "version": "amphion-26f6883110181f1dbfe95c70a7c7dbaf4de5f42a.vevo2-2674843cbaa50aa89ee7ccaf5bb15d6ccf46c6c8",
+      "sha256": null,
+      "size": null,
+      "license": "CC BY-NC-ND 4.0",
+      "archive": "file",
+      "fileName": null,
+      "availability": "blocked",
+      "platforms": ["win32-x64"],
+      "diagnosticCode": "vevo2_fileset_not_locked"
+    },
+    {
       "id": "ace_step_1_5",
       "displayName": "ACE-Step 1.5 Runtime",
       "kind": "runtime",

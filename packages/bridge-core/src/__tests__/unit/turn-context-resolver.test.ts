@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   createTurnEvidenceEnvelope,
   formatStructuredTurnContext,
+  permitsLightweightResponse,
   resolveTurnFocus,
   validateAgentTurnFocusDecision,
   type TurnEvidenceItem,
@@ -58,6 +59,7 @@ describe('turn context resolver', () => {
     assert.equal(decision.focus, 'current_request');
     assert.deepEqual(decision.primaryEvidenceIds, ['current-message']);
     assert.equal(decision.requiresAgentResolution, false);
+    assert.equal(permitsLightweightResponse(decision), true);
   });
 
   it('selects one confirmed native reply over unrelated nearby and memory evidence', () => {
@@ -97,6 +99,7 @@ describe('turn context resolver', () => {
     const decision = resolveTurnFocus(envelope);
 
     assert.equal(decision.focus, 'reply_target');
+    assert.equal(permitsLightweightResponse(decision), false);
     assert.deepEqual(decision.primaryEvidenceIds, ['reply-1']);
     assert.ok(decision.supportingEvidenceIds.includes('nearby-1'));
     assert.ok(decision.supportingEvidenceIds.includes('memory-1'));
@@ -195,7 +198,7 @@ describe('turn context resolver', () => {
     assert.match(recoveredDecision.reason, /正文或附件/);
   });
 
-  it('falls back to one reliable nearby message when an unrecovered native reply cannot be resolved', async () => {
+  it('keeps an unrecovered native reply ambiguous instead of guessing from short text', async () => {
     const resolved = await resolveStructuredTurnContext({
       sessionId: 'session-unrecovered-reply-fallback',
       channelType: 'feishu',
@@ -233,12 +236,9 @@ describe('turn context resolver', () => {
       },
     });
 
-    assert.equal(resolved.decision.focus, 'continuation');
-    assert.deepEqual(resolved.decision.primaryEvidenceIds, ['nearby-human-message']);
-    assert.deepEqual(resolved.decision.conflictingEvidenceIds, ['reply-shell']);
-    assert.equal(resolved.decision.requiresAgentResolution, false);
-    assert.match(resolved.decision.reason, /近邻.*不是.*引用正文/);
-    assert.match(resolved.prompt, /不代表原生引用正文已恢复/);
+    assert.equal(resolved.decision.focus, 'ambiguous');
+    assert.equal(resolved.decision.requiresAgentResolution, true);
+    assert.match(resolved.prompt, /不要猜测或选择最近消息冒充原生引用/);
   });
 
   it('keeps the turn ambiguous when multiple reliable nearby messages compete', async () => {
@@ -353,7 +353,7 @@ describe('turn context resolver', () => {
     assert.equal(resolved.decision.requiresAgentResolution, true);
   });
 
-  it('uses the last readable message before card shells and excludes future nearby evidence', async () => {
+  it('does not promote a nearby message when an unrecovered reply leaves the target ambiguous', async () => {
     const resolved = await resolveStructuredTurnContext({
       sessionId: 'session-card-adjacent-fallback',
       channelType: 'feishu',
@@ -416,8 +416,8 @@ describe('turn context resolver', () => {
       ],
     });
 
-    assert.equal(resolved.decision.focus, 'continuation');
-    assert.deepEqual(resolved.decision.primaryEvidenceIds, ['card-prompt']);
+    assert.equal(resolved.decision.focus, 'ambiguous');
+    assert.equal(resolved.decision.requiresAgentResolution, true);
     assert.equal(resolved.envelope.evidence.some((item) => item.id === 'future-distractor'), false);
   });
 

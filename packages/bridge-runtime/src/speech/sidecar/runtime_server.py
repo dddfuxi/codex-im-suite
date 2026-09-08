@@ -110,6 +110,8 @@ class SpeechHandler(BaseHTTPRequestHandler):
                 result = self.backends.transcribe(payload)
             elif self.path == "/v1/synthesize":
                 result = self.backends.synthesize(payload)
+            elif self.path == "/v1/compare-speakers":
+                result = self.backends.compare_speakers(payload)
             else:
                 self.send_json(HTTPStatus.NOT_FOUND, {"protocol": RESULT_PROTOCOL, "ok": False, "status": "blocked", "errorCode": "route_not_found"})
                 return

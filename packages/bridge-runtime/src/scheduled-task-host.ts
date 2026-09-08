@@ -588,10 +588,15 @@ export function createBridgeScheduledTaskActionHost(
     async history(input) {
       try {
         const runs = await host.history(input.taskId, toRuntimeActor(input.actor), input.limit);
-        const enriched = await Promise.all(runs.map(async (run) => ({
-          ...run,
-          checkInCount: (await options.store.getCheckIns(run.taskId, run.slotKey))?.entries.length ?? 0,
-        })));
+        const enriched = await Promise.all(runs.map(async (run) => {
+          const checkIns = await options.store.getCheckIns(run.taskId, run.slotKey);
+          return {
+            ...run,
+            checkInCount: checkIns?.entries.length ?? 0,
+            // 保留 Runtime 已持久化的真实参与者，名称由当前渠道适配器解析。
+            participants: checkIns?.entries.map((entry) => ({ ...entry })) ?? [],
+          };
+        }));
         return { ok: true, runs: enriched };
       } catch (error) {
         return { ok: false, runs: [], error: error instanceof Error ? error.message : String(error) };

@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { CODEX_HOME } from './config.js';
@@ -54,6 +56,38 @@ export interface OfficialSkillToolsOptions {
   run?: (call: ProcessCall) => Promise<ProcessResult>;
 }
 
+/**
+ * 官方系统 Skill 不属于 suite 仓库，也不保证每个 Codex Home 都复制一份。
+ * 运行版可能使用隔离 Home，因此只拼一个固定路径会把“当前 Home 没有脚本”
+ * 误报成工具执行失败。按受控候选根解析，并在最终错误里指出缺失能力。
+ */
+function resolveOfficialScript(codexHome: string, skillId: 'skill-creator' | 'skill-installer', scriptName: string): string {
+  const homes = [
+    codexHome,
+    process.env.CODEX_HOME || '',
+    path.join(os.homedir(), '.codex'),
+    path.join(os.homedir(), '.claude-to-im', 'runtime', 'codex-home-official'),
+    path.join(os.homedir(), '.claude-to-im', 'runtime', 'codex-home'),
+  ];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const home of homes) {
+    if (!home) continue;
+    for (const relative of [
+      path.join('skills', '.system', skillId, 'scripts', scriptName),
+      path.join('skills', skillId, 'scripts', scriptName),
+    ]) {
+      const candidate = path.resolve(home, relative);
+      const key = candidate.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  throw new Error(`缺少官方 ${skillId} 脚本：${scriptName}。已检查受控 Codex skill 根：${candidates.join('；')}`);
+}
+
 async function runProcess(call: ProcessCall): Promise<ProcessResult> {
   return await new Promise<ProcessResult>((resolve, reject) => {
     const child = spawn(call.file, call.args, {
@@ -92,15 +126,13 @@ export function createOfficialSkillTools(options: OfficialSkillToolsOptions = {}
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8',
   };
-  const creatorScripts = path.join(codexHome, 'skills', '.system', 'skill-creator', 'scripts');
-  const installerScripts = path.join(codexHome, 'skills', '.system', 'skill-installer', 'scripts');
-
   return {
     async createDraft(input) {
+      const initSkillScript = resolveOfficialScript(codexHome, 'skill-creator', 'init_skill.py');
       const result = await run({
         file: pythonExe,
         args: [
-          path.join(creatorScripts, 'init_skill.py'),
+          initSkillScript,
           input.name,
           '--path',
           path.resolve(input.draftRoot),
@@ -118,9 +150,10 @@ export function createOfficialSkillTools(options: OfficialSkillToolsOptions = {}
     },
 
     async validate(skillDir) {
+      const quickValidateScript = resolveOfficialScript(codexHome, 'skill-creator', 'quick_validate.py');
       const result = await run({
         file: pythonExe,
-        args: [path.join(creatorScripts, 'quick_validate.py'), path.resolve(skillDir)],
+        args: [quickValidateScript, path.resolve(skillDir)],
         env: processEnv,
         shell: false,
       });
@@ -131,9 +164,10 @@ export function createOfficialSkillTools(options: OfficialSkillToolsOptions = {}
     },
 
     async listCurated() {
+      const listSkillsScript = resolveOfficialScript(codexHome, 'skill-installer', 'list-skills.py');
       const result = requireSuccess(await run({
         file: pythonExe,
-        args: [path.join(installerScripts, 'list-skills.py'), '--format', 'json'],
+        args: [listSkillsScript, '--format', 'json'],
         env: processEnv,
         shell: false,
       }), '读取官方精选 Skill');
@@ -149,10 +183,11 @@ export function createOfficialSkillTools(options: OfficialSkillToolsOptions = {}
     },
 
     async installFromGithub(input) {
+      const installScript = resolveOfficialScript(codexHome, 'skill-installer', 'install-skill-from-github.py');
       const result = await run({
         file: pythonExe,
         args: [
-          path.join(installerScripts, 'install-skill-from-github.py'),
+          installScript,
           '--url', input.url,
           '--dest', path.resolve(input.destinationRoot),
           '--name', input.name,

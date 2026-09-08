@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { createOfficialSkillTools, type ProcessCall } from '../official-skill-tools.js';
@@ -8,6 +9,11 @@ describe('official skill tools', () => {
   it('uses official creator and validator scripts without shell interpolation', async () => {
     const calls: ProcessCall[] = [];
     const codexHome = path.resolve('C:/test/codex-home');
+    for (const script of ['list-skills.py', 'install-skill-from-github.py']) {
+      const scriptPath = path.join(codexHome, 'skills', '.system', 'skill-installer', 'scripts', script);
+      fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+      fs.writeFileSync(scriptPath, '# test\n', 'utf8');
+    }
     const draftRoot = path.resolve('C:/test/drafts');
     const tools = createOfficialSkillTools({
       codexHome,
@@ -17,6 +23,16 @@ describe('official skill tools', () => {
         return { exitCode: 0, stdout: 'ok', stderr: '' };
       },
     });
+
+    const scriptsRoot = path.join(codexHome, 'skills', '.system');
+    for (const [skill, script] of [
+      ['skill-creator', 'init_skill.py'],
+      ['skill-creator', 'quick_validate.py'],
+    ] as const) {
+      const scriptPath = path.join(scriptsRoot, skill, 'scripts', script);
+      fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+      fs.writeFileSync(scriptPath, '# test\n', 'utf8');
+    }
 
     await tools.createDraft({
       name: 'asset-cleaner',
@@ -43,6 +59,11 @@ describe('official skill tools', () => {
   it('uses the official curated list and GitHub installer scripts', async () => {
     const calls: ProcessCall[] = [];
     const codexHome = path.resolve('C:/test/codex-home');
+    for (const script of ['list-skills.py', 'install-skill-from-github.py']) {
+      const scriptPath = path.join(codexHome, 'skills', '.system', 'skill-installer', 'scripts', script);
+      fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+      fs.writeFileSync(scriptPath, '# test\n', 'utf8');
+    }
     const tools = createOfficialSkillTools({
       codexHome,
       pythonExe: 'python',

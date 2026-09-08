@@ -22,6 +22,15 @@ export interface FeishuCliUserAuthorizationPolicyViolation {
   userMessage: string;
 }
 
+/** 由真实 user API 错误返回的最小权限证据，禁止由模型正文猜测。 */
+export interface FeishuCliUserMissingScopeEvidence {
+  protocol: 'cti-feishu-cli-user-missing-scope/v1';
+  toolUseId: string;
+  toolName: string;
+  identity: 'user';
+  scopes: string[];
+}
+
 export interface FeishuCliUserAuthorizationEvidenceInput {
   toolUseId: string;
   toolName: string;
@@ -134,6 +143,31 @@ export function extractFeishuBotMissingAppScopes(content: unknown): string[] {
       .map((scope) => typeof scope === 'string' ? scope.trim() : '')
       .filter((scope) => /^[a-z0-9_.-]+:[a-z0-9_.:-]+$/iu.test(scope)),
   )).sort();
+}
+
+export function extractFeishuCliUserMissingScopeEvidence(input: FeishuCliUserAuthorizationEvidenceInput): FeishuCliUserMissingScopeEvidence | null {
+  if (!input.toolResultIsError) return null;
+  const result = parseJsonObject(input.toolResultContent);
+  if (!result) return null;
+  const error = result.error && typeof result.error === 'object' && !Array.isArray(result.error)
+    ? result.error as Record<string, unknown>
+    : result;
+  const identity = String(error.identity || result.identity || '').trim().toLowerCase();
+  const subtype = String(error.subtype || '').trim().toLowerCase();
+  if (identity !== 'user' || subtype !== 'missing_scope') return null;
+  const scopes = Array.from(new Set(
+    (Array.isArray(error.missing_scopes) ? error.missing_scopes : [])
+      .map((scope) => typeof scope === 'string' ? scope.trim() : '')
+      .filter((scope) => /^[a-z0-9_.-]+:[a-z0-9_.:-]+$/iu.test(scope)),
+  )).sort();
+  if (scopes.length !== 1) return null;
+  return {
+    protocol: 'cti-feishu-cli-user-missing-scope/v1',
+    toolUseId: input.toolUseId,
+    toolName: input.toolName,
+    identity: 'user',
+    scopes,
+  };
 }
 
 export function extractFeishuCliUserAuthorizationPolicyViolation(

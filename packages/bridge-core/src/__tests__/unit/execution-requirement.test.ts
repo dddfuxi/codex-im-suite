@@ -83,6 +83,7 @@ describe('execution requirement classifier', () => {
         workingDirectory: 'C:\\workspace',
         envelope: { ...envelope, currentText: userText },
         focus,
+        continuationAdjustment: 'adjust',
       });
       assert.equal(inherited.kind, 'artifact_required', userText);
       assert.equal(inherited.inheritedFromContinuation, true, userText);
@@ -94,6 +95,7 @@ describe('execution requirement classifier', () => {
       userText: '看到了，谢谢',
       envelope,
       focus,
+      continuationAdjustment: 'not_adjust',
     });
     assert.equal(acknowledgement.kind, 'none');
   });
@@ -130,6 +132,7 @@ describe('execution requirement classifier', () => {
         requiresAgentResolution: false,
         reason: 'test',
       },
+      continuationAdjustment: 'adjust',
     });
 
     assert.equal(inherited.kind, 'none');

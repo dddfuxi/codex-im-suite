@@ -61,9 +61,22 @@ describe('managed singing runtime supervisor', () => {
     const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
     const child = new EventEmitter() as EventEmitter & { pid: number; kill: () => boolean };
     child.pid = 43210;
-    child.kill = () => { value.alive.delete(child.pid); return true; };
+    child.kill = () => {
+      value.alive.delete(child.pid);
+      child.emit('exit', 0, null);
+      return true;
+    };
     value.alive.add(child.pid);
     try {
+      const stateRoot = path.join(value.root, 'runtime', 'speech', 'ace-step-host');
+      const tempAudioRoot = path.join(stateRoot, 'temp', 'api_audio');
+      const cacheRoot = path.join(stateRoot, 'cache');
+      fs.mkdirSync(tempAudioRoot, { recursive: true });
+      fs.mkdirSync(cacheRoot, { recursive: true });
+      const staleAudio = path.join(tempAudioRoot, 'stale.wav');
+      const cacheFile = path.join(cacheRoot, 'keep.bin');
+      fs.writeFileSync(staleAudio, 'stale', 'utf8');
+      fs.writeFileSync(cacheFile, 'cache', 'utf8');
       const supervisor = new ManagedSingingRuntimeSupervisor({
         config: value.config,
         ctiHome: value.root,
@@ -84,6 +97,8 @@ describe('managed singing runtime supervisor', () => {
       const endpoint = await supervisor.ensureRunning();
       assert.equal(endpoint.baseUrl, 'http://127.0.0.1:43123/');
       assert.ok(endpoint.token.length >= 32);
+      assert.equal(fs.existsSync(staleAudio), false);
+      assert.equal(fs.existsSync(cacheFile), true);
       assert.equal(calls.length, 1);
       const hostIndex = calls[0].args.indexOf('--host');
       assert.deepEqual(calls[0].args.slice(hostIndex, hostIndex + 4), ['--host', '127.0.0.1', '--port', '43123']);
@@ -95,7 +110,7 @@ describe('managed singing runtime supervisor', () => {
       assert.equal(environment.HF_HUB_OFFLINE, '1');
       assert.equal(environment.TRANSFORMERS_OFFLINE, '1');
       assert.equal(environment.ACESTEP_QUEUE_WORKERS, '1');
-      assert.equal(environment.ACESTEP_INIT_LLM, 'false');
+      assert.equal(environment.ACESTEP_INIT_LLM, 'true');
       assert.equal(environment.PYTHONIOENCODING, 'utf-8');
       assert.equal(environment.PYTHONNOUSERSITE, '1');
       assert.equal(calls[0].args.includes('--init-llm'), false);
@@ -110,12 +125,17 @@ describe('managed singing runtime supervisor', () => {
       assert.match(bootstrap, /handler\._ensure_models_present=lambda/u);
       assert.match(bootstrap, /handler\._sync_model_code_if_needed=lambda/u);
       assert.doesNotMatch(bootstrap, /lambda: model_root/u);
-      const statePath = path.join(value.root, 'runtime', 'speech', 'ace-step-host', 'runtime.json');
+      const statePath = path.join(stateRoot, 'runtime.json');
       const stateText = fs.readFileSync(statePath, 'utf8');
       assert.equal(stateText.includes(endpoint.token), false);
       assert.equal(stateText.includes('127.0.0.1'), false);
+      fs.mkdirSync(tempAudioRoot, { recursive: true });
+      const currentAudio = path.join(tempAudioRoot, 'current.wav');
+      fs.writeFileSync(currentAudio, 'current', 'utf8');
       supervisor.stop();
       assert.equal(fs.existsSync(statePath), false);
+      assert.equal(fs.existsSync(currentAudio), false);
+      assert.equal(fs.existsSync(cacheFile), true);
     } finally { value.cleanup(); }
   });
 
@@ -125,6 +145,9 @@ describe('managed singing runtime supervisor', () => {
       const stateRoot = path.join(value.root, 'runtime', 'speech', 'ace-step-host');
       fs.mkdirSync(stateRoot, { recursive: true });
       const statePath = path.join(stateRoot, 'runtime.json');
+      const activeTempPath = path.join(stateRoot, 'temp', 'api_audio', 'active.wav');
+      fs.mkdirSync(path.dirname(activeTempPath), { recursive: true });
+      fs.writeFileSync(activeTempPath, 'active', 'utf8');
       fs.writeFileSync(statePath, JSON.stringify({
         protocol: 'cti-managed-singing-runtime/v1', runId: 'previous', ownerPid: 9991,
         childPid: 9992, port: 40000, startedAt: new Date().toISOString(), runtimeVersion: 'v1', modelVersion: 'v1',
@@ -139,6 +162,7 @@ describe('managed singing runtime supervisor', () => {
         Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'singing_runtime_already_running')
       ));
       assert.equal(fs.existsSync(statePath), true);
+      assert.equal(fs.existsSync(activeTempPath), true);
     } finally { value.cleanup(); }
   });
 });

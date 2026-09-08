@@ -19,7 +19,7 @@ import {
   type CodexProviderProfile,
 } from './codex-provider.js';
 import { getLocalCodexProviderAdapter, type LocalCodexProviderAdapter } from './local-codex-provider-registry.js';
-import { resolveProviderWorkspace } from './provider-workspace.js';
+import { resolveProviderWorkspace, shouldSkipGitRepoCheckForWorkspace } from './provider-workspace.js';
 import { McpBridge, type McpManifestRecord, type McpToolInfo } from './mcp-bridge.js';
 import { loadMcpToolCallDefinitions, loadShellArtifactDefinitions, loadUnityMcpExecuteCodeDefinitions } from './local-agent-tool-registry.js';
 import {
@@ -667,7 +667,7 @@ export class CodexLocalCliProvider implements LLMProvider {
 
           if (!restrictedMode) {
             for (const dir of additionalDirectories) args.push('--add-dir', dir);
-            if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
+            if (shouldSkipGitRepoCheck() || shouldSkipGitRepoCheckForWorkspace(params.workspacePlan)) args.push('--skip-git-repo-check');
             if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
             if (shouldBypassLocalApprovals()) {
               args.push('--dangerously-bypass-approvals-and-sandbox');
@@ -1360,7 +1360,7 @@ export class CodexLocalCliProvider implements LLMProvider {
         ? providerWorkspace.additionalDirectories
         : normalizeAdditionalDirectories(input.params.additionalDirectories);
       for (const dir of additionalDirectories) args.push('--add-dir', dir);
-      if (shouldSkipGitRepoCheck()) args.push('--skip-git-repo-check');
+      if (shouldSkipGitRepoCheck() || shouldSkipGitRepoCheckForWorkspace(input.params.workspacePlan)) args.push('--skip-git-repo-check');
       if (shouldIgnoreLocalUserConfig()) args.push('--ignore-user-config');
       if (shouldBypassLocalApprovals()) {
         args.push('--dangerously-bypass-approvals-and-sandbox');

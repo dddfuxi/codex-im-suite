@@ -5,6 +5,7 @@ namespace ClaudeToImControlPanel;
 internal sealed record SpeechReferenceVoiceImportMetadata(
     string DisplayName,
     string Transcript,
+    bool TranscriptConfirmed,
     string SourceLabel,
     string License,
     bool AuthorizationConfirmed,
@@ -35,23 +36,39 @@ internal sealed partial class MainForm
             "speech.benchmarkTtsModel" => new
             {
                 modelId = ReadRequiredSpeechString(payload, "modelId"),
+                voiceProfileId = ReadOptionalSpeechString(payload, "voiceProfileId"),
             },
             "speech.benchmarkSingingModel" => new { },
-            "speech.previewVoice" or "speech.previewSingingVoice" => new
+            "speech.previewVoice" => new
             {
                 modelId = ReadRequiredSpeechString(payload, "modelId"),
                 voiceProfileId = ReadOptionalSpeechString(payload, "voiceProfileId"),
                 text = ReadRequiredSpeechString(payload, "text"),
             },
-            "speech.activateVoiceProfile" => new
+            "speech.previewSingingVoice" or "speech.generateSinging" => new
+            {
+                providerId = ReadRequiredSpeechString(payload, "providerId"),
+                voiceProfileId = ReadOptionalSpeechString(payload, "voiceProfileId"),
+                lyrics = ReadRequiredSpeechString(payload, "lyrics"),
+                stylePrompt = ReadRequiredSpeechString(payload, "stylePrompt"),
+                vocalLanguage = ReadRequiredSpeechString(payload, "vocalLanguage"),
+                durationSeconds = ReadOptionalSpeechNumber(payload, "durationSeconds"),
+                melodyMode = ReadRequiredSpeechString(payload, "melodyMode"),
+            },
+            "speech.activateVoiceProfile" or "speech.deleteReferenceVoice" => new
             {
                 voiceProfileId = ReadRequiredSpeechString(payload, "voiceProfileId"),
+            },
+            "speech.renameReferenceVoice" => new
+            {
+                voiceProfileId = ReadRequiredSpeechString(payload, "voiceProfileId"),
+                displayName = ReadRequiredSpeechString(payload, "displayName"),
             },
             "speech.importReferenceVoice" => await BuildReferenceVoiceImportInputAsync(payload),
             _ => throw new SpeechRuntimeGatewayException("speech_action_not_allowed"),
         };
         var gateway = CreateSpeechRuntimeGateway();
-        return command is "speech.previewVoice" or "speech.previewSingingVoice"
+        return command is "speech.previewVoice" or "speech.previewSingingVoice" or "speech.generateSinging"
             ? await gateway.RunPreviewAsync(command, input)
             : await gateway.RunActionAsync(command, input);
     }
@@ -101,6 +118,7 @@ internal sealed partial class MainForm
             sourcePath,
             displayName = metadata.DisplayName,
             transcript = metadata.Transcript,
+            transcriptConfirmed = metadata.TranscriptConfirmed,
             sourceLabel = metadata.SourceLabel,
             license = metadata.License,
             authorizationConfirmed = metadata.AuthorizationConfirmed,
@@ -110,6 +128,10 @@ internal sealed partial class MainForm
 
     internal static SpeechReferenceVoiceImportMetadata ReadSpeechReferenceVoiceImportMetadata(JsonElement payload)
     {
+        if (!ReadSpeechBoolean(payload, "transcriptConfirmed"))
+        {
+            throw new SpeechRuntimeGatewayException("speech_reference_transcript_confirmation_required");
+        }
         if (!ReadSpeechBoolean(payload, "authorizationConfirmed"))
         {
             throw new SpeechRuntimeGatewayException("speech_reference_authorization_required");
@@ -121,6 +143,7 @@ internal sealed partial class MainForm
         return new SpeechReferenceVoiceImportMetadata(
             ReadRequiredSpeechString(payload, "displayName"),
             ReadRequiredSpeechString(payload, "transcript"),
+            true,
             ReadRequiredSpeechString(payload, "sourceLabel"),
             ReadRequiredSpeechString(payload, "license"),
             true,
@@ -173,4 +196,12 @@ internal sealed partial class MainForm
         => payload.ValueKind == JsonValueKind.Object
             && payload.TryGetProperty(name, out var value)
             && value.ValueKind == JsonValueKind.True;
+
+    private static double? ReadOptionalSpeechNumber(JsonElement payload, string name)
+        => payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.Number
+            && value.TryGetDouble(out var number)
+                ? number
+                : null;
 }

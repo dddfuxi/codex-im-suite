@@ -9,18 +9,21 @@ import type {
   FeishuCliUserAuthHost,
   FeishuOAuthManualResumeRequest,
 } from 'claude-to-im/host';
+import { resolveFeishuCliUserConfigDir } from './feishu-cli-user-profile.js';
 
 const execFileAsync = promisify(execFile);
 
 export interface FeishuCliDeviceAuthorizationResult {
   ok: boolean;
-  reason?: 'expired' | 'denied' | 'failed';
+  reason?: 'expired' | 'denied' | 'failed' | 'unconfigured';
 }
 
 export interface FeishuCliDeviceAuthorizationRunner {
   waitForAuthorization(input: {
     deviceCode: string;
     expiresInSeconds: number;
+    /** 当前真实入站用户；用于选择隔离的 lark-cli 配置目录。 */
+    userId: string;
   }): Promise<FeishuCliDeviceAuthorizationResult>;
 }
 
@@ -115,11 +118,11 @@ function buildAuthorizationCard(input: FeishuCliUserAuthBeginInput): string {
     },
     header: {
       title: { tag: 'plain_text', content: '需要飞书用户授权' },
-      subtitle: { tag: 'plain_text', content: '本机共享 lark-cli 用户身份' },
+      subtitle: { tag: 'plain_text', content: '使用你的飞书用户身份' },
       template: 'blue',
       icon: { tag: 'standard_icon', token: 'approve_colorful' },
       text_tag_list: [
-        { tag: 'text_tag', text: { tag: 'plain_text', content: 'Owner 授权' }, color: 'blue' },
+        { tag: 'text_tag', text: { tag: 'plain_text', content: '本人授权' }, color: 'blue' },
       ],
     },
     body: {
@@ -159,6 +162,7 @@ function buildAuthorizationCard(input: FeishuCliUserAuthBeginInput): string {
 function buildFailureText(reason: FeishuCliDeviceAuthorizationResult['reason']): string {
   if (reason === 'expired') return '未完成：飞书用户授权已过期，请重新发送原任务以生成新的授权卡。';
   if (reason === 'denied') return '未完成：飞书用户授权未通过，原任务没有继续执行。';
+  if (reason === 'unconfigured') return '未完成：本机未配置可隔离的飞书用户身份，请先完成 lark-cli 配置后重试。';
   return '未完成：飞书用户授权没有成功，原任务没有继续执行。请稍后重新发送原任务。';
 }
 
@@ -226,6 +230,7 @@ class FeishuCliUserAuthBroker implements FeishuCliUserAuthHost {
       result = await this.options.runner.waitForAuthorization({
         deviceCode: pending.deviceCode,
         expiresInSeconds: pending.expiresInSeconds,
+        userId: pending.requests[0]?.userId || '',
       });
     } catch {
       result = { ok: false, reason: 'failed' };
@@ -267,7 +272,10 @@ function resolveLarkCliInvocation(): { file: string; argsPrefix: string[] } {
 
 export function createLarkCliDeviceAuthorizationRunner(): FeishuCliDeviceAuthorizationRunner {
   return {
-    waitForAuthorization: async ({ deviceCode, expiresInSeconds }) => {
+    waitForAuthorization: async ({ deviceCode, expiresInSeconds, userId }) => {
+      // 配置目录按真实入站用户隔离；不能依赖当前进程的共享 lark-cli 登录态。
+      const configDir = resolveFeishuCliUserConfigDir(userId);
+      if (!configDir) return { ok: false, reason: 'unconfigured' as const };
       const invocation = resolveLarkCliInvocation();
       try {
         await execFileAsync(
@@ -279,6 +287,7 @@ export function createLarkCliDeviceAuthorizationRunner(): FeishuCliDeviceAuthori
             maxBuffer: 512 * 1024,
             env: {
               ...process.env,
+              LARKSUITE_CLI_CONFIG_DIR: configDir,
               LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
               LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1',
             },

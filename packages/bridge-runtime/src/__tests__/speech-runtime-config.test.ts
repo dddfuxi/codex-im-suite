@@ -16,8 +16,18 @@ describe('speech runtime config', () => {
     assert.equal(config.voiceProfileId, 'qwen3.serena');
     assert.equal(config.tonePolicy, 'adaptive_natural');
     assert.equal(config.voiceCloneBenchmarkPassed, false);
+    assert.equal(config.ownerSelfVoiceAutoAuthorization, false);
+    assert.equal(config.requestTimeoutMs, 90_000);
+    assert.equal(config.synthesisTimeoutMs, 600_000);
     assert.equal(config.maxInputBytes, 20 * 1024 * 1024);
     assert.equal(config.maxDurationMs, 300_000);
+  });
+
+  it('enables Owner self-voice auto authorization only through the explicit config flag', () => {
+    const config = loadSpeechRuntimeConfig(new Map([
+      ['CTI_SPEECH_OWNER_SELF_VOICE_AUTO_AUTHORIZATION', 'true'],
+    ]));
+    assert.equal(config.ownerSelfVoiceAutoAuthorization, true);
   });
 
   it('keeps the legacy clone benchmark flag readable only for config migration', () => {

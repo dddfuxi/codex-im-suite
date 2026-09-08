@@ -131,6 +131,48 @@ test('飞书语音缺少 file_key 仍入队失败关闭，且不创建附件或�
   assert.equal(inbound.text, '');
 });
 
+test('回复中的 m4a 文件按真实文件头恢复为可克隆音频 evidence', async () => {
+  const adapter = new FeishuAdapter() as any;
+  adapter.downloadResource = async () => adapter.buildDownloadedResourceAttachment(
+    'file_m4a_1',
+    'file',
+    Buffer.concat([Buffer.from('....ftypM4A ', 'ascii'), Buffer.alloc(120)]),
+  );
+  const result = await adapter.downloadAttachmentsFromMessageItem({
+    message_id: 'om_reply_m4a',
+    chat_id: 'oc_audio',
+    create_time: String(Date.now()),
+    msg_type: 'file',
+    body: { content: JSON.stringify({ file_key: 'file_m4a_1' }) },
+    sender: { id: 'ou_owner', sender_type: 'user' },
+  });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, 'audio/mp4');
+  result[0].id = 'reply-m4a-1';
+
+  const raw = {
+    feishuReplyTo: { messageId: 'om_reply_m4a', attachmentCount: 1 },
+    feishuNativeReplyAttachments: [{
+      protocol: 'cti-feishu-native-reply-attachment/v1',
+      relation: 'native_reply',
+      sourceMessageId: 'om_request_m4a',
+      messageId: 'om_reply_m4a',
+      fileKey: 'file_m4a_1',
+      resourceType: 'audio',
+      attachmentId: 'reply-m4a-1',
+    }],
+  };
+  const { resolveTrustedNativeReplyAudio } = await import('../application/speech-policy.js');
+  const resolved = resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'om_request_m4a',
+    raw,
+    attachments: result,
+  });
+  assert.equal(resolved?.attachment.id, 'reply-m4a-1');
+  assert.equal((resolved?.evidence as { resourceType?: string }).resourceType, 'audio');
+});
+
 test('飞书 HTTP 资源下载先检查 Content-Length，并对伪造小长度继续执行流式上限', async () => {
   let oversizedPulled = false;
   const oversized = new Response(new ReadableStream<Uint8Array>({

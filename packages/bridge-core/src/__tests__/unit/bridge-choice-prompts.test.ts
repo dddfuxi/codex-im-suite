@@ -85,6 +85,9 @@ describe('structured choice prompts', () => {
     assert.deepEqual(parseChoiceSessionDirective({ mode: 'parallel', callback_url: 'https://unsafe' }), {
       mode: 'parallel', audience: 'chat_members', state: 'active',
     });
+    assert.deepEqual(parseChoiceSessionDirective({ mode: 'single_user', audience: 'participant' }), {
+      mode: 'single_user', audience: 'participant', state: 'active',
+    });
     assert.equal(parseChoiceSessionDirective({ mode: 'vote', duration_seconds: 3 }), undefined);
     assert.equal(parseChoiceSessionDirective({ mode: 'vote' }), undefined);
     assert.equal(parseChoiceSessionDirective({ mode: 'permission', duration_seconds: 30 }), undefined);
@@ -165,6 +168,21 @@ describe('structured choice prompts', () => {
     assert.equal(registry.finalizeVote(registered.nonce), null);
     registry.acknowledgeFinalization(registered.nonce);
     assert.equal(registry.listPendingFinalizations().length, 0);
+  });
+
+  it('binds a participant audience to the verified target instead of the initiator', () => {
+    const registry = new ChoicePromptRegistry({ nonceFactory: () => 'participant_nonce' });
+    const registered = registry.register({
+      channelType: 'feishu', chatId: 'oc_chat', userId: 'ou_target', sessionId: 'session_1', prompt: 'MBTI',
+      choicePrompt: { options: [{ label: 'A' }, { label: 'B' }] },
+      choiceSession: { mode: 'single_user', audience: 'participant', state: 'active' },
+    });
+    assert.equal(registry.consume(registered.options[0].callbackData, {
+      channelType: 'feishu', chatId: 'oc_chat', userId: 'ou_host', chatMemberVerified: true,
+    }).kind, 'forbidden');
+    assert.equal(registry.consume(registered.options[1].callbackData, {
+      channelType: 'feishu', chatId: 'oc_chat', userId: 'ou_target', chatMemberVerified: true,
+    }).kind, 'resolved');
   });
 
   it('freezes a verified participant roster and finalizes immediately after every member selects', () => {

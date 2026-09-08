@@ -3,3 +3,7 @@ import './lib/bridge/adapters/index.js';
 
 export * from './lib/bridge/bridge-manager.js';
 export * from './lib/bridge/context.js';
+export type {
+  ContinuationAdjustmentIntentHost,
+  ContinuationAdjustmentIntentInput,
+} from './lib/bridge/host.js';

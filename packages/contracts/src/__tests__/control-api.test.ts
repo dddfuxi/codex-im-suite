@@ -14,6 +14,8 @@ describe('control panel shared contracts', () => {
     assert.equal(contracts.CONTROL_PANEL_STATE_SCHEMA, 'codex-im-suite/control-panel-state/v1');
     assert.equal(contracts.CONTROL_COMMAND_SCHEMA, 'codex-im-suite/control-command/v1');
     assert.equal(contracts.CONTROL_RESULT_SCHEMA, 'codex-im-suite/control-result/v1');
+    assert.equal(contracts.PANEL_SETTINGS_SNAPSHOT_PROTOCOL, 'cti-panel-settings-snapshot/v1');
+    assert.equal(contracts.PANEL_SETTINGS_UPDATE_PROTOCOL, 'cti-panel-settings-update-receipt/v1');
     assert.equal(contracts.SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v2');
     assert.equal(contracts.SPEECH_SETTINGS_SCHEMA, 'codex-im-suite/speech-settings/v2');
     assert.equal(contracts.WORKFLOW_PANEL_STATE_PROTOCOL, 'workflow-runtime/v1');
@@ -26,11 +28,13 @@ describe('control panel shared contracts', () => {
     const projectRegistryPath = path.join(schemaDir, 'project-registry.schema.json');
     const agentCollaborationPath = path.join(schemaDir, 'agent-collaboration.schema.json');
     const speechPath = path.join(schemaDir, 'speech.schema.json');
+    const panelSettingsPath = path.join(schemaDir, 'panel-settings.schema.json');
 
     assert.equal(fs.existsSync(controlApiPath), true, 'control-api.schema.json should exist');
     assert.equal(fs.existsSync(projectRegistryPath), true, 'project-registry.schema.json should exist');
     assert.equal(fs.existsSync(agentCollaborationPath), true, 'agent-collaboration.schema.json should exist');
     assert.equal(fs.existsSync(speechPath), true, 'speech.schema.json should exist');
+    assert.equal(fs.existsSync(panelSettingsPath), true, 'panel-settings.schema.json should exist');
 
     const controlApi = JSON.parse(fs.readFileSync(controlApiPath, 'utf8')) as {
       $id?: string;
@@ -45,6 +49,10 @@ describe('control panel shared contracts', () => {
       $defs?: Record<string, { required?: string[] }>;
     };
     const speech = JSON.parse(fs.readFileSync(speechPath, 'utf8')) as {
+      $id?: string;
+      $defs?: Record<string, { required?: string[] }>;
+    };
+    const panelSettings = JSON.parse(fs.readFileSync(panelSettingsPath, 'utf8')) as {
       $id?: string;
       $defs?: Record<string, { required?: string[] }>;
     };
@@ -72,6 +80,8 @@ describe('control panel shared contracts', () => {
       'protocol', 'updatedAt', 'mode', 'poolHealth', 'activeTaskCount', 'workers', 'agents', 'recentRuns', 'metrics',
     ]);
     assert.equal(speech.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
+    assert.equal(panelSettings.$id, 'https://codex-im-suite.local/schemas/panel-settings.schema.json');
+    assert.deepEqual(panelSettings.$defs?.PanelSettingsSnapshotContract?.required, ['protocol', 'version', 'generatedAt', 'settings']);
     assert.deepEqual(speech.$defs?.SpeechSettingsContract?.required, [
       'schema', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
       'asrProvider', 'ttsProvider', 'ttsModelId', 'tonePolicy', 'singingProvider', 'activeVoiceProfileId', 'activeSingingVoiceProfileId',

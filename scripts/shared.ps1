@@ -62,7 +62,20 @@ function Get-ReleaseFileHash {
         return '<missing>'
     }
 
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.Substring(0, 12)
+    # 发布/同步脚本会由 powershell.exe -NoProfile 在受限环境启动，不能假设
+    # Get-FileHash cmdlet 已可用。直接使用 .NET 流式计算，避免将大 bundle 读入内存。
+    $stream = $null
+    $sha = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $sha.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hash).Replace('-', '')).Substring(0, 12)
+    }
+    finally {
+        if ($null -ne $sha) { $sha.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
 }
 
 function Get-ReleaseContentHash {

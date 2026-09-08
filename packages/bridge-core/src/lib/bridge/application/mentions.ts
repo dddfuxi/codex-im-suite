@@ -27,7 +27,7 @@ const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【,，.。!！?？~～:：;；]
 const FEISHU_BARE_AT_BOUNDARY_CLASS = '[\\s([{（【,，.。!！?？~～:：;；]';
 const FEISHU_BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
 const FEISHU_EXPLICIT_MENTION_TARGET_TOKEN = '[@＠]?[\\p{L}\\p{N}_.$·-]{1,64}?';
-const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|回答|处理|吗|呢|吧|啊|呀|哈|哦|噢)';
+const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|回答|处理|打(?:个)?招呼|问候|致意|说话|发言|吗|呢|吧|啊|呀|哈|哦|噢)';
 const FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE = /(?:让|叫|喊|通知|请|麻烦|要)(?:他|她|它|ta|TA|对方|其|那个人|这个人|该成员)|(?:跟|和)(?:你|我|他|她|它|ta|TA|对方)|(?:去|来|帮|帮忙|帮我)(?:看|看看|处理|回复|聊|聊天|说|问|确认|查|检查|修|改|做|发|转发)/iu;
 const FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE = new RegExp(
   `(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)\\s*(?:一下|下|一声|一下子|给|把|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})${FEISHU_EXPLICIT_MENTION_TARGET_STOP}`,
@@ -300,9 +300,32 @@ function isFeishuAmbiguousPronounTarget(target: string): boolean {
   return /^(?:我|你|他|她|它|ta|TA|对方|那个人|这个人)$/u.test(target.trim());
 }
 
+/**
+ * 群体称呼描述的是要对谁说话，不是飞书可解析的单一成员身份。
+ *
+ * 这里故意只拒绝带有明确集合语义的称呼；“群里的小明”仍会在后续清洗为
+ * “小明”，以便走同群成员唯一校验。这样不会把某个固定群、昵称或话术写成
+ * 特例，同时也不会把自然的群体问候误送成原生 @all 或成员查询。
+ */
+export function isFeishuGroupAudienceTarget(target: string): boolean {
+  const cleaned = (target || '')
+    .normalize('NFKC')
+    .replace(/^[@＠]+/u, '')
+    .replace(/\s+/gu, '')
+    .trim();
+  if (!cleaned) return false;
+  if (/^(?:大家|各位|所有人|全体|全员|群友(?:们)?|群成员(?:们)?|群里(?:的)?人|群内(?:的)?人|朋友(?:们)?|伙伴(?:们)?|同学(?:们)?|老师(?:们)?|大哥大姐|哥哥姐姐|兄弟姐妹)$/u.test(cleaned)) {
+    return true;
+  }
+  const groupPrefix = /^(?:(?:本|这|当前)?(?:群|群聊)(?:里|内)?(?:的)?|(?:各位|全体|所有|在场|在座)(?:的)?)(.+)$/u.exec(cleaned);
+  if (!groupPrefix) return false;
+  return /^(?:大家|人|成员(?:们)?|群成员(?:们)?|朋友(?:们)?|群友(?:们)?|伙伴(?:们)?|同学(?:们)?|老师(?:们)?|大哥大姐|哥哥姐姐|兄弟姐妹|(?:飞书)?(?:机器人|智能体|agent|bot)(?:们)?)$/iu.test(groupPrefix[1] || '');
+}
+
 function isFeishuGenericMentionTarget(target: string): boolean {
   const cleaned = (target || '').normalize('NFKC').replace(/^[@＠]+/u, '').replace(/\s+/g, '').trim();
   if (!cleaned || isNonAddressableMentionTarget(cleaned)) return true;
+  if (isFeishuGroupAudienceTarget(cleaned)) return true;
   if (/^(?:我|你|您|他|她|它|ta|TA|对方|那个人|这个人|你们|我们|他们|她们|它们|大家|所有人|全体|某人|别人|其他人|其他成员|群里的人|群成员)$/u.test(cleaned)) return true;
   if (/^(?:一个|一位|一名|某个|某位|某名|任意|随机|另一个|另一位|另一名|下一个|上一个|那位|这位|对应的|胜出的|当前|相关).{0,24}$/u.test(cleaned)) return true;
   if (/^(?:我|你|您|他|她|它|ta|TA|自己|本(?:人|机|机器人)|这(?:个|位)?(?:机器人|智能体|agent|bot)?|该(?:机器人|智能体|agent|bot)?)(?:自己)?(?:的)?(?:主人|主子|开发者|作者|创建者|维护者|管理员|负责人|老板|owner|creator|developer|maintainer|admin|娘|妈妈|妈|爸爸|爸)$/iu.test(cleaned)) return true;
@@ -311,14 +334,26 @@ function isFeishuGenericMentionTarget(target: string): boolean {
 
 function cleanExplicitFeishuMentionTarget(target: string): string {
   let cleaned = target.normalize('NFKC').replace(/^[@＠]+/, '').replace(/[<>"'`]/g, '').trim()
-    .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '')
+    .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '');
+  // 先在保留“群里/各位”等集合语义的状态下裁决，避免后面的地点前缀清洗把
+  // “群里的大哥大姐”错误缩成貌似单人的“大哥大姐”。
+  if (isFeishuGroupAudienceTarget(cleaned)) return '';
+  cleaned = cleaned
+    // “群里的小明”仍可解析小明；但群体位置本身不是可 @ 的成员名称。
+    .replace(/^(?:(?:本|这|当前)?(?:群|群聊)(?:里|内)?(?:的)?)/u, '')
     .replace(/(?:一下|下|一声|看看|看一下|回复(?:一下)?|回答(?:一下)?|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
     .replace(/(?:这个|那个|该|对应的)?(?:机器人|智能体|agent|bot|应用)(?:人)?(?:的)?$/iu, '')
     .trim();
+  if (isFeishuGroupAudienceTarget(cleaned)) return '';
   if (/^(?:一|一下|下|一声|一下子)$/u.test(cleaned)) return '';
   const followup = FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE.exec(cleaned);
   if (followup) cleaned = cleaned.slice(0, followup.index).trim();
   if (!cleaned || FEISHU_OTHER_PERSON_TARGET_RE.test(cleaned) || isFeishuGenericMentionTarget(cleaned)) return '';
+  // 回复引用会被统一还原为“请处理我在本条…回复或引用的消息”。这类
+  // 任务短语不能因为同时含有“请/回复”而被贪婪正则伪装成成员名；同样
+  // 不把由动作动词开头的片段提升为可投递的人员目标。
+  if (/^(?:处理|回复|回应|答复|回答|查看|检查|修复|解决|执行|跟进|安排|通知|联系|协助|帮忙)(?:我|你|他|她|它|ta|TA|在|的|本|这|该|当前|刚才|一下|消息|话题|引用)/iu.test(cleaned)) return '';
+  if (/(?:本条|这条|该条|当前消息|引用的消息|回复或引用|飞书话题)/u.test(cleaned)) return '';
   if (/^(?:谁|他|她|它|ta|TA|对方|那个人|这个人|某人)$/u.test(cleaned)) return '';
   return cleaned;
 }

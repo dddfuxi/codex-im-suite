@@ -9,6 +9,7 @@ describe('self-maintenance correction routing', () => {
       assert.equal(shouldRunCorrectionMaintenance({
         currentUserText: text,
         previousAssistantText: '上一轮已经完成基础实现。',
+        hasTrustedPreviousAssistantRelation: true,
       }), false, text);
     }
   });
@@ -23,6 +24,7 @@ describe('self-maintenance correction routing', () => {
       assert.equal(shouldRunCorrectionMaintenance({
         currentUserText: text,
         previousAssistantText: '文件不存在。',
+        hasTrustedPreviousAssistantRelation: true,
       }), true, text);
     }
   });
@@ -31,6 +33,15 @@ describe('self-maintenance correction routing', () => {
     assert.equal(shouldRunCorrectionMaintenance({
       currentUserText: '你判断错了。',
       previousAssistantText: '',
+      hasTrustedPreviousAssistantRelation: true,
+    }), false);
+  });
+
+  it('does not treat isolated correction wording as self-maintenance evidence', () => {
+    assert.equal(shouldRunCorrectionMaintenance({
+      currentUserText: '还是错，正确的是 B。',
+      previousAssistantText: '文件不存在。',
+      hasTrustedPreviousAssistantRelation: false,
     }), false);
   });
 });

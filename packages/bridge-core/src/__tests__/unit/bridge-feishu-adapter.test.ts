@@ -2795,6 +2795,23 @@ describe('FeishuAdapter outbound mentions', () => {
     assert.equal(resolved.text, '@刘丹 哈喽呀');
   });
 
+  it('resolves an explicit selected member without modifying the visible greeting text', async () => {
+    const adapter = new FeishuAdapter() as any;
+    adapter.fetchChatMentionCandidates = async (chatId: string) => {
+      assert.equal(chatId, 'oc_group');
+      return [{ userId: 'ou_xiaoming', name: '小明', aliases: ['小明'] }];
+    };
+
+    const resolved = await adapter.resolveOutboundMentionTargets({
+      address: { channelType: 'feishu', chatId: 'oc_group', chatType: 'group' },
+      text: '小明，麻烦看一下这条消息。',
+      parseMode: 'plain',
+    }, undefined, ['小明']);
+
+    assert.equal(resolved.text, '小明，麻烦看一下这条消息。');
+    assert.deepEqual(resolved.mentions, [{ userId: 'ou_xiaoming', name: '小明' }]);
+  });
+
   it('verifies a same-chat mention directly by platform id and returns the latest display name', async () => {
     const adapter = new FeishuAdapter() as any;
     adapter.fetchChatMentionCandidates = async (chatId: string) => {

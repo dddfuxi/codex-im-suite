@@ -391,7 +391,13 @@ internal sealed partial class MainForm : Form
     {
         var webFiles = new PhysicalFileProvider(webRoot);
         app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = webFiles });
-        app.UseStaticFiles(new StaticFileOptions { FileProvider = webFiles });
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = webFiles,
+            // 面板 bundle 与 live EXE 同步发布。浏览器若复用旧静态资源，会出现
+            // “Runtime 已更新但按钮仍缺失”的假不生效；每次打开都要求重新验证。
+            OnPrepareResponse = context => ControlPanelWebCachePolicy.Apply(context.Context.Response),
+        });
         Directory.CreateDirectory(_mediaCacheDir);
         app.Use(async (context, next) =>
         {
@@ -596,6 +602,8 @@ internal sealed partial class MainForm : Form
         var role = RequiredRoleForControlCommand(command, payload);
         // 参考音频元数据和本机路径不得进入活动日志；审计只保留动作类型与结果。
         var summary = string.Equals(command, "speech.importReferenceVoice", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "speech.renameReferenceVoice", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(command, "speech.deleteReferenceVoice", StringComparison.OrdinalIgnoreCase)
             ? "{\"redacted\":\"authorized-reference-voice-metadata\"}"
             : payload.ValueKind == JsonValueKind.Undefined ? "" : payload.GetRawText();
         if (summary.Length > 500) summary = summary[..500] + "...";
@@ -646,7 +654,13 @@ internal sealed partial class MainForm : Form
 
         try
         {
-            await _webView.EnsureCoreWebView2Async();
+            var webViewEnvironment = await CoreWebView2Environment.CreateAsync(
+                browserExecutableFolder: null,
+                userDataFolder: null,
+                options: WebViewMediaPlaybackPolicy.CreateEnvironmentOptions());
+            await _webView.EnsureCoreWebView2Async(webViewEnvironment);
+            // 用户点击试听后模型可能推理数十秒；宿主策略允许播放后仍显式清除持久静音状态。
+            _webView.CoreWebView2.IsMuted = false;
             _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             Directory.CreateDirectory(_mediaCacheDir);
@@ -839,8 +853,11 @@ internal sealed partial class MainForm : Form
             case "speech.benchmarkTtsModel":
             case "speech.benchmarkSingingModel":
             case "speech.importReferenceVoice":
+            case "speech.renameReferenceVoice":
+            case "speech.deleteReferenceVoice":
             case "speech.previewVoice":
             case "speech.previewSingingVoice":
+            case "speech.generateSinging":
             case "speech.activateVoiceProfile":
                 return await RunSpeechControlCommandAsync(command, payload);
             case "agentCollaboration.setMode":
@@ -2576,9 +2593,61 @@ internal sealed partial class MainForm : Form
                 lastSelection = (object?)null,
             };
         }
+
+        // executor-status.json is a runtime cache.  The control panel can
+        // outlive Bridge (or be opened after config.env was edited), so never
+        // let an older cache overwrite the current model-source settings.
+        // Keep the runtime-owned manifest details, but overlay the stable
+        // Codex identity and invalidate selections captured before the latest
+        // config change.  Bridge will still regenerate the complete snapshot
+        // on its next start.
+        OverlayCurrentCodexConfiguration(root);
         root["defaultExecutorId"] ??= NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", ""));
         root["sessionDefaults"] = defaults.DeepClone();
         return root;
+    }
+
+    private void OverlayCurrentCodexConfiguration(JsonObject root)
+    {
+        if (root["executors"] is not JsonArray executors) return;
+        var codex = executors
+            .OfType<JsonObject>()
+            .FirstOrDefault(item => string.Equals(ReadJsonString(item, "id", ""), "codex", StringComparison.OrdinalIgnoreCase));
+        if (codex is null) return;
+
+        var source = NormalizeCodexModelSource(GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource()));
+        var routingMode = NormalizeCodexRoutingMode(GetConfig("CTI_CODEX_ROUTING_MODE", "manual"));
+        var localModel = GetConfig("CTI_LOCAL_AI_MODEL", GetConfig("CTI_OLLAMA_MODEL", "qwen2.5-coder:7b"));
+        var localBaseUrl = GetConfig("CTI_LOCAL_AI_BASE_URL", GetConfig("CTI_OLLAMA_BASE_URL", "http://127.0.0.1:11434"));
+        var codexModel = GetConfig("CTI_CODEX_MODEL", "");
+        var codexBaseUrl = GetConfig("CTI_CODEX_BASE_URL", "");
+        var displayName = source switch
+        {
+            "local_api" => $"Codex CLI (本地模型 API: {localModel})",
+            "external_api" => $"Codex CLI (外部 API: {(string.IsNullOrWhiteSpace(codexModel) ? "未指定模型" : codexModel)})",
+            _ when routingMode == "auto_failover" => $"Codex CLI (auto failover: {NormalizeCodexApiFallbackChain(GetConfig("CTI_CODEX_API_FALLBACK_CHAIN", "local_api,external_api"))})",
+            _ => "Codex CLI / SDK",
+        };
+        codex["displayName"] = displayName;
+        codex["enabled"] = string.Equals(GetConfig("CTI_RUNTIME", "claude"), "codex", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(GetConfig("CTI_RUNTIME", "claude"), "auto", StringComparison.OrdinalIgnoreCase);
+        if (codex["configSchema"] is not JsonObject schema)
+        {
+            schema = new JsonObject();
+            codex["configSchema"] = schema;
+        }
+        schema["modelSource"] = source;
+        schema["model"] = source == "local_api" ? localModel : codexModel;
+        schema["baseUrl"] = source == "local_api" ? localBaseUrl : codexBaseUrl;
+        schema["routingMode"] = routingMode;
+        schema["fallbackChain"] = JsonValue.Create(NormalizeCodexApiFallbackChain(GetConfig("CTI_CODEX_API_FALLBACK_CHAIN", "local_api,external_api")))!.ToString()
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Aggregate(new JsonArray(), (array, item) => { array.Add(item); return array; });
+
+        var configStamp = File.Exists(_configPath) ? File.GetLastWriteTimeUtc(_configPath) : DateTime.MinValue;
+        var statusStamp = File.Exists(_executorStatusPath) ? File.GetLastWriteTimeUtc(_executorStatusPath) : DateTime.MinValue;
+        if (configStamp > statusStamp) root.Remove("lastSelection");
+        root["defaultExecutorId"] = NormalizeExecutorId(GetConfig("CTI_DEFAULT_EXECUTOR_ID", ""));
     }
 
     private object SetExecutorSessionDefault(JsonElement payload)
@@ -4216,6 +4285,17 @@ internal sealed partial class MainForm : Form
                 Path.GetDirectoryName(_localLlmStartScript) ?? "",
                 "",
                 "本地或自托管 OpenAI-compatible 模型后端，用作 Codex agent 的可选模型来源。")),
+            BuildAIBridgeRuntimeUnit(GetRuntimeManifestOrFallback(
+                runtimeManifests,
+                "tool.aibridge",
+                "Unity AIBridge",
+                "tool",
+                "unity-editor",
+                "project-managed",
+                "project-registry",
+                "",
+                "",
+                "通过项目注册表发现 Unity 工程内的 AIBridge CLI；与 Unity MCP 独立，可单独检查和打开工程入口。")),
         };
 
         // 带 update 声明的外部 CLI 工具由 runtime manifest 自动进入面板，避免以后每接一个官方工具都改 C# 分支。
@@ -4243,6 +4323,8 @@ internal sealed partial class MainForm : Form
                 new("check", "检查", true),
                 new("start", "启动", manifest.Enabled != false && hasLauncher),
                 new("stop", "停止", manifest.Enabled != false),
+                new("pause", "暂停", manifest.Enabled != false),
+                new("resume", "恢复", manifest.Enabled == false),
                 new("install", "安装", canInstall),
             };
             if (updatePlan is not null)
@@ -6068,6 +6150,26 @@ exit $LASTEXITCODE
             }
         }
 
+        if (string.Equals(unitId, "tool.aibridge", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (action)
+            {
+                case "check":
+                case "status":
+                    return await CheckAIBridgeAsync();
+                case "openLocation":
+                    var snapshot = BuildProjectRegistrySnapshot();
+                    var project = snapshot.Projects.FirstOrDefault(item => item.Enabled && string.Equals(item.Type, "unity", StringComparison.OrdinalIgnoreCase));
+                    var root = project?.UnityProjectRoot ?? project?.WorkspaceRoot;
+                    if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+                    {
+                        throw new InvalidOperationException("没有可打开的 Unity 工程。");
+                    }
+                    OpenPath(root);
+                    return "opened";
+            }
+        }
+
         if (unitId.StartsWith("mcp.", StringComparison.OrdinalIgnoreCase))
         {
             var id = unitId["mcp.".Length..];
@@ -6085,6 +6187,12 @@ exit $LASTEXITCODE
                 case "stop":
                     await StopMcpAsync(manifest);
                     return _mcpRuntimeStatus.Text;
+                case "pause":
+                    await SetMcpEnabledAsync(manifest, false);
+                    return "paused";
+                case "resume":
+                    await SetMcpEnabledAsync(manifest, true);
+                    return "resumed";
                 case "register":
                     await RegisterAllMcpsAsync();
                     return _mcpStatus.Text;
@@ -7475,12 +7583,49 @@ exit $LASTEXITCODE
         }
     }
 
+    private BridgeRuntimeStatus? ReadBridgeRuntimeStatus()
+    {
+        try
+        {
+            if (!File.Exists(_statusJsonPath)) return null;
+            var raw = File.ReadAllText(_statusJsonPath, Encoding.UTF8);
+            return string.IsNullOrWhiteSpace(raw)
+                ? null
+                : JsonSerializer.Deserialize<BridgeRuntimeStatus>(raw, JsonOptions);
+        }
+        catch
+        {
+            // 原子替换窗口中的短暂读取失败由后续探针重试。
+            return null;
+        }
+    }
+
+    private BridgeRuntimeIdentitySnapshot? ReadCurrentBridgeIdentity()
+    {
+        var status = ReadBridgeRuntimeStatus();
+        if (status is not null && status.Pid > 0)
+        {
+            return new BridgeRuntimeIdentitySnapshot(status.Pid, status.RunId, status.StartedAt);
+        }
+        var audit = ReadBridgeRuntimeAudit();
+        return audit is null || audit.Pid <= 0
+            ? null
+            : new BridgeRuntimeIdentitySnapshot(audit.Pid, audit.RunId, audit.StartedAt);
+    }
+
     private async Task RunDaemonAsync(string action)
     {
-        var preserveManagedChildren = BridgeLifecycleProcessPolicy.PreserveManagedChildrenOnTimeout(action);
-        var daemonArguments = action is "start" or "stop" or "restart"
-            ? $"{action} -Source control_panel"
-            : action;
+        var normalizedAction = action ?? "";
+        var command = normalizedAction
+            .Trim()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault() ?? "";
+        var isRestart = string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase);
+        var previousIdentity = isRestart ? ReadCurrentBridgeIdentity() : null;
+        var preserveManagedChildren = BridgeLifecycleProcessPolicy.PreserveManagedChildrenOnTimeout(normalizedAction);
+        var daemonArguments = normalizedAction is "start" or "stop" or "restart"
+            ? $"{normalizedAction} -Source control_panel"
+            : normalizedAction;
         var result = await RunPowerShellFileAsync(
             _daemonScript,
             daemonArguments,
@@ -7489,6 +7634,36 @@ exit $LASTEXITCODE
             killEntireProcessTreeOnTimeout: !preserveManagedChildren,
             isolateBackgroundOutput: preserveManagedChildren);
         AppendCommand($"daemon {daemonArguments}", result);
+        if (isRestart)
+        {
+            // drain 延期/门禁缺失属于“明确未执行”，不能被稍后恰好健康的旧进程覆盖。
+            if (BridgeRestartCommandPolicy.IsAuthoritativeRejection(result.ExitCode, result.Stdout, result.Stderr))
+            {
+                throw new InvalidOperationException(
+                    BridgeRestartCommandPolicy.DescribeUnverifiedFailure(result.ExitCode, result.Stdout, result.Stderr));
+            }
+
+            try
+            {
+                // 包装器的 stdout/退出码只是一层回执。真正的成功条件是 PID、runId、
+                // 启动时间、审计、心跳和渠道连接均切换到同一个新运行实例。
+                await WaitForBridgeRestartReadinessAsync(previousIdentity);
+            }
+            catch (Exception verificationError) when (result.ExitCode != 0)
+            {
+                var wrapperFailure = BridgeRestartCommandPolicy.DescribeUnverifiedFailure(
+                    result.ExitCode,
+                    result.Stdout,
+                    result.Stderr);
+                throw new InvalidOperationException($"{wrapperFailure} {verificationError.Message}", verificationError);
+            }
+
+            if (result.ExitCode != 0)
+            {
+                AppendLog($"Bridge 包装器退出码为 {result.ExitCode}，但新运行实例已通过完整现场验证。");
+            }
+            return;
+        }
         if (result.ExitCode == -1 && preserveManagedChildren)
         {
             // PowerShell 包装器可能仍持有后台进程句柄；只结束包装器后，以
@@ -7518,25 +7693,14 @@ exit $LASTEXITCODE
         await CheckLocalLlmAsync(true);
     }
 
-    private async Task WaitForBridgeRestartReadinessAsync()
+    private async Task WaitForBridgeRestartReadinessAsync(BridgeRuntimeIdentitySnapshot? previousIdentity = null)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
+        var deadline = DateTimeOffset.UtcNow.Add(BridgeRestartReadiness.VerificationTimeout);
         BridgeRestartReadinessResult? last = null;
         do
         {
             var daemon = await RunPowerShellFileAsync(_daemonScript, "status", _skillDir, 60000);
-            BridgeRuntimeStatus? status = null;
-            try
-            {
-                var raw = File.Exists(_statusJsonPath) ? File.ReadAllText(_statusJsonPath, Encoding.UTF8) : "";
-                status = string.IsNullOrWhiteSpace(raw)
-                    ? null
-                    : JsonSerializer.Deserialize<BridgeRuntimeStatus>(raw, JsonOptions);
-            }
-            catch
-            {
-                // 状态文件可能正处于原子替换窗口，下一次探针会重新读取。
-            }
+            var status = ReadBridgeRuntimeStatus();
 
             var audit = ReadBridgeRuntimeAudit();
             var callbackStates = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -7550,11 +7714,13 @@ exit $LASTEXITCODE
                 DaemonReportsRunning: daemon.ExitCode == 0 && daemon.Stdout.Contains("Bridge status: running", StringComparison.OrdinalIgnoreCase),
                 BridgeProcessAlive: status is not null && status.Pid > 0 && IsProcessAlive(status.Pid),
                 ProcessManagerAlive: managerAlive,
-                StatusPid: status?.Pid ?? 0,
-                AuditPid: audit?.Pid ?? 0,
-                StatusRunId: status?.RunId,
-                AuditRunId: audit?.RunId,
+                StatusIdentity: new BridgeRuntimeIdentitySnapshot(status?.Pid ?? 0, status?.RunId, status?.StartedAt),
+                AuditIdentity: new BridgeRuntimeIdentitySnapshot(audit?.Pid ?? 0, audit?.RunId, audit?.StartedAt),
+                PreviousIdentity: previousIdentity,
                 LastHeartbeatAt: audit?.LastHeartbeatAt,
+                StatusLastExitReason: status?.LastExitReason,
+                AuditLastExitReason: audit?.LastExitReason,
+                AuditHasUnhandledError: audit?.LastUnhandledError is not null,
                 EnabledChannels: status?.Channels,
                 CallbackStates: callbackStates,
                 ObservedAt: DateTimeOffset.UtcNow));
@@ -8409,7 +8575,7 @@ exit $LASTEXITCODE
         await StopMcpAsync(manifest);
     }
 
-    private async Task StopMcpAsync(McpManifest manifest)
+    private async Task StopMcpAsync(McpManifest manifest, bool refreshState = true)
     {
         var states = LoadMcpServiceStates();
         var key = manifest.Id ?? manifest.DisplayName ?? "";
@@ -8429,10 +8595,13 @@ exit $LASTEXITCODE
             }
             states.Remove(key);
             SaveMcpServiceStates(states);
-            LoadManifests();
-            await UpdateMcpManifestStatesAsync();
-            RenderMcpList();
-            await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+            if (refreshState)
+            {
+                LoadManifests();
+                await UpdateMcpManifestStatesAsync();
+                RenderMcpList();
+                await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+            }
             return;
         }
 
@@ -8449,10 +8618,13 @@ exit $LASTEXITCODE
 
         states.Remove(key);
         SaveMcpServiceStates(states);
-        LoadManifests();
-        await UpdateMcpManifestStatesAsync();
-        RenderMcpList();
-        await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+        if (refreshState)
+        {
+            LoadManifests();
+            await UpdateMcpManifestStatesAsync();
+            RenderMcpList();
+            await RefreshSelectedMcpRuntimeStatusAsync(manifest);
+        }
     }
 
     private async Task CheckSelectedMcpAsync()
@@ -10696,6 +10868,29 @@ exit $LASTEXITCODE
             killEntireProcessTreeOnTimeout);
     }
 
+    private async Task SetMcpEnabledAsync(McpManifest manifest, bool enabled)
+    {
+        if (string.IsNullOrWhiteSpace(manifest.ManifestPath))
+        {
+            throw new InvalidOperationException("当前 MCP 没有可写的 manifest 路径。");
+        }
+
+        var root = LoadManifestNode(manifest.ManifestPath);
+        root["enabled"] = enabled;
+        SaveManifestNode(manifest.ManifestPath, root);
+        if (!enabled)
+        {
+            // 暂停必须先停止托管 helper，防止仅改配置但旧进程继续占用端口。
+            await StopMcpAsync(manifest, refreshState: false);
+        }
+        LoadManifests();
+        RenderMcpList();
+        if (_mcpList.SelectedItem is McpManifest selected)
+        {
+            _mcpRuntimeStatus.Text = enabled ? "已恢复配置；尚未启动 MCP。" : "已暂停；不会自动启动 Unity MCP。";
+        }
+    }
+
     private static async Task<ProcessResult> RunPowerShellFileWithIsolatedOutputAsync(
         string scriptPath,
         string trailingArgs,
@@ -11535,6 +11730,7 @@ internal sealed class BridgeRuntimeStatus
     public string? RunId { get; set; }
     public string? StartedAt { get; set; }
     public string[]? Channels { get; set; }
+    public string? LastExitReason { get; set; }
 }
 
 internal sealed class BridgeRuntimeAuditRecord
@@ -11549,8 +11745,16 @@ internal sealed class BridgeRuntimeAuditRecord
     public BridgeRuntimeRequestRecord? LastCompletedRequest { get; set; }
     public string? LastExitReason { get; set; }
     public string? LastExitAt { get; set; }
+    public BridgeRuntimeUnhandledErrorRecord? LastUnhandledError { get; set; }
     public BridgeRuntimeFeishuWsRecord? FeishuWs { get; set; }
     public BridgeRuntimeFeishuP2pPollRecord? FeishuP2pPoll { get; set; }
+}
+
+internal sealed class BridgeRuntimeUnhandledErrorRecord
+{
+    public string? Message { get; set; }
+    public string? Type { get; set; }
+    public string? At { get; set; }
 }
 
 internal sealed class BridgeRuntimeRequestRecord

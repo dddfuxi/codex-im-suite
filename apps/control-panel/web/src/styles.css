@@ -1413,6 +1413,17 @@ button:disabled {
   min-height: 0;
 }
 
+/*
+ * 页面内容按文档流从上到下排列。默认的 grid align-content: stretch 会在
+ * workspace 有剩余高度时拉伸各行；详情类面板内容较长时又会溢出该行，
+ * 从而被后面的提醒/状态面板绘制在上方。固定使用内容高度并让页面自身
+ * 负责滚动，避免不同页面之间出现互相覆盖。
+ */
+.content-stack {
+  align-content: start;
+  grid-auto-rows: max-content;
+}
+
 .overview-grid {
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
 }
@@ -1451,6 +1462,7 @@ button:disabled {
 .sessions-layout {
   grid-template-columns: minmax(300px, 0.7fr) minmax(360px, 0.95fr) minmax(420px, 1fr);
   align-items: start;
+  grid-auto-rows: max-content;
 }
 
 .panel,
@@ -3279,6 +3291,8 @@ button:disabled {
 
 .detail-drawer {
   min-height: 0;
+  max-height: calc(100vh - 260px);
+  overflow: auto;
 }
 
 .detail-header-actions {
@@ -4089,6 +4103,7 @@ button:disabled {
     z-index: 24;
     display: none;
     overflow: auto;
+    max-height: none;
     box-shadow: var(--overlay-shadow);
     background: var(--panel-strong);
   }
@@ -4378,6 +4393,33 @@ button:disabled {
   justify-self: start;
 }
 
+.speech-singing-lyrics textarea {
+  min-height: 150px;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.speech-singing-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.speech-singing-actions,
+.speech-receipt-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.speech-receipt-facts span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: var(--text-soft);
+  background: var(--accent-soft);
+  font-size: 12px;
+}
+
 .speech-details {
   margin-top: 14px;
 }
@@ -4524,6 +4566,10 @@ button:disabled {
   width: 100%;
 }
 
+.speech-provider-grid {
+  margin-top: 12px;
+}
+
 .speech-limit-row {
   flex-wrap: wrap;
   margin-top: 12px;
@@ -4588,7 +4634,8 @@ button:disabled {
   }
 
   .speech-settings-grid,
-  .speech-card-grid {
+  .speech-card-grid,
+  .speech-singing-options {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -4599,7 +4646,8 @@ button:disabled {
   .speech-toggle-grid,
   .speech-quick-grid,
   .speech-settings-grid,
-  .speech-card-grid {
+  .speech-card-grid,
+  .speech-singing-options {
     grid-template-columns: minmax(0, 1fr);
   }
 

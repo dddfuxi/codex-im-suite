@@ -20,6 +20,8 @@ public sealed class SpeechRuntimeGatewayTests
     [InlineData("speech.installComponent", "owner")]
     [InlineData("speech.installPresetVoice", "owner")]
     [InlineData("speech.importReferenceVoice", "owner")]
+    [InlineData("speech.renameReferenceVoice", "owner")]
+    [InlineData("speech.deleteReferenceVoice", "owner")]
     public void Policy_UsesExplicitSpeechRoles(string command, string expected)
         => Assert.Equal(expected, SpeechCommandPolicy.GetRequiredRole(command));
 
@@ -28,6 +30,8 @@ public sealed class SpeechRuntimeGatewayTests
     [InlineData("speech.installComponent", true)]
     [InlineData("speech.installPresetVoice", true)]
     [InlineData("speech.importReferenceVoice", true)]
+    [InlineData("speech.renameReferenceVoice", false)]
+    [InlineData("speech.deleteReferenceVoice", true)]
     [InlineData("speech.activateVoiceProfile", true)]
     [InlineData("speech.refresh", false)]
     [InlineData("speech.previewVoice", false)]
@@ -78,6 +82,49 @@ public sealed class SpeechRuntimeGatewayTests
     }
 
     [Fact]
+    public async Task RunActionAsync_DistinguishesReferenceRegistrationFromGenerationDeliveryAndSimilarityAcceptance()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", "")));
+
+        var receipt = await gateway.RunActionAsync("speech.importReferenceVoice", new { });
+
+        Assert.True(receipt.RestartRequired);
+        Assert.Contains("已登记", receipt.Notice);
+        Assert.Contains("尚未生成", receipt.Notice);
+        Assert.Contains("尚未发送", receipt.Notice);
+        Assert.Contains("相似度尚未验收", receipt.Notice);
+    }
+
+    [Fact]
+    public async Task RunActionAsync_ReportsManagedReferenceVoiceDeletionAndRestartRequirement()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", "")));
+
+        var receipt = await gateway.RunActionAsync("speech.deleteReferenceVoice", new { voiceProfileId = "reference-safe" });
+
+        Assert.True(receipt.RestartRequired);
+        Assert.Contains("受管音频", receipt.Notice);
+        Assert.Contains("相似度验收记录", receipt.Notice);
+        Assert.Contains("重启 Bridge", receipt.Notice);
+    }
+
+    [Fact]
+    public async Task RunActionAsync_ReportsReferenceVoiceRenameWithoutClaimingGenerationOrRestart()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", "")));
+
+        var receipt = await gateway.RunActionAsync("speech.renameReferenceVoice", new { voiceProfileId = "reference-safe", displayName = "新名称" });
+
+        Assert.False(receipt.RestartRequired);
+        Assert.Contains("名称已更新", receipt.Notice);
+        Assert.Contains("Profile ID", receipt.Notice);
+        Assert.DoesNotContain("已生成", receipt.Notice);
+    }
+
+    [Fact]
     public async Task RunAsync_UsesWhitelistCliAndUtf8Base64UrlPayload()
     {
         using var fixture = new SpeechRuntimeGatewayFixture();
@@ -92,7 +139,7 @@ public sealed class SpeechRuntimeGatewayTests
 
         Assert.True(result.RootElement.GetProperty("saved").GetBoolean());
         Assert.NotNull(captured);
-        Assert.Equal(fixture.DevelopmentCliPath, captured.Arguments[0]);
+        Assert.Equal(fixture.LiveCliPath, captured.Arguments[0]);
         Assert.Equal("speech.saveSettings", captured.Arguments[1]);
         Assert.Equal("--input-json", captured.Arguments[2]);
         var payload = DecodeBase64Url(captured.Arguments[3]);
@@ -100,6 +147,24 @@ public sealed class SpeechRuntimeGatewayTests
         Assert.Equal("飞书", document.RootElement.GetProperty("channelIds")[0].GetString());
         Assert.Equal(fixture.CtiHome, captured.Environment["CTI_HOME"]);
         Assert.False(captured.UseShellExecute);
+    }
+
+    [Fact]
+    public async Task RunAsync_FallsBackToDevelopmentCliOnlyWhenLiveCliIsMissing()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        File.Delete(fixture.LiveCliPath);
+        SpeechCliInvocation? captured = null;
+        var gateway = fixture.CreateGateway(invocation =>
+        {
+            captured = invocation;
+            return Task.FromResult(new SpeechCliExecutionResult(0, "{\"ok\":true,\"data\":{}}", ""));
+        });
+
+        using var result = await gateway.RunAsync("speech.refresh", new { });
+
+        Assert.NotNull(captured);
+        Assert.Equal(fixture.DevelopmentCliPath, captured.Arguments[0]);
     }
 
     [Fact]
@@ -235,12 +300,55 @@ public sealed class SpeechRuntimeGatewayTests
     [Theory]
     [InlineData("speech.previewVoice")]
     [InlineData("speech.previewSingingVoice")]
+    [InlineData("speech.generateSinging")]
     public async Task RunPreviewAsync_ProjectsOnlyValidatedOggOpusMedia(string command)
     {
         using var fixture = new SpeechRuntimeGatewayFixture();
         var media = Encoding.ASCII.GetBytes("OggS-safe-preview");
         var base64 = Convert.ToBase64String(media);
         var sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(media)).ToLowerInvariant();
+        var data = new JsonObject
+        {
+            ["protocol"] = "codex-im-suite/speech-preview/v2",
+            ["mediaType"] = "audio/ogg; codecs=opus",
+            ["base64"] = base64,
+            ["bytes"] = media.Length,
+            ["sha256"] = sha256,
+            ["durationMs"] = 1000,
+            ["modelId"] = "model-a",
+            ["voiceProfileId"] = "acestep.default",
+            ["generationStatus"] = "generated",
+            ["deliveryStatus"] = "not_sent",
+            ["speakerSimilarityStatus"] = "not_applicable",
+            ["validated"] = true,
+        };
+        if (command is "speech.previewSingingVoice" or "speech.generateSinging")
+        {
+            data["lyricsAlignmentStatus"] = "passed";
+            data["lyricsAlignment"] = 0.93;
+            data["lyricsAlignmentThreshold"] = 0.80;
+            data["lyricsAlignmentPassed"] = true;
+        }
+        var response = new JsonObject { ["ok"] = true, ["data"] = data }.ToJsonString();
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
+            0,
+            response,
+            "")));
+
+        var receipt = await gateway.RunPreviewAsync(command, new { lyrics = "试听", voiceProfileId = "acestep.default" });
+
+        Assert.Equal(base64, receipt.Base64);
+        Assert.Equal(media.Length, receipt.Bytes);
+        Assert.True(receipt.Validated);
+        var projected = JsonSerializer.Serialize(receipt, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+        Assert.DoesNotContain("\"speakerSimilarity\":", projected, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunPreviewAsync_AcceptsCompleteSpeakerSimilarityEvidence()
+    {
+        using var fixture = new SpeechRuntimeGatewayFixture();
+        var media = Encoding.ASCII.GetBytes("OggS-reference-preview");
         var response = JsonSerializer.Serialize(new
         {
             ok = true,
@@ -248,29 +356,34 @@ public sealed class SpeechRuntimeGatewayTests
             {
                 protocol = "codex-im-suite/speech-preview/v2",
                 mediaType = "audio/ogg; codecs=opus",
-                base64,
+                base64 = Convert.ToBase64String(media),
                 bytes = media.Length,
-                sha256,
+                sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(media)).ToLowerInvariant(),
                 durationMs = 1000,
                 modelId = "model-a",
-                voiceProfileId = "acestep.default",
+                voiceProfileId = "reference.voice",
+                generationStatus = "generated",
+                deliveryStatus = "not_sent",
+                speakerSimilarityStatus = "passed",
+                speakerSimilarity = 0.84,
+                speakerSimilarityThreshold = 0.72,
+                speakerSimilarityPassed = true,
                 validated = true,
             },
         });
-        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
-            0,
-            response,
-            "")));
+        var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(0, response, "")));
 
-        var receipt = await gateway.RunPreviewAsync(command, new { text = "试听", voiceProfileId = "acestep.default" });
+        var receipt = await gateway.RunPreviewAsync("speech.previewVoice", new { text = "试听" });
 
-        Assert.Equal(base64, receipt.Base64);
-        Assert.Equal(media.Length, receipt.Bytes);
-        Assert.True(receipt.Validated);
+        Assert.Equal(0.84, receipt.SpeakerSimilarity);
+        Assert.Equal(0.72, receipt.SpeakerSimilarityThreshold);
+        Assert.True(receipt.SpeakerSimilarityPassed);
     }
 
     [Theory]
     [InlineData("extra", "OggS-safe-preview")]
+    [InlineData("partial_similarity", "OggS-safe-preview")]
+    [InlineData("inconsistent_similarity", "OggS-safe-preview")]
     [InlineData("bad_hash", "OggS-safe-preview")]
     [InlineData("bad_header", "RIFF-not-ogg-data")]
     public async Task RunPreviewAsync_RejectsUntrustedMediaVariants(string mutation, string content)
@@ -290,9 +403,23 @@ public sealed class SpeechRuntimeGatewayTests
             ["durationMs"] = 1000,
             ["modelId"] = "model-a",
             ["voiceProfileId"] = "acestep.default",
+            ["generationStatus"] = "generated",
+            ["deliveryStatus"] = "not_sent",
+            ["speakerSimilarityStatus"] = "not_applicable",
+            ["lyricsAlignmentStatus"] = "passed",
+            ["lyricsAlignment"] = 0.93,
+            ["lyricsAlignmentThreshold"] = 0.80,
+            ["lyricsAlignmentPassed"] = true,
             ["validated"] = true,
         };
         if (mutation == "extra") data["path"] = "C:/must-not-leak.ogg";
+        if (mutation == "partial_similarity") data["speakerSimilarity"] = 0.84;
+        if (mutation == "inconsistent_similarity")
+        {
+            data["speakerSimilarity"] = 0.84;
+            data["speakerSimilarityThreshold"] = 0.72;
+            data["speakerSimilarityPassed"] = false;
+        }
         var response = new JsonObject { ["ok"] = true, ["data"] = data }.ToJsonString();
         var gateway = fixture.CreateGateway(_ => Task.FromResult(new SpeechCliExecutionResult(
             0,
@@ -384,14 +511,15 @@ public sealed class SpeechRuntimeGatewayTests
     public void ReferenceVoiceImportMetadata_RequiresIndependentSafetyConfirmations()
     {
         using var valid = JsonDocument.Parse("""
-        {"displayName":"授权音色","transcript":"这是一段准确转写。","sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":true}
+        {"displayName":"授权音色","transcript":"这是一段准确转写。","transcriptConfirmed":true,"sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":true}
         """);
         var metadata = MainForm.ReadSpeechReferenceVoiceImportMetadata(valid.RootElement);
         Assert.True(metadata.AuthorizationConfirmed);
+        Assert.True(metadata.TranscriptConfirmed);
         Assert.True(metadata.CleanSingleSpeakerConfirmed);
 
         using var missingClean = JsonDocument.Parse("""
-        {"displayName":"授权音色","transcript":"这是一段准确转写。","sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":false}
+        {"displayName":"授权音色","transcript":"这是一段准确转写。","transcriptConfirmed":true,"sourceLabel":"用户本人录音","license":"本人授权","authorizationConfirmed":true,"cleanSingleSpeakerConfirmed":false}
         """);
         var error = Assert.Throws<SpeechRuntimeGatewayException>(() =>
             MainForm.ReadSpeechReferenceVoiceImportMetadata(missingClean.RootElement));
@@ -445,7 +573,31 @@ public sealed class SpeechRuntimeGatewayTests
     }
 
     private const string ValidStatusJson = """
-    {"protocol":"codex-im-suite/speech-status/v2","state":"ready","inputEnabled":true,"outputEnabled":true,"singingEnabled":false,"channels":[{"id":"feishu","displayName":"飞书","state":"ready","enabled":true,"inputSupported":true,"outputSupported":true,"selected":true}],"replyPolicy":{"value":"on","options":[{"id":"on","displayName":"开启","state":"ready","enabled":true}]},"deliveryMode":{"value":"voice_only","options":[{"id":"voice_only","displayName":"仅语音","state":"ready","enabled":true}]},"asrProvider":{"value":"asr","options":[{"id":"asr","displayName":"ASR","state":"ready","enabled":true}]},"ttsProvider":{"value":"tts","options":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true}]},"ttsModel":{"value":"model-a","liveValue":"model-a","restartRequired":false,"options":[{"id":"model-a","displayName":"模型 A","state":"ready","enabled":true,"providerId":"tts","variant":"custom_voice","sizeLabel":"1.7B","componentId":"model-a","capabilities":["preset_voice","instruction_control"],"defaultVoiceProfileId":"voice","benchmark":{"state":"ready","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]},"tonePolicy":{"value":"adaptive_natural","options":[{"id":"adaptive_natural","displayName":"自适应自然","state":"ready","enabled":true}]},"singingProvider":{"value":"ace_step_1_5","options":[{"id":"ace_step_1_5","displayName":"ACE-Step 1.5","state":"blocked","enabled":true}]},"singingBenchmark":{"state":"optional_missing","revision":"uninstalled","diagnosticCode":"singing_benchmark_not_verified"},"activeVoiceProfileId":"voice","activeSingingVoiceProfileId":"","capabilities":[{"id":"speech.input","displayName":"语音输入","state":"ready","supported":true}],"components":[{"id":"sensevoice","displayName":"SenseVoice","kind":"model","state":"optional_missing","installable":true,"capabilities":["asr"]}],"voiceProfiles":[{"id":"voice","displayName":"预设音色","kind":"preset","state":"ready","active":true,"license":"内置","sourceLabel":"Runtime","authorizationConfirmed":true,"capabilities":["speech"],"compatibleTtsModelIds":["model-a"]}],"limits":{"maxInputBytes":1024,"maxInputDurationSeconds":60,"maxOutputCharacters":500,"maxPreviewCharacters":240,"maxSongDurationSeconds":60},"actions":[{"id":"speech.previewVoice","label":"试听","enabled":true},{"id":"speech.previewSingingVoice","label":"试听歌声","enabled":false,"diagnosticCode":"singing_benchmark_not_verified"}],"lastCheckedAt":"2026-08-07T00:00:00.000Z"}
+    {
+      "protocol":"codex-im-suite/speech-status/v2",
+      "state":"ready",
+      "inputEnabled":true,
+      "outputEnabled":true,
+      "singingEnabled":false,
+      "channels":[{"id":"feishu","displayName":"飞书","state":"ready","enabled":true,"inputSupported":true,"outputSupported":true,"selected":true}],
+      "replyPolicy":{"value":"on","options":[{"id":"on","displayName":"开启","state":"ready","enabled":true}]},
+      "deliveryMode":{"value":"voice_only","options":[{"id":"voice_only","displayName":"仅语音","state":"ready","enabled":true}]},
+      "asrProvider":{"value":"asr","options":[{"id":"asr","displayName":"ASR","state":"ready","enabled":true}]},
+      "ttsProvider":{"value":"tts","options":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true}]},
+      "ttsModel":{"value":"model-a","liveValue":"model-a","restartRequired":false,"options":[{"id":"model-a","displayName":"模型 A","state":"ready","enabled":true,"providerId":"tts","variant":"custom_voice","sizeLabel":"1.7B","qualityTier":"high_quality","qualityRank":300,"componentId":"model-a","capabilities":["preset_voice","instruction_control"],"defaultVoiceProfileId":"voice","benchmark":{"state":"ready","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]},
+      "tonePolicy":{"value":"adaptive_natural","options":[{"id":"adaptive_natural","displayName":"自适应自然","state":"ready","enabled":true}]},
+      "singingProvider":{"value":"ace_step_1_5","options":[{"id":"ace_step_1_5","displayName":"ACE-Step 1.5","state":"blocked","enabled":true}]},
+      "singingBenchmark":{"state":"optional_missing","revision":"uninstalled","diagnosticCode":"singing_benchmark_not_verified"},
+      "activeVoiceProfileId":"voice",
+      "activeSingingVoiceProfileId":"",
+      "providers":[{"id":"tts","displayName":"TTS","state":"ready","enabled":true,"experimental":false,"license":"Apache-2.0","capabilities":["speech.text"]}],
+      "capabilities":[{"id":"speech.input","displayName":"语音输入","state":"ready","supported":true}],
+      "components":[{"id":"sensevoice","displayName":"SenseVoice","kind":"model","state":"optional_missing","installable":true,"capabilities":["asr"]}],
+      "voiceProfiles":[{"id":"voice","displayName":"预设音色","kind":"preset","state":"ready","active":true,"license":"内置","sourceLabel":"Runtime","authorizationConfirmed":true,"capabilities":["speech"],"compatibleTtsModelIds":["model-a"],"speechAcceptance":{"state":"not_applicable"},"singingAcceptance":{"state":"not_applicable"}}],
+      "limits":{"maxInputBytes":1024,"maxInputDurationSeconds":60,"maxOutputCharacters":500,"maxPreviewCharacters":240,"maxSongLyricsCharacters":6000,"maxSongDurationSeconds":60},
+      "actions":[{"id":"speech.previewVoice","label":"试听","enabled":true},{"id":"speech.previewSingingVoice","label":"试听歌声","enabled":false,"diagnosticCode":"singing_benchmark_not_verified"},{"id":"speech.generateSinging","label":"完整生成","enabled":false,"diagnosticCode":"singing_benchmark_not_verified"}],
+      "lastCheckedAt":"2026-08-07T00:00:00.000Z"
+    }
     """;
 
     private sealed class SpeechRuntimeGatewayFixture : IDisposable
@@ -457,9 +609,12 @@ public sealed class SpeechRuntimeGatewayTests
             SkillRoot = Path.Combine(Root, "live-skill");
             CtiHome = Path.Combine(Root, "cti-home");
             DevelopmentCliPath = Path.Combine(SuiteRoot, "packages", "bridge-runtime", "dist", "speech-control-cli.mjs");
+            LiveCliPath = Path.Combine(SkillRoot, "dist", "speech-control-cli.mjs");
             Directory.CreateDirectory(Path.GetDirectoryName(DevelopmentCliPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(LiveCliPath)!);
             Directory.CreateDirectory(CtiHome);
             File.WriteAllText(DevelopmentCliPath, "// fixture", new UTF8Encoding(false));
+            File.WriteAllText(LiveCliPath, "// fixture", new UTF8Encoding(false));
         }
 
         public string Root { get; }
@@ -467,6 +622,7 @@ public sealed class SpeechRuntimeGatewayTests
         public string SkillRoot { get; }
         public string CtiHome { get; }
         public string DevelopmentCliPath { get; }
+        public string LiveCliPath { get; }
 
         public SpeechRuntimeGateway CreateGateway(SpeechCliCommandExecutor executor)
             => new(SuiteRoot, SkillRoot, CtiHome, executor, "node");

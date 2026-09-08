@@ -1,4 +1,5 @@
 import type { SpeechPanelStateContract } from './speech-contract.js';
+import type { PanelSettingsStateContract } from './panel-settings.js';
 
 export type ControlApiRole = 'viewer' | 'operator' | 'owner';
 
@@ -76,7 +77,7 @@ export interface ControlPanelStateSections {
   mcp: unknown;
   release: unknown;
   liveSync: unknown;
-  settings: unknown;
+  settings: PanelSettingsStateContract;
   history: unknown;
   speech: SpeechPanelStateContract;
   workflow: unknown;

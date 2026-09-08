@@ -18,12 +18,16 @@ import type {
   WorkflowRecoveryInputEvidenceRefContract,
   WorkflowReplaySafety,
   WorkflowRetryDisposition,
+  PanelSettingChangeContract,
+  PanelSettingsSnapshotContract,
+  PanelSettingsUpdateReceiptContract,
 } from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
 import type {
   FeishuCliUserAuthorizationChallenge,
   FeishuCliUserAuthorizationPolicyViolation,
+  FeishuCliUserMissingScopeEvidence,
 } from './feishu-cli-user-auth.js';
 import type { TurnWorkspacePlan } from './workspace-plan.js';
 import type {
@@ -108,6 +112,12 @@ export interface SpeechSynthesisReceipt {
   ttsModelId: string;
   modelRevision: string;
   voiceProfileId: string | null;
+  generationStatus: 'generated';
+  deliveryStatus: 'not_sent';
+  speakerSimilarityStatus: 'passed' | 'not_verified' | 'not_applicable';
+  speakerSimilarity?: number;
+  speakerSimilarityThreshold?: number;
+  speakerSimilarityPassed?: true;
 }
 
 export interface SpeechReferenceVoiceAuthorization {
@@ -124,6 +134,15 @@ export interface SpeechReferenceVoiceAuthorization {
   expiresAt: string;
 }
 
+/**
+ * Runtime 只向 Core 暴露受限的参考音色导入策略。开启自动授权仅表示唯一
+ * Bridge Owner 上传自己的录音时不用重复确认权利与本机用途；来源、参考文本、
+ * 音频质量和说话人相似度门禁仍由 Core/Runtime 分层校验。
+ */
+export interface SpeechReferenceVoiceImportPolicy {
+  ownerSelfVoiceAutoAuthorization: boolean;
+}
+
 export interface SpeechReferenceVoiceImportReceipt {
   protocol: 'cti-speech-reference-voice-import/v1';
   voiceProfileId: string;
@@ -133,6 +152,8 @@ export interface SpeechReferenceVoiceImportReceipt {
   attachmentId: string;
   fileSha256: string;
   authorizationExpiresAt: string;
+  registrationStatus: 'registered';
+  speakerSimilarityStatus: 'not_verified';
   validated: true;
 }
 
@@ -146,7 +167,17 @@ export interface SingingSynthesisReceipt {
   requestSha256: string;
   fileSha256: string;
   validated: true;
+  generationStatus: 'generated';
+  deliveryStatus: 'not_sent';
   voiceProfileId?: string;
+  speakerSimilarityStatus: 'passed' | 'not_applicable';
+  speakerSimilarity?: number;
+  speakerSimilarityThreshold?: number;
+  speakerSimilarityPassed?: true;
+  lyricsAlignmentStatus: 'passed';
+  lyricsAlignment: number;
+  lyricsAlignmentThreshold: number;
+  lyricsAlignmentPassed: true;
 }
 
 export type LocalAudioSynthesisReceipt = SpeechSynthesisReceipt | SingingSynthesisReceipt;
@@ -158,6 +189,7 @@ export type LocalAudioSynthesisReceipt = SpeechSynthesisReceipt | SingingSynthes
  */
 export interface SpeechHost {
   getReplyPolicy?(): SpeechReplyPolicy;
+  getReferenceVoiceImportPolicy?(): SpeechReferenceVoiceImportPolicy;
   /**
    * 返回当前 Runtime 实际就绪的模型/版本/音色快照。缺失或无效时 Core
    * 失败关闭为文字交付，不允许自行猜默认模型或音色。
@@ -178,6 +210,8 @@ export interface SpeechHost {
   synthesize(input: {
     text: string;
     expectedIdentity: SpeechSynthesisIdentity;
+    /** 模型只能要求已激活参考音色类别，Runtime 仍独占具体 profile 解析。 */
+    voiceRequirement?: 'active_reference';
     scratchDir?: string;
     signal?: AbortSignal;
   }): Promise<SpeechSynthesisReceipt>;
@@ -195,6 +229,9 @@ export interface SpeechHost {
     fileKey: string;
     attachmentId: string;
     transcript: SpeechTranscriptReceipt;
+    confirmedTranscript?: string;
+    confirmedTranscriptSource?: 'user_confirmed' | 'runtime_revalidated';
+    confirmedTranscriptAccepted: true;
     authorization: SpeechReferenceVoiceAuthorization;
     signal?: AbortSignal;
   }): Promise<SpeechReferenceVoiceImportReceipt>;
@@ -215,6 +252,8 @@ export interface SingingHost {
     lyrics: string;
     vocalLanguage: string;
     durationSeconds: number;
+    /** 类别要求；Runtime 只能从当前配置解析，Core/模型不能传具体 ID。 */
+    voiceRequirement?: 'active_reference';
     scratchDir?: string;
     signal?: AbortSignal;
   }): Promise<SingingSynthesisReceipt>;
@@ -470,6 +509,7 @@ export interface AnswerReviewInput {
     inputEvidenceProvider?: string;
     feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
     feishuCliUserAuthorizationViolations?: FeishuCliUserAuthorizationPolicyViolation[];
+    feishuCliUserMissingScopes?: FeishuCliUserMissingScopeEvidence[];
   };
 }
 
@@ -549,6 +589,17 @@ export interface MemoryWriteIntentDecision {
 
 export interface MemoryIntentHost {
   classifyMemoryWrite(input: MemoryWriteIntentInput): Promise<MemoryWriteIntentDecision>;
+}
+
+/** 只判断可信已完成结果的回复是否提出修订，不执行工具或生成回复。 */
+export interface ContinuationAdjustmentIntentInput {
+  sessionId: string;
+  currentText: string;
+  recoveredCompletedContext: string;
+}
+
+export interface ContinuationAdjustmentIntentHost {
+  classifyContinuationAdjustment(input: ContinuationAdjustmentIntentInput): Promise<'adjust' | 'not_adjust' | 'ambiguous'>;
 }
 
 /** Runtime-owned sticker semantic persistence and policy boundary. */
@@ -698,7 +749,7 @@ export interface ChoicePromptStateEntrySnapshot {
   continuationParticipantKey?: string;
   choiceSession?: {
     mode: 'single_user' | 'vote' | 'claim' | 'parallel';
-    audience: 'initiator' | 'chat_members';
+    audience: 'initiator' | 'participant' | 'chat_members';
     state: 'active' | 'complete';
     durationSeconds?: number;
     allowChange?: boolean;
@@ -918,7 +969,7 @@ export interface FeishuOAuthManualHost {
   handleManualCallbackText(input: FeishuOAuthManualCallbackInput): Promise<FeishuOAuthManualCallbackResult>;
 }
 
-// ── Host Interface: lark-cli shared user authorization ──────
+// ── Host Interface: lark-cli per-user authorization ─────────
 
 export interface FeishuCliUserAuthBeginInput extends FeishuOAuthManualResumeRequest {
   challenge: FeishuCliUserAuthorizationChallenge;
@@ -1176,6 +1227,8 @@ export interface StreamChatParams {
   interactionMode?: 'agent' | 'classifier' | 'response_only';
   /** provider 原生支持时用于约束 classifier 的最终 JSON。 */
   responseSchema?: unknown;
+  /** Bridge 已依据结构化回合焦点裁决：本轮是否可进入受限轻聊快速路径。 */
+  lightChatEligible?: boolean;
   model?: string;
   systemPrompt?: string;
   /** 本轮必须优先保留的关联证据，独立于可截断的 systemPrompt。 */
@@ -1235,7 +1288,12 @@ export type ScheduledTaskScheduleInput =
   | { kind: 'cron'; expression: string; timezone: string };
 
 export type ScheduledTaskActionInput =
-  | { kind: 'notify'; text: string }
+  | {
+      kind: 'notify';
+      text: string;
+      /** 仅由创建计划任务时的明确用户要求签发；具体模型和音色仍归 Runtime。 */
+      speech?: { mode: 'voice_only' };
+    }
   | {
       kind: 'check_in';
       text: string;
@@ -1430,6 +1488,27 @@ export interface BridgeRestartScheduleResult {
  */
 export interface BridgeControlHost {
   scheduleRestart(input: BridgeRestartRequest): Promise<BridgeRestartScheduleResult>;
+}
+
+export interface PanelSettingsActor {
+  role: 'owner';
+  channelType: string;
+  chatId: string;
+  userId: string;
+  messageId?: string;
+}
+
+/**
+ * Runtime 独占的面板设置边界。Core 只能提交共享目录中的稳定 key 和标量值；
+ * env 名、敏感值、路径落盘与版本冲突均由 Runtime 重新校验。
+ */
+export interface PanelSettingsHost {
+  list(input: { actor: PanelSettingsActor }): Promise<PanelSettingsSnapshotContract>;
+  update(input: {
+    actor: PanelSettingsActor;
+    changes: PanelSettingChangeContract[];
+    expectedVersion?: string;
+  }): Promise<PanelSettingsUpdateReceiptContract>;
 }
 
 // ── Host Interface: Extension Catalog Actions ────────────────

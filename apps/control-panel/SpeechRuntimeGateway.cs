@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ClaudeToImControlPanel;
 
@@ -19,14 +20,16 @@ internal delegate Task<SpeechCliExecutionResult> SpeechCliCommandExecutor(Speech
 // 以下 DTO 只镜像 packages/contracts/schemas/speech.schema.json，不承载业务裁决。
 internal sealed record SpeechSelectionOptionContract(string Id, string DisplayName, string State, bool Enabled, string? DiagnosticCode);
 internal sealed record SpeechSelectionContract(string Value, SpeechSelectionOptionContract[] Options);
-internal sealed record SpeechModelBenchmarkContract(string State, string Revision, string? TestedAt, double? ColdStartMs, double? WarmSynthesisMs, double? OutputDurationMs, double? RealTimeFactor, double? PeakVramMiB, string? DiagnosticCode);
-internal sealed record SpeechModelOptionContract(string Id, string DisplayName, string State, bool Enabled, string? DiagnosticCode, string ProviderId, string Variant, string SizeLabel, string ComponentId, string[] Capabilities, string DefaultVoiceProfileId, SpeechModelBenchmarkContract Benchmark);
+internal sealed record SpeechModelBenchmarkContract(string State, string Revision, string? TestedAt, double? ColdStartMs, double? WarmSynthesisMs, double? OutputDurationMs, double? RealTimeFactor, double? PeakVramMiB, string? VoiceProfileId, double? SpeakerSimilarity, double? SpeakerSimilarityThreshold, bool? SpeakerSimilarityPassed, double? LyricsAlignment, double? LyricsAlignmentThreshold, bool? LyricsAlignmentPassed, string? DiagnosticCode);
+internal sealed record SpeechModelOptionContract(string Id, string DisplayName, string State, bool Enabled, string? DiagnosticCode, string ProviderId, string Variant, string SizeLabel, string QualityTier, double QualityRank, string ComponentId, string[] Capabilities, string DefaultVoiceProfileId, SpeechModelBenchmarkContract Benchmark);
 internal sealed record SpeechModelSelectionContract(string Value, string LiveValue, bool RestartRequired, SpeechModelOptionContract[] Options);
 internal sealed record SpeechChannelContract(string Id, string DisplayName, string State, bool Enabled, string? DiagnosticCode, bool InputSupported, bool OutputSupported, bool Selected);
 internal sealed record SpeechCapabilityContract(string Id, string DisplayName, string State, bool Supported, string? DiagnosticCode);
 internal sealed record SpeechComponentContract(string Id, string DisplayName, string Kind, string State, bool Installable, string? Version, string[] Capabilities, string? DiagnosticCode);
-internal sealed record SpeechVoiceProfileContract(string Id, string DisplayName, string Kind, string State, bool Active, string License, string SourceLabel, bool AuthorizationConfirmed, string[] Capabilities, string[] CompatibleTtsModelIds, string? DiagnosticCode);
-internal sealed record SpeechLimitsContract(long MaxInputBytes, double MaxInputDurationSeconds, int MaxOutputCharacters, int MaxPreviewCharacters, int MaxSongDurationSeconds);
+internal sealed record SpeechProviderContract(string Id, string DisplayName, string State, bool Enabled, bool Experimental, string License, string[] Capabilities, string? DiagnosticCode);
+internal sealed record SpeechVoiceAcceptanceContract(string State, string? ProviderId, string? ModelId, string? Revision, string? TestedAt, double? Similarity, double? SimilarityThreshold, double? LyricsAlignment, double? LyricsAlignmentThreshold, string? DiagnosticCode);
+internal sealed record SpeechVoiceProfileContract(string Id, string DisplayName, string Kind, string State, bool Active, string License, string SourceLabel, bool AuthorizationConfirmed, string[] Capabilities, string[] CompatibleTtsModelIds, SpeechVoiceAcceptanceContract SpeechAcceptance, SpeechVoiceAcceptanceContract SingingAcceptance, string? DiagnosticCode);
+internal sealed record SpeechLimitsContract(long MaxInputBytes, double MaxInputDurationSeconds, int MaxOutputCharacters, int MaxPreviewCharacters, int MaxSongLyricsCharacters, int MaxSongDurationSeconds);
 internal sealed record SpeechActionContract(string Id, string Label, bool Enabled, string? DiagnosticCode);
 internal sealed record SpeechSettingsContract(string Schema, bool InputEnabled, bool OutputEnabled, bool SingingEnabled, string[] ChannelIds, string ReplyPolicy, string DeliveryMode, string AsrProvider, string TtsProvider, string TtsModelId, string TonePolicy, string SingingProvider, string ActiveVoiceProfileId, string ActiveSingingVoiceProfileId);
 internal sealed record SpeechStatusContract(
@@ -46,6 +49,7 @@ internal sealed record SpeechStatusContract(
     SpeechModelBenchmarkContract SingingBenchmark,
     string ActiveVoiceProfileId,
     string ActiveSingingVoiceProfileId,
+    SpeechProviderContract[] Providers,
     SpeechCapabilityContract[] Capabilities,
     SpeechComponentContract[] Components,
     SpeechVoiceProfileContract[] VoiceProfiles,
@@ -64,6 +68,23 @@ internal sealed record SpeechPreviewReceiptContract(
     double DurationMs,
     string ModelId,
     string VoiceProfileId,
+    string GenerationStatus,
+    string DeliveryStatus,
+    string SpeakerSimilarityStatus,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    double? SpeakerSimilarity,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    double? SpeakerSimilarityThreshold,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    bool? SpeakerSimilarityPassed,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    string? LyricsAlignmentStatus,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    double? LyricsAlignment,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    double? LyricsAlignmentThreshold,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    bool? LyricsAlignmentPassed,
     bool Validated);
 
 internal static class SpeechCommandPolicy
@@ -71,8 +92,8 @@ internal static class SpeechCommandPolicy
     public static string? GetRequiredRole(string command) => command switch
     {
         "speech.refresh" => "viewer",
-        "speech.saveSettings" or "speech.previewVoice" or "speech.previewSingingVoice" or "speech.activateVoiceProfile" or "speech.benchmarkTtsModel" or "speech.benchmarkSingingModel" => "operator",
-        "speech.installComponent" or "speech.installPresetVoice" or "speech.importReferenceVoice" => "owner",
+        "speech.saveSettings" or "speech.previewVoice" or "speech.previewSingingVoice" or "speech.generateSinging" or "speech.activateVoiceProfile" or "speech.benchmarkTtsModel" or "speech.benchmarkSingingModel" => "operator",
+        "speech.installComponent" or "speech.installPresetVoice" or "speech.importReferenceVoice" or "speech.renameReferenceVoice" or "speech.deleteReferenceVoice" => "owner",
         _ => null,
     };
 
@@ -83,6 +104,7 @@ internal static class SpeechCommandPolicy
         "speech.installComponent" or
         "speech.installPresetVoice" or
         "speech.importReferenceVoice" or
+        "speech.deleteReferenceVoice" or
         "speech.activateVoiceProfile" => true,
         _ => false,
     };
@@ -93,6 +115,7 @@ internal static class SpeechCommandPolicy
     {
         "speech.installComponent" or "speech.installPresetVoice" => 60 * 60 * 1000,
         "speech.benchmarkTtsModel" or "speech.benchmarkSingingModel" => 15 * 60 * 1000,
+        "speech.generateSinging" => 15 * 60 * 1000,
         "speech.previewVoice" or "speech.previewSingingVoice" or "speech.importReferenceVoice" => 5 * 60 * 1000,
         _ => 2 * 60 * 1000,
     };
@@ -122,7 +145,7 @@ internal sealed class SpeechRuntimeGateway
 {
     internal const string StatusProtocol = "codex-im-suite/speech-status/v2";
     internal const string PreviewProtocol = "codex-im-suite/speech-preview/v2";
-    private const int MaxPreviewBytes = 4 * 1024 * 1024;
+    private const int MaxPreviewBytes = 16 * 1024 * 1024;
     private static readonly HashSet<string> AllowedCommands = new(StringComparer.Ordinal)
     {
         "speech.refresh",
@@ -132,8 +155,11 @@ internal sealed class SpeechRuntimeGateway
         "speech.benchmarkTtsModel",
         "speech.benchmarkSingingModel",
         "speech.importReferenceVoice",
+        "speech.renameReferenceVoice",
+        "speech.deleteReferenceVoice",
         "speech.previewVoice",
         "speech.previewSingingVoice",
+        "speech.generateSinging",
         "speech.activateVoiceProfile",
     };
     private static readonly HashSet<string> AllowedStates = new(StringComparer.Ordinal)
@@ -197,11 +223,20 @@ internal sealed class SpeechRuntimeGateway
         using var data = await RunAsync(command, input, timeoutMs > 0 ? timeoutMs : SpeechCommandPolicy.GetTimeoutMs(command), cancellationToken);
         // 普通动作的 Runtime data 不直接外发。
         var restartRequired = SpeechCommandPolicy.RequiresBridgeRestart(command);
+        var notice = command == "speech.importReferenceVoice"
+            ? "参考音色已登记：参考文本已通过 live ASR 核对；尚未生成语音；尚未发送；音色相似度尚未验收。请切换复刻模型并完成真实性能测试。"
+            : command == "speech.renameReferenceVoice"
+                ? "参考音色名称已更新；稳定 Profile ID、受管音频、授权与相似度记录均未改变。"
+            : command == "speech.deleteReferenceVoice"
+                ? "参考音色、受管音频与相似度验收记录已删除；请受控重启 Bridge 后再做现场验收。"
+            : restartRequired
+                ? "语音配置已写入；请在服务页受控重启 Bridge 后再做现场验收。"
+                : null;
         return new SpeechCommandReceiptContract(
             command,
             true,
             restartRequired,
-            restartRequired ? "语音配置已写入；请在服务页受控重启 Bridge 后再做现场验收。" : null);
+            notice);
     }
 
     public Task<SpeechPreviewReceiptContract> RunPreviewAsync(
@@ -216,13 +251,16 @@ internal sealed class SpeechRuntimeGateway
         int timeoutMs = 0,
         CancellationToken cancellationToken = default)
     {
-        if (command is not ("speech.previewVoice" or "speech.previewSingingVoice"))
+        if (command is not ("speech.previewVoice" or "speech.previewSingingVoice" or "speech.generateSinging"))
         {
             throw new SpeechRuntimeGatewayException("speech_action_not_allowed");
         }
         using var data = await RunAsync(command, input, timeoutMs > 0 ? timeoutMs : SpeechCommandPolicy.GetTimeoutMs(command), cancellationToken);
         var preview = JsonSerializer.Deserialize<SpeechPreviewReceiptContract>(data.RootElement.GetRawText(), JsonOptions);
-        if (!IsValidPreviewReceipt(data.RootElement, preview))
+        if (!IsValidPreviewReceipt(
+            data.RootElement,
+            preview,
+            requireLyricsAcceptance: command is "speech.previewSingingVoice" or "speech.generateSinging"))
         {
             throw new SpeechRuntimeGatewayException("speech_preview_response_invalid");
         }
@@ -324,9 +362,12 @@ internal sealed class SpeechRuntimeGateway
     {
         var candidates = new[]
         {
-            Path.Combine(_suiteRoot, "packages", "bridge-runtime", "dist", "speech-control-cli.mjs"),
             Path.Combine(_skillRoot, "dist", "speech-control-cli.mjs"),
+            Path.Combine(_suiteRoot, "packages", "bridge-runtime", "dist", "speech-control-cli.mjs"),
         };
+        // 面板控制的是当前 live Runtime，CLI 必须优先来自同一 live 发布包。
+        // 开发仓库可能已经构建了更新协议；反向优先会把新 CLI 接到旧 daemon，
+        // 使随机 nonce 正常也被误报为 response owner mismatch。
         return candidates.FirstOrDefault(File.Exists)
             ?? throw new SpeechRuntimeGatewayException("speech_cli_missing");
     }
@@ -346,6 +387,11 @@ internal sealed class SpeechRuntimeGateway
             && IsValidModelSelection(status.TtsModel)
             && IsValidSelection(status.TonePolicy)
             && IsValidSelection(status.SingingProvider)
+            && HasUniqueNonEmptyIds(status.Providers, item => item.Id, item =>
+                !string.IsNullOrWhiteSpace(item.DisplayName)
+                && AllowedStates.Contains(item.State)
+                && !string.IsNullOrWhiteSpace(item.License)
+                && HasUniqueNonEmptyStrings(item.Capabilities))
             && HasUniqueNonEmptyIds(status.Capabilities, item => item.Id, item =>
                 !string.IsNullOrWhiteSpace(item.DisplayName) && AllowedStates.Contains(item.State))
             && HasUniqueNonEmptyIds(status.Components, item => item.Id, item =>
@@ -359,7 +405,9 @@ internal sealed class SpeechRuntimeGateway
                 && AllowedStates.Contains(item.State)
                 && HasUniqueNonEmptyStrings(item.Capabilities)
                 && item.Capabilities.All(capability => capability is "speech" or "singing")
-                && HasUniqueNonEmptyStrings(item.CompatibleTtsModelIds))
+                && HasUniqueNonEmptyStrings(item.CompatibleTtsModelIds)
+                && IsValidAcceptance(item.SpeechAcceptance)
+                && IsValidAcceptance(item.SingingAcceptance))
             && (string.IsNullOrEmpty(status.ActiveVoiceProfileId)
                 || status.VoiceProfiles.Any(item => string.Equals(item.Id, status.ActiveVoiceProfileId, StringComparison.Ordinal)))
             && (string.IsNullOrEmpty(status.ActiveSingingVoiceProfileId)
@@ -371,16 +419,35 @@ internal sealed class SpeechRuntimeGateway
             && status.Limits.MaxInputDurationSeconds >= 0
             && status.Limits.MaxOutputCharacters >= 0
             && status.Limits.MaxPreviewCharacters is >= 1 and <= 240
+            && status.Limits.MaxSongLyricsCharacters is >= 1 and <= 20000
             && status.Limits.MaxSongDurationSeconds is >= 10 and <= 600
             && HasUniqueNonEmptyIds(status.Actions, item => item.Id, item => !string.IsNullOrWhiteSpace(item.Label));
 
-    private static bool IsValidPreviewReceipt(JsonElement raw, SpeechPreviewReceiptContract? receipt)
+    private static bool IsValidPreviewReceipt(
+        JsonElement raw,
+        SpeechPreviewReceiptContract? receipt,
+        bool requireLyricsAcceptance)
     {
+        var propertyNames = raw.ValueKind == JsonValueKind.Object
+            ? raw.EnumerateObject().Select(property => property.Name).ToHashSet(StringComparer.Ordinal)
+            : [];
+        var similarityNames = new[] { "speakerSimilarity", "speakerSimilarityThreshold", "speakerSimilarityPassed" };
+        var hasAnySimilarity = similarityNames.Any(propertyNames.Contains);
+        var hasAllSimilarity = similarityNames.All(propertyNames.Contains);
+        var lyricsNames = new[] { "lyricsAlignmentStatus", "lyricsAlignment", "lyricsAlignmentThreshold", "lyricsAlignmentPassed" };
+        var hasAnyLyrics = lyricsNames.Any(propertyNames.Contains);
+        var hasAllLyrics = lyricsNames.All(propertyNames.Contains);
         if (receipt is null
             || raw.ValueKind != JsonValueKind.Object
-            || raw.EnumerateObject().Count() != 9
+            || propertyNames.Count != 12 + (hasAllSimilarity ? 3 : 0) + (hasAllLyrics ? 4 : 0)
+            || hasAnySimilarity != hasAllSimilarity
+            || hasAnyLyrics != hasAllLyrics
+            || requireLyricsAcceptance != hasAllLyrics
             || !string.Equals(receipt.Protocol, PreviewProtocol, StringComparison.Ordinal)
             || !string.Equals(receipt.MediaType, "audio/ogg; codecs=opus", StringComparison.Ordinal)
+            || !string.Equals(receipt.GenerationStatus, "generated", StringComparison.Ordinal)
+            || !string.Equals(receipt.DeliveryStatus, "not_sent", StringComparison.Ordinal)
+            || receipt.SpeakerSimilarityStatus is not ("passed" or "not_applicable")
             || !receipt.Validated
             || string.IsNullOrEmpty(receipt.Base64)
             || receipt.Bytes <= 0
@@ -395,7 +462,34 @@ internal sealed class SpeechRuntimeGateway
             || !receipt.VoiceProfileId.All(ch => char.IsAsciiLetterOrDigit(ch) || ch is '.' or '_' or '-')
             || string.IsNullOrEmpty(receipt.Sha256)
             || receipt.Sha256.Length != 64
-            || !receipt.Sha256.All(ch => ch is >= '0' and <= '9' or >= 'a' and <= 'f'))
+            || !receipt.Sha256.All(ch => ch is >= '0' and <= '9' or >= 'a' and <= 'f')
+            || (receipt.SpeakerSimilarityStatus == "passed" && (!hasAllSimilarity
+                || receipt.SpeakerSimilarity is not double similarity
+                || !double.IsFinite(similarity)
+                || similarity is < -1 or > 1
+                || receipt.SpeakerSimilarityThreshold is not double threshold
+                || !double.IsFinite(threshold)
+                || threshold is < 0 or > 1
+                || receipt.SpeakerSimilarityPassed is not bool passed
+                || !passed
+                || similarity < threshold))
+            || (receipt.SpeakerSimilarityStatus == "not_applicable" && hasAnySimilarity)
+            || (hasAllLyrics && (
+                receipt.LyricsAlignmentStatus != "passed"
+                || receipt.LyricsAlignment is not double alignment
+                || !double.IsFinite(alignment)
+                || alignment is < 0 or > 1
+                || receipt.LyricsAlignmentThreshold is not double alignmentThreshold
+                || !double.IsFinite(alignmentThreshold)
+                || alignmentThreshold is < 0 or > 1
+                || receipt.LyricsAlignmentPassed is not true
+                || alignment < alignmentThreshold))
+            || (!hasAllLyrics && (
+                receipt.LyricsAlignmentStatus is not null
+                || receipt.LyricsAlignment is not null
+                || receipt.LyricsAlignmentThreshold is not null
+                || receipt.LyricsAlignmentPassed is not null))
+            )
         {
             return false;
         }
@@ -422,6 +516,9 @@ internal sealed class SpeechRuntimeGateway
         var allowed = new HashSet<string>(StringComparer.Ordinal)
         {
             "protocol", "mediaType", "base64", "bytes", "sha256", "durationMs", "modelId", "voiceProfileId", "validated",
+            "generationStatus", "deliveryStatus", "speakerSimilarityStatus",
+            "speakerSimilarity", "speakerSimilarityThreshold", "speakerSimilarityPassed",
+            "lyricsAlignmentStatus", "lyricsAlignment", "lyricsAlignmentThreshold", "lyricsAlignmentPassed",
         };
         return raw.EnumerateObject().All(property => allowed.Contains(property.Name));
     }
@@ -433,6 +530,14 @@ internal sealed class SpeechRuntimeGateway
                 !string.IsNullOrWhiteSpace(item.DisplayName) && AllowedStates.Contains(item.State))
             && selection.Options.Any(item => string.Equals(item.Id, selection.Value, StringComparison.Ordinal));
 
+    private static bool IsValidAcceptance(SpeechVoiceAcceptanceContract? acceptance)
+        => acceptance is not null
+            && acceptance.State is "not_applicable" or "not_verified" or "passed" or "failed"
+            && (acceptance.Similarity is null || double.IsFinite(acceptance.Similarity.Value))
+            && (acceptance.SimilarityThreshold is null || double.IsFinite(acceptance.SimilarityThreshold.Value))
+            && (acceptance.LyricsAlignment is null || double.IsFinite(acceptance.LyricsAlignment.Value))
+            && (acceptance.LyricsAlignmentThreshold is null || double.IsFinite(acceptance.LyricsAlignmentThreshold.Value));
+
     private static bool IsValidModelSelection(SpeechModelSelectionContract? selection)
         => selection is not null
             && !string.IsNullOrWhiteSpace(selection.Value)
@@ -443,6 +548,9 @@ internal sealed class SpeechRuntimeGateway
                 && !string.IsNullOrWhiteSpace(item.ProviderId)
                 && !string.IsNullOrWhiteSpace(item.Variant)
                 && !string.IsNullOrWhiteSpace(item.SizeLabel)
+                && item.QualityTier is "high_quality" or "balanced" or "low_resource"
+                && double.IsFinite(item.QualityRank)
+                && item.QualityRank >= 0
                 && !string.IsNullOrWhiteSpace(item.ComponentId)
                 && HasUniqueNonEmptyStrings(item.Capabilities)
                 && item.Capabilities.All(capability => capability is "preset_voice" or "voice_clone" or "instruction_control")
@@ -512,6 +620,14 @@ internal sealed class SpeechRuntimeGateway
             && singingBenchmark.ValueKind == JsonValueKind.Object
             && HasString(singingBenchmark, "state")
             && HasString(singingBenchmark, "revision")
+            && HasArray(status, "providers", item =>
+                HasString(item, "id")
+                && HasString(item, "displayName")
+                && HasString(item, "state")
+                && HasBoolean(item, "enabled")
+                && HasBoolean(item, "experimental")
+                && HasString(item, "license")
+                && HasArray(item, "capabilities", capability => capability.ValueKind == JsonValueKind.String))
             && HasArray(status, "capabilities", item =>
                 HasString(item, "id")
                 && HasString(item, "displayName")
@@ -534,18 +650,26 @@ internal sealed class SpeechRuntimeGateway
                 && HasString(item, "sourceLabel")
                 && HasBoolean(item, "authorizationConfirmed")
                 && HasArray(item, "capabilities", capability => capability.ValueKind == JsonValueKind.String)
-                && HasArray(item, "compatibleTtsModelIds", model => model.ValueKind == JsonValueKind.String))
+                && HasArray(item, "compatibleTtsModelIds", model => model.ValueKind == JsonValueKind.String)
+                && HasAcceptance(item, "speechAcceptance")
+                && HasAcceptance(item, "singingAcceptance"))
             && status.TryGetProperty("limits", out var limits)
             && limits.ValueKind == JsonValueKind.Object
             && HasNumber(limits, "maxInputBytes")
             && HasNumber(limits, "maxInputDurationSeconds")
             && HasNumber(limits, "maxOutputCharacters")
             && HasNumber(limits, "maxPreviewCharacters")
+            && HasNumber(limits, "maxSongLyricsCharacters")
             && HasNumber(limits, "maxSongDurationSeconds")
             && HasArray(status, "actions", item =>
                 HasString(item, "id")
                 && HasString(item, "label")
                 && HasBoolean(item, "enabled"));
+
+    private static bool HasAcceptance(JsonElement owner, string name)
+        => owner.TryGetProperty(name, out var acceptance)
+            && acceptance.ValueKind == JsonValueKind.Object
+            && HasString(acceptance, "state");
 
     private static bool HasSelection(JsonElement owner, string name)
         => owner.TryGetProperty(name, out var selection)
@@ -571,6 +695,9 @@ internal sealed class SpeechRuntimeGateway
                 && HasString(item, "providerId")
                 && HasString(item, "variant")
                 && HasString(item, "sizeLabel")
+                && HasString(item, "qualityTier")
+                && item.TryGetProperty("qualityRank", out var qualityRank)
+                && qualityRank.ValueKind == JsonValueKind.Number
                 && HasString(item, "componentId")
                 && HasString(item, "defaultVoiceProfileId")
                 && HasArray(item, "capabilities", capability => capability.ValueKind == JsonValueKind.String)

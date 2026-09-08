@@ -32,6 +32,8 @@ import type {
   BridgeStore,
   LLMProvider,
   MemoryIntentHost,
+  ContinuationAdjustmentIntentHost,
+  ContinuationAdjustmentIntentInput,
   MemoryWriteIntentDecision,
   MemoryWriteIntentInput,
   RetrievedFeishuHistoryContext,
@@ -132,6 +134,7 @@ import {
 import { buildManifestCodexSlimParams } from './manifest-codex-slim.js';
 import { sseEvent } from './sse-utils.js';
 import { McpBridge, type McpManifestRecord } from './mcp-bridge.js';
+import { PersistentMcpContextProvider } from './mcp-context-provider.js';
 import {
   applyMavisDefaultExecutor,
   buildExecutorManifests,
@@ -157,6 +160,7 @@ import {
 } from './todo-reminders.js';
 import { createExtensionCatalogHost } from './extension-catalog-host.js';
 import { createBridgeControlHost } from './bridge-control-host.js';
+import { createPanelSettingsHost } from './panel-settings-host.js';
 import { startActiveReplyControlService } from './active-reply-control.js';
 import { createOfficialSkillTools } from './official-skill-tools.js';
 import { createSkillLifecycleService } from './skill-lifecycle.js';
@@ -585,6 +589,28 @@ class ProviderMemoryIntentHost implements MemoryIntentHost {
       executionRequirement: { kind: 'none', reason: 'memory intent classification', requiredToolFamilies: [] },
     }, Math.max(10, Math.floor(this.timeoutMs)));
     return normalizeMemoryIntentDecision(extractJsonObject(text));
+  }
+}
+
+class ProviderContinuationAdjustmentIntentHost implements ContinuationAdjustmentIntentHost {
+  constructor(private readonly provider: LLMProvider, private readonly timeoutMs = 4000) {}
+
+  async classifyContinuationAdjustment(input: ContinuationAdjustmentIntentInput): Promise<'adjust' | 'not_adjust' | 'ambiguous'> {
+    const text = await collectProviderText(this.provider, {
+      prompt: [
+        '判断当前消息是否在修订已完成结果。只返回 JSON。',
+        'schema: {"decision":"adjust|not_adjust|ambiguous"}',
+        '只有当前消息要求改变、补充、重排或重新产出该已完成结果时为 adjust；致谢、评价、普通追问或无法唯一判断时不是 adjust。',
+        `已恢复的完成结果上下文:\n${input.recoveredCompletedContext.slice(0, 4000)}`,
+        `当前消息:\n${input.currentText.slice(0, 1000)}`,
+      ].join('\n\n'),
+      sessionId: `${input.sessionId}:continuation-adjustment`, forceFreshThread: true,
+      interactionMode: 'classifier', responseSchema: { type: 'object', properties: { decision: { enum: ['adjust', 'not_adjust', 'ambiguous'] } }, required: ['decision'], additionalProperties: false },
+      systemPrompt: 'Return strict JSON only. No tools.', conversationHistory: [],
+      executionRequirement: { kind: 'none', reason: 'continuation adjustment classification', requiredToolFamilies: [] },
+    }, Math.max(10, Math.floor(this.timeoutMs)));
+    const value = extractJsonObject(text)?.decision;
+    return value === 'adjust' || value === 'not_adjust' ? value : 'ambiguous';
   }
 }
 
@@ -3053,7 +3079,11 @@ async function resolveProvider(
   const executorRegistry = buildExecutorRegistry(config, turnStorage);
   // 官方 / 外部 Codex Home 继续隔离用户全局 MCP，只接收由 Runtime 根据
   // config/mcp.d 与当前工作区边界生成的受管投影。模型不能自行提供这些连接。
-  const managedCodexMcpServers = new McpBridge(config).listCodexServerProjections();
+  const mcpBridge = new McpBridge(config);
+  const managedCodexMcpServers = mcpBridge.listCodexServerProjections();
+  const projectedManifestIds = new Set(managedCodexMcpServers.map((server) => server.manifestId));
+  const managedMcpManifests = mcpBridge.listManifests()
+    .filter((manifest) => projectedManifestIds.has(manifest.id));
 
   const wrapWithLocalHub = (
     provider: LLMProvider,
@@ -3061,7 +3091,7 @@ async function resolveProvider(
     lightConversationProvider?: LLMProvider,
   ): LLMProvider => {
     const localProvider = new OllamaProvider(config);
-    return new HubLlmProvider(
+    return new PersistentMcpContextProvider(new HubLlmProvider(
       config,
       store,
       localProvider,
@@ -3072,7 +3102,7 @@ async function resolveProvider(
       provider,
       executorRegistry,
       lightConversationProvider,
-    );
+    ), managedMcpManifests);
   };
   const wrapCodexMainProvider = (
     provider: LLMProvider,
@@ -3640,6 +3670,7 @@ async function main(): Promise<void> {
         workingDirectory: sourceSession?.working_directory,
         sourcePrompt: task.action.kind === 'agent_turn' ? task.action.prompt : task.name,
         feishuCardJson,
+        speech: task.action.kind === 'notify' ? task.action.speech : undefined,
       });
       return delivered.ok
         ? { ok: true, messageId: delivered.messageId, cardId: delivered.cardId }
@@ -3649,6 +3680,7 @@ async function main(): Promise<void> {
   scheduledTaskService = createScheduledTaskService({
     store: scheduledTaskStore,
     execute: scheduledTaskExecute,
+    maxConcurrentRuns: config.scheduledTasksMaxConcurrentRuns ?? 4,
   });
   const scheduledTasks = createBridgeScheduledTaskActionHost({
     store: scheduledTaskStore,
@@ -3744,6 +3776,7 @@ async function main(): Promise<void> {
     llm,
     permissions: gateway,
     bridgeControl: createBridgeControlHost(),
+    panelSettings: createPanelSettingsHost(),
     extensions: createExtensionCatalogHost({ lifecycle: skillLifecycle }),
     feishuCloudDocuments,
     feishuCliUserAuth,
@@ -3754,6 +3787,7 @@ async function main(): Promise<void> {
       }),
     },
     memoryIntents: workerMemoryIntentHost || new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
+    continuationAdjustments: new ProviderContinuationAdjustmentIntentHost(llm, config.memoryIntentTimeoutMs),
     stickerSemantics,
     agentHome: config.memoryRepoDir ? {
       readPromptSections: async (input) => readAgentHomePromptSections(config.memoryRepoDir!, {
@@ -3976,6 +4010,7 @@ export {
   HubLlmProvider,
   CodexApiFailoverProvider,
   ProviderMemoryIntentHost,
+  ProviderContinuationAdjustmentIntentHost,
   ProviderSelfMaintenanceHost,
   ProviderTurnReferenceResolverHost,
 };

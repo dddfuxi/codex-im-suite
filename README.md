@@ -31,6 +31,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Registry 驱动 Skill 治理：`bridge-runtime` 统一维护 Skill Registry、官方创建/校验/安装适配、审批、审计和回滚；飞书与控制面板共用同一 lifecycle，面板不再维护第二套 Skill 安装逻辑。
 - 点餐顾问扩展：开发版内置 `food-ordering-advisor` Skill，通过美团、大众点评或其他可验证本地生活来源完成多轮问答、餐厅推荐、跨平台比选和购物车准备；正常官方 Codex 回合可用服务端只读实时网页搜索获取公开页面证据，不依赖默认隔离的 Desktop Browser 插件。实时价格、配送、优惠与订单结果必须来自当前工具证据，提交及支付保留用户确认/接管边界，安装或同步后才进入对应运行环境。
 - 控制面板重做：面板升级为 `WinForms + WebView2 + React/Vite`，并按“运行 / 机器人 / 能力 / 治理”四域组织服务、会话、计划任务、架构、Prompt Snapshot、Memory、Skills、MCP、模型、插件、权限和设置。
+- Unity 编辑器工具分层：控制面板“运行 → 服务”页会从项目注册表发现 Unity 工程内的 `AIBridgeCLI`，可执行真实 harness 检查；Unity MCP 可在能力页显式暂停/恢复，暂停会停止 helper 且不会自动启动，AIBridge 不依赖 MCP。
 - Ignis / MCP 能力并入套件：新增 `packages/mcp-ignis`、Ignis manifest、生成结果回传和 GLB 资产后处理链路，MCP 注册和状态发现也统一收口。
 - Workflow / Executor 平台落地：运行时开始记录请求阶段、执行器路由和会话默认 executor，面板可查看 workflow run、executor 状态和单次请求运行历程。
 - Workflow 当前回复可受控终止：执行器页和会话详情对仍在生成的 run 显示“终止回复”，请求经 Runtime 本机命令通道核对 run、session 与原 turn 后触发该回合真实 AbortController；不会停止 Bridge 或影响其他会话。面板会显示“正在终止 / 已终止”，已经结束或身份不完整的 run 不会被宽松取消，终止后也不会自动重试或补发迟到结果。
@@ -43,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
 - 记忆数据治理：整理草稿、勾选应用、撤销、定期整理和归档恢复/删除统一放在“治理 → 设置”；提醒检查、完成和测试发送放在“运行 → 会话”，旧命令协议保持兼容。
-- 统一计划任务：`notify / check_in / agent_turn / controlled_tool` 共用 Scheduler、原子 Store、slot 幂等和运行账本；`check_in` 每次触发生成独立飞书打卡卡片，按本轮真实点击者去重并在历史中保留人数，不会把整个周期任务标记完成。`cti-reminder` 与 `/remind` 兼容转换为单次 `notify`，周期任务使用 `cti-scheduled-task`。执行成功但飞书投递失败时只重试投递，不重跑 Agent；运行态固定写入 `CTI_HOME\data\scheduled-tasks`，不进入工作区或记忆库。
+- 统一计划任务：`notify / check_in / agent_turn / controlled_tool` 共用 Scheduler、原子 Store、slot 幂等和运行账本；`check_in` 每次触发生成独立飞书打卡卡片，按本轮真实点击者去重并在历史中保留人数与参与者记录，不会把整个周期任务标记完成。`cti-reminder` 与 `/remind` 兼容转换为单次 `notify`，周期任务使用 `cti-scheduled-task`。执行成功但飞书投递失败时只重试投递，不重跑 Agent；运行态固定写入 `CTI_HOME\data\scheduled-tasks`，不进入工作区或记忆库。
 - 飞书云文档读取 v1：飞书消息里的 Docx、Sheets、Base 链接会先用应用 `tenant_access_token` 读取，应用无权时再按发起人 OAuth 用户身份读取；缺少用户授权时发送登录卡片，登录后仍无权限则明确提示需要文档所有者分享或导出。
 - 飞书群成员取证按请求字段最小化：成员类型只使用当前群成员列表区分用户/机器人，不进入 Contact；除“查/列出”和“是什么/有哪些/分别属于”等完整问句外，“群成员部门情况”“某成员头像”这类短名词式低风险读取也会进入明确字段计划，不依赖固定动作词。头像请求会先解析目标是用户、机器人、全体、当前消息发送者或当前群具名成员；“我/我的头像”绑定入站 sender ID，再用当前群 roster 唯一复核，禁止从句子片段猜姓名；“现在你能看到头像了吗”一类能力/状态问句不会被截成成员名。具名显示名先在当前群 roster 精确复核，精确失败后只允许唯一的规范化相关名称命中，零命中或同名/多候选仍阻塞，不跨群猜人、不申请权限。“你们/各自/自己的头像”等机器人集合自指只读取机器人头像，当前机器人复用 Bot v3 信息，不扩张到用户头像或 Application v6 管理员权限。成员 evidence 官方 API 对网络异常、限流和 5xx 最多自动续试一次；头像下载会依次尝试官方返回的多个尺寸，单个成员、部门或头像尺寸失败不影响其余已明确目标继续处理。
 - 会话详情升级：飞书图片和文件会下载到本机缓存并在面板里直接预览；详情页同时展示关联 workflow 事件，方便回溯一次请求从接收、路由、执行到交付的完整链路。
@@ -231,17 +232,20 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-control-api.ps1 -HostNa
 
 ## 本地语音（开发版 0.4.0）
 
-截至 2026-08-09，本地语音与歌声仍是飞书首发的可选能力；功能默认关闭，不影响现有文字消息和其他渠道。本机 live 已完成受管组件、普通语音原生出站、RTX 3070 歌声性能门禁和控制面板试听链验收，但飞书入站新语音的完整 `ASR -> Primary -> 原生语音唯一终态` 仍需由用户发送一条重启后的真实语音完成现场复测。
+截至 2026-08-11，本地语音与歌声仍是飞书首发的可选能力；功能默认关闭，不影响现有文字消息和其他渠道。本机 live 已完成受管组件、普通语音原生出站、RTX 3070 歌声性能门禁和控制面板试听链验收。高质量 TTS 的生成时限不再与普通媒体/ASR 请求共用固定 90 秒：Runtime 会按同模型、同版本、同硬件 benchmark 与正文规模计算有界时限，缺少 benchmark 时使用独立绝对上限；是否现场生效仍以同步重启后的新 PID、连接状态和真实飞书新消息为准。
 
 - 无会话覆盖时，真实飞书语音由本地 ASR 转写后交给 Primary Agent，并默认以语音回复；普通文字默认仍以文字回复。
 - 飞书会话中发送 `/voice on` 可把当前会话设为默认语音回复；`/voice off` 是硬禁用，直到再次发送 `/voice on` 前，真实入站语音和 Primary 的结构化语音意图都只能返回文字。普通自然语言不再由关键词正则直接触发语音或授权；Primary 只能输出受限 `speech.mode/style`，Bridge 再结合真实媒体 evidence、会话状态、角色和风险裁决。
+- 用户指出上一轮应交付的语音未发送、未送达或未收到时，会按“语音媒介 + 交付动作 + 未完成状态”三个可组合信号要求补齐受管 `voice_only` 协议；其他窗口/会话、能力、配置或是否支持等抽象咨询仍保持文字解释，不会误启动合成。没有提供或可靠引用长正文的短语音请求使用 36 个可见 Unicode 字符的默认口播预算，先在 response-only 协议审查中要求模型收短，避免模型自行扩写成长故事后让高质量 TTS 等待数分钟；用户明确提供的正文和唯一可信原生回复内容不受该默认预算截断。固定计划任务只有在创建时明确要求每次发送原生语音，才保存受控 `notify.speech={mode:"voice_only"}` 并在触发时复用同一 SpeechHost；互动打卡卡片、图片、文件和 mention 不会被语音替代。
 - 语音成功只发送一个飞书原生 Opus 终态。转写、合成、产物校验、进度卡替换或平台上传任一步失败，都只发送一次完整文字错误或结果，不产生“语音失败后又重复发多份文字”的双终态。
-- 用户明确要求唱歌时，模型只能提交受限的歌词、音乐风格、语言和时长；Bridge 通过独立 `SingingHost` 调用本机 ACE-Step 1.5。歌声与普通 TTS 完全分离，ACE-Step 不可用时只返回一次完整文字，不会把拉长音调的 TTS 冒充唱歌。
+- `CTI_SPEECH_REQUEST_TIMEOUT_MS` 只作为普通媒体、ASR 与短请求基线；`CTI_SPEECH_SYNTHESIS_TIMEOUT_MS` 是 TTS 生成绝对上限（默认 10 分钟）。实际 TTS 时限由 Runtime 使用当前模型 benchmark 的热态耗时、输出时长和 RTF 动态收窄，冷启动/首次无记录不会再被旧 90 秒阈值误杀。失败回执明确区分“未开始”“生成未完成”“生成结果未通过验收”和“已生成但发送失败”，审计只保留稳定阶段码。
+- 用户明确要求唱歌时，模型只能提交受限的歌词、音乐风格、语言和时长；唯一可信的原生回复正文可作为“把这个唱出来”的歌词来源。明确要求克隆/参考音色演唱时还必须携带 `voice_requirement=active_reference` 类别要求，Runtime 只使用面板已激活的参考歌声音色；未选择或不兼容时明确失败，不能改用默认歌声冒充。Bridge 通过独立 `SingingHost` 调用本机 ACE-Step 1.5，歌声与普通 TTS 完全分离。
 - 默认 TTS 是 `Qwen3-TTS-12Hz-1.7B-CustomVoice + Serena`，低显存可显式切换 `0.6B-CustomVoice`；授权音色复刻只使用对应 `1.7B/0.6B-Base`，不会把 CustomVoice 冒充克隆模型。SenseVoice 继续负责 ASR，ACE-Step 继续作为独立歌声模型。
-- 控制面板从 Runtime Catalog 动态展示 Provider、模型、音色、语气策略、安装状态和模型级 benchmark。四个 Qwen 模型使用固定官方 revision、逐文件 SHA-256 与大小的事务式清单；任一资源未完整校验都不会发布为受管模型。benchmark 绑定模型、revision 与硬件，换模型或换硬件后不会沿用旧结果。
+- 控制面板从 Runtime Catalog 动态展示 Provider、模型、音色、语气策略、安装状态和模型级 benchmark，并把 1.7B 高质量档排在 0.6B 低显存备选之前，但不覆盖用户显式选择。模型文件已加载与硬件性能通过是两个独立状态：例如 benchmark 为 `tts_model_warm_benchmark_too_slow` 时，面板会显示“模型已加载，但当前硬件生成过慢”，不能再用组件 `ready` 冒充性能可用。四个 Qwen 模型使用固定官方 revision、逐文件 SHA-256 与大小的事务式清单；任一资源未完整校验都不会发布为受管模型。参考音色导入必须由当前 live Runtime 对同一文件重新 ASR，并与用户逐字确认文本一致；核对后的文件 Hash 在复制时再次绑定。复刻 benchmark 进一步绑定具体 `voiceProfileId`，使用 Qwen Base 自带 speaker encoder 的余弦相似度验收；未达到统一阈值时丢弃产物、禁止发送，也不能显示“克隆成功”。
+- `CTI_SPEECH_OWNER_SELF_VOICE_AUTO_AUTHORIZATION=true` 可为唯一 Bridge Owner 开启“本人音色自动授权”：原生回复自己的干净单人录音并明确要求克隆时，不再重复询问录音权利、本机 TTS 用途和单人录音确认。该开关默认关闭，也不会放宽逐字参考文本、真实音频来源、ASR 一致性、文件 Hash、音频质量或说话人相似度门禁；当前消息缺逐字文本时只报告该缺项，不能把 ASR 猜测提升为确认文本。
 - 可选模型、FFmpeg、Python、ASR/TTS 二进制不进入 npm 依赖、live skill 或 release 包，首条语音消息也不会触发隐式下载。只有用户在控制面板显式安装受管组件，或显式配置本机依赖路径后，Runtime 才会使用它们。Qwen 独立环境使用固定 CPython 3.12、固定 uv、全哈希 requirements lock 和固定 CUDA 12.8 wheel 集合；安装 argv、环境隔离、版本/CUDA 探针与 stage 发布均由 Runtime 固定，不污染全局 Python，也不允许 manifest 携带任意命令。
 - 这条链路不读取、不迁移、不依赖 `F:\unity\ST4\.cti-audio`；ST4 和其他外部项目的历史音频缓存不会成为 Bridge 的默认来源。
-- 控制面板语音页默认汇总“听懂语音、语音回复、唱歌、克隆音色、消息渠道”五项能力，只展开日常开关、模型/音色选择和普通语音/固定 10 秒歌声试听；渠道、Provider、性能门禁、组件诊断、完整音色库和授权参考音频导入收进按需展开区。试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。
+- 控制面板语音页默认汇总“听懂语音、语音回复、唱歌、克隆音色、消息渠道”五项能力，并提供完整歌词、演唱风格、语言、自动旋律和可选时长；“10 秒快速试听”只截取试听内容，“按完整内容生成”保留全部歌词，两者复用同一内容规划核心。渠道、Provider 能力/许可矩阵、性能门禁、组件诊断、完整音色库和授权参考音频导入收进按需展开区。导入成功的克隆音色会长期保存在受管音色库并在 Bridge 重启后恢复；参考音色卡可对每个具体 Profile 单独执行“相似度验收”、重命名或经确认随时删除。重命名只更新显示名，稳定 Profile ID、受管音频、授权和验收记录保持不变；删除会同时清理受管参考音频与该 Profile 的验收记录，当前激活项则先安全回退或清空。音色身份验收与模型速度验收分开呈现：相似度达到阈值后显示“音色相似度已通过”，高质量模型较慢仍由独立性能状态提示，不能再误报为“相似度未验收”。生成回执分别显示内容已生成、面板未发送、音色相似度和歌词对齐状态。试听媒体经过 Runtime、C# 与浏览器三层协议校验，只以受限 Base64 Ogg/Opus 回执进入内存播放器，不外发本地路径、参考音频或密钥。试听回执到达后不再等待一次全量状态刷新；本机 WebView2 会直接播放并滚动显示播放器，系统仍拒绝自动播放时明确提示用户点击原生播放键。
 
 模块边界保持单向：
 
@@ -256,7 +260,7 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 | 内容 | 路径 |
 |---|---|
 | 受管模型与二进制 | `CTI_HOME\runtime-deps\speech` |
-| 音色注册表与授权参考音频 | `CTI_HOME\runtime\speech\voices` |
+| 音色注册表与授权参考音频 | `CTI_HOME\runtime\speech\voices`；长期保存，由 Runtime 按 Profile 删除受管音频与关联验收记录 |
 | 请求临时文件与默认输出 | `CTI_HOME\runtime\speech` |
 
 控制面板按共享协议显示四态：`ready` 表示当前选择可用；`optional_missing` 表示可选能力未安装或语音尚未启用；`blocked` 表示显式配置、授权、校验或受管清单阻塞；`error` 表示运行时检查失败。缺少可选语音依赖不能阻断文字 Bridge。设置保存只代表 UTF-8 `CTI_HOME\config.env` 写入成功；必须在服务页受控重启 Bridge、重新读取 Runtime 状态并核对新 PID、飞书长连接和开发/live bundle Hash，才可描述为 live 已加载。
@@ -317,7 +321,7 @@ CTI_EXTENSION_CATALOG_DYNAMIC_REFRESH_HOURS=24
 powershell -ExecutionPolicy Bypass -File .\scripts\build-packages.ps1
 ```
 
-控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、计划任务状态/历史/暂停/恢复/删除、Workflow 当前回复终止、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。面板会读取 runtime capabilities；尚未接通 daemon 控制面的计划任务“立即运行 / 取消运行 / 仅重试投递”保持禁用并显示原因。
+控制面板采用 WinForms 宿主 + WebView2 + React/Vite 前端。`build-packages.ps1` 会先构建 `apps/control-panel/web`，再发布桌面壳；如果本机缺少 WebView2 Runtime，面板启动时会显示安装提示。当前主界面支持四域导航、可操作系统蓝图、机器人架构、Prompt Snapshot、Memory/Skill 索引、统一运行单元动作、计划任务状态/历史/暂停/恢复/删除、Workflow 当前回复终止、会话详情抽屉、面板自重启，以及随窗口宽度自动重排导航、列表、详情区和设置表单。Bridge 重启不再只信短命 PowerShell 包装器的退出码：面板会在有界 120 秒验证窗口内等待 PID、runId、启动时间、运行审计、心跳和已启用回调通道共同切换到同一新实例，覆盖可选语音 Runtime 与飞书 WS 的真实冷启动；包装器回执异常但真实新实例健康时不会显示红色伪失败，Workflow drain 明确延期、旧实例未切换或审计错误仍会失败关闭。面板会读取 runtime capabilities；尚未接通 daemon 控制面的计划任务“立即运行 / 取消运行 / 仅重试投递”保持禁用并显示原因。
 
 打包 portable 和 installer：
 
@@ -467,7 +471,7 @@ CTI_TODO_PUSH_WINDOW_MS=300000
 每个工作日 10:00 发喝水待办，让群成员点按钮打卡，1 小时内有效。
 ```
 
-第一条会创建 `cron 30 10 * * 1-5 + Asia/Shanghai` 的动态 `agent_turn`；第二条属于固定 `notify`；第三条使用 `check_in`，每次运行生成一轮独立打卡。飞书成员点击原生按钮后按真实平台用户去重，卡片只展示汇总人数；`history` 同时返回每轮 `checkInCount`。单次低风险提醒继续兼容：
+第一条会创建 `cron 30 10 * * 1-5 + Asia/Shanghai` 的动态 `agent_turn`；第二条属于固定 `notify`；第三条使用 `check_in`，每次运行生成一轮独立打卡。飞书成员点击原生按钮后按真实平台用户去重，卡片展示汇总人数；查询历史时会按当前群成员接口把真实参与者解析为姓名，并同时保留每轮 `checkInCount`。单次低风险提醒继续兼容：
 
 ```text
 /remind 10分钟后 看电脑
@@ -484,7 +488,7 @@ CTI_SCHEDULED_TASKS_FAILURE_ALERT_AFTER=3
 CTI_SCHEDULED_TASKS_FAILURE_ALERT_COOLDOWN_MS=3600000
 ```
 
-任务定义、状态、运行记录、逐轮打卡账本、隔离区和迁移清单统一位于 `CTI_HOME\data\scheduled-tasks`。打卡账本绑定 `taskId + runId + slotKey`，卡片 callback 还会复核真实投递 message ID、当前 chat 和平台点击者；普通文字回复不计入打卡。当前调度 tick 仍按安全串行方式执行；`MAX_CONCURRENT_RUNS` 和连续失败告警配置已经保留，但并发与主动告警尚未开放为完成能力，面板和文档不把它们伪装为已生效。
+任务定义、状态、运行记录、逐轮打卡账本、隔离区和迁移清单统一位于 `CTI_HOME\data\scheduled-tasks`。打卡账本绑定 `taskId + runId + slotKey`，卡片 callback 还会复核真实投递 message ID、当前 chat 和平台点击者；普通文字回复不计入打卡。同一调度批次先为所有到期任务原子预留稳定 slot，再按 `MAX_CONCURRENT_RUNS` 有界并发执行；固定 `notify/check_in` 优先进入执行槽，不再等待慢 `agent_turn` 完成。运行账本记录 `dispatchDelayMs`，用于区分调度延迟与飞书投递延迟；连续失败主动告警仍未开放为完成能力。
 
 CLI 示例：
 
@@ -562,6 +566,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\update-architecture-docs.ps1
 ```
 
 ## 运行版同步
+
+### Owner 通过飞书读取和修改面板设置
+
+唯一 Bridge Owner 可以用普通文字或可信飞书语音直接查询、修改控制面板“设置”页中的受控属性。语音先经过现有 ASR，随后与文字请求复用同一 `cti-panel-settings` 链路；不依赖固定中文句子。Runtime 会先列出当前可管理属性、类型、枚举、当前值和重启要求，再校验 Owner、属性 key、标量类型、范围、路径与快照版本，定向原子更新 `CTI_HOME\config.env`，保留未知字段和注释。
+
+API key/token 只显示“已配置/未配置”，不能从机器人读取或修改。写入成功后，回复会明确列出本次旧值/新值和更新后的完整脱敏快照，并安排在当前回复发送完成后执行固定 Bridge 重启；“配置已写入”不等于“live 已重启生效”。非 Owner、未知/只读属性、非法值、版本冲突或 Host 缺失都会失败关闭。
 
 当前 live skill 仍位于：
 

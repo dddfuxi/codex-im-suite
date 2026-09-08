@@ -110,6 +110,53 @@ function Test-PidAlive {
     catch { return $false }
 }
 
+function Get-ProcessCommandLine {
+    param([string]$ProcessIdValue)
+    if (-not $ProcessIdValue) { return $null }
+    try {
+        return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop).CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Test-BridgePid {
+    param([string]$ProcessIdValue)
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+
+    # Windows can reuse a terminated Bridge PID for an unrelated application.
+    # A numeric PID is therefore never enough evidence to block start or stop.
+    # Fail closed when command-line inspection is unavailable, rather than
+    # risking a false “already running” result or terminating another process.
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop
+        if ($process.Name -notmatch '^node(?:\.exe)?$') { return $false }
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+        $expectedDaemon = [IO.Path]::GetFullPath($DaemonMjs).Replace('/', '\\')
+        return $commandLine.IndexOf($expectedDaemon, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    } catch {
+        return $false
+    }
+}
+
+function Test-SupervisorPid {
+    param([string]$ProcessIdValue)
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop
+        if ($process.Name -notmatch '^(?:powershell|pwsh)(?:\.exe)?$') { return $false }
+        $commandLine = [string]$process.CommandLine
+        $match = [regex]::Match($commandLine, '(?i)-EncodedCommand\s+([^\s]+)')
+        if (-not $match.Success) { return $false }
+        $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($match.Groups[1].Value))
+        $expectedScript = [IO.Path]::GetFullPath($PSCommandPath)
+        return $decoded.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $decoded -match "-Command 'run-supervisor'"
+    } catch {
+        return $false
+    }
+}
+
 function Stop-PidIfAlive {
     param(
         [string]$ProcessIdValue,
@@ -137,7 +184,7 @@ function Test-StatusRunning {
         $json = Get-Content $StatusFile -Raw | ConvertFrom-Json
         if ($json.running -ne $true) { return $false }
         if ($json.pid) {
-            return Test-PidAlive ([string]$json.pid)
+            return Test-BridgePid ([string]$json.pid)
         }
         return $false
     } catch {
@@ -364,7 +411,7 @@ switch ($Command) {
 
         $existingPid = Read-Pid
         $existingSupervisorPid = Read-SupervisorPid
-        if (($existingPid -and (Test-PidAlive $existingPid)) -or ($existingSupervisorPid -and (Test-PidAlive $existingSupervisorPid))) {
+        if (($existingPid -and (Test-BridgePid $existingPid)) -or ($existingSupervisorPid -and (Test-SupervisorPid $existingSupervisorPid))) {
             Write-Host "Bridge already running"
             if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             Publish-IsolatedCommandCompletion 1
@@ -379,7 +426,7 @@ switch ($Command) {
             Start-Sleep -Seconds 3
 
             $newPid = Read-Pid
-            if ($newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+            if ($newPid -and (Test-BridgePid $newPid) -and (Test-StatusRunning)) {
                 Write-Output 'CTI_DAEMON_START_READY_V1'
                 Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, managed by Windows Service)"
@@ -398,16 +445,16 @@ switch ($Command) {
 
             $newPid = Read-Pid
             $newSupervisorPid = Read-SupervisorPid
-            if ($newSupervisorPid -and (Test-PidAlive $newSupervisorPid) -and $newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+            if ($newSupervisorPid -and (Test-SupervisorPid $newSupervisorPid) -and $newPid -and (Test-BridgePid $newPid) -and (Test-StatusRunning)) {
                 Write-Output 'CTI_DAEMON_START_READY_V1'
                 Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, supervisor: $newSupervisorPid)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
                 Write-Host "Failed to start bridge."
-                if (-not $newSupervisorPid -or -not (Test-PidAlive $newSupervisorPid)) {
+                if (-not $newSupervisorPid -or -not (Test-SupervisorPid $newSupervisorPid)) {
                     Write-Host "  Supervisor exited immediately."
-                } elseif (-not $newPid -or -not (Test-PidAlive $newPid)) {
+                } elseif (-not $newPid -or -not (Test-BridgePid $newPid)) {
                     Write-Host "  Bridge process exited immediately."
                 }
                 Show-LastExitReason
@@ -432,11 +479,15 @@ switch ($Command) {
             $bridgePid = Read-Pid
             $supervisorPid = Read-SupervisorPid
             if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; break }
-            $bridgeStopped = Stop-PidIfAlive $bridgePid 'Bridge'
+            $bridgeStopped = if (Test-BridgePid $bridgePid) { Stop-PidIfAlive $bridgePid 'Bridge' } else { $false }
             if ($bridgePid -and -not $bridgeStopped) {
-                Write-Host "Bridge was not running (stale PID file)"
+                Write-Host "Bridge was not running (stale or mismatched PID file)"
             }
-            [void](Stop-PidIfAlive $supervisorPid 'Supervisor')
+            if (Test-SupervisorPid $supervisorPid) {
+                [void](Stop-PidIfAlive $supervisorPid 'Supervisor')
+            } elseif ($supervisorPid) {
+                Write-Host "Supervisor PID did not identify this Bridge; leaving it untouched"
+            }
             if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
             if (Test-Path $SupervisorPidFile) { Remove-Item $SupervisorPidFile -Force }
             if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
@@ -452,11 +503,11 @@ switch ($Command) {
         if ($svc) {
             Write-Host "Windows Service '$ServiceName': $($svc.Status)"
         }
-        if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
+        if ($supervisorPid -and (Test-SupervisorPid $supervisorPid)) {
             Write-Host "Supervisor process is running (PID: $supervisorPid)"
         }
 
-        if ($bridgePid -and (Test-PidAlive $bridgePid)) {
+        if ($bridgePid -and (Test-BridgePid $bridgePid)) {
             Write-Host "Bridge process is running (PID: $bridgePid)"
             if (Test-StatusRunning) {
                 Write-Host "Bridge status: running"

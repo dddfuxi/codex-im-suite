@@ -61,11 +61,13 @@ import {
   DIRECT_MESSAGE_ACTION_FENCE,
   REMINDER_ACTION_FENCE,
   SCHEDULED_TASK_ACTION_FENCE,
+  PANEL_SETTINGS_ACTION_FENCE,
   extractCtiArtifactPromotionAction as parseCtiArtifactPromotionActionBlock,
   extractCtiBridgeControlAction as parseCtiBridgeControlActionBlock,
   extractCtiDirectMessageAction as parseCtiDirectMessageActionBlock,
   extractCtiReminderAction as parseCtiReminderActionBlock,
   extractCtiScheduledTaskAction as parseCtiScheduledTaskActionBlock,
+  extractCtiPanelSettingsAction as parseCtiPanelSettingsActionBlock,
 } from './application/action-blocks.js';
 import {
   hasTrustedDirectMessageContinuationAuthorization,
@@ -80,9 +82,29 @@ import {
 } from './application/reminders.js';
 import { reviewDeferredBridgeActionProtocol } from './application/deferred-action-review.js';
 import {
+  buildDeterministicReferencedSingingDirective,
+  expectsManagedSingingProtocol,
+  reviewSingingReplyProtocol,
+} from './application/singing-request-review.js';
+import {
+  buildOwnerAutoAuthorizedReferenceVoiceAction,
+  expectsReferenceVoiceCreation,
+  expectsManagedSpeechProtocol,
+  resolveEffectiveSpeechRequest,
+  reviewReferenceVoiceCreationProtocol,
+  reviewSpeechReplyProtocol,
+} from './application/speech-request-review.js';
+import {
+  buildScheduledTaskCheckInHistoryEvidencePrompt,
   buildScheduledTaskReadEvidencePrompt,
   resolveScheduledTaskReadIntent,
 } from './application/scheduled-task-read-policy.js';
+import {
+  buildPanelSettingsEvidencePrompt,
+  formatPanelSettingsSnapshot,
+  resolvePanelSettingsIntent,
+} from './application/panel-settings-policy.js';
+import { requiresResponseOnlyForTrustedLocalReadEvidence } from './application/trusted-read-evidence-policy.js';
 import {
   extractBareFeishuAtTargets,
   extractExplicitFeishuMentionTargetsFromRequest,
@@ -167,6 +189,7 @@ import {
   mergeTranscriptWithUserText,
   normalizeSpeechSynthesisText,
   parseSpeechReferenceVoiceImportReceipt,
+  referenceVoiceImportFailureMessage,
   parseSpeechSynthesisIdentity,
   parseSpeechSynthesisReceipt,
   parseSpeechTranscriptReceipt,
@@ -174,6 +197,8 @@ import {
   resolveTrustedInboundAudio,
   resolveTrustedNativeReplyAudio,
   speechFailureMessage,
+  speechFailureDiagnosticCode,
+  type SpeechReplyDirective,
 } from './application/speech-policy.js';
 import {
   parseSingingSynthesisReceipt,
@@ -232,6 +257,7 @@ import {
 } from './feishu-document-memory.js';
 import { buildFeishuCapabilityReport } from './feishu-capabilities.js';
 import { resolveStructuredTurnContext } from './turn-context-broker.js';
+import { permitsLightweightResponse } from './turn-context.js';
 import { shouldRunCorrectionMaintenance } from './self-maintenance-routing.js';
 import {
   buildWorkspaceChatCatalog,
@@ -325,11 +351,17 @@ function appendReplyEndMarker(text: string): string {
   return `${trimmed}\n\n${marker}`;
 }
 
+function stripReplyEndMarker(text: string): string {
+  const marker = getReplyEndMarker();
+  const trimmed = text.trimEnd();
+  return trimmed.endsWith(marker)
+    ? trimmed.slice(0, -marker.length).trimEnd()
+    : trimmed;
+}
+
 const TOOL_EXECUTION_REQUEST_PATTERN = /(unity\s*mcp|unitymcp|mcp\s*for\s*unity|unity|blender|hsscene|furniture_|prefab|timeline|场景|节点|截图|导入|导出|看一眼|查一下|分析一下|整理.*列表)/i;
 const OUTSOURCED_TOOL_REPLY_PATTERN = /(请|可以|建议|需要).{0,16}(手动|自行|自己).{0,48}(检查|打开|查找|搜索|运行|分析)|打开你的\s*Unity\s*项目|在\s*Unity\s*编辑器中|使用\s*Unity\s*的搜索功能|将脚本添加到项目|运行脚本|示例列表草案/i;
 const MCP_ENTRY_CLARIFICATION_REPLY_PATTERN = /(?:请(?:先)?(?:明确|指定).{0,12}(?:MCP|Unity MCP).{0,12}(?:入口|目标)|可用\s*MCP\s*入口|例如[:：].{0,80}(?:Unity MCP|Unity Prefab MCP|Blender MCP|Fetch MCP))/i;
-const TASK_INTENT_PATTERN = /(帮我|麻烦|请|需要|能不能|可以帮|处理|执行|运行|启动|停止|重启|发布|同步|安装|升级|修|修复|改|修改|替换|检查|排查|诊断|看一下|看一眼|查一下|找一下|分析|整理|总结|汇总|生成|创建|写|删除|添加|上传|下载|截图|回溯|记忆|记得|历史|权限|报错|异常|失败|为什么|怎么回事|哪里|怎么|如何|unity|mcp|codex|claude|bridge|飞书|面板|文件|代码|仓库|commit|push|git)/i;
-
 function isToolExecutionRequestText(text: string): boolean {
   return TOOL_EXECUTION_REQUEST_PATTERN.test(text);
 }
@@ -415,10 +447,6 @@ function extractCtiReminderAction(text: string) {
   });
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function extractCtiScheduledTaskAction(text: string, referenceTime: Date = new Date()) {
   return parseCtiScheduledTaskActionBlock(text, { referenceTime });
 }
@@ -429,6 +457,10 @@ function extractCtiDirectMessageAction(text: string) {
 
 function extractCtiBridgeControlAction(text: string) {
   return parseCtiBridgeControlActionBlock(text);
+}
+
+function extractCtiPanelSettingsAction(text: string) {
+  return parseCtiPanelSettingsActionBlock(text);
 }
 
 function extractCtiArtifactPromotionAction(text: string) {
@@ -909,6 +941,64 @@ function buildScheduledTaskActor(msg: InboundMessage): ScheduledTaskCreateInput[
     chatId: msg.address.chatId,
     messageId: msg.messageId,
   };
+}
+
+/**
+ * 把 Runtime 账本里的真实参与者 ID 交给当前渠道适配器解析为名称。
+ * 解析失败不影响统计结果，未解析项会继续只显示人数。
+ */
+async function resolveScheduledTaskCheckInParticipantNames(
+  adapter: BaseChannelAdapter,
+  task: unknown,
+  runs: unknown[],
+): Promise<unknown[]> {
+  const taskRecord = task && typeof task === 'object' && !Array.isArray(task)
+    ? task as Record<string, unknown>
+    : null;
+  const delivery = taskRecord?.delivery && typeof taskRecord.delivery === 'object' && !Array.isArray(taskRecord.delivery)
+    ? taskRecord.delivery as Record<string, unknown>
+    : null;
+  const channelType = typeof delivery?.channelType === 'string' ? delivery.channelType.trim() : '';
+  const chatId = typeof delivery?.chatId === 'string' ? delivery.chatId.trim() : '';
+  if (!chatId || (channelType && channelType !== adapter.channelType)) return runs;
+  const participantIds = new Set<string>();
+  for (const rawRun of runs) {
+    const run = rawRun && typeof rawRun === 'object' && !Array.isArray(rawRun)
+      ? rawRun as Record<string, unknown>
+      : null;
+    if (!Array.isArray(run?.participants)) continue;
+    for (const rawParticipant of run.participants) {
+      const participant = rawParticipant && typeof rawParticipant === 'object' && !Array.isArray(rawParticipant)
+        ? rawParticipant as Record<string, unknown>
+        : null;
+      const userId = typeof participant?.userId === 'string' ? participant.userId.trim() : '';
+      if (userId) participantIds.add(userId);
+    }
+  }
+  if (participantIds.size === 0) return runs;
+  let names: Record<string, string> = {};
+  try {
+    names = await adapter.resolveMemberDisplayNames(chatId, [...participantIds]);
+  } catch {
+    return runs;
+  }
+  return runs.map((rawRun) => {
+    const run = rawRun && typeof rawRun === 'object' && !Array.isArray(rawRun)
+      ? rawRun as Record<string, unknown>
+      : null;
+    if (!run || !Array.isArray(run.participants)) return rawRun;
+    return {
+      ...run,
+      participants: run.participants.map((rawParticipant) => {
+        const participant = rawParticipant && typeof rawParticipant === 'object' && !Array.isArray(rawParticipant)
+          ? rawParticipant as Record<string, unknown>
+          : null;
+        const userId = typeof participant?.userId === 'string' ? participant.userId.trim() : '';
+        const name = userId ? names[userId]?.trim() : '';
+        return participant && name ? { ...participant, name } : rawParticipant;
+      }),
+    };
+  });
 }
 
 function buildScheduledTaskResultText(
@@ -1562,20 +1652,9 @@ interface MemoryIntentPreflight {
 
 const EXPLICIT_MEMORY_WRITE_REQUEST_RE = /(?:记住|记一下|记下来|记入|保存到?记忆|写入记忆|更新记忆|记录下来|以后(?:都|统一|默认)?按)/u;
 const NEGATED_MEMORY_WRITE_REQUEST_RE = /(?:不要|不用|不必|别|无需|无须|禁止).{0,12}(?:记住|记录|保存|写入记忆)/u;
-const MEMORY_INTENT_CANDIDATE_RE = /(?:记住|记一下|记下来|记入|保存到?记忆|写入记忆|更新记忆|覆盖记忆|长期记忆|跨会话|以后(?:都|统一|默认)?按|固定(?:名|键|值|映射)|仅在.+生效|只在.+生效|memory)/iu;
-const DURABLE_PREFERENCE_MUTATION_RE = /(?:规则|约束|偏好|称呼|别名|映射|默认(?:行为|设置|值)?).{0,24}(?:改成|修改为|设为|设置为|定义为|更新为|覆盖为)/iu;
-const TEMPORARY_CONTEXT_INTENT_RE = /(?:(?:仅|只).{0,12}(?:当前|本次)(?:对话|会话|回合)(?:上下文)?|(?:临时|暂时).{0,12}(?:保留|记住|记录|上下文))/iu;
 
 function isExplicitMemoryWriteRequestText(text: string): boolean {
   return EXPLICIT_MEMORY_WRITE_REQUEST_RE.test(text) && !NEGATED_MEMORY_WRITE_REQUEST_RE.test(text);
-}
-
-function isMemoryIntentCandidateText(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, ' ').trim();
-  if (!normalized || NEGATED_MEMORY_WRITE_REQUEST_RE.test(normalized)) return false;
-  return MEMORY_INTENT_CANDIDATE_RE.test(normalized)
-    || DURABLE_PREFERENCE_MUTATION_RE.test(normalized)
-    || TEMPORARY_CONTEXT_INTENT_RE.test(normalized);
 }
 
 function resolveInboundMemoryActorKind(msg: InboundMessage): MemoryWriteClassification['actorKind'] {
@@ -1997,13 +2076,10 @@ function getInboundMessageKind(msg: InboundMessage, rawData: Record<string, any>
 }
 
 function shouldAttachRecentConversationMedia(text: string): boolean {
-  const normalized = text.normalize('NFKC').trim().toLowerCase();
-  if (!normalized) return false;
-  const hasMediaReference = /(这|那|上|刚|前|原|题目|图|图片|照片|截图|画面|表情包|附件|它|这个|那个|上一[张个条]|刚才|前面|上面|原图|题图|题目图|the|this|that|above|previous|last|image|picture|photo|screenshot|attachment)/iu.test(normalized);
-  const hasFollowUpAction = /(继续|分析|看|读|识别|解|算|讲|说明|判断|推理|一步|步骤|思路|按|根据|基于|照着|再来|接着|continue|analy[sz]e|solve|explain|read|identify|based on|use)/iu.test(normalized);
-  if (hasMediaReference && hasFollowUpAction) return true;
-  return normalized.length <= 40
-    && /(继续|接着|再来|一步一步|思路|怎么解|帮我看|看一下|分析一下|讲一下|这题|这个呢|它呢|what about this|continue)/iu.test(normalized);
+  // 不能根据“这张图/继续分析”等文字把最近图片冒充成本轮引用。可靠媒体
+  // 只由原生 reply、当前附件或受控历史 evidence 恢复；默认失败关闭。
+  void text;
+  return false;
 }
 
 function parseStoredFileAttachments(content: string): Array<{ id?: string; name?: string; type?: string; size?: number; filePath?: string }> {
@@ -2980,6 +3056,8 @@ async function recordSelfMaintenanceSkipSafely(input: {
 
 /**
  * 用户本轮明确要求执行 @ 时，由 delivery 在当前群官方成员/机器人中确定性解析。
+ * 群体称呼在提取阶段已被排除；指定成员则必须同时满足用户明确点名与 Agent
+ * 当前回复的显式选择，不能由 Delivery 擅自补写正文中的 @ 来触发平台动作。
  * bot-to-bot 回合另有一个窄口：仅允许回复原生唤醒当前机器人的发送方机器人，
  * 且必须把事件真实 sender app/open/user/union ID 与当前群可 mention member_id 唯一求交。
  * 普通叙述、未来流程、
@@ -3013,25 +3091,10 @@ async function resolveFeishuAgentSelectedMentions(
       : {};
     const isBotToBotTurn = typeof botToBot.senderType === 'string' && !!botToBot.senderType.trim();
     if (!isBotToBotTurn || !adapter.resolveOutboundReplyToSenderMention) return payload;
-    const botReplyTargets = new Map<string, string>();
-    for (const target of [...extractBareFeishuAtTargets(payload.text), ...(payload.mentionTargets || [])]) {
-      const key = normalizeFeishuMentionTargetKey(target);
-      if (key) botReplyTargets.set(key, target);
-    }
-    let resolverText = payload.text;
-    const presentTargetKeys = new Set(
-      extractBareFeishuAtTargets(resolverText).map(normalizeFeishuMentionTargetKey).filter(Boolean),
-    );
-    const missingTargets = [...botReplyTargets]
-      .filter(([key]) => !presentTargetKeys.has(key))
-      .map(([, target]) => `@${target}`);
-    if (missingTargets.length > 0) {
-      resolverText = [missingTargets.join(' '), resolverText].filter(Boolean).join('\n');
-    }
     try {
       const resolved = await adapter.resolveOutboundReplyToSenderMention({
         address: context.message.address,
-        text: resolverText,
+        text: payload.text,
         parseMode: payload.parseMode,
         mentions: payload.mentions,
         replyToMessageId: payload.replyTo,
@@ -3049,55 +3112,55 @@ async function resolveFeishuAgentSelectedMentions(
       return preserveReplyWithFeishuMentionNonDelivery(payload);
     }
   }
-  if (!adapter.resolveOutboundMentions) return payload;
+  if (!adapter.resolveOutboundMentions && !adapter.resolveOutboundMentionTargets) return payload;
 
   const requestedByKey = new Map(
     requestedTargets
       .map((target) => [normalizeFeishuMentionTargetKey(target), target] as const)
       .filter(([key]) => !!key),
   );
-  const trustedTargetKeys = new Set(
-    (payload.mentions || [])
-      .map((mention) => normalizeFeishuMentionTargetKey(mention.name || ''))
-      .filter(Boolean),
-  );
-  // 已通过本轮原生 evidence 验证的 mention 原样保留；只把仍缺失的明确目标
-  // 交给当前群官方成员/机器人 resolver，避免一个成功目标遮住另一个失败目标。
-  const selectedTargets = new Map(
-    [...requestedByKey].filter(([key]) => !trustedTargetKeys.has(key)),
-  );
-  if (selectedTargets.size === 0) return payload;
-  for (const target of extractBareFeishuAtTargets(payload.text)) {
+  // 用户点名本身只是授权范围，不能代替 Agent 对本条回复的实际选择。只接受
+  // cti-final 的 mention 名称、已验证结构化 mention 或正文中 Agent 自己写出的
+  // 同名裸 @；三者均必须与用户明确点名求交，避免 Delivery 自动制造平台动作。
+  const selectedTargets = new Map<string, string>();
+  const selectTarget = (target: string) => {
     const key = normalizeFeishuMentionTargetKey(target);
-    if (key && requestedByKey.has(key)) selectedTargets.set(key, requestedByKey.get(key) || target);
-  }
+    const requested = key ? requestedByKey.get(key) : '';
+    if (key && requested) selectedTargets.set(key, requested);
+  };
+  for (const target of payload.mentionTargets || []) selectTarget(target);
+  for (const target of extractBareFeishuAtTargets(payload.text)) selectTarget(target);
+  for (const mention of payload.mentions || []) selectTarget(mention.name || '');
+  if (selectedTargets.size === 0) return payload;
 
-  // resolver 只看到用户本轮明确要求的目标；题面、引用或说明中的其他裸 @ 不产生通知。
-  let resolverText = payload.text;
-  for (const target of extractBareFeishuAtTargets(payload.text)) {
+  // 只有本轮已获授权且被 Agent 选择的成员可以保留裸 @ 文本。其他裸 @ 即使
+  // 出现在题面、示例或模型叙述中也只是未验证的展示符号，先还原为普通文字，
+  // 防止“看似 @ 但没有原生身份”的伪通知随最终回复漏出。
+  let visibleText = payload.text;
+  for (const target of extractBareFeishuAtTargets(visibleText)) {
     if (!selectedTargets.has(normalizeFeishuMentionTargetKey(target))) {
-      resolverText = stripBareFeishuAtTarget(resolverText, target);
+      visibleText = stripBareFeishuAtTarget(visibleText, target);
     }
-  }
-  const presentTargetKeys = new Set(
-    extractBareFeishuAtTargets(resolverText).map(normalizeFeishuMentionTargetKey).filter(Boolean),
-  );
-  const missingTargetPrefixes = [...selectedTargets]
-    .filter(([key]) => !presentTargetKeys.has(key))
-    .map(([, target]) => `@${target}`);
-  if (missingTargetPrefixes.length > 0) {
-    resolverText = [missingTargetPrefixes.join(' '), resolverText].filter(Boolean).join('\n');
   }
 
   try {
-    const resolved = await adapter.resolveOutboundMentions({
+    const requested = [...selectedTargets.values()];
+    const outbound = {
       address: context.message.address,
-      text: resolverText,
+      text: visibleText,
       parseMode: payload.parseMode,
       mentions: payload.mentions,
       replyToMessageId: payload.replyTo,
       feishuCardJson: payload.feishuCardJson,
-    }, context.message);
+    };
+    // 新入口接收独立的显示名集合，避免通过拼接裸 @ 反向驱动平台解析。
+    // 旧 adapter 只在 Agent 已自己写出同名裸 @ 时兼容使用，绝不再补写该文本。
+    const resolved = adapter.resolveOutboundMentionTargets
+      ? await adapter.resolveOutboundMentionTargets(outbound, context.message, requested)
+      : adapter.resolveOutboundMentions && extractBareFeishuAtTargets(payload.text)
+        .some((target) => selectedTargets.has(normalizeFeishuMentionTargetKey(target)))
+        ? await adapter.resolveOutboundMentions(outbound, context.message)
+        : outbound;
 
     const acceptedMentions = new Map<string, OutboundMention>(
       (payload.mentions || [])
@@ -3116,13 +3179,10 @@ async function resolveFeishuAgentSelectedMentions(
     }
 
     const unresolvedTargets: string[] = [];
-    let text = payload.text;
+    let text = visibleText;
     for (const [key, target] of selectedTargets) {
       const accepted = resolvedSelectedMentions.get(key);
-      if (accepted) {
-        text = ensureBareFeishuAtTarget(text, target, accepted.name || target);
-        continue;
-      }
+      if (accepted) continue;
       text = stripBareFeishuAtTarget(text, target);
       unresolvedTargets.push(target);
     }
@@ -3140,21 +3200,6 @@ async function resolveFeishuAgentSelectedMentions(
     // 平台查询失败继续交给统一安全层，保留 Agent 正常回答并明确标记未投递。
     return payload;
   }
-}
-
-function ensureBareFeishuAtTarget(text: string, target: string, canonicalName: string): string {
-  const existingTarget = extractBareFeishuAtTargets(text)
-    .find((item) => normalizeFeishuMentionTargetKey(item) === normalizeFeishuMentionTargetKey(target));
-  if (existingTarget) return replaceBareFeishuAtTarget(text, existingTarget, canonicalName);
-
-  // 结构化模型 ID 被安全层撤销后，正文里通常还保留显示名。只有官方 resolver
-  // 已唯一确认身份时，才把首个独立显示名恢复为原生 mention 占位；否则放到句首。
-  const safeTarget = escapeRegExp(target);
-  const plainTargetPattern = new RegExp(`(^|[^\\p{L}\\p{N}_])${safeTarget}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
-  if (plainTargetPattern.test(text)) {
-    return text.replace(plainTargetPattern, (_match, prefix: string) => `${prefix}@${canonicalName}`);
-  }
-  return text.trim() ? `@${canonicalName}\n${text}` : `@${canonicalName}`;
 }
 
 function stripUnverifiedFeishuBareMentions(text: string): string {
@@ -3885,7 +3930,7 @@ function appendChoiceTextFallback(text: string, payload: PreparedBridgeReplyPayl
   ].join('\n'));
 }
 
-function attachAgentChoicePresentation(input: {
+async function attachAgentChoicePresentation(input: {
   adapter: BaseChannelAdapter;
   msg: InboundMessage;
   sessionId: string;
@@ -3893,7 +3938,7 @@ function attachAgentChoicePresentation(input: {
   visibleText: string;
   continuation?: ActiveChoiceContinuation;
   cardHero?: FeishuCardHeroImage;
-}): { payload: PreparedBridgeReplyPayload; deliveryText: string; registeredChoice?: ChoicePromptView } {
+}): Promise<{ payload: PreparedBridgeReplyPayload; deliveryText: string; registeredChoice?: ChoicePromptView }> {
   const choicePrompt = input.payload.choicePrompt;
   if (!choicePrompt
     || input.payload.feishuCardJson
@@ -3907,12 +3952,30 @@ function attachAgentChoicePresentation(input: {
   }
 
   const prompt = stripConfiguredReplyEndMarker(input.visibleText) || '请选择一个选项。';
+  let targetUserId: string | undefined;
+  let targetDisplayName: string | undefined;
+  if (input.payload.choiceSession?.audience === 'participant') {
+    const resolved = await input.adapter.resolveChoiceParticipant({
+      chatId: input.msg.address.chatId,
+      sourceMessage: input.msg,
+    });
+    if (!resolved.ok || !resolved.userId) {
+      return {
+        payload: { ...input.payload, choicePrompt: undefined, choiceSession: undefined },
+        deliveryText: `${resolved.error || '没有唯一识别出指定作答人'}请明确 @目标成员后再发起选择。`,
+      };
+    }
+    targetUserId = resolved.userId;
+    targetDisplayName = resolved.displayName;
+  }
   const continuingParallelBranch = input.continuation?.groupMode === 'parallel'
     && Boolean(input.continuation.participantKey);
   const registered = choicePromptRegistry.register({
     channelType: input.adapter.channelType,
     chatId: input.msg.address.chatId,
-    userId: input.msg.address.userId,
+    // participant 模式绑定适配器刚刚用真实群成员证据解析出的目标；
+    // 其它模式保持原有发起人绑定或群体校验。
+    userId: targetUserId || input.msg.address.userId,
     sessionId: input.sessionId,
     prompt,
     choicePrompt,
@@ -3963,7 +4026,9 @@ function attachAgentChoicePresentation(input: {
           callbackData: option.callbackData,
           type: 'primary',
         })),
-        footer: registered.choiceSession.mode === 'vote'
+        footer: registered.choiceSession.audience === 'participant'
+          ? `已指定${targetDisplayName || '目标成员'}作答，其他成员不能代选。`
+          : registered.choiceSession.mode === 'vote'
           ? '每位群成员一票；全员选择完会立即继续，最晚在截止时统一继续。收口前再次点击可改票。'
           : registered.choiceSession.mode === 'claim'
             ? '全员可抢选，首个合法点击者成功后立即收口。'
@@ -4508,6 +4573,32 @@ function buildFeishuHistoryEvidencePrompt(context: {
   ].filter(Boolean).join('\n');
 }
 
+/** 恢复同一聊天最近一次真实 user 缺权证据，供“授权/继续”短回复续办。 */
+function buildRecentFeishuUserMissingScopePrompt(adapter: BaseChannelAdapter, chatId: string, userText: string): string {
+  if (adapter.channelType !== 'feishu') return '';
+  if (!/(?:授权|登录飞书|给你授权|重新授权|确认授权|同意授权)/u.test(userText)) return '';
+  const store = getBridgeContext().store as unknown as {
+    listAuditLogs?: (filter?: { channelType?: string; chatId?: string; direction?: 'inbound' | 'outbound'; limit?: number }) => Array<{ summary?: string; createdAt?: string }>;
+  };
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const record of store.listAuditLogs?.({ channelType: 'feishu', chatId, direction: 'outbound', limit: 20 }) || []) {
+    const createdAt = Date.parse(record.createdAt || '');
+    if (Number.isFinite(createdAt) && createdAt < cutoff) continue;
+    const summary = record.summary || '';
+    if (!summary.startsWith('[FEISHU_CLI_USER_MISSING_SCOPE]')) continue;
+    const scope = /(?:^|\s)scope=([^\s]+)/u.exec(summary)?.[1]?.trim() || '';
+    const toolName = /(?:^|\s)tool=([^\s]+)/u.exec(summary)?.[1]?.trim() || '';
+    if (!scope || !/^[a-z0-9_.-]+:[a-z0-9_.:-]+$/iu.test(scope)) continue;
+    return [
+      'Recent Feishu user authorization evidence (Bridge-trusted):',
+      `- 最近真实 user API 已返回缺失权限：${scope}${toolName ? `（来源工具：${toolName}）` : ''}。`,
+      '- 如果用户确认“授权/让我给你授权”，只能为这一项生成 lark-cli auth login --scope，禁止使用 --domain、--recommend 或多 scope。',
+      '- 授权成功后恢复原始任务；如果没有这条真实证据，不得猜测任何 scope。',
+    ].join('\n');
+  }
+  return '';
+}
+
 function promptField(value: unknown): string {
   if (typeof value !== 'string') return '';
   return value.replace(/\s+/g, ' ').trim();
@@ -4966,7 +5057,7 @@ async function buildFeishuMentionResolutionPrompt(
     ...orchestrationLines,
     ...botToBotLines,
     ...lines,
-    '- 对已唯一确认且用户本轮明确要求执行的目标，在最终可见回复中写出同名裸 @（例如 @显示名）；delivery 会再次核验并转换成原生提及。',
+    '- 对已唯一确认且用户本轮明确要求执行的目标，只能在 cti-final.mentions 中用显示名明确选择（例如 ["显示名"]）；Delivery 会再次核验并转换成原生提及，不要为了触发平台动作在正文补写 @。',
     '- 不要输出、猜测或复述平台用户 ID；普通叙述、广播对象、角色和关系称呼仍不得触发身份查询。',
   ].join('\n');
 }
@@ -5430,6 +5521,121 @@ function finalizeActiveTaskCardOnce(
     }
   })();
   return task.cardFinalization;
+}
+
+async function executePanelSettingsActionFromReply(
+  rawReply: string,
+  msg: InboundMessage,
+  rawPrompt: string,
+): Promise<BridgeActionReplyResult> {
+  const extracted = extractCtiPanelSettingsAction(rawReply);
+  const intent = resolvePanelSettingsIntent(rawPrompt);
+  if (!extracted.action) {
+    if (extracted.hadBlock) {
+      return { handled: true, text: `未完成：${extracted.error || '面板设置动作无效'}` };
+    }
+    if (intent === 'update' && /(?:已|已经|成功).{0,12}(?:修改|设置|更新|保存|写入)/iu.test(rawReply)) {
+      return { handled: true, text: '未完成：回复声称已修改面板设置，但没有真实设置 Host 回执，已拦截伪完成。' };
+    }
+    if (intent === 'list') {
+      if (!isOwnerMessage(msg) || !msg.address.userId?.trim()) {
+        return { handled: true, text: buildOwnerRequiredMessage(msg) };
+      }
+      const host = getBridgeContext().panelSettings;
+      if (!host) return { handled: true, text: '未完成：当前 runtime 没有加载受控面板设置服务。' };
+      try {
+        const snapshot = await host.list({
+          actor: {
+            role: 'owner',
+            channelType: msg.address.channelType,
+            chatId: msg.address.chatId,
+            userId: msg.address.userId.trim(),
+            messageId: msg.messageId,
+          },
+        });
+        return {
+          handled: true,
+          text: ['## 当前面板设置（敏感项已脱敏）', formatPanelSettingsSnapshot(snapshot)].join('\n\n'),
+          bridgeActionToolName: PANEL_SETTINGS_ACTION_FENCE,
+        };
+      } catch {
+        return { handled: true, text: '未完成：当前面板设置读取失败。' };
+      }
+    }
+    return { handled: false, text: rawReply };
+  }
+  if (intent !== 'update') {
+    return { handled: true, text: '未完成：本轮没有明确要求修改面板设置，已拦截设置动作。' };
+  }
+  if (!isOwnerMessage(msg) || !msg.address.userId?.trim()) {
+    return { handled: true, text: buildOwnerRequiredMessage(msg) };
+  }
+  const host = getBridgeContext().panelSettings;
+  if (!host) return { handled: true, text: '未完成：当前 runtime 没有加载受控面板设置服务。' };
+  try {
+    const actor = {
+      role: 'owner' as const,
+      channelType: msg.address.channelType,
+      chatId: msg.address.chatId,
+      userId: msg.address.userId.trim(),
+      messageId: msg.messageId,
+    };
+    const receipt = await host.update({
+      actor,
+      changes: extracted.action.changes,
+      expectedVersion: extracted.action.expectedVersion,
+    });
+    if (!receipt.ok || !receipt.written) {
+      return { handled: true, text: `未完成：${receipt.error || '面板设置未写入。'}` };
+    }
+    let restartText = '本次修改不需要重启。';
+    if (receipt.restartRequired) {
+      const restart = await getBridgeContext().bridgeControl?.scheduleRestart({ requestedBy: actor });
+      restartText = restart?.ok
+        ? '已安排在当前回复发送完成后重启 live Bridge；重启成功前仅代表配置已写入。'
+        : '配置已写入，但 live Bridge 重启未能安排，需要从控制面板手动重启。';
+    }
+    const changes = receipt.applied.map((change) => `- ${change.key}：${JSON.stringify(change.previousValue)} → ${JSON.stringify(change.value)}`).join('\n');
+    return {
+      handled: true,
+      text: [
+        '面板设置已写入。',
+        '',
+        '### 本次修改',
+        changes,
+        '',
+        restartText,
+        '',
+        '## 当前面板设置（敏感项已脱敏）',
+        formatPanelSettingsSnapshot(receipt.snapshot),
+      ].join('\n'),
+      bridgeActionToolName: PANEL_SETTINGS_ACTION_FENCE,
+    };
+  } catch (error) {
+    const message = error instanceof Error && /^(?:未知设置|设置不可|设置重复|每次必须|值必须|允许值|必须提供|执行器 ID|只允许|设置已被|设置文件正在)/u.test(error.message)
+      ? error.message
+      : '面板设置写入失败';
+    return { handled: true, text: `未完成：${message}` };
+  }
+}
+
+/**
+ * 只恢复焦点裁决已经唯一选中的原生回复正文。该值可用于 response-only 协议
+ * 修复，但不能作为平台身份、路径、权限或执行证据。
+ */
+function resolveTrustedPrimaryReplyText(
+  envelope?: TurnEvidenceEnvelope,
+  focus?: TurnFocusDecision,
+): string {
+  if (!envelope || !focus || focus.focus !== 'reply_target' || focus.confidence < 0.8) return '';
+  if (focus.primaryEvidenceIds.length !== 1 || focus.conflictingEvidenceIds.length > 0) return '';
+  const evidence = envelope.evidence.find((item) => item.id === focus.primaryEvidenceIds[0]);
+  if (!evidence
+    || evidence.relation !== 'native_reply'
+    || evidence.confidence < 0.8
+    || evidence.metadata?.contentRecovered === false) return '';
+  const text = evidence.content.normalize('NFKC').replace(/\r\n?/gu, '\n').trim();
+  return Array.from(text).length <= 1_000 ? text : '';
 }
 
 async function finalizeInterruptedTaskCard(task: ActiveBridgeTask, responseText = DEFAULT_INTERRUPTED_CARD_TEXT): Promise<boolean> {
@@ -5929,6 +6135,8 @@ export async function deliverProactiveMessage(input: {
   workingDirectory?: string;
   additionalDirectories?: string[];
   sourcePrompt?: string;
+  /** 只能来自受控调用方或已解析的 cti-final；模型、音色和路径继续由 Runtime 独占。 */
+  speech?: SpeechReplyDirective;
 }): Promise<import('./types.js').SendResult> {
   const state = getState();
   const adapter = state.adapters.get(input.address.channelType);
@@ -5961,6 +6169,145 @@ export async function deliverProactiveMessage(input: {
   const preparedCardHero = prepared && !input.feishuCardJson
     ? await prepareFeishuCardHero(adapter, prepared)
     : null;
+
+  const { store } = getBridgeContext();
+  const speechDirective = input.speech || prepared?.speech;
+  const speechHost = getBridgeContext().speech;
+  let sessionPreference: SpeechReplyPreference | null = null;
+  if (input.sessionId && typeof store.getSpeechReplyPreference === 'function') {
+    try { sessionPreference = store.getSpeechReplyPreference(input.sessionId); } catch { /* 读取失败时继续使用安全默认文字。 */ }
+  }
+  let proactiveReplyPolicy: SpeechReplyPolicy | undefined;
+  try { proactiveReplyPolicy = speechHost?.getReplyPolicy?.(); } catch { /* 可选只读策略失败不阻断文字投递。 */ }
+  const speechDecision = decideSpeechReply({
+    sessionPreference,
+    inboundAudio: false,
+    modelDirective: speechDirective,
+    replyPolicy: proactiveReplyPolicy,
+  });
+  const proactiveSpeechText = normalizeSpeechSynthesisText(stripReplyEndMarker(outboundText));
+  const proactiveSpeechEligibility = evaluateSpeechSynthesisEligibility({
+    text: proactiveSpeechText,
+    imageCount: localImagePaths.length,
+    fileCount: localFilePaths.length,
+    hasInteractiveContent: Boolean(input.feishuCardJson || prepared?.feishuCardJson || prepared?.choicePrompt
+      || prepared?.choiceFlow || prepared?.choiceSession || prepared?.analysisView),
+    mentionCount: prepared?.mentions?.length || input.mentions?.length || 0,
+    permissionRequested: false,
+  });
+  const proactiveSpeechEligible = adapter.channelType === 'feishu'
+    && speechDecision.mode === 'voice'
+    && proactiveSpeechEligibility.eligible
+    && Boolean(proactiveSpeechText);
+
+  if (speechDecision.mode === 'voice' && !proactiveSpeechEligibility.eligible) {
+    try {
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: input.address.chatId,
+        direction: 'outbound',
+        messageId: '',
+        summary: `[SPEECH_SYNTHESIS_SKIPPED] reason=${proactiveSpeechEligibility.reason}`,
+      });
+    } catch { /* 观察链失败不能阻断原始主动投递。 */ }
+  }
+
+  if (proactiveSpeechEligible) {
+    if (input.dedupKey) {
+      try {
+        if (store.checkDedup(input.dedupKey)) return { ok: true, messageId: undefined };
+      } catch { /* 与普通 Delivery 一致，去重状态读取失败时继续真实投递。 */ }
+    }
+    let receipt: SpeechSynthesisReceipt | null = null;
+    try {
+      if (!speechHost) throw { errorCode: 'speech_not_ready' };
+      const synthesisIdentity = parseSpeechSynthesisIdentity(await speechHost.getSynthesisIdentity());
+      if (!synthesisIdentity) throw { errorCode: 'speech_synthesis_identity_unavailable' };
+      const synthesisRequest = {
+        text: proactiveSpeechText,
+        expectedIdentity: synthesisIdentity,
+        ...(speechDirective?.voiceRequirement ? { voiceRequirement: speechDirective.voiceRequirement } : {}),
+      };
+      const rawReceipt = await speechHost.synthesize(synthesisRequest);
+      receipt = parseSpeechSynthesisReceipt(rawReceipt, synthesisRequest);
+      if (!receipt) {
+        try { await speechHost.releaseSynthesis?.(rawReceipt); } catch { /* Runtime 复验清理，失败只进入观察链。 */ }
+        throw { errorCode: 'speech_invalid_synthesis_receipt' };
+      }
+
+      const failureNotice = speechFailureMessage({ errorCode: 'speech_delivery_failed' }, 'synthesize');
+      const delivered = await deliverSpeechWithTextFallback({
+        sendAudio: () => adapter.sendLocalAudio(
+          input.address.chatId,
+          receipt!.path,
+          prepared?.replyTo || input.replyToMessageId,
+          { expectedSha256: receipt!.fileSha256 },
+        ),
+        sendTextFallback: () => deliver(adapter, {
+          address: input.address,
+          text: [outboundText, failureNotice].filter(Boolean).join('\n\n'),
+          parseMode: outboundParseMode,
+          replyToMessageId: prepared?.replyTo || input.replyToMessageId,
+          mentions: prepared?.mentions || input.mentions,
+        }, {
+          dedupKey: input.dedupKey,
+          sessionId: input.sessionId,
+        }),
+      });
+      if (delivered.kind === 'unresolved') return { ok: false, error: delivered.error };
+      if (delivered.kind === 'text_fallback') return { ok: true, messageId: delivered.messageId };
+
+      if (input.dedupKey) {
+        try { store.insertDedup(input.dedupKey); } catch { /* 平台已成功，不得改写真实结果。 */ }
+      }
+      const continuationContext = [
+        input.sourcePrompt?.trim() ? `原始请求：${input.sourcePrompt.trim()}` : '',
+        '上一轮状态：已完成',
+        '交付类型：完整语音结果',
+        '生成状态：已生成',
+        `音色相似度：${receipt.speakerSimilarityStatus === 'passed' ? '已通过' : receipt.speakerSimilarityStatus === 'not_verified' ? '未验收（当前设置不阻塞）' : '不适用（预设音色）'}`,
+        '发送状态：已发送',
+        proactiveSpeechText ? `上一轮结果：${proactiveSpeechText}` : '',
+      ].filter(Boolean).join('\n');
+      try {
+        if (input.sessionId) {
+          store.insertOutboundRef({
+            channelType: adapter.channelType,
+            chatId: input.address.chatId,
+            codepilotSessionId: input.sessionId,
+            platformMessageId: delivered.messageId,
+            purpose: 'response',
+            messageKind: 'audio',
+            continuationContext,
+          });
+        }
+        store.insertAuditLog({
+          channelType: adapter.channelType,
+          chatId: input.address.chatId,
+          direction: 'outbound',
+          messageId: delivered.messageId,
+          summary: continuationContext.slice(0, 900),
+        });
+      } catch { /* 语音已真实发送，观察写入失败不能回滚。 */ }
+      return { ok: true, messageId: delivered.messageId };
+    } catch (error) {
+      const fallback = await deliver(adapter, {
+        address: input.address,
+        text: [outboundText, speechFailureMessage(error, 'synthesize')].filter(Boolean).join('\n\n'),
+        parseMode: outboundParseMode,
+        replyToMessageId: prepared?.replyTo || input.replyToMessageId,
+        mentions: prepared?.mentions || input.mentions,
+      }, {
+        dedupKey: input.dedupKey,
+        sessionId: input.sessionId,
+      });
+      return fallback;
+    } finally {
+      if (receipt) {
+        try { await speechHost?.releaseSynthesis?.(receipt); } catch { /* 清理失败只进入 Runtime 观察链。 */ }
+      }
+    }
+  }
 
   const sent = await deliver(adapter, {
     address: input.address,
@@ -6444,7 +6791,8 @@ async function handleMessage(
     const inspectedChoice = choicePromptRegistry.inspect(msg.callbackData);
     let chatMemberVerified = false;
     let eligibleParticipantKeys: string[] | undefined;
-    if (inspectedChoice?.choiceSession.audience === 'chat_members') {
+    if (inspectedChoice?.choiceSession.audience === 'chat_members'
+      || inspectedChoice?.choiceSession.audience === 'participant') {
       const participant = await adapter.verifyChoiceParticipant(msg.address.chatId, msg.address.userId || '');
       chatMemberVerified = participant.allowed;
       if (participant.source === 'callback_event' && participant.error) {
@@ -6498,6 +6846,8 @@ async function handleMessage(
       const text = selected.kind === 'forbidden'
         ? inspectedChoice?.choiceSession.audience === 'chat_members'
           ? '当前点击者未通过本群成员校验，不能参与这轮选择。'
+          : inspectedChoice?.choiceSession.audience === 'participant'
+            ? '这轮题目已指定给另一位成员，不能代替对方选择。'
           : '这个选择按钮属于原发起人，不能代替对方选择。'
         : selected.kind === 'consumed'
           ? '这个选择已经处理过了，请使用最新一轮的选项。'
@@ -7070,7 +7420,12 @@ async function handleMessage(
     })
     : null;
   const nativeReplyAudioClaimed = Array.isArray(rawData?.feishuNativeReplyAttachments)
-    && rawData.feishuNativeReplyAttachments.some((item) => item?.resourceType === 'audio');
+    && rawData.feishuNativeReplyAttachments.some((item) => {
+      if (item?.resourceType === 'audio') return true;
+      if (item?.resourceType !== 'file' || typeof item?.attachmentId !== 'string') return false;
+      const attachment = (msg.attachments || []).find((candidate) => candidate.id === item.attachmentId);
+      return Boolean(attachment?.type?.toLowerCase().startsWith('audio/'));
+    });
   const nativeReplySpeechPlan = nativeReplyAudioClaimed
     ? resolveTrustedNativeReplyAudio({
       channelType: adapter.channelType,
@@ -7238,10 +7593,14 @@ async function handleMessage(
     }
   }
 
-  const memoryIntentCandidate = isMemoryIntentCandidateText(text || rawText);
+  // 记忆写入不能由“记住/长期”等固定词直接裁决。对所有可分类的纯文本回合
+  // 交给受限 JSON classifier；它返回 ignore 时不产生记忆副作用，也不触发协作。
+  const memoryIntentClassifierEligible = Boolean((text || rawText).trim())
+    && !hasAttachments
+    && !isFeishuStickerMessageKind(inboundMessageKind);
   let memoryIntentPreflight: MemoryIntentPreflight | null = null;
   try {
-    memoryIntentPreflight = memoryIntentCandidate && !hasAttachments && !isFeishuStickerMessageKind(inboundMessageKind)
+    memoryIntentPreflight = memoryIntentClassifierEligible
       ? await prepareModelPlannedMemoryWrite(
         msg,
         binding,
@@ -7256,6 +7615,9 @@ async function handleMessage(
     throw error;
   }
   if (finishCancelledBeforeProvider()) return;
+  // Collaboration 只接收 classifier 已确认的记忆意图，避免每条普通消息都被
+  // 当成“可能记忆任务”而改变专业 Agent 的调度。
+  const memoryIntentCandidate = memoryIntentPreflight !== null;
   const preparedMemoryWrite = memoryIntentPreflight?.preparedWrite;
 
   let memoryRecallExtraSystemPrompt = '';
@@ -7467,6 +7829,7 @@ async function handleMessage(
     ? buildStickerCandidateAnalysisSystemPrompt(feishuStickerLibraryAttachedFileKeys, rawText)
     : '';
   const feishuHistoryEvidencePrompt = buildFeishuHistoryEvidencePrompt(rawData?.feishuHistoryContext);
+  const recentFeishuUserMissingScopePrompt = buildRecentFeishuUserMissingScopePrompt(adapter, msg.address.chatId, rawText);
   const inboundActorContextPrompt = buildInboundActorContextPrompt(adapter, msg, rawData);
   const assistantMaintainerContextPrompt = buildAssistantMaintainerContextPrompt(adapter, msg);
   const isStickerMessage = isFeishuStickerMessageKind(inboundMessageKind);
@@ -7498,7 +7861,7 @@ async function handleMessage(
     : '';
   const scheduledTaskReadIntent = resolveScheduledTaskReadIntent(text || rawText);
   let scheduledTaskReadEvidencePrompt = '';
-  if (scheduledTaskReadIntent === 'list') {
+  if (scheduledTaskReadIntent) {
     const scheduledTasks = getBridgeContext().scheduledTasks;
     let listResult: ScheduledTaskListResult = {
       ok: false,
@@ -7513,7 +7876,83 @@ async function handleMessage(
         listResult = { ok: false, tasks: [], error: 'scheduled task list failed' };
       }
     }
-    scheduledTaskReadEvidencePrompt = buildScheduledTaskReadEvidencePrompt(listResult);
+    if (scheduledTaskReadIntent === 'list') {
+      scheduledTaskReadEvidencePrompt = buildScheduledTaskReadEvidencePrompt(listResult);
+    } else {
+      // 统计互动打卡时，先按当前 Actor 的可见范围列出任务，再逐个读取运行账本。
+      // 不把 taskId、参与者身份或文件路径交给 Provider，避免它转而猜测飞书资源。
+      const historyItems: Array<{ task: unknown; runs: unknown[] }> = [];
+      let historyOk = listResult.ok;
+      if (scheduledTasks && listResult.ok) {
+        for (const task of listResult.tasks) {
+          const candidate = task && typeof task === 'object' && !Array.isArray(task)
+            ? task as Record<string, unknown>
+            : null;
+          const action = candidate?.action && typeof candidate.action === 'object' && !Array.isArray(candidate.action)
+            ? candidate.action as Record<string, unknown>
+            : null;
+          const taskId = typeof candidate?.id === 'string' ? candidate.id.trim() : '';
+          if (!taskId || action?.kind !== 'check_in') continue;
+          try {
+            const history = await scheduledTasks.history({
+              taskId,
+              actor: buildScheduledTaskActor(msg),
+              // 限制读取规模，但足以覆盖高频互动打卡的两周比较；Host 仍拥有最终权限裁决。
+              limit: 512,
+            });
+            if (!history.ok) {
+              historyOk = false;
+              break;
+            }
+            historyItems.push({
+              task,
+              runs: await resolveScheduledTaskCheckInParticipantNames(adapter, task, history.runs),
+            });
+          } catch {
+            historyOk = false;
+            break;
+          }
+        }
+      }
+      scheduledTaskReadEvidencePrompt = buildScheduledTaskCheckInHistoryEvidencePrompt({
+        ok: historyOk,
+        items: historyItems,
+      }, {
+        // 时间窗口必须由 Bridge 在可信账本投影前裁决，不能交给模型从全量记录猜测。
+        requestText: text || rawText,
+      });
+    }
+  }
+  const panelSettingsIntent = resolvePanelSettingsIntent(text || rawText);
+  let panelSettingsEvidencePrompt = '';
+  if (panelSettingsIntent) {
+    if (!ownerMessage || !msg.address.userId?.trim()) {
+      panelSettingsEvidencePrompt = [
+        'Panel settings policy:',
+        '- 当前发送者不是 Bridge Owner。不得读取、列出或修改面板设置，也不得输出 cti-panel-settings 动作。',
+        '- 用中文明确说明该能力仅限 Owner。',
+      ].join('\n');
+    } else {
+      const panelSettings = getBridgeContext().panelSettings;
+      if (panelSettings) {
+        try {
+          const snapshot = await panelSettings.list({
+            actor: {
+              role: 'owner',
+              channelType: msg.address.channelType,
+              chatId: msg.address.chatId,
+              userId: msg.address.userId.trim(),
+              messageId: msg.messageId,
+            },
+          });
+          panelSettingsEvidencePrompt = buildPanelSettingsEvidencePrompt(snapshot);
+        } catch {
+          panelSettingsEvidencePrompt = 'Panel settings Host evidence unavailable. Do not guess settings or claim a write succeeded.';
+        }
+      } else {
+        panelSettingsEvidencePrompt = 'Panel settings Host is unavailable. Do not guess settings or claim a write succeeded.';
+      }
+    }
   }
   const hasPreResolvedEvidence = Boolean(
     feishuCloudSystemPrompt
@@ -7522,8 +7961,16 @@ async function handleMessage(
     || feishuStickerLibraryContextPrompt
     || feishuAvatarEvidencePrompt
     || feishuMemberProfileEvidencePrompt
-    || scheduledTaskReadEvidencePrompt,
+    || scheduledTaskReadEvidencePrompt
+    || panelSettingsEvidencePrompt,
   );
+  // Runtime 已把纯读取的本地事实投影为受控 evidence 时，不能再让 Provider
+  // 通过 Bash/CLI/外部连接器寻找第二份数据并反向覆盖 Host 的真实结果。
+  // 写入型面板设置继续走 cti-panel-settings + 后置 Host，不在此处禁用其协议。
+  const responseOnlyForTrustedLocalReadEvidence = requiresResponseOnlyForTrustedLocalReadEvidence([
+    { available: Boolean(scheduledTaskReadEvidencePrompt), readOnly: Boolean(scheduledTaskReadIntent) },
+    { available: Boolean(panelSettingsEvidencePrompt), readOnly: panelSettingsIntent === 'list' },
+  ]);
   let uiExecutionRequirement = classifyExecutionRequirement({
     userText: text || rawText,
     workingDirectory: effectiveBinding.workingDirectory || store.getSession(effectiveBinding.codepilotSessionId)?.working_directory || undefined,
@@ -7796,6 +8243,7 @@ async function handleMessage(
     if (shouldRunCorrectionMaintenance({
       currentUserText: storedUserText,
       previousAssistantText,
+      hasTrustedPreviousAssistantRelation: Boolean(rawData?.feishuReplyTo?.messageId),
     })) {
       await runSelfMaintenanceSafely({
         phase: 'correction',
@@ -7857,6 +8305,39 @@ async function handleMessage(
     if (taskAbort.signal.aborted) return;
     const structuredTurnContextPrompt = resolvedTurnContext.prompt;
     const hasStructuredConversationEvidence = resolvedTurnContext.hasPlatformEvidence;
+    // 由结构化焦点统一决定快速路径资格。只要本轮依赖回复、续办或仍有歧义，
+    // 就保留给 Primary；不根据用户的某个固定措辞猜测“是不是任务”。
+    const lightChatEligible = permitsLightweightResponse(resolvedTurnContext.decision);
+    const trustedPrimaryReplyText = resolveTrustedPrimaryReplyText(
+      resolvedTurnContext.envelope,
+      resolvedTurnContext.decision,
+    );
+    // 原生 reply 只有 @ 机器人时，平台会提供不含业务语义的通用续办文本。
+    // 仅在 Reference Resolver 已确认唯一、可信且可读的原消息时，才继承其中
+    // 的明确语音交付要求；普通引用、新指令和“不要发语音”仍以当前消息为准。
+    const effectiveSpeechRequest = resolveEffectiveSpeechRequest({
+      currentText: rawText,
+      trustedNativeReplyText: trustedPrimaryReplyText || undefined,
+    });
+    const continuationPrimaryIds = new Set(resolvedTurnContext.decision.primaryEvidenceIds);
+    const recoveredCompletedContinuationContext = resolvedTurnContext.envelope.evidence
+      .filter((item) => continuationPrimaryIds.has(item.id))
+      .filter((item) => item.source === 'local_outbound_ref' || item.metadata?.continuationContextRecovered === true)
+      .map((item) => item.content.trim())
+      .filter(Boolean)
+      .join('\n');
+    let continuationAdjustment: 'adjust' | 'not_adjust' | 'ambiguous' = 'ambiguous';
+    if (recoveredCompletedContinuationContext && !resolvedTurnContext.decision.requiresAgentResolution) {
+      try {
+        continuationAdjustment = await getBridgeContext().continuationAdjustments?.classifyContinuationAdjustment({
+          sessionId: effectiveBinding.codepilotSessionId,
+          currentText: text || rawText,
+          recoveredCompletedContext: recoveredCompletedContinuationContext,
+        }) || 'ambiguous';
+      } catch {
+        // 分类器失败不得按旧词表回退；Primary 继续处理，但不继承执行要求。
+      }
+    }
     uiExecutionRequirement = inheritContinuationExecutionRequirement({
       currentRequirement: uiExecutionRequirement,
       userText: text || rawText,
@@ -7868,6 +8349,7 @@ async function handleMessage(
       hasPreResolvedEvidence,
       envelope: resolvedTurnContext.envelope,
       focus: resolvedTurnContext.decision,
+      continuationAdjustment,
     });
     if (providerMemoryMode === 'off' && uiExecutionRequirement.kind !== 'none') {
       providerMemoryMode = 'augment';
@@ -7933,7 +8415,49 @@ async function handleMessage(
       feishuMemberProfileEvidencePrompt,
       feishuAvatarEvidencePrompt,
       speechTranscriptContext,
+      recentFeishuUserMissingScopePrompt,
     ].filter(Boolean).join('\n\n');
+    const managedSingingProtocolExpected = adapter.channelType === 'feishu'
+      && uiExecutionRequirement.kind === 'none'
+      && expectsManagedSingingProtocol(rawText);
+    const deterministicReferencedSingingDirective = managedSingingProtocolExpected
+      ? buildDeterministicReferencedSingingDirective({
+          userText: rawText,
+          referencedText: trustedPrimaryReplyText || undefined,
+        })
+      : undefined;
+    const speechSessionPreference = readSpeechReplyPreference(msg, effectiveBinding.codepilotSessionId);
+    const managedSpeechProtocolExpected = adapter.channelType === 'feishu'
+      && speechSessionPreference !== 'off'
+      && uiExecutionRequirement.kind === 'none'
+      && expectsManagedSpeechProtocol(effectiveSpeechRequest.userText);
+    let ownerSelfVoiceAutoAuthorization = false;
+    try {
+      ownerSelfVoiceAutoAuthorization = getBridgeContext().speech
+        ?.getReferenceVoiceImportPolicy?.().ownerSelfVoiceAutoAuthorization === true;
+    } catch {
+      // 可选策略读取失败时保持默认关闭，不能放宽参考音色授权。
+    }
+    const referenceVoiceCreationIntent = adapter.channelType === 'feishu'
+      && expectsReferenceVoiceCreation(rawText, Boolean(trustedNativeReferenceSource));
+    // “创建/导入”会被通用执行分类器保守地标为 tool_required。若没有任何外部
+    // 工具族，且目标明确是参考音色，则改由 Bridge 自己的 SpeechHost 收口，
+    // 禁止 Primary 用 Bash 或文件附件旁路。复合 Unity/文件/MCP 任务不会降级。
+    const managedReferenceVoiceCreationExpected = referenceVoiceCreationIntent
+      && (uiExecutionRequirement.kind === 'none' || uiExecutionRequirement.requiredToolFamilies.length === 0);
+    if (managedReferenceVoiceCreationExpected && uiExecutionRequirement.kind !== 'none') {
+      uiExecutionRequirement = {
+        kind: 'none',
+        reason: 'reference voice creation is executed by the Bridge-owned SpeechHost',
+        requiredToolFamilies: [],
+      };
+    }
+    const deterministicOwnerReferenceVoiceAction = buildOwnerAutoAuthorizedReferenceVoiceAction({
+      userText: rawText,
+      ownerMessage,
+      hasTrustedNativeReplyAudio: Boolean(trustedNativeReferenceSource),
+      ownerSelfVoiceAutoAuthorization,
+    });
     if (collaborationRunId) {
       try {
         collaborationHost?.markPrimaryStarted(collaborationRunId);
@@ -7964,6 +8488,7 @@ async function handleMessage(
       historyLimit: fastPathOptions.historyLimit,
       memoryMode: providerMemoryMode,
       priorityTurnContext,
+      lightChatEligible,
       extraSystemPrompt: [
         // Sticker receive/annotation rules must stay at the retained prefix so
         // a generated evidence sentence like “用户发送了一个表情包” cannot be
@@ -7983,6 +8508,7 @@ async function handleMessage(
         fastPathOptions.extraSystemPrompt,
         hasStructuredConversationEvidence ? '' : feishuConversationContextPrompt,
         feishuHistoryEvidencePrompt,
+        recentFeishuUserMissingScopePrompt,
         feishuDocumentMemoryPrompt,
         preparedMemoryWriteAgentPrompt,
         temporaryMemoryAgentPrompt,
@@ -7992,12 +8518,32 @@ async function handleMessage(
         recentConversationMediaPrompt,
       ].filter(Boolean).join('\n\n'),
       additionalPromptSections: [
+        ...(ownerSelfVoiceAutoAuthorization ? [{
+          id: 'speech.owner-self-voice-auto-authorization',
+          kind: 'policy' as const,
+          source: 'runtime.speech-policy',
+          priority: 16,
+          content: [
+            'Reference voice owner policy (Bridge-trusted):',
+            '- The unique Bridge Owner has enabled automatic authorization for their own clean recording, limited to local TTS.',
+            '- Do not ask the Owner again to repeat recording-rights, local-use, or clean-single-speaker confirmation.',
+            '- The exact spoken reference transcript is still mandatory and must be explicitly supplied in the current user message; never copy or treat an ASR transcript as user confirmation.',
+            '- The Bridge constructs and executes the bounded speech_action from current trusted evidence. Do not claim registration, synthesis, delivery, or similarity success in advance.',
+          ].join('\n'),
+        }] : []),
         ...(scheduledTaskReadEvidencePrompt ? [{
           id: 'scheduled-task.read-evidence',
           kind: 'execution' as const,
           source: 'runtime.scheduled-task-host',
           priority: 17,
           content: scheduledTaskReadEvidencePrompt,
+        }] : []),
+        ...(panelSettingsEvidencePrompt ? [{
+          id: 'panel-settings.evidence',
+          kind: 'execution' as const,
+          source: 'runtime.panel-settings-host',
+          priority: 17,
+          content: panelSettingsEvidencePrompt,
         }] : []),
         ...(stickerExpressionPromptSection ? [{
           id: stickerExpressionPromptSection.id,
@@ -8012,7 +8558,16 @@ async function handleMessage(
       memoryIntentHandled: Boolean(memoryIntentPreflight),
       // “把已有结果整理成飞书文档”是内部纯文本改写，不是新的执行任务。
       // 即使改写提示中出现 Unity、截图或失败说明，也必须禁止 Manifest/MCP 路由。
-      responseOnly: Boolean(memoryIntentPreflight || directFeishuDocRequest),
+      // 无外部证据要求的明确演唱请求，Primary 只负责构造 singing 协议；
+      // Shell/TTS/文件生成不是 Primary 的执行边界，真实合成由后置 Host 独占。
+      responseOnly: Boolean(
+        memoryIntentPreflight
+        || directFeishuDocRequest
+        || managedSingingProtocolExpected
+        || managedSpeechProtocolExpected
+        || managedReferenceVoiceCreationExpected
+        || responseOnlyForTrustedLocalReadEvidence
+      ),
       memoryUserId: msg.address.userId,
       memoryUserDisplayName: msg.address.displayName,
       sourceMessageId: msg.messageId,
@@ -8025,13 +8580,58 @@ async function handleMessage(
       choiceContinuation: activeChoiceContinuation,
       // 动作尚未执行前先做纯协议审查。Conversation Engine 只会在无工具、无权限
       // 流程的安全回合自动重写一次；Owner、身份与高风险校验仍在真实执行入口完成。
-      postGenerationReview: ({ responseText }) => reviewDeferredBridgeActionProtocol(responseText),
+      postGenerationReview: ({ responseText }) => {
+        const deferredActionReview = reviewDeferredBridgeActionProtocol(responseText);
+        if (!deferredActionReview.ok) return deferredActionReview;
+        const referenceVoiceReview = adapter.channelType === 'feishu'
+          ? reviewReferenceVoiceCreationProtocol({
+              userText: rawText,
+              responseText,
+              ownerMessage,
+              hasTrustedNativeReplyAudio: Boolean(trustedNativeReferenceSource),
+              ownerSelfVoiceAutoAuthorization,
+            })
+          : { ok: true } as const;
+        if (!referenceVoiceReview.ok) return referenceVoiceReview;
+        const speechReview = adapter.channelType === 'feishu'
+          ? reviewSpeechReplyProtocol({
+              userText: effectiveSpeechRequest.userText,
+              responseText,
+              sessionVoiceDisabled: speechSessionPreference === 'off',
+              hasReferencedContent: Boolean(trustedPrimaryReplyText) || effectiveSpeechRequest.inheritedFromTrustedReply,
+            })
+          : { ok: true } as const;
+        if (!speechReview.ok) return speechReview;
+        // 这里只要求 Primary 补齐受管协议；真实执行仍由严格 singing directive、
+        // 当前 Feishu 回合和 SingingHost 回执共同授权，不能靠关键词直接启动模型。
+        return adapter.channelType === 'feishu' && !deterministicReferencedSingingDirective
+          ? reviewSingingReplyProtocol({
+              userText: rawText,
+              responseText,
+              referencedText: trustedPrimaryReplyText || undefined,
+            })
+          : { ok: true };
+      },
     });
     // 控制面板取消与 Provider 结束可能并发。Abort 一旦生效，本轮不能继续
     // 记忆、附件或文本投递，也不能让迟到结果覆盖已经定稿的中断卡片。
     if (taskAbort.signal.aborted) {
       ack();
       return;
+    }
+    const missingScopeEvidence = result.executionEvidence.feishuCliUserMissingScopes?.[0];
+    if (adapter.channelType === 'feishu' && missingScopeEvidence?.scopes.length === 1) {
+      store.insertAuditLog({
+        channelType: msg.address.channelType,
+        chatId: msg.address.chatId,
+        direction: 'outbound',
+        messageId: msg.messageId,
+        summary: [
+          '[FEISHU_CLI_USER_MISSING_SCOPE]',
+          `scope=${missingScopeEvidence.scopes[0]}`,
+          `tool=${missingScopeEvidence.toolName.replace(/\s+/g, '_').slice(0, 120)}`,
+        ].join(' '),
+      });
     }
     updateBridgeRuntimeActiveRequest(activeRequest, 'provider_streaming');
 
@@ -8090,17 +8690,58 @@ async function handleMessage(
       ? result.executionEvidence.feishuCliUserAuthorizationChallenges?.[0]
       : undefined;
     if (feishuCliAuthorizationChallenge) {
+      if (scheduledTaskReadIntent === 'check_in_history') {
+        // 本地互动打卡统计已经由 Runtime 读取并注入受限 evidence。模型仍尝试
+        // lark-cli 只能视为错误路由，绝不能把它合并进共享的飞书 OAuth 队列。
+        const misrouteText = '未完成：本次是 Bridge 本地互动打卡统计，不需要飞书用户授权。已拒绝错误的授权请求；请在修复后的本地统计入口重试。';
+        store.insertAuditLog({
+          channelType: msg.address.channelType,
+          chatId: msg.address.chatId,
+          direction: 'outbound',
+          messageId: msg.messageId,
+          summary: '[LOCAL_CHECK_IN_AUTH_MISROUTE_REJECTED]',
+        });
+        let statusCardFinalized = false;
+        if ((workflowCardStarted || lightStatusCardStarted) && adapter.onStreamEnd) {
+          try {
+            statusCardFinalized = await adapter.onStreamEnd(
+              msg.address.chatId,
+              'error',
+              misrouteText,
+              result.runSummary,
+              undefined,
+              undefined,
+              {
+                codepilotSessionId: effectiveBinding.codepilotSessionId,
+                sourceMessageId: msg.messageId,
+                sourceText: storedUserText,
+              },
+            );
+          } catch { /* 状态卡失败不能影响唯一文字终态。 */ }
+        }
+        if (!statusCardFinalized) {
+          await deliver(adapter, {
+            address: msg.address,
+            text: misrouteText,
+            parseMode: 'plain',
+            replyToMessageId: msg.messageId,
+          }, { sessionId: effectiveBinding.codepilotSessionId });
+        }
+        recordConversationMemoryEvent(msg, effectiveBinding, 'assistant', misrouteText);
+        ack();
+        return;
+      }
       clearLightStatusTimer();
-      const ownerAuthorized = isOwnerMessage(msg);
-      let authorizationText = ownerAuthorized
+      const requesterUserId = msg.address.userId?.trim() || '';
+      let authorizationText = requesterUserId
         ? '未完成：当前运行时没有配置飞书 CLI 用户授权接管能力。'
-        : '未完成：本机 lark-cli 用户身份由所有任务共享，只允许 Owner 发起授权。请联系 Owner 完成授权后再重试。';
+        : '未完成：无法确认当前飞书消息的发起人身份，不能安全发起用户授权。';
       let authorizationCardJson: string | undefined;
       const authorizationStatus: 'error' = 'error';
-      let authorizationAuditStatus = ownerAuthorized ? 'host_missing' : 'owner_required';
+      let authorizationAuditStatus = requesterUserId ? 'host_missing' : 'requester_identity_missing';
       let authorizationRequestId = '';
 
-      if (ownerAuthorized) {
+      if (requesterUserId) {
         const authHost = getBridgeContext().feishuCliUserAuth;
         if (authHost) {
           try {
@@ -8280,7 +8921,10 @@ async function handleMessage(
       }
     }
     const providerVisibleResponseText = stickerCandidateAnalysisResult.text;
-    const bridgeControlAction = providerVisibleResponseText
+    const panelSettingsAction = providerVisibleResponseText
+      ? await executePanelSettingsActionFromReply(providerVisibleResponseText, msg, rawText)
+      : { handled: false, text: '' };
+    const bridgeControlAction = !panelSettingsAction.handled && providerVisibleResponseText
       ? await executeBridgeControlActionFromReply(
         providerVisibleResponseText,
         msg,
@@ -8289,10 +8933,10 @@ async function handleMessage(
         resolvedTurnContext.decision,
       )
       : { handled: false, text: '' };
-    const artifactPromotionAction = !bridgeControlAction.handled && providerVisibleResponseText
+    const artifactPromotionAction = !panelSettingsAction.handled && !bridgeControlAction.handled && providerVisibleResponseText
       ? await executeArtifactPromotionActionFromReply(providerVisibleResponseText, msg, rawText)
       : { handled: false, text: '' };
-    const directMessageAction = !bridgeControlAction.handled && !artifactPromotionAction.handled && providerVisibleResponseText
+    const directMessageAction = !panelSettingsAction.handled && !bridgeControlAction.handled && !artifactPromotionAction.handled && providerVisibleResponseText
       ? await executeDirectMessageActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -8303,7 +8947,7 @@ async function handleMessage(
         resolvedTurnContext.decision,
       )
       : { handled: false, text: '' };
-    const scheduledTaskAction = !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && providerVisibleResponseText
+    const scheduledTaskAction = !panelSettingsAction.handled && !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && providerVisibleResponseText
       ? await executeScheduledTaskActionFromReply(
         providerVisibleResponseText,
         msg,
@@ -8311,20 +8955,23 @@ async function handleMessage(
         rawText,
       )
       : { handled: false, text: '' };
-    let bridgeActionToolName = bridgeControlAction.bridgeActionToolName
+    let bridgeActionToolName = panelSettingsAction.bridgeActionToolName
+      || bridgeControlAction.bridgeActionToolName
       || artifactPromotionAction.bridgeActionToolName
       || directMessageAction.bridgeActionToolName
       || scheduledTaskAction.bridgeActionToolName;
-    let responseText = bridgeControlAction.handled
-      ? bridgeControlAction.text
-      : artifactPromotionAction.handled
+    let responseText = panelSettingsAction.handled
+      ? panelSettingsAction.text
+      : bridgeControlAction.handled
+        ? bridgeControlAction.text
+        : artifactPromotionAction.handled
         ? artifactPromotionAction.text
         : directMessageAction.handled
           ? directMessageAction.text
           : scheduledTaskAction.handled
             ? scheduledTaskAction.text
             : '';
-    if (!bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && !scheduledTaskAction.handled && providerVisibleResponseText) {
+    if (!panelSettingsAction.handled && !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && !scheduledTaskAction.handled && providerVisibleResponseText) {
       const reminderAction = await executeReminderActionFromReply(
         adapter,
         providerVisibleResponseText,
@@ -8397,6 +9044,22 @@ async function handleMessage(
         requestedTargets: feishuSemanticMentionTargets,
       });
       preparedReply = enforceFeishuAvatarEvidenceCompletion(preparedReply, rawData?.feishuAvatarEvidence);
+      // 唯一可靠原生回复已恢复时，Bridge 可补齐受限歌词指令。Provider 给出
+      // 同等或更完整的合法指令时保留 Provider 风格；漏协议或漏参考音色门禁时
+      // 才使用确定性计划，避免再次卡在 response-only 协议修复。
+      if (deterministicReferencedSingingDirective && (
+        !preparedReply.singing
+        || (deterministicReferencedSingingDirective.voiceRequirement === 'active_reference'
+          && preparedReply.singing.voiceRequirement !== 'active_reference')
+      )) {
+        preparedReply = { ...preparedReply, singing: deterministicReferencedSingingDirective };
+      }
+      if (deterministicOwnerReferenceVoiceAction) {
+        // 自动授权模式下始终覆盖模型动作：Owner 直克隆路径使用
+        // runtime_revalidated，显式文本路径使用 user_confirmed；两者都不能被
+        // ASR 猜测或旧上下文文本冒充。
+        preparedReply = { ...preparedReply, speechAction: deterministicOwnerReferenceVoiceAction };
+      }
     }
     if (preparedReply) {
       preparedReply = applyFeishuAnalysisPresentation(adapter.channelType, preparedReply);
@@ -8500,6 +9163,9 @@ async function handleMessage(
       }
     }
     let outboundDeliveryResponseText = deliveryResponseText;
+    // Provider 正常完成不代表语音交付完成。此标记只来自受控 Speech/Singing
+    // Host 的真实失败回执，用于避免最终卡片把文本回退误显示为“结果已生成”。
+    let speechPresentationFailed = false;
     let agentChoiceCardAttached = false;
     let registeredChoiceForDelivery: ChoicePromptView | undefined;
     const preparedCardHero = preparedReply && !feishuDocRequest
@@ -8507,7 +9173,7 @@ async function handleMessage(
       : null;
     if (preparedReply) {
       const hadCardBeforeChoice = Boolean(preparedReply.feishuCardJson);
-      const choicePresentation = attachAgentChoicePresentation({
+      const choicePresentation = await attachAgentChoicePresentation({
         adapter,
         msg,
         sessionId: effectiveBinding.codepilotSessionId,
@@ -8521,7 +9187,7 @@ async function handleMessage(
       registeredChoiceForDelivery = choicePresentation.registeredChoice;
       agentChoiceCardAttached = !hadCardBeforeChoice && Boolean(preparedReply.feishuCardJson);
     }
-    const referenceVoiceAction = preparedReply?.speechAction;
+    const referenceVoiceAction = preparedReply?.speechAction || deterministicOwnerReferenceVoiceAction;
     if (referenceVoiceAction && !result.hasError) {
       let referenceVoiceResultText = '';
       const speechHost = getBridgeContext().speech;
@@ -8535,7 +9201,7 @@ async function handleMessage(
       } else if (!ownerMessage || !msg.address.userId?.trim()) {
         referenceVoiceResultText = '参考音色未创建：该动作只允许当前 Bridge Owner 显式授权。';
       } else if (!trustedNativeReferenceSource) {
-        referenceVoiceResultText = '参考音色未创建：请原生回复一条可读取的语音，并在当前消息中明确要求创建参考音色。';
+        referenceVoiceResultText = '参考音色未创建：没有找到当前回复绑定的可读取音频附件；请直接回复或附加一条真实录音后重试。';
       } else if (typeof speechHost?.importReferenceVoice !== 'function') {
         referenceVoiceResultText = '参考音色未创建：当前 Runtime 尚未提供受管音色导入能力。';
       } else {
@@ -8564,6 +9230,9 @@ async function handleMessage(
               fileKey: source.fileKey,
               attachmentId: source.attachmentId,
               transcript: source.transcript,
+              confirmedTranscript: referenceVoiceAction.referenceTranscript || source.transcript.text,
+              confirmedTranscriptSource: referenceVoiceAction.referenceTranscriptSource,
+              confirmedTranscriptAccepted: referenceVoiceAction.referenceTranscriptConfirmed,
               authorization,
               signal: taskAbort.signal,
             }),
@@ -8578,11 +9247,11 @@ async function handleMessage(
           );
           if (taskAbort.signal.aborted) return;
           referenceVoiceResultText = receipt
-            ? `参考音色已创建：${receipt.voiceProfileId}`
-            : '参考音色未创建：Runtime 回执未通过当前消息、附件、哈希与授权时效绑定校验。';
-        } catch {
+            ? `参考音色已登记：${receipt.voiceProfileId}\n\n状态：参考文件与确认文本已登记；尚未生成语音；尚未发送；音色相似度尚未验收。`
+            : '参考音色未登记：Runtime 回执未通过当前消息、附件、哈希、文本确认与授权时效绑定校验。';
+        } catch (error) {
           if (taskAbort.signal.aborted) return;
-          referenceVoiceResultText = '参考音色未创建：Runtime 导入失败，请检查本地音色注册与依赖状态。';
+          referenceVoiceResultText = referenceVoiceImportFailureMessage(error);
         }
       }
       // 动作结果必须由真实 Host 回执收口，不能继续展示模型预先声称的成功文案。
@@ -8614,7 +9283,7 @@ async function handleMessage(
       // Runtime policy 是可选呈现配置；读取异常时使用 Core 的兼容默认。
     }
     const speechDecision = decideSpeechReply({
-      sessionPreference: readSpeechReplyPreference(msg, effectiveBinding.codepilotSessionId),
+      sessionPreference: speechSessionPreference,
       inboundAudio: inboundSpeechReceived,
       modelDirective: preparedReply?.speech,
       replyPolicy: runtimeReplyPolicy,
@@ -8632,7 +9301,9 @@ async function handleMessage(
         || preparedReply?.choiceSession
         || preparedReply?.analysisView
       ),
-      mentionCount: preparedReply?.mentions?.length || 0,
+      // @ 不能写入或朗读到原生音频，但允许声明为 after_send_text 的第二段
+      // 文字消息；无跟进文本时仍维持原门禁，避免隐式丢失 mention。
+      mentionCount: preparedReply?.speech?.afterSendText ? 0 : (preparedReply?.mentions?.length || 0),
       permissionRequested: permissionRequestedThisTurn,
     });
     if (speechDecision.mode === 'voice' && !speechContentEligibility.eligible) {
@@ -8648,6 +9319,9 @@ async function handleMessage(
     }
     const speechEligible = adapter.channelType === 'feishu'
       && !preparedReply?.singing
+      // 参考音色动作只允许由真实导入回执收口；无论登记成功还是文本核对失败，
+      // 都不能再被“收到语音则语音回复”策略送入通用 TTS。
+      && !referenceVoiceAction
       && speechDecision.mode === 'voice'
       && speechContentEligibility.eligible
       && Boolean(speechText)
@@ -8675,6 +9349,9 @@ async function handleMessage(
           const synthesisRequest = {
             text: speechText,
             expectedIdentity: synthesisIdentity,
+            ...(preparedReply?.speech?.voiceRequirement
+              ? { voiceRequirement: preparedReply.speech.voiceRequirement }
+              : {}),
             scratchDir,
             signal: taskAbort.signal,
           };
@@ -8699,12 +9376,32 @@ async function handleMessage(
           }
         } catch (error) {
           if (!taskAbort.signal.aborted) {
+            speechPresentationFailed = true;
+            try {
+              store.insertAuditLog({
+                channelType: adapter.channelType,
+                chatId: msg.address.chatId,
+                direction: 'outbound',
+                messageId: msg.messageId,
+                summary: `[SPEECH_SYNTHESIS_FAILED] code=${speechFailureDiagnosticCode(error, 'synthesize')} generation=not_completed delivery=not_sent fallback=text_once`,
+              });
+            } catch { /* 观察链失败不能覆盖 exactly-once 文字回退。 */ }
             const notice = speechFailureMessage(error, 'synthesize');
             deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
             outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
           }
         }
       } else {
+        speechPresentationFailed = true;
+        try {
+          store.insertAuditLog({
+            channelType: adapter.channelType,
+            chatId: msg.address.chatId,
+            direction: 'outbound',
+            messageId: msg.messageId,
+            summary: '[SPEECH_SYNTHESIS_FAILED] code=speech_not_ready generation=not_started delivery=not_sent fallback=text_once',
+          });
+        } catch { /* 观察链失败不能覆盖 exactly-once 文字回退。 */ }
         const notice = speechFailureMessage({ errorCode: 'speech_not_ready' }, 'synthesize');
         deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
         outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
@@ -8737,6 +9434,9 @@ async function handleMessage(
             lyrics: singingDirective.lyrics,
             vocalLanguage: singingDirective.vocalLanguage,
             durationSeconds: singingDirective.durationSeconds,
+            ...(singingDirective.voiceRequirement
+              ? { voiceRequirement: singingDirective.voiceRequirement }
+              : {}),
             scratchDir,
             signal: taskAbort.signal,
           }), singingDirective);
@@ -8752,14 +9452,16 @@ async function handleMessage(
             const receipt = managedSpeechReceipt;
             releaseManagedAudio = () => managedSingingHost!.releaseSynthesis!(receipt as import('./host.js').SingingSynthesisReceipt);
           }
-        } catch {
+        } catch (error) {
           if (!taskAbort.signal.aborted) {
-            const notice = singingFailureMessage();
+            speechPresentationFailed = true;
+            const notice = singingFailureMessage(error);
             deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
             outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
           }
         }
       } else {
+        speechPresentationFailed = true;
         const notice = singingFailureMessage();
         deliveryResponseText = [deliveryResponseText, notice].filter(Boolean).join('\n\n');
         outboundDeliveryResponseText = [outboundDeliveryResponseText, notice].filter(Boolean).join('\n\n');
@@ -8781,7 +9483,7 @@ async function handleMessage(
       try {
         collaborationHost?.markPrimaryCompleted({
           runId: collaborationRunId,
-          status: result.hasError || documentDeliveryFailed ? 'failed' : 'succeeded',
+          status: result.hasError || documentDeliveryFailed || speechPresentationFailed ? 'failed' : 'succeeded',
           answerSummary: deliveryResponseText || safeProviderErrorText,
           errorCode: result.hasError
             ? 'primary_agent_error'
@@ -8815,7 +9517,7 @@ async function handleMessage(
         // 卡片状态和耐久 continuation 也必须记录为 error，不能展示紫色完成态。
         const status = taskAbort.signal.aborted
           ? 'interrupted'
-          : result.hasError || documentDeliveryFailed || isExplicitUnfinishedReplyText(finalText)
+            : result.hasError || documentDeliveryFailed || speechPresentationFailed || isExplicitUnfinishedReplyText(finalText)
             ? 'error'
             : 'completed';
         const streamEndArgs: StreamEndArgs = [
@@ -8837,6 +9539,7 @@ async function handleMessage(
               speechDelivery: {
                 receipt: managedSpeechReceipt,
                 fallbackText: deliveryResponseText,
+                ...(preparedReply?.speech?.afterSendText ? { followUpText: preparedReply.speech.afterSendText } : {}),
               },
             } : {}),
           },
@@ -8902,11 +9605,41 @@ async function handleMessage(
             ? { ok: false, error: speechDelivery.error }
             : { ok: true, messageId: speechDelivery.messageId };
           if (speechDelivery.kind === 'audio') {
+            if (preparedReply?.speech?.afterSendText) {
+              const followUp = await deliverResponse(
+                adapter,
+                msg.address,
+                preparedReply.speech.afterSendText,
+                effectiveBinding.codepilotSessionId,
+                undefined,
+                true,
+                preparedReply?.parseMode,
+                preparedReply?.mentions,
+              );
+              if (!followUp.ok) {
+                try {
+                  store.insertAuditLog({
+                    channelType: adapter.channelType,
+                    chatId: msg.address.chatId,
+                    direction: 'outbound',
+                    messageId: speechDelivery.messageId,
+                    summary: '[SPEECH_FOLLOW_UP_FAILED] audio=sent follow_up=text_not_sent',
+                  });
+                } catch { /* 音频已真实送达，跟进观察失败不能回滚。 */ }
+              }
+            }
             try {
               const continuationContext = [
                 storedUserText ? `原始请求：${storedUserText}` : '',
                 '上一轮状态：已完成',
                 managedSpeechReceipt.protocol === 'cti-singing-synthesis/v1' ? '交付类型：完整歌声结果' : '交付类型：完整语音结果',
+                '生成状态：已生成',
+                managedSpeechReceipt.protocol === 'cti-speech-synthesis/v1'
+                  ? `音色相似度：${managedSpeechReceipt.speakerSimilarityStatus === 'passed' ? '已通过' : managedSpeechReceipt.speakerSimilarityStatus === 'not_verified' ? '未验收（当前设置不阻塞）' : '不适用（预设音色）'}` : '',
+                managedSpeechReceipt.protocol === 'cti-singing-synthesis/v1'
+                  ? `音色相似度：${managedSpeechReceipt.speakerSimilarityStatus === 'passed' ? '已通过' : '不适用（默认歌声）'}` : '',
+                managedSpeechReceipt.protocol === 'cti-singing-synthesis/v1' ? '歌词对齐：已通过' : '',
+                '发送状态：已发送',
                 deliveryResponseText ? `上一轮结果：${deliveryResponseText}` : '',
               ].filter(Boolean).join('\n');
               store.insertOutboundRef({

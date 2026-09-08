@@ -201,14 +201,11 @@ export function resolveSpeechBackendDependencies(
   if (!modelRootBlocked && selectedModel?.capabilities.includes('voice_clone') && ttsModel.state === 'ready') {
     ttsReferenceModel = { ...ttsModel, id: 'tts_reference_model' };
   }
-  // 参考音色复刻必须经过现场性能/OOM 门禁；未确认前不把模型路径交给 Sidecar。
-  if (selectedModel?.capabilities.includes('voice_clone') && !config.voiceCloneBenchmarkPassed && ttsReferenceModel.state !== 'blocked') {
-    ttsReferenceModel = {
-      id: 'tts_reference_model',
-      state: 'blocked',
-      diagnosticCode: 'voice_clone_benchmark_not_verified',
-    };
-  }
+  // 未完成相似度验收时仍须让 Sidecar 加载已验证的 Base 模型：验收本身需要
+  // 真实合成和说话人编码，若在依赖解析阶段撤掉模型路径会形成“无法启动→无法
+  // 验收→永远无法启动”的循环。此处只声明受管模型可加载；实际合成出口仍由
+  // RuntimeSpeechHost 对当前 profile/model/revision/hardware 的相似度回执强制
+  // 门禁，未通过时丢弃产物且绝不发送或标记克隆成功。
   return { senseVoiceBinary, senseVoiceModel, ttsModel, ttsReferenceModel };
 }
 

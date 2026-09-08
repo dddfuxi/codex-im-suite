@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/panel-settings.schema.json",
+  "title": "Codex IM Suite Panel Settings",
+  "$defs": {
+    "PanelSettingsStateContract": {
+      "type": "object",
+      "required": ["defaultWorkDir", "allowedRoots", "memoryRepo", "additionalDirs", "replyStyleHint", "defaultExecutorId", "localAiKind", "localAiBaseUrl", "ollamaModelsDir", "localAiModel", "localAiApiKeyAction", "localAiApiKeyValue", "localAiApiKeyMasked", "localAiApiKeySet", "localAiTimeoutMs", "codexModelSource", "codexRoutingMode", "codexApiFallbackChain", "codexBaseUrl", "codexModel", "codexPassModel", "codexReasoningEffort", "memoryOptimizerEnabled", "memoryOptimizerIntervalDays", "memoryOptimizerModelSource", "codexApiKeyAction", "codexApiKeyValue", "codexApiKeyMasked", "codexApiKeySet", "safetyPolicyProfile"],
+      "properties": {
+        "defaultWorkDir": { "type": "string" }, "allowedRoots": { "type": "string" }, "memoryRepo": { "type": "string" }, "additionalDirs": { "type": "string" }, "replyStyleHint": { "type": "string" }, "defaultExecutorId": { "type": "string" },
+        "localAiKind": { "type": "string" }, "localAiBaseUrl": { "type": "string" }, "ollamaModelsDir": { "type": "string" }, "localAiModel": { "type": "string" },
+        "localAiApiKeyAction": { "enum": ["keep", "set", "clear"] }, "localAiApiKeyValue": { "type": "string" }, "localAiApiKeyMasked": { "type": "string" }, "localAiApiKeySet": { "type": "boolean" }, "localAiTimeoutMs": { "type": "string" },
+        "codexModelSource": { "type": "string" }, "codexRoutingMode": { "type": "string" }, "codexApiFallbackChain": { "type": "string" }, "codexBaseUrl": { "type": "string" }, "codexModel": { "type": "string" }, "codexPassModel": { "type": "boolean" }, "codexReasoningEffort": { "type": "string" },
+        "memoryOptimizerEnabled": { "type": "boolean" }, "memoryOptimizerIntervalDays": { "type": "string" }, "memoryOptimizerModelSource": { "type": "string" },
+        "codexApiKeyAction": { "enum": ["keep", "set", "clear"] }, "codexApiKeyValue": { "type": "string" }, "codexApiKeyMasked": { "type": "string" }, "codexApiKeySet": { "type": "boolean" }, "safetyPolicyProfile": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "PanelSettingDescriptorContract": {
+      "type": "object",
+      "required": ["key", "label", "group", "type", "writable", "restartRequired"],
+      "properties": {
+        "key": { "type": "string" }, "label": { "type": "string" }, "group": { "type": "string" },
+        "type": { "enum": ["string", "number", "boolean", "path", "path_list", "enum", "secret_status"] },
+        "writable": { "type": "boolean" }, "restartRequired": { "type": "boolean" },
+        "enumValues": { "type": "array", "items": { "type": "string" } }, "minimum": { "type": "number" }, "maximum": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "PanelSettingEntryContract": {
+      "allOf": [
+        { "$ref": "#/$defs/PanelSettingDescriptorContract" },
+        { "type": "object", "required": ["value"], "properties": { "value": { "type": ["string", "number", "boolean"] } } }
+      ]
+    },
+    "PanelSettingsSnapshotContract": {
+      "type": "object",
+      "required": ["protocol", "version", "generatedAt", "settings"],
+      "properties": {
+        "protocol": { "const": "cti-panel-settings-snapshot/v1" }, "version": { "type": "string" }, "generatedAt": { "type": "string" },
+        "settings": { "type": "array", "items": { "$ref": "#/$defs/PanelSettingEntryContract" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

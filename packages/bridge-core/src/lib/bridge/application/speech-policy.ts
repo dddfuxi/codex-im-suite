@@ -49,6 +49,13 @@ export interface InboundSpeechPlanSet {
 
 export interface SpeechReplyDirective {
   mode: 'voice_only' | 'text_only';
+  /** 只声明语义要求，不允许模型选择具体音色 ID。 */
+  voiceRequirement?: 'active_reference';
+  /**
+   * 原生语音已得到平台成功回执后才发送的第二段纯文字。它不参与 TTS，
+   * 可搭配同一 cti-final 的受控原生 mention，避免把 @ 名称读进语音。
+   */
+  afterSendText?: string;
 }
 
 export interface SpeechReferenceVoiceAction {
@@ -58,6 +65,10 @@ export interface SpeechReferenceVoiceAction {
   rightsBasis: 'self_or_authorized';
   usageScope: 'local_tts_only';
   cleanSingleSpeakerConfirmed: true;
+  /** 用户确认文本，或由 Bridge 交给 Runtime 二次 ASR 核验的候选文本。 */
+  referenceTranscript?: string;
+  referenceTranscriptSource?: 'user_confirmed' | 'runtime_revalidated';
+  referenceTranscriptConfirmed: true;
 }
 
 export type SpeechReplyReason =
@@ -194,7 +205,9 @@ export function resolveTrustedNativeReplyAudio(input: {
 
   const audioBindings = bindings.filter((candidate) => candidate.protocol === 'cti-feishu-native-reply-attachment/v1'
     && candidate.relation === 'native_reply'
-    && candidate.resourceType === 'audio'
+    // 老版本 adapter 可能把“文件形式上传的音频”记成 file；最终是否为音频
+    // 以同一 attachment 的真实 MIME/文件头为准，不能因 transport 名称误拦截。
+    && (candidate.resourceType === 'audio' || candidate.resourceType === 'file')
     && candidate.sourceMessageId === input.sourceMessageId
     && candidate.messageId === reply.messageId
     && typeof candidate.fileKey === 'string'
@@ -319,10 +332,20 @@ export function mergeTranscriptWithUserText(transcript: string, userText: string
 /** 模型只能声明受限呈现意图；出现任何额外执行字段时整段拒绝，不能静默剥离。 */
 export function parseSpeechReplyDirective(candidate: unknown): SpeechReplyDirective | undefined {
   const raw = asRecord(candidate);
+  const afterSendText = typeof raw?.after_send_text === 'string'
+    ? raw.after_send_text.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim()
+    : undefined;
   if (!raw
     || (raw.mode !== 'voice_only' && raw.mode !== 'text_only')
-    || Object.keys(raw).length !== 1) return undefined;
-  return { mode: raw.mode };
+    || Object.keys(raw).some((key) => !['mode', 'voice_requirement', 'after_send_text'].includes(key))
+    || (raw.voice_requirement !== undefined && raw.voice_requirement !== 'active_reference')
+    || (raw.mode === 'text_only' && (raw.voice_requirement !== undefined || raw.after_send_text !== undefined))
+    || (raw.after_send_text !== undefined && (!afterSendText || Array.from(afterSendText).length > 500))) return undefined;
+  return {
+    mode: raw.mode,
+    ...(raw.voice_requirement === 'active_reference' ? { voiceRequirement: 'active_reference' as const } : {}),
+    ...(afterSendText ? { afterSendText } : {}),
+  };
 }
 
 export function parseVoiceCommandPreference(args: string): SpeechReplyPreference | null {
@@ -381,17 +404,31 @@ export function parseSpeechReferenceVoiceAction(candidate: unknown): SpeechRefer
     'rights_basis',
     'usage_scope',
     'clean_single_speaker_confirmed',
+    'reference_transcript',
+    'reference_transcript_confirmed',
+    'reference_transcript_source',
   ].includes(key))) return undefined;
   if (raw.rights_basis !== 'self_or_authorized'
     || raw.usage_scope !== 'local_tts_only'
-    || raw.clean_single_speaker_confirmed !== true) {
+    || raw.clean_single_speaker_confirmed !== true
+    || raw.reference_transcript_confirmed !== true
+    || typeof raw.reference_transcript !== 'string'
+    || (raw.reference_transcript_source !== undefined && raw.reference_transcript_source !== 'user_confirmed')) {
     return undefined;
   }
+  const referenceTranscript = typeof raw.reference_transcript === 'string' ? raw.reference_transcript
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/\s{2,}/gu, ' ')
+    .trim() : undefined;
+  if (!referenceTranscript || referenceTranscript.length > 1_000) return undefined;
   const baseAction: SpeechReferenceVoiceAction = {
     action: 'create_reference_voice',
     rightsBasis: 'self_or_authorized',
     usageScope: 'local_tts_only',
     cleanSingleSpeakerConfirmed: true,
+    referenceTranscriptSource: 'user_confirmed',
+    ...(referenceTranscript ? { referenceTranscript } : {}),
+    referenceTranscriptConfirmed: true,
   };
   if (raw.profile_name === undefined) return baseAction;
   if (typeof raw.profile_name !== 'string') return undefined;
@@ -469,7 +506,9 @@ export function parseSpeechReferenceVoiceImportReceipt(
     || raw.fileKey !== expected.fileKey
     || raw.attachmentId !== expected.attachmentId
     || raw.fileSha256 !== expected.fileSha256
-    || raw.authorizationExpiresAt !== expected.authorizationExpiresAt) {
+    || raw.authorizationExpiresAt !== expected.authorizationExpiresAt
+    || raw.registrationStatus !== 'registered'
+    || raw.speakerSimilarityStatus !== 'not_verified') {
     return null;
   }
   return {
@@ -481,6 +520,8 @@ export function parseSpeechReferenceVoiceImportReceipt(
     attachmentId: expected.attachmentId,
     fileSha256: expected.fileSha256,
     authorizationExpiresAt: expected.authorizationExpiresAt,
+    registrationStatus: 'registered',
+    speakerSimilarityStatus: 'not_verified',
     validated: true,
   };
 }
@@ -511,9 +552,38 @@ export function parseSpeechSynthesisReceipt(
     || raw.ttsModelId !== expectedIdentity.ttsModelId
     || raw.modelRevision !== expectedIdentity.modelRevision
     || !Object.prototype.hasOwnProperty.call(raw, 'voiceProfileId')
-    || raw.voiceProfileId !== expectedIdentity.voiceProfileId) {
+    || raw.voiceProfileId !== expectedIdentity.voiceProfileId
+    || raw.generationStatus !== 'generated'
+    || raw.deliveryStatus !== 'not_sent'
+    || (raw.speakerSimilarityStatus !== 'passed' && raw.speakerSimilarityStatus !== 'not_verified' && raw.speakerSimilarityStatus !== 'not_applicable')) {
     return null;
   }
+  const similarityFieldsPresent = ['speakerSimilarity', 'speakerSimilarityThreshold', 'speakerSimilarityPassed']
+    .some((key) => Object.prototype.hasOwnProperty.call(raw, key));
+  if ((raw.speakerSimilarityStatus === 'passed' && (!similarityFieldsPresent
+    || typeof raw.speakerSimilarity !== 'number'
+    || !Number.isFinite(raw.speakerSimilarity)
+    || raw.speakerSimilarity < -1
+    || raw.speakerSimilarity > 1
+    || typeof raw.speakerSimilarityThreshold !== 'number'
+    || !Number.isFinite(raw.speakerSimilarityThreshold)
+    || raw.speakerSimilarityThreshold < 0
+    || raw.speakerSimilarityThreshold > 1
+    || raw.speakerSimilarity < raw.speakerSimilarityThreshold
+    || raw.speakerSimilarityPassed !== true))
+    || ((raw.speakerSimilarityStatus === 'not_applicable' || raw.speakerSimilarityStatus === 'not_verified') && similarityFieldsPresent)) return null;
+  if (similarityFieldsPresent && (
+    typeof raw.speakerSimilarity !== 'number'
+    || !Number.isFinite(raw.speakerSimilarity)
+    || raw.speakerSimilarity < -1
+    || raw.speakerSimilarity > 1
+    || typeof raw.speakerSimilarityThreshold !== 'number'
+    || !Number.isFinite(raw.speakerSimilarityThreshold)
+    || raw.speakerSimilarityThreshold < 0
+    || raw.speakerSimilarityThreshold > 1
+    || raw.speakerSimilarity < raw.speakerSimilarityThreshold
+    || raw.speakerSimilarityPassed !== true
+  )) return null;
   const expectedTextSha256 = crypto.createHash('sha256').update(expected.text, 'utf8').digest('hex');
   if (raw.textSha256.toLowerCase() !== expectedTextSha256) return null;
   return {
@@ -528,12 +598,40 @@ export function parseSpeechSynthesisReceipt(
     ttsModelId: expectedIdentity.ttsModelId,
     modelRevision: expectedIdentity.modelRevision,
     voiceProfileId: expectedIdentity.voiceProfileId,
+    generationStatus: 'generated',
+    deliveryStatus: 'not_sent',
+    speakerSimilarityStatus: raw.speakerSimilarityStatus,
+    ...(similarityFieldsPresent ? {
+      speakerSimilarity: raw.speakerSimilarity as number,
+      speakerSimilarityThreshold: raw.speakerSimilarityThreshold as number,
+      speakerSimilarityPassed: true as const,
+    } : {}),
   };
 }
 
-export function speechFailureMessage(error: unknown, phase: 'transcribe' | 'synthesize'): string {
+/** 参考音色导入失败只对外暴露可操作的稳定结论。 */
+export function referenceVoiceImportFailureMessage(error: unknown): string {
+  const raw = asRecord(error);
+  const code = raw?.errorCode ?? raw?.code;
+  if (code === 'voice_reference_transcript_unconfirmed') {
+    return '参考音色未登记：请先明确提供或确认录音中的准确文本。';
+  }
+  if (code === 'voice_reference_transcript_mismatch') {
+    return '参考音色未登记：确认文本与本次语音识别结果不一致，已停止后续合成。请修正文本或换一段清晰录音。';
+  }
+  return '参考音色未登记：Runtime 导入失败，请检查参考文本、录音质量和本地依赖状态。';
+}
+
+export function speechFailureDiagnosticCode(error: unknown, phase: 'transcribe' | 'synthesize'): string {
   const record = asRecord(error);
-  const code = record?.errorCode ?? record?.code;
+  const rawCode = record?.errorCode ?? record?.code;
+  return typeof rawCode === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/i.test(rawCode)
+    ? rawCode.toLowerCase()
+    : phase === 'transcribe' ? 'speech_transcription_failed' : 'speech_synthesis_failed';
+}
+
+export function speechFailureMessage(error: unknown, phase: 'transcribe' | 'synthesize'): string {
+  const code = speechFailureDiagnosticCode(error, phase);
   if (phase === 'transcribe') {
     if (code === 'speech_input_too_large' || code === 'audio_too_large') {
       return '这条语音超过了本地转写上限，请缩短语音后重试。';
@@ -559,5 +657,26 @@ export function speechFailureMessage(error: unknown, phase: 'transcribe' | 'synt
     }
     return '这条语音暂时无法完成本地转写，请重试或直接发送文字。';
   }
-  return '语音回复暂时不可用，已改为发送完整文字结果。';
+  if (code === 'voice_clone_similarity_below_threshold') {
+    return '语音已停止：说话人相似度未通过阈值，未发送音频。';
+  }
+  if (code === 'voice_clone_similarity_not_verified') {
+    return '语音已停止：当前音色尚未完成说话人相似度验收，未发送音频。';
+  }
+  if (code === 'voice_reference_not_active') {
+    return '语音已停止：当前没有已激活并通过验收的复刻音色；未使用预设音色冒充。请先在控制面板完成参考音色登记、相似度验收并激活。';
+  }
+  if (code === 'tts_synthesis_timeout' || code === 'sidecar_request_timeout' || code === 'speech_timeout') {
+    return '语音生成超时：生成状态为“未完成”，发送状态为“未发送”；已改为发送完整文字结果（仅一次）。';
+  }
+  if (code === 'speech_delivery_failed') {
+    return '语音已生成，但飞书原生语音发送失败：发送状态为“未发送”；已改为发送完整文字结果（仅一次）。';
+  }
+  if (code === 'tts_output_not_opus' || code === 'speech_invalid_synthesis_receipt' || code === 'tts_model_identity_mismatch') {
+    return '语音生成结果未通过格式或身份验收：发送状态为“未发送”；已改为发送完整文字结果（仅一次）。';
+  }
+  if (code === 'speech_not_ready' || code === 'speech_synthesis_identity_unavailable' || code === 'speech_output_disabled') {
+    return '语音 Runtime 尚未就绪：生成状态为“未开始”，发送状态为“未发送”；已改为发送完整文字结果（仅一次）。';
+  }
+  return '语音未生成或未通过验收：发送状态为“未发送”；已改为发送完整文字结果（仅一次）。';
 }

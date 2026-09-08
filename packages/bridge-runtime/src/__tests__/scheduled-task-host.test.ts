@@ -391,6 +391,50 @@ describe('scheduled task runtime host', () => {
       assert.match(first.feishuCardJson || '', /scheduled-check-in:task_check_in_001:slot_check_in_host_001/u);
       assert.equal(duplicate.checkInStatus, 'already_recorded');
       assert.equal((history.runs[0] as { checkInCount?: number }).checkInCount, 1);
+      assert.deepEqual((history.runs[0] as { participants?: unknown[] }).participants, [{
+        channelType: 'feishu', userId: 'ou_member', checkedInAt: '2026-07-18T08:10:00.000Z',
+      }]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves an explicit voice-only directive when creating a fixed notification', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-voice-host-'));
+    try {
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => 'task_voice_001',
+      });
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-18T08:00:00.000Z',
+        execute: async () => ({ executionStatus: 'ok', deliveryStatus: 'not_requested' }),
+      });
+      const host = createBridgeScheduledTaskActionHost({ store, service });
+
+      const created = await host.create({
+        name: '工作日语音喝水提醒',
+        schedule: { kind: 'cron', expression: '0 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'notify',
+          text: '大家记得喝水。',
+          speech: { mode: 'voice_only' },
+        },
+        executionContext: { sourceSessionId: 'session_voice', workspaceMode: 'none' },
+        delivery: {
+          target: { channelType: 'feishu', chatId: 'oc_voice', userId: 'ou_owner', chatType: 'group' },
+          mode: 'result',
+        },
+        actor: { role: 'viewer', channelType: 'feishu', userId: 'ou_owner', messageId: 'om_create_voice' },
+      });
+
+      assert.equal(created.ok, true);
+      assert.deepEqual((await store.getTask('task_voice_001'))?.action, {
+        kind: 'notify',
+        text: '大家记得喝水。',
+        speech: { mode: 'voice_only' },
+      });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

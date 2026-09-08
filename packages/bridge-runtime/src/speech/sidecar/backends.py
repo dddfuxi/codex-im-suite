@@ -10,6 +10,7 @@ import os
 import hashlib
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -241,7 +242,7 @@ def _load_cosyvoice_runtime(model_dir: str) -> tuple[Any, Any, Any]:
 
 
 def _split_tts_text(text: str, max_chars: int = MAX_TTS_SEGMENT_CHARS) -> list[str]:
-    """按中英文句界切分，并对超长句做有界软切分；不重排、不生成空块。"""
+    """按句界识别后尽量装满有界分段；避免每个短句都触发一次昂贵模型推理。"""
     if max_chars < 1:
         raise ValueError("tts_segment_limit_invalid")
     normalized = CONTROL_CHARS.sub(" ", text).strip()
@@ -264,7 +265,7 @@ def _split_tts_text(text: str, max_chars: int = MAX_TTS_SEGMENT_CHARS) -> list[s
             flush()
     flush()
 
-    segments: list[str] = []
+    pieces: list[str] = []
     for sentence in sentences:
         remaining = sentence
         while len(remaining) > max_chars:
@@ -275,10 +276,24 @@ def _split_tts_text(text: str, max_chars: int = MAX_TTS_SEGMENT_CHARS) -> list[s
                     break
             segment = remaining[:cut].strip()
             if segment:
-                segments.append(segment)
+                pieces.append(segment)
             remaining = remaining[cut:].strip()
         if remaining:
-            segments.append(remaining)
+            pieces.append(remaining)
+
+    # Qwen/CosyVoice 的一次生成调用有显著固定开销。把相邻短句按原顺序装入
+    # 同一分段，既保留句界标点，也避免百字文本被拆成七八次独立推理。
+    segments: list[str] = []
+    pending = ""
+    for piece in pieces:
+        separator = " " if pending else ""
+        if pending and len(pending) + len(separator) + len(piece) > max_chars:
+            segments.append(pending)
+            pending = piece
+        else:
+            pending = f"{pending}{separator}{piece}" if pending else piece
+    if pending:
+        segments.append(pending)
     return segments
 
 
@@ -546,6 +561,7 @@ class Qwen3TTSBackend:
         reference_path: str | None = None,
         reference_transcript: str | None = None,
         tone_instruction: str | None = None,
+        speaker_similarity_threshold: float | None = None,
     ) -> dict[str, Any]:
         if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
             raise BackendFailure("tts_text_invalid", "blocked")
@@ -601,6 +617,31 @@ class Qwen3TTSBackend:
                     raise BackendFailure("qwen_tts_output_invalid")
                 duration_ms = round(created.getnframes() * 1000 / created.getframerate())
             peak_vram_mib = round(torch_module.cuda.max_memory_allocated() / 1024 / 1024, 1)
+            speaker_similarity: float | None = None
+            similarity_passed: bool | None = None
+            if self.model_id.endswith("-base"):
+                if not isinstance(speaker_similarity_threshold, (int, float)) or not 0 <= float(speaker_similarity_threshold) <= 1:
+                    raise BackendFailure("tts_speaker_similarity_threshold_invalid", "blocked")
+                # 复用 Qwen Base 自带 speaker encoder；禁止用文本、音量或简单声学特征冒充音色相似度。
+                reference_prompt = model.create_voice_clone_prompt(
+                    ref_audio=str(reference), ref_text=None, x_vector_only_mode=True,
+                )
+                generated_prompt = model.create_voice_clone_prompt(
+                    ref_audio=str(temporary), ref_text=None, x_vector_only_mode=True,
+                )
+                if len(reference_prompt) != 1 or len(generated_prompt) != 1:
+                    raise BackendFailure("tts_speaker_embedding_invalid")
+                reference_embedding = reference_prompt[0].ref_spk_embedding.float().reshape(-1)
+                generated_embedding = generated_prompt[0].ref_spk_embedding.float().reshape(-1)
+                if reference_embedding.numel() == 0 or reference_embedding.shape != generated_embedding.shape:
+                    raise BackendFailure("tts_speaker_embedding_invalid")
+                similarity_tensor = torch_module.nn.functional.cosine_similarity(
+                    reference_embedding.unsqueeze(0), generated_embedding.unsqueeze(0), dim=1,
+                )
+                speaker_similarity = float(similarity_tensor.item())
+                if not -1.0 <= speaker_similarity <= 1.0:
+                    raise BackendFailure("tts_speaker_similarity_invalid")
+                similarity_passed = speaker_similarity >= float(speaker_similarity_threshold)
             os.replace(temporary, output)
             completed = True
             return {
@@ -609,12 +650,20 @@ class Qwen3TTSBackend:
                 "model": self.model_id,
                 "revision": self.revision,
                 "peakVramMiB": peak_vram_mib,
+                **({
+                    "speakerSimilarity": speaker_similarity,
+                    "speakerSimilarityThreshold": float(speaker_similarity_threshold),
+                    "speakerSimilarityPassed": similarity_passed,
+                } if speaker_similarity is not None else {}),
             }
         except BackendFailure:
             raise
         except torch_module.cuda.OutOfMemoryError:
             raise BackendFailure("qwen_tts_out_of_memory", "blocked") from None
-        except Exception:
+        except Exception as error:
+            # 对外仍只返回稳定错误码；仅在受管本地 Sidecar 日志记录异常类别，
+            # 便于定位模型/解码依赖回归而不泄露参考音频路径、文本或授权信息。
+            print(f"qwen_tts_synthesis_exception={type(error).__name__}", file=sys.stderr, flush=True)
             raise BackendFailure("qwen_tts_synthesis_failed") from None
         finally:
             for candidate in (temporary, output if not completed else None):
@@ -624,6 +673,55 @@ class Qwen3TTSBackend:
                     candidate.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def compare_speakers(
+        self,
+        reference_path: str,
+        candidate_path: str,
+        speaker_similarity_threshold: float,
+    ) -> dict[str, Any]:
+        if not self.model_id.endswith("-base"):
+            raise BackendFailure("speaker_similarity_model_unsupported", "blocked")
+        if not isinstance(speaker_similarity_threshold, (int, float)) or not 0 <= float(speaker_similarity_threshold) <= 1:
+            raise BackendFailure("tts_speaker_similarity_threshold_invalid", "blocked")
+        reference = _safe_file(reference_path, "tts_reference_invalid")
+        candidate = _safe_file(candidate_path, "tts_candidate_invalid")
+        if self.probe().state != "ready" or self._runtime is None:
+            snapshot = self.snapshot()
+            raise BackendFailure(snapshot.diagnostic_code or "tts_backend_optional_missing", snapshot.state)
+        model, torch_module, _soundfile_module = self._runtime
+        try:
+            reference_prompt = model.create_voice_clone_prompt(
+                ref_audio=str(reference), ref_text=None, x_vector_only_mode=True,
+            )
+            candidate_prompt = model.create_voice_clone_prompt(
+                ref_audio=str(candidate), ref_text=None, x_vector_only_mode=True,
+            )
+            if len(reference_prompt) != 1 or len(candidate_prompt) != 1:
+                raise BackendFailure("tts_speaker_embedding_invalid")
+            reference_embedding = reference_prompt[0].ref_spk_embedding.float().reshape(-1)
+            candidate_embedding = candidate_prompt[0].ref_spk_embedding.float().reshape(-1)
+            if reference_embedding.numel() == 0 or reference_embedding.shape != candidate_embedding.shape:
+                raise BackendFailure("tts_speaker_embedding_invalid")
+            similarity = float(torch_module.nn.functional.cosine_similarity(
+                reference_embedding.unsqueeze(0), candidate_embedding.unsqueeze(0), dim=1,
+            ).item())
+            if not -1.0 <= similarity <= 1.0:
+                raise BackendFailure("tts_speaker_similarity_invalid")
+            return {
+                "provider": self.provider_id,
+                "model": self.model_id,
+                "revision": self.revision,
+                "speakerSimilarity": similarity,
+                "speakerSimilarityThreshold": float(speaker_similarity_threshold),
+                "speakerSimilarityPassed": similarity >= float(speaker_similarity_threshold),
+            }
+        except BackendFailure:
+            raise
+        except torch_module.cuda.OutOfMemoryError:
+            raise BackendFailure("qwen_tts_out_of_memory", "blocked") from None
+        except Exception:
+            raise BackendFailure("tts_speaker_similarity_failed") from None
 
 
 class BackendRegistry:
@@ -728,4 +826,19 @@ class BackendRegistry:
             ]
             if isinstance(self.tts_backend, Qwen3TTSBackend):
                 args.append(payload.get("toneInstruction") if isinstance(payload.get("toneInstruction"), str) else None)
+                args.append(payload.get("speakerSimilarityThreshold") if isinstance(payload.get("speakerSimilarityThreshold"), (int, float)) else None)
             return self.tts_backend.synthesize(*args)
+
+    def compare_speakers(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if payload.get("provider") != self.provider_id or payload.get("modelId") != self.model_id:
+            raise BackendFailure("speaker_similarity_request_invalid", "blocked")
+        if not isinstance(payload.get("referencePath"), str) or not isinstance(payload.get("candidatePath"), str):
+            raise BackendFailure("speaker_similarity_request_invalid", "blocked")
+        if not isinstance(self.tts_backend, Qwen3TTSBackend):
+            raise BackendFailure("speaker_similarity_model_unsupported", "blocked")
+        with self._execution_lock:
+            return self.tts_backend.compare_speakers(
+                payload["referencePath"],
+                payload["candidatePath"],
+                payload.get("speakerSimilarityThreshold"),
+            )

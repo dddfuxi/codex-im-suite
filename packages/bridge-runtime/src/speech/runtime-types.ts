@@ -27,6 +27,10 @@ export interface SpeechRuntimeConfig {
   ttsModelPath?: string;
   ttsReferenceModelPath?: string;
   voiceCloneBenchmarkPassed: boolean;
+  /** 可选质量门禁；关闭时保留测量结果但不阻止参考音色试听、生成或投递。 */
+  requireVoiceSimilarityAcceptance: boolean;
+  /** 唯一 Bridge Owner 本人音色可免重复授权确认；质量与文本门禁不受影响。 */
+  ownerSelfVoiceAutoAuthorization: boolean;
   voiceProfileId?: string;
   singingEnabled: boolean;
   singingProvider: string;
@@ -36,6 +40,12 @@ export interface SpeechRuntimeConfig {
   singingBenchmarkPassed: boolean;
   singingModel: string;
   singingLmModel: string;
+  /** 歌声生成后的歌词验收器；默认仍用现有 SenseVoice，FireRed 仅为可选 WSL Runtime。 */
+  singingLyricsVerifier: string;
+  singingLyricsVerifierWslDistro?: string;
+  singingLyricsVerifierWslPython?: string;
+  singingLyricsVerifierScriptPath?: string;
+  singingLyricsVerifierModelPath?: string;
   singingTimeoutMs: number;
   maxSongDurationSeconds: number;
   ffmpegPath?: string;
@@ -43,6 +53,8 @@ export interface SpeechRuntimeConfig {
   pythonPath?: string;
   sidecarPath?: string;
   requestTimeoutMs: number;
+  /** 单次 TTS 生成的绝对上限；实际时限会结合当前模型 benchmark 动态收窄。 */
+  synthesisTimeoutMs: number;
   startupTimeoutMs: number;
   maxInputBytes: number;
   maxDurationMs: number;
@@ -131,6 +143,15 @@ export class RuntimeSpeechError extends Error {
     public readonly code: string,
     public readonly status: Exclude<SpeechRuntimeState, 'ready'>,
     message: string,
+    /**
+     * 仅携带可安全持久化的数值质量观测；不得放入文本、路径、身份或模型原始输出。
+     * benchmark 失败也应保留这些指标，才能区分模型质量问题和执行链失败。
+     */
+    public readonly qualityMetrics?: {
+      lyricsAlignment?: number;
+      lyricsAlignmentThreshold?: number;
+      lyricsAlignmentPassed?: false;
+    },
   ) {
     super(message);
     this.name = 'RuntimeSpeechError';

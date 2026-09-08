@@ -17,6 +17,7 @@ import {
   resolveTrustedInboundAudio,
   resolveTrustedNativeReplyAudio,
   speechFailureMessage,
+  speechFailureDiagnosticCode,
 } from './speech-policy.js';
 
 const HASH_A = 'a'.repeat(64);
@@ -148,6 +149,31 @@ test('回复旧语音只接受当前消息、原生 reply、fileKey 与 reply �
     },
     attachments: [attachment, { ...attachment, id: 'reply-audio-2' }],
   }), null);
+});
+
+test('文件 transport 只要附件真实 MIME 为音频即可进入可信回复音频计划', () => {
+  const attachment = {
+    id: 'reply-m4a', name: 'recording.m4a', type: 'audio/mp4', size: 256, data: 'ZnR5cE1BNA==',
+  };
+  const resolved = resolveTrustedNativeReplyAudio({
+    channelType: 'feishu',
+    sourceMessageId: 'request-1',
+    raw: {
+      feishuReplyTo: { messageId: 'reply-1', attachmentCount: 1 },
+      feishuNativeReplyAttachments: [{
+        protocol: 'cti-feishu-native-reply-attachment/v1',
+        relation: 'native_reply',
+        sourceMessageId: 'request-1',
+        messageId: 'reply-1',
+        fileKey: 'file-1',
+        resourceType: 'file',
+        attachmentId: attachment.id,
+      }],
+    },
+    attachments: [attachment],
+  });
+  assert.equal(resolved?.attachment.id, attachment.id);
+  assert.equal((resolved?.evidence as { resourceType?: string } | undefined)?.resourceType, 'audio');
 });
 
 test('当前语音与原生回复语音同时存在时只把当前语音设为 primary', () => {
@@ -316,9 +342,27 @@ test('语音回复裁决只接受结构化 intent、会话命令和可信入站�
   }).mode, 'voice');
 });
 
-test('模型 speech 对象只允许唯一 mode 字段，出现执行字段时整段拒绝', () => {
+test('模型 speech 对象只允许 mode 与受控参考音色类别，出现执行字段或非法组合时整段拒绝', () => {
   assert.deepEqual(parseSpeechReplyDirective({ mode: 'voice_only' }), { mode: 'voice_only' });
+  assert.deepEqual(parseSpeechReplyDirective({
+    mode: 'voice_only',
+    after_send_text: '小明，收到请回复。',
+  }), {
+    mode: 'voice_only',
+    afterSendText: '小明，收到请回复。',
+  });
+  assert.deepEqual(parseSpeechReplyDirective({
+    mode: 'voice_only',
+    voice_requirement: 'active_reference',
+  }), {
+    mode: 'voice_only',
+    voiceRequirement: 'active_reference',
+  });
   assert.deepEqual(parseSpeechReplyDirective({ mode: 'text_only' }), { mode: 'text_only' });
+  assert.equal(parseSpeechReplyDirective({ mode: 'text_only', voice_requirement: 'active_reference' }), undefined);
+  assert.equal(parseSpeechReplyDirective({ mode: 'text_only', after_send_text: '不允许' }), undefined);
+  assert.equal(parseSpeechReplyDirective({ mode: 'voice_only', voice_requirement: 'qwen3.serena' }), undefined);
+  assert.equal(parseSpeechReplyDirective({ mode: 'voice_only', voice_requirement: 'reference_or_preset' }), undefined);
   assert.equal(parseSpeechReplyDirective({
     mode: 'voice_only',
     provider: 'forged',
@@ -350,11 +394,30 @@ test('TTS 身份快照和回执必须精确绑定模型、版本、音色与正�
     textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
     fileSha256: HASH_B,
     validated: true,
+    generationStatus: 'generated',
+    deliveryStatus: 'not_sent',
+    speakerSimilarityStatus: 'not_applicable',
     ...identity,
   };
   const expected = { text, expectedIdentity: identity };
   const receipt = parseSpeechSynthesisReceipt(rawReceipt, expected);
   assert.equal(receipt?.format, 'opus');
+  assert.equal(receipt?.generationStatus, 'generated');
+  assert.equal(receipt?.deliveryStatus, 'not_sent');
+  assert.equal(parseSpeechSynthesisReceipt({
+    ...rawReceipt,
+    speakerSimilarityStatus: 'passed',
+    speakerSimilarity: 0.81,
+    speakerSimilarityThreshold: 0.72,
+    speakerSimilarityPassed: true,
+  }, expected)?.speakerSimilarityPassed, true);
+  assert.equal(parseSpeechSynthesisReceipt({
+    ...rawReceipt,
+    speakerSimilarityStatus: 'passed',
+    speakerSimilarity: 0.61,
+    speakerSimilarityThreshold: 0.72,
+    speakerSimilarityPassed: false,
+  }, expected), null);
   assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, format: 'wav' }, expected), null);
   assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, validated: false }, expected), null);
   assert.equal(parseSpeechSynthesisReceipt({ ...rawReceipt, path: 'reply.opus' }, expected), null);
@@ -378,23 +441,32 @@ test('参考音色动作只接受语义字段，导入回执绑定真实证据�
     rights_basis: 'self_or_authorized',
     usage_scope: 'local_tts_only',
     clean_single_speaker_confirmed: true,
+    reference_transcript: '这是准确参考文本',
+    reference_transcript_confirmed: true,
   }), {
     action: 'create_reference_voice',
     profileName: '我的 音色',
     rightsBasis: 'self_or_authorized',
     usageScope: 'local_tts_only',
-    cleanSingleSpeakerConfirmed: true,
+      cleanSingleSpeakerConfirmed: true,
+      referenceTranscriptSource: 'user_confirmed',
+      referenceTranscript: '这是准确参考文本',
+    referenceTranscriptConfirmed: true,
   });
   assert.equal(parseSpeechReferenceVoiceAction({
     action: 'create_reference_voice',
     rights_basis: 'self_or_authorized',
     usage_scope: 'local_tts_only',
+    reference_transcript: '文本',
+    reference_transcript_confirmed: true,
   }), undefined);
   assert.equal(parseSpeechReferenceVoiceAction({
     action: 'create_reference_voice',
     rights_basis: 'public_domain',
     usage_scope: 'local_tts_only',
     clean_single_speaker_confirmed: true,
+    reference_transcript: '文本',
+    reference_transcript_confirmed: true,
   }), undefined);
   assert.equal(parseSpeechReferenceVoiceAction({
     action: 'create_reference_voice',
@@ -418,6 +490,8 @@ test('参考音色动作只接受语义字段，导入回执绑定真实证据�
     protocol: 'cti-speech-reference-voice-import/v1',
     voiceProfileId: 'voice.reference.1',
     ...expected,
+    registrationStatus: 'registered',
+    speakerSimilarityStatus: 'not_verified',
     validated: true,
   };
   assert.equal(parseSpeechReferenceVoiceImportReceipt(raw, expected)?.voiceProfileId, 'voice.reference.1');
@@ -437,4 +511,9 @@ test('语音失败只映射稳定、可行动且不泄露内部路径的中文�
   assert.match(speechFailureMessage({ code: 'speech_input_disabled' }, 'transcribe'), /尚未就绪/u);
   assert.doesNotMatch(speechFailureMessage({ code: 'speech_timeout', message: 'C:\\private\\model' }, 'transcribe'), /private/u);
   assert.match(speechFailureMessage(new Error('secret'), 'synthesize'), /完整文字/u);
+  assert.match(speechFailureMessage({ code: 'tts_synthesis_timeout' }, 'synthesize'), /生成状态为“未完成”/u);
+  assert.match(speechFailureMessage({ code: 'speech_delivery_failed' }, 'synthesize'), /语音已生成/u);
+  assert.match(speechFailureMessage({ code: 'tts_output_not_opus' }, 'synthesize'), /未通过格式或身份验收/u);
+  assert.equal(speechFailureDiagnosticCode({ code: 'tts_synthesis_timeout', message: 'C:\\private\\model' }, 'synthesize'), 'tts_synthesis_timeout');
+  assert.equal(speechFailureDiagnosticCode(new Error('C:\\private\\model'), 'synthesize'), 'speech_synthesis_failed');
 });

@@ -13,6 +13,7 @@ export const REMINDER_ACTION_FENCE = 'cti-reminder';
 export const SCHEDULED_TASK_ACTION_FENCE = 'cti-scheduled-task';
 export const DIRECT_MESSAGE_ACTION_FENCE = 'cti-direct-message';
 export const BRIDGE_CONTROL_ACTION_FENCE = 'cti-bridge-control';
+export const PANEL_SETTINGS_ACTION_FENCE = 'cti-panel-settings';
 export const ARTIFACT_PROMOTION_ACTION_FENCE = 'cti-artifact-promote';
 
 export interface CtiReminderAction {
@@ -83,6 +84,19 @@ export interface ExtractedArtifactPromotionAction {
 
 export interface ActionBlockParseOptions {
   parseMentions?: (value: unknown) => OutboundMention[] | undefined;
+}
+
+export interface CtiPanelSettingsAction {
+  action: 'update';
+  changes: Array<{ key: string; value: string | number | boolean }>;
+  expectedVersion?: string;
+}
+
+export interface ExtractedPanelSettingsAction {
+  action: CtiPanelSettingsAction | null;
+  text: string;
+  hadBlock: boolean;
+  error?: string;
 }
 
 export interface ScheduledTaskActionParseOptions {
@@ -305,7 +319,14 @@ function parseScheduledTaskAction(value: unknown): ScheduledTaskActionInput | nu
   const kind = getStringField(raw, ['kind']).toLowerCase();
   if (kind === 'notify') {
     const text = getStringField(raw, ['text', 'message', 'content']);
-    return text ? { kind: 'notify', text } : null;
+    const speechRaw = getRecordField(raw.speech);
+    const speech = speechRaw
+      && Object.keys(speechRaw).every((key) => key === 'mode')
+      && speechRaw.mode === 'voice_only'
+      ? { mode: 'voice_only' as const }
+      : undefined;
+    if (raw.speech !== undefined && !speech) return null;
+    return text ? { kind: 'notify', text, ...(speech ? { speech } : {}) } : null;
   }
   if (kind === 'check_in' || kind === 'check-in' || kind === 'checkin') {
     const text = getStringField(raw, ['text', 'message', 'content']);
@@ -559,6 +580,45 @@ export function extractCtiBridgeControlAction(text: string): ExtractedBridgeCont
     return { action: { action: 'restart_live' }, text: cleaned, hadBlock: true };
   } catch {
     return { action: null, text: cleaned, hadBlock: true, error: 'Bridge 控制动作 JSON 解析失败' };
+  }
+}
+
+export function extractCtiPanelSettingsAction(text: string): ExtractedPanelSettingsAction {
+  const fencePattern = buildFencePattern(PANEL_SETTINGS_ACTION_FENCE);
+  const match = text.match(fencePattern);
+  if (!match) return { action: null, text, hadBlock: false };
+  const cleaned = removeFence(text, fencePattern);
+  try {
+    const raw = getRecordField(JSON.parse(match[2].trim()));
+    if (!raw || raw.action !== 'update' || !Array.isArray(raw.changes)) {
+      return { action: null, text: cleaned, hadBlock: true, error: '面板设置动作仅支持 update changes' };
+    }
+    const unexpected = Object.keys(raw).filter((key) => !['action', 'changes', 'expectedVersion'].includes(key));
+    if (unexpected.length > 0) {
+      return { action: null, text: cleaned, hadBlock: true, error: `面板设置动作包含不允许字段：${unexpected.sort().join(', ')}` };
+    }
+    if (raw.changes.length < 1 || raw.changes.length > 10) {
+      return { action: null, text: cleaned, hadBlock: true, error: '面板设置动作每次只能修改 1–10 项' };
+    }
+    const changes: CtiPanelSettingsAction['changes'] = [];
+    for (const item of raw.changes) {
+      const change = getRecordField(item);
+      if (!change || Object.keys(change).some((key) => !['key', 'value'].includes(key))) {
+        return { action: null, text: cleaned, hadBlock: true, error: '面板设置 changes 只允许 key 和 value' };
+      }
+      const key = getStringField(change, ['key']);
+      const value = change.value;
+      if (!key || !['string', 'number', 'boolean'].includes(typeof value)) {
+        return { action: null, text: cleaned, hadBlock: true, error: '面板设置 change 缺少有效 key 或标量 value' };
+      }
+      changes.push({ key, value: value as string | number | boolean });
+    }
+    const expectedVersion = typeof raw.expectedVersion === 'string' && raw.expectedVersion.trim()
+      ? raw.expectedVersion.trim()
+      : undefined;
+    return { action: { action: 'update', changes, expectedVersion }, text: cleaned, hadBlock: true };
+  } catch {
+    return { action: null, text: cleaned, hadBlock: true, error: '面板设置动作 JSON 解析失败' };
   }
 }
 

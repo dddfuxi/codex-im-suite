@@ -32,6 +32,7 @@ function configIdentity(config: SpeechRuntimeConfig): string {
     tonePolicy: config.tonePolicy,
     voiceProfileId: config.voiceProfileId || '',
     voiceCloneBenchmarkPassed: config.voiceCloneBenchmarkPassed,
+    requireVoiceSimilarityAcceptance: config.requireVoiceSimilarityAcceptance,
     // 路径只参与不可逆身份 Hash，不进入持久化状态。
     dependencyIdentity: crypto.createHash('sha256').update(JSON.stringify([
       config.modelRoot || '',

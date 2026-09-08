@@ -9,6 +9,8 @@ export interface SpeechModelCatalogEntry {
   providerDisplayName: string;
   variant: SpeechModelVariant;
   sizeLabel: string;
+  qualityTier: 'high_quality' | 'balanced' | 'low_resource';
+  qualityRank: number;
   componentId: string;
   /** Sidecar 只能把这个官方身份与本地受管目录核对，禁止在线解析或下载。 */
   upstreamModelId: string;
@@ -38,12 +40,16 @@ const qwenCustomModels = [
     id: DEFAULT_TTS_MODEL_ID,
     displayName: 'Qwen3-TTS 12Hz 1.7B CustomVoice',
     sizeLabel: '1.7B',
+    qualityTier: 'high_quality',
+    qualityRank: 300,
     upstreamModelId: 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
   },
   {
     id: LOW_VRAM_TTS_MODEL_ID,
     displayName: 'Qwen3-TTS 12Hz 0.6B CustomVoice（低显存）',
     sizeLabel: '0.6B',
+    qualityTier: 'low_resource',
+    qualityRank: 100,
     upstreamModelId: 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice',
   },
 ] as const;
@@ -53,12 +59,16 @@ const qwenBaseModels = [
     id: 'qwen3-tts-12hz-1.7b-base',
     displayName: 'Qwen3-TTS 12Hz 1.7B Base（音色复刻）',
     sizeLabel: '1.7B',
+    qualityTier: 'high_quality',
+    qualityRank: 300,
     upstreamModelId: 'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
   },
   {
     id: 'qwen3-tts-12hz-0.6b-base',
     displayName: 'Qwen3-TTS 12Hz 0.6B Base（低显存复刻）',
     sizeLabel: '0.6B',
+    qualityTier: 'low_resource',
+    qualityRank: 100,
     upstreamModelId: 'Qwen/Qwen3-TTS-12Hz-0.6B-Base',
   },
 ] as const;
@@ -93,6 +103,8 @@ export const SPEECH_MODEL_CATALOG: readonly SpeechModelCatalogEntry[] = [
     providerDisplayName: 'CosyVoice',
     variant: 'sft',
     sizeLabel: '300M',
+    qualityTier: 'balanced',
+    qualityRank: 200,
     componentId: 'cosyvoice',
     upstreamModelId: 'FunAudioLLM/CosyVoice-300M-SFT',
     capabilities: ['preset_voice'],

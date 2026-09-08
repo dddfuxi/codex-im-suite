@@ -4,6 +4,7 @@ import {
   extractCtiDirectMessageAction,
   extractCtiReminderAction,
   extractCtiScheduledTaskAction,
+  extractCtiPanelSettingsAction,
 } from './action-blocks.js';
 import { containsUnverifiedReminderCompletion } from './reminders.js';
 
@@ -31,12 +32,14 @@ function inspectActionBlocks(responseText: string): ActionBlockReview[] {
   const directMessage = extractCtiDirectMessageAction(responseText);
   const bridgeControl = extractCtiBridgeControlAction(responseText);
   const artifactPromotion = extractCtiArtifactPromotionAction(responseText);
+  const panelSettings = extractCtiPanelSettingsAction(responseText);
   return [
     { family: 'cti-reminder', hadBlock: reminder.hadBlock, valid: Boolean(reminder.action), error: reminder.error },
     { family: 'cti-scheduled-task', hadBlock: scheduledTask.hadBlock, valid: Boolean(scheduledTask.action), error: scheduledTask.error },
     { family: 'cti-direct-message', hadBlock: directMessage.hadBlock, valid: Boolean(directMessage.action), error: directMessage.error },
     { family: 'cti-bridge-control', hadBlock: bridgeControl.hadBlock, valid: Boolean(bridgeControl.action), error: bridgeControl.error },
     { family: 'cti-artifact-promotion', hadBlock: artifactPromotion.hadBlock, valid: Boolean(artifactPromotion.action), error: artifactPromotion.error },
+    { family: 'cti-panel-settings', hadBlock: panelSettings.hadBlock, valid: Boolean(panelSettings.action), error: panelSettings.error },
   ];
 }
 

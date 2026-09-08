@@ -9,11 +9,11 @@ import {
   SPEECH_PREVIEW_PROTOCOL,
   type SpeechPreviewReceipt,
 } from './speech-preview.js';
+import type { SingingAudioContentPlanContract } from '@codex-im-suite/contracts/speech';
 
-/** 歌声试听固定短时长，避免面板误触发完整歌曲和长时间占用 GPU。 */
-export async function createSingingVoicePreview(input: {
+async function createSingingVoiceOutput(input: {
   host: AceStepSingingHost;
-  lyrics: string;
+  plan: SingingAudioContentPlanContract;
   modelId: string;
   voiceProfileId: string;
   signal?: AbortSignal;
@@ -23,10 +23,11 @@ export async function createSingingVoicePreview(input: {
   let synthesis: RuntimeSingingSynthesisReceipt | undefined;
   try {
     synthesis = await input.host.synthesizeSong({
-      prompt: '清晰自然的中文流行人声，简洁伴奏，适合作为歌声音色试听',
-      lyrics: input.lyrics,
-      vocalLanguage: 'zh',
-      durationSeconds: 10,
+      prompt: input.plan.stylePrompt,
+      lyrics: input.plan.lyrics,
+      vocalLanguage: input.plan.vocalLanguage,
+      durationSeconds: input.plan.durationSeconds,
+      ...(input.voiceProfileId !== 'acestep.default' ? { voiceRequirement: 'active_reference' as const } : {}),
       signal: input.signal,
       ...(input.benchmarkMode ? { benchmarkMode: true } : {}),
     });
@@ -34,9 +35,15 @@ export async function createSingingVoicePreview(input: {
       || synthesis.mediaType !== 'audio/ogg; codecs=opus'
       || synthesis.format !== 'opus'
       || synthesis.validated !== true
+      || synthesis.generationStatus !== 'generated'
+      || synthesis.deliveryStatus !== 'not_sent'
+      || synthesis.lyricsAlignmentStatus !== 'passed'
+      || synthesis.lyricsAlignmentPassed !== true
       || (input.voiceProfileId === 'acestep.default'
-        ? Boolean(synthesis.voiceProfileId)
-        : synthesis.voiceProfileId !== input.voiceProfileId)) {
+        ? synthesis.speakerSimilarityStatus !== 'not_applicable' || Boolean(synthesis.voiceProfileId)
+        : synthesis.voiceProfileId !== input.voiceProfileId
+          || synthesis.speakerSimilarityStatus !== 'passed'
+          || synthesis.speakerSimilarityPassed !== true)) {
       throw new RuntimeSpeechError('singing_preview_receipt_invalid', 'blocked', '歌声试听回执无效');
     }
     const stat = assertRegularNonSymlink(synthesis.path);
@@ -57,6 +64,18 @@ export async function createSingingVoicePreview(input: {
       durationMs: synthesis.durationMs,
       modelId: input.modelId,
       voiceProfileId: input.voiceProfileId,
+      generationStatus: 'generated',
+      deliveryStatus: 'not_sent',
+      speakerSimilarityStatus: synthesis.speakerSimilarityStatus,
+      ...(synthesis.speakerSimilarityStatus === 'passed' ? {
+        speakerSimilarity: synthesis.speakerSimilarity,
+        speakerSimilarityThreshold: synthesis.speakerSimilarityThreshold,
+        speakerSimilarityPassed: true,
+      } : {}),
+      lyricsAlignmentStatus: 'passed',
+      lyricsAlignment: synthesis.lyricsAlignment,
+      lyricsAlignmentThreshold: synthesis.lyricsAlignmentThreshold,
+      lyricsAlignmentPassed: true,
       ...(input.benchmarkMode ? {
         modelRevision: input.modelRevision,
         peakVramMiB: synthesis.peakVramMiB,
@@ -68,4 +87,23 @@ export async function createSingingVoicePreview(input: {
       try { input.host.releaseSynthesis(synthesis); } catch { /* 清理失败不能覆盖试听主结果。 */ }
     }
   }
+}
+
+/** 快速试听与完整生成复用同一受控计划和媒体验收，只在计划模式上区分。 */
+export function createSingingVoicePreview(input: Omit<Parameters<typeof createSingingVoiceOutput>[0], 'plan'> & {
+  plan: SingingAudioContentPlanContract;
+}): Promise<SpeechPreviewReceipt> {
+  if (input.plan.outputMode !== 'quick_preview' || input.plan.durationSeconds !== 10) {
+    throw new RuntimeSpeechError('singing_preview_plan_invalid', 'blocked', '歌声快速试听计划无效');
+  }
+  return createSingingVoiceOutput(input);
+}
+
+export function createSingingVoiceGeneration(input: Omit<Parameters<typeof createSingingVoiceOutput>[0], 'plan'> & {
+  plan: SingingAudioContentPlanContract;
+}): Promise<SpeechPreviewReceipt> {
+  if (input.plan.outputMode !== 'full_generation') {
+    throw new RuntimeSpeechError('singing_generation_plan_invalid', 'blocked', '完整歌声生成计划无效');
+  }
+  return createSingingVoiceOutput(input);
 }

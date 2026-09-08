@@ -66,7 +66,9 @@ function normalizeEntry(value: unknown, now: number): ChoicePromptStateEntrySnap
   const mode = rawSession && ['single_user', 'vote', 'claim', 'parallel'].includes(String(rawSession.mode))
     ? rawSession.mode as 'single_user' | 'vote' | 'claim' | 'parallel'
     : 'single_user';
-  const audience = mode === 'single_user' ? 'initiator' as const : 'chat_members' as const;
+  const audience = mode === 'single_user'
+    ? rawSession?.audience === 'participant' ? 'participant' as const : 'initiator' as const
+    : 'chat_members' as const;
   const durationSeconds = Number.isInteger(rawSession?.durationSeconds)
     && Number(rawSession?.durationSeconds) >= 10
     && Number(rawSession?.durationSeconds) <= 3_600

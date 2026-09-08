@@ -10,7 +10,9 @@ import type {
 } from './runtime-speech-host.js';
 
 export const SPEECH_PREVIEW_PROTOCOL = 'codex-im-suite/speech-preview/v2' as const;
-export const MAX_SPEECH_PREVIEW_BYTES = 4 * 1024 * 1024;
+// 完整歌声仍只通过受限内存回执进入面板；16 MiB 可覆盖最长受控 Opus，
+// 同时避免把 Runtime 路径或任意大文件暴露给 WebView。
+export const MAX_SPEECH_PREVIEW_BYTES = 16 * 1024 * 1024;
 export const MAX_SPEECH_PREVIEW_TEXT_CHARACTERS = 240;
 
 export interface SpeechPreviewReceipt {
@@ -22,9 +24,19 @@ export interface SpeechPreviewReceipt {
   durationMs: number;
   modelId: string;
   voiceProfileId: string;
+  generationStatus: 'generated';
+  deliveryStatus: 'not_sent';
+  speakerSimilarityStatus: 'passed' | 'not_verified' | 'not_applicable';
   /** 仅 benchmark mailbox 使用，不进入浏览器试听协议。 */
   modelRevision?: string;
   peakVramMiB?: number;
+  speakerSimilarity?: number;
+  speakerSimilarityThreshold?: number;
+  speakerSimilarityPassed?: boolean;
+  lyricsAlignmentStatus?: 'passed';
+  lyricsAlignment?: number;
+  lyricsAlignmentThreshold?: number;
+  lyricsAlignmentPassed?: boolean;
   validated: true;
 }
 
@@ -51,6 +63,15 @@ function validateSynthesisReceipt(
     || receipt.format !== 'opus'
     || receipt.voiceProfileId !== voiceProfileId
     || receipt.ttsModelId !== ttsModelId
+    || receipt.generationStatus !== 'generated'
+    || receipt.deliveryStatus !== 'not_sent'
+    || (receipt.speakerSimilarityStatus !== 'passed' && receipt.speakerSimilarityStatus !== 'not_verified' && receipt.speakerSimilarityStatus !== 'not_applicable')
+    || (receipt.speakerSimilarityStatus === 'passed' && receipt.speakerSimilarityPassed !== true)
+    || ((receipt.speakerSimilarityStatus === 'not_applicable' || receipt.speakerSimilarityStatus === 'not_verified') && (
+      receipt.speakerSimilarity !== undefined
+      || receipt.speakerSimilarityThreshold !== undefined
+      || receipt.speakerSimilarityPassed !== undefined
+    ))
     || !Number.isFinite(receipt.durationMs)
     || receipt.durationMs <= 0
     || !/^[a-f0-9]{64}$/u.test(receipt.fileSha256)
@@ -127,6 +148,14 @@ export async function createSpeechVoicePreview(input: {
       durationMs: synthesis.durationMs,
       modelId: input.ttsModelId,
       voiceProfileId: input.voiceProfileId,
+      generationStatus: 'generated',
+      deliveryStatus: 'not_sent',
+      speakerSimilarityStatus: synthesis.speakerSimilarityStatus,
+      ...(synthesis.speakerSimilarityStatus === 'passed' ? {
+        speakerSimilarity: synthesis.speakerSimilarity,
+        speakerSimilarityThreshold: synthesis.speakerSimilarityThreshold,
+        speakerSimilarityPassed: true,
+      } : {}),
       ...(input.benchmarkMode ? {
         modelRevision: synthesis.modelRevision,
         ...(synthesis.peakVramMiB !== undefined ? { peakVramMiB: synthesis.peakVramMiB } : {}),

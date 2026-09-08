@@ -1,5 +1,51 @@
 # codex-im-suite 开发记录
 
+- 2026-09-03 飞书审批用户身份隔离修复（开发版）：此前 `lark-cli` 默认读取本机共享登录目录，且 Bridge 只允许 Owner 发起授权；同一审批能力被其他成员触发时既不能建立自己的身份，也存在误用 Owner token 的风险。现按当前真实 Feishu sender 的 userId 建立独立运行态配置目录，授权卡改为“本人授权”，授权完成后的 Codex 工具回合通过同一隔离目录执行，避免不同成员互相覆盖或冒用身份。缺少可隔离 CLI 配置时明确失败，不回退共享 token。已补充 Runtime/Bridge 回归；尚未同步 live、重启 Bridge 或完成新的现场审批提交复测。
+
+- 2026-09-02 互动打卡参与者显示修复（开发版与 live）：移除只向 Provider 投影打卡人数、屏蔽参与者身份的专用限制。Runtime 历史现在保留真实打卡条目，Bridge 通过当前渠道适配器按真实用户 ID 查询当前会话成员姓名，再将已验证姓名用于“谁参加了打卡/打卡排行榜”等统计；解析失败仍保留人数结果，不把 ID 当姓名。新增参与者意图识别和 Core/Runtime 回归，Core/Runtime 类型检查及打卡专项测试通过。已执行 `sync-live-skill.ps1` 并受控重启 live，当前 Bridge PID=`93908`、Feishu WS=`connected`、`lastUnhandledError=null`；开发版与 live 相关源码及 `daemon.mjs` Hash 一致。尚未用新的现场消息完成平台端到端复测。
+
+- 2026-08-26 中文克隆歌声音色验收器（开发中）：现有 ACE-Step 1.5 已真实生成并通过受管参考音频、Ogg/Opus 与音色相似度链路，但普通 SenseVoice 在中文演唱歌词实测未达到 `0.8` 对齐门禁，产物被正确拒绝，未发送到飞书。为避免降低门禁或以普通 TTS 冒充唱歌，开发版新增可选的 `fireredasr2_aed_wsl` 验收器：仅在显式启用时将已归一化的受管 WAV、F 盘受管 WSL 发行版和已存在的 FireRed 模型目录交给无 shell 的一次性 WSL 调用；返回值必须是可信 Provider/模型身份的严格 JSON，之后仍由 Runtime 执行 Unicode 歌词对齐与克隆音色相似度裁决。普通 ASR 不受替换，FireRed 不允许下载模型、生成产物或投递飞书。新增适配单测和 TypeScript 检查已通过；全量 Runtime 测试中有 4 项既有轻聊路由测试失败，未把它们计为通过。Ubuntu 镜像正下载到 `F:\CodexImSuite\wsl\packages`，后续会导入 `F:\CodexImSuite\wsl\UbuntuFireRed`；尚未同步 live、未重启 Bridge，未宣称真实唱歌验收或飞书新消息投递完成。
+
+- 2026-08-21 短约束续办去短语化（开发版）：已完成结果的回复不再由“改成、重做、预算数字”等正则决定是否继承执行要求。Manager 只在结构化焦点已指向同会话恢复的 durable outbound context 时调用禁工具、严格 JSON 的 `ContinuationAdjustmentIntentHost`；只有 `adjust` 才继承原任务的 artifact/tool evidence，`not_adjust / ambiguous`、超时或无效输出均不继承并继续由 Primary 处理。自维护纠错也新增可信上一轮机器人结果关系门禁，孤立纠错短语不会触发旁路维护。仅修改开发版，未同步 live 或重启 Bridge。
+
+- 2026-08-21 短语依赖路由收敛（开发版）：继续审计“轻聊抢占任务”的相邻路径后，删除未恢复原生回复按短句猜附近上下文的回退、文本跟随自动重挂最近媒体、社交短语触发 sticker-only，以及本地轻聊候选中的动作/响应速度/寒暄词表。现在轻聊只能消费 Core 签发的 `lightChatEligible`，可靠 reply、continuation、歧义和未恢复引用全部失败关闭到 Primary。记忆写入不再以“记住”等关键词决定是否分类：所有无附件可分类文本均交给禁工具 JSON classifier，`ignore` 不写入、不触发协作；专项 Ignis/MCP 快路径则必须同时拥有 Core 的执行证据要求和运行时 manifest，文本命中只保留为候选，不能单独授权调用。续办产物仍只在可信 outbound evidence 下继承执行要求；计划任务、点名和危险操作继续保留真实身份、目标、权限和 Host 回执门禁。本轮完成 Core/Runtime 类型检查和相关单测，未同步 live、未重启 Bridge，尚未用现场新消息复测。
+
+- 2026-08-21 轻聊误入任务续办修复（开发版）：现场回合虽带可靠的原生回复上下文，但轻聊资格此前仍主要由短文本表面特征判断，可能裁剪掉 Primary 所需的工作区、工具与证据边界。现由 Core 的 `TurnFocusDecision` 统一签发 `lightChatEligible`：只有主焦点唯一为当前消息且不需要引用解析时，Runtime 才允许进入受限轻聊路径；可靠回复目标、续办与歧义焦点均直接保留完整 Primary 回合。该策略只消费结构化焦点和证据关系，不依赖特定语言、业务名或用户句式，也不把上下文存在本身提升为执行成功。新增焦点策略、Core 到 Provider 字段传递和 Runtime 路由回归；仅修改开发版，尚未同步 live 或重启 Bridge。
+
+- 2026-08-18 飞书原生回复语音续办重启稳定性修复：现场“仅 @ 机器人并回复上一条语音任务”的入站文本会被平台统一为通用续办描述，旧 Manager 仅用这条描述判断语音协议，丢失了已可靠恢复的原始语音请求，导致 Primary 可误报当前群无法发送语音而不调用 Runtime。现新增通用 `resolveEffectiveSpeechRequest`：只有唯一、可信、已恢复的 native reply 且当前消息确属无新业务语义的续办时，才继承旧请求的受管语音与 reference 类别要求；当前新指令、普通引用、模糊上下文及“不要发语音”等显式关闭均不继承。Manager 的协议 expectation 与 post-generation review 统一消费该结果，可信被回复正文同时计为引用内容，避免默认短口播预算错误截断。新增策略和 Manager 端到端回归覆盖“第一次模型漏 speech 指令、仅修复一次、Runtime 合成、原生 audio 投递”以及显式关闭/新任务反例；专项 `299/299` 通过。部署与现场运行态核验见下一条记录；最终平台 audio 回执仍需新群消息确认。
+
+- 2026-08-18 上述语音续办修复已同步 live 并完成受控重启：同步前 Workflow drain 为零，live Core 与 Runtime 编译产物均与开发版哈希一致；新运行实例已建立、飞书长连接为 `connected`，运行审计没有未处理错误或退出原因。启动包装器曾在冷启动窗口内先返回失败，但后续仅按实际新进程、状态、审计和 WebSocket 复核为健康，未据包装器的早期结果作伪失败结论。由于新实例尚未收到一条真实群内“回复旧语音请求且仅 @ 机器人”的消息，本条只完成部署与运行态验证，最终平台 audio 回执仍待现场复测。
+
+- 2026-08-18 飞书语音群问候与引用续办修复：群体称呼不再被当作需要解析的原生 @ 成员；只有可归一为具体人名的当前轮明确目标才进入群成员复核。原生回复机器人而形成的通用续办语义（例如“请处理我引用的消息”）此前会被贪婪目标解析误识别为待 @ 的成员，现统一拒绝任务动词、引用定位和消息说明等非身份短语，同时保留“群里的具体姓名”到具体成员的受控解析。语音 Runtime 现场状态进一步核实：指定的参考音色已成功生成合法 Ogg/Opus，并获得平台原生 audio 发送回执；未使用或发送其他临时合成结果。专项 mention 解析测试和 Core typecheck 通过；live 同步后的同类新消息仍需继续观察。
+
+- 2026-08-17 本地可信读取结果防覆盖通用修复（开发版与 live）：互动打卡历史现场已由 Runtime Host 成功读取并脱敏投影，但 Provider 仍以普通 Agent 模式调用工具读取旧导出文件，导致错误来源覆盖本地账本。本次新增通用 `trusted-read-evidence-policy` 执行边界：仅当当前请求严格只读且 Runtime 已返回可信本地 evidence 时，Conversation Engine 固定以 `response_only` 调用 Provider，禁止 Bash、CLI、MCP 或外部连接器再取第二来源；计划任务列表/互动打卡历史和 Owner 面板设置查询均接入该边界。面板设置修改等写入意图不适用，继续使用受控动作块、版本校验和后置 Host，避免“禁工具”意外阻断真实变更。Core 类型检查、相关单测 `292/292`、人类文档门禁和 diff 检查通过。已整包同步并重启 live；首次重启包装器早于本机语音预热完成而报失败，但随后新 Bridge 已实际接管，状态、运行审计与飞书 WS 均显示健康，且 live bundle 已检出该边界。仍需以重启后的真实新一条互动打卡统计消息完成渠道端到端复测，不能用旧回合结果替代。
+
+- 2026-08-17 互动打卡历史误入飞书授权修复（开发版）：用户请求“对比两周喝水打卡”原本没有命中计划任务读取入口，Provider 因而错误尝试访问飞书资源并合并到已有用户 OAuth。现将“互动打卡 + 对比/统计/周期”识别为受控本地只读意图：Runtime 仅按当前 Actor 可见范围读取 `check_in` 任务与运行账本，Core 仅向 Provider 投影任务名称、运行时间、汇总人数、执行/投递状态；任务 ID、参与者身份、卡片正文和路径均不外泄。该 Prompt 明确禁止 `lark-cli` 与用户 OAuth，并在 Provider 仍错误产生 OAuth challenge 时拒绝合并到共享授权队列。飞书考勤、云文档与 Base 仍走独立的外部资源权限链，未按“打卡”字面混同。Core 类型检查与新增定向策略测试 `5/5` 通过；工作区已有语音测试失败未由本次修改引入。本轮仅修改开发版，尚未同步 live 或重启 Bridge。
+
+- 2026-08-14 控制面板新增独立 `Unity AIBridge` Runtime Unit：从 `CTI_HOME/project-registry.json` 的启用 Unity 工程发现 `.aibridge/cli/AIBridgeCLI`，面板“服务”页提供状态、真实 `harness status` 检查和打开工程入口；没有登记工程或 CLI 缺失时保持 warning/error，不伪造可用。Unity MCP manifest 新增“暂停/恢复”，暂停会先写入 UTF-8 `enabled=false` 再停止托管 helper，恢复需显式操作，且 AIBridge 与 MCP 不互相依赖。开发版已暂停 `config/mcp.d/unity-mcp.json`，停止 helper 的真实脚本回执为 PID `40064` 与 `1912` 已停止；未同步 live，也未宣称 Unity MCP 现场恢复。
+
+- 2026-08-14 飞书 Unity 任务“工具调用后仍显示未完成”完成开发版修复与现场连接恢复：现场 Workflow `f0927344-2e26-495b-93c3-70d061e1153b` 的真实证据显示 35 次工具调用中 7 次失败，失败集中在官方 `skill-creator` / `skill-installer` 脚本仅拼接单一隔离 Home 路径，以及 Unity MCP 编辑器会话断开；Workflow 虽为 `succeeded`，但 `evidenceSatisfied=false`，因此不能把“完成”当作已验收。Runtime 现按受控 Codex Home 候选根解析两种官方 Skill 脚本布局，缺失时给出受控根诊断，并补齐路径回归。随后只重启 Unity MCP helper，不结束有未保存改动的 Unity 编辑器；真实 MCP `initialize` 与 `mcpforunity://instances` 已恢复 `instance_count=1`（Unity `Game` / 2022.3.27f1）。当前编辑器仍处于一个持续的 busy 状态，场景读取调用未冒充成功，待无损释放或用户确认保存重启后再做新的 Unity MCP 现场复测。Runtime 全量测试 `992/992` 通过；本轮尚未同步 live 或宣称飞书新消息端到端完成。
+
+- 2026-08-13 飞书用户授权续办修复：真实 `user` API 返回的 `missing_scope` 现在被 Core 解析为单独的 `cti-feishu-cli-user-missing-scope/v1` 证据，并以脱敏 scope 写入当前群审计。后续同群明确发送“授权/重新授权”时，仅在最近 30 分钟存在该真实证据的情况下把精确 scope 注入高优先级上下文；模型不得改用 `--domain`、`--recommend` 或多 scope。缺权证据不再凭空猜测，既有 lark-cli 授权卡、Owner 门禁和官方 device-code 回执保持不变。专项授权测试 `11/11`、Bridge Manager 相关回归 `296/296`、Core typecheck 通过；本条只完成开发版，尚未同步 live 或重启 Bridge。
+
+- 2026-08-11 克隆音色 live 合成门禁补修：飞书现场新消息在已激活 reference、面板 `ready` 且 speaker similarity `0.9888 >= 0.72` 的情况下，仍返回“当前音色尚未完成说话人相似度验收”。根因是 `RuntimeSpeechHost.synthesize()` 仍把整个 benchmark 的 `state=ready` 当作音色身份条件；高质量 1.7B Base 因热态生成较慢被独立标记为 `blocked / tts_model_warm_benchmark_too_slow`，从而被 Host 二次误判。现改为 Host、状态页和控制服务统一调用 `speakerSimilarityAcceptanceRecorded()`，只消费同模型/revision/硬件/Profile 绑定且数值自洽的相似度结论；模型速度继续独立影响性能状态和超时估算，不再阻断已经通过的音色身份。新增真实 Host 回归覆盖“速度 blocked + 相似度通过”仍可生成并返回 `speakerSimilarityStatus=passed`，专项 Runtime Host `10/10`、语音相关 `19/19`、Runtime typecheck/build 与人类文档门禁通过。修复已正式同步 live 并受控重启，Bridge PID=`82252`、runId=`d415d821-fc81-46a5-b73d-2fdc1686ee3d`、startedAt=`2026-08-11T09:56:04.056Z`，飞书 WS=`connected`、`lastUnhandledError=null`、`lastExitReason=null`，开发/live `daemon.mjs` Hash 一致。重启后的 live 控制入口已取得真实 `codex-im-suite/speech-preview/v2` Ogg/Opus 回执：`validated=true`、`6829` bytes、`1767ms`，Base64 非空且解码字节数、4 MiB 门禁、64 位 SHA-256 及实际内容 Hash 全部一致；当前 reference 仍为 active/ready，模型 benchmark 明确记录 similarity `0.9888 >= 0.72` 且通过，`tts_model_warm_benchmark_too_slow` 仅保留为独立性能提示。用户截图中的“再试”经审计确认发生于 `2026-08-11T09:41:57.608Z`，早于本次新 Bridge，属于修复前失败证据；新 run 尚未收到明确语音请求，因此飞书原生 `audio` 平台回执和“已生成 / 已发送 / 相似度已通过”唯一终态仍保持待现场验收，不能用面板试听替代。
+
+- 2026-08-11 克隆音色面板可见性、身份验收与重命名修复：真实 1.7B Base benchmark 得到 speaker similarity `0.9888`、阈值 `0.72`、明确通过，但热态合成 `34735ms` 超过 20 秒；旧逻辑把模型性能 `blocked` 错误复用成 `voice_clone_similarity_not_verified`，导致已通过身份验收的参考音色仍不可选。现将音色身份验收改为严格消费同模型/revision/硬件/Profile 绑定且数值自洽的 similarity 指标，模型速度仍独立保持 `tts_model_warm_benchmark_too_slow`。新增 owner 级 `speech.renameReferenceVoice`：只允许 reference、只改显示名，拒绝空名/超长名/规范化重名，稳定 Profile ID、受管音频、授权证据和 benchmark 均不变；预设音色拒绝重命名。面板 reference 卡新增“重命名”和“音色相似度：已通过”，控制 API 审计继续整体脱敏参考音色元数据；面板 HTML/JS/CSS 同时统一返回 `no-cache, no-store, must-revalidate`，避免 live 更新后浏览器继续复用旧 bundle。全量门禁已通过 Runtime、Core `936/936`、Contracts、Web `49/49` 与构建、C# `191/191`、依赖边界、人类文档和 Suite 构建；开发/live 指纹一致。live Bridge 继续运行于 PID `67996`、runId `45181a22-1a73-449f-b137-559d7bfafa9d`；实际 8788 语音页已显示长期保存的克隆音色、“重命名”和“音色相似度：已通过”，并经 live 控制 API 收到无需重启的真实重命名成功回执。
+
+- 2026-08-11 参考音色正式导入现场暴露通用依赖解析缺口：实时 ASR/TTS 已从受管 `ffmpeg_runtime` 解析 `ffprobe`，但长期音色注册表的导入校验仍只按独立 `ffprobe` 组件名查找，导致同一 live Runtime 返回 `executable_not_found`，且没有写入 reference Profile。`speech-runtime.ts` 现把参考音频媒体校验收口到共享 `resolveReferenceAudioFfprobeDependency`，固定兼容 `ffmpeg_runtime / ffprobe` 两种受管组件身份，显式路径和受控 PATH 的失败关闭规则保持不变；新增回归测试用真实受管安装 marker 证明参考音色导入可以发现 FFmpeg 包内的 `ffprobe`。用户已确认此前录音逐字文本、单人干净录音与长期克隆授权；修复同步 live 后仍必须由当前 Runtime 重新 ASR、完成具体参考 Profile 的相似度 benchmark、激活并用重启后的飞书新消息验收，不能用本条代码修复记录代替现场成功。
+
+- 2026-08-11 飞书普通语音现场再次出现 2 分 32 秒后文字回退。重启后新消息的结构化 `speech` 协议已成功解析，真实 Sidecar 日志显示 Qwen3-TTS 1.7B 在 90 秒窗口内持续生成多个分段，随后旧 `CTI_SPEECH_REQUEST_TIMEOUT_MS=90000` 中断请求并重启 Sidecar；因此根因不是固定句子、语音意图或模型协议，而是把普通媒体请求时限错误复用于高质量 TTS。开发版现分离 `requestTimeoutMs / startupTimeoutMs / synthesisTimeoutMs`，新增纯策略按同模型、revision、硬件 benchmark 的热态耗时、输出时长、RTF 与本轮文本规模动态计算 TTS 时限，缺记录时使用受控 10 分钟上限；Sidecar 合成超时返回独立 `tts_synthesis_timeout`。Core 失败文案明确区分未开始、未完成、验收未过和已生成但未发送，审计只写稳定码、生成/发送阶段与 exactly-once 文字回退，不写正文、路径或身份。Core `936/936`、Runtime `974/974`、两包类型检查、依赖/静态边界、人类文档、扩展清单、完整 Suite build 与 `git diff --check` 均已通过。正式同步并受控重启后 Bridge PID=`87880`、runId=`047c1b8a-d27c-48e5-b859-809868df4b8a`、startedAt=`2026-08-11T07:11:20.923Z`，飞书 WS=`connected`、`lastUnhandledError=null`、`lastExitReason=null`；开发/live 的 Bridge manager、Runtime Speech Host、动态超时策略、Speech CLI 与 daemon Hash 全部一致。同一 live Sidecar 的等长文本试听约 `162.9s` 完成，明确跨过旧 90 秒中断点；随后短文本试听约 `11.0s` 返回真实 Ogg/Opus、`10188` bytes、`2567ms`、Hash 非空且 `validated=true`。这些证据证明生成与 live 加载已修复，但最终飞书渠道 E2E 仍必须用该 startedAt 之后的真实新消息取得原生 `msg_type=audio` 平台回执，不能用本地试听冒充已发送。
+
+- 2026-08-10 控制面板 Bridge 重启伪失败完成通用开发与 live 修复：现场截图显示包装器返回空 stdout、退出码 1 后面板报“Bridge restart 失败：”，但同一时刻真实 Bridge 已切换到健康 PID/runId，飞书 WS 连接正常；命令失败后的过早状态推送又把语音初始化窗口投影成临时 `optional_missing`。根因首先是 `RunDaemonAsync` 只对包装器超时执行 readiness，普通非零退出码会在真实进程核验前直接抛错。现在重启前冻结旧 `PID / runId / startedAt`，所有非明确 drain 拒绝的结果都进入有界核验；只有新 PID、新 runId、新启动时间、Supervisor/Service、status/audit 身份一致、近实时心跳、`lastExitReason=null`、`lastUnhandledError=null` 和已启用飞书回调 `connected` 同时满足才成功。首次真实 8788 按钮复测进一步测得包装器 21:35:24 返回后，新 Bridge 21:36:26 才建立身份、21:36:55 才连接 Feishu WS，原 45 秒 readiness 早于真实冷启动结束，仍会先报 `bridge_restart_not_verified`。验证窗口据此提升为有界 120 秒，覆盖本机约 91 秒冷启动而不无限等待。包装器退出码 1 但 evidence 完整时记录观察日志并正常返回，避免失败分支提前刷新语音过渡态；Workflow drain 延期或门禁缺失仍为权威失败，未验证错误使用稳定诊断码且不再出现空冒号。专项新增旧 PID/旧 runId、旧启动时间、退出残留、未处理错误、空回执、冷启动窗口和 drain 延期回归；Control Panel `187/187`、Web `49/49`、Workflow drain、依赖边界、人类文档、完整 build 和 `git diff --check` 通过。同步前活动 Workflow 为 0、协作 `currentRun=null`、Git lock 为 0；第二次真实 `8788` 服务页按钮从 PID `44324` 重启到 PID `30600`，包装器仍真实 `exit=1`，面板在 readiness 内返回 `runtime.invokeAction ok` 并记录“新运行实例已通过完整现场验证”，没有红色失败。最终 runId=`b4665d5e-f4a6-4c8e-8adf-81d198d370cc`、startedAt=`2026-08-10T13:43:20.102Z`、Feishu WS=`connected`、status/audit 身份一致、`lastUnhandledError=null`、`lastExitReason=null`；新浏览器标签语音 Runtime 为 `ready`，五项能力均“可用”，无 `optional_missing`、console warning/error。开发/live 的 Core、Runtime daemon、控制面板 EXE 和 Web index Hash 全部一致。
+
+- 2026-08-10 克隆音色持久音色库与删除链路完成开发与 live 收口：参考音色沿用 `CTI_HOME/runtime/speech/voices` 的持久注册表和受管 `files`，Bridge 重启后仍由 Runtime 投影到控制面板音色库；新增 owner 级 `speech.deleteReferenceVoice`，只接受 Profile ID 并由 Runtime 重新解析，预设/catalog 音色拒绝删除。参考文件先在同卷移动为墓碑，再原子更新注册表并清理；删除同时移除该 Profile 的全部 speaker similarity benchmark。若它是当前说话音色，先回退到当前模型的兼容默认预设，找不到则清空；若它是当前歌声音色则清空，并要求受控重启。React 仅对 reference 卡片显示删除按钮，操作前明确提示会清理受管音频与验收记录且不可撤销；控制面板审计不记录 Profile、路径、转写或音频元数据。门禁通过 Runtime `968/968`、Core `930/930`、Contracts `17/17`、Control Panel `179/179`、Web `49/49`、依赖边界、静态边界、人类文档、扩展清单、完整 build 和 `git diff --check`。同步前活动 Workflow 为 0、协作 `currentRun` 为空且无 Git 锁；开发/live 的 Core、Runtime daemon、语音控制 CLI、控制面板 EXE 与 Web 资源 Hash 一致。最终受控重启后的 Bridge PID=`15288`、runId=`fd17cb57-9515-41f8-b0de-0dd0e3c35b5a`、startedAt=`2026-08-10T13:05:29.832Z`，飞书 WS=`connected`、`lastUnhandledError=null`、`lastExitReason=null`。真实 `8788` 页面显示 `Live 已同步`、语音 Runtime `ready`、音色库长期保存/随时删除文案和 9 个预设卡；预设卡删除按钮数为 0，浏览器控制台无 warning/error。当前 live 没有授权 reference Profile，因此没有伪造一次真实音色删除；reference 卡按钮与不可撤销确认、重启持久化、受管文件清理、benchmark 定向删除和激活项回退均由专项测试覆盖，后续真实导入音色可直接在同一面板现场复验。
+
+- 2026-08-10 ACE-Step 临时音频清理完成通用开发版修复：现场 `CTI_HOME\runtime\speech\ace-step-host\temp\api_audio` 留有官方服务生成的 WAV；Singing Host 自身下载的中间 WAV 和最终 Ogg 已按回执释放，但受管 ACE-Step 子进程的专用 temp 未进入 Supervisor 清理边界。Supervisor 现只在旧 owner/child 均确认退出后清理上轮专用 temp，并在本实例收到真实子进程 `exit/error` 后清理本轮 temp；终止请求保留 child/runId 到真实退出，避免新实例在旧进程尚未结束时误删正在写入的文件。遍历逐项 `lstat`，只删除受管 temp 根内普通文件与清空后的普通目录，symlink/junction、未知节点、模型、缓存、参考音色和最终交付目录均不触碰；清理失败只进入观察链。专项回归覆盖启动前残留删除、退出后本轮删除、缓存保留，以及旧活进程存在时不清理。
+
+- 2026-08-10 音色复刻门禁完成开发版收口：飞书参考语音和控制面板本地文件现在都必须携带用户逐字确认文本，并由当前唯一 live Runtime 对同一文件重新 ASR；归一化只忽略空白与断句，实际字词或承载读音的符号不同立即返回 `voice_reference_transcript_mismatch`，不登记、不继续合成。参考音色动作由真实导入结果唯一收口，显式排除通用“收到语音则语音回复”TTS 入口，避免登记成功或文本核对失败后再次合成状态文案。面板 CLI 通过升级后的单实例 mailbox 请求核对，不启动第二个 Sidecar；响应只含源文件 Hash 与 matched 状态，注册表复制时再次绑定该 Hash 关闭 TOCTOU。Qwen Base 使用自身 speaker encoder 分别提取参考/生成 embedding 并计算余弦相似度，统一阈值为 `0.72`；未通过时删除临时产物且不进入 Opus/飞书投递。benchmark 身份扩展为 `provider + model + revision + hardware + voiceProfileId`，每个参考 Profile 可在面板单独验收；模型目录按质量档排序，1.7B 显示为高质量优先，0.6B 保留为用户显式低显存备选。Runtime/Core 回执强制区分 `generationStatus=generated`、`deliveryStatus=not_sent` 与 `speakerSimilarityStatus=passed/not_applicable`；只有真实平台音频消息回执成功后，普通与流式卡替换链才在 outbound ref/audit 写“发送状态：已发送”。参考音色登记只显示“已登记，尚未生成、尚未发送、相似度尚未验收”，不再使用“克隆成功”。现场 `speech_preview_response_owner_mismatch` 另经真实 live 回执定位为面板错误优先调用开发版 v3 CLI、连接仍为 v2 的 live daemon；面板现固定优先同一 live 发布包内的 CLI，仅在 live CLI 缺失时回退开发版，避免跨协议串版。首次同步后的现场试听进一步暴露 `speech_preview_response_invalid`：C# 投影把可选说话人相似度字段补成 `null`，而 Web 严格协议拒绝额外字段。现在预设音色省略整组三项空字段，参考音色则必须完整提供 `speakerSimilarity / threshold / passed`，并在 C# 与 Web 两层同时核对范围和阈值结果，禁止部分字段或矛盾通过标记。验证通过 Runtime `963/963`、Core `926/926`、Contracts `17/17`、Control Panel `176/176`、Web `49/49`、依赖边界 `4/4`、静态边界、人类文档门禁、完整 Suite build 与 `git diff --check`。现场同步与播放器复测结果须另以重启后的 live 回执为准，不能仅凭自动化测试声明完成。
+
+- 2026-08-10 控制面板“试听已生成但听不到”完成通用修复与 live 页面验收：直接调用当前 live Runtime 复现 Serena 试听，得到合法 `codex-im-suite/speech-preview/v2`、Ogg/Opus、Hash 一致且 `validated=true` 的 2–3 秒音频；流式解码复验 RMS 约 `-28.7 dBFS`、峰值约 `-13.8 dBFS`，确认不是模型输出静音。根因是 React 在收到试听回执后仍先等待全量状态刷新，播放器创建被额外延迟；模型推理和刷新完成时 Chromium 的短暂用户手势已经失效，`autoPlay` 可能被 WebView2 策略拦截，播放器又位于卡片下方，用户只看到按钮结束而听不到声音。普通和歌声试听现都在回执到达后立即解码，不重复刷新；播放器显式解除静音、恢复满音量、调用 `load/play` 并滚动到可见区域，失败时保留原生控制条和中文手动播放提示。WinForms 为本机受信控制页面创建带异步媒体播放策略的 WebView2 Environment，并清除持久静音状态；策略和浏览器播放 helper 均新增回归。Web `49/49`、Control Panel `171/171`、Release build、依赖边界、人类文档和 Web production build 均通过。正式同步后开发/live 控制面板 EXE 与 `wwwroot` Hash 一致，新 live 面板 PID=`33824`、端口 `8788`，其 WebView2 主进程真实携带 `--autoplay-policy=no-user-gesture-required`；页面显示 `Live 已同步`。在同一 live Control API 页面点击“试听当前音色”约 9 秒后播放器可见并自动滚动，`blob:` 音频 `readyState=4`、未静音、音量 100%、无媒体错误且播放到 `2.6465s` 自然结束，控制台无 warning/error。同步期间被发布锁策略终止的一份 live Codex 子进程不影响 Bridge：运行审计仍为 PID=`22388`、runId=`dbcfb566-acb5-4bb2-a618-f9ebaf1089c8`、飞书 WS=`connected`、`lastUnhandledError=null`、`lastExitReason=null`。这次验收覆盖普通 Serena 面板试听；固定 10 秒歌声按钮未再次占用 GPU 实跑，不将普通试听结果冒充歌声现场结果。
+
 - 2026-08-09 飞书提醒/计划任务门禁误判与“只拦截不自修复”完成通用开发版修复：真实 live 历史证明“列出你的所有计划任务”的模型原文为“计划任务列表为空 / 已安排待执行：无 / 提醒：未创建”，旧 `containsUnverifiedReminderCompletion()` 却先压平换行，再把不同列表项的“已 + 安排 + 提醒”拼成伪完成声明。检测现按自然分句和列表项独立裁决，并识别空、无、未创建、尚未设置、0 个等前后置否定；真实完成声明、Windows Scheduler artifact 和合法 Bridge 动作仍保留门禁。纯计划任务读取新增 Runtime Host 前置 evidence：按当前原生 actor 过滤任务并同源读取 state，Core 只投影 ID、名称、启停、受限 schedule、action kind 与运行/投递状态，动作正文、Owner、工作区、路径和原始错误不进入 Prompt，Host 失败也不再冒充空列表。Conversation Engine 新增可复用 post-generation review hook：无效 deferred action 或无 evidence 完成声明会携带稳定错误码、原任务与上一结果进行一次禁工具重写；任何工具、成功工具结果、权限请求、取消或未知副作用都会禁止自动重放，真实 Owner/身份/授权/目标/风险仍由后续 Host 门禁复核。回归覆盖现场原文、前后置否定、五类 deferred action、一次真实重写、工具/权限不重放、Host actor 与脱敏 evidence、Host failure/空列表区分及 Runtime 同源 state；Contracts `17/17`、Core `926/926`、Runtime `956/956`、两包 typecheck、依赖边界 `4/4`、静态边界、扩展清单、人类文档门禁、完整 Suite build 与 `git diff --check` 已通过。此时尚未完成提交推送、release/live 同步、新 PID/飞书 WS 和重启后新消息复测，不能描述为现场已生效。
 
 - 2026-08-09 控制面板语音页完成信息层级精简的开发版实现：React 继续只消费 Runtime Speech Contract，把细粒度状态投影为“听懂语音、语音回复、唱歌、克隆音色、消息渠道”五项用户能力；默认页面仅保留三个功能开关、回复方式、语音模型/音色/语气和普通/歌声试听。渠道、Provider、交付模式、限制值、TTS/歌声 benchmark 与安装入口进入“高级设置与性能诊断”，组件诊断、完整音色库、授权参考音频导入分别默认折叠，避免同一模型、音色和试听控件重复出现。克隆模型未就绪时明确显示“待安装”，不再误投影为“已关闭”。Web 单测 `47/47`、Control Panel `170/170`、人类文档门禁、完整 Suite build 和 `git diff --check` 已通过；此时尚未完成正式 release/live 同步和真实 `8788` 页面复验，不能把开发版页面描述为现场已生效。
@@ -1192,3 +1238,98 @@ Skills 页面内部只保留“已安装、草稿、能力目录、审批队列�
 - ACE-Step 主模型与 0.6B LM 已固定到官方 revision，共 25 个文件、`7709375886` bytes，并逐文件记录 HTTPS、大小和 SHA-256；模型组件现在可显式安装且状态为 `optional_missing / installable=true`。独立 Runtime 仍因官方 v0.1.8 没有可固定 Hash 的 Windows 安装资产而保持 `blocked / manifest_incomplete`，唱歌与歌声试听继续失败关闭，禁止用普通 TTS 冒充。
 - 开发版提交 `bc2afde` 已同步两份 live skill 并受控重启。当前 Supervisor PID `34064`、Bridge PID `33428`、runId `9a2f9f6d-713a-4334-8928-00a2130b91c`，飞书 `client ready / ws client ready`、`feishuWs.state=connected`、`lastUnhandledError=null`；正式控制面板 PID `12992`，`/healthz` 返回 200。开发/live 语音受管清单 SHA-256 同为 `0D38722E9AEE995F1A62BD2B046D2DC097D86FA7AD678A09B9AB3C1C1F3B1ECB`。面板已真实完成 `0.6B CustomVoice + Serena` 试听，浏览器音频 `sourceScheme=blob`、`readyState=4`、时长 `2.8065s`、`ended=true`、无媒体错误。
 - Runtime 全量 `948/948`、TypeScript typecheck、扩展校验、人类文档门禁和完整构建已通过；portable/installer 重新组装后 MainPreflight fork-health 的全部组件均为 `same`，release manifest summary 通过。尚未完成的是重启后真实飞书新语音 ASR、原生 Opus 唯一终态、普通文字仅回文字、`/voice off` 硬禁用和强制 TTS 失败单次文字回退；0.6B Base 也仍缺用户明确授权的 3–30 秒参考音频及当前组合 benchmark。完成这些现场证据前不能宣称收发语音、克隆或唱歌已全部验收。
+
+# 2026-08-10
+
+- 飞书现场请求“唱一首小星星 / 发语音唱”证明歌声链存在协议遗漏旁路：第一轮 Primary 只输出拟声文字且工具数为 0，第二轮自行调用 Bash/`edge-tts` 生成 MP3，再由通用 `sendLocalFile` 投递为文件附件；两轮都未进入独立 SingingHost，因此问题不是 ACE-Step 生成质量，也不是飞书原生 audio API 本身。
+- 新增通用歌声协议期待审查。它只识别需要 Primary 补齐受管 singing 协议的明确演唱请求，不直接授权或启动 Runtime；能力咨询、否定/取消请求不触发。无外部证据要求的明确演唱从首次 Provider 调用起即固定为 response-only，缺少 singing 时只允许一次同样禁工具的协议修复；异常 Provider 仍返回工具副作用时失败关闭，避免普通 Shell/TTS 在 Primary 内生成音频。
+- `cti-final.singing` 现在必须与纯文字回退独占同一终态；只要夹带 MP3/WAV 等 `files`、图片、普通 TTS intent 或参考音色动作，整个 envelope 即失效并进入上述协议审查。合法路径仍是 ACE-Step SingingHost 回执、Ogg/Opus 校验和飞书原生 `audio` exactly-once 投递，普通文件附件不再能显示为“唱好啦”。
+- 另一个飞书窗口现场请求“用你刚刚克隆的音色给大家打个招呼”时，Primary 错误声称“当前会话没有音色合成和语音发送能力”。SpeechHost 实际是同一 live Bridge 的共享 Runtime，聊天会话只拥有 `/voice on|off` 偏好，不能各自丢失语音能力。新增普通语音协议期待审查：无外部执行要求的明确语音/指定音色说话请求首次即 response-only；缺少 `speech.mode=voice_only` 时只做一次禁工具修复，Primary 不得自行判断某窗口无能力。合法协议必须是纯文字回退加受限 speech 指令；夹带 MP3/WAV、图片、交互卡、普通 TTS 工具或文件附件会失败关闭。对“刚克隆的 / 复刻的 / 参考音色”请求再签发受控 `voice_requirement=active_reference` 类别要求，Core 不接受模型指定音色 ID；Runtime 在当前激活 Profile 不是 reference 或相似度 benchmark 未通过时明确失败，不能以 Serena 等预设音色冒充。`/voice off` 继续优先且不会被审查绕过，能力咨询、故障追问、取消和唱歌也不会误触发普通 SpeechHost。
+- 开发版验证已通过：跨窗口普通语音/歌声/参考音色类别专项 `305/305`，Runtime SpeechHost 专项 `9/9`，Core 全量 `930/930`，Runtime 全量 `964/964`，依赖边界 `4/4`、静态边界、人类文档门禁、完整 Suite build 与 `git diff --check` 均通过。同步前曾捕捉到一个正在收口的 Workflow 和协作回合，因此先等待其自然结束，复核活动 Workflow 为 0、`currentRun` 为空且无 Git 锁后才同步两份 live skill。受控重启包装器虽然返回空输出退出码 1，但真实 Bridge 已换为 PID `35732`、runId `795325c8-bca9-4147-b898-4b7e8bcf9b10`、startedAt `2026-08-10T12:31:51.980Z`，飞书长连接为 `connected`，`lastUnhandledError=null`、`lastExitReason=null`；开发/live 的 Manager、语音审查、语音策略、Runtime Host、daemon bundle 和正式控制面板 EXE Hash 均一致，正式面板 `/healthz` 返回 200。当前 live 语音状态为 `ready`，输入、输出和歌声均启用，独立歌声 benchmark 为 `ready`；注册表没有 reference 音色且当前激活项为 preset，所以“刚克隆的音色”必须明确阻断，不能用预设音色冒充。重启后的真实飞书新消息仍需用户从目标窗口发送，现场确认前只声明代码与 live 部署完成，不把渠道 E2E 说成已验收。
+
+# 2026-08-11
+
+- 新增通用 Owner 面板设置链路：可信飞书语音 ASR 与文字复用同一意图路由；Runtime 通过 Schema 驱动目录列出面板属性、类型、枚举、当前值和重启要求，API key/token 仅显示配置状态。`cti-panel-settings` 只接受 1–10 个稳定 key/标量值和快照版本，Manager 重新绑定真实 Owner，Runtime 校验字段、类型、范围、路径与版本后保留注释和未知 env 做原子定向更新。成功终态自动列出旧值/新值和更新后完整脱敏设置，再安排回复后的固定 Bridge 重启；查询同样以真实 Host 快照确定性收口，非 Owner、只读字段、伪完成和 Host 失败均失败关闭。开发版门禁通过：Contracts `17/17`、Core `944/944`、Runtime `990/990`、Web `49/49`、C# `192/192`，完整构建、依赖边界、扩展、人类文档和 `git diff --check` 通过。同步前活动 Workflow 为 0、协作 `currentRun` 为空且无 Git 锁；两份 live skill 同步并经正式 supervisor 重启后，Bridge PID `34620`、runId `0d725c6c-4421-4016-96d7-4264532d54e8`、startedAt `2026-08-11T13:23:52.935Z`，飞书 `connected`、`lastUnhandledError=null`、`lastExitReason=null`。开发/live 的 Manager、设置策略、Runtime Host、Core bundle 和 daemon bundle Hash 一致，正式控制面板 PID `6980`，`/healthz` 返回成功。重启后的真实飞书语音修改仍需 Owner 发新消息完成渠道 E2E，不能用单测或旧消息冒充。
+
+- 飞书参考音色未真正克隆问题完成开发版修复：现场附件下载和 ASR 正常，但“同意克隆”只生成文字回执，后续“克隆”又被 Primary 旁路为 Bash/普通回复，没有形成 `speech_action`，因此正式 `SpeechHost.importReferenceVoice` 从未调用。新增通用参考音色创建审查和默认关闭的 `CTI_SPEECH_OWNER_SELF_VOICE_AUTO_AUTHORIZATION`；开启后唯一 Owner 本人录音不再重复询问权利、本机用途和干净单人录音确认，Bridge 只从当前用户显式 `参考文本：…` 构造确定性动作，并覆盖模型可能复制的 ASR 猜测。明确克隆回合固定为 Bridge-owned response-only Host 链，禁止 Bash、路径或文件附件旁路；缺逐字文本时只报告该缺项，非 Owner、缺可信原生回复音频、文本不一致、文件/质量/相似度未过仍失败关闭。专项 Core、Runtime 与类型检查已通过。随后在无活动 Workflow、协作 `currentRun` 为空且无 Git 锁时完成两份 live skill 同步，并显式启用唯一 Owner 本人录音免重复授权策略；正式 live 脚本重启后 Supervisor PID `3252`、Bridge PID `35260`、runId `c38ba706-9716-44a9-a03c-4bdb2ccb4de2`、startedAt `2026-08-11T12:43:08.532Z`，飞书长连接为 `connected`，`lastUnhandledError=null`、`lastExitReason=null`。开发/live 的参考音色审查、Manager、Runtime 配置、SpeechHost 与 daemon bundle SHA-256 均一致。只读 Runtime 状态确认持久参考音色“我的克隆音色”已激活，说话相似度 `0.9888` 高于 `0.72` 阈值且验收为 `passed`；歌声验收仍为 `not_verified`，不会错误继承说话验收。正式 live 控制面板也已重新启动，`/healthz` 返回成功。重启后的真实飞书新克隆消息仍需用户发送后再做渠道 E2E，不把旧消息或面板状态冒充现场入站验收。
+
+- 修复语音交付未发生的追问被当成普通故障咨询的问题：当前实现不匹配现场整句，而是分别识别语音媒介、交付动作和未完成状态，三类信号可按不同自然语序组合；其他窗口/会话、能力和配置咨询会优先排除。明确交付纠正进入受管语音协议审查并要求 Primary 补齐 `speech.mode=voice_only`；取消和唱歌仍保持各自边界。Prompt 同步禁止 Primary 自行声称某聊天窗口未开放语音，真实能力只由同一 live SpeechHost 回执裁决。
+- 统一计划任务的固定 `notify` 新增可选、严格受限的 `speech={mode:"voice_only"}`。该字段只在用户明确要求每次计划通知都发原生语音时签发，不能携带模型、音色或路径，且 `check_in` 不接受该字段。Runtime 触发后把它传入 `deliverProactiveMessage`，复用普通语音的身份绑定、回执解析、SHA-256 上传复验、Runtime 释放、outbound ref 与去重；原生语音成功不再追加文字，上传或合成失败只发一次完整文字回退，`/voice off` 与互动内容继续失败关闭到文字/卡片。
+- 新增主动语音成功、单次文字回退、会话关闭、互动卡片隔离、去重，以及计划任务 Host/Store 往返测试。当前开发版 Core 全量 `936/936`、Runtime 全量 `970/970`、两包 TypeScript typecheck、完整 Suite build、依赖边界与人类文档门禁均通过。活动 Workflow 为 0、协作 `currentRun` 为空且无 Git 锁后，已同步两份 live skill；唯一启用的普通 `notify`“工作日整点喝水和上厕所提醒”经原子 Store 乐观版本更新到 `speech.mode=voice_only`，独立 `check_in` 未修改。
+- 首次停机时误把长驻 `dist/daemon.mjs` 当成控制 CLI 并传入 `stop`，该入口实际启动了第二个 Bridge。发现后立即按本轮新建的精确 PID 终止该实例及两个 Worker，保留原实例；随后恢复被覆盖的 PID evidence，并改用正式 `scripts/daemon.ps1` 完成 drain 停机。长期规则已补充为禁止把 `daemon.mjs` 当 CLI。去除固定句式并再次同步后，live 仅保留一个 Bridge：PID `35256`、runId `8bf1f539-0cb3-4095-8114-f5cbab34bbf8`、startedAt `2026-08-11T03:46:10.058Z`，飞书 `connected`、`lastUnhandledError=null`、`lastExitReason=null`。语音状态为 `ready`，输入/输出/歌声均启用，当前 TTS 为 Qwen3-TTS 1.7B CustomVoice，Feishu 渠道 `ready`；开发/live 的 Manager、语音审查、Runtime main、Core bundle 和 daemon bundle Hash 全部一致。尚未用重启后的真实飞书新消息完成渠道端语音验收。
+- 飞书 16:05 现场“发个语音”在 4m42s 后以 `tts_synthesis_timeout` 单次文字回退。审计与 Sidecar 日志证明 Primary 把短请求自行扩写成约百字故事，Qwen3-TTS 1.7B 在 RTX 3070 的现有 benchmark 为 `86707ms / 16567ms / RTF 5.2337 / blocked`，且 Sidecar 旧切分器又把每个短句各自作为一次模型调用。当前开发版新增 36 字默认口播预算（只约束无可信正文的短请求）、相邻短句 300 字有界装箱和“模型已加载 / 性能未通过”分离状态；不切换低质量档，也不继续单纯抬高总超时。
+- 飞书 16:14 现场“用克隆音色把这个唱出来”在协议修复后仍缺有效 singing 指令。当前开发版把唯一可靠原生回复正文作为歌词来源交给 response-only 修复，并为克隆/参考音色演唱新增 `singing.voice_requirement=active_reference` 类别门禁；Runtime 只使用面板独立激活的参考歌声音色，未选择或不兼容时明确说明且拒绝默认歌声冒充。专项语音/歌声协议、Sidecar、状态与控制面板测试已通过；尚未同步 live、重启或完成这两条重启后真实飞书复测。
+- 中文统一语音与歌声开发版收口：面板新增完整歌词、演唱风格、语言、自动旋律、可选时长和“10 秒快速试听 / 按完整内容生成”双入口；Provider 能力/许可、音色说话/歌声独立验收、内容生成/面板未发送/相似度/歌词对齐回执已贯通 Contract、Runtime、Core、C# 与 Web。人工审计同时修正 Provider 身份匹配时忽略模型/性能阻塞的问题，并把新增 Provider、音色验收、模型选择和试听回执 DTO 纳入 C# Schema 逐字段门禁。Vevo2 仍为 `experimental / blocked`，没有下载未锁定文件，也没有切换默认 Provider。开发版门禁通过：Contracts `17/17`、Core `937/937`、Runtime `986/986`、Python Sidecar `10/10`、Web `49/49`、C# `192/192`，依赖边界、静态边界、人类文档、顺序 Web 构建与 `git diff --check` 均通过；Provider 修正后的 Runtime 全量与 C# 全量已重跑通过。尚未同步 live 或进行渠道现场验收。
+# 2026-08-12：计划任务临时工作区的 Codex 信任门禁修复
+
+- 现象：无绑定工作区的计划任务在临时沙箱中启动 Codex Exec 时，被 Codex 的 Git 仓库信任检查拒绝。
+- 修复：Provider 仅对 workspace plan 中明确没有 `projectId` 的隔离沙箱传递 `skipGitRepoCheck`；注册项目继续保留原生信任门禁，未启用全局绕过。
+- 验证：bridge-runtime 全量测试 990/990 通过，TypeScript typecheck 通过。
+- 状态：开发版已修改；尚未同步 live、重启 Bridge 或现场复测。
+
+# 2026-08-12：飞书回复文件音频识别修复
+
+- 现象：Owner 回复一条 `.m4a` 文件后要求“克隆音色”，界面返回“请原生回复一条可读取的语音”；实际附件已从同一 `message_id + file_key` 下载，但 Feishu `file` transport 被恢复层保留为普通文件，未进入参考音色导入 Host。
+- 修复：Core adapter 对已下载字节执行通用音频文件头识别（WAV/Ogg/FLAC/MP3/M4A/WebM），仅当真实 MIME 为 `audio/*` 时把原生回复绑定升级为 `resourceType=audio`；普通文件、路径和模型描述仍不能替代原生音频，逐字参考文本与 Runtime 音频质量/相似度门禁保持不变。
+- 回归：新增 `.m4a` file transport → native reply audio evidence 测试；Core typecheck 与全量单测 `944/944` 通过。
+- 状态：开发版已修复；待同步 live、重启 Bridge，并用重启后的新 Feishu 回复消息完成渠道现场复测。
+
+- 现场补修：飞书把 `.m4a` 录音作为 `file` transport 返回时，可信回复恢复层现依据下载字节的真实音频 MIME/文件头识别，并允许旧绑定的 `resourceType=file` 在附件确认为 `audio/*` 时兼容提升；普通文件、路径和模型描述仍被拒绝。Owner 直克隆缺少可恢复音频时改为动态提示“当前请求绑定的可读取音频附件”，不再要求固定回复话术。已重建并同步 live，受控重启后 Bridge PID `14228`、runId `fd256e07-c50c-4d6a-83a9-70cdac6e9d7f`，`feishuWs.state=connected`、`lastUnhandledError=null`、`lastExitReason=null`。渠道端仍需用户从目标窗口发送一条新的真实回复录音完成 E2E，不用旧消息冒充验收。
+## 2026-08-12 参考音色克隆触发优化
+
+- Owner 回复可信原生录音后可直接发送“克隆这条录音”，不再要求固定的“参考文本：……”输入格式。
+- 逐字质量门禁未关闭：Bridge 将首轮 ASR 与来源绑定，Runtime 对同一音频重新 ASR；两次结果不一致时阻断登记。
+
+## 2026-08-12 计划任务整点打卡延迟修复
+
+- 现场证据显示 16:00 打卡任务直到 16:02:39 才入队，飞书在 16:02:40 完成卡片投递；同一 tick 前面的旧 `agent_turn` 用时约 2 分半，原调度循环逐条等待完整执行，导致后续 `check_in` 被串行阻塞。
+- 调度服务现先扫描并原子预留整批到期任务，再复用既有 `CTI_SCHEDULED_TASKS_MAX_CONCURRENT_RUNS` 做有界并发；`notify/check_in` 作为无需模型的固定交付优先进入执行槽，优先级只依赖通用 action kind。稳定 `slotKey`、CAS、租约、重启恢复和执行/投递分离保持不变。
+- 运行账本新增向后兼容的 `dispatchDelayMs`，直接记录 `queuedAt - scheduledFor`。新增回归验证慢 `agent_turn` 未释放时打卡仍能优先启动、同批任务不超过配置并发上限；开发版计划任务专项 `41/41`、Runtime 全量 `992/992`、TypeScript typecheck 与人类文档门禁通过，尚未同步或重启 live，也未做重启后的飞书现场复测。
+
+## 2026-08-13 定向作答人选择卡
+
+- 新增 `choice_session.audience="participant"`：群聊发起人可明确让当前群另一成员作答，默认发起人 choices 与全员 `vote/claim/parallel` 保持兼容。
+- Feishu adapter 仅使用当前群成员 API 与本轮原生 mention/明确姓名解析目标，模型不得提交用户 ID；目标缺失、同名或成员 API 不可用时阻断发卡并要求澄清，回调只允许目标成员点击。
+- Core/Runtime typecheck 通过，选择状态机专项测试 14/14 通过。仅开发版修改，尚未同步 live 或做飞书现场复测。
+
+# 2026-08-13 会话页提醒面板覆盖修复
+
+- 现场截图确认会话页的提醒面板覆盖在会话列表和详情之上，根因是内容网格默认拉伸行高，详情内容溢出后与后续面板发生视觉重叠。
+- 开发版统一为 `.content-stack` 和会话布局按内容高度从上到下排列，并给会话详情增加受控滚动边界；窄屏抽屉继续使用独立固定层，不改变既有交互。
+- `apps/control-panel/web` 生产构建通过，5173 开发入口经浏览器实际截图确认提醒位于会话区域下方、无覆盖。随后按现场要求同步 live 控制面板 bundle 并重启正式面板，旧 PID `100932` 已退出，新 PID `34444` 已启动；live CSS 已包含 `align-content:start`、`grid-auto-rows:max-content` 和详情滚动边界。未重启 Bridge（本次仅涉及控制面板前端）。
+
+# 2026-08-13 执行器状态缓存与官方 Codex 显示修复
+
+- 现场 `config.env` 已配置 `CTI_RUNTIME=codex`、`CTI_CODEX_MODEL_SOURCE=official`、`CTI_CODEX_MODEL=gpt-5.6-sol`，但旧 `executor-status.json` 仍显示本地模型并保留旧默认选择，导致面板误判 Codex CLI 只剩本地模型。
+- 控制面板读取执行器缓存时现在以当前 `config.env` 覆盖 Codex 显示名、模型来源、Base URL、路由和默认执行器；配置比缓存新时清除过期的上次选择。Bridge 启动仍会完整重建运行态快照。
+- C# 构建与控制面板测试 `192/192` 通过。Bridge 已按官方配置重启，PID `49004`；状态确认 `Codex CLI / SDK`、`official`、`gpt-5.6-sol`。已单独发布并替换 Live 控制面板，当前面板 PID `33868`；未终止 Bridge 正在执行的其他 Codex 任务。
+
+# 2026-08-14 TTS 慢模型不再误报为语音不可用
+
+- 现场状态显示高质量 `qwen3-tts-12hz-1.7b-base` 的音色相似度已通过，但暖态合成耗时较长，旧状态聚合把性能 benchmark 的 `blocked` 直接提升为整项语音 `blocked`。
+- Runtime 现在将“能否真实生成”与“当前硬件速度是否达标”分开：依赖、模型身份、音色相似度和媒体校验仍是硬门禁；仅性能偏慢时，语音输出和总状态保持可用，benchmark/诊断继续显示实际耗时，便于用户选择更快模型或限制文本长度。
+- 面板不再把此场景显示为“需处理”，而显示语音可用并保留“模型已加载，但当前硬件生成过慢”的可观察提示；未通过相似度、模型未加载或真实合成失败仍继续阻断。
+- 更新 Runtime 状态回归测试；待构建、同步 live、重启 Bridge 后用新消息完成现场语音生成验收。
+
+# 2026-08-18 参考音色解码与语音回退终态修复
+
+- 飞书原生参考录音在 Qwen Base 侧可能落入 Python `audioread` 的可选解码后端；Runtime 现在在每次参考音色合成前，使用已受管并验证的 FFmpeg 生成临时单声道 PCM WAV 再交给 Sidecar。注册表仍保留原始受权录音、稳定 Profile ID、Hash 与授权证据，临时规范化副本在本轮结束时清理，避免将格式兼容性寄托给 SoX 或系统环境。
+- 语音或歌声 Host 合成失败不再让流式终态卡把主文本回复显示为绿色“结果已生成”。真实 Host 失败会把卡片、协作终态和可见证据统一收口为未完成；音频实际发送成功仍是唯一的“已发送”依据。
+- Runtime/ Core TypeScript typecheck 通过；Runtime 的参考音色专项回归验证了 Sidecar 收到规范化副本且副本随回合清理。Core 全量测试仍有两项既有的参考音色协议断言与当前并行改动不一致，未将其掩盖为本轮通过。
+
+## 群聊语音后的受控文字跟进
+
+- 群聊原生语音不是能力边界；此前语音呈现把同回合 `@` 视作不适合朗读的交互内容而整体退回文字，且“你直接发个语音”这类带主语的自然表达未被协议审查稳定识别。
+- `cti-final.speech` 现可携带受限 `after_send_text`：Bridge 先以实际平台回执发送原生 Ogg/Opus，成功后才发送第二条纯文字并应用原生 mention；音频失败时仍只发送一次完整文字回退，不会伪造 @ 已送达，也不会把名字读入语音。该规则适用于任何明确的“先语音、后文字/@”请求，不绑定人名或群聊。
+
+# 2026-08-18 飞书泛称问候与指定成员原生 @ 分离
+
+- 修复 Delivery 曾为“用户点名但 Agent 未选择目标”的回复自动补写 `@名称` 的行为。现在用户本轮明确点名只定义候选授权范围；只有 Agent 本轮在 `cti-final.mentions`、已验证结构化 mention 或其自行写出的裸 `@` 中选择同一成员，才会进入当前群成员唯一解析并生成原生 mention。正文不会被 Delivery 反向改写来制造平台动作。
+- 新增群体受众裁决：“大家”“各位”“群成员”“群里的机器人”等泛称保留为普通问候文本，不进入成员查询、不触发广播或原生 @；“群里的小明”等可还原为单一显示名的具体成员仍须通过当前群官方唯一校验。bot-to-bot 原生唤醒者的专用回艾特链路保持不变。
+- 开发版验证通过：Manager `289/289`、mention 解析 `9/9`、Feishu adapter `194/194`、架构策略 `19/19`、`bridge-core` TypeScript typecheck，以及依赖边界、静态边界、人类文档和受影响文件的 `git diff --check`。运行队列清空且无 Git 锁后已同步两份 live skill；live 源码和本次相关 Manager、mention、adapter 文件 Hash 一致，单实例 Bridge 的 Feishu WS 为 `connected`，运行审计 `lastUnhandledError=null`、`lastExitReason=null`。启动包装器曾在 Bridge 完成延迟初始化前提前返回失败，实际新实例随后通过状态与审计复核健康；该包装器时序问题没有被伪报为部署失败或现场验收成功。仍待用户从目标群发送重启后的真实新消息完成渠道端验收。
+## 2026-08-26 TAPD 上下文持久化注入（开发版）
+
+- 新增 `mcp-context/v1` 受管状态：按 `channel + chat + user` 持久化已由用户明确提供的非敏感 TAPD `company_id`，使用 UTF-8 原子写入到 `CTI_HOME/runtime/mcp-context.json`。
+- 每轮 Primary Provider 调用前从同一作用域回注入已验证 `company_id`；classifier / response-only 不携带该上下文。TAPD token 只从受管 `config.env` 注入 MCP 子进程，不写入状态、Prompt 或日志。
+- 新增 TAPD MCP 开发版 manifest 与启动脚本，并以 `requiredEnvironment` 门禁缺失 token 时不投影 MCP。当前 live overlay 仍需在用户轮换泄露 token 后明确同步并重启，不能把开发版测试当作现场生效。
+- 已验证：Runtime typecheck、`mcp-context-provider.test.ts` 3/3；截图中的个人访问令牌视为已泄露，未写入任何文件。

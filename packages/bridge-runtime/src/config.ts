@@ -336,10 +336,10 @@ function resolveSafeUploadCacheDir(rawUploadCacheDir: string | undefined, defaul
   return isSameOrChildPath(normalized, defaultWorkDir) ? fallback : normalized;
 }
 
-export function loadConfig(): Config {
+export function loadConfig(configPath = CONFIG_PATH): Config {
   let env = new Map<string, string>();
   try {
-    const content = fs.readFileSync(CONFIG_PATH, "utf-8");
+    const content = fs.readFileSync(configPath, "utf-8");
     env = parseEnvFile(content);
   } catch {
     // Config file doesn't exist yet — use defaults

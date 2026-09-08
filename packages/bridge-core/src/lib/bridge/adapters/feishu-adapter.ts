@@ -828,6 +828,24 @@ const MIME_BY_TYPE: Record<string, string> = {
   media: 'application/octet-stream',
 };
 
+/**
+ * 飞书的语音消息有时会以 file transport 返回（尤其是 m4a）。
+ * 不能只信消息类型或 HTTP Content-Type：原始文件头才是跨 transport
+ * 的媒体事实。这里只做无副作用嗅探，真正的音频校验仍由 Runtime 完成。
+ */
+function sniffAudioMimeType(buffer: Buffer): string | undefined {
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WAVE') return 'audio/wav';
+  if (buffer.length >= 4 && buffer.subarray(0, 4).toString('ascii') === 'OggS') return 'audio/ogg';
+  if (buffer.length >= 4 && buffer.subarray(0, 4).toString('ascii') === 'fLaC') return 'audio/flac';
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString('ascii') === 'ID3') return 'audio/mpeg';
+  if (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'audio/mpeg';
+  if (buffer.length >= 12 && buffer.subarray(4, 8).toString('ascii') === 'ftyp'
+    && /^(?:M4A|M4B|M4P)\s$/u.test(buffer.subarray(8, 12).toString('ascii'))) return 'audio/mp4';
+  if (buffer.length >= 4 && buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) return 'audio/webm';
+  return undefined;
+}
+
 type FeishuMessageRecalledEventData = {
   event?: unknown;
   message?: unknown;
@@ -2564,6 +2582,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
             });
             if (replacement.kind === 'card_preserved') return false;
             if (replacement.kind === 'unresolved') return false;
+            if (replacement.kind === 'audio' && turnContext.speechDelivery?.followUpText) {
+              const followUp = await this.send({
+                address: { channelType: 'feishu', chatId },
+                text: turnContext.speechDelivery.followUpText,
+                parseMode: 'plain',
+                mentions,
+              });
+              if (!followUp.ok) {
+                console.warn('[feishu-adapter] Speech follow-up delivery failed after native audio:', followUp.error || 'unknown error');
+              }
+            }
             speechReplacement = {
               messageId: replacement.messageId,
               messageKind: replacement.kind === 'audio' ? 'audio' : 'text',
@@ -2635,9 +2664,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
       replacement?.resultText || extractStreamingFinalResponse(responseText),
       continuationLimit,
     );
+    // 只有 replaceProgressCardWithSpeech 已拿到真实 audio messageId 时才可记录“已发送”；
+    // 生成与相似度状态继续来自 Runtime 的受控回执，不能由卡片正文推断。
+    const deliveredSpeechReceipt = replacement?.messageKind === 'audio'
+      ? turnContext?.speechDelivery?.receipt
+      : undefined;
     const continuationContext = [
       sourceText ? `原始请求：${sourceText}` : '',
       `上一轮状态：${status === 'completed' ? '已完成' : status === 'interrupted' ? '已中断' : '未完成'}`,
+      deliveredSpeechReceipt ? '生成状态：已生成' : '',
+      deliveredSpeechReceipt?.protocol === 'cti-speech-synthesis/v1'
+        ? `音色相似度：${deliveredSpeechReceipt.speakerSimilarityStatus === 'passed' ? '已通过' : deliveredSpeechReceipt.speakerSimilarityStatus === 'not_verified' ? '未验收（当前设置不阻塞）' : '不适用（预设音色）'}` : '',
+      deliveredSpeechReceipt?.protocol === 'cti-singing-synthesis/v1'
+        ? `音色相似度：${deliveredSpeechReceipt.speakerSimilarityStatus === 'passed' ? '已通过' : '不适用（默认歌声）'}` : '',
+      deliveredSpeechReceipt?.protocol === 'cti-singing-synthesis/v1' ? '歌词对齐：已通过' : '',
+      deliveredSpeechReceipt ? '发送状态：已发送' : '',
       resultText ? `上一轮结果：${resultText}` : '',
     ].filter(Boolean).join('\n');
     if (!continuationContext) return;
@@ -4575,6 +4616,57 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
   }
 
+  /**
+   * 处理 cti-final 中由 Agent 主动选择的显示名。目标列表已经由 Manager 收敛为
+   * “用户本轮明确点名 ∩ Agent 当前回复选择”，本方法只做当前群成员唯一解析，
+   * 不再为了触发原生 @ 向正文补写或前置任何名字。
+   */
+  async resolveOutboundMentionTargets(
+    message: OutboundMessage,
+    sourceMessage: InboundMessage | undefined,
+    targets: string[],
+  ): Promise<OutboundMessage> {
+    if (message.address.channelType !== 'feishu' || targets.length === 0) return message;
+
+    const candidates = await this.collectOutboundMentionCandidates(message, sourceMessage);
+    const nextMentions: OutboundMention[] = [...(message.mentions || [])];
+    const seenMentionKeys = new Set(nextMentions.map((mention) => (
+      mention.atAll ? '__all__' : (mention.userId || '').trim()
+    )).filter(Boolean));
+    const uniqueTargets = new Map<string, string>();
+    for (const target of targets) {
+      const normalized = normalizeMentionAlias(target);
+      if (normalized) uniqueTargets.set(normalized, target);
+    }
+
+    let text = message.text;
+    let changed = false;
+    for (const target of uniqueTargets.values()) {
+      const resolved = resolveOutboundMentionTarget(target, candidates);
+      // 原生 @all 不是单成员点名，不能从这个窄口产生。
+      if (!resolved?.userId || resolved.atAll) continue;
+      if (seenMentionKeys.has(resolved.userId)) continue;
+      seenMentionKeys.add(resolved.userId);
+      nextMentions.push(resolved);
+      changed = true;
+
+      // 如果 Agent 已在可见正文自行写了裸 @，只归一为官方群显示名；没有写则
+      // 保持原文不变，平台标签会由 OutboundMention 在传输层单独生成。
+      const canonicalName = cleanMentionName(resolved.name, target);
+      if (extractBareAtTargets(text).some((item) => normalizeMentionAlias(item) === normalizeMentionAlias(target))
+        && normalizeMentionAlias(target) !== normalizeMentionAlias(canonicalName)) {
+        text = replaceBareAtTarget(text, target, canonicalName);
+      }
+    }
+
+    if (!changed && text === message.text) return message;
+    return {
+      ...message,
+      text,
+      mentions: nextMentions.length > 0 ? nextMentions : undefined,
+    };
+  }
+
   async verifyOutboundMentionIdentity(
     message: OutboundMessage,
     _sourceMessage: InboundMessage | undefined,
@@ -5485,6 +5577,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (candidate) names.set(candidate.userId, candidate.name);
     }
     return names;
+  }
+
+  /** 只把当前群成员接口确认过的名称返回给 Bridge，避免把历史 userId 当作姓名。 */
+  async resolveMemberDisplayNames(chatId: string, userIds: readonly string[]): Promise<Record<string, string>> {
+    const wanted = new Set(userIds.map((id) => id.trim()).filter(Boolean));
+    if (!chatId.trim() || wanted.size === 0) return {};
+    const names = await this.fetchChatMemberNames(chatId);
+    const resolved: Record<string, string> = {};
+    for (const userId of wanted) {
+      const name = names.get(userId)?.trim();
+      if (name) resolved[userId] = name;
+    }
+    return resolved;
   }
 
   /**
@@ -6967,8 +7072,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const limit = this.getLightContextMessageLimit();
     if (limit <= 0 || !userText.trim()) return null;
     const mentions = this.normalizeLightContextMentions(nativeMentions);
-    const isShortContextualAsk = this.isShortContextualAskText(userText);
-    if (!replyTargetMessageId && !isShortContextualAsk) return null;
+    // 附近上下文只能由原生 reply 或当前原生 @ 触发。普通文字里的代词、
+    // “继续”等说法不是可靠引用关系，不能据此额外拉取并绑定历史消息。
+    if (!replyTargetMessageId && mentions.length === 0) return null;
 
     try {
       // Short Feishu replies may lose native quote metadata in receive_v1.
@@ -6981,11 +7087,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       ]);
 
       const isShortReplyCommand = this.isShortReplyContextCommand(userText);
-      const hasContinuationTask = this.hasContinuationTaskSignal(userText);
       const includeBotMessages = isShortReplyCommand
-        || mentions.length > 0
-        || this.isDeicticLightContextAsk(userText)
-        || hasContinuationTask;
+        || mentions.length > 0;
       const { items, likelyContextMessageId } = selectFeishuLightContextItems({
         recentMessages,
         repliedMessage,
@@ -7011,7 +7114,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
         .join('\n');
       if (!formatted) return null;
       const referenceSignals = this.formatLightContextReferenceSignals(userText, mentions);
-      const continuationGuidance = hasContinuationTask ? this.formatContinuationTaskGuidance(userText) : [];
       const evidence = this.buildLightContextEvidence(
         items,
         replyTargetMessageId || '',
@@ -7023,7 +7125,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return {
         prompt: [
           ...referenceSignals,
-          ...continuationGuidance,
           'Feishu recent conversation context:',
           '- These are nearby messages from the same Feishu group, provided only to understand the current reply/mention.',
           '- Use them as chat context for tone, names, and references. Do not claim you searched all history.',
@@ -7140,7 +7241,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   private formatLightContextReferenceSignals(userText: string, mentions: FeishuLightContextMention[]): string[] {
-    if (mentions.length === 0 && !this.isDeicticLightContextAsk(userText)) return [];
+    if (mentions.length === 0) return [];
     const mentionLines = mentions.map((mention) => {
       const ids = [
         mention.openId ? `open_id=${mention.openId}` : '',
@@ -7156,51 +7257,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       mentionLines.length > 0 ? '- native mentions in current message:' : '',
       ...mentionLines,
     ].filter(Boolean);
-  }
-
-  private formatContinuationTaskGuidance(userText: string): string[] {
-    if (!this.hasContinuationTaskSignal(userText)) return [];
-    const metadataClauses = this.extractMetadataLikeClauses(userText);
-    return [
-      'Continuation task guardrails:',
-      '- The current message contains follow-up signals such as “也/继续/同样/按刚刚”. Do not analyze it as a fresh isolated command.',
-      '- First resolve what should continue from the replied message, nearby messages, and local outbound summaries. If the inherited task target or rule is still absent, ask one minimal clarification instead of inventing.',
-      '- Descriptive clauses in the current message are context metadata by default; only write their literal text onto an artifact when the user explicitly asks to add/write/贴/写上 that exact text.',
-      metadataClauses.length > 0
-        ? `- Metadata-like clauses detected in current message: ${metadataClauses.map((item) => `“${item}”`).join('、')}；不要直接当作要写到图片上的文字。`
-        : '',
-      '',
-    ].filter(Boolean);
-  }
-
-  private hasContinuationTaskSignal(userText: string): boolean {
-    const normalized = userText.replace(/\s+/g, '').trim();
-    if (!normalized) return false;
-    const hasContinuation = /(?:也|继续|接着|同样|照着|照旧|沿用|仍然|还是按|按(?:刚刚|刚才|上次|之前|前面|上一轮|原来)|再(?:来|做|改|补|处理|标|标记|标注|命名|取名)?)/u.test(normalized);
-    const hasTaskObject = /(?:这张图|这个图|这图|图片|图上|文件|表|名单|规则|格式|标记|标注|命名|取名|修改|处理|生成|整理|总结)/u.test(normalized);
-    return hasContinuation && hasTaskObject;
-  }
-
-  private extractMetadataLikeClauses(userText: string): string[] {
-    return userText
-      .split(/[，,。；;！!？?\n\r]+/u)
-      .map((part) => part.replace(/\s+/g, '').trim())
-      .filter((part) => part.length >= 3 && part.length <= 40)
-      .filter((part) => /^(?:这(?:个|张|份)?(?:图|图片|文件|表)?|这个|它|其|本(?:图|文件|表)|该(?:图|文件|表)?)(?:是|为|属于|作为|用作).+/u.test(part))
-      .slice(0, 3);
-  }
-
-  private isShortContextualAskText(userText: string): boolean {
-    const normalized = userText.replace(/\s+/g, '').trim();
-    if (!normalized || normalized.length > 80) return false;
-    return /(?:怎么看|咋看|怎么起|起名|这个|那个|上面|刚刚|刚才|前面|上一条|前一条|回复|你觉得|帮.*想|咋回事|怎么回事|什么情况|啥情况|啥意思|什么意思|为什么|为啥|继续|接着|然后呢|你说|刚说)/u.test(userText);
-  }
-
-  private isDeicticLightContextAsk(userText: string): boolean {
-    const normalized = userText.replace(/\s+/g, '').trim();
-    if (!normalized || normalized.length > 40) return false;
-    return /(?:^|[这那他她它]|ta|TA|上面|前面|刚才|刚刚|回复).*(?:咋回事|怎么回事|什么情况|啥情况|啥意思|什么意思|咋样|怎么看|是啥|是什么)/u.test(normalized)
-      || /^(?:这|这个|那|那个|他|她|它|ta|TA)(?:呢|咋样|怎么看)?$/u.test(normalized);
   }
 
   private isShortReplyContextCommand(userText: string): boolean {
@@ -7260,6 +7316,47 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return this.downloadNativeReplyAttachmentsFromMessageItem(item, sourceMessageId);
   }
 
+  async resolveChoiceParticipant(input: {
+    chatId: string;
+    sourceMessage: InboundMessage;
+  }): Promise<{ ok: boolean; userId?: string; displayName?: string; error?: string }> {
+    const text = input.sourceMessage.text || '';
+    // 只从“选择人/作答人/答题人”这类明确结构提取目标，避免把普通姓名提及误当成绑定。
+    const explicitNames = [
+      ...Array.from(text.matchAll(/(?:选择人|作答人|答题人|参与人)\s*(?:是|为|：|:)\s*[@＠]?([\p{L}\p{N}_-]{1,32})/gu)),
+      ...Array.from(text.matchAll(/(?:让|给|由)\s*[@＠]?([\p{L}\p{N}_-]{1,32})\s*(?:来|选择|作答|回答|答题)/gu)),
+    ].map((match) => (match[1] || '').trim()).filter(Boolean);
+    const raw = getRawObject(input.sourceMessage.raw);
+    const nativeMentions = Array.isArray(raw.feishuMentions) ? raw.feishuMentions : [];
+    const nativeNames = nativeMentions.map((item) => {
+      const record = getRawObject(item);
+      const id = getRawObject(record.id);
+      const userId = firstNonEmptyString(record.openId, record.open_id, id.open_id, record.userId, record.user_id, id.user_id);
+      const name = firstNonEmptyString(record.name, record.user_name, record.key);
+      return userId && name && !this.isKnownBotSenderId(userId) ? { userId, name } : null;
+    }).filter((item): item is { userId: string; name: string } => Boolean(item));
+
+    let candidates: FeishuMentionCandidate[];
+    try {
+      candidates = await this.fetchChatMentionCandidates(input.chatId);
+    } catch (error) {
+      return { ok: false, error: `无法读取当前群成员，暂时不能安全指定作答人：${error instanceof Error ? error.message : String(error)}` };
+    }
+    const targets = explicitNames.length > 0 ? explicitNames : nativeNames.map((item) => item.name);
+    if (targets.length === 0) return { ok: false, error: '未识别到明确的作答人，请写“选择人是某某”或原生 @某某。' };
+    const matches = new Map<string, FeishuMentionCandidate>();
+    for (const target of targets) {
+      for (const candidate of findOutboundMentionCandidateMatches(target, candidates, 'exact')) {
+        matches.set(candidate.userId, candidate);
+      }
+    }
+    if (matches.size !== 1) {
+      return { ok: false, error: matches.size > 1 ? '指定的作答人存在同名成员，请使用原生 @成员 消除歧义。' : `当前群成员中找不到“${targets[0]}”。` };
+    }
+    const selected = [...matches.values()][0];
+    return { ok: true, userId: selected.userId, displayName: selected.name };
+  }
+
   /**
    * 保留平台附件下载的通用数组接口；原生回复专用绑定由下方方法另行构造，
    * 避免 ASR evidence 扩展改变 sticker/image/file 的既有调用契约。
@@ -7299,13 +7396,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
         );
       if (attachment) {
         attachments.push(attachment);
+        // 文件消息可能承载真实音频（例如 .m4a）。根据已下载字节的
+        // MIME 结果重新签发 resourceType，避免把可信音频降级成普通文件。
+        const resolvedResourceType = request.resourceType === 'file'
+          && attachment.type.toLowerCase().startsWith('audio/')
+          ? 'audio'
+          : request.resourceType;
         bindings.push({
           protocol: 'cti-feishu-native-reply-attachment/v1',
           relation: 'native_reply',
           sourceMessageId,
           messageId: request.messageId,
           fileKey: request.fileKey,
-          resourceType: request.resourceType,
+          resourceType: resolvedResourceType,
           attachmentId: attachment.id,
         });
       }
@@ -8176,7 +8279,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // 飞书有时通过 type=file 返回真实图片，Content-Type 仅为
     // application/octet-stream；文件头是跨 transport 的最终媒体事实。
     const sniffed = sniffImageMimeType(buffer);
-    const mimeType = sniffed?.mimeType || mimeTypeOverride || MIME_BY_TYPE[resourceType] || 'application/octet-stream';
+    const mimeType = sniffed?.mimeType
+      || sniffAudioMimeType(buffer)
+      || mimeTypeOverride
+      || MIME_BY_TYPE[resourceType]
+      || 'application/octet-stream';
     const ext = this.extensionForFeishuResource(resourceType, mimeType);
     return {
       id: crypto.randomUUID(),

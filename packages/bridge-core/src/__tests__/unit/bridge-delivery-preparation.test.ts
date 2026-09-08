@@ -65,6 +65,10 @@ describe('bridge delivery preparation', () => {
       kind: 'text', text: '文字结果', images: [], files: [], reply_mode: 'plain',
       speech: { mode: 'text_only' },
     }), '```'].join('\n'), 'C:/workspace');
+    const activeReference = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      kind: 'text', text: '参考音色语音结果', images: [], files: [], reply_mode: 'plain',
+      speech: { mode: 'voice_only', voice_requirement: 'active_reference' },
+    }), '```'].join('\n'), 'C:/workspace');
     const forged = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
       kind: 'text', text: '安全文字结果', images: [], files: [], reply_mode: 'plain',
       speech: { mode: 'voice_only', ttsModelId: 'forged', path: 'C:/unsafe.ogg', file_key: 'forged' },
@@ -77,6 +81,8 @@ describe('bridge delivery preparation', () => {
         rights_basis: 'self_or_authorized',
         usage_scope: 'local_tts_only',
         clean_single_speaker_confirmed: true,
+        reference_transcript: '这是准确参考文本',
+        reference_transcript_confirmed: true,
       },
     }), '```'].join('\n'), 'C:/workspace');
     const forgedReferenceVoice = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
@@ -88,6 +94,10 @@ describe('bridge delivery preparation', () => {
 
     assert.deepEqual(valid.payload.speech, { mode: 'voice_only' });
     assert.deepEqual(textOnly.payload.speech, { mode: 'text_only' });
+    assert.deepEqual(activeReference.payload.speech, {
+      mode: 'voice_only',
+      voiceRequirement: 'active_reference',
+    });
     assert.equal(forged.payload.speech, undefined);
     assert.deepEqual(referenceVoice.payload.speechAction, {
       action: 'create_reference_voice',
@@ -95,8 +105,33 @@ describe('bridge delivery preparation', () => {
       rightsBasis: 'self_or_authorized',
       usageScope: 'local_tts_only',
       cleanSingleSpeakerConfirmed: true,
+      referenceTranscript: '这是准确参考文本',
+      referenceTranscriptConfirmed: true,
     });
     assert.equal(forgedReferenceVoice.payload.speechAction, undefined);
+  });
+
+  it('拒绝 singing 同时夹带普通音频文件或 TTS intent', () => {
+    const base = {
+      kind: 'text', text: '歌声结果', images: [], files: [], reply_mode: 'plain',
+      singing: {
+        mode: 'song_only', prompt: '轻快童谣', lyrics: '星光落下来',
+        vocal_language: 'zh', duration_seconds: 10,
+      },
+    };
+    const withFile = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      ...base, kind: 'mixed', files: ['song.mp3'],
+    }), '```'].join('\n'), 'C:/workspace');
+    const withTts = prepareDeliveryCandidate(['```cti-final', JSON.stringify({
+      ...base, speech: { mode: 'voice_only' },
+    }), '```'].join('\n'), 'C:/workspace');
+
+    assert.equal(withFile.status.parsed, false);
+    assert.deepEqual(withFile.payload.files, []);
+    assert.equal(withFile.payload.singing, undefined);
+    assert.equal(withTts.status.parsed, false);
+    assert.equal(withTts.payload.speech, undefined);
+    assert.equal(withTts.payload.singing, undefined);
   });
 
   it('accepts a card hero only when it selects the same delivered image path', () => {

@@ -39,6 +39,8 @@ export type ScheduledTaskServiceOptions = {
   store: ScheduledTaskStore;
   now?: () => string;
   leaseMs?: number;
+  /** 同一到期批次的执行并发上限；固定投递会优先占用槽位。 */
+  maxConcurrentRuns?: number;
   execute: (input: ScheduledTaskExecuteInput) => Promise<ScheduledTaskExecutionResult>;
 };
 
@@ -98,6 +100,11 @@ function createRun(
   queuedAt: string,
 ): ScheduledTaskRun {
   const slotKey = createScheduledSlotKey(task.id, slotIdentity);
+  const scheduledForMs = new Date(scheduledFor).getTime();
+  const queuedAtMs = new Date(queuedAt).getTime();
+  const dispatchDelayMs = Number.isFinite(scheduledForMs) && Number.isFinite(queuedAtMs)
+    ? Math.max(0, queuedAtMs - scheduledForMs)
+    : undefined;
   const runId = trigger === 'manual'
     ? `${task.id}:manual:${queuedAt}:${crypto.randomUUID()}`
     : `${task.id}:${scheduledFor}:1`;
@@ -110,6 +117,7 @@ function createRun(
     trigger,
     attempt: 1,
     queuedAt,
+    dispatchDelayMs,
     executionStatus: 'pending',
     deliveryStatus: task.delivery.mode === 'none' ? 'not_requested' : 'pending',
   };
@@ -120,7 +128,50 @@ export function createScheduledTaskService(
 ): ScheduledTaskService {
   const now = options.now ?? (() => new Date().toISOString());
   const leaseMs = Math.max(5_000, Math.floor(options.leaseMs ?? 10 * 60_000));
+  const maxConcurrentRuns = Math.max(1, Math.min(16, Math.floor(options.maxConcurrentRuns ?? 4)));
   let runningTick: Promise<number> | null = null;
+
+  type ReservedRun = {
+    task: VersionedScheduledTask;
+    reserved: VersionedScheduledTaskState;
+    run: ScheduledTaskRun;
+    preserveNextRun: boolean;
+  };
+
+  /**
+   * 固定通知和互动打卡不依赖模型，优先进入执行槽，避免被慢 Agent 回合挤到批次末尾。
+   * 同优先级继续沿用 Store 的稳定顺序，不按具体任务名称或时间写特例。
+   */
+  const executionPriority = (task: VersionedScheduledTask): number => {
+    if (task.action.kind === 'notify' || task.action.kind === 'check_in') return 0;
+    if (task.action.kind === 'controlled_tool') return 1;
+    return 2;
+  };
+
+  const runWithConcurrency = async <T>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<void>,
+  ): Promise<void> => {
+    let nextIndex = 0;
+    const errors: unknown[] = [];
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex];
+        nextIndex += 1;
+        if (item === undefined) continue;
+        try {
+          await worker(item);
+        } catch (error) {
+          // 单个运行的持久化异常不能阻止同批其他任务启动；异常仍回传给 scheduler 审计。
+          errors.push(error);
+        }
+      }
+    });
+    await Promise.all(workers);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, '多个计划任务运行失败');
+  };
 
   const ensureTaskState = async (taskId: string): Promise<VersionedScheduledTaskState> => {
     const existing = await options.store.getState(taskId);
@@ -224,13 +275,13 @@ export function createScheduledTaskService(
     return finalizeRun(task, runningRun, result, preserveNextRun);
   };
 
-  const reserveAndExecute = async (
+  const reserveRun = async (
     task: VersionedScheduledTask,
     state: VersionedScheduledTaskState,
     scheduledFor: string,
     trigger: ScheduledTaskRunTrigger,
     preserveNextRun: boolean,
-  ): Promise<ScheduledTaskRun | null> => {
+  ): Promise<ReservedRun | null> => {
     const queuedAt = now();
     const slotIdentity = trigger === 'manual'
       ? `manual:${queuedAt}:${crypto.randomUUID()}`
@@ -247,7 +298,7 @@ export function createScheduledTaskService(
       throw error;
     }
     await options.store.appendRun(run);
-    return executeReservedRun(task, reserved, run, preserveNextRun);
+    return { task, reserved, run, preserveNextRun };
   };
 
   const recordOverlap = async (
@@ -285,6 +336,7 @@ export function createScheduledTaskService(
     await recoverExpiredRuns();
     const tickNow = now();
     let handled = 0;
+    const dueTasks: Array<{ task: VersionedScheduledTask; state: VersionedScheduledTaskState; scheduledFor: string }> = [];
     for (const task of await options.store.listTasks()) {
       if (!task.enabled) continue;
       const state = await ensureTaskState(task.id);
@@ -295,9 +347,41 @@ export function createScheduledTaskService(
         handled += 1;
         continue;
       }
-      const run = await reserveAndExecute(task, state, scheduledFor, 'scheduled', false);
-      if (run) handled += 1;
+      dueTasks.push({ task, state, scheduledFor });
     }
+
+    dueTasks.sort((left, right) => (
+      executionPriority(left.task) - executionPriority(right.task)
+      || left.scheduledFor.localeCompare(right.scheduledFor)
+      || left.task.createdAt.localeCompare(right.task.createdAt)
+      || left.task.id.localeCompare(right.task.id)
+    ));
+
+    // 先为整批任务写入稳定 slot 和 queued 状态，再开始任何可能耗时的 Provider/工具调用。
+    // 这样慢 agent_turn 不会阻止后续 notify/check_in 被调度器发现和准入。
+    const reservedRuns: ReservedRun[] = [];
+    for (const due of dueTasks) {
+      const reserved = await reserveRun(
+        due.task,
+        due.state,
+        due.scheduledFor,
+        'scheduled',
+        false,
+      );
+      if (reserved) {
+        reservedRuns.push(reserved);
+        handled += 1;
+      }
+    }
+
+    await runWithConcurrency(reservedRuns, maxConcurrentRuns, async (reserved) => {
+      await executeReservedRun(
+        reserved.task,
+        reserved.reserved,
+        reserved.run,
+        reserved.preserveNextRun,
+      );
+    });
     return handled;
   };
 
@@ -390,11 +474,17 @@ export function createScheduledTaskService(
       const task = await options.store.getTask(taskId);
       if (!task) throw new Error(`计划任务不存在：${taskId}`);
       const state = await ensureTaskState(taskId);
+      if (state.queuedRunId) throw new Error('计划任务已有排队中的实例');
       if (hasActiveLease(state, now())) throw new Error('计划任务已有运行中的实例');
       const scheduledFor = now();
-      const run = await reserveAndExecute(task, state, scheduledFor, 'manual', true);
-      if (!run) throw new Error('计划任务运行准入冲突');
-      return run;
+      const reserved = await reserveRun(task, state, scheduledFor, 'manual', true);
+      if (!reserved) throw new Error('计划任务运行准入冲突');
+      return executeReservedRun(
+        reserved.task,
+        reserved.reserved,
+        reserved.run,
+        reserved.preserveNextRun,
+      );
     },
   };
 }

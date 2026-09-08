@@ -1,6 +1,8 @@
 export interface CorrectionMaintenanceRoutingInput {
   currentUserText: string;
   previousAssistantText?: string;
+  /** 仅由平台原生回复或耐久 outbound-ref 证明当前消息确实指向上一轮机器人结果。 */
+  hasTrustedPreviousAssistantRelation?: boolean;
 }
 
 const DIRECT_CORRECTION_RE = /(?:你|刚才|上一条|上次|还是|又).{0,28}(?:错(?:了|误)?|不对|误判|说错|弄错|搞错|漏掉|遗漏|没有生效|没效果|并不存在)|(?:wrong|incorrect|mistaken|you\s+(?:missed|forgot|claimed))/iu;
@@ -13,7 +15,9 @@ const FAILURE_FEEDBACK_RE = /(?:还是|依然|仍然|又).{0,18}(?:错|失败|�
  */
 export function shouldRunCorrectionMaintenance(input: CorrectionMaintenanceRoutingInput): boolean {
   const current = input.currentUserText.trim();
-  if (!current || !input.previousAssistantText?.trim()) return false;
+  // 词表只用于把已经关联到真实上一轮结果的反馈送入无副作用 classifier；
+  // 普通聊天、第三方消息或孤立的“还是错”绝不能触发自维护。
+  if (!current || !input.previousAssistantText?.trim() || input.hasTrustedPreviousAssistantRelation !== true) return false;
   return DIRECT_CORRECTION_RE.test(current)
     || CONTRASTIVE_FACT_RE.test(current)
     || FAILURE_FEEDBACK_RE.test(current);

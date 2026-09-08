@@ -5,6 +5,7 @@ import type {
   SpeechSelectionContract,
   SpeechState,
   SpeechStatusContract,
+  SpeechVoiceAcceptanceContract,
 } from '@codex-im-suite/contracts/speech';
 
 import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
@@ -19,6 +20,8 @@ import {
   findSpeechModel,
   listSpeechProviders,
 } from './speech-model-catalog.js';
+import { speakerSimilarityAcceptanceRecorded } from './speaker-similarity-policy.js';
+import { projectSpeechProviders } from './speech-provider-catalog.js';
 
 export interface ManagedSpeechComponentStatus {
   id: string;
@@ -129,18 +132,37 @@ export class SpeechRuntimeStatusService {
     const asrDiagnostic = asrReady ? undefined : (asrManifest?.state !== 'ready' ? asrManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'asr_backend_missing';
     const ttsDiagnostic = ttsReady ? undefined : (ttsManifest?.state !== 'ready' ? ttsManifest?.diagnosticCode : undefined) || sidecarDiagnostic || 'tts_backend_missing';
     const hardwareId = this.options.hardwareId || '0'.repeat(64);
-    const modelOptions: SpeechModelOptionContract[] = SPEECH_MODEL_CATALOG.map((model) => {
+    let activeReferenceProfile: ReturnType<SpeechVoiceRegistry['resolveProfile']> | undefined;
+    let activeReferenceProfileId: string | undefined;
+    try {
+      const candidate = config.voiceProfileId ? this.options.voiceRegistry.resolveProfile(config.voiceProfileId) : undefined;
+      if (candidate?.kind === 'reference') {
+        activeReferenceProfile = candidate;
+        activeReferenceProfileId = config.voiceProfileId;
+      }
+    } catch {
+      // 配置中的旧/坏音色不能影响其余状态；下方 profile 状态会失败关闭。
+    }
+    const persistedReferenceProfiles = this.options.voiceRegistry.list().filter((profile) => profile.kind === 'reference');
+    const modelOptions: SpeechModelOptionContract[] = [...SPEECH_MODEL_CATALOG]
+      .sort((left, right) => right.qualityRank - left.qualityRank)
+      .map((model) => {
       const component = managed.find((item) => item.id === model.componentId);
       const isLive = liveTtsProviderId === model.providerId && liveTtsModelId === model.id && Boolean(liveTtsRevision);
       const modelState: SpeechState = isLive && ttsReady
         ? 'ready'
         : component?.state || 'optional_missing';
       const revision = isLive ? liveTtsRevision : component?.version || 'uninstalled';
+      const benchmarkVoiceProfileId = activeReferenceProfile?.compatibleTtsModelIds.includes(model.id)
+        ? activeReferenceProfileId
+        : persistedReferenceProfiles.find((profile) => profile.compatibleTtsModelIds.includes(model.id))?.id;
       const benchmark = this.options.benchmarkStore?.find({
         modelId: model.id,
         providerId: model.providerId,
         revision,
         hardwareId,
+        ...(model.capabilities.includes('voice_clone') && benchmarkVoiceProfileId
+          ? { voiceProfileId: benchmarkVoiceProfileId } : {}),
       });
       const benchmarkStatus: SpeechModelBenchmarkContract = benchmark
         ? {
@@ -152,6 +174,10 @@ export class SpeechRuntimeStatusService {
             ...(benchmark.outputDurationMs !== undefined ? { outputDurationMs: benchmark.outputDurationMs } : {}),
             ...(benchmark.realTimeFactor !== undefined ? { realTimeFactor: benchmark.realTimeFactor } : {}),
             ...(benchmark.peakVramMiB !== undefined ? { peakVramMiB: benchmark.peakVramMiB } : {}),
+            ...(benchmark.voiceProfileId ? { voiceProfileId: benchmark.voiceProfileId } : {}),
+            ...(benchmark.speakerSimilarity !== undefined ? { speakerSimilarity: benchmark.speakerSimilarity } : {}),
+            ...(benchmark.speakerSimilarityThreshold !== undefined ? { speakerSimilarityThreshold: benchmark.speakerSimilarityThreshold } : {}),
+            ...(benchmark.speakerSimilarityPassed !== undefined ? { speakerSimilarityPassed: benchmark.speakerSimilarityPassed } : {}),
             ...(benchmark.diagnosticCode ? { diagnosticCode: benchmark.diagnosticCode } : {}),
           }
         : {
@@ -169,6 +195,8 @@ export class SpeechRuntimeStatusService {
         providerId: model.providerId,
         variant: model.variant,
         sizeLabel: model.sizeLabel,
+        qualityTier: model.qualityTier,
+        qualityRank: model.qualityRank,
         componentId: model.componentId,
         capabilities: [...model.capabilities],
         defaultVoiceProfileId: model.defaultVoiceProfileId,
@@ -177,7 +205,6 @@ export class SpeechRuntimeStatusService {
       };
     });
     const configuredModelOption = modelOptions.find((item) => item.id === config.ttsModelId);
-    const configuredModelBenchmarkReady = configuredModelOption?.benchmark.state === 'ready';
     const singingRuntimeManifest = managed.find((item) => item.id === 'ace_step_1_5');
     const singingModelManifest = managed.find((item) => item.id === 'ace_step_1_5_models');
     const singingManifest = singingModelManifest || singingRuntimeManifest
@@ -200,6 +227,9 @@ export class SpeechRuntimeStatusService {
           ...(storedSingingBenchmark.outputDurationMs !== undefined ? { outputDurationMs: storedSingingBenchmark.outputDurationMs } : {}),
           ...(storedSingingBenchmark.realTimeFactor !== undefined ? { realTimeFactor: storedSingingBenchmark.realTimeFactor } : {}),
           ...(storedSingingBenchmark.peakVramMiB !== undefined ? { peakVramMiB: storedSingingBenchmark.peakVramMiB } : {}),
+          ...(storedSingingBenchmark.lyricsAlignment !== undefined ? { lyricsAlignment: storedSingingBenchmark.lyricsAlignment } : {}),
+          ...(storedSingingBenchmark.lyricsAlignmentThreshold !== undefined ? { lyricsAlignmentThreshold: storedSingingBenchmark.lyricsAlignmentThreshold } : {}),
+          ...(storedSingingBenchmark.lyricsAlignmentPassed !== undefined ? { lyricsAlignmentPassed: storedSingingBenchmark.lyricsAlignmentPassed } : {}),
           ...(storedSingingBenchmark.diagnosticCode ? { diagnosticCode: storedSingingBenchmark.diagnosticCode } : {}),
         }
       : {
@@ -230,9 +260,23 @@ export class SpeechRuntimeStatusService {
         || (singingBenchmark.state !== 'ready' ? singingBenchmark.diagnosticCode || 'singing_benchmark_not_verified' : singingHealth.diagnosticCode)
         || 'singing_backend_missing';
 
+    // Sidecar health 只证明模型文件已加载；性能 benchmark 只描述速度，不再把
+    // “慢”误报成“不可用”。真正不能生成的依赖/模型/音色问题仍由 ttsState 阻断，
+    // benchmark 结果保留在模型卡片和 capability diagnostic 中供用户判断是否切换档位。
+    const ttsPerformanceState: SpeechState = ttsReady
+      && configuredModelOption?.benchmark.state !== 'ready'
+      ? configuredModelOption?.benchmark.state || 'optional_missing'
+      : ttsState;
+    const ttsPerformanceDiagnostic = ttsPerformanceState === 'ready'
+      ? undefined
+      : configuredModelOption?.benchmark.diagnosticCode || ttsDiagnostic || 'tts_model_benchmark_not_run';
+
     const activeCapabilities: Array<{ state: SpeechState; diagnosticCode?: string }> = [];
     if (config.inputEnabled) activeCapabilities.push({ state: asrState, diagnosticCode: asrDiagnostic });
-    if (config.outputEnabled) activeCapabilities.push({ state: ttsState, diagnosticCode: ttsDiagnostic });
+    // 语音输出的 state 表示“能否真实生成”，速度门禁只作为诊断信息。
+    // 这样高质量复刻模型即使较慢，仍可生成短语音；超时/内容预算仍由 Host
+    // 的真实合成时限和媒体校验负责，不会被这里绕过。
+    if (config.outputEnabled) activeCapabilities.push({ state: ttsState, diagnosticCode: ttsPerformanceDiagnostic });
     if (config.singingEnabled) activeCapabilities.push({ state: singingState, diagnosticCode: singingDiagnostic });
     const state = anyAudioCapabilityEnabled ? worstState(activeCapabilities.map((item) => item.state)) : 'optional_missing';
     const diagnosticCode = anyAudioCapabilityEnabled
@@ -242,16 +286,96 @@ export class SpeechRuntimeStatusService {
       : 'speech_disabled';
     const profiles = this.options.voiceRegistry.listSummaries(config.voiceProfileId).map((profile) => {
       const active = profile.id === config.voiceProfileId || profile.id === config.singingVoiceProfileId;
+      const profileBenchmark = profile.kind === 'reference' && configuredModelOption
+        ? this.options.benchmarkStore?.find({
+            modelId: configuredModelOption.id,
+            providerId: configuredModelOption.providerId,
+            revision: configuredModelOption.benchmark.revision,
+            hardwareId,
+            voiceProfileId: profile.id,
+          })
+        : undefined;
+      const speechAcceptance: SpeechVoiceAcceptanceContract = profile.kind === 'preset'
+        ? { state: 'not_applicable' }
+        : profileBenchmark && speakerSimilarityAcceptanceRecorded(profileBenchmark)
+          ? {
+              state: 'passed',
+              providerId: configuredModelOption?.providerId,
+              modelId: configuredModelOption?.id,
+              revision: profileBenchmark.revision,
+              ...(profileBenchmark.testedAt ? { testedAt: profileBenchmark.testedAt } : {}),
+              similarity: profileBenchmark.speakerSimilarity,
+              similarityThreshold: profileBenchmark.speakerSimilarityThreshold,
+            }
+          : {
+              state: profileBenchmark?.state === 'blocked' || profileBenchmark?.state === 'error' ? 'failed' : 'not_verified',
+              ...(configuredModelOption ? {
+                providerId: configuredModelOption.providerId,
+                modelId: configuredModelOption.id,
+                revision: profileBenchmark?.revision || configuredModelOption.benchmark.revision,
+              } : {}),
+              ...(profileBenchmark?.testedAt ? { testedAt: profileBenchmark.testedAt } : {}),
+              ...(profileBenchmark?.speakerSimilarity !== undefined ? { similarity: profileBenchmark.speakerSimilarity } : {}),
+              ...(profileBenchmark?.speakerSimilarityThreshold !== undefined ? { similarityThreshold: profileBenchmark.speakerSimilarityThreshold } : {}),
+              diagnosticCode: profileBenchmark?.diagnosticCode || 'voice_clone_similarity_not_verified',
+            };
+      const singingProfileBenchmark = profile.kind === 'reference'
+        ? this.options.benchmarkStore?.find({
+            modelId: config.singingModel,
+            providerId: config.singingProvider,
+            revision: singingRevision,
+            hardwareId,
+            voiceProfileId: profile.id,
+          })
+        : undefined;
+      const singingAccepted = Boolean(
+        singingProfileBenchmark?.state === 'ready'
+        && speakerSimilarityAcceptanceRecorded(singingProfileBenchmark)
+        && singingProfileBenchmark?.lyricsAlignmentPassed === true
+        && typeof singingProfileBenchmark.lyricsAlignment === 'number'
+        && typeof singingProfileBenchmark.lyricsAlignmentThreshold === 'number'
+        && singingProfileBenchmark.lyricsAlignment >= singingProfileBenchmark.lyricsAlignmentThreshold,
+      );
+      const singingAcceptance: SpeechVoiceAcceptanceContract = profile.kind !== 'reference'
+        || !profile.capabilities.includes('singing')
+        ? { state: 'not_applicable' }
+        : singingAccepted
+          ? {
+              state: 'passed',
+              providerId: config.singingProvider,
+              modelId: config.singingModel,
+              revision: singingProfileBenchmark!.revision,
+              ...(singingProfileBenchmark!.testedAt ? { testedAt: singingProfileBenchmark!.testedAt } : {}),
+              similarity: singingProfileBenchmark!.speakerSimilarity,
+              similarityThreshold: singingProfileBenchmark!.speakerSimilarityThreshold,
+              lyricsAlignment: singingProfileBenchmark!.lyricsAlignment,
+              lyricsAlignmentThreshold: singingProfileBenchmark!.lyricsAlignmentThreshold,
+            }
+          : {
+              state: singingProfileBenchmark?.state === 'blocked' || singingProfileBenchmark?.state === 'error' ? 'failed' : 'not_verified',
+              providerId: config.singingProvider,
+              modelId: config.singingModel,
+              revision: singingProfileBenchmark?.revision || singingRevision,
+              ...(singingProfileBenchmark?.testedAt ? { testedAt: singingProfileBenchmark.testedAt } : {}),
+              ...(singingProfileBenchmark?.speakerSimilarity !== undefined ? { similarity: singingProfileBenchmark.speakerSimilarity } : {}),
+              ...(singingProfileBenchmark?.speakerSimilarityThreshold !== undefined ? { similarityThreshold: singingProfileBenchmark.speakerSimilarityThreshold } : {}),
+              ...(singingProfileBenchmark?.lyricsAlignment !== undefined ? { lyricsAlignment: singingProfileBenchmark.lyricsAlignment } : {}),
+              ...(singingProfileBenchmark?.lyricsAlignmentThreshold !== undefined ? { lyricsAlignmentThreshold: singingProfileBenchmark.lyricsAlignmentThreshold } : {}),
+              diagnosticCode: singingProfileBenchmark?.diagnosticCode || 'singing_voice_acceptance_not_verified',
+            };
+      const projected = { ...profile, active, speechAcceptance, singingAcceptance };
       if (!profile.compatibleTtsModelIds.includes(config.ttsModelId) && profile.capabilities.includes('speech')) {
-        return { ...profile, active, state: 'blocked' as const, diagnosticCode: 'voice_profile_model_incompatible' };
+        return { ...projected, state: 'blocked' as const, diagnosticCode: 'voice_profile_model_incompatible' };
       }
-      if (profile.kind === 'reference' && !configuredModelBenchmarkReady) {
-        return { ...profile, active, state: 'blocked' as const, diagnosticCode: 'voice_clone_benchmark_not_verified' };
+      if (profile.kind === 'reference' && config.requireVoiceSimilarityAcceptance) {
+        if (!speakerSimilarityAcceptanceRecorded(profileBenchmark)) {
+          return { ...projected, state: 'blocked' as const, diagnosticCode: 'voice_clone_similarity_not_verified' };
+        }
       }
       if (profile.state === 'ready' && !ttsReady && !(profile.capabilities.includes('singing') && singingReady)) {
-        return { ...profile, active, state: ttsState, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) };
+        return { ...projected, state: ttsState, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) };
       }
-      return { ...profile, active };
+      return projected;
     });
     const knownChannels = [...new Set(['feishu', ...config.channels])];
     const hasInstallable = managed.some((item) => item.installable);
@@ -332,9 +456,19 @@ export class SpeechRuntimeStatusService {
       singingBenchmark,
       activeVoiceProfileId: config.voiceProfileId || '',
       activeSingingVoiceProfileId: config.singingVoiceProfileId || '',
+      providers: projectSpeechProviders({
+        componentStates: new Map([...dependencyComponents, ...managedComponents]
+          .map((item) => [item.id, { state: item.state, ...(item.diagnosticCode ? { diagnosticCode: item.diagnosticCode } : {}) }])),
+        liveTtsProviderId,
+        liveTtsState: ttsState,
+        ...(ttsPerformanceDiagnostic ? { liveTtsDiagnostic: ttsPerformanceDiagnostic } : {}),
+        activeSingingProviderId: config.singingProvider,
+        singingState,
+        ...(singingDiagnostic ? { singingDiagnostic } : {}),
+      }),
       capabilities: [
         { id: 'speech.input', displayName: '语音输入', state: asrState, supported: asrReady, ...(asrDiagnostic ? { diagnosticCode: asrDiagnostic } : {}) },
-        { id: 'speech.output', displayName: '语音输出', state: ttsState, supported: ttsReady, ...(ttsDiagnostic ? { diagnosticCode: ttsDiagnostic } : {}) },
+        { id: 'speech.output', displayName: '语音输出', state: ttsState, supported: ttsReady, ...(ttsPerformanceDiagnostic ? { diagnosticCode: ttsPerformanceDiagnostic } : {}) },
         { id: 'speech.singing', displayName: '歌声合成', state: singingState, supported: singingReady, ...(singingDiagnostic ? { diagnosticCode: singingDiagnostic } : {}) },
       ],
       components: [...dependencyComponents, ...managedComponents],
@@ -344,6 +478,7 @@ export class SpeechRuntimeStatusService {
         maxInputDurationSeconds: config.maxDurationMs / 1000,
         maxOutputCharacters: config.maxTextChars,
         maxPreviewCharacters: MAX_SPEECH_PREVIEW_TEXT_CHARACTERS,
+        maxSongLyricsCharacters: 6_000,
         maxSongDurationSeconds: config.maxSongDurationSeconds,
       },
       actions: [
@@ -369,9 +504,28 @@ export class SpeechRuntimeStatusService {
             && singingRevision !== 'uninstalled' && previewTransportReady)
             ? { diagnosticCode: singingHealth.diagnosticCode || singingManifest?.diagnosticCode || 'singing_runtime_not_ready' } : {}),
         },
-        { id: 'speech.importReferenceVoice', label: '导入参考音色', enabled: true },
+        {
+          id: 'speech.importReferenceVoice',
+          label: '导入参考音色',
+          enabled: asrReady && previewTransportReady,
+          ...(!(asrReady && previewTransportReady)
+            ? { diagnosticCode: asrDiagnostic || 'speech_reference_transcript_live_runtime_unavailable' } : {}),
+        },
+        {
+          id: 'speech.renameReferenceVoice',
+          label: '重命名参考音色',
+          enabled: profiles.some((item) => item.kind === 'reference'),
+          ...(!profiles.some((item) => item.kind === 'reference') ? { diagnosticCode: 'reference_voice_not_found' } : {}),
+        },
+        {
+          id: 'speech.deleteReferenceVoice',
+          label: '删除参考音色',
+          enabled: profiles.some((item) => item.kind === 'reference'),
+          ...(!profiles.some((item) => item.kind === 'reference') ? { diagnosticCode: 'reference_voice_not_found' } : {}),
+        },
         { id: 'speech.previewVoice', label: '试听音色', enabled: previewEnabled, ...(previewDiagnostic ? { diagnosticCode: previewDiagnostic } : {}) },
-        { id: 'speech.previewSingingVoice', label: '试听歌声', enabled: singingReady && previewTransportReady, ...(!(singingReady && previewTransportReady) ? { diagnosticCode: singingDiagnostic || 'speech_preview_live_runtime_unavailable' } : {}) },
+        { id: 'speech.previewSingingVoice', label: '10 秒快速试听歌声', enabled: singingReady && previewTransportReady, ...(!(singingReady && previewTransportReady) ? { diagnosticCode: singingDiagnostic || 'speech_preview_live_runtime_unavailable' } : {}) },
+        { id: 'speech.generateSinging', label: '按完整内容生成歌声', enabled: singingReady && previewTransportReady, ...(!(singingReady && previewTransportReady) ? { diagnosticCode: singingDiagnostic || 'speech_preview_live_runtime_unavailable' } : {}) },
         { id: 'speech.activateVoiceProfile', label: '启用音色', enabled: profiles.some((item) => item.state === 'ready') },
       ],
       ...(diagnosticCode ? { diagnosticCode } : {}),

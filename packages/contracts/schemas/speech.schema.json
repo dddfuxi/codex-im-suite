@@ -69,9 +69,48 @@
       },
       "additionalProperties": false
     },
+    "SpeechProviderContract": {
+      "type": "object",
+      "required": ["id", "displayName", "state", "enabled", "experimental", "license", "capabilities"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "state": { "$ref": "#/$defs/SpeechState" },
+        "enabled": { "type": "boolean" },
+        "experimental": { "type": "boolean" },
+        "license": { "type": "string" },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "enum": ["speech.text", "speech.emotion", "speech.prosody_reference", "singing.text_to_singing", "singing.melody", "singing.voice_conversion", "voice.zero_shot_clone", "voice.cross_mode_identity"]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SpeechVoiceAcceptanceContract": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["not_applicable", "not_verified", "passed", "failed"] },
+        "providerId": { "type": "string" },
+        "modelId": { "type": "string" },
+        "revision": { "type": "string" },
+        "testedAt": { "type": "string" },
+        "similarity": { "type": "number", "minimum": -1, "maximum": 1 },
+        "similarityThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignment": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignmentThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "diagnosticCode": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "SpeechVoiceProfileContract": {
       "type": "object",
-      "required": ["id", "displayName", "kind", "state", "active", "license", "sourceLabel", "authorizationConfirmed", "capabilities", "compatibleTtsModelIds"],
+      "required": ["id", "displayName", "kind", "state", "active", "license", "sourceLabel", "authorizationConfirmed", "capabilities", "compatibleTtsModelIds", "speechAcceptance", "singingAcceptance"],
       "properties": {
         "id": { "type": "string" },
         "displayName": { "type": "string" },
@@ -88,18 +127,21 @@
           "uniqueItems": true
         },
         "compatibleTtsModelIds": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "speechAcceptance": { "$ref": "#/$defs/SpeechVoiceAcceptanceContract" },
+        "singingAcceptance": { "$ref": "#/$defs/SpeechVoiceAcceptanceContract" },
         "diagnosticCode": { "type": "string" }
       },
       "additionalProperties": false
     },
     "SpeechLimitsContract": {
       "type": "object",
-      "required": ["maxInputBytes", "maxInputDurationSeconds", "maxOutputCharacters", "maxPreviewCharacters", "maxSongDurationSeconds"],
+      "required": ["maxInputBytes", "maxInputDurationSeconds", "maxOutputCharacters", "maxPreviewCharacters", "maxSongLyricsCharacters", "maxSongDurationSeconds"],
       "properties": {
         "maxInputBytes": { "type": "integer", "minimum": 0 },
         "maxInputDurationSeconds": { "type": "number", "minimum": 0 },
         "maxOutputCharacters": { "type": "integer", "minimum": 0 },
         "maxPreviewCharacters": { "type": "integer", "minimum": 1, "maximum": 240 },
+        "maxSongLyricsCharacters": { "type": "integer", "minimum": 1, "maximum": 20000 },
         "maxSongDurationSeconds": { "type": "integer", "minimum": 10, "maximum": 600 }
       },
       "additionalProperties": false
@@ -138,7 +180,7 @@
     },
     "SpeechStatusContract": {
       "type": "object",
-      "required": ["protocol", "state", "inputEnabled", "outputEnabled", "singingEnabled", "channels", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "ttsModel", "tonePolicy", "singingProvider", "singingBenchmark", "activeVoiceProfileId", "activeSingingVoiceProfileId", "capabilities", "components", "voiceProfiles", "limits", "actions", "lastCheckedAt"],
+      "required": ["protocol", "state", "inputEnabled", "outputEnabled", "singingEnabled", "channels", "replyPolicy", "deliveryMode", "asrProvider", "ttsProvider", "ttsModel", "tonePolicy", "singingProvider", "singingBenchmark", "activeVoiceProfileId", "activeSingingVoiceProfileId", "providers", "capabilities", "components", "voiceProfiles", "limits", "actions", "lastCheckedAt"],
       "properties": {
         "protocol": { "const": "codex-im-suite/speech-status/v2" },
         "state": { "$ref": "#/$defs/SpeechState" },
@@ -156,6 +198,7 @@
         "singingBenchmark": { "$ref": "#/$defs/SpeechModelBenchmarkContract" },
         "activeVoiceProfileId": { "type": "string" },
         "activeSingingVoiceProfileId": { "type": "string" },
+        "providers": { "type": "array", "items": { "$ref": "#/$defs/SpeechProviderContract" } },
         "capabilities": { "type": "array", "items": { "$ref": "#/$defs/SpeechCapabilityContract" } },
         "components": { "type": "array", "items": { "$ref": "#/$defs/SpeechComponentContract" } },
         "voiceProfiles": { "type": "array", "items": { "$ref": "#/$defs/SpeechVoiceProfileContract" } },
@@ -193,13 +236,20 @@
         "outputDurationMs": { "type": "number", "exclusiveMinimum": 0 },
         "realTimeFactor": { "type": "number", "minimum": 0 },
         "peakVramMiB": { "type": "number", "minimum": 0 },
+        "voiceProfileId": { "type": "string" },
+        "speakerSimilarity": { "type": "number", "minimum": -1, "maximum": 1 },
+        "speakerSimilarityThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "speakerSimilarityPassed": { "type": "boolean" },
+        "lyricsAlignment": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignmentThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignmentPassed": { "type": "boolean" },
         "diagnosticCode": { "type": "string" }
       },
       "additionalProperties": false
     },
     "SpeechModelOptionContract": {
       "type": "object",
-      "required": ["id", "displayName", "state", "enabled", "providerId", "variant", "sizeLabel", "componentId", "capabilities", "defaultVoiceProfileId", "benchmark"],
+      "required": ["id", "displayName", "state", "enabled", "providerId", "variant", "sizeLabel", "qualityTier", "qualityRank", "componentId", "capabilities", "defaultVoiceProfileId", "benchmark"],
       "properties": {
         "id": { "type": "string" },
         "displayName": { "type": "string" },
@@ -209,6 +259,8 @@
         "providerId": { "type": "string" },
         "variant": { "type": "string" },
         "sizeLabel": { "type": "string" },
+        "qualityTier": { "enum": ["high_quality", "balanced", "low_resource"] },
+        "qualityRank": { "type": "number", "minimum": 0 },
         "componentId": { "type": "string" },
         "capabilities": { "type": "array", "items": { "enum": ["preset_voice", "voice_clone", "instruction_control"] }, "minItems": 1, "uniqueItems": true },
         "defaultVoiceProfileId": { "type": "string" },
@@ -229,17 +281,42 @@
     },
     "SpeechPreviewReceiptContract": {
       "type": "object",
-      "required": ["protocol", "mediaType", "base64", "bytes", "sha256", "durationMs", "modelId", "voiceProfileId", "validated"],
+      "required": ["protocol", "mediaType", "base64", "bytes", "sha256", "durationMs", "modelId", "voiceProfileId", "generationStatus", "deliveryStatus", "speakerSimilarityStatus", "validated"],
       "properties": {
         "protocol": { "const": "codex-im-suite/speech-preview/v2" },
         "mediaType": { "const": "audio/ogg; codecs=opus" },
         "base64": { "type": "string", "minLength": 4 },
-        "bytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+        "bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
         "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "durationMs": { "type": "number", "exclusiveMinimum": 0 },
         "modelId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9._-]+$" },
         "voiceProfileId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9._-]+$" },
+        "generationStatus": { "const": "generated" },
+        "deliveryStatus": { "const": "not_sent" },
+        "speakerSimilarityStatus": { "enum": ["passed", "not_applicable"] },
+        "speakerSimilarity": { "type": "number", "minimum": -1, "maximum": 1 },
+        "speakerSimilarityThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "speakerSimilarityPassed": { "type": "boolean" },
+        "lyricsAlignment": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignmentThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "lyricsAlignmentPassed": { "type": "boolean" },
+        "lyricsAlignmentStatus": { "const": "passed" },
         "validated": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "SingingAudioContentPlanContract": {
+      "type": "object",
+      "required": ["schema", "outputMode", "lyrics", "stylePrompt", "vocalLanguage", "durationSeconds", "melodyMode"],
+      "properties": {
+        "schema": { "const": "codex-im-suite/singing-audio-content-plan/v1" },
+        "outputMode": { "enum": ["quick_preview", "full_generation"] },
+        "lyrics": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "stylePrompt": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "vocalLanguage": { "type": "string", "pattern": "^[a-z]{2,8}(?:-[a-z0-9]{1,8}){0,2}$" },
+        "durationSeconds": { "type": "integer", "minimum": 10, "maximum": 600 },
+        "melodyMode": { "enum": ["auto", "reference_audio", "midi_or_f0"] },
+        "voiceRequirement": { "const": "active_reference" }
       },
       "additionalProperties": false
     }
@@ -248,6 +325,7 @@
     { "$ref": "#/$defs/SpeechSettingsContract" },
     { "$ref": "#/$defs/SpeechStatusContract" },
     { "$ref": "#/$defs/SpeechPanelStateContract" },
-    { "$ref": "#/$defs/SpeechPreviewReceiptContract" }
+    { "$ref": "#/$defs/SpeechPreviewReceiptContract" },
+    { "$ref": "#/$defs/SingingAudioContentPlanContract" }
   ]
 }

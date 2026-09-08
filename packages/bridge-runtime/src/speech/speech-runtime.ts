@@ -12,7 +12,7 @@ import { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
 import { getSpeechHardwareIdentity, readNvidiaUsedMemoryMiB } from './speech-hardware.js';
 import { SpeechRuntimeStatusService } from './speech-status.js';
 import { createSpeechVoicePreview } from './speech-preview.js';
-import { createSingingVoicePreview } from './singing-preview.js';
+import { createSingingVoiceGeneration, createSingingVoicePreview } from './singing-preview.js';
 import { startSpeechPreviewControlService } from './speech-preview-control.js';
 import type { SpeechRuntimeConfig } from './runtime-types.js';
 import { SpeechVoiceRegistry } from './voice-registry.js';
@@ -27,6 +27,24 @@ function firstExisting(candidates: string[]): string {
   if (!found) throw new Error('speech_manifest_missing');
   return path.resolve(found);
 }
+
+/**
+ * 参考音色导入与实时语音媒体链路必须复用同一套受管 ffprobe 发现规则。
+ * 官方 FFmpeg 包同时提供 ffmpeg/ffprobe，不能假设存在单独的 ffprobe 组件目录。
+ */
+export function resolveReferenceAudioFfprobeDependency(input: {
+  explicitPath?: string;
+  runtimeDepsRoot: string;
+}) {
+  return resolveExecutableDependency({
+    id: 'ffprobe',
+    displayName: 'ffprobe',
+    explicitPath: input.explicitPath,
+    runtimeDepsRoot: input.runtimeDepsRoot,
+    componentIds: ['ffmpeg_runtime', 'ffprobe'],
+  });
+}
+
 export function createSpeechRuntime(input: {
   config: SpeechRuntimeConfig;
   ctiHome: string;
@@ -44,13 +62,15 @@ export function createSpeechRuntime(input: {
     path.join(input.skillRoot, 'dist', 'speech-sidecar', 'runtime_server.py'),
     path.join(input.skillRoot, 'src', 'speech', 'sidecar', 'runtime_server.py'),
   ];
+  const singingLyricsVerifierCandidates = [
+    path.join(input.skillRoot, 'dist', 'speech-sidecar', 'firered_lyrics_verifier.py'),
+    path.join(input.skillRoot, 'src', 'speech', 'sidecar', 'firered_lyrics_verifier.py'),
+  ];
   const voiceRegistry = new SpeechVoiceRegistry(
     path.join(input.ctiHome, 'runtime', 'speech', 'voices'),
     input.config.maxInputBytes,
     async (sourcePath) => {
-      const ffprobe = resolveExecutableDependency({
-        id: 'ffprobe',
-        displayName: 'ffprobe',
+      const ffprobe = resolveReferenceAudioFfprobeDependency({
         explicitPath: input.config.ffprobePath,
         runtimeDepsRoot,
       });
@@ -90,6 +110,7 @@ export function createSpeechRuntime(input: {
     ctiHome: input.ctiHome,
     runtimeDepsRoot,
     bundledSidecarCandidates: sidecarCandidates,
+    bundledSingingLyricsVerifierCandidates: singingLyricsVerifierCandidates,
     voiceRegistry,
     benchmarkStore,
     hardwareId: hardware.id,
@@ -113,6 +134,12 @@ export function createSpeechRuntime(input: {
       return Boolean(identity && benchmarkStore.find(identity)?.state === 'ready');
     },
     readGpuMemoryMiB: readNvidiaUsedMemoryMiB,
+    verifyOutput: async ({ lyrics, candidatePath, referenceAudioPath, signal }) => {
+      // ACE-Step 和 Qwen/SenseVoice 共用单张 GPU：先确认歌声进程真实退出，
+      // 再启动 Sidecar 做歌词与说话人验收，禁止两个重型模型并发常驻。
+      await managedSingingRuntime.stopAndWait();
+      return host.verifySingingOutput({ lyrics, candidatePath, referenceAudioPath, signal });
+    },
   });
   let previewControlService: ReturnType<typeof startSpeechPreviewControlService> | undefined;
   const status = new SpeechRuntimeStatusService({
@@ -163,30 +190,46 @@ export function createSpeechRuntime(input: {
             benchmarkMode: true,
             signal,
           }),
-          previewSingingVoice: async ({ text, modelId, voiceProfileId, signal }) => {
+          verifyReferenceTranscript: ({ sourcePath, confirmedTranscript, signal }) => host.verifyLocalReferenceTranscript({
+            path: sourcePath,
+            confirmedTranscript,
+            confirmedTranscriptAccepted: true,
+            signal,
+          }),
+          previewSingingVoice: async ({ plan, modelId, voiceProfileId, signal }) => {
             // Qwen TTS 与 ACE-Step 共用本机 GPU；歌声启动前释放空闲 Sidecar，
             // 后续 ASR/TTS 请求会按需重建，避免两个模型常驻挤压 8GB 显存。
             await host.sidecar.stop();
             return createSingingVoicePreview({
               host: singingHost,
-              lyrics: text,
+              plan,
               modelId,
               voiceProfileId,
               signal,
             });
           },
-          benchmarkSingingVoice: async ({ text, modelId, voiceProfileId, signal }) => {
+          benchmarkSingingVoice: async ({ plan, modelId, voiceProfileId, signal }) => {
             const identity = singingIdentity();
             if (!identity) throw new Error('singing_managed_components_missing');
             await host.sidecar.stop();
             return createSingingVoicePreview({
               host: singingHost,
-              lyrics: text,
+              plan,
               modelId,
               voiceProfileId,
               signal,
               benchmarkMode: true,
               modelRevision: identity.revision,
+            });
+          },
+          generateSinging: async ({ plan, modelId, voiceProfileId, signal }) => {
+            await host.sidecar.stop();
+            return createSingingVoiceGeneration({
+              host: singingHost,
+              plan,
+              modelId,
+              voiceProfileId,
+              signal,
             });
           },
         });

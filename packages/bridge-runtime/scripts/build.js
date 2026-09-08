@@ -143,7 +143,7 @@ await esbuild.build({
 // Python Sidecar 只发布白名单源码；先清理旧目录，避免本机 __pycache__/.pyc 或历史文件残留进 dist/live。
 const speechSidecarSource = fromPackageRoot('src', 'speech', 'sidecar');
 const speechSidecarTarget = fromPackageRoot('dist', 'speech-sidecar');
-const speechSidecarFiles = ['runtime_server.py', 'backends.py', 'requirements.txt'];
+const speechSidecarFiles = ['runtime_server.py', 'backends.py', 'firered_lyrics_verifier.py', 'requirements.txt'];
 fs.rmSync(speechSidecarTarget, { recursive: true, force: true });
 fs.mkdirSync(speechSidecarTarget, { recursive: true });
 for (const fileName of speechSidecarFiles) {

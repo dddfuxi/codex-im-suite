@@ -79,6 +79,45 @@ describe('bridge action block parsing', () => {
     ]);
   });
 
+  it('preserves only a bounded voice-only directive for scheduled notifications', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '整点语音提醒',
+        schedule: { kind: 'cron', expression: '0 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'notify',
+          text: '大家记得喝水。',
+          speech: { mode: 'voice_only' },
+        },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.taskAction, {
+      kind: 'notify',
+      text: '大家记得喝水。',
+      speech: { mode: 'voice_only' },
+    });
+
+    const rejected = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '越界语音提醒',
+        schedule: { kind: 'cron', expression: '0 10 * * 1-5', timezone: 'Asia/Shanghai' },
+        taskAction: {
+          kind: 'notify',
+          text: '大家记得喝水。',
+          speech: { mode: 'voice_only', voiceId: 'model-supplied' },
+        },
+      }),
+      '```',
+    ].join('\n'));
+    assert.equal(rejected.action, null);
+  });
+
   it('parses a per-run check-in action without accepting participant identities', () => {
     const result = extractCtiScheduledTaskAction([
       '```cti-scheduled-task',

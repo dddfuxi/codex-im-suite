@@ -222,6 +222,98 @@ internal sealed partial class MainForm
             ]);
     }
 
+    /// <summary>
+    /// AIBridge 是 Unity 工程内的编辑器工具，不是 MCP server。
+    /// 这里只从受控项目注册表发现 CLI，避免把某个工程路径写死到面板。
+    /// </summary>
+    private RuntimeUnitContract BuildAIBridgeRuntimeUnit(RuntimeUnitManifestDefinition manifest)
+    {
+        var snapshot = BuildProjectRegistrySnapshot();
+        var unityProjects = snapshot.Projects
+            .Where(project => project.Enabled && string.Equals(project.Type, "unity", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var available = unityProjects
+            .Select(project => (Project: project, Cli: ResolveAIBridgeCliPath(project)))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Cli))
+            .ToArray();
+        var status = unityProjects.Length == 0
+            ? "warning"
+            : available.Length == unityProjects.Length ? "ok" : available.Length > 0 ? "warning" : "error";
+        var detail = snapshot.Exists
+            ? $"已发现 {unityProjects.Length} 个启用的 Unity 项目，AIBridge CLI 可用 {available.Length} 个。"
+            : "项目注册表不存在，无法安全发现 AIBridge；请先在项目注册表中登记 Unity 工程。";
+        if (!string.IsNullOrWhiteSpace(snapshot.Error)) detail += $" 读取错误：{snapshot.Error}";
+        var firstProjectRoot = unityProjects
+            .Select(project => project.UnityProjectRoot ?? project.WorkspaceRoot)
+            .FirstOrDefault(root => !string.IsNullOrWhiteSpace(root)) ?? "";
+        var version = available.Length > 0 ? "project" : "";
+        return new RuntimeUnitContract(
+            manifest.Id,
+            manifest.Id,
+            manifest.DisplayName,
+            manifest.Kind,
+            manifest.Category,
+            status,
+            detail,
+            manifest.Enabled,
+            manifest.InstallState,
+            snapshot.RegistryPath,
+            firstProjectRoot,
+            version,
+            manifest.Description,
+            false,
+            [
+                new RuntimeActionContract("check", "检查", true),
+                new RuntimeActionContract("status", "状态", true),
+                new RuntimeActionContract("openLocation", "打开工程", unityProjects.Length > 0),
+            ]);
+    }
+
+    private static string ResolveAIBridgeCliPath(RegisteredProjectContract project)
+    {
+        var root = project.UnityProjectRoot ?? project.WorkspaceRoot;
+        if (string.IsNullOrWhiteSpace(root)) return "";
+        var candidates = new[]
+        {
+            Path.Combine(root, ".aibridge", "cli", "AIBridgeCLI.exe"),
+            Path.Combine(root, ".aibridge", "cli", "aibridgecli.exe"),
+            Path.Combine(root, ".aibridge", "cli", "AIBridgeCLI.dll"),
+        };
+        return candidates.FirstOrDefault(File.Exists) ?? "";
+    }
+
+    private async Task<string> CheckAIBridgeAsync()
+    {
+        var snapshot = BuildProjectRegistrySnapshot();
+        var projects = snapshot.Projects
+            .Where(project => project.Enabled && string.Equals(project.Type, "unity", StringComparison.OrdinalIgnoreCase))
+            .Select(project => (Project: project, Cli: ResolveAIBridgeCliPath(project)))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Cli))
+            .ToArray();
+        if (projects.Length == 0)
+        {
+            return snapshot.Exists
+                ? "AIBridge 不可用：当前没有已登记且包含 .aibridge CLI 的 Unity 工程。"
+                : "AIBridge 不可用：项目注册表不存在。";
+        }
+
+        var lines = new List<string>();
+        foreach (var item in projects)
+        {
+            var workingDirectory = item.Project.UnityProjectRoot ?? item.Project.WorkspaceRoot;
+            var isManagedDll = item.Cli.EndsWith(".dll", StringComparison.OrdinalIgnoreCase);
+            var fileName = isManagedDll ? "dotnet" : item.Cli;
+            var arguments = isManagedDll
+                ? $"\"{item.Cli.Replace("\"", "\\\"")}\" harness status --pretty --timeout 8000"
+                : "harness status --pretty --timeout 8000";
+            var result = await RunProcessAsync(fileName, arguments, workingDirectory, null, 15000);
+            var output = string.IsNullOrWhiteSpace(result.Stdout) ? result.Stderr : result.Stdout;
+            var firstLine = FirstNonEmptyLine(output) ?? (result.ExitCode == 0 ? "命令已返回空结果" : "命令失败");
+            lines.Add($"{item.Project.DisplayName}: {(result.ExitCode == 0 ? "通过" : "失败")} | {firstLine}");
+        }
+        return string.Join(Environment.NewLine, lines);
+    }
+
     private RuntimeUnitContract BuildManagedToolRuntimeUnit(RuntimeUnitManifestDefinition manifest)
     {
         var updatePlan = ResolveRuntimeUpdatePlan(manifest);

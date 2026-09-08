@@ -55,6 +55,7 @@ import { extractFinalReplyEnvelope } from './application/delivery-preparation.js
 import type { ActiveChoiceContinuation } from './application/choice-prompts.js';
 import {
   extractFeishuBotMissingAppScopes,
+  extractFeishuCliUserMissingScopeEvidence,
   extractFeishuCliUserAuthorizationChallenge,
   extractFeishuCliUserAuthorizationPolicyViolation,
   type FeishuCliUserAuthorizationChallenge,
@@ -131,6 +132,7 @@ export interface ConversationResult {
     inputEvidenceProvider?: string;
     feishuCliUserAuthorizationChallenges?: FeishuCliUserAuthorizationChallenge[];
     feishuCliUserAuthorizationViolations?: FeishuCliUserAuthorizationPolicyViolation[];
+    feishuCliUserMissingScopes?: import('./feishu-cli-user-auth.js').FeishuCliUserMissingScopeEvidence[];
     replaySafety?: WorkflowReplaySafety;
     retryDisposition?: WorkflowRetryDisposition;
     /** 后置协议审查的稳定错误码；只用于观察链，不直接外发。 */
@@ -235,6 +237,8 @@ export interface ConversationProcessOptions {
   additionalPromptSections?: PromptSection[];
   /** Adapter 产生的本轮关联证据，不能依赖 system prompt 的保留长度。 */
   priorityTurnContext?: string;
+  /** 仅当 Context Broker 已确认回合不依赖回复/续办上下文时才允许轻聊快速路径。 */
+  lightChatEligible?: boolean;
   memoryPlan?: MemoryQueryPlan;
   /** 只让主模型整理 bridge 已裁决的结果，禁止再次调用工具或写外部状态。 */
   responseOnly?: boolean;
@@ -459,6 +463,7 @@ function emptyExecutionEvidence(requirement?: ExecutionRequirement, noEvidenceRe
     acceptedInputEvidenceIds: [],
     feishuCliUserAuthorizationChallenges: [],
     feishuCliUserAuthorizationViolations: [],
+    feishuCliUserMissingScopes: [],
     ...(requirement ? {
       requiredEvidenceKind: requirement.kind,
       evidenceSatisfied: requirement.kind === 'none',
@@ -549,6 +554,7 @@ function buildBridgeScopedPrompt(
       'capability_router.existing_sticker_delivery',
       'policy_registry.outbound_mention_targets',
       'policy_registry.scheduled_task_actions',
+      'policy_registry.panel_settings_actions',
       'policy_registry.artifact_promotion',
       'memory_system.partitioned_memory_intent',
       'delivery_layer.result_envelope',
@@ -1260,6 +1266,7 @@ export async function processMessage(
       sdkSessionId: attempt === 'initial' && providerRecoveryAttempt === 0 ? binding.sdkSessionId || undefined : undefined,
       forceFreshThread: attempt === 'initial' && providerRecoveryAttempt === 0 ? !binding.sdkSessionId : true,
       interactionMode: options?.responseOnly || responseOnlyRepair ? 'response_only' : 'agent',
+      lightChatEligible: options?.lightChatEligible,
       model: effectiveModel,
       systemPrompt: composedPrompt.text,
       priorityTurnContext: options?.priorityTurnContext,
@@ -1679,6 +1686,21 @@ async function consumeStream(
               const resultData = JSON.parse(event.data);
               const resultQuality = classifyToolResultQuality(resultData.content, resultData.is_error);
               const matchingToolUse = toolUsesById.get(String(resultData.tool_use_id || ''));
+              if (matchingToolUse) {
+                const missingScopeEvidence = extractFeishuCliUserMissingScopeEvidence({
+                  toolUseId: String(resultData.tool_use_id || ''),
+                  toolName: matchingToolUse.name,
+                  toolInput: matchingToolUse.input,
+                  toolResultContent: resultData.content,
+                  toolResultIsError: !resultQuality.ok,
+                });
+                if (missingScopeEvidence && !(executionEvidence.feishuCliUserMissingScopes || []).some((item) => item.toolUseId === missingScopeEvidence.toolUseId)) {
+                  executionEvidence.feishuCliUserMissingScopes = [
+                    ...(executionEvidence.feishuCliUserMissingScopes || []),
+                    missingScopeEvidence,
+                  ];
+                }
+              }
               const managedArtifacts = registerToolResultArtifactsSafely({
                 sessionId,
                 turnId,

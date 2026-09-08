@@ -38,9 +38,28 @@ export interface McpManifestRecord {
   cwd?: string;
   registerName?: string;
   env?: Record<string, string>;
+  /** 启动此 MCP 前必须已在 Runtime 进程环境中存在的凭据名；只校验存在性，绝不读取或记录值。 */
+  requiredEnvironment?: string[];
+  /** 可按会话保存、且允许回注入模型的非敏感上下文字段。 */
+  context?: McpContextManifest;
   healthCheck?: McpHealthCheck;
   description?: string;
   manifestPath: string;
+}
+
+export interface McpContextFieldManifest {
+  /** 注入 MCP 时使用的稳定字段名，例如 company_id。 */
+  name: string;
+  /** 用户显式提供该字段时允许识别的名称；不得用于识别凭据。 */
+  aliases?: string[];
+  /** 完整值校验正则，避免把自然语言或无关数据写入受管状态。 */
+  valuePattern?: string;
+  /** 可选的 Runtime 环境默认值，例如 CTI_TAPD_DEFAULT_COMPANY_ID。 */
+  envDefault?: string;
+}
+
+export interface McpContextManifest {
+  fields?: McpContextFieldManifest[];
 }
 
 /**
@@ -450,6 +469,17 @@ export class McpBridge {
 
   constructor(private readonly config: Config) {}
 
+  /**
+   * 凭据只在受管 Runtime 环境中保存和传递。这里特意不把值拼进日志、错误或
+   * 模型 Prompt；缺失时仅让该可选 MCP 不进入当前连接投影。
+   */
+  private hasRequiredEnvironment(manifest: McpManifestRecord): boolean {
+    return (manifest.requiredEnvironment || []).every((key) => {
+      const normalized = key.trim();
+      return /^[A-Za-z_][A-Za-z0-9_]*$/u.test(normalized) && Boolean(process.env[normalized]?.trim());
+    });
+  }
+
   private validateManifestWorkspace(manifest: McpManifestRecord): McpHealthStatus {
     const manifestCwd = expandManifestValue(manifest.cwd, this.config);
     if (!manifestCwd) {
@@ -522,6 +552,7 @@ export class McpBridge {
     const projections: CodexMcpServerProjection[] = [];
     for (const manifest of this.listManifests()) {
       if (manifest.enabled === false) continue;
+      if (!this.hasRequiredEnvironment(manifest)) continue;
       const name = (manifest.registerName || manifest.id || '').trim();
       if (!/^[A-Za-z0-9_-]{1,64}$/u.test(name)) continue;
       if (!this.validateManifestWorkspace(manifest).ok) continue;
@@ -579,7 +610,7 @@ export class McpBridge {
 
   listAvailableManifestNames(): string[] {
     return this.listManifests()
-      .filter((manifest) => manifest.enabled !== false)
+      .filter((manifest) => manifest.enabled !== false && this.hasRequiredEnvironment(manifest))
       .map((manifest) => manifest.displayName || manifest.id)
       .filter(Boolean);
   }

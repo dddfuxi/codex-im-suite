@@ -10,6 +10,17 @@ export interface ResolvedProviderWorkspace {
   source: 'workspace_plan' | 'legacy_params';
 }
 
+/**
+ * 临时隔离工作区不是 Git 项目，Codex 的仓库信任检查对这类受控沙箱没有
+ * 可验证的仓库根可比较。只有 workspace plan 明确没有 projectId 时才跳过
+ * 该检查；已注册项目仍保留 Codex 原生信任门禁。
+ */
+export function shouldSkipGitRepoCheckForWorkspace(
+  workspacePlan: Pick<NonNullable<StreamChatParams['workspacePlan']>, 'primaryWorkspace'> | undefined,
+): boolean {
+  return Boolean(workspacePlan && !workspacePlan.primaryWorkspace.projectId);
+}
+
 function existingDirectory(value: string | undefined): string | undefined {
   if (!value?.trim()) return undefined;
   const resolved = path.resolve(value.trim());

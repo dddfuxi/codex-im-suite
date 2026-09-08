@@ -16,11 +16,13 @@ import type {
   ReminderActionHost,
   ScheduledTaskActionHost,
   BridgeControlHost,
+  PanelSettingsHost,
   ExtensionCatalogHost,
   FeishuCloudDocumentHost,
   FeishuCliUserAuthHost,
   FeishuOAuthManualHost,
   MemoryIntentHost,
+  ContinuationAdjustmentIntentHost,
   StickerSemanticEvolutionHost,
   AgentHomeHost,
   SelfMaintenanceHost,
@@ -41,11 +43,13 @@ export interface BridgeContext {
   reminders?: ReminderActionHost;
   scheduledTasks?: ScheduledTaskActionHost;
   bridgeControl?: BridgeControlHost;
+  panelSettings?: PanelSettingsHost;
   extensions?: ExtensionCatalogHost;
   feishuCloudDocuments?: FeishuCloudDocumentHost;
   feishuCliUserAuth?: FeishuCliUserAuthHost;
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
+  continuationAdjustments?: ContinuationAdjustmentIntentHost;
   stickerSemantics?: StickerSemanticEvolutionHost;
   agentHome?: AgentHomeHost;
   selfMaintenance?: SelfMaintenanceHost;

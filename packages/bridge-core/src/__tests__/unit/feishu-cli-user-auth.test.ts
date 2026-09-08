@@ -4,6 +4,7 @@ import {
   extractFeishuBotMissingAppScopes,
   extractFeishuCliUserAuthorizationChallenge,
   extractFeishuCliUserAuthorizationPolicyViolation,
+  extractFeishuCliUserMissingScopeEvidence,
 } from '../../lib/bridge/feishu-cli-user-auth';
 
 const validToolInput = {
@@ -20,6 +21,49 @@ const validToolResult = JSON.stringify({
 });
 
 describe('Feishu CLI user authorization challenge evidence', () => {
+  it('extracts one exact missing user scope from the real API error envelope', () => {
+    const evidence = extractFeishuCliUserMissingScopeEvidence({
+      toolUseId: 'tool-approval-query',
+      toolName: 'Bash',
+      toolInput: { command: 'lark-cli approval tasks query --as user --format json' },
+      toolResultContent: JSON.stringify({
+        ok: false,
+        identity: 'user',
+        error: {
+          type: 'authorization',
+          subtype: 'missing_scope',
+          identity: 'user',
+          missing_scopes: ['approval:task:read'],
+        },
+      }),
+      toolResultIsError: true,
+    });
+    assert.deepEqual(evidence, {
+      protocol: 'cti-feishu-cli-user-missing-scope/v1',
+      toolUseId: 'tool-approval-query',
+      toolName: 'Bash',
+      identity: 'user',
+      scopes: ['approval:task:read'],
+    });
+  });
+
+  it('does not turn absent or ambiguous scope data into authorization evidence', () => {
+    const base = {
+      toolUseId: 'tool-missing',
+      toolName: 'Bash',
+      toolInput: { command: 'lark-cli approval tasks query --as user --format json' },
+      toolResultIsError: true,
+    } as const;
+    assert.equal(extractFeishuCliUserMissingScopeEvidence({
+      ...base,
+      toolResultContent: JSON.stringify({ ok: false, identity: 'user', error: { subtype: 'missing_scope', identity: 'user' } }),
+    }), null);
+    assert.equal(extractFeishuCliUserMissingScopeEvidence({
+      ...base,
+      toolResultContent: JSON.stringify({ ok: false, identity: 'user', error: { subtype: 'missing_scope', identity: 'user', missing_scopes: ['a:b', 'c:d'] } }),
+    }), null);
+  });
+
   it('extracts a challenge only from a successful matching auth-login tool pair', () => {
     const challenge = extractFeishuCliUserAuthorizationChallenge({
       toolUseId: 'tool-auth-1',

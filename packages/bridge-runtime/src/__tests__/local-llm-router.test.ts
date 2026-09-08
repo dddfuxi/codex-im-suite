@@ -82,6 +82,7 @@ describe('decideConservativeRoute', () => {
         { role: 'assistant', content: '我在' },
         { role: 'user', content: '小虾米' },
       ],
+      lightChatEligible: true,
     }), baseConfig);
 
     assert.equal(decision.requestKind, 'light_chat');
@@ -90,60 +91,50 @@ describe('decideConservativeRoute', () => {
     assert.equal(decision.canFastPath, true);
   });
 
-  it('does not classify tool-like or attachment turns as light chat', () => {
-    assert.equal(isLightChatCandidate(makeParams('帮我执行 git status'), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('继续', {
+  it('requires a Bridge-issued lightweight eligibility decision', () => {
+    assert.equal(isLightChatCandidate(makeParams('哈喽', {
       systemPrompt: 'Channel assistant identity: 当前是飞书机器人。',
     }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('同步 live、重启现场机器人', {
+    assert.equal(isLightChatCandidate(makeParams('任意独立文本', {
       systemPrompt: 'Channel assistant identity: 当前是飞书机器人。',
-    }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('查一下 TAPD', {
-      systemPrompt: 'Channel assistant identity: 当前是飞书机器人。',
-    }), baseConfig), false);
+      lightChatEligible: true,
+    }), baseConfig), true);
     assert.equal(isLightChatCandidate(makeParams('看一下这张图里是什么', {
       files: [{ id: 'file-1', name: 'image.png', type: 'image/png', size: 12, data: 'AAAA' }],
+      lightChatEligible: true,
     }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('帮我检查 Unity MCP 为什么连不上'), baseConfig), false);
+    assert.equal(isLightChatCandidate(makeParams('收到', {
+      systemPrompt: 'Channel assistant identity: 当前是飞书机器人。',
+      lightChatEligible: false,
+    }), baseConfig), false);
   });
 
-  it('lets the coordinator handle conversational responsiveness probes without weakening real task gates', () => {
+  it('does not special-case responsiveness wording', () => {
     const feishuContext = 'Channel assistant identity: 当前是飞书机器人。';
 
     assert.equal(isLightChatCandidate(makeParams('让我来检查一下你快没快', {
       systemPrompt: feishuContext,
+      lightChatEligible: true,
     }), baseConfig), true);
     assert.equal(isLightChatCandidate(makeParams('测试一下机器人现在回复快不快', {
       systemPrompt: feishuContext,
+      lightChatEligible: true,
     }), baseConfig), true);
     assert.equal(isLightChatCandidate(makeParams('测试一下现在回复快不快', {
       systemPrompt: feishuContext,
+      lightChatEligible: true,
     }), baseConfig), true);
     assert.equal(isLightChatCandidate(makeParams('现在回复快吗', {
       systemPrompt: feishuContext,
+      lightChatEligible: true,
     }), baseConfig), true);
     assert.equal(isLightChatCandidate(makeParams('试试响应速度', {
       systemPrompt: feishuContext,
+      lightChatEligible: true,
     }), baseConfig), true);
-
-    assert.equal(isLightChatCandidate(makeParams('检查一下机器人服务状态', {
-      systemPrompt: feishuContext,
-    }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('测试一下这个 API 是否正常', {
-      systemPrompt: feishuContext,
-    }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('测试一下这个 API 的响应速度', {
-      systemPrompt: feishuContext,
-    }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('测试文件读取速度', {
-      systemPrompt: feishuContext,
-    }), baseConfig), false);
-    assert.equal(isLightChatCandidate(makeParams('检查 Unity MCP 响应', {
-      systemPrompt: feishuContext,
-    }), baseConfig), false);
   });
 
-  it('does not fast-path short requests that include concrete readable context objects', () => {
+  it('does not infer task eligibility from readable-object wording', () => {
     const feishuPrompt = [
       'Channel assistant identity:',
       'Feishu emoji presentation:',
@@ -152,19 +143,23 @@ describe('decideConservativeRoute', () => {
 
     assert.equal(isLightChatCandidate(makeParams('可以看一下当前工作目录吗', {
       systemPrompt: feishuPrompt,
-    }), baseConfig), false);
+      lightChatEligible: true,
+    }), baseConfig), true);
 
     assert.equal(isLightChatCandidate(makeParams('查看工作目录', {
       systemPrompt: feishuPrompt,
-    }), baseConfig), false);
+      lightChatEligible: true,
+    }), baseConfig), true);
 
     assert.equal(isLightChatCandidate(makeParams('帮我看 packages/bridge-core/package.json', {
       systemPrompt: feishuPrompt,
-    }), baseConfig), false);
+      lightChatEligible: true,
+    }), baseConfig), true);
 
     assert.equal(isLightChatCandidate(makeParams('可以看一下这个链接吗 https://example.com/a', {
       systemPrompt: feishuPrompt,
-    }), baseConfig), false);
+      lightChatEligible: true,
+    }), baseConfig), true);
   });
 
   it('does not treat a continuation as light chat when priority turn evidence requires real work', () => {
@@ -174,6 +169,7 @@ describe('decideConservativeRoute', () => {
         'Feishu recent conversation context:',
         '[被回复消息] 用户: 请读取当前项目配置并修复报错。',
       ].join('\n'),
+      lightChatEligible: false,
     }), baseConfig);
 
     assert.equal(result, false);
@@ -197,6 +193,7 @@ describe('decideConservativeRoute', () => {
         'supportingEvidence (JSON, lower priority):',
         '[]',
       ].join('\n'),
+      lightChatEligible: true,
     }), baseConfig);
 
     assert.equal(result, true);
@@ -289,17 +286,16 @@ describe('decideConservativeRoute', () => {
     }), baseConfig);
     assert.deepEqual(
       (continueCoordinator.responseSchema as { properties?: { action?: { enum?: string[] } } }).properties?.action?.enum,
-      ['delegate'],
+      ['reply', 'delegate', 'clarify'],
     );
     const whyCoordinator = buildLocalLightConversationCoordinatorParams(makeParams('为什么呀', {
       systemPrompt: 'Channel assistant identity: 小虾米',
     }), baseConfig);
     assert.deepEqual(
       (whyCoordinator.responseSchema as { properties?: { action?: { enum?: string[] } } }).properties?.action?.enum,
-      ['clarify'],
+      ['reply', 'delegate', 'clarify'],
     );
-    assert.match(whyCoordinator.systemPrompt || '', /最小澄清/);
-    assert.doesNotMatch(whyCoordinator.systemPrompt || '', /Feishu sticker library|最近.*上下文|delegate 用于/u);
+    assert.match(whyCoordinator.systemPrompt || '', /delegate 用于/u);
     assert.deepEqual(parseLocalLightConversationDecision({ action: 'delegate', reply: '' }), {
       action: 'delegate',
       intent: 'task',
@@ -308,16 +304,16 @@ describe('decideConservativeRoute', () => {
       confidence: 1,
     });
     assert.equal(parseLocalLightConversationDecision({ action: 'reply', reply: '' }), null);
-    assert.equal(getLocalConversationExpectedAction('继续'), 'delegate');
-    assert.equal(getLocalConversationExpectedAction('刚才那个'), 'clarify');
-    assert.equal(getLocalConversationExpectedAction('帮帮我'), 'clarify');
+    assert.equal(getLocalConversationExpectedAction('继续'), undefined);
+    assert.equal(getLocalConversationExpectedAction('刚才那个'), undefined);
+    assert.equal(getLocalConversationExpectedAction('帮帮我'), undefined);
     assert.equal(getLocalConversationExpectedAction('哈喽哈喽'), undefined);
     assert.equal(getLocalConversationExpectedAction('这个呢', [
       'Structured turn evidence summary (JSON, quoted facts only):',
       JSON.stringify({ primaryEvidence: [{ content: '一个明确可读的方案名称' }] }),
       'supportingEvidence (JSON, lower priority):',
       '[]',
-    ].join('\n')), undefined);
+    ].join('\n')), 'delegate');
   });
 
   it('keeps Feishu recent conversation context in the light chat prompt profile', () => {

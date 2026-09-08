@@ -97,6 +97,9 @@
     "SpeechPanelStateContract": {
       "$ref": "speech.schema.json#/$defs/SpeechPanelStateContract"
     },
+    "PanelSettingsStateContract": {
+      "$ref": "panel-settings.schema.json#/$defs/PanelSettingsStateContract"
+    },
     "ControlPanelStateContract": {
       "type": "object",
       "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "speech", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
@@ -126,7 +129,7 @@
         "mcp": {},
         "release": {},
         "liveSync": {},
-        "settings": {},
+        "settings": { "$ref": "#/$defs/PanelSettingsStateContract" },
         "history": {},
         "speech": { "$ref": "#/$defs/SpeechPanelStateContract" },
         "workflow": {},

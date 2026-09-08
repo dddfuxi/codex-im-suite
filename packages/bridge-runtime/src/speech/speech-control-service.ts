@@ -1,4 +1,9 @@
-import type { SpeechSettingsContract, SpeechStatusContract } from '@codex-im-suite/contracts/speech';
+import {
+  createSingingAudioContentPlan,
+  type SingingAudioContentPlanContract,
+  type SpeechSettingsContract,
+  type SpeechStatusContract,
+} from '@codex-im-suite/contracts/speech';
 
 import type { ManagedSpeechDependencyManager } from './managed-dependency-manager.js';
 import type { SpeechRuntimeStatusService } from './speech-status.js';
@@ -10,6 +15,8 @@ import {
 import { DEFAULT_PRESET_VOICE, type SpeechVoiceRegistry } from './voice-registry.js';
 import type { SpeechModelBenchmarkStore } from './speech-model-benchmark-store.js';
 import { findSpeechModel } from './speech-model-catalog.js';
+import { speakerSimilarityAcceptanceRecorded } from './speaker-similarity-policy.js';
+import type { RuntimeReferenceTranscriptVerificationReceipt } from './runtime-speech-host.js';
 
 export const SPEECH_CONTROL_ACTIONS = [
   'speech.refresh',
@@ -19,8 +26,11 @@ export const SPEECH_CONTROL_ACTIONS = [
   'speech.benchmarkTtsModel',
   'speech.benchmarkSingingModel',
   'speech.importReferenceVoice',
+  'speech.renameReferenceVoice',
+  'speech.deleteReferenceVoice',
   'speech.previewVoice',
   'speech.previewSingingVoice',
+  'speech.generateSinging',
   'speech.activateVoiceProfile',
 ] as const;
 
@@ -31,15 +41,53 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function stringValue(value: unknown, field: string, allowEmpty = false): string {
+function stringValue(value: unknown, field: string, allowEmpty = false, maxLength = 4_000): string {
   if (typeof value !== 'string') throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '语音命令参数无效');
   const normalized = value.trim();
-  if ((!normalized && !allowEmpty) || normalized.length > 4_000) throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '语音命令参数无效');
+  if ((!normalized && !allowEmpty) || normalized.length > maxLength) throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '语音命令参数无效');
   return normalized;
 }
 
 function hasOption(status: SpeechStatusContract, field: 'replyPolicy' | 'deliveryMode' | 'asrProvider' | 'ttsProvider' | 'tonePolicy' | 'singingProvider', value: string): boolean {
   return status[field].options.some((option) => option.id === value && option.enabled);
+}
+
+function buildSingingPlan(
+  input: Record<string, unknown>,
+  outputMode: 'quick_preview' | 'full_generation',
+  config: SpeechRuntimeConfig,
+  fallbackLyrics?: string,
+): SingingAudioContentPlanContract {
+  const lyrics = stringValue(input.lyrics ?? input.text ?? fallbackLyrics, 'singing_lyrics', false, 6_000);
+  const stylePrompt = typeof input.stylePrompt === 'string' && input.stylePrompt.trim()
+    ? stringValue(input.stylePrompt, 'singing_style_prompt', false, 500)
+    : '清晰自然的中文演唱，准确表达歌词内容，保持稳定节奏与干净人声';
+  const vocalLanguage = typeof input.vocalLanguage === 'string' && input.vocalLanguage.trim()
+    ? stringValue(input.vocalLanguage, 'singing_vocal_language', false, 16)
+    : 'zh';
+  const melodyMode = input.melodyMode === undefined ? 'auto' : stringValue(input.melodyMode, 'singing_melody_mode');
+  // 当前稳定 Provider 只支持自动旋律；其它模式必须等声明相应输入协议的 Provider，
+  // 不能悄悄忽略用户选择。
+  if (melodyMode !== 'auto') {
+    throw new RuntimeSpeechError('singing_melody_mode_unsupported', 'blocked', '当前歌声 Provider 尚未接入该旋律输入模式');
+  }
+  const requestedDurationSeconds = input.durationSeconds === undefined || input.durationSeconds === null
+    || input.durationSeconds === '' ? undefined : Number(input.durationSeconds);
+  const plan = createSingingAudioContentPlan({
+    outputMode,
+    lyrics,
+    stylePrompt,
+    vocalLanguage,
+    requestedDurationSeconds,
+    maxDurationSeconds: config.maxSongDurationSeconds,
+    maxLyricsCharacters: 6_000,
+    melodyMode: 'auto',
+    ...(typeof input.voiceProfileId === 'string' && input.voiceProfileId.trim() && input.voiceProfileId !== 'acestep.default'
+      ? { voiceRequirement: 'active_reference' as const }
+      : {}),
+  });
+  if (!plan) throw new RuntimeSpeechError('singing_content_plan_invalid', 'blocked', '歌词、风格、语言或时长不符合歌声生成限制');
+  return plan;
 }
 
 export class SpeechControlService {
@@ -62,15 +110,24 @@ export class SpeechControlService {
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
     benchmarkSingingVoice?: (input: {
-      text: string;
+      plan: SingingAudioContentPlanContract;
       modelId: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
     previewSingingVoice?: (input: {
-      text: string;
+      plan: SingingAudioContentPlanContract;
       modelId: string;
       voiceProfileId: string;
     }) => Promise<SpeechPreviewReceipt>;
+    generateSinging?: (input: {
+      plan: SingingAudioContentPlanContract;
+      modelId: string;
+      voiceProfileId: string;
+    }) => Promise<SpeechPreviewReceipt>;
+    verifyReferenceTranscript?: (input: {
+      sourcePath: string;
+      confirmedTranscript: string;
+    }) => Promise<RuntimeReferenceTranscriptVerificationReceipt>;
     benchmarkStore?: SpeechModelBenchmarkStore;
     hardwareId?: string;
     gpuMemoryMiB?: number;
@@ -100,6 +157,12 @@ export class SpeechControlService {
         ...DEFAULT_PRESET_VOICE,
       });
     }
+    else if (action === 'speech.renameReferenceVoice') {
+      this.options.voiceRegistry.renameReferenceVoice(
+        stringValue(input.voiceProfileId, 'voice_profile_id'),
+        stringValue(input.displayName, 'display_name'),
+      );
+    }
     else if (action === 'speech.benchmarkTtsModel') {
       const current = await this.refreshStatus();
       const modelId = stringValue(input.modelId, 'model_id');
@@ -113,15 +176,18 @@ export class SpeechControlService {
           '当前模型尚未由 live Runtime 加载，不能执行真实性能测试',
         );
       }
+      const requestedVoiceProfileId = typeof input.voiceProfileId === 'string' && input.voiceProfileId.trim()
+        ? stringValue(input.voiceProfileId, 'voice_profile_id') : '';
       const configuredProfile = current.voiceProfiles.find((item) => item.id === this.options.config.voiceProfileId
         && item.compatibleTtsModelIds.includes(modelId));
-      const voiceProfileId = model.defaultVoiceProfileId
+      const voiceProfileId = requestedVoiceProfileId
+        || model.defaultVoiceProfileId
         || configuredProfile?.id
         || current.voiceProfiles.find((item) => item.kind === 'reference' && item.compatibleTtsModelIds.includes(modelId))?.id
         || '';
       const profile = current.voiceProfiles.find((item) => item.id === voiceProfileId);
       if (!profile || !profile.compatibleTtsModelIds.includes(modelId)
-        || (profile.state !== 'ready' && profile.diagnosticCode !== 'voice_clone_benchmark_not_verified')) {
+        || (profile.state !== 'ready' && profile.diagnosticCode !== 'voice_clone_similarity_not_verified')) {
         throw new RuntimeSpeechError('tts_model_benchmark_voice_unavailable', 'blocked', '当前模型没有可用于测试的兼容音色');
       }
       const startedAt = Date.now();
@@ -133,19 +199,34 @@ export class SpeechControlService {
         });
         const warmSynthesisMs = Date.now() - startedAt;
         const realTimeFactor = warmSynthesisMs / receipt.durationMs;
-        const ready = warmSynthesisMs <= 20_000;
+        const referenceProfile = profile.kind === 'reference';
+        const similarityReady = !referenceProfile || (
+          receipt.speakerSimilarityPassed === true
+          && typeof receipt.speakerSimilarity === 'number'
+          && typeof receipt.speakerSimilarityThreshold === 'number'
+          && receipt.speakerSimilarity >= receipt.speakerSimilarityThreshold
+        );
+        const ready = warmSynthesisMs <= 20_000 && similarityReady;
         this.options.benchmarkStore.write({
           modelId,
           providerId: model.providerId,
           revision: receipt.modelRevision || model.benchmark.revision,
           hardwareId: this.options.hardwareId,
+          ...(referenceProfile ? { voiceProfileId } : {}),
           state: ready ? 'ready' : 'blocked',
           testedAt: new Date().toISOString(),
           warmSynthesisMs,
           outputDurationMs: receipt.durationMs,
           realTimeFactor,
           ...(receipt.peakVramMiB !== undefined ? { peakVramMiB: receipt.peakVramMiB } : {}),
-          ...(ready ? {} : { diagnosticCode: 'tts_model_warm_benchmark_too_slow' }),
+          ...(receipt.speakerSimilarity !== undefined ? { speakerSimilarity: receipt.speakerSimilarity } : {}),
+          ...(receipt.speakerSimilarityThreshold !== undefined ? { speakerSimilarityThreshold: receipt.speakerSimilarityThreshold } : {}),
+          ...(receipt.speakerSimilarityPassed !== undefined ? { speakerSimilarityPassed: receipt.speakerSimilarityPassed } : {}),
+          ...(ready ? {} : {
+            diagnosticCode: similarityReady
+              ? 'tts_model_warm_benchmark_too_slow'
+              : 'voice_clone_similarity_below_threshold',
+          }),
         });
       } catch (error) {
         this.options.benchmarkStore.write({
@@ -153,6 +234,7 @@ export class SpeechControlService {
           providerId: model.providerId,
           revision: model.benchmark.revision,
           hardwareId: this.options.hardwareId,
+          ...(profile.kind === 'reference' ? { voiceProfileId } : {}),
           state: 'blocked',
           testedAt: new Date().toISOString(),
           diagnosticCode: error instanceof RuntimeSpeechError ? error.code : 'tts_model_benchmark_failed',
@@ -175,8 +257,14 @@ export class SpeechControlService {
       }
       const startedAt = Date.now();
       try {
+        const benchmarkPlan = buildSingingPlan(
+          { voiceProfileId },
+          'quick_preview',
+          this.options.config,
+          '[Verse]\n晚风轻轻经过窗前，我把今天唱成温柔的纪念。',
+        );
         const receipt = await this.options.benchmarkSingingVoice({
-          text: '[Verse]\n晚风轻轻经过窗前，我把今天唱成温柔的纪念。',
+          plan: benchmarkPlan,
           modelId,
           voiceProfileId,
         });
@@ -187,8 +275,28 @@ export class SpeechControlService {
           && peakVramMiB! > 0
           && Number.isFinite(this.options.gpuMemoryMiB)
           && peakVramMiB! <= this.options.gpuMemoryMiB!;
-        const ready = warmSynthesisMs <= 180_000 && memoryReady;
-        this.options.benchmarkStore.write({
+        const referenceVoice = voiceProfileId !== 'acestep.default';
+        const lyricsReady = receipt.lyricsAlignmentPassed === true
+          && typeof receipt.lyricsAlignment === 'number'
+          && typeof receipt.lyricsAlignmentThreshold === 'number'
+          && receipt.lyricsAlignment >= receipt.lyricsAlignmentThreshold;
+        const similarityReady = !referenceVoice || (
+          receipt.speakerSimilarityPassed === true
+          && typeof receipt.speakerSimilarity === 'number'
+          && typeof receipt.speakerSimilarityThreshold === 'number'
+          && receipt.speakerSimilarity >= receipt.speakerSimilarityThreshold
+        );
+        const ready = warmSynthesisMs <= 180_000 && memoryReady && lyricsReady && similarityReady;
+        const diagnosticCode = ready
+          ? undefined
+          : !lyricsReady
+            ? 'singing_lyrics_alignment_below_threshold'
+            : !similarityReady
+              ? 'singing_voice_similarity_below_threshold'
+              : memoryReady
+                ? 'singing_warm_benchmark_too_slow'
+                : 'singing_vram_benchmark_unavailable_or_exceeded';
+        const commonRecord = {
           modelId,
           providerId: this.options.config.singingProvider,
           revision,
@@ -199,34 +307,117 @@ export class SpeechControlService {
           outputDurationMs: receipt.durationMs,
           realTimeFactor,
           ...(peakVramMiB !== undefined ? { peakVramMiB } : {}),
-          ...(ready ? {} : {
-            diagnosticCode: memoryReady
-              ? 'singing_warm_benchmark_too_slow'
-              : 'singing_vram_benchmark_unavailable_or_exceeded',
-          }),
-        });
+          ...(receipt.lyricsAlignment !== undefined ? { lyricsAlignment: receipt.lyricsAlignment } : {}),
+          ...(receipt.lyricsAlignmentThreshold !== undefined ? { lyricsAlignmentThreshold: receipt.lyricsAlignmentThreshold } : {}),
+          ...(receipt.lyricsAlignmentPassed !== undefined ? { lyricsAlignmentPassed: receipt.lyricsAlignmentPassed } : {}),
+          ...(diagnosticCode ? { diagnosticCode } : {}),
+        } as const;
+        // 全局记录只代表模型性能与歌词能力；参考音色验收另写精确 Profile 记录。
+        this.options.benchmarkStore.write(commonRecord);
+        if (referenceVoice) {
+          this.options.benchmarkStore.write({
+            ...commonRecord,
+            voiceProfileId,
+            ...(receipt.speakerSimilarity !== undefined ? { speakerSimilarity: receipt.speakerSimilarity } : {}),
+            ...(receipt.speakerSimilarityThreshold !== undefined ? { speakerSimilarityThreshold: receipt.speakerSimilarityThreshold } : {}),
+            ...(receipt.speakerSimilarityPassed !== undefined ? { speakerSimilarityPassed: receipt.speakerSimilarityPassed } : {}),
+          });
+        }
       } catch (error) {
-        this.options.benchmarkStore.write({
+        const qualityMetrics = error instanceof RuntimeSpeechError ? error.qualityMetrics : undefined;
+        const failureRecord = {
           modelId,
           providerId: this.options.config.singingProvider,
           revision,
           hardwareId: this.options.hardwareId,
           state: 'blocked',
           testedAt: new Date().toISOString(),
+          ...(qualityMetrics?.lyricsAlignment !== undefined ? { lyricsAlignment: qualityMetrics.lyricsAlignment } : {}),
+          ...(qualityMetrics?.lyricsAlignmentThreshold !== undefined ? { lyricsAlignmentThreshold: qualityMetrics.lyricsAlignmentThreshold } : {}),
+          ...(qualityMetrics?.lyricsAlignmentPassed !== undefined ? { lyricsAlignmentPassed: qualityMetrics.lyricsAlignmentPassed } : {}),
           diagnosticCode: error instanceof RuntimeSpeechError ? error.code : 'singing_benchmark_failed',
-        });
+        } as const;
+        this.options.benchmarkStore.write(failureRecord);
+        if (voiceProfileId !== 'acestep.default') {
+          this.options.benchmarkStore.write({ ...failureRecord, voiceProfileId });
+        }
       }
     }
     else if (action === 'speech.importReferenceVoice') {
+      if (input.transcriptConfirmed !== true) {
+        throw new RuntimeSpeechError('voice_reference_transcript_unconfirmed', 'blocked', '参考文本尚未逐字确认');
+      }
+      if (!this.options.verifyReferenceTranscript) {
+        throw new RuntimeSpeechError(
+          'speech_reference_transcript_live_runtime_unavailable',
+          'blocked',
+          '实时参考文本核对通道不可用',
+        );
+      }
+      const sourcePath = stringValue(input.sourcePath, 'source_path');
+      const confirmedTranscript = stringValue(input.transcript, 'transcript');
+      const verification = await this.options.verifyReferenceTranscript({ sourcePath, confirmedTranscript });
+      if (verification.protocol !== 'cti-speech-reference-transcript-verification/v1'
+        || verification.transcriptStatus !== 'matched'
+        || verification.validated !== true
+        || !/^[a-f0-9]{64}$/u.test(verification.sourceSha256)) {
+        throw new RuntimeSpeechError('speech_reference_transcript_response_invalid', 'error', '参考文本核对响应无效');
+      }
       await this.options.voiceRegistry.importReferenceVoice({
-        sourcePath: stringValue(input.sourcePath, 'source_path'),
+        sourcePath,
+        expectedSha256: verification.sourceSha256,
         displayName: stringValue(input.displayName, 'display_name'),
-        transcript: stringValue(input.transcript, 'transcript'),
+        transcript: confirmedTranscript,
         sourceLabel: stringValue(input.sourceLabel, 'source_label'),
         license: stringValue(input.license, 'license'),
         authorizationConfirmed: input.authorizationConfirmed === true,
         cleanSingleSpeakerConfirmed: input.cleanSingleSpeakerConfirmed === true,
       });
+    } else if (action === 'speech.deleteReferenceVoice') {
+      const voiceProfileId = stringValue(input.voiceProfileId, 'voice_profile_id');
+      const profile = this.options.voiceRegistry.list().find((item) => item.id === voiceProfileId);
+      if (!profile) {
+        // Runtime 必须自己根据受管注册表重新解析身份，不能相信前端传入的 kind 或路径。
+        this.options.voiceRegistry.resolveProfile(voiceProfileId);
+        throw new RuntimeSpeechError('voice_preset_delete_forbidden', 'blocked', '预设音色不能从音色库删除');
+      }
+      if (profile.kind !== 'reference') {
+        throw new RuntimeSpeechError('voice_preset_delete_forbidden', 'blocked', '预设音色不能从音色库删除');
+      }
+      if (!this.options.benchmarkStore) {
+        throw new RuntimeSpeechError('speech_benchmark_store_unavailable', 'error', '音色验收记录存储不可用，未执行删除');
+      }
+
+      const activeForSpeech = this.options.config.voiceProfileId === voiceProfileId;
+      const activeForSinging = this.options.config.singingVoiceProfileId === voiceProfileId;
+      if (activeForSpeech || activeForSinging) {
+        let fallbackVoiceProfileId: string | undefined;
+        if (activeForSpeech) {
+          const model = findSpeechModel(this.options.config.ttsModelId);
+          const candidate = model?.defaultVoiceProfileId;
+          if (candidate && candidate !== voiceProfileId) {
+            try {
+              const fallback = this.options.voiceRegistry.resolveProfile(candidate);
+              if (fallback.kind === 'preset' && fallback.compatibleTtsModelIds.includes(model!.id)) {
+                fallbackVoiceProfileId = candidate;
+              }
+            } catch {
+              // 当前模型没有安全可用的默认预设时清空，让 Runtime 明确回到“未选择音色”。
+            }
+          }
+        }
+        const nextConfig: SpeechRuntimeConfig = {
+          ...this.options.config,
+          ...(activeForSpeech ? { voiceProfileId: fallbackVoiceProfileId } : {}),
+          ...(activeForSinging ? { singingVoiceProfileId: undefined } : {}),
+        };
+        this.options.saveConfig(nextConfig);
+        Object.assign(this.options.config, nextConfig);
+      }
+
+      // 先清除身份验收结论，再删除注册表与参考音频；失败时最多要求重新验收，不会复用旧结论。
+      this.options.benchmarkStore.deleteVoiceProfile(voiceProfileId);
+      this.options.voiceRegistry.deleteReferenceVoice(voiceProfileId);
     } else if (action === 'speech.previewVoice') {
       const current = await this.refreshStatus();
       const previewAction = current.actions.find((item) => item.id === action);
@@ -258,24 +449,49 @@ export class SpeechControlService {
         );
       }
       return this.options.previewVoice({ text, modelId, voiceProfileId });
-    } else if (action === 'speech.previewSingingVoice') {
+    } else if (action === 'speech.previewSingingVoice' || action === 'speech.generateSinging') {
       const current = await this.refreshStatus();
-      const previewAction = current.actions.find((item) => item.id === action);
-      if (!previewAction?.enabled || !this.options.previewSingingVoice) {
-        throw new RuntimeSpeechError(previewAction?.diagnosticCode || 'singing_preview_unavailable', 'blocked', '当前实时歌声服务无法安全试听');
+      const generationAction = current.actions.find((item) => item.id === action);
+      const generate = action === 'speech.generateSinging' ? this.options.generateSinging : this.options.previewSingingVoice;
+      if (!generationAction?.enabled || !generate) {
+        throw new RuntimeSpeechError(generationAction?.diagnosticCode || 'singing_preview_unavailable', 'blocked', '当前实时歌声服务无法安全生成');
       }
-      const text = stringValue(input.text, 'singing_preview_text');
-      if (Array.from(text).length > MAX_SPEECH_PREVIEW_TEXT_CHARACTERS) {
-        throw new RuntimeSpeechError('singing_preview_text_too_long', 'blocked', '歌声试听歌词超过长度限制');
+      const singingInputKeys = new Set([
+        'providerId', 'voiceProfileId', 'lyrics', 'stylePrompt',
+        'vocalLanguage', 'durationSeconds', 'melodyMode',
+      ]);
+      if (Object.keys(input).some((key) => !singingInputKeys.has(key))) {
+        throw new RuntimeSpeechError('singing_generation_payload_invalid', 'blocked', '歌声生成参数包含未声明字段');
       }
-      const voiceProfileId = stringValue(input.voiceProfileId, 'singing_voice_profile_id');
+      const providerId = stringValue(input.providerId, 'singing_provider_id');
+      if (providerId !== current.singingProvider.value || providerId !== this.options.config.singingProvider) {
+        throw new RuntimeSpeechError('singing_provider_not_active', 'blocked', '所选歌声 Provider 尚未由 live Runtime 激活');
+      }
+      const requestedVoiceProfileId = stringValue(input.voiceProfileId, 'singing_voice_profile_id', true);
+      const voiceProfileId = requestedVoiceProfileId || 'acestep.default';
+      const activeVoiceProfileId = this.options.config.singingVoiceProfileId || 'acestep.default';
+      if (voiceProfileId !== activeVoiceProfileId) {
+        throw new RuntimeSpeechError('singing_voice_profile_not_active', 'blocked', '所选歌声音色尚未由 live Runtime 激活');
+      }
       if (voiceProfileId !== 'acestep.default') {
         const profile = current.voiceProfiles.find((item) => item.id === voiceProfileId);
         if (!profile || profile.state !== 'ready' || !profile.capabilities.includes('singing')) {
           throw new RuntimeSpeechError(profile?.diagnosticCode || 'singing_preview_voice_profile_unavailable', 'blocked', '所选歌声音色当前不可试听');
         }
+        if (profile.singingAcceptance.state !== 'passed') {
+          throw new RuntimeSpeechError(
+            profile.singingAcceptance.diagnosticCode || 'singing_voice_similarity_not_verified',
+            'blocked',
+            '所选参考音色尚未通过歌声相似度与歌词对齐验收',
+          );
+        }
       }
-      return this.options.previewSingingVoice({ text, modelId: this.options.config.singingModel, voiceProfileId });
+      const plan = buildSingingPlan(
+        { ...input, voiceProfileId },
+        action === 'speech.generateSinging' ? 'full_generation' : 'quick_preview',
+        this.options.config,
+      );
+      return generate({ plan, modelId: this.options.config.singingModel, voiceProfileId });
     } else if (action === 'speech.activateVoiceProfile') {
       const voiceProfileId = stringValue(input.voiceProfileId, 'voice_profile_id');
       const profile = this.options.voiceRegistry.resolveProfile(voiceProfileId);
@@ -284,13 +500,28 @@ export class SpeechControlService {
       if (!model || !profile.compatibleTtsModelIds.includes(model.id)) {
         throw new RuntimeSpeechError('voice_profile_model_incompatible', 'blocked', '所选音色与当前模型不兼容');
       }
-      if (profile.kind === 'reference' && model.benchmark.state !== 'ready') {
-        throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
+      if (profile.kind === 'reference' && this.options.config.requireVoiceSimilarityAcceptance && !this.referenceBenchmarkReady(model, voiceProfileId)) {
+        throw new RuntimeSpeechError('voice_clone_similarity_not_verified', 'blocked', '参考音色尚未通过本机说话人相似度门禁');
       }
       this.options.config.voiceProfileId = voiceProfileId;
       this.options.saveConfig({ ...this.options.config });
     }
     return this.refreshStatus(false);
+  }
+
+  private referenceBenchmarkReady(
+    model: SpeechStatusContract['ttsModel']['options'][number],
+    voiceProfileId: string,
+  ): boolean {
+    if (!this.options.benchmarkStore || !this.options.hardwareId || !voiceProfileId) return false;
+    const benchmark = this.options.benchmarkStore.find({
+      modelId: model.id,
+      providerId: model.providerId,
+      revision: model.benchmark.revision,
+      hardwareId: this.options.hardwareId,
+      voiceProfileId,
+    });
+    return speakerSimilarityAcceptanceRecorded(benchmark);
   }
 
   private async saveSettings(input: Record<string, unknown>): Promise<void> {
@@ -304,7 +535,12 @@ export class SpeechControlService {
       throw new RuntimeSpeechError('speech_channel_invalid', 'blocked', '所选渠道不在 Runtime 能力列表中');
     }
     for (const field of ['replyPolicy', 'deliveryMode', 'asrProvider', 'ttsProvider', 'tonePolicy', 'singingProvider'] as const) {
-      if (!hasOption(current, field, stringValue(canonical[field], field))) {
+      const requestedValue = stringValue(canonical[field], field);
+      // 运行态配置可能保留一个已知 blocked 的旧选择（例如旧模型不支持的
+      // tone policy）。编辑其它独立设置时允许原样保留它，但绝不允许把一个
+      // 新的 disabled 选项写入配置；真实运行入口仍会报告该旧选择的诊断。
+      const preservingCurrentValue = requestedValue === current[field].value;
+      if (!hasOption(current, field, requestedValue) && !preservingCurrentValue) {
         throw new RuntimeSpeechError(`speech_${field}_invalid`, 'blocked', '所选语音能力不在 Runtime 声明列表中');
       }
     }
@@ -320,8 +556,16 @@ export class SpeechControlService {
       if (!profile.compatibleTtsModelIds.includes(ttsModelId)) {
         throw new RuntimeSpeechError('voice_profile_model_incompatible', 'blocked', '所选音色与语音模型不兼容');
       }
-      if (profile.kind === 'reference' && ttsModel.benchmark.state !== 'ready') {
-        throw new RuntimeSpeechError('voice_clone_benchmark_not_verified', 'blocked', '参考音色尚未通过本机性能门禁');
+      // 保存歌声音色等相邻设置时，不能因为“当前已持久化的说话参考音色”
+      // 的历史基准失败而阻断整次保存。该旧选择依然会在真正 TTS 合成时被
+      // Runtime 门禁拦截；只有本次试图切换到一个新的参考音色时才签发新的
+      // 说话音色准入，避免把无关设置改动误写成克隆验收通过。
+      const selectingDifferentSpeechReference = activeVoiceProfileId !== (this.options.config.voiceProfileId || '');
+      if (profile.kind === 'reference'
+        && selectingDifferentSpeechReference
+        && this.options.config.requireVoiceSimilarityAcceptance
+        && !this.referenceBenchmarkReady(ttsModel, activeVoiceProfileId)) {
+        throw new RuntimeSpeechError('voice_clone_similarity_not_verified', 'blocked', '参考音色尚未通过本机说话人相似度门禁');
       }
     }
     if (activeSingingVoiceProfileId) {

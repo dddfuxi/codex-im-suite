@@ -233,6 +233,9 @@ function Invoke-ControlPanelPublish {
     }
 }
 
+# Runtime bundle 会内联共享 Contract 的已编译入口；先构建 Contract，避免源码
+# 已更新而 live bundle 仍携带旧 dist 的协议/裁决逻辑。
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/contracts' -Description 'contracts'
 Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-core' -Description 'bridge-core'
 Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-runtime' -Description 'bridge-runtime'
 

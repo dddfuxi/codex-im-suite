@@ -13,6 +13,41 @@ const STATE_PROTOCOL = 'cti-managed-singing-runtime/v1' as const;
 const ACE_RUNTIME_COMPONENT_ID = 'ace_step_1_5';
 const ACE_MODEL_COMPONENT_ID = 'ace_step_1_5_models';
 
+/**
+ * 清理 ACE-Step 官方 Runtime 写入专用 temp 根的短期产物。
+ *
+ * 该目录与模型、缓存和最终交付目录分离，只在确认没有受管子进程使用时调用。
+ * 遍历始终使用 lstat，遇到 symlink/junction 或未知节点直接保留，避免清理越界。
+ */
+function cleanupManagedTempRoot(stateRoot: string): void {
+  const tempRoot = path.resolve(stateRoot, 'temp');
+  if (!isWithinRoot(tempRoot, stateRoot) || !fs.existsSync(tempRoot)) return;
+  let rootStat: fs.Stats;
+  try { rootStat = fs.lstatSync(tempRoot); } catch { return; }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
+
+  const cleanupDirectory = (directory: string): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.resolve(directory, entry.name);
+      if (!isWithinRoot(candidate, tempRoot)) continue;
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(candidate); } catch { continue; }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        cleanupDirectory(candidate);
+        try { fs.rmdirSync(candidate); } catch { /* 非空、竞态或权限失败时保留。 */ }
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      try { fs.unlinkSync(candidate); } catch { /* 清理仅影响观察链，不能覆盖真实 Runtime 终态。 */ }
+    }
+  };
+
+  cleanupDirectory(tempRoot);
+}
+
 // 固定 bootstrap 把官方 API 的可写 project root 与只读模型根彻底分开：
 // 缓存/产物进入 Runtime state，模型只从已经通过 marker 的受管模型根读取。
 // 官方下载与模型代码同步均被失败关闭，避免离线运行时改写受管权重目录。
@@ -70,6 +105,11 @@ interface ManagedSingingRuntimeState {
 export interface ManagedSingingRuntimeEndpoint {
   baseUrl: string;
   token: string;
+  /**
+   * ACE-Step 子进程可读取的临时目录。仅用于向同机 loopback API 交付本轮
+   * 已核验的参考音频副本，禁止把受管音色库目录暴露给模型服务。
+   */
+  temporaryAudioRoot: string;
 }
 
 interface SupervisorOperations {
@@ -159,8 +199,9 @@ function createIsolatedEnvironment(input: {
   environment.ACESTEP_CONFIG_PATH = input.modelId;
   environment.ACESTEP_LM_MODEL_PATH = input.lmModelId;
   environment.ACESTEP_LM_BACKEND = 'pt';
-  // 当前受限歌声请求使用官方直接 DiT 路径；不在启动阶段常驻加载 LM。
-  environment.ACESTEP_INIT_LLM = 'false';
+  // 歌声使用官方 5Hz LM 生成语义码并受约束解码，避免直接 DiT 在短歌词上
+  // 只生成伴奏或吞字。实际显存、时延和歌词/音色验收仍由 benchmark 硬门禁。
+  environment.ACESTEP_INIT_LLM = 'true';
   environment.ACESTEP_NO_INIT = 'false';
   environment.ACESTEP_QUEUE_WORKERS = '1';
   environment.ACESTEP_API_WORKERS = '1';
@@ -234,6 +275,9 @@ export class ManagedSingingRuntimeSupervisor {
       try { fs.unlinkSync(this.statePath); } catch { throw new RuntimeSpeechError('singing_runtime_state_locked', 'blocked', '旧歌声 Runtime 状态无法清理'); }
     }
 
+    // 只有旧 owner/child 都已确认退出后才清理上轮 temp；不会触碰模型、缓存、参考音色或最终产物。
+    cleanupManagedTempRoot(this.stateRoot);
+
     const ffmpeg = this.options.dependencies.resolveInstalledComponent('ffmpeg_runtime');
     const port = await this.operations.allocatePort();
     const token = crypto.randomBytes(32).toString('base64url');
@@ -283,7 +327,11 @@ export class ManagedSingingRuntimeSupervisor {
     child.once('exit', () => this.handleExit(runId));
     child.once('error', () => this.handleExit(runId));
 
-    const endpoint = { baseUrl: `http://127.0.0.1:${port}/`, token };
+    const endpoint: ManagedSingingRuntimeEndpoint = {
+      baseUrl: `http://127.0.0.1:${port}/`,
+      token,
+      temporaryAudioRoot: path.join(this.stateRoot, 'temp'),
+    };
     const deadline = Date.now() + Math.min(this.options.config.singingTimeoutMs, 10 * 60_000);
     while (Date.now() < deadline) {
       if (!this.operations.processAlive(child.pid)) break;
@@ -306,20 +354,39 @@ export class ManagedSingingRuntimeSupervisor {
 
   stop(): void {
     const child = this.child;
-    this.child = undefined;
     this.endpoint = undefined;
     if (child?.pid && this.operations.processAlive(child.pid)) {
-      try { child.kill('SIGTERM'); } catch { /* 退出链继续按状态归属清理。 */ }
+      try {
+        // 保留 child/runId 直到真实 exit 回调，避免终止尚未完成时新实例误清正在写入的 temp。
+        child.kill('SIGTERM');
+        return;
+      } catch { /* 仅在子进程已经退出时由下面的统一终态清理收口。 */ }
     }
-    this.removeOwnedState(this.runId);
-    this.runId = undefined;
+    this.finishStoppedRun(this.runId);
+  }
+
+  /** 歌声模型释放 GPU 后才允许启动说话/ASR Sidecar 做后验验收。 */
+  async stopAndWait(timeoutMs = 10_000): Promise<void> {
+    this.stop();
+    const deadline = Date.now() + Math.max(100, Math.min(30_000, Math.trunc(timeoutMs)));
+    while (this.child?.pid && this.operations.processAlive(this.child.pid) && Date.now() < deadline) {
+      await sleep(50);
+    }
+    if (this.child?.pid && this.operations.processAlive(this.child.pid)) {
+      throw new RuntimeSpeechError('singing_runtime_stop_timeout', 'error', '歌声 Runtime 未能及时释放 GPU');
+    }
   }
 
   private handleExit(runId: string): void {
     if (this.runId !== runId) return;
+    this.finishStoppedRun(runId);
+  }
+
+  private finishStoppedRun(runId: string | undefined): void {
     this.child = undefined;
     this.endpoint = undefined;
     this.removeOwnedState(runId);
+    cleanupManagedTempRoot(this.stateRoot);
     this.runId = undefined;
   }
 

@@ -31,6 +31,8 @@ export type ScheduledTaskAction =
   | {
       kind: 'notify';
       text: string;
+      /** 显式原生语音呈现；没有该字段时计划通知继续保持普通文字。 */
+      speech?: { mode: 'voice_only' };
     }
   | {
       /** 每次计划运行各生成一轮独立打卡，不会把整个周期任务标记完成。 */
@@ -159,6 +161,8 @@ export type ScheduledTaskRun = {
   trigger: ScheduledTaskRunTrigger;
   attempt: number;
   queuedAt: string;
+  /** 实际进入调度队列相对计划时刻的延迟；旧运行记录允许缺省。 */
+  dispatchDelayMs?: number;
   startedAt?: string;
   endedAt?: string;
   executionStatus: ScheduledTaskExecutionStatus;

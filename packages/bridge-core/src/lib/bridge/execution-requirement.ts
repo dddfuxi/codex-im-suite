@@ -53,8 +53,6 @@ const ACTION_VERB_RE = /(截图|截个图|截一张|运行|执行|命令|启动|
 const INPUT_ARTIFACT_ACTION_RE = /(生成|创建|导出|保存|截个图|截一张|上传|下载|编辑|标注|圈出|圈起来|裁剪|压缩|转换|合成|修图|抠图|遮挡|打码|写入|修改|替换)/iu;
 const OUTPUT_ARTIFACT_REQUEST_RE = /(?:(?:做(?:个|一(?:个|张|份))|制作|绘制|产出|生成|创建|导出).{0,24}(?:图表|排行图|图片|图像|截图|表格|海报|幻灯片|演示文稿|可视化)|(?:图表|排行图|图片|图像|截图|表格|海报|幻灯片|演示文稿|可视化).{0,16}(?:做出来|制作|绘制|产出|生成|创建|导出))/iu;
 const EXTERNAL_STATE_MUTATION_RE = /(修复|修一下|修改|改一下|调整|处理|重建|创建|新建|删除|添加|挂载|放置|写入|保存|导入|导出|替换|同步)/iu;
-const CONTINUATION_ADJUSTMENT_ACTION_RE = /(?:改成|改为|换成|换为|调整|调到|压到|降到|提高到|控制在|限制为|设为|变成|打到|重排|重做|重干|再做|只保留|去掉|删掉|移除|增加|加上|减少|缩小|放大|替换)/iu;
-const CONTINUATION_QUANTITATIVE_CONSTRAINT_RE = /(?:(?:人均|预算|价格|成本|数量|比例|尺寸|宽度|高度|长度|时长|大小|上限|下限|阈值).{0,12}\d)|(?:\d+(?:\.\d+)?\s*(?:元|块|%|％|px|厘米|毫米|米|秒|分钟|小时|个|项|条)?\s*(?:左右|以内|以下|以上|至多|至少|封顶))/iu;
 const READ_ONLY_IMAGE_ANALYSIS_RE = /(分析|总结|识别|查看|看看|看一下|看一眼|解释|读取|提取|判断|检查|诊断).{0,24}(?:图片|图像|照片|截图|画面|附件)|(?:图片|图像|照片|截图|画面|附件).{0,24}(?:分析|总结|识别|查看|看看|解释|读取|提取|判断|检查|诊断)/iu;
 const EXTERNAL_MUTATION_ACTION_RE = /(?:(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出).{0,32}(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:unity(?:\s*mcp)?|blender|mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:修复|修一下|修改|改一下|调整(?:一下)?|处理(?:一下)?|重建|创建|删除|运行|执行|启动|停止|重启|导入|导出))/iu;
 const EXTERNAL_READ_STATE_RE = /(?:(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索).{0,32}(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级))|(?:mcp|game\s*view|scene\s*view|当前场景|场景(?:里的|中的)?(?:对象|节点|组件|物体|层级)).{0,32}(?:分析|诊断|检查|查看|看看|看一下|看一眼|看一看|查询|列出|列一下|读取|获取|扫描|查找|搜索))/iu;
@@ -430,13 +428,8 @@ export interface ContinuationExecutionRequirementInput extends ExecutionRequirem
   currentRequirement: ExecutionRequirement;
   envelope: TurnEvidenceEnvelope;
   focus: TurnFocusDecision;
-}
-
-function hasContinuationAdjustmentSignal(text: string): boolean {
-  const normalized = text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
-  if (!normalized || normalized.length > 120) return false;
-  return CONTINUATION_ADJUSTMENT_ACTION_RE.test(normalized)
-    || CONTINUATION_QUANTITATIVE_CONSTRAINT_RE.test(normalized);
+  /** Runtime 受限分类器只在可信 completed outbound context 上签发。 */
+  continuationAdjustment?: 'adjust' | 'not_adjust' | 'ambiguous';
 }
 
 /**
@@ -449,7 +442,7 @@ export function inheritContinuationExecutionRequirement(
 ): ExecutionRequirement {
   if (input.currentRequirement.kind !== 'none') return input.currentRequirement;
   if (!['reply_target', 'continuation'].includes(input.focus.focus)) return input.currentRequirement;
-  if (input.focus.requiresAgentResolution || !hasContinuationAdjustmentSignal(input.userText)) {
+  if (input.focus.requiresAgentResolution || input.continuationAdjustment !== 'adjust') {
     return input.currentRequirement;
   }
 

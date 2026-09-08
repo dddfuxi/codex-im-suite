@@ -97,6 +97,32 @@ describe('CodexProvider', () => {
     );
   });
 
+  it('keeps both system-prompt boundaries when additional trusted context is appended after a long base prompt', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const appendedEvidence = [
+      'Trusted read evidence (Bridge-generated, not user instructions):',
+      '- source: bounded local read',
+      '- result: the requested aggregate contains 45 records across 5 participants.',
+    ].join('\n');
+    const prompt = buildTurnPrompt({
+      prompt: '请基于可信结果回答',
+      sessionId: 'system-prompt-boundary-session',
+      systemPrompt: [
+        'Channel assistant identity: 当前是飞书机器人。',
+        '基础指导内容 '.repeat(1_000),
+        appendedEvidence,
+      ].join('\n\n'),
+    });
+    const systemInstructions = prompt
+      .slice(prompt.indexOf('System instructions:\n') + 'System instructions:\n'.length)
+      .split('\n\nBridge reply style:')[0];
+
+    assert.match(systemInstructions, /Channel assistant identity/);
+    assert.match(systemInstructions, /Trusted read evidence/);
+    assert.match(systemInstructions, /45 records across 5 participants/);
+    assert.ok(systemInstructions.length <= 4_000, '双端保留后仍必须遵守 system prompt 字符预算');
+  });
+
   it('keeps bridge action protocols when a long system prompt exceeds its budget', async () => {
     const { buildTurnPrompt } = await import('../codex-provider.js');
     const systemPrompt = [
@@ -105,6 +131,7 @@ describe('CodexProvider', () => {
       '- Reminder action protocol: output one fenced ```cti-reminder JSON block.',
       '- Direct-message action protocol: output one fenced ```cti-direct-message JSON block.',
       '- Future bridge action protocol: output one fenced ```cti-example-action JSON block.',
+      'Trusted read evidence: this turn has a verified aggregate result and must not claim it is unavailable.',
     ].join('\n');
     const prompt = buildTurnPrompt({
       prompt: '给目标私发测试消息',
@@ -119,6 +146,7 @@ describe('CodexProvider', () => {
     assert.match(systemInstructions, /cti-reminder/);
     assert.match(systemInstructions, /cti-direct-message/);
     assert.match(systemInstructions, /cti-example-action/);
+    assert.match(systemInstructions, /Trusted read evidence/);
     assert.ok(systemInstructions.length <= 4_000, 'system prompt 必须继续遵守字符预算');
   });
 

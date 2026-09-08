@@ -365,6 +365,235 @@ describe('bridge-manager lifecycle', () => {
     assert.equal(dedupKeys.has('todo-reminder:1'), true);
   });
 
+  it('delivers an explicit proactive voice-only notification as one native audio message', async () => {
+    const dedupKeys = new Set<string>();
+    const outboundRefs: any[] = [];
+    const released: unknown[] = [];
+    const synthesizedTexts: string[] = [];
+    const store = {
+      ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+      checkDedup: (key: string) => dedupKeys.has(key),
+      insertDedup: (key: string) => { dedupKeys.add(key); },
+      insertOutboundRef: (entry: any) => { outboundRefs.push(entry); },
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('unexpected transcription'); },
+        getReplyPolicy: () => 'explicit_only',
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text }) => {
+          synthesizedTexts.push(text);
+          return createManagedSpeechReceipt(text, 'proactive-success');
+        },
+        releaseSynthesis: async (receipt) => { released.push(receipt); },
+      },
+    });
+    const sentTexts: OutboundMessage[] = [];
+    const sentAudio: Array<{ chatId: string; path: string; expectedSha256?: string }> = [];
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sentTexts.push(message);
+      return { ok: true, messageId: 'om_unexpected_text' };
+    });
+    adapter.sendLocalAudio = async (chatId, filePath, _replyTo, options) => {
+      sentAudio.push({ chatId, path: filePath, expectedSha256: options?.expectedSha256 });
+      return { ok: true, messageId: 'om_proactive_audio' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    const result = await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_voice' },
+      text: '大家记得喝水。',
+      sessionId: 'session-proactive-voice',
+      sourcePrompt: '工作日喝水提醒',
+      dedupKey: 'scheduled-run:voice-success',
+      speech: { mode: 'voice_only' },
+    });
+
+    assert.deepEqual(result, { ok: true, messageId: 'om_proactive_audio' });
+    assert.deepEqual(synthesizedTexts, ['大家记得喝水。']);
+    assert.equal(sentTexts.length, 0);
+    assert.equal(sentAudio.length, 1);
+    assert.equal(sentAudio[0].chatId, 'oc_voice');
+    assert.equal(sentAudio[0].expectedSha256, 'f'.repeat(64));
+    assert.equal(released.length, 1);
+    assert.equal(dedupKeys.has('scheduled-run:voice-success'), true);
+    assert.equal(outboundRefs.length, 1);
+    assert.equal(outboundRefs[0].messageKind, 'audio');
+    assert.match(outboundRefs[0].continuationContext, /生成状态：已生成/u);
+    assert.match(outboundRefs[0].continuationContext, /发送状态：已发送/u);
+  });
+
+  it('falls back to exactly one complete text notification when proactive native audio delivery fails', async () => {
+    const sentTexts: OutboundMessage[] = [];
+    let audioAttempts = 0;
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('unexpected transcription'); },
+        getReplyPolicy: () => 'explicit_only',
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text }) => createManagedSpeechReceipt(text, 'proactive-fallback'),
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sentTexts.push(message);
+      return { ok: true, messageId: 'om_proactive_fallback' };
+    });
+    adapter.sendLocalAudio = async () => {
+      audioAttempts += 1;
+      return { ok: false, error: 'upload failed' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    const result = await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_voice_fallback' },
+      text: '这是一条不能丢失的完整提醒。',
+      speech: { mode: 'voice_only' },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(audioAttempts, 1);
+    assert.equal(sentTexts.length, 1);
+    assert.match(sentTexts[0].text, /这是一条不能丢失的完整提醒/u);
+    assert.match(sentTexts[0].text, /语音/u);
+  });
+
+  it('keeps proactive notifications as text while the bound session has voice disabled', async () => {
+    let synthesisCalls = 0;
+    const sentTexts: OutboundMessage[] = [];
+    const store = {
+      ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+      getSpeechReplyPreference: () => 'off' as const,
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('unexpected transcription'); },
+        getReplyPolicy: () => 'explicit_only',
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'proactive-off');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sentTexts.push(message);
+      return { ok: true, messageId: 'om_voice_off_text' };
+    });
+    let audioCalls = 0;
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_unexpected_audio' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_voice_off' },
+      sessionId: 'session-voice-off',
+      text: '关闭语音后保持文字。',
+      speech: { mode: 'voice_only' },
+    });
+
+    assert.equal(synthesisCalls, 0);
+    assert.equal(audioCalls, 0);
+    assert.equal(sentTexts.length, 1);
+  });
+
+  it('does not replace an interactive proactive card with synthesized speech', async () => {
+    let synthesisCalls = 0;
+    const sentTexts: OutboundMessage[] = [];
+    const store = createMinimalStore({ remote_bridge_enabled: 'true' });
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('unexpected transcription'); },
+        getReplyPolicy: () => 'explicit_only',
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'proactive-card');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sentTexts.push(message);
+      return { ok: true, messageId: 'om_card_text' };
+    });
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_check_in' },
+      text: '请点击按钮打卡。',
+      feishuCardJson: '{"schema":"2.0","body":{}}',
+      speech: { mode: 'voice_only' },
+    });
+
+    assert.equal(synthesisCalls, 0);
+    assert.equal(sentTexts.length, 1);
+    assert.equal(sentTexts[0].feishuCardJson, '{"schema":"2.0","body":{}}');
+  });
+
+  it('does not synthesize or resend a proactive voice notification after its dedup key is recorded', async () => {
+    let synthesisCalls = 0;
+    let audioCalls = 0;
+    const store = {
+      ...createMinimalStore({ remote_bridge_enabled: 'true' }),
+      checkDedup: (key: string) => key === 'scheduled-run:already-sent',
+    } as BridgeStore;
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('unexpected transcription'); },
+        getReplyPolicy: () => 'explicit_only',
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text }) => {
+          synthesisCalls += 1;
+          return createManagedSpeechReceipt(text, 'proactive-dedup');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_unexpected_text' }));
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_unexpected_audio' };
+    };
+    const { registerAdapter, deliverProactiveMessage } = await import('../../lib/bridge/bridge-manager');
+    registerAdapter(adapter);
+
+    const result = await deliverProactiveMessage({
+      address: { channelType: 'feishu', chatId: 'oc_dedup' },
+      text: '这条语音已经投递过。',
+      dedupKey: 'scheduled-run:already-sent',
+      speech: { mode: 'voice_only' },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(synthesisCalls, 0);
+    assert.equal(audioCalls, 0);
+  });
+
   it('delivers proactive cti-final images as clean text plus local image attachments', async () => {
     const auditLogs: Array<{ direction: string; chatId: string; summary: string }> = [];
     const store = {
@@ -2684,11 +2913,13 @@ describe('bridge-manager result block delivery', () => {
     const sent: OutboundMessage[] = [];
     const listInputs: any[] = [];
     const systemPrompts: string[] = [];
+    const interactionModes: string[] = [];
     initBridgeContext({
       store: createStatefulStore({ remote_bridge_enabled: 'true' }),
       llm: {
-        streamChat: (input: { systemPrompt?: string }) => {
+        streamChat: (input: { systemPrompt?: string; interactionMode?: string }) => {
           systemPrompts.push(input.systemPrompt || '');
+          interactionModes.push(input.interactionMode || 'agent');
           return createTextStream('共有 1 个计划任务：每日单子（启用，下一次 2026-08-10 09:00）。');
         },
       },
@@ -2735,6 +2966,7 @@ describe('bridge-manager result block delivery', () => {
     assert.ok(systemPrompts.some((prompt) => /cti-scheduled-task-list-evidence\/v1/u.test(prompt)));
     assert.ok(systemPrompts.some((prompt) => /task_daily/u.test(prompt)));
     assert.ok(systemPrompts.every((prompt) => !/不应暴露的执行正文|ou_private/u.test(prompt)));
+    assert.deepEqual(interactionModes, ['response_only']);
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /共有 1 个计划任务/u);
   });
@@ -3080,6 +3312,100 @@ describe('bridge-manager result block delivery', () => {
     assert.equal(sent.length, 1);
     assert.match(sent[0].text, /已安排 live Bridge 重启/);
     assert.doesNotMatch(sent[0].text, /cti-bridge-control|restart_live/);
+  });
+
+  it('lets the verified owner update panel settings and returns the current redacted snapshot before scheduling restart', async () => {
+    const sent: OutboundMessage[] = [];
+    const updates: unknown[] = [];
+    let restartCount = 0;
+    const before = {
+      protocol: 'cti-panel-settings-snapshot/v1' as const,
+      version: 'settings-v1',
+      generatedAt: '2026-08-11T00:00:00.000Z',
+      settings: [
+        { key: 'replyStyleHint', label: '回复风格', group: '回复与执行', type: 'string' as const, writable: true, restartRequired: true, value: '详细' },
+        { key: 'codexApiKeySet', label: 'Codex API Key', group: 'Codex', type: 'secret_status' as const, writable: false, restartRequired: true, value: true },
+      ],
+    };
+    const after = {
+      ...before,
+      version: 'settings-v2',
+      settings: [
+        { ...before.settings[0], value: '简洁、结果优先' },
+        before.settings[1],
+      ],
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true', bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-panel-settings',
+        JSON.stringify({ action: 'update', expectedVersion: 'settings-v1', changes: [{ key: 'replyStyleHint', value: '简洁、结果优先' }] }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      panelSettings: {
+        list: async () => before,
+        update: async (input) => {
+          updates.push(input);
+          return {
+            protocol: 'cti-panel-settings-update-receipt/v1', ok: true, written: true,
+            restartRequired: true, version: after.version,
+            applied: [{ key: 'replyStyleHint', previousValue: '详细', value: '简洁、结果优先' }],
+            snapshot: after,
+          };
+        },
+      },
+      bridgeControl: {
+        scheduleRestart: async () => { restartCount += 1; return { ok: true }; },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('把面板里的回复风格改成简洁、结果优先，并列出当前设置', 'ou_owner'));
+
+    assert.equal(updates.length, 1);
+    assert.equal((updates[0] as any).actor.userId, 'ou_owner');
+    assert.deepEqual((updates[0] as any).changes, [{ key: 'replyStyleHint', value: '简洁、结果优先' }]);
+    assert.equal(restartCount, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /面板设置已写入/u);
+    assert.match(sent[0].text, /回复风格："简洁、结果优先"/u);
+    assert.match(sent[0].text, /Codex API Key：已配置/u);
+    assert.doesNotMatch(sent[0].text, /cti-panel-settings|settings-v1/u);
+  });
+
+  it('blocks a non-owner panel settings mutation before the Runtime Host', async () => {
+    const sent: OutboundMessage[] = [];
+    let updated = false;
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true', bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-panel-settings',
+        JSON.stringify({ action: 'update', changes: [{ key: 'replyStyleHint', value: '详细' }] }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      panelSettings: {
+        list: async () => { throw new Error('non-owner must not list'); },
+        update: async () => { updated = true; throw new Error('non-owner must not update'); },
+      },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: `om_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('把面板设置里的回复风格改成详细', 'ou_viewer'));
+
+    assert.equal(updated, false);
+    assert.match(sent[0].text, /owner/u);
   });
 
   it('records a scheduled check-in from verified native callback identity without invoking the model', async () => {
@@ -5395,7 +5721,7 @@ describe('bridge-manager Feishu CLI user authorization governance', () => {
     assert.doesNotMatch(authAudit, /device-secret-value|flow-1|ABCD-EFGH/);
   });
 
-  it('blocks non-Owners without starting or exposing the shared CLI authorization', async () => {
+  it('allows a non-Owner to start authorization for their own isolated CLI identity', async () => {
     const sent: OutboundMessage[] = [];
     let beginCount = 0;
     initBridgeContext({
@@ -5408,7 +5734,12 @@ describe('bridge-manager Feishu CLI user authorization governance', () => {
       feishuCliUserAuth: {
         beginAuthorization: async () => {
           beginCount += 1;
-          throw new Error('non-owner must not start authorization');
+          return {
+            status: 'started',
+            userMessage: '请使用你自己的飞书账号完成授权。',
+            feishuCardJson: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+            authorizationRequestId: 'auth-viewer-1',
+          };
         },
       },
       lifecycle: {},
@@ -5421,11 +5752,10 @@ describe('bridge-manager Feishu CLI user authorization governance', () => {
 
     await _testOnly.handleMessage(adapter, createInboundMessage('查询一下今日待办', 'ou_viewer', 'oc_auth'));
 
-    assert.equal(beginCount, 0);
+    assert.equal(beginCount, 1);
     assert.equal(sent.length, 1);
-    assert.match(sent[0].text, /未完成/);
-    assert.match(sent[0].text, /Owner|owner/);
-    assert.equal(sent[0].feishuCardJson, undefined);
+    assert.match(sent[0].text, /自己的飞书账号/u);
+    assert.ok(sent[0].feishuCardJson);
   });
 
   it('falls back to the official authorization URL when the interactive card cannot be sent', async () => {
@@ -5905,7 +6235,7 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(streamParams[0].systemPrompt || '', /\[微笑\]/);
     assert.match(streamParams[0].systemPrompt || '', /\[表情包:alias\]/);
     assert.equal(memoryDecisionCalls, 0);
-    assert.equal(memoryWriteClassifierCalls, 0, 'ordinary identity chat must stay on the zero-worker path');
+    assert.equal(memoryWriteClassifierCalls, 1, '每个可分类纯文本回合都应由受限记忆分类器明确返回 ignore；不得用关键词跳过。');
   });
 
   it('keeps safe provider rationale in workflow cards while redacting internals', async () => {
@@ -7043,7 +7373,7 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].prompt, /Do not merely describe, caption, or OCR/i);
   });
 
-  it('reattaches recent conversation images for follow-up messages that refer back to prior media', async (t) => {
+  it('does not reattach recent conversation images from a text-only follow-up', async (t) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-recent-media-'));
     const previousIdleFreshMs = process.env.CTI_SESSION_IDLE_FRESH_MS;
     process.env.CTI_SESSION_IDLE_FRESH_MS = String(365 * 24 * 60 * 60 * 1000);
@@ -7090,10 +7420,9 @@ describe('bridge-manager policy helpers', () => {
     });
 
     assert.equal(streamParams.length, 2);
-    assert.equal(streamParams[1].files?.length, 1);
-    assert.equal(streamParams[1].files?.[0]?.name, 'math-question.png');
+    assert.equal(streamParams[1].files, undefined);
     assert.match(streamParams[1].prompt, /继续一步一步分析/);
-    assert.match(streamParams[1].systemPrompt || '', /recent conversation media/i);
+    assert.doesNotMatch(streamParams[1].systemPrompt || '', /recent conversation media/i);
   });
 
   it('does not apply no-tool-evidence interception to sticker chat replies', async () => {
@@ -7392,6 +7721,7 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].systemPrompt || '', /current message native mentions/i);
     assert.match(streamParams[0].systemPrompt || '', /苏庆华/);
     assert.match(streamParams[0].systemPrompt || '', /小虾米/);
+    assert.equal(streamParams[0].lightChatEligible, true);
   });
 
   it('preserves native Feishu direct-message targets in priority turn context', async () => {
@@ -7519,6 +7849,7 @@ describe('bridge-manager policy helpers', () => {
     assert.match(streamParams[0].priorityTurnContext || '', /reply_attachment/);
     assert.doesNotMatch(streamParams[0].priorityTurnContext || '', /base64-data-must-not-enter-prompt/);
     assert.doesNotMatch(streamParams[0].priorityTurnContext || '', /Feishu recent conversation context/);
+    assert.equal(streamParams[0].lightChatEligible, false);
   });
 
   it('inherits artifact evidence for a short revision of a recovered Feishu result', async () => {
@@ -8511,7 +8842,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('resolves an explicit Feishu display name from the current official chat roster', async () => {
+  it('does not infer a native mention from an explicit request when the agent only writes a display name', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -8548,13 +8879,13 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
-    assert.match(reply!.text, /^@乔治/u);
-    assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    assert.equal(resolverInputs.length, 0);
+    assert.doesNotMatch(reply!.text, /^@乔治/u);
+    assert.match(reply!.text, /原生 @ 未投递/u);
+    assert.equal(reply!.mentions, undefined);
   });
 
-  it('resolves compact at-name commands after the agent returns only the plain display name', async () => {
+  it('does not infer a native mention from a compact command when the agent only writes a display name', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -8594,11 +8925,11 @@ describe('bridge-manager policy helpers', () => {
       },
     });
 
-    assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.equal(resolverInputs.length, 0);
     assert.equal(sent.length, 1);
-    assert.match(sent[0].text, /^@乔治/u);
-    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
+    assert.doesNotMatch(sent[0].text, /^@乔治/u);
+    assert.match(sent[0].text, /原生 @ 未投递/u);
+    assert.equal(sent[0].mentions, undefined);
   });
 
   it('routes Feishu native mention tasks through the agent instead of a shortcut mention reply', async () => {
@@ -9397,7 +9728,7 @@ describe('bridge-manager policy helpers', () => {
     assert.doesNotMatch(sent[0].text, /原生 @ 未投递|当前不再按文字自动解析/);
   });
 
-  it('resolves an explicit current-turn mention even when the agent reply omits the bare at target', async () => {
+  it('does not infer an explicit current-turn mention when the agent reply omits every target selection', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     const systemPrompts: string[] = [];
@@ -9450,13 +9781,12 @@ describe('bridge-manager policy helpers', () => {
       },
     });
 
-    assert.equal(resolverInputs.length, 1);
+    assert.equal(resolverInputs.length, 0);
     assert.match(systemPrompts[0], /当前群官方成员.*唯一确认.*乔治/u);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
     assert.equal(sent.length, 1);
-    assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
-    assert.match(sent[0].text, /^@乔治/u);
-    assert.doesNotMatch(sent[0].text, /原生 @ 未投递/);
+    assert.equal(sent[0].mentions, undefined);
+    assert.doesNotMatch(sent[0].text, /^@乔治/u);
+    assert.match(sent[0].text, /原生 @ 未投递/);
   });
 
   it('normalizes supported mention id field spellings and matches them against current native evidence', async () => {
@@ -9942,11 +10272,12 @@ describe('bridge-manager policy helpers', () => {
       lifecycle: {},
     });
     const adapter = createRunningAdapter('feishu', async () => ({ ok: true, messageId: 'om_turtle_soup' })) as BaseChannelAdapter & {
-      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+      resolveOutboundMentionTargets?: BaseChannelAdapter['resolveOutboundMentionTargets'];
     };
     adapter.getAssistantIdentity = () => ({ displayName: '小虾米', botOpenId: 'ou_current_bot' });
-    adapter.resolveOutboundMentions = async (message) => {
+    adapter.resolveOutboundMentionTargets = async (message, _sourceMessage, targets) => {
       resolverInputs.push(message);
+      assert.deepEqual(targets, ['乔治']);
       return {
         ...message,
         mentions: [
@@ -9981,10 +10312,12 @@ describe('bridge-manager policy helpers', () => {
     });
 
     assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.match(resolverInputs[0].text, /乔治/u);
+    assert.doesNotMatch(resolverInputs[0].text, /^@乔治/u);
     assert.equal(resolverInputs[0].mentions, undefined);
     assert.equal(finalized.length, 1);
-    assert.match(String(finalized[0][2]), /@乔治/u);
+    assert.match(String(finalized[0][2]), /乔治/u);
+    assert.doesNotMatch(String(finalized[0][2]), /@乔治/u);
     assert.doesNotMatch(String(finalized[0][2]), /@小虾米/u);
     assert.deepEqual(finalized[0][4], [{ userId: 'ou_george', name: '乔治' }]);
   });
@@ -10142,7 +10475,7 @@ describe('bridge-manager policy helpers', () => {
     });
 
     assert.equal(replyResolverInputs.length, 1);
-    assert.match(replyResolverInputs[0].text, /^@乔治/u);
+    assert.doesNotMatch(replyResolverInputs[0].text, /^@乔治/u);
     assert.deepEqual(sent[0].mentions, [{ userId: 'ou_george', name: '乔治' }]);
   });
 
@@ -10348,7 +10681,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('queries the official roster for a compact Feishu mention command from a wake alias', async () => {
+  it('does not query a native mention resolver for a compact command when the agent made no target selection', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -10377,10 +10710,129 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.equal(resolverInputs.length, 0);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
+  });
+
+  it('keeps a generic group salutation as content without resolving or sending a native mention', async () => {
+    const sent: OutboundMessage[] = [];
+    let resolverCalled = false;
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('各位大哥大姐，大家好！') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_group_salutation' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentionTargets?: BaseChannelAdapter['resolveOutboundMentionTargets'];
+    };
+    adapter.resolveOutboundMentionTargets = async () => {
+      resolverCalled = true;
+      throw new Error('群体称呼不应进入成员解析');
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('请艾特群里的大哥大姐，打个招呼', 'ou_sender', 'oc_group'),
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_sender', displayName: '刘丹', chatType: 'group' },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.equal(resolverCalled, false);
+    assert.equal(reply!.mentions, undefined);
+    assert.match(reply!.text, /各位大哥大姐，大家好/u);
+    assert.doesNotMatch(reply!.text, /原生 @ 未投递/u);
+  });
+
+  it('resolves an agent-selected named member without injecting a bare at into visible text', async () => {
+    const sent: OutboundMessage[] = [];
+    const resolverInputs: Array<{ message: OutboundMessage; targets: string[] }> = [];
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => createTextStream([
+          '```cti-final',
+          JSON.stringify({
+            kind: 'text',
+            text: '乔治，请看一下这条消息。',
+            images: [],
+            files: [],
+            reply_mode: 'plain',
+            mentions: ['乔治'],
+          }),
+          '```',
+        ].join('\n')),
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_structured_target' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentionTargets?: BaseChannelAdapter['resolveOutboundMentionTargets'];
+    };
+    adapter.resolveOutboundMentionTargets = async (message, _sourceMessage, targets) => {
+      resolverInputs.push({ message, targets });
+      return {
+        ...message,
+        mentions: [{ userId: 'ou_george', name: '乔治' }],
+      };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('请艾特乔治，让他看一下', 'ou_sender', 'oc_group'),
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_sender', displayName: '刘丹', chatType: 'group' },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.equal(resolverInputs.length, 1);
+    assert.deepEqual(resolverInputs[0].targets, ['乔治']);
+    assert.match(resolverInputs[0].message.text, /^乔治，请看一下这条消息。/u);
+    assert.doesNotMatch(resolverInputs[0].message.text, /@乔治/u);
+    assert.doesNotMatch(reply!.text, /^@乔治/u);
+    assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: '乔治' }]);
+  });
+
+  it('does not turn a named delivery request into a native mention when the agent did not select that member', async () => {
+    const sent: OutboundMessage[] = [];
+    let resolverCalled = false;
+    initBridgeContext({
+      store: createMinimalStore({ remote_bridge_enabled: 'true' }),
+      llm: { streamChat: () => createTextStream('我会通知乔治查看这条消息。') },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_no_implicit_target' };
+    }) as BaseChannelAdapter & {
+      resolveOutboundMentionTargets?: BaseChannelAdapter['resolveOutboundMentionTargets'];
+    };
+    adapter.resolveOutboundMentionTargets = async () => {
+      resolverCalled = true;
+      throw new Error('没有显式选择成员时不应调用');
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('请艾特乔治，让他看一下', 'ou_sender', 'oc_group'),
+      address: { channelType: 'feishu', chatId: 'oc_group', userId: 'ou_sender', displayName: '刘丹', chatType: 'group' },
+    });
+
+    const reply = sent.at(-1);
+    assert.ok(reply);
+    assert.equal(resolverCalled, false);
+    assert.equal(reply!.mentions, undefined);
+    assert.match(reply!.text, /原生 @ 未投递/u);
+    assert.doesNotMatch(reply!.text, /@乔治/u);
   });
 
   it('does not treat future workflow rules that mention at-actions as an outbound mention request', async () => {
@@ -10672,7 +11124,7 @@ describe('bridge-manager policy helpers', () => {
     assert.equal(inspectorCalled, false);
   });
 
-  it('queries the official roster for an explicit Feishu at command with a delivery reason', async () => {
+  it('does not query a native mention resolver when a delivery request has no agent target selection', async () => {
     const sent: OutboundMessage[] = [];
     let resolverCalled = false;
     initBridgeContext({
@@ -10689,12 +11141,12 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverCalled, true);
+    assert.equal(resolverCalled, false);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('normalizes a robot type suffix before querying the official roster', async () => {
+  it('keeps a robot type suffix as ordinary text when the agent did not select a native target', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({ store: createMinimalStore({ remote_bridge_enabled: 'true' }), llm: { streamChat: () => createTextStream('好，我去叫乔治。') }, permissions: { resolvePendingPermission: () => false }, lifecycle: {} });
@@ -10707,14 +11159,13 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
   });
 
-  it('queries by the user-provided display name without trusting the model placeholder', async () => {
+  it('does not replace a model placeholder with a user target unless the agent explicitly selects that target', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({ store: createMinimalStore({ remote_bridge_enabled: 'true' }), llm: { streamChat: () => createTextStream(['```cti-final', '{"kind":"text","text":"乔治乔治，出来接客啦～ @_user_1","images":[],"files":[],"reply_mode":"plain","mentions":["_user_1"]}', '```'].join('\n')) }, permissions: { resolvePendingPermission: () => false }, lifecycle: {} });
@@ -10727,8 +11178,7 @@ describe('bridge-manager policy helpers', () => {
     });
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 1);
-    assert.match(resolverInputs[0].text, /^@乔治/u);
+    assert.equal(resolverInputs.length, 0);
     assert.doesNotMatch(reply!.text, /@_user_1/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
@@ -10823,7 +11273,7 @@ describe('bridge-manager policy helpers', () => {
       llm: {
         streamChat: () => createTextStream([
           '```cti-final',
-          '{"kind":"text","text":"George, come say something. @_user_1","images":[],"files":[],"reply_mode":"plain"}',
+          '{"kind":"text","text":"George, come say something. @_user_1","images":[],"files":[],"reply_mode":"plain","mentions":["George"]}',
           '```',
         ].join('\n')),
       },
@@ -10834,11 +11284,12 @@ describe('bridge-manager policy helpers', () => {
       sent.push(message);
       return { ok: true, messageId: 'om_reply' };
     }) as BaseChannelAdapter & {
-      resolveOutboundMentions?: (message: OutboundMessage) => Promise<OutboundMessage>;
+      resolveOutboundMentionTargets?: BaseChannelAdapter['resolveOutboundMentionTargets'];
     };
-    adapter.resolveOutboundMentions = async (message) => {
+    adapter.resolveOutboundMentionTargets = async (message, _sourceMessage, targets) => {
       resolverInputs.push(message);
-      return message.text.includes('@George') && !message.text.includes('@_user_1')
+      assert.deepEqual(targets, ['George']);
+      return !message.text.includes('@_user_1')
         ? {
             ...message,
             mentions: [{ userId: 'ou_george', name: 'George' }],
@@ -10862,11 +11313,11 @@ describe('bridge-manager policy helpers', () => {
     assert.ok(reply);
     assert.equal(resolverInputs.length, 1);
     assert.doesNotMatch(reply!.text, /@_user_1/);
-    assert.match(reply!.text, /^@George/u);
+    assert.doesNotMatch(reply!.text, /^@George/u);
     assert.deepEqual(reply!.mentions, [{ userId: 'ou_george', name: 'George' }]);
   });
 
-  it('resolves a named Feishu target followed by an explicit pronoun action', async () => {
+  it('does not infer a named Feishu target from an explicit pronoun action alone', async () => {
     const sent: OutboundMessage[] = [];
     const resolverInputs: OutboundMessage[] = [];
     initBridgeContext({
@@ -10905,12 +11356,13 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverInputs.length, 1);
-    assert.match(reply!.text, /^@苏木/u);
-    assert.deepEqual(reply!.mentions, [{ userId: 'ou_sumu', name: '苏木' }]);
+    assert.equal(resolverInputs.length, 0);
+    assert.doesNotMatch(reply!.text, /^@苏木/u);
+    assert.match(reply!.text, /原生 @ 未投递/u);
+    assert.equal(reply!.mentions, undefined);
   });
 
-  it('queries the resolver for an explicit Feishu display name', async () => {
+  it('does not query the resolver for an explicit Feishu display name without an agent selection', async () => {
     const sent: OutboundMessage[] = [];
     let resolverCalls = 0;
     initBridgeContext({
@@ -10944,7 +11396,7 @@ describe('bridge-manager policy helpers', () => {
 
     const reply = sent.at(-1);
     assert.ok(reply);
-    assert.equal(resolverCalls, 1);
+    assert.equal(resolverCalls, 0);
     assert.doesNotMatch(reply!.text, /@乔治/);
     assert.match(reply!.text, /原生 @ 未投递/);
     assert.equal(reply!.mentions, undefined);
@@ -11881,7 +12333,11 @@ const TEST_SPEECH_SYNTHESIS_IDENTITY = {
   voiceProfileId: 'voice.zh.test',
 };
 
-function createSpeechReply(text: string, mode: 'voice_only' | 'text_only'): string {
+function createSpeechReply(
+  text: string,
+  mode: 'voice_only' | 'text_only',
+  voiceRequirement?: 'active_reference',
+): string {
   return [
     '```cti-final',
     JSON.stringify({
@@ -11890,7 +12346,10 @@ function createSpeechReply(text: string, mode: 'voice_only' | 'text_only'): stri
       images: [],
       files: [],
       reply_mode: 'plain',
-      speech: { mode },
+      speech: {
+        mode,
+        ...(voiceRequirement ? { voice_requirement: voiceRequirement } : {}),
+      },
     }),
     '```',
   ].join('\n');
@@ -11914,6 +12373,9 @@ function createManagedSpeechReceipt(
     textSha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
     fileSha256: 'f'.repeat(64),
     validated: true as const,
+    generationStatus: 'generated' as const,
+    deliveryStatus: 'not_sent' as const,
+    speakerSimilarityStatus: 'not_applicable' as const,
     ...identity,
   };
 }
@@ -11923,6 +12385,7 @@ function createManagedSingingReceipt(input: {
   lyrics: string;
   vocalLanguage: string;
   durationSeconds: number;
+  voiceRequirement?: 'active_reference';
 }, suffix: string) {
   return {
     protocol: 'cti-singing-synthesis/v1' as const,
@@ -11935,9 +12398,23 @@ function createManagedSingingReceipt(input: {
       lyrics: input.lyrics,
       vocalLanguage: input.vocalLanguage,
       durationSeconds: input.durationSeconds,
+      voiceRequirement: input.voiceRequirement || null,
     }), 'utf8').digest('hex'),
     fileSha256: 'e'.repeat(64),
     validated: true as const,
+    generationStatus: 'generated' as const,
+    deliveryStatus: 'not_sent' as const,
+    speakerSimilarityStatus: input.voiceRequirement === 'active_reference' ? 'passed' as const : 'not_applicable' as const,
+    ...(input.voiceRequirement === 'active_reference' ? {
+      voiceProfileId: 'voice.reference.test',
+      speakerSimilarity: 0.91,
+      speakerSimilarityThreshold: 0.72,
+      speakerSimilarityPassed: true as const,
+    } : {}),
+    lyricsAlignmentStatus: 'passed' as const,
+    lyricsAlignment: 0.96,
+    lyricsAlignmentThreshold: 0.8,
+    lyricsAlignmentPassed: true as const,
   };
 }
 
@@ -12187,7 +12664,7 @@ describe('bridge-manager speech integration', () => {
     assert.doesNotMatch(sent[0].text, /高风险动作/u);
   });
 
-  it('参考音色导入只使用 Owner、可信 native reply 与 Bridge 授权，且不受 /voice off 阻断', async () => {
+  it('参考音色导入只使用 Owner、可信 native reply 与 Bridge 授权，且动作收口后不继续合成', async () => {
     let importInput: any;
     let synthesisCalls = 0;
     const sent: OutboundMessage[] = [];
@@ -12217,6 +12694,8 @@ describe('bridge-manager speech integration', () => {
             rights_basis: 'self_or_authorized',
             usage_scope: 'local_tts_only',
             clean_single_speaker_confirmed: true,
+            reference_transcript: '这是一段经授权的参考语音',
+            reference_transcript_confirmed: true,
           },
         }),
         '```',
@@ -12249,12 +12728,14 @@ describe('bridge-manager speech integration', () => {
             attachmentId: input.attachmentId,
             fileSha256: input.sha256,
             authorizationExpiresAt: input.authorization.expiresAt,
+            registrationStatus: 'registered',
+            speakerSimilarityStatus: 'not_verified',
             validated: true,
           };
         },
         synthesize: async () => {
           synthesisCalls += 1;
-          throw new Error('/voice off 后不应合成回复');
+          throw new Error('参考音色动作收口后不应继续合成回复');
         },
       },
     });
@@ -12264,7 +12745,6 @@ describe('bridge-manager speech integration', () => {
     });
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
-    await _testOnly.handleMessage(adapter, createInboundMessage('/voice off', 'ou_owner', 'oc_clone_voice'));
     await _testOnly.handleMessage(adapter, message as any);
 
     assert.equal(importInput.profileName, 'Owner 参考音色');
@@ -12279,8 +12759,125 @@ describe('bridge-manager speech integration', () => {
     assert.equal(importInput.authorization.cleanSingleSpeakerConfirmed, true);
     assert.equal(Date.parse(importInput.authorization.expiresAt) - Date.parse(importInput.authorization.authorizedAt), 5 * 60 * 1000);
     assert.equal(synthesisCalls, 0);
-    assert.match(sent.at(-1)?.text || '', /参考音色已创建：voice\.reference\.owner/u);
+    assert.match(sent.at(-1)?.text || '', /参考音色已登记：voice\.reference\.owner/u);
+    assert.match(sent.at(-1)?.text || '', /尚未生成语音.*尚未发送.*相似度尚未验收/us);
     assert.doesNotMatch(sent.at(-1)?.text || '', /模型预写的成功文案/u);
+  });
+
+  it('Owner 自动授权时由 Bridge 确定性补齐克隆动作，不要求 Primary 复述授权字段', async () => {
+    let importInput: any;
+    const sent: OutboundMessage[] = [];
+    const full = createTrustedCurrentAndNativeReplySpeechMessage('om_clone_auto', 'oc_clone_auto') as any;
+    const message = {
+      ...createInboundMessage('克隆这条录音；参考文本：这是一段经授权的参考语音', 'ou_owner', 'oc_clone_auto'),
+      messageId: 'om_clone_auto',
+      attachments: [full.attachments[0]],
+      raw: {
+        feishuReplyTo: full.raw.feishuReplyTo,
+        feishuNativeReplyAttachments: full.raw.feishuNativeReplyAttachments,
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true', bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({ kind: 'text', text: '正在处理。', images: [], files: [], reply_mode: 'plain' }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getReferenceVoiceImportPolicy: () => ({ ownerSelfVoiceAutoAuthorization: true }),
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => ({
+          protocol: 'cti-speech-transcript/v1', attachmentId: input.attachmentId,
+          relation: input.relation, requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId, text: '这是一段经授权的参考语音',
+          model: 'test-asr', language: 'zh', fileSha256: input.sha256, validated: true,
+        }),
+        importReferenceVoice: async (input: any) => {
+          importInput = input;
+          return {
+            protocol: 'cti-speech-reference-voice-import/v1', voiceProfileId: 'voice.reference.auto',
+            requestMessageId: input.requestMessageId, sourceMessageId: input.sourceMessageId,
+            fileKey: input.fileKey, attachmentId: input.attachmentId, fileSha256: input.sha256,
+            authorizationExpiresAt: input.authorization.expiresAt, registrationStatus: 'registered',
+            speakerSimilarityStatus: 'not_verified', validated: true,
+          };
+        },
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (outbound) => {
+      sent.push(outbound);
+      return { ok: true, messageId: `om_clone_auto_result_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.equal(importInput.confirmedTranscript, '这是一段经授权的参考语音');
+    assert.equal(importInput.authorization.rightsBasis, 'self_or_authorized');
+    assert.equal(importInput.authorization.usageScope, 'local_tts_only');
+    assert.match(sent.at(-1)?.text || '', /参考音色已登记：voice\.reference\.auto/u);
+  });
+
+  it('Owner 自动授权允许省略固定参考文本格式，并交由 Runtime 二次 ASR 核验', async () => {
+    let importCalls = 0;
+    const sent: OutboundMessage[] = [];
+    const full = createTrustedCurrentAndNativeReplySpeechMessage('om_clone_missing_text', 'oc_clone_missing_text') as any;
+    const message = {
+      ...createInboundMessage('克隆', 'ou_owner', 'oc_clone_missing_text'),
+      messageId: 'om_clone_missing_text',
+      attachments: [full.attachments[0]],
+      raw: {
+        feishuReplyTo: full.raw.feishuReplyTo,
+        feishuNativeReplyAttachments: full.raw.feishuNativeReplyAttachments,
+      },
+    };
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true', bridge_feishu_owner_users: 'ou_owner' }),
+      llm: { streamChat: () => createTextStream([
+        '```cti-final',
+        JSON.stringify({
+          kind: 'text', text: '我会克隆。', images: [], files: [], reply_mode: 'plain',
+          speech_action: {
+            action: 'create_reference_voice', rights_basis: 'self_or_authorized',
+            usage_scope: 'local_tts_only', clean_single_speaker_confirmed: true,
+            reference_transcript: '模型从 ASR 复制的猜测', reference_transcript_confirmed: true,
+          },
+        }),
+        '```',
+      ].join('\n')) },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      turnStorage: createSpeechTurnStorage(),
+      speech: {
+        getReferenceVoiceImportPolicy: () => ({ ownerSelfVoiceAutoAuthorization: true }),
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async (input: any) => ({
+          protocol: 'cti-speech-transcript/v1', attachmentId: input.attachmentId,
+          relation: input.relation, requestMessageId: input.requestMessageId,
+          sourceMessageId: input.sourceMessageId, text: '模型从 ASR 复制的猜测',
+          model: 'test-asr', language: 'zh', fileSha256: input.sha256, validated: true,
+        }),
+        importReferenceVoice: async () => { importCalls += 1; throw new Error('must not import'); },
+        synthesize: async () => { throw new Error('not used'); },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (outbound) => {
+      sent.push(outbound);
+      return { ok: true, messageId: `om_clone_missing_text_result_${sent.length}` };
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, message as any);
+
+    assert.equal(importCalls, 1);
+    assert.match(sent.at(-1)?.text || '', /Runtime 导入失败/u);
+    assert.doesNotMatch(sent.at(-1)?.text || '', /请在回复同一条音频时附上/u);
+    assert.doesNotMatch(sent.at(-1)?.text || '', /我会克隆/u);
   });
 
   it('非 Owner 即使模型返回完整参考音色动作也不能签发授权或调用 Runtime', async () => {
@@ -12310,6 +12907,8 @@ describe('bridge-manager speech integration', () => {
             rights_basis: 'self_or_authorized',
             usage_scope: 'local_tts_only',
             clean_single_speaker_confirmed: true,
+            reference_transcript: '未授权发送者的语音',
+            reference_transcript_confirmed: true,
           },
         }),
         '```',
@@ -12535,7 +13134,7 @@ describe('bridge-manager speech integration', () => {
     const { _testOnly } = await import('../../lib/bridge/bridge-manager');
 
     await _testOnly.handleMessage(adapter, createInboundMessage(
-      '请用语音回答，但 Primary 没有给结构化 intent。',
+      '解释一下语音回复和文字回复的区别。',
       'ou_speech',
       'oc_speech_keyword',
     ));
@@ -12633,6 +13232,86 @@ describe('bridge-manager speech integration', () => {
     assert.equal(released.length, 1);
     assert.equal(outboundRefs.find((entry) => entry.messageKind === 'audio')?.platformMessageId, 'om_native_voice');
     assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /完整语音结果/u);
+    assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /生成状态：已生成/u);
+    assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /音色相似度：不适用/u);
+    assert.match(outboundRefs.find((entry) => entry.messageKind === 'audio')?.continuationContext || '', /发送状态：已发送/u);
+  });
+
+  it('仅 @ 机器人回复旧语音请求时继承受控语音协议并真实走原生音频', async () => {
+    const originalRequest = '请用刚克隆的音色发一条语音，向群里的大哥大姐打个招呼。';
+    let streamCalls = 0;
+    let synthesisCalls = 0;
+    let audioCalls = 0;
+    const interactionModes: string[] = [];
+    const textMessages: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamCalls += 1;
+          interactionModes.push(params.interactionMode || 'agent');
+          if (streamCalls === 1) {
+            // 模拟 Primary 忽略通用续办文本中的原始语音要求；review 必须只修复一次。
+            return createTextStream(['```cti-final', JSON.stringify({
+              kind: 'text', text: '当前只能发送文字说明。', images: [], files: [], reply_mode: 'plain',
+            }), '```'].join('\n'));
+          }
+          return createTextStream(createSpeechReply(
+            '各位好，很高兴认识大家，祝大家今天顺利。',
+            'voice_only',
+            'active_reference',
+          ));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        transcribe: async () => { throw new Error('not used'); },
+        synthesize: async ({ text, voiceRequirement }) => {
+          synthesisCalls += 1;
+          assert.equal(voiceRequirement, 'active_reference');
+          return createManagedSpeechReceipt(text, 'trusted-reply-voice');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-trusted-reply-text' };
+    });
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_trusted_reply_voice' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage(
+        '请处理我在本条飞书话题中回复或引用的消息。',
+        'ou_speech',
+        'oc_trusted_reply_voice',
+      ),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:om_original_voice_request',
+            kind: 'message',
+            relation: 'native_reply',
+            source: 'platform_api',
+            confidence: 1,
+            content: originalRequest,
+            metadata: { contentRecovered: true },
+          }],
+        },
+        feishuReplyTo: { messageId: 'om_original_voice_request', attachmentCount: 0 },
+      },
+    });
+
+    assert.equal(streamCalls, 2);
+    assert.deepEqual(interactionModes, ['response_only', 'response_only']);
+    assert.equal(synthesisCalls, 1);
+    assert.equal(audioCalls, 1);
+    assert.equal(textMessages.length, 0);
   });
 
   it('TTS 忽略取消并迟到返回时释放回执，且不再投递语音或文字', async () => {
@@ -12848,6 +13527,73 @@ describe('bridge-manager speech integration', () => {
     assert.equal(sent.length, 0);
   });
 
+  it('其他飞书会话的明确音色请求缺少 speech 协议时只修复一次再走原生语音', async () => {
+    let streamCalls = 0;
+    let synthesisCalls = 0;
+    let audioCalls = 0;
+    const interactionModes: string[] = [];
+    const synthesisInputs: Array<{ text: string; voiceRequirement?: 'active_reference' }> = [];
+    const textMessages: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamCalls += 1;
+          interactionModes.push(params.interactionMode || 'agent');
+          if (streamCalls === 1) {
+            return createTextStream(['```cti-final', JSON.stringify({
+              kind: 'text',
+              text: '当前会话没有音色合成和语音发送能力。',
+              images: [],
+              files: [],
+              reply_mode: 'plain',
+            }), '```'].join('\n'));
+          }
+          return createTextStream(createSpeechReply(
+            '大家好，很高兴认识大家，请多多关照。',
+            'voice_only',
+            'active_reference',
+          ));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      speech: {
+        transcribe: async () => { throw new Error('not used'); },
+        getSynthesisIdentity: () => TEST_SPEECH_SYNTHESIS_IDENTITY,
+        synthesize: async ({ text, voiceRequirement }) => {
+          synthesisCalls += 1;
+          synthesisInputs.push({ text, voiceRequirement });
+          return createManagedSpeechReceipt(text, 'cross-session');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-cross-session-text' };
+    });
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_cross_session_native_audio' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage(
+      '用你刚刚克隆的音色给大家打个招呼',
+      'ou_speech',
+      'oc_another_voice_window',
+    ));
+
+    assert.equal(streamCalls, 2);
+    assert.deepEqual(interactionModes, ['response_only', 'response_only']);
+    assert.equal(synthesisCalls, 1);
+    assert.equal(synthesisInputs.length, 1);
+    assert.match(synthesisInputs[0]?.text || '', /^大家好，很高兴认识大家，请多多关照。/u);
+    assert.equal(synthesisInputs[0]?.voiceRequirement, 'active_reference');
+    assert.equal(audioCalls, 1);
+    assert.equal(textMessages.length, 0);
+  });
+
   it('唱歌指令只调用独立 SingingHost，成功时只投递一条飞书原生音频', async () => {
     let speechCalls = 0;
     let singingCalls = 0;
@@ -12902,6 +13648,185 @@ describe('bridge-manager speech integration', () => {
     assert.equal(textMessages.length, 0);
     assert.equal(audioOptions?.expectedSha256, 'e'.repeat(64));
     assert.equal(releaseCalls, 1);
+  });
+
+  it('明确演唱请求缺少 singing 协议时只做一次 response-only 修复再调用 SingingHost', async () => {
+    let streamCalls = 0;
+    let singingCalls = 0;
+    let audioCalls = 0;
+    const interactionModes: string[] = [];
+    const textMessages: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: (params) => {
+          streamCalls += 1;
+          interactionModes.push(params.interactionMode || 'agent');
+          if (streamCalls === 1) {
+            return createTextStream(['```cti-final', JSON.stringify({
+              kind: 'text', text: '唱好啦，给你一段软萌版。', images: [], files: [], reply_mode: 'plain',
+            }), '```'].join('\n'));
+          }
+          return createTextStream(['```cti-final', JSON.stringify({
+            kind: 'text', text: '为你生成一段真实歌声；失败时以此文字说明收口。', images: [], files: [], reply_mode: 'plain',
+            singing: {
+              mode: 'song_only', prompt: '轻快童谣', lyrics: '星光轻轻落下来',
+              vocal_language: 'zh', duration_seconds: 10,
+            },
+          }), '```'].join('\n'));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      singing: {
+        synthesizeSong: async (input) => {
+          singingCalls += 1;
+          return createManagedSingingReceipt(input, 'repaired');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-repaired-text' };
+    });
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_repaired_native_song' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('唱一首小星星', 'ou_speech', 'oc_song_repair'));
+
+    assert.equal(streamCalls, 2);
+    assert.deepEqual(interactionModes, ['response_only', 'response_only']);
+    assert.equal(singingCalls, 1);
+    assert.equal(audioCalls, 1);
+    assert.equal(textMessages.length, 0);
+  });
+
+  it('可靠原生回复歌词由 Bridge 直接形成完整歌声计划，不触发第二次协议修复', async () => {
+    const lyrics = '[Verse]\n第一句要完整唱。\n第二句也不能遗漏。\n[Chorus]\n副歌按引用内容继续。';
+    let streamCalls = 0;
+    let singingCalls = 0;
+    let audioCalls = 0;
+    const singingInputs: Array<{
+      lyrics: string;
+      voiceRequirement?: 'active_reference';
+      durationSeconds: number;
+    }> = [];
+    const outboundRefs: any[] = [];
+    const textMessages: OutboundMessage[] = [];
+    const store = createStatefulStore({ remote_bridge_enabled: 'true' });
+    store.insertOutboundRef = (input: any) => { outboundRefs.push(input); };
+    initBridgeContext({
+      store,
+      llm: {
+        streamChat: () => {
+          streamCalls += 1;
+          return createTextStream(['```cti-final', JSON.stringify({
+            kind: 'text', text: '将按你回复的歌词生成真实歌声。', images: [], files: [], reply_mode: 'plain',
+          }), '```'].join('\n'));
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      singing: {
+        synthesizeSong: async (input) => {
+          singingCalls += 1;
+          singingInputs.push(input);
+          return createManagedSingingReceipt(input, 'native-reply');
+        },
+      },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      textMessages.push(message);
+      return { ok: true, messageId: 'unexpected-native-reply-text' };
+    });
+    adapter.sendLocalAudio = async () => {
+      audioCalls += 1;
+      return { ok: true, messageId: 'om_native_reply_song' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, {
+      ...createInboundMessage('用克隆音色把这个唱出来', 'ou_speech', 'oc_native_reply_song'),
+      raw: {
+        feishuConversationContext: {
+          evidence: [{
+            id: 'message:om_song_lyrics',
+            kind: 'message',
+            relation: 'native_reply',
+            source: 'platform_api',
+            confidence: 1,
+            content: lyrics,
+            actor: { id: 'ou_lyric_author', displayName: '歌词作者', type: 'human' },
+            metadata: { contentRecovered: true },
+          }],
+        },
+        feishuReplyTo: { messageId: 'om_song_lyrics', attachmentCount: 0 },
+      },
+    });
+
+    assert.equal(streamCalls, 1);
+    assert.equal(singingCalls, 1);
+    assert.equal(singingInputs[0]?.lyrics, lyrics);
+    assert.equal(singingInputs[0]?.voiceRequirement, 'active_reference');
+    assert.ok((singingInputs[0]?.durationSeconds || 0) >= 10);
+    assert.equal(audioCalls, 1);
+    assert.equal(textMessages.length, 0);
+    const ref = outboundRefs.find((entry) => entry.messageKind === 'audio');
+    assert.equal(ref?.platformMessageId, 'om_native_reply_song');
+    assert.match(ref?.continuationContext || '', /生成状态：已生成/u);
+    assert.match(ref?.continuationContext || '', /发送状态：已发送/u);
+    assert.match(ref?.continuationContext || '', /音色相似度：已通过/u);
+    assert.match(ref?.continuationContext || '', /歌词对齐：已通过/u);
+  });
+
+  it('演唱请求已经调用普通工具生成 MP3 时失败关闭且不发送文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-song-file-bypass-'));
+    const mp3Path = path.join(root, 'fake-song.mp3');
+    fs.writeFileSync(mp3Path, Buffer.from('not-a-managed-song'));
+    let streamCalls = 0;
+    let fileCalls = 0;
+    const sent: OutboundMessage[] = [];
+    initBridgeContext({
+      store: createStatefulStore({ remote_bridge_enabled: 'true' }),
+      llm: {
+        streamChat: () => {
+          streamCalls += 1;
+          return createEventStream([
+            { type: 'tool_use', data: JSON.stringify({ id: 'tool-tts', name: 'Bash', input: { command: 'edge-tts' } }) },
+            { type: 'tool_result', data: JSON.stringify({ tool_use_id: 'tool-tts', content: '{"ok":true}', is_error: false }) },
+            { type: 'text', data: ['```cti-final', JSON.stringify({
+              kind: 'file', text: '唱好啦。', images: [], files: [mp3Path], reply_mode: 'plain',
+            }), '```'].join('\n') },
+            { type: 'result', data: '{}' },
+          ]);
+        },
+      },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+      singing: { synthesizeSong: async () => { throw new Error('不应调用'); } },
+    });
+    const adapter = createRunningAdapter('feishu', async (message) => {
+      sent.push(message);
+      return { ok: true, messageId: 'om_song_bypass_blocked' };
+    }) as BaseChannelAdapter & {
+      sendLocalFile?: (chatId: string, filePath: string, replyToMessageId?: string) => Promise<SendResult>;
+    };
+    adapter.sendLocalFile = async () => {
+      fileCalls += 1;
+      return { ok: true, messageId: 'unexpected-file' };
+    };
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    await _testOnly.handleMessage(adapter, createInboundMessage('发语音唱一段', 'ou_speech', 'oc_song_bypass'));
+
+    assert.equal(streamCalls, 1);
+    assert.equal(fileCalls, 0);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /没有形成可由受管 SingingHost 验证的歌声指令/u);
+    assert.doesNotMatch(sent[0].text, /唱好啦/u);
   });
 
   it('歌声合成失败时只发送一次完整文字，不用 TTS 冒充', async () => {

@@ -26,9 +26,10 @@ import {
   type CodexProviderProfile,
   type CodexReasoningEffort,
 } from './codex-execution-profile.js';
-import { resolveProviderWorkspace } from './provider-workspace.js';
+import { resolveProviderWorkspace, shouldSkipGitRepoCheckForWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
 import type { CodexMcpServerProjection } from './mcp-bridge.js';
+import { resolveFeishuCliUserConfigDir } from './feishu-cli-user-profile.js';
 
 export type { CodexProviderProfile } from './codex-execution-profile.js';
 
@@ -774,6 +775,7 @@ function buildCodexClientOptions(
   profile: CodexProviderProfile = 'primary',
   managedMcpServers: readonly CodexMcpServerProjection[] = [],
   homeOverride?: string,
+  sourceUserId?: string,
 ): CodexClientOptions & {
   executionProfile: CodexExecutionProfile;
   modelOverride?: string;
@@ -792,7 +794,7 @@ function buildCodexClientOptions(
       : undefined;
   const bridgeCodexHome = ensureBridgeCodexHome(profile, managedMcpServers, homeOverride);
   process.env.CODEX_HOME = bridgeCodexHome;
-  const env = {
+  const env: Record<string, string> = {
     ...toTextEnv(process.env),
     // Codex tool calls inherit only this explicit environment object.  The
     // bridge may resolve CTI_HOME from its default path without exporting the
@@ -801,6 +803,20 @@ function buildCodexClientOptions(
     CTI_HOME: process.env.CTI_HOME || CTI_HOME,
     CODEX_HOME: bridgeCodexHome,
   };
+  const feishuCliConfigDir = sourceUserId?.trim()
+    ? resolveFeishuCliUserConfigDir(sourceUserId)
+    : undefined;
+  if (sourceUserId?.trim()) {
+    if (!feishuCliConfigDir) {
+      // 不能让 resolver 失败后继续继承 process.env 中可能存在的共享目录；
+      // 否则本轮会静默回退到 Owner token。直接失败关闭，交由上层给出可见错误。
+      delete env.LARKSUITE_CLI_CONFIG_DIR;
+      throw new Error('[CodexProvider] no isolated Feishu CLI profile for the current sender');
+    }
+    // Codex 的 shell/MCP 子进程只继承这个显式 env；因此本轮所有 lark-cli
+    // 调用都会落到当前真实发起人的隔离配置目录，而不会读共享 Owner token。
+    env.LARKSUITE_CLI_CONFIG_DIR = feishuCliConfigDir;
+  }
   return {
     ...(apiKey ? { apiKey } : {}),
     ...(executionProfile.baseUrl ? { baseUrl: executionProfile.baseUrl } : {}),
@@ -818,13 +834,14 @@ function buildCodexClientOptions(
 export function buildCodexClientOptionsForTest(
   profile: CodexProviderProfile = 'primary',
   managedMcpServers: readonly CodexMcpServerProjection[] = [],
+  sourceUserId?: string,
 ): CodexClientOptions & {
   executionProfile: CodexExecutionProfile;
   modelOverride?: string;
   passModel: boolean;
   profile: CodexProviderProfile;
 } {
-  return buildCodexClientOptions(profile, managedMcpServers);
+  return buildCodexClientOptions(profile, managedMcpServers, undefined, sourceUserId);
 }
 
 /**
@@ -871,6 +888,25 @@ function truncateText(text: string, maxLen: number): string {
   return normalized.length > maxLen ? `${normalized.slice(0, maxLen - 3)}...` : normalized;
 }
 
+/**
+ * Codex 的 system prompt 只有一个扁平字符串入口。上游的 PromptSection
+ * 优先级在跨包边界后不再可见，因此超出预算时必须同时保留两端：前缀通常
+ * 放身份/安全约束，尾部通常放本轮追加的可信证据或协议。这样不依赖某个
+ * 业务标题、渠道或功能名称，也不会因为新增 section 而静默丢掉整段尾部。
+ */
+function truncateTextPreservingBoundaries(text: string, maxLen: number): string {
+  const normalized = normalizeText(text);
+  if (!normalized || normalized.length <= maxLen) return normalized;
+
+  const omission = ' …[中间系统上下文已按预算省略]… ';
+  if (maxLen <= omission.length + 2) return truncateText(normalized, maxLen);
+
+  const retainedChars = maxLen - omission.length;
+  const prefixChars = Math.ceil(retainedChars / 2);
+  const suffixChars = retainedChars - prefixChars;
+  return `${normalized.slice(0, prefixChars)}${omission}${normalized.slice(-suffixChars)}`;
+}
+
 function truncateSystemPromptPreservingProtocols(text: string, maxLen = SYSTEM_PROMPT_CHAR_BUDGET): string {
   const normalized = normalizeText(text);
   if (!normalized || normalized.length <= maxLen) return normalized;
@@ -883,7 +919,7 @@ function truncateSystemPromptPreservingProtocols(text: string, maxLen = SYSTEM_P
   const protocolLines = [...new Set(lines.filter(line => (
     /\bprotocol\b/i.test(line) && /```cti-[a-z0-9][a-z0-9-]*/i.test(line)
   )))];
-  if (protocolLines.length === 0) return truncateText(text, maxLen);
+  if (protocolLines.length === 0) return truncateTextPreservingBoundaries(text, maxLen);
 
   // 协议可能位于任意 prompt section；先给结构化动作协议保留预算，再裁剪普通上下文。
   const protocolBlock = ['Critical bridge protocols:', ...protocolLines].join('\n');
@@ -893,7 +929,7 @@ function truncateSystemPromptPreservingProtocols(text: string, maxLen = SYSTEM_P
   const protocolSet = new Set(protocolLines);
   const regularText = lines.filter(line => !protocolSet.has(line)).join(' ');
   const regularBudget = maxLen - protocolBlock.length - separator.length;
-  const regularBlock = truncateText(regularText, regularBudget);
+  const regularBlock = truncateTextPreservingBoundaries(regularText, regularBudget);
   return regularBlock ? `${regularBlock}${separator}${protocolBlock}` : protocolBlock;
 }
 
@@ -952,7 +988,8 @@ function buildBridgeReplyGuardrails(params?: StreamChatParams): string {
     '- Keep the normal text as useful fallback detail, but do not repeat the same analysis_view title, verdict, and all metrics verbatim. Use it for supporting evidence or context.',
     '- When the user must choose one of 2-8 concrete known alternatives, optional choices may be an array of objects with only label and optional description; optional choice_title names the decision.',
     '- For a multi-turn finite-choice interaction, include choice_flow={"mode":"continuous","state":"active"} with 2-8 choices on every non-terminal turn. On the terminal turn include choice_flow={"mode":"continuous","state":"complete"}. Never invent a flow ID; the Bridge owns it.',
-    '- Only when the user explicitly requests group participation, include choice_session: vote={"mode":"vote","state":"active","duration_seconds":10..3600}, claim={"mode":"claim","state":"active"}, or parallel={"mode":"parallel","state":"active"}. Ordinary choices omit it and remain initiator-only.',
+    '- Ordinary choices omit choice_session and remain initiator-only. If the user explicitly asks another current-chat member to answer (for example “选择人是某某”“让某某作答” or a native @member), include choice_session={"mode":"single_user","audience":"participant","state":"active"}; never include a user ID or participant key because the Bridge resolves the target from current-chat evidence. If the target is ambiguous, the Bridge asks for clarification.',
+    '- Only when the user explicitly requests group participation, include choice_session: vote={"mode":"vote","state":"active","duration_seconds":10..3600}, claim={"mode":"claim","state":"active"}, or parallel={"mode":"parallel","state":"active"}.',
     '- Group choice is never a permission, Owner/high-risk confirmation, credential, or identity mechanism. Never include participant IDs or callback/action fields.',
     '- Do not use choices for free-form input, permissions, Owner/high-risk confirmation, secrets, identity resolution, or arbitrary commands. Never include callback_data or platform/action parameters; the Bridge creates safe buttons.',
     '- Never output a naked JSON object outside the fenced result block.',
@@ -1068,6 +1105,8 @@ export function buildTurnPrompt(params: StreamChatParams): string {
 export class CodexProvider implements LLMProvider {
   private sdk: CodexModule | null = null;
   private codex: CodexInstance | null = null;
+  /** Feishu 群聊可由不同成员发起私有审批，按用户隔离 Codex 子进程环境。 */
+  private readonly codexBySourceUser = new Map<string, CodexInstance>();
   private classifierCodex: CodexInstance | null = null;
 
   /**
@@ -1083,9 +1122,11 @@ export class CodexProvider implements LLMProvider {
   /**
    * Lazily load the Codex SDK. Throws a clear error if not installed.
    */
-  private async ensureSDK(): Promise<{ sdk: CodexModule; codex: CodexInstance }> {
-    if (this.sdk && this.codex) {
-      return { sdk: this.sdk, codex: this.codex };
+  private async ensureSDK(sourceUserId?: string): Promise<{ sdk: CodexModule; codex: CodexInstance }> {
+    const userKey = sourceUserId?.trim() || '';
+    if (this.sdk) {
+      const existing = userKey ? this.codexBySourceUser.get(userKey) : this.codex;
+      if (existing) return { sdk: this.sdk, codex: existing };
     }
 
     try {
@@ -1100,17 +1141,21 @@ export class CodexProvider implements LLMProvider {
     const clientOptions = buildCodexClientOptions(
       this.options.profile || 'primary',
       this.options.managedMcpServers,
+      this.options.codexHome,
+      userKey || undefined,
     );
 
     const CodexClass = this.sdk.Codex;
-    this.codex = new CodexClass({
+    const codex = new CodexClass({
       ...(clientOptions.apiKey ? { apiKey: clientOptions.apiKey } : {}),
       ...(clientOptions.baseUrl ? { baseUrl: clientOptions.baseUrl } : {}),
       config: clientOptions.config,
       env: clientOptions.env,
     });
+    if (userKey) this.codexBySourceUser.set(userKey, codex);
+    else this.codex = codex;
 
-    return { sdk: this.sdk, codex: this.codex };
+    return { sdk: this.sdk, codex };
   }
 
   private async ensureClassifierSDK(): Promise<{ sdk: CodexModule; codex: CodexInstance }> {
@@ -1153,7 +1198,9 @@ export class CodexProvider implements LLMProvider {
             const restrictedMode = classifierMode || responseOnlyMode;
             const { codex } = restrictedMode
               ? await self.ensureClassifierSDK()
-              : await self.ensureSDK();
+              : await self.ensureSDK(
+                params.sourceChannelType === 'feishu' ? params.sourceUserId : undefined,
+              );
 
             const profile = self.options.profile || 'primary';
             const executionProfile = resolveExecutionProfile(profile, restrictedMode);
@@ -1219,7 +1266,7 @@ export class CodexProvider implements LLMProvider {
               ...(executionProfile.submittedModel ? { model: executionProfile.submittedModel } : {}),
               ...(workingDirectory ? { workingDirectory } : {}),
               ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
-              ...(shouldSkipGitRepoCheck() ? { skipGitRepoCheck: true } : {}),
+              ...((shouldSkipGitRepoCheck() || shouldSkipGitRepoCheckForWorkspace(params.workspacePlan)) ? { skipGitRepoCheck: true } : {}),
               approvalPolicy,
               sandboxMode,
               modelReasoningEffort: executionProfile.submittedReasoningEffort,

@@ -114,6 +114,26 @@ export async function normalizeForAsr(input: {
   if (result.code !== 0) throw new Error('ffmpeg_asr_normalize_failed');
 }
 
+/**
+ * Qwen Base 在构建克隆提示时会经由 Python 的音频加载栈读取参考录音；
+ * 飞书原生 Ogg 等格式不应依赖可选的 audioread/SoX 后端。Runtime 先用已
+ * 验证的受管 FFmpeg 转为标准 PCM WAV，再交给 Sidecar。原始参考文件、哈希
+ * 与授权证据继续由音色注册表保留，这个文件只属于单次受管合成临时目录。
+ */
+export async function normalizeForVoiceClone(input: {
+  ffmpegPath: string;
+  sourcePath: string;
+  outputPath: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const result = await runNoShell(input.ffmpegPath, [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', input.sourcePath,
+    '-vn', '-ac', '1', '-ar', '24000', '-c:a', 'pcm_s16le', input.outputPath,
+  ], { signal: input.signal, timeoutMs: input.timeoutMs });
+  if (result.code !== 0) throw new Error('ffmpeg_voice_clone_normalize_failed');
+}
+
 /** Sidecar 统一产出 WAV；Runtime 再转 16kHz 单声道 Opus 供渠道交付。 */
 export async function wavToMonoOpus(input: {
   ffmpegPath: string;

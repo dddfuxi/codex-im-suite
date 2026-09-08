@@ -29,10 +29,16 @@ public sealed class ControlApiContractTests
         var speechChannelType = assembly.GetType("ClaudeToImControlPanel.SpeechChannelContract");
         var speechCapabilityType = assembly.GetType("ClaudeToImControlPanel.SpeechCapabilityContract");
         var speechComponentType = assembly.GetType("ClaudeToImControlPanel.SpeechComponentContract");
+        var speechProviderType = assembly.GetType("ClaudeToImControlPanel.SpeechProviderContract");
+        var speechVoiceAcceptanceType = assembly.GetType("ClaudeToImControlPanel.SpeechVoiceAcceptanceContract");
         var speechVoiceType = assembly.GetType("ClaudeToImControlPanel.SpeechVoiceProfileContract");
         var speechLimitsType = assembly.GetType("ClaudeToImControlPanel.SpeechLimitsContract");
         var speechActionType = assembly.GetType("ClaudeToImControlPanel.SpeechActionContract");
         var speechBenchmarkType = assembly.GetType("ClaudeToImControlPanel.SpeechModelBenchmarkContract");
+        var speechModelOptionType = assembly.GetType("ClaudeToImControlPanel.SpeechModelOptionContract");
+        var speechModelSelectionType = assembly.GetType("ClaudeToImControlPanel.SpeechModelSelectionContract");
+        var speechPreviewReceiptType = assembly.GetType("ClaudeToImControlPanel.SpeechPreviewReceiptContract");
+        var settingsSnapshotType = assembly.GetType("ClaudeToImControlPanel.SettingsSnapshot");
 
         Assert.NotNull(panelStateType);
         Assert.NotNull(commandType);
@@ -52,10 +58,16 @@ public sealed class ControlApiContractTests
         Assert.NotNull(speechChannelType);
         Assert.NotNull(speechCapabilityType);
         Assert.NotNull(speechComponentType);
+        Assert.NotNull(speechProviderType);
+        Assert.NotNull(speechVoiceAcceptanceType);
         Assert.NotNull(speechVoiceType);
         Assert.NotNull(speechLimitsType);
         Assert.NotNull(speechActionType);
         Assert.NotNull(speechBenchmarkType);
+        Assert.NotNull(speechModelOptionType);
+        Assert.NotNull(speechModelSelectionType);
+        Assert.NotNull(speechPreviewReceiptType);
+        Assert.NotNull(settingsSnapshotType);
 
         var schemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "control-api.schema.json");
         Assert.True(File.Exists(schemaPath), $"共享协议 schema 不存在：{schemaPath}");
@@ -67,6 +79,11 @@ public sealed class ControlApiContractTests
         AssertDtoProperties(resultType!, definitions.GetProperty("ControlCommandResult"));
         AssertDtoProperties(runtimeUnitType!, definitions.GetProperty("RuntimeUnitContract"));
         AssertDtoProperties(projectRegistryType!, definitions.GetProperty("ProjectRegistrySnapshotContract"));
+
+        var panelSettingsSchemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "panel-settings.schema.json");
+        Assert.True(File.Exists(panelSettingsSchemaPath), $"面板设置共享协议 schema 不存在：{panelSettingsSchemaPath}");
+        using var panelSettingsSchema = JsonDocument.Parse(File.ReadAllText(panelSettingsSchemaPath, Encoding.UTF8));
+        AssertDtoProperties(settingsSnapshotType!, panelSettingsSchema.RootElement.GetProperty("$defs").GetProperty("PanelSettingsStateContract"));
 
         var agentSchemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "agent-collaboration.schema.json");
         Assert.True(File.Exists(agentSchemaPath), $"Agent 协作 schema 不存在：{agentSchemaPath}");
@@ -90,10 +107,15 @@ public sealed class ControlApiContractTests
         AssertDtoProperties(speechChannelType!, speechDefinitions.GetProperty("SpeechChannelContract"));
         AssertDtoProperties(speechCapabilityType!, speechDefinitions.GetProperty("SpeechCapabilityContract"));
         AssertDtoProperties(speechComponentType!, speechDefinitions.GetProperty("SpeechComponentContract"));
+        AssertDtoProperties(speechProviderType!, speechDefinitions.GetProperty("SpeechProviderContract"));
+        AssertDtoProperties(speechVoiceAcceptanceType!, speechDefinitions.GetProperty("SpeechVoiceAcceptanceContract"));
         AssertDtoProperties(speechVoiceType!, speechDefinitions.GetProperty("SpeechVoiceProfileContract"));
         AssertDtoProperties(speechLimitsType!, speechDefinitions.GetProperty("SpeechLimitsContract"));
         AssertDtoProperties(speechActionType!, speechDefinitions.GetProperty("SpeechActionContract"));
         AssertDtoProperties(speechBenchmarkType!, speechDefinitions.GetProperty("SpeechModelBenchmarkContract"));
+        AssertDtoProperties(speechModelOptionType!, speechDefinitions.GetProperty("SpeechModelOptionContract"));
+        AssertDtoProperties(speechModelSelectionType!, speechDefinitions.GetProperty("SpeechModelSelectionContract"));
+        AssertDtoProperties(speechPreviewReceiptType!, speechDefinitions.GetProperty("SpeechPreviewReceiptContract"));
     }
 
     private static void AssertDtoProperties(Type dtoType, JsonElement schema)

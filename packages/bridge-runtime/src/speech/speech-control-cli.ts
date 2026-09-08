@@ -3,11 +3,13 @@ import { fileURLToPath } from 'node:url';
 
 import { CTI_HOME, hydrateProcessEnvironmentFromConfigFile, loadConfig, saveConfig } from '../config.js';
 import { createSpeechRuntime } from './speech-runtime.js';
-import { RuntimeSpeechError } from './runtime-types.js';
+import { RuntimeSpeechError, type SpeechRuntimeConfig } from './runtime-types.js';
 import { SpeechControlService } from './speech-control-service.js';
 import {
   requestSingingVoiceBenchmark,
+  requestSingingGeneration,
   requestSingingVoicePreview,
+  requestReferenceTranscriptVerification,
   requestSpeechVoiceBenchmark,
   requestSpeechVoicePreview,
 } from './speech-preview-control.js';
@@ -32,6 +34,10 @@ export function resolveSpeechSkillRoot(moduleFilePath: string): string {
     : parentDir;
 }
 
+export function resolveSpeechControlTtsTimeoutMs(config: Pick<SpeechRuntimeConfig, 'synthesisTimeoutMs'>): number {
+  return Math.min(14 * 60_000, config.synthesisTimeoutMs + 10_000);
+}
+
 export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
   hydrateProcessEnvironmentFromConfigFile();
   const config = loadConfig();
@@ -54,28 +60,41 @@ export async function runSpeechControlCli(argv: string[]): Promise<unknown> {
         modelId,
         voiceProfileId,
         // 面板按动作设置总超时；Runtime 仍服从用户配置，并为清理与 JSON 回传留出余量。
-        timeoutMs: Math.min(4 * 60_000, config.speech!.requestTimeoutMs + 10_000),
+        timeoutMs: resolveSpeechControlTtsTimeoutMs(config.speech!),
       }),
       benchmarkVoice: ({ text, modelId, voiceProfileId }) => requestSpeechVoiceBenchmark({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
         text,
         modelId,
         voiceProfileId,
-        timeoutMs: Math.min(14 * 60_000, config.speech!.requestTimeoutMs + 10_000),
+        timeoutMs: resolveSpeechControlTtsTimeoutMs(config.speech!),
       }),
-      previewSingingVoice: ({ text, modelId, voiceProfileId }) => requestSingingVoicePreview({
+      previewSingingVoice: ({ plan, modelId, voiceProfileId }) => requestSingingVoicePreview({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
-        text,
+        plan,
         modelId,
         voiceProfileId,
         timeoutMs: Math.min(4 * 60_000, config.speech!.singingTimeoutMs + 10_000),
       }),
-      benchmarkSingingVoice: ({ text, modelId, voiceProfileId }) => requestSingingVoiceBenchmark({
+      benchmarkSingingVoice: ({ plan, modelId, voiceProfileId }) => requestSingingVoiceBenchmark({
         runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
-        text,
+        plan,
         modelId,
         voiceProfileId,
         timeoutMs: Math.min(14 * 60_000, config.speech!.singingTimeoutMs + 10_000),
+      }),
+      generateSinging: ({ plan, modelId, voiceProfileId }) => requestSingingGeneration({
+        runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
+        plan,
+        modelId,
+        voiceProfileId,
+        timeoutMs: Math.min(14 * 60_000, config.speech!.singingTimeoutMs + 10_000),
+      }),
+      verifyReferenceTranscript: ({ sourcePath, confirmedTranscript }) => requestReferenceTranscriptVerification({
+        runtimeStateRoot: path.join(CTI_HOME, 'runtime', 'speech'),
+        sourcePath,
+        confirmedTranscript,
+        timeoutMs: Math.min(4 * 60_000, config.speech!.requestTimeoutMs + 10_000),
       }),
       benchmarkStore: runtime.benchmarkStore,
       hardwareId: runtime.hardware.id,

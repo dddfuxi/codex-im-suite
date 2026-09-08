@@ -68,6 +68,7 @@ describe('agent architecture registry', () => {
       'agent_kernel.proactive_completion',
       'capability_router.existing_sticker_delivery',
       'policy_registry.scheduled_task_actions',
+      'policy_registry.panel_settings_actions',
       'policy_registry.artifact_promotion',
       'memory_system.partitioned_memory_intent',
     ]);
@@ -78,6 +79,7 @@ describe('agent architecture registry', () => {
     assert.match(lines.join('\n'), /must not substitute image generation/i);
     assert.match(lines.join('\n'), /do not read skills, call tools, or create assets/i);
     assert.match(lines.join('\n'), /cti-scheduled-task/i);
+    assert.match(lines.join('\n'), /cti-panel-settings/i);
     assert.match(lines.join('\n'), /periodic|recurring|周期/i);
     assert.match(lines.join('\n'), /kind:"at".*RFC3339.*kind:"every".*everyMs/i);
     assert.match(lines.join('\n'), /Do not substitute datetime, delay, once, interval, everyMinutes, or type aliases/i);
@@ -181,6 +183,10 @@ describe('agent architecture registry', () => {
     assert.match(lines, /may select a real evidence ID/i);
     assert.match(lines, /Invented IDs/i);
     assert.match(lines, /broadcast audiences/i);
+    assert.match(lines, /Collective greetings and audiences/i);
+    assert.match(lines, /never member-resolution or broadcast targets/i);
+    assert.match(lines, /requires the Agent to select the same member/i);
+    assert.match(lines, /must not inject bare @ text/i);
   });
 
   it('assigns persistent chat workspace switching to the Policy Registry', () => {
@@ -219,13 +225,18 @@ describe('agent architecture registry', () => {
     assert.ok(policy);
     assert.equal(policy.layerId, 'delivery_layer');
     assert.match(policy.responsibility, /without selecting a provider, local path, voice identity, command, or platform resource/i);
-    assert.match(lines, /exactly .*speech\.mode=voice_only/i);
+    assert.match(lines, /speech\.mode=voice_only/i);
+    assert.match(lines, /speech\.voice_requirement="active_reference"/i);
+    assert.match(lines, /shared Bridge Runtime owns actual availability/i);
+    assert.match(lines, /must never substitute a preset voice/i);
     assert.match(lines, /speech\.mode=text_only/i);
-    assert.match(lines, /rights_basis="self_or_authorized"/i);
-    assert.match(lines, /usage_scope="local_tts_only"/i);
-    assert.match(lines, /clean_single_speaker_confirmed=true/i);
+    assert.match(lines, /recording is self-owned or authorized, limited to local TTS, and clean single-speaker/i);
+    assert.match(lines, /reference_transcript_source="user_confirmed"/i);
+    assert.match(lines, /reference_transcript_source="runtime_revalidated"/i);
+    assert.match(lines, /Never treat an unverified ASR result as user confirmation/i);
+    assert.match(lines, /never ask for a fixed .*参考文本.* prefix/i);
     assert.match(lines, /Do not claim creation succeeded/i);
-    assert.match(lines, /complete final visible answer in .*text/i);
+    assert.match(lines, /complete spoken result in .*text/i);
     assert.match(lines, /Never put a provider, model, command, local path, URL, voice or speaker ID/i);
     assert.match(lines, /file_key, message ID, user ID, chat ID, token, or platform identity/i);
     assert.ok(policy.tags.includes('speech'));

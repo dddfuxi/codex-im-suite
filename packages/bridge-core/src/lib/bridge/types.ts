@@ -320,6 +320,8 @@ export interface StreamingCardTurnContext {
   speechDelivery?: {
     receipt: import('./host.js').LocalAudioSynthesisReceipt;
     fallbackText: string;
+    /** 原生语音成功后才发送的受控文字跟进；不能替代语音失败时的完整文字回退。 */
+    followUpText?: string;
   };
 }
 

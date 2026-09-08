@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import {
   extractExplicitFeishuMentionTargetsFromRequest,
   hasFeishuCounterpartyMentionHandoff,
+  isFeishuGroupAudienceTarget,
   isFeishuMentionExecutionRequest,
   normalizeFeishuMentionTargetKey,
   parseEnvelopeMentionTargets,
@@ -64,6 +65,19 @@ describe('bridge mention parsing', () => {
     assert.equal(isFeishuMentionExecutionRequest('之后主持人艾特另一个参与者继续'), false);
     assert.equal(isFeishuMentionExecutionRequest('为什么群里的 @ 通知没有送进来'), false);
     assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('等待主持人艾特参与者后再回答'), []);
+  });
+
+  it('does not turn reply-continuation text or a group salutation into an outbound mention', () => {
+    // 该续办文本由原生 reply 的通用语义恢复器生成，不含任何成员目标。
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('请处理我在本条飞书话题中回复或引用的消息。'), []);
+    // 群体称呼只影响要朗读的问候内容，不能要求成员目录解析或阻断语音交付。
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('发语音给群里的大哥大姐打个招呼'), []);
+    assert.equal(isFeishuGroupAudienceTarget('群里的大哥大姐'), true);
+    assert.equal(isFeishuGroupAudienceTarget('各位飞书机器人'), true);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('请艾特群里的大哥大姐打个招呼'), []);
+    // 保留明确给出具体姓名的同类指令。
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('先发语音，再艾特群里的小明打招呼'), ['小明']);
+    assert.deepEqual(extractExplicitFeishuMentionTargetsFromRequest('向大家问好，再艾特群里的小明'), ['小明']);
   });
 
   it('treats an explicitly started multi-bot handoff as a current mention action', () => {

@@ -22,6 +22,10 @@
       "types": "./src/project-registry.ts",
       "import": "./dist/project-registry.js"
     },
+    "./panel-settings": {
+      "types": "./src/panel-settings.ts",
+      "import": "./dist/panel-settings.js"
+    },
     "./speech": {
       "types": "./src/speech-contract.ts",
       "import": "./dist/speech-contract.js"

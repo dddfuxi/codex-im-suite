@@ -39,6 +39,18 @@ export interface SidecarSynthesisResult {
   provider: string;
   model: string;
   revision: string;
+  speakerSimilarity?: number;
+  speakerSimilarityThreshold?: number;
+  speakerSimilarityPassed?: boolean;
+}
+
+export interface SidecarSpeakerSimilarityResult {
+  provider: string;
+  model: string;
+  revision: string;
+  speakerSimilarity: number;
+  speakerSimilarityThreshold: number;
+  speakerSimilarityPassed: boolean;
 }
 
 export type SpeechSidecarInterruption = 'abort' | 'timeout';
@@ -70,8 +82,13 @@ export class SpeechSidecarClient {
     if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1') throw new Error('sidecar_endpoint_not_loopback');
   }
 
-  private async request<T>(pathname: string, body: unknown, signal?: AbortSignal): Promise<T> {
-    const abort = combineAbort(signal, this.timeoutMs);
+  private async request<T>(
+    pathname: string,
+    body: unknown,
+    signal?: AbortSignal,
+    options: { timeoutMs?: number; timeoutCode?: string } = {},
+  ): Promise<T> {
+    const abort = combineAbort(signal, options.timeoutMs || this.timeoutMs);
     try {
       const response = await this.fetchImpl(new URL(pathname, this.baseUrl), {
         method: 'POST',
@@ -104,7 +121,7 @@ export class SpeechSidecarClient {
         if (interruption === 'abort') {
           throw new RuntimeSpeechError('speech_request_aborted', 'error', '语音请求已取消');
         }
-        throw new RuntimeSpeechError('sidecar_request_timeout', 'error', '语音服务请求超时');
+        throw new RuntimeSpeechError(options.timeoutCode || 'sidecar_request_timeout', 'error', '语音服务请求超时');
       }
       if (error instanceof RuntimeSpeechError) throw error;
       throw new RuntimeSpeechError('sidecar_unreachable', 'error', '本地语音服务不可达');
@@ -153,8 +170,25 @@ export class SpeechSidecarClient {
     presetSpeakerId?: string;
     voiceReferencePath?: string;
     voiceReferenceTranscript?: string;
-  }, signal?: AbortSignal): Promise<SidecarSynthesisResult> {
-    return this.request('/v1/synthesize', input, signal);
+    speakerSimilarityThreshold?: number;
+  }, signal?: AbortSignal, timeoutMs?: number): Promise<SidecarSynthesisResult> {
+    return this.request('/v1/synthesize', input, signal, {
+      timeoutMs,
+      timeoutCode: 'tts_synthesis_timeout',
+    });
+  }
+
+  compareSpeakers(input: {
+    provider: string;
+    modelId: string;
+    referencePath: string;
+    candidatePath: string;
+    speakerSimilarityThreshold: number;
+  }, signal?: AbortSignal, timeoutMs?: number): Promise<SidecarSpeakerSimilarityResult> {
+    return this.request('/v1/compare-speakers', input, signal, {
+      timeoutMs,
+      timeoutCode: 'speaker_similarity_timeout',
+    });
   }
 }
 

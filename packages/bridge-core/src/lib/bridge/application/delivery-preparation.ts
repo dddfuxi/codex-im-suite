@@ -126,6 +126,12 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
   if (!kind || !['text', 'image', 'file', 'mixed'].includes(kind)) return null;
   if (!replyMode || !['plain', 'markdown', 'html'].includes(replyMode)) return null;
   if (!text.trim() && images.length === 0 && files.length === 0) return null;
+  const speech = parseSpeechReplyDirective(raw.speech);
+  const speechAction = parseSpeechReferenceVoiceAction(raw.speech_action);
+  const singing = parseSingingReplyDirective(raw.singing);
+  // 歌声结果只能由 Runtime 生成并以原生 audio 投递。模型夹带的 MP3/WAV、
+  // 图片或普通 TTS intent 会让整个 envelope 失效，再交给协议审查安全修复。
+  if (singing && (kind !== 'text' || images.length > 0 || files.length > 0 || speech || speechAction)) return null;
   const cardHero = parseDeliveryCardHero(raw.card_hero, images);
   return {
     kind,
@@ -141,9 +147,9 @@ function parseEnvelopeObject(candidate: unknown): FinalReplyEnvelope | null {
     choice_flow: parseChoiceFlowDirective(raw.choice_flow),
     choice_session: parseChoiceSessionDirective(raw.choice_session),
     analysis_view: parseAnalysisView(raw.analysis_view),
-    speech: parseSpeechReplyDirective(raw.speech),
-    speech_action: parseSpeechReferenceVoiceAction(raw.speech_action),
-    singing: parseSingingReplyDirective(raw.singing),
+    speech,
+    speech_action: speechAction,
+    singing,
   };
 }
 

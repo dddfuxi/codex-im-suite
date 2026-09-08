@@ -81,6 +81,17 @@ export interface TurnFocusDecision {
   clarification?: string;
 }
 
+/**
+ * 轻聊只能消费与当前消息本身无关的上下文。任何已解析的回复、续办或歧义
+ * 都必须回到 Primary，使完整上下文、执行能力和证据门禁保持可用。
+ */
+export function permitsLightweightResponse(decision: TurnFocusDecision): boolean {
+  return decision.focus === 'current_request'
+    && !decision.requiresAgentResolution
+    && decision.primaryEvidenceIds.length === 1
+    && decision.primaryEvidenceIds[0] === 'current-message';
+}
+
 export interface CreateTurnEvidenceEnvelopeInput {
   channelType: string;
   chatId: string;
@@ -249,49 +260,6 @@ export function resolveTurnFocus(envelope: TurnEvidenceEnvelope): TurnFocusDecis
   };
 }
 
-function isShortConversationalFollowUp(text: string): boolean {
-  const normalized = text.replace(/\s+/gu, ' ').trim();
-  if (!normalized || normalized.length > 32 || /[\r\n]/u.test(text)) return false;
-  if (/(?:删|移除|修改|编辑|写入|保存|创建|生成|安装|卸载|启动|停止|重启|运行|执行|调用|发送|私发|上传|下载|发布|部署|提交|推送|合并|切换|授权|审批|提醒|定时|delete|remove|modify|edit|write|save|create|generate|install|uninstall|start|stop|restart|run|execute|invoke|send|upload|download|publish|deploy|commit|push|merge|switch|authorize|approve|schedule)/iu.test(normalized)) {
-    return false;
-  }
-  return /(?:[?？]$|^(?:你猜|猜猜|怎么看|什么意思|什么情况|怎么回事|为什么|然后呢|所以呢|继续|说说|你觉得|如何|guess|why|what(?:\s+do\s+you\s+think|\s+does\s+this\s+mean)?|and\s+then|continue))/iu.test(normalized);
-}
-
-function isReliableNearbyText(item: TurnEvidenceItem): boolean {
-  const content = item.content.trim();
-  if (item.kind !== 'message' || item.relation !== 'nearby' || item.confidence < 0.7) return false;
-  if (!content || item.metadata?.contentRecovered === false) return false;
-  return !/^\[(?:卡片消息|图片|文件|语音|视频|飞书表情包|sticker|image|file)[^\]]*\]$/iu.test(content)
-    && !/(?:正文未随事件返回|客户端兼容占位|资源\s*key\s*=)/iu.test(content);
-}
-
-function isUnrecoveredNearbyResource(item: TurnEvidenceItem): boolean {
-  return item.kind === 'message'
-    && item.relation === 'nearby'
-    && item.metadata?.contentRecovered === false;
-}
-
-function selectReliableNearbyFallback(envelope: TurnEvidenceEnvelope): TurnEvidenceItem | null {
-  const reliableCandidates = envelope.evidence.filter(isReliableNearbyText);
-  if (reliableCandidates.length === 1) return reliableCandidates[0];
-
-  // 多条近邻时，只接受“最后一条可读文本后紧跟不可读资源卡片”的会话形态。
-  // 这能恢复卡片所承接的语义主题，但不会把资源壳本身伪装成正文。
-  const orderedNearbyMessages = envelope.evidence
-    .filter((item) => item.kind === 'message' && item.relation === 'nearby' && Number.isFinite(item.timestamp))
-    .sort((left, right) => (left.timestamp || 0) - (right.timestamp || 0));
-  let index = orderedNearbyMessages.length - 1;
-  let trailingShellCount = 0;
-  while (index >= 0 && isUnrecoveredNearbyResource(orderedNearbyMessages[index])) {
-    trailingShellCount += 1;
-    index -= 1;
-  }
-  if (trailingShellCount === 0 || index < 0) return null;
-  const adjacentCandidate = orderedNearbyMessages[index];
-  return isReliableNearbyText(adjacentCandidate) ? adjacentCandidate : null;
-}
-
 /**
  * 引用解析增强层不可用时的保守回退。
  *
@@ -302,25 +270,10 @@ export function resolveUnrecoveredReplyFallback(
   envelope: TurnEvidenceEnvelope,
   decision: TurnFocusDecision,
 ): TurnFocusDecision {
-  if (!decision.requiresAgentResolution || decision.focus !== 'ambiguous') return decision;
-  const nativeReplies = envelope.evidence.filter((item) => item.relation === 'native_reply');
-  if (nativeReplies.length !== 1 || getNativeReplyReliability(envelope, nativeReplies[0]) > 0) return decision;
-  if (!isShortConversationalFollowUp(envelope.currentText)) return decision;
-
-  const nearby = selectReliableNearbyFallback(envelope);
-  if (!nearby) return decision;
-
-  return {
-    protocol: TURN_FOCUS_PROTOCOL,
-    mode: 'deterministic',
-    focus: 'continuation',
-    primaryEvidenceIds: [nearby.id],
-    supportingEvidenceIds: supportingIds(envelope, [nearby.id]),
-    conflictingEvidenceIds: [nativeReplies[0].id],
-    confidence: Math.min(0.7, nearby.confidence),
-    requiresAgentResolution: false,
-    reason: '原生引用正文未可靠恢复；当前短接话仅回退到受控选出的同群近邻，这不是已恢复的引用正文。',
-  };
+  // 缺少已恢复正文时，文本短语不能证明用户要承接哪一条附近消息。保留歧义
+  // 交给 Reference Resolver / Primary，而不是把“继续、为什么”等说法猜成续办。
+  void envelope;
+  return decision;
 }
 
 export function validateAgentTurnFocusDecision(

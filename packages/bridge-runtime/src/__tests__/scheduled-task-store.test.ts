@@ -180,6 +180,32 @@ describe('file scheduled task store', () => {
     }
   });
 
+  it('persists the bounded native-voice presentation on notify actions', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-voice-store-'));
+    try {
+      const store = makeStore(root);
+      const input = makeTaskCreate();
+      const created = await store.createTask({
+        ...input,
+        action: {
+          kind: 'notify',
+          text: '大家记得喝水。',
+          speech: { mode: 'voice_only' },
+        },
+      });
+
+      assert.deepEqual(created.action, {
+        kind: 'notify',
+        text: '大家记得喝水。',
+        speech: { mode: 'voice_only' },
+      });
+      assert.deepEqual((await store.getTask(created.id))?.action, created.action);
+      assert.deepEqual((await store.listTasks())[0]?.action, created.action);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not leave temporary files after successful writes', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-temp-'));
     try {

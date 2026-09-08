@@ -6,6 +6,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { removeManagedTempDirectorySafely, resolveExecutableDependency } from '../speech/dependency-resolution.js';
+import { resolveReferenceAudioFfprobeDependency } from '../speech/speech-runtime.js';
 
 describe('speech dependency resolution', () => {
   it('fails closed for a bad explicit path instead of falling back', () => {
@@ -77,6 +78,31 @@ describe('speech dependency resolution', () => {
       const result = resolveExecutableDependency({
         id: 'ffmpeg', displayName: 'FFmpeg', runtimeDepsRoot: root, componentIds: ['ffmpeg_runtime'],
       });
+      assert.equal(result.state, 'ready');
+      assert.equal(result.path, path.resolve(managed));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the shared FFmpeg runtime when validating imported reference audio', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-speech-reference-ffprobe-'));
+    const executableName = process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe';
+    const versionRoot = path.join(root, 'speech', 'ffmpeg_runtime', 'v1');
+    const relativeEntry = `ffmpeg-build/bin/${executableName}`;
+    const managed = path.join(versionRoot, ...relativeEntry.split('/'));
+    fs.mkdirSync(path.dirname(managed), { recursive: true });
+    fs.writeFileSync(managed, 'ffprobe', 'utf8');
+    if (process.platform !== 'win32') fs.chmodSync(managed, 0o700);
+    fs.writeFileSync(path.join(versionRoot, '.installed.json'), JSON.stringify({
+      protocol: 'cti-speech-component-install/v1', id: 'ffmpeg_runtime', version: 'v1',
+      sha256: 'e'.repeat(64), size: 7, source: 'https://example.invalid/ffmpeg.zip', license: 'LGPL',
+      platform: `${process.platform}-${process.arch}`, entryPoint: relativeEntry,
+      entryPointSha256: crypto.createHash('sha256').update('ffprobe').digest('hex'), entryPointSize: 7,
+      installedAt: '2026-08-11T00:00:00.000Z',
+    }), 'utf8');
+    try {
+      const result = resolveReferenceAudioFfprobeDependency({ runtimeDepsRoot: root });
       assert.equal(result.state, 'ready');
       assert.equal(result.path, path.resolve(managed));
     } finally {

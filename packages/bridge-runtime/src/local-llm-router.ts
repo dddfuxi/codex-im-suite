@@ -96,8 +96,6 @@ const LOCAL_FRIENDLY_PATTERNS: PatternRule[] = [
   { pattern: /(帮我总结|概括一下|提炼一下|简要说明)/i, reason: '总结类请求', taskKind: 'summarize' },
 ];
 
-const READABLE_CONTEXT_OBJECT_RE = /(?:https?:\/\/\S+|[A-Za-z]:[\\/]|(?:^|[\s"'`])\.{1,2}[\\/]|[\w.-]+[\\/][\w .\\/.-]+|\.(?:md|json|txt|ts|tsx|js|mjs|cjs|cs|prefab|unity|yml|yaml|toml|env|log)\b|工作目录|当前目录|本地目录|项目结构|仓库结构|目录|文件夹|子目录|路径|文件|仓库|workspace|repo|repository|mcp\s*manifest|manifest|config\/mcp\.d|链接|url)/iu;
-const READABLE_CONTEXT_ACTION_RE = /(?:看一看|看一下|看一眼|看看|查看|查一下|查询|列出|列一下|有哪些|有什么|读一下|读取|打开|搜索|搜一下|查找|总结|概括|分析)/iu;
 
 function normalizeText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
@@ -187,41 +185,6 @@ function getLightChatHistoryLimit(config: Config): number {
   return Math.max(0, Math.min(4, Number.isFinite(raw) ? Math.floor(raw) : DEFAULT_LIGHT_CHAT_HISTORY_LIMIT));
 }
 
-function looksLikeExecutionIntent(text: string): boolean {
-  return /(执行|运行|重启|同步|修复|修改|更新|部署|构建|测试|检查|查询|查一下|读取|搜索|创建|删除|发送|上传|下载|帮我拉取|帮我\s*pull|帮我查一下|帮我看看|直接做|直接处理|请处理)/i.test(text);
-}
-
-/**
- * “测试 / 检查”也常用于跟机器人轻聊式确认响应速度，例如“检查一下你快没快”。
- * 这类消息本身就是测试，不需要因为单个执行动词直接进入完整工具链；具体 API、
- * 服务、文件或 MCP 等目标仍会被上方硬门禁和可读对象门禁拦截。
- */
-function isAssistantResponsivenessProbe(text: string): boolean {
-  const normalized = normalizeText(text);
-  if (!normalized) return false;
-  const addressesAssistant = /(?:你|机器人|助手|小虾米|\bbot\b|\bassistant\b)/iu.test(normalized);
-  const asksAboutResponsiveness = /(?:快没快|快不快|慢不慢|快(?:吗|了没|点了吗)|反应|响应|回复速度|响应速度|反应速度|延迟|卡顿|卡不卡|秒回|灵不灵|活没活|恢复没|在不在)/iu.test(normalized);
-  if (addressesAssistant && asksAboutResponsiveness) {
-    return !/(?:API|接口|服务|进程|文件|路径|目录|仓库|TAPD|Unity|Blender|MCP|附件|图片|配置|状态|网络|数据库|模型|Provider|工具)/iu.test(normalized);
-  }
-
-  // 中文轻聊经常省略“你 / 机器人”主语，例如“测试一下现在回复快不快”。
-  // 只有同时具备对话响应对象、性能语义和现场探测语境时才补全该主语；
-  // API、服务、文件、MCP 等具体对象继续留给 Primary 走真实工具/evidence 链。
-  const hasConversationResponseTarget = /(?:回复|回话|回消息|接话|应答|响应|反应|出卡|首卡)/iu.test(normalized);
-  const hasPerformanceMeaning = /(?:快没快|快不快|慢不慢|快(?:吗|了没|点了吗)|速度|延迟|耗时|反应时间|响应时间|卡顿|卡不卡|秒回)/iu.test(normalized);
-  const hasLiveProbeContext = /(?:现在|当前|这次|这回|刚才|试试|测试|测一下|测测|体验一下)/iu.test(normalized);
-  const hasConcreteTaskTarget = /(?:API|接口|服务|进程|文件|路径|目录|仓库|TAPD|Unity|Blender|MCP|附件|图片|配置|状态|网络|数据库|模型|Provider|工具)/iu.test(normalized);
-  return hasConversationResponseTarget
-    && hasPerformanceMeaning
-    && hasLiveProbeContext
-    && !hasConcreteTaskTarget;
-}
-
-function hasReadableContextObject(text: string): boolean {
-  return READABLE_CONTEXT_ACTION_RE.test(text) && READABLE_CONTEXT_OBJECT_RE.test(text);
-}
-
 function extractSystemSection(systemPrompt: string | undefined, heading: string): string {
   const text = systemPrompt || '';
   if (!text.trim()) return '';
@@ -294,13 +257,6 @@ function extractFirstSystemSectionUntilHeadings(
 function hasFeishuLightContext(params: StreamChatParams): boolean {
   const context = [params.systemPrompt, params.priorityTurnContext, params.prompt].filter(Boolean).join('\n');
   return /Feishu|飞书|表情包|sticker|reaction|emoji|轻量聊天|light[_ -]?status/i.test(context);
-}
-
-function hasLightChatTone(text: string): boolean {
-  const normalized = text.trim();
-  if (!normalized) return false;
-  if (normalized.length <= 24) return true;
-  return /(收到|好的|好呀|可以|在呢|谢谢|哈哈|嘿嘿|早|晚安|辛苦|赞|OK|ok|嗯|哦|嗨|hello|hi|表情包|sticker)/iu.test(normalized);
 }
 
 /**
@@ -383,6 +339,9 @@ export function extractPriorityEvidenceContents(priorityTurnContext?: string): s
 
 export function isLightChatCandidate(params: StreamChatParams, config: Config): boolean {
   if (config.lightChatFastPathEnabled === false) return false;
+  // 轻聊不是文本分类器的默认出口。只有 Bridge 已依据焦点与真实 evidence
+  // 明确签发资格时，才允许进入受限协调器；缺少该结构化信号一律回 Primary。
+  if (params.lightChatEligible !== true) return false;
   const prompt = (params.prompt || '').trim();
   if (!prompt) return false;
   if (prompt.length > getLightChatMaxInputChars(config)) return false;
@@ -390,22 +349,9 @@ export function isLightChatCandidate(params: StreamChatParams, config: Config): 
   const requirement = params.executionRequirement;
   if (requirement && requirement.kind !== 'none') return false;
 
-  const evidenceText = extractPriorityEvidenceContents(params.priorityTurnContext);
-  // “继续 / 接着”属于明确续办，不需要先花一轮协调模型判断，直接保留完整
-  // 回合进入 Primary；Primary 再依据真实上下文决定是否调用工具或最小澄清。
-  if (getLocalConversationExpectedAction(prompt, params.priorityTurnContext) === 'delegate') return false;
-  const combinedInput = [prompt, evidenceText].filter(Boolean).join('\n');
-  for (const rule of HARD_EXCLUDE_PATTERNS) {
-    if (rule.pattern.test(combinedInput)) return false;
-  }
-  if (hasReadableContextObject(combinedInput)) return false;
-  // 响应速度探测属于对话元信息，应交给受限协调器自己回复或升级；不能被
-  // “测试 / 检查”两个词机械劫持。其他执行意图继续保守进入 Primary。
-  if (!isAssistantResponsivenessProbe(prompt) && looksLikeExecutionIntent(combinedInput)) return false;
-  if (/(执行|运行|命令|文件|读取|搜索|截图|图片|附件|MCP|Unity|Blender|发布|报错|错误|阻塞|日志|git\s+(?:status|pull|fetch|branch|log)|Feishu doc|飞书文档|docx|sheets|base)/iu.test(combinedInput)) {
-    return false;
-  }
-  return hasFeishuLightContext(params) && hasLightChatTone(prompt);
+  // 协调器仍会把任务、查询和对象不明的请求失败关闭到 Primary；这里不再维护
+  // 中文动作词、寒暄词或长度阈值来抢先下结论。
+  return hasFeishuLightContext(params);
 }
 
 export function buildLightChatParams(params: StreamChatParams, config: Config): StreamChatParams {
@@ -497,17 +443,13 @@ function buildLocalLightConversationResponseSchema(
 }
 
 export function getLocalConversationExpectedAction(
-  prompt: string,
+  _prompt: string,
   priorityTurnContext?: string,
 ): LightConversationAction | undefined {
-  const text = normalizeText(prompt);
+  // 只接受 Bridge 已抽取出的真实关联 evidence。当前用户文字无论看起来像
+  // “续办”还是“求助”，都不能在这里被固定短语强制成某个动作。
   const hasRelatedEvidence = Boolean(extractPriorityEvidenceContents(priorityTurnContext));
-  if (/(?:^|[，。！？!?\s])(继续|接着|然后|往下|照旧)(?:[吧呢呀啊]?[，。！？!?\s]*$)/u.test(text)) return 'delegate';
-  if (!hasRelatedEvidence && (
-    /^(?:这个|那个|刚才(?:那个|这个|说的|提到的)?|上面|前面|之前|为什么)(?:呢|呀|啊|吧)?[？?]?$/u.test(text)
-    || /^(?:帮帮我|帮我一下|怎么办|怎么弄)(?:吧|呢|呀|啊)?[？?]?$/u.test(text)
-  )) return 'clarify';
-  return undefined;
+  return hasRelatedEvidence ? 'delegate' : undefined;
 }
 
 export function buildLightConversationCoordinatorParams(
@@ -688,9 +630,11 @@ export function decideConservativeRoute(params: StreamChatParams, config: Config
 
   for (const rule of LOCAL_FRIENDLY_PATTERNS) {
     if (rule.pattern.test(combinedInput)) {
-      const executionIntent = rule.taskKind === 'repo_query' || rule.taskKind === 'tool_request'
-        ? looksLikeExecutionIntent(combinedInput) || /\bgit (pull|status|fetch|branch|log)\b/i.test(combinedInput)
-        : false;
+      // 只有上游的结构化执行要求才能让本地友好规则变成可执行快速路径。
+      // 规则文本仅用于选择候选能力，不能凭动词词表授予执行资格。
+      const executionIntent = (rule.taskKind === 'repo_query' || rule.taskKind === 'tool_request')
+        && params.executionRequirement?.kind !== undefined
+        && params.executionRequirement.kind !== 'none';
       const preferLocal = rule.preferLocal !== false;
       const allowLocalFallback = rule.allowFallback === true || preferLocal;
       return fallback({

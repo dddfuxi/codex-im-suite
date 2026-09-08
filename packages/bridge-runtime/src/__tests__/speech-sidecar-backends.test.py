@@ -75,6 +75,32 @@ class FakeQwenModel:
         self.calls.append(("clone", kwargs))
         return [[0.1, 0.0]], 16000
 
+    def create_voice_clone_prompt(self, **kwargs):
+        self.calls.append(("embedding", kwargs))
+        return [SimpleNamespace(ref_spk_embedding=FakeEmbedding())]
+
+
+class FakeEmbedding:
+    shape = (2,)
+
+    def float(self):
+        return self
+
+    def reshape(self, _shape):
+        return self
+
+    def numel(self):
+        return 2
+
+    def unsqueeze(self, _dim):
+        return self
+
+
+class FakeSimilarity:
+    @staticmethod
+    def item():
+        return 0.91
+
 
 class FakeCuda:
     class OutOfMemoryError(Exception):
@@ -91,6 +117,9 @@ class FakeCuda:
 
 class FakeQwenTorch:
     cuda = FakeCuda()
+    nn = SimpleNamespace(functional=SimpleNamespace(
+        cosine_similarity=lambda _left, _right, dim: FakeSimilarity() if dim == 1 else None,
+    ))
 
 
 class FakeSoundFile:
@@ -231,33 +260,34 @@ class SpeechBackendTests(unittest.TestCase):
             backend.synthesize("第一句。Second sentence!第三句？", str(preset_output), preset_speaker_id="cosyvoice.sft.zh_female")
             self.assertTrue(preset_output.is_file())
             self.assertEqual(
-                model.calls[:3],
+                model.calls[:1],
                 [
-                    ("sft", "第一句。", "中文女", False),
-                    ("sft", "Second sentence!", "中文女", False),
-                    ("sft", "第三句？", "中文女", False),
+                    ("sft", "第一句。 Second sentence! 第三句？", "中文女", False),
                 ],
             )
             self.assertEqual(len(FakeAudio.calls), 1)
-            self.assertEqual(FakeAudio.calls[0][1], ["a", "b", "a", "b", "a", "b"])
+            self.assertEqual(FakeAudio.calls[0][1], ["a", "b"])
 
             reference_output = root_path / "reference-output.wav"
             backend.synthesize("继续。再来！", str(reference_output), reference_path=str(reference), reference_transcript="参考文本")
             self.assertTrue(reference_output.is_file())
             self.assertEqual(
-                model.calls[3:],
+                model.calls[1:],
                 [
-                    ("reference", "继续。", "参考文本", str(reference.resolve()), False),
-                    ("reference", "再来！", "参考文本", str(reference.resolve()), False),
+                    ("reference", "继续。 再来！", "参考文本", str(reference.resolve()), False),
                 ],
             )
             self.assertEqual(len(FakeAudio.calls), 2)
 
     def test_tts_splitter_filters_empty_blocks_and_caps_long_segments(self):
         segments = BACKENDS._split_tts_text("  第一段。\n\nSecond sentence!  " + ("长" * 301))
-        self.assertEqual(segments[:2], ["第一段。", "Second sentence!"])
+        self.assertEqual(segments[0], "第一段。 Second sentence!")
         self.assertTrue(all(0 < len(segment) <= BACKENDS.MAX_TTS_SEGMENT_CHARS for segment in segments))
-        self.assertEqual("".join(segments[2:]), "长" * 301)
+        self.assertEqual("".join(segments[1:]), "长" * 301)
+
+    def test_tts_splitter_packs_short_sentences_into_one_model_call(self):
+        text = "第一句。第二句！第三句？第四句；第五句。"
+        self.assertEqual(BACKENDS._split_tts_text(text), ["第一句。 第二句！ 第三句？ 第四句； 第五句。"])
 
     def test_cosyvoice_removes_partial_output_after_failure(self):
         class FailingAudio:
@@ -336,6 +366,7 @@ class SpeechBackendTests(unittest.TestCase):
                 result = backend.synthesize(
                     "克隆测试", str(root_path / "clone.wav"),
                     reference_path=str(reference), reference_transcript="参考文本",
+                    speaker_similarity_threshold=0.72,
                 )
             finally:
                 if previous_numpy is None:
@@ -343,8 +374,9 @@ class SpeechBackendTests(unittest.TestCase):
                 else:
                     sys.modules["numpy"] = previous_numpy
             self.assertEqual(result["model"], "qwen3-tts-12hz-0.6b-base")
-            self.assertEqual(model.calls[-1][0], "clone")
-            self.assertEqual(model.calls[-1][1]["ref_text"], "参考文本")
+            self.assertEqual(next(call for call in model.calls if call[0] == "clone")[1]["ref_text"], "参考文本")
+            self.assertEqual(result["speakerSimilarity"], 0.91)
+            self.assertTrue(result["speakerSimilarityPassed"])
 
 
 if __name__ == "__main__":

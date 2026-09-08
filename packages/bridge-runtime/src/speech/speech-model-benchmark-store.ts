@@ -23,6 +23,10 @@ function finiteMetric(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function finiteSimilarity(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= -1 && value <= 1 ? value : undefined;
+}
+
 function validateRecord(value: unknown): SpeechModelBenchmarkRecord | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const item = value as Partial<SpeechModelBenchmarkRecord>;
@@ -38,12 +42,25 @@ function validateRecord(value: unknown): SpeechModelBenchmarkRecord | null {
     hardwareId: item.hardwareId!,
     revision: item.revision,
     state: item.state!,
+    ...(typeof item.voiceProfileId === 'string' && /^[a-z0-9][a-z0-9._-]{0,79}$/i.test(item.voiceProfileId)
+      ? { voiceProfileId: item.voiceProfileId } : {}),
     ...(testedAt ? { testedAt } : {}),
     ...(finiteMetric(item.coldStartMs) !== undefined ? { coldStartMs: finiteMetric(item.coldStartMs) } : {}),
     ...(finiteMetric(item.warmSynthesisMs) !== undefined ? { warmSynthesisMs: finiteMetric(item.warmSynthesisMs) } : {}),
     ...(finiteMetric(item.outputDurationMs) !== undefined ? { outputDurationMs: finiteMetric(item.outputDurationMs) } : {}),
     ...(finiteMetric(item.realTimeFactor) !== undefined ? { realTimeFactor: finiteMetric(item.realTimeFactor) } : {}),
     ...(finiteMetric(item.peakVramMiB) !== undefined ? { peakVramMiB: finiteMetric(item.peakVramMiB) } : {}),
+    ...(finiteSimilarity(item.speakerSimilarity) !== undefined ? { speakerSimilarity: finiteSimilarity(item.speakerSimilarity) } : {}),
+    ...(finiteSimilarity(item.speakerSimilarityThreshold) !== undefined && item.speakerSimilarityThreshold! >= 0
+      ? { speakerSimilarityThreshold: finiteSimilarity(item.speakerSimilarityThreshold) } : {}),
+    ...(typeof item.speakerSimilarityPassed === 'boolean'
+      ? { speakerSimilarityPassed: item.speakerSimilarityPassed } : {}),
+    ...(finiteSimilarity(item.lyricsAlignment) !== undefined && item.lyricsAlignment! >= 0
+      ? { lyricsAlignment: finiteSimilarity(item.lyricsAlignment) } : {}),
+    ...(finiteSimilarity(item.lyricsAlignmentThreshold) !== undefined && item.lyricsAlignmentThreshold! >= 0
+      ? { lyricsAlignmentThreshold: finiteSimilarity(item.lyricsAlignmentThreshold) } : {}),
+    ...(typeof item.lyricsAlignmentPassed === 'boolean'
+      ? { lyricsAlignmentPassed: item.lyricsAlignmentPassed } : {}),
     ...(typeof item.diagnosticCode === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/i.test(item.diagnosticCode)
       ? { diagnosticCode: item.diagnosticCode } : {}),
   };
@@ -71,11 +88,26 @@ export class SpeechModelBenchmarkStore {
     }
   }
 
-  find(input: { modelId: string; providerId: string; revision: string; hardwareId: string }): SpeechModelBenchmarkRecord | null {
+  find(input: { modelId: string; providerId: string; revision: string; hardwareId: string; voiceProfileId?: string }): SpeechModelBenchmarkRecord | null {
     return this.readDocument().records.find((item) => item.modelId === input.modelId
       && item.providerId === input.providerId
       && item.revision === input.revision
-      && item.hardwareId === input.hardwareId) || null;
+      && item.hardwareId === input.hardwareId
+      && item.voiceProfileId === input.voiceProfileId) || null;
+  }
+
+  /**
+   * 合成超时只消费性能指标：参考音色优先使用精确记录，预设音色或旧记录可回退
+   * 到同模型/版本/硬件的模型级 benchmark，但绝不跨模型、版本或硬件复用。
+   */
+  findTiming(input: { modelId: string; providerId: string; revision: string; hardwareId: string; voiceProfileId?: string }): SpeechModelBenchmarkRecord | null {
+    const candidates = this.readDocument().records.filter((item) => item.modelId === input.modelId
+      && item.providerId === input.providerId
+      && item.revision === input.revision
+      && item.hardwareId === input.hardwareId);
+    return candidates.find((item) => input.voiceProfileId && item.voiceProfileId === input.voiceProfileId)
+      || candidates.find((item) => item.voiceProfileId === undefined)
+      || null;
   }
 
   write(record: SpeechModelBenchmarkRecord): void {
@@ -85,8 +117,21 @@ export class SpeechModelBenchmarkStore {
     const records = document.records.filter((item) => !(item.modelId === normalized.modelId
       && item.providerId === normalized.providerId
       && item.revision === normalized.revision
-      && item.hardwareId === normalized.hardwareId));
+      && item.hardwareId === normalized.hardwareId
+      && item.voiceProfileId === normalized.voiceProfileId));
     records.push(normalized);
     writeUtf8TextAtomic(this.filePath, `${JSON.stringify({ protocol: PROTOCOL, records }, null, 2)}\n`);
+  }
+
+  /** 删除某个参考音色的全部硬件/模型验收记录，避免已删除身份的结论被继续复用。 */
+  deleteVoiceProfile(profileId: string): number {
+    if (!/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(profileId)) throw new Error('speech_benchmark_voice_profile_id_invalid');
+    const document = this.readDocument();
+    const records = document.records.filter((item) => item.voiceProfileId !== profileId);
+    const deleted = document.records.length - records.length;
+    if (deleted > 0) {
+      writeUtf8TextAtomic(this.filePath, `${JSON.stringify({ protocol: PROTOCOL, records }, null, 2)}\n`);
+    }
+    return deleted;
   }
 }

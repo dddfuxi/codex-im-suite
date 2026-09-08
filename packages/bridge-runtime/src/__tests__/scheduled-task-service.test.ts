@@ -31,6 +31,102 @@ function makeTaskCreate(overrides: Partial<ScheduledTaskCreate> = {}): Scheduled
 }
 
 describe('scheduled task service', () => {
+  it('dispatches due fixed deliveries without waiting for a slow agent turn', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-concurrent-'));
+    try {
+      const ids = ['task_slow_agent', 'task_fixed_check_in'];
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => ids.shift() || 'task_unexpected',
+      });
+      const slowTask = await store.createTask(makeTaskCreate({
+        name: '慢速动态任务',
+        action: { kind: 'agent_turn', prompt: '执行耗时分析', sessionMode: 'isolated' },
+      }));
+      const checkInTask = await store.createTask(makeTaskCreate({
+        name: '整点互动打卡',
+        action: {
+          kind: 'check_in',
+          text: '请完成后打卡。',
+          audience: 'chat_members',
+          buttonText: '我完成了',
+          successText: '打卡成功。',
+          windowMs: 3_600_000,
+        },
+      }));
+
+      let releaseSlow: (() => void) | undefined;
+      const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+      let fixedStarted: (() => void) | undefined;
+      const fixedStartedPromise = new Promise<void>((resolve) => { fixedStarted = resolve; });
+      const starts: string[] = [];
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-20T02:30:12.000Z',
+        maxConcurrentRuns: 2,
+        execute: async ({ task }) => {
+          starts.push(task.id);
+          if (task.action.kind === 'agent_turn') await slowGate;
+          else fixedStarted?.();
+          return { executionStatus: 'ok', deliveryStatus: 'delivered' };
+        },
+      });
+
+      const tickPromise = service.tick();
+      await Promise.race([
+        fixedStartedPromise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('固定打卡被慢任务阻塞')), 250)),
+      ]);
+
+      assert.equal(starts[0], checkInTask.id);
+      assert.equal(starts.includes(slowTask.id), true);
+      releaseSlow?.();
+      assert.equal(await tickPromise, 2);
+
+      const checkInRun = (await store.listRuns(checkInTask.id, 10))[0];
+      const slowRun = (await store.listRuns(slowTask.id, 10))[0];
+      assert.equal(checkInRun?.deliveryStatus, 'delivered');
+      assert.equal(checkInRun?.dispatchDelayMs, 12_000);
+      assert.equal(slowRun?.dispatchDelayMs, 12_000);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('honors the configured concurrency cap for one due batch', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-concurrency-cap-'));
+    try {
+      const ids = ['task_cap_001', 'task_cap_002', 'task_cap_003'];
+      const store = createFileScheduledTaskStore(root, {
+        now: () => '2026-07-18T08:00:00.000Z',
+        idFactory: () => ids.shift() || 'task_unexpected',
+      });
+      for (let index = 0; index < 3; index += 1) {
+        await store.createTask(makeTaskCreate({ name: `并发任务 ${index + 1}` }));
+      }
+
+      let active = 0;
+      let maximumActive = 0;
+      const service = createScheduledTaskService({
+        store,
+        now: () => '2026-07-20T02:30:00.000Z',
+        maxConcurrentRuns: 2,
+        execute: async () => {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          active -= 1;
+          return { executionStatus: 'ok', deliveryStatus: 'delivered' };
+        },
+      });
+
+      assert.equal(await service.tick(), 3);
+      assert.equal(maximumActive, 2);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('admits one run for one scheduled slot', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-scheduled-service-'));
     try {

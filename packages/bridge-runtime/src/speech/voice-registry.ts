@@ -65,6 +65,8 @@ interface VoiceRegistryDocument {
 
 export interface ImportReferenceVoiceInput {
   sourcePath: string;
+  /** live Runtime 完成同一文件 ASR 核对后签发；面板导入必须携带以关闭校验到复制之间的文件变更窗口。 */
+  expectedSha256?: string;
   displayName: string;
   transcript: string;
   sourceLabel: string;
@@ -89,6 +91,10 @@ function sanitizeText(value: unknown, maxChars: number, field: string): string {
 
 function extensionFor(format: AudioFormat): string {
   return format === 'm4a' ? '.m4a' : `.${format}`;
+}
+
+function displayNameKey(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase('zh-CN');
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -353,6 +359,99 @@ export class SpeechVoiceRegistry {
     return resolved;
   }
 
+  /**
+   * 只更新持久参考音色的显示名。稳定 Profile ID、受管音频、授权证据和
+   * benchmark 绑定都保持不变，避免一次展示层操作破坏音色身份。
+   */
+  renameReferenceVoice(profileId: string, displayName: string): VoiceProfileRecord {
+    const normalizedId = sanitizeText(profileId, 80, 'id');
+    if (!/^[a-z0-9][a-z0-9._-]+$/i.test(normalizedId)) throw new Error('voice_id_invalid');
+    const normalizedName = sanitizeText(displayName, 100, 'display_name');
+    return this.withLock(() => {
+      const document = this.readDocument();
+      const index = document.profiles.findIndex((item) => item.id === normalizedId);
+      if (index < 0) {
+        if (SPEECH_PRESET_VOICE_CATALOG.some((item) => item.id === normalizedId)) {
+          throw new Error('voice_preset_rename_forbidden');
+        }
+        throw new Error('voice_profile_not_found');
+      }
+      const profile = document.profiles[index]!;
+      if (profile.kind !== 'reference') throw new Error('voice_preset_rename_forbidden');
+      if (profile.displayName === normalizedName) return { ...profile };
+
+      const requestedKey = displayNameKey(normalizedName);
+      const nameExists = document.profiles.some((item) => item.id !== normalizedId
+        && displayNameKey(item.displayName) === requestedKey)
+        || SPEECH_PRESET_VOICE_CATALOG.some((item) => displayNameKey(item.displayName) === requestedKey);
+      if (nameExists) throw new Error('voice_display_name_conflict');
+
+      const renamed = { ...profile, displayName: normalizedName };
+      const profiles = [...document.profiles];
+      profiles[index] = renamed;
+      this.writeDocument({ protocol: document.protocol, revision: document.revision + 1, profiles });
+      return { ...renamed };
+    });
+  }
+
+  /**
+   * 删除持久化参考音色。预设音色属于模型能力目录，不能通过用户音色库删除。
+   * 文件先在同卷移动为临时墓碑，注册表原子写入成功后再清理，降低双文件更新留下悬空记录的风险。
+   */
+  deleteReferenceVoice(profileId: string): VoiceProfileRecord {
+    const normalizedId = sanitizeText(profileId, 80, 'id');
+    if (!/^[a-z0-9][a-z0-9._-]+$/i.test(normalizedId)) throw new Error('voice_id_invalid');
+    return this.withLock(() => {
+      const document = this.readDocument();
+      const profile = document.profiles.find((item) => item.id === normalizedId);
+      if (!profile) {
+        if (SPEECH_PRESET_VOICE_CATALOG.some((item) => item.id === normalizedId)) {
+          throw new Error('voice_preset_delete_forbidden');
+        }
+        throw new Error('voice_profile_not_found');
+      }
+      if (profile.kind !== 'reference') throw new Error('voice_preset_delete_forbidden');
+
+      const managedPath = path.resolve(this.root, ...profile.relativePath!.split('/'));
+      if (!isWithinRoot(managedPath, this.filesRoot)) throw new Error('voice_reference_delete_path_unsafe');
+      const tombstonePath = path.join(this.filesRoot, `.delete-${crypto.randomUUID()}.tmp`);
+      let moved = false;
+      if (fs.existsSync(managedPath)) {
+        assertRegularNonSymlink(managedPath);
+        fs.renameSync(managedPath, tombstonePath);
+        moved = true;
+      }
+
+      try {
+        this.writeDocument({
+          protocol: document.protocol,
+          revision: document.revision + 1,
+          profiles: document.profiles.filter((item) => item.id !== normalizedId),
+        });
+      } catch (error) {
+        if (moved) fs.renameSync(tombstonePath, managedPath);
+        throw error;
+      }
+
+      if (moved) {
+        try {
+          assertRegularNonSymlink(tombstonePath);
+          fs.unlinkSync(tombstonePath);
+        } catch (error) {
+          // 清理失败时尽力恢复注册表与原文件；不得把仍存在的音频谎报为已删除。
+          try {
+            if (fs.existsSync(tombstonePath) && !fs.existsSync(managedPath)) fs.renameSync(tombstonePath, managedPath);
+            this.writeDocument(document);
+          } catch {
+            // 原始错误继续外抛；后续维护可依据墓碑文件和注册表事实收口。
+          }
+          throw error;
+        }
+      }
+      return { ...profile };
+    });
+  }
+
   async importReferenceVoice(input: ImportReferenceVoiceInput): Promise<VoiceProfileRecord> {
     if (input.authorizationConfirmed !== true) throw new Error('voice_authorization_required');
     if (input.cleanSingleSpeakerConfirmed !== true) throw new Error('voice_clean_single_speaker_confirmation_required');
@@ -370,6 +469,10 @@ export class SpeechVoiceRegistry {
     if (evidence.durationMs < 3_000 || evidence.durationMs > 30_000) throw new Error('voice_duration_out_of_range');
     if (evidence.format !== format) throw new Error('voice_audio_format_mismatch');
     const sha256 = hashFileSha256(sourcePath);
+    if (input.expectedSha256 !== undefined
+      && (!/^[a-f0-9]{64}$/u.test(input.expectedSha256) || input.expectedSha256 !== sha256)) {
+      throw new Error('voice_reference_source_changed_after_transcript_verification');
+    }
     if (evidence.sha256 !== sha256) throw new Error('voice_audio_changed_after_validation');
     const fileName = `${sha256}${extensionFor(format)}`;
     const targetPath = path.join(this.filesRoot, fileName);

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   SPEECH_SETTINGS_SCHEMA,
   SPEECH_STATUS_PROTOCOL,
+  createSingingAudioContentPlan,
   type SpeechPanelStateContract,
   type SpeechSettingsContract,
 } from '../speech-contract.js';
@@ -14,6 +15,27 @@ import {
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 describe('speech shared contract', () => {
+  it('快速试听按可演唱正文而非段落标记截取歌词', () => {
+    const quick = createSingingAudioContentPlan({
+      outputMode: 'quick_preview',
+      lyrics: '[Verse]\n第一句要唱清楚，第二句也要完整唱出。',
+      stylePrompt: '清晰中文流行演唱',
+      vocalLanguage: 'zh',
+    });
+    const full = createSingingAudioContentPlan({
+      outputMode: 'full_generation',
+      lyrics: '[Verse]\n第一句要唱清楚，第二句也要完整唱出。',
+      stylePrompt: '清晰中文流行演唱',
+      vocalLanguage: 'zh',
+    });
+
+    assert.ok(quick);
+    assert.ok(full);
+    assert.equal(quick.lyrics.startsWith('[Verse]'), false);
+    assert.equal(quick.lyrics.startsWith('第一句'), true);
+    assert.equal(full.lyrics.startsWith('[Verse]'), true);
+  });
+
   it('keeps protocol identifiers and unavailable state explicit', () => {
     const unavailable: SpeechPanelStateContract = {
       available: false,
@@ -52,7 +74,7 @@ describe('speech shared contract', () => {
     assert.equal(schema.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.deepEqual(schema.$defs?.SpeechStatusContract?.required, [
       'protocol', 'state', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channels', 'replyPolicy',
-      'deliveryMode', 'asrProvider', 'ttsProvider', 'ttsModel', 'tonePolicy', 'singingProvider', 'singingBenchmark', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'capabilities',
+      'deliveryMode', 'asrProvider', 'ttsProvider', 'ttsModel', 'tonePolicy', 'singingProvider', 'singingBenchmark', 'activeVoiceProfileId', 'activeSingingVoiceProfileId', 'providers', 'capabilities',
       'components', 'voiceProfiles', 'limits', 'actions', 'lastCheckedAt',
     ]);
     const statusFields = Object.keys(schema.$defs?.SpeechStatusContract?.properties ?? {});

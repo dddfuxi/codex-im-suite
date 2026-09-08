@@ -27,7 +27,8 @@ export interface ChoiceFlowDirective {
 }
 
 export type ChoiceSessionMode = 'single_user' | 'vote' | 'claim' | 'parallel';
-export type ChoiceSessionAudience = 'initiator' | 'chat_members';
+/** single_user 的可选绑定对象；participant 由 Bridge 根据真实成员证据签发。 */
+export type ChoiceSessionAudience = 'initiator' | 'participant' | 'chat_members';
 
 /**
  * 模型只能声明低风险的参与语义；参与者身份、callback、会话与截止时间均由 Bridge 签发。
@@ -215,7 +216,11 @@ export function parseChoiceSessionDirective(value: unknown): ChoiceSessionDirect
   if (record.state !== undefined && record.state !== 'active' && record.state !== 'complete') return undefined;
   const mode = record.mode as ChoiceSessionMode;
   const state = (record.state || 'active') as 'active' | 'complete';
-  const audience: ChoiceSessionAudience = mode === 'single_user' ? 'initiator' : 'chat_members';
+  // 模型只能声明 participant 语义，绝不能在协议中携带 participantKey 等平台身份。
+  const requestedAudience = record.audience;
+  const audience: ChoiceSessionAudience = mode === 'single_user' && requestedAudience === 'participant'
+    ? 'participant'
+    : mode === 'single_user' ? 'initiator' : 'chat_members';
   const rawDuration = typeof record.duration_seconds === 'number'
     ? record.duration_seconds
     : typeof record.durationSeconds === 'number' ? record.durationSeconds : undefined;
@@ -424,6 +429,10 @@ export class ChoicePromptRegistry {
     const participantKey = normalizeParticipantKey(actor.userId);
     if (entry.choiceSession.audience === 'initiator') {
       if (entry.userId && entry.userId !== participantKey) return { kind: 'forbidden' };
+    } else if (entry.choiceSession.audience === 'participant') {
+      if (!participantKey || actor.chatMemberVerified !== true || (entry.userId && entry.userId !== participantKey)) {
+        return { kind: 'forbidden' };
+      }
     } else if (!participantKey || actor.chatMemberVerified !== true) {
       return { kind: 'forbidden' };
     }

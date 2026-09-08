@@ -548,7 +548,19 @@ export class LocalAgentProvider {
     this.mcpBridge = new McpBridge(config);
   }
 
+  /**
+   * 专项本地快路径只能消费核心层已经签发的执行要求。文本规则至多用于选择
+   * 已验证能力的候选入口，不能单独把一条消息升级为对 MCP 或生成服务的调用。
+   */
+  private hasVerifiedFastPathExecutionRequirement(params: StreamChatParams): boolean {
+    const requirement = params.executionRequirement;
+    if (!requirement || requirement.kind === 'none' || requirement.kind === 'input_evidence_required') return false;
+    const families = new Set((requirement.requiredToolFamilies || []).map((family) => family.trim().toLowerCase()));
+    return ['mcp', 'unity-mcp', 'blender', 'artifact', 'tool'].some((family) => families.has(family));
+  }
+
   canHandleIgnisFastPath(params: StreamChatParams): boolean {
+    if (!this.hasVerifiedFastPathExecutionRequirement(params)) return false;
     const hasFiles = Boolean(params.files?.length);
     const assessment = assessIgnisInteraction(params.prompt, hasFiles);
     if (assessment.interactionIntent === 'explain') return false;
@@ -560,6 +572,9 @@ export class LocalAgentProvider {
     params: StreamChatParams,
     mode: LocalRouterMode,
   ): Promise<LocalAgentHandleResult> {
+    if (!this.hasVerifiedFastPathExecutionRequirement(params)) {
+      return { handled: false, fallbackToCodex: true, fallbackReason: 'Ignis fast-path lacks a verified execution requirement' };
+    }
     const hasFiles = Boolean(params.files?.length);
     const assessment = assessIgnisInteraction(params.prompt, hasFiles);
     const intent = inferIgnisFastIntent(params.prompt, hasFiles, assessment);
@@ -1977,6 +1992,7 @@ export class LocalAgentProvider {
   }
 
   canHandleMcpBridgeFastPathV2(params: StreamChatParams): boolean {
+    if (!this.hasVerifiedFastPathExecutionRequirement(params)) return false;
     const assessment = assessMcpInteraction(params.prompt);
     if (assessment.interactionIntent === 'explain') return false;
     return inferMcpFastIntent(params.prompt, assessment) !== null;
@@ -1987,6 +2003,7 @@ export class LocalAgentProvider {
     params: StreamChatParams,
     mode: LocalRouterMode,
   ): Promise<LocalAgentHandleResult> {
+    if (!this.hasVerifiedFastPathExecutionRequirement(params)) return { handled: false };
     const assessment = assessMcpInteraction(params.prompt);
     const intent = inferMcpFastIntent(params.prompt, assessment);
     if (!intent) return { handled: false };
