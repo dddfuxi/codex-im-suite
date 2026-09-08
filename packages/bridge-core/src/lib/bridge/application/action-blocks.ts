@@ -38,6 +38,8 @@ export interface CtiScheduledTaskCreateAction {
   schedule: ScheduledTaskScheduleInput;
   taskAction: ScheduledTaskActionInput;
   deliveryMode: 'result' | 'summary' | 'none';
+  /** 由用户在创建计划时明确声明的一个或多个群目标；平台身份仍由 Bridge 解析。 */
+  targets?: Array<{ text: string; id?: string; kind?: ConversationTargetKind | 'any' }>;
   ignoredTrustedFields: string[];
   normalizedFields: string[];
 }
@@ -396,6 +398,21 @@ function collectIgnoredScheduledTaskFields(value: unknown): string[] {
     .sort();
 }
 
+function parseScheduledTaskTargets(value: unknown): CtiScheduledTaskCreateAction['targets'] {
+  if (!Array.isArray(value)) return undefined;
+  const targets = value.map((item) => {
+    if (typeof item === 'string' && item.trim()) return { text: item.trim() };
+    const raw = getRecordField(item);
+    if (!raw) return null;
+    const text = getStringField(raw, ['text', 'name', 'label', 'displayName', 'targetText', 'target_text']);
+    if (!text) return null;
+    const id = getStringField(raw, ['id', 'chatId', 'chat_id', 'targetId', 'target_id']) || undefined;
+    const kind = parseConversationTargetKind(raw.kind ?? raw.targetKind ?? raw.target_type);
+    return { text, ...(id ? { id } : {}), ...(kind ? { kind } : {}) };
+  }).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  return targets.length > 0 ? targets : undefined;
+}
+
 function collectIgnoredScheduledTaskActionFields(value: unknown): string[] {
   const raw = getRecordField(value);
   if (!raw) return [];
@@ -485,6 +502,7 @@ export function extractCtiScheduledTaskAction(
     const deliveryMode = requestedDeliveryMode === 'summary' || requestedDeliveryMode === 'none'
       ? requestedDeliveryMode
       : 'result';
+    const targets = parseScheduledTaskTargets(raw.targets ?? raw.deliveryTargets ?? raw.delivery_targets);
     if (!name) return { action: null, text: cleaned, hadBlock: true, error: '计划任务动作缺少 name' };
     if (!schedule) {
       return {
@@ -512,6 +530,7 @@ export function extractCtiScheduledTaskAction(
         schedule,
         taskAction,
         deliveryMode,
+        ...(targets ? { targets } : {}),
         normalizedFields: scheduleResult.normalizedFields,
         ignoredTrustedFields: [
           ...collectIgnoredScheduledTaskFields(parsed),

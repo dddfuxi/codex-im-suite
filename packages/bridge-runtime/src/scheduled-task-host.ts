@@ -493,6 +493,17 @@ export function createBridgeScheduledTaskActionHost(
           delivery: {
             channelType: input.delivery.target.channelType,
             chatId: input.delivery.target.chatId,
+            ...(input.delivery.targets?.length
+              ? {
+                  targets: input.delivery.targets.map((target) => ({
+                    channelType: target.channelType,
+                    chatId: target.chatId,
+                    chatType: target.chatType,
+                    threadId: target.threadId,
+                    accountId: target.accountId,
+                  })),
+                }
+              : {}),
             chatType: input.delivery.target.chatType,
             notifyTargets: input.delivery.notifyTargets,
             mode: input.delivery.mode,

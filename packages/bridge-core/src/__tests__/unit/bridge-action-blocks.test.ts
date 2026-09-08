@@ -52,6 +52,28 @@ describe('bridge action block parsing', () => {
     assert.deepEqual(result.action?.ignoredTrustedFields, ['actor', 'chatId']);
   });
 
+  it('preserves user-declared scheduled delivery targets without trusting platform identity', () => {
+    const result = extractCtiScheduledTaskAction([
+      '```cti-scheduled-task',
+      JSON.stringify({
+        action: 'create',
+        name: '周一鼓励',
+        schedule: { kind: 'cron', expression: '0 10 * * 1', timezone: 'Asia/Shanghai' },
+        targets: [
+          { name: '3D场景小分队', kind: 'chat' },
+          { name: '机器人大乱斗', kind: 'chat', id: 'model_supplied_id' },
+        ],
+        taskAction: { kind: 'agent_turn', prompt: '生成鼓励', sessionMode: 'isolated' },
+      }),
+      '```',
+    ].join('\n'));
+
+    assert.deepEqual(result.action?.targets, [
+      { text: '3D场景小分队', kind: 'chat' },
+      { text: '机器人大乱斗', id: 'model_supplied_id', kind: 'chat' },
+    ]);
+  });
+
   it('normalizes a current-chat direct_message scheduled action without trusting its target id', () => {
     const result = extractCtiScheduledTaskAction([
       '```cti-scheduled-task',

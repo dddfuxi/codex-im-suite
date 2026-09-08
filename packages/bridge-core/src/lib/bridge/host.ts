@@ -1324,6 +1324,8 @@ export interface ScheduledTaskCreateInput {
   };
   delivery: {
     target: ChannelAddress;
+    /** 用户确认的额外投递目标；缺省时仅使用 target。 */
+    targets?: ChannelAddress[];
     notifyTargets?: OutboundMention[];
     mode: 'result' | 'summary' | 'none';
   };

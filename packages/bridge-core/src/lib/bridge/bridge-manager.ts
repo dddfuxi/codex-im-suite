@@ -1030,6 +1030,7 @@ function buildTrustedScheduledTaskCreateInput(input: {
   schedule: ScheduledTaskScheduleInput;
   taskAction: ScheduledTaskActionInput;
   deliveryMode: 'result' | 'summary' | 'none';
+  targets?: ChannelAddress[];
   notifyTargets?: OutboundMention[];
 }): ScheduledTaskCreateInput {
   return {
@@ -1044,6 +1045,7 @@ function buildTrustedScheduledTaskCreateInput(input: {
     },
     delivery: {
       target: input.msg.address,
+      ...(input.targets?.length ? { targets: input.targets } : {}),
       ...(input.notifyTargets?.length ? { notifyTargets: input.notifyTargets } : {}),
       mode: input.deliveryMode,
     },
@@ -1052,6 +1054,7 @@ function buildTrustedScheduledTaskCreateInput(input: {
 }
 
 async function executeScheduledTaskActionFromReply(
+  adapter: BaseChannelAdapter,
   rawReply: string,
   msg: InboundMessage,
   sessionId: string,
@@ -1082,6 +1085,38 @@ async function executeScheduledTaskActionFromReply(
         summary: `[IGNORED_SCHEDULED_TASK_FIELDS] fields=${extracted.action.ignoredTrustedFields.join(',')}`,
       });
     }
+    let resolvedTargets: ChannelAddress[] | undefined;
+    if (extracted.action.targets?.length) {
+      if (!isOwnerMessage(msg)) return { handled: true, text: buildOwnerRequiredMessage(msg) };
+      if (typeof adapter.resolveConversationTarget !== 'function') {
+        return { handled: true, text: '未完成：当前渠道暂不支持计划任务目标群解析。' };
+      }
+      const resolved: ChannelAddress[] = [];
+      for (const requested of extracted.action.targets) {
+        const isCurrent = !requested.id && /^(?:当前群|当前群聊|当前会话|本群|本会话)$/u.test(requested.text.trim());
+        if (isCurrent) {
+          resolved.push(msg.address);
+          continue;
+        }
+        const target = await adapter.resolveConversationTarget({
+          sourceMessage: msg,
+          targetText: requested.text,
+          ...(requested.id ? { targetId: requested.id } : {}),
+          targetKind: requested.kind === 'user' ? 'user' : 'chat',
+        });
+        if (!target.ok || !target.target || target.target.kind !== 'chat') {
+          return { handled: true, text: `未完成：无法确认计划任务目标群“${requested.text}”。${target.error ? `原因：${target.error}` : ''}` };
+        }
+        resolved.push({
+          channelType: msg.address.channelType,
+          chatId: target.target.id,
+          chatType: target.target.chatType || 'group',
+          displayName: target.target.displayName,
+        });
+      }
+      resolvedTargets = Array.from(new Map(resolved.map((target) => [`${target.channelType}:${target.chatId}`, target])).values());
+      if (resolvedTargets.length === 0) return { handled: true, text: '未完成：计划任务没有有效目标群。' };
+    }
     if (extracted.action.normalizedFields.length > 0) {
       getBridgeContext().store.insertAuditLog({
         channelType: msg.address.channelType,
@@ -1099,6 +1134,7 @@ async function executeScheduledTaskActionFromReply(
       schedule: extracted.action.schedule,
       taskAction: extracted.action.taskAction,
       deliveryMode: extracted.action.deliveryMode,
+      targets: resolvedTargets,
       notifyTargets,
     }));
     return {
@@ -8949,6 +8985,7 @@ async function handleMessage(
       : { handled: false, text: '' };
     const scheduledTaskAction = !panelSettingsAction.handled && !bridgeControlAction.handled && !artifactPromotionAction.handled && !directMessageAction.handled && providerVisibleResponseText
       ? await executeScheduledTaskActionFromReply(
+        adapter,
         providerVisibleResponseText,
         msg,
         effectiveBinding.codepilotSessionId,

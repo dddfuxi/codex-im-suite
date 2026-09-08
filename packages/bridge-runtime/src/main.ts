@@ -3600,10 +3600,20 @@ async function main(): Promise<void> {
           const roots = getWorkspacePlanRoots(effectiveWorkspacePlan);
           executionStarted = true;
           return collectScheduledTaskAgentResponse(llm, {
-            prompt: task.action.kind === 'agent_turn' ? task.action.prompt : '',
+            // 计划 Agent 只负责计算结果；所有平台发送必须经过下面唯一的
+            // Runtime Delivery 路径，避免模型通过 CLI/MCP 产生第二条出站路径。
+            prompt: task.action.kind === 'agent_turn'
+              ? [
+                '这是受 Runtime 管理的计划任务计算回合。',
+                '你只能阅读已注入的证据并生成待投递文本。禁止发送消息、调用平台写操作、使用 cti-direct-message、shell、PowerShell、CLI、MCP 或任何外部投递能力。',
+                '你的输出只会作为 Delivery payload，由 Runtime 按用户确认的目标群列表统一投递。',
+                '',
+                task.action.prompt,
+              ].join('\n')
+              : '',
             sessionId: runSessionId,
             forceFreshThread: task.action.kind === 'agent_turn' && task.action.sessionMode === 'isolated',
-            interactionMode: 'agent',
+            interactionMode: 'response_only',
             workspacePlan: effectiveWorkspacePlan,
             workingDirectory: effectiveWorkspacePlan.primaryWorkspace.path,
             additionalDirectories: roots.slice(1),
@@ -3655,26 +3665,44 @@ async function main(): Promise<void> {
       if (task.action.kind === 'check_in' && !feishuCardJson) {
         return { ok: false, error: `当前渠道 ${task.delivery.channelType} 尚不支持计划任务原生打卡卡片` };
       }
-      const delivered = await bridgeManager.deliverProactiveMessage({
-        address: {
-          channelType: task.delivery.channelType,
-          chatId: task.delivery.chatId,
-          chatType: task.delivery.chatType,
-        },
-        text: payload.text || run.summary || task.name,
-        parseMode: payload.parseMode || 'plain',
-        mentions: task.delivery.notifyTargets,
-        sessionId: run.sessionId || task.executionContext.sourceSessionId,
-        dedupKey: `scheduled-task:${task.id}:${run.slotKey}`,
-        prepareFinalReply: true,
-        workingDirectory: sourceSession?.working_directory,
-        sourcePrompt: task.action.kind === 'agent_turn' ? task.action.prompt : task.name,
-        feishuCardJson,
-        speech: task.action.kind === 'notify' ? task.action.speech : undefined,
-      });
-      return delivered.ok
-        ? { ok: true, messageId: delivered.messageId, cardId: delivered.cardId }
-        : { ok: false, error: delivered.error || '计划任务投递失败' };
+      const targets = task.delivery.targets?.length
+        ? task.delivery.targets
+        : [{
+            channelType: task.delivery.channelType,
+            chatId: task.delivery.chatId,
+            chatType: task.delivery.chatType,
+            threadId: task.delivery.threadId,
+            accountId: task.delivery.accountId,
+          }];
+      const results = [] as Array<{ ok: boolean; messageId?: string; cardId?: string; error?: string }>;
+      for (const target of targets) {
+        const delivered = await bridgeManager.deliverProactiveMessage({
+          address: {
+            channelType: target.channelType,
+            chatId: target.chatId,
+            chatType: target.chatType,
+            threadId: target.threadId,
+            accountId: target.accountId,
+          },
+          text: payload.text || run.summary || task.name,
+          parseMode: payload.parseMode || 'plain',
+          mentions: task.delivery.notifyTargets,
+          sessionId: run.sessionId || task.executionContext.sourceSessionId,
+          // 每个已确认目标拥有独立去重键，避免多群 fan-out 时后续目标被首个目标吞掉。
+          dedupKey: `scheduled-task:${task.id}:${run.slotKey}:${target.channelType}:${target.chatId}`,
+          prepareFinalReply: true,
+          workingDirectory: sourceSession?.working_directory,
+          sourcePrompt: task.action.kind === 'agent_turn' ? task.action.prompt : task.name,
+          feishuCardJson,
+          speech: task.action.kind === 'notify' ? task.action.speech : undefined,
+        });
+        results.push(delivered);
+      }
+      const failed = results.find((result) => !result.ok);
+      const succeeded = results.find((result) => result.ok);
+      return failed
+        ? { ok: false, error: `计划任务部分目标投递失败：${failed.error || 'unknown error'}` }
+        : { ok: true, messageId: succeeded?.messageId, cardId: succeeded?.cardId };
     },
   });
   scheduledTaskService = createScheduledTaskService({

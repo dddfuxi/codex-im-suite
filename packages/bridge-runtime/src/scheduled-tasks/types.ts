@@ -74,6 +74,14 @@ export type ScheduledTaskNotifyTarget = {
 export type ScheduledTaskDelivery = {
   channelType: string;
   chatId: string;
+  /** 创建任务时由用户明确确认的目标集合；旧任务继续使用首个 target。 */
+  targets?: Array<{
+    channelType: string;
+    chatId: string;
+    chatType?: string;
+    threadId?: string;
+    accountId?: string;
+  }>;
   chatType?: string;
   threadId?: string;
   accountId?: string;
