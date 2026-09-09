@@ -1777,7 +1777,10 @@ export class JsonFileStore implements BridgeStore {
     });
 
     const selected = scored
-      .sort((left, right) => right.score - left.score)
+      // 同分时优先保留最新消息；计划任务和普通历史摘要都不能把
+      // 时间窗口内最早的旧消息误当成当前进展。
+      .sort((left, right) => right.score - left.score
+        || Number.parseInt(right.item.createTime || '0', 10) - Number.parseInt(left.item.createTime || '0', 10))
       .slice(0, Math.max(1, query.limit))
       .map((entry) => entry.item)
       .sort((left, right) => Number.parseInt(left.createTime || '0', 10) - Number.parseInt(right.createTime || '0', 10));

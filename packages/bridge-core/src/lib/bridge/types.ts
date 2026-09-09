@@ -25,6 +25,9 @@ export interface ChannelAddress {
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
   chatType?: string;     // Platform-specific chat type (group / p2p / etc.)
+  /** Optional platform thread/topic and account routing hints. */
+  threadId?: string;
+  accountId?: string;
 }
 
 /** Composite key for routing: channelType + chatId */

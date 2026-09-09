@@ -1105,6 +1105,65 @@ function formatMemoryContext(memory: RetrievedMemoryContext | null, feishuHistor
   return merged || undefined;
 }
 
+/**
+ * 为后台计划任务构造严格按已确认目标群隔离的历史证据。
+ * 计划任务没有入站消息上下文，不能让 Agent 自行搜索“可见群聊”；
+ * 每个目标只从对应 chatId 的本地索引取最近窗口，并在无证据时失败关闭。
+ */
+function buildScheduledTaskTargetHistoryPrompt(
+  store: BridgeStore,
+  task: {
+    action: { kind: string; prompt?: string };
+    delivery: { channelType: string; chatId: string; targets?: Array<{ channelType: string; chatId: string }> };
+  },
+  nowMs = Date.now(),
+): { prompt: string; hasEvidence: boolean } {
+  const targets = task.delivery.targets?.length
+    ? task.delivery.targets
+    : [{ channelType: task.delivery.channelType, chatId: task.delivery.chatId }];
+  const sections: string[] = [];
+  let hasEvidence = false;
+  for (const target of targets) {
+    if (target.channelType !== 'feishu' || !target.chatId.trim()) continue;
+    const status = store.getFeishuHistorySyncStatus?.(target.chatId.trim())?.[0];
+    const history = store.retrieveRelevantFeishuHistory?.({
+      chatId: target.chatId.trim(),
+      query: '',
+      // 只看近期窗口，避免把其他时期的项目内容当作本轮进展。
+      startTimeMs: nowMs - 7 * 24 * 60 * 60_000,
+      endTimeMs: nowMs + 60_000,
+      limit: 40,
+    }) || null;
+    const items = history?.items
+      ?.filter((item) => item.senderType !== 'app' && item.text.trim())
+      .slice(-24) || [];
+    if (items.length === 0) continue;
+    hasEvidence = true;
+    const label = status?.displayName || history?.syncStatus?.displayName || target.chatId;
+    sections.push(`目标群：${label}（chatId=${target.chatId}）\n${items.map((item) => {
+      const ts = Number.parseInt(item.createTime || '0', 10);
+      const time = Number.isFinite(ts) && ts > 0
+        ? new Date(ts).toLocaleString('zh-CN', { hour12: false })
+        : '未知时间';
+      return `[${time}] ${item.senderName || '群成员'}：${item.text}`;
+    }).join('\n')}`);
+  }
+  if (!hasEvidence) {
+    return {
+      hasEvidence: false,
+      prompt: '本轮没有找到已确认目标群在近期窗口内的可读成员消息。禁止读取、搜索或推测任何其他群聊，也禁止编造进展。',
+    };
+  }
+  return {
+    hasEvidence: true,
+    prompt: [
+      '以下是 Runtime 按用户确认目标注入的唯一群聊证据。只能依据这些消息生成结果：',
+      ...sections,
+      '禁止调用平台搜索、列出群聊或读取未列出的 chatId。',
+    ].join('\n\n'),
+  };
+}
+
 class CodexApiFailoverProvider implements LLMProvider {
   constructor(
     private readonly providers: Array<{ source: CodexModelSource; provider: LLMProvider }>,
@@ -3596,6 +3655,15 @@ async function main(): Promise<void> {
         : `${task.executionContext.sourceSessionId}:scheduled:${task.id}:${run.runId}`;
       let executionStarted = false;
       try {
+        const targetHistory = buildScheduledTaskTargetHistoryPrompt(store, task);
+        if (!targetHistory.hasEvidence) {
+          return {
+            ok: false,
+            error: '计划任务目标群近期历史不可用，已阻止无证据生成，未读取其他群聊',
+            errorKind: 'invalid_input',
+            executionStarted: false,
+          };
+        }
         const executeInWorkspace = async (effectiveWorkspacePlan: NonNullable<typeof workspacePlan>) => {
           const roots = getWorkspacePlanRoots(effectiveWorkspacePlan);
           executionStarted = true;
@@ -3607,6 +3675,7 @@ async function main(): Promise<void> {
                 '这是受 Runtime 管理的计划任务计算回合。',
                 '你只能阅读已注入的证据并生成待投递文本。禁止发送消息、调用平台写操作、使用 cti-direct-message、shell、PowerShell、CLI、MCP 或任何外部投递能力。',
                 '你的输出只会作为 Delivery payload，由 Runtime 按用户确认的目标群列表统一投递。',
+                targetHistory.prompt,
                 '',
                 task.action.prompt,
               ].join('\n')
