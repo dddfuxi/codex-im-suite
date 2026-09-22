@@ -55,6 +55,7 @@ import type {
   ResolvedConversationTarget,
 } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
+import { isJevPureModeEnabled } from '../application/jev-mode.js';
 import {
   bindStickerFeedbackCandidate,
   type StickerFeedbackInbound,
@@ -3515,7 +3516,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention && !isOtherBotSender) {
+      // Jev pure mode is an explicit chat-scoped opt-in.  It bypasses only the
+      // ordinary @mention wake gate for human group messages; all other group
+      // policy, bot filtering, allowlists, and identity checks remain active.
+      const jevPureMode = isJevPureModeEnabled('feishu', chatId);
+      // A message ending in `/jev` is an explicit one-turn wake.  Parse only
+      // the text payload here; the normal content/attachment extraction still
+      // runs below and remains the source of the inbound message body.
+      const explicitJevSuffix = messageType === 'text'
+        && /\/jev\s*$/iu.test(this.parseTextContent(msg.content));
+      const explicitJevCommand = messageType === 'text'
+        && /^\s*\/jev(?:\s|$)/iu.test(this.parseTextContent(msg.content));
+      if (requireMention && !jevPureMode && !explicitJevSuffix && !explicitJevCommand && !isOtherBotSender) {
         const nativeBotMentioned = this.isBotMentionedFromMessage(msg);
         // 群聊主入口仍只信任事件 mentions 中与当前 bot 身份相符的原生 @。
         // 但用户用飞书原生 reply 给“本 bot 已发送的消息”补发表情包/图片时，

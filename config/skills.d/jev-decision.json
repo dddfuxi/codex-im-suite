@@ -1,0 +1,18 @@
+{
+  "id": "jev-decision",
+  "displayName": "结构化判断",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\jev-decision",
+  "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.4.0 <1.0.0"
+  },
+  "category": "skill.decision",
+  "optional": true,
+  "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
+  "aliases": ["jev", "decision mode", "判断模式", "结构化判断", "概率判断"],
+  "enabled": true,
+  "description": "组织是非判断、有限分类和评分问题，并以受控概率视图呈现；实际 Provider、权限与飞书投递由 Runtime/Bridge 负责。"
+}

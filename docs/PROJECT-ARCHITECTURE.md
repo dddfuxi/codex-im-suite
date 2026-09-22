@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-08-14
+更新时间：2026-09-22
 
 ## 0. 架构文档维护规则
 
@@ -18,7 +18,7 @@
 
 - `bridge-core` 负责 IM 桥接核心能力。
 - `bridge-runtime` 负责把核心库、本地配置、Codex、本地模型和脚本组装成可运行服务。
-- `packages/contracts` 负责 Control API、workflow、node agent 和 extension capability 的共享契约。
+- `packages/contracts` 负责 Control API、workflow、node agent、extension capability 和结构化判断 Decision Layer 的共享契约。
 - `apps/control-panel` 负责可视化运维。
 - `config/*.d` 负责 manifest 驱动的扩展与内建运行单元发现。
 - `scripts` 负责构建、同步、打包、发布。
@@ -27,7 +27,7 @@ Unity 编辑器能力在控制面板中分为两个独立运行单元：`tool.ai
 
 跨包依赖通过稳定公共出口收口：`bridge-core/src/index.ts` 是 Application Facade，`host/evidence/policy/channel/workspace/runtime-audit` 面向 Node Runtime，`architecture` 是控制面板 Web 可消费的浏览器安全元数据出口。`package.json exports` 不再发布 `src/lib` 通配符，Runtime 和测试不能穿透 package 内部目录；`scripts/check-dependency-boundaries.mjs` 同时拦截深层导入、跨包源码相对路径、Web 引入 Node-only policy 和 `bridge-core -> runtime` 反向依赖。
 
-控制面板 wire 协议由 `packages/contracts` 单点声明：`control-api.ts` 固定 `ControlPanelStateContract`、Control Command/Result、`RuntimeUnitContract`，`workflow.ts` 同时提供面板读取的完整 runtime run 与跨节点精简 trace contract，`project-registry.ts` 提供项目记录和只读面板快照，`agent-collaboration.ts` 定义只读专业 Agent、Worker NDJSON、协作图快照、面板状态和聊天卡片最小脱敏状态。React 只从 `@codex-im-suite/contracts/control-api|workflow|project-registry|agent-collaboration` 浏览器安全子路径导入；Runtime 的 `workflow-status.ts` 只保留存储和归一化行为，DTO 通过 type alias 复用共享来源。C# 宿主的 `ControlApiContracts.cs` 是无业务裁决的薄 DTO 层，字段由 `schemas/control-api.schema.json`、`schemas/project-registry.schema.json` 和 `schemas/agent-collaboration.schema.json` 约束，.NET 测试逐字段核对；`Program.cs` 读取项目注册表与 Agent 协作运行快照，不推断第二份业务事实。唯一写入口 `agentCollaboration.setMode` 只接受固定三档模式，写入 UTF-8 `config.env` 后重启 Bridge，实际状态仍由 Runtime 快照回读。
+控制面板 wire 协议由 `packages/contracts` 单点声明：`control-api.ts` 固定 `ControlPanelStateContract`、Control Command/Result、`RuntimeUnitContract`，`workflow.ts` 同时提供面板读取的完整 runtime run 与跨节点精简 trace contract，`project-registry.ts` 提供项目记录和只读面板快照，`agent-collaboration.ts` 定义只读专业 Agent、Worker NDJSON、协作图快照、面板状态和聊天卡片最小脱敏状态。`decision.ts` 与 `schemas/decision.schema.json` 则定义 Core/Runtime/Skill 共用的 provider-neutral 结构化判断，不把 Jev HTTP 字段或平台卡片字段提升为面板事实。React 只从 `@codex-im-suite/contracts/control-api|workflow|project-registry|agent-collaboration` 浏览器安全子路径导入；Runtime 的 `workflow-status.ts` 只保留存储和归一化行为，DTO 通过 type alias 复用共享来源。C# 宿主的 `ControlApiContracts.cs` 是无业务裁决的薄 DTO 层，字段由 `schemas/control-api.schema.json`、`schemas/project-registry.schema.json` 和 `schemas/agent-collaboration.schema.json` 约束，.NET 测试逐字段核对；`Program.cs` 读取项目注册表与 Agent 协作运行快照，不推断第二份业务事实。唯一写入口 `agentCollaboration.setMode` 只接受固定三档模式，写入 UTF-8 `config.env` 后重启 Bridge，实际状态仍由 Runtime 快照回读。
 
 ### 1.1 系统上下文图
 
@@ -91,6 +91,10 @@ flowchart TD
   ScheduledTaskReadPolicy --> ScheduledEngine
   BridgeFacade --> DeferredActionReview[后置动作协议纯审查]
   DeferredActionReview --> ConversationEngine[一次无副作用 response-only 修复]
+  BridgeFacade --> DecisionView[application/decision-view 结构化判断校验与呈现]
+  DecisionView --> FeishuDecisionCard[channels/feishu/cards 无按钮判断卡]
+  BridgeRuntime --> DecisionHost[DecisionProviderHost 注入边界]
+  DecisionHost --> DecisionView
   BridgeFacade --> MentionParsing[application/mentions 提及意图与目标解析]
   BridgeFacade --> StickerPolicy[application/stickers 表情包意图、协议与候选门禁]
   BridgeFacade --> ChoicePrompts[application/choice-prompts 有限选项与受控回调]
@@ -154,6 +158,24 @@ flowchart TD
 | Delivery Layer | `cti-final`、Markdown/card、附件、chunk、retry、dedup、outbound refs | 上下文检索、能力选择 |
 
 Runtime model identity is a provider-owned evidence boundary. Each provider builds a bounded identity section from the same model ID it submits to `thread/start` or the local CLI command. The section is placed after ordinary history/context and before the current request, so stale assistant text such as an old GPT-5.4 self-report cannot become current model evidence. A submitted model ID identifies only the requested/submitted route; it does not prove the upstream physical model or vendor behind a proxy. Missing evidence remains unknown and must not be guessed. Classifier turns keep their existing strict JSON schema.
+
+### 1.4 结构化判断 Decision Layer
+
+结构化判断是可替换的只读辅助链，不属于普通聊天模型路由。`packages/contracts/src/decision.ts` 与 `packages/contracts/schemas/decision.schema.json` 共同声明 `cti-decision-request/v1`、`cti-decision-result/v1` 和 `cti-decision-view/v1`，覆盖 `noul`（是/否概率）、`choice`（有限分类）和 `score`（评分及分布）。Core 通过可选 `DecisionProviderHost` 把已经裁决过的短状态与问题交给 Runtime；Core 会复核问题类型、答案 ID 和概率边界，结果只能作为只读 evidence，不能携带按钮回调、平台身份、路径、命令或凭据。
+
+Runtime 的 `JevDecisionProvider` 是 OpenRouter Decisions API 的专用适配器，默认 endpoint 为 `https://openrouter.ai/api/alpha/decisions`、模型为 `typesafe/jev-1.13`，不会进入 Codex/Claude 普通聊天链。配置与受控 Panel Settings 描述符已经定义 `CTI_DECISION_PROVIDER=off|jev`、`CTI_DECISION_MODE=off|shadow|assist` 和 `CTI_DECISION_RESPONSE_MODE=off|explicit|auto`，并支持 endpoint、模型和超时；`CTI_JEV_API_KEY` 只在本机受控 `config.env` 中读取，普通设置只投影是否配置及掩码。当前实现按 provider/key/非 off mode 装配 Host，用户主动调用的判断回合直接返回只读结果；`shadow` 观察链、`assist` 注入 Primary 和普通消息 `auto` 触发仍未接入，不把配置枚举当成已完成行为。关闭、缺少密钥、超时、取消、HTTP 错误或非法结果都不产生伪造概率；显式或纯模式请求报告不可用，未进入判断入口的普通请求保持 Primary 链路。
+
+```mermaid
+flowchart LR
+  Request[显式命令、后缀或聊天纯模式] --> Host[DecisionProviderHost]
+  Host -->|provider=jev| Jev[Jev Decisions API]
+  Jev --> Validate[Core 类型与概率校验]
+  Validate --> View[只读 DecisionView]
+  View --> FeishuCard[Feishu 无按钮判断卡]
+  View --> Markdown[其他渠道 Markdown]
+```
+
+飞书 `/jev status|on|off|debug`、消息末尾 `/jev` 和按 `channel + chatId` 隔离的 `/jev pure on|off|status` 只改变入口与展示范围；纯模式仍受群、身份、机器人和 allowlist 门禁约束。`choice` 结果是模型分类分布，不能复用 `cti-final.choices` 的真人点击选择卡；Decision Card 只显示 `noul`、`choice` 或 `score` 及概率分布，不生成 callback。
 
 飞书文本呈现由 Delivery Layer 双层收口：`agent-architecture.ts` 的 `delivery_layer.feishu_text_presentation` 只在飞书回合告诉 Provider 按语义选择分区、引用、粗体、斜体、删除线和列表，短聊天保持自然；`markdown/feishu.ts` 在普通卡片与 streaming final card 共用的预处理入口做平台兼容规范化。Card 2.0 文档未声明支持的 `<u>/<ins>` 只在代码块外确定性降级为蓝色强调加粗；`**标签：**正文` 这类紧邻正文的加粗标签会只在代码块外补入必要空格，普通句内加粗和代码围栏保持逐字原样。有限选择由 `delivery_layer.structured_choice_prompt` 约束：只有确实存在 2–8 个具体可理解选项时，Provider 才在 `cti-final.choices` 提交可见 `label/description`；普通选择绑定发起人，多轮选择用 `choice_flow continuous active/complete`。用户明确要求全员参与时，Provider 可额外声明受控 `choice_session vote/claim/parallel`，Bridge 负责当前群成员校验、计票/单赢家/匿名分支、截止时间和回调，模型不能提供 flow ID、`callback_data`、平台身份或动作参数。活动流程漏掉选项与终态时，Conversation Engine 只在原回合做一次禁工具的 response-only 协议修复，不从 Markdown 的编号或字母模式猜造按钮。可选 `cti-final.card_hero` 只选择同一 `images` 中的一张已交付图片；Bridge 验证、上传并签发平台 `image_key`，再由普通卡、流式终态卡和选择卡共用 Card 2.0 横幅组件。嵌入成功后同图不重复发送，上传或卡片发送失败继续走普通图片附件。`delivery_layer.analysis_view` 允许分析、监控、对比、复盘或态势类多指标结果提交只含可见文本的 `cti-final.analysis_view`；`application/analysis-view.ts` 先在受控扫描窗口内过滤无效与同名指标，再收集最多 6 个有效指标，并合并同名分区、去重条目后保留最多 4 个分区。`markdown/feishu.ts` 映射为结论标签、移动端双列指标表和风险/观察/下一步标签分区，当前值与变化信号共用 tone；普通正文中与结构化标题/结论完全相同的非代码展示行被折叠，代码块和独有依据保持原样。该结构不接受 Card JSON、颜色、URL、命令、路径、回调或平台身份，不能为填模板伪造数值；轻聊和单一事实保持普通文本。分析视图和原始正文、头图、有限选择按钮复用同一卡片链，后置证据或权限门禁将结果改为未完成时必须清除旧分析视图，避免保留过期的积极结论。自由输入、权限批准、Owner/高风险确认、密钥和身份解析继续走各自专用门禁。真实发送仍由 adapter 执行，呈现策略不接触凭据、mention 解析或平台重试。
 

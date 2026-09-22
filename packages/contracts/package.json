@@ -14,6 +14,10 @@
       "types": "./src/control-api.ts",
       "import": "./dist/control-api.js"
     },
+    "./decision": {
+      "types": "./src/decision.ts",
+      "import": "./dist/decision.js"
+    },
     "./agent-collaboration": {
       "types": "./src/agent-collaboration.ts",
       "import": "./dist/agent-collaboration.js"

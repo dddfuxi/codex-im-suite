@@ -481,6 +481,19 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     ],
     tags: ['delivery', 'cti-final', 'attachments'],
   },
+  {
+    id: 'policy_registry.structured_decision',
+    layerId: 'policy_registry',
+    title: 'Structured Decision Provider',
+    responsibility: 'Keep provider-neutral noul, choice, and score evaluations behind an optional DecisionProviderHost.',
+    promptLines: [
+      '- Structured decision results are read-only evidence. The Bridge validates the answer type and bounds before displaying any probability.',
+      '- Jev is a Decisions API provider, never a normal chat model. When the provider or mode is off, fail closed and continue the existing Primary path.',
+      '- A Jev choice classification is not a user choice prompt. Do not route it through cti-final.choices or create callback buttons from it.',
+      '- Pure Jev mode is an explicit chat-scoped opt-in; it may bypass only the Feishu @mention wake gate and must preserve group, identity, and bot safety checks.',
+    ],
+    tags: ['decision', 'jev', 'provider', 'feishu', 'policy'],
+  },
 ];
 
 export type SlashCommandRequiredRole = 'operator' | 'owner';
@@ -496,6 +509,7 @@ const SLASH_COMMAND_REQUIRED_ROLES = new Map<string, SlashCommandRequiredRole>([
   ['/bind', 'operator'],
   ['/cwd', 'operator'],
   ['/mode', 'operator'],
+  ['/jev', 'operator'],
   ['/status', 'operator'],
   ['/docs', 'operator'],
   ['/projects', 'operator'],

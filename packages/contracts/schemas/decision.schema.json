@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/decision.schema.json",
+  "title": "Codex IM Suite Structured Decision Contracts",
+  "$defs": {
+    "DecisionQuestionContract": {
+      "type": "object",
+      "required": ["id", "type", "instructions", "criteria"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["noul", "choice", "score"] },
+        "instructions": { "type": "string", "minLength": 1 },
+        "criteria": {
+          "oneOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "object", "additionalProperties": { "type": "string" } }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DecisionRequestContract": {
+      "type": "object",
+      "required": ["protocol", "requestId", "state", "questions", "evidenceRefs", "requestedAt"],
+      "properties": {
+        "protocol": { "const": "cti-decision-request/v1" },
+        "requestId": { "type": "string", "minLength": 1 },
+        "state": { "type": "string" },
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/DecisionQuestionContract" }
+        },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "requestedAt": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "DecisionAnswerContract": {
+      "type": "object",
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["noul", "choice", "score"] },
+        "noul": { "type": "number", "minimum": 0, "maximum": 1 },
+        "choice": { "type": "string" },
+        "score": { "type": "number" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "probabilities": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "legend": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "DecisionUsageContract": {
+      "type": "object",
+      "properties": {
+        "inputTokens": { "type": "number", "minimum": 0 },
+        "outputTokens": { "type": "number", "minimum": 0 },
+        "cost": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "DecisionResultContract": {
+      "type": "object",
+      "required": ["protocol", "provider", "model", "answers", "generatedAt"],
+      "properties": {
+        "protocol": { "const": "cti-decision-result/v1" },
+        "provider": { "enum": ["jev", "custom"] },
+        "model": { "type": "string", "minLength": 1 },
+        "answers": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/DecisionAnswerContract" } },
+        "requestId": { "type": "string" },
+        "usage": { "$ref": "#/$defs/DecisionUsageContract" },
+        "generatedAt": { "type": "string", "minLength": 1 },
+        "errorCode": { "type": "string" },
+        "errorSummary": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "DecisionViewContract": {
+      "type": "object",
+      "required": ["protocol", "title", "questions", "result"],
+      "properties": {
+        "protocol": { "const": "cti-decision-view/v1" },
+        "title": { "type": "string", "minLength": 1 },
+        "state": { "type": "string" },
+        "providerKind": { "enum": ["noul", "choice", "score"] },
+        "questions": { "type": "array", "items": { "$ref": "#/$defs/DecisionQuestionContract" } },
+        "result": { "$ref": "#/$defs/DecisionResultContract" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/DecisionRequestContract" },
+    { "$ref": "#/$defs/DecisionResultContract" },
+    { "$ref": "#/$defs/DecisionViewContract" }
+  ]
+}

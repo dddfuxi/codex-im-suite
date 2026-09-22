@@ -127,7 +127,7 @@ describe('agent architecture registry', () => {
   });
 
   it('keeps slash command role gates in the policy registry', () => {
-    for (const command of ['/new', '/bind', '/cwd', '/mode', '/status', '/docs', '/projects', '/sessions', '/stop']) {
+    for (const command of ['/new', '/bind', '/cwd', '/mode', '/jev', '/status', '/docs', '/projects', '/sessions', '/stop']) {
       assert.equal(getSlashCommandRequiredRole(command), 'operator', command);
     }
     assert.equal(getSlashCommandRequiredRole('/feishu'), 'owner');
@@ -280,6 +280,19 @@ describe('agent architecture registry', () => {
     assert.match(lines, /Bridge signs button callbacks/i);
     assert.match(lines, /parallel mode.*shared entry/i);
     assert.match(lines, /follow-up buttons.*participant/i);
+  });
+
+  it('keeps structured Jev decisions provider-neutral and read-only', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'policy_registry.structured_decision');
+    const lines = getAgentPolicyPromptLines(['policy_registry.structured_decision']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'policy_registry');
+    assert.match(lines, /read-only evidence/i);
+    assert.match(lines, /Jev is a Decisions API provider/i);
+    assert.match(lines, /not a user choice prompt/i);
+    assert.match(lines, /chat-scoped opt-in/i);
   });
 
   it('keeps generic analysis dashboards in the Delivery Layer without templating light chat', () => {

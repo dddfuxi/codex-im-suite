@@ -56,6 +56,7 @@ import { JsonFileStore } from './store.js';
 import { readAgentHomePromptSections } from './agent-home.js';
 import { ArtifactEncodingInspector } from './artifact-encoding-inspector.js';
 import { RuntimeChoicePromptStateHost } from './choice-prompt-state-host.js';
+import { JevDecisionProvider } from './jev-decision-provider.js';
 import { DeterministicEvidenceRecoveryProvider } from './deterministic-evidence-recovery-provider.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
 import {
@@ -3484,6 +3485,20 @@ async function main(): Promise<void> {
   // config.env 是跨平台运行配置事实源；先覆盖父进程继承的旧值，再创建 Provider。
   hydrateProcessEnvironmentFromConfigFile();
   const config = loadConfig();
+  const decisions = config.decisionProvider === 'jev'
+    && Boolean(config.decisionApiKey)
+    && config.decisionMode !== 'off'
+    && config.decisionResponseMode !== 'off'
+    ? new JevDecisionProvider({
+      apiKey: config.decisionApiKey,
+      baseUrl: config.decisionBaseUrl,
+      model: config.decisionModel,
+      timeoutMs: config.decisionTimeoutMs,
+    })
+    : undefined;
+  if (config.decisionProvider === 'jev' && !decisions) {
+    console.warn('[claude-to-im] Structured decisions disabled: provider/key/mode configuration is incomplete.');
+  }
   const turnStorage = createRuntimeTurnStorage(config);
   let speechRuntime: ReturnType<typeof createSpeechRuntime> | undefined;
   if (config.speech) {
@@ -3884,6 +3899,7 @@ async function main(): Promise<void> {
       }),
     },
     memoryIntents: workerMemoryIntentHost || new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
+    decisions,
     continuationAdjustments: new ProviderContinuationAdjustmentIntentHost(llm, config.memoryIntentTimeoutMs),
     stickerSemantics,
     agentHome: config.memoryRepoDir ? {

@@ -556,6 +556,7 @@ function buildBridgeScopedPrompt(
       'policy_registry.scheduled_task_actions',
       'policy_registry.panel_settings_actions',
       'policy_registry.artifact_promotion',
+      'policy_registry.structured_decision',
       'memory_system.partitioned_memory_intent',
       'delivery_layer.result_envelope',
     ]),

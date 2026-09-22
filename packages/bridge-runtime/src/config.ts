@@ -59,6 +59,16 @@ export interface Config {
   memoryOptimizerEnabled?: boolean;
   memoryOptimizerIntervalDays?: number;
   memoryOptimizerModelSource?: 'codex_primary' | 'local_ai' | 'external_api';
+  /** 结构化判断后端；默认 off，jev 只走 OpenRouter Decisions API。 */
+  decisionProvider?: 'off' | 'jev';
+  /** 接入层行为：off 关闭，shadow 只记录结果，assist 允许辅助主链路。 */
+  decisionMode?: 'off' | 'shadow' | 'assist';
+  /** 触发策略：off 关闭，explicit 仅技能/命令触发，auto 允许有界自动识别。 */
+  decisionResponseMode?: 'off' | 'explicit' | 'auto';
+  decisionBaseUrl?: string;
+  decisionApiKey?: string;
+  decisionModel?: string;
+  decisionTimeoutMs?: number;
   ollamaEnabled?: boolean;
   ollamaBaseUrl?: string;
   ollamaModel?: string;
@@ -522,6 +532,13 @@ export function loadConfig(configPath = CONFIG_PATH): Config {
   const memoryOptimizerModelSource = (["codex_primary", "local_ai", "external_api"].includes(rawMemoryOptimizerModelSource)
     ? rawMemoryOptimizerModelSource
     : "codex_primary") as NonNullable<Config["memoryOptimizerModelSource"]>;
+  const rawDecisionProvider = (env.get("CTI_DECISION_PROVIDER") || "off").trim().toLowerCase();
+  const decisionProvider = (rawDecisionProvider === "jev" ? "jev" : "off") as NonNullable<Config["decisionProvider"]>;
+  const rawDecisionMode = (env.get("CTI_DECISION_MODE") || (decisionProvider === "off" ? "off" : "shadow")).trim().toLowerCase();
+  const decisionMode = (["off", "shadow", "assist"].includes(rawDecisionMode) ? rawDecisionMode : "off") as NonNullable<Config["decisionMode"]>;
+  const rawDecisionResponseMode = (env.get("CTI_DECISION_RESPONSE_MODE") || (decisionProvider === "off" ? "off" : "explicit")).trim().toLowerCase();
+  const decisionResponseMode = (["off", "explicit", "auto"].includes(rawDecisionResponseMode) ? rawDecisionResponseMode : "off") as NonNullable<Config["decisionResponseMode"]>;
+  const decisionTimeoutMs = env.get("CTI_DECISION_TIMEOUT_MS") ? Number(env.get("CTI_DECISION_TIMEOUT_MS")) : undefined;
 
   return {
     runtime,
@@ -595,6 +612,15 @@ export function loadConfig(configPath = CONFIG_PATH): Config {
     memoryOptimizerEnabled: env.has("CTI_MEMORY_OPTIMIZER_ENABLED") ? env.get("CTI_MEMORY_OPTIMIZER_ENABLED") === "true" : false,
     memoryOptimizerIntervalDays: Number.isFinite(memoryOptimizerIntervalDays) ? Math.max(1, Math.floor(memoryOptimizerIntervalDays)) : 7,
     memoryOptimizerModelSource,
+    decisionProvider,
+    decisionMode,
+    decisionResponseMode,
+    decisionBaseUrl: env.get("CTI_DECISION_BASE_URL") || "https://openrouter.ai/api/alpha/decisions",
+    decisionApiKey: env.get("CTI_JEV_API_KEY") || undefined,
+    decisionModel: env.get("CTI_DECISION_MODEL") || "typesafe/jev-1.13",
+    decisionTimeoutMs: typeof decisionTimeoutMs === "number" && Number.isFinite(decisionTimeoutMs)
+      ? Math.max(500, Math.min(60_000, Math.floor(decisionTimeoutMs)))
+      : 8000,
     ollamaEnabled,
     ollamaBaseUrl,
     ollamaModel,
@@ -821,6 +847,14 @@ export function saveConfig(config: Config): void {
   if (config.memoryOptimizerIntervalDays !== undefined)
     out += formatEnvLine("CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", String(config.memoryOptimizerIntervalDays));
   out += formatEnvLine("CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", config.memoryOptimizerModelSource);
+  out += formatEnvLine("CTI_DECISION_PROVIDER", config.decisionProvider || "off");
+  out += formatEnvLine("CTI_DECISION_MODE", config.decisionMode || "off");
+  out += formatEnvLine("CTI_DECISION_RESPONSE_MODE", config.decisionResponseMode || "off");
+  out += formatEnvLine("CTI_DECISION_BASE_URL", config.decisionBaseUrl);
+  out += formatEnvLine("CTI_JEV_API_KEY", config.decisionApiKey);
+  out += formatEnvLine("CTI_DECISION_MODEL", config.decisionModel);
+  if (config.decisionTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_DECISION_TIMEOUT_MS", String(config.decisionTimeoutMs));
   if (config.ollamaEnabled !== undefined)
     out += formatEnvLine("CTI_OLLAMA_ENABLED", String(config.ollamaEnabled));
   out += formatEnvLine("CTI_OLLAMA_BASE_URL", config.ollamaBaseUrl);
@@ -1235,6 +1269,20 @@ export function configToSettings(config: Config): Map<string, string> {
   m.set("bridge_memory_optimizer_enabled", String(config.memoryOptimizerEnabled === true));
   m.set("bridge_memory_optimizer_interval_days", String(config.memoryOptimizerIntervalDays ?? 7));
   m.set("bridge_memory_optimizer_model_source", config.memoryOptimizerModelSource || "codex_primary");
+  m.set("bridge_decision_provider", config.decisionProvider || "off");
+  m.set("bridge_decision_mode", config.decisionMode || "off");
+  m.set("bridge_decision_response_mode", config.decisionResponseMode || "off");
+  if (config.decisionBaseUrl) m.set("bridge_decision_base_url", config.decisionBaseUrl);
+  if (config.decisionModel) m.set("bridge_decision_model", config.decisionModel);
+  if (config.decisionApiKey) {
+    m.set("bridge_decision_api_key_set", "true");
+    m.set("bridge_decision_api_key_masked", maskSecret(config.decisionApiKey));
+  } else {
+    m.set("bridge_decision_api_key_set", "false");
+  }
+  if (typeof config.decisionTimeoutMs === "number" && Number.isFinite(config.decisionTimeoutMs)) {
+    m.set("bridge_decision_timeout_ms", String(Math.max(500, Math.floor(config.decisionTimeoutMs))));
+  }
   m.set("bridge_default_executor_id", normalizeExecutorId(config.defaultExecutorId) || "");
   if (config.ollamaEnabled !== undefined) {
     m.set("bridge_ollama_enabled", String(config.ollamaEnabled));

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { maskSecret, configToSettings, type Config } from '../config.js';
+import { maskSecret, configToSettings, loadConfig, type Config } from '../config.js';
 
 // ── maskSecret ──
 
@@ -823,6 +823,38 @@ describe('loadConfig/saveConfig round-trip', () => {
     } finally {
       if (previousCtiHome === undefined) delete process.env.CTI_HOME;
       else process.env.CTI_HOME = previousCtiHome;
+      fs.rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  it('loads structured decision settings with Jev disabled by default', () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-decision-config-'));
+    const configPath = path.join(configDir, 'config.env');
+    try {
+      fs.writeFileSync(configPath, [
+        'CTI_RUNTIME=codex',
+        'CTI_DEFAULT_WORKDIR=C:\\workspace',
+        'CTI_DECISION_PROVIDER=jev',
+        'CTI_DECISION_MODE=assist',
+        'CTI_DECISION_RESPONSE_MODE=auto',
+        'CTI_DECISION_BASE_URL=https://openrouter.ai/api/alpha/decisions',
+        'CTI_DECISION_MODEL=typesafe/jev-1.13',
+        'CTI_JEV_API_KEY=secret-value',
+        'CTI_DECISION_TIMEOUT_MS=9000',
+      ].join('\n'), 'utf8');
+      const config = loadConfig(configPath);
+      assert.equal(config.decisionProvider, 'jev');
+      assert.equal(config.decisionMode, 'assist');
+      assert.equal(config.decisionResponseMode, 'auto');
+      assert.equal(config.decisionApiKey, 'secret-value');
+      assert.equal(config.decisionTimeoutMs, 9000);
+      const settings = configToSettings(config);
+      assert.equal(settings.get('bridge_decision_provider'), 'jev');
+      assert.equal(settings.get('bridge_decision_mode'), 'assist');
+      assert.equal(settings.get('bridge_decision_response_mode'), 'auto');
+      assert.equal(settings.get('bridge_decision_api_key_set'), 'true');
+      assert.equal(settings.get('bridge_decision_api_key_masked'), '********alue');
+    } finally {
       fs.rmSync(configDir, { recursive: true, force: true });
     }
   });

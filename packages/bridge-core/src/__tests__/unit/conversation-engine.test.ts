@@ -133,6 +133,8 @@ test('instructs Feishu turns to decide intent state without exposing tool proces
   assert.match(prompt, /current sender/i);
   assert.match(prompt, /我\/发起人/);
   assert.match(prompt, /cti-direct-message/);
+  assert.match(prompt, /Jev is a Decisions API provider/i);
+  assert.match(prompt, /not a user choice prompt/i);
 });
 
 test('injects the speech reply protocol only for Feishu turns', () => {

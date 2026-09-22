@@ -23,6 +23,7 @@ import type {
   FeishuOAuthManualHost,
   MemoryIntentHost,
   ContinuationAdjustmentIntentHost,
+  DecisionProviderHost,
   StickerSemanticEvolutionHost,
   AgentHomeHost,
   SelfMaintenanceHost,
@@ -50,6 +51,8 @@ export interface BridgeContext {
   feishuOAuth?: FeishuOAuthManualHost;
   memoryIntents?: MemoryIntentHost;
   continuationAdjustments?: ContinuationAdjustmentIntentHost;
+  /** 可选结构化判断 Host；缺失时不应阻断普通 Primary 回复。 */
+  decisions?: DecisionProviderHost;
   stickerSemantics?: StickerSemanticEvolutionHost;
   agentHome?: AgentHomeHost;
   selfMaintenance?: SelfMaintenanceHost;

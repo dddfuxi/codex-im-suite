@@ -104,6 +104,14 @@ const SETTINGS: readonly PanelSettingDefinition[] = [
   { key: 'memoryOptimizerEnabled', label: '启用记忆整理', group: '记忆整理', type: 'boolean', writable: true, restartRequired: true, envKeys: ['CTI_MEMORY_OPTIMIZER_ENABLED'], read: (c) => Boolean(c.memoryOptimizerEnabled), normalize: booleanValue },
   { key: 'memoryOptimizerIntervalDays', label: '记忆整理间隔（天）', group: '记忆整理', type: 'number', writable: true, restartRequired: true, minimum: 1, maximum: 365, envKeys: ['CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS'], read: (c) => c.memoryOptimizerIntervalDays || 7, normalize: boundedInteger(1, 365) },
   { key: 'memoryOptimizerModelSource', label: '记忆整理模型来源', group: '记忆整理', type: 'enum', writable: true, restartRequired: true, enumValues: ['codex_primary', 'local_ai', 'external_api'], envKeys: ['CTI_MEMORY_OPTIMIZER_MODEL_SOURCE'], read: (c) => c.memoryOptimizerModelSource || 'codex_primary', normalize: enumValue(['codex_primary', 'local_ai', 'external_api']) },
+
+  { key: 'decisionProvider', label: '结构化判断 Provider', group: 'Jev 判断', type: 'enum', writable: true, restartRequired: true, enumValues: ['off', 'jev'], envKeys: ['CTI_DECISION_PROVIDER'], read: (c) => c.decisionProvider || 'off', normalize: enumValue(['off', 'jev']) },
+  { key: 'decisionMode', label: '判断接入模式', group: 'Jev 判断', type: 'enum', writable: true, restartRequired: true, enumValues: ['off', 'shadow', 'assist'], envKeys: ['CTI_DECISION_MODE'], read: (c) => c.decisionMode || 'off', normalize: enumValue(['off', 'shadow', 'assist']) },
+  { key: 'decisionResponseMode', label: '判断触发模式', group: 'Jev 判断', type: 'enum', writable: true, restartRequired: true, enumValues: ['off', 'explicit', 'auto'], envKeys: ['CTI_DECISION_RESPONSE_MODE'], read: (c) => c.decisionResponseMode || 'off', normalize: enumValue(['off', 'explicit', 'auto']) },
+  { key: 'decisionBaseUrl', label: 'Decisions API 地址', group: 'Jev 判断', type: 'string', writable: true, restartRequired: true, envKeys: ['CTI_DECISION_BASE_URL'], read: (c) => c.decisionBaseUrl || 'https://openrouter.ai/api/alpha/decisions', normalize: safeHttpUrl },
+  { key: 'decisionModel', label: 'Jev 模型', group: 'Jev 判断', type: 'string', writable: true, restartRequired: true, envKeys: ['CTI_DECISION_MODEL'], read: (c) => c.decisionModel || 'typesafe/jev-1.13', normalize: normalizedText },
+  { key: 'decisionTimeoutMs', label: 'Jev 超时（毫秒）', group: 'Jev 判断', type: 'number', writable: true, restartRequired: true, minimum: 500, maximum: 60000, envKeys: ['CTI_DECISION_TIMEOUT_MS'], read: (c) => c.decisionTimeoutMs || 8000, normalize: boundedInteger(500, 60000) },
+  { key: 'decisionApiKeySet', label: 'Jev API Key', group: 'Jev 判断', type: 'secret_status', writable: false, restartRequired: true, envKeys: [], read: (c) => Boolean(c.decisionApiKey) },
 ] as const;
 
 function readConfigText(configPath: string): string {

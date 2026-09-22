@@ -40,6 +40,8 @@ import type {
   ScheduledTaskListResult,
   ScheduledTaskMutationResult,
   ScheduledTaskScheduleInput,
+  DecisionQuestion,
+  DecisionQuestionType,
 } from './host.js';
 import type { TurnEvidenceEnvelope, TurnEvidenceItem, TurnFocusDecision } from './turn-context.js';
 import { execFile } from 'node:child_process';
@@ -216,6 +218,10 @@ import {
   type FinalizedChoiceSession,
 } from './application/choice-prompts.js';
 import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
+import { buildFeishuDecisionCard } from './channels/feishu/cards/decision-card.js';
+import { normalizeDecisionResult, renderDecisionView } from './application/decision-view.js';
+import { getJevChatMode, isJevPureModeEnabled, setJevChatMode } from './application/jev-mode.js';
+export { isJevPureModeEnabled };
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
 import * as router from './channel-router.js';
@@ -7251,6 +7257,30 @@ async function handleMessage(
     return;
   }
 
+  // A chat suffix is a one-turn Jev debug request.  Pure mode makes the same
+  // routing decision for every ordinary text message in the current chat.
+  const jevMode = getJevChatMode(adapter.channelType, msg.address.chatId);
+  const hasJevSuffix = /\/jev\s*$/iu.test(rawText);
+  if ((hasJevSuffix || jevMode === 'pure') && rawText.trim()) {
+    const parsed = parseJevDebugArgs(rawText);
+    if (parsed) {
+      await handleJevEvaluation(adapter, msg, parsed, jevMode === 'pure' ? 'pure' : 'debug');
+      ack();
+      return;
+    }
+  }
+
+  // `auto` is deliberately narrow: it recognizes an explicit judgment,
+  // classification, or rating question, while execution requests and casual
+  // greetings remain on the normal Primary path.
+  const decisionResponseMode = (store.getSetting('bridge_decision_response_mode') || '').trim().toLowerCase();
+  if (decisionResponseMode === 'auto' && getBridgeContext().decisions && isAutoJevQuestion(rawText)) {
+    const parsed = inferJevQuestion(rawText);
+    await handleJevEvaluation(adapter, msg, parsed, 'auto');
+    ack();
+    return;
+  }
+
   // Sanitize general message text before routing to conversation engine
   let { text, truncated } = sanitizeInput(rawText);
   if (truncated) {
@@ -9959,6 +9989,204 @@ async function handleMessage(
   }
 }
 
+interface ParsedJevQuestion {
+  type: DecisionQuestionType;
+  question: string;
+  criteria: Record<string, string> | string[];
+}
+
+function inferJevQuestion(text: string, requestedType?: string): ParsedJevQuestion {
+  const question = text.replace(/\s*\/jev\s*$/iu, '').trim().slice(0, 16_000);
+  const explicit = requestedType?.toLowerCase();
+  if (explicit === 'noul' || explicit === 'choice' || explicit === 'score') {
+    return {
+      type: explicit,
+      question,
+      criteria: explicit === 'noul'
+        ? { true: '是', false: '否' }
+        : explicit === 'score'
+          ? ['极低', '低', '中', '高', '极高']
+          : { support: '支持', oppose: '反对', question: '疑问', supplement: '补充', irrelevant: '无关' },
+    };
+  }
+  if (/(?:是否|是不是|能否|可否|能不能|可不可以|应该不应该|会不会|吗[？?]?$)/iu.test(question)) {
+    return { type: 'noul', question, criteria: { true: '是', false: '否' } };
+  }
+  if (/(?:评分|打分|几分|分数|等级|程度|强度|满意度|0\s*[-~至]\s*10|1\s*[-~至]\s*5)/iu.test(question)) {
+    return { type: 'score', question, criteria: ['极低', '低', '中', '高', '极高'] };
+  }
+  return {
+    type: 'choice',
+    question,
+    criteria: { support: '支持', oppose: '反对', question: '疑问', supplement: '补充', irrelevant: '无关' },
+  };
+}
+
+function parseJevDebugArgs(args: string): ParsedJevQuestion | null {
+  const trimmed = args.trim();
+  if (!trimmed) return null;
+  const match = /^(noul|choice|score)\s+([\s\S]+)$/iu.exec(trimmed);
+  return match ? inferJevQuestion(match[2], match[1]) : inferJevQuestion(trimmed);
+}
+
+export function isAutoJevQuestion(text: string): boolean {
+  const normalized = text.replace(/\s*\/jev\s*$/iu, '').trim();
+  if (normalized.length < 8 || normalized.length > 16_000) return false;
+  if (/^(?:你好|您好|嗨|哈[哈呵]|谢谢|感谢|早上好|晚上好|晚安|在吗)[！!。,.，？?\s]*$/iu.test(normalized)) return false;
+  if (/(?:创建|修改|删除|发送|运行|读取|搜索|部署|重启|安装|同步|调用|打开|执行|写入|上传|下载|发到|私聊)/iu.test(normalized)) return false;
+  return /(?:是否|是不是|能否|可否|能不能|可不可以|应该不应该|会不会|属于哪一类|哪一类|分类|选择哪一个|选哪个|评分|打分|几分|分数|满意度|强度|程度|吗[？?]?$)/iu.test(normalized);
+}
+
+async function handleJevEvaluation(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  parsed: ParsedJevQuestion,
+  source: 'debug' | 'pure' | 'auto',
+): Promise<void> {
+  const { store } = getBridgeContext();
+  const configuredProvider = (store.getSetting('bridge_decision_provider') || '').trim().toLowerCase();
+  const configuredMode = (store.getSetting('bridge_decision_mode') || '').trim().toLowerCase();
+  const host = getBridgeContext().decisions;
+  if (configuredProvider === 'off' || configuredMode === 'off') {
+    await deliver(adapter, {
+      address: msg.address,
+      text: 'Jev 当前已关闭（decision provider/mode=off）。请先在 Runtime 配置中启用后再调试。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (!host) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: 'Jev 当前未启用：Decision Provider 不可用。普通回复链路保持不变。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const question: DecisionQuestion = {
+    id: 'intent',
+    type: parsed.type,
+    instructions: parsed.question,
+    criteria: parsed.criteria,
+  };
+  const result = normalizeDecisionResult(await host.evaluate({
+    state: parsed.question,
+    questions: [question],
+  }), [question]);
+  if (!result) {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `Jev ${source === 'pure' ? '纯模式' : source === 'auto' ? '自动判断' : '调试'}未返回有效判断；已失败关闭，不会伪造概率。`,
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  const visible = renderDecisionView({
+    title: source === 'pure' ? 'Jev 纯模式判断' : source === 'auto' ? 'Jev 自动判断' : 'Jev 调试结果',
+    state: parsed.question,
+    questions: [question],
+    result,
+  });
+  await deliver(adapter, {
+    address: msg.address,
+    text: visible,
+    parseMode: adapter.channelType === 'feishu' ? 'Markdown' : 'plain',
+    replyToMessageId: msg.messageId,
+    ...(adapter.channelType === 'feishu' ? {
+      feishuCardJson: buildFeishuDecisionCard({
+        title: source === 'pure' ? 'Jev 纯模式判断' : source === 'auto' ? 'Jev 自动判断' : 'Jev 调试结果',
+        state: parsed.question,
+        questions: [question],
+        result,
+      }),
+    } : {}),
+  });
+}
+
+async function handleJevCommand(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  args: string,
+): Promise<void> {
+  const normalized = args.trim();
+  const [subcommand = 'status', ...rest] = normalized.split(/\s+/u);
+  const sub = subcommand.toLowerCase();
+  const mode = getJevChatMode(adapter.channelType, msg.address.chatId);
+  if (sub === 'status') {
+    const host = getBridgeContext().decisions;
+    const provider = getBridgeContext().store.getSetting('bridge_decision_provider') || 'off';
+    const decisionMode = getBridgeContext().store.getSetting('bridge_decision_mode') || 'off';
+    const responseMode = getBridgeContext().store.getSetting('bridge_decision_response_mode') || 'off';
+    await deliver(adapter, {
+      address: msg.address,
+      text: [
+        '**Jev 状态**',
+        `Provider：${provider}；运行模式：${decisionMode}；响应模式：${responseMode}`,
+        `Provider Host：${host ? 'available' : 'off'}`,
+        `当前聊天模式：${mode || 'off'}`,
+        '纯模式：接收当前聊天消息并只输出结构化判断；关闭后恢复现有 Primary 链路。',
+      ].join('\n'),
+      parseMode: adapter.channelType === 'feishu' ? 'Markdown' : 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (sub === 'on' || sub === 'off') {
+    setJevChatMode(adapter.channelType, msg.address.chatId, sub === 'on' ? 'explicit' : null);
+    await deliver(adapter, {
+      address: msg.address,
+      text: sub === 'on'
+        ? '已开启当前聊天的 Jev 显式调试入口；发送 `/jev debug <问题>` 或在消息末尾加 `/jev`。'
+        : '已关闭当前聊天的 Jev；普通消息继续走现有 Primary 链路。',
+      parseMode: 'plain',
+      replyToMessageId: msg.messageId,
+    });
+    return;
+  }
+  if (sub === 'pure') {
+    const action = (rest[0] || 'status').toLowerCase();
+    if (action === 'on') {
+      if (!isOwnerMessage(msg)) {
+        await deliver(adapter, { address: msg.address, text: buildOwnerRequiredMessage(msg), parseMode: 'plain', replyToMessageId: msg.messageId });
+        return;
+      }
+      const provider = (getBridgeContext().store.getSetting('bridge_decision_provider') || '').trim().toLowerCase();
+      const decisionMode = (getBridgeContext().store.getSetting('bridge_decision_mode') || '').trim().toLowerCase();
+      if (provider === 'off' || decisionMode === 'off' || !getBridgeContext().decisions) {
+        await deliver(adapter, { address: msg.address, text: 'Jev 当前未启用。请先配置 Decision Provider、API Key 和非 off 运行模式。', parseMode: 'plain', replyToMessageId: msg.messageId });
+        return;
+      }
+      setJevChatMode(adapter.channelType, msg.address.chatId, 'pure');
+      await deliver(adapter, { address: msg.address, text: '已开启当前聊天 Jev 纯模式：后续消息自动识别意图并返回 noul、choice 或 score。', parseMode: 'plain', replyToMessageId: msg.messageId });
+    } else if (action === 'off') {
+      if (!isOwnerMessage(msg)) {
+        await deliver(adapter, { address: msg.address, text: buildOwnerRequiredMessage(msg), parseMode: 'plain', replyToMessageId: msg.messageId });
+        return;
+      }
+      setJevChatMode(adapter.channelType, msg.address.chatId, null);
+      await deliver(adapter, { address: msg.address, text: '已关闭当前聊天 Jev 纯模式。', parseMode: 'plain', replyToMessageId: msg.messageId });
+    } else {
+      await deliver(adapter, { address: msg.address, text: `Jev 纯模式：${mode === 'pure' ? 'on' : 'off'}。用法：/jev pure on|off`, parseMode: 'plain', replyToMessageId: msg.messageId });
+    }
+    return;
+  }
+  if (sub === 'debug') {
+    const parsed = parseJevDebugArgs(rest.join(' '));
+    if (!parsed) {
+      await deliver(adapter, { address: msg.address, text: '用法：/jev debug [noul|choice|score] <问题>', parseMode: 'plain', replyToMessageId: msg.messageId });
+      return;
+    }
+    await handleJevEvaluation(adapter, msg, parsed, 'debug');
+    return;
+  }
+  const parsed = parseJevDebugArgs(normalized);
+  if (parsed) await handleJevEvaluation(adapter, msg, parsed, 'debug');
+  else await deliver(adapter, { address: msg.address, text: '用法：/jev status|on|off|pure on|pure off|debug <问题>', parseMode: 'plain', replyToMessageId: msg.messageId });
+}
+
 /**
  * Handle IM slash commands.
  */
@@ -10019,6 +10247,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
+        '/jev status|on|off|pure on|pure off|debug <问题> - Structured Jev decisions',
         '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
@@ -10092,6 +10321,13 @@ async function handleCommand(
     case '/ext': {
       response = await handleExtensionCommand(adapter, msg, args);
       break;
+    }
+
+    case '/jev': {
+      // Jev owns structured result delivery (including the Feishu decision
+      // card), so it returns before the generic HTML response path.
+      await handleJevCommand(adapter, msg, args);
+      return;
     }
 
     case '/new': {
@@ -10308,6 +10544,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
+        '/jev status|on|off|pure on|pure off|debug &lt;问题&gt; - Structured Jev decisions',
         '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',

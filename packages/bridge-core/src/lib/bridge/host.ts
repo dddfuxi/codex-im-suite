@@ -21,6 +21,11 @@ import type {
   PanelSettingChangeContract,
   PanelSettingsSnapshotContract,
   PanelSettingsUpdateReceiptContract,
+  DecisionAnswerContract,
+  DecisionQuestionContract,
+  DecisionQuestionType as DecisionQuestionTypeContract,
+  DecisionRequestContract,
+  DecisionResultContract,
 } from '@codex-im-suite/contracts';
 import type { SkillRiskLevel, SkillSourceClass } from './agent-architecture.js';
 import type { InputEvidenceKind } from './input-evidence.js';
@@ -600,6 +605,24 @@ export interface ContinuationAdjustmentIntentInput {
 
 export interface ContinuationAdjustmentIntentHost {
   classifyContinuationAdjustment(input: ContinuationAdjustmentIntentInput): Promise<'adjust' | 'not_adjust' | 'ambiguous'>;
+}
+
+/**
+ * 可替换的结构化判断 Host。它只接收 Core 已经裁决过的状态和固定问题，
+ * 不拥有工具、工作区、平台身份或发送权限；Runtime 可以用 Jev 或其他
+ * 专用 Decisions API 实现它，关闭时由 Host 缺失直接失败关闭。
+ * Shared contract shapes are the source of truth. Host input/result types are
+ * the runtime projection：协议/证据元数据仅在 Runtime 契约边界附加，
+ * 可选 AbortSignal 不会跨边界传播。
+ */
+export type DecisionQuestionType = DecisionQuestionTypeContract;
+export type DecisionQuestion = DecisionQuestionContract;
+export type DecisionRequest = Pick<DecisionRequestContract, 'state' | 'questions'> & { signal?: AbortSignal };
+export type DecisionAnswer = DecisionAnswerContract;
+export type DecisionResult = Omit<DecisionResultContract, 'protocol'>;
+
+export interface DecisionProviderHost {
+  evaluate(input: DecisionRequest): Promise<DecisionResult | null>;
 }
 
 /** Runtime-owned sticker semantic persistence and policy boundary. */

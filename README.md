@@ -40,6 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 飞书卡片支持受控横幅头图：Provider 可用 `cti-final.card_hero` 从同一结果的 `images` 中选择一张已验证图片，Bridge 上传后把真实 `image_key` 嵌入普通卡、流式终态卡或有限选择按钮卡；嵌入成功不再重复发同一图片。组合卡若被平台拒绝，会先去掉可选头图并保留原正文与按钮，图片改走普通附件；卡片仍不可用时再以飞书富文本回退，不会裸露 Markdown。模型声明的 URL、`image_key`、输入证据或未交付路径不会被提升成头图。
 - 飞书支持通用“看盘式”分析卡：市场观察、服务健康、项目态势、故障复盘、测试对比等确有多项指标的结果，可用 `cti-final.analysis_view` 在同一卡片中展示结论、最多 6 项指标和最多 4 个风险/观察/下一步分区；指标采用更适合移动端的双列表格，当前值和变化信号沿用同一语义色。协议会先过滤无效/重复项再计入上限，同名分区自动合并去重；正文中与结构化标题、结论完全相同的展示行会被折叠，但代码块和独有依据保持原样。普通正文仍作为补充说明及非飞书回退。该能力不绑定股票关键词，轻聊和单一事实不会机械套模板，也不会为了填满版式伪造价格、百分比、趋势或状态。头图、分析视图和有限选择按钮可以复用同一张 Card 2.0 卡片。
 - 飞书有限选择支持显式群体会话：普通按钮仍只允许发起人点击；用户明确要求全员参与时，`cti-final.choice_session` 可选择 `vote`（倒计时结束统一回调）、`claim`（首个合法点击者抢选）或 `parallel`（每位成员分别续跑）。parallel 的共享入口允许多人各自进入，但进入某位参与者的分线后，后续按钮只允许该参与者继续，其他成员不会串线。群体点击绑定原群与原生 operator，优先复核当前群成员；状态、计票、截止时间、匿名分支、原卡消息和待投递终态会原子持久化，Bridge 重启后恢复。投票终态在原卡明确显示赢家、平票或无人参与；卡片暂时刷新失败也不会回滚已记录选票。不靠正文模拟投票，也不用于权限或高风险确认。
+- 结构化判断 Decision Layer 开发预览：共享契约支持 `noul`（是/否概率）、`choice`（有限分类）和 `score`（评分分布），当前 Jev 只通过 OpenRouter Decisions API 专用 Provider 接入，不进入普通聊天模型链路。配置默认关闭，开发版已有飞书 `/jev` 调试/纯模式和无按钮 Decision Card，只展示结果及概率，`choice` 不复用真人点击选择卡。关闭、超时或非法返回会明确报告判断不可用，普通 Primary 链路保持原行为；shadow/assist 的自动辅助链与面板专属设置页仍在实施中。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
@@ -77,6 +78,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 控制面板前端源码：`apps/control-panel/web`
 - Control API 启动脚本：`scripts/start-control-api.ps1`
 - Agent 协作 Manifest：`config/agents.d`；运行模式使用 `CTI_AGENT_COLLABORATION_MODE=off|shadow|assist`，默认 `off`。也可在控制面板总览的“多 Agent 协作”卡片点击“开启/关闭”，或在“机器人 → 架构”选择 `关闭 / Shadow / Assist`；面板会写入 `config.env` 并通过带 Workflow drain 的统一入口重启 Bridge。架构页的 Performance 建议会显示已完成回合数、证据引用和短分析水位。
+- 结构化判断配置：Runtime 已接受 `CTI_DECISION_PROVIDER`、`CTI_DECISION_MODE`、`CTI_DECISION_RESPONSE_MODE`、`CTI_DECISION_BASE_URL`、`CTI_DECISION_MODEL` 和 `CTI_DECISION_TIMEOUT_MS`，受控 Panel Settings 目录已声明对应枚举及重启要求。`CTI_JEV_API_KEY` 只读取本机受控 `config.env`，不得提交到仓库；普通设置只显示是否配置及掩码。当前配置示例见 `packages/bridge-runtime/config.env.example`，完整接入进度见 [Jev 实施计划](docs/superpowers/plans/2026-09-22-Jev结构化决策接入实施计划.md)。
 - 安全档位：控制面板“设置 → 自适应安全策略”，默认“智能平衡”；只放宽强平台 evidence 支撑的同群低风险动作，不关闭 Owner、平台授权、身份冲突或高风险确认。
 - 最近发布摘要：[publish-summary.md](./publish-summary.md)
 - 发布历史：[release-notes.md](./release-notes.md)
