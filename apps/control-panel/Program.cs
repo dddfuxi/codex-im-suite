@@ -1831,7 +1831,14 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "codexApiKeyValue", ""),
             ReadPayloadString(payload, "codexApiKeyMasked", current.CodexApiKeyMasked),
             ReadPayloadBool(payload, "codexApiKeySet", current.CodexApiKeySet),
-            NormalizeSafetyPolicyProfile(ReadPayloadString(payload, "safetyPolicyProfile", current.SafetyPolicyProfile)));
+            NormalizeSafetyPolicyProfile(ReadPayloadString(payload, "safetyPolicyProfile", current.SafetyPolicyProfile)),
+            NormalizeDecisionProvider(ReadPayloadString(payload, "decisionProvider", current.DecisionProvider)),
+            NormalizeDecisionMode(ReadPayloadString(payload, "decisionMode", current.DecisionMode)),
+            NormalizeDecisionResponseMode(ReadPayloadString(payload, "decisionResponseMode", current.DecisionResponseMode)),
+            ReadPayloadString(payload, "decisionBaseUrl", current.DecisionBaseUrl),
+            ReadPayloadString(payload, "decisionModel", current.DecisionModel),
+            NormalizeDecisionTimeout(ReadPayloadString(payload, "decisionTimeoutMs", current.DecisionTimeoutMs)),
+            current.DecisionApiKeySet);
     }
 
     private async Task<WebSessionDetail> GetSessionDetailAsync(JsonElement payload)
@@ -7006,7 +7013,14 @@ exit $LASTEXITCODE
         "",
         MaskSecretForSettings(GetConfig("CTI_CODEX_API_KEY", "")),
         !string.IsNullOrWhiteSpace(GetConfig("CTI_CODEX_API_KEY", "")),
-        NormalizeSafetyPolicyProfile(GetConfig("CTI_SAFETY_POLICY_PROFILE", "balanced"))
+        NormalizeSafetyPolicyProfile(GetConfig("CTI_SAFETY_POLICY_PROFILE", "balanced")),
+        NormalizeDecisionProvider(GetConfig("CTI_DECISION_PROVIDER", "off")),
+        NormalizeDecisionMode(GetConfig("CTI_DECISION_MODE", "off")),
+        NormalizeDecisionResponseMode(GetConfig("CTI_DECISION_RESPONSE_MODE", "off")),
+        GetConfig("CTI_DECISION_BASE_URL", "https://openrouter.ai/api/alpha/decisions"),
+        GetConfig("CTI_DECISION_MODEL", "typesafe/jev-1.13"),
+        NormalizeDecisionTimeout(GetConfig("CTI_DECISION_TIMEOUT_MS", "8000")),
+        !string.IsNullOrWhiteSpace(GetConfig("CTI_JEV_API_KEY", ""))
     );
 
     private void ShowSettingsDialog()
@@ -7056,6 +7070,12 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_INTERVAL_DAYS", NormalizePositiveNumber(settings.MemoryOptimizerIntervalDays, "7"));
         SetOrAppendEnv(lines, "CTI_MEMORY_OPTIMIZER_MODEL_SOURCE", NormalizeMemoryOptimizerModelSource(settings.MemoryOptimizerModelSource));
         SetOrAppendEnv(lines, "CTI_SAFETY_POLICY_PROFILE", NormalizeSafetyPolicyProfile(settings.SafetyPolicyProfile));
+        SetOrAppendEnv(lines, "CTI_DECISION_PROVIDER", NormalizeDecisionProvider(settings.DecisionProvider));
+        SetOrAppendEnv(lines, "CTI_DECISION_MODE", NormalizeDecisionMode(settings.DecisionMode));
+        SetOrAppendEnv(lines, "CTI_DECISION_RESPONSE_MODE", NormalizeDecisionResponseMode(settings.DecisionResponseMode));
+        SetOrAppendEnv(lines, "CTI_DECISION_BASE_URL", settings.DecisionBaseUrl.Trim());
+        SetOrAppendEnv(lines, "CTI_DECISION_MODEL", settings.DecisionModel.Trim());
+        SetOrAppendEnv(lines, "CTI_DECISION_TIMEOUT_MS", NormalizeDecisionTimeout(settings.DecisionTimeoutMs));
         ApplySecretEnv(lines, "CTI_CODEX_API_KEY", settings.CodexApiKeyAction, settings.CodexApiKeyValue);
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
         AppendLog("配置已保存。Codex CLI 模型来源、路径和回复风格将在重启飞书桥接后生效。");
@@ -7409,6 +7429,29 @@ exit $LASTEXITCODE
         value = (value ?? "").Trim().ToLowerInvariant();
         return value is "strict" or "balanced" or "fluent" ? value : "balanced";
     }
+
+    private static string NormalizeDecisionProvider(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "off" or "jev" ? value : "off";
+    }
+
+    private static string NormalizeDecisionMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "off" or "shadow" or "assist" ? value : "off";
+    }
+
+    private static string NormalizeDecisionResponseMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "off" or "explicit" or "auto" ? value : "off";
+    }
+
+    private static string NormalizeDecisionTimeout(string value)
+        => int.TryParse((value ?? "").Trim(), out var parsed) && parsed is >= 500 and <= 60000
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : "8000";
 
     private static string NormalizeExecutorId(string value)
     {
@@ -12477,7 +12520,14 @@ internal sealed record SettingsSnapshot(
     string CodexApiKeyValue = "",
     string CodexApiKeyMasked = "",
     bool CodexApiKeySet = false,
-    string SafetyPolicyProfile = "balanced");
+    string SafetyPolicyProfile = "balanced",
+    string DecisionProvider = "off",
+    string DecisionMode = "off",
+    string DecisionResponseMode = "off",
+    string DecisionBaseUrl = "https://openrouter.ai/api/alpha/decisions",
+    string DecisionModel = "typesafe/jev-1.13",
+    string DecisionTimeoutMs = "8000",
+    bool DecisionApiKeySet = false);
 
 internal sealed record HistorySearchQuery(
     string Chat,
@@ -12501,6 +12551,15 @@ internal sealed class SettingsForm : Form
     private readonly Action<SettingsSnapshot> _saveSettings;
     private readonly Action<string> _openPath;
     private string _defaultExecutorId = "";
+    // The legacy native dialog does not render Jev fields yet; retain their
+    // loaded values so saving that dialog cannot silently disable the decision layer.
+    private string _decisionProvider = "off";
+    private string _decisionMode = "off";
+    private string _decisionResponseMode = "off";
+    private string _decisionBaseUrl = "https://openrouter.ai/api/alpha/decisions";
+    private string _decisionModel = "typesafe/jev-1.13";
+    private string _decisionTimeoutMs = "8000";
+    private bool _decisionApiKeySet;
 
     public SettingsForm(
         SettingsSnapshot settings,
@@ -12673,6 +12732,13 @@ internal sealed class SettingsForm : Form
         _replyStyleHint.Text = settings.ReplyStyleHint;
         _defaultExecutorId = settings.DefaultExecutorId;
         _safetyPolicyProfile = settings.SafetyPolicyProfile;
+        _decisionProvider = settings.DecisionProvider;
+        _decisionMode = settings.DecisionMode;
+        _decisionResponseMode = settings.DecisionResponseMode;
+        _decisionBaseUrl = settings.DecisionBaseUrl;
+        _decisionModel = settings.DecisionModel;
+        _decisionTimeoutMs = settings.DecisionTimeoutMs;
+        _decisionApiKeySet = settings.DecisionApiKeySet;
         _replyStylePreset.SelectedItem = ResolveReplyStylePreset(settings.ReplyStyleHint);
     }
 
@@ -12685,6 +12751,13 @@ internal sealed class SettingsForm : Form
         _defaultExecutorId)
     {
         SafetyPolicyProfile = _safetyPolicyProfile,
+        DecisionProvider = _decisionProvider,
+        DecisionMode = _decisionMode,
+        DecisionResponseMode = _decisionResponseMode,
+        DecisionBaseUrl = _decisionBaseUrl,
+        DecisionModel = _decisionModel,
+        DecisionTimeoutMs = _decisionTimeoutMs,
+        DecisionApiKeySet = _decisionApiKeySet,
     };
 
     private string ResolveReplyStylePreset(string value)

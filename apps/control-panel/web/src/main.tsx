@@ -1046,6 +1046,13 @@ const fallbackState: PanelState = {
     codexApiKeyMasked: '',
     codexApiKeySet: false,
     safetyPolicyProfile: 'balanced',
+    decisionProvider: 'off',
+    decisionMode: 'off',
+    decisionResponseMode: 'off',
+    decisionBaseUrl: 'https://openrouter.ai/api/alpha/decisions',
+    decisionModel: 'typesafe/jev-1.13',
+    decisionTimeoutMs: '8000',
+    decisionApiKeySet: false,
   },
   history: { status: '', sessions: [] },
   speech: { available: false, unavailableCode: 'speech_runtime_unavailable', status: null },
@@ -6791,6 +6798,54 @@ function SettingsPage({
               )}
             </div>
           )}
+          <div className="decision-settings-panel">
+            <div className="settings-subhead">结构化判断（Jev Decisions API）</div>
+            <div className="path-grid">
+              <label className="stack-field">
+                <span>判断 Provider</span>
+                <select value={settings.decisionProvider || 'off'} onChange={(event) => update('decisionProvider', event.target.value as SettingsState['decisionProvider'])}>
+                  <option value="off">关闭</option>
+                  <option value="jev">Jev（OpenRouter Decisions API）</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>接入模式</span>
+                <select value={settings.decisionMode || 'off'} onChange={(event) => update('decisionMode', event.target.value as SettingsState['decisionMode'])}>
+                  <option value="off">关闭</option>
+                  <option value="shadow">Shadow（观察）</option>
+                  <option value="assist">Assist（辅助判断）</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>触发模式</span>
+                <select value={settings.decisionResponseMode || 'off'} onChange={(event) => update('decisionResponseMode', event.target.value as SettingsState['decisionResponseMode'])}>
+                  <option value="off">关闭</option>
+                  <option value="explicit">显式（/jev 或后缀）</option>
+                  <option value="auto">自动识别判断类问题</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>Decisions API 地址</span>
+                <input value={settings.decisionBaseUrl || ''} onChange={(event) => update('decisionBaseUrl', event.target.value)} placeholder="https://openrouter.ai/api/alpha/decisions" />
+              </label>
+              <label className="stack-field">
+                <span>Jev 模型</span>
+                <input value={settings.decisionModel || ''} onChange={(event) => update('decisionModel', event.target.value)} placeholder="typesafe/jev-1.13" />
+              </label>
+              <label className="stack-field">
+                <span>请求超时（毫秒）</span>
+                <input value={settings.decisionTimeoutMs || '8000'} onChange={(event) => update('decisionTimeoutMs', event.target.value)} inputMode="numeric" />
+              </label>
+              <div className="stack-field">
+                <span>Jev API Key</span>
+                <strong>{settings.decisionApiKeySet ? '已设置' : '未设置'}</strong>
+                <span className="micro-copy">面板只显示是否已设置，不读取或展示 Key 内容。</span>
+              </div>
+            </div>
+            <p className="field-hint">
+              Jev 只用于结构化判断并返回 noul、choice 或 score 概率分布，不进入普通聊天模型链路。配置修改后需要保存并重启 Bridge 才会生效。
+            </p>
+          </div>
           <details className="advanced-settings">
             <summary>高级设置</summary>
             <div className="path-grid">

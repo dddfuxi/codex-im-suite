@@ -163,7 +163,7 @@ Runtime model identity is a provider-owned evidence boundary. Each provider buil
 
 结构化判断是可替换的只读辅助链，不属于普通聊天模型路由。`packages/contracts/src/decision.ts` 与 `packages/contracts/schemas/decision.schema.json` 共同声明 `cti-decision-request/v1`、`cti-decision-result/v1` 和 `cti-decision-view/v1`，覆盖 `noul`（是/否概率）、`choice`（有限分类）和 `score`（评分及分布）。Core 通过可选 `DecisionProviderHost` 把已经裁决过的短状态与问题交给 Runtime；Core 会复核问题类型、答案 ID 和概率边界，结果只能作为只读 evidence，不能携带按钮回调、平台身份、路径、命令或凭据。
 
-Runtime 的 `JevDecisionProvider` 是 OpenRouter Decisions API 的专用适配器，默认 endpoint 为 `https://openrouter.ai/api/alpha/decisions`、模型为 `typesafe/jev-1.13`，不会进入 Codex/Claude 普通聊天链。配置与受控 Panel Settings 描述符已经定义 `CTI_DECISION_PROVIDER=off|jev`、`CTI_DECISION_MODE=off|shadow|assist` 和 `CTI_DECISION_RESPONSE_MODE=off|explicit|auto`，并支持 endpoint、模型和超时；`CTI_JEV_API_KEY` 只在本机受控 `config.env` 中读取，普通设置只投影是否配置及掩码。当前实现按 provider/key/非 off mode 装配 Host，用户主动调用的判断回合直接返回只读结果；`shadow` 观察链、`assist` 注入 Primary 和普通消息 `auto` 触发仍未接入，不把配置枚举当成已完成行为。关闭、缺少密钥、超时、取消、HTTP 错误或非法结果都不产生伪造概率；显式或纯模式请求报告不可用，未进入判断入口的普通请求保持 Primary 链路。
+Runtime 的 `JevDecisionProvider` 是 OpenRouter Decisions API 的专用适配器，默认 endpoint 为 `https://openrouter.ai/api/alpha/decisions`、模型为 `typesafe/jev-1.13`，不会进入 Codex/Claude 普通聊天链。配置与受控 Panel Settings 描述符已经定义 `CTI_DECISION_PROVIDER=off|jev`、`CTI_DECISION_MODE=off|shadow|assist` 和 `CTI_DECISION_RESPONSE_MODE=off|explicit|auto`，并支持 endpoint、模型和超时；`CTI_JEV_API_KEY` 只在本机受控 `config.env` 中读取，控制面板只投影是否已设置，不展示密钥值。控制面板的结构化判断设置区可读取并保存这些非密钥配置，保存后需重启 Bridge 才生效。当前实现按 provider/key/非 off mode 装配 Host，用户主动调用的判断回合直接返回只读结果；普通消息 `auto` 已接入窄范围判断类问题入口，`shadow` 的观察链和 `assist` 的 Primary 注入语义仍待补齐，不把配置枚举当成已完成行为。关闭、缺少密钥、超时、取消、HTTP 错误或非法结果都不产生伪造概率；显式或纯模式请求报告不可用，未进入判断入口的普通请求保持 Primary 链路。
 
 ```mermaid
 flowchart LR

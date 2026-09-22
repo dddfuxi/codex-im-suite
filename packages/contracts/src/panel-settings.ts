@@ -58,6 +58,14 @@ export interface PanelSettingsStateContract {
   codexApiKeyMasked: string;
   codexApiKeySet: boolean;
   safetyPolicyProfile: string;
+  /** 结构化判断层（Jev Decisions API）的受控配置。密钥只投影状态，不投影原文。 */
+  decisionProvider: 'off' | 'jev';
+  decisionMode: 'off' | 'shadow' | 'assist';
+  decisionResponseMode: 'off' | 'explicit' | 'auto';
+  decisionBaseUrl: string;
+  decisionModel: string;
+  decisionTimeoutMs: string;
+  decisionApiKeySet: boolean;
 }
 
 export interface PanelSettingDescriptorContract {

@@ -3133,6 +3133,19 @@ button:disabled {
   background: var(--panel-muted);
 }
 
+.decision-settings-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-muted);
+}
+
+.decision-settings-panel .path-grid {
+  margin: 0;
+}
+
 .failover-chain-row {
   display: flex;
   align-items: center;
