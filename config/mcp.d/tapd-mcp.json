@@ -1,0 +1,34 @@
+{
+  "id": "tapdMCP",
+  "displayName": "TAPD MCP",
+  "type": "stdio",
+  "version": "0.4.3",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "mcp.project-management",
+  "optional": true,
+  "installState": "external",
+  "source": "npm:tapd-server-cli@0.4.3",
+  "aliases": ["tapd", "tapd mcp", "本周 tapd", "tapd 标题"],
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-tapd-mcp.ps1",
+  "cwd": "${SUITE_ROOT}",
+  "registerName": "tapd",
+  "requiredEnvironment": ["TAPD_TOKEN"],
+  "context": {
+    "fields": [
+      {
+        "name": "company_id",
+        "aliases": ["company_id", "companyId", "公司ID", "公司 id"],
+        "valuePattern": "^[0-9]{1,20}$",
+        "envDefault": "CTI_TAPD_DEFAULT_COMPANY_ID"
+      }
+    ]
+  },
+  "healthCheck": {
+    "kind": "codex-mcp-list"
+  },
+  "description": "TAPD Open API MCP；令牌仅从 Runtime 受管环境注入，已验证 company_id 按渠道、聊天和用户持久化。"
+}

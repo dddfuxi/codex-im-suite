@@ -1,4 +1,4 @@
-import type { StreamChatParams } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type StreamChatParams } from 'claude-to-im/host';
 
 import type { Config } from './config.js';
 import {
@@ -23,9 +23,33 @@ interface ChatCompletionResponse {
   usage?: Record<string, unknown>;
 }
 
+interface OllamaChatResponse {
+  message?: {
+    content?: unknown;
+  };
+  prompt_eval_count?: unknown;
+  eval_count?: unknown;
+}
+
 export interface LocalModelMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+}
+
+interface OllamaTagResponse {
+  models?: Array<{ name?: unknown; model?: unknown }>;
+}
+
+export function parseOllamaTags(payload: unknown): string[] {
+  const data = payload as OllamaTagResponse | null | undefined;
+  if (!data || !Array.isArray(data.models)) return [];
+  return data.models
+    .map((item) => {
+      if (typeof item.name === 'string' && item.name.trim()) return item.name.trim();
+      if (typeof item.model === 'string' && item.model.trim()) return item.model.trim();
+      return '';
+    })
+    .filter(Boolean);
 }
 
 function trimText(text: string): string {
@@ -49,6 +73,25 @@ function extractContent(response: ChatCompletionResponse): string {
     );
   }
   return '';
+}
+
+function extractOllamaContent(response: OllamaChatResponse): string {
+  return typeof response.message?.content === 'string'
+    ? trimText(response.message.content)
+    : '';
+}
+
+function extractOllamaUsage(response: OllamaChatResponse): Record<string, unknown> | undefined {
+  const promptTokens = Number(response.prompt_eval_count);
+  const completionTokens = Number(response.eval_count);
+  if (!Number.isFinite(promptTokens) && !Number.isFinite(completionTokens)) return undefined;
+  const normalizedPromptTokens = Number.isFinite(promptTokens) ? Math.max(0, promptTokens) : 0;
+  const normalizedCompletionTokens = Number.isFinite(completionTokens) ? Math.max(0, completionTokens) : 0;
+  return {
+    prompt_tokens: normalizedPromptTokens,
+    completion_tokens: normalizedCompletionTokens,
+    total_tokens: normalizedPromptTokens + normalizedCompletionTokens,
+  };
 }
 
 function looksUnsafe(text: string): string | null {
@@ -77,15 +120,17 @@ function buildAnswerMessages(
   const route = options.route;
   const prompt = route?.compressedPrompt || compressPromptText(params, config);
   const history = route?.compressedHistory || compressConversationHistory(params, config);
+  const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
   const systemLines = [
     '你是本地低成本代码助手。',
     '你的职责是给出解释、总结、命令草案、小脚本草案和轻量代码说明。',
     '不要声称你已经执行命令、修改仓库、运行 Unity、操作 Blender、创建或删除飞书文档。',
+    '如果用户请求的是 Unity、Blender、MCP、仓库、文件、图片或历史的实际执行/检查，而你没有真实工具结果，只能明确说未完成和卡点；不要输出通用操作步骤、示例列表或样例脚本来假装完成。',
     '用户侧输出保持简洁中文，只给关键结论，不要暴露长思考过程。',
   ];
 
   if (options.bestEffort) {
-    systemLines.push('当前更强模型不可用或不允许升级。你只能尽力给出解释、建议和草案，不能伪造真实执行结果。');
+    systemLines.push('当前更强模型不可用或不允许升级。你只能基于已有真实信息回答；如果请求需要真实工具执行且没有工具结果，必须明确说未完成和具体限制，不要给用户布置操作教程。');
   }
   if (options.limitReason) {
     systemLines.push(`限制说明：${options.limitReason}`);
@@ -100,6 +145,7 @@ function buildAnswerMessages(
   const userLines = [
     options.recallContext ? `已命中的相关历史/记忆:\n${options.recallContext}` : '',
     history ? `最近相关上下文:\n${history}` : '',
+    priorityTurnContext,
     `当前请求:\n${prompt}`,
   ].filter(Boolean);
 
@@ -109,37 +155,105 @@ function buildAnswerMessages(
   ];
 }
 
-export class LocalLlamaProvider {
+export class OllamaProvider {
   constructor(private readonly config: Config) {}
+
+  /**
+   * 用轻量只读请求预热本地 Provider 健康状态，避免离线端点把重启后的首条
+   * 聊天拖到完整推理超时。该探针不加载模型、不生成文本，也不改变外部状态。
+   */
+  async probe(timeoutMs = 600): Promise<void> {
+    const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    const kind = (this.config.localAiKind || 'ollama').trim().toLowerCase();
+    const endpoint = kind === 'ollama' ? `${baseUrl}/api/tags` : `${baseUrl}/v1/models`;
+    const controller = new AbortController();
+    const boundedTimeoutMs = Math.max(250, Math.min(1_500, Math.floor(timeoutMs)));
+    const timer = setTimeout(() => controller.abort(), boundedTimeoutMs);
+    const headers: Record<string, string> = {};
+    if (this.config.localAiApiKey) headers.Authorization = `Bearer ${this.config.localAiApiKey}`;
+    try {
+      const response = await fetch(endpoint, { method: 'GET', headers, signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`本地模型健康探针超时(${boundedTimeoutMs}ms)`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   async complete(
     messages: LocalModelMessage[],
-    options?: { temperature?: number; maxTokens?: number; timeoutMs?: number },
+    options?: { temperature?: number; maxTokens?: number; timeoutMs?: number; responseSchema?: unknown; model?: string; keepAlive?: string | number },
   ): Promise<{ text: string; usage?: Record<string, unknown> }> {
-    const baseUrl = (this.config.localLlmBaseUrl || 'http://127.0.0.1:8080').replace(/\/+$/, '');
-    const endpoint = `${baseUrl}/v1/chat/completions`;
-    const timeoutMs = Math.max(5000, options?.timeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const baseUrl = (this.config.localAiBaseUrl || this.config.ollamaBaseUrl || this.config.localLlmBaseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    const kind = (this.config.localAiKind || 'ollama').trim().toLowerCase();
+    // Ollama 的 OpenAI 兼容端点会忽略 keep_alive，导致看似已经预热的模型仍按
+    // 默认 TTL 卸载。只有调用者明确要求驻留时才切到原生 chat 端点；普通请求和
+    // 其他 OpenAI-compatible Provider 继续使用现有协议，避免扩大行为变化范围。
+    const useNativeOllama = kind === 'ollama' && options?.keepAlive !== undefined;
+    const endpoint = useNativeOllama ? `${baseUrl}/api/chat` : `${baseUrl}/v1/chat/completions`;
+    const timeoutMs = options?.timeoutMs !== undefined
+      ? Math.max(250, Math.floor(options.timeoutMs))
+      : Math.max(5000, this.config.localAiTimeoutMs || this.config.ollamaTimeoutMs || this.config.localLlmTimeoutMs || 45000);
+    const model = options?.model || this.config.localAiModel || this.config.ollamaModel || this.config.localLlmModel || 'qwen2.5-coder:7b';
+    const maxTokens = Math.max(options?.responseSchema ? 24 : 128, options?.maxTokens || this.config.localLlmMaxOutputTokens || 768);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.config.localAiApiKey) {
+      headers.Authorization = `Bearer ${this.config.localAiApiKey}`;
+    }
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: this.config.localLlmModel || 'qwen2.5-coder-7b-instruct',
-          messages,
-          stream: false,
-          temperature: options?.temperature ?? 0.1,
-          max_tokens: Math.max(128, options?.maxTokens || this.config.localLlmMaxOutputTokens || 768),
-        }),
+        headers,
+        body: JSON.stringify(useNativeOllama
+          ? {
+              model,
+              messages,
+              stream: false,
+              keep_alive: options?.keepAlive,
+              options: {
+                temperature: options?.temperature ?? 0.1,
+                num_predict: maxTokens,
+              },
+              ...(options?.responseSchema ? { format: options.responseSchema } : {}),
+            }
+          : {
+              model,
+              messages,
+              stream: false,
+              temperature: options?.temperature ?? 0.1,
+              max_tokens: maxTokens,
+              ...(options?.responseSchema ? {
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: {
+                    name: 'cti_local_structured_output',
+                    strict: true,
+                    schema: options.responseSchema,
+                  },
+                },
+              } : {}),
+            }),
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      const json = await response.json() as ChatCompletionResponse;
-      const text = extractContent(json);
+      const json = await response.json() as ChatCompletionResponse | OllamaChatResponse;
+      const text = useNativeOllama
+        ? extractOllamaContent(json as OllamaChatResponse)
+        : extractContent(json as ChatCompletionResponse);
       const unsafeReason = looksUnsafe(text);
       if (unsafeReason) throw new Error(unsafeReason);
-      return { text, usage: json.usage };
+      return {
+        text,
+        usage: useNativeOllama
+          ? extractOllamaUsage(json as OllamaChatResponse)
+          : (json as ChatCompletionResponse).usage,
+      };
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`本地模型超时(${timeoutMs}ms)`);
@@ -220,3 +334,5 @@ export class LocalLlamaProvider {
     });
   }
 }
+
+export { OllamaProvider as LocalLlamaProvider };

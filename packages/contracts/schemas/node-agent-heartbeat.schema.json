@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/node-agent-heartbeat.schema.json",
+  "title": "NodeAgentHeartbeat",
+  "type": "object",
+  "required": ["schema", "nodeId", "displayName", "kind", "status", "version", "lastSeenAt", "capabilities"],
+  "properties": {
+    "schema": { "const": "codex-im-suite/node-agent-heartbeat/v1" },
+    "nodeId": { "type": "string", "minLength": 1 },
+    "displayName": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["local", "remote", "fake"] },
+    "status": { "enum": ["online", "degraded", "offline", "unknown"] },
+    "version": { "type": "string", "minLength": 1 },
+    "host": { "type": "string" },
+    "lastSeenAt": { "type": "string", "format": "date-time" },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "displayName", "category", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "displayName": { "type": "string", "minLength": 1 },
+          "category": { "enum": ["bridge", "executor", "mcp", "memory", "extension", "release", "media", "custom"] },
+          "status": { "enum": ["online", "degraded", "offline", "unknown"] },
+          "detail": { "type": "string" },
+          "risk": { "enum": ["low", "medium", "high"] }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

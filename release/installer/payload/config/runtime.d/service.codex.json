@@ -1,0 +1,24 @@
+{
+  "id": "service.codex",
+  "displayName": "Codex CLI",
+  "kind": "tool",
+  "category": "codex",
+  "enabled": true,
+  "installState": "installed",
+  "source": "%APPDATA%\\npm",
+  "cwd": "%APPDATA%\\npm",
+  "version": "",
+  "description": "Codex CLI 工具型服务，默认提供检查与工作目录入口，不伪造常驻 daemon 开关。",
+  "update": {
+    "enabled": true,
+    "surfaces": [
+      "service",
+      "extension"
+    ],
+    "kind": "npm_global_package",
+    "packageName": "@openai/codex",
+    "postCheckUnitIds": [
+      "service.codex"
+    ]
+  }
+}

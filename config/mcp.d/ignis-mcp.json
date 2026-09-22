@@ -1,0 +1,29 @@
+{
+  "id": "ignisMCP",
+  "displayName": "Ignis MCP",
+  "type": "http",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "mcp.creative",
+  "optional": true,
+  "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
+  "source": "${SUITE_ROOT}\\packages\\mcp-ignis",
+  "aliases": ["ignis", "ignis mcp", "ignismcp"],
+  "enabled": true,
+  "launcher": "${SUITE_ROOT}\\scripts\\launch-ignis-mcp.ps1",
+  "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-ignis-mcp.ps1",
+  "cwd": "${SUITE_ROOT}",
+  "registerName": "ignisMCP",
+  "env": {
+    "IGNIS_MCP_PORT": "8787"
+  },
+  "healthCheck": {
+    "kind": "http",
+    "url": "http://127.0.0.1:8787/mcp"
+  },
+  "description": "Ignis creative generation CLI MCP for images, videos, 3D models, asset upload, sessions, and result polling."
+}

@@ -135,6 +135,7 @@ export async function annotateUnityPrefabFolder(
   input: {
     folder_path: string;
     output_path?: string;
+    artifact_root?: string;
     columns?: number;
     page_size?: number;
     force_refresh?: boolean;
@@ -165,6 +166,7 @@ export async function annotateUnityPrefabFolder(
     folderPath,
     prefabs: scanned.prefabs,
     outputPath,
+    artifactRoot: input.artifact_root,
     columns: input.columns ?? cfg.defaultColumns,
   });
 

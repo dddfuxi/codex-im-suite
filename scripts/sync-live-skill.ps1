@@ -1,3 +1,7 @@
+param(
+    [switch]$NoForceUpdate
+)
+
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'shared.ps1')
 
@@ -9,13 +13,24 @@ $liveRuntime = Join-Path $userHome '.codex\skills\claude-to-im'
 
 $suiteCore = Join-Path $suiteRoot 'packages\bridge-core'
 $suiteRuntime = Join-Path $suiteRoot 'packages\bridge-runtime'
+$suiteMcpManifests = Join-Path $suiteRoot 'config\mcp.d'
+$suiteSkillManifests = Join-Path $suiteRoot 'config\skills.d'
+$suitePluginManifests = Join-Path $suiteRoot 'config\plugins.d'
+$suiteRuntimeManifests = Join-Path $suiteRoot 'config\runtime.d'
+$suiteActionManifests = Join-Path $suiteRoot 'config\action-manifests.d'
+$suiteAgentManifests = Join-Path $suiteRoot 'config\agents.d'
+$suiteFeishuEmojiCatalog = Join-Path $suiteRoot 'config\feishu-emoji.d'
+$suiteExtensionCatalog = Join-Path $suiteRoot 'config\extension-catalog.json'
 $suiteControlPanel = Join-Path $suiteRoot 'apps\control-panel'
+$portableDir = Join-Path $suiteRoot 'release\portable'
+
+Clear-RunningProcessInPathForUpdate -Roots @($liveRuntime, $liveCore, $portableDir) -Purpose 'sync live skill' -NoForceUpdate:$NoForceUpdate
 
 function Copy-PathContent {
     param(
         [string]$Source,
         [string]$Target,
-        [string[]]$ExcludeDirectories = @('node_modules', 'bin', 'obj', '.git', 'coverage', '.turbo', '.next', 'release'),
+        [string[]]$ExcludeDirectories = @('node_modules', 'bin', 'obj', '.git', 'coverage', '.turbo', '.next', 'release', 'CodexImSuiteControlPanel.exe.WebView2'),
         [string[]]$ExcludeFiles = @('*.tmp')
     )
 
@@ -52,7 +67,18 @@ function Copy-ExistingFile {
     }
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
-    Copy-Item -LiteralPath $Source -Destination $Target -Force
+    $maxAttempts = 10
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt += 1) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Target -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge $maxAttempts -or -not ($_.Exception -is [System.IO.IOException])) {
+                throw
+            }
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
 }
 
 function Copy-ExistingDirectory {
@@ -65,6 +91,161 @@ function Copy-ExistingDirectory {
         Copy-PathContent -Source $Source -Target $Target
     }
 }
+
+function Get-PackageDependencyVersion {
+    param(
+        [string]$PackageJsonPath,
+        [string]$PackageName
+    )
+
+    if (-not (Test-Path -LiteralPath $PackageJsonPath)) {
+        return $null
+    }
+
+    $package = Get-Content -Raw -LiteralPath $PackageJsonPath | ConvertFrom-Json
+    foreach ($section in @('dependencies', 'optionalDependencies', 'devDependencies')) {
+        $items = $package.$section
+        if ($null -ne $items -and $items.PSObject.Properties.Name -contains $PackageName) {
+            return [string]$items.PSObject.Properties[$PackageName].Value
+        }
+    }
+
+    return $null
+}
+
+function Convert-NpmRangeToInstallVersion {
+    param([string]$Range)
+
+    if ([string]::IsNullOrWhiteSpace($Range)) {
+        return $null
+    }
+
+    $trimmed = $Range.Trim()
+    if ($trimmed -match '^[\^~>=<\s]*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$') {
+        return $Matches[1]
+    }
+
+    return $trimmed
+}
+
+function Get-InstalledNodePackageVersion {
+    param(
+        [string]$Root,
+        [string]$PackageName
+    )
+
+    $packageJson = Join-Path $Root ("node_modules\" + $PackageName.Replace('/', '\') + "\package.json")
+    if (-not (Test-Path -LiteralPath $packageJson)) {
+        return $null
+    }
+
+    $package = Get-Content -Raw -LiteralPath $packageJson | ConvertFrom-Json
+    return [string]$package.version
+}
+
+function Ensure-NpmPackageVersion {
+    param(
+        [string]$Root,
+        [string]$PackageName,
+        [string]$RequiredRange
+    )
+
+    $requiredVersion = Convert-NpmRangeToInstallVersion -Range $RequiredRange
+    if ([string]::IsNullOrWhiteSpace($requiredVersion)) {
+        return
+    }
+
+    $installedVersion = Get-InstalledNodePackageVersion -Root $Root -PackageName $PackageName
+    if ($installedVersion -eq $requiredVersion) {
+        return
+    }
+
+    $currentLabel = if ([string]::IsNullOrWhiteSpace($installedVersion)) { 'missing' } else { $installedVersion }
+    Write-Host "install live dependency $PackageName@$requiredVersion (current: $currentLabel)"
+    Push-Location $Root
+    try {
+        npm install "$PackageName@$requiredVersion" --no-save --package-lock=false | Out-Host
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-SuiteNpmBuild {
+    param(
+        [string]$WorkspaceName,
+        [string]$Description
+    )
+
+    Write-Host "build suite $Description"
+    Push-Location $suiteRoot
+    try {
+        npm --workspace $WorkspaceName run build | Out-Host
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-ControlPanelWebBuild {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'package.json'))) {
+        throw "control-panel web package.json not found: $Path"
+    }
+
+    Write-Host "build suite control-panel web"
+    Push-Location $Path
+    try {
+        if (-not (Test-Path -LiteralPath 'node_modules')) {
+            if (Test-Path -LiteralPath 'package-lock.json') {
+                npm ci | Out-Host
+            } else {
+                npm install | Out-Host
+            }
+            if ($LASTEXITCODE -ne 0) {
+                throw "control-panel web dependency install failed"
+            }
+        }
+        npm run build | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "control-panel web build failed"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-ControlPanelPublish {
+    param([string]$OutputDir)
+
+    $project = Join-Path $suiteControlPanel 'CodexImSuite.ControlPanel.csproj'
+    if (-not (Test-Path -LiteralPath $project)) {
+        throw "control-panel project not found: $project"
+    }
+
+    Write-Host "publish suite control-panel"
+    Clear-RunningProcessInPathForUpdate -Roots @($OutputDir) -Purpose 'control panel publish' -NoForceUpdate:$NoForceUpdate
+    if (Test-Path -LiteralPath $OutputDir) {
+        Remove-PathForUpdate -Path $OutputDir -Purpose 'control panel publish cleanup'
+    }
+    dotnet publish $project -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $OutputDir | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "control-panel publish failed"
+    }
+}
+
+# Runtime bundle 会内联共享 Contract 的已编译入口；先构建 Contract，避免源码
+# 已更新而 live bundle 仍携带旧 dist 的协议/裁决逻辑。
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/contracts' -Description 'contracts'
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-core' -Description 'bridge-core'
+Invoke-SuiteNpmBuild -WorkspaceName 'packages/bridge-runtime' -Description 'bridge-runtime'
+
+$builtPanelDir = if ($env:CTI_RELEASE_CONTROL_PANEL_DIR) {
+    $env:CTI_RELEASE_CONTROL_PANEL_DIR
+} else {
+    Join-Path $suiteRoot 'release\artifacts\control-panel'
+}
+Invoke-ControlPanelWebBuild -Path (Join-Path $suiteControlPanel 'web')
+Invoke-ControlPanelPublish -OutputDir $builtPanelDir
 
 Write-Host "sync suite bridge-core -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteCore 'src') -Target (Join-Path $liveCore 'src')
@@ -87,10 +268,21 @@ foreach ($name in $coreFiles) {
 Write-Host "sync suite bridge-runtime -> live skill"
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'src') -Target (Join-Path $liveRuntime 'src')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'scripts') -Target (Join-Path $liveRuntime 'scripts')
-Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'mcp.d') -Target (Join-Path $liveRuntime 'mcp.d')
+Copy-ExistingDirectory -Source $suiteMcpManifests -Target (Join-Path $liveRuntime 'mcp.d')
+Copy-ExistingDirectory -Source $suiteSkillManifests -Target (Join-Path $liveRuntime 'skills.d')
+Copy-ExistingDirectory -Source $suitePluginManifests -Target (Join-Path $liveRuntime 'plugins.d')
+Copy-ExistingDirectory -Source $suiteRuntimeManifests -Target (Join-Path $liveRuntime 'config\runtime.d')
+Copy-ExistingDirectory -Source $suiteActionManifests -Target (Join-Path $liveRuntime 'config\action-manifests.d')
+Copy-ExistingDirectory -Source $suiteAgentManifests -Target (Join-Path $liveRuntime 'config\agents.d')
+Copy-ExistingDirectory -Source $suiteFeishuEmojiCatalog -Target (Join-Path $liveRuntime 'config\feishu-emoji.d')
+Copy-ExistingFile -Source $suiteExtensionCatalog -Target (Join-Path $liveRuntime 'config\extension-catalog.json')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'docs') -Target (Join-Path $liveRuntime 'docs')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'references') -Target (Join-Path $liveRuntime 'references')
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'evals') -Target (Join-Path $liveRuntime 'evals')
+$liveRuntimeDist = Join-Path $liveRuntime 'dist'
+Write-Host "remove live runtime-generated dist residues"
+Remove-ContainedPathForUpdate -Root $liveRuntimeDist -RelativePath 'release' -Purpose 'live runtime legacy release mirror cleanup'
+Remove-ContainedPathForUpdate -Root $liveRuntimeDist -RelativePath 'speech-sidecar\__pycache__' -Purpose 'live speech sidecar bytecode cleanup'
 Copy-ExistingDirectory -Source (Join-Path $suiteRuntime 'dist') -Target (Join-Path $liveRuntime 'dist')
 
 $runtimeFiles = @(
@@ -112,18 +304,59 @@ foreach ($name in $runtimeFiles) {
     Copy-ExistingFile -Source (Join-Path $suiteRuntime $name) -Target (Join-Path $liveRuntime $name)
 }
 
+$codexSdkRange = Get-PackageDependencyVersion -PackageJsonPath (Join-Path $suiteRuntime 'package.json') -PackageName '@openai/codex-sdk'
+Ensure-NpmPackageVersion -Root $liveRuntime -PackageName '@openai/codex-sdk' -RequiredRange $codexSdkRange
+
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.ps1') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.ps1')
+Copy-ExistingFile -Source (Join-Path $suiteRoot 'scripts\export-glb-asset-package.py') -Target (Join-Path $liveRuntime 'scripts\export-glb-asset-package.py')
+
 Write-Host "remove live legacy tools mirror"
 $liveToolsDir = Join-Path $liveRuntime 'tools'
 if (Test-Path -LiteralPath $liveToolsDir) {
     Remove-Item -LiteralPath $liveToolsDir -Recurse -Force
 }
 
-$builtPanelExe = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.exe'
-$builtPanelPdb = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.pdb'
+Write-Host "remove live legacy local-agent tool manifests"
+$liveLegacyLocalAgentToolManifestDir = Join-Path $liveRuntime 'config\local-agent-tools.d'
+if (Test-Path -LiteralPath $liveLegacyLocalAgentToolManifestDir) {
+    Remove-Item -LiteralPath $liveLegacyLocalAgentToolManifestDir -Recurse -Force
+}
+
+$builtPanelExe = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.exe'
+$builtPanelPdb = Join-Path $builtPanelDir 'CodexImSuiteControlPanel.pdb'
 $livePanelDir = Join-Path $liveRuntime 'dist\control-panel'
+Copy-ExistingDirectory -Source $builtPanelDir -Target $livePanelDir
 Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe')
-Copy-ExistingFile -Source $builtPanelExe -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.exe')
 Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'CodexImSuiteControlPanel.pdb')
-Copy-ExistingFile -Source $builtPanelPdb -Target (Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb')
+
+$legacyPanelExe = Join-Path $livePanelDir 'ClaudeToImControlPanel.exe'
+$legacyPanelPdb = Join-Path $livePanelDir 'ClaudeToImControlPanel.pdb'
+foreach ($legacyPath in @($legacyPanelExe, $legacyPanelPdb)) {
+    if (Test-Path -LiteralPath $legacyPath) {
+        Remove-Item -LiteralPath $legacyPath -Force
+    }
+}
+
+$runtimeContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveRuntime -Layout 'LiveRuntime'
+$runtimeFingerprint = New-SuiteReleaseFingerprint `
+    -SuiteRoot $suiteRoot `
+    -TargetName 'live runtime skill' `
+    -TargetRole 'runtime copy generated from suite' `
+    -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
+    -Content $runtimeContent `
+    -ManifestSummary (Get-ReleaseManifestSummary -Root $liveRuntime) `
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $livePanelDir 'CodexImSuiteControlPanel.exe'))
+Write-SuiteReleaseFingerprint -TargetRoot $liveRuntime -Fingerprint $runtimeFingerprint | Out-Null
+
+$coreContent = Get-SuiteReleaseActualContentMap -SuiteRoot $suiteRoot -TargetRoot $liveCore -Layout 'LiveCore'
+$coreFingerprint = New-SuiteReleaseFingerprint `
+    -SuiteRoot $suiteRoot `
+    -TargetName 'live core skill' `
+    -TargetRole 'runtime copy generated from suite' `
+    -ReleaseRunId $env:CTI_RELEASE_RUN_ID `
+    -Content $coreContent `
+    -ManifestSummary (Get-ReleaseManifestSummary -Root $liveCore) `
+    -PanelSummary (Get-ReleasePanelSummary -Path (Join-Path $liveCore 'dist\control-panel\CodexImSuiteControlPanel.exe'))
+Write-SuiteReleaseFingerprint -TargetRoot $liveCore -Fingerprint $coreFingerprint | Out-Null
 
 Write-Host "sync complete: suite -> live skills"

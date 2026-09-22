@@ -1,9 +1,103 @@
 {
   "name": "codex-im-suite",
   "displayName": "Feishu CLI / Codex / MCP Suite",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "platform": "windows",
+  "branches": {
+    "stable": "main",
+    "integration": "codex/dev",
+    "featurePrefix": "codex/"
+  },
+  "versioning": {
+    "scheme": "semver",
+    "pre1Policy": "Breaking manifest or config protocol changes bump minor; normal features bump minor; fixes bump patch."
+  },
+  "extensionProtocol": {
+    "version": "1.0.0",
+    "id": "extension-manifest/v1",
+    "manifestDirs": [
+      "./config/mcp.d",
+      "./config/skills.d",
+      "./config/plugins.d"
+    ],
+    "requiredFields": [
+      "id",
+      "displayName",
+      "type",
+      "version",
+      "compatibility",
+      "category",
+      "optional",
+      "installState",
+      "source",
+      "enabled",
+      "description"
+    ]
+  },
+  "runtimeProtocol": {
+    "version": "1.0.0",
+    "id": "runtime-manifest/v1",
+    "requiredFields": [
+      "id",
+      "displayName",
+      "kind",
+      "category",
+      "enabled",
+      "installState",
+      "source",
+      "cwd",
+      "version",
+      "description"
+    ]
+  },
+  "actionProtocol": {
+    "version": "1.0.0",
+    "id": "action-manifest/v1",
+    "manifestDirs": [
+      "./config/action-manifests.d"
+    ],
+    "legacyManifestDirs": [
+      "./config/local-agent-tools.d"
+    ],
+    "requiredFields": [
+      "id",
+      "displayName",
+      "description",
+      "enabled",
+      "type",
+      "compatibility"
+    ]
+  },
+  "agentCollaborationProtocol": {
+    "version": "1.0.0",
+    "id": "codex-im-suite/agent-collaboration/v1",
+    "workerProtocol": "codex-im-suite/agent-worker/v1",
+    "manifestDirs": [
+      "./config/agents.d"
+    ],
+    "requiredFields": [
+      "protocol",
+      "id",
+      "displayName",
+      "enabled",
+      "responsibilities",
+      "owns",
+      "excludes",
+      "capabilities",
+      "inputEvidenceKinds",
+      "outputSchemaId",
+      "sideEffectLevel",
+      "timeoutMs",
+      "concurrency",
+      "modelProfile"
+    ]
+  },
   "packages": {
+    "contracts": {
+      "path": "./packages/contracts",
+      "role": "shared-contracts",
+      "buildScript": "npm run build"
+    },
     "bridge-core": {
       "path": "./packages/bridge-core",
       "role": "core-library",
@@ -23,6 +117,11 @@
       "path": "./packages/mcp-unity-prefab",
       "role": "external-mcp",
       "buildScript": "npm run build"
+    },
+    "mcp-ignis": {
+      "path": "./packages/mcp-ignis",
+      "role": "external-mcp",
+      "buildScript": "npm run build"
     }
   },
   "apps": {
@@ -38,7 +137,12 @@
   "config": {
     "mcpManifestDir": "./config/mcp.d",
     "skillManifestDir": "./config/skills.d",
-    "pluginManifestDir": "./config/plugins.d"
+    "pluginManifestDir": "./config/plugins.d",
+    "runtimeManifestDir": "./config/runtime.d",
+    "actionManifestDir": "./config/action-manifests.d",
+    "legacyLocalAgentToolManifestDir": "./config/local-agent-tools.d",
+    "feishuEmojiCatalogDir": "./config/feishu-emoji.d",
+    "agentManifestDir": "./config/agents.d"
   },
   "extensions": {
     "skills": {
@@ -51,6 +155,10 @@
     },
     "mcps": {
       "manifestDir": "./config/mcp.d"
+    },
+    "actions": {
+      "manifestDir": "./config/action-manifests.d",
+      "legacyManifestDir": "./config/local-agent-tools.d"
     }
   },
   "release": {

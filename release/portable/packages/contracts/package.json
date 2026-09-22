@@ -1,0 +1,52 @@
+{
+  "name": "@codex-im-suite/contracts",
+  "version": "0.4.0",
+  "description": "Shared JSON contracts for codex-im-suite control plane, node agents, workflow runs, and extensions.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./control-api": {
+      "types": "./src/control-api.ts",
+      "import": "./dist/control-api.js"
+    },
+    "./agent-collaboration": {
+      "types": "./src/agent-collaboration.ts",
+      "import": "./dist/agent-collaboration.js"
+    },
+    "./project-registry": {
+      "types": "./src/project-registry.ts",
+      "import": "./dist/project-registry.js"
+    },
+    "./speech": {
+      "types": "./src/speech-contract.ts",
+      "import": "./dist/speech-contract.js"
+    },
+    "./workflow": {
+      "types": "./src/workflow.ts",
+      "import": "./dist/workflow.js"
+    }
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx src/__tests__/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

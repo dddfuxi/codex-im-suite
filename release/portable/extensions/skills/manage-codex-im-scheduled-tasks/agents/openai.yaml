@@ -1,0 +1,4 @@
+interface:
+  display_name: "管理飞书计划任务"
+  short_description: "创建、管理和诊断飞书提醒、逐轮打卡、运行账本与统一计划任务"
+  default_prompt: "Use $manage-codex-im-scheduled-tasks to create a verified Feishu scheduled reminder or per-run check-in."

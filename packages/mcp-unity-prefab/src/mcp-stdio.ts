@@ -78,7 +78,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           output_path: {
             type: "string",
-            description: "Optional PNG output path relative to project cwd",
+            description: "Optional absolute path or path relative to runtime artifact_root",
+          },
+          artifact_root: {
+            type: "string",
+            description: "Runtime-managed artifact root injected by codex-im-suite",
           },
           columns: {
             type: "integer",
@@ -149,6 +153,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = await annotateUnityPrefabFolder(cfg, {
         folder_path: String(input.folder_path ?? ""),
         output_path: typeof input.output_path === "string" ? input.output_path : undefined,
+        artifact_root: typeof input.artifact_root === "string" ? input.artifact_root : process.env.CTI_ARTIFACT_ROOT,
         columns: typeof input.columns === "number" ? input.columns : undefined,
         page_size: typeof input.page_size === "number" ? input.page_size : undefined,
         force_refresh: input.force_refresh === true,

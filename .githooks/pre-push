@@ -1,0 +1,12 @@
+#!/bin/sh
+# Managed by scripts/install-git-session-archive.ps1.
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+entire="$repo/.codex-tools/bin/entire.exe"
+if [ ! -f "$entire" ]; then
+  entire="$repo/.codex-tools/bin/entire"
+fi
+if [ ! -f "$entire" ]; then
+  printf '%s\n' '[git-session-archive] Project-local Entire CLI is not installed. Run scripts/install-git-session-archive.ps1.' >&2
+  exit 0
+fi
+"$entire" hooks git pre-push "$1" || true

@@ -29,6 +29,7 @@ export type AnnotationStyle = "arrow" | "numbered";
 
 export type ObjectsRequest = TranslateRequest & {
   output_path?: string;
+  artifact_root?: string;
   category?: string;
   /** Rendering style: "arrow" (default) draws arrows+labels; "numbered" draws badge numbers + side legend */
   style?: AnnotationStyle;
@@ -779,9 +780,26 @@ export interface DetectedObjectsResult {
   style: AnnotationStyle;
 }
 
-function resolveOutputPath(outputPath?: string, prefix = "objects"): string {
-  if (outputPath?.trim()) return path.resolve(process.cwd(), outputPath.trim());
-  return path.join(path.resolve(process.cwd(), "output"), `${prefix}-${Date.now()}.png`);
+export function resolveArtifactOutputPath(
+  outputPath: string | undefined,
+  artifactRoot: string | undefined,
+  prefix = "objects",
+  now = Date.now(),
+): string {
+  const requested = outputPath?.trim() || "";
+  if (requested && path.isAbsolute(requested)) return path.resolve(requested);
+
+  const configuredRoot = artifactRoot?.trim() || process.env.CTI_ARTIFACT_ROOT?.trim() || "";
+  const root = configuredRoot ? path.resolve(configuredRoot) : "";
+  if (!root) {
+    throw new Error("artifact_root is required when output_path is omitted or relative");
+  }
+  const resolved = path.resolve(root, requested || `${prefix}-${now}.png`);
+  const relative = path.relative(root, resolved);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`output_path is outside artifact_root: ${resolved}`);
+  }
+  return resolved;
 }
 
 export async function renderAnnotatedObjectsImage(params: {
@@ -791,11 +809,12 @@ export async function renderAnnotatedObjectsImage(params: {
   objects: LabeledObject[];
   style?: AnnotationStyle;
   output_path?: string;
+  artifact_root?: string;
 }): Promise<{ outputPath: string } | { error: string }> {
   if (params.objects.length === 0) return { error: "No objects available for annotation" };
 
   try {
-    const outPath = resolveOutputPath(params.output_path, "objects");
+    const outPath = resolveArtifactOutputPath(params.output_path, params.artifact_root, "objects");
     await fs.mkdir(path.dirname(outPath), { recursive: true });
     const style = params.style ?? "arrow";
 
@@ -897,7 +916,7 @@ export async function detectObjectsInImage(
 export async function createSubjectAnnotatedImage(
   cfg: AppConfig,
   clients: ModelClients,
-  req: TranslateRequest & { output_path?: string }
+  req: TranslateRequest & { output_path?: string; artifact_root?: string }
 ): Promise<{ outputPath: string; subjectBox: SubjectBox; routing: AnnotationRoutingDecision } | { error: string }> {
   const parsed = parseImageInput({
     image_url: req.image_url,
@@ -920,11 +939,8 @@ export async function createSubjectAnnotatedImage(
     const meta = await sharp(inputBuf).metadata();
     if (!meta.width || !meta.height) return { error: "Unable to read image size" };
     const overlay = Buffer.from(buildSingleOverlaySvg(meta.width, meta.height, box));
-    const outDir = path.resolve(process.cwd(), "output");
-    await fs.mkdir(outDir, { recursive: true });
-    const outPath = req.output_path?.trim()
-      ? path.resolve(process.cwd(), req.output_path.trim())
-      : path.join(outDir, `annotated-${Date.now()}.png`);
+    const outPath = resolveArtifactOutputPath(req.output_path, req.artifact_root, "annotated");
+    await fs.mkdir(path.dirname(outPath), { recursive: true });
     await sharp(inputBuf).composite([{ input: overlay }]).png().toFile(outPath);
     return { outputPath: outPath, subjectBox: box, routing };
   } catch (e) {
@@ -988,11 +1004,8 @@ export async function createObjectsAnnotatedImage(
     }
 
     const style: AnnotationStyle = routing.style;
-    const outDir = path.resolve(process.cwd(), "output");
-    await fs.mkdir(outDir, { recursive: true });
-    const outPath = req.output_path?.trim()
-      ? path.resolve(process.cwd(), req.output_path.trim())
-      : path.join(outDir, `objects-${Date.now()}.png`);
+    const outPath = resolveArtifactOutputPath(req.output_path, req.artifact_root, "objects");
+    await fs.mkdir(path.dirname(outPath), { recursive: true });
 
     if (style === "numbered") {
       const maxLabelLen = Math.max(...objects.map(o => o.label.length));

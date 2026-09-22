@@ -25,12 +25,32 @@ export interface ChannelAddress {
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
   chatType?: string;     // Platform-specific chat type (group / p2p / etc.)
+  /** Optional platform thread/topic and account routing hints. */
+  threadId?: string;
+  accountId?: string;
 }
 
 /** Composite key for routing: channelType + chatId */
 export interface SessionKey {
   channelType: ChannelType;
   chatId: string;
+}
+
+export interface InboundLifecycleControl {
+  /**
+   * Platform lifecycle event that targets a previously received user message.
+   * This is intentionally generic so adapters can map native recall/delete
+   * events without bridge-manager depending on platform-specific payloads.
+   */
+  type: 'message_withdrawn';
+  /** Original platform message ID that should no longer be processed. */
+  targetMessageId: string;
+  reason?: 'recalled' | 'deleted' | 'placeholder' | string;
+  /**
+   * If true, manager may send a pause notice even when the target was still in
+   * an adapter-local queue and therefore has no manager task record yet.
+   */
+  notifyIfUnknown?: boolean;
 }
 
 // ── Messages ───────────────────────────────────────────────────
@@ -43,6 +63,8 @@ export interface InboundMessage {
   address: ChannelAddress;
   /** Plain text content of the message */
   text: string;
+  /** Structured adapter event kind for non-text messages that still need agent handling. */
+  messageKind?: string;
   /** Timestamp of the message (ISO string or unix epoch ms) */
   timestamp: number;
   /** If this is a callback query (inline button press), the callback data */
@@ -51,16 +73,56 @@ export interface InboundMessage {
   callbackMessageId?: string;
   /** Platform-specific raw update object (for adapter-specific handling) */
   raw?: unknown;
+  /** Optional platform lifecycle control message, e.g. Feishu recalled event. */
+  control?: InboundLifecycleControl;
   /** Adapter-specific update ID for deferred offset acknowledgement */
   updateId?: number;
   /** File attachments (images, documents) from the IM channel */
   attachments?: import('./host.js').FileAttachment[];
+  /**
+   * Optional second-stage adapter preparation for agent-only evidence.
+   *
+   * Adapters enqueue the accepted message first, then the bridge awaits this
+   * hook after arming user-visible feedback. Implementations may enrich the
+   * existing address/raw/attachments objects, but must not change the user's
+   * original intent text.
+   */
+  prepareForAgent?: () => Promise<void>;
 }
 
 export interface OutboundMention {
   userId?: string;
   name?: string;
   atAll?: boolean;
+}
+
+/**
+ * A bridge-owned authorization for one platform-native media delivery.
+ *
+ * This is deliberately separate from the user-visible reply text: adapters
+ * must not treat a model-written marker such as `[表情包:file_key]` as proof
+ * that the media is safe to send.
+ */
+export interface VerifiedMediaAction {
+  kind: 'sticker';
+  key: string;
+  provenance: 'turn_attached_model_selection';
+  /** Runtime authorization fields; absent legacy actions remain non-recordable. */
+  semanticRevisionId?: string;
+  contextHash?: string;
+}
+
+export interface VerifiedStickerDeliveryReceipt {
+  kind: 'sticker';
+  fileKey: string;
+  semanticRevisionId: string;
+  contextHash: string;
+}
+
+/** Bridge 通过平台上传接口取得的可信卡片头图引用；模型不能直接提供 imageKey。 */
+export interface FeishuCardHeroImage {
+  imageKey: string;
+  alt: string;
 }
 
 /** Outbound message to send to an IM channel */
@@ -77,6 +139,17 @@ export interface OutboundMessage {
   replyToMessageId?: string;
   /** Optional mentions for channels that support native mention formatting */
   mentions?: OutboundMention[];
+  /** Feishu-specific interactive card payload. Non-Feishu adapters ignore it. */
+  feishuCardJson?: string;
+  /** 飞书 Card 2.0 的可信头图。非飞书渠道忽略并继续发送普通图片附件。 */
+  feishuCardHero?: FeishuCardHeroImage;
+  /** Bridge-owned proof for an otherwise gated native-media delivery. */
+  verifiedMediaAction?: VerifiedMediaAction;
+  /** Bridge-owned source context used only to gate optional sticker presentation. */
+  stickerDeliveryContext?: {
+    sourceText?: string;
+    explicitRequest?: boolean;
+  };
 }
 
 /** Inline keyboard button for permission prompts */
@@ -90,7 +163,23 @@ export interface SendResult {
   ok: boolean;
   /** Platform-specific message ID of the sent message */
   messageId?: string;
+  /** Platform-specific card ID when the channel returns one. */
+  cardId?: string;
+  /** 真实平台回执确认发送的是可交互卡片，而不是纯文本降级。 */
+  interactiveCardSent?: boolean;
+  /** 仅在图片已经进入成功发送/更新的卡片时返回，供 Bridge 避免重复发图。 */
+  cardHeroEmbedded?: boolean;
+  /** Bridge-owned receipt emitted only after a verified sticker action succeeds. */
+  verifiedMediaDelivery?: VerifiedStickerDeliveryReceipt;
   error?: string;
+}
+
+export interface UploadedFileLink {
+  title: string;
+  url: string;
+  platform?: string;
+  fileToken?: string;
+  documentId?: string;
 }
 
 // ── Bindings ───────────────────────────────────────────────────
@@ -189,6 +278,54 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** Raw tool input used only for safe, user-visible progress summaries. */
+  input?: unknown;
+  /** Bridge-owned first-seen time, used to render a relative execution timeline. */
+  startedAt?: number;
+  /** Bridge-owned terminal time; absent while the tool is still running. */
+  completedAt?: number;
+}
+
+export interface RunTokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface RunSummary {
+  executorId?: string;
+  executorName?: string;
+  executorKind?: string;
+  provider?: string;
+  modelSource?: string;
+  selectedSource?: string;
+  model?: string;
+  codexProfile?: string;
+  baseUrl?: string;
+  tokenUsage?: RunTokenUsage;
+}
+
+/**
+ * 流式卡片收尾时由 bridge-manager 交给 adapter 的本轮关联信息。
+ * adapter 只将其用于按实际出站消息 ID 回填后续原生回复的上下文，
+ * 不能据此直接执行请求或改变权限判断。
+ */
+export interface StreamingCardTurnContext {
+  codepilotSessionId?: string;
+  sourceMessageId?: string;
+  sourceText?: string;
+  chatType?: string;
+  /** 最终卡片使用的可信平台图片引用。 */
+  feishuCardHero?: FeishuCardHeroImage;
+  /** Bridge 基于受管 TTS/歌声回执签发的唯一终态替换计划；模型不能提供。 */
+  speechDelivery?: {
+    receipt: import('./host.js').LocalAudioSynthesisReceipt;
+    fallbackText: string;
+    /** 原生语音成功后才发送的受控文字跟进；不能替代语音失败时的完整文字回退。 */
+    followUpText?: string;
+  };
 }
 
 // ── Config ─────────────────────────────────────────────────────

@@ -11,7 +11,94 @@ import type {
   OutboundMessage,
   PreviewCapabilities,
   SendResult,
+  UploadedFileLink,
+  VerifiedMediaAction,
 } from './types.js';
+
+export interface AdapterAssistantIdentity {
+  displayName?: string;
+  platform?: string;
+  appId?: string;
+  botOpenId?: string;
+  /** 官方平台返回的当前机器人头像地址，仅用于构造受控视觉证据。 */
+  avatarUrl?: string;
+}
+
+export interface DirectMessageRequest {
+  sourceMessage: InboundMessage;
+  targetText: string;
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+  /** 本轮 bridge 基于真实附件和模型精确选择签发的媒体许可。 */
+  verifiedMediaAction?: VerifiedMediaAction;
+}
+
+export interface DirectMessageSendResult extends SendResult {
+  targetDisplayName?: string;
+  targetUserId?: string;
+}
+
+export type ConversationTargetKind = 'chat' | 'user';
+
+export interface ConversationTargetResolveRequest {
+  sourceMessage: InboundMessage;
+  targetText?: string;
+  targetId?: string;
+  targetKind?: ConversationTargetKind | 'any';
+}
+
+export interface ResolvedConversationTarget {
+  kind: ConversationTargetKind;
+  id: string;
+  displayName: string;
+  chatType?: string;
+  userId?: string;
+}
+
+export interface ConversationTargetResolveResult {
+  ok: boolean;
+  target?: ResolvedConversationTarget;
+  error?: string;
+  candidates?: Array<{ id: string; displayName: string; kind: ConversationTargetKind; chatType?: string }>;
+}
+
+export interface ConversationMessageRequest {
+  sourceMessage: InboundMessage;
+  target: ResolvedConversationTarget;
+  text: string;
+  parseMode?: OutboundMessage['parseMode'];
+}
+
+export interface ConversationMessageSendResult extends SendResult {
+  targetDisplayName?: string;
+  targetId?: string;
+  targetKind?: ConversationTargetKind;
+}
+
+export interface OutboundMentionResolutionCandidate {
+  name: string;
+  aliases?: string[];
+}
+
+export interface OutboundMentionResolutionInspection {
+  target: string;
+  status: 'resolved' | 'ambiguous' | 'not_found' | 'lookup_failed';
+  searchedSources: string[];
+  candidates: OutboundMentionResolutionCandidate[];
+  error?: string;
+}
+
+export interface OutboundMentionIdentityVerification {
+  status: 'verified' | 'not_found' | 'lookup_failed' | 'unavailable';
+  /** 平台确认后的最新显示名；身份仍以 caller 提供的真实 evidence ID 为准。 */
+  name?: string;
+  error?: string;
+}
+
+export interface LocalAudioDeliveryOptions {
+  /** Runtime 已验证产物的 SHA-256；平台上传前必须对实际上传字节再次核对。 */
+  expectedSha256?: string;
+}
 
 export abstract class BaseChannelAdapter {
   /** Which channel type this adapter handles */
@@ -53,6 +140,49 @@ export abstract class BaseChannelAdapter {
     return { ok: false, error: 'Local image sending is not supported by this adapter' };
   }
 
+  /** Send one Runtime-validated local audio result through a platform-native voice message. */
+  async sendLocalAudio(
+    _chatId: string,
+    _filePath: string,
+    _replyToMessageId?: string,
+    _options?: LocalAudioDeliveryOptions,
+  ): Promise<SendResult> {
+    return { ok: false, error: 'Local audio sending is not supported by this adapter' };
+  }
+
+  /**
+   * 上传一张已通过交付边界的本地图片，供平台原生卡片引用。
+   * 默认不支持；实现方必须返回平台真实回执，不能接受模型提供的资源 key。
+   */
+  async prepareLocalImageForCard(_filePath: string): Promise<{ ok: boolean; imageKey?: string; error?: string }> {
+    return { ok: false, error: 'Card image preparation is not supported by this adapter' };
+  }
+
+  /**
+   * Send a local file to the channel when the adapter supports outbound files.
+   * Default implementation is unsupported.
+   */
+  async sendLocalFile(_chatId: string, _filePath: string, _replyToMessageId?: string): Promise<SendResult> {
+    return { ok: false, error: 'Local file sending is not supported by this adapter' };
+  }
+
+  /**
+   * Upload a local file to a platform-native cloud space and return a share link.
+   * Used when the channel cannot deliver the file directly due to size limits.
+   */
+  async uploadLocalFileForLink(_filePath: string): Promise<UploadedFileLink | null> {
+    return null;
+  }
+
+  /**
+   * Recall/delete a previously sent platform message when the channel supports it.
+   * Implementations must only act on platform message IDs already known to belong
+   * to this bot; callers are responsible for that ownership check.
+   */
+  async recallMessage(_chatId: string, _messageId: string): Promise<SendResult> {
+    return { ok: false, error: 'Message recall is not supported by this adapter' };
+  }
+
   /**
    * Answer a callback query (e.g. Telegram inline button press).
    * Not all platforms support this — default implementation is a no-op.
@@ -60,6 +190,50 @@ export abstract class BaseChannelAdapter {
   async answerCallback(_callbackQueryId: string, _text?: string): Promise<void> {
     // No-op by default; override in adapters that support callback queries
   }
+
+  /** 更新已由本机器人发送的通用交互卡片；调用方必须传入受控状态重建的完整卡片。 */
+  async updateInteractiveCard(_messageId: string, _cardJson: string): Promise<SendResult> {
+    return { ok: false, error: 'Interactive card update is not supported by this adapter' };
+  }
+
+  /**
+   * 复核群体选择点击者。原生 callback 已是强平台 evidence；成员 API 暂时不可用时，
+   * adapter 可明确返回 callback_event 降级，但不得信任模型或正文提供的 ID。
+   */
+  async verifyChoiceParticipant(_chatId: string, _userId: string): Promise<{
+    allowed: boolean;
+    source: 'member_api' | 'callback_event' | 'rejected';
+    /**
+     * 成员接口成功时返回本轮可参与的稳定身份集合。Registry 只使用真实平台 ID
+     * 判断是否全员完成；接口降级时省略，继续依赖截止时间，避免按猜测人数提前收口。
+     */
+    eligibleParticipantKeys?: string[];
+    error?: string;
+  }> {
+    return { allowed: false, source: 'rejected', error: 'Choice participant verification is not supported' };
+  }
+
+  /** 解析“定向给某人作答”的目标；身份必须由适配器使用当前平台证据解析。 */
+  async resolveChoiceParticipant(_input: {
+    chatId: string;
+    sourceMessage: InboundMessage;
+  }): Promise<{ ok: boolean; userId?: string; displayName?: string; error?: string }> {
+    return { ok: false, error: '当前渠道不支持定向选择人解析' };
+  }
+
+  /**
+   * 按真实平台用户 ID 解析当前会话成员名称。
+   * 该能力只返回适配器从平台成员接口确认过的名称，不能接受模型生成的 ID。
+   */
+  async resolveMemberDisplayNames(
+    _chatId: string,
+    _userIds: readonly string[],
+  ): Promise<Record<string, string>> {
+    return {};
+  }
+
+  /** 将后台倒计时收口恢复为普通入站，复用 adapter FIFO 与会话锁。 */
+  enqueueSyntheticInbound?(_message: InboundMessage): boolean;
 
   /**
    * Validate that the adapter's configuration is complete.
@@ -73,8 +247,119 @@ export abstract class BaseChannelAdapter {
    */
   abstract isAuthorized(userId: string, chatId: string): boolean;
 
+  /**
+   * Return platform-native assistant identity when known.
+   * Used only as user-visible persona context; adapters may return partial data.
+   */
+  getAssistantIdentity?(): AdapterAssistantIdentity | null;
+
+  /** Optional channel-specific presentation hints for model prompts. */
+  getEmojiPresentationPrompt?(chatId?: string, userId?: string): string;
+
+  /** Optional channel-specific sticker library hints for model prompts. */
+  getStickerPresentationPrompt?(chatId?: string, userId?: string): string;
+
+  /**
+   * Store channel-native sticker semantics learned from a model or user.
+   * Adapters should treat user-supplied explanations as evidence, not as
+   * trusted sendable semantics, until a vision/manual source verifies them.
+   * The adapter owns platform identifiers and persistence; callers should pass
+   * only sanitized meaning fields plus the source message context.
+   */
+  recordStickerAnnotation?(_input: {
+    fileKey: string;
+    chatId: string;
+    userId?: string;
+    learnedFromMessageId?: string;
+    label?: string;
+    description?: string;
+    intent?: string;
+    tone?: string;
+    usage?: string;
+    avoidWhen?: string;
+    aliases?: string[];
+    examples?: string[];
+    annotationConfidence?: number;
+    source?: 'vision' | 'user' | 'manual';
+    visionMediaFileKey?: string;
+  }): boolean;
+
+  /**
+   * Resolve channel-native mentions before final delivery.
+   * Adapters can turn user-visible text such as "@name" into structured mention
+   * metadata using platform APIs or cached inbound context.
+   */
+  resolveOutboundMentions?(_message: OutboundMessage, _sourceMessage?: InboundMessage): Promise<OutboundMessage>;
+
+  /**
+   * 把已由 Agent 明确选择、且仍受用户本轮请求约束的显示名解析为原生 mention。
+   * 与正文裸 @ 解析分开，避免 Delivery 为了触发平台解析而改写用户可见文本。
+   */
+  resolveOutboundMentionTargets?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _targets: string[],
+  ): Promise<OutboundMessage>;
+
+  /**
+   * 按本轮真实 evidence 中的平台 ID 验证同群 mention 身份。
+   * 该入口避免把强 ID 证据降级成姓名后再反查，也不接受模型自行生成的 ID。
+   */
+  verifyOutboundMentionIdentity?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _candidate: { userId: string; name: string },
+  ): Promise<OutboundMentionIdentityVerification>;
+
+  /**
+   * Resolve a return mention to the verified bot/app that sent the current
+   * inbound message. This narrow path must not resolve unrelated model names.
+   */
+  resolveOutboundReplyToSenderMention?(
+    _message: OutboundMessage,
+    _sourceMessage?: InboundMessage,
+  ): Promise<OutboundMessage>;
+
+  /**
+   * Explain how a channel-native mention target was resolved or why it was not.
+   * Used after normal resolution fails so blockers can say what was searched
+   * without exposing platform IDs or raw API payloads.
+   */
+  inspectOutboundMentionTarget?(
+    _message: OutboundMessage,
+    _sourceMessage: InboundMessage | undefined,
+    _target: string,
+  ): Promise<OutboundMentionResolutionInspection>;
+
+  /**
+   * Send a controlled one-to-one message resolved from channel context.
+   * The model only declares intent; adapters own identity resolution and the
+   * platform API call so group replies cannot fake a private delivery.
+   */
+  sendDirectMessage?(_request: DirectMessageRequest): Promise<DirectMessageSendResult>;
+
+  /**
+   * Resolve a cross-conversation target before sending. This lets bridge-manager
+   * show the human-readable name and platform ID to the owner for confirmation.
+   */
+  resolveConversationTarget?(_request: ConversationTargetResolveRequest): Promise<ConversationTargetResolveResult>;
+
+  /**
+   * Send to a controlled conversation target. Cross-conversation targets must
+   * be resolved and owner-confirmed first; an exact current-chat target may be
+   * sent after the bridge verifies current-turn or durable continuation intent.
+   */
+  sendConversationMessage?(_request: ConversationMessageRequest): Promise<ConversationMessageSendResult>;
+
   /** Called when message processing starts (e.g., typing indicator). */
   onMessageStart?(_chatId: string): void;
+
+  /**
+   * Return the channel-preferred delay before user-visible turn feedback starts.
+   * Explicit store/environment settings still take precedence. Channels with a
+   * multi-request feedback surface can request zero delay to hide platform RTT.
+   */
+  getPreferredTurnFeedbackDelayMs?(): number;
 
   /** Called when message processing ends. */
   onMessageEnd?(_chatId: string): void;
@@ -119,11 +404,28 @@ export abstract class BaseChannelAdapter {
   onToolEvent?(_chatId: string, _tools: import('./types.js').ToolCallInfo[]): void;
 
   /**
+   * Runtime 只通过该入口投递脱敏后的协作状态。Adapter 不得从完整 Workflow
+   * 重新推断 Agent 路由，也不得把 findings、Prompt 或 evidence 原文放进卡片。
+   */
+  onAgentProgress?(
+    _chatId: string,
+    _progress: import('@codex-im-suite/contracts').AgentCardProgressSnapshot,
+  ): void;
+
+  /**
    * Called when streaming ends. Adapter should finalize the streaming card
    * (close streaming mode, add footer, etc.).
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
-  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+  onStreamEnd?(
+    _chatId: string,
+    _status: 'completed' | 'interrupted' | 'error',
+    _responseText: string,
+    _summary?: import('./types.js').RunSummary,
+    _mentions?: import('./types.js').OutboundMention[],
+    _verifiedMediaAction?: import('./types.js').VerifiedMediaAction,
+    _turnContext?: import('./types.js').StreamingCardTurnContext,
+  ): Promise<boolean>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

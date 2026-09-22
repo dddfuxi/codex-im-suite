@@ -14,7 +14,8 @@ import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
 import { deliver } from '../../lib/bridge/delivery-layer';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
-import type { BridgeStore, LLMProvider, PermissionGateway, LifecycleHooks } from '../../lib/bridge/host';
+import type { BridgeStore, StickerSemanticEvolutionHost } from '../../lib/bridge/host';
+import type { StickerDeliveryEvidence } from '../../lib/bridge/sticker-semantic-evolution.js';
 import type { OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Mock Adapter ────────────────────────────────────────────
@@ -81,13 +82,14 @@ function createMockStore() {
 
 type MockStore = ReturnType<typeof createMockStore>;
 
-function setupContext(store: MockStore) {
+function setupContext(store: MockStore, stickerSemantics?: StickerSemanticEvolutionHost) {
   delete (globalThis as Record<string, unknown>)['__bridge_context__'];
   initBridgeContext({
     store: store as unknown as BridgeStore,
     llm: { streamChat: () => new ReadableStream() },
     permissions: { resolvePendingPermission: () => false },
     lifecycle: {},
+    stickerSemantics,
   });
 }
 
@@ -202,5 +204,76 @@ describe('delivery-layer', () => {
 
     assert.equal(result.ok, false);
     assert.ok(result.error);
+  });
+
+  it('records sticker delivery only after platform returns a message id', async () => {
+    const recorded: StickerDeliveryEvidence[] = [];
+    setupContext(store, {
+      authorizeSelection: async () => null,
+      recordDelivery: async (item) => { recorded.push(item); },
+      findDeliveriesByOutboundMessageIds: async () => [],
+      processFeedback: async () => ({ status: 'ignored' }),
+      buildExpressionPromptSection: async () => null,
+    });
+    const adapter = createMockAdapter({
+      sendFn: async () => ({
+        ok: true,
+        messageId: 'om_1',
+        verifiedMediaDelivery: {
+          kind: 'sticker',
+          fileKey: 'img_v2_key',
+          semanticRevisionId: 'revision-1',
+          contextHash: 'a'.repeat(64),
+        },
+      }),
+    });
+    (adapter as { channelType: string }).channelType = 'feishu';
+
+    const result = await deliver(adapter, {
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '[表情包:img_v2_key]',
+      verifiedMediaAction: {
+        kind: 'sticker',
+        key: 'img_v2_key',
+        provenance: 'turn_attached_model_selection',
+        semanticRevisionId: 'revision-1',
+        contextHash: 'a'.repeat(64),
+      },
+    }, { sessionId: 'session-1' });
+
+    assert.equal(result.ok, true);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].outboundMessageId, 'om_1');
+    assert.equal(recorded[0].fileKey, 'img_v2_key');
+  });
+
+  it('does not record delivery for failed sticker send', async () => {
+    const recorded: StickerDeliveryEvidence[] = [];
+    setupContext(store, {
+      authorizeSelection: async () => null,
+      recordDelivery: async (item) => { recorded.push(item); },
+      findDeliveriesByOutboundMessageIds: async () => [],
+      processFeedback: async () => ({ status: 'ignored' }),
+      buildExpressionPromptSection: async () => null,
+    });
+    const adapter = createMockAdapter({
+      sendFn: async () => ({ ok: false, error: 'send failed', httpStatus: 400 } as SendResult),
+    });
+    (adapter as { channelType: string }).channelType = 'feishu';
+
+    const result = await deliver(adapter, {
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '[表情包:img_v2_key]',
+      verifiedMediaAction: {
+        kind: 'sticker',
+        key: 'img_v2_key',
+        provenance: 'turn_attached_model_selection',
+        semanticRevisionId: 'revision-1',
+        contextHash: 'a'.repeat(64),
+      },
+    }, { sessionId: 'session-1' });
+
+    assert.equal(result.ok, false);
+    assert.equal(recorded.length, 0);
   });
 });

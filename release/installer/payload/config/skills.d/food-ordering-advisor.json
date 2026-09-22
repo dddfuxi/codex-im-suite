@@ -1,0 +1,25 @@
+{
+  "id": "food-ordering-advisor",
+  "displayName": "点餐顾问",
+  "source": "${SUITE_ROOT}\\extensions\\skills\\food-ordering-advisor",
+  "type": "skill",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "skill.local-life",
+  "optional": true,
+  "installState": "bundled",
+  "installer": "..\\..\\scripts\\install-suite-extension.ps1",
+  "aliases": [
+    "点餐顾问",
+    "美团点餐",
+    "大众点评推荐",
+    "外卖推荐",
+    "餐厅推荐",
+    "吃什么"
+  ],
+  "enabled": true,
+  "description": "通过美团、大众点评或其他可验证本地生活来源完成多轮餐厅推荐、跨平台比较、菜单选择、购物车准备和受控下单交接。"
+}

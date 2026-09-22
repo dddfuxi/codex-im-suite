@@ -1,0 +1,254 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { readAnyManagedInstallMarker } from './managed-install-marker.js';
+import { findSpeechModel } from './speech-model-catalog.js';
+import type { SpeechRuntimeConfig } from './runtime-types.js';
+
+export type SpeechBackendDependencyState = 'ready' | 'optional_missing' | 'blocked';
+
+export interface SpeechBackendDependency {
+  id: string;
+  state: SpeechBackendDependencyState;
+  source?: 'explicit' | 'managed';
+  path?: string;
+  diagnosticCode?: string;
+}
+
+export interface SpeechBackendDependencies {
+  senseVoiceBinary: SpeechBackendDependency;
+  senseVoiceModel: SpeechBackendDependency;
+  ttsModel: SpeechBackendDependency;
+  ttsReferenceModel: SpeechBackendDependency;
+}
+
+type DependencyKind = 'executable' | 'file' | 'directory';
+
+interface ResolveBackendDependencyInput {
+  id: string;
+  kind: DependencyKind;
+  explicitPath?: string;
+  runtimeDepsRoot: string;
+  componentIds: string[];
+  relativeCandidates?: string[];
+  directoryMarkers?: string[];
+}
+
+function inspectCandidate(candidate: string, kind: DependencyKind, markers: string[]): boolean {
+  try {
+    const comparable = (value: string) => process.platform === 'win32'
+      ? path.normalize(value).toLowerCase()
+      : path.normalize(value);
+    if (comparable(fs.realpathSync.native(candidate)) !== comparable(path.resolve(candidate))) return false;
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink()) return false;
+    if (kind === 'directory') {
+      if (!stat.isDirectory()) return false;
+      return markers.length === 0 || markers.some((marker) => {
+        const markerPath = path.join(candidate, marker);
+        try {
+          const markerStat = fs.lstatSync(markerPath);
+          return markerStat.isFile() && !markerStat.isSymbolicLink();
+        } catch {
+          return false;
+        }
+      });
+    }
+    if (!stat.isFile()) return false;
+    if (kind === 'executable' && process.platform !== 'win32') {
+      try { fs.accessSync(candidate, fs.constants.X_OK); } catch { return false; }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function managedBases(runtimeDepsRoot: string, componentIds: string[]): string[] {
+  const roots: string[] = [];
+  for (const componentId of componentIds) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(componentId)) continue;
+    for (const componentRoot of [
+      path.join(runtimeDepsRoot, 'speech', componentId),
+      path.join(runtimeDepsRoot, componentId),
+    ]) {
+      try {
+        const stat = fs.lstatSync(componentRoot);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) continue;
+        for (const entry of fs.readdirSync(componentRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.isSymbolicLink() || !/^[a-z0-9._-]+$/i.test(entry.name)) continue;
+          const versionRoot = path.join(componentRoot, entry.name);
+          if (readAnyManagedInstallMarker(versionRoot, {
+            id: componentId,
+            version: entry.name,
+            platform: `${process.platform}-${process.arch}`,
+          })) roots.push(versionRoot);
+        }
+      } catch {
+        // 受管组件尚未安装是正常的 optional_missing。
+      }
+    }
+  }
+  return roots;
+}
+
+export function resolveBackendDependency(input: ResolveBackendDependencyInput): SpeechBackendDependency {
+  const explicit = input.explicitPath?.trim();
+  const markers = input.directoryMarkers || [];
+  if (explicit) {
+    if (!path.isAbsolute(explicit)) {
+      return { id: input.id, state: 'blocked', source: 'explicit', diagnosticCode: 'explicit_path_not_absolute' };
+    }
+    const candidate = path.resolve(explicit);
+    return inspectCandidate(candidate, input.kind, markers)
+      ? { id: input.id, state: 'ready', source: 'explicit', path: candidate }
+      : { id: input.id, state: 'blocked', source: 'explicit', diagnosticCode: 'explicit_path_missing_or_unsafe' };
+  }
+
+  const relativeCandidates = input.relativeCandidates || ['.'];
+  for (const base of managedBases(path.resolve(input.runtimeDepsRoot), input.componentIds)) {
+    for (const relative of relativeCandidates) {
+      const candidate = path.resolve(base, relative);
+      const relativeToBase = path.relative(base, candidate);
+      if (relativeToBase.startsWith('..') || path.isAbsolute(relativeToBase)) continue;
+      if (inspectCandidate(candidate, input.kind, markers)) {
+        return { id: input.id, state: 'ready', source: 'managed', path: candidate };
+      }
+    }
+  }
+  return { id: input.id, state: 'optional_missing', diagnosticCode: 'backend_dependency_not_installed' };
+}
+
+function senseVoiceExecutableCandidates(): string[] {
+  const names = process.platform === 'win32'
+    ? ['llama-funasr-sensevoice.exe', 'llama-funasr-sensevoice']
+    : ['llama-funasr-sensevoice'];
+  return names.flatMap((name) => [name, path.join('bin', name)]);
+}
+
+const COSYVOICE_MARKERS = ['cosyvoice.yaml', 'cosyvoice2.yaml', 'cosyvoice3.yaml'];
+
+export function resolveSpeechBackendDependencies(
+  config: SpeechRuntimeConfig,
+  runtimeDepsRoot: string,
+): SpeechBackendDependencies {
+  const selectedModel = findSpeechModel(config.ttsModelId);
+  let modelDependencyRoot = path.resolve(runtimeDepsRoot);
+  let modelRootBlocked = false;
+  if (config.modelRoot) {
+    if (!path.isAbsolute(config.modelRoot) || !inspectCandidate(path.resolve(config.modelRoot), 'directory', [])) {
+      modelRootBlocked = true;
+    } else {
+      // 显式模型根一旦有效便独占模型解析；无效时 blocked，禁止偷偷回退 runtime-deps。
+      modelDependencyRoot = path.resolve(config.modelRoot);
+    }
+  }
+  const senseVoiceBinary = resolveBackendDependency({
+    id: 'sensevoice_binary',
+    kind: 'executable',
+    explicitPath: config.senseVoiceBinaryPath,
+    runtimeDepsRoot: path.resolve(runtimeDepsRoot),
+    componentIds: ['sensevoice_runtime', 'sensevoice_gguf'],
+    relativeCandidates: senseVoiceExecutableCandidates(),
+  });
+  let senseVoiceModel = resolveBackendDependency({
+    id: 'sensevoice_model',
+    kind: 'file',
+    explicitPath: config.asrModel,
+    runtimeDepsRoot: modelDependencyRoot,
+    componentIds: ['sensevoice_gguf'],
+    relativeCandidates: [
+      'sensevoice-small-q8.gguf',
+      'sensevoice-small-f16.gguf',
+      'sensevoice-small.gguf',
+    ],
+  });
+  let ttsModel = resolveBackendDependency({
+    id: 'tts_model',
+    kind: 'directory',
+    explicitPath: config.ttsModelPath,
+    runtimeDepsRoot: modelDependencyRoot,
+    componentIds: selectedModel ? [selectedModel.componentId] : [],
+    directoryMarkers: selectedModel?.providerId === 'cosyvoice' ? COSYVOICE_MARKERS : ['config.json'],
+  });
+  let ttsReferenceModel = resolveBackendDependency({
+    id: 'tts_reference_model',
+    kind: 'directory',
+    explicitPath: config.ttsReferenceModelPath,
+    runtimeDepsRoot: modelDependencyRoot,
+    componentIds: selectedModel?.capabilities.includes('voice_clone')
+      ? [selectedModel.componentId]
+      : selectedModel?.providerId === 'cosyvoice' ? ['cosyvoice_clone', 'cosyvoice'] : [],
+    directoryMarkers: selectedModel?.providerId === 'cosyvoice' ? COSYVOICE_MARKERS : ['config.json'],
+  });
+  if (!selectedModel) {
+    ttsModel = { id: 'tts_model', state: 'blocked', diagnosticCode: 'tts_model_unknown' };
+    ttsReferenceModel = { id: 'tts_reference_model', state: 'blocked', diagnosticCode: 'tts_model_unknown' };
+  }
+  if (modelRootBlocked) {
+    const blocked = (id: string): SpeechBackendDependency => ({
+      id,
+      state: 'blocked',
+      source: 'explicit',
+      diagnosticCode: 'explicit_model_root_missing_or_unsafe',
+    });
+    if (!config.asrModel) senseVoiceModel = blocked('sensevoice_model');
+    if (!config.ttsModelPath) ttsModel = blocked('tts_model');
+    if (!config.ttsReferenceModelPath) ttsReferenceModel = blocked('tts_reference_model');
+  }
+  // Base 模型的克隆能力和普通合成来自同一受管目录；是否真正支持仍由
+  // Sidecar health 与具体调用复核，不能仅凭目录名宣称 ready。
+  if (!modelRootBlocked && selectedModel?.capabilities.includes('voice_clone') && ttsModel.state === 'ready') {
+    ttsReferenceModel = { ...ttsModel, id: 'tts_reference_model' };
+  }
+  // 未完成相似度验收时仍须让 Sidecar 加载已验证的 Base 模型：验收本身需要
+  // 真实合成和说话人编码，若在依赖解析阶段撤掉模型路径会形成“无法启动→无法
+  // 验收→永远无法启动”的循环。此处只声明受管模型可加载；实际合成出口仍由
+  // RuntimeSpeechHost 对当前 profile/model/revision/hardware 的相似度回执强制
+  // 门禁，未通过时丢弃产物且绝不发送或标记克隆成功。
+  return { senseVoiceBinary, senseVoiceModel, ttsModel, ttsReferenceModel };
+}
+
+function aggregate(
+  dependencies: SpeechBackendDependency[],
+  missingCode: string,
+): { state: SpeechBackendDependencyState; diagnosticCode?: string } {
+  const blocked = dependencies.find((item) => item.state === 'blocked');
+  if (blocked) return { state: 'blocked', diagnosticCode: blocked.diagnosticCode || missingCode };
+  if (dependencies.every((item) => item.state === 'ready')) return { state: 'ready' };
+  return { state: 'optional_missing', diagnosticCode: missingCode };
+}
+
+/** 仅把已验证的本地路径交给 Sidecar；缺失/坏路径只传稳定状态码。 */
+export function speechBackendEnvironment(
+  dependencies: SpeechBackendDependencies,
+  config?: SpeechRuntimeConfig,
+): NodeJS.ProcessEnv {
+  const asr = aggregate(
+    [dependencies.senseVoiceBinary, dependencies.senseVoiceModel],
+    'sensevoice_dependency_missing',
+  );
+  const ttsCandidates = [dependencies.ttsModel, dependencies.ttsReferenceModel];
+  const ttsReady = ttsCandidates.some((item) => item.state === 'ready');
+  const ttsBlocked = ttsCandidates.find((item) => item.state === 'blocked');
+  const tts = ttsReady
+    ? { state: 'ready' as const }
+    : ttsBlocked
+      ? { state: 'blocked' as const, diagnosticCode: ttsBlocked.diagnosticCode || 'tts_dependency_missing' }
+      : { state: 'optional_missing' as const, diagnosticCode: 'tts_dependency_missing' };
+  const selectedModel = config ? findSpeechModel(config.ttsModelId) : undefined;
+  return {
+    CTI_SPEECH_ASR_DEPENDENCY_STATE: asr.state,
+    CTI_SPEECH_ASR_DIAGNOSTIC: asr.diagnosticCode,
+    CTI_SPEECH_TTS_DEPENDENCY_STATE: tts.state,
+    CTI_SPEECH_TTS_DIAGNOSTIC: tts.diagnosticCode,
+    CTI_SPEECH_SENSEVOICE_BINARY: dependencies.senseVoiceBinary.path,
+    CTI_SPEECH_ASR_MODEL_PATH: dependencies.senseVoiceModel.path,
+    CTI_SPEECH_TTS_PROVIDER: config?.ttsProvider,
+    CTI_SPEECH_TTS_MODEL_ID: config?.ttsModelId,
+    CTI_SPEECH_TTS_UPSTREAM_MODEL_ID: selectedModel?.upstreamModelId,
+    CTI_SPEECH_TONE_POLICY: config?.tonePolicy,
+    CTI_SPEECH_TTS_MODEL_PATH: dependencies.ttsModel.path,
+    CTI_SPEECH_TTS_REFERENCE_MODEL_PATH: dependencies.ttsReferenceModel.path,
+  };
+}

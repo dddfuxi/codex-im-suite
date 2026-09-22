@@ -73,7 +73,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ["arrow", "numbered"],
             description: "Rendering style: 'arrow' draws arrows+labels (default); 'numbered' draws numbered badges with a side legend panel (cleaner for dense scenes)",
           },
-          output_path: { type: "string", description: "Optional output PNG path relative to project cwd" },
+          output_path: { type: "string", description: "Optional absolute path or path relative to runtime artifact_root" },
+          artifact_root: { type: "string", description: "Runtime-managed artifact root injected by codex-im-suite" },
         },
       },
     },
@@ -90,7 +91,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           language: { type: "string", enum: ["zh", "en"], default: "zh" },
           detail: { type: "string", enum: ["brief", "standard", "rich"], default: "standard" },
           context: { type: "string", description: "Optional task context from agent" },
-          output_path: { type: "string", description: "Optional output PNG path, relative to project cwd" },
+          output_path: { type: "string", description: "Optional absolute path or path relative to runtime artifact_root" },
+          artifact_root: { type: "string", description: "Runtime-managed artifact root injected by codex-im-suite" },
         },
       },
     },
@@ -201,6 +203,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       context: typeof a.context === "string" ? a.context : undefined,
       style: (a.style === "numbered" ? "numbered" : "arrow") as AnnotationStyle,
       output_path: typeof a.output_path === "string" ? a.output_path : undefined,
+      artifact_root: typeof a.artifact_root === "string" ? a.artifact_root : process.env.CTI_ARTIFACT_ROOT,
     });
     if ("error" in res) return { content: [{ type: "text", text: res.error }], isError: true };
     return {
@@ -220,6 +223,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : ("standard" as Detail),
       context: typeof a.context === "string" ? a.context : undefined,
       output_path: typeof a.output_path === "string" ? a.output_path : undefined,
+      artifact_root: typeof a.artifact_root === "string" ? a.artifact_root : process.env.CTI_ARTIFACT_ROOT,
     });
     if ("error" in subject) {
       return {

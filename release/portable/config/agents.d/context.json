@@ -1,0 +1,16 @@
+{
+  "protocol": "codex-im-suite/agent-collaboration/v1",
+  "id": "context",
+  "displayName": "上下文 Agent",
+  "enabled": true,
+  "responsibilities": ["在确定性引用解析冲突或低置信时裁决当前焦点", "只选择本轮真实 evidence ID"],
+  "owns": ["冲突引用裁决", "上下文 evidence 排序"],
+  "excludes": ["不创造 evidence", "不生成最终回复", "不执行工具", "不读取工作区"],
+  "capabilities": ["resolve_context", "rank_context"],
+  "inputEvidenceKinds": ["message", "mention", "attachment", "history", "document", "conversation_state"],
+  "outputSchemaId": "codex-im-suite/agent-task-result/v1",
+  "sideEffectLevel": "none",
+  "timeoutMs": 30000,
+  "concurrency": 1,
+  "modelProfile": "classifier"
+}

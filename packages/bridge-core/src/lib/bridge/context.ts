@@ -13,6 +13,26 @@ import type {
   LLMProvider,
   PermissionGateway,
   LifecycleHooks,
+  ReminderActionHost,
+  ScheduledTaskActionHost,
+  BridgeControlHost,
+  PanelSettingsHost,
+  ExtensionCatalogHost,
+  FeishuCloudDocumentHost,
+  FeishuCliUserAuthHost,
+  FeishuOAuthManualHost,
+  MemoryIntentHost,
+  ContinuationAdjustmentIntentHost,
+  StickerSemanticEvolutionHost,
+  AgentHomeHost,
+  SelfMaintenanceHost,
+  TurnReferenceResolverHost,
+  TurnStorageHost,
+  ArtifactEncodingInspectorHost,
+  AgentCollaborationHost,
+  ChoicePromptStateHost,
+  SpeechHost,
+  SingingHost,
 } from './host.js';
 
 export interface BridgeContext {
@@ -20,6 +40,28 @@ export interface BridgeContext {
   llm: LLMProvider;
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;
+  reminders?: ReminderActionHost;
+  scheduledTasks?: ScheduledTaskActionHost;
+  bridgeControl?: BridgeControlHost;
+  panelSettings?: PanelSettingsHost;
+  extensions?: ExtensionCatalogHost;
+  feishuCloudDocuments?: FeishuCloudDocumentHost;
+  feishuCliUserAuth?: FeishuCliUserAuthHost;
+  feishuOAuth?: FeishuOAuthManualHost;
+  memoryIntents?: MemoryIntentHost;
+  continuationAdjustments?: ContinuationAdjustmentIntentHost;
+  stickerSemantics?: StickerSemanticEvolutionHost;
+  agentHome?: AgentHomeHost;
+  selfMaintenance?: SelfMaintenanceHost;
+  turnReferences?: TurnReferenceResolverHost;
+  turnStorage?: TurnStorageHost;
+  artifactEncoding?: ArtifactEncodingInspectorHost;
+  agentCollaboration?: AgentCollaborationHost;
+  choicePrompts?: ChoicePromptStateHost;
+  /** 可选 Runtime 本地语音 Host；缺失时语音入口失败关闭为可行动文字提示。 */
+  speech?: SpeechHost;
+  /** 可选独立歌声 Host；缺失时唱歌请求只回退完整文字，绝不调用 TTS 冒充。 */
+  singing?: SingingHost;
 }
 
 const CONTEXT_KEY = '__bridge_context__';

@@ -20,6 +20,45 @@ export function maskSecrets(text: string): string {
   return result;
 }
 
+export function formatLogArgument(value: unknown): string {
+  if (typeof value === 'string') return maskSecrets(value);
+  if (value === undefined) return 'undefined';
+  if (typeof value === 'symbol') return String(value);
+  if (typeof value === 'bigint') return `${value.toString()}n`;
+  if (typeof value === 'function') return `[Function ${(value as Function).name || 'anonymous'}]`;
+
+  const seen = new WeakSet<object>();
+  try {
+    const serialized = JSON.stringify(value, (_key, current) => {
+      if (typeof current === 'bigint') return `${current.toString()}n`;
+      if (typeof current === 'function') return `[Function ${current.name || 'anonymous'}]`;
+      if (current instanceof Error) {
+        const plain: Record<string, unknown> = {
+          name: current.name,
+          message: current.message,
+          stack: current.stack,
+        };
+        for (const key of Object.keys(current)) {
+          plain[key] = (current as unknown as Record<string, unknown>)[key];
+        }
+        return plain;
+      }
+      if (current && typeof current === 'object') {
+        if (seen.has(current)) return '[Circular]';
+        seen.add(current);
+      }
+      return current;
+    });
+    return maskSecrets(serialized ?? String(value));
+  } catch {
+    try {
+      return maskSecrets(String(value));
+    } catch {
+      return '[Unserializable]';
+    }
+  }
+}
+
 const LOG_DIR = path.join(CTI_HOME, 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'bridge.log');
 const MAX_LOG_SIZE = 10 * 1024 * 1024; // 10MB
@@ -65,7 +104,7 @@ export function setupLogger(): void {
 
   const write = (level: string, args: unknown[]) => {
     const timestamp = new Date().toISOString();
-    const message = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    const message = args.map(formatLogArgument).join(' ');
     const formatted = `[${timestamp}] [${level}] ${message}`;
     const masked = maskSecrets(formatted);
 

@@ -1,0 +1,16 @@
+{
+  "protocol": "codex-im-suite/agent-collaboration/v1",
+  "id": "performance",
+  "displayName": "性能 Agent",
+  "enabled": true,
+  "responsibilities": ["批量分析脱敏 Workflow 指标", "生成只读性能建议和指标依据"],
+  "owns": ["协作耗时分析", "fallback 和 Worker 稳定性建议"],
+  "excludes": ["不进入用户回合关键路径", "不自动改配置", "不重启", "不发布"],
+  "capabilities": ["analyze_performance"],
+  "inputEvidenceKinds": ["conversation_state"],
+  "outputSchemaId": "codex-im-suite/agent-performance-suggestion/v1",
+  "sideEffectLevel": "none",
+  "timeoutMs": 30000,
+  "concurrency": 1,
+  "modelProfile": "classifier"
+}

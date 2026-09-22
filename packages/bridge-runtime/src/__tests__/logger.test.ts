@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { maskSecrets } from '../logger.js';
+import { formatLogArgument, maskSecrets } from '../logger.js';
 
 describe('maskSecrets', () => {
   it('masks token=value patterns', () => {
@@ -57,5 +57,23 @@ describe('maskSecrets', () => {
     const input = 'token="my-secret-token"';
     const result = maskSecrets(input);
     assert.ok(!result.includes('my-secret-token'));
+  });
+});
+
+describe('formatLogArgument', () => {
+  it('serializes circular SDK error payloads without throwing', () => {
+    const payload: Record<string, unknown> = {
+      code: 14005,
+      msg: 'Resource Has Been Deleted',
+      token: 'secret-token-value',
+    };
+    payload.self = payload;
+
+    const result = formatLogArgument(payload);
+
+    assert.match(result, /14005/);
+    assert.match(result, /Resource Has Been Deleted/);
+    assert.match(result, /\[Circular\]/);
+    assert.ok(!result.includes('secret-token-value'));
   });
 });

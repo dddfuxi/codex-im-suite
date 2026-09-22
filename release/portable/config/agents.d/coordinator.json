@@ -1,0 +1,16 @@
+{
+  "protocol": "codex-im-suite/agent-collaboration/v1",
+  "id": "coordinator",
+  "displayName": "协作协调 Agent",
+  "enabled": true,
+  "responsibilities": ["判断复杂回合是否需要专业 Agent 协作", "从当前注册表生成最多两个只读任务"],
+  "owns": ["协作任务选择", "任务目标和 evidence 引用计划"],
+  "excludes": ["不生成用户回复", "不决定权限", "不执行工具", "不写入或发送"],
+  "capabilities": ["plan_turn"],
+  "inputEvidenceKinds": ["message", "mention", "attachment", "history", "memory", "document", "conversation_state"],
+  "outputSchemaId": "codex-im-suite/agent-turn-plan/v1",
+  "sideEffectLevel": "none",
+  "timeoutMs": 30000,
+  "concurrency": 1,
+  "modelProfile": "classifier"
+}

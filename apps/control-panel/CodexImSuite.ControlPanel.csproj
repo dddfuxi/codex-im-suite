@@ -7,5 +7,31 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>CodexImSuiteControlPanel</AssemblyName>
     <RootNamespace>CodexImSuiteControlPanel</RootNamespace>
+    <!-- 发布提交由 .suite-release.json 单点记录；禁止 SDK 把 HEAD 写入 EXE，
+         包括 InformationalVersion 与 SourceLink/PDB 标识，否则提交 release
+         产物后会再次改变面板 Hash，造成 live/portable 永久追赶。 -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <EnableSourceLink>false</EnableSourceLink>
   </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3912.50" />
+  </ItemGroup>
+  <Target Name="RemoveUnusedWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Reference.Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
+  <ItemGroup>
+    <Content Include="wwwroot\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="ControlPanel.Tests\**\*.cs" />
+    <EmbeddedResource Remove="ControlPanel.Tests\**\*" />
+    <None Remove="ControlPanel.Tests\**\*" />
+  </ItemGroup>
 </Project>

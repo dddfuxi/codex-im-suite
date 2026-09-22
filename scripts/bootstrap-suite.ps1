@@ -3,6 +3,12 @@ $ErrorActionPreference = 'Stop'
 
 $suiteRoot = Get-SuiteRoot
 $manifest = Get-SuiteManifest -SuiteRoot $suiteRoot
+$powershellUtf8ProfileScript = Join-Path $PSScriptRoot 'windows-powershell-utf8-profile.ps1'
+
+& $powershellUtf8ProfileScript -Mode Apply
+if ($LASTEXITCODE -ne 0) {
+    throw 'PowerShell 5.1 UTF-8 profile bootstrap failed.'
+}
 
 function Install-PackageDeps {
     param([string]$Path)

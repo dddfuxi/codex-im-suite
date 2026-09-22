@@ -1,0 +1,230 @@
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+
+import type { SpeechPanelStateContract, SpeechStatusContract } from '@codex-im-suite/contracts/speech';
+import {
+  canImportSpeechReferenceVoice,
+  canInstallSpeechComponent,
+  canSaveSpeechSettings,
+  createSpeechSettingsDraft,
+  decodeSpeechPreviewReceipt,
+  describeSpeechDisplayState,
+  getSpeechAction,
+  getSpeechCommandNotice,
+  getSpeechFeatureSummaries,
+  getSpeechPanelDiagnostic,
+  updateSpeechChannelIds,
+} from './speech-view-model.js';
+import { acceptanceMetric } from './pages/SpeechPage.js';
+
+const readyStatus: SpeechStatusContract = {
+  protocol: 'codex-im-suite/speech-status/v2',
+  state: 'ready',
+  inputEnabled: true,
+  outputEnabled: true,
+  singingEnabled: false,
+  channels: [{ id: 'feishu', displayName: '飞书', state: 'ready', enabled: true, inputSupported: true, outputSupported: true, selected: true }],
+  replyPolicy: { value: 'on', options: [{ id: 'on', displayName: '开启', state: 'ready', enabled: true }] },
+  deliveryMode: { value: 'voice_only', options: [{ id: 'voice_only', displayName: '仅语音', state: 'ready', enabled: true }] },
+  asrProvider: { value: 'asr-a', options: [{ id: 'asr-a', displayName: 'ASR A', state: 'ready', enabled: true }] },
+  ttsProvider: { value: 'tts-a', options: [{ id: 'tts-a', displayName: 'TTS A', state: 'ready', enabled: true }] },
+  ttsModel: {
+    value: 'model-a', liveValue: 'model-a', restartRequired: false,
+    options: [{
+      id: 'model-a', displayName: '模型 A', state: 'ready', enabled: true, providerId: 'tts-a',
+      variant: 'custom_voice', sizeLabel: '1.7B', qualityTier: 'high_quality', qualityRank: 300, componentId: 'model-a',
+      capabilities: ['preset_voice', 'instruction_control'], defaultVoiceProfileId: 'voice-a',
+      benchmark: { state: 'ready', revision: 'a'.repeat(64) },
+    }],
+  },
+  tonePolicy: { value: 'adaptive_natural', options: [{ id: 'adaptive_natural', displayName: '自适应', state: 'ready', enabled: true }] },
+  singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'blocked', enabled: true }] },
+  singingBenchmark: { state: 'optional_missing', revision: 'uninstalled', diagnosticCode: 'singing_benchmark_not_verified' },
+  activeVoiceProfileId: 'voice-a',
+  activeSingingVoiceProfileId: '',
+  providers: [{ id: 'tts-a', displayName: 'TTS A', state: 'ready', enabled: true, experimental: false, license: 'test', capabilities: ['speech.text'] }],
+  capabilities: [],
+  components: [],
+  voiceProfiles: [{ id: 'voice-a', displayName: '音色 A', kind: 'preset', state: 'ready', active: true, license: '内置', sourceLabel: 'Runtime', authorizationConfirmed: true, capabilities: ['speech'], compatibleTtsModelIds: ['model-a'], speechAcceptance: { state: 'not_applicable' }, singingAcceptance: { state: 'not_applicable' } }],
+  limits: { maxInputBytes: 1024, maxInputDurationSeconds: 60, maxOutputCharacters: 500, maxPreviewCharacters: 240, maxSongLyricsCharacters: 6000, maxSongDurationSeconds: 60 },
+  actions: [{ id: 'speech.previewVoice', label: '试听', enabled: true }],
+  lastCheckedAt: '2026-08-07T00:00:00.000Z',
+};
+
+describe('speech view model', () => {
+  it('treats nullable Runtime acceptance metrics as not verified instead of crashing the page', () => {
+    assert.equal(acceptanceMetric({ state: 'not_verified', similarity: null as unknown as number, similarityThreshold: null as unknown as number }), '');
+    assert.equal(acceptanceMetric({ state: 'passed', similarity: 0.91, similarityThreshold: 0.72 }), '相似度 0.910 / 阈值 0.720');
+  });
+  it('shows unavailable without inventing a SpeechStatus', () => {
+    const panel: SpeechPanelStateContract = { available: false, unavailableCode: 'speech_cli_missing', status: null };
+    assert.equal(describeSpeechDisplayState(panel).label, 'unavailable');
+    assert.equal(getSpeechPanelDiagnostic(panel), 'speech_cli_missing');
+  });
+
+  it('builds settings only from Runtime-declared opaque ids', () => {
+    const status: SpeechStatusContract = {
+      ...readyStatus,
+      channels: [
+        ...readyStatus.channels,
+        { id: 'channel-b', displayName: '渠道 B', state: 'ready', enabled: true, inputSupported: true, outputSupported: false, selected: true },
+      ],
+    };
+    const draft = createSpeechSettingsDraft(status);
+    assert.deepEqual(draft.channelIds, ['feishu', 'channel-b']);
+    assert.deepEqual(updateSpeechChannelIds(draft.channelIds, 'feishu', false), ['channel-b']);
+    assert.deepEqual(updateSpeechChannelIds(draft.channelIds, 'channel-c', true), ['feishu', 'channel-b', 'channel-c']);
+    assert.deepEqual(updateSpeechChannelIds(draft.channelIds, 'channel-b', true), ['feishu', 'channel-b']);
+    assert.equal(canSaveSpeechSettings(status, draft), true);
+    assert.equal(canSaveSpeechSettings(status, { ...draft, ttsProvider: 'invented-provider' }), false);
+  });
+
+  it('summarizes user-facing speech capabilities without inventing providers', () => {
+    const status: SpeechStatusContract = {
+      ...readyStatus,
+      singingEnabled: true,
+      singingProvider: { value: 'singing-a', options: [{ id: 'singing-a', displayName: '歌声 A', state: 'ready', enabled: true }] },
+      singingBenchmark: { state: 'ready', revision: 'singing-revision' },
+      capabilities: [
+        { id: 'speech.input', displayName: '输入', state: 'ready', supported: true },
+        { id: 'speech.output', displayName: '输出', state: 'ready', supported: true },
+        { id: 'speech.singing', displayName: '唱歌', state: 'ready', supported: true },
+      ],
+      ttsModel: {
+        ...readyStatus.ttsModel,
+        options: [
+          ...readyStatus.ttsModel.options,
+          {
+            id: 'clone-a', displayName: '复刻模型 A', state: 'ready', enabled: true, providerId: 'tts-a',
+            variant: 'base', sizeLabel: '0.6B', qualityTier: 'low_resource', qualityRank: 100, componentId: 'clone-a', capabilities: ['voice_clone'],
+            defaultVoiceProfileId: '', benchmark: { state: 'ready', revision: 'clone-revision' },
+          },
+        ],
+      },
+    };
+    const summaries = getSpeechFeatureSummaries(status);
+    assert.deepEqual(summaries.map((item) => item.title), ['听懂语音', '语音回复', '唱歌', '克隆音色', '消息渠道']);
+    assert.equal(summaries.find((item) => item.id === 'voice_clone')?.state, 'ready');
+    assert.match(summaries.find((item) => item.id === 'output')?.detail || '', /模型 A/u);
+    assert.equal(getSpeechFeatureSummaries({ ...status, inputEnabled: false })[0]?.enabled, false);
+    const missingClone = getSpeechFeatureSummaries(readyStatus).find((item) => item.id === 'voice_clone');
+    assert.equal(missingClone?.state, 'optional_missing');
+    assert.equal(missingClone?.enabled, true);
+
+    const slowStatus: SpeechStatusContract = {
+      ...status,
+      capabilities: status.capabilities.map((item) => item.id === 'speech.output'
+        ? { ...item, state: 'blocked', diagnosticCode: 'tts_model_warm_benchmark_too_slow' }
+        : item),
+      ttsModel: {
+        ...status.ttsModel,
+        options: status.ttsModel.options.map((item) => item.id === status.ttsModel.value
+          ? { ...item, benchmark: { ...item.benchmark, state: 'blocked', diagnosticCode: 'tts_model_warm_benchmark_too_slow' } }
+          : item),
+      },
+    };
+    const slowOutput = getSpeechFeatureSummaries(slowStatus).find((item) => item.id === 'output');
+    assert.equal(slowOutput?.state, 'blocked');
+    assert.match(slowOutput?.detail || '', /模型已加载，但当前硬件生成过慢/u);
+  });
+
+  it('fails closed when an action was not declared by Runtime', () => {
+    assert.equal(getSpeechAction(readyStatus, 'speech.previewVoice').enabled, true);
+    assert.deepEqual(getSpeechAction(readyStatus, 'speech.installComponent'), {
+      id: 'speech.installComponent',
+      label: 'speech.installComponent',
+      enabled: false,
+      diagnosticCode: 'speech_action_unavailable',
+    });
+  });
+
+  it('only allows installation for a component with a real managed installer', () => {
+    const action = { id: 'speech.installComponent', label: '安装组件', enabled: true };
+    const base = {
+      id: 'component-a',
+      displayName: '组件 A',
+      kind: 'model',
+      state: 'optional_missing' as const,
+      installable: true,
+      capabilities: ['asr'],
+    };
+    assert.equal(canInstallSpeechComponent(base, action), true);
+    assert.equal(canInstallSpeechComponent({ ...base, installable: false }, action), false);
+    assert.equal(canInstallSpeechComponent({ ...base, state: 'ready' }, action), false);
+    assert.equal(canInstallSpeechComponent(base, { ...action, enabled: false }), false);
+  });
+
+  it('requires transcript, authorization and clean single-speaker confirmations before reference import', () => {
+    const draft = {
+      displayName: '授权音色',
+      transcript: '这是一段准确转写。',
+      transcriptConfirmed: true,
+      sourceLabel: '用户本人录音',
+      license: '本人授权',
+      authorizationConfirmed: true,
+      cleanSingleSpeakerConfirmed: true,
+    };
+    assert.equal(canImportSpeechReferenceVoice(draft), true);
+    assert.equal(canImportSpeechReferenceVoice({ ...draft, authorizationConfirmed: false }), false);
+    assert.equal(canImportSpeechReferenceVoice({ ...draft, cleanSingleSpeakerConfirmed: false }), false);
+    assert.equal(canImportSpeechReferenceVoice({ ...draft, transcript: '   ' }), false);
+    assert.equal(canImportSpeechReferenceVoice({ ...draft, transcriptConfirmed: false }), false);
+  });
+
+  it('does not claim live speech settings applied before a controlled Bridge restart', () => {
+    assert.match(getSpeechCommandNotice({ restartRequired: true }), /重启 Bridge/u);
+    assert.equal(getSpeechCommandNotice({ restartRequired: false, notice: '不应显示' }), '');
+    assert.match(getSpeechCommandNotice({ action: 'speech.renameReferenceVoice', restartRequired: false, notice: '名称已更新' }), /名称已更新/u);
+    assert.equal(getSpeechCommandNotice(null), '');
+  });
+
+  it('only decodes the exact validated Ogg preview projection', () => {
+    const base = {
+      protocol: 'codex-im-suite/speech-preview/v2',
+      mediaType: 'audio/ogg; codecs=opus',
+      base64: Buffer.from('OggS-safe-preview', 'ascii').toString('base64'),
+      bytes: Buffer.byteLength('OggS-safe-preview', 'ascii'),
+      sha256: 'a'.repeat(64),
+      durationMs: 1000,
+      modelId: 'model-a',
+      voiceProfileId: 'acestep.default',
+      generationStatus: 'generated',
+      deliveryStatus: 'not_sent',
+      speakerSimilarityStatus: 'not_applicable',
+      validated: true,
+    };
+    assert.equal(decodeSpeechPreviewReceipt(base).media.byteLength, base.bytes);
+    const withSimilarity = {
+      ...base,
+      speakerSimilarityStatus: 'passed',
+      speakerSimilarity: 0.84,
+      speakerSimilarityThreshold: 0.72,
+      speakerSimilarityPassed: true,
+    };
+    assert.equal(decodeSpeechPreviewReceipt(withSimilarity).receipt.speakerSimilarityPassed, true);
+    const singingReceipt = {
+      ...base,
+      lyricsAlignmentStatus: 'passed',
+      lyricsAlignment: 0.93,
+      lyricsAlignmentThreshold: 0.8,
+      lyricsAlignmentPassed: true,
+    };
+    assert.equal(
+      decodeSpeechPreviewReceipt(singingReceipt, { requireLyricsAcceptance: true }).receipt.lyricsAlignmentPassed,
+      true,
+    );
+    assert.throws(
+      () => decodeSpeechPreviewReceipt(base, { requireLyricsAcceptance: true }),
+      /speech_preview_response_invalid/u,
+    );
+    assert.throws(() => decodeSpeechPreviewReceipt({ ...base, speakerSimilarity: 0.84 }), /speech_preview_response_invalid/u);
+    assert.throws(() => decodeSpeechPreviewReceipt({ ...withSimilarity, speakerSimilarityPassed: false }), /speech_preview_response_invalid/u);
+    assert.throws(() => decodeSpeechPreviewReceipt({ ...base, path: 'C:/unsafe.ogg' }), /speech_preview_response_invalid/u);
+    const badHeader = Buffer.from('RIFF-not-ogg-data', 'ascii');
+    assert.throws(() => decodeSpeechPreviewReceipt({
+      ...base,
+      base64: badHeader.toString('base64'),
+      bytes: badHeader.length,
+    }), /speech_preview_response_invalid/u);
+  });
+});

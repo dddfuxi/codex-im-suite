@@ -1,0 +1,430 @@
+import type { OutboundMention } from '../types.js';
+import { isNonAddressableMentionTarget } from '../agent-architecture.js';
+import { hasSchedulingTimeHint, hasTaskSchedulingIntent } from './reminders.js';
+
+export interface FeishuMentionIntentOptions {
+  invocationAliases?: string[];
+}
+
+const FEISHU_MENTION_ID_FIELDS = [
+  'userId',
+  'user_id',
+  'openId',
+  'open_id',
+  'unionId',
+  'union_id',
+  // 官方模型有时会把当前原生 mention evidence 归一成通用 id。
+  // 这里只保留为待验证候选；后续仍必须与本轮平台 evidence 精确求交集。
+  'id',
+] as const;
+const FEISHU_MENTION_ACTION_RE = /(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu;
+// JavaScript 的 `\b` 只按 ASCII 单词边界工作，`at乔治` / `必须at对方`
+// 这类中英紧邻写法不会形成可靠边界。先把可信的 Latin `at` 动词归一为
+// “艾特”，同时用 ASCII 左边界及右侧小写单词保护避免误吃 format/status/chat。
+const FEISHU_COMPACT_LATIN_AT_ACTION_RE = /(?<![A-Za-z0-9_])[Aa][Tt](?=$|[^A-Za-z0-9_]|[A-Z])/gu;
+const FEISHU_OTHER_PERSON_TARGET_RE = /(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人|一个(?:成员|群成员|机器人|参与者|玩家|用户|人)|一位(?:成员|群成员|机器人|参与者|玩家|用户|人)|某个(?:成员|群成员|机器人|参与者|玩家|用户|人))/iu;
+const FEISHU_BARE_AT_TARGET_RE = /(?:^|[\s([{（【,，.。!！?？~～:：;；])@([^\s@,，.。!！?？~～:：;；<>\])）】]{1,64})(?=$|[\s,，.。!！?？~～:：;；<>\])）】])/gu;
+const FEISHU_BARE_AT_BOUNDARY_CLASS = '[\\s([{（【,，.。!！?？~～:：;；]';
+const FEISHU_BARE_AT_END_BOUNDARY_CLASS = '[\\s,，.。!！?？~～:：;；<>\\])）】]';
+const FEISHU_EXPLICIT_MENTION_TARGET_TOKEN = '[@＠]?[\\p{L}\\p{N}_.$·-]{1,64}?';
+const FEISHU_EXPLICIT_MENTION_TARGET_STOP = '(?=$|[\\s,，.。!！?？~～:：;；、<>\\])）】]|一下|下|一声|看看|看一下|回复|回答|处理|打(?:个)?招呼|问候|致意|说话|发言|吗|呢|吧|啊|呀|哈|哦|噢)';
+const FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE = /(?:让|叫|喊|通知|请|麻烦|要)(?:他|她|它|ta|TA|对方|其|那个人|这个人|该成员)|(?:跟|和)(?:你|我|他|她|它|ta|TA|对方)|(?:去|来|帮|帮忙|帮我)(?:看|看看|处理|回复|聊|聊天|说|问|确认|查|检查|修|改|做|发|转发)/iu;
+const FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE = new RegExp(
+  `(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)\\s*(?:一下|下|一声|一下子|给|把|请|麻烦)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})${FEISHU_EXPLICIT_MENTION_TARGET_STOP}`,
+  'giu',
+);
+const FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE = new RegExp(
+  `(?:把|给)\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:艾特|\\bat\\b|mention|提到|点名|通知|叫|喊)(?:一下|下|一声)?`,
+  'giu',
+);
+const FEISHU_THIRD_PARTY_SPEAK_TARGET_RE = new RegExp(
+  `(?:让|叫|喊|请|找|通知|麻烦)\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:出来\\s*)?(?:说话|发言|回复|回应|回(?:复)?一下|吱一声|看(?:一)?下|处理(?:一)?下)`,
+  'giu',
+);
+const FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE = new RegExp(
+  `^(?:让|叫|喊|请|找|通知|麻烦)\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})\\s*(?:出来\\s*)?(?:说话|发言|回复|回应|回(?:复)?一下|吱一声|看(?:一)?下|处理(?:一)?下)`,
+  'iu',
+);
+const FEISHU_PLACEHOLDER_MENTION_TEXT_RE = /(^|[^\p{L}\p{N}_])@?_user_\d+(?=$|[^\p{L}\p{N}_])/giu;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeFeishuMentionActionSyntax(text: string): string {
+  return (text || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(FEISHU_COMPACT_LATIN_AT_ACTION_RE, '艾特');
+}
+
+/** 只归一化字段拼写；是否可信仍必须与当前回合原生 evidence 求交集。 */
+export function readFeishuMentionIds(raw: Record<string, unknown>): string[] {
+  const ids = new Set<string>();
+  for (const field of FEISHU_MENTION_ID_FIELDS) {
+    const value = raw[field];
+    if (typeof value === 'string' && value.trim()) ids.add(value.trim());
+  }
+  return [...ids];
+}
+
+export function readFeishuMentionId(raw: Record<string, unknown>): string {
+  return readFeishuMentionIds(raw)[0] || '';
+}
+
+export function normalizeFeishuMentionTargetKey(target: string): string {
+  return (target || '').normalize('NFKC').replace(/^[@＠]+/u, '').replace(/\s+/g, '').trim().toLocaleLowerCase();
+}
+
+export function isFeishuPlaceholderMentionTarget(target: string): boolean {
+  return /^_user_\d+$/iu.test(normalizeFeishuMentionTargetKey(target));
+}
+
+export function parseEnvelopeMentions(rawMentions: unknown): OutboundMention[] | undefined {
+  if (!Array.isArray(rawMentions)) return undefined;
+  const mentions: OutboundMention[] = [];
+  for (const item of rawMentions) {
+    if (!item || typeof item !== 'object') continue;
+    const raw = item as Record<string, unknown>;
+    const userId = readFeishuMentionId(raw);
+    const name = typeof raw.name === 'string'
+      ? raw.name.trim()
+      : typeof raw.user_name === 'string'
+        ? raw.user_name.trim()
+        : '';
+    const atAll = raw.atAll === true || raw.at_all === true;
+    if (!atAll && (isFeishuPlaceholderMentionTarget(userId) || isFeishuPlaceholderMentionTarget(name))) continue;
+    if (!atAll && !userId) continue;
+    mentions.push({
+      ...(userId ? { userId } : {}),
+      ...(name ? { name } : {}),
+      ...(atAll ? { atAll: true } : {}),
+    });
+  }
+  return mentions.length > 0 ? mentions : undefined;
+}
+
+/**
+ * 官方模型可能把 `cti-final.mentions` 输出为显示名字符串或仅含 name 的对象。
+ * 这些值只能作为“希望艾特谁”的名称提示，不能直接提升为平台身份；后续仍需
+ * 与当前消息意图、bot sender evidence 和当前群官方成员列表求交集。
+ */
+export function parseEnvelopeMentionTargets(rawMentions: unknown): string[] | undefined {
+  if (!Array.isArray(rawMentions)) return undefined;
+  const targets = new Map<string, string>();
+  for (const item of rawMentions) {
+    const name = typeof item === 'string'
+      ? item.trim()
+      : item && typeof item === 'object'
+        ? typeof (item as Record<string, unknown>).name === 'string'
+          ? ((item as Record<string, unknown>).name as string).trim()
+          : typeof (item as Record<string, unknown>).user_name === 'string'
+            ? ((item as Record<string, unknown>).user_name as string).trim()
+            : ''
+        : '';
+    const cleaned = cleanExplicitFeishuMentionTarget(name);
+    const key = normalizeFeishuMentionTargetKey(cleaned);
+    if (!cleaned || !key || isFeishuPlaceholderMentionTarget(cleaned)) continue;
+    targets.set(key, cleaned);
+  }
+  return targets.size > 0 ? [...targets.values()] : undefined;
+}
+
+export function hasStructuredMentions(mentions: OutboundMention[] | undefined): boolean {
+  return Array.isArray(mentions) && mentions.some((mention) => mention?.atAll || !!mention?.userId?.trim());
+}
+
+function getFeishuMentionInvocationAliases(options: FeishuMentionIntentOptions = {}): string[] {
+  const seen = new Set<string>();
+  const aliases: string[] = [];
+  for (const alias of options.invocationAliases || []) {
+    const normalized = (alias || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const key = normalizeFeishuMentionTargetKey(normalized);
+    if (!normalized || !key || seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(normalized);
+  }
+  return aliases.sort((a, b) => normalizeFeishuMentionTargetKey(b).length - normalizeFeishuMentionTargetKey(a).length);
+}
+
+function stripLeadingFeishuMentionInvocation(text: string, options: FeishuMentionIntentOptions = {}): string {
+  const compact = normalizeFeishuMentionActionSyntax(text).replace(/\s+/g, '').trim();
+  if (!compact) return compact;
+  const lowerCompact = compact.toLocaleLowerCase();
+  for (const alias of getFeishuMentionInvocationAliases(options)) {
+    const aliasKey = normalizeFeishuMentionTargetKey(alias);
+    if (!aliasKey || !lowerCompact.startsWith(aliasKey)) continue;
+    const rest = compact.slice(aliasKey.length).replace(/^[,，、:：]+/u, '');
+    if (/^(?:请|帮我|帮忙|麻烦|劳驾|直接|去|先|再|立即|马上|现在|艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊|让|找)/iu.test(rest)) return rest;
+  }
+  return compact;
+}
+
+function hasFeishuDirectInvocationPrefix(compact: string, options: FeishuMentionIntentOptions = {}): boolean {
+  if (/^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)/iu.test(compact)) return true;
+  return stripLeadingFeishuMentionInvocation(compact, options) !== compact;
+}
+
+function isFeishuMentionDeliveryDiagnosticText(userText: string): boolean {
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '');
+  if (!compact || !/(?:艾特|@|＠|\bat\b|mention|提到|点名)/iu.test(compact)) return false;
+  const startsWithCurrentMentionCommand = /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:艾特|@|＠|\bat\b|mention|提到|点名|叫|喊)/iu.test(compact);
+  const hasPlatformDeliveryDiagnosticSignal = /(?:技术诊断|事件管线|事件订阅|事件回调|回调事件|长连接|webhook|入站|路由规则|消息投递|通知投递|投递失败|未投递|未送达|没送进来|未送进来|群内@|群里@|群聊@|@通知|艾特通知)/iu.test(compact);
+  if (startsWithCurrentMentionCommand && !hasPlatformDeliveryDiagnosticSignal) return false;
+  return /(?:没收到|收不到|没有收到|未收到|没看见|看不见|没触发|未触发|触发不了|没进来|未进来|没送进来|未送进来|未送达|没送达|未投递|投递失败).{0,32}(?:群内|群里|群聊|@|＠|艾特|at|mention|提到|点名|通知|事件|回调|入站|路由)/iu.test(compact)
+    || /(?:群内|群里|群聊|@|＠|艾特|at|mention|提到|点名|通知|事件|回调|入站|路由).{0,32}(?:没收到|收不到|没有收到|未收到|没看见|看不见|没触发|未触发|触发不了|没进来|未进来|没送进来|未送进来|未送达|没送达|未投递|投递失败)/iu.test(compact)
+    || /(?:事件管线|事件订阅|事件回调|回调事件|长连接|webhook|入站|路由规则|消息投递|通知投递).{0,32}(?:没有|未|没|缺少|未开|没开|未配置|没配置|没触发|未触发|没进来|未进来|没送进来|未送进来)/iu.test(compact)
+    || /(?:没有|未|没|缺少|未开|没开|未配置|没配置|没触发|未触发|没进来|未进来|没送进来|未送进来).{0,32}(?:事件管线|事件订阅|事件回调|回调事件|长连接|webhook|入站|路由规则|消息投递|通知投递)/iu.test(compact)
+    || /(?:技术诊断|诊断|原因|排查).{0,32}(?:群内|群里|群聊|@|＠|艾特|at|mention|提到|点名|通知|事件|回调|入站|投递)/iu.test(compact);
+}
+
+function isFeishuMentionHowToOrDiagnosticRequest(userText: string): boolean {
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '');
+  if (!compact) return false;
+  return /(?:怎么|如何|怎样|咋|教(?:一教|一下)?|教程|方法|做到).{0,32}(?:艾特|@|＠|at|mention|提到|点名)/iu.test(compact)
+    || /(?:艾特|@|＠|at|mention|提到|点名).{0,32}(?:怎么|如何|怎样|为什么|为啥|不行|不能|失败|没反应|不回复|教程|方法)/iu.test(compact)
+    || /(?:不能|不行|失败|没反应|不回复).{0,24}(?:艾特|@|＠|at|mention|提到|点名)/iu.test(compact)
+    || isFeishuMentionDeliveryDiagnosticText(compact);
+}
+
+function splitFeishuMentionIntentClauses(text: string): string[] {
+  return normalizeFeishuMentionActionSyntax(text)
+    .split(/[\r\n。！？!?；;]+/u)
+    .flatMap((part) => part.split(/(?<=[，,、])\s*/u))
+    .map((part) => part.replace(/^[，,、\s]+|[，,、\s]+$/gu, '').trim())
+    .filter(Boolean);
+}
+
+function isFeishuNarrativeMentionClause(clause: string, options: FeishuMentionIntentOptions = {}): boolean {
+  const compact = normalizeFeishuMentionActionSyntax(clause).replace(/\s+/g, '');
+  if (!compact || !FEISHU_MENTION_ACTION_RE.test(compact)) return false;
+  FEISHU_MENTION_ACTION_RE.lastIndex = 0;
+  if (/^(?:当|等|等待|直到|如果|若|每当|轮到|之后|然后|接下来|随后|后面|这时|此时|按顺序|依次|轮流)/u.test(compact)) return true;
+  if (/(?:我(?:会|将|再|来|要|准备)|我们(?:会|将|再|来|要)|[\p{L}\p{N}_]{1,12}(?:人|者|员|官|方|角色)|玩家|参与者|成员|用户|大家|所有人).{0,16}(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(compact)
+    && !hasFeishuDirectInvocationPrefix(compact, options)) return true;
+  return /(?:规则|流程|步骤|玩法|说明|要求|必须|需要|等待|按顺序|依次|轮流|继续).{0,24}(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(compact)
+    && /(?:一个|一位|一名|某个|任意|随机|另一个|另一位|下一个|上一个|你们|他们|她们|大家|所有人|参与者|玩家|成员|机器人|用户)/iu.test(compact);
+}
+
+function isFeishuDirectMentionExecutionClause(clause: string, options: FeishuMentionIntentOptions = {}): boolean {
+  const compact = normalizeFeishuMentionActionSyntax(clause).replace(/\s+/g, '');
+  if (!compact) return false;
+  const directCompact = stripLeadingFeishuMentionInvocation(compact, options);
+  if (FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact) && !isFeishuNarrativeMentionClause(clause, options)) return true;
+  if (/^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot)?(?:把|给)(?:他|她|它|ta|TA|对方|那个人|这个人)(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)) return true;
+  if (!FEISHU_MENTION_ACTION_RE.test(compact)) return false;
+  FEISHU_MENTION_ACTION_RE.lastIndex = 0;
+  if (isFeishuNarrativeMentionClause(clause, options)) return false;
+  if (/^(?:重发|补发|重新发送|再发(?:一次)?)(?:一下)?(?:并|后|然后)?(?:请|麻烦)?(?:艾特|@|＠|\bat\b|mention|点名|通知)/iu.test(directCompact)) return true;
+  return /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot|直接|去)?(?:先|再|立即|马上|现在)?(?:艾特|@|＠|\bat\b|mention|提到|点名|通知|叫|喊)/iu.test(directCompact)
+    || FEISHU_LEADING_THIRD_PARTY_SPEAK_TARGET_RE.test(directCompact)
+    || /^(?:请|帮我|帮忙|麻烦|劳驾|你|机器人|bot).{0,16}(?:另一个人|另个人|别人|其他人|其他成员|群里的人|某个人|随便一个人|一个(?:成员|群成员|机器人|参与者|玩家|用户|人)|一位(?:成员|群成员|机器人|参与者|玩家|用户|人)|某个(?:成员|群成员|机器人|参与者|玩家|用户|人))/iu.test(directCompact);
+}
+
+export function extractFeishuOrchestratedStarterTargets(userText: string): string[] {
+  const normalized = normalizeFeishuMentionActionSyntax(userText).trim();
+  if (!normalized) return [];
+  const compact = normalized.replace(/\s+/g, '');
+  // “每次要 @ 某人”通常只是流程说明；只有用户同时要求现在开局，并把该人
+  // 指定为首位参与者/回答者时，开局回复才需要立即执行这次 mention。
+  // 参与者自己的局部否定（如“乔治第一轮不要 at”）不能扩大成整轮禁令，
+  // 否则会把另一位明确先手的当前动作一并抹掉。
+  const suppressesSessionStart = /(?:先不要|暂不|暂时不|不要|别|无需|不用).{0,16}(?:开始|开局|执行|进行|发起)/iu.test(compact);
+  const suppressesCurrentMention = /(?:^|[，,。！？!?；;])(?:现在|当前|这轮|本轮|第一轮)?(?:先不要|暂不|暂时不|不要|别|无需|不用).{0,16}(?:艾特|@|＠|mention)/iu.test(compact);
+  if (suppressesSessionStart || suppressesCurrentMention) {
+    return [];
+  }
+  const directlyStartsInteraction = /(?:你们(?:俩|两个|几位)?|两位|双方|机器人们?).{0,24}(?:开始|开辩|辩论|讨论|对话|轮流|互相)/u.test(compact)
+    || /(?:开始|开辩|辩论|讨论|对话).{0,24}(?:你们(?:俩|两个|几位)?|两位|双方|机器人们?)/u.test(compact);
+  const immediatelyStartsSession = directlyStartsInteraction
+    || /(?:来|开|开始|启动|发起)(?:一|这)?(?:局|轮|场|次|个)/u.test(compact)
+    || /(?:现在|立即|马上)(?:开始|开局|启动|发起|进行)/u.test(compact);
+  const repeatedMentionHandoff = /(?:每次|每轮|每回合|发言完|说完|回复完|观点后|结束前).{0,48}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  const mandatoryMentionHandoff = /(?:必须|需要|要|务必|记得|都得|都要|应当|应该).{0,24}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  const requiresMentionHandoff = repeatedMentionHandoff || mandatoryMentionHandoff;
+
+  const targets = new Map<string, string>();
+  if (directlyStartsInteraction && requiresMentionHandoff) {
+    const starterPattern = new RegExp(
+      `(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})(?:先开始|先手|先发言|先说|先来|第一个(?:开始|发言|说))`,
+      'giu',
+    );
+    for (const match of normalized.matchAll(starterPattern)) {
+      const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+      const key = normalizeFeishuMentionTargetKey(target);
+      if (target && key && !isFeishuAmbiguousPronounTarget(target)) targets.set(key, target);
+    }
+  }
+
+  if (immediatelyStartsSession) {
+    const repeatedNamedTargetPattern = new RegExp(
+      `(?:每次|每轮|每回合|开局时|开始时).{0,24}?(?:艾特|@|＠|\\bat\\b|mention|点名|通知)\\s*(?:一下|下|一声|给|把|请)?\\s*(${FEISHU_EXPLICIT_MENTION_TARGET_TOKEN})${FEISHU_EXPLICIT_MENTION_TARGET_STOP}`,
+      'giu',
+    );
+    for (const match of normalized.matchAll(repeatedNamedTargetPattern)) {
+      const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+      const key = normalizeFeishuMentionTargetKey(target);
+      if (!target || !key || isFeishuAmbiguousPronounTarget(target)) continue;
+      const safeTarget = escapeRegExp(target.replace(/\s+/g, ''));
+      const assignedParticipant = new RegExp(
+        `(?:让|叫|请|由)?${safeTarget}(?:来|负责|先)?(?:回答|答题|发言|回复|回应|接话|提问|猜|判断|参与|先手|开始)|(?:回答者|答题者|参与者|玩家|首位)(?:是|由)?${safeTarget}`,
+        'iu',
+      ).test(compact);
+      if (assignedParticipant) targets.set(key, target);
+    }
+  }
+  return [...targets.values()];
+}
+
+/** 只识别当前轮次的“发言后交接给对方”语义，具体人物由平台身份策略解析。 */
+export function hasFeishuCounterpartyMentionHandoff(userText: string): boolean {
+  const compact = normalizeFeishuMentionActionSyntax(userText).replace(/\s+/g, '').trim();
+  if (!compact) return false;
+  const repeatedMentionHandoff = /(?:每次|每轮|每回合|发言完|说完|回复完|观点后|结束前).{0,48}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  const mandatoryMentionHandoff = /(?:必须|需要|要|务必|记得|都得|都要|应当|应该).{0,24}(?:艾特|@|＠|\bat\b|mention|点名|通知).{0,24}(?:对方|另一方|另一个|下一位|下一个|彼此|互相)/iu.test(compact);
+  return repeatedMentionHandoff || mandatoryMentionHandoff;
+}
+
+function isFeishuTaskSchedulingContext(userText: string): boolean {
+  const normalized = (userText || '').normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  return Boolean(normalized) && hasTaskSchedulingIntent(normalized) && hasSchedulingTimeHint(normalized);
+}
+
+export function isFeishuMentionExecutionRequest(userText: string, options: FeishuMentionIntentOptions = {}): boolean {
+  if (isFeishuTaskSchedulingContext(userText) || isFeishuMentionHowToOrDiagnosticRequest(userText)) return false;
+  return extractFeishuOrchestratedStarterTargets(userText).length > 0
+    || splitFeishuMentionIntentClauses(userText).some((clause) => isFeishuDirectMentionExecutionClause(clause, options));
+}
+
+function isFeishuAmbiguousPronounTarget(target: string): boolean {
+  return /^(?:我|你|他|她|它|ta|TA|对方|那个人|这个人)$/u.test(target.trim());
+}
+
+/**
+ * 群体称呼描述的是要对谁说话，不是飞书可解析的单一成员身份。
+ *
+ * 这里故意只拒绝带有明确集合语义的称呼；“群里的小明”仍会在后续清洗为
+ * “小明”，以便走同群成员唯一校验。这样不会把某个固定群、昵称或话术写成
+ * 特例，同时也不会把自然的群体问候误送成原生 @all 或成员查询。
+ */
+export function isFeishuGroupAudienceTarget(target: string): boolean {
+  const cleaned = (target || '')
+    .normalize('NFKC')
+    .replace(/^[@＠]+/u, '')
+    .replace(/\s+/gu, '')
+    .trim();
+  if (!cleaned) return false;
+  if (/^(?:大家|各位|所有人|全体|全员|群友(?:们)?|群成员(?:们)?|群里(?:的)?人|群内(?:的)?人|朋友(?:们)?|伙伴(?:们)?|同学(?:们)?|老师(?:们)?|大哥大姐|哥哥姐姐|兄弟姐妹)$/u.test(cleaned)) {
+    return true;
+  }
+  const groupPrefix = /^(?:(?:本|这|当前)?(?:群|群聊)(?:里|内)?(?:的)?|(?:各位|全体|所有|在场|在座)(?:的)?)(.+)$/u.exec(cleaned);
+  if (!groupPrefix) return false;
+  return /^(?:大家|人|成员(?:们)?|群成员(?:们)?|朋友(?:们)?|群友(?:们)?|伙伴(?:们)?|同学(?:们)?|老师(?:们)?|大哥大姐|哥哥姐姐|兄弟姐妹|(?:飞书)?(?:机器人|智能体|agent|bot)(?:们)?)$/iu.test(groupPrefix[1] || '');
+}
+
+function isFeishuGenericMentionTarget(target: string): boolean {
+  const cleaned = (target || '').normalize('NFKC').replace(/^[@＠]+/u, '').replace(/\s+/g, '').trim();
+  if (!cleaned || isNonAddressableMentionTarget(cleaned)) return true;
+  if (isFeishuGroupAudienceTarget(cleaned)) return true;
+  if (/^(?:我|你|您|他|她|它|ta|TA|对方|那个人|这个人|你们|我们|他们|她们|它们|大家|所有人|全体|某人|别人|其他人|其他成员|群里的人|群成员)$/u.test(cleaned)) return true;
+  if (/^(?:一个|一位|一名|某个|某位|某名|任意|随机|另一个|另一位|另一名|下一个|上一个|那位|这位|对应的|胜出的|当前|相关).{0,24}$/u.test(cleaned)) return true;
+  if (/^(?:我|你|您|他|她|它|ta|TA|自己|本(?:人|机|机器人)|这(?:个|位)?(?:机器人|智能体|agent|bot)?|该(?:机器人|智能体|agent|bot)?)(?:自己)?(?:的)?(?:主人|主子|开发者|作者|创建者|维护者|管理员|负责人|老板|owner|creator|developer|maintainer|admin|娘|妈妈|妈|爸爸|爸)$/iu.test(cleaned)) return true;
+  return /^(?:人|成员|群成员|机器人|bot|智能体|应用|玩家|参与者|用户|主持人|发起人|组织者|出题人|出题官)$/iu.test(cleaned);
+}
+
+function cleanExplicitFeishuMentionTarget(target: string): string {
+  let cleaned = target.normalize('NFKC').replace(/^[@＠]+/, '').replace(/[<>"'`]/g, '').trim()
+    .replace(/^(?:一下|下|一声|一下子|给|把|请|麻烦|帮我|帮忙)+/u, '');
+  // 先在保留“群里/各位”等集合语义的状态下裁决，避免后面的地点前缀清洗把
+  // “群里的大哥大姐”错误缩成貌似单人的“大哥大姐”。
+  if (isFeishuGroupAudienceTarget(cleaned)) return '';
+  cleaned = cleaned
+    // “群里的小明”仍可解析小明；但群体位置本身不是可 @ 的成员名称。
+    .replace(/^(?:(?:本|这|当前)?(?:群|群聊)(?:里|内)?(?:的)?)/u, '')
+    .replace(/(?:一下|下|一声|看看|看一下|回复(?:一下)?|回答(?:一下)?|处理一下|吧|呀|呢|吗|啊|哈|哦|噢)$/u, '')
+    .replace(/(?:这个|那个|该|对应的)?(?:机器人|智能体|agent|bot|应用)(?:人)?(?:的)?$/iu, '')
+    .trim();
+  if (isFeishuGroupAudienceTarget(cleaned)) return '';
+  if (/^(?:一|一下|下|一声|一下子)$/u.test(cleaned)) return '';
+  const followup = FEISHU_EXPLICIT_MENTION_TARGET_FOLLOWUP_RE.exec(cleaned);
+  if (followup) cleaned = cleaned.slice(0, followup.index).trim();
+  if (!cleaned || FEISHU_OTHER_PERSON_TARGET_RE.test(cleaned) || isFeishuGenericMentionTarget(cleaned)) return '';
+  // 回复引用会被统一还原为“请处理我在本条…回复或引用的消息”。这类
+  // 任务短语不能因为同时含有“请/回复”而被贪婪正则伪装成成员名；同样
+  // 不把由动作动词开头的片段提升为可投递的人员目标。
+  if (/^(?:处理|回复|回应|答复|回答|查看|检查|修复|解决|执行|跟进|安排|通知|联系|协助|帮忙)(?:我|你|他|她|它|ta|TA|在|的|本|这|该|当前|刚才|一下|消息|话题|引用)/iu.test(cleaned)) return '';
+  if (/(?:本条|这条|该条|当前消息|引用的消息|回复或引用|飞书话题)/u.test(cleaned)) return '';
+  if (/^(?:谁|他|她|它|ta|TA|对方|那个人|这个人|某人)$/u.test(cleaned)) return '';
+  return cleaned;
+}
+
+export function extractBareFeishuAtTargets(text: string): string[] {
+  const targets: string[] = [];
+  FEISHU_BARE_AT_TARGET_RE.lastIndex = 0;
+  for (const match of (text || '').matchAll(FEISHU_BARE_AT_TARGET_RE)) {
+    const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+    if (target) targets.push(target);
+  }
+  return targets;
+}
+
+export function replaceBareFeishuAtTarget(text: string, target: string, replacementName: string): string {
+  const safeTarget = escapeRegExp(target);
+  const pattern = new RegExp(`(^|${FEISHU_BARE_AT_BOUNDARY_CLASS})@${safeTarget}(?=$|${FEISHU_BARE_AT_END_BOUNDARY_CLASS})`, 'giu');
+  return text.replace(pattern, (_match, prefix: string) => `${prefix}@${replacementName}`);
+}
+
+export function stripBareFeishuAtTarget(text: string, target: string): string {
+  const safeTarget = escapeRegExp(target);
+  const pattern = new RegExp(`(^|${FEISHU_BARE_AT_BOUNDARY_CLASS})@${safeTarget}(?=$|${FEISHU_BARE_AT_END_BOUNDARY_CLASS})`, 'giu');
+  return text.replace(pattern, (_match, prefix: string) => `${prefix}${target}`);
+}
+
+export function extractExplicitFeishuMentionTargetsFromRequest(
+  userText: string,
+  options: FeishuMentionIntentOptions = {},
+): string[] {
+  const normalized = normalizeFeishuMentionActionSyntax(userText).trim();
+  if (!isFeishuMentionExecutionRequest(normalized, options)) return [];
+  const targets = new Map<string, string>();
+  const addTarget = (target: string) => {
+    const cleaned = cleanExplicitFeishuMentionTarget(target);
+    if (cleaned) targets.set(cleaned.replace(/\s+/g, '').toLocaleLowerCase(), cleaned);
+  };
+  for (const target of extractFeishuOrchestratedStarterTargets(normalized)) addTarget(target);
+  for (const target of extractBareFeishuAtTargets(normalized)) addTarget(target);
+  FEISHU_THIRD_PARTY_SPEAK_TARGET_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_THIRD_PARTY_SPEAK_TARGET_RE)) {
+    const target = cleanExplicitFeishuMentionTarget(match[1] || '');
+    if (target && !isFeishuAmbiguousPronounTarget(target)) addTarget(target);
+  }
+  FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_EXPLICIT_MENTION_AFTER_VERB_RE)) addTarget(match[1] || '');
+  FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE.lastIndex = 0;
+  for (const match of normalized.matchAll(FEISHU_EXPLICIT_MENTION_BEFORE_VERB_RE)) addTarget(match[1] || '');
+  return [...targets.values()];
+}
+
+export function stripFeishuPlaceholderMentionText(text: string): string {
+  if (!text || !/@?_user_\d+/iu.test(text)) return text;
+  return text.replace(FEISHU_PLACEHOLDER_MENTION_TEXT_RE, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]+(\r?\n)/g, '$1')
+    .replace(/[ \t]+([,，。！？!?;；:：])/gu, '$1')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+}
+
+export function stripFeishuGenericBareMentionText(text: string): string {
+  if (!text || !/[@＠]/u.test(text)) return text;
+  FEISHU_BARE_AT_TARGET_RE.lastIndex = 0;
+  return text.replace(FEISHU_BARE_AT_TARGET_RE, (match, target: string) => {
+    const rawTarget = (target || '').trim();
+    if (!rawTarget || isFeishuPlaceholderMentionTarget(rawTarget)) return match;
+    return cleanExplicitFeishuMentionTarget(rawTarget) ? match : match.replace(/[@＠]/u, '');
+  });
+}
+
+export function needsExplicitFeishuMentionTarget(userText: string, options: FeishuMentionIntentOptions = {}): boolean {
+  return isFeishuMentionExecutionRequest(userText, options) && FEISHU_OTHER_PERSON_TARGET_RE.test(userText);
+}

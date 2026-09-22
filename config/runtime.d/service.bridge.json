@@ -1,0 +1,12 @@
+{
+  "id": "service.bridge",
+  "displayName": "飞书桥接",
+  "kind": "service",
+  "category": "bridge",
+  "enabled": true,
+  "installState": "installed",
+  "source": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
+  "cwd": "${USERPROFILE}\\.codex\\skills\\claude-to-im",
+  "version": "",
+  "description": "负责 Feishu / Codex / 本地执行链路的主桥接服务。"
+}

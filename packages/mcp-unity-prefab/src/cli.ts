@@ -15,6 +15,7 @@ interface ParsedArgs {
   command: Command;
   folderPath: string;
   outputPath?: string;
+  artifactRoot?: string;
   forceRefresh: boolean;
   pageSize?: number;
   columns?: number;
@@ -24,9 +25,11 @@ function printHelp(): void {
   console.log(`
 MCP-for-Unity-Prefab CLI
 
+Relative or default output paths require --artifact-root or CTI_ARTIFACT_ROOT.
+
 Usage:
   npm run cli -- prefab-scan --folder Assets/Prefabs [--page-size 100] [--force-refresh]
-  npm run cli -- prefab-annotate --folder Assets/Prefabs [--output output/prefabs.png] [--columns 4] [--page-size 100] [--force-refresh]
+  npm run cli -- prefab-annotate --folder Assets/Prefabs [--output output/prefabs.png] [--artifact-root <dir>] [--columns 4] [--page-size 100] [--force-refresh]
   npm run cli -- prefab-recall --folder Assets/Prefabs
 `.trim());
 }
@@ -69,6 +72,7 @@ function parseArgs(argv: string[]): ParsedArgs | { error: string } {
     command: commandRaw as Command,
     folderPath,
     outputPath: args.get("output")?.trim(),
+    artifactRoot: args.get("artifact-root")?.trim() || process.env.CTI_ARTIFACT_ROOT?.trim(),
     forceRefresh: parseBooleanFlag(args.get("force-refresh")),
     pageSize: parsePositiveInt(args.get("page-size")),
     columns: parsePositiveInt(args.get("columns")),
@@ -118,6 +122,7 @@ async function main(): Promise<void> {
   const result = await annotateUnityPrefabFolder(cfg, {
     folder_path: parsed.folderPath,
     output_path: parsed.outputPath,
+    artifact_root: parsed.artifactRoot,
     columns: parsed.columns,
     page_size: parsed.pageSize,
     force_refresh: parsed.forceRefresh,

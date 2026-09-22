@@ -1,0 +1,12 @@
+{
+  "id": "tool.aibridge",
+  "displayName": "Unity AIBridge",
+  "kind": "tool",
+  "category": "unity-editor",
+  "enabled": true,
+  "installState": "project-managed",
+  "source": "project-registry",
+  "cwd": "${CTI_PROJECT_REGISTRY_PATH}",
+  "version": "",
+  "description": "通过项目注册表发现 Unity 工程内的 AIBridge CLI；与 Unity MCP 独立，可单独检查和打开工程入口。"
+}

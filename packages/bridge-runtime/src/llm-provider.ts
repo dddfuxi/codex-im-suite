@@ -9,7 +9,11 @@ import fs from 'node:fs';
 import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
-import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
+import { formatPriorityTurnContext, type LLMProvider, type StreamChatParams, type FileAttachment } from 'claude-to-im/host';
+import {
+  buildProviderInputEvidenceReceipt,
+  type ProviderInputEvidenceReceipt,
+} from 'claude-to-im/evidence';
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
@@ -352,6 +356,14 @@ const SUPPORTED_IMAGE_TYPES = new Set<string>([
   'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
 ]);
 
+function getSupportedClaudeImageFiles(files?: FileAttachment[]): FileAttachment[] {
+  return files?.filter((file) => SUPPORTED_IMAGE_TYPES.has(file.type)) || [];
+}
+
+export function buildClaudeInputEvidenceReceipt(files?: FileAttachment[]): ProviderInputEvidenceReceipt | undefined {
+  return buildProviderInputEvidenceReceipt(getSupportedClaudeImageFiles(files), 'claude', ['image']) || undefined;
+}
+
 /**
  * Build a prompt for query(). When files are present, returns an async
  * iterable that yields a single SDKUserMessage with multi-modal content
@@ -361,8 +373,8 @@ function buildPrompt(
   text: string,
   files?: FileAttachment[],
 ): string | AsyncIterable<{ type: 'user'; message: { role: 'user'; content: unknown[] }; parent_tool_use_id: null; session_id: string }> {
-  const imageFiles = files?.filter(f => SUPPORTED_IMAGE_TYPES.has(f.type));
-  if (!imageFiles || imageFiles.length === 0) return text;
+  const imageFiles = getSupportedClaudeImageFiles(files);
+  if (imageFiles.length === 0) return text;
 
   const contentBlocks: unknown[] = [];
 
@@ -417,6 +429,20 @@ export interface StreamState {
    * as assistant text but were followed by a CLI crash.
    */
   lastAssistantText: string;
+  /** Structured attachment receipt emitted only after the provider initializes the turn. */
+  inputEvidenceReceipt?: ProviderInputEvidenceReceipt | null;
+  inputEvidenceReceiptEmitted?: boolean;
+}
+
+/** Claude Agent SDK 的分类器模式：只允许单轮模型输出，不暴露任何工具或工作区。 */
+export function buildClassifierClaudeQueryPolicy(): Record<string, unknown> {
+  return {
+    allowedTools: [],
+    permissionMode: 'plan',
+    cwd: undefined,
+    resume: undefined,
+    maxTurns: 1,
+  };
 }
 
 export class SDKLLMProvider implements LLMProvider {
@@ -443,6 +469,8 @@ export class SDKLLMProvider implements LLMProvider {
 
           try {
             const cleanEnv = buildSubprocessEnv();
+            const classifierMode = params.interactionMode === 'classifier';
+            const restrictedMode = classifierMode || params.interactionMode === 'response_only';
 
             // Cross-runtime migration safety: drop non-Claude model names
             // that may linger in session data from a previous Codex runtime.
@@ -462,13 +490,16 @@ export class SDKLLMProvider implements LLMProvider {
             }
 
             const queryOptions: Record<string, unknown> = {
-              cwd: params.workingDirectory,
+              cwd: restrictedMode ? undefined : params.workingDirectory,
               model,
-              resume: params.sdkSessionId || undefined,
+              resume: restrictedMode ? undefined : params.sdkSessionId || undefined,
               abortController: params.abortController,
-              permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
+              permissionMode: restrictedMode
+                ? 'plan'
+                : (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
+              ...(restrictedMode ? buildClassifierClaudeQueryPolicy() : {}),
               stderr: (data: string) => {
                 stderrBuf += data;
                 if (stderrBuf.length > MAX_STDERR) {
@@ -480,6 +511,12 @@ export class SDKLLMProvider implements LLMProvider {
                   input: Record<string, unknown>,
                   opts: { toolUseID: string; suggestions?: string[] },
                 ): Promise<PermissionResult> => {
+                  if (restrictedMode) {
+                    return {
+                      behavior: 'deny' as const,
+                      message: 'Restricted response turns cannot use tools.',
+                    };
+                  }
                   // Auto-approve if configured (useful for channels without
                   // interactive permission UI, e.g. Feishu WebSocket mode)
                   if (autoApprove) {
@@ -512,7 +549,13 @@ export class SDKLLMProvider implements LLMProvider {
               queryOptions.pathToClaudeCodeExecutable = cliPath;
             }
 
-            const prompt = buildPrompt(params.prompt, params.files);
+            const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
+            const promptText = priorityTurnContext
+              ? [priorityTurnContext, `Current user request:\n${params.prompt}`].join('\n\n')
+              : params.prompt;
+            const prompt = buildPrompt(promptText, params.files);
+            const inputEvidenceReceipt = buildClaudeInputEvidenceReceipt(params.files);
+            state.inputEvidenceReceipt = inputEvidenceReceipt;
             const q = query({
               prompt: prompt as Parameters<typeof query>[0]['prompt'],
               options: queryOptions as Parameters<typeof query>[0]['options'],
@@ -706,12 +749,17 @@ export function handleMessage(
 
     case 'system': {
       if (msg.subtype === 'init') {
+        const inputEvidence = state.inputEvidenceReceipt && !state.inputEvidenceReceiptEmitted
+          ? state.inputEvidenceReceipt
+          : undefined;
         controller.enqueue(
           sseEvent('status', {
             session_id: msg.session_id,
             model: msg.model,
+            ...(inputEvidence ? { inputEvidence } : {}),
           }),
         );
+        if (inputEvidence) state.inputEvidenceReceiptEmitted = true;
       }
       break;
     }

@@ -2,6 +2,16 @@
   "id": "unityMCP",
   "displayName": "Unity MCP",
   "type": "http",
+  "version": "1.0.0",
+  "compatibility": {
+    "protocol": "extension-manifest/v1",
+    "suite": ">=0.2.0 <1.0.0"
+  },
+  "category": "mcp.game-engine",
+  "optional": true,
+  "installState": "external",
+  "source": "external:unity-editor-http-mcp",
+  "aliases": ["unity", "unity mcp", "unitymcp"],
   "enabled": true,
   "launcher": "${SUITE_ROOT}\\scripts\\launch-unity-mcp.ps1",
   "stopLauncher": "${SUITE_ROOT}\\scripts\\stop-unity-mcp.ps1",
@@ -11,8 +21,11 @@
     "CTI_UNITY_MCP_ENDPOINT": "http://127.0.0.1:8081/mcp"
   },
   "healthCheck": {
-    "kind": "http",
-    "url": "http://127.0.0.1:8081/mcp"
+    "kind": "mcp-http-resource",
+    "url": "http://127.0.0.1:8081/mcp",
+    "resourceUri": "mcpforunity://instances",
+    "successRegex": "\\\\?\"instance_count\\\\?\"\\s*:\\s*[1-9][0-9]*",
+    "failureRegex": "\\\\?\"instance_count\\\\?\"\\s*:\\s*0|Unity session not available|No Unity instance|unavailable"
   },
   "description": "Unity Editor HTTP MCP endpoint"
 }

@@ -22,6 +22,15 @@ import { escapeHtml } from './adapters/telegram-utils.js';
  */
 const recentPermissionForwards = new Map<string, number>();
 
+function serializePermissionToolInput(toolInput: Record<string, unknown>): string {
+  try {
+    const serialized = JSON.stringify(toolInput);
+    return serialized.length > 8000 ? serialized.slice(0, 8000) : serialized;
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Forward a permission request to an IM channel as an interactive message.
  */
@@ -126,6 +135,7 @@ export async function forwardPermissionRequest(
         chatId: address.chatId,
         messageId: result.messageId,
         toolName,
+        toolInputJson: serializePermissionToolInput(toolInput),
         suggestions: suggestions ? JSON.stringify(suggestions) : '',
       });
     } catch { /* best effort */ }

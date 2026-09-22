@@ -10,6 +10,6 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["src/lib/**/*.ts"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "src/__tests__", "src/lib/bridge/examples"]
 }

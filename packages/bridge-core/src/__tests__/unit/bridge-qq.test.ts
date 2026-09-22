@@ -112,7 +112,7 @@ describe('delivery-layer - qq chunking', () => {
   let store: MockStore;
 
   beforeEach(() => {
-    store = createMockStore();
+    store = createMockStore({ bridge_qq_owner_users: 'user-1' });
     setupContext(store);
   });
 
@@ -206,7 +206,7 @@ describe('permission-broker - qq text permissions', () => {
   let store: MockStore;
 
   beforeEach(() => {
-    store = createMockStore();
+    store = createMockStore({ bridge_qq_owner_users: 'user-1' });
     setupContext(store);
   });
 
@@ -627,7 +627,7 @@ describe('numeric shortcut permission replies', () => {
   let store: MockStore;
 
   beforeEach(() => {
-    store = createMockStore();
+    store = createMockStore({ bridge_qq_owner_users: 'user-1' });
     // Wire up a functional permission store for these tests
     store.getPermissionLink = (id: string) => {
       const link = store.permLinks.get(id);

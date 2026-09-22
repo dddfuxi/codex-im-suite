@@ -8,6 +8,7 @@
 import type { ChannelAddress, ChannelBinding, ChannelType } from './types.js';
 import { getBridgeContext } from './context.js';
 import { isPathWithinAllowedRoots, splitWorkspacePathList } from './security/validators.js';
+import { parseProjectRegistryDocument } from '@codex-im-suite/contracts';
 
 function getCurrentFingerprints(): { bridgeFingerprint: string; toolingFingerprint: string } {
   const { store } = getBridgeContext();
@@ -24,7 +25,41 @@ function getDefaultWorkingDirectory(): string {
 
 function getAllowedWorkspaceRoots(): string[] {
   const { store } = getBridgeContext();
-  return splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
+  const legacyRoots = splitWorkspacePathList(store.getSetting('bridge_allowed_workspace_roots'));
+  const registryJson = store.getSetting('bridge_project_registry_json');
+  if (!registryJson) return legacyRoots;
+
+  try {
+    const deniedRoots = splitWorkspacePathList(store.getSetting('bridge_project_denied_roots'));
+    const registeredRoots = parseProjectRegistryDocument(JSON.parse(registryJson), { deniedRoots })
+      .filter((project) => project.enabled)
+      .map((project) => project.workspaceRoot);
+    const seen = new Set<string>();
+
+    // 项目注册表是结构化工作区授权来源；旧 allowlist 仅作为兼容来源。
+    // 两者必须在会话路由层合并，否则按钮允许切换后，下一条消息会被旧
+    // allowlist 误判为越界并静默回退到默认工作区。
+    return [...legacyRoots, ...registeredRoots].filter((root) => {
+      const key = root.replace(/[\\/]+$/gu, '').toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  } catch (error) {
+    console.warn('[channel-router] Invalid registered workspace policy:', error instanceof Error ? error.message : error);
+    return legacyRoots;
+  }
+}
+
+function getSessionIdleFreshMs(): number {
+  const fallback = 12 * 60 * 60 * 1000;
+  return Math.max(5 * 60 * 1000, Number.parseInt(process.env.CTI_SESSION_IDLE_FRESH_MS || `${fallback}`, 10) || fallback);
+}
+
+function shouldRotateIdleBinding(existing: ChannelBinding): boolean {
+  const updatedAtMs = Date.parse(existing.updatedAt || '');
+  if (!Number.isFinite(updatedAtMs)) return false;
+  return (Date.now() - updatedAtMs) > getSessionIdleFreshMs();
 }
 
 function rebindToFreshSession(existing: ChannelBinding, workingDirectoryOverride?: string): ChannelBinding {
@@ -103,6 +138,9 @@ export function resolve(address: ChannelAddress): ChannelBinding {
   const { store } = getBridgeContext();
   const existing = store.getChannelBinding(address.channelType, address.chatId);
   if (existing) {
+    if (shouldRotateIdleBinding(existing)) {
+      return rebindToFreshSession(existing);
+    }
     const session = store.getSession(existing.codepilotSessionId);
     if (session) return refreshBindingForRuntimeChanges(enforceWorkspacePolicy(existing));
     return createBinding(address);

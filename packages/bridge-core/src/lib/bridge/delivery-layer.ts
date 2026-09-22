@@ -3,6 +3,8 @@
  * dedup, retry, error classification, and reference tracking.
  */
 
+import crypto from 'node:crypto';
+
 import type {
   ChannelType,
   ChannelAddress,
@@ -21,9 +23,18 @@ const BASE_DELAY_MS = 1000;
 const JITTER_MAX_MS = 500;
 /** Delay between sending multiple chunks to avoid rate limits. */
 const INTER_CHUNK_DELAY_MS = 300;
+const INTERNAL_MESSAGE_ID_SUFFIX_RE = /:(?:oauth-resume|oauth-callback)$/;
+const DEFAULT_RATE_LIMIT_MAX_MESSAGES = 20;
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_MESSAGES_SETTING = 'bridge_delivery_rate_limit_max_messages';
+const RATE_LIMIT_WINDOW_MS_SETTING = 'bridge_delivery_rate_limit_window_ms';
 
 /** Shared rate limiter instance (20 messages/minute per chat). */
-const rateLimiter = new ChatRateLimiter();
+let rateLimiter = new ChatRateLimiter({
+  maxMessages: DEFAULT_RATE_LIMIT_MAX_MESSAGES,
+  windowMs: DEFAULT_RATE_LIMIT_WINDOW_MS,
+});
+let rateLimiterConfigKey = `${DEFAULT_RATE_LIMIT_MAX_MESSAGES}:${DEFAULT_RATE_LIMIT_WINDOW_MS}`;
 
 // Periodically clean up idle rate limiter buckets (every 5 minutes).
 // unref() so the timer doesn't prevent Node.js process exit (e.g. in tests).
@@ -56,6 +67,29 @@ function chunkText(text: string, maxLength: number): string[] {
   }
 
   return chunks;
+}
+
+function platformReplyToMessageId(messageId: string | undefined): string | undefined {
+  return messageId?.replace(INTERNAL_MESSAGE_ID_SUFFIX_RE, '');
+}
+
+function readIntegerSetting(value: string | null | undefined, fallback: number): number {
+  if (value === null || value === undefined || !value.trim()) return fallback;
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getRateLimiter(): ChatRateLimiter | null {
+  const { store } = getBridgeContext();
+  const maxMessages = readIntegerSetting(store.getSetting(RATE_LIMIT_MAX_MESSAGES_SETTING), DEFAULT_RATE_LIMIT_MAX_MESSAGES);
+  if (maxMessages <= 0) return null;
+  const windowMs = Math.max(1000, readIntegerSetting(store.getSetting(RATE_LIMIT_WINDOW_MS_SETTING), DEFAULT_RATE_LIMIT_WINDOW_MS));
+  const configKey = `${maxMessages}:${windowMs}`;
+  if (configKey !== rateLimiterConfigKey) {
+    rateLimiter = new ChatRateLimiter({ maxMessages, windowMs });
+    rateLimiterConfigKey = configKey;
+  }
+  return rateLimiter;
 }
 
 /**
@@ -142,7 +176,7 @@ export async function deliver(
     dedupKey?: string;
   },
 ): Promise<SendResult> {
-  const { store } = getBridgeContext();
+  const { store, stickerSemantics } = getBridgeContext();
 
   // Dedup check
   if (opts?.dedupKey) {
@@ -158,6 +192,7 @@ export async function deliver(
 
   const limit = limits[adapter.channelType] || 4096;
   let chunks = chunkText(message.text, limit);
+  const limiter = getRateLimiter();
 
   // QQ: limit to max 3 segments to avoid flooding
   if (adapter.channelType === 'qq' && chunks.length > 3) {
@@ -170,10 +205,12 @@ export async function deliver(
   }
 
   let lastMessageId: string | undefined;
+  let lastVerifiedMediaDelivery: SendResult['verifiedMediaDelivery'];
+  let cardHeroEmbedded = false;
 
   for (let i = 0; i < chunks.length; i++) {
     // Rate limit: wait if this chat is sending too fast
-    await rateLimiter.acquire(message.address.chatId);
+    await limiter?.acquire(message.address.chatId);
 
     // Inter-chunk delay to avoid hitting rate limits on multi-chunk messages
     if (i > 0) {
@@ -185,8 +222,10 @@ export async function deliver(
       text: chunks[i],
       // Only attach inline buttons to the last chunk
       inlineButtons: i === chunks.length - 1 ? message.inlineButtons : undefined,
+      // 一张回复只提升一次头图；超长正文后续分片不重复横幅。
+      feishuCardHero: i === 0 ? message.feishuCardHero : undefined,
       // Pass through replyToMessageId for platforms that need it (e.g. QQ passive reply)
-      replyToMessageId: message.replyToMessageId,
+      replyToMessageId: platformReplyToMessageId(message.replyToMessageId),
     };
 
     const result = await sendWithRetry(adapter, chunkMessage);
@@ -194,6 +233,37 @@ export async function deliver(
       return result;
     }
     lastMessageId = result.messageId;
+    lastVerifiedMediaDelivery = result.verifiedMediaDelivery;
+    cardHeroEmbedded = cardHeroEmbedded || result.cardHeroEmbedded === true;
+
+    if (
+      adapter.channelType === 'feishu'
+      && result.messageId
+      && result.verifiedMediaDelivery?.kind === 'sticker'
+      && opts?.sessionId
+      && stickerSemantics
+    ) {
+      try {
+        await stickerSemantics.recordDelivery({
+          schema: 'codex-im-suite/sticker-delivery-evidence/v1',
+          deliveryId: crypto.createHash('sha256')
+            .update(`${adapter.channelType}\n${message.address.chatId}\n${result.messageId}`, 'utf8')
+            .digest('hex'),
+          channelType: 'feishu',
+          chatId: message.address.chatId,
+          targetUserId: message.address.userId,
+          fileKey: result.verifiedMediaDelivery.fileKey,
+          outboundMessageId: result.messageId,
+          semanticRevisionId: result.verifiedMediaDelivery.semanticRevisionId,
+          contextHash: result.verifiedMediaDelivery.contextHash,
+          sessionId: opts.sessionId,
+          sentAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        // 平台发送已经成功；语义审计失败只能失败关闭学习，不能向用户谎报发送失败。
+        console.warn('[delivery-layer] Sticker delivery evidence write failed:', error instanceof Error ? error.message : error);
+      }
+    }
 
     // Track outbound reference
     if (result.messageId && opts?.sessionId) {
@@ -204,6 +274,7 @@ export async function deliver(
           codepilotSessionId: opts.sessionId,
           platformMessageId: result.messageId,
           purpose: message.inlineButtons ? 'permission' : 'response',
+          messageKind: message.feishuCardJson ? 'card' : message.parseMode || 'text',
         });
       } catch { /* best effort */ }
     }
@@ -225,7 +296,12 @@ export async function deliver(
     });
   } catch { /* best effort */ }
 
-  return { ok: true, messageId: lastMessageId };
+  return {
+    ok: true,
+    messageId: lastMessageId,
+    verifiedMediaDelivery: lastVerifiedMediaDelivery,
+    ...(cardHeroEmbedded ? { cardHeroEmbedded: true } : {}),
+  };
 }
 
 /**
@@ -335,6 +411,7 @@ export async function deliverRendered(
           codepilotSessionId: opts.sessionId,
           platformMessageId: result.messageId,
           purpose: 'response',
+          messageKind: 'rendered',
         });
       } catch { /* best effort */ }
     }

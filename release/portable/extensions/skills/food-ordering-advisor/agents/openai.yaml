@@ -1,0 +1,4 @@
+interface:
+  display_name: "点餐顾问"
+  short_description: "通过美团与大众点评证据完成餐厅推荐、菜单比较和安全点餐"
+  default_prompt: "使用 $food-ordering-advisor 根据当前位置、预算和口味推荐餐厅，并在真实平台证据下准备可确认的订单。"

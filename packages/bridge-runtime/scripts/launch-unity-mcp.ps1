@@ -33,13 +33,42 @@ function Test-McpEndpoint {
         }
         $client.Close()
 
-        $resp = Invoke-WebRequest -Uri $Url -Method Get -TimeoutSec $TimeoutSec -UseBasicParsing
-        return @{ ok = $true; detail = "HTTP $($resp.StatusCode)" }
+        $initBody = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-to-im-unity-mcp-precheck","version":"0.0.0"}}}'
+        $init = Invoke-WebRequest `
+            -Uri $Url `
+            -Method Post `
+            -Headers @{ Accept = 'application/json, text/event-stream' } `
+            -ContentType 'application/json' `
+            -Body $initBody `
+            -TimeoutSec ([Math]::Max(2, $TimeoutSec)) `
+            -UseBasicParsing
+        $sessionId = $init.Headers['mcp-session-id']
+        if (-not $sessionId) {
+            return @{ ok = $false; detail = "MCP initialize OK but missing mcp-session-id" }
+        }
+
+        $instancesBody = '{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"mcpforunity://instances"}}'
+        $instances = Invoke-WebRequest `
+            -Uri $Url `
+            -Method Post `
+            -Headers @{ Accept = 'application/json, text/event-stream'; 'mcp-session-id' = $sessionId } `
+            -ContentType 'application/json' `
+            -Body $instancesBody `
+            -TimeoutSec ([Math]::Max(2, $TimeoutSec)) `
+            -UseBasicParsing
+        $content = [string]$instances.Content
+        if ($content -match 'Unity session not available|No Unity instance|not available|unavailable') {
+            return @{ ok = $false; detail = "MCP protocol OK but Unity session unavailable" }
+        }
+        if ($content -match '"instance_count"\s*:\s*([1-9][0-9]*)') {
+            return @{ ok = $true; detail = "MCP protocol OK; Unity instance_count=$($Matches[1])" }
+        }
+        return @{ ok = $false; detail = "MCP protocol OK but Unity instances response is empty or unknown" }
     }
     catch {
         $response = $_.Exception.Response
         if ($response) {
-            return @{ ok = $true; detail = "HTTP $([int]$response.StatusCode)" }
+            return @{ ok = $false; detail = "HTTP $([int]$response.StatusCode)" }
         }
         return @{ ok = $false; detail = $_.Exception.Message }
     }
@@ -100,17 +129,6 @@ function Resolve-UnityProjectPath {
     if ($env:CTI_UNITY_PROJECT_PATH) { $candidates.Add($env:CTI_UNITY_PROJECT_PATH) }
     if ($env:CTI_DEFAULT_WORKDIR) { $candidates.Add($env:CTI_DEFAULT_WORKDIR) }
     $candidates.Add((Get-Location).Path)
-
-    $fallbackRoots = @('C:\unity', 'D:\unity', 'F:\unity')
-    foreach ($root in $fallbackRoots) {
-        if (-not (Test-Path $root)) { continue }
-        $projects = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue
-        foreach ($proj in $projects) {
-            $candidates.Add($proj.FullName)
-            $gameSub = Join-Path $proj.FullName 'Game'
-            $candidates.Add($gameSub)
-        }
-    }
 
     foreach ($candidate in $candidates) {
         if (Test-UnityProjectPath $candidate) { return $candidate }

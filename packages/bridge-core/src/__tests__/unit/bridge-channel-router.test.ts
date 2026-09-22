@@ -19,20 +19,29 @@ import type { ChannelBinding } from '../../lib/bridge/types';
 
 // ── Mock Store ──────────────────────────────────────────────
 
-function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, { id: string; working_directory: string; model: string }> } {
+function createMockStore(): BridgeStore & {
+  bindings: Map<string, ChannelBinding>;
+  sessions: Map<string, { id: string; working_directory: string; model: string }>;
+  settings: Map<string, string>;
+} {
   const bindings = new Map<string, ChannelBinding>();
   const sessions = new Map<string, { id: string; working_directory: string; model: string }>();
+  const settings = new Map<string, string>([
+    ['bridge_default_work_dir', '/tmp/test'],
+    ['bridge_allowed_workspace_roots', '/tmp/test'],
+    ['bridge_default_model', 'claude-3'],
+    ['bridge_default_provider_id', ''],
+    ['bridge_runtime_fingerprint', 'profile-old'],
+    ['bridge_tooling_fingerprint', 'tooling-stable'],
+  ]);
   let nextId = 1;
 
   return {
     bindings,
     sessions,
+    settings,
     getSetting(key: string) {
-      if (key === 'bridge_default_work_dir') return '/tmp/test';
-      if (key === 'bridge_allowed_workspace_roots') return '/tmp/test';
-      if (key === 'bridge_default_model') return 'claude-3';
-      if (key === 'bridge_default_provider_id') return '';
-      return null;
+      return settings.get(key) ?? null;
     },
     getChannelBinding(channelType: string, chatId: string) {
       return bindings.get(`${channelType}:${chatId}`) ?? null;
@@ -48,6 +57,8 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
         model: data.model,
         mode: 'code',
         active: true,
+        bridgeFingerprint: data.bridgeFingerprint,
+        toolingFingerprint: data.toolingFingerprint,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -151,6 +162,24 @@ describe('channel-router', () => {
     assert.equal(store.bindings.size, 1);
   });
 
+  it('clears only sdkSessionId when bridge fingerprint changes', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'profile-chat' });
+    store.bindings.set('telegram:profile-chat', {
+      ...first,
+      sdkSessionId: 'old-codex-thread',
+      bridgeFingerprint: 'profile-old',
+      toolingFingerprint: 'tooling-stable',
+    });
+    store.settings.set('bridge_runtime_fingerprint', 'profile-new');
+
+    const refreshed = router.resolve({ channelType: 'telegram', chatId: 'profile-chat' });
+
+    assert.equal(refreshed.sdkSessionId, '');
+    assert.equal(refreshed.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(refreshed.workingDirectory, first.workingDirectory);
+    assert.equal(refreshed.bridgeFingerprint, 'profile-new');
+  });
+
   it('resolve() recreates binding when session was deleted', () => {
     const first = router.resolve({ channelType: 'telegram', chatId: '123' });
     // Delete the session
@@ -175,6 +204,82 @@ describe('channel-router', () => {
     const second = router.resolve({ channelType: 'telegram', chatId: '123' });
     assert.notEqual(first.codepilotSessionId, second.codepilotSessionId);
     assert.equal(second.workingDirectory, '/tmp/test');
+  });
+
+  it('keeps bindings inside an enabled registered project even when the legacy allowlist is narrower', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'registered-project' });
+    const registeredRoot = '/registered/project';
+    const session = store.sessions.get(first.codepilotSessionId);
+    assert.ok(session);
+    if (session) session.working_directory = registeredRoot;
+    store.bindings.set('telegram:registered-project', {
+      ...first,
+      workingDirectory: registeredRoot,
+    });
+    store.settings.set('bridge_project_registry_json', JSON.stringify({
+      schema: 'codex-im-suite/project-registry/v1',
+      projects: [{
+        id: 'registered-project',
+        displayName: 'Registered Project',
+        type: 'generic',
+        workspaceRoot: registeredRoot,
+        accessMode: 'read_only',
+        enabled: true,
+      }],
+    }));
+
+    const resolved = router.resolve({ channelType: 'telegram', chatId: 'registered-project' });
+
+    assert.equal(resolved.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(resolved.workingDirectory, registeredRoot);
+  });
+
+  it('still rejects a binding when its matching registered project is disabled', () => {
+    const first = router.resolve({ channelType: 'telegram', chatId: 'disabled-project' });
+    const disabledRoot = '/registered/disabled';
+    const session = store.sessions.get(first.codepilotSessionId);
+    assert.ok(session);
+    if (session) session.working_directory = disabledRoot;
+    store.bindings.set('telegram:disabled-project', {
+      ...first,
+      workingDirectory: disabledRoot,
+    });
+    store.settings.set('bridge_project_registry_json', JSON.stringify({
+      schema: 'codex-im-suite/project-registry/v1',
+      projects: [{
+        id: 'disabled-project',
+        displayName: 'Disabled Project',
+        type: 'generic',
+        workspaceRoot: disabledRoot,
+        accessMode: 'read_write',
+        enabled: false,
+      }],
+    }));
+
+    const resolved = router.resolve({ channelType: 'telegram', chatId: 'disabled-project' });
+
+    assert.notEqual(resolved.codepilotSessionId, first.codepilotSessionId);
+    assert.equal(resolved.workingDirectory, '/tmp/test');
+  });
+
+  it('resolve() rebinds to a fresh session after the binding has been idle too long', () => {
+    const oldIdleMs = process.env.CTI_SESSION_IDLE_FRESH_MS;
+    process.env.CTI_SESSION_IDLE_FRESH_MS = '3600000';
+    try {
+      const first = router.resolve({ channelType: 'telegram', chatId: 'idle-chat' });
+      store.bindings.set('telegram:idle-chat', {
+        ...first,
+        sdkSessionId: 'old-sdk-session',
+        updatedAt: new Date(Date.now() - 2 * 3600000).toISOString(),
+      });
+
+      const second = router.resolve({ channelType: 'telegram', chatId: 'idle-chat' });
+      assert.notEqual(first.codepilotSessionId, second.codepilotSessionId);
+      assert.equal(second.sdkSessionId, '');
+    } finally {
+      if (oldIdleMs === undefined) delete process.env.CTI_SESSION_IDLE_FRESH_MS;
+      else process.env.CTI_SESSION_IDLE_FRESH_MS = oldIdleMs;
+    }
   });
 
   it('createBinding() uses custom working directory', () => {

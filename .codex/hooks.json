@@ -1,0 +1,52 @@
+{
+    "hooks":  {
+                  "PostToolUse":  [
+                                      {
+                                          "hooks":  [
+                                                        {
+                                                            "command":  "sh -c \u0027repo=$(git rev-parse --show-toplevel 2\u003e/dev/null || pwd); entire=\"$repo/.codex-tools/bin/entire.exe\"; if [ ! -f \"$entire\" ]; then entire=\"$repo/.codex-tools/bin/entire\"; fi; if [ -f \"$entire\" ]; then \"$entire\" hooks codex post-tool-use; fi\u0027",
+                                                            "timeout":  30,
+                                                            "type":  "command"
+                                                        }
+                                                    ],
+                                          "matcher":  null
+                                      }
+                                  ],
+                  "SessionStart":  [
+                                       {
+                                           "hooks":  [
+                                                         {
+                                                             "command":  "sh -c \u0027repo=$(git rev-parse --show-toplevel 2\u003e/dev/null || pwd); entire=\"$repo/.codex-tools/bin/entire.exe\"; if [ ! -f \"$entire\" ]; then entire=\"$repo/.codex-tools/bin/entire\"; fi; if [ -f \"$entire\" ]; then \"$entire\" hooks codex session-start; fi; powershell -NoProfile -ExecutionPolicy Bypass -File \"$repo/scripts/complete-git-session-archive.ps1\" -Phase session-start\u0027",
+                                                             "timeout":  30,
+                                                             "type":  "command"
+                                                         }
+                                                     ],
+                                           "matcher":  null
+                                       }
+                                   ],
+                  "Stop":  [
+                               {
+                                   "hooks":  [
+                                                 {
+                                                     "command":  "sh -c \u0027repo=$(git rev-parse --show-toplevel 2\u003e/dev/null || pwd); entire=\"$repo/.codex-tools/bin/entire.exe\"; if [ ! -f \"$entire\" ]; then entire=\"$repo/.codex-tools/bin/entire\"; fi; if [ -f \"$entire\" ]; then \"$entire\" hooks codex stop; fi; powershell -NoProfile -ExecutionPolicy Bypass -File \"$repo/scripts/complete-git-session-archive.ps1\" -Phase stop\u0027",
+                                                     "timeout":  120,
+                                                     "type":  "command"
+                                                 }
+                                             ],
+                                   "matcher":  null
+                               }
+                           ],
+                  "UserPromptSubmit":  [
+                                           {
+                                               "hooks":  [
+                                                             {
+                                                                 "command":  "sh -c \u0027repo=$(git rev-parse --show-toplevel 2\u003e/dev/null || pwd); entire=\"$repo/.codex-tools/bin/entire.exe\"; if [ ! -f \"$entire\" ]; then entire=\"$repo/.codex-tools/bin/entire\"; fi; if [ -f \"$entire\" ]; then \"$entire\" hooks codex user-prompt-submit; fi\u0027",
+                                                                 "timeout":  30,
+                                                                 "type":  "command"
+                                                             }
+                                                         ],
+                                               "matcher":  null
+                                           }
+                                       ]
+              }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "service.localLlm",
+  "displayName": "本地模型 API",
+  "kind": "service",
+  "category": "local-ai",
+  "enabled": true,
+  "installState": "installed",
+  "source": "${SUITE_ROOT}\\scripts\\local-llm\\README.md",
+  "cwd": "${SUITE_ROOT}\\scripts\\local-llm",
+  "version": "",
+  "description": "本地或自托管 OpenAI-compatible 模型后端，用作 Codex agent 的可选模型来源；仅在选择 local_api 或自动切换链包含 local_api 时参与。"
+}

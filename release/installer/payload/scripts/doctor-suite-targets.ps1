@@ -131,13 +131,27 @@ $checks += [pscustomobject]@{
     SuiteHash = 'expected=removed'
     OtherHash = "path=$legacyInstaller"
 }
+$powershellUtf8ProfileScript = Join-Path $PSScriptRoot 'windows-powershell-utf8-profile.ps1'
+$powershellUtf8Output = (& $powershellUtf8ProfileScript -Mode Check 2>&1 | Out-String).Trim()
+$powershellUtf8ExitCode = $LASTEXITCODE
+$checks += [pscustomobject]@{
+    Check = 'powershell-utf8'
+    Status = if ($powershellUtf8ExitCode -eq 0) { 'healthy' } else { 'failed' }
+    SuiteHash = if ($powershellUtf8ExitCode -eq 0) { 'stdin=utf8' } else { 'stdin=unsafe' }
+    OtherHash = if ($powershellUtf8ExitCode -eq 0) {
+        $powershellUtf8Output
+    } else {
+        "repair=powershell -ExecutionPolicy Bypass -File `"$powershellUtf8ProfileScript`" -Mode Apply"
+    }
+}
 
 Write-Host 'Key file checks:'
 $checks | Format-Table -AutoSize | Out-String | Write-Host
 
 $suitePanelExe = Join-Path $suiteRoot 'release\artifacts\control-panel\CodexImSuiteControlPanel.exe'
 $portablePanelExe = Join-Path $suiteRoot 'release\portable\CodexImSuiteControlPanel.exe'
-$livePanelExe = Join-Path $liveRuntime 'dist\control-panel\ClaudeToImControlPanel.exe'
+$livePanelExe = Join-Path $liveRuntime 'dist\control-panel\CodexImSuiteControlPanel.exe'
+$legacyLivePanelExe = Join-Path $liveRuntime 'dist\control-panel\ClaudeToImControlPanel.exe'
 
 Write-Host 'Panel executables:'
 foreach ($path in @($suitePanelExe, $portablePanelExe, $livePanelExe)) {
@@ -147,6 +161,9 @@ foreach ($path in @($suitePanelExe, $portablePanelExe, $livePanelExe)) {
     } else {
         Write-Host "  <missing> $path"
     }
+}
+if (Test-Path -LiteralPath $legacyLivePanelExe) {
+    Write-Host "  legacy-compatible entry present; remove after switching shortcuts: $legacyLivePanelExe"
 }
 
 Write-Host ''

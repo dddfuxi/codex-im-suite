@@ -1,4 +1,4 @@
-﻿/**
+/**
  * JSON file-backed BridgeStore implementation.
  *
  * Uses in-memory Maps as cache with write-through persistence
@@ -13,6 +13,8 @@ import type {
   BridgeSession,
   BridgeMessage,
   BridgeApiProvider,
+  ConversationMemoryEvent,
+  MemoryReplyDecision,
   MemoryRetrievalQuery,
   RetrievedMemoryContext,
   RetrievedMemoryHit,
@@ -25,28 +27,71 @@ import type {
   PermissionLinkInput,
   PermissionLinkRecord,
   OutboundRefInput,
+  OutboundRefRecord,
+  OutboundRefFilter,
+  MarkOutboundRefRecalledInput,
   UpsertChannelBindingInput,
-} from 'claude-to-im/src/lib/bridge/host.js';
-import type { ChannelBinding, ChannelType } from 'claude-to-im/src/lib/bridge/types.js';
+  MemoryWriteCandidate,
+  MemoryWriteClassification,
+  PromptSnapshotRecord,
+} from 'claude-to-im/host';
+import type { ChannelBinding, ChannelType } from 'claude-to-im/channel';
 import { CTI_HOME } from './config.js';
+import { reviewOutboundAnswerRules, type AnswerReviewDecision, type AnswerReviewInput } from './answer-review.js';
+import { readKnowledgeIndex, searchKnowledgeIndex, type KnowledgeItem } from './knowledge-indexer.js';
+import { rebuildKnowledgeIndex } from './knowledge-index-service.js';
+import {
+  upsertConfirmedMemoryDocument,
+} from './memory-documents.js';
+import {
+  classifyCandidateEligibility,
+  mergeCandidateObservation,
+} from './memory-items/candidate-policy.js';
+import { readMemoryGraphIndex, searchMemoryGraph, type MemoryGraphContext, type MemoryGraphIndex } from './memory-graph.js';
+import {
+  memoryPartitionSegment,
+  isVisibleMemoryV2PathToQuery,
+  isVisibleMemoryV2SourceToQuery,
+} from './memory-source-policy.js';
+import { repairLikelyMojibakeText } from './mojibake.js';
+import { createPromptSnapshotStore } from './prompt-snapshot-store.js';
+import { writeUtf8TextAtomic } from './atomic-text-file.js';
+import {
+  decideMemoryReply as decideMemoryReplyFromHits,
+  inferStructuredMemories,
+  isLowValueMemoryText,
+  planMemoryQuery,
+} from './memory-routing.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 const MESSAGE_ARCHIVES_DIR = path.join(DATA_DIR, 'message-archives');
+const MEMORY_PROFILES_PATH = path.join(DATA_DIR, 'memory-profiles.json');
+const PERMISSION_LINKS_PATH = path.join(DATA_DIR, 'permission-links.json');
+const OUTBOUND_REFS_PATH = path.join(DATA_DIR, 'outbound-refs.json');
 const FEISHU_CHAT_INDEX_PATH = path.join(DATA_DIR, 'feishu-chat-index.json');
 const FEISHU_P2P_USER_INDEX_PATH = path.join(DATA_DIR, 'feishu-p2p-user-index.json');
 const FEISHU_HISTORY_DIR = path.join(DATA_DIR, 'feishu-history');
 const FEISHU_HISTORY_INDEX_PATH = path.join(DATA_DIR, 'feishu-history-index.json');
+const ANSWER_REVIEW_AUDIT_PATH = path.join(DATA_DIR, 'answer-review-audit.json');
+const SESSIONS_PATH = path.join(DATA_DIR, 'sessions.json');
+const BINDINGS_PATH = path.join(DATA_DIR, 'bindings.json');
+const STATE_FILE_LOCK_STALE_MS = 30_000;
+const STATE_FILE_LOCK_RETRY_DELAYS_MS = [10, 20, 50, 100, 200, 400, 800, 1_000] as const;
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
-const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '80', 10) || 80);
-const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '32000', 10) || 32000);
-const KEEP_RECENT_MESSAGES = Math.max(12, Number.parseInt(process.env.CTI_HISTORY_KEEP_RECENT || '24', 10) || 24);
+const MAX_ACTIVE_MESSAGES = Math.max(20, Number.parseInt(process.env.CTI_HISTORY_MAX_MESSAGES || '36', 10) || 36);
+const MAX_ACTIVE_CHARS = Math.max(8000, Number.parseInt(process.env.CTI_HISTORY_MAX_CHARS || '12000', 10) || 12000);
+const KEEP_RECENT_MESSAGES = Math.max(8, Number.parseInt(process.env.CTI_HISTORY_KEEP_RECENT || '12', 10) || 12);
 const SUMMARY_REFRESH_EVERY = Math.max(6, Number.parseInt(process.env.CTI_SUMMARY_REFRESH_EVERY || '12', 10) || 12);
 const MEMORY_MAX_HITS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_MAX_HITS || '6', 10) || 6);
 const MEMORY_MAX_CHARS = Math.max(600, Number.parseInt(process.env.CTI_MEMORY_MAX_CHARS || '2200', 10) || 2200);
+const MEMORY_ARCHIVE_MAX_FILES = Math.max(0, Number.parseInt(process.env.CTI_MEMORY_ARCHIVE_MAX_FILES || '5', 10) || 5);
 const MEMORY_MIN_SCORE = Number.parseFloat(process.env.CTI_MEMORY_MIN_SCORE || '6') || 6;
+const MEMORY_PROFILE_MAX_ITEMS = Math.max(6, Number.parseInt(process.env.CTI_MEMORY_PROFILE_MAX_ITEMS || '24', 10) || 24);
+const MEMORY_PROFILE_EVENT_MIN_CHARS = Math.max(2, Number.parseInt(process.env.CTI_MEMORY_PROFILE_EVENT_MIN_CHARS || '2', 10) || 2);
 const ENGLISH_STOP_TOKENS = new Set(['this', 'that', 'with', 'from', 'then', 'just', 'into', 'them', 'they', 'what', 'when', 'where', 'which', 'have', 'will', 'your', 'about', 'please']);
 const CHINESE_STOP_TOKENS = new Set(['这个', '那个', '现在', '刚才', '继续', '直接', '帮我', '处理', '一下', '看看', '这里', '当前', '应该', '进行', '根据', '然后', '就是', '可以', '能够']);
+const MEMORY_RECALL_RE = /(记得|回忆|历史|上次|之前|以前|刚才|说过|提到|对应表|常用|查一下|找一下|回溯|总结|汇总)/i;
 
 // Helpers
 
@@ -55,9 +100,64 @@ function ensureDir(dir: string): void {
 }
 
 function atomicWrite(filePath: string, data: string): void {
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, data, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  writeUtf8TextAtomic(filePath, data);
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+function isProcessAlive(processId: number): boolean {
+  if (!Number.isInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+function removeStaleStateFileLock(lockPath: string): boolean {
+  try {
+    const stat = fs.statSync(lockPath);
+    if ((Date.now() - stat.mtimeMs) < STATE_FILE_LOCK_STALE_MS) return false;
+    const ownerPid = Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    if (isProcessAlive(ownerPid)) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+  }
+}
+
+/**
+ * sessions/bindings 是多个 Bridge 进程共享的运行态事实源。锁内必须先回读
+ * 磁盘，再修改目标记录并原子写回，防止重启重叠期的旧内存快照覆盖新工作区。
+ */
+function withStateFileLock<T>(filePath: string, operation: () => T): T {
+  ensureDir(DATA_DIR);
+  const lockPath = `${filePath}.lock`;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= STATE_FILE_LOCK_RETRY_DELAYS_MS.length; attempt += 1) {
+    let fileDescriptor: number | undefined;
+    try {
+      fileDescriptor = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fileDescriptor, String(process.pid), 'utf8');
+      return operation();
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST' || attempt >= STATE_FILE_LOCK_RETRY_DELAYS_MS.length) throw error;
+      if (!removeStaleStateFileLock(lockPath)) sleepSync(STATE_FILE_LOCK_RETRY_DELAYS_MS[attempt]);
+    } finally {
+      if (fileDescriptor !== undefined) {
+        try { fs.closeSync(fileDescriptor); } catch { /* best effort */ }
+        try { fs.unlinkSync(lockPath); } catch { /* best effort */ }
+      }
+    }
+  }
+  throw lastError;
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
@@ -73,12 +173,162 @@ function writeJson(filePath: string, data: unknown): void {
   atomicWrite(filePath, JSON.stringify(data, null, 2));
 }
 
+function readPermissionLinks(): Record<string, PermissionLinkRecord> {
+  const current = readJson<Record<string, PermissionLinkRecord> | null>(PERMISSION_LINKS_PATH, null);
+  if (current) return current;
+
+  const legacyPath = path.join(DATA_DIR, 'permissions.json');
+  const legacy = readJson<unknown>(legacyPath, null);
+  if (!legacy || typeof legacy !== 'object' || Array.isArray(legacy)) return {};
+  if ((legacy as { protocol?: unknown; Protocol?: unknown }).protocol === 'cti-permissions/v1'
+    || (legacy as { protocol?: unknown; Protocol?: unknown }).Protocol === 'cti-permissions/v1'
+    || Array.isArray((legacy as { subjects?: unknown; Subjects?: unknown }).subjects)
+    || Array.isArray((legacy as { subjects?: unknown; Subjects?: unknown }).Subjects)) {
+    return {};
+  }
+  return legacy as Record<string, PermissionLinkRecord>;
+}
+
 function uuid(): string {
   return crypto.randomUUID();
 }
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function slugForFileName(text: string): string {
+  const ascii = text
+    .normalize('NFKC')
+    .replace(/[^A-Za-z0-9\u4e00-\u9fff_-]+/gu, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 48);
+  return ascii || 'memory';
+}
+
+function resolveDurableMemoryDirectory(
+  memoryRoot: string,
+  input: Pick<MemoryWriteInput, 'channelType' | 'chatId' | 'userId' | 'classification'>,
+): { dir?: string; error?: string } {
+  const classification = input.classification;
+  if (!classification) return { error: 'memory intent classification is required' };
+  if (classification.actorKind !== 'human') return { error: 'only human-originated messages may write durable memory' };
+  if (classification.confidence < 0.8) return { error: 'memory intent confidence is below the durable-write threshold' };
+
+  const channel = memoryPartitionSegment(input.channelType || 'unknown');
+  switch (classification.scope) {
+    case 'temporary':
+      return { error: 'temporary memory must remain in runtime session context' };
+    case 'user':
+      if (!input.userId?.trim()) return { error: 'user memory requires a verified user id' };
+      return { dir: path.join(memoryRoot, 'memory', 'users', channel, memoryPartitionSegment(input.userId)) };
+    case 'group':
+      if (!input.chatId?.trim()) return { error: 'group memory requires a verified chat id' };
+      return { dir: path.join(memoryRoot, 'memory', 'groups', channel, memoryPartitionSegment(input.chatId)) };
+    case 'long_term':
+      return { dir: path.join(memoryRoot, 'memory', 'long-term') };
+    default:
+      return { error: 'unknown memory partition scope' };
+  }
+}
+
+function escapeMarkdownTableCell(text: string): string {
+  return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+}
+
+function inferExplicitMemoryPrefixedLine(text: string): string | null {
+  if (/[\r\n|]/.test(text)) return null;
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length > 240 || /^(事实|偏好|约定|结论|决策|决定|待办|todo|TODO|后续|风险|资源|文件|图片|链接|场景|Scene)\s*[:：]/u.test(normalized)) {
+    return null;
+  }
+  const content = normalized
+    .replace(/^(?:请你|你也|也|帮我|麻烦你)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*/u, '')
+    .replace(/[，,。.\s]*(?:请你|你也|也|帮我|麻烦你)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*$/u, '')
+    .trim();
+  if (!content || content.length > 220 || /\r?\n|\|/.test(content)) return null;
+  if (/(?:待办|TODO|todo|后续|提醒|待处理|需要处理|风险|修复|跟进|检查|补齐|完善|实现|迁移|清理)/iu.test(content)) {
+    return `待办: ${content}`;
+  }
+  if (/(?:决定|决策|采用|默认|不要|不能|必须|需要|优先|策略|规则|约定|边界|统一|改为|不再|只允许|禁止)/u.test(content)) {
+    return `结论: ${content}`;
+  }
+  return `事实: ${content}`;
+}
+
+function cleanMemoryWriteText(text: string): string {
+  return text
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^(?:请你|麻烦你|帮我|你也|也)?(?:重新|再|更新|覆盖)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*/u, '')
+    .replace(/[，,。.\s]*(?:请你|麻烦你|帮我|你也|也)?(?:重新|再|更新|覆盖)?(?:记住|记一下|记下来|保存记忆|记录一下)[，,。.\s]*$/u, '')
+    .trim();
+}
+
+function cleanMemoryCandidatePart(text: string | undefined): string {
+  return (text || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^`|`$/g, '')
+    .replace(/^[：:，,。.\s]+|[：:，,。.\s]+$/g, '')
+    .trim();
+}
+
+function addMemoryCandidatePair(
+  pairs: Array<{ key: string; value: string }>,
+  seen: Set<string>,
+  key: string | undefined,
+  value: string | undefined,
+): void {
+  const cleanedKey = cleanMemoryCandidatePart(key);
+  const cleanedValue = cleanMemoryCandidatePart(value);
+  if (!cleanedKey || !cleanedValue || isLowValueMemoryText(cleanedValue)) return;
+  const dedupKey = `${cleanedKey.toLowerCase()}\n${cleanedValue.toLowerCase()}`;
+  if (seen.has(dedupKey)) return;
+  seen.add(dedupKey);
+  pairs.push({ key: cleanedKey, value: cleanedValue });
+}
+
+function inferNaturalMemoryPairs(text: string): Array<{ key: string; value: string }> {
+  const normalized = cleanMemoryWriteText(text.replace(/\r\n/g, '\n'));
+  const pairs: Array<{ key: string; value: string }> = [];
+  const seen = new Set<string>();
+  const valueToken = '([A-Za-z0-9][A-Za-z0-9_.\\-/]{1,120})';
+  const keyToken = '([\\u4e00-\\u9fffA-Za-z0-9 _-]{2,80}(?:名称|名字|分支名|git分支名|路径|地址|链接|配置|版本|命令))';
+
+  const valueFirst = new RegExp(`${valueToken}\\s*(?:\\n|\\s+)${keyToken}`, 'iu');
+  const valueFirstMatch = normalized.match(valueFirst);
+  if (valueFirstMatch) addMemoryCandidatePair(pairs, seen, valueFirstMatch[2], valueFirstMatch[1]);
+
+  const keyFirst = new RegExp(`${keyToken}\\s*(?:是|为|叫|=|==|:|：)\\s*${valueToken}`, 'iu');
+  const keyFirstMatch = normalized.match(keyFirst);
+  if (keyFirstMatch) addMemoryCandidatePair(pairs, seen, keyFirstMatch[1], keyFirstMatch[2]);
+
+  return pairs;
+}
+
+function normalizeMemoryWriteCandidates(
+  candidates: MemoryWriteCandidate[] | undefined,
+): Array<{ key: string; value: string }> {
+  const pairs: Array<{ key: string; value: string }> = [];
+  const seen = new Set<string>();
+
+  for (const candidate of candidates || []) {
+    addMemoryCandidatePair(pairs, seen, candidate.key, candidate.value);
+    if ((!candidate.key || !candidate.value) && candidate.text) {
+      for (const pair of inferStructuredMemories(candidate.text)) {
+        addMemoryCandidatePair(pairs, seen, pair.key, pair.value);
+      }
+      for (const pair of inferNaturalMemoryPairs(candidate.text)) {
+        addMemoryCandidatePair(pairs, seen, pair.key, pair.value);
+      }
+    }
+  }
+
+  return pairs;
 }
 
 // Lock entry
@@ -101,6 +351,63 @@ interface FeishuChatIndexRecord {
 interface FeishuHistoryIndexRecord extends FeishuHistorySyncStatus {}
 interface FeishuP2pUserAliasIndexRecord extends FeishuP2pUserAliasRecord {}
 
+type MemoryProfileScope = 'user' | 'chat' | 'global';
+
+interface MemoryProfileRecord {
+  scope: MemoryProfileScope;
+  key: string;
+  sessionId?: string;
+  channelType?: string;
+  chatId?: string;
+  userId?: string;
+  displayName?: string;
+  workingDirectory?: string;
+  topics: string[];
+  facts: string[];
+  pending: string[];
+  observationCounts?: Record<string, number>;
+  observationSessions?: Record<string, string[]>;
+  observationMessageHashes?: Record<string, string[]>;
+  messageCount: number;
+  updatedAt: string;
+  lastEventAt: string;
+}
+
+interface AnswerReviewAuditRecord extends AnswerReviewDecision {
+  id: string;
+  channelType: string;
+  chatId: string;
+  userId?: string;
+  userText: string;
+  answerText: string;
+  source?: AnswerReviewInput['source'];
+  executionEvidence?: AnswerReviewInput['executionEvidence'];
+}
+
+interface MemoryWriteInput {
+  sessionId: string;
+  channelType: string;
+  chatId: string;
+  chatDisplayName?: string;
+  userId?: string;
+  userDisplayName?: string;
+  text: string;
+  workingDirectory?: string;
+  createdAt?: string;
+  candidates?: MemoryWriteCandidate[];
+  classification?: MemoryWriteClassification;
+}
+
+interface MemoryWriteResult {
+  ok: boolean;
+  skipped?: boolean;
+  memoryRoot?: string;
+  filePath?: string;
+  knowledgeRebuilt?: boolean;
+  scope?: MemoryWriteClassification['scope'];
+  error?: string;
+}
+
 // Store
 
 export class JsonFileStore implements BridgeStore {
@@ -112,9 +419,11 @@ export class JsonFileStore implements BridgeStore {
   private offsets = new Map<string, string>();
   private dedupKeys = new Map<string, number>();
   private locks = new Map<string, LockEntry>();
+  private memoryProfiles = new Map<string, MemoryProfileRecord>();
   private feishuChatIndex = new Map<string, FeishuChatIndexRecord>();
   private feishuP2pUserIndex = new Map<string, FeishuP2pUserAliasIndexRecord>();
   private feishuHistoryIndex = new Map<string, FeishuHistoryIndexRecord>();
+  private outboundRefs = new Map<string, OutboundRefRecord>();
   private auditLog: Array<AuditLogInput & { id: string; createdAt: string }> = [];
 
   constructor(settingsMap: Map<string, string>) {
@@ -130,28 +439,19 @@ export class JsonFileStore implements BridgeStore {
 
   private loadAll(): void {
     // Sessions
-    const sessions = readJson<Record<string, BridgeSession>>(
-      path.join(DATA_DIR, 'sessions.json'),
-      {},
-    );
+    const sessions = readJson<Record<string, BridgeSession>>(SESSIONS_PATH, {});
     for (const [id, s] of Object.entries(sessions)) {
       this.sessions.set(id, s);
     }
 
     // Bindings
-    const bindings = readJson<Record<string, ChannelBinding>>(
-      path.join(DATA_DIR, 'bindings.json'),
-      {},
-    );
+    const bindings = readJson<Record<string, ChannelBinding>>(BINDINGS_PATH, {});
     for (const [key, b] of Object.entries(bindings)) {
       this.bindings.set(key, b);
     }
 
     // Permission links
-    const perms = readJson<Record<string, PermissionLinkRecord>>(
-      path.join(DATA_DIR, 'permissions.json'),
-      {},
-    );
+    const perms = readPermissionLinks();
     for (const [id, p] of Object.entries(perms)) {
       this.permissionLinks.set(id, p);
     }
@@ -172,6 +472,34 @@ export class JsonFileStore implements BridgeStore {
     );
     for (const [k, v] of Object.entries(dedup)) {
       this.dedupKeys.set(k, v);
+    }
+
+    const memoryProfiles = readJson<Record<string, MemoryProfileRecord>>(
+      MEMORY_PROFILES_PATH,
+      {},
+    );
+    for (const [key, value] of Object.entries(memoryProfiles)) {
+      if (value?.scope && value?.key) {
+        if (value.scope === 'global') continue;
+        this.memoryProfiles.set(key, {
+          ...value,
+          topics: Array.isArray(value.topics) ? value.topics : [],
+          facts: Array.isArray(value.facts) ? value.facts : [],
+          pending: Array.isArray(value.pending) ? value.pending : [],
+          observationCounts: value.observationCounts && typeof value.observationCounts === 'object'
+            ? value.observationCounts
+            : {},
+          observationSessions: value.observationSessions && typeof value.observationSessions === 'object'
+            ? value.observationSessions
+            : {},
+          observationMessageHashes: value.observationMessageHashes && typeof value.observationMessageHashes === 'object'
+            ? value.observationMessageHashes
+            : {},
+          messageCount: Number.isFinite(value.messageCount) ? value.messageCount : 0,
+          updatedAt: value.updatedAt || now(),
+          lastEventAt: value.lastEventAt || value.updatedAt || now(),
+        });
+      }
     }
 
     const feishuChatIndex = readJson<Record<string, FeishuChatIndexRecord>>(
@@ -198,27 +526,60 @@ export class JsonFileStore implements BridgeStore {
       this.feishuHistoryIndex.set(key, value);
     }
 
+    const outboundRefs = readJson<Record<string, OutboundRefRecord>>(OUTBOUND_REFS_PATH, {});
+    for (const [key, value] of Object.entries(outboundRefs)) {
+      if (value?.channelType && value?.chatId && value?.platformMessageId) {
+        this.outboundRefs.set(key, value);
+      }
+    }
+
     // Audit
     this.auditLog = readJson(path.join(DATA_DIR, 'audit.json'), []);
   }
 
-  private persistSessions(): void {
-    writeJson(
-      path.join(DATA_DIR, 'sessions.json'),
-      Object.fromEntries(this.sessions),
-    );
+  private refreshSessionsFromDisk(): void {
+    if (!fs.existsSync(SESSIONS_PATH)) return;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(SESSIONS_PATH, 'utf8')) as Record<string, BridgeSession>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      this.sessions = new Map(Object.entries(parsed));
+    } catch {
+      // 保留最后一份有效内存快照；短暂文件锁或坏 JSON 不能把全部会话清空。
+    }
   }
 
-  private persistBindings(): void {
-    writeJson(
-      path.join(DATA_DIR, 'bindings.json'),
-      Object.fromEntries(this.bindings),
-    );
+  private mutateSessions<T>(operation: () => T): T {
+    return withStateFileLock(SESSIONS_PATH, () => {
+      this.refreshSessionsFromDisk();
+      const result = operation();
+      writeJson(SESSIONS_PATH, Object.fromEntries(this.sessions));
+      return result;
+    });
+  }
+
+  private refreshBindingsFromDisk(): void {
+    if (!fs.existsSync(BINDINGS_PATH)) return;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(BINDINGS_PATH, 'utf8')) as Record<string, ChannelBinding>;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      this.bindings = new Map(Object.entries(parsed));
+    } catch {
+      // 保留最后一份有效内存快照；短暂文件锁或坏 JSON 不能把全部绑定清空。
+    }
+  }
+
+  private mutateBindings<T>(operation: () => T): T {
+    return withStateFileLock(BINDINGS_PATH, () => {
+      this.refreshBindingsFromDisk();
+      const result = operation();
+      writeJson(BINDINGS_PATH, Object.fromEntries(this.bindings));
+      return result;
+    });
   }
 
   private persistPermissions(): void {
     writeJson(
-      path.join(DATA_DIR, 'permissions.json'),
+      PERMISSION_LINKS_PATH,
       Object.fromEntries(this.permissionLinks),
     );
   }
@@ -258,6 +619,14 @@ export class JsonFileStore implements BridgeStore {
     );
   }
 
+  private persistOutboundRefs(): void {
+    writeJson(OUTBOUND_REFS_PATH, Object.fromEntries(this.outboundRefs));
+  }
+
+  private outboundRefKey(channelType: string, chatId: string, platformMessageId: string): string {
+    return `${channelType}:${chatId}:${platformMessageId}`;
+  }
+
   private getFeishuHistoryPath(chatId: string): string {
     return path.join(FEISHU_HISTORY_DIR, `${chatId}.json`);
   }
@@ -277,6 +646,12 @@ export class JsonFileStore implements BridgeStore {
   private persistMessages(sessionId: string): void {
     const msgs = this.messages.get(sessionId) || [];
     writeJson(path.join(MESSAGES_DIR, `${sessionId}.json`), msgs);
+  }
+
+  private persistMemoryProfiles(): void {
+    const boundedProfiles = [...this.memoryProfiles].filter(([, profile]) => profile.scope !== 'global');
+    this.memoryProfiles = new Map(boundedProfiles);
+    writeJson(MEMORY_PROFILES_PATH, Object.fromEntries(boundedProfiles));
   }
 
   private loadMessages(sessionId: string): BridgeMessage[] {
@@ -312,7 +687,8 @@ export class JsonFileStore implements BridgeStore {
 
     const files = fs.readdirSync(archiveDir)
       .filter((name) => name.endsWith('.json'))
-      .sort((left, right) => right.localeCompare(left));
+      .sort((left, right) => right.localeCompare(left))
+      .slice(0, MEMORY_ARCHIVE_MAX_FILES);
 
     const collected: BridgeMessage[] = [];
     for (const name of files) {
@@ -329,36 +705,226 @@ export class JsonFileStore implements BridgeStore {
       .replace(/\s+/g, ' ')
       .trim();
     if (!cleaned) return '';
-    return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 3)}...` : cleaned;
+    const repaired = repairLikelyMojibakeText(cleaned);
+    if (repaired.unresolved) return '';
+    return repaired.text.length > maxLen ? `${repaired.text.slice(0, maxLen - 3)}...` : repaired.text;
+  }
+
+  private sanitizePersistedText(content: string): string {
+    const repaired = repairLikelyMojibakeText(content || '');
+    return repaired.unresolved ? '' : repaired.text;
+  }
+
+  private memoryProfileKey(scope: MemoryProfileScope, channelType: string, id = '', sessionId = ''): string {
+    const normalizedId = id.trim() || 'all';
+    const sessionKey = sessionId.trim()
+      ? crypto.createHash('sha1').update(sessionId.trim(), 'utf8').digest('hex').slice(0, 12)
+      : 'legacy';
+    return `${scope}:${channelType || 'all'}:${normalizedId}:${sessionKey}`;
+  }
+
+  private appendMemoryItems(existing: string[], incoming: string[]): string[] {
+    const seen = new Set<string>();
+    const combined: string[] = [];
+    for (const item of [...existing, ...incoming]) {
+      const normalized = this.summarizeMessageContent(item, 180);
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      combined.push(normalized);
+    }
+    return combined.slice(-MEMORY_PROFILE_MAX_ITEMS);
+  }
+
+  private extractMemoryProfileItems(text: string, role: 'user' | 'assistant'): {
+    topics: string[];
+    facts: string[];
+    pending: string[];
+  } {
+    const normalized = this.summarizeMessageContent(text, 520);
+    if (!normalized || normalized.length < MEMORY_PROFILE_EVENT_MIN_CHARS) {
+      return { topics: [], facts: [], pending: [] };
+    }
+    if (isLowValueMemoryText(normalized)) {
+      return { topics: [], facts: [], pending: [] };
+    }
+
+    const facts: string[] = [];
+    const pending: string[] = [];
+    const topics: string[] = [];
+    const lower = normalized.toLowerCase();
+
+    // 这里只维护有界运行态画像，不授予持久化权限。候选资格是失败关闭
+    // 预筛；真正写入 memory v3 仍必须经过独立记忆意图分类器。
+    const candidate = classifyCandidateEligibility({ role, text: normalized });
+    if (candidate.eligible) facts.push(candidate.normalizedText);
+
+    if (/未完成|阻塞|失败|报错|不可用|待办|下次|继续|还没|需要后续/.test(normalized)) {
+      pending.push(normalized);
+    }
+
+    if (
+      role === 'user'
+      && normalized.length >= 8
+      && !/^(你好|你好呀|hi|hello|在吗|谢谢|好的|收到|嗯|哈哈|晚安|早上好)$/i.test(lower)
+    ) {
+      topics.push(normalized);
+    }
+
+    return { topics, facts, pending };
+  }
+
+  private upsertMemoryProfile(
+    scope: MemoryProfileScope,
+    key: string,
+    event: ConversationMemoryEvent,
+    items: { topics: string[]; facts: string[]; pending: string[] },
+  ): void {
+    const existing = this.memoryProfiles.get(key);
+    const timestamp = event.createdAt || now();
+    const observationCounts = { ...(existing?.observationCounts || {}) };
+    const observationSessions = { ...(existing?.observationSessions || {}) };
+    const observationMessageHashes = { ...(existing?.observationMessageHashes || {}) };
+    for (const fact of items.facts) {
+      const normalizedFact = this.summarizeMessageContent(fact, 180);
+      if (!normalizedFact) continue;
+      const previousSessionIds = observationSessions[normalizedFact] || [];
+      const previousMessageHashes = observationMessageHashes[normalizedFact] || [];
+      const merged = mergeCandidateObservation({
+        normalizedText: normalizedFact,
+        fingerprint: crypto.createHash('sha256').update(normalizedFact, 'utf8').digest('hex'),
+        sessionIds: previousSessionIds,
+        sourceMessageHashes: previousMessageHashes,
+        distinctSessionCount: previousSessionIds.length,
+        firstObservedAt: existing?.lastEventAt || timestamp,
+        lastObservedAt: existing?.lastEventAt || timestamp,
+      }, {
+        sessionId: event.sessionId,
+        text: normalizedFact,
+        sourceMessageHash: crypto.createHash('sha256').update(`${event.sessionId}\n${timestamp}\n${normalizedFact}`, 'utf8').digest('hex'),
+        observedAt: timestamp,
+      });
+      observationCounts[normalizedFact] = merged.distinctSessionCount;
+      observationSessions[normalizedFact] = merged.sessionIds;
+      observationMessageHashes[normalizedFact] = merged.sourceMessageHashes;
+    }
+    const record: MemoryProfileRecord = {
+      scope,
+      key,
+      sessionId: event.sessionId,
+      channelType: event.channelType || existing?.channelType,
+      chatId: scope === 'chat' ? event.chatId : existing?.chatId,
+      userId: scope === 'user' ? event.userId : existing?.userId,
+      displayName: scope === 'user'
+        ? (event.userDisplayName || existing?.displayName || event.userId)
+        : scope === 'chat'
+          ? (event.chatDisplayName || existing?.displayName || event.chatId)
+          : (existing?.displayName || '所有会话'),
+      workingDirectory: event.workingDirectory || existing?.workingDirectory,
+      topics: this.appendMemoryItems(existing?.topics || [], items.topics),
+      facts: this.appendMemoryItems(existing?.facts || [], items.facts),
+      pending: this.appendMemoryItems(existing?.pending || [], items.pending),
+      observationCounts,
+      observationSessions,
+      observationMessageHashes,
+      messageCount: (existing?.messageCount || 0) + 1,
+      updatedAt: now(),
+      lastEventAt: timestamp,
+    };
+    this.memoryProfiles.set(key, record);
+  }
+
+  private recordFeishuHistoryProfiles(chatId: string, displayName: string | undefined, messages: FeishuHistoryIndexedMessage[]): void {
+    let changed = false;
+    for (const item of messages) {
+      const safeText = this.summarizeMessageContent(item.text || '', 800);
+      if (!safeText) continue;
+      const createdAt = item.createTime && /^\d+$/.test(item.createTime)
+        ? new Date(Number.parseInt(item.createTime, 10)).toISOString()
+        : undefined;
+      changed = this.applyMemoryEvent({
+        sessionId: `feishu-history:${chatId}`,
+        channelType: 'feishu',
+        chatId,
+        chatDisplayName: displayName,
+        userId: item.senderId,
+        userDisplayName: item.senderName,
+        role: item.senderType === 'app' ? 'assistant' : 'user',
+        text: safeText,
+        createdAt,
+      }) || changed;
+    }
+    if (changed) {
+      this.persistMemoryProfiles();
+    }
+  }
+
+  private extractCtiFinalVisibleTexts(text: string): string[] {
+    const out: string[] = [];
+    const fence = /```cti-final\s*([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    while ((match = fence.exec(text)) !== null) {
+      const rawJson = (match[1] || '').trim();
+      if (!rawJson) continue;
+      try {
+        const parsed = JSON.parse(rawJson) as { text?: unknown };
+        const visibleText = typeof parsed.text === 'string' ? parsed.text : '';
+        const normalized = this.summarizeMessageContent(visibleText, 4000);
+        if (normalized) out.push(normalized);
+      } catch {
+        // Ignore malformed historical result blocks. The raw text block below
+        // still contributes a safe, shortened fallback.
+      }
+    }
+    return out;
+  }
+
+  private extractStructuredTextBlockForMemory(text: string, maxLen: number): string {
+    const ctiFinalTexts = this.extractCtiFinalVisibleTexts(text);
+    const withoutResultBlocks = text.replace(/```cti-final\s*[\s\S]*?```/g, ' ');
+    const normalText = this.summarizeMessageContent(withoutResultBlocks, Math.min(maxLen, 1200));
+    // The user-visible final answer is the highest quality memory signal.
+    // Keep it before progress chatter so matched excerpts show the answer
+    // instead of "我先查一下..." style process text.
+    return [ctiFinalTexts.join(' | '), normalText].filter(Boolean).join(' | ');
+  }
+
+  private extractPlainMessageTextForMemory(content: string): string {
+    const ctiFinalTexts = this.extractCtiFinalVisibleTexts(content);
+    if (ctiFinalTexts.length > 0) {
+      // 有些历史记录不是 Claude/Codex block 数组，而是直接保存了
+      // ```cti-final``` 文本。检索时仍然只取用户可见 text。
+      return ctiFinalTexts.join(' | ');
+    }
+    return content;
   }
 
   private extractStructuredMessageText(content: string, maxLen: number): string {
     try {
       const blocks = JSON.parse(content) as Array<Record<string, unknown>>;
+      const finalTexts = blocks
+        .filter((block) => block?.type === 'text')
+        .flatMap((block) => this.extractCtiFinalVisibleTexts(String(block.text || '')));
+      if (finalTexts.length > 0) {
+        // 历史检索需要优先还原用户真正看到的最终答复。
+        // 一旦结构化消息里存在 cti-final，就不要把进度话术、
+        // tool_use 或 tool_result 当成主记忆文本，避免工具日志污染旧答案。
+        return this.summarizeMessageContent(finalTexts.join(' | '), maxLen);
+      }
       const parts: string[] = [];
       const textBudget = Math.max(4000, maxLen);
-      const toolBudget = Math.max(4000, maxLen);
       for (const block of blocks) {
         if (block?.type === 'text') {
-          const text = this.summarizeMessageContent(String(block.text || ''), textBudget);
+          const text = this.extractStructuredTextBlockForMemory(String(block.text || ''), textBudget);
           if (text) parts.push(text);
           continue;
         }
-        if (block?.type === 'tool_use') {
-          const name = String(block.name || '');
-          const input = block.input as { command?: unknown; files?: Array<{ path?: string; kind?: string }> } | undefined;
-          if (name === 'Bash' && typeof input?.command === 'string') {
-            parts.push(`执行命令: ${this.summarizeMessageContent(input.command, 400)}`);
-          } else if (name === 'Edit' && Array.isArray(input?.files)) {
-            parts.push(`文件修改: ${input.files.slice(0, 8).map((file) => `${file.kind}:${file.path}`).join(', ')}`);
-          } else if (name) {
-            parts.push(`工具: ${name}`);
-          }
+        if (block?.type === 'tool_use' || block?.type === 'tool_result') {
+          // 记忆检索的主证据只回答“用户当时看见了什么结论”。
+          // 工具命令和原始结果留给 audit / workflow / compact summary，
+          // 不进入历史问答检索摘要，避免旧路径或日志盖过正文。
           continue;
-        }
-        if (block?.type === 'tool_result') {
-          const text = this.summarizeMessageContent(String(block.content || ''), toolBudget);
-          if (text) parts.push(`工具结果: ${text}`);
         }
       }
       return this.summarizeMessageContent(parts.join(' | '), maxLen);
@@ -494,7 +1060,9 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private extractMemoryTokens(text: string): string[] {
-    const normalized = text
+    const repaired = repairLikelyMojibakeText(text);
+    if (repaired.unresolved) return [];
+    const normalized = repaired.text
       .replace(/<!--files:[\s\S]*?-->/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -538,9 +1106,28 @@ export class JsonFileStore implements BridgeStore {
       const searchText = raw;
       return content ? { content, searchText, source: 'message' } : null;
     }
-    const content = this.summarizeMessageContent(message.content, 220);
-    const searchText = this.summarizeMessageContent(message.content, 12000);
+    const memoryText = this.extractPlainMessageTextForMemory(message.content);
+    const content = this.summarizeMessageContent(memoryText, 220);
+    const searchText = this.summarizeMessageContent(memoryText, 12000);
     return content ? { content, searchText, source: 'message' } : null;
+  }
+
+  private summarizeAdjacentAssistantAnswer(messages: BridgeMessage[], index: number): {
+    content: string;
+    searchText: string;
+  } | null {
+    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+      const next = messages[nextIndex];
+      if (!next) break;
+      if (next.role !== 'assistant') break;
+      const summarized = this.summarizeMessageForMemory(next);
+      if (!summarized) continue;
+      return {
+        content: this.summarizeMessageContent(summarized.searchText, 700),
+        searchText: summarized.searchText,
+      };
+    }
+    return null;
   }
 
   private selectMessagesForMemory(
@@ -610,6 +1197,257 @@ export class JsonFileStore implements BridgeStore {
       lines.push(`- [${tags.join(' / ')}] ${hit.content}`);
     }
     return lines.join('\n');
+  }
+
+  private formatKnowledgeHit(item: KnowledgeItem): string {
+    const source = item.source.path ? path.basename(item.source.path) : 'knowledge';
+    const exact = item.key && item.value
+      ? `${item.key} = ${item.value}`
+      : item.text;
+    const conflict = item.conflict ? '（冲突候选）' : '';
+    return `[知识库/${item.kind}/${source}] ${exact}${conflict}`;
+  }
+
+  /**
+   * Knowledge indexes are shared implementation artifacts, not permission
+   * boundaries. Enforce the memory partition boundary again before a query can
+   * see an indexed item or graph node.
+   */
+  private isMemorySourceVisibleToQuery(sourcePath: string, memoryRoot: string, query: MemoryRetrievalQuery): boolean {
+    return isVisibleMemoryV2PathToQuery(memoryRoot, sourcePath, query);
+  }
+
+  private isMemoryItemVisibleToQuery(item: KnowledgeItem, memoryRoot: string, query: MemoryRetrievalQuery): boolean {
+    return isVisibleMemoryV2SourceToQuery(memoryRoot, item.source.path, item.source.metadata, query);
+  }
+
+  private filterMemoryGraphForQuery(
+    graph: MemoryGraphIndex,
+    memoryRoot: string,
+    query: MemoryRetrievalQuery,
+  ): MemoryGraphIndex {
+    // A graph node merged from two partitions is ambiguous. Excluding it is
+    // safer than using one user's relation to reveal another user's fact.
+    const nodes = graph.nodes.filter((node) => {
+      const sources = node.sourcePaths || [];
+      return sources.length > 0 && sources.every((source) => this.isMemorySourceVisibleToQuery(source, memoryRoot, query));
+    });
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = graph.edges.filter((edge) => {
+      const sources = edge.sourcePaths || [];
+      return nodeIds.has(edge.from)
+        && nodeIds.has(edge.to)
+        && sources.length > 0
+        && sources.every((source) => this.isMemorySourceVisibleToQuery(source, memoryRoot, query));
+    });
+    return { ...graph, nodeCount: nodes.length, edgeCount: edges.length, nodes, edges };
+  }
+
+  private searchKnowledgeIndexForMemory(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return [];
+    const index = readKnowledgeIndex(memoryRoot);
+    if (!index || index.items.length === 0) return [];
+
+    const scopedIndex = {
+      ...index,
+      items: index.items.filter((item) => this.isMemoryItemVisibleToQuery(item, memoryRoot, query)),
+    };
+    const hits = searchKnowledgeIndex(scopedIndex, {
+      query: query.query,
+      limit: MEMORY_RECALL_RE.test(query.query) ? 6 : 4,
+    });
+    if (hits.length === 0) return [];
+
+    return hits
+      .map((item) => {
+        const haystack = `${item.key || ''} ${item.value || ''} ${item.text}`.toLowerCase();
+        const normalizedQuery = query.query.trim().toLowerCase();
+        const itemKey = (item.key || '').trim().toLowerCase();
+        let score = item.confidence * 6;
+        if (normalizedQuery && itemKey) {
+          if (itemKey === normalizedQuery) score += 42;
+          else if (itemKey.includes(normalizedQuery) || normalizedQuery.includes(itemKey)) score += 24;
+        }
+        for (const token of tokens) {
+          if (haystack.includes(token.toLowerCase())) score += /[a-z]/i.test(token) ? 2 : 1.5;
+        }
+        if (MEMORY_RECALL_RE.test(query.query)) score += 4;
+        return {
+          sessionId: `knowledge-index:${item.id}`,
+          channelType: query.channelType,
+          chatId: query.chatId,
+          workingDirectory: query.workingDirectory,
+          role: 'assistant' as const,
+          source: 'summary' as const,
+          sourceType: 'knowledge' as const,
+          score,
+          confidence: Math.max(0, Math.min(0.98, item.confidence + (item.key && item.value ? 0.08 : 0))),
+          answerability: item.key && item.value ? 'structured' as const : 'summary' as const,
+          quality: item.conflict ? 'medium' as const : 'high' as const,
+          structuredKey: item.key,
+          structuredValue: item.value,
+          content: this.summarizeMessageContent(this.formatKnowledgeHit(item), 300),
+        };
+      })
+      .filter((hit) => hit.score >= (MEMORY_RECALL_RE.test(query.query) ? 4 : MEMORY_MIN_SCORE));
+  }
+
+  private summarizeProfileForMemory(profile: MemoryProfileRecord): string {
+    const parts: string[] = [];
+    const label = profile.displayName || profile.userId || profile.chatId || profile.key;
+    if (profile.facts.length > 0) {
+      parts.push(`事实/偏好: ${profile.facts.slice(-6).join(' | ')}`);
+    }
+    if (profile.pending.length > 0) {
+      parts.push(`待跟进: ${profile.pending.slice(-4).join(' | ')}`);
+    }
+    if (profile.topics.length > 0) {
+      parts.push(`近期主题: ${profile.topics.slice(-5).join(' | ')}`);
+    }
+    if (parts.length === 0) return '';
+    return `${label}: ${parts.join('；')}`;
+  }
+
+  private scoreMemoryProfile(query: MemoryRetrievalQuery, tokens: string[], profile: MemoryProfileRecord, text: string): number {
+    const haystack = `${profile.displayName || ''} ${profile.userId || ''} ${profile.chatId || ''} ${text}`;
+    const lower = haystack.toLowerCase();
+    let score = 0;
+
+    for (const token of tokens) {
+      const needle = /[a-z]/i.test(token) ? token.toLowerCase() : token;
+      if (!needle) continue;
+      if (lower.includes(needle.toLowerCase())) {
+        score += /[a-z]/i.test(token)
+          ? Math.min(5, Math.max(2, token.length / 2))
+          : Math.min(4, Math.max(1.5, token.length));
+      }
+    }
+
+    if (profile.channelType && profile.channelType === query.channelType) score += 1;
+    if (profile.chatId && profile.chatId === query.chatId) score += 5;
+    if (query.userId && profile.userId && profile.userId === query.userId) score += 6;
+    if (
+      query.userDisplayName
+      && profile.displayName
+      && (profile.displayName.includes(query.userDisplayName) || query.userDisplayName.includes(profile.displayName))
+    ) {
+      score += 3;
+    }
+    if (
+      profile.workingDirectory
+      && query.workingDirectory
+      && profile.workingDirectory.toLowerCase() === query.workingDirectory.toLowerCase()
+    ) {
+      score += 3;
+    }
+    if (MEMORY_RECALL_RE.test(query.query)) {
+      if (profile.scope === 'user' && query.userId && profile.userId === query.userId) score += 4;
+      if (profile.scope === 'chat' && profile.chatId === query.chatId) score += 3;
+      if (profile.scope === 'global') score += 1;
+    }
+
+    const ageMs = Date.now() - Date.parse(profile.lastEventAt || profile.updatedAt);
+    if (!Number.isNaN(ageMs)) {
+      if (ageMs < 24 * 60 * 60 * 1000) score += 1.5;
+      else if (ageMs < 14 * 24 * 60 * 60 * 1000) score += 0.5;
+    }
+
+    return score;
+  }
+
+  private searchMemoryProfiles(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    if (this.memoryProfiles.size === 0) return [];
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return [];
+
+    const hits: RetrievedMemoryHit[] = [];
+    for (const profile of this.memoryProfiles.values()) {
+      if (!profile.sessionId || profile.sessionId !== query.sessionId) continue;
+      if (profile.scope === 'user' && profile.userId !== query.userId) continue;
+      if (profile.scope === 'chat' && profile.chatId !== query.chatId) continue;
+      if (profile.scope === 'global') continue;
+      const text = this.summarizeProfileForMemory(profile);
+      if (!text) continue;
+      const score = this.scoreMemoryProfile(query, tokens, profile, text);
+      if (score < MEMORY_MIN_SCORE) continue;
+      const structuredPairs = inferStructuredMemories(text);
+      const structured = structuredPairs[0] || null;
+      hits.push({
+        sessionId: `memory-profile:${profile.key}`,
+        channelType: profile.channelType,
+        chatId: profile.chatId,
+        workingDirectory: profile.workingDirectory,
+        role: 'assistant',
+        source: 'summary',
+        sourceType: 'profile',
+        score,
+        confidence: Math.max(0, Math.min(0.9, score / 18)),
+        answerability: structured ? 'structured' : 'summary',
+        quality: isLowValueMemoryText(text) ? 'low' : (structured ? 'high' : 'medium'),
+        structuredKey: structured?.key,
+        structuredValue: structured?.value,
+        structuredPairs,
+        content: this.summarizeMessageContent(text, 260),
+      });
+    }
+    return hits;
+  }
+
+  private searchAuditLogForMemory(query: MemoryRetrievalQuery, tokens: string[]): RetrievedMemoryHit[] {
+    if (this.auditLog.length === 0) return [];
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query)) return [];
+
+    const hits: RetrievedMemoryHit[] = [];
+    const dedup = new Set<string>();
+    for (const entry of this.auditLog) {
+      if (entry.direction !== 'outbound') continue;
+      if (entry.channelType !== query.channelType || entry.chatId !== query.chatId) continue;
+      const searchText = this.summarizeMessageContent(entry.summary || '', 12000);
+      if (!searchText || isLowValueMemoryText(searchText)) continue;
+      const contentKey = crypto
+        .createHash('sha1')
+        .update(`${entry.channelType}:${entry.chatId}:${entry.direction}:${searchText}`)
+        .digest('hex');
+      if (dedup.has(contentKey)) continue;
+
+      let score = this.scoreMemoryHit(
+        query,
+        tokens,
+        searchText,
+        {
+          channelType: entry.channelType,
+          chatId: entry.chatId,
+          updatedAt: entry.createdAt,
+        },
+        `audit:${entry.id}`,
+        'message',
+        entry.direction === 'outbound' ? 'assistant' : 'user',
+      );
+      if (entry.direction === 'outbound') score += 1;
+      if (MEMORY_RECALL_RE.test(query.query) && /(对应表|常用|==|=>|->)/.test(searchText)) score += 3;
+      if (score < (MEMORY_RECALL_RE.test(query.query) ? 4 : MEMORY_MIN_SCORE)) continue;
+
+      dedup.add(contentKey);
+      const structuredPairs = inferStructuredMemories(searchText);
+      const structured = structuredPairs[0] || null;
+      hits.push({
+        sessionId: `audit:${entry.id}`,
+        channelType: entry.channelType,
+        chatId: entry.chatId,
+        role: entry.direction === 'outbound' ? 'assistant' : 'user',
+        source: 'message',
+        sourceType: 'audit',
+        score,
+        confidence: Math.max(0, Math.min(0.92, score / 16)),
+        answerability: structured ? 'structured' : 'summary',
+        quality: structured ? 'high' : 'medium',
+        structuredKey: structured?.key,
+        structuredValue: structured?.value,
+        structuredPairs,
+        content: this.buildMatchedMemoryExcerpt(searchText, tokens, 300),
+      });
+    }
+    return hits;
   }
 
   private buildMatchedMemoryExcerpt(searchText: string, tokens: string[], maxLen = 220): string {
@@ -719,67 +1557,70 @@ export class JsonFileStore implements BridgeStore {
   // Channel Bindings
 
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null {
+    this.refreshBindingsFromDisk();
     return this.bindings.get(`${channelType}:${chatId}`) ?? null;
   }
 
   upsertChannelBinding(data: UpsertChannelBindingInput): ChannelBinding {
-    const key = `${data.channelType}:${data.chatId}`;
-    const existing = this.bindings.get(key);
-    const nextMode = (data.mode as ChannelBinding['mode'] | undefined)
-      ?? existing?.mode
-      ?? (this.settings.get('bridge_default_mode') as ChannelBinding['mode'] | null)
-      ?? 'code';
-    if (existing) {
-      const updated: ChannelBinding = {
-        ...existing,
-        displayName: data.displayName ?? existing.displayName,
-        chatType: data.chatType ?? existing.chatType,
+    return this.mutateBindings(() => {
+      const key = `${data.channelType}:${data.chatId}`;
+      const existing = this.bindings.get(key);
+      const nextMode = (data.mode as ChannelBinding['mode'] | undefined)
+        ?? existing?.mode
+        ?? (this.settings.get('bridge_default_mode') as ChannelBinding['mode'] | null)
+        ?? 'code';
+      if (existing) {
+        const updated: ChannelBinding = {
+          ...existing,
+          displayName: data.displayName ?? existing.displayName,
+          chatType: data.chatType ?? existing.chatType,
+          codepilotSessionId: data.codepilotSessionId,
+          sdkSessionId: data.sdkSessionId ?? existing.sdkSessionId,
+          workingDirectory: data.workingDirectory,
+          model: data.model,
+          mode: nextMode,
+          bridgeFingerprint: data.bridgeFingerprint ?? existing.bridgeFingerprint,
+          toolingFingerprint: data.toolingFingerprint ?? existing.toolingFingerprint,
+          updatedAt: now(),
+        };
+        this.bindings.set(key, updated);
+        return updated;
+      }
+      const binding: ChannelBinding = {
+        id: uuid(),
+        channelType: data.channelType,
+        chatId: data.chatId,
+        displayName: data.displayName,
+        chatType: data.chatType,
         codepilotSessionId: data.codepilotSessionId,
-        sdkSessionId: data.sdkSessionId ?? existing.sdkSessionId,
+        sdkSessionId: data.sdkSessionId || '',
         workingDirectory: data.workingDirectory,
         model: data.model,
         mode: nextMode,
-        bridgeFingerprint: data.bridgeFingerprint ?? existing.bridgeFingerprint,
-        toolingFingerprint: data.toolingFingerprint ?? existing.toolingFingerprint,
+        bridgeFingerprint: data.bridgeFingerprint,
+        toolingFingerprint: data.toolingFingerprint,
+        active: true,
+        createdAt: now(),
         updatedAt: now(),
       };
-      this.bindings.set(key, updated);
-      this.persistBindings();
-      return updated;
-    }
-    const binding: ChannelBinding = {
-      id: uuid(),
-      channelType: data.channelType,
-      chatId: data.chatId,
-      displayName: data.displayName,
-      chatType: data.chatType,
-      codepilotSessionId: data.codepilotSessionId,
-      sdkSessionId: data.sdkSessionId || '',
-      workingDirectory: data.workingDirectory,
-      model: data.model,
-      mode: nextMode,
-      bridgeFingerprint: data.bridgeFingerprint,
-      toolingFingerprint: data.toolingFingerprint,
-      active: true,
-      createdAt: now(),
-      updatedAt: now(),
-    };
-    this.bindings.set(key, binding);
-    this.persistBindings();
-    return binding;
+      this.bindings.set(key, binding);
+      return binding;
+    });
   }
 
   updateChannelBinding(id: string, updates: Partial<ChannelBinding>): void {
-    for (const [key, b] of this.bindings) {
-      if (b.id === id) {
-        this.bindings.set(key, { ...b, ...updates, updatedAt: now() });
-        this.persistBindings();
-        break;
+    this.mutateBindings(() => {
+      for (const [key, b] of this.bindings) {
+        if (b.id === id) {
+          this.bindings.set(key, { ...b, ...updates, updatedAt: now() });
+          break;
+        }
       }
-    }
+    });
   }
 
   listChannelBindings(channelType?: ChannelType): ChannelBinding[] {
+    this.refreshBindingsFromDisk();
     const all = Array.from(this.bindings.values());
     if (!channelType) return all;
     return all.filter((b) => b.channelType === channelType);
@@ -850,10 +1691,11 @@ export class JsonFileStore implements BridgeStore {
     for (const item of existing) merged.set(item.messageId, item);
     for (const item of data.messages) {
       if (!item.messageId?.trim()) continue;
+      const text = this.sanitizePersistedText(item.text || '');
       merged.set(item.messageId, {
         ...item,
         chatId,
-        text: item.text || '',
+        text,
       });
     }
 
@@ -878,6 +1720,7 @@ export class JsonFileStore implements BridgeStore {
       displayName: status.displayName,
       lastMessageAt: status.latestMessageTime,
     });
+    this.recordFeishuHistoryProfiles(chatId, status.displayName, data.messages);
     return status;
   }
 
@@ -892,7 +1735,13 @@ export class JsonFileStore implements BridgeStore {
   retrieveRelevantFeishuHistory(query: FeishuHistoryQuery): RetrievedFeishuHistoryContext | null {
     const chatId = query.chatId.trim();
     if (!chatId) return null;
-    const allMessages = this.loadFeishuHistoryMessages(chatId);
+    const allMessages = this.loadFeishuHistoryMessages(chatId)
+      .map((item) => ({
+        ...item,
+        senderName: this.sanitizePersistedText(item.senderName || ''),
+        text: this.sanitizePersistedText(item.text || ''),
+      }))
+      .filter((item) => item.text);
     if (allMessages.length === 0) return null;
 
     const tokens = this.extractMemoryTokens(query.query);
@@ -928,7 +1777,10 @@ export class JsonFileStore implements BridgeStore {
     });
 
     const selected = scored
-      .sort((left, right) => right.score - left.score)
+      // 同分时优先保留最新消息；计划任务和普通历史摘要都不能把
+      // 时间窗口内最早的旧消息误当成当前进展。
+      .sort((left, right) => right.score - left.score
+        || Number.parseInt(right.item.createTime || '0', 10) - Number.parseInt(left.item.createTime || '0', 10))
       .slice(0, Math.max(1, query.limit))
       .map((entry) => entry.item)
       .sort((left, right) => Number.parseInt(left.createTime || '0', 10) - Number.parseInt(right.createTime || '0', 10));
@@ -956,6 +1808,7 @@ export class JsonFileStore implements BridgeStore {
   // Sessions
 
   getSession(id: string): BridgeSession | null {
+    this.refreshSessionsFromDisk();
     return this.sessions.get(id) ?? null;
   }
 
@@ -966,23 +1819,43 @@ export class JsonFileStore implements BridgeStore {
     cwd?: string,
     _mode?: string,
   ): BridgeSession {
-    const session: BridgeSession = {
-      id: uuid(),
-      working_directory: cwd || this.settings.get('bridge_default_work_dir') || process.cwd(),
-      model,
-      system_prompt: systemPrompt,
-    };
-    this.sessions.set(session.id, session);
-    this.persistSessions();
-    return session;
+    return this.mutateSessions(() => {
+      const session: BridgeSession = {
+        id: uuid(),
+        working_directory: cwd || this.settings.get('bridge_default_work_dir') || process.cwd(),
+        model,
+        system_prompt: systemPrompt,
+      };
+      this.sessions.set(session.id, session);
+      return session;
+    });
   }
 
   updateSessionProviderId(sessionId: string, providerId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      s.provider_id = providerId;
-      this.persistSessions();
-    }
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) session.provider_id = providerId;
+    });
+  }
+
+  getSpeechReplyPreference(sessionId: string): 'on' | 'off' | null {
+    this.refreshSessionsFromDisk();
+    const session = this.sessions.get(sessionId) as (BridgeSession & { speech_reply_preference?: unknown }) | undefined;
+    return session?.speech_reply_preference === 'on' || session?.speech_reply_preference === 'off'
+      ? session.speech_reply_preference
+      : null;
+  }
+
+  /**
+   * 会话语音偏好复用 sessions.json 的跨进程锁与原子写入；不能落到普通
+   * settings、session.mode 或独立无锁 JSON，否则会污染执行语义或状态回退。
+   */
+  setSpeechReplyPreference(sessionId: string, preference: 'on' | 'off'): void {
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId) as (BridgeSession & { speech_reply_preference?: 'on' | 'off' }) | undefined;
+      if (!session) throw new Error('speech_preference_session_not_found');
+      session.speech_reply_preference = preference;
+    });
   }
 
   // Messages
@@ -1002,14 +1875,155 @@ export class JsonFileStore implements BridgeStore {
     return { messages: [...msgs] };
   }
 
+  private applyMemoryEvent(event: ConversationMemoryEvent): boolean {
+    const text = this.summarizeMessageContent(event.text || '', 800);
+    if (!text) return false;
+
+    // Conversation capture is temporary/profile evidence only. Durable memory
+    // may be promoted exclusively by the classified write path in bridge-core.
+    const items = this.extractMemoryProfileItems(text, event.role);
+    const hasUsefulItems = items.topics.length > 0 || items.facts.length > 0 || items.pending.length > 0;
+    if (!hasUsefulItems && text.length < 12) return false;
+
+    const timestampedEvent: ConversationMemoryEvent = {
+      ...event,
+      text,
+      createdAt: event.createdAt || now(),
+    };
+
+    if (event.chatId?.trim()) {
+      const chatKey = this.memoryProfileKey('chat', event.channelType, event.chatId, event.sessionId);
+      this.upsertMemoryProfile('chat', chatKey, timestampedEvent, items);
+    }
+
+    if (event.userId?.trim() && event.role === 'user') {
+      const userKey = this.memoryProfileKey('user', event.channelType, event.userId, event.sessionId);
+      this.upsertMemoryProfile('user', userKey, timestampedEvent, items);
+    }
+
+    return true;
+  }
+
+  private persistExplicitMemoryWrite(
+    event: ConversationMemoryEvent,
+    text: string,
+    candidates?: MemoryWriteCandidate[],
+    classification?: MemoryWriteClassification,
+  ): MemoryWriteResult {
+    if (event.role !== 'user') return { ok: false, skipped: true, error: 'not_user_message' };
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return { ok: false, error: 'bridge_memory_repo_dir is not configured' };
+    const partition = resolveDurableMemoryDirectory(memoryRoot, {
+      channelType: event.channelType,
+      chatId: event.chatId,
+      userId: event.userId,
+      classification,
+    });
+    if (!partition.dir) return { ok: false, skipped: true, error: partition.error };
+
+    const candidatePairs = normalizeMemoryWriteCandidates(candidates);
+    if (candidatePairs.length === 0) {
+      return { ok: false, skipped: true, error: 'classified durable memory requires structured candidates' };
+    }
+
+    const pairSeen = new Set<string>();
+    const pairs: Array<{ key: string; value: string }> = [];
+    for (const pair of candidatePairs) {
+      addMemoryCandidatePair(pairs, pairSeen, pair.key, pair.value);
+    }
+    let filePath = partition.dir;
+    try {
+      const written = upsertConfirmedMemoryDocument({
+        memoryRoot,
+        scope: classification!.scope as 'user' | 'group' | 'long_term',
+        channelType: event.channelType,
+        chatId: event.chatId,
+        userId: event.userId,
+        displayName: classification!.scope === 'group'
+          ? event.chatDisplayName
+          : event.userDisplayName,
+        pairs,
+        evidenceText: cleanMemoryWriteText(text) || text,
+        createdAt: event.createdAt || now(),
+      });
+      filePath = written.filePath;
+      rebuildKnowledgeIndex(memoryRoot);
+      return {
+        ok: true,
+        memoryRoot,
+        filePath,
+        knowledgeRebuilt: true,
+        scope: classification!.scope,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('[store] Failed to persist explicit memory write:', message);
+      return {
+        ok: false,
+        memoryRoot,
+        filePath,
+        knowledgeRebuilt: false,
+        scope: classification!.scope,
+        error: message,
+      };
+    }
+  }
+
+  persistMemoryWrite(input: MemoryWriteInput): MemoryWriteResult {
+    return this.persistExplicitMemoryWrite({
+      sessionId: input.sessionId,
+      channelType: input.channelType,
+      chatId: input.chatId,
+      chatDisplayName: input.chatDisplayName,
+      userId: input.userId,
+      userDisplayName: input.userDisplayName,
+      role: 'user',
+      text: input.text,
+      workingDirectory: input.workingDirectory,
+      createdAt: input.createdAt || now(),
+    }, this.sanitizePersistedText(input.text || ''), input.candidates, input.classification);
+  }
+
+  recordPromptSnapshot(snapshot: PromptSnapshotRecord): void {
+    const maxItems = Math.max(1, Number.parseInt(this.getSetting('bridge_prompt_snapshot_max_items') || '100', 10) || 100);
+    const maxAgeDays = Math.max(1, Number.parseInt(this.getSetting('bridge_prompt_snapshot_retention_days') || '7', 10) || 7);
+    createPromptSnapshotStore({ ctiHome: CTI_HOME, maxItems, maxAgeDays }).record(snapshot);
+  }
+
+  recordMemoryEvent(event: ConversationMemoryEvent): void {
+    if (!this.applyMemoryEvent(event)) return;
+    this.persistMemoryProfiles();
+  }
+
   retrieveRelevantMemory(query: MemoryRetrievalQuery): RetrievedMemoryContext | null {
     const tokens = this.extractMemoryTokens(query.query);
-    if (tokens.length === 0) return null;
+    const knowledgeHits = this.searchKnowledgeIndexForMemory(query, tokens);
+    const graphContext = this.retrieveMemoryGraphContext(query);
+    const graphHits: RetrievedMemoryHit[] = (graphContext?.related || [])
+      .slice(0, 4)
+      .map((item) => ({
+        sessionId: `memory-graph:${item.id}`,
+        channelType: query.channelType,
+        chatId: query.chatId,
+        workingDirectory: query.workingDirectory,
+        role: 'assistant' as const,
+        source: 'summary' as const,
+        sourceType: 'knowledge' as const,
+        score: Math.max(0, item.score) + 3,
+        confidence: Math.max(0.45, Math.min(0.88, item.score / 12)),
+        answerability: item.edgeTypes.includes('maps_to') || item.edgeTypes.includes('reverse_lookup') ? 'structured' as const : 'summary' as const,
+        quality: 'medium' as const,
+        structuredKey: query.query,
+        structuredValue: item.label,
+        content: `[记忆关系图] ${query.query} -> ${item.label}（${item.edgeTypes.join(', ')}）`,
+      }));
+    if (tokens.length === 0 && !MEMORY_RECALL_RE.test(query.query) && knowledgeHits.length === 0 && graphHits.length === 0) return null;
 
     const metaBySession = this.buildMemorySessionMeta();
     const sameChatHits: RetrievedMemoryHit[] = [];
     const currentSessionHits: RetrievedMemoryHit[] = [];
-    const sameWorkdirHits: RetrievedMemoryHit[] = [];
+    const auditHits = this.searchAuditLogForMemory(query, tokens);
+    const profileHits = this.searchMemoryProfiles(query, tokens);
     const dedup = new Set<string>();
     const recentHistoryLimit = Math.max(0, query.recentHistoryLimit || 0);
 
@@ -1019,29 +2033,35 @@ export class JsonFileStore implements BridgeStore {
       };
 
       const sameChat = meta.channelType === query.channelType && meta.chatId === query.chatId;
-      const sameWorkdir = !!meta.workingDirectory && !!query.workingDirectory
-        && meta.workingDirectory.toLowerCase() === query.workingDirectory.toLowerCase();
       const isCurrentSession = sessionId === query.sessionId;
 
-      if (!sameChat && !sameWorkdir && !isCurrentSession) continue;
+      if (!sameChat && !isCurrentSession) continue;
 
       const messages = this.loadMessages(sessionId);
       const candidates = this.selectMessagesForMemory(isCurrentSession, messages, recentHistoryLimit);
       const archivedCandidates = this.loadArchivedMessagesForMemory(sessionId);
 
-      for (const message of [...candidates, ...archivedCandidates]) {
+      const memoryCandidates = [...candidates, ...archivedCandidates];
+      for (let index = 0; index < memoryCandidates.length; index += 1) {
+        const message = memoryCandidates[index];
         const summarized = this.summarizeMessageForMemory(message);
         if (!summarized) continue;
+        const adjacentAnswer = message.role !== 'assistant'
+          ? this.summarizeAdjacentAssistantAnswer(memoryCandidates, index)
+          : null;
+        const combinedSearchText = adjacentAnswer
+          ? `${summarized.searchText}\n相邻助手回复：${adjacentAnswer.searchText}`
+          : summarized.searchText;
         const contentKey = crypto
           .createHash('sha1')
-          .update(`${summarized.source}:${message.role}:${summarized.searchText}`)
+          .update(`${summarized.source}:${message.role}:${combinedSearchText}`)
           .digest('hex');
         if (dedup.has(contentKey)) continue;
 
         const score = this.scoreMemoryHit(
           query,
           tokens,
-          summarized.searchText,
+          combinedSearchText,
           meta,
           sessionId,
           summarized.source,
@@ -1050,6 +2070,8 @@ export class JsonFileStore implements BridgeStore {
         if (score < MEMORY_MIN_SCORE) continue;
 
         dedup.add(contentKey);
+        const structuredPairs = inferStructuredMemories(combinedSearchText);
+        const structured = structuredPairs[0] || null;
         const hit: RetrievedMemoryHit = {
           sessionId,
           channelType: meta.channelType,
@@ -1057,24 +2079,39 @@ export class JsonFileStore implements BridgeStore {
           workingDirectory: meta.workingDirectory,
           role: message.role === 'assistant' ? 'assistant' : 'user',
           source: summarized.source,
+          sourceType: sameChat ? 'chat' : (isCurrentSession ? 'session' : 'workdir'),
           score,
-          content: this.buildMatchedMemoryExcerpt(summarized.searchText, tokens),
+          confidence: Math.max(0, Math.min(0.9, score / 18)),
+          answerability: structured ? 'structured' : 'summary',
+          quality: isLowValueMemoryText(combinedSearchText) ? 'low' : (structured ? 'high' : 'medium'),
+          structuredKey: structured?.key,
+          structuredValue: structured?.value,
+          structuredPairs,
+          content: adjacentAnswer
+            ? [
+              `用户请求：${this.buildMatchedMemoryExcerpt(summarized.searchText, tokens, 220)}`,
+              `相邻助手回复：${adjacentAnswer.content}`,
+            ].join('；')
+            : this.buildMatchedMemoryExcerpt(combinedSearchText, tokens),
         };
         if (sameChat) sameChatHits.push(hit);
         else if (isCurrentSession) currentSessionHits.push(hit);
-        else sameWorkdirHits.push(hit);
       }
     }
 
-    const hits = sameChatHits.length > 0
-      ? sameChatHits
-      : currentSessionHits.length > 0
-        ? currentSessionHits
-        : sameWorkdirHits;
+    const hits = [
+      ...knowledgeHits,
+      ...graphHits,
+      ...sameChatHits,
+      ...currentSessionHits,
+      ...auditHits,
+      ...profileHits,
+    ];
 
     const selected: RetrievedMemoryHit[] = [];
     let usedChars = 0;
     for (const hit of hits.sort((left, right) => right.score - left.score)) {
+      if (hit.quality === 'low' || isLowValueMemoryText(hit.content)) continue;
       const nextChars = usedChars + hit.content.length;
       if (selected.length > 0 && nextChars > MEMORY_MAX_CHARS) break;
       selected.push(hit);
@@ -1087,6 +2124,59 @@ export class JsonFileStore implements BridgeStore {
       summary: this.buildMemorySummary(selected),
       hits: selected,
     };
+  }
+
+  decideMemoryReply(query: MemoryRetrievalQuery): MemoryReplyDecision {
+    const plan = planMemoryQuery(query.query);
+    if (plan.intent !== 'explicit_recall') {
+      return {
+        type: 'augment_codex',
+        memory: null,
+        plan,
+      };
+    }
+    const memory = this.retrieveRelevantMemory({
+      ...query,
+      query: plan.normalizedKey || plan.queryText,
+      recentHistoryLimit: plan.intent === 'explicit_recall' ? 0 : query.recentHistoryLimit,
+    });
+    return decideMemoryReplyFromHits(plan, memory);
+  }
+
+  retrieveMemoryGraphContext(query: MemoryRetrievalQuery): MemoryGraphContext | null {
+    const memoryRoot = this.settings.get('bridge_memory_repo_dir');
+    if (!memoryRoot) return null;
+    const graph = readMemoryGraphIndex(memoryRoot);
+    if (!graph) return null;
+    const context = searchMemoryGraph(this.filterMemoryGraphForQuery(graph, memoryRoot, query), query.query, { limit: MEMORY_MAX_HITS });
+    return context.related.length > 0 ? context : null;
+  }
+
+  reviewOutboundAnswer(input: AnswerReviewInput): AnswerReviewDecision {
+    const modeSetting = this.settings.get('bridge_answer_review_mode') || process.env.CTI_ANSWER_REVIEW_MODE || '';
+    const configuredMode = modeSetting === 'block_or_replace'
+      ? 'block_or_replace'
+      : 'observe';
+    const decision = reviewOutboundAnswerRules(input, { mode: configuredMode });
+    this.appendAnswerReviewAudit(input, decision);
+    return decision;
+  }
+
+  private appendAnswerReviewAudit(input: AnswerReviewInput, decision: AnswerReviewDecision): void {
+    if (decision.verdict === 'pass' && decision.reasonCodes.length === 0) return;
+    const existing = readJson<AnswerReviewAuditRecord[]>(ANSWER_REVIEW_AUDIT_PATH, []);
+    const record: AnswerReviewAuditRecord = {
+      ...decision,
+      id: uuid(),
+      channelType: input.channelType,
+      chatId: input.chatId,
+      userId: input.userId,
+      userText: this.summarizeMessageContent(input.userText || '', 800),
+      answerText: this.summarizeMessageContent(input.answerText || '', 1200),
+      source: input.source,
+      executionEvidence: input.executionEvidence,
+    };
+    writeJson(ANSWER_REVIEW_AUDIT_PATH, [...existing, record].slice(-500));
   }
 
   // Session Locking
@@ -1126,27 +2216,28 @@ export class JsonFileStore implements BridgeStore {
   // SDK Session
 
   updateSdkSessionId(sessionId: string, sdkSessionId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      // Store sdkSessionId on the session object
-      (s as unknown as Record<string, unknown>)['sdk_session_id'] = sdkSessionId;
-      this.persistSessions();
-    }
-    // Also update any bindings that reference this session
-    for (const [key, b] of this.bindings) {
-      if (b.codepilotSessionId === sessionId) {
-        this.bindings.set(key, { ...b, sdkSessionId, updatedAt: now() });
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        (session as unknown as Record<string, unknown>)['sdk_session_id'] = sdkSessionId;
       }
-    }
-    this.persistBindings();
+    });
+    // 绑定可能刚被另一个 Bridge 切到新工作区；事务内先回读，旧 session
+    // 的迟到 SDK 回执只能更新仍然引用它的绑定，不能把新绑定覆盖回去。
+    this.mutateBindings(() => {
+      for (const [key, b] of this.bindings) {
+        if (b.codepilotSessionId === sessionId) {
+          this.bindings.set(key, { ...b, sdkSessionId, updatedAt: now() });
+        }
+      }
+    });
   }
 
   updateSessionModel(sessionId: string, model: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) {
-      s.model = model;
-      this.persistSessions();
-    }
+    this.mutateSessions(() => {
+      const session = this.sessions.get(sessionId);
+      if (session) session.model = model;
+    });
   }
 
   syncSdkTasks(_sessionId: string, _todos: unknown): void {
@@ -1178,6 +2269,25 @@ export class JsonFileStore implements BridgeStore {
     this.persistAudit();
   }
 
+  listAuditLogs(filter: {
+    channelType?: string;
+    chatId?: string;
+    direction?: 'inbound' | 'outbound';
+    messageId?: string;
+    limit?: number;
+  } = {}): Array<AuditLogInput & { id?: string; createdAt?: string }> {
+    const limit = Number.isFinite(filter.limit)
+      ? Math.max(1, Math.min(200, Math.floor(filter.limit as number)))
+      : 50;
+    return [...this.auditLog]
+      .reverse()
+      .filter((entry) => !filter.channelType || entry.channelType === filter.channelType)
+      .filter((entry) => !filter.chatId || entry.chatId === filter.chatId)
+      .filter((entry) => !filter.direction || entry.direction === filter.direction)
+      .filter((entry) => !filter.messageId || entry.messageId === filter.messageId)
+      .slice(0, limit);
+  }
+
   checkDedup(key: string): boolean {
     const ts = this.dedupKeys.get(key);
     if (ts === undefined) return false;
@@ -1206,8 +2316,49 @@ export class JsonFileStore implements BridgeStore {
     if (changed) this.persistDedup();
   }
 
-  insertOutboundRef(_ref: OutboundRefInput): void {
-    // no-op for file-based store
+  insertOutboundRef(ref: OutboundRefInput): void {
+    const channelType = ref.channelType?.trim();
+    const chatId = ref.chatId?.trim();
+    const platformMessageId = ref.platformMessageId?.trim();
+    if (!channelType || !chatId || !platformMessageId) return;
+    const key = this.outboundRefKey(channelType, chatId, platformMessageId);
+    const existing = this.outboundRefs.get(key);
+    const createdAt = existing?.createdAt || ref.createdAt || now();
+    this.outboundRefs.set(key, {
+      ...existing,
+      ...ref,
+      channelType,
+      chatId,
+      platformMessageId,
+      codepilotSessionId: ref.codepilotSessionId || existing?.codepilotSessionId || '',
+      purpose: ref.purpose || existing?.purpose || 'response',
+      createdAt,
+      updatedAt: now(),
+    });
+    this.persistOutboundRefs();
+  }
+
+  listOutboundRefs(filter: OutboundRefFilter = {}): OutboundRefRecord[] {
+    return [...this.outboundRefs.values()]
+      .filter((ref) => !filter.channelType || ref.channelType === filter.channelType)
+      .filter((ref) => !filter.chatId || ref.chatId === filter.chatId)
+      .filter((ref) => !filter.platformMessageId || ref.platformMessageId === filter.platformMessageId)
+      .filter((ref) => !filter.codepilotSessionId || ref.codepilotSessionId === filter.codepilotSessionId)
+      .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+  }
+
+  markOutboundRefRecalled(input: MarkOutboundRefRecalledInput): boolean {
+    const key = this.outboundRefKey(input.channelType, input.chatId, input.platformMessageId);
+    const existing = this.outboundRefs.get(key);
+    if (!existing) return false;
+    this.outboundRefs.set(key, {
+      ...existing,
+      recalledAt: input.ok ? (input.recalledAt || now()) : existing.recalledAt,
+      recallError: input.ok ? undefined : (input.error || '撤回失败'),
+      updatedAt: now(),
+    });
+    this.persistOutboundRefs();
+    return true;
   }
 
   // Permission Links
@@ -1215,9 +2366,12 @@ export class JsonFileStore implements BridgeStore {
   insertPermissionLink(link: PermissionLinkInput): void {
     const record: PermissionLinkRecord = {
       permissionRequestId: link.permissionRequestId,
+      channelType: link.channelType,
       chatId: link.chatId,
       messageId: link.messageId,
       resolved: false,
+      toolName: link.toolName,
+      toolInputJson: link.toolInputJson,
       suggestions: link.suggestions,
     };
     this.permissionLinks.set(link.permissionRequestId, record);

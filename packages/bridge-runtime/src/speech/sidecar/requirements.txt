@@ -1,0 +1,2 @@
+# Sidecar 协议壳只依赖 Python 3 标准库。
+# ASR/TTS 后端及模型必须由受管 manifest 固定版本、SHA 与许可证后另行安装。

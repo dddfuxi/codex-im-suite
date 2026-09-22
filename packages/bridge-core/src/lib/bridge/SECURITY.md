@@ -17,7 +17,7 @@ The bridge exposes an LLM to messages from IM platforms. Key threats:
 Each adapter implements `isAuthorized(userId, chatId)`:
 - **Telegram**: `telegram_bridge_allowed_users` CSV whitelist
 - **Discord**: `bridge_discord_allowed_users`, `_allowed_channels`, `_allowed_guilds` with group policy
-- **Feishu**: `bridge_feishu_allowed_users` + group policy + mention requirement
+- **Feishu**: open inbound chat access + group policy + mention requirement; sensitive actions are gated by Viewer / Operator / Owner roles
 
 Unauthorized messages are silently dropped (no response leak).
 
@@ -54,7 +54,7 @@ All inbound and outbound messages are logged via `store.insertAuditLog()` with:
 
 ## Recommendations for Deployments
 
-1. Always configure `allowed_users` — never run with open access
+1. For Feishu, manage Viewer / Operator / Owner roles in `permissions.json` or the control panel, and use group policy / mention requirement to limit noise
 2. Use separate bot tokens for bridge vs. notifications
 3. Monitor audit logs for unusual patterns
 4. Keep bot token rotation in your operational runbook

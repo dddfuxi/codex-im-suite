@@ -22,12 +22,17 @@ param(
     [string]$Command = 'help',
 
     [Parameter(Position=1)]
-    [int]$LogLines = 50
+    [int]$LogLines = 50,
+
+    [string]$CommandCompletionPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
-# ── Paths ──
+# Paths
 $DefaultCtiHome = Join-Path $HOME '.claude-to-im'
 if (-not $env:CTI_HOME) {
     $env:CTI_HOME = $DefaultCtiHome
@@ -41,11 +46,20 @@ $StopFlagFile = Join-Path $RuntimeDir 'bridge.stop'
 $StatusFile = Join-Path $RuntimeDir 'status.json'
 $LogFile    = Join-Path (Join-Path $CtiHome 'logs') 'bridge.log'
 $ErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-error.log'
+$SupervisorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor.log'
+$SupervisorErrorLogFile = Join-Path (Join-Path $CtiHome 'logs') 'bridge-supervisor-error.log'
 $DaemonMjs  = Join-Path (Join-Path $SkillDir 'dist') 'daemon.mjs'
+$script:IsolatedCommandCompletionPath = if ([string]::IsNullOrWhiteSpace($CommandCompletionPath)) {
+    $env:CTI_DAEMON_COMMAND_COMPLETION_PATH
+} else {
+    $CommandCompletionPath
+}
+# 该回执只属于当前 start 命令包装器，禁止让长驻 Supervisor/Bridge 继承。
+[System.Environment]::SetEnvironmentVariable('CTI_DAEMON_COMMAND_COMPLETION_PATH', $null)
 
 $ServiceName = 'ClaudeToIMBridge'
 
-# ── Helpers ──
+# Helpers
 
 function Ensure-Dirs {
     @('data','logs','runtime','data/messages') | ForEach-Object {
@@ -96,13 +110,81 @@ function Test-PidAlive {
     catch { return $false }
 }
 
+function Get-ProcessCommandLine {
+    param([string]$ProcessIdValue)
+    if (-not $ProcessIdValue) { return $null }
+    try {
+        return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop).CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Test-BridgePid {
+    param([string]$ProcessIdValue)
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+
+    # Windows can reuse a terminated Bridge PID for an unrelated application.
+    # A numeric PID is therefore never enough evidence to block start or stop.
+    # Fail closed when command-line inspection is unavailable, rather than
+    # risking a false “already running” result or terminating another process.
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop
+        if ($process.Name -notmatch '^node(?:\.exe)?$') { return $false }
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+        $expectedDaemon = [IO.Path]::GetFullPath($DaemonMjs).Replace('/', '\\')
+        return $commandLine.IndexOf($expectedDaemon, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    } catch {
+        return $false
+    }
+}
+
+function Test-SupervisorPid {
+    param([string]$ProcessIdValue)
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$ProcessIdValue)" -ErrorAction Stop
+        if ($process.Name -notmatch '^(?:powershell|pwsh)(?:\.exe)?$') { return $false }
+        $commandLine = [string]$process.CommandLine
+        $match = [regex]::Match($commandLine, '(?i)-EncodedCommand\s+([^\s]+)')
+        if (-not $match.Success) { return $false }
+        $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($match.Groups[1].Value))
+        $expectedScript = [IO.Path]::GetFullPath($PSCommandPath)
+        return $decoded.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $decoded -match "-Command 'run-supervisor'"
+    } catch {
+        return $false
+    }
+}
+
+function Stop-PidIfAlive {
+    param(
+        [string]$ProcessIdValue,
+        [string]$Label
+    )
+    if (-not $ProcessIdValue) { return $false }
+    if (-not (Test-PidAlive $ProcessIdValue)) { return $false }
+    try {
+        Stop-Process -Id ([int]$ProcessIdValue) -Force -ErrorAction Stop
+        if ($Label) { Write-Host "$Label stopped" }
+        return $true
+    } catch {
+        $message = $_.Exception.Message
+        if ($_.FullyQualifiedErrorId -like '*NoProcessFoundForGivenId*' -or $message -match 'Cannot find a process|process identifier') {
+            if ($Label) { Write-Host "$Label was already stopped" }
+            return $false
+        }
+        throw
+    }
+}
+
 function Test-StatusRunning {
     if (-not (Test-Path $StatusFile)) { return $false }
     try {
         $json = Get-Content $StatusFile -Raw | ConvertFrom-Json
         if ($json.running -ne $true) { return $false }
         if ($json.pid) {
-            return Test-PidAlive ([string]$json.pid)
+            return Test-BridgePid ([string]$json.pid)
         }
         return $false
     } catch {
@@ -143,7 +225,25 @@ function Get-NodePath {
     return $nodePath
 }
 
-# ── WinSW / NSSM detection ──
+function Publish-IsolatedCommandCompletion {
+    param([int]$ExitCode)
+    if ([string]::IsNullOrWhiteSpace($script:IsolatedCommandCompletionPath)) { return }
+    [IO.File]::WriteAllText(
+        $script:IsolatedCommandCompletionPath,
+        [string]$ExitCode,
+        [Text.UTF8Encoding]::new($false))
+}
+
+function ConvertTo-WindowsCommandLineArgument {
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    # Start-Process on Windows joins ArgumentList into one command line. Quote
+    # path-like values explicitly so spaces are not split into extra argv items.
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
+
+# WinSW / NSSM detection
 
 function Find-ServiceManager {
     # Prefer WinSW, then NSSM
@@ -234,21 +334,36 @@ function Install-NSSMService {
     Write-Host "Or:          sc.exe start $ServiceName"
 }
 
-# ── Fallback: Start-Process (no service manager) ──
+# Fallback: Start-Process (no service manager)
 
 function Start-Fallback {
     if (Test-Path $StopFlagFile) { Remove-Item $StopFlagFile -Force -ErrorAction SilentlyContinue }
-    $supervisorProc = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @(
-            '-NoLogo',
-            '-NoProfile',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $PSCommandPath,
-            '-Command', 'run-supervisor'
-        ) `
-        -WorkingDirectory $SkillDir `
-        -WindowStyle Hidden `
-        -PassThru
+    # Give the supervisor independent file handles. Otherwise daemon restart can
+    # inherit an anonymous output pipe and wait forever for EOF.
+    # Windows PowerShell 5.1 joins Start-Process ArgumentList without quoting
+    # array items. Encode the command so repository paths containing spaces or
+    # non-ASCII characters can never be split at the -File boundary.
+    $escapedSupervisorScript = $PSCommandPath.Replace("'", "''")
+    $supervisorCommand = "`$ErrorActionPreference='Stop'; `$OutputEncoding=[System.Text.UTF8Encoding]::new(`$false); [Console]::InputEncoding=[System.Text.UTF8Encoding]::new(`$false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(`$false); & '$escapedSupervisorScript' -Command 'run-supervisor'"
+    $encodedSupervisorCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($supervisorCommand))
+    $supervisorArgumentList = @(
+        '-NoLogo'
+        '-NoProfile'
+        '-ExecutionPolicy'
+        'Bypass'
+        '-EncodedCommand'
+        $encodedSupervisorCommand
+    )
+    $startSupervisorArgs = @{
+        FilePath = 'powershell.exe'
+        ArgumentList = $supervisorArgumentList
+        WorkingDirectory = $SkillDir
+        WindowStyle = 'Hidden'
+        RedirectStandardOutput = $SupervisorLogFile
+        RedirectStandardError = $SupervisorErrorLogFile
+        PassThru = $true
+    }
+    $supervisorProc = Start-Process @startSupervisorArgs
 
     Set-Content -Path $SupervisorPidFile -Value $supervisorProc.Id
     return $supervisorProc.Id
@@ -263,12 +378,13 @@ function Run-SupervisorLoop {
     $nodePath = Get-NodePath
     [System.Environment]::SetEnvironmentVariable('CLAUDECODE', $null)
     [System.Environment]::SetEnvironmentVariable('CTI_HOME', $CtiHome)
+    $daemonArgument = ConvertTo-WindowsCommandLineArgument $DaemonMjs
 
     while ($true) {
         if (Test-Path $StopFlagFile) { break }
 
         $proc = Start-Process -FilePath $nodePath `
-            -ArgumentList $DaemonMjs `
+            -ArgumentList $daemonArgument `
             -WorkingDirectory $SkillDir `
             -WindowStyle Hidden `
             -RedirectStandardOutput $LogFile `
@@ -286,7 +402,7 @@ function Run-SupervisorLoop {
     if (Test-Path $PidFile) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
 }
 
-# ── Commands ──
+# Commands
 
 switch ($Command) {
     'start' {
@@ -295,9 +411,10 @@ switch ($Command) {
 
         $existingPid = Read-Pid
         $existingSupervisorPid = Read-SupervisorPid
-        if (($existingPid -and (Test-PidAlive $existingPid)) -or ($existingSupervisorPid -and (Test-PidAlive $existingSupervisorPid))) {
+        if (($existingPid -and (Test-BridgePid $existingPid)) -or ($existingSupervisorPid -and (Test-SupervisorPid $existingSupervisorPid))) {
             Write-Host "Bridge already running"
             if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
+            Publish-IsolatedCommandCompletion 1
             exit 1
         }
 
@@ -309,13 +426,16 @@ switch ($Command) {
             Start-Sleep -Seconds 3
 
             $newPid = Read-Pid
-            if ($newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+            if ($newPid -and (Test-BridgePid $newPid) -and (Test-StatusRunning)) {
+                Write-Output 'CTI_DAEMON_START_READY_V1'
+                Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, managed by Windows Service)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
                 Write-Host "Failed to start bridge via service."
                 Show-LastExitReason
                 Show-FailureHelp
+                Publish-IsolatedCommandCompletion 1
                 exit 1
             }
         } else {
@@ -325,21 +445,26 @@ switch ($Command) {
 
             $newPid = Read-Pid
             $newSupervisorPid = Read-SupervisorPid
-            if ($newSupervisorPid -and (Test-PidAlive $newSupervisorPid) -and $newPid -and (Test-PidAlive $newPid) -and (Test-StatusRunning)) {
+            if ($newSupervisorPid -and (Test-SupervisorPid $newSupervisorPid) -and $newPid -and (Test-BridgePid $newPid) -and (Test-StatusRunning)) {
+                Write-Output 'CTI_DAEMON_START_READY_V1'
+                Publish-IsolatedCommandCompletion 0
                 Write-Host "Bridge started (PID: $newPid, supervisor: $newSupervisorPid)"
                 if (Test-Path $StatusFile) { Get-Content $StatusFile -Raw }
             } else {
                 Write-Host "Failed to start bridge."
-                if (-not $newSupervisorPid -or -not (Test-PidAlive $newSupervisorPid)) {
+                if (-not $newSupervisorPid -or -not (Test-SupervisorPid $newSupervisorPid)) {
                     Write-Host "  Supervisor exited immediately."
-                } elseif (-not $newPid -or -not (Test-PidAlive $newPid)) {
+                } elseif (-not $newPid -or -not (Test-BridgePid $newPid)) {
                     Write-Host "  Bridge process exited immediately."
                 }
                 Show-LastExitReason
                 Show-FailureHelp
+                Publish-IsolatedCommandCompletion 1
                 exit 1
             }
         }
+        # 成功回执在完整启动检查后立即发布，避免后续主机输出刷新被后台
+        # 句柄拖住；daemon 只会结束短命包装器，不终止受管进程组。
     }
 
     'stop' {
@@ -353,16 +478,15 @@ switch ($Command) {
         } else {
             $bridgePid = Read-Pid
             $supervisorPid = Read-SupervisorPid
-            if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; exit 0 }
-            if (Test-PidAlive $bridgePid) {
-                Stop-Process -Id ([int]$bridgePid) -Force
-                Write-Host "Bridge stopped"
-            } else {
-                Write-Host "Bridge was not running (stale PID file)"
+            if (-not $bridgePid -and -not $supervisorPid) { Write-Host "No bridge running"; break }
+            $bridgeStopped = if (Test-BridgePid $bridgePid) { Stop-PidIfAlive $bridgePid 'Bridge' } else { $false }
+            if ($bridgePid -and -not $bridgeStopped) {
+                Write-Host "Bridge was not running (stale or mismatched PID file)"
             }
-            if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
-                Stop-Process -Id ([int]$supervisorPid) -Force
-                Write-Host "Supervisor stopped"
+            if (Test-SupervisorPid $supervisorPid) {
+                [void](Stop-PidIfAlive $supervisorPid 'Supervisor')
+            } elseif ($supervisorPid) {
+                Write-Host "Supervisor PID did not identify this Bridge; leaving it untouched"
             }
             if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
             if (Test-Path $SupervisorPidFile) { Remove-Item $SupervisorPidFile -Force }
@@ -379,11 +503,11 @@ switch ($Command) {
         if ($svc) {
             Write-Host "Windows Service '$ServiceName': $($svc.Status)"
         }
-        if ($supervisorPid -and (Test-PidAlive $supervisorPid)) {
+        if ($supervisorPid -and (Test-SupervisorPid $supervisorPid)) {
             Write-Host "Supervisor process is running (PID: $supervisorPid)"
         }
 
-        if ($bridgePid -and (Test-PidAlive $bridgePid)) {
+        if ($bridgePid -and (Test-BridgePid $bridgePid)) {
             Write-Host "Bridge process is running (PID: $bridgePid)"
             if (Test-StatusRunning) {
                 Write-Host "Bridge status: running"

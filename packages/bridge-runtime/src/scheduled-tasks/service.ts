@@ -1,0 +1,536 @@
+import crypto from 'node:crypto';
+
+import { computeNextScheduledAt, resolveDueScheduledSlot } from './schedule.js';
+import type { ScheduledTaskStore } from './store.js';
+import type {
+  ScheduledTaskDeliveryStatus,
+  ScheduledTaskExecutionStatus,
+  ScheduledTaskRun,
+  ScheduledTaskRunTrigger,
+  ScheduledTaskState,
+  VersionedScheduledTask,
+  VersionedScheduledTaskState,
+} from './types.js';
+import { SCHEDULED_TASK_RUN_SCHEMA } from './types.js';
+
+export type ScheduledTaskExecutionResult = {
+  executionStatus: Exclude<ScheduledTaskExecutionStatus, 'pending' | 'running'>;
+  deliveryStatus: ScheduledTaskDeliveryStatus;
+  errorKind?: string;
+  error?: string;
+  summary?: string;
+  sessionId?: string;
+  provider?: string;
+  model?: string;
+  messageId?: string;
+  cardId?: string;
+  deliveryPayload?: ScheduledTaskRun['deliveryPayload'];
+  executionStarted?: boolean;
+};
+
+export type ScheduledTaskExecuteInput = {
+  task: VersionedScheduledTask;
+  run: ScheduledTaskRun;
+  mode: 'full' | 'delivery_only';
+  previousRun?: ScheduledTaskRun;
+};
+
+export type ScheduledTaskServiceOptions = {
+  store: ScheduledTaskStore;
+  now?: () => string;
+  leaseMs?: number;
+  /** 同一到期批次的执行并发上限；固定投递会优先占用槽位。 */
+  maxConcurrentRuns?: number;
+  execute: (input: ScheduledTaskExecuteInput) => Promise<ScheduledTaskExecutionResult>;
+};
+
+export interface ScheduledTaskService {
+  tick(): Promise<number>;
+  recover(): Promise<number>;
+  ensureTaskState(taskId: string): Promise<VersionedScheduledTaskState>;
+  runNow(taskId: string): Promise<ScheduledTaskRun>;
+}
+
+export function createScheduledSlotKey(taskId: string, scheduledFor: string): string {
+  return crypto.createHash('sha256').update(`${taskId}\0${scheduledFor}`).digest('hex');
+}
+
+function isDue(nextRunAt: string | undefined, now: string): boolean {
+  if (!nextRunAt) return false;
+  const nextMs = new Date(nextRunAt).getTime();
+  const nowMs = new Date(now).getTime();
+  return Number.isFinite(nextMs) && Number.isFinite(nowMs) && nextMs <= nowMs;
+}
+
+function hasActiveLease(state: VersionedScheduledTaskState, now: string): boolean {
+  if (!state.runningRunId || !state.runningLeaseUntil) return false;
+  const leaseMs = new Date(state.runningLeaseUntil).getTime();
+  const nowMs = new Date(now).getTime();
+  return Number.isFinite(leaseMs) && Number.isFinite(nowMs) && leaseMs > nowMs;
+}
+
+function nextStateCounters(
+  state: VersionedScheduledTaskState,
+  status: ScheduledTaskExecutionResult['executionStatus'],
+): Pick<ScheduledTaskState, 'consecutiveErrors' | 'consecutiveSkipped'> {
+  if (status === 'ok') return { consecutiveErrors: 0, consecutiveSkipped: 0 };
+  if (status === 'error') {
+    return {
+      consecutiveErrors: state.consecutiveErrors + 1,
+      consecutiveSkipped: 0,
+    };
+  }
+  if (status === 'skipped') {
+    return {
+      consecutiveErrors: state.consecutiveErrors,
+      consecutiveSkipped: state.consecutiveSkipped + 1,
+    };
+  }
+  return {
+    consecutiveErrors: state.consecutiveErrors,
+    consecutiveSkipped: state.consecutiveSkipped,
+  };
+}
+
+function createRun(
+  task: VersionedScheduledTask,
+  scheduledFor: string,
+  trigger: ScheduledTaskRunTrigger,
+  slotIdentity: string,
+  queuedAt: string,
+): ScheduledTaskRun {
+  const slotKey = createScheduledSlotKey(task.id, slotIdentity);
+  const scheduledForMs = new Date(scheduledFor).getTime();
+  const queuedAtMs = new Date(queuedAt).getTime();
+  const dispatchDelayMs = Number.isFinite(scheduledForMs) && Number.isFinite(queuedAtMs)
+    ? Math.max(0, queuedAtMs - scheduledForMs)
+    : undefined;
+  const runId = trigger === 'manual'
+    ? `${task.id}:manual:${queuedAt}:${crypto.randomUUID()}`
+    : `${task.id}:${scheduledFor}:1`;
+  return {
+    schema: SCHEDULED_TASK_RUN_SCHEMA,
+    taskId: task.id,
+    runId,
+    slotKey,
+    scheduledFor,
+    trigger,
+    attempt: 1,
+    queuedAt,
+    dispatchDelayMs,
+    executionStatus: 'pending',
+    deliveryStatus: task.delivery.mode === 'none' ? 'not_requested' : 'pending',
+  };
+}
+
+export function createScheduledTaskService(
+  options: ScheduledTaskServiceOptions,
+): ScheduledTaskService {
+  const now = options.now ?? (() => new Date().toISOString());
+  const leaseMs = Math.max(5_000, Math.floor(options.leaseMs ?? 10 * 60_000));
+  const maxConcurrentRuns = Math.max(1, Math.min(16, Math.floor(options.maxConcurrentRuns ?? 4)));
+  let runningTick: Promise<number> | null = null;
+
+  type ReservedRun = {
+    task: VersionedScheduledTask;
+    reserved: VersionedScheduledTaskState;
+    run: ScheduledTaskRun;
+    preserveNextRun: boolean;
+  };
+
+  /**
+   * 固定通知和互动打卡不依赖模型，优先进入执行槽，避免被慢 Agent 回合挤到批次末尾。
+   * 同优先级继续沿用 Store 的稳定顺序，不按具体任务名称或时间写特例。
+   */
+  const executionPriority = (task: VersionedScheduledTask): number => {
+    if (task.action.kind === 'notify' || task.action.kind === 'check_in') return 0;
+    if (task.action.kind === 'controlled_tool') return 1;
+    return 2;
+  };
+
+  const runWithConcurrency = async <T>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<void>,
+  ): Promise<void> => {
+    let nextIndex = 0;
+    const errors: unknown[] = [];
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (nextIndex < items.length) {
+        const item = items[nextIndex];
+        nextIndex += 1;
+        if (item === undefined) continue;
+        try {
+          await worker(item);
+        } catch (error) {
+          // 单个运行的持久化异常不能阻止同批其他任务启动；异常仍回传给 scheduler 审计。
+          errors.push(error);
+        }
+      }
+    });
+    await Promise.all(workers);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, '多个计划任务运行失败');
+  };
+
+  const ensureTaskState = async (taskId: string): Promise<VersionedScheduledTaskState> => {
+    const existing = await options.store.getState(taskId);
+    if (existing) return existing;
+    const task = await options.store.getTask(taskId);
+    if (!task) throw new Error(`计划任务不存在：${taskId}`);
+    const initial: ScheduledTaskState = {
+      taskId,
+      nextRunAt: computeNextScheduledAt(task.schedule, task.createdAt),
+      consecutiveErrors: 0,
+      consecutiveSkipped: 0,
+    };
+    try {
+      return await options.store.compareAndSetState(taskId, 0, initial);
+    } catch (error) {
+      if (!/版本冲突/u.test(error instanceof Error ? error.message : String(error))) throw error;
+      const raced = await options.store.getState(taskId);
+      if (!raced) throw error;
+      return raced;
+    }
+  };
+
+  const finalizeRun = async (
+    task: VersionedScheduledTask,
+    run: ScheduledTaskRun,
+    result: ScheduledTaskExecutionResult,
+    preserveNextRun: boolean,
+  ): Promise<ScheduledTaskRun> => {
+    const endedAt = now();
+    const finalized: ScheduledTaskRun = {
+      ...run,
+      endedAt,
+      executionStatus: result.executionStatus,
+      deliveryStatus: result.deliveryStatus,
+      errorKind: result.errorKind,
+      error: result.error,
+      summary: result.summary,
+      sessionId: result.sessionId,
+      provider: result.provider,
+      model: result.model,
+      messageId: result.messageId,
+      cardId: result.cardId,
+      deliveryPayload: result.deliveryPayload,
+      executionStarted: result.executionStarted,
+    };
+    await options.store.appendRun(finalized);
+
+    const state = await options.store.getState(task.id);
+    if (!state || state.runningRunId !== run.runId) return finalized;
+    const counters = nextStateCounters(state, result.executionStatus);
+    await options.store.compareAndSetState(task.id, state.version, {
+      ...state,
+      ...counters,
+      nextRunAt: preserveNextRun
+        ? state.nextRunAt
+        : computeNextScheduledAt(task.schedule, new Date(Math.max(
+          new Date(run.scheduledFor).getTime(), new Date(endedAt).getTime(),
+        )).toISOString()),
+      queuedRunId: undefined,
+      runningRunId: undefined,
+      runningLeaseUntil: undefined,
+      lastRunAt: endedAt,
+      lastRunStatus: result.executionStatus,
+      lastExecutionStatus: result.executionStatus,
+      lastDeliveryStatus: result.deliveryStatus,
+      lastError: result.error,
+    });
+    return finalized;
+  };
+
+  const executeReservedRun = async (
+    task: VersionedScheduledTask,
+    reserved: VersionedScheduledTaskState,
+    run: ScheduledTaskRun,
+    preserveNextRun: boolean,
+  ): Promise<ScheduledTaskRun> => {
+    const startedAt = now();
+    const runningState = await options.store.compareAndSetState(task.id, reserved.version, {
+      ...reserved,
+      queuedRunId: undefined,
+      runningRunId: run.runId,
+      runningLeaseUntil: new Date(new Date(startedAt).getTime() + leaseMs).toISOString(),
+    });
+    const runningRun: ScheduledTaskRun = {
+      ...run,
+      startedAt,
+      executionStatus: 'running',
+    };
+    await options.store.appendRun(runningRun);
+
+    let result: ScheduledTaskExecutionResult;
+    try {
+      result = await options.execute({ task, run: runningRun, mode: 'full' });
+    } catch (error) {
+      result = {
+        executionStatus: 'error',
+        deliveryStatus: 'unknown',
+        errorKind: 'unknown',
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    void runningState;
+    return finalizeRun(task, runningRun, result, preserveNextRun);
+  };
+
+  const reserveRun = async (
+    task: VersionedScheduledTask,
+    state: VersionedScheduledTaskState,
+    scheduledFor: string,
+    trigger: ScheduledTaskRunTrigger,
+    preserveNextRun: boolean,
+  ): Promise<ReservedRun | null> => {
+    const queuedAt = now();
+    const slotIdentity = trigger === 'manual'
+      ? `manual:${queuedAt}:${crypto.randomUUID()}`
+      : scheduledFor;
+    const run = createRun(task, scheduledFor, trigger, slotIdentity, queuedAt);
+    let reserved: VersionedScheduledTaskState;
+    try {
+      reserved = await options.store.compareAndSetState(task.id, state.version, {
+        ...state,
+        queuedRunId: run.runId,
+      });
+    } catch (error) {
+      if (/版本冲突/u.test(error instanceof Error ? error.message : String(error))) return null;
+      throw error;
+    }
+    await options.store.appendRun(run);
+    return { task, reserved, run, preserveNextRun };
+  };
+
+  const recordOverlap = async (
+    task: VersionedScheduledTask,
+    state: VersionedScheduledTaskState,
+    scheduledFor: string,
+  ): Promise<ScheduledTaskRun> => {
+    const occurredAt = now();
+    const run: ScheduledTaskRun = {
+      ...createRun(task, scheduledFor, 'scheduled', scheduledFor, occurredAt),
+      runId: `${task.id}:${scheduledFor}:overlap`,
+      startedAt: occurredAt,
+      endedAt: occurredAt,
+      executionStatus: 'skipped',
+      deliveryStatus: 'not_requested',
+      errorKind: 'overlap_skipped',
+      error: `前一运行 ${state.runningRunId} 仍持有有效租约`,
+    };
+    await options.store.appendRun(run);
+    await options.store.compareAndSetState(task.id, state.version, {
+      ...state,
+      nextRunAt: computeNextScheduledAt(task.schedule, occurredAt),
+      lastRunAt: occurredAt,
+      lastRunStatus: 'skipped',
+      lastExecutionStatus: 'skipped',
+      lastDeliveryStatus: 'not_requested',
+      consecutiveErrors: state.consecutiveErrors,
+      consecutiveSkipped: state.consecutiveSkipped + 1,
+      lastError: run.error,
+    });
+    return run;
+  };
+
+  const tickOnce = async (): Promise<number> => {
+    await recoverExpiredRuns();
+    const tickNow = now();
+    let handled = 0;
+    const dueTasks: Array<{ task: VersionedScheduledTask; state: VersionedScheduledTaskState; scheduledFor: string; caughtUp: boolean }> = [];
+    for (const task of await options.store.listTasks()) {
+      if (!task.enabled) continue;
+      const state = await ensureTaskState(task.id);
+      if (!isDue(state.nextRunAt, tickNow)) continue;
+      if (hasActiveLease(state, tickNow)) {
+        await recordOverlap(task, state, state.nextRunAt!);
+        handled += 1;
+        continue;
+      }
+      const decision = resolveDueScheduledSlot(task.schedule, state.nextRunAt!, tickNow, task.misfirePolicy);
+      const { scheduledFor, caughtUp } = decision;
+      if (!decision.shouldRun) {
+        // Persist the future watermark first: a crash must not re-admit stale work.
+        await options.store.compareAndSetState(task.id, state.version, {
+          ...state,
+          nextRunAt: decision.nextRunAt,
+          lastRunAt: tickNow,
+          lastRunStatus: 'skipped',
+          lastExecutionStatus: 'skipped',
+          lastDeliveryStatus: 'not_requested',
+          consecutiveSkipped: state.consecutiveSkipped + 1,
+          lastError: '已跳过过期计划任务，不补发历史轮次',
+        });
+        await options.store.appendRun({
+          ...createRun(task, scheduledFor, 'scheduled', scheduledFor, tickNow),
+          endedAt: tickNow,
+          executionStatus: 'skipped',
+          deliveryStatus: 'not_requested',
+          errorKind: 'misfire_skipped',
+          summary: '已跳过过期计划任务，不补发历史轮次',
+        });
+        handled += 1;
+        continue;
+      }
+      dueTasks.push({ task, state, scheduledFor, caughtUp });
+    }
+
+    dueTasks.sort((left, right) => (
+      executionPriority(left.task) - executionPriority(right.task)
+      || left.scheduledFor.localeCompare(right.scheduledFor)
+      || left.task.createdAt.localeCompare(right.task.createdAt)
+      || left.task.id.localeCompare(right.task.id)
+    ));
+
+    // 先为整批任务写入稳定 slot 和 queued 状态，再开始任何可能耗时的 Provider/工具调用。
+    // 这样慢 agent_turn 不会阻止后续 notify/check_in 被调度器发现和准入。
+    const reservedRuns: ReservedRun[] = [];
+    for (const due of dueTasks) {
+      const reserved = await reserveRun(
+        due.task,
+        due.state,
+        due.scheduledFor,
+        due.caughtUp ? 'catch_up' : 'scheduled',
+        false,
+      );
+      if (reserved) {
+        reservedRuns.push(reserved);
+        handled += 1;
+      }
+    }
+
+    await runWithConcurrency(reservedRuns, maxConcurrentRuns, async (reserved) => {
+      await executeReservedRun(
+        reserved.task,
+        reserved.reserved,
+        reserved.run,
+        reserved.preserveNextRun,
+      );
+    });
+    return handled;
+  };
+
+  const recoverExpiredRuns = async (): Promise<number> => {
+    const recoveryNow = now();
+    const recoveryNowMs = new Date(recoveryNow).getTime();
+    let recovered = 0;
+    for (const task of await options.store.listTasks()) {
+      const state = await options.store.getState(task.id);
+      if (!state) continue;
+
+      if (state.queuedRunId && !state.runningRunId) {
+        await options.store.compareAndSetState(task.id, state.version, {
+          ...state,
+          queuedRunId: undefined,
+        });
+        recovered += 1;
+        continue;
+      }
+
+      if (!state.runningRunId || !state.runningLeaseUntil) continue;
+      const leaseMs = new Date(state.runningLeaseUntil).getTime();
+      if (!Number.isFinite(leaseMs) || leaseMs > recoveryNowMs) continue;
+
+      const previousRun = (await options.store.listRuns(task.id, 200))
+        .find((run) => run.runId === state.runningRunId);
+      if (
+        previousRun
+        && previousRun.executionStatus === 'ok'
+        && previousRun.deliveryStatus === 'failed'
+        && previousRun.deliveryPayload
+      ) {
+        const deliveryDecision = previousRun.trigger !== 'manual' && isDue(previousRun.scheduledFor, recoveryNow)
+          ? resolveDueScheduledSlot(task.schedule, previousRun.scheduledFor, recoveryNow, task.misfirePolicy)
+          : undefined;
+        if (!task.enabled || (deliveryDecision && (
+          !deliveryDecision.shouldRun || deliveryDecision.caughtUp
+        ))) {
+          await finalizeRun(task, previousRun, {
+            executionStatus: 'ok',
+            deliveryStatus: 'not_requested',
+            deliveryPayload: previousRun.deliveryPayload,
+            errorKind: 'misfire_delivery_skipped',
+            summary: '历史结果已保留；任务已暂停或投递已过期，未自动补发',
+          }, previousRun.trigger === 'manual');
+          recovered += 1;
+          continue;
+        }
+        const deliveryResult = await options.execute({
+          task,
+          run: previousRun,
+          mode: 'delivery_only',
+          previousRun,
+        });
+        await finalizeRun(task, previousRun, deliveryResult, previousRun.trigger === 'manual');
+        recovered += 1;
+        continue;
+      }
+
+      const scheduledFor = previousRun?.scheduledFor ?? state.nextRunAt ?? recoveryNow;
+      const interrupted: ScheduledTaskRun = {
+        ...(previousRun ?? createRun(task, scheduledFor, 'scheduled', scheduledFor, recoveryNow)),
+        runId: state.runningRunId,
+        startedAt: previousRun?.startedAt ?? recoveryNow,
+        endedAt: recoveryNow,
+        executionStatus: 'error',
+        deliveryStatus: 'unknown',
+        errorKind: 'interrupted_by_restart',
+        error: '计划任务在 Bridge 重启前未留下终态结果',
+        executionStarted: true,
+      };
+      await options.store.appendRun(interrupted);
+      await options.store.compareAndSetState(task.id, state.version, {
+        ...state,
+        nextRunAt: previousRun?.trigger === 'manual'
+          ? state.nextRunAt
+          : computeNextScheduledAt(task.schedule, new Date(Math.max(
+            new Date(scheduledFor).getTime(), recoveryNowMs,
+          )).toISOString()),
+        queuedRunId: undefined,
+        runningRunId: undefined,
+        runningLeaseUntil: undefined,
+        lastRunAt: recoveryNow,
+        lastRunStatus: 'error',
+        lastExecutionStatus: 'error',
+        lastDeliveryStatus: 'unknown',
+        consecutiveErrors: state.consecutiveErrors + 1,
+        consecutiveSkipped: 0,
+        lastError: interrupted.error,
+      });
+      recovered += 1;
+    }
+    return recovered;
+  };
+
+  return {
+    ensureTaskState,
+
+    recover: recoverExpiredRuns,
+
+    async tick() {
+      if (runningTick) return runningTick;
+      runningTick = tickOnce().finally(() => {
+        runningTick = null;
+      });
+      return runningTick;
+    },
+
+    async runNow(taskId) {
+      const task = await options.store.getTask(taskId);
+      if (!task) throw new Error(`计划任务不存在：${taskId}`);
+      const state = await ensureTaskState(taskId);
+      if (state.queuedRunId) throw new Error('计划任务已有排队中的实例');
+      if (hasActiveLease(state, now())) throw new Error('计划任务已有运行中的实例');
+      const scheduledFor = now();
+      const reserved = await reserveRun(task, state, scheduledFor, 'manual', true);
+      if (!reserved) throw new Error('计划任务运行准入冲突');
+      return executeReservedRun(
+        reserved.task,
+        reserved.reserved,
+        reserved.run,
+        reserved.preserveNextRun,
+      );
+    },
+  };
+}

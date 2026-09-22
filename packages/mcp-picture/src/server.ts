@@ -117,6 +117,7 @@ app.post("/v1/annotate-subject", async (req, res) => {
     detail?: Detail;
     context?: string;
     output_path?: string;
+    artifact_root?: string;
   };
   const result = await createSubjectAnnotatedImage(cfg, clients, {
     image_url: body.image_url,
@@ -126,6 +127,7 @@ app.post("/v1/annotate-subject", async (req, res) => {
     detail: body.detail ?? "standard",
     context: body.context,
     output_path: body.output_path,
+    artifact_root: body.artifact_root,
   });
   if ("error" in result) return res.status(502).json({ ok: false, error: result.error });
   return res.json({
@@ -148,6 +150,7 @@ app.post("/v1/annotate-objects", async (req, res) => {
     style?: string;
     context?: string;
     output_path?: string;
+    artifact_root?: string;
   };
   const keyError = getMissingKeyMessage(cfg);
   if (keyError) return res.status(503).json({ ok: false, error: keyError });
@@ -160,6 +163,7 @@ app.post("/v1/annotate-objects", async (req, res) => {
     style: (body.style === "numbered" ? "numbered" : "arrow") as AnnotationStyle,
     context: body.context,
     output_path: body.output_path,
+    artifact_root: body.artifact_root,
   });
   if ("error" in result) return res.status(502).json({ ok: false, error: result.error });
   return res.json({

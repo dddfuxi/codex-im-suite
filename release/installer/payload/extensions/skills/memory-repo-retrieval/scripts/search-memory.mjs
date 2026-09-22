@@ -3,7 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 const SUMMARY_MARKER = '[[CTI_SUMMARY]]';
-const home = process.env.CTI_HOME || 'E:\\cli-md' || path.join(os.homedir(), '.claude-to-im');
+const LOW_VALUE_MEMORY_RE = /(没有可用.{0,36}(记忆|功能)|请手动记录|未完成：这个请求需要实际|已拦截通用手动排查步骤|无法访问聊天记录|没有拿到可用工具输出|不能把任务退回给用户|本地记录里没保存.{0,40}(完整|清单|摘要)|完整.{0,16}(列表|清单|名字).{0,24}(没|未)(在)?(归档里)?(命中|找到|保存))/i;
+const home = resolveHistoryHome();
 const dataDir = path.join(home, 'data');
 const messagesDir = path.join(dataDir, 'messages');
 const archivesDir = path.join(dataDir, 'message-archives');
@@ -33,11 +34,25 @@ for (const [sessionId, session] of Object.entries(sessions)) {
   const filePath = path.join(messagesDir, `${sessionId}.json`);
   const messages = readJson(filePath, []);
   const archivedMessages = readArchivedMessages(sessionId);
-  for (const message of [...selectMessages(messages), ...archivedMessages]) {
+  const memoryCandidates = [...selectMessages(messages), ...archivedMessages];
+  for (let index = 0; index < memoryCandidates.length; index += 1) {
+    const message = memoryCandidates[index];
     const rawContent = searchableMessage(message?.content || '');
-    const content = summarizeMessage(message?.content || '');
+    const adjacentAnswer = message?.role !== 'assistant'
+      ? summarizeAdjacentAssistantAnswer(memoryCandidates, index)
+      : null;
+    const searchContent = adjacentAnswer
+      ? `${rawContent}\n相邻助手回复：${adjacentAnswer.searchText}`
+      : rawContent;
+    if (isLowValueMemoryText(searchContent)) continue;
+    const content = adjacentAnswer
+      ? [
+        `用户请求：${summarizeMessage(message?.content || '', 180)}`,
+        `相邻助手回复：${adjacentAnswer.content}`,
+      ].filter(Boolean).join('；')
+      : summarizeMessage(message?.content || '');
     if (!content || !rawContent) continue;
-    const score = scoreText(rawContent, tokens, meta, chatId, cwd, sessionId);
+    const score = scoreText(searchContent, tokens, meta, chatId, cwd, sessionId);
     if (score <= 0) continue;
     hits.push({
       sessionId,
@@ -63,6 +78,31 @@ for (const hit of hits
 function readFlag(name) {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : '';
+}
+
+function resolveHistoryHome() {
+  if (process.env.CTI_HOME && process.env.CTI_HOME.trim()) {
+    return process.env.CTI_HOME.trim();
+  }
+
+  const defaultBridgeHome = path.join(os.homedir(), '.claude-to-im');
+  const legacyMemoryHome = process.platform === 'win32' ? 'E:\\cli-md' : path.join(os.homedir(), '.claude-to-im', 'memory-repo');
+  for (const candidate of [defaultBridgeHome, legacyMemoryHome]) {
+    if (!candidate) continue;
+    const dataRoot = path.join(candidate, 'data');
+    // 原始聊天、Feishu history 和压缩归档属于 bridge runtime data。
+    // 旧版曾把它们误当成 memory repo 下的数据；这里按真实存在的
+    // runtime 数据目录优先，避免回捞历史时落到陈旧 E:\cli-md 副本。
+    if (
+      fs.existsSync(path.join(dataRoot, 'sessions.json'))
+      || fs.existsSync(path.join(dataRoot, 'messages'))
+      || fs.existsSync(path.join(dataRoot, 'message-archives'))
+      || fs.existsSync(path.join(dataRoot, 'feishu-history'))
+    ) {
+      return candidate;
+    }
+  }
+  return defaultBridgeHome;
 }
 
 function readJson(filePath, fallback) {
@@ -119,36 +159,101 @@ function readArchivedMessages(sessionId) {
   return out;
 }
 
-function summarizeMessage(content) {
-  if (!content) return '';
-  const cleaned = structuredText(content)
+function truncateText(content, maxLen) {
+  return content.length > maxLen ? `${content.slice(0, Math.max(0, maxLen - 3))}...` : content;
+}
+
+function cleanupMessageText(content) {
+  return String(content || '')
     .replace(/<!--files:[\s\S]*?-->/g, ' ')
     .replace(SUMMARY_MARKER, '')
     .replace(/\s+/g, ' ')
     .trim();
-  return cleaned.length > 240 ? `${cleaned.slice(0, 237)}...` : cleaned;
+}
+
+function isLowValueMemoryText(text) {
+  return LOW_VALUE_MEMORY_RE.test(cleanupMessageText(text));
+}
+
+function summarizeMessage(content, maxLen = 240) {
+  if (!content) return '';
+  const cleaned = cleanupMessageText(structuredText(content));
+  return truncateText(cleaned, maxLen);
 }
 
 function searchableMessage(content) {
   if (!content) return '';
-  const cleaned = structuredText(content)
-    .replace(/<!--files:[\s\S]*?-->/g, ' ')
-    .replace(SUMMARY_MARKER, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned.length > 4000 ? cleaned.slice(0, 4000) : cleaned;
+  const cleaned = cleanupMessageText(structuredText(content));
+  return truncateText(cleaned, 4000);
+}
+
+function extractCtiFinalVisibleTexts(text) {
+  const out = [];
+  const fence = /```cti-final\s*([\s\S]*?)```/g;
+  let match;
+  while ((match = fence.exec(String(text || ''))) !== null) {
+    const rawJson = String(match[1] || '').trim();
+    if (!rawJson) continue;
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (typeof parsed?.text === 'string' && parsed.text.trim()) out.push(cleanupMessageText(parsed.text));
+    } catch {
+      // 历史里偶尔有截断的 cti-final；解析失败时交给普通文本兜底。
+    }
+  }
+  return out.filter(Boolean);
+}
+
+function textBlockForMemory(text) {
+  const finals = extractCtiFinalVisibleTexts(text);
+  if (finals.length > 0) return finals.join(' | ');
+  return String(text || '').replace(/```cti-final\s*[\s\S]*?```/g, ' ');
+}
+
+function sanitizeToolResult(content) {
+  return truncateText(cleanupMessageText(content), 120);
+}
+
+function summarizeAdjacentAssistantAnswer(messages, index) {
+  for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+    const next = messages[nextIndex];
+    if (!next) break;
+    if (next.role !== 'assistant') break;
+    const searchText = searchableMessage(next.content || '');
+    if (!searchText) continue;
+    return {
+      content: truncateText(searchText, 700),
+      searchText,
+    };
+  }
+  return null;
 }
 
 function structuredText(content) {
   const raw = String(content || '');
+  const rawFinalTexts = extractCtiFinalVisibleTexts(raw);
+  if (rawFinalTexts.length > 0) {
+    return rawFinalTexts.join(' | ');
+  }
   if (!raw.trim().startsWith('[')) return raw;
   try {
     const blocks = JSON.parse(raw);
+    const finalTexts = blocks
+      .filter((block) => block?.type === 'text')
+      .flatMap((block) => extractCtiFinalVisibleTexts(block.text || ''));
+    if (finalTexts.length > 0) {
+      // 脚本用于回捞“用户最终看见过什么”，有最终结果块时
+      // 不把进度文本和工具输出混入候选，避免路径/日志污染答案。
+      return finalTexts.join(' | ');
+    }
     const parts = [];
     for (const block of blocks) {
-      if (block?.type === 'text' && block.text) parts.push(String(block.text));
-      if (block?.type === 'tool_use' && block?.input?.command) parts.push(`执行命令: ${block.input.command}`);
-      if (block?.type === 'tool_result' && block.content) parts.push(`工具结果: ${block.content}`);
+      if (block?.type === 'text' && block.text) parts.push(textBlockForMemory(block.text));
+      if (block?.type === 'tool_use' || block?.type === 'tool_result') {
+        // 技能检索输出的是历史对话证据，不是工具审计报告；
+        // 工具命令/结果容易把旧路径、日志当成“原答案”。
+        continue;
+      }
     }
     return parts.join(' | ');
   } catch {

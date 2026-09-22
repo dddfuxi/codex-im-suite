@@ -41,6 +41,15 @@ if [ "${1:-}" = "--link" ]; then
 else
   cp -R "$SOURCE_DIR" "$TARGET_DIR"
   echo "Copied to: $TARGET_DIR"
+  cat > "$TARGET_DIR/.cti-install.json" <<EOF
+{
+  "protocol": "cti-install-metadata/v1",
+  "installKind": "copy",
+  "installedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "sourceRoot": "$SOURCE_DIR",
+  "installScript": "$SOURCE_DIR/scripts/install-codex.sh"
+}
+EOF
 fi
 
 # Ensure dependencies (need devDependencies for build step)

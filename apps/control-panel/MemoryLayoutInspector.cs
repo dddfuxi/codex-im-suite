@@ -1,0 +1,334 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace ClaudeToImControlPanel;
+
+internal sealed record MemorySourceLayoutClassification(string SourceGroup, bool Legacy, string LayoutVersion);
+
+internal static class MemorySourceLayoutClassifier
+{
+    private const string MemoryV2Schema = "codex-im-suite/memory/v2";
+    private const string MemoryV3Schema = "codex-im-suite/memory/v3";
+
+    public static MemorySourceLayoutClassification Classify(
+        string root,
+        string sourcePath,
+        IReadOnlyDictionary<string, string> metadata)
+    {
+        if (string.IsNullOrWhiteSpace(root)
+            || string.IsNullOrWhiteSpace(sourcePath)
+            || !sourcePath.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
+            || !metadata.TryGetValue("schema", out var schema)
+            || !metadata.TryGetValue("memoryScope", out var scope))
+        {
+            return new("", false, "");
+        }
+
+        var isV3 = string.Equals(schema, MemoryV3Schema, StringComparison.Ordinal);
+        var isV2 = string.Equals(schema, MemoryV2Schema, StringComparison.Ordinal);
+        if (!isV3 && !isV2) return new("", false, "");
+
+        var segments = RelativeSegments(root, sourcePath);
+        var offset = isV3 ? 1 : 3;
+        if (isV3 && (segments.Length < 3 || !segments[0].Equals("memory", StringComparison.OrdinalIgnoreCase)))
+        {
+            return new("", false, "");
+        }
+        if (isV2 && (segments.Length < 5
+            || !segments[0].Equals("data", StringComparison.OrdinalIgnoreCase)
+            || !segments[1].Equals("memory", StringComparison.OrdinalIgnoreCase)
+            || !segments[2].Equals("v2", StringComparison.OrdinalIgnoreCase)))
+        {
+            return new("", false, "");
+        }
+
+        var legacy = isV2;
+        var version = isV3 ? "v3" : "v2";
+        if (scope.Equals("long_term", StringComparison.OrdinalIgnoreCase))
+        {
+            return segments.Length > offset && segments[offset].Equals("long-term", StringComparison.OrdinalIgnoreCase)
+                ? new("memory_long_term", legacy, version)
+                : new("", legacy, version);
+        }
+
+        if (!metadata.TryGetValue("channelType", out var channelType) || string.IsNullOrWhiteSpace(channelType))
+        {
+            return new("", legacy, version);
+        }
+        var channelSegment = PartitionSegment(channelType);
+        if (scope.Equals("user", StringComparison.OrdinalIgnoreCase)
+            && metadata.TryGetValue("userId", out var userId)
+            && !string.IsNullOrWhiteSpace(userId)
+            && segments.Length >= offset + 4
+            && segments[offset].Equals("users", StringComparison.OrdinalIgnoreCase)
+            && segments[offset + 1].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
+            && segments[offset + 2].Equals(PartitionSegment(userId), StringComparison.OrdinalIgnoreCase))
+        {
+            return new("memory_user", legacy, version);
+        }
+        if (scope.Equals("group", StringComparison.OrdinalIgnoreCase)
+            && metadata.TryGetValue("chatId", out var chatId)
+            && !string.IsNullOrWhiteSpace(chatId)
+            && segments.Length >= offset + 4
+            && segments[offset].Equals("groups", StringComparison.OrdinalIgnoreCase)
+            && segments[offset + 1].Equals(channelSegment, StringComparison.OrdinalIgnoreCase)
+            && segments[offset + 2].Equals(PartitionSegment(chatId), StringComparison.OrdinalIgnoreCase))
+        {
+            return new("memory_group", legacy, version);
+        }
+        return new("", legacy, version);
+    }
+
+    private static string[] RelativeSegments(string root, string sourcePath)
+    {
+        var fullRoot = Path.GetFullPath(root);
+        var fullSource = Path.GetFullPath(sourcePath);
+        var relative = Path.GetRelativePath(fullRoot, fullSource);
+        if (relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)) return [];
+        return relative.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static string PartitionSegment(string value)
+    {
+        var normalized = value.Normalize(NormalizationForm.FormKC).Trim();
+        var safe = Regex.Replace(normalized, @"[\\/:*?""<>|]+", "_");
+        safe = Regex.Replace(safe, @"[\u0000-\u001F]", "");
+        if (safe.Length > 96) safe = safe[..96];
+        return !string.IsNullOrWhiteSpace(safe)
+            ? safe
+            : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))).ToLowerInvariant()[..20];
+    }
+}
+
+internal sealed record AgentHomeEntry(string Name, string Path, bool Exists);
+internal sealed record RootMarkdownDocument(string Name, string Path);
+internal sealed record SelfMaintenanceLayoutSnapshot(
+    int DailyReflectionCount,
+    int WorkProfileCount,
+    int CorrectionDocumentCount,
+    int VersionBackupCount,
+    int ClassifierCalls,
+    int ClassifierSkips,
+    int ClassifierApplied,
+    int ClassifierRejected,
+    int AverageDurationMs,
+    int LockConflicts,
+    int HashConflicts,
+    int TrialRuleCount,
+    int ConfirmedRuleCount,
+    int RegressedRuleCount,
+    string? LastUpdatedAt,
+    string StatusPath);
+
+internal sealed record MemoryLayoutSnapshot(
+    string LayoutVersion,
+    string MigrationState,
+    int V3SourceCount,
+    int LegacySourceCount,
+    IReadOnlyList<AgentHomeEntry> AgentHome,
+    IReadOnlyList<RootMarkdownDocument> UnclassifiedRootDocuments,
+    SelfMaintenanceLayoutSnapshot SelfMaintenance);
+
+internal static class MemoryLayoutInspector
+{
+    private static readonly string[] AgentHomeNames =
+    [
+        "机器人身份.md",
+        "行为与安全规则.md",
+        "工具与环境.md",
+        "记忆总索引.md",
+        "记忆库说明.md",
+    ];
+
+    public static MemoryLayoutSnapshot Inspect(string memoryRoot)
+    {
+        var root = Path.GetFullPath(memoryRoot);
+        var v3SourceCount = CountMarkdown(Path.Combine(root, "memory"));
+        var legacySourceCount = CountMarkdown(Path.Combine(root, "data", "memory", "v2"));
+        var migrationState = v3SourceCount > 0 && legacySourceCount > 0
+            ? "mixed"
+            : v3SourceCount > 0
+                ? "v3_only"
+                : legacySourceCount > 0
+                    ? "legacy_only"
+                    : "empty";
+        var agentHome = AgentHomeNames
+            .Select(name =>
+            {
+                var filePath = Path.Combine(root, name);
+                return new AgentHomeEntry(name, filePath, File.Exists(filePath));
+            })
+            .ToArray();
+        var unclassifiedRootDocuments = FindUnclassifiedDocuments(root);
+        var selfMaintenance = InspectSelfMaintenance(root);
+        return new MemoryLayoutSnapshot(
+            v3SourceCount > 0 ? "v3" : legacySourceCount > 0 ? "v2" : "none",
+            migrationState,
+            v3SourceCount,
+            legacySourceCount,
+            agentHome,
+            unclassifiedRootDocuments,
+            selfMaintenance);
+    }
+
+    private static SelfMaintenanceLayoutSnapshot InspectSelfMaintenance(string root)
+    {
+        var statusPath = Path.Combine(root, ".cti-self-history", "status.json");
+        var metricsPath = Path.Combine(root, ".cti-self-history", "metrics.json");
+        string? lastUpdatedAt = null;
+        var classifierCalls = 0;
+        var classifierSkips = 0;
+        var classifierApplied = 0;
+        var classifierRejected = 0;
+        var averageDurationMs = 0;
+        var lockConflicts = 0;
+        var hashConflicts = 0;
+        if (File.Exists(statusPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(statusPath, Encoding.UTF8));
+                if (document.RootElement.TryGetProperty("updatedAt", out var value) && value.ValueKind == JsonValueKind.String)
+                {
+                    lastUpdatedAt = value.GetString();
+                }
+            }
+            catch
+            {
+                // 面板只展示可观察状态；损坏的 status 不应阻断整个内存布局页。
+            }
+        }
+
+        if (File.Exists(metricsPath))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(metricsPath, Encoding.UTF8));
+                classifierCalls = ReadInt(document.RootElement, "totalCalls");
+                classifierSkips = ReadInt(document.RootElement, "skipped");
+                classifierApplied = ReadInt(document.RootElement, "applied");
+                classifierRejected = ReadInt(document.RootElement, "rejected");
+                averageDurationMs = ReadInt(document.RootElement, "averageDurationMs");
+                lockConflicts = ReadInt(document.RootElement, "lockConflicts");
+                hashConflicts = ReadInt(document.RootElement, "hashConflicts");
+            }
+            catch
+            {
+                // 指标损坏只影响观察数据，不阻断 Memory 页面。
+            }
+        }
+
+        var ruleCounts = CountRuleStatuses(Path.Combine(root, ".cti-self-history", "rules"));
+
+        return new SelfMaintenanceLayoutSnapshot(
+            CountMarkdown(Path.Combine(root, "daily-reflection")),
+            CountNamedMarkdown(Path.Combine(root, "work"), "工作档案.md"),
+            CountMarkdown(Path.Combine(root, "corrections")),
+            CountMarkdown(Path.Combine(root, ".cti-self-history", "versions")),
+            classifierCalls,
+            classifierSkips,
+            classifierApplied,
+            classifierRejected,
+            averageDurationMs,
+            lockConflicts,
+            hashConflicts,
+            ruleCounts.Trial,
+            ruleCounts.Confirmed,
+            ruleCounts.Regressed,
+            lastUpdatedAt,
+            statusPath);
+    }
+
+    private static int ReadInt(JsonElement root, string name)
+    {
+        return root.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : 0;
+    }
+
+    private static (int Trial, int Confirmed, int Regressed) CountRuleStatuses(string root)
+    {
+        if (!Directory.Exists(root)) return (0, 0, 0);
+        var trial = 0;
+        var confirmed = 0;
+        var regressed = 0;
+        try
+        {
+            foreach (var filePath in Directory.EnumerateFiles(root, "*.json", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    using var document = JsonDocument.Parse(File.ReadAllText(filePath, Encoding.UTF8));
+                    if (!document.RootElement.TryGetProperty("status", out var value) || value.ValueKind != JsonValueKind.String) continue;
+                    switch (value.GetString())
+                    {
+                        case "trial": trial += 1; break;
+                        case "confirmed": confirmed += 1; break;
+                        case "regressed": regressed += 1; break;
+                    }
+                }
+                catch
+                {
+                    // 单条规则状态损坏时跳过该条。
+                }
+            }
+        }
+        catch
+        {
+            return (0, 0, 0);
+        }
+        return (trial, confirmed, regressed);
+    }
+
+    private static IReadOnlyList<RootMarkdownDocument> FindUnclassifiedDocuments(string root)
+    {
+        if (!Directory.Exists(root)) return [];
+        var agentHomeNames = AgentHomeNames.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var rootDocuments = Directory.EnumerateFiles(root, "*.md", SearchOption.TopDirectoryOnly)
+                .Where(filePath => !agentHomeNames.Contains(Path.GetFileName(filePath)));
+            var docsRoot = Path.Combine(root, "docs");
+            var docsDocuments = Directory.Exists(docsRoot)
+                ? Directory.EnumerateFiles(docsRoot, "*.md", SearchOption.AllDirectories)
+                : [];
+            return rootDocuments
+                .Concat(docsDocuments)
+                .Select(filePath => new RootMarkdownDocument(
+                    Path.GetRelativePath(root, filePath).Replace('\\', '/'),
+                    filePath))
+                .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static int CountNamedMarkdown(string root, string fileName)
+    {
+        if (!Directory.Exists(root)) return 0;
+        try
+        {
+            return Directory.EnumerateFiles(root, fileName, SearchOption.AllDirectories).Count();
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static int CountMarkdown(string root)
+    {
+        if (!Directory.Exists(root)) return 0;
+        try
+        {
+            return Directory.EnumerateFiles(root, "*.md", SearchOption.AllDirectories).Count();
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+}

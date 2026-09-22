@@ -54,7 +54,8 @@ function Expand-ManifestValue {
 function Upsert-StdioServer {
     param(
         [string]$Name,
-        [string]$LauncherPath
+        [string]$LauncherPath,
+        [string[]]$EnvArgs = @()
     )
 
     $existing = codex mcp list
@@ -62,7 +63,7 @@ function Upsert-StdioServer {
         codex mcp remove $Name | Out-Host
     }
 
-    codex mcp add $Name -- powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $LauncherPath | Out-Host
+    codex mcp add $Name @EnvArgs -- powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $LauncherPath | Out-Host
 }
 
 if (-not (Test-Path -LiteralPath $ManifestDir)) {
@@ -98,8 +99,18 @@ foreach ($file in $manifests) {
         continue
     }
 
+    $envArgs = @()
+    if ($manifest.env) {
+        foreach ($property in $manifest.env.PSObject.Properties) {
+            $key = [string]$property.Name
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            $value = Expand-ManifestValue -Value ([string]$property.Value) -EnvValues $envValues
+            $envArgs += @('--env', "$key=$value")
+        }
+    }
+
     Write-Host "register MCP: $name -> $launcher"
-    Upsert-StdioServer -Name $name -LauncherPath $launcher
+    Upsert-StdioServer -Name $name -LauncherPath $launcher -EnvArgs $envArgs
 }
 
 codex mcp list | Out-Host

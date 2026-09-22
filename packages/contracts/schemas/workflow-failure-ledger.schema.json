@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/workflow-failure-ledger.schema.json",
+  "title": "WorkflowFailureLedgerContract",
+  "type": "object",
+  "required": ["protocol", "updatedAt", "nextSequence", "retainedFromSequence", "entries"],
+  "properties": {
+    "protocol": { "const": "workflow-failure-ledger/v1" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "nextSequence": { "type": "integer", "minimum": 1 },
+    "retainedFromSequence": { "type": "integer", "minimum": 1 },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sequence", "fingerprint", "occurredAt", "kind", "state", "stage", "workflowStatus", "failureCodes"],
+        "properties": {
+          "sequence": { "type": "integer", "minimum": 1 },
+          "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "occurredAt": { "type": "string", "format": "date-time" },
+          "kind": { "enum": ["workflow_failed", "retry_failed", "restart_interrupted"] },
+          "state": { "enum": ["observed", "resolved"] },
+          "stage": { "enum": ["received", "authorized", "contextualized", "routed", "executing", "finalizing", "delivered", "failed"] },
+          "workflowStatus": { "enum": ["running", "succeeded", "failed", "cancelled", "retry_pending", "retrying"] },
+          "failureCodes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 12, "uniqueItems": true },
+          "replaySafety": { "enum": ["safe_no_tools", "safe_read_only", "unsafe_side_effects", "unsafe_unknown"] },
+          "retryDisposition": { "enum": ["not_needed", "retry_in_turn", "artifact_recovery", "manual_retry_required", "exhausted", "not_retryable"] },
+          "repairEvidenceRefs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 20, "uniqueItems": true }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

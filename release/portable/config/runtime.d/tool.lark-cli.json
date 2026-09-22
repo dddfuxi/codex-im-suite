@@ -1,0 +1,24 @@
+{
+  "id": "tool.larkCli",
+  "displayName": "官方 lark-cli",
+  "kind": "tool",
+  "category": "feishu-official-cli",
+  "enabled": true,
+  "installState": "installed",
+  "source": "%APPDATA%\\npm",
+  "cwd": "%APPDATA%\\npm",
+  "version": "",
+  "description": "飞书官方 CLI；负责配置、身份、scope/schema、健康检查和控制面板人工平台操作，不承担 Bridge 实时事件主链。",
+  "update": {
+    "enabled": true,
+    "surfaces": [
+      "service",
+      "extension"
+    ],
+    "kind": "npm_global_package",
+    "packageName": "@larksuite/cli",
+    "postCheckUnitIds": [
+      "tool.larkCli"
+    ]
+  }
+}
