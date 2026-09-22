@@ -1,6 +1,6 @@
 import { Cron } from 'croner';
 
-import type { ScheduledTaskSchedule } from './types.js';
+import type { ScheduledTaskMisfirePolicy, ScheduledTaskSchedule } from './types.js';
 
 const OFFSET_SUFFIX_RE = /(?:Z|[+-]\d{2}:?\d{2})$/iu;
 const LOCAL_DATE_TIME_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/u;
@@ -169,4 +169,40 @@ export function computeNextScheduledAt(
     catch: false,
   }).nextRun(new Date(afterMs));
   return next?.toISOString();
+}
+
+/** Resolve an entire overdue window without enumerating historical occurrences. */
+export function resolveDueScheduledSlot(
+  schedule: ScheduledTaskSchedule,
+  firstDueAt: string,
+  now: string,
+  policy: ScheduledTaskMisfirePolicy,
+): { scheduledFor: string; nextRunAt?: string; shouldRun: boolean; caughtUp: boolean } {
+  const normalized = normalizeScheduledTaskSchedule(schedule);
+  const nowMs = new Date(now).getTime();
+  const firstMs = new Date(firstDueAt).getTime();
+  if (!Number.isFinite(nowMs) || !Number.isFinite(firstMs) || firstMs > nowMs) {
+    throw new Error('无效计划任务到期窗口');
+  }
+  let latestMs = firstMs;
+  if (normalized.kind === 'every') {
+    const anchorMs = new Date(normalized.anchorAt).getTime();
+    latestMs = Math.max(firstMs, anchorMs + Math.floor((nowMs - anchorMs) / normalized.everyMs) * normalized.everyMs);
+  } else if (normalized.kind === 'cron') {
+    // Croner previousRuns excludes the reference second; include the current second.
+    const reference = new Date(Math.floor(nowMs / 1_000) * 1_000 + 1_000);
+    const latest = new Cron(normalized.expression, {
+      timezone: normalized.timezone,
+      catch: false,
+    }).previousRuns(1, reference)[0];
+    if (latest) latestMs = Math.max(firstMs, latest.getTime());
+  }
+  const caughtUp = latestMs > firstMs;
+  return {
+    scheduledFor: new Date(latestMs).toISOString(),
+    nextRunAt: computeNextScheduledAt(normalized, now),
+    shouldRun: nowMs - latestMs <= policy.maxLatenessMs
+      && (policy.mode === 'run_latest' || !caughtUp),
+    caughtUp,
+  };
 }

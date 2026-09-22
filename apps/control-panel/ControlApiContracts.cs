@@ -40,6 +40,24 @@ internal sealed record ControlCommandResult(
         => new(ControlApiContracts.ResultSchema, id, "result", false, null, error);
 }
 
+internal sealed record CodexModelOptionContract(
+    string Id,
+    string DisplayName,
+    bool Hidden,
+    bool IsDefault,
+    string[] InputModalities,
+    string DefaultReasoningEffort,
+    string[] SupportedReasoningEfforts);
+
+internal sealed record CodexModelCatalogContract(
+    string Protocol,
+    string GeneratedAt,
+    string Status,
+    string Source,
+    CodexModelOptionContract[] Models,
+    string ConfiguredModel,
+    string Error);
+
 internal sealed record RuntimeActionContract(string Id, string Label, bool Enabled, string Reason = "");
 
 internal sealed record RuntimeUnitContract(

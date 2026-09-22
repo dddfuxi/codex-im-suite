@@ -1086,6 +1086,8 @@ internal sealed partial class MainForm : Form
                 return await ProbeLocalLlmToolCallingAsync(payload);
             case "settings.testCodexApi":
                 return TestCodexApiSettings(payload);
+            case "settings.listCodexModels":
+                return await ListCodexModelsAsync(payload);
             case "runtime.listUnits":
                 return BuildRuntimeUnits();
             case "runtime.invokeAction":
@@ -7155,6 +7157,23 @@ exit $LASTEXITCODE
             reasoningEffort = effort,
             apiKeySet = !string.IsNullOrWhiteSpace(apiKey),
         };
+    }
+
+    private Task<CodexModelCatalogContract> ListCodexModelsAsync(JsonElement payload)
+    {
+        var source = NormalizeCodexModelSource(ReadPayloadString(payload, "source", GetConfig("CTI_CODEX_MODEL_SOURCE", InferCodexModelSource())));
+        var configuredModel = source == "local_api"
+            ? GetConfig("CTI_LOCAL_AI_MODEL", GetConfig("CTI_OLLAMA_MODEL", ""))
+            : GetConfig("CTI_CODEX_MODEL", "");
+        object? request = payload.ValueKind == JsonValueKind.Object
+            ? JsonSerializer.Deserialize<object>(payload.GetRawText(), WebJsonOptions)
+            : null;
+        return new CodexModelCatalogGateway(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"))
+            .DiscoverAsync(request, configuredModel, source);
     }
 
     private string ResolveSecretForTest(string envKey, string action, string value)

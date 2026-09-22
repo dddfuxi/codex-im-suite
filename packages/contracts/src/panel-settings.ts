@@ -1,8 +1,30 @@
 export const PANEL_SETTINGS_SNAPSHOT_PROTOCOL = 'cti-panel-settings-snapshot/v1' as const;
 export const PANEL_SETTINGS_UPDATE_PROTOCOL = 'cti-panel-settings-update-receipt/v1' as const;
+export const CODEX_MODEL_CATALOG_PROTOCOL = 'cti-codex-model-catalog/v1' as const;
 
 export type PanelSettingsScalar = string | number | boolean;
 export type PanelSettingValueType = 'string' | 'number' | 'boolean' | 'path' | 'path_list' | 'enum' | 'secret_status';
+
+/** Codex app-server model/list 的脱敏只读结果。模型目录不包含凭据或本地路径。 */
+export interface CodexModelOptionContract {
+  id: string;
+  displayName: string;
+  hidden: boolean;
+  isDefault: boolean;
+  inputModalities: string[];
+  defaultReasoningEffort: string;
+  supportedReasoningEfforts: string[];
+}
+
+export interface CodexModelCatalogContract {
+  protocol: typeof CODEX_MODEL_CATALOG_PROTOCOL;
+  generatedAt: string;
+  status: 'ready' | 'empty' | 'error';
+  source: 'codex_app_server' | 'openai_compatible' | 'ollama';
+  models: CodexModelOptionContract[];
+  configuredModel: string;
+  error: string;
+}
 
 /** 控制面板 settings.read 的共享 wire 类型。敏感值仍只暴露 masked/set 状态。 */
 export interface PanelSettingsStateContract {

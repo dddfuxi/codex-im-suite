@@ -28,6 +28,7 @@ import {
 } from './codex-execution-profile.js';
 import { resolveProviderWorkspace, shouldSkipGitRepoCheckForWorkspace } from './provider-workspace.js';
 import { sseEvent } from './sse-utils.js';
+import { buildRuntimeModelIdentityPrompt, type RuntimeModelIdentity } from './runtime-model-identity.js';
 import type { CodexMcpServerProjection } from './mcp-bridge.js';
 import { resolveFeishuCliUserConfigDir } from './feishu-cli-user-profile.js';
 
@@ -1079,7 +1080,7 @@ function selectHistoryEntries(
   return selected.reverse();
 }
 
-export function buildTurnPrompt(params: StreamChatParams): string {
+export function buildTurnPrompt(params: StreamChatParams, identity?: RuntimeModelIdentity): string {
   const sections: string[] = [];
   const systemPrompt = truncateSystemPromptPreservingProtocols(params.systemPrompt || '');
   const priorityTurnContext = formatPriorityTurnContext(params.priorityTurnContext);
@@ -1098,6 +1099,11 @@ export function buildTurnPrompt(params: StreamChatParams): string {
   if (priorityTurnContext) {
     sections.push(priorityTurnContext);
   }
+  // Keep current execution evidence outside the system/history truncation budget.
+  // params.model can be a stale session default, so only the Provider supplies it.
+  // Classifier callers intentionally omit this section to preserve their strict
+  // JSON-only protocol; normal/restricted response turns pass an explicit profile.
+  if (identity !== undefined) sections.push(buildRuntimeModelIdentityPrompt(identity));
   sections.push(`Current user request:\n${userPrompt}`);
   return sections.join('\n\n');
 }
@@ -1237,7 +1243,7 @@ export class CodexProvider implements LLMProvider {
                 params.systemPrompt?.trim() ? `Classifier instructions:\n${params.systemPrompt.trim()}` : '',
                 `Classifier input:\n${params.prompt.trim()}`,
               ].filter(Boolean).join('\n\n')
-              : buildTurnPrompt(params);
+              : buildTurnPrompt(params, executionProfile);
             const providerWorkspace = restrictedMode ? null : resolveProviderWorkspace(params);
             const workingDirectory = restrictedMode
               ? undefined

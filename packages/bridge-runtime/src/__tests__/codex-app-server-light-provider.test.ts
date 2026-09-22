@@ -191,4 +191,91 @@ describe('CodexAppServerLightProvider', () => {
     assert.match(output, /尝试了禁用工具：commandExecution/);
     assert.doesNotMatch(output, /"type":"text"/);
   });
+
+  it('把同一 thread/start 的真实模型身份插入每轮 classifier prompt，覆盖 GPT-6、Grok 和未知模型', async () => {
+    const keys = ['CTI_CODEX_MODEL_SOURCE', 'CTI_CODEX_MODEL', 'CTI_CODEX_BASE_URL'];
+    const previous = new Map(keys.map((key) => [key, process.env[key]]));
+    const restoreEnvironment = () => {
+      for (const key of keys) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    };
+
+    const cases = [
+      { profile: 'official' as const, source: 'official', model: 'gpt-6-astra' },
+      { profile: 'external' as const, source: 'external_api', model: 'grok-4.6' },
+      { profile: 'official' as const, source: 'official', model: undefined },
+    ];
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        if (testCase.model) process.env.CTI_CODEX_MODEL = testCase.model;
+        else delete process.env.CTI_CODEX_MODEL;
+        process.env.CTI_CODEX_MODEL_SOURCE = testCase.source;
+        if (testCase.profile === 'external') process.env.CTI_CODEX_BASE_URL = 'https://api.example.test/v1';
+        else delete process.env.CTI_CODEX_BASE_URL;
+
+        const isolatedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-app-server-identity-test-'));
+        tempDirs.push(isolatedDirectory);
+        let threadStartModel: unknown;
+        const turnStartTexts: string[] = [];
+        const fake = new FakeAppServerProcess((request, child) => {
+          const id = request.id as number | undefined;
+          if (request.method === 'initialize') {
+            child.send({ jsonrpc: '2.0', id, result: {} });
+          } else if (request.method === 'thread/start') {
+            threadStartModel = (request.params as JsonRecord).model;
+            child.send({ jsonrpc: '2.0', id, result: { thread: { id: `identity-thread-${index}` } } });
+          } else if (request.method === 'turn/start') {
+            const input = ((request.params as JsonRecord).input as Array<JsonRecord>)[0];
+            turnStartTexts.push(String(input.text));
+            // 模拟异步执行期间配置被改成旧模型；状态仍应沿用 thread/start 的 profile。
+            process.env.CTI_CODEX_MODEL = 'gpt-5.4';
+            const turnId = `identity-turn-${index}`;
+            child.send(
+              { jsonrpc: '2.0', id, result: { turn: { id: turnId } } },
+              { method: 'item/agentMessage/delta', params: { threadId: `identity-thread-${index}`, turnId, delta: '{"action":"reply","intent":"light_chat","reply":"ok","reason":"test","confidence":1}' } },
+              { method: 'turn/completed', params: { threadId: `identity-thread-${index}`, turn: { id: turnId, status: 'completed', items: [] } } },
+            );
+          } else if (id !== undefined) {
+            child.send({ jsonrpc: '2.0', id, result: {} });
+          }
+        });
+        const provider = new CodexAppServerLightProvider({
+          profile: testCase.profile,
+          executablePath: 'fake-codex',
+          isolatedDirectory,
+          spawnProcess: () => fake,
+          terminateProcess: (child) => { child.kill(); },
+          rpcTimeoutMs: 500,
+          turnTimeoutMs: 500,
+        });
+        await provider.warmup();
+        const systemPrompt = '旧历史摘要：助手曾说自己是 GPT-5.4。';
+        const output = await collect(provider.streamChat({ ...params('你是什么模型？'), systemPrompt }));
+        await provider.dispose();
+
+        assert.equal(threadStartModel, testCase.model || null);
+        if (testCase.model) assert.match(output, new RegExp(testCase.model));
+        assert.equal(turnStartTexts.length, 1);
+        const turnPrompt = turnStartTexts[0];
+        const identityOffset = turnPrompt.indexOf('Runtime model identity (current request evidence):');
+        assert.ok(identityOffset > turnPrompt.indexOf(systemPrompt));
+        const inputOffset = turnPrompt.indexOf('Classifier input:');
+        assert.ok(inputOffset > identityOffset);
+        const identitySection = turnPrompt.slice(identityOffset, inputOffset);
+        if (testCase.model) {
+          assert.match(identitySection, new RegExp(`"submittedModel":"${testCase.model}"`));
+          assert.match(identitySection, new RegExp(`"modelSource":"${testCase.source}"`));
+        } else {
+          assert.match(identitySection, /"submittedModel":null/);
+          assert.match(identitySection, /"evidenceLevel":"unknown"/);
+          assert.doesNotMatch(identitySection, /GPT-5\.4/);
+        }
+      }
+    } finally {
+      restoreEnvironment();
+    }
+  });
 });

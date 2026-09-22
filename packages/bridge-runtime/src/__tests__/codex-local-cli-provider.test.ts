@@ -167,6 +167,71 @@ describe('CodexLocalCliProvider JSON tool protocol', () => {
     }
   });
 
+  it('uses the same local model for the CLI command and runtime identity prompt', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-codex-model-identity-'));
+    const oldPath = process.env.PATH || process.env.Path || '';
+    const oldPromptPath = process.env.CTI_TEST_PROMPT_PATH;
+    const oldArgsPath = process.env.CTI_TEST_ARGS_PATH;
+    try {
+      const binDir = path.join(root, 'bin');
+      fs.mkdirSync(binDir);
+      const promptPath = path.join(root, 'prompt.txt');
+      const argsPath = path.join(root, 'args.txt');
+      const successScript = path.join(binDir, 'capture.js');
+      fs.writeFileSync(successScript, [
+        "const fs = require('fs');",
+        "let input = '';",
+        "process.stdin.setEncoding('utf8');",
+        "process.stdin.on('data', chunk => { input += chunk; });",
+        "process.stdin.on('end', () => {",
+        "  fs.writeFileSync(process.env.CTI_TEST_PROMPT_PATH, input, 'utf8');",
+        "  fs.writeFileSync(process.env.CTI_TEST_ARGS_PATH, process.argv.slice(2).join(' '), 'utf8');",
+        "  console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'本地模型回复'}}));",
+        "  console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));",
+        "});",
+      ].join('\n'), 'utf-8');
+      process.env.CTI_TEST_PROMPT_PATH = promptPath;
+      process.env.CTI_TEST_ARGS_PATH = argsPath;
+      if (process.platform === 'win32') {
+        fs.writeFileSync(path.join(binDir, 'codex.cmd'), `@echo off\r\n"${process.execPath}" "${successScript}" %*\r\n`, 'utf-8');
+        process.env.PATH = `${binDir};${oldPath}`;
+      } else {
+        const codexPath = path.join(binDir, 'codex');
+        fs.writeFileSync(codexPath, `#!/bin/sh\n"${process.execPath}" "${successScript}" "$@"\n`, 'utf-8');
+        fs.chmodSync(codexPath, 0o755);
+        process.env.PATH = `${binDir}:${oldPath}`;
+      }
+
+      const provider = new CodexLocalCliProvider(makeConfig(root));
+      const events = await collectStream(provider.streamChat({
+        sessionId: 'local-model-identity',
+        // Deliberately stale: the provider must use the model selected for its
+        // local command, not a session/default model carried by params.
+        model: 'stale-session-model',
+        prompt: '介绍一下你自己',
+        workingDirectory: root,
+        permissionMode: 'default',
+        executionRequirement: { kind: 'none', reason: 'plain chat', requiredToolFamilies: [] },
+      }));
+
+      const prompt = fs.readFileSync(promptPath, 'utf-8');
+      const args = fs.readFileSync(argsPath, 'utf-8');
+      assert.match(args, /(?:^|\s)--model(?:\s|=)qwen-test(?:\s|$)/);
+      assert.match(prompt, /Runtime model identity \(current request evidence\):/);
+      assert.match(prompt, /"submittedModel":"qwen-test"/);
+      assert.match(prompt, /"modelSource":"local_api"/);
+      assert.doesNotMatch(prompt, /stale-session-model/);
+      assert.match(String(events.find((event) => event.type === 'text')?.data || ''), /本地模型回复/);
+    } finally {
+      process.env.PATH = oldPath;
+      if (oldPromptPath === undefined) delete process.env.CTI_TEST_PROMPT_PATH;
+      else process.env.CTI_TEST_PROMPT_PATH = oldPromptPath;
+      if (oldArgsPath === undefined) delete process.env.CTI_TEST_ARGS_PATH;
+      else process.env.CTI_TEST_ARGS_PATH = oldArgsPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('executes deterministic runtime tool requests and lets the model compose the final reply', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-local-json-tool-provider-'));
     try {

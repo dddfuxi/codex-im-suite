@@ -52,6 +52,36 @@ function parseSSEData(event: { data: string } | undefined): Record<string, unkno
 }
 
 describe('CodexProvider', () => {
+  it('uses the current Runtime submitted model as authoritative identity after stale history', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const prompt = buildTurnPrompt({
+      prompt: '你是什么模型？',
+      sessionId: 'model-identity-session',
+      conversationHistory: [
+        { role: 'assistant', content: '我底层是 OpenAI 的 GPT-5.4。' },
+      ],
+    }, { submittedModel: 'gpt-6-astra', modelSource: 'official' });
+
+    const identityIndex = prompt.indexOf('Runtime model identity (current request evidence):');
+    assert.ok(identityIndex >= 0);
+    assert.ok(identityIndex > prompt.indexOf('GPT-5.4'), '身份证据应位于旧历史之后');
+    assert.ok(identityIndex < prompt.indexOf('Current user request:'), '身份证据应位于当前请求之前');
+    assert.match(prompt.slice(identityIndex), /"submittedModel":"gpt-6-astra"/);
+    assert.match(prompt.slice(identityIndex), /"modelSource":"official"/);
+    assert.match(prompt.slice(identityIndex), /History, nearby messages, memory/i);
+  });
+
+  it('does not invent a model name when the Runtime has no submitted model', async () => {
+    const { buildTurnPrompt } = await import('../codex-provider.js');
+    const prompt = buildTurnPrompt({ prompt: '请介绍一下底层模型', sessionId: 'unknown-model-identity-session' }, {});
+    const identityIndex = prompt.indexOf('Runtime model identity (current request evidence):');
+    assert.ok(identityIndex >= 0);
+    const identity = prompt.slice(identityIndex, prompt.indexOf('Current user request:', identityIndex));
+    assert.match(identity, /"submittedModel":null/);
+    assert.match(identity, /exact model ID is unavailable/i);
+    assert.doesNotMatch(identity, /gpt-5\.4|gpt-6|grok/i);
+  });
+
   it('adds explicit reply style context to normal Codex turns', async () => {
     const { buildTurnPrompt } = await import('../codex-provider.js');
     const prompt = buildTurnPrompt({

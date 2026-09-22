@@ -12,6 +12,7 @@ import {
 import type { AgentCollaborationPanelState } from '@codex-im-suite/contracts/agent-collaboration';
 import type { ProjectRegistrySnapshotContract } from '@codex-im-suite/contracts/project-registry';
 import type { SpeechPanelStateContract } from '@codex-im-suite/contracts/speech';
+import type { CodexModelCatalogContract } from '@codex-im-suite/contracts/panel-settings';
 import type {
   WorkflowPanelRunContract as WorkflowRun,
   WorkflowPanelStateContract as WorkflowStatus,
@@ -6302,6 +6303,8 @@ function SettingsPage({
   const [requestText, setRequestText] = useState('');
   const [modelCatalogItems, setModelCatalogItems] = useState<ExtensionCatalogItem[]>([]);
   const [modelCatalogError, setModelCatalogError] = useState('');
+  const [codexModelCatalog, setCodexModelCatalog] = useState<CodexModelCatalogContract | undefined>();
+  const [codexModelCatalogLoading, setCodexModelCatalogLoading] = useState(false);
   const settingsDirtyRef = useRef(false);
   const activePreset = presets.find((preset) => settings.replyStyleHint === preset.value);
 
@@ -6325,6 +6328,7 @@ function SettingsPage({
   const usesConfigurableCodexModel = aiStrategy === 'official'
     || aiStrategy === 'external_api'
     || (aiStrategy === 'auto_failover' && (fallbackChain.includes('official') || fallbackChain.includes('external_api')));
+  const usesRuntimeModelCatalog = aiStrategy === 'official' || aiStrategy === 'external_api' || aiStrategy === 'local_api';
   const executorOptions = state.executors?.executors ?? [];
   const pathSections = buildWorkspacePathSections(settings);
   const localModelOptions = useMemo(() => {
@@ -6357,9 +6361,67 @@ function SettingsPage({
     }
   };
 
+  const catalogSource = aiStrategy === 'official' || aiStrategy === 'external_api' || aiStrategy === 'local_api'
+    ? aiStrategy
+    : undefined;
+  const loadCodexModelCatalog = async (source = catalogSource) => {
+    if (!source) return;
+    setCodexModelCatalogLoading(true);
+    try {
+      const snapshot = await run('settings.listCodexModels', {
+        source,
+        localKind: settings.localAiKind,
+      }) as CodexModelCatalogContract;
+      setCodexModelCatalog(snapshot);
+    } catch (error) {
+      setCodexModelCatalog({
+        protocol: 'cti-codex-model-catalog/v1',
+        generatedAt: new Date().toISOString(),
+        status: 'error',
+        source: source === 'local_api'
+          ? settings.localAiKind.trim().toLowerCase() === 'ollama' ? 'ollama' : 'openai_compatible'
+          : source === 'external_api' ? 'openai_compatible' : 'codex_app_server',
+        models: [],
+        configuredModel: source === 'local_api' ? settings.localAiModel : settings.codexModel,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setCodexModelCatalogLoading(false);
+    }
+  };
+
   useEffect(() => {
     void loadModelCatalog(false);
   }, []);
+
+  useEffect(() => {
+    if (catalogSource) {
+      setCodexModelCatalog(undefined);
+      void loadCodexModelCatalog(catalogSource);
+    }
+  }, [aiStrategy, settings.localAiKind]);
+
+  const codexModelOptions = useMemo(() => {
+    const byId = new Map<string, CodexModelCatalogContract['models'][number]>();
+    for (const model of codexModelCatalog?.models ?? []) {
+      if (model.hidden || !model.id.trim() || byId.has(model.id.toLowerCase())) continue;
+      byId.set(model.id.toLowerCase(), model);
+    }
+    const options = [...byId.values()];
+    const configured = (aiStrategy === 'local_api' ? settings.localAiModel : settings.codexModel).trim();
+    if (configured && !options.some((item) => item.id.toLowerCase() === configured.toLowerCase())) {
+      options.unshift({
+        id: configured,
+        displayName: `${configured}（当前配置，未出现在本次目录）`,
+        hidden: false,
+        isDefault: false,
+        inputModalities: [],
+        defaultReasoningEffort: '',
+        supportedReasoningEfforts: [],
+      });
+    }
+    return options;
+  }, [aiStrategy, codexModelCatalog, settings.codexModel, settings.localAiModel]);
 
   const setFallbackChain = (chain: CodexSource[]) => {
     const unique = Array.from(new Set(chain));
@@ -6588,15 +6650,26 @@ function SettingsPage({
                   </select>
                 </label>
                 <label className="stack-field">
-                  <span>模型</span>
+                  <span>模型（自动识别）</span>
                   <div className="path-input-group">
-                    <input
-                      list="local-ai-model-catalog"
-                      value={settings.localAiModel}
-                      onChange={(event) => update('localAiModel', event.target.value)}
-                      placeholder="例如 qwen3-coder:30b"
-                    />
-                    <MiniButton label="刷新目录" icon={<RefreshCw size={14} />} onClick={() => void loadModelCatalog(true)} pending={pending['extension.catalog.refresh']} />
+                    {codexModelCatalog?.status === 'ready' && codexModelOptions.length > 0 ? (
+                      <select value={settings.localAiModel} onChange={(event) => update('localAiModel', event.target.value)}>
+                        <option value="">跟随本地服务默认模型</option>
+                        {codexModelOptions.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.displayName || model.id}{model.isDefault ? ' · 默认' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        list="local-ai-model-catalog"
+                        value={settings.localAiModel}
+                        onChange={(event) => update('localAiModel', event.target.value)}
+                        placeholder="例如 qwen3-coder:30b"
+                      />
+                    )}
+                    <MiniButton label="重新识别" icon={<RefreshCw size={14} />} onClick={() => void loadCodexModelCatalog('local_api')} pending={codexModelCatalogLoading || pending['settings.listCodexModels']} />
                   </div>
                   <datalist id="local-ai-model-catalog">
                     {localModelOptions.map(([model, item]) => (
@@ -6634,7 +6707,9 @@ function SettingsPage({
               </div>
               <p className="field-hint">
                 Provider 能力：{localAiCapabilityLabel(settings.localAiKind)}。{localAiCapabilityHint(settings.localAiKind)}
-                模型候选来自扩展在线目录；仍可手动输入任意 Ollama 模型名。
+                {codexModelCatalog?.status === 'ready'
+                  ? `已从当前本地服务识别 ${codexModelCatalog.models.length} 个可用模型。`
+                  : '正在读取当前本地服务的模型目录；请先保存地址或 Provider 改动再重新识别，失败时仍保留扩展目录候选。'}
                 {modelCatalogError ? ` 目录读取失败：${modelCatalogError}` : ''}
               </p>
             </>
@@ -6672,8 +6747,29 @@ function SettingsPage({
                 </label>
               )}
               <label className="stack-field">
-                <span>{aiStrategy === 'official' ? '官方 Codex Model（可选）' : 'Codex Model（可选）'}</span>
-                <input value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)} placeholder={aiStrategy === 'official' ? '留空跟随 Codex 默认模型' : '留空由当前来源决定默认模型'} />
+                <span>{usesRuntimeModelCatalog ? `${aiStrategy === 'official' ? '官方 Codex' : '外部 API'} Model（自动识别）` : 'Codex Model（可选）'}</span>
+                {usesRuntimeModelCatalog ? (
+                  <div className="path-input-group">
+                    <select value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)}>
+                      <option value="">跟随当前来源默认模型</option>
+                      {codexModelOptions.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.displayName || model.id}{model.isDefault ? ' · 默认' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <MiniButton label="重新识别" icon={<RefreshCw size={14} />} onClick={() => void loadCodexModelCatalog(catalogSource)} pending={codexModelCatalogLoading || pending['settings.listCodexModels']} />
+                  </div>
+                ) : (
+                  <input value={settings.codexModel} onChange={(event) => update('codexModel', event.target.value)} placeholder="留空由当前来源决定默认模型" />
+                )}
+                {usesRuntimeModelCatalog && (
+                  <span className="micro-copy">
+                    {codexModelCatalog?.status === 'ready'
+                      ? `已从当前模型来源识别 ${codexModelCatalog.models.length} 个可用模型。`
+                      : codexModelCatalog?.error || '正在读取当前模型来源的目录；失败时可继续跟随默认模型。'}
+                  </span>
+                )}
               </label>
               {usesExternalCodexApi && (
                 <>

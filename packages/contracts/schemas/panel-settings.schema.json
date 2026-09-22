@@ -3,6 +3,34 @@
   "$id": "https://codex-im-suite.local/schemas/panel-settings.schema.json",
   "title": "Codex IM Suite Panel Settings",
   "$defs": {
+    "CodexModelOptionContract": {
+      "type": "object",
+      "required": ["id", "displayName", "hidden", "isDefault", "inputModalities", "defaultReasoningEffort", "supportedReasoningEfforts"],
+      "properties": {
+        "id": { "type": "string" },
+        "displayName": { "type": "string" },
+        "hidden": { "type": "boolean" },
+        "isDefault": { "type": "boolean" },
+        "inputModalities": { "type": "array", "items": { "type": "string" } },
+        "defaultReasoningEffort": { "type": "string" },
+        "supportedReasoningEfforts": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "CodexModelCatalogContract": {
+      "type": "object",
+      "required": ["protocol", "generatedAt", "status", "source", "models", "configuredModel", "error"],
+      "properties": {
+        "protocol": { "const": "cti-codex-model-catalog/v1" },
+        "generatedAt": { "type": "string" },
+        "status": { "enum": ["ready", "empty", "error"] },
+        "source": { "enum": ["codex_app_server", "openai_compatible", "ollama"] },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/CodexModelOptionContract" } },
+        "configuredModel": { "type": "string" },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "PanelSettingsStateContract": {
       "type": "object",
       "required": ["defaultWorkDir", "allowedRoots", "memoryRepo", "additionalDirs", "replyStyleHint", "defaultExecutorId", "localAiKind", "localAiBaseUrl", "ollamaModelsDir", "localAiModel", "localAiApiKeyAction", "localAiApiKeyValue", "localAiApiKeyMasked", "localAiApiKeySet", "localAiTimeoutMs", "codexModelSource", "codexRoutingMode", "codexApiFallbackChain", "codexBaseUrl", "codexModel", "codexPassModel", "codexReasoningEffort", "memoryOptimizerEnabled", "memoryOptimizerIntervalDays", "memoryOptimizerModelSource", "codexApiKeyAction", "codexApiKeyValue", "codexApiKeyMasked", "codexApiKeySet", "safetyPolicyProfile"],

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { computeNextScheduledAt } from './schedule.js';
+import { computeNextScheduledAt, resolveDueScheduledSlot } from './schedule.js';
 import type { ScheduledTaskStore } from './store.js';
 import type {
   ScheduledTaskDeliveryStatus,
@@ -227,7 +227,9 @@ export function createScheduledTaskService(
       ...counters,
       nextRunAt: preserveNextRun
         ? state.nextRunAt
-        : computeNextScheduledAt(task.schedule, run.scheduledFor),
+        : computeNextScheduledAt(task.schedule, new Date(Math.max(
+          new Date(run.scheduledFor).getTime(), new Date(endedAt).getTime(),
+        )).toISOString()),
       queuedRunId: undefined,
       runningRunId: undefined,
       runningLeaseUntil: undefined,
@@ -320,7 +322,7 @@ export function createScheduledTaskService(
     await options.store.appendRun(run);
     await options.store.compareAndSetState(task.id, state.version, {
       ...state,
-      nextRunAt: computeNextScheduledAt(task.schedule, scheduledFor),
+      nextRunAt: computeNextScheduledAt(task.schedule, occurredAt),
       lastRunAt: occurredAt,
       lastRunStatus: 'skipped',
       lastExecutionStatus: 'skipped',
@@ -336,18 +338,42 @@ export function createScheduledTaskService(
     await recoverExpiredRuns();
     const tickNow = now();
     let handled = 0;
-    const dueTasks: Array<{ task: VersionedScheduledTask; state: VersionedScheduledTaskState; scheduledFor: string }> = [];
+    const dueTasks: Array<{ task: VersionedScheduledTask; state: VersionedScheduledTaskState; scheduledFor: string; caughtUp: boolean }> = [];
     for (const task of await options.store.listTasks()) {
       if (!task.enabled) continue;
       const state = await ensureTaskState(task.id);
       if (!isDue(state.nextRunAt, tickNow)) continue;
-      const scheduledFor = state.nextRunAt!;
       if (hasActiveLease(state, tickNow)) {
-        await recordOverlap(task, state, scheduledFor);
+        await recordOverlap(task, state, state.nextRunAt!);
         handled += 1;
         continue;
       }
-      dueTasks.push({ task, state, scheduledFor });
+      const decision = resolveDueScheduledSlot(task.schedule, state.nextRunAt!, tickNow, task.misfirePolicy);
+      const { scheduledFor, caughtUp } = decision;
+      if (!decision.shouldRun) {
+        // Persist the future watermark first: a crash must not re-admit stale work.
+        await options.store.compareAndSetState(task.id, state.version, {
+          ...state,
+          nextRunAt: decision.nextRunAt,
+          lastRunAt: tickNow,
+          lastRunStatus: 'skipped',
+          lastExecutionStatus: 'skipped',
+          lastDeliveryStatus: 'not_requested',
+          consecutiveSkipped: state.consecutiveSkipped + 1,
+          lastError: '已跳过过期计划任务，不补发历史轮次',
+        });
+        await options.store.appendRun({
+          ...createRun(task, scheduledFor, 'scheduled', scheduledFor, tickNow),
+          endedAt: tickNow,
+          executionStatus: 'skipped',
+          deliveryStatus: 'not_requested',
+          errorKind: 'misfire_skipped',
+          summary: '已跳过过期计划任务，不补发历史轮次',
+        });
+        handled += 1;
+        continue;
+      }
+      dueTasks.push({ task, state, scheduledFor, caughtUp });
     }
 
     dueTasks.sort((left, right) => (
@@ -365,7 +391,7 @@ export function createScheduledTaskService(
         due.task,
         due.state,
         due.scheduledFor,
-        'scheduled',
+        due.caughtUp ? 'catch_up' : 'scheduled',
         false,
       );
       if (reserved) {
@@ -414,13 +440,29 @@ export function createScheduledTaskService(
         && previousRun.deliveryStatus === 'failed'
         && previousRun.deliveryPayload
       ) {
+        const deliveryDecision = previousRun.trigger !== 'manual' && isDue(previousRun.scheduledFor, recoveryNow)
+          ? resolveDueScheduledSlot(task.schedule, previousRun.scheduledFor, recoveryNow, task.misfirePolicy)
+          : undefined;
+        if (!task.enabled || (deliveryDecision && (
+          !deliveryDecision.shouldRun || deliveryDecision.caughtUp
+        ))) {
+          await finalizeRun(task, previousRun, {
+            executionStatus: 'ok',
+            deliveryStatus: 'not_requested',
+            deliveryPayload: previousRun.deliveryPayload,
+            errorKind: 'misfire_delivery_skipped',
+            summary: '历史结果已保留；任务已暂停或投递已过期，未自动补发',
+          }, previousRun.trigger === 'manual');
+          recovered += 1;
+          continue;
+        }
         const deliveryResult = await options.execute({
           task,
           run: previousRun,
           mode: 'delivery_only',
           previousRun,
         });
-        await finalizeRun(task, previousRun, deliveryResult, false);
+        await finalizeRun(task, previousRun, deliveryResult, previousRun.trigger === 'manual');
         recovered += 1;
         continue;
       }
@@ -440,7 +482,11 @@ export function createScheduledTaskService(
       await options.store.appendRun(interrupted);
       await options.store.compareAndSetState(task.id, state.version, {
         ...state,
-        nextRunAt: computeNextScheduledAt(task.schedule, scheduledFor),
+        nextRunAt: previousRun?.trigger === 'manual'
+          ? state.nextRunAt
+          : computeNextScheduledAt(task.schedule, new Date(Math.max(
+            new Date(scheduledFor).getTime(), recoveryNowMs,
+          )).toISOString()),
         queuedRunId: undefined,
         runningRunId: undefined,
         runningLeaseUntil: undefined,

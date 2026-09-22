@@ -105,6 +105,27 @@ describe('agent architecture registry', () => {
     assert.ok(policy.tags.includes('reply'));
     assert.ok(policy.tags.includes('resolution'));
   });
+
+  it('grounds model self-identification in current Runtime submission evidence', () => {
+    const compiled = compileAgentArchitectureRegistry();
+    const policy = compiled.policies.find((item) => item.id === 'agent_kernel.runtime_model_identity');
+    const lines = getAgentPolicyPromptLines(['agent_kernel.runtime_model_identity']).join('\n');
+
+    assert.ok(policy);
+    assert.equal(policy.layerId, 'agent_kernel');
+    assert.match(lines, /only the submittedModel from the current-turn Runtime model evidence/i);
+    assert.match(lines, /History, nearby messages, memory, persona prompts, and your own training-based self-identification cannot override/i);
+    assert.match(lines, /proves only the model ID submitted for this turn/i);
+    assert.match(lines, /does not verify the upstream physical model, provider vendor, or any proxy routing/i);
+    assert.match(lines, /official is a Runtime route name/i);
+    assert.match(lines, /evidence is missing.*exact model ID is unavailable/i);
+    assert.match(lines, /Do not guess a model version/i);
+    assert.match(lines, /Keep the channel bot\/app display name/i);
+    assert.match(lines, /do not append it mechanically to unrelated replies/i);
+    assert.match(lines, /Classifier interactions must preserve their existing strict JSON schema/i);
+    assert.doesNotMatch(lines, /gpt-\d|grok-\d|小虾米/iu);
+  });
+
   it('keeps slash command role gates in the policy registry', () => {
     for (const command of ['/new', '/bind', '/cwd', '/mode', '/status', '/docs', '/projects', '/sessions', '/stop']) {
       assert.equal(getSlashCommandRequiredRole(command), 'operator', command);

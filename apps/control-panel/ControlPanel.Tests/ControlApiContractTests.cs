@@ -38,6 +38,8 @@ public sealed class ControlApiContractTests
         var speechModelOptionType = assembly.GetType("ClaudeToImControlPanel.SpeechModelOptionContract");
         var speechModelSelectionType = assembly.GetType("ClaudeToImControlPanel.SpeechModelSelectionContract");
         var speechPreviewReceiptType = assembly.GetType("ClaudeToImControlPanel.SpeechPreviewReceiptContract");
+        var codexModelOptionType = assembly.GetType("ClaudeToImControlPanel.CodexModelOptionContract");
+        var codexModelCatalogType = assembly.GetType("ClaudeToImControlPanel.CodexModelCatalogContract");
         var settingsSnapshotType = assembly.GetType("ClaudeToImControlPanel.SettingsSnapshot");
 
         Assert.NotNull(panelStateType);
@@ -67,6 +69,8 @@ public sealed class ControlApiContractTests
         Assert.NotNull(speechModelOptionType);
         Assert.NotNull(speechModelSelectionType);
         Assert.NotNull(speechPreviewReceiptType);
+        Assert.NotNull(codexModelOptionType);
+        Assert.NotNull(codexModelCatalogType);
         Assert.NotNull(settingsSnapshotType);
 
         var schemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "control-api.schema.json");
@@ -84,6 +88,10 @@ public sealed class ControlApiContractTests
         Assert.True(File.Exists(panelSettingsSchemaPath), $"面板设置共享协议 schema 不存在：{panelSettingsSchemaPath}");
         using var panelSettingsSchema = JsonDocument.Parse(File.ReadAllText(panelSettingsSchemaPath, Encoding.UTF8));
         AssertDtoProperties(settingsSnapshotType!, panelSettingsSchema.RootElement.GetProperty("$defs").GetProperty("PanelSettingsStateContract"));
+        AssertDtoProperties(codexModelOptionType!, panelSettingsSchema.RootElement.GetProperty("$defs").GetProperty("CodexModelOptionContract"));
+        AssertDtoProperties(codexModelCatalogType!, panelSettingsSchema.RootElement.GetProperty("$defs").GetProperty("CodexModelCatalogContract"));
+        var catalogSchema = panelSettingsSchema.RootElement.GetProperty("$defs").GetProperty("CodexModelCatalogContract");
+        Assert.Equal(new[] { "codex_app_server", "openai_compatible", "ollama" }, catalogSchema.GetProperty("properties").GetProperty("source").GetProperty("enum").EnumerateArray().Select(item => item.GetString()).ToArray());
 
         var agentSchemaPath = Path.Combine(FindRepositoryRoot(), "packages", "contracts", "schemas", "agent-collaboration.schema.json");
         Assert.True(File.Exists(agentSchemaPath), $"Agent 协作 schema 不存在：{agentSchemaPath}");

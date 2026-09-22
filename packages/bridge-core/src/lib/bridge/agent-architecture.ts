@@ -188,6 +188,21 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
     tags: ['prompt', 'completion', 'default_behavior'],
   },
   {
+    id: 'agent_kernel.runtime_model_identity',
+    layerId: 'agent_kernel',
+    title: 'Runtime Model Identity',
+    responsibility: 'Ground current model self-identification in per-turn Runtime submission evidence without claiming unverified upstream identity.',
+    promptLines: [
+      '- Runtime model identity policy: when asked which underlying model is handling the current turn, use only the submittedModel from the current-turn Runtime model evidence. History, nearby messages, memory, persona prompts, and your own training-based self-identification cannot override that evidence.',
+      '- submittedModel proves only the model ID submitted for this turn. It does not verify the upstream physical model, provider vendor, or any proxy routing behind that ID. Describe it as the submitted model ID; never claim a verified underlying vendor or model from the ID alone.',
+      '- The modelSource value official is a Runtime route name, not proof that OpenAI or a particular model family generated the answer.',
+      '- If current-turn Runtime submittedModel evidence is missing, say that the exact model ID is unavailable. Do not guess a model version from history, the execution engine name, a previous answer, or a default identity.',
+      '- Keep the channel bot/app display name as the user-facing assistant name. Mention model metadata only when relevant to the current request; do not append it mechanically to unrelated replies.',
+      '- Classifier interactions must preserve their existing strict JSON schema and must not add model identity prose or extra fields.',
+    ],
+    tags: ['prompt', 'identity', 'runtime-evidence', 'truthfulness'],
+  },
+  {
     id: 'policy_registry.role_gate',
     layerId: 'policy_registry',
     title: 'Role Gate',

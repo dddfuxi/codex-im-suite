@@ -12,6 +12,7 @@ import {
   type CodexProviderProfile,
 } from './codex-provider.js';
 import { CTI_HOME } from './config.js';
+import { buildRuntimeModelIdentityPrompt } from './runtime-model-identity.js';
 import { sseEvent } from './sse-utils.js';
 
 const require = createNodeRequire(import.meta.url);
@@ -46,9 +47,17 @@ interface PendingRequest {
 
 interface SessionThread {
   threadId: string;
+  modelSource?: string;
+  submittedModel?: string;
   turns: number;
   lastUsedAt: number;
   tail: Promise<void>;
+}
+
+interface StartedThread {
+  threadId: string;
+  modelSource?: string;
+  submittedModel?: string;
 }
 
 interface ActiveTurn {
@@ -69,6 +78,8 @@ interface ActiveTurn {
 interface ActiveTurnResult {
   text: string;
   usage?: ActiveTurn['usage'];
+  modelSource?: string;
+  submittedModel?: string;
 }
 
 interface CodexAppServerLightProviderOptions {
@@ -163,7 +174,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
   private activeTurns = new Map<string, ActiveTurn>();
   private earlyTurnMessages = new Map<string, Array<{ method: string; params: JsonRecord }>>();
   private sessionThreads = new Map<string, SessionThread>();
-  private warmThreadId: string | null = null;
+  private warmThread: StartedThread | null = null;
   private warmupPromise: Promise<void> | null = null;
   private initialized = false;
   private disposed = false;
@@ -235,7 +246,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
     const child = this.child;
     this.child = null;
     this.initialized = false;
-    this.warmThreadId = null;
+    this.warmThread = null;
     this.sessionThreads.clear();
     const error = new Error('Codex app-server 已关闭');
     for (const request of this.pending.values()) {
@@ -262,13 +273,12 @@ export class CodexAppServerLightProvider implements LLMProvider {
       }
       const signal = params.abortController?.signal;
       await this.waitWithAbort(this.warmup(), signal);
-      const result = await this.runSerialized(params.sessionId, () => this.runTurn(params));
-      const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile, this.restrictedCodexHome);
+      const result = await this.runSerialized(params.sessionId, (binding) => this.runTurn(params, binding));
       controller.enqueue(sseEvent('status', {
         provider: 'codex_app_server',
         codexProfile: this.profile,
-        modelSource: runtimeProfile.executionProfile.modelSource,
-        model: runtimeProfile.executionProfile.submittedModel,
+        modelSource: result.modelSource,
+        model: result.submittedModel,
         persistentProcess: true,
       }));
       controller.enqueue(sseEvent('text', result.text));
@@ -288,7 +298,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
   private async startAndWarm(): Promise<void> {
     fs.mkdirSync(this.isolatedDirectory, { recursive: true });
     await this.ensureProcess();
-    if (!this.warmThreadId) this.warmThreadId = await this.startThread();
+    if (!this.warmThread) this.warmThread = await this.startThread();
   }
 
   private async ensureProcess(): Promise<void> {
@@ -331,7 +341,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
     this.initialized = true;
   }
 
-  private async startThread(): Promise<string> {
+  private async startThread(): Promise<StartedThread> {
     const runtimeProfile = buildRestrictedCodexRuntimeProfile(this.profile, this.restrictedCodexHome);
     const response = getObject(await this.request('thread/start', {
       model: runtimeProfile.executionProfile.submittedModel || null,
@@ -357,7 +367,11 @@ export class CodexAppServerLightProvider implements LLMProvider {
     const thread = getObject(response?.thread);
     const threadId = getString(thread, 'id');
     if (!threadId) throw new Error('Codex app-server thread/start 未返回 thread id');
-    return threadId;
+    return {
+      threadId,
+      modelSource: runtimeProfile.executionProfile.modelSource,
+      submittedModel: runtimeProfile.executionProfile.submittedModel,
+    };
   }
 
   private async getSessionThread(sessionId: string): Promise<SessionThread> {
@@ -370,9 +384,14 @@ export class CodexAppServerLightProvider implements LLMProvider {
       this.sessionThreads.delete(sessionId);
       this.unsubscribeThread(binding.threadId);
     }
-    const threadId = this.warmThreadId || await this.startThread();
-    this.warmThreadId = null;
-    binding = { threadId, turns: 0, lastUsedAt: Date.now(), tail: Promise.resolve() };
+    const startedThread = this.warmThread || await this.startThread();
+    this.warmThread = null;
+    binding = {
+      ...startedThread,
+      turns: 0,
+      lastUsedAt: Date.now(),
+      tail: Promise.resolve(),
+    };
     this.sessionThreads.set(sessionId, binding);
     this.evictOldThreads(sessionId);
     return binding;
@@ -394,23 +413,28 @@ export class CodexAppServerLightProvider implements LLMProvider {
     void this.request('thread/unsubscribe', { threadId }, 3_000).catch(() => {});
   }
 
-  private async runSerialized<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+  private async runSerialized<T>(sessionId: string, task: (binding: SessionThread) => Promise<T>): Promise<T> {
     const binding = await this.getSessionThread(sessionId);
     const previous = binding.tail;
     let release!: () => void;
     binding.tail = new Promise<void>((resolve) => { release = resolve; });
     await previous.catch(() => {});
     try {
-      return await task();
+      return await task(binding);
     } finally {
       release();
     }
   }
 
-  private async runTurn(params: StreamChatParams): Promise<ActiveTurnResult> {
-    const binding = await this.getSessionThread(params.sessionId);
+  private async runTurn(params: StreamChatParams, sessionBinding?: SessionThread): Promise<ActiveTurnResult> {
+    const binding = sessionBinding || await this.getSessionThread(params.sessionId);
+    const modelIdentity = buildRuntimeModelIdentityPrompt({
+      submittedModel: binding.submittedModel,
+      modelSource: binding.modelSource,
+    });
     const prompt = [
       params.systemPrompt?.trim() ? `Classifier instructions:\n${params.systemPrompt.trim()}` : '',
+      modelIdentity,
       `Classifier input:\n${params.prompt.trim()}`,
     ].filter(Boolean).join('\n\n');
     const response = getObject(await this.request('turn/start', {
@@ -464,7 +488,11 @@ export class CodexAppServerLightProvider implements LLMProvider {
         this.replayEarlyTurnMessages(turnId);
       });
       binding.turns += 1;
-      return result;
+      return {
+        ...result,
+        modelSource: binding.modelSource,
+        submittedModel: binding.submittedModel,
+      };
     } catch (error) {
       if (this.sessionThreads.get(params.sessionId) === binding) {
         this.sessionThreads.delete(params.sessionId);
@@ -648,7 +676,7 @@ export class CodexAppServerLightProvider implements LLMProvider {
     const child = this.child;
     this.child = null;
     this.initialized = false;
-    this.warmThreadId = null;
+    this.warmThread = null;
     this.sessionThreads.clear();
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);

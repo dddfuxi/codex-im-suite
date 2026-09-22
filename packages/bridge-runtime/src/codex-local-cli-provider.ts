@@ -18,6 +18,7 @@ import {
   toTextEnv,
   type CodexProviderProfile,
 } from './codex-provider.js';
+import { buildRuntimeModelIdentityPrompt } from './runtime-model-identity.js';
 import { getLocalCodexProviderAdapter, type LocalCodexProviderAdapter } from './local-codex-provider-registry.js';
 import { resolveProviderWorkspace, shouldSkipGitRepoCheckForWorkspace } from './provider-workspace.js';
 import { McpBridge, type McpManifestRecord, type McpToolInfo } from './mcp-bridge.js';
@@ -738,7 +739,12 @@ export class CodexLocalCliProvider implements LLMProvider {
           let terminationGraceTimer: NodeJS.Timeout | undefined;
           params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
-          const prompt = buildTurnPrompt(params);
+          const prompt = buildTurnPrompt(
+            params,
+            params.interactionMode === 'classifier'
+              ? undefined
+              : { submittedModel: model, modelSource: 'local_api' },
+          );
           child.stdin.write(prompt);
           child.stdin.end();
 
@@ -1406,7 +1412,13 @@ export class CodexLocalCliProvider implements LLMProvider {
       input.params.abortController?.signal.addEventListener('abort', abort, { once: true });
 
       const systemPrompt = input.replaceSystemPrompt
-        ? input.systemPromptAppend || ''
+        ? [
+          buildRuntimeModelIdentityPrompt({
+            submittedModel: input.model,
+            modelSource: 'local_api',
+          }),
+          input.systemPromptAppend || '',
+        ].filter((part) => part.trim()).join('\n\n')
         : [input.params.systemPrompt, input.systemPromptAppend]
             .filter((part): part is string => !!part?.trim())
             .join('\n\n');
@@ -1423,6 +1435,9 @@ export class CodexLocalCliProvider implements LLMProvider {
           systemPrompt,
           sdkSessionId: undefined,
           forceFreshThread: true,
+        }, {
+          submittedModel: input.model,
+          modelSource: 'local_api',
         });
       child.stdin.write(prompt);
       child.stdin.end();

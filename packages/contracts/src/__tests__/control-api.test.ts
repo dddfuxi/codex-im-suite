@@ -16,6 +16,7 @@ describe('control panel shared contracts', () => {
     assert.equal(contracts.CONTROL_RESULT_SCHEMA, 'codex-im-suite/control-result/v1');
     assert.equal(contracts.PANEL_SETTINGS_SNAPSHOT_PROTOCOL, 'cti-panel-settings-snapshot/v1');
     assert.equal(contracts.PANEL_SETTINGS_UPDATE_PROTOCOL, 'cti-panel-settings-update-receipt/v1');
+    assert.equal(contracts.CODEX_MODEL_CATALOG_PROTOCOL, 'cti-codex-model-catalog/v1');
     assert.equal(contracts.SPEECH_STATUS_PROTOCOL, 'codex-im-suite/speech-status/v2');
     assert.equal(contracts.SPEECH_SETTINGS_SCHEMA, 'codex-im-suite/speech-settings/v2');
     assert.equal(contracts.WORKFLOW_PANEL_STATE_PROTOCOL, 'workflow-runtime/v1');
@@ -81,6 +82,12 @@ describe('control panel shared contracts', () => {
     ]);
     assert.equal(speech.$id, 'https://codex-im-suite.local/schemas/speech.schema.json');
     assert.equal(panelSettings.$id, 'https://codex-im-suite.local/schemas/panel-settings.schema.json');
+    assert.deepEqual(panelSettings.$defs?.CodexModelOptionContract?.required, [
+      'id', 'displayName', 'hidden', 'isDefault', 'inputModalities', 'defaultReasoningEffort', 'supportedReasoningEfforts',
+    ]);
+    assert.deepEqual(panelSettings.$defs?.CodexModelCatalogContract?.required, [
+      'protocol', 'generatedAt', 'status', 'source', 'models', 'configuredModel', 'error',
+    ]);
     assert.deepEqual(panelSettings.$defs?.PanelSettingsSnapshotContract?.required, ['protocol', 'version', 'generatedAt', 'settings']);
     assert.deepEqual(speech.$defs?.SpeechSettingsContract?.required, [
       'schema', 'inputEnabled', 'outputEnabled', 'singingEnabled', 'channelIds', 'replyPolicy', 'deliveryMode',
