@@ -221,6 +221,7 @@ import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
 import { buildFeishuDecisionCard } from './channels/feishu/cards/decision-card.js';
 import { normalizeDecisionResult, renderDecisionView } from './application/decision-view.js';
 import { getJevChatMode, isJevPureModeEnabled, setJevChatMode } from './application/jev-mode.js';
+import { analyzeJevIntent, normalizeJevDecisionQuestion, renderJevPlannerFailure } from './application/jev-intent-policy.js';
 export { isJevPureModeEnabled };
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
@@ -285,6 +286,8 @@ import {
 } from './runtime-audit.js';
 
 const GLOBAL_KEY = '__bridge_manager__';
+const DEFAULT_MAX_CONCURRENT_TURNS = 2;
+const MAX_MAX_CONCURRENT_TURNS = 8;
 const execFileAsync = promisify(execFile);
 const BRIDGE_HOME = process.env.CTI_HOME || path.join(os.homedir(), '.claude-to-im');
 const PERMISSIONS_PATH = path.join(BRIDGE_HOME, 'data', 'permissions.json');
@@ -5442,6 +5445,9 @@ interface BridgeManagerState {
   messageTasks: Map<string, MessageLifecycleTask>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
+  /** Cross-session limiter for model/tool turns; prevents unbounded heavy work. */
+  globalTurnActive: number;
+  globalTurnWaiters: Array<{ resolve: (release: () => void) => void }>;
   /** 仅供尚未升级专用 Store 接口的旧 Runtime 使用；新 Runtime 必须持久化。 */
   speechReplyPreferences: Map<string, SpeechReplyPreference>;
   speechPreferenceFallbackAudited: Set<string>;
@@ -5460,6 +5466,8 @@ function getState(): BridgeManagerState {
       activeTasks: new Map(),
       messageTasks: new Map(),
       sessionLocks: new Map(),
+      globalTurnActive: 0,
+      globalTurnWaiters: [],
       speechReplyPreferences: new Map(),
       speechPreferenceFallbackAudited: new Set(),
       autoStartChecked: false,
@@ -5472,6 +5480,12 @@ function getState(): BridgeManagerState {
   if (!g[GLOBAL_KEY].messageTasks) {
     g[GLOBAL_KEY].messageTasks = new Map();
   }
+  if (typeof g[GLOBAL_KEY].globalTurnActive !== 'number') {
+    g[GLOBAL_KEY].globalTurnActive = 0;
+  }
+  if (!g[GLOBAL_KEY].globalTurnWaiters) {
+    g[GLOBAL_KEY].globalTurnWaiters = [];
+  }
   if (!g[GLOBAL_KEY].speechReplyPreferences) {
     g[GLOBAL_KEY].speechReplyPreferences = new Map();
   }
@@ -5479,6 +5493,41 @@ function getState(): BridgeManagerState {
     g[GLOBAL_KEY].speechPreferenceFallbackAudited = new Set();
   }
   return g[GLOBAL_KEY];
+}
+
+function resolveMaxConcurrentTurns(): number {
+  const configured = Number(process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_MAX_CONCURRENT_TURNS;
+  return Math.max(1, Math.min(MAX_MAX_CONCURRENT_TURNS, Math.floor(configured)));
+}
+
+function createGlobalTurnRelease(state: BridgeManagerState): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.globalTurnActive = Math.max(0, state.globalTurnActive - 1);
+    const next = state.globalTurnWaiters.shift();
+    if (!next) return;
+    state.globalTurnActive += 1;
+    next.resolve(createGlobalTurnRelease(state));
+  };
+}
+
+/**
+ * Acquire a bounded cross-session slot before entering a model/tool turn.
+ * Session locks still preserve per-session FIFO; this second gate keeps
+ * multiple chats from starting unbounded Codex/voice work at once.
+ */
+function acquireGlobalTurnPermit(): Promise<() => void> {
+  const state = getState();
+  if (state.globalTurnActive < resolveMaxConcurrentTurns()) {
+    state.globalTurnActive += 1;
+    return Promise.resolve(createGlobalTurnRelease(state));
+  }
+  return new Promise((resolve) => {
+    state.globalTurnWaiters.push({ resolve });
+  });
 }
 
 function auditSpeechPreferenceFallback(msg: InboundMessage, sessionId: string, reason: 'unsupported' | 'store_error'): void {
@@ -6084,6 +6133,12 @@ export async function stop(): Promise<void> {
 
   state.running = false;
 
+  // Wake turns waiting for a global slot so stop() cannot leave a session
+  // lock pending forever. They will observe running=false and exit without
+  // entering handleMessage.
+  const waitingTurns = state.globalTurnWaiters.splice(0);
+  for (const waiter of waitingTurns) waiter.resolve(() => {});
+
   for (const timer of choiceDeadlineTimers.values()) clearTimeout(timer);
   choiceDeadlineTimers.clear();
 
@@ -6492,13 +6547,23 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           // Fire-and-forget into session lock — loop continues to accept
           // messages for other sessions immediately.
           processWithSessionLock(binding.codepilotSessionId, async () => {
-            if (lifecycleTask?.cancelled) {
-              await pauseMessageLifecycleTask(lifecycleTask);
-              cleanupMessageLifecycleTask(lifecycleTask);
-              return;
+            const releaseGlobalTurn = await acquireGlobalTurnPermit();
+            try {
+              if (!state.running || !adapter.isRunning()) {
+                if (lifecycleTask) await pauseMessageLifecycleTask(lifecycleTask);
+                cleanupMessageLifecycleTask(lifecycleTask);
+                return;
+              }
+              if (lifecycleTask?.cancelled) {
+                await pauseMessageLifecycleTask(lifecycleTask);
+                cleanupMessageLifecycleTask(lifecycleTask);
+                return;
+              }
+              if (lifecycleTask) lifecycleTask.state = 'running';
+              await handleMessage(adapter, msg);
+            } finally {
+              releaseGlobalTurn();
             }
-            if (lifecycleTask) lifecycleTask.state = 'running';
-            await handleMessage(adapter, msg);
           }).catch(err => {
             console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
           });
@@ -7276,9 +7341,11 @@ async function handleMessage(
   const decisionResponseMode = (store.getSetting('bridge_decision_response_mode') || '').trim().toLowerCase();
   if (decisionResponseMode === 'auto' && getBridgeContext().decisions && isAutoJevQuestion(rawText)) {
     const parsed = inferJevQuestion(rawText);
-    await handleJevEvaluation(adapter, msg, parsed, 'auto');
-    ack();
-    return;
+    if (parsed) {
+      await handleJevEvaluation(adapter, msg, parsed, 'auto');
+      ack();
+      return;
+    }
   }
 
   // Sanitize general message text before routing to conversation engine
@@ -9991,34 +10058,31 @@ async function handleMessage(
 
 interface ParsedJevQuestion {
   type: DecisionQuestionType;
+  state: string;
   question: string;
   criteria: Record<string, string> | string[];
 }
 
-function inferJevQuestion(text: string, requestedType?: string): ParsedJevQuestion {
-  const question = text.replace(/\s*\/jev\s*$/iu, '').trim().slice(0, 16_000);
-  const explicit = requestedType?.toLowerCase();
-  if (explicit === 'noul' || explicit === 'choice' || explicit === 'score') {
-    return {
-      type: explicit,
-      question,
-      criteria: explicit === 'noul'
-        ? { true: '是', false: '否' }
-        : explicit === 'score'
-          ? ['极低', '低', '中', '高', '极高']
-          : { support: '支持', oppose: '反对', question: '疑问', supplement: '补充', irrelevant: '无关' },
-    };
-  }
-  if (/(?:是否|是不是|能否|可否|能不能|可不可以|应该不应该|会不会|吗[？?]?$)/iu.test(question)) {
-    return { type: 'noul', question, criteria: { true: '是', false: '否' } };
-  }
-  if (/(?:评分|打分|几分|分数|等级|程度|强度|满意度|0\s*[-~至]\s*10|1\s*[-~至]\s*5)/iu.test(question)) {
-    return { type: 'score', question, criteria: ['极低', '低', '中', '高', '极高'] };
-  }
+function inferJevQuestion(text: string, requestedType?: string): ParsedJevQuestion | null {
+  const questionText = text.replace(/\s*\/jev\s*$/iu, '').trim().slice(0, 16_000);
+  if (!questionText) return null;
+  const normalizedRequestedType = requestedType?.trim().toLowerCase();
+  const requested = normalizedRequestedType === 'noul'
+    || normalizedRequestedType === 'choice'
+    || normalizedRequestedType === 'score'
+    ? normalizedRequestedType
+    : undefined;
+  // The policy performs one deterministic intent pass and organizes the
+  // bounded DecisionQuestion consumed by the single Decisions API request.
+  // Explicit types remain an operator override of that pass.
+  const analysis = analyzeJevIntent(questionText, requested ? { requestedType: requested } : undefined);
+  const decisionQuestion = analysis.decisionQuestion;
+  if (!decisionQuestion) return null;
   return {
-    type: 'choice',
-    question,
-    criteria: { support: '支持', oppose: '反对', question: '疑问', supplement: '补充', irrelevant: '无关' },
+    type: decisionQuestion.type,
+    state: questionText,
+    question: decisionQuestion.instructions,
+    criteria: decisionQuestion.criteria,
   };
 }
 
@@ -10026,7 +10090,12 @@ function parseJevDebugArgs(args: string): ParsedJevQuestion | null {
   const trimmed = args.trim();
   if (!trimmed) return null;
   const match = /^(noul|choice|score)\s+([\s\S]+)$/iu.exec(trimmed);
-  return match ? inferJevQuestion(match[2], match[1]) : inferJevQuestion(trimmed);
+  if (match) return inferJevQuestion(match[2], match[1]);
+  // `auto` is an explicit debug spelling. It intentionally uses the same
+  // one-pass organizer as an omitted type, rather than making a second
+  // provider call or falling back to the old fixed five-label taxonomy.
+  const autoMatch = /^auto\s+([\s\S]+)$/iu.exec(trimmed);
+  return inferJevQuestion(autoMatch ? autoMatch[1] : trimmed);
 }
 
 export function isAutoJevQuestion(text: string): boolean {
@@ -10065,14 +10134,38 @@ async function handleJevEvaluation(
     });
     return;
   }
-  const question: DecisionQuestion = {
+  let question: DecisionQuestion = {
     id: 'intent',
     type: parsed.type,
     instructions: parsed.question,
     criteria: parsed.criteria,
   };
+  if (source === 'pure') {
+    const planner = getBridgeContext().decisionQuestionPlanner;
+    if (!planner) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: 'Jev 纯模式的动态题目规划不可用；已失败关闭，没有使用固定分类或伪造概率。',
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    const planned = await planner.plan({ state: parsed.state }).catch(() => ({ errorCode: 'provider_error' as const }));
+    const normalized = normalizeJevDecisionQuestion(planned);
+    if (!normalized) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: renderJevPlannerFailure(planned ?? { errorCode: 'invalid_output' }),
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    question = normalized;
+  }
   const result = normalizeDecisionResult(await host.evaluate({
-    state: parsed.question,
+    state: parsed.state,
     questions: [question],
   }), [question]);
   if (!result) {
@@ -10086,7 +10179,7 @@ async function handleJevEvaluation(
   }
   const visible = renderDecisionView({
     title: source === 'pure' ? 'Jev 纯模式判断' : source === 'auto' ? 'Jev 自动判断' : 'Jev 调试结果',
-    state: parsed.question,
+    state: parsed.state,
     questions: [question],
     result,
   });
@@ -10098,7 +10191,7 @@ async function handleJevEvaluation(
     ...(adapter.channelType === 'feishu' ? {
       feishuCardJson: buildFeishuDecisionCard({
         title: source === 'pure' ? 'Jev 纯模式判断' : source === 'auto' ? 'Jev 自动判断' : 'Jev 调试结果',
-        state: parsed.question,
+        state: parsed.state,
         questions: [question],
         result,
       }),
@@ -10176,7 +10269,7 @@ async function handleJevCommand(
   if (sub === 'debug') {
     const parsed = parseJevDebugArgs(rest.join(' '));
     if (!parsed) {
-      await deliver(adapter, { address: msg.address, text: '用法：/jev debug [noul|choice|score] <问题>', parseMode: 'plain', replyToMessageId: msg.messageId });
+      await deliver(adapter, { address: msg.address, text: '用法：/jev debug [auto|noul|choice|score] <问题>（省略类型也会自动识别意图）', parseMode: 'plain', replyToMessageId: msg.messageId });
       return;
     }
     await handleJevEvaluation(adapter, msg, parsed, 'debug');
@@ -10184,7 +10277,7 @@ async function handleJevCommand(
   }
   const parsed = parseJevDebugArgs(normalized);
   if (parsed) await handleJevEvaluation(adapter, msg, parsed, 'debug');
-  else await deliver(adapter, { address: msg.address, text: '用法：/jev status|on|off|pure on|pure off|debug <问题>', parseMode: 'plain', replyToMessageId: msg.messageId });
+  else await deliver(adapter, { address: msg.address, text: '用法：/jev status|on|off|pure on|pure off|debug [auto|noul|choice|score] <问题>', parseMode: 'plain', replyToMessageId: msg.messageId });
 }
 
 /**
@@ -10247,7 +10340,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
-        '/jev status|on|off|pure on|pure off|debug <问题> - Structured Jev decisions',
+        '/jev status|on|off|pure on|pure off|debug [auto|noul|choice|score] <问题> - Structured Jev decisions',
         '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
@@ -10544,7 +10637,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session (operator)',
         '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
         '/mode plan|code|ask - Change mode (operator)',
-        '/jev status|on|off|pure on|pure off|debug &lt;问题&gt; - Structured Jev decisions',
+        '/jev status|on|off|pure on|pure off|debug [auto|noul|choice|score] &lt;问题&gt; - Structured Jev decisions',
         '/voice on|off - Set this session\'s default reply format',
         '/status - Show current status (operator)',
         '/whoami - Show current Feishu sender IDs',
@@ -10634,4 +10727,7 @@ export const _testOnly = {
   launchOutcomeSelfMaintenance,
   recordSelfMaintenanceSkipSafely,
   enforceMemoryIntentOutcome,
+  // Test/diagnostic access to the same limiter used by the adapter loop.
+  acquireGlobalTurnPermit,
+  resolveMaxConcurrentTurns,
 };

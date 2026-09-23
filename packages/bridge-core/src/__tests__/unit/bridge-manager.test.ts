@@ -289,6 +289,49 @@ describe('bridge-manager session locks', () => {
   });
 });
 
+describe('bridge-manager global turn limiter', () => {
+  it('bounds work across sessions and releases waiters in FIFO order', async () => {
+    const previousLimit = process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS;
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS = '1';
+    try {
+      const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+      const firstRelease = await _testOnly.acquireGlobalTurnPermit();
+      let secondStarted = false;
+      const second = _testOnly.acquireGlobalTurnPermit().then((release: () => void) => {
+        secondStarted = true;
+        release();
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(secondStarted, false, 'a second session must wait for the global slot');
+      firstRelease();
+      await second;
+      assert.equal(secondStarted, true);
+    } finally {
+      if (previousLimit === undefined) delete process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS;
+      else process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS = previousLimit;
+      delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    }
+  });
+
+  it('clamps unsafe configuration to the documented range', async () => {
+    const previousLimit = process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS;
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    try {
+      const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+      process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS = '0';
+      assert.equal(_testOnly.resolveMaxConcurrentTurns(), 2);
+      process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS = '99';
+      assert.equal(_testOnly.resolveMaxConcurrentTurns(), 8);
+    } finally {
+      if (previousLimit === undefined) delete process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS;
+      else process.env.CTI_BRIDGE_MAX_CONCURRENT_TURNS = previousLimit;
+      delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    }
+  });
+});
+
 describe('bridge-manager adapter polling', () => {
   it('backs off when an adapter returns no message', async () => {
     const adapter = createRunningAdapter('feishu', async () => ({ ok: true }));

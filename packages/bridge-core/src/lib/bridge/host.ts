@@ -625,6 +625,25 @@ export interface DecisionProviderHost {
   evaluate(input: DecisionRequest): Promise<DecisionResult | null>;
 }
 
+/**
+ * Runtime-owned planner for dynamic Jev questions.
+ *
+ * The planner may use a restricted classifier model to describe one bounded
+ * question, but it never evaluates that question and never has tools,
+ * workspace, credentials, or delivery permissions. Core validates its output
+ * before handing the question to DecisionProviderHost.
+ */
+export interface DecisionQuestionPlanningFailure {
+  errorCode: 'timeout' | 'cancelled' | 'provider_error' | 'invalid_output';
+}
+
+export interface DecisionQuestionPlannerHost {
+  plan(input: {
+    state: string;
+    signal?: AbortSignal;
+  }): Promise<DecisionQuestion | DecisionQuestionPlanningFailure | null>;
+}
+
 /** Runtime-owned sticker semantic persistence and policy boundary. */
 export interface StickerSemanticEvolutionHost {
   authorizeSelection(input: StickerSelectionRequest): Promise<StickerSelectionAuthorization | null>;

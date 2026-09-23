@@ -24,6 +24,7 @@ import type {
   MemoryIntentHost,
   ContinuationAdjustmentIntentHost,
   DecisionProviderHost,
+  DecisionQuestionPlannerHost,
   StickerSemanticEvolutionHost,
   AgentHomeHost,
   SelfMaintenanceHost,
@@ -53,6 +54,8 @@ export interface BridgeContext {
   continuationAdjustments?: ContinuationAdjustmentIntentHost;
   /** 可选结构化判断 Host；缺失时不应阻断普通 Primary 回复。 */
   decisions?: DecisionProviderHost;
+  /** 纯 Jev 动态题目规划 Host；缺失时纯模式失败关闭，不回退固定分类。 */
+  decisionQuestionPlanner?: DecisionQuestionPlannerHost;
   stickerSemantics?: StickerSemanticEvolutionHost;
   agentHome?: AgentHomeHost;
   selfMaintenance?: SelfMaintenanceHost;

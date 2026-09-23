@@ -30,9 +30,20 @@ permission gates identify a real judgment, classification, or score request.
 Do not turn ordinary words such as“看看”“检查”or“选一个”into a Decision
 request by themselves.
 
-When the DecisionProvider is disabled, unavailable, timed out, or returns an
-invalid result, continue through the existing Primary path. Do not fabricate a
-decision, probability, provider name, or completion claim.
+In chat-scoped pure mode, the Runtime first runs a restricted classifier
+planner with no tools, workspace, credentials, or delivery access. The planner
+generates one bounded `noul`, `choice`, or `score` question from the current
+message, Core validates it, and Jev evaluates it. This is intentionally a
+two-stage `planner -> Jev` path, so the visible categories can fit the current
+message instead of repeating a fixed intent table. `/jev debug` without a type
+or `/jev debug auto` keep the Core's deterministic intent organizer and do not
+silently enter the planner path.
+
+When the DecisionProvider or pure-mode planner is disabled, unavailable, timed
+out, or returns an invalid result, report that the structured judgment is
+unavailable and fail closed for that explicit/pure request. Do not fabricate a
+decision, probability, provider name, or completion claim; ordinary messages
+outside pure mode continue through the existing Primary path.
 
 ## Visible result
 

@@ -15,7 +15,9 @@ export interface FeishuDecisionCardInput {
 export function buildFeishuDecisionCard(input: FeishuDecisionCardInput): string {
   const elements: Array<Record<string, unknown>> = [];
   if (input.cardHero) elements.push(buildFeishuCardHeroElement(input.cardHero));
-  elements.push({ tag: 'markdown', content: renderDecisionView(input) });
+  // The Card 2.0 header already contains the title.  Suppress the Markdown
+  // heading so mobile users do not see "Jev ..." twice in the same card.
+  elements.push({ tag: 'markdown', content: renderDecisionView({ ...input, showTitle: false }) });
   return JSON.stringify({
     schema: '2.0',
     config: { wide_screen_mode: true },

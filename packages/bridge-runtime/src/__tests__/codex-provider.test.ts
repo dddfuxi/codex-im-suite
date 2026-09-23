@@ -288,6 +288,7 @@ describe('CodexProvider', () => {
     fs.writeFileSync(path.join(globalHome, 'auth.json'), '{}', 'utf-8');
     fs.writeFileSync(path.join(globalHome, 'config.toml'), [
       'model = "gpt-5.3-codex"',
+      'model_catalog_json = "C:\\Users\\admin\\AppData\\Roaming\\stllmtool\\catalog.json"',
       'model_reasoning_effort = "high"',
       '[features]',
       'rmcp_client = true',
@@ -307,6 +308,7 @@ describe('CodexProvider', () => {
       assert.equal(options.env.CODEX_HOME, bridgeHome);
       assert.ok(!bridgeConfig.includes('[mcp_servers.unityMCP]'));
       assert.ok(!bridgeConfig.includes('rmcp_client'));
+      assert.ok(!bridgeConfig.includes('model_catalog_json'));
       assert.ok(bridgeConfig.includes("[projects.'C:\\\\unity\\\\ST3']"));
       assert.ok(bridgeConfig.includes('model_reasoning_effort'));
     } finally {
@@ -778,6 +780,34 @@ describe('CodexProvider', () => {
     assert.ok(events.some((event) => event.type === 'text' && event.data.includes('已完成')));
     assert.equal(events.filter((event) => event.type === 'result').length, 1);
     assert.equal(events.some((event) => event.type === 'error'), false);
+  });
+
+  it('aborts a hanging SDK turn at the configured hard timeout', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions(), { turnTimeoutMs: 20 });
+    let runSignal: AbortSignal | undefined;
+    const mockThread = {
+      runStreamed: (_input: unknown, options: { signal?: AbortSignal }) => {
+        runSignal = options.signal;
+        return {
+          events: (async function* () {
+            await new Promise<void>(() => undefined);
+          })(),
+        };
+      },
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = { startThread: () => mockThread };
+
+    const events = parseSSEChunks(await collectStream(provider.streamChat({
+      prompt: '挂起的任务',
+      sessionId: 'turn-hard-timeout',
+    })));
+
+    assert.equal(runSignal?.aborted, true);
+    assert.ok(events.some((event) => event.type === 'error' && event.data.includes('safety limit')));
+    assert.equal(events.some((event) => event.type === 'result'), false);
   });
 
   it('keeps normal turn completion authoritative after a complete final envelope', async () => {

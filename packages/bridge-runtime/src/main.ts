@@ -41,6 +41,9 @@ import type {
   SelfMaintenanceHost,
   SelfMaintenanceInput,
   SelfMaintenanceResult,
+  DecisionQuestion,
+  DecisionQuestionPlanningFailure,
+  DecisionQuestionPlannerHost,
   TurnReferenceResolutionInput,
   TurnReferenceResolverHost,
 } from 'claude-to-im/host';
@@ -612,6 +615,108 @@ class ProviderContinuationAdjustmentIntentHost implements ContinuationAdjustment
     }, Math.max(10, Math.floor(this.timeoutMs)));
     const value = extractJsonObject(text)?.decision;
     return value === 'adjust' || value === 'not_adjust' ? value : 'ambiguous';
+  }
+}
+
+const JEV_DYNAMIC_QUESTION_RESPONSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    type: { type: 'string', enum: ['noul', 'choice', 'score'] },
+    instructions: { type: 'string', minLength: 1, maxLength: 1200 },
+    // Structured-output backends reject oneOf and open-ended object keys.
+    // Use one closed wire shape, then project it to the Decisions contract.
+    options: {
+      type: 'array', minItems: 2, maxItems: 8,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          key: { type: 'string', minLength: 1, maxLength: 80 },
+          label: { type: 'string', minLength: 1, maxLength: 180 },
+        },
+        required: ['key', 'label'],
+      },
+    },
+  },
+  required: ['type', 'instructions', 'options'],
+} as const;
+
+function normalizeDynamicDecisionQuestion(payload: Record<string, unknown> | null): DecisionQuestion | null {
+  if (!payload) return null;
+  const type = payload.type === 'noul' || payload.type === 'choice' || payload.type === 'score'
+    ? payload.type
+    : null;
+  const instructions = typeof payload.instructions === 'string' ? payload.instructions.trim() : '';
+  if (!type || !instructions || instructions.length > 1200
+    || Object.keys(payload).some((key) => !['type', 'instructions', 'options'].includes(key))
+    || !Array.isArray(payload.options) || payload.options.length < 2 || payload.options.length > 8) return null;
+  const entries: Array<[string, string]> = [];
+  for (const value of payload.options) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const option = value as Record<string, unknown>;
+    if (Object.keys(option).some((key) => key !== 'key' && key !== 'label')) return null;
+    const key = typeof option.key === 'string' ? option.key.normalize('NFKC').trim() : '';
+    const label = typeof option.label === 'string' ? option.label.normalize('NFKC').trim() : '';
+    if (!key || key.length > 80 || !label || label.length > 180
+      || entries.some(([existingKey, existingLabel]) => existingKey === key || existingLabel === label)) return null;
+    entries.push([key, label]);
+  }
+  if (type === 'noul' || type === 'choice') {
+    const criteria = Object.fromEntries(entries);
+    if (type === 'noul' && (Object.keys(criteria).length !== 2 || !criteria.true || !criteria.false)) return null;
+    if (type === 'choice' && (Object.keys(criteria).length < 2 || Object.keys(criteria).length > 8)) return null;
+    return { id: 'jev_dynamic', type, instructions, criteria };
+  }
+  const criteria = entries.map(([, label]) => label);
+  if (criteria.length < 2 || criteria.length > 6) return null;
+  return { id: 'jev_dynamic', type, instructions, criteria };
+}
+
+/** Strict JSON planner used only by Jev pure mode; it has no tools or delivery access. */
+class ProviderDecisionQuestionPlannerHost implements DecisionQuestionPlannerHost {
+  constructor(
+    private readonly provider: LLMProvider,
+    private readonly timeoutMs = 45_000,
+  ) {}
+
+  async plan(input: { state: string; signal?: AbortSignal }): Promise<DecisionQuestion | DecisionQuestionPlanningFailure> {
+    const state = input.state.trim().slice(0, 16_000);
+    if (input.signal?.aborted) return { errorCode: 'cancelled' };
+    if (!state) return { errorCode: 'invalid_output' };
+    const prompt = [
+      '你是 Jev 结构化判断题规划器，不是聊天助手。',
+      '只为当前消息生成一条供 Jev 使用的判断题，绝不回答消息，绝不解释，绝不执行工具。',
+      '只输出严格 JSON：{"type":"noul|choice|score","instructions":"待判断的问题","options":[{"key":"候选键","label":"候选说明"}]}。',
+      '所有题型都输出 options 列表。noul 只有 key 为 true 和 false 的两项；choice 生成 2 到 8 个互斥、覆盖主要可能性的分类；score 生成 2 到 6 个从低到高的等级。候选键与候选说明各自不可重复。',
+      '分类和等级必须根据当前消息本身动态组织，不能套用固定的问候/请求/反馈分类表；信息不足时要提供明确的“无法确定/其他”候选。',
+      '不要输出 URL、路径、命令、回调、平台 ID、密钥、Token 或任何动作参数。',
+      `当前消息：${state}`,
+    ].join('\n');
+    const timeout = AbortSignal.timeout(Number.isFinite(this.timeoutMs) ? Math.max(10, Math.min(60_000, Math.floor(this.timeoutMs))) : 45_000);
+    const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
+    const startedAt = Date.now();
+    const failed = (errorCode: DecisionQuestionPlanningFailure['errorCode']): DecisionQuestionPlanningFailure => {
+      console.warn(`[jev-question-planner] ${errorCode}; elapsedMs=${Date.now() - startedAt}`);
+      return { errorCode };
+    };
+    try {
+      const text = await collectProviderText(this.provider, {
+        prompt,
+        sessionId: `jev-question-planner:${crypto.randomUUID()}`,
+        forceFreshThread: true,
+        interactionMode: 'classifier',
+        responseSchema: JEV_DYNAMIC_QUESTION_RESPONSE_SCHEMA,
+        systemPrompt: 'Return one strict JSON Jev question only. No tools, no prose.',
+        conversationHistory: [],
+        executionRequirement: { kind: 'none', reason: 'jev dynamic question planning', requiredToolFamilies: [] },
+      }, 60_000, signal);
+      if (signal.aborted) return failed(input.signal?.aborted ? 'cancelled' : 'timeout');
+      // Do not extract JSON from prose or Markdown: this is a strict classifier.
+      const payload = tryParseJson<Record<string, unknown>>(text);
+      return normalizeDynamicDecisionQuestion(payload) || failed('invalid_output');
+    } catch {
+      return failed(input.signal?.aborted ? 'cancelled' : timeout.aborted ? 'timeout' : 'provider_error');
+    }
   }
 }
 
@@ -3207,6 +3312,7 @@ async function resolveProvider(
       return new CodexProvider(pendingPerms, {
         profile,
         managedMcpServers: managedCodexMcpServers,
+        turnTimeoutMs: config.bridgeProcessingTimeoutMs,
       });
     };
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
@@ -3248,6 +3354,7 @@ async function resolveProvider(
       return new CodexProvider(pendingPerms, {
         profile,
         managedMcpServers: managedCodexMcpServers,
+        turnTimeoutMs: config.bridgeProcessingTimeoutMs,
       });
     };
     const failoverChain: CodexModelSource[] = (config.codexApiFallbackChain || ['local_api', 'external_api'])
@@ -3900,6 +4007,9 @@ async function main(): Promise<void> {
     },
     memoryIntents: workerMemoryIntentHost || new ProviderMemoryIntentHost(llm, config.memoryIntentTimeoutMs),
     decisions,
+    decisionQuestionPlanner: decisions
+      ? new ProviderDecisionQuestionPlannerHost(llm)
+      : undefined,
     continuationAdjustments: new ProviderContinuationAdjustmentIntentHost(llm, config.memoryIntentTimeoutMs),
     stickerSemantics,
     agentHome: config.memoryRepoDir ? {
@@ -4124,6 +4234,7 @@ export {
   CodexApiFailoverProvider,
   ProviderMemoryIntentHost,
   ProviderContinuationAdjustmentIntentHost,
+  ProviderDecisionQuestionPlannerHost,
   ProviderSelfMaintenanceHost,
   ProviderTurnReferenceResolverHost,
 };

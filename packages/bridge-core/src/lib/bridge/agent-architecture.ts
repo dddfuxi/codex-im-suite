@@ -491,6 +491,8 @@ export const AGENT_POLICY_REGISTRY: readonly AgentPolicyDefinition[] = [
       '- Jev is a Decisions API provider, never a normal chat model. When the provider or mode is off, fail closed and continue the existing Primary path.',
       '- A Jev choice classification is not a user choice prompt. Do not route it through cti-final.choices or create callback buttons from it.',
       '- Pure Jev mode is an explicit chat-scoped opt-in; it may bypass only the Feishu @mention wake gate and must preserve group, identity, and bot safety checks.',
+      '- Automatic Jev debug entry performs one provider-neutral intent pass before organizing the bounded noul, choice, or score question; ordinary greetings and statements use the intent taxonomy instead of a fixed irrelevant fallback.',
+      '- `/jev debug` without an explicit type and `/jev debug auto` use that deterministic organizer. Pure mode may use the separate restricted DecisionQuestionPlannerHost to generate one dynamic question before Jev; planner output is Core-validated and planner/Jev failures close the pure request without a static fallback.',
     ],
     tags: ['decision', 'jev', 'provider', 'feishu', 'policy'],
   },

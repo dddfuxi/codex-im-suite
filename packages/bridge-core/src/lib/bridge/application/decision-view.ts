@@ -2,6 +2,12 @@ import type { DecisionAnswer, DecisionResult, DecisionQuestion, DecisionQuestion
 
 export interface DecisionViewInput {
   title?: string;
+  /**
+   * Feishu decision cards already render the title in their native header.
+   * Keep the Markdown projection title by default for non-card channels, but
+   * let card callers suppress it so the same title is not shown twice.
+   */
+  showTitle?: boolean;
   state?: string;
   questions: readonly DecisionQuestion[];
   result: DecisionResult;
@@ -121,9 +127,36 @@ function probabilityRows(answer: DecisionAnswer, question?: DecisionQuestion): s
   });
 }
 
+function criterionLabel(answer: DecisionAnswer, question?: DecisionQuestion): string {
+  const key = text(answer.choice, 80);
+  if (!key) return '';
+  const criteria = question?.criteria;
+  if (Array.isArray(criteria)) {
+    const index = Number(key);
+    if (Number.isInteger(index) && index >= 0 && index < criteria.length) {
+      return text(criteria[index], 80) || key;
+    }
+  }
+  if (criteria && !Array.isArray(criteria) && Object.prototype.hasOwnProperty.call(criteria, key)) {
+    return text(criteria[key], 80) || key;
+  }
+  return text(answer.legend?.[key], 80) || key;
+}
+
+function visibleQuestionLabel(instructions: string): string {
+  const prefixes = [
+    '识别这条消息在当前对话中的主要意图：',
+    '判断这条消息所涉及的命题是否成立或可接受：',
+    '评估这条消息表达的程度或满意度：',
+  ];
+  const prefix = prefixes.find((candidate) => instructions.startsWith(candidate));
+  const withoutPrefix = prefix ? instructions.slice(prefix.length) : instructions;
+  return withoutPrefix.split('。结合相关上下文：', 1)[0] || withoutPrefix;
+}
+
 function answerHeadline(answer: DecisionAnswer, question?: DecisionQuestion): string {
   if (answer.type === 'noul') return `是概率 **${percent(answer.noul)}**`;
-  if (answer.type === 'choice') return `选择 **${text(answer.choice, 80) || '未返回'}**`;
+  if (answer.type === 'choice') return `选择 **${criterionLabel(answer, question) || '未返回'}**`;
   const score = typeof answer.score === 'number' && Number.isFinite(answer.score) ? String(Math.round(answer.score * 100) / 100) : '—';
   const legend = typeof answer.score === 'number' && question?.type === 'score' && Array.isArray(question.criteria)
     ? text(question.criteria[Math.round(answer.score)] || '', 80)
@@ -136,12 +169,20 @@ export function renderDecisionView(input: DecisionViewInput): string {
   const title = text(input.title, 80) || '结构化判断';
   const state = text(input.state, 240);
   const questions = new Map(input.questions.map((question) => [question.id, question]));
-  const blocks: string[] = [`# ${escapeCell(title)}`];
-  if (state) blocks.push(`**状态：**${escapeCell(state)}`);
+  const blocks: string[] = input.showTitle === false ? [] : [`# ${escapeCell(title)}`];
+
+  // The state is often the exact question sent to Jev.  Showing both the
+  // state line and the question heading made pure-mode cards look as though
+  // the model had returned the same text twice.  Keep the question heading
+  // as the canonical display and only show state when it adds context.
+  const stateIsQuestion = state.length > 0 && input.result.answers.some((answer) => (
+    text(visibleQuestionLabel(questions.get(answer.id)?.instructions || ''), 240) === state
+  ));
+  if (state && !stateIsQuestion) blocks.push(`**状态：** ${escapeCell(state)}`);
 
   for (const answer of input.result.answers.slice(0, 8)) {
     const question = questions.get(answer.id);
-    const label = text(question?.instructions, 120) || answer.id;
+    const label = text(question ? visibleQuestionLabel(question.instructions) : '', 120) || answer.id;
     const rows = probabilityRows(answer, question);
     const lines = [
       `**${escapeCell(label)}**`,

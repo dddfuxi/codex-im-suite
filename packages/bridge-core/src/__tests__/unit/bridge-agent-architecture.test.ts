@@ -293,6 +293,8 @@ describe('agent architecture registry', () => {
     assert.match(lines, /Jev is a Decisions API provider/i);
     assert.match(lines, /not a user choice prompt/i);
     assert.match(lines, /chat-scoped opt-in/i);
+    assert.match(lines, /one provider-neutral intent pass/i);
+    assert.match(lines, /fixed irrelevant fallback/i);
   });
 
   it('keeps generic analysis dashboards in the Delivery Layer without templating light chat', () => {

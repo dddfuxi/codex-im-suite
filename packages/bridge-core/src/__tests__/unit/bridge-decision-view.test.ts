@@ -46,6 +46,62 @@ test('decision view renders noul probabilities as a read-only table', () => {
   assert.doesNotMatch(text, /callback|button|choice-card/iu);
 });
 
+test('decision view does not repeat a state that is already the question and keeps state spacing', () => {
+  const question: DecisionQuestion = {
+    id: 'intent',
+    type: 'choice',
+    instructions: '哈喽',
+    criteria: { greeting: '问候' },
+  };
+  const duplicateState = renderDecisionView({
+    title: 'Jev 纯模式判断',
+    state: '哈喽',
+    questions: [question],
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{ id: 'intent', type: 'choice', choice: 'greeting', probabilities: { greeting: 1 } }],
+    },
+  });
+  assert.equal((duplicateState.match(/哈喽/gu) || []).length, 1);
+
+  const contextualState = renderDecisionView({
+    title: 'Jev 调试结果',
+    state: '当前对话主题：问候',
+    questions: [question],
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{ id: 'intent', type: 'choice', choice: 'greeting', probabilities: { greeting: 1 } }],
+    },
+  });
+  assert.match(contextualState, /\*\*状态：\*\* 当前对话主题：问候/u);
+});
+
+test('decision view keeps the original message as the visible label for organized intent prompts', () => {
+  const text = renderDecisionView({
+    title: 'Jev 纯模式判断',
+    state: '哈喽',
+    questions: [{
+      id: 'intent',
+      type: 'choice',
+      instructions: '识别这条消息在当前对话中的主要意图：哈喽',
+      criteria: { greeting: '问候或打招呼' },
+    }],
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{ id: 'intent', type: 'choice', choice: 'greeting', probabilities: { greeting: 1 } }],
+    },
+  });
+  assert.match(text, /\*\*哈喽\*\*/u);
+  assert.doesNotMatch(text, /识别这条消息在当前对话中的主要意图/u);
+  assert.doesNotMatch(text, /\*\*状态：\*\*/u);
+});
+
 test('Feishu decision card is read-only and does not expose choice callbacks', () => {
   const card = buildFeishuDecisionCard({
     title: 'Jev 调试结果',
@@ -80,4 +136,29 @@ test('choice distributions use the question criteria labels', () => {
   });
   assert.match(text, /\| 支持 \| 80% \|/u);
   assert.match(text, /\| 反对 \| 20% \|/u);
+  assert.match(text, /选择 \*\*支持\*\*/u);
+  assert.doesNotMatch(text, /选择 \*\*support\*\*/u);
+});
+
+test('Feishu decision cards use the native header as the only title', () => {
+  const card = JSON.parse(buildFeishuDecisionCard({
+    title: 'Jev 纯模式判断',
+    state: '哈喽',
+    questions: [{
+      id: 'intent',
+      type: 'choice',
+      instructions: '哈喽',
+      criteria: { irrelevant: '无关' },
+    }],
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{ id: 'intent', type: 'choice', choice: 'irrelevant', probabilities: { irrelevant: 1 } }],
+    },
+  })) as { header?: { title?: { content?: string } }; body?: { elements?: Array<{ tag?: string; content?: string }> } };
+  const markdown = card.body?.elements?.find((element) => element.tag === 'markdown')?.content || '';
+  assert.equal(card.header?.title?.content, 'Jev 纯模式判断');
+  assert.doesNotMatch(markdown, /^# /mu);
+  assert.doesNotMatch(markdown, /\*\*状态：\*\*/u);
 });

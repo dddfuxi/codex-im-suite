@@ -6,4 +6,5 @@ export * from './lib/bridge/context.js';
 export type {
   ContinuationAdjustmentIntentHost,
   ContinuationAdjustmentIntentInput,
+  DecisionQuestionPlannerHost,
 } from './lib/bridge/host.js';

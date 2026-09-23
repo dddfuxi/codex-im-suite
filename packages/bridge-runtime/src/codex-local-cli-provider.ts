@@ -80,8 +80,11 @@ export function buildClassifierCodexExecArgs(baseArgs: string[], outputSchemaPat
 
 function resolveCodexExecTimeoutMs(config: Config): number | undefined {
   const configured = Number(config.bridgeProcessingTimeoutMs);
-  if (Number.isFinite(configured)) {
-    return configured > 0 ? Math.max(1000, Math.floor(configured)) : undefined;
+  // 0 used to mean "wait forever".  A stuck local CLI can retain a full
+  // model process and make the host unresponsive, so zero now falls back to
+  // the bounded safety default; callers can still raise the limit explicitly.
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.max(1000, Math.floor(configured));
   }
   return DEFAULT_CODEX_EXEC_TIMEOUT_MS;
 }

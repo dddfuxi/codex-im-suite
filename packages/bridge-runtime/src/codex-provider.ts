@@ -54,9 +54,15 @@ const DEFAULT_FINAL_DRAIN_TIMEOUT_MS = 5_000;
 const MIN_FINAL_DRAIN_TIMEOUT_MS = 1_000;
 const MAX_FINAL_DRAIN_TIMEOUT_MS = 60_000;
 const FINAL_DRAIN_TIMEOUT = Symbol('codex-final-drain-timeout');
+const DEFAULT_TURN_TIMEOUT_MS = 15 * 60_000;
+const MAX_TURN_TIMEOUT_MS = 30 * 60_000;
+const TURN_TIMEOUT = Symbol('codex-turn-timeout');
 const DEFAULT_STREAM_RECOVERY_TIMEOUT_MS = 15 * 60_000;
 const MAX_STREAM_RECOVERY_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_STREAM_RECOVERY_POLL_MS = 500;
+const ROLLOUT_SCAN_RETRY_MS = 2_000;
+const MAX_ROLLOUT_READ_BYTES_PER_POLL = 256 * 1024;
+const MAX_ROLLOUT_PENDING_BYTES = 2 * 1024 * 1024;
 const SHARED_CODEX_HOME_PATHS = ['skills', 'plugins', 'vendor_imports', 'rules'];
 const DEFAULT_BRIDGE_BLOCKED_SKILLS = ['github-memory-protocol'];
 const LOCAL_CODEX_HOME_BLOCKED_PATHS = ['plugins', path.join('.tmp', 'plugins')];
@@ -82,6 +88,8 @@ interface CodexProviderOptions {
   finalDrainTimeoutMs?: number;
   /** SDK 断流后等待同一受管 rollout 收口的时长；不会重放原任务。 */
   streamRecoveryTimeoutMs?: number;
+  /** 单轮 Codex 回合的硬上限，避免失联/工具死循环长期占用资源。 */
+  turnTimeoutMs?: number;
   /** 测试或受控宿主可覆盖 rollout 所在 Codex Home。 */
   codexHome?: string;
   /** 测试可降低轮询间隔。 */
@@ -107,6 +115,19 @@ function resolveStreamRecoveryTimeoutMs(configured?: number): number {
   const fromEnv = Number(process.env.CTI_CODEX_STREAM_RECOVERY_TIMEOUT_MS);
   if (!Number.isFinite(fromEnv) || fromEnv <= 0) return DEFAULT_STREAM_RECOVERY_TIMEOUT_MS;
   return Math.min(MAX_STREAM_RECOVERY_TIMEOUT_MS, Math.max(1_000, Math.floor(fromEnv)));
+}
+
+function resolveTurnTimeoutMs(configured?: number): number {
+  // The legacy bridge timeout is allowed to be zero for backwards-compatible
+  // config files, but zero must mean "use the bounded default", not "disable
+  // the safety limit". Let the dedicated Codex setting still override it.
+  const configuredValue = Number(configured);
+  const fromEnv = Number(process.env.CTI_CODEX_TURN_TIMEOUT_MS);
+  const candidate = Number.isFinite(configuredValue) && configuredValue > 0
+    ? configuredValue
+    : fromEnv;
+  if (!Number.isFinite(candidate) || candidate <= 0) return DEFAULT_TURN_TIMEOUT_MS;
+  return Math.min(MAX_TURN_TIMEOUT_MS, Math.max(1_000, Math.floor(candidate)));
 }
 
 function resolveStreamRecoveryPollMs(configured?: number): number {
@@ -217,88 +238,121 @@ interface DisconnectedTurnRecoveryInput {
 async function recoverDisconnectedTurn(input: DisconnectedTurnRecoveryInput): Promise<boolean> {
   const deadline = Date.now() + input.timeoutMs;
   let rolloutPath: string | undefined;
+  let nextRolloutScanAt = 0;
   let offset = 0;
+  let pending = Buffer.alloc(0);
   const pendingCalls = new Map<string, { name: string; toolName: string; toolInput: unknown }>();
   const emittedCommentary = new Set<string>();
 
   while (Date.now() < deadline && !input.signal.aborted) {
-    rolloutPath ||= findManagedRolloutFile(input.codexHome, input.threadId);
+    if (!rolloutPath && Date.now() >= nextRolloutScanAt) {
+      rolloutPath = findManagedRolloutFile(input.codexHome, input.threadId);
+      nextRolloutScanAt = Date.now() + ROLLOUT_SCAN_RETRY_MS;
+    }
     if (rolloutPath) {
-      let buffer: Buffer;
+      let available = 0;
       try {
-        buffer = fs.readFileSync(rolloutPath);
+        const size = fs.statSync(rolloutPath).size;
+        if (size < offset) {
+          offset = 0;
+          pending = Buffer.alloc(0);
+        }
+        available = Math.max(0, size - offset);
       } catch {
-        buffer = Buffer.alloc(0);
+        available = 0;
       }
-      if (buffer.length < offset) offset = 0;
-      const unread = buffer.subarray(offset);
-      const lastNewline = unread.lastIndexOf(0x0a);
-      if (lastNewline >= 0) {
-        const complete = unread.subarray(0, lastNewline + 1).toString('utf8');
-        offset += lastNewline + 1;
-        for (const line of complete.split(/\r?\n/gu)) {
-          if (!line.trim()) continue;
-          let record: Record<string, unknown>;
-          try {
-            record = JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            continue;
+      if (available > 0) {
+        const readLength = Math.min(available, MAX_ROLLOUT_READ_BYTES_PER_POLL);
+        const chunk = Buffer.allocUnsafe(readLength);
+        let bytesRead = 0;
+        let handle: number | undefined;
+        try {
+          handle = fs.openSync(rolloutPath, 'r');
+          bytesRead = fs.readSync(handle, chunk, 0, readLength, offset);
+        } catch {
+          bytesRead = 0;
+        } finally {
+          if (handle !== undefined) {
+            try { fs.closeSync(handle); } catch { /* ignore */ }
           }
-          const timestamp = Date.parse(String(record.timestamp || ''));
-          if (Number.isFinite(timestamp) && timestamp + 1_000 < input.turnStartedAtMs) continue;
-          const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
-            ? record.payload as Record<string, unknown>
-            : undefined;
-          if (!payload) continue;
+        }
+        if (bytesRead > 0) {
+          offset += bytesRead;
+          pending = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+          const lastNewline = pending.lastIndexOf(0x0a);
+          if (lastNewline >= 0) {
+            const complete = pending.subarray(0, lastNewline + 1).toString('utf8');
+            pending = pending.subarray(lastNewline + 1);
+            for (const line of complete.split(/\r?\n/gu)) {
+              if (!line.trim()) continue;
+              let record: Record<string, unknown>;
+              try {
+                record = JSON.parse(line) as Record<string, unknown>;
+              } catch {
+                continue;
+              }
+              const timestamp = Date.parse(String(record.timestamp || ''));
+              if (Number.isFinite(timestamp) && timestamp + 1_000 < input.turnStartedAtMs) continue;
+              const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+                ? record.payload as Record<string, unknown>
+                : undefined;
+              if (!payload) continue;
 
-          if (record.type === 'response_item' && payload.type === 'function_call') {
-            const callId = String(payload.call_id || '');
-            if (!callId || input.seenItemIds.has(callId)) continue;
-            const name = String(payload.name || 'tool');
-            const toolInput = parseRolloutToolInput(payload.arguments);
-            const command = name === 'shell_command' ? readRolloutCommand(toolInput) : '';
-            const toolName = name === 'shell_command' ? inferCommandExecutionToolName(command) : name;
-            pendingCalls.set(callId, { name, toolName, toolInput });
-            input.controller.enqueue(sseEvent('tool_use', {
-              id: callId,
-              name: toolName,
-              input: toolInput,
-            }));
-            continue;
-          }
+              if (record.type === 'response_item' && payload.type === 'function_call') {
+                const callId = String(payload.call_id || '');
+                if (!callId || input.seenItemIds.has(callId)) continue;
+                const name = String(payload.name || 'tool');
+                const toolInput = parseRolloutToolInput(payload.arguments);
+                const command = name === 'shell_command' ? readRolloutCommand(toolInput) : '';
+                const toolName = name === 'shell_command' ? inferCommandExecutionToolName(command) : name;
+                pendingCalls.set(callId, { name, toolName, toolInput });
+                input.controller.enqueue(sseEvent('tool_use', {
+                  id: callId,
+                  name: toolName,
+                  input: toolInput,
+                }));
+                continue;
+              }
 
-          if (record.type === 'response_item' && payload.type === 'function_call_output') {
-            const callId = String(payload.call_id || '');
-            if (!callId || input.seenItemIds.has(callId)) continue;
-            const pending = pendingCalls.get(callId);
-            if (!pending) continue;
-            const output = typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output ?? 'Done');
-            input.seenItemIds.add(callId);
-            pendingCalls.delete(callId);
-            input.controller.enqueue(sseEvent('tool_result', {
-              tool_use_id: callId,
-              content: output || 'Done',
-              is_error: isRolloutToolOutputError(output),
-            }));
-            continue;
-          }
+              if (record.type === 'response_item' && payload.type === 'function_call_output') {
+                const callId = String(payload.call_id || '');
+                if (!callId || input.seenItemIds.has(callId)) continue;
+                const pendingCall = pendingCalls.get(callId);
+                if (!pendingCall) continue;
+                const output = typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output ?? 'Done');
+                input.seenItemIds.add(callId);
+                pendingCalls.delete(callId);
+                input.controller.enqueue(sseEvent('tool_result', {
+                  tool_use_id: callId,
+                  content: output || 'Done',
+                  is_error: isRolloutToolOutputError(output),
+                }));
+                continue;
+              }
 
-          if (record.type === 'event_msg' && payload.type === 'agent_message' && payload.phase === 'commentary') {
-            const message = typeof payload.message === 'string' ? payload.message.trim() : '';
-            if (message && !emittedCommentary.has(message)) {
-              emittedCommentary.add(message);
-              input.controller.enqueue(sseEvent('text', message));
+              if (record.type === 'event_msg' && payload.type === 'agent_message' && payload.phase === 'commentary') {
+                const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+                if (message && !emittedCommentary.has(message)) {
+                  emittedCommentary.add(message);
+                  input.controller.enqueue(sseEvent('text', message));
+                }
+                continue;
+              }
+
+              if (record.type === 'event_msg' && payload.type === 'task_complete') {
+                const finalText = typeof payload.last_agent_message === 'string'
+                  ? payload.last_agent_message.trim()
+                  : '';
+                if (finalText) input.controller.enqueue(sseEvent('text', finalText));
+                input.controller.enqueue(sseEvent('result', { session_id: input.threadId }));
+                return true;
+              }
             }
-            continue;
           }
-
-          if (record.type === 'event_msg' && payload.type === 'task_complete') {
-            const finalText = typeof payload.last_agent_message === 'string'
-              ? payload.last_agent_message.trim()
-              : '';
-            if (finalText) input.controller.enqueue(sseEvent('text', finalText));
-            input.controller.enqueue(sseEvent('result', { session_id: input.threadId }));
-            return true;
+          if (pending.length > MAX_ROLLOUT_PENDING_BYTES) {
+            // A malformed or unexpectedly huge JSONL record must not make
+            // recovery retain unbounded memory; the caller will fail closed.
+            return false;
           }
         }
       }
@@ -611,6 +665,11 @@ function sanitizeCodexConfig(content: string, reasoningEffort: string, profile: 
     }
     if (skipSection) continue;
     if (inTopLevel && /^model\s*=/.test(trimmed)) continue;
+    // Desktop/STLLMTool model catalogs can contain reasoning levels that this
+    // bundled Codex binary does not understand (for example `max`/`ultra`).
+    // A bridge-owned Home must not inherit that external catalog and fail
+    // before the isolated app-server can warm up.
+    if (inTopLevel && /^model_catalog_json\s*=/.test(trimmed)) continue;
     if (isolateLocalAgent && inTopLevel && /^(personality|notify)\s*=/.test(trimmed)) continue;
     if (trimmed.startsWith('model_reasoning_effort')) continue;
     (inTopLevel ? topLevel : sections).push(line);
@@ -1344,6 +1403,8 @@ export class CodexProvider implements LLMProvider {
                 const upstreamSignal = params.abortController?.signal;
                 const runAbortController = new AbortController();
                 const turnStartedAtMs = Date.now();
+                const turnTimeoutMs = resolveTurnTimeoutMs(self.options.turnTimeoutMs);
+                const turnDeadlineAtMs = turnStartedAtMs + turnTimeoutMs;
                 let activeThreadId = savedThreadId;
                 const seenItemIds = new Set<string>();
                 const relayUpstreamAbort = () => runAbortController.abort(upstreamSignal?.reason);
@@ -1352,6 +1413,19 @@ export class CodexProvider implements LLMProvider {
                 } else {
                   upstreamSignal?.addEventListener('abort', relayUpstreamAbort, { once: true });
                 }
+                let turnTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+                let turnTimedOut = false;
+                const turnTimeoutPromise = new Promise<typeof TURN_TIMEOUT>((resolve) => {
+                  const remainingMs = Math.max(1, turnDeadlineAtMs - Date.now());
+                  turnTimeoutTimer = setTimeout(() => {
+                    turnTimedOut = true;
+                    runAbortController.abort(new Error('Codex turn timeout'));
+                    resolve(TURN_TIMEOUT);
+                  }, remainingMs);
+                  // A long-lived safety timer must not keep the daemon alive by itself.
+                  const timer = turnTimeoutTimer as ReturnType<typeof setTimeout> & { unref?: () => void };
+                  timer.unref?.();
+                });
                 let events: AsyncIterable<any>;
                 try {
                   ({ events } = await thread.runStreamed(input, {
@@ -1359,8 +1433,13 @@ export class CodexProvider implements LLMProvider {
                     signal: runAbortController.signal,
                   }));
                 } catch (err) {
+                  if (turnTimeoutTimer) clearTimeout(turnTimeoutTimer);
+                  turnTimeoutTimer = undefined;
                   upstreamSignal?.removeEventListener('abort', relayUpstreamAbort);
                   runAbortController.abort(err);
+                  if (turnTimedOut) {
+                    throw new Error(`Codex turn exceeded the ${Math.round(turnTimeoutMs / 1000)}s safety limit.`);
+                  }
                   throw err;
                 }
 
@@ -1408,9 +1487,13 @@ export class CodexProvider implements LLMProvider {
                 try {
                   eventLoop: while (true) {
                     const nextEvent = finalDrainPromise
-                      ? await Promise.race([iterator.next(), finalDrainPromise])
-                      : await iterator.next();
+                      ? await Promise.race([iterator.next(), finalDrainPromise, turnTimeoutPromise])
+                      : await Promise.race([iterator.next(), turnTimeoutPromise]);
                     if (nextEvent === FINAL_DRAIN_TIMEOUT) {
+                      void Promise.resolve(iterator.return?.()).catch(() => undefined);
+                      break;
+                    }
+                    if (nextEvent === TURN_TIMEOUT) {
                       void Promise.resolve(iterator.return?.()).catch(() => undefined);
                       break;
                     }
@@ -1522,7 +1605,12 @@ export class CodexProvider implements LLMProvider {
                   }
                 } finally {
                   clearFinalDrain();
+                  if (turnTimeoutTimer) clearTimeout(turnTimeoutTimer);
+                  turnTimeoutTimer = undefined;
                   upstreamSignal?.removeEventListener('abort', relayUpstreamAbort);
+                }
+                if (turnTimedOut) {
+                  throw new Error(`Codex turn exceeded the ${Math.round(turnTimeoutMs / 1000)}s safety limit.`);
                 }
                 if (postFinalDrainTriggered && sawCompleteFinalEnvelope && !upstreamSignal?.aborted) {
                   const threadId = self.threadBindings.get(params.sessionId)?.threadId;
@@ -1543,6 +1631,10 @@ export class CodexProvider implements LLMProvider {
                   upstreamSignal?.addEventListener('abort', relayUpstreamAbort, { once: true });
                   let recovered = false;
                   try {
+                    const recoveryRemainingMs = turnDeadlineAtMs - Date.now();
+                    if (recoveryRemainingMs <= 0) {
+                      throw new Error(`Codex turn exceeded the ${Math.round(turnTimeoutMs / 1000)}s safety limit.`);
+                    }
                     recovered = !restrictedMode && !!activeThreadId
                       && await recoverDisconnectedTurn({
                         codexHome: self.options.codexHome || getCodexHomeForProfile(profile),
@@ -1550,7 +1642,10 @@ export class CodexProvider implements LLMProvider {
                         turnStartedAtMs,
                         controller,
                         signal: runAbortController.signal,
-                        timeoutMs: resolveStreamRecoveryTimeoutMs(self.options.streamRecoveryTimeoutMs),
+                        timeoutMs: Math.min(
+                          resolveStreamRecoveryTimeoutMs(self.options.streamRecoveryTimeoutMs),
+                          recoveryRemainingMs,
+                        ),
                         pollMs: resolveStreamRecoveryPollMs(self.options.streamRecoveryPollMs),
                         seenItemIds,
                       });
