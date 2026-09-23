@@ -23,3 +23,13 @@ test('Jev auto mode only takes explicit judgment questions', () => {
   assert.equal(isAutoJevQuestion('请把这个文件部署到服务器'), false);
   assert.equal(isAutoJevQuestion('你好'), false);
 });
+
+test('shared help includes the complete Jev command surface', async () => {
+  const { _testOnly } = await import('../../lib/bridge/bridge-manager.js');
+  const help = _testOnly.buildBridgeCommandHelpLines().join('\n');
+  assert.match(help, /\/start/u);
+  assert.match(help, /\/jev pure on\|off\|status/u);
+  assert.match(help, /\/jev debug \[auto\|noul\|choice\|score\]/u);
+  assert.match(help, /&lt;消息&gt; \/jev/u);
+  assert.match(help, /\/help/u);
+});

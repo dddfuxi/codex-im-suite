@@ -10281,6 +10281,39 @@ async function handleJevCommand(
 }
 
 /**
+ * Keep /start and /help on the same command surface.  This is intentionally
+ * a presentation-only list: command routing and role gates remain in the
+ * switch below and in the shared policy registry.
+ */
+function buildBridgeCommandHelpLines(): string[] {
+  return [
+    '/start - Show the bridge welcome and command list',
+    '/new [project_or_path] - Start a new session (operator)',
+    '/bind &lt;session_id&gt; - Bind to an existing session (operator)',
+    '/cwd &lt;project_or_path&gt; - Change the working directory (operator)',
+    '/mode plan|code|ask - Change the conversation mode (operator)',
+    '/jev status - Show Jev provider and current chat mode',
+    '/jev on|off - Enable or disable one-turn Jev debug entry',
+    '/jev pure on|off|status - Toggle pure Jev mode for this chat',
+    '/jev debug [auto|noul|choice|score] &lt;问题&gt; - Run one structured Jev decision',
+    '&lt;消息&gt; /jev - Run one structured Jev decision for the current message',
+    '/voice on|off - Set this session\'s default reply format',
+    '/status - Show current session status (operator)',
+    '/whoami - Show current Feishu sender IDs',
+    '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
+    '/docs - List generated Feishu documents (operator)',
+    '/projects - List available workspaces (operator)',
+    '/sessions - List recent sessions (operator)',
+    '/remind 10分钟后 内容 - Create a bridge-managed reminder',
+    '/ext search|install|remove &lt;关键词或URL&gt; - Manage the extension catalog',
+    '/stop - Stop the current session (operator)',
+    '/perm allow|allow_session|deny &lt;id&gt; - Respond to a permission request',
+    '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending request)',
+    '/help - Show this complete command list',
+  ];
+}
+
+/**
  * Handle IM slash commands.
  */
 async function handleCommand(
@@ -10336,23 +10369,7 @@ async function handleCommand(
         'Send any message to interact with Claude.',
         '',
         '<b>Commands:</b>',
-        '/new [project_or_path] - Start new session (operator)',
-        '/bind &lt;session_id&gt; - Bind to existing session (operator)',
-        '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
-        '/mode plan|code|ask - Change mode (operator)',
-        '/jev status|on|off|pure on|pure off|debug [auto|noul|choice|score] <问题> - Structured Jev decisions',
-        '/voice on|off - Set this session\'s default reply format',
-        '/status - Show current status (operator)',
-        '/whoami - Show current Feishu sender IDs',
-        '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
-        '/docs - List generated Feishu documents (operator)',
-        '/projects - List available workspaces (operator)',
-        '/sessions - List recent sessions (operator)',
-        '/remind 10分钟后 内容 - Create a bridge-managed reminder',
-        '/ext search|install|remove <关键词或URL> - Manage extension catalog',
-        '/stop - Stop current session (operator)',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
-        '/help - Show this help',
+        ...buildBridgeCommandHelpLines(),
       ].join('\n');
       break;
 
@@ -10633,24 +10650,7 @@ async function handleCommand(
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
-        '/new [project_or_path] - Start new session (operator)',
-        '/bind &lt;session_id&gt; - Bind to existing session (operator)',
-        '/cwd &lt;project_or_path&gt; - Change working directory (operator)',
-        '/mode plan|code|ask - Change mode (operator)',
-        '/jev status|on|off|pure on|pure off|debug [auto|noul|choice|score] &lt;问题&gt; - Structured Jev decisions',
-        '/voice on|off - Set this session\'s default reply format',
-        '/status - Show current status (operator)',
-        '/whoami - Show current Feishu sender IDs',
-        '/feishu - Show Feishu developer platform capability and scope diagnostics (owner)',
-        '/docs - List generated Feishu documents (operator)',
-        '/projects - List available workspaces (operator)',
-        '/sessions - List recent sessions (operator)',
-        '/remind 10分钟后 内容 - Create a bridge-managed reminder',
-        '/ext search|install|remove &lt;关键词或URL&gt; - Manage extension catalog',
-        '/stop - Stop current session (operator)',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
-        '/help - Show this help',
+        ...buildBridgeCommandHelpLines(),
       ].join('\n');
       break;
 
@@ -10699,6 +10699,7 @@ export function computeSdkSessionUpdate(
 /** @internal */
 export const _testOnly = {
   handleMessage,
+  buildBridgeCommandHelpLines,
   isDangerousUserRequest,
   isShutdownRequest,
   isShutdownConfirmation,
