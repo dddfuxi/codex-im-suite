@@ -162,3 +162,34 @@ test('Feishu decision cards use the native header as the only title', () => {
   assert.doesNotMatch(markdown, /^# /mu);
   assert.doesNotMatch(markdown, /\*\*状态：\*\*/u);
 });
+
+test('Feishu decision cards render sorted visual probability bars for every candidate', () => {
+  const card = JSON.parse(buildFeishuDecisionCard({
+    title: 'Jev 纯模式判断',
+    questions: [{
+      id: 'intent',
+      type: 'choice',
+      instructions: '当前消息的主要意图',
+      criteria: { a: '需要确认', b: '直接执行', c: '补充说明' },
+    }],
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{
+        id: 'intent',
+        type: 'choice',
+        choice: 'b',
+        probabilities: { a: 0.12, b: 0.87, c: 0.01 },
+      }],
+    },
+  })) as { body?: { elements?: Array<{ tag?: string; content?: string }> } };
+  const markdown = card.body?.elements?.find((element) => element.tag === 'markdown')?.content || '';
+  assert.match(markdown, /\| 候选 \| 概率 \| 分布 \|/u);
+  assert.match(markdown, /🥇 直接执行 \| \*\*87%\*\* \|/u);
+  assert.match(markdown, /🟦/u);
+  assert.match(markdown, /⬜/u);
+  assert.match(markdown, /需要确认/u);
+  assert.match(markdown, /补充说明/u);
+  assert.doesNotMatch(markdown, /tag['"]?\s*:\s*['"]action/iu);
+});

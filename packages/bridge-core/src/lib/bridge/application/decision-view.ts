@@ -11,6 +11,8 @@ export interface DecisionViewInput {
   state?: string;
   questions: readonly DecisionQuestion[];
   result: DecisionResult;
+  /** 飞书 Card 2.0 使用紧凑的图标概率条；普通 Markdown 保持兼容表格。 */
+  visualProbabilityBars?: boolean;
 }
 
 /**
@@ -127,6 +129,44 @@ function probabilityRows(answer: DecisionAnswer, question?: DecisionQuestion): s
   });
 }
 
+interface ProbabilityDisplayRow {
+  label: string;
+  value: number;
+}
+
+function probabilityDisplayRows(answer: DecisionAnswer, question?: DecisionQuestion): ProbabilityDisplayRow[] {
+  const probabilities = answer.probabilities || {};
+  const keys = Object.keys(probabilities).slice(0, 12);
+  if (keys.length === 0 && answer.type === 'noul' && typeof answer.noul === 'number') {
+    return [
+      { label: '是', value: answer.noul },
+      { label: '否', value: 1 - answer.noul },
+    ];
+  }
+  const criteria = question?.criteria;
+  return keys.map((key) => {
+    const criterionLabel = Array.isArray(criteria)
+      ? criteria[Number(key)]
+      : criteria && typeof criteria === 'object'
+        ? criteria[key]
+        : undefined;
+    return {
+      label: text(criterionLabel || answer.legend?.[key] || key, 80) || '未命名候选',
+      value: Math.max(0, Math.min(1, probabilities[key] || 0)),
+    };
+  });
+}
+
+function probabilityBar(value: number): string {
+  const bounded = Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
+  const filled = Math.round(bounded * 10);
+  return `${'🟦'.repeat(filled)}${'⬜'.repeat(10 - filled)}`;
+}
+
+function rankIcon(index: number): string {
+  return index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '▫️';
+}
+
 function criterionLabel(answer: DecisionAnswer, question?: DecisionQuestion): string {
   const key = text(answer.choice, 80);
   if (!key) return '';
@@ -190,10 +230,17 @@ export function renderDecisionView(input: DecisionViewInput): string {
       ...(typeof answer.confidence === 'number' ? [`置信度 **${percent(answer.confidence)}**`] : []),
     ];
     if (rows.length > 0) {
-      lines.push('', '| 候选 / 概率 | 概率 |', '| --- | --- |', ...rows.map((row) => {
-        const [candidate, probability] = row.split(' | ');
-        return `| ${candidate || '—'} | ${probability || '—'} |`;
-      }));
+      if (input.visualProbabilityBars) {
+        const visualRows = probabilityDisplayRows(answer, question)
+          .sort((left, right) => right.value - left.value)
+          .map((row, index) => `| ${rankIcon(index)} ${escapeCell(row.label)} | **${percent(row.value)}** | ${probabilityBar(row.value)} |`);
+        lines.push('', '| 候选 | 概率 | 分布 |', '| --- | ---: | --- |', ...visualRows);
+      } else {
+        lines.push('', '| 候选 / 概率 | 概率 |', '| --- | --- |', ...rows.map((row) => {
+          const [candidate, probability] = row.split(' | ');
+          return `| ${candidate || '—'} | ${probability || '—'} |`;
+        }));
+      }
     }
     blocks.push(lines.join('\n'));
   }

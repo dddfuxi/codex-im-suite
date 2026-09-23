@@ -17,7 +17,10 @@ export function buildFeishuDecisionCard(input: FeishuDecisionCardInput): string 
   if (input.cardHero) elements.push(buildFeishuCardHeroElement(input.cardHero));
   // The Card 2.0 header already contains the title.  Suppress the Markdown
   // heading so mobile users do not see "Jev ..." twice in the same card.
-  elements.push({ tag: 'markdown', content: renderDecisionView({ ...input, showTitle: false }) });
+  elements.push({
+    tag: 'markdown',
+    content: renderDecisionView({ ...input, showTitle: false, visualProbabilityBars: true }),
+  });
   return JSON.stringify({
     schema: '2.0',
     config: { wide_screen_mode: true },
