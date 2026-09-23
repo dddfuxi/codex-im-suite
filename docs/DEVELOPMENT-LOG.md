@@ -1,5 +1,7 @@
 # codex-im-suite 开发记录
 
+- 2026-09-23 `/help` / `/start` 用法清单可读性修复（开发版）：原命令表以英文和长串参数为主，用户难以判断先发什么、何时恢复普通聊天。现在两条入口共用同一份中文清单，先显示“怎么用”的三步流程，再按常用、Jev 结构化判断、语音/提醒/扩展、权限/诊断分组；Jev 的 `debug auto`、消息后缀 `/jev`、`pure on/off/status` 分开列出并附可复制示例。普通消息仍直接走 Primary，纯 Jev 仍必须显式 `/jev pure on`，没有改变默认关闭行为。Core typecheck、Jev 定向测试和 `git diff --check` 通过；live 同步与新 `/help` 飞书回执待本轮部署后复核。
+
 - 2026-09-23 Jev 纯模式动态题目规划超时/契约修复：现场收到“哈喽”时，planner 与 Jev 共用 8000ms，Codex classifier 冷启动在首轮超时后被统一显示成“动态判断题无效”。现将 planner 使用独立 45 秒上限，保留 Jev Decisions API 的原配置超时；真实 Codex 服务随后确认不接受 `oneOf`，因此将 planner 改成固定 `type/instructions/options` JSON（每个候选只有 `key/label`），Runtime 再投影为 Jev 的 `noul / choice / score` 题型，彻底移除动态对象键和不受支持的 schema 组合。Core 对失败提示区分超时、取消、服务不可用和格式错误，仍失败关闭且不伪造概率。Runtime/Core typecheck、planner 7/7 定向测试及真实“哈喽” planner 调用通过；live 同步重启后的真实纯模式群消息仍待用户发送复测。
 
 - 2026-09-23 Jev 纯模式动态题目规划（开发版）：现场 Feishu 卡片确认纯模式一直重复展示固定十条意图候选，根因是 Core 的 `JEV_INTENT_CRITERIA` 静态表；Jev Decisions API 只评估调用方提供的题目，不会自行生成候选。现新增 `DecisionQuestionPlannerHost` 与受限 Runtime classifier planner：纯模式先根据当前消息生成一条严格 JSON 的 `noul / choice / score` 题目，Core 重新校验题型、长度、候选数量及敏感字段，再交给 Jev；planner 或 Jev 失败都失败关闭，不回退静态分类、不伪造概率。`/jev debug` 省略类型与 `auto` 保持原确定性组织。Core/Runtime typecheck 和动态题目策略定向测试通过；尚未同步 live 或完成真实飞书新消息验收。

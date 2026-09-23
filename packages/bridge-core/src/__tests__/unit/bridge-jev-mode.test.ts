@@ -27,9 +27,13 @@ test('Jev auto mode only takes explicit judgment questions', () => {
 test('shared help includes the complete Jev command surface', async () => {
   const { _testOnly } = await import('../../lib/bridge/bridge-manager.js');
   const help = _testOnly.buildBridgeCommandHelpLines().join('\n');
+  assert.match(help, /怎么用/u);
   assert.match(help, /\/start/u);
-  assert.match(help, /\/jev pure on\|off\|status/u);
-  assert.match(help, /\/jev debug \[auto\|noul\|choice\|score\]/u);
-  assert.match(help, /&lt;消息&gt; \/jev/u);
+  assert.match(help, /\/jev pure on/u);
+  assert.match(help, /\/jev pure off/u);
+  assert.match(help, /\/jev pure status/u);
+  assert.match(help, /\/jev debug auto/u);
+  assert.match(help, /\/jev debug noul\|choice\|score/u);
+  assert.match(help, /消息末尾加 \/jev/u);
   assert.match(help, /\/help/u);
 });
