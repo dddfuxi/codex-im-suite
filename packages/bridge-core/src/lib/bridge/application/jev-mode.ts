@@ -19,3 +19,7 @@ export function setJevChatMode(channelType: string, chatId: string, mode: JevCha
   if (!mode) chatModes.delete(chatKey);
   else chatModes.set(chatKey, { mode, enabledAt: Date.now() });
 }
+
+export function shouldUseJevSuffix(mode: JevChatMode | null, hasSuffix: boolean): boolean {
+  return hasSuffix && mode === 'explicit';
+}

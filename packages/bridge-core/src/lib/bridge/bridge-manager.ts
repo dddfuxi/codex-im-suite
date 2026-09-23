@@ -220,7 +220,7 @@ import {
 import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
 import { buildFeishuDecisionCard } from './channels/feishu/cards/decision-card.js';
 import { normalizeDecisionResult, renderDecisionView } from './application/decision-view.js';
-import { getJevChatMode, isJevPureModeEnabled, setJevChatMode } from './application/jev-mode.js';
+import { getJevChatMode, isJevPureModeEnabled, setJevChatMode, shouldUseJevSuffix } from './application/jev-mode.js';
 import { analyzeJevIntent, normalizeJevDecisionQuestion, renderJevPlannerFailure } from './application/jev-intent-policy.js';
 export { isJevPureModeEnabled };
 // Side-effect import: triggers self-registration of all adapter factories
@@ -7326,7 +7326,8 @@ async function handleMessage(
   // routing decision for every ordinary text message in the current chat.
   const jevMode = getJevChatMode(adapter.channelType, msg.address.chatId);
   const hasJevSuffix = /\/jev\s*$/iu.test(rawText);
-  if ((hasJevSuffix || jevMode === 'pure') && rawText.trim()) {
+  const useJevSuffix = shouldUseJevSuffix(jevMode, hasJevSuffix);
+  if ((useJevSuffix || jevMode === 'pure') && rawText.trim()) {
     const parsed = parseJevDebugArgs(rawText);
     if (parsed) {
       await handleJevEvaluation(adapter, msg, parsed, jevMode === 'pure' ? 'pure' : 'debug');
@@ -10289,7 +10290,7 @@ function buildBridgeCommandHelpLines(): string[] {
   return [
     '<b>怎么用</b>',
     '1. 普通聊天：直接发消息，不需要命令。',
-    '2. 一次判断：使用 /jev debug auto，或在消息末尾加 /jev。',
+    '2. 一次判断：直接用 /jev debug auto；要用消息后缀，先发 /jev on，再在消息末尾加 /jev。',
     '3. 整个群持续判断：先发 /jev pure on；恢复普通聊天发 /jev pure off。',
     '',
     '<b>常用</b>',
@@ -10309,7 +10310,7 @@ function buildBridgeCommandHelpLines(): string[] {
     '/jev status - 查看 Jev 是否可用及当前聊天模式',
     '/jev debug auto &lt;问题&gt; - 只判断一次；例：/jev debug auto 这个方案适合新手吗？',
     '/jev debug noul|choice|score &lt;问题&gt; - 指定是非、分类或评分题型',
-    '消息末尾加 /jev - 例：这个方案可以上线吗？ /jev',
+    '消息末尾加 /jev（先用 /jev on 开启）- 例：这个方案可以上线吗？ /jev',
     '/jev pure on - 当前聊天进入纯 Jev，之后每条消息都只输出判断卡',
     '/jev pure off - 关闭当前聊天纯 Jev，恢复普通回答',
     '/jev pure status - 查看当前聊天纯 Jev 是否开启',

@@ -178,7 +178,7 @@ flowchart LR
   View --> Markdown[其他渠道 Markdown]
 ```
 
-飞书 `/jev status|on|off|debug`、消息末尾 `/jev` 和按 `channel + chatId` 隔离的 `/jev pure on|off|status` 只改变入口与展示范围；纯模式仍受群、身份、机器人和 allowlist 门禁约束，并在 planner 失败时失败关闭。`choice` 结果是模型分类分布，不能复用 `cti-final.choices` 的真人点击选择卡；Decision Card 只显示实际题目的 `noul`、`choice` 或 `score` 及概率分布，不生成 callback。
+飞书 `/jev status|on|off|debug`、消息末尾 `/jev` 和按 `channel + chatId` 隔离的 `/jev pure on|off|status` 只改变入口与展示范围；消息末尾后缀只有当前聊天先用 `/jev on` 标记为 `explicit` 才会触发，`/jev off` 或未设置时仍走普通 Primary，纯模式仍受群、身份、机器人和 allowlist 门禁约束，并在 planner 失败时失败关闭。`choice` 结果是模型分类分布，不能复用 `cti-final.choices` 的真人点击选择卡；Decision Card 只显示实际题目的 `noul`、`choice` 或 `score` 及概率分布，不生成 callback。
 
 `/help` 与 `/start` 共用 `buildBridgeCommandHelpLines()`，先给出普通聊天、一次 Jev 判断和纯模式开关的三步用法，再按场景分组列出可复制命令与示例。帮助文案只负责呈现入口，不改变命令路由、角色门禁或 Jev 的默认关闭策略。
 

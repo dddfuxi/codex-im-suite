@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getJevChatMode, isJevPureModeEnabled, setJevChatMode } from '../../lib/bridge/application/jev-mode.js';
+import { getJevChatMode, isJevPureModeEnabled, setJevChatMode, shouldUseJevSuffix } from '../../lib/bridge/application/jev-mode.js';
 import { isAutoJevQuestion } from '../../lib/bridge/bridge-manager.js';
 
 test('Jev chat mode is isolated by channel and chat and can be disabled', () => {
@@ -16,6 +16,10 @@ test('Jev chat mode is isolated by channel and chat and can be disabled', () => 
 
   setJevChatMode('feishu', 'chat-a', null);
   assert.equal(getJevChatMode('feishu', 'chat-a'), null);
+  assert.equal(shouldUseJevSuffix(null, true), false);
+  assert.equal(shouldUseJevSuffix('explicit', true), true);
+  assert.equal(shouldUseJevSuffix('pure', true), false);
+  assert.equal(shouldUseJevSuffix('explicit', false), false);
 });
 
 test('Jev auto mode only takes explicit judgment questions', () => {
