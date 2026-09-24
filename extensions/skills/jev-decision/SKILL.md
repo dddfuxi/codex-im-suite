@@ -32,12 +32,15 @@ request by themselves.
 
 In chat-scoped pure mode, the Runtime first runs a restricted classifier
 planner with no tools, workspace, credentials, or delivery access. The planner
-generates one bounded `noul`, `choice`, or `score` question from the current
-message, Core validates it, and Jev evaluates it. This is intentionally a
-two-stage `planner -> Jev` path, so the visible categories can fit the current
-message instead of repeating a fixed intent table. `/jev debug` without a type
-or `/jev debug auto` keep the Core's deterministic intent organizer and do not
-silently enter the planner path.
+first understands the current message and generates 3–5 complete answer or
+solution candidates. Core validates the bounded `choice` question and Jev then
+assigns probabilities to those candidates. The automatically recognized
+message intent is auxiliary context for the visible result, not the main set
+of candidates. This is intentionally a two-stage `planner -> Jev` path, so
+the answer/solution candidates fit the current message instead of repeating a
+fixed intent table. `/jev debug` without a type or `/jev debug auto` keep the
+Core's deterministic intent organizer and do not silently enter the planner
+path.
 
 When the DecisionProvider or pure-mode planner is disabled, unavailable, timed
 out, or returns an invalid result, report that the structured judgment is

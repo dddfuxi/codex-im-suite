@@ -49,6 +49,8 @@ export interface JevIntentAnalysis {
   decisionQuestion: DecisionQuestion | null;
 }
 
+export type JevPlannerPurpose = 'intent' | 'answer_options';
+
 const MAX_DYNAMIC_INSTRUCTIONS_CHARS = 1_200;
 const MAX_DYNAMIC_CRITERION_KEY_CHARS = 80;
 const MAX_DYNAMIC_CRITERION_LABEL_CHARS = 180;
@@ -72,12 +74,16 @@ function cleanDynamicText(value: unknown, maxChars: number): string {
  * planning is allowed to create useful labels, but never platform actions,
  * credentials, paths, URLs, or an unbounded free-form answer.
  */
-export function normalizeJevDecisionQuestion(input: unknown): DecisionQuestion | null {
+export function normalizeJevDecisionQuestion(
+  input: unknown,
+  options: { purpose?: JevPlannerPurpose } = {},
+): DecisionQuestion | null {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
   const raw = input as Record<string, unknown>;
   const type = raw.type === 'noul' || raw.type === 'choice' || raw.type === 'score' ? raw.type : null;
   const instructions = cleanDynamicText(raw.instructions, MAX_DYNAMIC_INSTRUCTIONS_CHARS);
   if (!type || !instructions || DYNAMIC_QUESTION_UNSAFE_TEXT.test(instructions)) return null;
+  if (options.purpose === 'answer_options' && type !== 'choice') return null;
   const criteria = raw.criteria;
   if (type === 'choice' || type === 'noul') {
     if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) return null;
@@ -88,12 +94,18 @@ export function normalizeJevDecisionQuestion(input: unknown): DecisionQuestion |
       ] as const)
       .filter(([key, value]) => key && value && !DYNAMIC_QUESTION_UNSAFE_TEXT.test(key) && !DYNAMIC_QUESTION_UNSAFE_TEXT.test(value));
     const unique = new Map<string, string>();
+    const labels = new Set<string>();
     for (const [key, value] of entries) {
-      if (!unique.has(key)) unique.set(key, value);
+      if (!unique.has(key) && !labels.has(value)) {
+        unique.set(key, value);
+        labels.add(value);
+      }
     }
     if (type === 'noul') {
       if (!unique.has('true') || !unique.has('false') || unique.size !== 2) return null;
-    } else if (unique.size < 2 || unique.size > 8) {
+    } else if (options.purpose === 'answer_options'
+      ? unique.size < 3 || unique.size > 5
+      : unique.size < 2 || unique.size > 8) {
       return null;
     }
     return {
@@ -272,4 +284,19 @@ export function inferJevIntentQuestion(text: string, context: JevIntentContext =
 /** Exported for tests and lightweight route gates without exposing regex details. */
 export function isJevGreeting(text: string): boolean {
   return isGreeting(cleanText(text));
+}
+
+export function jevIntentKindLabel(kind: JevIntentKind): string {
+  const labels: Record<JevIntentKind, string> = {
+    greeting: '问候或打招呼',
+    question: '提问或求解释',
+    request: '请求帮助或处理',
+    feedback: '反馈体验或结果',
+    thanks: '感谢或礼貌回应',
+    choice: '选择或分类问题',
+    score: '评分或程度问题',
+    statement: '陈述或补充信息',
+    unknown: '暂时无法确定',
+  };
+  return labels[kind];
 }

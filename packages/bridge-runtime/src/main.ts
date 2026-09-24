@@ -641,7 +641,10 @@ const JEV_DYNAMIC_QUESTION_RESPONSE_SCHEMA = {
   required: ['type', 'instructions', 'options'],
 } as const;
 
-function normalizeDynamicDecisionQuestion(payload: Record<string, unknown> | null): DecisionQuestion | null {
+function normalizeDynamicDecisionQuestion(
+  payload: Record<string, unknown> | null,
+  purpose: 'intent' | 'answer_options' = 'intent',
+): DecisionQuestion | null {
   if (!payload) return null;
   const type = payload.type === 'noul' || payload.type === 'choice' || payload.type === 'score'
     ? payload.type
@@ -650,6 +653,7 @@ function normalizeDynamicDecisionQuestion(payload: Record<string, unknown> | nul
   if (!type || !instructions || instructions.length > 1200
     || Object.keys(payload).some((key) => !['type', 'instructions', 'options'].includes(key))
     || !Array.isArray(payload.options) || payload.options.length < 2 || payload.options.length > 8) return null;
+  if (purpose === 'answer_options' && type !== 'choice') return null;
   const entries: Array<[string, string]> = [];
   for (const value of payload.options) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -664,7 +668,9 @@ function normalizeDynamicDecisionQuestion(payload: Record<string, unknown> | nul
   if (type === 'noul' || type === 'choice') {
     const criteria = Object.fromEntries(entries);
     if (type === 'noul' && (Object.keys(criteria).length !== 2 || !criteria.true || !criteria.false)) return null;
-    if (type === 'choice' && (Object.keys(criteria).length < 2 || Object.keys(criteria).length > 8)) return null;
+    if (type === 'choice' && (purpose === 'answer_options'
+      ? Object.keys(criteria).length < 3 || Object.keys(criteria).length > 5
+      : Object.keys(criteria).length < 2 || Object.keys(criteria).length > 8)) return null;
     return { id: 'jev_dynamic', type, instructions, criteria };
   }
   const criteria = entries.map(([, label]) => label);
@@ -679,16 +685,28 @@ class ProviderDecisionQuestionPlannerHost implements DecisionQuestionPlannerHost
     private readonly timeoutMs = 45_000,
   ) {}
 
-  async plan(input: { state: string; signal?: AbortSignal }): Promise<DecisionQuestion | DecisionQuestionPlanningFailure> {
+  async plan(input: {
+    state: string;
+    signal?: AbortSignal;
+    purpose?: 'intent' | 'answer_options';
+  }): Promise<DecisionQuestion | DecisionQuestionPlanningFailure> {
     const state = input.state.trim().slice(0, 16_000);
     if (input.signal?.aborted) return { errorCode: 'cancelled' };
     if (!state) return { errorCode: 'invalid_output' };
+    const purpose = input.purpose || 'intent';
     const prompt = [
       '你是 Jev 结构化判断题规划器，不是聊天助手。',
-      '只为当前消息生成一条供 Jev 使用的判断题，绝不回答消息，绝不解释，绝不执行工具。',
+      purpose === 'answer_options'
+        ? '当前任务是答案/解决方案候选规划：先理解消息，再生成 3 到 5 个可能的答案或解决方案候选，供 Jev 比较概率；不要输出意图分类。'
+        : '当前任务是意图判断题规划：只为当前消息生成一条供 Jev 使用的判断题。',
+      '绝不直接回答消息，绝不解释规划过程，绝不执行工具。',
       '只输出严格 JSON：{"type":"noul|choice|score","instructions":"待判断的问题","options":[{"key":"候选键","label":"候选说明"}]}。',
-      '所有题型都输出 options 列表。noul 只有 key 为 true 和 false 的两项；choice 生成 2 到 8 个互斥、覆盖主要可能性的分类；score 生成 2 到 6 个从低到高的等级。候选键与候选说明各自不可重复。',
-      '分类和等级必须根据当前消息本身动态组织，不能套用固定的问候/请求/反馈分类表；信息不足时要提供明确的“无法确定/其他”候选。',
+      purpose === 'answer_options'
+        ? 'type 必须是 choice；options 必须是 3 到 5 个互斥但有区别的答案/解决方案，label 要写成用户可读的完整候选，不要写“问候/请求/反馈”等意图标签。'
+        : '所有题型都输出 options 列表。noul 只有 key 为 true 和 false 的两项；choice 生成 2 到 8 个互斥、覆盖主要可能性的分类；score 生成 2 到 6 个从低到高的等级。候选键与候选说明各自不可重复。',
+      purpose === 'answer_options'
+        ? '候选必须根据当前消息动态组织；可以是不同处理方案、解释方向、优先级或下一步建议。信息不足时保留一个“需要更多信息/其他可行方案”候选。'
+        : '分类和等级必须根据当前消息本身动态组织，不能套用固定的问候/请求/反馈分类表；信息不足时要提供明确的“无法确定/其他”候选。',
       '不要输出 URL、路径、命令、回调、平台 ID、密钥、Token 或任何动作参数。',
       `当前消息：${state}`,
     ].join('\n');
@@ -713,7 +731,7 @@ class ProviderDecisionQuestionPlannerHost implements DecisionQuestionPlannerHost
       if (signal.aborted) return failed(input.signal?.aborted ? 'cancelled' : 'timeout');
       // Do not extract JSON from prose or Markdown: this is a strict classifier.
       const payload = tryParseJson<Record<string, unknown>>(text);
-      return normalizeDynamicDecisionQuestion(payload) || failed('invalid_output');
+      return normalizeDynamicDecisionQuestion(payload, purpose) || failed('invalid_output');
     } catch {
       return failed(input.signal?.aborted ? 'cancelled' : timeout.aborted ? 'timeout' : 'provider_error');
     }

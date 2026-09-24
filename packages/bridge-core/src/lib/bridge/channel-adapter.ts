@@ -175,6 +175,15 @@ export abstract class BaseChannelAdapter {
   }
 
   /**
+   * Delete a cloud document owned by this adapter's platform.  Document
+   * deletion is intentionally optional and must be invoked only after the
+   * bridge has performed its owner and confirmation checks.
+   */
+  async deleteDocument(_documentId: string): Promise<{ ok: boolean; error?: string }> {
+    return { ok: false, error: 'Document deletion is not supported by this adapter' };
+  }
+
+  /**
    * Recall/delete a previously sent platform message when the channel supports it.
    * Implementations must only act on platform message IDs already known to belong
    * to this bot; callers are responsible for that ownership check.

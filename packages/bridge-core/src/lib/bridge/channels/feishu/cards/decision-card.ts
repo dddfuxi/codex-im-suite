@@ -1,6 +1,6 @@
 import type { DecisionQuestion, DecisionResult } from '../../../host.js';
 import { buildFeishuCardHeroElement } from './card-hero.js';
-import { renderDecisionView } from '../../../application/decision-view.js';
+import { renderDecisionView, type DecisionViewInput } from '../../../application/decision-view.js';
 import type { FeishuCardHeroImage } from '../../../types.js';
 
 export interface FeishuDecisionCardInput {
@@ -9,6 +9,7 @@ export interface FeishuDecisionCardInput {
   questions: readonly DecisionQuestion[];
   result: DecisionResult;
   cardHero?: FeishuCardHeroImage;
+  auxiliaryIntent?: DecisionViewInput['auxiliaryIntent'];
 }
 
 /** Jev 结果专用只读卡片；它没有 callback，不能被误当成用户选择卡。 */

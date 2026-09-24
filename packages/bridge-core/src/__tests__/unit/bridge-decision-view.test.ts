@@ -193,3 +193,39 @@ test('Feishu decision cards render sorted visual probability bars for every cand
   assert.match(markdown, /补充说明/u);
   assert.doesNotMatch(markdown, /tag['"]?\s*:\s*['"]action/iu);
 });
+
+test('pure Jev cards prioritize answer candidates and keep intent as auxiliary context', () => {
+  const question: DecisionQuestion = {
+    id: 'jev_dynamic',
+    type: 'choice',
+    instructions: '比较当前问题的可行答案或解决方案',
+    criteria: {
+      direct: '直接按当前方案推进',
+      clarify: '先补充信息再决定',
+      alternative: '改用替代方案',
+    },
+  };
+  const card = JSON.parse(buildFeishuDecisionCard({
+    title: 'Jev 纯模式判断',
+    state: '这个方案应该怎么落地？',
+    questions: [question],
+    auxiliaryIntent: { label: '提问或求解释', confidence: 0.9 },
+    result: {
+      provider: 'jev',
+      model: 'typesafe/jev-1.13',
+      generatedAt: new Date().toISOString(),
+      answers: [{
+        id: 'jev_dynamic',
+        type: 'choice',
+        choice: 'clarify',
+        probabilities: { direct: 0.22, clarify: 0.63, alternative: 0.15 },
+      }],
+    },
+  })) as { body?: { elements?: Array<{ tag?: string; content?: string }> } };
+  const markdown = card.body?.elements?.find((element) => element.tag === 'markdown')?.content || '';
+  assert.match(markdown, /先补充信息再决定/u);
+  assert.match(markdown, /🥇 先补充信息再决定 \| \*\*63%\*\*/u);
+  assert.match(markdown, /\*\*辅助意图：\*\* 提问或求解释（90%）/u);
+  assert.ok(markdown.indexOf('先补充信息再决定') < markdown.indexOf('辅助意图：'));
+  assert.doesNotMatch(markdown, /问候或打招呼 \| \*\*|反馈体验或结果 \| \*\*/u);
+});

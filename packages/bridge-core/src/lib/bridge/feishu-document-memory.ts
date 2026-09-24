@@ -189,6 +189,29 @@ export function recordFeishuDocumentMemory(
   return next;
 }
 
+/**
+ * Remove one entry from the local document index after the remote document
+ * deletion has already succeeded. The stable local entry id is deliberately
+ * the only accepted selector; callers must not pass arbitrary URLs or tokens.
+ */
+export function removeFeishuDocumentMemory(
+  store: Pick<BridgeStore, 'getSetting'>,
+  entryId: string,
+): FeishuDocumentMemoryEntry | null {
+  const normalizedId = entryId.trim();
+  if (!normalizedId) return null;
+
+  const existing = loadFeishuDocumentMemory(store);
+  const removed = existing.find((entry) => entry.id === normalizedId);
+  if (!removed) return null;
+
+  const remaining = existing.filter((entry) => entry.id !== normalizedId);
+  const now = new Date().toISOString();
+  writeJson(getFeishuDocumentIndexPath(store), { updatedAt: now, documents: remaining });
+  writeText(getFeishuDocumentGuidePath(store), buildFeishuDocumentGuideMarkdown(remaining));
+  return removed;
+}
+
 export function renderFeishuDocumentMemoryList(
   store: Pick<BridgeStore, 'getSetting'>,
   limit = 12,

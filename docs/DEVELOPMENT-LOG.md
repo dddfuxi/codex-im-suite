@@ -1,5 +1,18 @@
 # codex-im-suite 开发记录
 
+# 2026-09-24 Jev 纯模式答案/解决方案候选概率化（开发版）
+
+- 纯 Jev 模式的主展示改为“先生成候选、再评估概率”：受限 Runtime classifier planner 根据当前消息生成 3–5 个完整的答案或解决方案候选，Core 只接受 `choice` 题型并重新校验候选数量、长度和敏感字段，之后将候选交给 Jev Decisions API 输出概率分布。
+- Feishu Decision Card 的主内容展示答案/解决方案候选、概率和视觉分布；当前消息的自动识别意图只作为“辅助意图”及可选置信度展示，不再替代主候选。该结果仍是只读判断卡，不生成真人点击回调。
+- `/jev debug` 与普通自动判断入口继续沿用原有确定性组织；只有 `/jev pure on` 使用答案/解决方案候选规划。planner 或 Jev 关闭、缺少密钥、超时、取消、返回非法候选或评估结果无效时，继续失败关闭且不伪造概率。
+- 本轮实现已通过 Core 与 Runtime typecheck；Core Jev/Decision View 定向回归 18/18、Runtime planner 定向回归 9/9 通过，覆盖 3–5 候选边界、仅允许 `choice`、辅助意图展示和失败关闭。完整门禁仍由主任务统一复核；尚未同步 live，也未完成真实飞书新消息验收。
+
+# 2026-09-24 `/docs` 飞书文档管理与删除
+
+- `/docs` 在飞书中改为展示文档管理卡片，列出已生成文档的标题、摘要、更新时间和打开链接；删除按钮只对 Owner 显示。
+- 删除使用 5 分钟短期回调并绑定当前渠道、聊天和用户，点击后先展示二次确认卡。确认时由 FeishuAdapter 调用云盘删除接口，只有收到远端成功回执后才移除本地文档索引和 `DOCUMENT_GUIDE.md`；失败、过期、跨用户或跨聊天回调保留索引并返回明确原因。
+- 普通渠道保留文本列表行为。开发版尚未执行真实文档删除；需使用测试文档完成渠道端回执验收后再考虑 live 同步。
+
 - 2026-09-23 Jev 纯模式 Decision Card 概率视觉优化（开发版并已同步 live）：原卡片使用普通两列表格，候选较多时难以快速比较。现将 Feishu 只读判断卡的候选按概率从高到低排序，第一、第二、第三名分别显示 🥇/🥈/🥉，其余显示 ▫️；每行同时保留中文候选、百分比和十格 `🟦/⬜` 概率条。卡片仍不生成按钮或 callback，`noul / choice / score` 继续复用同一 provider-neutral 结果与失败关闭规则。Core typecheck、Decision View 定向测试、边界/人类文档门禁和 diff 检查通过；suite/live `daemon.mjs` SHA-256 均为 `5159ABFA4EA6C7C6129ECDC0CA0AA1B56EFBC4453A34D2C54598C1900C84FBFC`。同步后的启动包装器曾返回 1，但复查确认新 Bridge PID=`45824`、`status.running=true`、`lastExitReason=null`、Feishu WS=`connected`、`lastUnhandledError=null`；真实飞书新卡片回执仍待现场消息确认，不能把运行态证据写成客户端视觉已验收。卡片视觉规则与实现入口已同步写入架构文档。
 
 - 2026-09-23 `/help` / `/start` 用法清单可读性修复（开发版并已同步 live）：原命令表以英文和长串参数为主，用户难以判断先发什么、何时恢复普通聊天。现在两条入口共用同一份中文清单，先显示“怎么用”的三步流程，再按常用、Jev 结构化判断、语音/提醒/扩展、权限/诊断分组；Jev 的 `debug auto`、消息后缀 `/jev`、`pure on/off/status` 分开列出并附可复制示例，消息后缀必须先用 `/jev on` 开启，`/jev off` 后回到 Primary。普通消息仍直接走 Primary，纯 Jev 仍必须显式 `/jev pure on`，没有改变默认关闭行为。Core typecheck、Jev 定向测试和 `git diff --check` 通过；live bundle hash 与受控重启后的新 PID=`31364`、Feishu WS=`connected` 已核对，真实新 `/help` 飞书回执仍待用户发送后确认。

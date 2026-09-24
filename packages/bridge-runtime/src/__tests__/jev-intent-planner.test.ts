@@ -38,6 +38,57 @@ test('dynamic Jev planner returns a bounded question from strict JSON', async ()
   });
 });
 
+test('pure-mode planner asks for 3 to 5 answer or solution candidates', async () => {
+  let captured: StreamChatParams | undefined;
+  const planner = new ProviderDecisionQuestionPlannerHost({ streamChat(params) {
+    captured = params;
+    return providerReturning({
+      type: 'choice',
+      instructions: '针对当前问题比较可行的处理方案。',
+      options: [
+        { key: 'direct', label: '直接按现有方案推进' },
+        { key: 'clarify', label: '先补充关键信息再决定' },
+        { key: 'alternative', label: '改用另一种实现路径' },
+        { key: 'defer', label: '暂缓处理并观察后续变化' },
+      ],
+    }).streamChat(params);
+  } });
+
+  const result = await planner.plan({ state: '这个方案应该怎么落地？', purpose: 'answer_options' });
+  assert.deepEqual(result, {
+    id: 'jev_dynamic',
+    type: 'choice',
+    instructions: '针对当前问题比较可行的处理方案。',
+    criteria: {
+      direct: '直接按现有方案推进',
+      clarify: '先补充关键信息再决定',
+      alternative: '改用另一种实现路径',
+      defer: '暂缓处理并观察后续变化',
+    },
+  });
+  assert.match(captured?.prompt || '', /生成 3 到 5 个可能的答案或解决方案候选/u);
+  assert.match(captured?.prompt || '', /不要输出意图分类/u);
+});
+
+test('pure-mode planner fails closed when answer candidate count is outside 3 to 5', async () => {
+  for (const count of [2, 6]) {
+    const options = Array.from({ length: count }, (_, index) => ({
+      key: `candidate-${index}`,
+      label: `候选方案 ${index + 1}`,
+    }));
+    const planner = new ProviderDecisionQuestionPlannerHost(providerReturning({
+      type: 'choice',
+      instructions: '比较答案或解决方案',
+      options,
+    }));
+    assert.deepEqual(
+      await planner.plan({ state: '请给出可行方案', purpose: 'answer_options' }),
+      { errorCode: 'invalid_output' },
+      `candidate count ${count} should be rejected`,
+    );
+  }
+});
+
 test('dynamic Jev planner fails closed on malformed criteria', async () => {
   const planner = new ProviderDecisionQuestionPlannerHost(providerReturning({
     type: 'choice',

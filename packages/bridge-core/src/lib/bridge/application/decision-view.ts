@@ -13,6 +13,11 @@ export interface DecisionViewInput {
   result: DecisionResult;
   /** 飞书 Card 2.0 使用紧凑的图标概率条；普通 Markdown 保持兼容表格。 */
   visualProbabilityBars?: boolean;
+  /** Pure Jev keeps deterministic intent as a secondary hint below the main result. */
+  auxiliaryIntent?: {
+    label: string;
+    confidence?: number;
+  };
 }
 
 /**
@@ -219,7 +224,6 @@ export function renderDecisionView(input: DecisionViewInput): string {
     text(visibleQuestionLabel(questions.get(answer.id)?.instructions || ''), 240) === state
   ));
   if (state && !stateIsQuestion) blocks.push(`**状态：** ${escapeCell(state)}`);
-
   for (const answer of input.result.answers.slice(0, 8)) {
     const question = questions.get(answer.id);
     const label = text(question ? visibleQuestionLabel(question.instructions) : '', 120) || answer.id;
@@ -243,6 +247,12 @@ export function renderDecisionView(input: DecisionViewInput): string {
       }
     }
     blocks.push(lines.join('\n'));
+  }
+  if (input.auxiliaryIntent?.label?.trim()) {
+    const confidence = typeof input.auxiliaryIntent.confidence === 'number'
+      ? `（${percent(input.auxiliaryIntent.confidence)}）`
+      : '';
+    blocks.push(`**辅助意图：** ${escapeCell(text(input.auxiliaryIntent.label, 80))}${confidence}`);
   }
   if (input.result.answers.length === 0) blocks.push('Jev 未返回可展示的判断结果。');
   return blocks.join('\n\n');

@@ -6756,6 +6756,47 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
   }
 
+  /**
+   * Move a generated Docx document to the Feishu Drive recycle bin.
+   * The manager performs the owner, confirmation, and local-index checks;
+   * this adapter only talks to the platform using the supplied document token.
+   */
+  async deleteDocument(documentId: string): Promise<{ ok: boolean; error?: string }> {
+    const normalizedDocumentId = documentId.trim();
+    if (!normalizedDocumentId) return { ok: false, error: '缺少飞书文档 ID' };
+
+    try {
+      const { appId, appSecret, baseUrl } = this.getAuthContext();
+      const tenantAccessToken = await this.fetchTenantAccessToken(appId, appSecret, baseUrl);
+      const response = await this.fetchFeishuEvidenceApiWithRetry(
+        `${baseUrl}/open-apis/drive/v1/files/${encodeURIComponent(normalizedDocumentId)}?type=file`,
+        {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${tenantAccessToken}` },
+        },
+      );
+      let payload: { code?: number; msg?: string } = {};
+      try {
+        payload = await response.json() as { code?: number; msg?: string };
+      } catch {
+        // Some successful Drive responses have no JSON body.
+      }
+
+      if (response.ok && payload.code === 0) {
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        error: `飞书删除接口失败 [${payload.code ?? response.status}]：${payload.msg || response.statusText || '平台未接受请求'}`,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : '飞书删除接口调用失败',
+      };
+    }
+  }
+
   async replaceDocumentFromMarkdown(
     documentId: string,
     markdown: string,

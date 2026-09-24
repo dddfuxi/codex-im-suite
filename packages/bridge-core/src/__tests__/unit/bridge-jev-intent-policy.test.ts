@@ -95,3 +95,51 @@ test('动态题目拒绝无界、动作或凭据字段，失败关闭', () => {
     criteria: { only: '只有一个候选' },
   }), null);
 });
+
+test('纯 Jev 答案候选题只接受 3 到 5 个 choice 候选', () => {
+  const result = normalizeJevDecisionQuestion({
+    type: 'choice',
+    instructions: '比较当前问题的可行答案或解决方案',
+    criteria: {
+      direct: '直接按当前方案推进',
+      clarify: '先补充信息再决定',
+      alternative: '改用替代方案',
+      defer: '暂缓处理并观察',
+    },
+  }, { purpose: 'answer_options' });
+  assert.deepEqual(result, {
+    id: 'jev_dynamic',
+    type: 'choice',
+    instructions: '比较当前问题的可行答案或解决方案',
+    criteria: {
+      direct: '直接按当前方案推进',
+      clarify: '先补充信息再决定',
+      alternative: '改用替代方案',
+      defer: '暂缓处理并观察',
+    },
+  });
+
+  for (const criteria of [
+    { a: '方案 A', b: '方案 B' },
+    { a: '方案 A', b: '方案 B', c: '方案 C', d: '方案 D', e: '方案 E', f: '方案 F' },
+  ]) {
+    assert.equal(normalizeJevDecisionQuestion({
+      type: 'choice',
+      instructions: '候选方案',
+      criteria,
+    }, { purpose: 'answer_options' }), null);
+  }
+});
+
+test('纯 Jev 答案候选题拒绝 noul 和 score', () => {
+  assert.equal(normalizeJevDecisionQuestion({
+    type: 'noul',
+    instructions: '方案是否可行',
+    criteria: { true: '可行', false: '不可行' },
+  }, { purpose: 'answer_options' }), null);
+  assert.equal(normalizeJevDecisionQuestion({
+    type: 'score',
+    instructions: '方案质量评分',
+    criteria: ['低', '中', '高'],
+  }, { purpose: 'answer_options' }), null);
+});

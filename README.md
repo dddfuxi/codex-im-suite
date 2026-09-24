@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - 飞书卡片支持受控横幅头图：Provider 可用 `cti-final.card_hero` 从同一结果的 `images` 中选择一张已验证图片，Bridge 上传后把真实 `image_key` 嵌入普通卡、流式终态卡或有限选择按钮卡；嵌入成功不再重复发同一图片。组合卡若被平台拒绝，会先去掉可选头图并保留原正文与按钮，图片改走普通附件；卡片仍不可用时再以飞书富文本回退，不会裸露 Markdown。模型声明的 URL、`image_key`、输入证据或未交付路径不会被提升成头图。
 - 飞书支持通用“看盘式”分析卡：市场观察、服务健康、项目态势、故障复盘、测试对比等确有多项指标的结果，可用 `cti-final.analysis_view` 在同一卡片中展示结论、最多 6 项指标和最多 4 个风险/观察/下一步分区；指标采用更适合移动端的双列表格，当前值和变化信号沿用同一语义色。协议会先过滤无效/重复项再计入上限，同名分区自动合并去重；正文中与结构化标题、结论完全相同的展示行会被折叠，但代码块和独有依据保持原样。普通正文仍作为补充说明及非飞书回退。该能力不绑定股票关键词，轻聊和单一事实不会机械套模板，也不会为了填满版式伪造价格、百分比、趋势或状态。头图、分析视图和有限选择按钮可以复用同一张 Card 2.0 卡片。
 - 飞书有限选择支持显式群体会话：普通按钮仍只允许发起人点击；用户明确要求全员参与时，`cti-final.choice_session` 可选择 `vote`（倒计时结束统一回调）、`claim`（首个合法点击者抢选）或 `parallel`（每位成员分别续跑）。parallel 的共享入口允许多人各自进入，但进入某位参与者的分线后，后续按钮只允许该参与者继续，其他成员不会串线。群体点击绑定原群与原生 operator，优先复核当前群成员；状态、计票、截止时间、匿名分支、原卡消息和待投递终态会原子持久化，Bridge 重启后恢复。投票终态在原卡明确显示赢家、平票或无人参与；卡片暂时刷新失败也不会回滚已记录选票。不靠正文模拟投票，也不用于权限或高风险确认。
-- 结构化判断 Decision Layer 开发预览：共享契约支持 `noul`（是/否概率）、`choice`（有限分类）和 `score`（评分分布），Jev 只通过 OpenRouter Decisions API 专用 Provider 接入，不进入普通聊天模型链路。配置默认关闭；飞书 `/jev debug`（省略类型或使用 `auto`）继续使用 Core 的确定性组织，`/jev pure on` 则先调用受限 classifier planner，按当前消息动态生成一条题目和 2–8 个候选，再交给 Jev 评估，因此不会固定重复同一组问候/请求/反馈标签。planner 与 Jev 任一不可用、超时或返回非法题目都会失败关闭，不伪造概率。无按钮 Decision Card 只展示实际题目的中文结论及概率；每个候选按概率排序并显示金银铜排名图标、百分比和 `🟦/⬜` 视觉概率条，`choice` 不复用真人点击选择卡；shadow/assist 的自动辅助链仍按独立配置控制。飞书 `/help` 与 `/start` 会用中文分组列出可复制示例；普通消息无需命令，纯 Jev 必须显式 `/jev pure on`，用 `/jev pure off` 恢复普通聊天。
+- 结构化判断 Decision Layer 开发预览：共享契约支持 `noul`（是/否概率）、`choice`（有限分类）和 `score`（评分分布），Jev 只通过 OpenRouter Decisions API 专用 Provider 接入，不进入普通聊天模型链路。配置默认关闭；飞书 `/jev debug`（省略类型或使用 `auto`）继续使用 Core 的确定性组织。`/jev pure on` 下，受限 classifier planner 会先理解当前消息并生成 3–5 个答案或解决方案候选，随后只把这些候选交给 Jev 的 `choice` 模式打概率；卡片主内容是“答案/解决方案 + 概率分布”，自动识别的意图只作为辅助信息展示，不再作为主候选。planner 与 Jev 任一不可用、超时或返回非法题目都会失败关闭，不伪造概率。无按钮 Decision Card 只展示实际题目的中文结论及概率；每个候选按概率排序并显示金银铜排名图标、百分比和 `🟦/⬜` 视觉概率条，`choice` 不复用真人点击选择卡；shadow/assist 的自动辅助链仍按独立配置控制。飞书 `/help` 与 `/start` 会用中文分组列出可复制示例；普通消息无需命令，纯 Jev 必须显式 `/jev pure on`，用 `/jev pure off` 恢复普通聊天。
 - 多节点控制面打底：新增共享契约包和控制面板“节点”页，当前先暴露本机 node 与 fake remote node 的 heartbeat、能力清单和可管理状态，为后续多 runtime 管理预留协议边界。
 - Ollama 本地后端落地：旧 `llama.cpp` / GGUF / `127.0.0.1:8080` 默认链路废弃，统一使用 `CTI_OLLAMA_*` 配置，默认 `http://127.0.0.1:11434` 和 `qwen2.5-coder:7b`。
 - 工作区、记忆与自维护分层：每轮只挂载当前工作区，项目注册根只作为权限上界；本轮明确引用的其他项目才进入临时挂载。`E:\cli-md` 使用可见的 Agent Home、memory v3 分区、工作档案、每日反思和纠错档案，`.cti-index` 只保存机器索引。
@@ -297,6 +297,8 @@ Runtime 数据只放在 `CTI_HOME` 的受控目录：
 - 权限主数据是 `C:\Users\admin\.claude-to-im\data\permissions.json`；面板会继续兼容并同步 `CTI_*_ALLOWED_USERS` 和 `CTI_*_OWNER_USERS`。
 
 ## 关键命令
+
+飞书中的 `/docs` 会列出 Bridge 记录的已生成文档。Owner 可以点击“打开文档”查看，也可以点击“删除”，在二次确认后将文档移入飞书回收站；只有远端删除成功后，本地 `data/documents/index.json` 和 `DOCUMENT_GUIDE.md` 才会同步移除记录。普通渠道继续返回文本列表，过期、跨聊天或非 Owner 的删除回调会被拒绝。
 
 校验扩展 manifest 和 runtime manifest：
 

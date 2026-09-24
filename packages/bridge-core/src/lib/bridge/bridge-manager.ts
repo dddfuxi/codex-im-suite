@@ -221,7 +221,13 @@ import { buildFeishuChoiceCard } from './channels/feishu/cards/choice-card.js';
 import { buildFeishuDecisionCard } from './channels/feishu/cards/decision-card.js';
 import { normalizeDecisionResult, renderDecisionView } from './application/decision-view.js';
 import { getJevChatMode, isJevPureModeEnabled, setJevChatMode, shouldUseJevSuffix } from './application/jev-mode.js';
-import { analyzeJevIntent, normalizeJevDecisionQuestion, renderJevPlannerFailure } from './application/jev-intent-policy.js';
+import {
+  analyzeJevIntent,
+  jevIntentKindLabel,
+  normalizeJevDecisionQuestion,
+  renderJevPlannerFailure,
+  type JevIntentKind,
+} from './application/jev-intent-policy.js';
 export { isJevPureModeEnabled };
 // Side-effect import: triggers self-registration of all adapter factories
 import './adapters/index.js';
@@ -259,6 +265,8 @@ import {
 import {
   getFeishuDocumentGuideMetaPath,
   getFeishuDocumentGuidePath,
+  loadFeishuDocumentMemory,
+  removeFeishuDocumentMemory,
   recordFeishuDocumentMemory,
   renderFeishuDocumentMemoryList,
 } from './feishu-document-memory.js';
@@ -275,6 +283,20 @@ import {
 
 const choicePromptRegistry = new ChoicePromptRegistry();
 const choiceDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+interface PendingFeishuDocumentDelete {
+  entryId: string;
+  documentId: string;
+  title: string;
+  url: string;
+  channelType: ChannelType;
+  chatId: string;
+  ownerUserId: string;
+  expiresAt: number;
+}
+
+const pendingFeishuDocumentDeletes = new Map<string, PendingFeishuDocumentDelete>();
+const FEISHU_DOCUMENT_DELETE_TTL_MS = 5 * 60 * 1000;
 import {
   completeBridgeRuntimeRequest,
   failBridgeRuntimeRequest,
@@ -5530,6 +5552,216 @@ function acquireGlobalTurnPermit(): Promise<() => void> {
   });
 }
 
+function createFeishuDocumentDeleteNonce(): string {
+  return crypto.randomBytes(12).toString('hex');
+}
+
+function escapeFeishuCardMarkdown(value: string): string {
+  return value
+    .replace(/\\/gu, '\\\\')
+    .replace(/([*_`\[\]<>])/gu, '\\$1')
+    .replace(/&/gu, '&amp;');
+}
+
+function isSafeGeneratedFeishuDocument(entry: { url: string; documentId?: string }): boolean {
+  const documentId = entry.documentId?.trim();
+  if (!documentId) return false;
+  try {
+    const parsed = new URL(entry.url);
+    const host = parsed.hostname.toLowerCase();
+    const hostAllowed = host === 'feishu.cn'
+      || host.endsWith('.feishu.cn')
+      || host === 'larksuite.com'
+      || host.endsWith('.larksuite.com');
+    const match = /^\/docx\/([^/?#]+)$/u.exec(parsed.pathname);
+    return parsed.protocol === 'https:' && hostAllowed && match?.[1] === documentId;
+  } catch {
+    return false;
+  }
+}
+
+function buildFeishuDocumentListCard(
+  store: ReturnType<typeof getBridgeContext>['store'],
+  msg: InboundMessage,
+): string {
+  const now = Date.now();
+  for (const [nonce, pending] of pendingFeishuDocumentDeletes) {
+    if (pending.expiresAt <= now) pendingFeishuDocumentDeletes.delete(nonce);
+  }
+  const entries = loadFeishuDocumentMemory(store)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 12);
+  const owner = isOwnerMessage(msg);
+  const elements: Array<Record<string, unknown>> = [];
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: '还没有记录到机器人生成的飞书文档。' });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: owner
+        ? '已生成的飞书文档\n\n点击“删除”后还会再次确认，确认后文档将进入飞书回收站。'
+        : '已生成的飞书文档\n\n你可以打开文档；删除操作仅限 Owner。',
+    });
+    for (const entry of entries) {
+      const summary = entry.sourceSummary ? `\n摘要：${entry.sourceSummary}` : '';
+      elements.push({
+        tag: 'markdown',
+        content: `**${escapeFeishuCardMarkdown(entry.title)}**\n更新时间：${escapeFeishuCardMarkdown(entry.updatedAt)}${escapeFeishuCardMarkdown(summary)}`,
+      });
+      const buttons: Array<Record<string, unknown>> = [];
+      if (isSafeGeneratedFeishuDocument(entry)) {
+        buttons.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '打开文档' },
+          type: 'primary',
+          size: 'small',
+          behaviors: [{ type: 'open_url', value: { url: entry.url } }],
+        });
+      }
+      const documentId = entry.documentId?.trim();
+      if (owner && documentId && isSafeGeneratedFeishuDocument(entry)) {
+        const nonce = createFeishuDocumentDeleteNonce();
+        pendingFeishuDocumentDeletes.set(nonce, {
+          entryId: entry.id,
+          documentId,
+          title: entry.title,
+          url: entry.url,
+          channelType: msg.address.channelType,
+          chatId: msg.address.chatId,
+          ownerUserId: msg.address.userId || '',
+          expiresAt: Date.now() + FEISHU_DOCUMENT_DELETE_TTL_MS,
+        });
+        buttons.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '删除' },
+          type: 'danger',
+          size: 'small',
+          value: { callback_data: `docs:delete:request:${nonce}` },
+        });
+      }
+      if (buttons.length > 0) elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_align: 'left',
+        columns: buttons.map((button) => ({ tag: 'column', width: 'auto', elements: [button] })),
+      });
+      elements.push({ tag: 'hr' });
+    }
+  }
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'blue', title: { tag: 'plain_text', content: '飞书文档管理' } },
+    body: { elements },
+  });
+}
+
+function parseFeishuDocumentDeleteCallback(callbackData: string): { action: 'request' | 'confirm' | 'cancel'; nonce: string } | null {
+  const match = /^docs:delete:(request|confirm|cancel):([a-f0-9]{16,64})$/i.exec(callbackData.trim());
+  return match ? { action: match[1] as 'request' | 'confirm' | 'cancel', nonce: match[2] } : null;
+}
+
+function buildFeishuDocumentDeleteConfirmCard(pending: PendingFeishuDocumentDelete): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'red', title: { tag: 'plain_text', content: '确认删除飞书文档' } },
+    body: {
+      elements: [
+        { tag: 'markdown', content: `你即将删除：\n**${escapeFeishuCardMarkdown(pending.title)}**\n\n删除后文档会进入飞书回收站。` },
+        { tag: 'hr' },
+        {
+          tag: 'column_set',
+          flex_mode: 'none',
+          columns: [
+            {
+              tag: 'column',
+              elements: [{ tag: 'button', text: { tag: 'plain_text', content: '确认删除' }, type: 'danger', size: 'medium', value: { callback_data: `docs:delete:confirm:${pendingFeishuDocumentDeletesKey(pending)}` } }],
+            },
+            {
+              tag: 'column',
+              elements: [{ tag: 'button', text: { tag: 'plain_text', content: '取消' }, type: 'default', size: 'medium', value: { callback_data: `docs:delete:cancel:${pendingFeishuDocumentDeletesKey(pending)}` } }],
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+function pendingFeishuDocumentDeletesKey(pending: PendingFeishuDocumentDelete): string {
+  for (const [nonce, value] of pendingFeishuDocumentDeletes) if (value === pending) return nonce;
+  return '';
+}
+
+function getPendingFeishuDocumentDelete(msg: InboundMessage, nonce: string): PendingFeishuDocumentDelete | null {
+  const pending = pendingFeishuDocumentDeletes.get(nonce);
+  if (!pending || pending.expiresAt <= Date.now()) {
+    pendingFeishuDocumentDeletes.delete(nonce);
+    return null;
+  }
+  if (pending.channelType !== msg.address.channelType
+    || pending.chatId !== msg.address.chatId
+    || pending.ownerUserId !== (msg.address.userId || '')
+    || !isOwnerMessage(msg)) return null;
+  return pending;
+}
+
+async function handleFeishuDocumentDeleteCallback(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  callback: { action: 'request' | 'confirm' | 'cancel'; nonce: string },
+): Promise<void> {
+  const pending = getPendingFeishuDocumentDelete(msg, callback.nonce);
+  if (!pending) {
+    await deliver(adapter, { address: msg.address, text: '这个文档操作已过期、无效或没有权限，请重新发送 /docs。', parseMode: 'plain', replyToMessageId: msg.callbackMessageId || msg.messageId });
+    return;
+  }
+  if (callback.action === 'request') {
+    const card = buildFeishuDocumentDeleteConfirmCard(pending);
+    const updated = msg.callbackMessageId ? await adapter.updateInteractiveCard(msg.callbackMessageId, card) : { ok: false };
+    if (!updated.ok) await deliver(adapter, { address: msg.address, text: '请确认删除以下飞书文档：\n' + pending.title, parseMode: 'plain', replyToMessageId: msg.callbackMessageId || msg.messageId, feishuCardJson: card });
+    return;
+  }
+  pendingFeishuDocumentDeletes.delete(callback.nonce);
+  if (callback.action === 'cancel') {
+    await deliver(adapter, { address: msg.address, text: '已取消删除，文档仍保留。', parseMode: 'plain', replyToMessageId: msg.callbackMessageId || msg.messageId });
+    return;
+  }
+  const result = await adapter.deleteDocument(pending.documentId);
+  if (!result.ok) {
+    await deliver(adapter, { address: msg.address, text: `删除飞书文档失败：${result.error || '平台未接受删除请求'}\n本地文档索引未修改。`, parseMode: 'plain', replyToMessageId: msg.callbackMessageId || msg.messageId });
+    return;
+  }
+  try {
+    const removed = removeFeishuDocumentMemory(getBridgeContext().store, pending.entryId);
+    if (!removed) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: `飞书文档已移入回收站，但本地索引没有找到对应记录：${pending.title}。请重新发送 /docs 检查。`,
+        parseMode: 'plain',
+        replyToMessageId: msg.callbackMessageId || msg.messageId,
+      });
+      return;
+    }
+  } catch {
+    await deliver(adapter, {
+      address: msg.address,
+      text: `飞书文档已移入回收站，但本地索引同步失败：${pending.title}。请保留本机数据后再检查。`,
+      parseMode: 'plain',
+      replyToMessageId: msg.callbackMessageId || msg.messageId,
+    });
+    return;
+  }
+  if (msg.callbackMessageId) {
+    await adapter.updateInteractiveCard(
+      msg.callbackMessageId,
+      buildFeishuDocumentListCard(getBridgeContext().store, msg),
+    );
+  }
+  await deliver(adapter, { address: msg.address, text: `已删除飞书文档：${pending.title}\n文档已进入飞书回收站，本地索引已同步。`, parseMode: 'plain', replyToMessageId: msg.callbackMessageId || msg.messageId });
+}
+
 function auditSpeechPreferenceFallback(msg: InboundMessage, sessionId: string, reason: 'unsupported' | 'store_error'): void {
   const state = getState();
   const key = `${sessionId}:${reason}`;
@@ -7013,6 +7245,12 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
+    const documentDeleteCallback = parseFeishuDocumentDeleteCallback(msg.callbackData);
+    if (documentDeleteCallback) {
+      await handleFeishuDocumentDeleteCallback(adapter, msg, documentDeleteCallback);
+      ack();
+      return;
+    }
     if (msg.callbackData.startsWith('reminder:complete:')) {
       await handleReminderCompleteCallback(adapter, msg);
       ack();
@@ -10062,6 +10300,8 @@ interface ParsedJevQuestion {
   state: string;
   question: string;
   criteria: Record<string, string> | string[];
+  intentKind: JevIntentKind;
+  intentConfidence: number;
 }
 
 function inferJevQuestion(text: string, requestedType?: string): ParsedJevQuestion | null {
@@ -10084,6 +10324,8 @@ function inferJevQuestion(text: string, requestedType?: string): ParsedJevQuesti
     state: questionText,
     question: decisionQuestion.instructions,
     criteria: decisionQuestion.criteria,
+    intentKind: analysis.kind,
+    intentConfidence: analysis.confidence,
   };
 }
 
@@ -10152,8 +10394,9 @@ async function handleJevEvaluation(
       });
       return;
     }
-    const planned = await planner.plan({ state: parsed.state }).catch(() => ({ errorCode: 'provider_error' as const }));
-    const normalized = normalizeJevDecisionQuestion(planned);
+    const planned = await planner.plan({ state: parsed.state, purpose: 'answer_options' })
+      .catch(() => ({ errorCode: 'provider_error' as const }));
+    const normalized = normalizeJevDecisionQuestion(planned, { purpose: 'answer_options' });
     if (!normalized) {
       await deliver(adapter, {
         address: msg.address,
@@ -10183,6 +10426,12 @@ async function handleJevEvaluation(
     state: parsed.state,
     questions: [question],
     result,
+    ...(source === 'pure' ? {
+      auxiliaryIntent: {
+        label: jevIntentKindLabel(parsed.intentKind),
+        confidence: parsed.intentConfidence,
+      },
+    } : {}),
   });
   await deliver(adapter, {
     address: msg.address,
@@ -10195,6 +10444,12 @@ async function handleJevEvaluation(
         state: parsed.state,
         questions: [question],
         result,
+        ...(source === 'pure' ? {
+          auxiliaryIntent: {
+            label: jevIntentKindLabel(parsed.intentKind),
+            confidence: parsed.intentConfidence,
+          },
+        } : {}),
       }),
     } : {}),
   });
@@ -10326,7 +10581,7 @@ function buildBridgeCommandHelpLines(): string[] {
     '1/2/3 - 飞书中有且仅有一个待处理权限时的快捷回复',
     '/whoami - 查看当前发送者和聊天身份信息',
     '/feishu - 查看飞书能力和权限诊断（仅 Owner）',
-    '/docs - 查看已生成的飞书文档',
+    '/docs - 查看已生成的飞书文档；Owner 可在卡片中打开或删除',
   ];
 }
 
@@ -10377,6 +10632,7 @@ async function handleCommand(
   }
 
   let response = '';
+  let feishuCardJson: string | undefined;
 
   switch (command) {
     case '/start':
@@ -10600,6 +10856,7 @@ async function handleCommand(
 
     case '/docs': {
       response = escapeHtml(renderFeishuDocumentMemoryList(store));
+      if (adapter.channelType === 'feishu') feishuCardJson = buildFeishuDocumentListCard(store, msg);
       break;
     }
 
@@ -10681,6 +10938,7 @@ async function handleCommand(
       text: response,
       parseMode: 'HTML',
       replyToMessageId: msg.messageId,
+      feishuCardJson,
     });
   }
 }

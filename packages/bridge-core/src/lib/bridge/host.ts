@@ -641,6 +641,8 @@ export interface DecisionQuestionPlannerHost {
   plan(input: {
     state: string;
     signal?: AbortSignal;
+    /** Pure mode asks for answer/solution candidates; the default keeps the intent-question behavior. */
+    purpose?: 'intent' | 'answer_options';
   }): Promise<DecisionQuestion | DecisionQuestionPlanningFailure | null>;
 }
 
