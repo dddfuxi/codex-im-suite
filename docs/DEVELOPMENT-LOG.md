@@ -1,5 +1,12 @@
 # codex-im-suite 开发记录
 
+# 2026-09-24 Jev 纯模式同步 live 与飞书通知
+
+- 已按用户明确要求运行 `scripts/sync-live-skill.ps1`，先重新构建 Contracts、Core、Runtime 和控制面板，再同步 suite 到 `C:\Users\admin\.codex\skills\claude-to-im` / `claude-to-im-core`。`packages/bridge-runtime/dist/daemon.mjs`、Core bundle、`bridge-manager.ts` 和 Runtime `main.ts` 的 suite/live SHA-256 均一致。
+- 已通过 live `daemon.ps1 restart` 受控重启。现场状态：Bridge PID=`6936`，runId=`92ba7a8b-b156-4356-b13a-cf892d5f1970`，`status.json.running=true`，`lastExitReason=null`，Runtime audit `lastUnhandledError=null`，Feishu WS=`connected`，P2P poll=`polling`。
+- 重启包装器曾返回 `Supervisor command start failed`，但随后 live supervisor/Bridge 已真实存活并写入新的 status/audit；复核后的运行态以 PID、status、audit、bridge.log 和 WS 状态为准，不能用包装器退出码单独判定失败。
+- 已通过 `lark-cli im +messages-send --as bot --user-id ou_36a8e0643570496a4da881e731b63a1b` 发送接入完成通知，平台回执 `chat_id=oc_6b3ea532437a1bd1f32d8117184360f5`、`message_id=om_x100b647af95828a4b36c891b3f0799a`（2026-09-24 17:20:57）。
+
 # 2026-09-24 Jev 纯模式答案/解决方案候选概率化（开发版）
 
 - 纯 Jev 模式的主展示改为“先生成候选、再评估概率”：受限 Runtime classifier planner 根据当前消息生成 3–5 个完整的答案或解决方案候选，Core 只接受 `choice` 题型并重新校验候选数量、长度和敏感字段，之后将候选交给 Jev Decisions API 输出概率分布。
