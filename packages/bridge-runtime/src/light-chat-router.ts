@@ -30,11 +30,20 @@ export interface LightChatRouteDistribution {
 
 export interface LightChatRouteDecision {
   provider: string;
+  model?: string;
   intent: LightChatRouteIntent;
   probabilities: LightChatRouteDistribution;
   confidence: number;
   accepted: boolean;
   reason: string;
+  /** Provider-reported usage is optional and never contains prompt content. */
+  usage?: LightChatRouteUsage;
+}
+
+export interface LightChatRouteUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  reportedCostUsd?: number;
 }
 
 export interface LightChatRouteProvider {
@@ -204,4 +213,3 @@ export async function evaluateLightChatRoute(input: {
 function clampProbability(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 }
-

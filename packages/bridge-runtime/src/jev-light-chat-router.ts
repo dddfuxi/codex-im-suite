@@ -96,13 +96,22 @@ export class JevLightChatRouteProvider implements LightChatRouteProvider {
     const confidence = clamp(answer.confidence) ?? ranked.top;
     const accepted = ranked.top >= LIGHT_CHAT_ROUTE_MIN_PROBABILITY
       && ranked.top - ranked.second >= LIGHT_CHAT_ROUTE_MIN_MARGIN;
+    const usage = result?.usage
+      ? {
+          ...(typeof result.usage.inputTokens === 'number' ? { inputTokens: result.usage.inputTokens } : {}),
+          ...(typeof result.usage.outputTokens === 'number' ? { outputTokens: result.usage.outputTokens } : {}),
+          ...(typeof result.usage.cost === 'number' ? { reportedCostUsd: result.usage.cost } : {}),
+        }
+      : undefined;
     return {
       provider: 'jev',
+      ...(result?.model ? { model: result.model } : {}),
       intent: ranked.intent,
       probabilities,
       confidence,
       accepted,
       reason: accepted ? 'jev_choice_route' : 'jev_low_confidence_route',
+      ...(usage && Object.keys(usage).length > 0 ? { usage } : {}),
     };
   }
 }
@@ -112,4 +121,3 @@ export function createJevLightChatRouteProvider(decisions: DecisionProviderHost)
 }
 
 export { ROUTE_QUESTION_ID as JEV_LIGHT_CHAT_ROUTE_QUESTION_ID };
-

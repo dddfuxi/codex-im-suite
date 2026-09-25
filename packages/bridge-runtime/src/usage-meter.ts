@@ -58,6 +58,17 @@ function boundedText(value: unknown, fallback: string | null): string | null {
   return text ? text.slice(0, MAX_TEXT) : fallback;
 }
 
+function safeDiagnostic(value: unknown): string | null {
+  const text = boundedText(value, null);
+  if (!text) return null;
+  return text
+    .replace(/Bearer\s+\S+/giu, 'Bearer [redacted]')
+    .replace(/sk-[A-Za-z0-9_-]+/gu, '[redacted]')
+    .replace(/[A-Za-z]:\\[^\s]+/gu, '[path]')
+    .replace(/(?:\/|\\)Users(?:\/|\\)[^\s]+/giu, '[path]')
+    .slice(0, MAX_TEXT);
+}
+
 function normalizeStatus(value: unknown): UsageStatus {
   return value === 'failed' || value === 'cancelled' || value === 'timeout' || value === 'fallback'
     ? value
@@ -199,8 +210,8 @@ export class UsageMeter {
       outputRateUsdPer1M: price?.outputRateUsdPer1M ?? null,
       cacheReadInputRateUsdPer1M: price?.cacheReadInputRateUsdPer1M ?? null,
       cacheCreationInputRateUsdPer1M: price?.cacheCreationInputRateUsdPer1M ?? null,
-      routeDecision: boundedText(input.routeDecision, null),
-      fallbackReason: boundedText(input.fallbackReason, null),
+      routeDecision: safeDiagnostic(input.routeDecision),
+      fallbackReason: safeDiagnostic(input.fallbackReason),
     };
     this.records = [...this.records, record].slice(-this.maxRecords);
     try {
