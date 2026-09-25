@@ -102,7 +102,7 @@
     },
     "ControlPanelStateContract": {
       "type": "object",
-      "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "speech", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities"],
+      "required": ["schema", "generatedAt", "suite", "services", "nodes", "extensions", "skillGovernance", "promptSnapshots", "scheduledTasks", "mcp", "release", "liveSync", "settings", "history", "speech", "workflow", "projectRegistry", "memory", "memorySkillAssets", "memoryReminders", "executors", "permissions", "paths", "activities", "usage"],
       "properties": {
         "schema": { "const": "codex-im-suite/control-panel-state/v1" },
         "generatedAt": { "type": "string" },
@@ -142,6 +142,7 @@
         "permissions": {},
         "paths": {},
         "activities": { "type": "array" },
+        "usage": { "type": "object" },
         "diagnostics": {}
       },
       "additionalProperties": false

@@ -430,6 +430,12 @@ internal sealed partial class MainForm : Form
             return Results.Json(await BuildWebStateAsync(), WebJsonOptions);
         });
 
+        app.MapGet("/api/usage", (HttpContext context) =>
+        {
+            if (!AuthorizeControlApi(context, "usage.snapshot", out var failure)) return failure;
+            return Results.Json(BuildUsageSnapshot(), WebJsonOptions);
+        });
+
         app.MapPost("/api/commands", async (HttpContext context) =>
         {
             ControlCommandRequest? request;
@@ -814,6 +820,8 @@ internal sealed partial class MainForm : Form
             case "state.refresh":
                 await RefreshAllAsync();
                 return await BuildWebStateAsync();
+            case "usage.snapshot":
+                return BuildUsageSnapshot();
             case "nodes.list":
                 {
                     var suite = ReadSuiteVersionInfo();
@@ -1323,12 +1331,84 @@ internal sealed partial class MainForm : Form
                 logs = Path.Combine(_ctiHome, "logs"),
             },
             Activities: _activities.TakeLast(220).ToArray(),
+            Usage: BuildUsageSnapshot(),
             Diagnostics: new
             {
                 webNavigationCount = Volatile.Read(ref _webNavigationCount),
                 webStatePushCount = Volatile.Read(ref _webStatePushCount),
                 sessionDetailRequestCount = Volatile.Read(ref _webSessionDetailRequestCount),
             });
+    }
+
+    /// <summary>读取 Runtime 的 provider-neutral 用量账本并生成面板脱敏快照。</summary>
+    private object BuildUsageSnapshot()
+    {
+        var path = Path.Combine(_ctiHome, "runtime", "model-usage.json");
+        var root = ReadJsonObjectFile(path);
+        var records = root?["records"] as JsonArray ?? [];
+        var allRecords = records.OfType<JsonObject>().ToArray();
+        var safeRecords = allRecords.TakeLast(200).ToArray();
+        static double Number(JsonObject item, string name) =>
+            item[name] is JsonValue value && value.TryGetValue<double>(out var parsed) && double.IsFinite(parsed) && parsed >= 0
+                ? parsed
+                : 0;
+        static string Text(JsonObject item, string name) =>
+            item[name] is JsonValue value && value.TryGetValue<string>(out var parsed) ? parsed : "";
+
+        var calls = allRecords.Length;
+        var succeeded = allRecords.Count(item => string.Equals(Text(item, "status"), "succeeded", StringComparison.OrdinalIgnoreCase));
+        var input = allRecords.Sum(item => Number(item, "inputTokens"));
+        var output = allRecords.Sum(item => Number(item, "outputTokens"));
+        var total = allRecords.Sum(item => Number(item, "totalTokens"));
+        var reportedCost = allRecords.Sum(item => Number(item, "reportedCostUsd"));
+        var calculatedCost = allRecords.Sum(item => Number(item, "calculatedCostUsd"));
+        var known = allRecords.Count(item => !string.Equals(Text(item, "costSource"), "unknown", StringComparison.OrdinalIgnoreCase));
+        var latencies = allRecords.Select(item => Number(item, "latencyMs")).Where(value => value > 0).OrderBy(value => value).ToArray();
+        static double? Percentile(double[] values, double fraction)
+        {
+            if (values.Length == 0) return null;
+            var index = Math.Clamp((int)Math.Ceiling(values.Length * fraction) - 1, 0, values.Length - 1);
+            return values[index];
+        }
+        var providers = allRecords
+            .GroupBy(item => Text(item, "provider") is { Length: > 0 } provider ? provider : "unknown", StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => new
+                {
+                    calls = group.Count(),
+                    totalTokens = group.Sum(item => Number(item, "totalTokens")),
+                    knownCostUsd = group.Sum(item => Number(item, "reportedCostUsd") + Number(item, "calculatedCostUsd")),
+                },
+                StringComparer.OrdinalIgnoreCase);
+        return new
+        {
+            protocol = "cti-model-usage/v1",
+            generatedAt = DateTime.UtcNow.ToString("o"),
+            records = safeRecords,
+            summary = new
+            {
+                protocol = "cti-model-usage/v1",
+                generatedAt = DateTime.UtcNow.ToString("o"),
+                from = allRecords.Length == 0 ? null : Text(allRecords[0], "timestamp"),
+                to = allRecords.Length == 0 ? null : Text(allRecords[^1], "timestamp"),
+                calls,
+                succeededCalls = succeeded,
+                failedCalls = calls - succeeded,
+                totalInputTokens = input,
+                totalOutputTokens = output,
+                totalCacheReadInputTokens = allRecords.Sum(item => Number(item, "cacheReadInputTokens")),
+                totalCacheCreationInputTokens = allRecords.Sum(item => Number(item, "cacheCreationInputTokens")),
+                totalTokens = total,
+                reportedCostUsd = reportedCost,
+                calculatedCostUsd = calculatedCost,
+                knownCostCalls = known,
+                unknownCostCalls = calls - known,
+                p50LatencyMs = Percentile(latencies, 0.5),
+                p95LatencyMs = Percentile(latencies, 0.95),
+                byProvider = providers,
+            },
+        };
     }
 
     private WebLiveSyncStatus BuildLiveSyncStatus(string suiteCommit)
@@ -1838,7 +1918,10 @@ internal sealed partial class MainForm : Form
             ReadPayloadString(payload, "decisionBaseUrl", current.DecisionBaseUrl),
             ReadPayloadString(payload, "decisionModel", current.DecisionModel),
             NormalizeDecisionTimeout(ReadPayloadString(payload, "decisionTimeoutMs", current.DecisionTimeoutMs)),
-            current.DecisionApiKeySet);
+            current.DecisionApiKeySet,
+            NormalizeLightChatRouterProvider(ReadPayloadString(payload, "lightChatRouterProvider", current.LightChatRouterProvider)),
+            NormalizeLightChatRouterMode(ReadPayloadString(payload, "lightChatRouterMode", current.LightChatRouterMode)),
+            NormalizeLightChatRouterTimeout(ReadPayloadString(payload, "lightChatRouterTimeoutMs", current.LightChatRouterTimeoutMs)));
     }
 
     private async Task<WebSessionDetail> GetSessionDetailAsync(JsonElement payload)
@@ -7020,7 +7103,10 @@ exit $LASTEXITCODE
         GetConfig("CTI_DECISION_BASE_URL", "https://openrouter.ai/api/alpha/decisions"),
         GetConfig("CTI_DECISION_MODEL", "typesafe/jev-1.13"),
         NormalizeDecisionTimeout(GetConfig("CTI_DECISION_TIMEOUT_MS", "8000")),
-        !string.IsNullOrWhiteSpace(GetConfig("CTI_JEV_API_KEY", ""))
+        !string.IsNullOrWhiteSpace(GetConfig("CTI_JEV_API_KEY", "")),
+        NormalizeLightChatRouterProvider(GetConfig("CTI_LIGHT_CHAT_ROUTER_PROVIDER", "coordinator")),
+        NormalizeLightChatRouterMode(GetConfig("CTI_LIGHT_CHAT_ROUTER_MODE", "off")),
+        NormalizeLightChatRouterTimeout(GetConfig("CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS", "1500"))
     );
 
     private void ShowSettingsDialog()
@@ -7076,6 +7162,9 @@ exit $LASTEXITCODE
         SetOrAppendEnv(lines, "CTI_DECISION_BASE_URL", settings.DecisionBaseUrl.Trim());
         SetOrAppendEnv(lines, "CTI_DECISION_MODEL", settings.DecisionModel.Trim());
         SetOrAppendEnv(lines, "CTI_DECISION_TIMEOUT_MS", NormalizeDecisionTimeout(settings.DecisionTimeoutMs));
+        SetOrAppendEnv(lines, "CTI_LIGHT_CHAT_ROUTER_PROVIDER", NormalizeLightChatRouterProvider(settings.LightChatRouterProvider));
+        SetOrAppendEnv(lines, "CTI_LIGHT_CHAT_ROUTER_MODE", NormalizeLightChatRouterMode(settings.LightChatRouterMode));
+        SetOrAppendEnv(lines, "CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS", NormalizeLightChatRouterTimeout(settings.LightChatRouterTimeoutMs));
         ApplySecretEnv(lines, "CTI_CODEX_API_KEY", settings.CodexApiKeyAction, settings.CodexApiKeyValue);
         File.WriteAllLines(_configPath, lines, new UTF8Encoding(false));
         AppendLog("配置已保存。Codex CLI 模型来源、路径和回复风格将在重启飞书桥接后生效。");
@@ -7452,6 +7541,23 @@ exit $LASTEXITCODE
         => int.TryParse((value ?? "").Trim(), out var parsed) && parsed is >= 500 and <= 60000
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : "8000";
+
+    private static string NormalizeLightChatRouterProvider(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "coordinator" or "jev" ? value : "coordinator";
+    }
+
+    private static string NormalizeLightChatRouterMode(string value)
+    {
+        value = (value ?? "").Trim().ToLowerInvariant();
+        return value is "off" or "shadow" or "assist" ? value : "off";
+    }
+
+    private static string NormalizeLightChatRouterTimeout(string value)
+        => int.TryParse((value ?? "").Trim(), out var parsed) && parsed is >= 250 and <= 30000
+            ? parsed.ToString(CultureInfo.InvariantCulture)
+            : "1500";
 
     private static string NormalizeExecutorId(string value)
     {
@@ -12527,7 +12633,10 @@ internal sealed record SettingsSnapshot(
     string DecisionBaseUrl = "https://openrouter.ai/api/alpha/decisions",
     string DecisionModel = "typesafe/jev-1.13",
     string DecisionTimeoutMs = "8000",
-    bool DecisionApiKeySet = false);
+    bool DecisionApiKeySet = false,
+    string LightChatRouterProvider = "coordinator",
+    string LightChatRouterMode = "off",
+    string LightChatRouterTimeoutMs = "1500");
 
 internal sealed record HistorySearchQuery(
     string Chat,
@@ -12560,6 +12669,9 @@ internal sealed class SettingsForm : Form
     private string _decisionModel = "typesafe/jev-1.13";
     private string _decisionTimeoutMs = "8000";
     private bool _decisionApiKeySet;
+    private string _lightChatRouterProvider = "coordinator";
+    private string _lightChatRouterMode = "off";
+    private string _lightChatRouterTimeoutMs = "1500";
 
     public SettingsForm(
         SettingsSnapshot settings,
@@ -12739,6 +12851,9 @@ internal sealed class SettingsForm : Form
         _decisionModel = settings.DecisionModel;
         _decisionTimeoutMs = settings.DecisionTimeoutMs;
         _decisionApiKeySet = settings.DecisionApiKeySet;
+        _lightChatRouterProvider = settings.LightChatRouterProvider;
+        _lightChatRouterMode = settings.LightChatRouterMode;
+        _lightChatRouterTimeoutMs = settings.LightChatRouterTimeoutMs;
         _replyStylePreset.SelectedItem = ResolveReplyStylePreset(settings.ReplyStyleHint);
     }
 
@@ -12758,6 +12873,9 @@ internal sealed class SettingsForm : Form
         DecisionModel = _decisionModel,
         DecisionTimeoutMs = _decisionTimeoutMs,
         DecisionApiKeySet = _decisionApiKeySet,
+        LightChatRouterProvider = _lightChatRouterProvider,
+        LightChatRouterMode = _lightChatRouterMode,
+        LightChatRouterTimeoutMs = _lightChatRouterTimeoutMs,
     };
 
     private string ResolveReplyStylePreset(string value)

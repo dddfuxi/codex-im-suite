@@ -67,7 +67,7 @@ describe('control panel shared contracts', () => {
       'schema', 'generatedAt', 'suite', 'services', 'nodes', 'extensions', 'skillGovernance',
       'promptSnapshots', 'scheduledTasks', 'mcp', 'release', 'liveSync', 'settings', 'history',
       'speech', 'workflow', 'projectRegistry', 'memory', 'memorySkillAssets', 'memoryReminders', 'executors',
-      'permissions', 'paths', 'activities',
+      'permissions', 'paths', 'activities', 'usage',
     ]);
     assert.deepEqual(controlApi.$defs?.ProjectRegistrySnapshotContract?.required, [
       'schema', 'generatedAt', 'registryPath', 'exists', 'projects', 'error',

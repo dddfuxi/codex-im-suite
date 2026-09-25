@@ -1,5 +1,6 @@
 import type { SpeechPanelStateContract } from './speech-contract.js';
 import type { PanelSettingsStateContract } from './panel-settings.js';
+import type { ModelUsageRecordContract, ModelUsageSummaryContract } from './usage.js';
 
 export type ControlApiRole = 'viewer' | 'operator' | 'owner';
 
@@ -90,6 +91,12 @@ export interface ControlPanelStateSections {
   permissions: unknown;
   paths: unknown;
   activities: unknown[];
+  usage: {
+    protocol: string;
+    generatedAt: string;
+    records: ModelUsageRecordContract[];
+    summary: ModelUsageSummaryContract;
+  };
   diagnostics?: unknown;
 }
 
@@ -121,6 +128,7 @@ export interface ControlPanelStateContract<
   permissions: TSections['permissions'];
   paths: TSections['paths'];
   activities: TSections['activities'];
+  usage: TSections['usage'];
   diagnostics?: TSections['diagnostics'];
 }
 

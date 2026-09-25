@@ -13,6 +13,7 @@ import type { AgentCollaborationPanelState } from '@codex-im-suite/contracts/age
 import type { ProjectRegistrySnapshotContract } from '@codex-im-suite/contracts/project-registry';
 import type { SpeechPanelStateContract } from '@codex-im-suite/contracts/speech';
 import type { CodexModelCatalogContract } from '@codex-im-suite/contracts/panel-settings';
+import type { ModelUsageRecordContract, ModelUsageSummaryContract } from '@codex-im-suite/contracts/usage';
 import type {
   WorkflowPanelRunContract as WorkflowRun,
   WorkflowPanelStateContract as WorkflowStatus,
@@ -936,6 +937,12 @@ type PanelState = ControlPanelStateContract<{
     logs: string;
   };
   activities: ActivityRecord[];
+  usage: {
+    protocol: string;
+    generatedAt: string;
+    records: ModelUsageRecordContract[];
+    summary: ModelUsageSummaryContract;
+  };
   diagnostics?: {
     webNavigationCount?: number;
     webStatePushCount?: number;
@@ -1053,6 +1060,9 @@ const fallbackState: PanelState = {
     decisionModel: 'typesafe/jev-1.13',
     decisionTimeoutMs: '8000',
     decisionApiKeySet: false,
+    lightChatRouterProvider: 'coordinator',
+    lightChatRouterMode: 'off',
+    lightChatRouterTimeoutMs: '1500',
   },
   history: { status: '', sessions: [] },
   speech: { available: false, unavailableCode: 'speech_runtime_unavailable', status: null },
@@ -1122,6 +1132,32 @@ const fallbackState: PanelState = {
   permissions: { protocol: 'cti-permissions/v1', updatedAt: '', subjects: [], candidates: [] },
   paths: { config: '', manifestDir: '', memoryRepo: '', logs: '' },
   activities: [],
+  usage: {
+    protocol: 'cti-model-usage/v1',
+    generatedAt: '',
+    records: [],
+    summary: {
+      protocol: 'cti-model-usage/v1',
+      generatedAt: '',
+      from: null,
+      to: null,
+      calls: 0,
+      succeededCalls: 0,
+      failedCalls: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheReadInputTokens: 0,
+      totalCacheCreationInputTokens: 0,
+      totalTokens: 0,
+      reportedCostUsd: 0,
+      calculatedCostUsd: 0,
+      knownCostCalls: 0,
+      unknownCostCalls: 0,
+      p50LatencyMs: null,
+      p95LatencyMs: null,
+      byProvider: {},
+    },
+  },
 };
 
 const themeStorageKey = 'codex-im-suite-control-panel-theme';
@@ -2987,6 +3023,7 @@ function OverviewPage({
         <Metric label="待提交" value={`${state.suite.gitDirty}`} />
         <Metric label="最近刷新" value={state.generatedAt || '-'} compact />
       </section>
+      <UsageOverview usage={state.usage} />
       <section className="panel panel-span-2">
         <SectionHeader title="关键运行单元" />
         <div className="runtime-grid compact">
@@ -3008,6 +3045,61 @@ function OverviewPage({
         <SectionHeader title="最近活动" action={<MiniButton label="日志" icon={<Logs size={14} />} onClick={openLogs} />} />
         <ActivityList activities={activities.slice(-8)} compact />
       </section>
+    </section>
+  );
+}
+
+function UsageOverview({ usage }: { usage: PanelState['usage'] }) {
+  const summary = usage?.summary;
+  if (!summary || summary.calls === 0) {
+    return (
+      <section className="panel panel-span-2">
+        <SectionHeader title="模型用量与费用" />
+        <p className="panel-intro">暂无用量记录。启用 Jev、Coordinator 或 Primary 后，这里会显示 Token、费用和延迟。</p>
+      </section>
+    );
+  }
+  const cost = (usage.records ?? []).reduce((total, record) => total + (record.reportedCostUsd ?? record.calculatedCostUsd ?? 0), 0);
+  const providerRows = Object.entries(summary.byProvider ?? {}).slice(0, 6);
+  return (
+    <section className="panel panel-span-2">
+      <SectionHeader title="模型用量与费用" />
+      <div className="summary-grid wide">
+        <SummaryFact label="调用次数" value={String(summary.calls)} />
+        <SummaryFact label="Token" value={summary.totalTokens.toLocaleString()} />
+        <SummaryFact label="输入 / 输出" value={`${summary.totalInputTokens.toLocaleString()} / ${summary.totalOutputTokens.toLocaleString()}`} />
+        <SummaryFact label="费用（USD）" value={summary.unknownCostCalls > 0 ? `${cost.toFixed(6)} + 未知` : cost.toFixed(6)} />
+        <SummaryFact label="p50 延迟" value={summary.p50LatencyMs == null ? '未知' : `${Math.round(summary.p50LatencyMs)} ms`} />
+        <SummaryFact label="p95 延迟" value={summary.p95LatencyMs == null ? '未知' : `${Math.round(summary.p95LatencyMs)} ms`} />
+      </div>
+      {providerRows.length > 0 && (
+        <div className="tag-row" style={{ marginTop: 12 }}>
+          {providerRows.map(([provider, row]) => (
+            <span className="status-pill idle" key={provider}>{provider} · {row.calls} 次 · {row.totalTokens.toLocaleString()} Token</span>
+          ))}
+        </div>
+      )}
+      <details className="advanced-settings" style={{ marginTop: 12 }}>
+        <summary>最近调用明细（最多 8 条）</summary>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead><tr><th>时间</th><th>Provider / 模型</th><th>Token</th><th>费用</th><th>状态 / 路由</th></tr></thead>
+            <tbody>
+              {(usage.records ?? []).slice(-8).reverse().map((record) => {
+                const recordCost = record.reportedCostUsd ?? record.calculatedCostUsd;
+                return <tr key={record.callId}>
+                  <td>{record.timestamp ? new Date(record.timestamp).toLocaleString() : '-'}</td>
+                  <td>{record.provider} / {record.model}</td>
+                  <td>{record.totalTokens == null ? '未知' : record.totalTokens.toLocaleString()}</td>
+                  <td>{recordCost == null ? '未知' : `$${recordCost.toFixed(6)}`}</td>
+                  <td>{record.status}{record.routeDecision ? ` · ${record.routeDecision}` : ''}{record.fallbackReason ? ` · 回退：${record.fallbackReason}` : ''}</td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+        </div>
+      </details>
+      <p className="micro-copy" style={{ marginTop: 10 }}>明细已脱敏保存于 Runtime 用量账本；费用按 Provider 回报优先、价格表兜底计算。</p>
     </section>
   );
 }
@@ -6845,6 +6937,31 @@ function SettingsPage({
             <p className="field-hint">
               Jev 只用于结构化判断并返回 noul、choice 或 score 概率分布，不进入普通聊天模型链路。配置修改后需要保存并重启 Bridge 才会生效。
             </p>
+          </div>
+          <div className="decision-settings-panel">
+            <div className="settings-subhead">轻聊分流（通用 Provider）</div>
+            <div className="path-grid">
+              <label className="stack-field">
+                <span>分流 Provider</span>
+                <select value={settings.lightChatRouterProvider || 'coordinator'} onChange={(event) => update('lightChatRouterProvider', event.target.value as SettingsState['lightChatRouterProvider'])}>
+                  <option value="coordinator">Coordinator（现有）</option>
+                  <option value="jev">Jev（快速 choice 判断）</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>分流模式</span>
+                <select value={settings.lightChatRouterMode || 'off'} onChange={(event) => update('lightChatRouterMode', event.target.value as SettingsState['lightChatRouterMode'])}>
+                  <option value="off">关闭</option>
+                  <option value="shadow">Shadow（只记录，不改变路由）</option>
+                  <option value="assist">Assist（高置信结果参与路由）</option>
+                </select>
+              </label>
+              <label className="stack-field">
+                <span>分流超时（毫秒）</span>
+                <input value={settings.lightChatRouterTimeoutMs || '1500'} onChange={(event) => update('lightChatRouterTimeoutMs', event.target.value)} inputMode="numeric" />
+              </label>
+            </div>
+            <p className="field-hint">只对已通过确定性轻聊门禁的短消息生效。命令、附件、工具、文档、仓库和高风险请求仍直接进入 Primary；Jev 失败会回退 Coordinator。</p>
           </div>
           <details className="advanced-settings">
             <summary>高级设置</summary>
