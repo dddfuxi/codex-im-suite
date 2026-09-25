@@ -37,6 +37,10 @@
     "./workflow": {
       "types": "./src/workflow.ts",
       "import": "./dist/workflow.js"
+    },
+    "./usage": {
+      "types": "./src/usage.ts",
+      "import": "./dist/usage.js"
     }
   },
   "files": [

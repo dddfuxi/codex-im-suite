@@ -8,3 +8,4 @@ export * from './project-registry.js';
 export * from './panel-settings.js';
 export * from './speech-contract.js';
 export * from './workflow.js';
+export * from './usage.js';

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-im-suite.local/schemas/usage.schema.json",
+  "title": "Codex IM Suite Model Usage Contracts",
+  "$defs": {
+    "ModelUsageRecordContract": {
+      "type": "object",
+      "required": ["protocol", "callId", "turnId", "timestamp", "operation", "provider", "model", "status", "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "totalTokens", "latencyMs", "reportedCostUsd", "calculatedCostUsd", "costSource", "inputRateUsdPer1M", "outputRateUsdPer1M", "cacheReadInputRateUsdPer1M", "cacheCreationInputRateUsdPer1M", "routeDecision", "fallbackReason"],
+      "properties": {
+        "protocol": { "const": "cti-model-usage/v1" },
+        "callId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": ["string", "null"] },
+        "timestamp": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["succeeded", "failed", "cancelled", "timeout", "fallback"] },
+        "inputTokens": { "type": ["number", "null"], "minimum": 0 },
+        "outputTokens": { "type": ["number", "null"], "minimum": 0 },
+        "cacheReadInputTokens": { "type": ["number", "null"], "minimum": 0 },
+        "cacheCreationInputTokens": { "type": ["number", "null"], "minimum": 0 },
+        "totalTokens": { "type": ["number", "null"], "minimum": 0 },
+        "latencyMs": { "type": ["number", "null"], "minimum": 0 },
+        "reportedCostUsd": { "type": ["number", "null"], "minimum": 0 },
+        "calculatedCostUsd": { "type": ["number", "null"], "minimum": 0 },
+        "costSource": { "enum": ["provider_reported", "price_table", "unknown"] },
+        "inputRateUsdPer1M": { "type": ["number", "null"], "minimum": 0 },
+        "outputRateUsdPer1M": { "type": ["number", "null"], "minimum": 0 },
+        "cacheReadInputRateUsdPer1M": { "type": ["number", "null"], "minimum": 0 },
+        "cacheCreationInputRateUsdPer1M": { "type": ["number", "null"], "minimum": 0 },
+        "routeDecision": { "type": ["string", "null"] },
+        "fallbackReason": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ModelUsagePriceContract": {
+      "type": "object",
+      "required": ["provider", "model", "inputRateUsdPer1M", "outputRateUsdPer1M"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "inputRateUsdPer1M": { "type": "number", "minimum": 0 },
+        "outputRateUsdPer1M": { "type": "number", "minimum": 0 },
+        "cacheReadInputRateUsdPer1M": { "type": "number", "minimum": 0 },
+        "cacheCreationInputRateUsdPer1M": { "type": "number", "minimum": 0 },
+        "effectiveFrom": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ModelUsageLedgerContract": {
+      "type": "object",
+      "required": ["protocol", "version", "updatedAt", "records"],
+      "properties": {
+        "protocol": { "const": "cti-model-usage/v1" },
+        "version": { "const": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/ModelUsageRecordContract" } }
+      },
+      "additionalProperties": false
+    },
+    "ModelUsageSummaryContract": {
+      "type": "object",
+      "required": ["protocol", "generatedAt", "from", "to", "calls", "succeededCalls", "failedCalls", "totalInputTokens", "totalOutputTokens", "totalCacheReadInputTokens", "totalCacheCreationInputTokens", "totalTokens", "reportedCostUsd", "calculatedCostUsd", "knownCostCalls", "unknownCostCalls", "p50LatencyMs", "p95LatencyMs", "byProvider"],
+      "properties": {
+        "protocol": { "const": "cti-model-usage/v1" },
+        "generatedAt": { "type": "string", "minLength": 1 },
+        "from": { "type": ["string", "null"] },
+        "to": { "type": ["string", "null"] },
+        "calls": { "type": "integer", "minimum": 0 },
+        "succeededCalls": { "type": "integer", "minimum": 0 },
+        "failedCalls": { "type": "integer", "minimum": 0 },
+        "totalInputTokens": { "type": "number", "minimum": 0 },
+        "totalOutputTokens": { "type": "number", "minimum": 0 },
+        "totalCacheReadInputTokens": { "type": "number", "minimum": 0 },
+        "totalCacheCreationInputTokens": { "type": "number", "minimum": 0 },
+        "totalTokens": { "type": "number", "minimum": 0 },
+        "reportedCostUsd": { "type": "number", "minimum": 0 },
+        "calculatedCostUsd": { "type": "number", "minimum": 0 },
+        "knownCostCalls": { "type": "integer", "minimum": 0 },
+        "unknownCostCalls": { "type": "integer", "minimum": 0 },
+        "p50LatencyMs": { "type": ["number", "null"], "minimum": 0 },
+        "p95LatencyMs": { "type": ["number", "null"], "minimum": 0 },
+        "byProvider": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["calls", "totalTokens", "knownCostUsd"],
+            "properties": {
+              "calls": { "type": "integer", "minimum": 0 },
+              "totalTokens": { "type": "number", "minimum": 0 },
+              "knownCostUsd": { "type": "number", "minimum": 0 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/ModelUsageRecordContract" },
+    { "$ref": "#/$defs/ModelUsagePriceContract" },
+    { "$ref": "#/$defs/ModelUsageLedgerContract" },
+    { "$ref": "#/$defs/ModelUsageSummaryContract" }
+  ]
+}
