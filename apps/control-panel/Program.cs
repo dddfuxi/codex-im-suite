@@ -1354,6 +1354,17 @@ internal sealed partial class MainForm : Form
                 : 0;
         static string Text(JsonObject item, string name) =>
             item[name] is JsonValue value && value.TryGetValue<string>(out var parsed) ? parsed : "";
+        static double KnownCost(JsonObject item)
+        {
+            if (item["reportedCostUsd"] is JsonValue reported
+                && reported.TryGetValue<double>(out var reportedValue)
+                && double.IsFinite(reportedValue)
+                && reportedValue >= 0)
+            {
+                return reportedValue;
+            }
+            return Number(item, "calculatedCostUsd");
+        }
 
         var calls = allRecords.Length;
         var succeeded = allRecords.Count(item => string.Equals(Text(item, "status"), "succeeded", StringComparison.OrdinalIgnoreCase));
@@ -1378,7 +1389,7 @@ internal sealed partial class MainForm : Form
                 {
                     calls = group.Count(),
                     totalTokens = group.Sum(item => Number(item, "totalTokens")),
-                    knownCostUsd = group.Sum(item => Number(item, "reportedCostUsd") + Number(item, "calculatedCostUsd")),
+                    knownCostUsd = group.Sum(KnownCost),
                 },
                 StringComparer.OrdinalIgnoreCase);
         return new
@@ -7555,7 +7566,7 @@ exit $LASTEXITCODE
     }
 
     private static string NormalizeLightChatRouterTimeout(string value)
-        => int.TryParse((value ?? "").Trim(), out var parsed) && parsed is >= 250 and <= 30000
+        => int.TryParse((value ?? "").Trim(), out var parsed) && parsed is >= 500 and <= 5000
             ? parsed.ToString(CultureInfo.InvariantCulture)
             : "1500";
 

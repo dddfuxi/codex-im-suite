@@ -1,6 +1,6 @@
 # codex-im-suite 项目架构
 
-更新时间：2026-09-23
+更新时间：2026-09-25
 
 ## 0. 架构文档维护规则
 
@@ -179,6 +179,26 @@ flowchart LR
 ```
 
 飞书 `/jev status|on|off|debug`、消息末尾 `/jev` 和按 `channel + chatId` 隔离的 `/jev pure on|off|status` 只改变入口与展示范围；消息末尾后缀只有当前聊天先用 `/jev on` 标记为 `explicit` 才会触发，`/jev off` 或未设置时仍走普通 Primary，纯模式仍受群、身份、机器人和 allowlist 门禁约束，并在 planner 失败时失败关闭。`choice` 结果是模型分类分布，不能复用 `cti-final.choices` 的真人点击选择卡；Decision Card 只显示实际题目的 `noul`、`choice` 或 `score` 及概率分布，不生成 callback。`application/decision-view.ts` 负责把候选概率限制在 0–100% 并生成十格图标条，`channels/feishu/cards/decision-card.ts` 只在 Feishu 投影启用该视觉模式；卡片将候选按概率从高到低排列，每行显示金银铜/通用排名图标、百分比和十格 `🟦/⬜` 视觉条。这是只读呈现，不改变 Decision Layer 的证据和回调边界。
+
+### 1.5 通用轻聊分流与模型用量计量
+
+轻聊分流位于现有确定性轻聊门禁之后、Coordinator/Primary 之前，是 Provider 无关的路由观察层。`packages/bridge-runtime/src/light-chat-router.ts` 定义 `LightChatRouteProvider`、`LightChatRouteDecision` 和固定的 `light_chat / task / ambiguous` 三类路由；命令、附件、工具、文档、仓库、权限、高风险和其他真实执行要求先被硬门禁拦截，不会把内容交给远程分类器。`coordinator` 保持现有 `reply / delegate / clarify` 流程，`jev` 通过专用 Decisions API 的 `choice` 题只返回三类概率，不生成用户回复或按钮。
+
+配置使用独立的 `CTI_LIGHT_CHAT_ROUTER_PROVIDER=coordinator|jev` 与 `CTI_LIGHT_CHAT_ROUTER_MODE=off|shadow|assist`，不改变 `/jev` 普通判断和纯模式设置。`shadow` 记录 Jev 结果但保留 Coordinator 的用户可见路由；`assist` 只接受最高概率至少 `0.80` 且领先第二名至少 `0.15` 的结果，高置信 `task` 跳过 Coordinator 进入 Primary，`light_chat` 与 `ambiguous` 仍交给 Coordinator。Jev 超时、取消、空结果、非法结果、低置信或概率差距不足均失败关闭到 Coordinator；Coordinator 自身失败时继续沿现有 Primary 回退链。配置默认 `coordinator + off`，部署时可在控制面板切换为 `jev + assist`，写入配置后需受控重启才生效。
+
+```mermaid
+flowchart LR
+  Message[短文本入站] --> Gate{确定性轻聊门禁}
+  Gate -->|命令/附件/工具/高风险| Primary[Primary]
+  Gate -->|候选| Router[LightChatRouteProvider]
+  Router -->|coordinator| Coordinator[现有 Coordinator]
+  Router -->|jev + shadow| Observe[记录结果，不改变路由]
+  Router -->|jev + assist，高置信 task| Primary
+  Router -->|light_chat / ambiguous 或失败| Coordinator
+  Coordinator -->|失败| Primary
+```
+
+`packages/contracts/src/usage.ts` 与 `schemas/usage.schema.json` 声明通用 `cti-model-usage/v1` 用量协议；`packages/bridge-runtime/src/usage-meter.ts` 统一记录 Jev 路由、Coordinator、Primary 以及后续 Provider 的调用。每条记录只包含 call/turn 标识、时间、操作、Provider/模型、状态、输入/输出/缓存/总 Token、延迟、回报或计算费用、费率、路由和回退原因，不保存完整 Prompt、回复、密钥或附件。Provider 回报费用优先，缺失时按带生效时间的本地价格表计算，价格未知保持 `null`/“未知”，不写成零；账本以 Runtime 原子写入和有界保留保存于 `CTI_HOME/runtime/model-usage.json`，写入失败只影响观察链。当前 Runtime/控制面板提供最近脱敏明细、Provider 汇总和 p50/p95 延迟字段，明细保留模型与日期；按模型/日期筛选及 Jev/Coordinator 一致率属于本增量的后续验收项。普通飞书回复和 Decision Card 不注入用量细节。
 
 `/help` 与 `/start` 共用 `buildBridgeCommandHelpLines()`，先给出普通聊天、一次 Jev 判断和纯模式开关的三步用法，再按场景分组列出可复制命令与示例。帮助文案只负责呈现入口，不改变命令路由、角色门禁或 Jev 的默认关闭策略。
 

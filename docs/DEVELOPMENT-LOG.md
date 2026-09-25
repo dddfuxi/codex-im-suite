@@ -1373,3 +1373,11 @@ Skills 页面内部只保留“已安装、草稿、能力目录、审批队列�
 - 每轮 Primary Provider 调用前从同一作用域回注入已验证 `company_id`；classifier / response-only 不携带该上下文。TAPD token 只从受管 `config.env` 注入 MCP 子进程，不写入状态、Prompt 或日志。
 - 新增 TAPD MCP 开发版 manifest 与启动脚本，并以 `requiredEnvironment` 门禁缺失 token 时不投影 MCP。当前 live overlay 仍需在用户轮换泄露 token 后明确同步并重启，不能把开发版测试当作现场生效。
 - 已验证：Runtime typecheck、`mcp-context-provider.test.ts` 3/3；截图中的个人访问令牌视为已泄露，未写入任何文件。
+
+# 2026-09-25 通用轻聊分流与模型用量计量（开发分支）
+
+- Jev 决策层已在 `archive/jev-decision-layer-20260925` 标签留档，并从该点创建 `codex/light-chat-router-usage-meter`；本阶段只在开发分支实现，尚未同步 live skill、重启正式 Bridge 或宣称飞书渠道验收完成。
+- 新增 Provider 无关的 `LightChatRouteProvider` 与 `LightChatRouteDecision`。确定性轻聊门禁先过滤命令、附件、工具、文档、仓库、权限和高风险请求；符合条件的短文本才可进入 `coordinator` 或 `jev` 分流。路由候选固定为 `light_chat / task / ambiguous`，Jev 只调用 Decisions API 的 `choice`，不会生成用户回复或按钮。
+- `CTI_LIGHT_CHAT_ROUTER_PROVIDER=coordinator|jev` 与 `CTI_LIGHT_CHAT_ROUTER_MODE=off|shadow|assist` 独立于 `/jev` 普通判断和纯模式。`shadow` 只记录对照结果；`assist` 采用固定 `top >= 0.80` 且 `top - second >= 0.15` 门槛，高置信 `task` 跳过 Coordinator 进入 Primary，其余继续 Coordinator。Jev 超时、取消、空结果、非法结果、低置信或概率差距不足均回退，不伪造分类结果。
+- `packages/contracts` 新增 `cti-model-usage/v1` 合约与 Schema，Runtime 新增通用 `UsageMeter`。Jev 路由、Coordinator 和 Primary 可记录同一套调用字段：Token（含缓存）、延迟、Provider/模型、状态、路由、回退原因、Provider 回报费用、本地价格表计算费用和费率。Provider 回报费用优先，价格未知保持 `null`；账本以原子写入保存在 `CTI_HOME/runtime/model-usage.json`，不保存完整 Prompt、回复、密钥或附件。
+- Jev 路由与用量计量专项测试已分别通过（`light-chat-router.test.ts`、`usage-meter.test.ts` 及 Contracts usage 测试）；根线程当前仍需完成控制面板 C#/Web 字段的最终对齐、完整定向构建和人类文档门禁后，再进行 Shadow 对照与 Jev Assist 现场验收。
