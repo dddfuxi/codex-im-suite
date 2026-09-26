@@ -112,6 +112,9 @@ const SETTINGS: readonly PanelSettingDefinition[] = [
   { key: 'decisionModel', label: 'Jev 模型', group: 'Jev 判断', type: 'string', writable: true, restartRequired: true, envKeys: ['CTI_DECISION_MODEL'], read: (c) => c.decisionModel || 'typesafe/jev-1.13', normalize: normalizedText },
   { key: 'decisionTimeoutMs', label: 'Jev 超时（毫秒）', group: 'Jev 判断', type: 'number', writable: true, restartRequired: true, minimum: 500, maximum: 60000, envKeys: ['CTI_DECISION_TIMEOUT_MS'], read: (c) => c.decisionTimeoutMs || 8000, normalize: boundedInteger(500, 60000) },
   { key: 'decisionApiKeySet', label: 'Jev API Key', group: 'Jev 判断', type: 'secret_status', writable: false, restartRequired: true, envKeys: [], read: (c) => Boolean(c.decisionApiKey) },
+  { key: 'lightChatRouterProvider', label: '轻聊分流 Provider', group: '轻聊分流', type: 'enum', writable: true, restartRequired: true, enumValues: ['coordinator', 'jev'], envKeys: ['CTI_LIGHT_CHAT_ROUTER_PROVIDER'], read: (c) => c.lightChatRouterProvider || 'coordinator', normalize: enumValue(['coordinator', 'jev']) },
+  { key: 'lightChatRouterMode', label: '轻聊分流模式', group: '轻聊分流', type: 'enum', writable: true, restartRequired: true, enumValues: ['off', 'shadow', 'assist'], envKeys: ['CTI_LIGHT_CHAT_ROUTER_MODE'], read: (c) => c.lightChatRouterMode || 'off', normalize: enumValue(['off', 'shadow', 'assist']) },
+  { key: 'lightChatRouterTimeoutMs', label: '轻聊分流超时（毫秒）', group: '轻聊分流', type: 'number', writable: true, restartRequired: true, minimum: 500, maximum: 5000, envKeys: ['CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS'], read: (c) => c.lightChatRouterTimeoutMs || 1500, normalize: boundedInteger(500, 5000) },
 ] as const;
 
 function readConfigText(configPath: string): string {

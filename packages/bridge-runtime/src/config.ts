@@ -90,6 +90,11 @@ export interface Config {
   localLlmComplexityMode?: string;
   lightChatFastPathEnabled?: boolean;
   lightChatFastPathTimeoutMs?: number;
+  /** 通用轻聊分流提供方；Jev 只是其中一种实现。 */
+  lightChatRouterProvider?: 'coordinator' | 'jev';
+  /** 轻聊分流接入层：off 关闭、shadow 只观察、assist 允许高置信结果参与路由。 */
+  lightChatRouterMode?: 'off' | 'shadow' | 'assist';
+  lightChatRouterTimeoutMs?: number;
   memoryIntentTimeoutMs?: number;
   agentCollaborationMode?: 'off' | 'shadow' | 'assist';
   agentWorkerPoolSize?: number;
@@ -416,6 +421,15 @@ export function loadConfig(configPath = CONFIG_PATH): Config {
   const lightChatFastPathTimeoutMs = env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS")
     ? Number(env.get("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS"))
     : undefined;
+  const lightChatRouterTimeoutMs = env.get("CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS")
+    ? Number(env.get("CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS"))
+    : undefined;
+  const rawLightChatRouterProvider = (env.get("CTI_LIGHT_CHAT_ROUTER_PROVIDER") || "coordinator").trim().toLowerCase();
+  const lightChatRouterProvider = (rawLightChatRouterProvider === "jev" ? "jev" : "coordinator") as NonNullable<Config["lightChatRouterProvider"]>;
+  const rawLightChatRouterMode = (env.get("CTI_LIGHT_CHAT_ROUTER_MODE") || "off").trim().toLowerCase();
+  const lightChatRouterMode = (["off", "shadow", "assist"].includes(rawLightChatRouterMode)
+    ? rawLightChatRouterMode
+    : "off") as NonNullable<Config["lightChatRouterMode"]>;
   const memoryIntentTimeoutMs = env.get("CTI_MEMORY_INTENT_TIMEOUT_MS")
     ? Number(env.get("CTI_MEMORY_INTENT_TIMEOUT_MS"))
     : undefined;
@@ -656,6 +670,11 @@ export function loadConfig(configPath = CONFIG_PATH): Config {
     lightChatFastPathTimeoutMs: typeof lightChatFastPathTimeoutMs === "number" && Number.isFinite(lightChatFastPathTimeoutMs)
       ? Math.max(250, Math.min(10_000, Math.floor(lightChatFastPathTimeoutMs)))
       : 2000,
+    lightChatRouterProvider,
+    lightChatRouterMode,
+    lightChatRouterTimeoutMs: typeof lightChatRouterTimeoutMs === "number" && Number.isFinite(lightChatRouterTimeoutMs)
+      ? Math.max(500, Math.min(5_000, Math.floor(lightChatRouterTimeoutMs)))
+      : 1500,
     memoryIntentTimeoutMs: typeof memoryIntentTimeoutMs === "number" && Number.isFinite(memoryIntentTimeoutMs)
       ? Math.max(30_000, Math.min(60_000, Math.floor(memoryIntentTimeoutMs)))
       : 30_000,
@@ -882,6 +901,10 @@ export function saveConfig(config: Config): void {
     out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_ENABLED", String(config.lightChatFastPathEnabled));
   if (config.lightChatFastPathTimeoutMs !== undefined)
     out += formatEnvLine("CTI_LIGHT_CHAT_FAST_PATH_TIMEOUT_MS", String(config.lightChatFastPathTimeoutMs));
+  out += formatEnvLine("CTI_LIGHT_CHAT_ROUTER_PROVIDER", config.lightChatRouterProvider || "coordinator");
+  out += formatEnvLine("CTI_LIGHT_CHAT_ROUTER_MODE", config.lightChatRouterMode || "off");
+  if (config.lightChatRouterTimeoutMs !== undefined)
+    out += formatEnvLine("CTI_LIGHT_CHAT_ROUTER_TIMEOUT_MS", String(config.lightChatRouterTimeoutMs));
   if (config.memoryIntentTimeoutMs !== undefined)
     out += formatEnvLine("CTI_MEMORY_INTENT_TIMEOUT_MS", String(config.memoryIntentTimeoutMs));
   out += formatEnvLine("CTI_AGENT_COLLABORATION_MODE", config.agentCollaborationMode || "off");
@@ -1341,6 +1364,11 @@ export function configToSettings(config: Config): Map<string, string> {
   }
   if (typeof config.lightChatFastPathTimeoutMs === "number" && Number.isFinite(config.lightChatFastPathTimeoutMs)) {
     m.set("bridge_light_chat_fast_path_timeout_ms", String(Math.max(250, Math.floor(config.lightChatFastPathTimeoutMs))));
+  }
+  m.set("bridge_light_chat_router_provider", config.lightChatRouterProvider || "coordinator");
+  m.set("bridge_light_chat_router_mode", config.lightChatRouterMode || "off");
+  if (typeof config.lightChatRouterTimeoutMs === "number" && Number.isFinite(config.lightChatRouterTimeoutMs)) {
+    m.set("bridge_light_chat_router_timeout_ms", String(Math.max(500, Math.floor(config.lightChatRouterTimeoutMs))));
   }
   if (typeof config.memoryIntentTimeoutMs === "number" && Number.isFinite(config.memoryIntentTimeoutMs)) {
     m.set("bridge_memory_intent_timeout_ms", String(Math.max(250, Math.floor(config.memoryIntentTimeoutMs))));

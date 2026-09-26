@@ -141,6 +141,17 @@ await esbuild.build({
 });
 
 await esbuild.build({
+  entryPoints: [fromPackageRoot('src', 'usage-control-cli.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outfile: fromPackageRoot('dist', 'usage-control.mjs'),
+  external: sharedExternals,
+  banner: sharedBanner,
+});
+
+await esbuild.build({
   entryPoints: [fromPackageRoot('src', 'speech', 'speech-control-cli.ts')],
   bundle: true,
   platform: 'node',
@@ -183,6 +194,7 @@ for (const bundle of [
   'dist/scheduled-task-cli.mjs',
   'dist/active-reply-control-cli.mjs',
   'dist/codex-model-catalog-cli.mjs',
+  'dist/usage-control.mjs',
   'dist/memory-item-cli.mjs',
   'dist/sticker-semantic-cli.mjs',
   'dist/cleanup-cli.mjs',
@@ -194,4 +206,4 @@ for (const bundle of [
   }
 }
 
-console.log('Built daemon, agent worker, speech control, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, scheduled task, active reply control, and Codex model catalog CLI bundles');
+console.log('Built daemon, agent worker, speech control, memory optimizer, memory item, sticker semantic, memory layout migration, workspace cleanup, skill lifecycle, scheduled task, active reply control, usage control, and Codex model catalog CLI bundles');

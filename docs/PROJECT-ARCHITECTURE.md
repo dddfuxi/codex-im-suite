@@ -198,7 +198,7 @@ flowchart LR
   Coordinator -->|失败| Primary
 ```
 
-`packages/contracts/src/usage.ts` 与 `schemas/usage.schema.json` 声明通用 `cti-model-usage/v1` 用量协议；`packages/bridge-runtime/src/usage-meter.ts` 统一记录 Jev 路由、Coordinator、Primary 以及后续 Provider 的调用。每条记录只包含 call/turn 标识、时间、操作、Provider/模型、状态、输入/输出/缓存/总 Token、延迟、回报或计算费用、费率、路由和回退原因，不保存完整 Prompt、回复、密钥或附件。Provider 回报费用优先，缺失时按带生效时间的本地价格表计算，价格未知保持 `null`/“未知”，不写成零；账本以 Runtime 原子写入和有界保留保存于 `CTI_HOME/runtime/model-usage.json`，写入失败只影响观察链。当前 Runtime/控制面板提供最近脱敏明细、Provider 汇总和 p50/p95 延迟字段，明细保留模型与日期；按模型/日期筛选及 Jev/Coordinator 一致率属于本增量的后续验收项。普通飞书回复和 Decision Card 不注入用量细节。
+`packages/contracts/src/usage.ts` 与 `schemas/usage.schema.json` 声明通用 `cti-model-usage/v1` 用量协议；`packages/bridge-runtime/src/usage-meter.ts` 统一记录 Jev 路由、Coordinator、Primary 以及后续 Provider 的调用。每条记录只包含 call/turn 标识、时间、操作、Provider/模型、状态、输入/输出/缓存/总 Token、延迟、回报或计算费用、费率、路由和回退原因，不保存完整 Prompt、回复、密钥或附件。Provider 回报费用优先，缺失时按带生效时间的本地价格表计算，价格未知保持 `null`/“未知”，不写成零；账本以 Runtime 原子写入和有界保留保存于 `CTI_HOME/runtime/model-usage.json`，写入失败只影响观察链。Runtime 通过受控 `usage-control.mjs` 提供快照，控制面板显示最近脱敏明细、Provider/模型/日期汇总、失败率、p50/p95、Jev/Coordinator 一致率和 Jev 跳过 Coordinator 次数。普通飞书回复和 Decision Card 不注入用量细节。
 
 `/help` 与 `/start` 共用 `buildBridgeCommandHelpLines()`，先给出普通聊天、一次 Jev 判断和纯模式开关的三步用法，再按场景分组列出可复制命令与示例。帮助文案只负责呈现入口，不改变命令路由、角色门禁或 Jev 的默认关闭策略。
 

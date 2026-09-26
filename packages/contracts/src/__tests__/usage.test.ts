@@ -57,5 +57,7 @@ describe('model usage contracts', () => {
     assert.ok(schema.$defs?.ModelUsageRecordContract);
     assert.ok(schema.$defs?.ModelUsageLedgerContract);
     assert.ok(schema.$defs?.ModelUsageSummaryContract);
+    assert.ok(schema.$defs?.ModelUsagePriceTableContract);
+    assert.ok(schema.$defs?.ModelUsageSnapshotContract);
   });
 });

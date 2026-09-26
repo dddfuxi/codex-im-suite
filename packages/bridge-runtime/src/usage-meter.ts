@@ -8,6 +8,8 @@ import type {
   ModelUsagePriceContract,
   ModelUsageRecordContract,
   ModelUsageSummaryContract,
+  ModelUsageSnapshotContract,
+  ModelUsagePriceTableContract,
   UsageCostSource,
   UsageStatus,
 } from '@codex-im-suite/contracts';
@@ -31,6 +33,10 @@ export interface UsageMeterInput {
   reportedCostUsd?: number | null;
   routeDecision?: string | null;
   fallbackReason?: string | null;
+  routeMode?: 'off' | 'shadow' | 'assist';
+  effectivePath?: 'coordinator' | 'primary' | 'skipped';
+  coordinatorRoute?: 'light_chat' | 'task' | 'ambiguous';
+  routeComparisonId?: string | null;
 }
 
 export interface UsageMeterOptions {
@@ -38,6 +44,8 @@ export interface UsageMeterOptions {
   prices?: readonly ModelUsagePriceContract[];
   maxRecords?: number;
   now?: () => Date;
+  /** If omitted, loads CTI_HOME/config/model-prices.json. */
+  priceFilePath?: string;
 }
 
 export interface UsageSummaryRange {
@@ -155,7 +163,8 @@ export class UsageMeter {
   constructor(options: UsageMeterOptions = {}) {
     const ctiHome = path.resolve(options.ctiHome || process.env.CTI_HOME?.trim() || CTI_HOME);
     this.filePath = path.join(ctiHome, 'runtime', 'model-usage.json');
-    this.prices = (options.prices || []).map(normalizePrice).filter((price): price is ModelUsagePriceContract => Boolean(price));
+    const filePrices = options.prices ? [] : this.loadPriceTable(options.priceFilePath || path.join(ctiHome, 'config', 'model-prices.json'));
+    this.prices = [...(options.prices || filePrices)].map(normalizePrice).filter((price): price is ModelUsagePriceContract => Boolean(price));
     this.maxRecords = Math.max(1, Math.min(50_000, Math.floor(options.maxRecords || DEFAULT_MAX_RECORDS)));
     this.now = options.now || (() => new Date());
     cleanupStaleAtomicWriteTemps(this.filePath);
@@ -173,8 +182,8 @@ export class UsageMeter {
     const cacheCreationInputTokens = finiteNonNegative(input.cacheCreationInputTokens);
     // Cache counters are sub-components of input tokens, so they are kept as
     // separate dimensions and must not be added to totalTokens a second time.
-    const totalTokens = inputTokens !== null || outputTokens !== null
-      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+    const totalTokens = inputTokens !== null && outputTokens !== null
+      ? inputTokens + outputTokens
       : null;
     const reportedCostUsd = finiteNonNegative(input.reportedCostUsd);
     const calculatedCostUsd = this.calculateCost({
@@ -212,6 +221,10 @@ export class UsageMeter {
       cacheCreationInputRateUsdPer1M: price?.cacheCreationInputRateUsdPer1M ?? null,
       routeDecision: safeDiagnostic(input.routeDecision),
       fallbackReason: safeDiagnostic(input.fallbackReason),
+      ...(input.routeMode ? { routeMode: input.routeMode } : {}),
+      ...(input.effectivePath ? { effectivePath: input.effectivePath } : {}),
+      ...(input.coordinatorRoute ? { coordinatorRoute: input.coordinatorRoute } : {}),
+      ...(safeDiagnostic(input.routeComparisonId) ? { routeComparisonId: safeDiagnostic(input.routeComparisonId)! } : {}),
     };
     this.records = [...this.records, record].slice(-this.maxRecords);
     try {
@@ -244,6 +257,8 @@ export class UsageMeter {
       .map((record) => record.latencyMs)
       .filter((value): value is number => value !== null);
     const byProvider: ModelUsageSummaryContract['byProvider'] = {};
+    const byModel: ModelUsageSummaryContract['byModel'] = {};
+    const byDate: ModelUsageSummaryContract['byDate'] = {};
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalCacheReadInputTokens = 0;
@@ -252,20 +267,58 @@ export class UsageMeter {
     let reportedCostUsd = 0;
     let calculatedCostUsd = 0;
     let knownCostCalls = 0;
+    let unknownInputTokenCalls = 0;
+    let unknownOutputTokenCalls = 0;
+    let unknownTotalTokenCalls = 0;
+    let knownCostUsd = 0;
+    let pairedComparisons = 0;
+    let agreeingComparisons = 0;
+    let skippedCoordinatorCalls = 0;
+    const routePairs = new Map<string, { jev?: string; coordinator?: string }>();
     for (const record of filtered) {
       totalInputTokens += record.inputTokens ?? 0;
       totalOutputTokens += record.outputTokens ?? 0;
       totalCacheReadInputTokens += record.cacheReadInputTokens ?? 0;
       totalCacheCreationInputTokens += record.cacheCreationInputTokens ?? 0;
       totalTokens += effectiveTokens(record);
-      reportedCostUsd += record.reportedCostUsd ?? 0;
-      calculatedCostUsd += record.calculatedCostUsd ?? 0;
+      // Keep provider-reported and locally calculated cost mutually exclusive
+      // in effective totals; a reported amount must never be double counted.
+      if (record.reportedCostUsd !== null) reportedCostUsd += record.reportedCostUsd;
+      else calculatedCostUsd += record.calculatedCostUsd ?? 0;
       if (record.costSource !== 'unknown') knownCostCalls += 1;
+      knownCostUsd += record.reportedCostUsd ?? record.calculatedCostUsd ?? 0;
+      if (record.inputTokens === null) unknownInputTokenCalls += 1;
+      if (record.outputTokens === null) unknownOutputTokenCalls += 1;
+      if (record.totalTokens === null) unknownTotalTokenCalls += 1;
+      if (record.effectivePath === 'primary' && record.routeDecision === 'task') skippedCoordinatorCalls += 1;
+      if (record.routeComparisonId) {
+        const pair = routePairs.get(record.routeComparisonId) || {};
+        if (record.provider === 'jev') pair.jev = record.routeDecision || undefined;
+        if (record.provider === 'coordinator') pair.coordinator = record.coordinatorRoute || record.routeDecision || undefined;
+        routePairs.set(record.routeComparisonId, pair);
+      }
       const provider = byProvider[record.provider] || { calls: 0, totalTokens: 0, knownCostUsd: 0 };
       provider.calls += 1;
       provider.totalTokens += effectiveTokens(record);
       provider.knownCostUsd += record.reportedCostUsd ?? record.calculatedCostUsd ?? 0;
       byProvider[record.provider] = provider;
+      const model = byModel[record.model] || { calls: 0, totalTokens: 0, knownCostUsd: 0 };
+      model.calls += 1;
+      model.totalTokens += effectiveTokens(record);
+      model.knownCostUsd += record.reportedCostUsd ?? record.calculatedCostUsd ?? 0;
+      byModel[record.model] = model;
+      const date = record.timestamp.slice(0, 10);
+      const daily = byDate[date] || { calls: 0, totalTokens: 0, knownCostUsd: 0 };
+      daily.calls += 1;
+      daily.totalTokens += effectiveTokens(record);
+      daily.knownCostUsd += record.reportedCostUsd ?? record.calculatedCostUsd ?? 0;
+      byDate[date] = daily;
+    }
+    for (const pair of routePairs.values()) {
+      if (pair.jev && pair.coordinator) {
+        pairedComparisons += 1;
+        if (pair.jev === pair.coordinator) agreeingComparisons += 1;
+      }
     }
     return {
       protocol: 'cti-model-usage/v1',
@@ -284,10 +337,59 @@ export class UsageMeter {
       calculatedCostUsd,
       knownCostCalls,
       unknownCostCalls: filtered.length - knownCostCalls,
+      knownCostUsd,
+      unknownInputTokenCalls,
+      unknownOutputTokenCalls,
+      unknownTotalTokenCalls,
+      failureRate: filtered.length ? filtered.filter((record) => record.status !== 'succeeded').length / filtered.length : null,
       p50LatencyMs: percentile(latency, 0.5),
       p95LatencyMs: percentile(latency, 0.95),
       byProvider,
+      byModel,
+      byDate,
+      routeMetrics: {
+        pairedComparisons,
+        agreeingComparisons,
+        agreementRate: pairedComparisons ? agreeingComparisons / pairedComparisons : null,
+        skippedCoordinatorCalls,
+      },
     };
+  }
+
+  snapshot(range: UsageSummaryRange = {}): ModelUsageSnapshotContract {
+    const summary = this.summary(range);
+    const records = this.records.filter((record) => {
+      const time = Date.parse(record.timestamp);
+      const from = parseDate(range.from);
+      const to = parseDate(range.to);
+      return (from === null || time >= from) && (to === null || time <= to);
+    });
+    const display = records.slice(-200);
+    return {
+      protocol: 'cti-model-usage-snapshot/v1',
+      generatedAt: this.now().toISOString(),
+      records: display,
+      summary,
+      window: {
+        maxRetainedRecords: this.maxRecords,
+        retainedRecords: records.length,
+        displayLimit: 200,
+        recordsTruncated: records.length > display.length,
+        oldestTimestamp: records[0]?.timestamp || null,
+        newestTimestamp: records[records.length - 1]?.timestamp || null,
+        dateTimeZone: 'UTC',
+      },
+    };
+  }
+
+  private loadPriceTable(filePath: string): ModelUsagePriceContract[] {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<ModelUsagePriceTableContract>;
+      if (parsed.protocol !== 'cti-model-prices/v1' || parsed.version !== 1 || !Array.isArray(parsed.prices)) return [];
+      return parsed.prices.filter((price) => typeof price?.effectiveFrom === 'string');
+    } catch {
+      return [];
+    }
   }
 
   private findPrice(provider: string, model: string, timestamp: string): ModelUsagePriceContract | null {
@@ -305,8 +407,15 @@ export class UsageMeter {
     cacheCreationInputTokens: number | null;
   }, price: ModelUsagePriceContract | null): number | null {
     if (!price) return null;
+    // A complete price needs both total input and output. Cache counters are
+    // subsets of input; if either cache dimension is present, the other must
+    // also be present so the uncached portion can be derived exactly.
+    if (tokens.inputTokens === null || tokens.outputTokens === null) return null;
+    const hasCacheRead = tokens.cacheReadInputTokens !== null;
+    const hasCacheCreation = tokens.cacheCreationInputTokens !== null;
+    if (hasCacheRead !== hasCacheCreation) return null;
+    if (!hasCacheRead && (price.cacheReadInputRateUsdPer1M !== undefined || price.cacheCreationInputRateUsdPer1M !== undefined)) return null;
     let total = 0;
-    let hasMeasuredComponent = false;
     const cacheReadRate = price.cacheReadInputRateUsdPer1M ?? price.inputRateUsdPer1M;
     const cacheCreationRate = price.cacheCreationInputRateUsdPer1M ?? price.inputRateUsdPer1M;
     const cacheRead = tokens.cacheReadInputTokens ?? 0;
@@ -314,21 +423,17 @@ export class UsageMeter {
     if (tokens.inputTokens !== null) {
       const uncachedInput = Math.max(0, tokens.inputTokens - cacheRead - cacheCreation);
       total += (uncachedInput / 1_000_000) * price.inputRateUsdPer1M;
-      hasMeasuredComponent = true;
     }
     if (tokens.outputTokens !== null) {
       total += (tokens.outputTokens / 1_000_000) * price.outputRateUsdPer1M;
-      hasMeasuredComponent = true;
     }
     if (tokens.cacheReadInputTokens !== null) {
       total += (tokens.cacheReadInputTokens / 1_000_000) * cacheReadRate;
-      hasMeasuredComponent = true;
     }
     if (tokens.cacheCreationInputTokens !== null) {
       total += (tokens.cacheCreationInputTokens / 1_000_000) * cacheCreationRate;
-      hasMeasuredComponent = true;
     }
-    return hasMeasuredComponent ? total : null;
+    return total;
   }
 
   private readLedger(): ModelUsageRecordContract[] {

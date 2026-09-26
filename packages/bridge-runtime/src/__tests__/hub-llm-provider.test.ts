@@ -118,6 +118,8 @@ function params(overrides: Partial<StreamChatParams> = {}): StreamChatParams {
     prompt: 'check git status',
     workingDirectory: process.cwd(),
     permissionMode: 'default',
+    // Hub tests model the Core-issued lightweight eligibility evidence.
+    lightChatEligible: overrides.lightChatEligible ?? true,
     ...overrides,
   };
 }

@@ -185,10 +185,17 @@ export async function evaluateLightChatRoute(input: {
   }
 
   let decision: LightChatRouteDecision | null = null;
+  let providerFailureReason: string | undefined;
   try {
     decision = await input.provider.classify(input.params, input.signal);
-  } catch {
+  } catch (error) {
     decision = null;
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    providerFailureReason = input.signal?.aborted
+      ? (String(input.signal.reason || '').toLowerCase().includes('timeout') ? 'timeout' : 'cancelled')
+      : message.includes('invalid')
+        ? 'invalid_result'
+        : 'provider_failed';
   }
   const accepted = selectConfidentLightChatRoute(decision);
   if (settings.mode === 'shadow' || !accepted) {
@@ -198,7 +205,7 @@ export async function evaluateLightChatRoute(input: {
       mode: settings.mode,
       decision,
       path: 'coordinator',
-      ...(accepted ? {} : { fallbackReason: decision ? 'low_confidence_or_invalid' : 'provider_failed' }),
+      ...(accepted ? {} : { fallbackReason: decision ? 'low_confidence_or_invalid' : (providerFailureReason || 'provider_failed') }),
     };
   }
   return {

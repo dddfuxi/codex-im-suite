@@ -46,6 +46,7 @@ import type {
   DecisionQuestionPlannerHost,
   TurnReferenceResolutionInput,
   TurnReferenceResolverHost,
+  DecisionProviderHost,
 } from 'claude-to-im/host';
 import type { ProviderRetryAdvice } from 'claude-to-im/host';
 import {
@@ -60,6 +61,9 @@ import { readAgentHomePromptSections } from './agent-home.js';
 import { ArtifactEncodingInspector } from './artifact-encoding-inspector.js';
 import { RuntimeChoicePromptStateHost } from './choice-prompt-state-host.js';
 import { JevDecisionProvider } from './jev-decision-provider.js';
+import { createJevLightChatRouteProvider } from './jev-light-chat-router.js';
+import { evaluateLightChatRoute, type LightChatRouteProvider } from './light-chat-router.js';
+import { createUsageMeter, type UsageMeter } from './usage-meter.js';
 import { DeterministicEvidenceRecoveryProvider } from './deterministic-evidence-recovery-provider.js';
 import { computeRuntimeExecutionEvidenceSatisfied } from './execution-evidence-policy.js';
 import {
@@ -311,6 +315,7 @@ async function collectProviderText(
   params: Parameters<LLMProvider['streamChat']>[0],
   timeoutMs: number,
   externalAbortSignal?: AbortSignal,
+  onUsage?: (usage: Record<string, unknown>) => void,
 ): Promise<string> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const abortController = new AbortController();
@@ -348,6 +353,12 @@ async function collectProviderText(
       }
       if (done) break;
       for (const event of parseBridgeSseEvents(value)) {
+        if (event.type === 'result' && event.data && typeof event.data === 'object') {
+          const usage = (event.data as Record<string, unknown>).usage;
+          if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+            onUsage?.(usage as Record<string, unknown>);
+          }
+        }
         if (event.type === 'text') {
           // Classifier providers may stream strict JSON either as a plain
           // string or as an already-parsed object after SSE normalization.
@@ -616,6 +627,60 @@ class ProviderContinuationAdjustmentIntentHost implements ContinuationAdjustment
     const value = extractJsonObject(text)?.decision;
     return value === 'adjust' || value === 'not_adjust' ? value : 'ambiguous';
   }
+}
+
+function extractUsageFromSseChunks(chunks: readonly string[]): Record<string, unknown> | undefined {
+  for (const chunk of [...chunks].reverse()) {
+    for (const event of parseBridgeSseEvents(chunk).reverse()) {
+      if (event.type !== 'result' || !event.data || typeof event.data !== 'object') continue;
+      const usage = (event.data as Record<string, unknown>).usage;
+      if (usage && typeof usage === 'object' && !Array.isArray(usage)) return usage as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Keep only bounded provider metadata while a stream is running.  Usage is
+ * carried by the terminal result event, so retaining every SSE chunk here can
+ * grow with a long response and is unnecessary for accounting.
+ */
+interface BoundedProviderMetadata {
+  usage?: Record<string, unknown>;
+  provider?: string;
+  model?: string;
+  terminal?: 'succeeded' | 'failed' | 'cancelled' | 'timeout';
+}
+
+function observeProviderSseChunk(value: string, metadata: BoundedProviderMetadata): void {
+  for (const event of parseBridgeSseEvents(value)) {
+    if (event.type === 'status' && event.data && typeof event.data === 'object') {
+      const status = event.data as Record<string, unknown>;
+      if (typeof status.provider === 'string' && status.provider.trim()) metadata.provider = status.provider.trim().slice(0, 120);
+      const model = status.model ?? status.submittedModel;
+      if (typeof model === 'string' && model.trim()) metadata.model = model.trim().slice(0, 160);
+    }
+    if (event.type === 'result' && event.data && typeof event.data === 'object') {
+      const result = event.data as Record<string, unknown>;
+      if (result.usage && typeof result.usage === 'object' && !Array.isArray(result.usage)) {
+        metadata.usage = result.usage as Record<string, unknown>;
+      }
+      metadata.terminal = result.is_error === true ? 'failed' : 'succeeded';
+    }
+    if (event.type === 'error') metadata.terminal = 'failed';
+  }
+}
+
+function usageStatusForError(error: unknown, signal?: AbortSignal): 'failed' | 'cancelled' | 'timeout' {
+  if (signal?.aborted) {
+    const reason = String(signal.reason || '').toLowerCase();
+    if (reason.includes('timeout')) return 'timeout';
+    return 'cancelled';
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes('timeout') || message.includes('timed out')) return 'timeout';
+  if (message.includes('abort') || message.includes('cancel')) return 'cancelled';
+  return 'failed';
 }
 
 const JEV_DYNAMIC_QUESTION_RESPONSE_SCHEMA = {
@@ -1705,6 +1770,9 @@ class HubLlmProvider implements LLMProvider {
      * 裁决；为空时保守复用普通 Provider，Primary 的执行边界保持不变。
      */
     private readonly lightConversationProvider?: LLMProvider,
+    /** Optional provider-neutral route classifier; it never generates replies. */
+    private readonly lightChatRouteProvider?: LightChatRouteProvider,
+    private readonly usageMeter?: UsageMeter,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -1746,6 +1814,7 @@ class HubLlmProvider implements LLMProvider {
         this.fallbackProvider,
         this.primaryExecutorId,
         this.executorRegistry,
+        this.usageMeter,
       ).streamChat(params);
     }
 
@@ -2157,12 +2226,105 @@ class HubLlmProvider implements LLMProvider {
     mode: ReturnType<typeof getLocalRouterMode>,
   ): Promise<void> {
     const coordinatorParams = buildLightConversationCoordinatorParams(params, this.config);
+    let routeComparisonId: string | undefined;
+    // Jev is an optional route classifier only. It runs after the existing
+    // deterministic light-chat gate and never replaces the coordinator's
+    // visible reply generation.
+    if (this.config.lightChatRouterProvider === 'jev'
+      && (this.config.lightChatRouterMode === 'shadow' || this.config.lightChatRouterMode === 'assist')
+      && this.lightChatRouteProvider) {
+      const startedAt = Date.now();
+      routeComparisonId = crypto.randomUUID();
+      const routeAbort = new AbortController();
+      const routeTimer = setTimeout(() => routeAbort.abort(new Error('light_chat_route_timeout')), this.config.lightChatRouterTimeoutMs ?? 1500);
+      const forwardAbort = () => routeAbort.abort(params.abortController?.signal?.reason);
+      if (params.abortController?.signal.aborted) forwardAbort();
+      else params.abortController?.signal.addEventListener('abort', forwardAbort, { once: true });
+      let route: Awaited<ReturnType<typeof evaluateLightChatRoute>>;
+      try {
+        try {
+          const routePromise = evaluateLightChatRoute({
+            params,
+            config: this.config,
+            settings: {
+              provider: this.config.lightChatRouterProvider,
+              mode: this.config.lightChatRouterMode,
+            },
+            provider: this.lightChatRouteProvider,
+            signal: routeAbort.signal,
+          });
+          const routeTimeout = new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => reject(new Error('light_chat_route_timeout')), this.config.lightChatRouterTimeoutMs ?? 1500);
+            routePromise.finally(() => clearTimeout(timer)).catch(() => {});
+          });
+          route = await Promise.race([routePromise, routeTimeout]);
+        } catch {
+          // Classifier failures are observational and must never break the
+          // existing coordinator/primary path.
+          route = {
+            eligible: true,
+            provider: 'jev',
+            mode: this.config.lightChatRouterMode || 'off',
+            decision: null,
+            path: 'coordinator',
+            fallbackReason: routeAbort.signal.aborted
+              ? (params.abortController?.signal.aborted ? 'cancelled' : 'timeout')
+              : 'provider_failed',
+          };
+        }
+      } finally {
+        clearTimeout(routeTimer);
+        params.abortController?.signal.removeEventListener('abort', forwardAbort);
+      }
+      const decision = route.decision;
+      this.usageMeter?.record({
+        turnId: params.turnId,
+        operation: 'light_chat_route',
+        provider: decision?.provider || route.provider || 'jev',
+        model: decision?.model || this.config.decisionModel || 'unknown',
+        inputTokens: decision?.usage?.inputTokens,
+        outputTokens: decision?.usage?.outputTokens,
+        reportedCostUsd: decision?.usage?.reportedCostUsd,
+        latencyMs: Date.now() - startedAt,
+        status: route.fallbackReason === 'timeout'
+          ? 'timeout'
+          : route.fallbackReason === 'cancelled'
+            ? 'cancelled'
+          : route.fallbackReason === 'provider_failed' || route.fallbackReason === 'invalid_result'
+            ? 'failed'
+            : route.fallbackReason
+              ? 'fallback'
+              : 'succeeded',
+        routeDecision: decision?.intent,
+        fallbackReason: route.fallbackReason,
+        routeMode: this.config.lightChatRouterMode,
+        effectivePath: route.path,
+        routeComparisonId,
+      });
+      // An explicit user cancellation must not start a new coordinator or
+      // Primary attempt after the route classifier returns. The cancelled
+      // classifier call is still retained in UsageMeter above.
+      if (params.abortController?.signal.aborted) {
+        try { controller.close(); } catch { /* already closed */ }
+        return;
+      }
+      if (route.path === 'primary') {
+        await this.pipeCodexPrimaryWithFallback(
+          controller,
+          params,
+          { ...conservative, useLocal: false, requestKind: 'chat', preferredDecision: 'escalate_codex' },
+          'Jev 轻聊分流判定为任务，已跳过 Coordinator 进入 Primary',
+        );
+        return;
+      }
+    }
     await this.runSelectedLightConversationCoordinator(
       controller,
       params,
       coordinatorParams,
       conservative,
       mode,
+      routeComparisonId,
     );
   }
 
@@ -2172,18 +2334,54 @@ class HubLlmProvider implements LLMProvider {
     coordinatorParams: Parameters<LLMProvider['streamChat']>[0],
     conservative: ReturnType<typeof decideConservativeRoute>,
     mode: ReturnType<typeof getLocalRouterMode>,
+    routeComparisonId?: string,
   ): Promise<void> {
     // 轻聊只缩减 Prompt、工作区、附件和工具权限，不再切换模型来源。这里始终
     // 使用控制面板当前选中的 Provider（或用户明确配置的 failover 链）。
     const provider = this.lightConversationProvider || this.fallbackProvider;
     const timeoutMs = Math.max(3_000, Math.min(8_000, (this.config.lightChatFastPathTimeoutMs ?? 2_000) * 3));
     let decision: LightConversationDecision | null = null;
+    const startedAt = Date.now();
+    let usage: Record<string, unknown> | undefined;
+    let coordinatorError: unknown;
     try {
-      const text = await collectProviderText(provider, coordinatorParams, timeoutMs, originalParams.abortController?.signal);
+      const text = await collectProviderText(
+        provider,
+        coordinatorParams,
+        timeoutMs,
+        originalParams.abortController?.signal,
+        (value) => { usage = value; },
+      );
       decision = parseLightConversationDecision(extractJsonObject(text));
-    } catch {
+    } catch (error) {
       // 协调器失败时保持失败关闭，直接让 Primary 按完整工具边界继续。
+      coordinatorError = error;
     }
+    this.usageMeter?.record({
+      turnId: originalParams.turnId,
+      operation: 'light_chat_coordinator',
+      provider: 'coordinator',
+      model: this.config.codexModel || 'unknown',
+      inputTokens: readUsageNumber(usage?.input_tokens ?? usage?.inputTokens),
+      outputTokens: readUsageNumber(usage?.output_tokens ?? usage?.outputTokens),
+      cacheReadInputTokens: readUsageNumber(usage?.cache_read_input_tokens ?? usage?.cacheReadInputTokens),
+      cacheCreationInputTokens: readUsageNumber(usage?.cache_creation_input_tokens ?? usage?.cacheCreationInputTokens),
+      reportedCostUsd: readUsageNumber(usage?.cost ?? usage?.reportedCostUsd),
+      latencyMs: Date.now() - startedAt,
+      status: decision
+        ? 'succeeded'
+        : coordinatorError
+          ? usageStatusForError(coordinatorError, originalParams.abortController?.signal)
+          : 'fallback',
+      routeDecision: decision?.action,
+      fallbackReason: decision ? null : 'coordinator_failed_or_invalid',
+      routeMode: routeComparisonId ? this.config.lightChatRouterMode : undefined,
+      effectivePath: 'coordinator',
+      coordinatorRoute: decision
+        ? decision.action === 'reply' ? 'light_chat' : decision.action === 'clarify' ? 'ambiguous' : 'task'
+        : undefined,
+      routeComparisonId,
+    });
 
     if (!decision || decision.action === 'delegate') {
       await this.pipeCodexPrimaryWithFallback(
@@ -2606,6 +2804,8 @@ class HubLlmProvider implements LLMProvider {
       compressedHistoryChars: summary.compressedHistoryChars,
       ...(summary.promptProfile ? { promptProfile: summary.promptProfile } : {}),
     }));
+    const startedAt = Date.now();
+    const metadata: BoundedProviderMetadata = {};
     try {
       const stream = provider instanceof CodexApiFailoverProvider && options?.excludeCodexSources
         ? provider.streamChatExcluding(params, options.excludeCodexSources)
@@ -2619,9 +2819,38 @@ class HubLlmProvider implements LLMProvider {
           throw new Error(fatalError);
         }
         controller.enqueue(value);
+        observeProviderSseChunk(value, metadata);
       }
       controller.close();
+      this.usageMeter?.record({
+        turnId: params.turnId,
+        operation: 'primary',
+        provider: metadata.provider || summary.provider || 'primary',
+        model: metadata.model || 'unknown',
+        inputTokens: readUsageNumber(metadata.usage?.input_tokens ?? metadata.usage?.inputTokens),
+        outputTokens: readUsageNumber(metadata.usage?.output_tokens ?? metadata.usage?.outputTokens),
+        cacheReadInputTokens: readUsageNumber(metadata.usage?.cache_read_input_tokens ?? metadata.usage?.cacheReadInputTokens ?? metadata.usage?.cached_input_tokens),
+        cacheCreationInputTokens: readUsageNumber(metadata.usage?.cache_creation_input_tokens ?? metadata.usage?.cacheCreationInputTokens),
+        reportedCostUsd: readUsageNumber(metadata.usage?.cost ?? metadata.usage?.reportedCostUsd),
+        latencyMs: Date.now() - startedAt,
+        status: summary.fallbackReason ? 'fallback' : 'succeeded',
+        routeDecision: summary.decision,
+        fallbackReason: summary.fallbackReason,
+      });
     } catch (error) {
+      this.usageMeter?.record({
+        turnId: params.turnId,
+        operation: 'primary',
+        provider: metadata.provider || summary.provider || 'primary',
+        model: metadata.model || 'unknown',
+        inputTokens: readUsageNumber(metadata.usage?.input_tokens ?? metadata.usage?.inputTokens),
+        outputTokens: readUsageNumber(metadata.usage?.output_tokens ?? metadata.usage?.outputTokens),
+        reportedCostUsd: readUsageNumber(metadata.usage?.cost ?? metadata.usage?.reportedCostUsd),
+        latencyMs: Date.now() - startedAt,
+        status: usageStatusForError(error, params.abortController?.signal),
+        routeDecision: summary.decision,
+        fallbackReason: error instanceof Error ? error.message : String(error),
+      });
       throw (error instanceof Error ? error : new Error(String(error)));
     }
   }
@@ -3113,6 +3342,7 @@ class ObservedLLMProvider implements LLMProvider {
     private readonly provider: LLMProvider,
     private readonly primaryExecutorId: string,
     private readonly executorRegistry?: ExecutorProviderRegistry,
+    private readonly usageMeter?: UsageMeter,
   ) {}
 
   streamChat(params: Parameters<LLMProvider['streamChat']>[0]): ReturnType<LLMProvider['streamChat']> {
@@ -3139,6 +3369,7 @@ class ObservedLLMProvider implements LLMProvider {
         const evidence = emptyStreamEvidence();
         seedExecutionRequirementEvidence(evidence, params);
         const observedController = createObservedController(controller, evidence);
+        const providerMetadata: BoundedProviderMetadata = {};
         try {
           appendWorkflowEvent(workflowRun.id, 'authorized', 'workflow.authorized', '请求进入执行器路由前置阶段');
           appendWorkflowEvent(workflowRun.id, 'contextualized', 'workflow.contextualized', '会话和工作区上下文已准备');
@@ -3181,11 +3412,38 @@ class ObservedLLMProvider implements LLMProvider {
             const fatalError = extractCodexFatalStreamError(value);
             if (fatalError) throw new Error(fatalError);
             observedController.enqueue(value);
+            observeProviderSseChunk(value, providerMetadata);
           }
+          this.usageMeter?.record({
+            turnId: params.turnId,
+            operation: 'primary',
+            provider: providerMetadata.provider || selection.executor.id || 'primary',
+            model: providerMetadata.model || 'unknown',
+            inputTokens: readUsageNumber(providerMetadata.usage?.input_tokens ?? providerMetadata.usage?.inputTokens),
+            outputTokens: readUsageNumber(providerMetadata.usage?.output_tokens ?? providerMetadata.usage?.outputTokens),
+            cacheReadInputTokens: readUsageNumber(providerMetadata.usage?.cache_read_input_tokens ?? providerMetadata.usage?.cacheReadInputTokens ?? providerMetadata.usage?.cached_input_tokens),
+            cacheCreationInputTokens: readUsageNumber(providerMetadata.usage?.cache_creation_input_tokens ?? providerMetadata.usage?.cacheCreationInputTokens),
+            reportedCostUsd: readUsageNumber(providerMetadata.usage?.cost ?? providerMetadata.usage?.reportedCostUsd),
+            status: 'succeeded',
+            routeDecision: selection.executor.id,
+          });
           flushWorkflowEvidence(workflowRun.id, evidence);
           completeWorkflowRun(workflowRun.id);
           observedController.close();
         } catch (error) {
+          this.usageMeter?.record({
+            turnId: params.turnId,
+            operation: 'primary',
+            provider: providerMetadata.provider || this.primaryExecutorId || 'primary',
+            model: providerMetadata.model || 'unknown',
+            inputTokens: readUsageNumber(providerMetadata.usage?.input_tokens ?? providerMetadata.usage?.inputTokens),
+            outputTokens: readUsageNumber(providerMetadata.usage?.output_tokens ?? providerMetadata.usage?.outputTokens),
+            cacheReadInputTokens: readUsageNumber(providerMetadata.usage?.cache_read_input_tokens ?? providerMetadata.usage?.cacheReadInputTokens ?? providerMetadata.usage?.cached_input_tokens),
+            cacheCreationInputTokens: readUsageNumber(providerMetadata.usage?.cache_creation_input_tokens ?? providerMetadata.usage?.cacheCreationInputTokens),
+            reportedCostUsd: readUsageNumber(providerMetadata.usage?.cost ?? providerMetadata.usage?.reportedCostUsd),
+            status: usageStatusForError(error, params.abortController?.signal),
+            fallbackReason: error instanceof Error ? error.message : String(error),
+          });
           flushWorkflowEvidence(workflowRun.id, evidence);
           if (isActiveUserTurn(params)) {
             handleObservedWorkflowFailure({
@@ -3255,6 +3513,9 @@ async function resolveProvider(
   pendingPerms: PendingPermissions,
   store: BridgeStore,
   turnStorage: RuntimeTurnStorage,
+  decisions?: DecisionProviderHost,
+  lightChatDecisions?: DecisionProviderHost,
+  usageMeter?: UsageMeter,
 ): Promise<LLMProvider> {
   // v3.4: registry is built once per daemon start, then injected into
   // HubLlmProvider / ObservedLLMProvider. External executors (currently
@@ -3274,6 +3535,9 @@ async function resolveProvider(
     lightConversationProvider?: LLMProvider,
   ): LLMProvider => {
     const localProvider = new OllamaProvider(config);
+    const routeProvider = config.lightChatRouterProvider === 'jev' && lightChatDecisions
+      ? createJevLightChatRouteProvider(lightChatDecisions)
+      : undefined;
     return new PersistentMcpContextProvider(new HubLlmProvider(
       config,
       store,
@@ -3285,6 +3549,8 @@ async function resolveProvider(
       provider,
       executorRegistry,
       lightConversationProvider,
+      routeProvider,
+      usageMeter,
     ), managedMcpManifests);
   };
   const wrapCodexMainProvider = (
@@ -3610,6 +3876,8 @@ async function main(): Promise<void> {
   // config.env 是跨平台运行配置事实源；先覆盖父进程继承的旧值，再创建 Provider。
   hydrateProcessEnvironmentFromConfigFile();
   const config = loadConfig();
+  const jevRouteEnabled = config.lightChatRouterProvider === 'jev'
+    && config.lightChatRouterMode !== 'off';
   const decisions = config.decisionProvider === 'jev'
     && Boolean(config.decisionApiKey)
     && config.decisionMode !== 'off'
@@ -3621,7 +3889,15 @@ async function main(): Promise<void> {
       timeoutMs: config.decisionTimeoutMs,
     })
     : undefined;
-  if (config.decisionProvider === 'jev' && !decisions) {
+  const lightChatDecisions = jevRouteEnabled && config.decisionApiKey
+    ? new JevDecisionProvider({
+      apiKey: config.decisionApiKey,
+      baseUrl: config.decisionBaseUrl,
+      model: config.decisionModel,
+      timeoutMs: Math.min(config.lightChatRouterTimeoutMs ?? 1500, config.decisionTimeoutMs ?? 8000),
+    })
+    : undefined;
+  if ((config.decisionProvider === 'jev' && !decisions) || (jevRouteEnabled && !lightChatDecisions)) {
     console.warn('[claude-to-im] Structured decisions disabled: provider/key/mode configuration is incomplete.');
   }
   const turnStorage = createRuntimeTurnStorage(config);
@@ -3690,13 +3966,14 @@ async function main(): Promise<void> {
     }
   }
   const pendingPerms = new PendingPermissions();
+  const usageMeter = createUsageMeter();
   try {
     writeExecutorStatus(config);
   } catch (error) {
     console.warn('[claude-to-im] Failed to write executor baseline status:', error instanceof Error ? error.message : error);
   }
   const llm = new DeterministicEvidenceRecoveryProvider(
-    await resolveProvider(config, pendingPerms, store, turnStorage),
+    await resolveProvider(config, pendingPerms, store, turnStorage, decisions, lightChatDecisions, usageMeter),
   );
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
   const agentManifestDirCandidates = [

@@ -1153,9 +1153,22 @@ const fallbackState: PanelState = {
       calculatedCostUsd: 0,
       knownCostCalls: 0,
       unknownCostCalls: 0,
+      knownCostUsd: 0,
+      unknownInputTokenCalls: 0,
+      unknownOutputTokenCalls: 0,
+      unknownTotalTokenCalls: 0,
+      failureRate: null,
       p50LatencyMs: null,
       p95LatencyMs: null,
       byProvider: {},
+      byModel: {},
+      byDate: {},
+      routeMetrics: {
+        pairedComparisons: 0,
+        agreeingComparisons: 0,
+        agreementRate: null,
+        skippedCoordinatorCalls: 0,
+      },
     },
   },
 };
@@ -3059,8 +3072,12 @@ function UsageOverview({ usage }: { usage: PanelState['usage'] }) {
       </section>
     );
   }
-  const cost = (usage.records ?? []).reduce((total, record) => total + (record.reportedCostUsd ?? record.calculatedCostUsd ?? 0), 0);
+  // Summary covers the full retained ledger; records is only the newest
+  // display window and must not undercount total cost after truncation.
+  const cost = summary.knownCostUsd ?? 0;
   const providerRows = Object.entries(summary.byProvider ?? {}).slice(0, 6);
+  const modelRows = Object.entries(summary.byModel ?? {}).slice(0, 6);
+  const dateRows = Object.entries(summary.byDate ?? {}).slice(-7).reverse();
   return (
     <section className="panel panel-span-2">
       <SectionHeader title="模型用量与费用" />
@@ -3069,6 +3086,9 @@ function UsageOverview({ usage }: { usage: PanelState['usage'] }) {
         <SummaryFact label="Token" value={summary.totalTokens.toLocaleString()} />
         <SummaryFact label="输入 / 输出" value={`${summary.totalInputTokens.toLocaleString()} / ${summary.totalOutputTokens.toLocaleString()}`} />
         <SummaryFact label="费用（USD）" value={summary.unknownCostCalls > 0 ? `${cost.toFixed(6)} + 未知` : cost.toFixed(6)} />
+        <SummaryFact label="失败率" value={summary.failureRate == null ? '未知' : `${(summary.failureRate * 100).toFixed(1)}%`} />
+        <SummaryFact label="Jev / Coordinator 一致率" value={summary.routeMetrics?.agreementRate == null ? '暂无对照' : `${(summary.routeMetrics.agreementRate * 100).toFixed(1)}%`} />
+        <SummaryFact label="Jev 跳过 Coordinator" value={String(summary.routeMetrics?.skippedCoordinatorCalls ?? 0)} />
         <SummaryFact label="p50 延迟" value={summary.p50LatencyMs == null ? '未知' : `${Math.round(summary.p50LatencyMs)} ms`} />
         <SummaryFact label="p95 延迟" value={summary.p95LatencyMs == null ? '未知' : `${Math.round(summary.p95LatencyMs)} ms`} />
       </div>
@@ -3079,11 +3099,17 @@ function UsageOverview({ usage }: { usage: PanelState['usage'] }) {
           ))}
         </div>
       )}
+      {(modelRows.length > 0 || dateRows.length > 0) && (
+        <div className="tag-row" style={{ marginTop: 8 }}>
+          {modelRows.map(([model, row]) => <span className="status-pill idle" key={`model-${model}`}>模型 {model} · {row.calls} 次 · {row.totalTokens.toLocaleString()} Token</span>)}
+          {dateRows.map(([date, row]) => <span className="status-pill idle" key={`date-${date}`}>日期 {date} · {row.calls} 次</span>)}
+        </div>
+      )}
       <details className="advanced-settings" style={{ marginTop: 12 }}>
         <summary>最近调用明细（最多 8 条）</summary>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>时间</th><th>Provider / 模型</th><th>Token</th><th>费用</th><th>状态 / 路由</th></tr></thead>
+            <thead><tr><th>时间</th><th>Provider / 模型</th><th>Token</th><th>费率（USD/1M）</th><th>费用</th><th>状态 / 路由</th></tr></thead>
             <tbody>
               {(usage.records ?? []).slice(-8).reverse().map((record) => {
                 const recordCost = record.reportedCostUsd ?? record.calculatedCostUsd;
@@ -3091,6 +3117,7 @@ function UsageOverview({ usage }: { usage: PanelState['usage'] }) {
                   <td>{record.timestamp ? new Date(record.timestamp).toLocaleString() : '-'}</td>
                   <td>{record.provider} / {record.model}</td>
                   <td>{record.totalTokens == null ? '未知' : record.totalTokens.toLocaleString()}</td>
+                  <td>{record.inputRateUsdPer1M == null || record.outputRateUsdPer1M == null ? '未知' : `${record.inputRateUsdPer1M} / ${record.outputRateUsdPer1M}`}</td>
                   <td>{recordCost == null ? '未知' : `$${recordCost.toFixed(6)}`}</td>
                   <td>{record.status}{record.routeDecision ? ` · ${record.routeDecision}` : ''}{record.fallbackReason ? ` · 回退：${record.fallbackReason}` : ''}</td>
                 </tr>;

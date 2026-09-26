@@ -66,6 +66,10 @@ export interface PanelSettingsStateContract {
   decisionModel: string;
   decisionTimeoutMs: string;
   decisionApiKeySet: boolean;
+  /** Provider-neutral light-chat routing controls. */
+  lightChatRouterProvider: 'coordinator' | 'jev';
+  lightChatRouterMode: 'off' | 'shadow' | 'assist';
+  lightChatRouterTimeoutMs: string;
 }
 
 export interface PanelSettingDescriptorContract {

@@ -37,9 +37,11 @@ function compactState(params: StreamChatParams): string {
 function normalizeProbabilities(answer: DecisionAnswer): LightChatRouteDistribution | null {
   const raw = answer.probabilities;
   if (!raw || typeof raw !== 'object') return null;
+  const keys = Object.keys(raw);
+  if (keys.length !== LIGHT_CHAT_ROUTE_INTENTS.length || LIGHT_CHAT_ROUTE_INTENTS.some((intent) => !keys.includes(intent))) return null;
   const values = LIGHT_CHAT_ROUTE_INTENTS.map((intent) => clamp(raw[intent]) ?? 0);
   const total = values.reduce((sum, value) => sum + value, 0);
-  if (!Number.isFinite(total) || total <= 0) return null;
+  if (!Number.isFinite(total) || total <= 0 || Math.abs(total - 1) > 0.02) return null;
   const normalized = values.map((value) => value / total);
   return {
     light_chat: normalized[0],

@@ -430,10 +430,10 @@ internal sealed partial class MainForm : Form
             return Results.Json(await BuildWebStateAsync(), WebJsonOptions);
         });
 
-        app.MapGet("/api/usage", (HttpContext context) =>
+        app.MapGet("/api/usage", async (HttpContext context) =>
         {
             if (!AuthorizeControlApi(context, "usage.snapshot", out var failure)) return failure;
-            return Results.Json(BuildUsageSnapshot(), WebJsonOptions);
+            return Results.Json(await CreateModelUsageGateway().ReadPanelStateAsync(), WebJsonOptions);
         });
 
         app.MapPost("/api/commands", async (HttpContext context) =>
@@ -546,6 +546,7 @@ internal sealed partial class MainForm : Form
 
     private static string RequiredRoleForControlCommand(string command, JsonElement payload = default)
     {
+        if (string.Equals(command, "usage.snapshot", StringComparison.OrdinalIgnoreCase)) return "viewer";
         var speechRole = SpeechCommandPolicy.GetRequiredRole(command);
         if (!string.IsNullOrWhiteSpace(speechRole)) return speechRole;
         var scheduledTaskRole = ScheduledTaskCommandPolicy.GetRequiredRole(command);
@@ -821,7 +822,7 @@ internal sealed partial class MainForm : Form
                 await RefreshAllAsync();
                 return await BuildWebStateAsync();
             case "usage.snapshot":
-                return BuildUsageSnapshot();
+                return await CreateModelUsageGateway().ReadPanelStateAsync();
             case "nodes.list":
                 {
                     var suite = ReadSuiteVersionInfo();
@@ -1254,6 +1255,7 @@ internal sealed partial class MainForm : Form
         var skillGovernance = await BuildSkillGovernanceStateAsync();
         var promptSnapshots = BuildPromptSnapshotState();
         var scheduledTasks = await CreateScheduledTaskGateway().ReadPanelStateAsync();
+        var usage = await CreateModelUsageGateway().ReadPanelStateAsync();
         var speech = await BuildSpeechPanelStateAsync();
         var memorySkillAssets = MemoryArtifactStore.BuildSkillAssetIndex(skillGovernance.Snapshot ?? default);
         var services = new[]
@@ -1331,95 +1333,13 @@ internal sealed partial class MainForm : Form
                 logs = Path.Combine(_ctiHome, "logs"),
             },
             Activities: _activities.TakeLast(220).ToArray(),
-            Usage: BuildUsageSnapshot(),
+            Usage: usage,
             Diagnostics: new
             {
                 webNavigationCount = Volatile.Read(ref _webNavigationCount),
                 webStatePushCount = Volatile.Read(ref _webStatePushCount),
                 sessionDetailRequestCount = Volatile.Read(ref _webSessionDetailRequestCount),
             });
-    }
-
-    /// <summary>读取 Runtime 的 provider-neutral 用量账本并生成面板脱敏快照。</summary>
-    private object BuildUsageSnapshot()
-    {
-        var path = Path.Combine(_ctiHome, "runtime", "model-usage.json");
-        var root = ReadJsonObjectFile(path);
-        var records = root?["records"] as JsonArray ?? [];
-        var allRecords = records.OfType<JsonObject>().ToArray();
-        var safeRecords = allRecords.TakeLast(200).ToArray();
-        static double Number(JsonObject item, string name) =>
-            item[name] is JsonValue value && value.TryGetValue<double>(out var parsed) && double.IsFinite(parsed) && parsed >= 0
-                ? parsed
-                : 0;
-        static string Text(JsonObject item, string name) =>
-            item[name] is JsonValue value && value.TryGetValue<string>(out var parsed) ? parsed : "";
-        static double KnownCost(JsonObject item)
-        {
-            if (item["reportedCostUsd"] is JsonValue reported
-                && reported.TryGetValue<double>(out var reportedValue)
-                && double.IsFinite(reportedValue)
-                && reportedValue >= 0)
-            {
-                return reportedValue;
-            }
-            return Number(item, "calculatedCostUsd");
-        }
-
-        var calls = allRecords.Length;
-        var succeeded = allRecords.Count(item => string.Equals(Text(item, "status"), "succeeded", StringComparison.OrdinalIgnoreCase));
-        var input = allRecords.Sum(item => Number(item, "inputTokens"));
-        var output = allRecords.Sum(item => Number(item, "outputTokens"));
-        var total = allRecords.Sum(item => Number(item, "totalTokens"));
-        var reportedCost = allRecords.Sum(item => Number(item, "reportedCostUsd"));
-        var calculatedCost = allRecords.Sum(item => Number(item, "calculatedCostUsd"));
-        var known = allRecords.Count(item => !string.Equals(Text(item, "costSource"), "unknown", StringComparison.OrdinalIgnoreCase));
-        var latencies = allRecords.Select(item => Number(item, "latencyMs")).Where(value => value > 0).OrderBy(value => value).ToArray();
-        static double? Percentile(double[] values, double fraction)
-        {
-            if (values.Length == 0) return null;
-            var index = Math.Clamp((int)Math.Ceiling(values.Length * fraction) - 1, 0, values.Length - 1);
-            return values[index];
-        }
-        var providers = allRecords
-            .GroupBy(item => Text(item, "provider") is { Length: > 0 } provider ? provider : "unknown", StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(
-                group => group.Key,
-                group => new
-                {
-                    calls = group.Count(),
-                    totalTokens = group.Sum(item => Number(item, "totalTokens")),
-                    knownCostUsd = group.Sum(KnownCost),
-                },
-                StringComparer.OrdinalIgnoreCase);
-        return new
-        {
-            protocol = "cti-model-usage/v1",
-            generatedAt = DateTime.UtcNow.ToString("o"),
-            records = safeRecords,
-            summary = new
-            {
-                protocol = "cti-model-usage/v1",
-                generatedAt = DateTime.UtcNow.ToString("o"),
-                from = allRecords.Length == 0 ? null : Text(allRecords[0], "timestamp"),
-                to = allRecords.Length == 0 ? null : Text(allRecords[^1], "timestamp"),
-                calls,
-                succeededCalls = succeeded,
-                failedCalls = calls - succeeded,
-                totalInputTokens = input,
-                totalOutputTokens = output,
-                totalCacheReadInputTokens = allRecords.Sum(item => Number(item, "cacheReadInputTokens")),
-                totalCacheCreationInputTokens = allRecords.Sum(item => Number(item, "cacheCreationInputTokens")),
-                totalTokens = total,
-                reportedCostUsd = reportedCost,
-                calculatedCostUsd = calculatedCost,
-                knownCostCalls = known,
-                unknownCostCalls = calls - known,
-                p50LatencyMs = Percentile(latencies, 0.5),
-                p95LatencyMs = Percentile(latencies, 0.95),
-                byProvider = providers,
-            },
-        };
     }
 
     private WebLiveSyncStatus BuildLiveSyncStatus(string suiteCommit)
@@ -10791,6 +10711,13 @@ exit $LASTEXITCODE
     }
 
     private ScheduledTaskGateway CreateScheduledTaskGateway()
+        => new(
+            _suiteRoot,
+            _skillDir,
+            _ctiHome,
+            nodeExecutable: GetConfig("CTI_NODE_EXE", "node"));
+
+    private ModelUsageGateway CreateModelUsageGateway()
         => new(
             _suiteRoot,
             _skillDir,

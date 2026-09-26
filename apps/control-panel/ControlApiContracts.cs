@@ -184,5 +184,5 @@ internal sealed record ControlPanelStateContract(
     object Permissions,
     object Paths,
     object Activities,
-    object Usage,
+    ModelUsagePanelSnapshotDto Usage,
     object? Diagnostics = null);

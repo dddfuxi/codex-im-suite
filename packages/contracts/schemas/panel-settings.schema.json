@@ -33,7 +33,7 @@
     },
     "PanelSettingsStateContract": {
       "type": "object",
-      "required": ["defaultWorkDir", "allowedRoots", "memoryRepo", "additionalDirs", "replyStyleHint", "defaultExecutorId", "localAiKind", "localAiBaseUrl", "ollamaModelsDir", "localAiModel", "localAiApiKeyAction", "localAiApiKeyValue", "localAiApiKeyMasked", "localAiApiKeySet", "localAiTimeoutMs", "codexModelSource", "codexRoutingMode", "codexApiFallbackChain", "codexBaseUrl", "codexModel", "codexPassModel", "codexReasoningEffort", "memoryOptimizerEnabled", "memoryOptimizerIntervalDays", "memoryOptimizerModelSource", "codexApiKeyAction", "codexApiKeyValue", "codexApiKeyMasked", "codexApiKeySet", "safetyPolicyProfile", "decisionProvider", "decisionMode", "decisionResponseMode", "decisionBaseUrl", "decisionModel", "decisionTimeoutMs", "decisionApiKeySet"],
+      "required": ["defaultWorkDir", "allowedRoots", "memoryRepo", "additionalDirs", "replyStyleHint", "defaultExecutorId", "localAiKind", "localAiBaseUrl", "ollamaModelsDir", "localAiModel", "localAiApiKeyAction", "localAiApiKeyValue", "localAiApiKeyMasked", "localAiApiKeySet", "localAiTimeoutMs", "codexModelSource", "codexRoutingMode", "codexApiFallbackChain", "codexBaseUrl", "codexModel", "codexPassModel", "codexReasoningEffort", "memoryOptimizerEnabled", "memoryOptimizerIntervalDays", "memoryOptimizerModelSource", "codexApiKeyAction", "codexApiKeyValue", "codexApiKeyMasked", "codexApiKeySet", "safetyPolicyProfile", "decisionProvider", "decisionMode", "decisionResponseMode", "decisionBaseUrl", "decisionModel", "decisionTimeoutMs", "decisionApiKeySet", "lightChatRouterProvider", "lightChatRouterMode", "lightChatRouterTimeoutMs"],
       "properties": {
         "defaultWorkDir": { "type": "string" }, "allowedRoots": { "type": "string" }, "memoryRepo": { "type": "string" }, "additionalDirs": { "type": "string" }, "replyStyleHint": { "type": "string" }, "defaultExecutorId": { "type": "string" },
         "localAiKind": { "type": "string" }, "localAiBaseUrl": { "type": "string" }, "ollamaModelsDir": { "type": "string" }, "localAiModel": { "type": "string" },
@@ -42,7 +42,8 @@
         "memoryOptimizerEnabled": { "type": "boolean" }, "memoryOptimizerIntervalDays": { "type": "string" }, "memoryOptimizerModelSource": { "type": "string" },
         "codexApiKeyAction": { "enum": ["keep", "set", "clear"] }, "codexApiKeyValue": { "type": "string" }, "codexApiKeyMasked": { "type": "string" }, "codexApiKeySet": { "type": "boolean" }, "safetyPolicyProfile": { "type": "string" },
         "decisionProvider": { "enum": ["off", "jev"] }, "decisionMode": { "enum": ["off", "shadow", "assist"] }, "decisionResponseMode": { "enum": ["off", "explicit", "auto"] },
-        "decisionBaseUrl": { "type": "string" }, "decisionModel": { "type": "string" }, "decisionTimeoutMs": { "type": "string" }, "decisionApiKeySet": { "type": "boolean" }
+        "decisionBaseUrl": { "type": "string" }, "decisionModel": { "type": "string" }, "decisionTimeoutMs": { "type": "string" }, "decisionApiKeySet": { "type": "boolean" },
+        "lightChatRouterProvider": { "enum": ["coordinator", "jev"] }, "lightChatRouterMode": { "enum": ["off", "shadow", "assist"] }, "lightChatRouterTimeoutMs": { "type": "string" }
       },
       "additionalProperties": false
     },

@@ -47,6 +47,21 @@ describe('UsageMeter', () => {
     assert.equal(unknown.calculatedCostUsd, null);
   });
 
+  it('loads versioned CTI_HOME/config/model-prices.json and requires complete cache dimensions', () => {
+    const home = tempHome();
+    const pricePath = path.join(home, 'config', 'model-prices.json');
+    fs.mkdirSync(path.dirname(pricePath), { recursive: true });
+    fs.writeFileSync(pricePath, JSON.stringify({
+      protocol: 'cti-model-prices/v1', version: 1,
+      prices: [{ provider: 'p', model: 'm', inputRateUsdPer1M: 1, outputRateUsdPer1M: 2, effectiveFrom: '2026-01-01T00:00:00.000Z' }],
+    }), 'utf8');
+    const meter = new UsageMeter({ ctiHome: home });
+    const partialCache = meter.record({ operation: 'chat', provider: 'p', model: 'm', inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 2 });
+    assert.equal(partialCache.calculatedCostUsd, null);
+    const complete = meter.record({ operation: 'chat', provider: 'p', model: 'm', inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 2, cacheCreationInputTokens: 0 });
+    assert.equal(complete.costSource, 'price_table');
+  });
+
   it('summarizes token, cost, status, provider and latency metrics', () => {
     const home = tempHome();
     const meter = new UsageMeter({ ctiHome: home, now: () => new Date('2026-09-25T00:00:00.000Z') });
@@ -56,12 +71,29 @@ describe('UsageMeter', () => {
     assert.equal(summary.calls, 2);
     assert.equal(summary.succeededCalls, 1);
     assert.equal(summary.failedCalls, 1);
-    assert.equal(summary.totalTokens, 9);
+    assert.equal(summary.totalTokens, 5);
     assert.equal(summary.knownCostCalls, 1);
     assert.equal(summary.unknownCostCalls, 1);
     assert.equal(summary.p50LatencyMs, 100);
     assert.equal(summary.p95LatencyMs, 300);
     assert.equal(summary.byProvider.jev?.calls, 2);
+    assert.equal(summary.knownCostUsd, 0.1);
+    assert.equal(summary.unknownInputTokenCalls, 0);
+    assert.equal(summary.unknownTotalTokenCalls, 1);
+    assert.equal(summary.routeMetrics.agreementRate, null);
+    assert.equal(summary.failureRate, 0.5);
+  });
+
+  it('builds a bounded display snapshot with route agreement metrics', () => {
+    const meter = new UsageMeter({ ctiHome: tempHome(), maxRecords: 5000 });
+    meter.record({ operation: 'router', provider: 'jev', model: 'm', inputTokens: 1, outputTokens: 1, routeDecision: 'task', routeMode: 'shadow', effectivePath: 'coordinator', routeComparisonId: 'pair-1' });
+    meter.record({ operation: 'router', provider: 'coordinator', model: 'c', inputTokens: 1, outputTokens: 1, routeDecision: 'task', coordinatorRoute: 'task', routeComparisonId: 'pair-1' });
+    const snapshot = meter.snapshot();
+    assert.equal(snapshot.protocol, 'cti-model-usage-snapshot/v1');
+    assert.equal(snapshot.records.length, 2);
+    assert.equal(snapshot.summary.routeMetrics.pairedComparisons, 1);
+    assert.equal(snapshot.summary.routeMetrics.agreementRate, 1);
+    assert.equal(snapshot.window.displayLimit, 200);
   });
 
   it('bounds retained records', () => {
