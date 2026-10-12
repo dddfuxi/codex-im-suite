@@ -4,3 +4,4 @@ export * from './extension.js';
 export * from './node-agent.js';
 export * from './project-registry.js';
 export * from './workflow.js';
+export * from './usage.js';
