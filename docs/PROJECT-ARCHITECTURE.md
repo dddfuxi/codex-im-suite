@@ -1688,6 +1688,10 @@ live skill 同步时，`scripts/sync-live-skill.ps1` 会先构建 `packages/brid
 
 同步控制面板发布目录时必须排除 `CodexImSuiteControlPanel.exe.WebView2` 用户数据目录，避免 WebView2 Cookie/Cache 临时文件被 robocopy 镜像到 live skill。
 
+### 9.1.1 Provider 无关模型用量账本
+
+`packages/contracts/src/usage.ts` 和 `schemas/usage.schema.json` 定义 `cti-model-usage/v1`。Runtime 的 `packages/bridge-runtime/src/usage-meter.ts` 只接收已经归一化的 Provider、模型、Token、缓存 Token、延迟、费率和费用，不保存完整 Prompt、回复、密钥或附件；写入使用 `atomic-text-file.ts` 的 UTF-8 原子替换和 Windows 锁重试。Provider 回报费用优先，本地价格表只在回报缺失时计算，价格未知保持 `null`。该模块是可替换 Provider 的共享基础设施，当前不改变 Coordinator/Primary 路由，也不启用 Jev。
+
 ### 9.1 入口定位
 
 日常维护入口：

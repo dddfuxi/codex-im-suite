@@ -45,6 +45,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-git-session-archive.p
 - AI 执行来源收口：设置页支持选择默认 executor 来源，执行器页可一键设为默认或恢复自动；Codex 内部仍支持官方 Codex、本地 API、外部 API 和自动切换链作为模型来源。Feishu 最终卡片底部会分开展示“来源”（executor/provider）与“模型 / token”，便于确认本轮到底由 Codex、Claude CLI 还是外部 agent 执行。
 - Codex 模型设置真实生效：官方 Codex 的模型可以留空（跟随 Codex 默认）或填写显式模型，普通任务推理强度支持 `minimal / low / medium / high / xhigh`。“保存并重启 Bridge”后后续任务使用新配置；会话页 Workflow 展示本轮已提交给 Codex 的模型、推理强度、受限覆盖和 thread 切换原因。classifier / response-only 固定使用 `low`，并明确标注，不会冒充全局设置失效。
 - 打包链路补齐：portable / installer / live skill 同步都按 suite 目录生成，控制面板 Web 前端和 `wwwroot` 资源会一并进入发布产物。
+- 模型用量记录保持 Provider 无关：`packages/contracts` 提供 `cti-model-usage/v1` 协议，Runtime 的 `UsageMeter` 以原子方式保存 Token、缓存 Token、延迟、费率和费用字段；Provider 未提供费用时才使用本地价格表，未知费率保持未知。该账本目前只作为通用基础设施，不启用 Jev 或改变现有路由。
 
 ## 快速入口
 
